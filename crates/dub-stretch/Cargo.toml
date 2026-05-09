@@ -1,0 +1,10 @@
+[package]
+name = "dub-stretch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rubber Band FFI wrapper (license-isolated). Time-stretch + key lock."
+
+[dependencies]

@@ -1,0 +1,6 @@
+# Project-wide clippy configuration.
+# We treat clippy warnings as errors in CI.
+
+# Enforce that we don't accidentally use floating-point in DSP code in a way that
+# silently rounds; allow with explicit comments.
+avoid-breaking-exported-api = false

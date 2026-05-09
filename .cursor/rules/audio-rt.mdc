@@ -1,0 +1,76 @@
+---
+description: Real-time audio thread rules — non-negotiable
+globs: crates/dub-engine/**/*.rs,crates/dub-dsp/**/*.rs,crates/dub-stretch/**/*.rs
+alwaysApply: false
+---
+
+# Audio thread rules — NON-NEGOTIABLE
+
+The audio thread is sacred (PRD §4.2). A single mistake here causes audible
+glitches in front of audiences. This rule applies to any code reachable from
+the render callback.
+
+## Forbidden inside the render path
+
+- **No allocation.** No `Box::new`, no `Vec::push` (that grows), no `String::from`,
+  no `format!`, no `vec![]`, no `to_owned`. Use pre-allocated buffers.
+- **No locks.** No `Mutex::lock`, no `RwLock`, no `parking_lot::*`. Use atomics
+  or lock-free SPSC channels (`ringbuf`).
+- **No syscalls.** No file I/O, no network, no `println!`, no `eprintln!`,
+  no `log::*`. Errors travel out via lock-free channels for the UI thread to log.
+- **No `unwrap()` or `panic!`.** Render must always return a buffer; unwinding
+  through CoreAudio is undefined behavior. Use `RtError` (Copy) and signal
+  the UI thread.
+- **No `dyn Trait` heap allocation.** Use enums or generics for polymorphism.
+- **No `std::thread::sleep`.** The render thread sleeps when the IO proc says so.
+- **No `Drop` that does any of the above.** RAII guards must be cheap.
+
+## Required patterns
+
+- Functions reachable on the audio thread take `&mut RealtimeContext<'_>` as
+  the first parameter (after `self`). This is the gating token.
+- Any new `Vec<T>` field is pre-allocated in the non-RT constructor; only
+  `vec[i] = x` (write into existing capacity) is allowed in render.
+- For UI ↔ audio messaging, use `ringbuf::HeapRb` (allocation up-front, lock-free
+  push/pop at runtime).
+- Tests for any RT path must run under `assert_no_alloc::assert_no_alloc(|| { ... })`.
+- For CPU-intensive inner loops, prefer SoA (struct-of-arrays) over AoS
+  (array-of-structs) and document the choice.
+
+## Example: correct render method
+
+```rust
+impl Engine {
+    pub fn render(&mut self, rt: &mut RealtimeContext<'_>, out: &mut [f32]) {
+        rt.tick();
+        debug_assert_eq!(out.len(), 2 * self.block_size);
+        // out is pre-allocated by the caller. We write through it.
+        for sample in out.iter_mut() {
+            *sample = 0.0;
+        }
+    }
+}
+```
+
+## Example: forbidden render method
+
+```rust
+// ❌ NEVER do this
+impl Engine {
+    pub fn render(&mut self, _rt: &mut RealtimeContext<'_>, out: &mut [f32]) {
+        let scratch = vec![0.0f32; out.len()]; // ❌ alloc
+        let lock = self.shared.lock().unwrap();  // ❌ lock + unwrap
+        log::info!("rendering");                 // ❌ syscall + alloc
+        out.copy_from_slice(&scratch);
+    }
+}
+```
+
+## When you NEED to allocate / log / etc.
+
+You're not on the audio thread. Move that work to a worker thread or the UI
+thread. Communicate via lock-free channels.
+
+If you're writing a test that legitimately needs `permit_alloc` (e.g. comparing
+two `Vec`s of output), wrap that *outside* the `assert_no_alloc` scope — never
+inside `engine.render(...)`.

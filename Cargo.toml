@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dub-engine",
+    "crates/dub-dsp",
+    "crates/dub-stretch",
+    "crates/dub-io",
+    "crates/dub-timecode",
+    "crates/dub-thru",
+    "crates/dub-fingerprint",
+    "crates/dub-library",
+    "crates/dub-controller",
+    "crates/dub-ffi",
+    "crates/dub-cli",
+    "tools/rt-audit",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/klos/dubjay"
+authors = ["klos"]
+
+[workspace.dependencies]
+# Internal crates wired by name; concrete versions only on external deps.
+dub-engine = { path = "crates/dub-engine" }
+dub-dsp = { path = "crates/dub-dsp" }
+dub-stretch = { path = "crates/dub-stretch" }
+dub-io = { path = "crates/dub-io" }
+dub-timecode = { path = "crates/dub-timecode" }
+dub-thru = { path = "crates/dub-thru" }
+dub-fingerprint = { path = "crates/dub-fingerprint" }
+dub-library = { path = "crates/dub-library" }
+dub-controller = { path = "crates/dub-controller" }
+dub-ffi = { path = "crates/dub-ffi" }
+
+# External (only what's needed for M0–M2; more added per milestone)
+assert_no_alloc = { version = "1.1", default-features = false }
+ringbuf = "0.4"
+thiserror = "1"
+anyhow = "1"
+
+# Test-only
+proptest = "1"
+insta = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = true             # keep symbols in release for crash reports
+
+[profile.release-rt]
+inherits = "release"
+overflow-checks = false  # for RT hot paths only — modules opt in
+
+[profile.dev]
+opt-level = 1            # zero-opt is too slow for real-time even in dev
+debug = true

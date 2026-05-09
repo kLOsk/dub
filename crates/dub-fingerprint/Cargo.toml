@@ -1,0 +1,10 @@
+[package]
+name = "dub-fingerprint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Audio fingerprinting for real-record recognition (v1.1). Chromaprint FFI."
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "dub-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Audio file decoding and in-memory track buffers. symphonia-based."
+
+[dependencies]

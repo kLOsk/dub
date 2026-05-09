@@ -1,0 +1,59 @@
+---
+description: Idiomatic Rust conventions for the Dub workspace
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust conventions for Dub
+
+## Always
+
+- Run `cargo fmt` after edits. The pre-commit hook does this; agents should mimic.
+- Run `cargo clippy --all-targets -- -D warnings` after non-trivial changes.
+- Run `cargo nextest run -p <crate>` for the changed crate; full workspace before merge.
+- Public items have `///` doc comments. `#![warn(missing_docs)]` is on in libraries.
+- Use `thiserror` for library errors; `anyhow` for binaries / integration tests.
+- No `unwrap()` outside test code. Use `?`, `.expect("why this can't fail: …")`, or proper error propagation.
+- No `panic!` in library code outside `assert!` family in tests.
+
+## Modules and naming
+
+- Module names: `snake_case`, singular. Files: `transport.rs`, not `transports.rs`.
+- Types: `PascalCase`. Acronyms get sentence case (`HttpClient`, not `HTTPClient`; `Rms`, not `RMS`).
+- Constants: `SCREAMING_SNAKE_CASE`.
+- Re-export key public types at the crate root via `pub use`.
+
+## Errors
+
+```rust
+// Good — typed errors per crate
+#[derive(Debug, thiserror::Error)]
+pub enum LibraryError {
+    #[error("library file not found: {path}")]
+    NotFound { path: PathBuf },
+    #[error("malformed entry at offset {offset}")]
+    Malformed { offset: u64 },
+}
+```
+
+## Comments
+
+- No comments that narrate what the code does. `// Increment counter` adds nothing.
+- Comments explain *why*: trade-offs, surprising invariants, references to PRD sections.
+- Reference PRD sections by number when relevant: `// See PRD §6.1.1`.
+
+## Tests
+
+- TDD: write the failing test first.
+- Property tests (`proptest`) for state machines and parsers.
+- Golden tests (`insta`) for DSP regression.
+- Tests live next to source as `#[cfg(test)] mod tests`.
+- Integration tests in `tests/`.
+
+## Things to avoid
+
+- `unwrap()` outside tests
+- `as` casts for numeric narrowing without comment
+- `dyn Trait` heap allocation in hot paths
+- `Mutex` / `RwLock` anywhere near the audio thread
+- `unsafe` (we have `#![forbid(unsafe_code)]` at crate level; FFI crates exempt)

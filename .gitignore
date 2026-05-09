@@ -1,0 +1,46 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Lockfiles - keep
+# (Cargo.lock IS committed for binaries; this workspace has bins so we keep it)
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Apple build outputs
+apple/build/
+apple/DerivedData/
+apple/*.xcodeproj/xcuserdata/
+apple/*.xcworkspace/xcuserdata/
+*.xcframework/*-Info.plist
+DubCore.xcframework/
+
+# Test / coverage outputs
+coverage/
+*.profraw
+*.profdata
+target/llvm-cov-target/
+
+# Fuzz outputs
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Local logs / dumps
+*.log
+crashes/
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Apple developer artifacts
+ExportOptions.plist
+*.p12

@@ -1,0 +1,11 @@
+[package]
+name = "dub-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FFI surface exposing dub-engine to Swift via UniFFI."
+
+[dependencies]
+dub-engine = { workspace = true }

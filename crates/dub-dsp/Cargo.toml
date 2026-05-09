@@ -1,0 +1,10 @@
+[package]
+name = "dub-dsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DSP building blocks: resamplers, filters, FX. Real-time safe."
+
+[dependencies]

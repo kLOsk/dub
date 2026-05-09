@@ -1,0 +1,88 @@
+---
+description: Testing discipline — TDD, property tests, golden tests
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Testing discipline
+
+See PRD §2.2 for the full philosophy. Quick rules:
+
+## Default: write the test first
+
+When adding behavior:
+
+1. Write the test that captures the desired behavior (it fails).
+2. Write the minimum code to pass it.
+3. Refactor.
+4. Commit both together.
+
+Carve-outs: throwaway exploratory `experimental/` code, SwiftUI views (use
+snapshot tests).
+
+## Test types
+
+- **Unit** — pure functions, small modules. `#[cfg(test)] mod tests`.
+- **Property** — `proptest` for state machines, parsers, audio math.
+- **Golden** — `insta` for DSP regression. Snapshot updates require explicit
+  acceptance via `cargo insta accept`.
+- **Integration** — multi-crate, in `crates/<name>/tests/`.
+- **RT-safety** — any test exercising the audio thread runs under
+  `assert_no_alloc::assert_no_alloc(|| { ... })`. Non-negotiable.
+
+## Property test example
+
+```rust
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn lfsr_decode_never_panics(input in proptest::collection::vec(any::<i16>(), 0..4096)) {
+        let _ = decode_serato(&input);
+    }
+}
+```
+
+## Golden test example
+
+```rust
+#[test]
+fn resampler_44100_to_48000_matches_reference() {
+    let input = include_bytes!("../tests/fixtures/sine_440_44100.wav");
+    let output = resample(input, 48_000);
+    insta::assert_debug_snapshot!(output_signature(&output));
+}
+```
+
+## Things to avoid
+
+- `#[ignore]` to dodge a flaky test. Fix the flake.
+- `--test-threads=1` as a workaround for shared mutable state. Fix the test.
+- `unwrap()` in test code — okay-ish but prefer `?` with `Result` returns.
+- Sleeps in tests longer than a few ms. Use deterministic clocks/mocks.
+
+## Coverage
+
+- Target ≥ 85 % branch coverage for non-trivial modules.
+- UI/glue/main fn code is exempt — coverage is a proxy, not the goal.
+- `make cov` for the report.
+
+## RT-safety pattern
+
+```rust
+use assert_no_alloc::AllocDisabler;
+
+#[global_allocator]
+static A: AllocDisabler = AllocDisabler;
+
+#[test]
+fn render_is_alloc_free() {
+    let mut engine = Engine::new(48_000.0, 64);
+    let mut buffer = vec![0.0f32; 128]; // pre-allocate OUTSIDE the assert
+    let mut rt = RealtimeContext::new();
+
+    assert_no_alloc::assert_no_alloc(|| {
+        engine.render(&mut rt, &mut buffer);
+    });
+}
+```

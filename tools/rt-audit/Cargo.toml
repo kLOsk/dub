@@ -1,0 +1,18 @@
+[package]
+name = "rt-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone tool: stress-render the engine under assert_no_alloc."
+publish = false
+
+[[bin]]
+name = "rt-audit"
+path = "src/main.rs"
+
+[dependencies]
+dub-engine = { workspace = true }
+assert_no_alloc = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "dub-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless smoke test + offline render harness for Dub."
+
+[[bin]]
+name = "dub"
+path = "src/main.rs"
+
+[dependencies]
+dub-engine = { workspace = true }
+dub-ffi = { workspace = true }
+anyhow = { workspace = true }

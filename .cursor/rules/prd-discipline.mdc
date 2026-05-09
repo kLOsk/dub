@@ -1,0 +1,50 @@
+---
+description: PRD discipline — never silently expand scope or violate design principles
+alwaysApply: true
+---
+
+# PRD discipline
+
+`docs/PRD.md` is the source of truth. When making changes, observe these rules:
+
+## Non-negotiable design principles (PRD §1, §2.1, §2.2)
+
+1. **No Mouse DJ Ever.** Performance interactions never require a mouse.
+2. **External mixer is the product.** No software mixer in v1/v2.
+3. **Real records are first-class.** Thru mode + auto-detection.
+4. **Reliability over features.** Audience-grade reliability.
+5. **Forward = backward symmetric playback.** Manual rewinds are first-class.
+6. **The audio thread is sacred.**
+
+## Out-of-scope (PRD §6.6, §15)
+
+Do not add code or UI for, in v1:
+
+- Software mixer / EQ / crossfader
+- Hot cues
+- Recording
+- Streaming services
+- Phase support
+- HID controllers
+- Stems / AI separation
+- Video / OBS
+
+If a user request would expand scope into one of these areas, **flag it and
+ask before implementing**. Don't silently add features that PRD §15 lists
+as out-of-scope.
+
+## Phase A pragmatism (PRD §2.2.0)
+
+We are pre-alpha. The full reliability gates (§2.2.6) apply only to Phase C
+(stable releases). In Phase A:
+
+- Tests are written, CI green, RT-safety enforced. **All framework operational.**
+- We do NOT block development on soak tests or gig-hour gates that don't yet
+  apply.
+- Author dogfoods on `main`; no formal release.
+
+## When in doubt
+
+- Read the relevant PRD section.
+- If the PRD doesn't specify, ask the user.
+- Never remove a "non-negotiable" without explicit user agreement.

@@ -1,0 +1,43 @@
+---
+description: Swift / SwiftUI conventions for the Dub macOS app
+globs: apple/**/*.swift
+alwaysApply: false
+---
+
+# Swift conventions for Dub
+
+The Apple shell consumes the Rust core via UniFFI. Swift code is the
+chrome (toolbar, library browser, preferences); Metal-rendered views handle
+the performance surface (waveforms, scopes).
+
+## Always
+
+- No implicit unwraps (`!`). Use `if let`, `guard let`, or `??`.
+- All UI mutation goes through `MainActor`-isolated code. Annotate `@MainActor`
+  explicitly when crossing actor boundaries.
+- Never call into Swift from the audio render thread. The audio thread runs
+  Rust code only. UniFFI bindings used by Swift are only called from non-RT
+  threads (UI dispatch, worker queues).
+- Snapshot test every view. `swift-snapshot-testing` is the tool. Failing
+  snapshots block the PR until reviewer-accepted.
+
+## Structure
+
+- Views are small. Extract subviews when a body exceeds ~30 lines.
+- View models are `@Observable` (Swift 5.9+) or `ObservableObject`. Pure logic
+  has no UI dependency.
+- One view per file. Same name as the type.
+
+## Performance UI
+
+- Use `MTKView` (subclassed) for waveforms and timecode scope. Not Canvas.
+- Render loop polls Rust core state via lock-free atomic snapshots, never
+  callbacks from the audio thread.
+- Target 60 fps; 120 fps where ProMotion is available.
+
+## Things to avoid
+
+- Force-unwrapping optionals (`!`).
+- `DispatchQueue.main.sync` from background — deadlock waiting to happen.
+- `Thread.sleep` — never.
+- Capturing `self` strongly in closures inside reactive code (use `[weak self]`).

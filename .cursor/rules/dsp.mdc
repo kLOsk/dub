@@ -1,0 +1,61 @@
+---
+description: DSP-specific patterns (resamplers, filters, FX) for Dub
+globs: crates/dub-dsp/**/*.rs,crates/dub-stretch/**/*.rs,crates/dub-engine/**/*.rs
+alwaysApply: false
+---
+
+# DSP rules
+
+In addition to the audio-rt rules. DSP-specific:
+
+## Numeric format
+
+- All audio is `f32`, planar by channel where convenient, interleaved at
+  engine-output boundary.
+- Sample rate is always known and explicit; never hard-code `44100` or `48000`.
+- Phase / position state is `f64` (sample-accurate over very long tracks);
+  audio buffers stay `f32`.
+
+## Denormals
+
+- Hot inner loops that feed back (filters, delays, reverbs) must protect
+  against denormal numbers. Common pattern: add a small DC offset (~1e-25)
+  or clamp to zero below threshold. Document in the comment.
+- On x86 we may set FTZ/DAZ at thread setup; on Apple Silicon ARM, denormals
+  default to flush-to-zero. Verify per-platform.
+
+## Numerical hygiene
+
+- No `panic!` from arithmetic. Use `f32::clamp`, `f32::max`, `f32::min`.
+- Comparisons with `==` on floats: only with `0.0` for "is silent" checks
+  (allow `clippy::float_cmp` locally with a comment). Otherwise compare
+  with `(a - b).abs() < eps`.
+- Zero-init buffers. Random buffer state from `Vec::with_capacity` then
+  `set_len` is undefined behavior — use `vec![0.0; n]` or `resize`.
+
+## Performance
+
+- Branch-free inner loops where it doesn't hurt clarity.
+- Prefer SoA over AoS for hot data. Comment when you do.
+- SIMD via `std::simd` (nightly) or hand-rolled — only after profiling shows
+  it helps. No premature SIMD.
+- `criterion` benchmarks live under `benches/`. Track regressions in CI.
+
+## Filters
+
+- Biquads: store coefficients as `[f32; 5]` (b0, b1, b2, a1, a2) with `a0` normalized.
+- State per channel: 2 floats (Direct Form II Transposed). Document choice.
+- Coefficient calculation off the audio thread; only state advance on RT.
+
+## Resampling
+
+- Use `rubato` for sinc resampling (off-RT) or simple linear interpolation
+  for scratching paths (on-RT, must handle negative rates).
+- Forward and backward playback share the same code path. There is no
+  separate "scratch resampler"; rate is just a real number, sign included.
+
+## Things to avoid
+
+- `dyn DspBlock` — use enums or generics.
+- `Vec::push` in any DSP function — pre-allocate.
+- `to_string` / `format!` for debug output in render path.

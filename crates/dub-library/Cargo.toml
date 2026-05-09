@@ -1,0 +1,10 @@
+[package]
+name = "dub-library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Track library: SQLite + import adapters (Serato, Traktor, rekordbox, iTunes, Lexicon)."
+
+[dependencies]

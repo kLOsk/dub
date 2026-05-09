@@ -1,0 +1,44 @@
+---
+description: FFI safety conventions (Rust ↔ Swift via UniFFI, C FFI to Rubber Band/Aubio)
+globs: crates/dub-ffi/**/*.rs,crates/dub-stretch/**/*.rs,crates/dub-fingerprint/**/*.rs
+alwaysApply: false
+---
+
+# FFI rules
+
+## Rust ↔ Swift via UniFFI
+
+- All UniFFI-exposed functions return `Result<T, E>` where `E` is a UDL-modeled
+  error type. Panics across the FFI boundary are undefined behavior.
+- Keep the surface minimal. Add a function only when Swift actually needs it.
+- The audio render path is **not** in the UniFFI surface. Swift never calls
+  into the render loop. Rust owns the IO proc end-to-end.
+- For high-frequency reads (transport position, peak meters), expose
+  atomic-snapshot accessors that copy a small struct, not callbacks.
+
+## Rust ↔ C (Rubber Band, Aubio, Chromaprint)
+
+- All `unsafe` blocks have a comment explaining why the safety contract holds.
+- Wrap C handles in a `Drop`-implementing wrapper; the wrapper is `Send` only
+  if the C library documents it as such (Rubber Band: per-instance, not Send).
+- Always check return codes; never ignore.
+- Allocations done by C libraries must be freed by the same library's free
+  fn, not Rust's allocator.
+- For libraries with non-stable ABIs, pin the version in `Cargo.toml` and
+  document the version compatibility in the wrapper module.
+
+## Things to avoid
+
+- Returning Rust references across FFI (lifetime is the C caller's problem).
+- Passing closures over FFI without a stable trampoline.
+- Calling into FFI from the audio render thread unless the C library
+  documents real-time safety (Rubber Band's `process` is RT-safe; setup is not).
+
+## File-level conventions
+
+- The FFI crate's `lib.rs` re-exports a small public surface. The internal
+  module structure mirrors the C library being wrapped.
+- One `mod sys;` for raw bindgen / hand-written FFI declarations.
+- One `mod safe;` for the safe Rust API.
+- `#![allow(unsafe_code)]` is permitted at the crate level for FFI crates,
+  with a comment explaining the scope.

@@ -1,0 +1,10 @@
+[package]
+name = "dub-thru"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thru-mode pipeline: real records through the engine. Auto-detection of timecode vs music."
+
+[dependencies]
