@@ -35,7 +35,10 @@ mod macos;
 pub use error::AudioError;
 
 #[cfg(target_os = "macos")]
-pub use macos::{query_default_output, AudioOutput, BufferFrameRange};
+pub use macos::{
+    list_input_devices, query_default_input, query_default_output, AudioInput, AudioOutput,
+    BufferFrameRange, InputDeviceInfo, InputOptions,
+};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

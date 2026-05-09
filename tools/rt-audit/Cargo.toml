@@ -15,5 +15,7 @@ path = "src/main.rs"
 [dependencies]
 dub-engine = { workspace = true }
 dub-io = { workspace = true }
+dub-timecode = { workspace = true }
 assert_no_alloc = { workspace = true }
 anyhow = { workspace = true }
+ringbuf = { workspace = true }

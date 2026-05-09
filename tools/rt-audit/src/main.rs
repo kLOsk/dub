@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use assert_no_alloc::AllocDisabler;
-use dub_engine::{Engine, RealtimeContext};
+use dub_engine::{Engine, RealtimeContext, TimecodeInputConfig};
 use dub_io::Track;
+use ringbuf::traits::{Producer as _, Split as _};
+use ringbuf::HeapRb;
 
 #[global_allocator]
 static A: AllocDisabler = AllocDisabler;
@@ -122,5 +124,94 @@ fn run() -> Result<()> {
         "rt-audit OK: {BLOCKS} blocks rendered in {:.3} ms (×{realtime_factor:.0} realtime)",
         elapsed.as_secs_f64() * 1000.0
     );
+
+    // ============================================================
+    //   M5.3 timecode-driven render path
+    // ============================================================
+    //
+    // Build a fresh engine, attach a synthetic timecode input to deck
+    // 0, prime the input ring with N blocks of forward-unity carrier,
+    // then render with the producer continuously refilling. The render
+    // path now exercises:
+    //
+    //   - Engine::drive_timecode_inputs (M5.3)
+    //   - Decoder::process (M5.1) on the audio thread
+    //   - Deck::set_rate / set_playing under decoder control
+    //
+    // Any allocation in those paths shows up here.
+    println!();
+    println!(
+        "rt-audit: timecode path — rendering {} blocks with synthetic carrier on deck 0",
+        TC_BLOCKS
+    );
+    let tc_elapsed = run_timecode_audit()?;
+    let tc_total_secs = (TC_BLOCKS as f32 * BLOCK_SIZE as f32) / SAMPLE_RATE;
+    let tc_factor = tc_total_secs / tc_elapsed.as_secs_f32();
+    println!(
+        "rt-audit OK: timecode path {TC_BLOCKS} blocks in {:.3} ms (\u{00d7}{tc_factor:.0} realtime)",
+        tc_elapsed.as_secs_f64() * 1000.0
+    );
     Ok(())
+}
+
+/// Number of blocks to render through the timecode path. Smaller than
+/// the main loop because we also re-render the synthetic carrier on
+/// the *producer* side (off-RT but still in-process), and we don't
+/// need 100k blocks to surface an allocation regression.
+const TC_BLOCKS: u64 = 10_000;
+
+fn run_timecode_audit() -> Result<std::time::Duration> {
+    const SAMPLE_RATE: f32 = 48_000.0;
+    const BLOCK_SIZE: usize = 64;
+
+    let mut engine = Engine::new(SAMPLE_RATE, BLOCK_SIZE);
+    // Seed deck 0 with a constant-value track so we can let the
+    // decoder freely drive transport without worrying about the
+    // playhead leaving the source.
+    let track = Arc::new(Track::from_interleaved(vec![0.1_f32; 48_000 * 2], 48_000, 2).unwrap());
+    engine.deck_mut(0).set_source(track);
+
+    // Build a 2-second-deep input ring. Deep enough that the producer
+    // can refill ahead of the consumer without ever overflowing.
+    let rb = HeapRb::<f32>::new((SAMPLE_RATE as usize) * 2 * 2);
+    let (mut tx, rx) = rb.split();
+    engine.attach_timecode_input(
+        0,
+        rx,
+        TimecodeInputConfig {
+            format: dub_timecode::Format::SeratoCv02,
+            input_sample_rate: SAMPLE_RATE,
+            max_block_frames: BLOCK_SIZE * 4,
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+        },
+    )?;
+
+    let mut gen =
+        dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, SAMPLE_RATE);
+    let mut sig = vec![0.0_f32; BLOCK_SIZE * 2];
+    let mut buffer = vec![0.0_f32; BLOCK_SIZE * 2];
+    let mut rt = RealtimeContext::new();
+
+    // Prime: render once so the decoder is past its first-block prime
+    // (avoids the false-positive of "first call allocates" on prev_*
+    // that doesn't actually allocate but might fool a measurement).
+    gen.render(&mut sig, 1.0, 0.5);
+    let _ = tx.push_slice(&sig);
+    engine.render(&mut rt, &mut buffer);
+
+    let start = Instant::now();
+    assert_no_alloc::assert_no_alloc(|| {
+        for _ in 0..TC_BLOCKS {
+            // Generator.render is alloc-free (M5.1 verified). Push
+            // into the SPSC ring is alloc-free.
+            gen.render(&mut sig, 1.0, 0.5);
+            let _ = tx.push_slice(&sig);
+            engine.render(&mut rt, &mut buffer);
+            black_box(&buffer);
+        }
+    });
+    Ok(start.elapsed())
 }

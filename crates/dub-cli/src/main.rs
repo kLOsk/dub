@@ -26,6 +26,8 @@ use dub_io::Track;
 
 mod analyze;
 mod decode_timecode;
+mod input_cmds;
+mod timecode_deck;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -38,6 +40,10 @@ fn main() -> ExitCode {
         "play" => play(&args[2..]),
         "analyze" => analyze_cmd(&args[2..]),
         "decode-timecode" => decode_timecode_cmd(&args[2..]),
+        "list-inputs" => input_cmds::list_inputs(),
+        "levels" => input_cmds::levels(&args[2..]),
+        "capture" => input_cmds::capture(&args[2..]),
+        "timecode-deck" => timecode_deck::run(&args[2..]),
         "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
@@ -67,6 +73,14 @@ fn print_help() {
     eprintln!("  rt-audit          stress the render path under assert_no_alloc");
     eprintln!("  version           print versions");
     eprintln!("  measure-latency   query the default output device for SR + buffer + latency");
+    eprintln!("  list-inputs       enumerate audio input devices (M5.2)");
+    eprintln!("  levels            [--device NAME] [--channels N] [--buffer-size F]");
+    eprintln!("                    [--input-channels N,M] [--sr SR] [--duration SECS]");
+    eprintln!("                                                  live RMS meters per ch");
+    eprintln!("  capture <wav>     [--device NAME] [--channels N] [--buffer-size F]");
+    eprintln!("                    [--input-channels N,M] [--sr SR] [--duration SECS]");
+    eprintln!("                                                  record input device to WAV");
+    eprintln!("                    --input-channels uses 1-based indices: SL3 deck A = 3,4");
     eprintln!("  play <deck-a> [<deck-b>]");
     eprintln!("                    [--realtime] [-o <output>] [--sr SR] [--block-size N]");
     eprintln!("                    [--duration SECS] [--buffer-size FRAMES]");
@@ -83,6 +97,12 @@ fn print_help() {
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--window MS] [--head N]");
     eprintln!("                    [--synthetic]   offline timecode-vinyl decoder (M5.1)");
+    eprintln!("  timecode-deck <track>");
+    eprintln!("                    --input-channels N,M [--device NAME] [--sr SR]");
+    eprintln!("                    [--duration SECS] [--confidence T]");
+    eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
+    eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
+    eprintln!("                                    live timecode \u{2192} deck-0 demo (M5.3)");
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
@@ -108,6 +128,19 @@ fn print_help() {
     eprintln!("    discrete time slices. Verdict heuristic LOCKED / PARTIAL / POOR. With");
     eprintln!("    --synthetic and no input path, decodes a built-in test scenario instead");
     eprintln!("    (sanity-check the decoder math without a turntable).");
+    eprintln!();
+    eprintln!("  timecode-deck (M5.3): live wiring — open the input device, route timecode");
+    eprintln!("    through the dub-timecode decoder into deck 0's transport, play the loaded");
+    eprintln!("    track through the default output. Forward platter motion plays forward,");
+    eprintln!("    scratching scratches, lifting the stylus mutes the deck. Lift is detected");
+    eprintln!("    via three layers: (1) amplitude gate — RMS below --amplitude-threshold means");
+    eprintln!("    carrier is dead regardless of confidence (catches lift's quiet-but-coherent");
+    eprintln!("    handling-noise); (2) confidence hysteresis — engage at --confidence, lukewarm");
+    eprintln!("    band down to --disengage-threshold rides scratch transients; (3) sticky");
+    eprintln!("    window — --sticky-blocks consecutive below-floor blocks before muting.");
+    eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
+    eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
+    eprintln!("    to stop.");
 }
 
 fn smoke() -> Result<()> {

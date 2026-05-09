@@ -29,11 +29,17 @@ mod deck;
 pub mod declick;
 mod handle;
 pub mod realtime;
+pub mod timecode;
 
 pub use command::Command;
 pub use deck::Deck;
 pub use handle::{CommandError, DeckCommand, DeckSnapshot, EngineHandle};
 pub use realtime::{RealtimeContext, RtError};
+pub use timecode::{
+    AttachError as TimecodeAttachError, TimecodeInput, TimecodeInputConfig,
+    DEFAULT_AMPLITUDE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD, DEFAULT_DISENGAGE_THRESHOLD,
+    DEFAULT_STICKY_BLOCKS_TO_DISENGAGE,
+};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -74,6 +80,12 @@ pub struct Engine {
     /// when an old `Arc<Track>` needed to go back. Surfaced to the UI
     /// via [`EngineHandle::trash_overflow_count`].
     trash_overflow: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Per-deck timecode input. `None` means the deck runs free under
+    /// normal command/handle control; `Some` means the deck's transport
+    /// is driven by the decoded carrier each block (M5.3). One slot per
+    /// deck so M5+ external-mixer routing can mix-and-match (deck A on
+    /// timecode, deck B on file playback, or vice versa).
+    timecode_inputs: [Option<TimecodeInput>; DECK_COUNT],
 }
 
 impl Engine {
@@ -93,6 +105,7 @@ impl Engine {
             cmd_rx: None,
             trash_tx: None,
             trash_overflow: None,
+            timecode_inputs: std::array::from_fn(|_| None),
         }
     }
 
@@ -118,8 +131,65 @@ impl Engine {
             cmd_rx: Some(side.cmd_rx),
             trash_tx: Some(side.trash_tx),
             trash_overflow: Some(side.overflow_counter),
+            timecode_inputs: std::array::from_fn(|_| None),
         };
         (engine, handle)
+    }
+
+    /// Attach a timecode input to a deck. After this call, the deck's
+    /// transport (rate + play/pause) is driven each render block by the
+    /// decoder; commands sent through the [`EngineHandle`] still apply
+    /// for non-transport state (gain, source loads), but `play`,
+    /// `pause`, and `set_rate` will be overwritten by the next block's
+    /// decoder output.
+    ///
+    /// Off-RT — call once during engine setup, before moving the engine
+    /// into the [`dub_audio::AudioOutput`] callback.
+    ///
+    /// # Errors
+    /// See [`TimecodeAttachError`] for the failure modes — bad deck
+    /// index, slot already occupied, SR mismatch with the engine, or a
+    /// pathological config.
+    pub fn attach_timecode_input(
+        &mut self,
+        deck_idx: usize,
+        rx: ringbuf::HeapCons<f32>,
+        config: TimecodeInputConfig,
+    ) -> Result<(), TimecodeAttachError> {
+        if deck_idx >= DECK_COUNT {
+            return Err(TimecodeAttachError::InvalidDeck {
+                idx: deck_idx,
+                count: DECK_COUNT,
+            });
+        }
+        config.validate(self.sample_rate)?;
+        if self.timecode_inputs[deck_idx].is_some() {
+            return Err(TimecodeAttachError::AlreadyAttached { idx: deck_idx });
+        }
+        self.timecode_inputs[deck_idx] = Some(TimecodeInput::new(rx, config));
+        Ok(())
+    }
+
+    /// Detach the timecode input from a deck (off-RT). Returns the
+    /// previously-attached input so the caller can drop it on the main
+    /// thread; the deck is then under handle/command control again.
+    #[must_use = "the returned TimecodeInput holds a ringbuf consumer; \
+                  drop it on the main thread, not the audio thread"]
+    pub fn detach_timecode_input(&mut self, deck_idx: usize) -> Option<TimecodeInput> {
+        self.timecode_inputs
+            .get_mut(deck_idx)
+            .and_then(Option::take)
+    }
+
+    /// Read-only view of the most recent decoder output for a deck.
+    /// Off-RT only (the audio thread mutates `last_output`); call from
+    /// the main thread between blocks for UI display.
+    #[must_use]
+    pub fn timecode_last_output(&self, deck_idx: usize) -> Option<dub_timecode::DecodeOutput> {
+        self.timecode_inputs
+            .get(deck_idx)
+            .and_then(|s| s.as_ref())
+            .and_then(TimecodeInput::last_output)
     }
 
     /// Engine-wide master gain (linear, default 1.0). Used by the debug
@@ -187,6 +257,12 @@ impl Engine {
         // allocation; apply_command writes plain fields and atomics.
         self.drain_commands();
 
+        // M5.3: drain each attached timecode input, run the decoder,
+        // and translate the result into deck transport intents. This
+        // happens BEFORE deck render so the new rate / play state is
+        // in effect for this block's output.
+        self.drive_timecode_inputs();
+
         for sample in out.iter_mut() {
             *sample = 0.0;
         }
@@ -214,6 +290,59 @@ impl Engine {
         // thread mutate transport state without ever calling Arc::drop.
         for idx in 0..DECK_COUNT {
             self.sweep_deck_disposal(idx);
+        }
+    }
+
+    /// For each deck with a timecode input attached, drain whatever
+    /// audio has arrived since last block, decode it, and translate
+    /// the decoder's `(rate, confidence)` into deck transport. This is
+    /// the M5.3 hot path.
+    ///
+    /// **RT-safety**: zero allocations. `pop_slice` is a memcpy,
+    /// `Decoder::process` is pure float math, and the deck transport
+    /// setters are field writes plus atomic stores. Verified by the
+    /// engine's `assert_no_alloc` tests + the rt-audit binary.
+    ///
+    /// Borrow gymnastics: `self.timecode_inputs[idx]` and
+    /// `self.decks[idx]` overlap through `&mut self`, so we run the
+    /// decoder inside an inner scope that drops the input borrow
+    /// before reaching for the deck. The intermediate `Intent` carries
+    /// only `Copy` data across the borrow boundary.
+    fn drive_timecode_inputs(&mut self) {
+        for idx in 0..DECK_COUNT {
+            let intent = match self.timecode_inputs[idx].as_mut() {
+                Some(input) => input.drive(),
+                None => continue,
+            };
+            let Some(intent) = intent else {
+                // No new input data this block — keep the deck at its
+                // current rate/play state. Single-block dropouts are
+                // common (CoreAudio jitter, USB scheduling).
+                continue;
+            };
+            let deck = &mut self.decks[idx];
+            match intent {
+                timecode::Intent::Locked { rate } => {
+                    deck.set_rate(rate);
+                    if !deck.is_playing() {
+                        // First lock after silence / dropout: start
+                        // playing. The 2 ms declick handles the
+                        // smooth fade-in from silence.
+                        deck.set_playing(true);
+                    }
+                }
+                timecode::Intent::DropoutHoldRate { rate } => {
+                    // Keep the rate in case confidence comes back next
+                    // block (single-tick dropouts shouldn't reset
+                    // scratch state), but mute the deck so the user
+                    // doesn't hear a held-DC tone while the stylus is
+                    // off.
+                    deck.set_rate(rate);
+                    if deck.is_playing() {
+                        deck.set_playing(false);
+                    }
+                }
+            }
         }
     }
 
@@ -758,5 +887,282 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             engine.render(&mut rt, &mut buffer);
         });
+    }
+
+    // ============================================================
+    //                    M5.3 timecode integration
+    // ============================================================
+
+    use ringbuf::traits::{Producer as _, Split as _};
+    use ringbuf::HeapRb;
+
+    /// Build (engine, deck-0 producer): a configured engine with a
+    /// 1-second input ringbuf wired into deck 0 via the timecode path.
+    /// Returns the *producer* end so the test can synthesize timecode
+    /// audio in lockstep with renders.
+    fn engine_with_tc_deck0(sr: f32, block: usize) -> (Engine, ringbuf::HeapProd<f32>) {
+        let mut engine = Engine::new(sr, block);
+        // 1 s of stereo headroom — comfortable for tests that render
+        // a few hundred ms.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rb = HeapRb::<f32>::new((sr as usize) * 2);
+        let (tx, rx) = rb.split();
+        let cfg = TimecodeInputConfig {
+            format: dub_timecode::Format::SeratoCv02,
+            input_sample_rate: sr,
+            max_block_frames: block.max(64),
+            confidence_threshold: 0.7,
+            // Tight hysteresis + minimal stickiness so existing
+            // tests, which feed steady-state synthetic carriers,
+            // engage on the very first block (no warm-up frames).
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            // Synthetic carrier in tests is full-amplitude (~0.5
+            // RMS); a tiny gate lets the carrier through but still
+            // exercises the gate code path so any future regression
+            // here trips integration tests too.
+            amplitude_threshold: 0.001,
+        };
+        engine
+            .attach_timecode_input(0, rx, cfg)
+            .expect("attach should succeed");
+        (engine, tx)
+    }
+
+    #[test]
+    fn timecode_attach_rejects_bad_deck_idx() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = engine
+            .attach_timecode_input(99, rx, TimecodeInputConfig::default())
+            .expect_err("idx 99 is out of range");
+        assert!(matches!(err, TimecodeAttachError::InvalidDeck { .. }));
+    }
+
+    #[test]
+    fn timecode_attach_rejects_sr_mismatch() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let cfg = TimecodeInputConfig {
+            input_sample_rate: 44_100.0,
+            ..TimecodeInputConfig::default()
+        };
+        let err = engine
+            .attach_timecode_input(0, rx, cfg)
+            .expect_err("44.1k input vs 48k engine should be rejected");
+        assert!(matches!(
+            err,
+            TimecodeAttachError::SampleRateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn timecode_attach_rejects_double_attach() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let rb1 = HeapRb::<f32>::new(64);
+        let (_tx1, rx1) = rb1.split();
+        engine
+            .attach_timecode_input(0, rx1, TimecodeInputConfig::default())
+            .unwrap();
+        let rb2 = HeapRb::<f32>::new(64);
+        let (_tx2, rx2) = rb2.split();
+        let err = engine
+            .attach_timecode_input(0, rx2, TimecodeInputConfig::default())
+            .expect_err("second attach should fail");
+        assert!(matches!(err, TimecodeAttachError::AlreadyAttached { .. }));
+    }
+
+    #[test]
+    fn timecode_lock_drives_deck_rate_and_plays() {
+        // Synthesize forward unity timecode at 48 kHz, push it through
+        // the input ringbuf, render the engine, assert the deck:
+        // (a) is playing,
+        // (b) has rate ≈ 1.0 from the decoder,
+        // (c) the loaded track's playhead has advanced.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        // Stick a short loop onto the deck so we can read its position.
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        // We deliberately do NOT call set_playing(true) — the decoder
+        // is supposed to do that on the first locked block.
+        engine.deck_mut(0).quiesce_declick_for_test();
+        assert!(!engine.deck(0).is_playing(), "deck should start paused");
+
+        // Generate 4 blocks worth of forward unity timecode.
+        let n = block * 4;
+        let mut sig = vec![0.0_f32; n * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        gen.render(&mut sig, 1.0, 0.5);
+        let pushed = tx.push_slice(&sig);
+        assert_eq!(pushed, sig.len(), "ring should be large enough");
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        // Render a few blocks so the decoder primes and locks.
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        let last = engine
+            .timecode_last_output(0)
+            .expect("decoder ran at least once");
+        assert!(
+            last.confidence > 0.99,
+            "synthetic input should lock 1.000 (got {})",
+            last.confidence
+        );
+        assert!(
+            (last.rate - 1.0).abs() < 0.01,
+            "rate should be ≈1.0 (got {})",
+            last.rate
+        );
+        assert!(
+            engine.deck(0).is_playing(),
+            "deck should be playing after lock"
+        );
+        // 4 blocks × 256 frames = 1024 output frames. Deck 0 advanced
+        // at rate ≈ 1.0 → position ≈ 1024 frames. Allow some slack for
+        // the M3.5 fade-in and decoder priming on the first block.
+        let pos = engine.deck(0).position_frames();
+        assert!(pos > 200.0, "deck position should advance (got {pos})");
+        assert!(pos < 1100.0, "and not run away (got {pos})");
+    }
+
+    #[test]
+    fn timecode_silence_pauses_deck() {
+        // Push pure silence through the input. The decoder reports
+        // ~0 confidence; engine's confidence-gated policy mutes the
+        // deck.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        // 2 blocks of silence into the input ring.
+        let silence = vec![0.0_f32; block * 2 * 2];
+        let pushed = tx.push_slice(&silence);
+        assert_eq!(pushed, silence.len());
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        engine.render(&mut rt, &mut buf);
+        engine.render(&mut rt, &mut buf);
+
+        let last = engine.timecode_last_output(0).unwrap();
+        assert!(
+            last.confidence < 0.2,
+            "silence should yield low confidence (got {})",
+            last.confidence
+        );
+        assert!(
+            !engine.deck(0).is_playing(),
+            "low confidence should mute the deck"
+        );
+        // Output buffer should be silence — deck is paused, no other
+        // decks loaded.
+        for s in &buf {
+            assert!(s.abs() < 0.01, "expected silence on output, got {s}");
+        }
+    }
+
+    #[test]
+    fn timecode_reverse_lock_drives_negative_rate() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_position_frames(10_000.0); // start mid-track for reverse
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let n = block * 4;
+        let mut sig = vec![0.0_f32; n * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        gen.render(&mut sig, -1.0, 0.5);
+        tx.push_slice(&sig);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        let last = engine.timecode_last_output(0).unwrap();
+        assert!(
+            (last.rate - (-1.0)).abs() < 0.01,
+            "reverse should give rate ≈-1.0 (got {})",
+            last.rate
+        );
+        // Position should have moved backward from 10_000.
+        assert!(
+            engine.deck(0).position_frames() < 10_000.0,
+            "reverse should walk position back from 10000 (got {})",
+            engine.deck(0).position_frames()
+        );
+    }
+
+    #[test]
+    fn timecode_drive_path_is_alloc_free() {
+        // Hot-loop steady-state: synthetic timecode in, decode, drive
+        // deck transport. Must never allocate. This is the M5.3
+        // RT-safety contract.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+
+        // Pre-allocate the per-block working buffer and prime the
+        // decoder with one block before entering the assert.
+        let mut sig = vec![0.0_f32; block * 2];
+        gen.render(&mut sig, 1.0, 0.5);
+        tx.push_slice(&sig);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        engine.render(&mut rt, &mut buf);
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..50 {
+                gen.render(&mut sig, 1.0, 0.5);
+                let _ = tx.push_slice(&sig);
+                engine.render(&mut rt, &mut buf);
+            }
+        });
+    }
+
+    #[test]
+    fn timecode_detach_returns_input_for_main_thread_drop() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        engine
+            .attach_timecode_input(0, rx, TimecodeInputConfig::default())
+            .unwrap();
+        let detached = engine.detach_timecode_input(0);
+        assert!(detached.is_some(), "detach should return the input");
+        // After detach the slot is free for another attach.
+        let rb2 = HeapRb::<f32>::new(64);
+        let (_tx2, rx2) = rb2.split();
+        engine
+            .attach_timecode_input(0, rx2, TimecodeInputConfig::default())
+            .expect("re-attach after detach should succeed");
     }
 }

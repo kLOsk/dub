@@ -85,6 +85,50 @@ See PRD §2.2.3 and `crates/dub-engine/src/realtime.rs`.
 - `AVAudioEngine` is **not** used (too high-level, hides the IO proc).
 - Per-deck input + output assignment in External Mixer mode (PRD §5.3).
 
+### HAL input invariant — sample-rate match (M5.2)
+
+CoreAudio HAL has a load-bearing footgun: if the AudioUnit's stream
+format SR does **not** equal the device's hardware nominal SR, the IO
+proc silently delivers zero callbacks. `AudioUnitStart` returns OK,
+`coreaudiod` logs nothing, the green mic indicator never lights up.
+You will think it's a TCC permission issue. It isn't.
+
+`AudioInput::start_with_options` enforces the invariant by:
+
+1. Reading `kAudioDevicePropertyNominalSampleRate` directly off the
+   device (not via `AudioUnit::sample_rate()` — a fresh HALOutput AU
+   reports its own internal default, 44.1 kHz, regardless of hardware).
+2. If the caller asked for a different SR, calling
+   `set_device_sample_rate` on the device first (synchronous; blocks
+   until the HAL rate listener confirms).
+3. Building the AudioUnit *uninitialized*, setting the stream format
+   on `(Scope::Output, Element::Input)` to match the now-actual device
+   SR, then calling `AudioUnitInitialize`.
+
+Reverse order — initialize, then set format — appears to succeed but
+sometimes leaves the IO proc unarmed. Set-then-init is the only
+robust sequence.
+
+`list_input_devices` and `query_default_input` likewise report the
+device's hardware nominal SR, so the user-visible rate matches the
+rate at which input will actually fire.
+
+#### Cold-start capture overshoot — known issue, deferred
+
+Empirically, the *first* `dub capture` against a freshly-opened SL3
+records ~1–3 s more audio than wall time accounts for; subsequent
+captures within the same process are exact (15.003 s wall ⇒ 14.997 s
+audio observed). The decoder still locks at confidence 1.000 across
+the entire capture and rate is correct, so the file is real audio, not
+duplicated samples — the IO proc simply runs ahead of nominal for the
+first second after `AudioUnitStart` on this driver. Levels mode never
+sees this because it doesn't write a WAV (the file create was the
+suspected trigger; the actual mechanism is undiagnosed). For M5.3 the
+deck consumes samples directly off the input ringbuf and never
+correlates input-sample-count with wall time, so the issue is invisible
+to the live integration. Re-investigate when we add input-clock-vs-
+output-clock drift compensation in M5.4+.
+
 ## Audio buffers
 
 Per PRD §4.4:
@@ -212,18 +256,30 @@ it up to live audio input.
 
 **Signal model.** Both stereo channels carry the same nominal sinusoid
 at the format's carrier (1 kHz for Serato CV02), offset by 90° between
-L and R. Treating each frame as a complex sample `s = L + jR`, the
-input becomes a single complex exponential `s(t) = A · exp(j·2π·f·t)`
-whose frequency is positive when the record turns forward and negative
-when reversed. Magnitude `|s|² = L² + R²` is constant across rotation,
+ch0 and ch1. The convention — verified empirically against a real
+Serato Control CV02 cartridge through an SL3 — is `ch0 ≈ A·sin(φ)`,
+`ch1 ≈ A·cos(φ)`, with ch0 *leading* ch1 by 90° at forward play.
+Treating each frame as a complex sample `s = ch1 + j·ch0` makes the
+input a single complex exponential `s(t) = A · exp(j·2π·f·t)` whose
+frequency is positive when the record turns forward and negative when
+reversed. Magnitude `|s|² = ch0² + ch1²` is constant across rotation,
 which is what makes amplitude AGC unnecessary for the *phase* tracking
 (it'll matter later for AM-bitstream decoding in M6).
+
+The synthetic generator in `dub-timecode::signal` emits the same
+quadrature convention so round-trip tests, the `dub decode-timecode`
+`--synthetic` mode, and live SL3 captures all share one sign convention:
+**forward stylus motion ⇒ +rate, reverse ⇒ −rate**. Getting this wrong
+in M5.1 would have looked perfectly reasonable on synthetic data
+(generator and decoder would have been internally consistent); only the
+first capture from real hardware exposed the channel ordering, which is
+why we delayed picking the convention until empirical data was in.
 
 **Per-block algorithm.**
 
 ```text
   for each stereo frame n:
-    s_n = L_n + j R_n
+    s_n = ch1_n + j·ch0_n                            # Serato CV02 quadrature
     accum  += s_n * conj(s_{n-1})
     amp_acc += |s_n|²
   Δφ_block = arg(accum)                              # coherent phase diff
@@ -263,6 +319,158 @@ xwax/Mixxx algorithm description; no xwax code copied (xwax is BSD;
 dub is GPL-3.0 — the *direction* of compatibility allows BSD → GPL,
 but we want attribution to remain unambiguous, hence the rewrite from
 spec).
+
+### Live timecode → deck — M5.3
+
+This is where the offline decoder (M5.1) and the input plumbing
+(M5.2) meet the engine. The integration is intentionally narrow:
+one new module (`dub_engine::timecode`), one new method
+(`Engine::attach_timecode_input`), one new render-loop step
+(`Engine::drive_timecode_inputs`). No new threads, no new channels,
+no extra IPC.
+
+**Wiring.**
+
+```text
+  CoreAudio input IOProc                       AudioOutput callback
+  (e.g. SL3 ch3+4, 48 kHz)                     (default device, 48 kHz)
+           │                                            │
+           ▼                                            ▼
+  HeapRb<f32> (1 s capacity)                    Engine::render
+           │  (consumer moved into engine               │
+           │   via AudioInput::take_consumer)           │
+           ▼                                            │
+  TimecodeInput { rx, decoder, scratch }                │
+           │                                            │
+           └────────► drive_timecode_inputs ────────────┤
+                          │ (per render block)          │
+                          │ pop_slice → Decoder::process│
+                          │ → DecodeOutput              │
+                          │                             │
+                          ▼                             │
+                  Intent::Locked { rate }   ──┐         │
+                  Intent::DropoutHoldRate    ──┤        │
+                                               ▼        │
+                                Deck.set_rate / set_playing
+                                               │        │
+                                               └───►Deck.render
+```
+
+The `AudioInput` keeps the AudioUnit alive on the main thread (drop
+= stop input). The consumer end of its IOProc → consumer ringbuf
+moves into the engine via `AudioInput::take_consumer`, after which
+`AudioInput::read_into` returns 0 forever (only one reader on an
+SPSC ring).
+
+**Lift policy: amplitude gate + two-edge confidence hysteresis +
+sticky window.**
+
+Three iterations on real SL3 hardware drove the design here, each
+exposing a class of bug the previous policy missed:
+
+1. *Single-threshold gate.* Confidence wobbles around 0.8 as the
+   carrier dies on lift → rapid play/pause toggles → audible
+   chatter from repeated 2 ms declick fades.
+2. *Two-edge confidence hysteresis (no amplitude gate).* The
+   lukewarm `[0.5, 0.8)` band is correct for *scratch* transients
+   (cartridge firmly on groove, brief direction reversals) but
+   *wrong* for lift: the cartridge picks up handling/rumble noise
+   that the decoder finds *some* coherent rotation in (moderate
+   confidence) while the RMS is near-zero. The deck stayed
+   engaged at `last_locked_rate`, burst-playing track audio for
+   as long as the needle was held aloft.
+3. *Amplitude gate over confidence hysteresis (current).*
+   Amplitude is the truthful "is the cartridge on the groove?"
+   signal; confidence alone is not. The gate overrides the
+   confidence bands.
+
+```text
+  amplitude < amplitude_threshold ─────────── "carrier dead"
+      Treated as below-floor regardless of confidence.
+      Engaged: counts toward sticky disengage.
+      Disengaged: stays disengaged.
+
+  amplitude ≥ amplitude_threshold AND ...
+    ┌── conf ≥ engage_threshold ───────────── "fully locked"
+    │       set rate = decoded_rate; engaged = true; reset countdown.
+    │
+    │── disengage_threshold ≤ conf < engage_threshold ── "lukewarm"
+    │       if engaged: hold last_locked_rate, stay engaged, reset
+    │                    countdown (mid-scratch transients).
+    │       if disengaged: stay disengaged (noise floor).
+    │
+    └── conf < disengage_threshold ─────────── "below floor"
+            engaged: increment countdown; disengage when it hits
+                     sticky_blocks_to_disengage (deck mutes via
+                     M3.5 declick).
+            disengaged: stays disengaged.
+```
+
+Defaults: engage 0.8, disengage 0.5, sticky 4 blocks (~21 ms @
+256-frame / 48 kHz), amplitude 0.01 RMS. CV02 carriers through SL3
+sit at 0.1–0.5 RMS; lifted needles drop to <0.005, so the gate has
+a wide margin. All four are tunable per attach via
+`TimecodeInputConfig`; the CLI exposes `--confidence` (engage),
+`--disengage-threshold`, `--sticky-blocks`, and
+`--amplitude-threshold`. Setting `amplitude_threshold = 0.0`
+disables the gate (confidence-only fallback) — diagnostic only,
+pinned by a regression test so we can't lose it.
+
+The factoring deliberately separates `step_policy(DecodeOutput)`
+from `drive(...)` (which sources data from the ringbuf) so the
+state machine is unit-testable without ringbufs or decoders. The
+test suite covers each pathology this policy was tightened to
+fix — including the lukewarm-but-quiet lift bug from the second
+SL3 validation. M5.4 layers calibration UX (per-cartridge stored
+thresholds) and a TUI scope on top; the lift gate itself is
+complete.
+
+**RT-safety.** `drive_timecode_inputs` is allocation-free and
+finite-time:
+
+- `pop_slice` on the SPSC consumer is a memcpy.
+- `Decoder::process` is `assert_no_alloc`-clean (M5.1 verified).
+- The scratch buffer is pre-allocated at attach time
+  (`max_block_frames × 2` interleaved samples) and never resized.
+- `Deck::set_rate` / `set_playing` are field writes plus relaxed
+  atomic stores; the M3.5 declick start is alloc-free (verified in
+  M3.5).
+
+`rt-audit` carries a 10k-block timecode-driven render path under
+`assert_no_alloc` so any future regression on this hot path fails
+CI rather than reaching audio threads in the wild.
+
+**SR alignment.** v1 requires `input_sample_rate == engine_sample_rate`
+to within 0.5 Hz; mismatch is rejected at attach time
+(`AttachError::SampleRateMismatch`). Sample-rate conversion between
+input and engine isn't in scope. The output device is *also* aligned
+to engine SR — `AudioOutput::start_with_buffer_size` queries the
+device's nominal rate and forces it via
+`kAudioDevicePropertyNominalSampleRate` if it differs (same gauntlet
+as `AudioInput`). The first SL3 run shipped with output at 44.1 kHz
+and engine at 48 kHz, which the CoreAudio HAL DefaultOutput unit
+sometimes resamples and sometimes plays literally at the device
+clock — driver-dependent and silent either way. Forcing alignment
+removes the resampler from the path; if the device can't honor the
+engine SR, output start-up fails with a clear error rather than
+shipping audible 8% pitch drift. `dub play --realtime` already
+built the engine at the device's reported SR so it sees a no-op
+here; only the timecode-deck case (which pins engine to *input* SR)
+exercises the new alignment.
+
+**What this is *not*.**
+
+- Position drift correction. Relative-mode in v1 lets deck position
+  evolve via integration of rate, which is what the platter
+  encodes. M5.4+ may add explicit re-sync if accumulated drift
+  becomes audible over long sessions.
+- Stickiness on stylus lift (M5.4).
+- External-mixer multi-channel output routing (M5.5). Output today
+  is a single summed stereo bus; per-deck routing waits until
+  hardware actually demands it.
+- Multi-deck timecode. Engine has slots for `[Option<TimecodeInput>;
+  DECK_COUNT]` so M5.5 just attaches a second one — but until then
+  CLI's `dub timecode-deck` wires only deck 0.
 
 ### Two decks + debug internal mixer — M4
 

@@ -9,6 +9,7 @@ description = "Platform audio I/O for Dub. macOS CoreAudio in v1; Windows ASIO a
 
 [dependencies]
 dub-engine = { workspace = true }
+ringbuf = { workspace = true }
 thiserror = { workspace = true }
 
 # CoreAudio is target-gated: the rest of the workspace builds fine on Linux
