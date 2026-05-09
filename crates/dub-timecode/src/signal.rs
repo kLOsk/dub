@@ -1,11 +1,12 @@
 //! Synthetic timecode signal generator.
 //!
-//! Produces a stereo carrier at the format's nominal frequency with
-//! `L = A·cos(φ)`, `R = A·sin(φ)` — i.e. quadrature L/R. The two-channel
-//! quadrature is what makes direction recoverable: forward stylus
-//! motion advances `φ`; reverse motion (manual rewind, scratch) makes
-//! `φ` decrease, so the complex envelope `L + jR` rotates the other
-//! way.
+//! Produces a stereo carrier at the format's nominal frequency
+//! matching the Serato CV02 convention observed on real cartridges:
+//! `ch0 = A·sin(φ)`, `ch1 = A·cos(φ)` — ch0 *leads* ch1 by 90°.
+//! The decoder treats `s = ch1 + j·ch0`, so the complex envelope
+//! `s = A·e^(jφ)` rotates positively for forward stylus motion.
+//! Reverse motion (manual rewind, scratch) decreases `φ`, so `s`
+//! rotates the other way and the decoder reports negative rate.
 //!
 //! The generator does NOT yet AM-modulate the bit pattern. Relative
 //! mode (M5.1) only needs the carrier; the bitstream is a byproduct
@@ -76,15 +77,17 @@ impl Generator {
         let two_pi = std::f64::consts::TAU;
         let phase_step = two_pi * f64::from(self.carrier_hz) / f64::from(self.sample_rate) * rate;
         for frame in out.chunks_exact_mut(2) {
-            // Compute L/R, then advance phase. f64 trig + f32 cast at the
-            // very end keeps phase continuity across block boundaries
-            // tight (≪ 1e-9 rad drift over seconds at 48 kHz).
+            // Compute ch0/ch1, then advance phase. f64 trig + f32 cast
+            // at the very end keeps phase continuity across block
+            // boundaries tight (≪ 1e-9 rad drift over seconds at 48 kHz).
+            // ch0 = sin(φ), ch1 = cos(φ) — Serato CV02 convention so
+            // the decoder reports +rate for forward play.
             #[allow(clippy::cast_possible_truncation)]
-            let l = (self.phase.cos() as f32) * amplitude;
+            let ch0 = (self.phase.sin() as f32) * amplitude;
             #[allow(clippy::cast_possible_truncation)]
-            let r = (self.phase.sin() as f32) * amplitude;
-            frame[0] = l;
-            frame[1] = r;
+            let ch1 = (self.phase.cos() as f32) * amplitude;
+            frame[0] = ch0;
+            frame[1] = ch1;
             self.phase += phase_step;
             // Keep the accumulator small to avoid catastrophic
             // cancellation from cos/sin of large arguments. A single
@@ -176,14 +179,14 @@ mod tests {
 
     #[test]
     fn zero_rate_emits_dc_offset_signal() {
-        // Rate=0 means the stylus isn't moving — phase is frozen, so
-        // the output is constant L=A·cos(φ₀)=A, R=A·sin(φ₀)=0.
+        // Rate=0 means the stylus isn't moving — phase is frozen at
+        // 0, so the output is constant ch0=sin(0)=0, ch1=cos(0)=1·A.
         let mut g = Generator::new(Format::SeratoCv02, 48_000.0);
         let mut buf = vec![0.0f32; 64 * 2];
         g.render(&mut buf, 0.0, 0.5);
         for frame in buf.chunks_exact(2) {
-            assert!((frame[0] - 0.5).abs() < 1e-6);
-            assert!(frame[1].abs() < 1e-6);
+            assert!(frame[0].abs() < 1e-6);
+            assert!((frame[1] - 0.5).abs() < 1e-6);
         }
     }
 }

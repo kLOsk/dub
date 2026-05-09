@@ -2,12 +2,14 @@
 //!
 //! ## Algorithm
 //!
-//! The two stereo channels of timecode vinyl carry the same carrier
-//! sinusoid offset by 90° — `L ≈ A·cos(φ)`, `R ≈ A·sin(φ)`. Treating
-//! the sample pair as a single complex sample `s = L + jR` makes the
-//! signal a pure complex exponential `s(t) = A·exp(j·2π·f·t)` whose
-//! frequency is positive when the record turns forward and negative
-//! when reversed.
+//! The two stereo channels of Serato Control CV02 vinyl carry the
+//! same carrier sinusoid offset by 90°. Per the empirical convention
+//! observed on real CV02 cartridges going through the SL3, channel 0
+//! leads channel 1 by 90° at forward play — i.e. `ch0 ≈ A·sin(φ)`,
+//! `ch1 ≈ A·cos(φ)`. We treat the sample pair as a single complex
+//! sample `s = ch1 + j·ch0`, which is `A·exp(j·2π·f·t)` rotating
+//! counter-clockwise (positive frequency) for forward stylus motion
+//! and clockwise (negative) for reverse.
 //!
 //! Per-sample phase advance is therefore:
 //!
@@ -97,10 +99,12 @@ pub struct Decoder {
     sample_rate: f32,
     /// Nominal carrier frequency in Hz (cached from [`Format`]).
     carrier_hz: f32,
-    /// Previous complex sample, retained across `process` calls so the
+    /// Previous complex sample's real part (= file ch1, the cos
+    /// component). Retained across `process` calls so the
     /// phase-difference formula has continuity at block boundaries.
-    prev_l: f64,
-    prev_r: f64,
+    prev_re: f64,
+    /// Previous complex sample's imag part (= file ch0, the sin component).
+    prev_im: f64,
     /// Whether `prev_*` have been seeded with at least one sample.
     primed: bool,
     /// Cumulative position in seconds-at-unity-speed.
@@ -124,8 +128,8 @@ impl Decoder {
         Self {
             sample_rate,
             carrier_hz: format.carrier_hz(),
-            prev_l: 0.0,
-            prev_r: 0.0,
+            prev_re: 0.0,
+            prev_im: 0.0,
             primed: false,
             position_secs: 0.0,
         }
@@ -134,8 +138,8 @@ impl Decoder {
     /// Reset accumulated position and the prev-sample register. Useful
     /// when re-cueing the deck or recovering from a stylus lift.
     pub fn reset(&mut self) {
-        self.prev_l = 0.0;
-        self.prev_r = 0.0;
+        self.prev_re = 0.0;
+        self.prev_im = 0.0;
         self.primed = false;
         self.position_secs = 0.0;
     }
@@ -173,21 +177,25 @@ impl Decoder {
         let mut samples_consumed = 0_usize;
 
         for frame in stereo.chunks_exact(2) {
-            let l = f64::from(frame[0]);
-            let r = f64::from(frame[1]);
-            // |s|² = L² + R²; Pythagorean amplitude regardless of phase.
-            mag_acc += l * l + r * r;
+            // Serato CV02 convention (verified against a real cartridge
+            // on an SL3): file ch0 ≈ A·sin(φ), file ch1 ≈ A·cos(φ).
+            // Map ch1 → real, ch0 → imag so `s = re + j·im = A·e^(jφ)`
+            // rotates the *positive* direction at forward play.
+            let im = f64::from(frame[0]);
+            let re = f64::from(frame[1]);
+            // |s|² = re² + im²; Pythagorean amplitude regardless of phase.
+            mag_acc += re * re + im * im;
 
             if self.primed {
-                // s_curr · conj(s_prev) = (l + jr)·(prev_l − j·prev_r)
-                //                       = (l·prev_l + r·prev_r)
-                //                       + j·(r·prev_l − l·prev_r)
-                acc_re += l * self.prev_l + r * self.prev_r;
-                acc_im += r * self.prev_l - l * self.prev_r;
+                // s_curr · conj(s_prev) = (re + j·im)·(prev_re − j·prev_im)
+                //                       = (re·prev_re + im·prev_im)
+                //                       + j·(im·prev_re − re·prev_im)
+                acc_re += re * self.prev_re + im * self.prev_im;
+                acc_im += im * self.prev_re - re * self.prev_im;
                 samples_consumed += 1;
             }
-            self.prev_l = l;
-            self.prev_r = r;
+            self.prev_re = re;
+            self.prev_im = im;
             self.primed = true;
         }
 
@@ -313,7 +321,7 @@ mod tests {
     #[test]
     fn stopped_decodes_to_zero_rate() {
         let out = roundtrip(0.0, 4_800);
-        // At rate=0 the signal is DC (constant L=A, R=0). The
+        // At rate=0 the signal is DC (constant ch0=0, ch1=A). The
         // phase-difference is zero, so rate = 0. Confidence stays
         // high because the signal is still perfectly coherent — just
         // at zero frequency.
