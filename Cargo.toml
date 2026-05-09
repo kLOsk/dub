@@ -42,6 +42,13 @@ ringbuf = "0.4"
 thiserror = "1"
 anyhow = "1"
 
+# Audio decoding. Add per-format features as we exercise them.
+# WAV/PCM are enabled in M1; MP3/FLAC/AAC/ALAC/AIFF land per format-test milestone.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm"] }
+
+# WAV writer (for offline-render output in dub-cli; not used in the engine).
+hound = "3"
+
 # Test-only
 proptest = "1"
 insta = "1"

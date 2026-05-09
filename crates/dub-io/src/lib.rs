@@ -1,13 +1,21 @@
 //! Audio file I/O for Dub.
 //!
 //! Per PRD §4.4, tracks are decoded fully into RAM on load to support
-//! sample-accurate, bidirectional playback (forward and backward are
-//! byte-for-byte symmetric in the engine). No per-block disk streaming.
+//! sample-accurate, bidirectional playback. Forward and backward are
+//! byte-for-byte symmetric in the engine. No per-block disk streaming.
 //!
-//! Implementation lands in M3 (see PRD §12).
+//! M1 ships WAV/PCM via symphonia. Other formats (MP3, FLAC, AIFF, ALAC,
+//! AAC) land in subsequent milestones, gated by their respective symphonia
+//! feature flags in the workspace `Cargo.toml`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+mod track;
+
+pub use track::{LoadError, Track};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

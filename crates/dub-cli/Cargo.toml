@@ -14,4 +14,6 @@ path = "src/main.rs"
 [dependencies]
 dub-engine = { workspace = true }
 dub-ffi = { workspace = true }
+dub-io = { workspace = true }
 anyhow = { workspace = true }
+hound = { workspace = true }

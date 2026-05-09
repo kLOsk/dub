@@ -8,3 +8,9 @@ repository.workspace = true
 description = "Audio file decoding and in-memory track buffers. symphonia-based."
 
 [dependencies]
+symphonia = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+hound = { workspace = true }

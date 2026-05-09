@@ -9,6 +9,7 @@ description = "Audio engine for Dub: graph, transport, RT-safety primitives."
 
 [dependencies]
 ringbuf = { workspace = true }
+dub-io = { workspace = true }
 
 [dev-dependencies]
 assert_no_alloc = { workspace = true }
