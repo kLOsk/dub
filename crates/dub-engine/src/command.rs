@@ -9,8 +9,15 @@
 //! no `dyn Trait`. Adding a new command means adding an enum variant and
 //! its match arm in [`crate::Engine::apply_command`] — that's all.
 //!
-//! A `Command` is `Copy` and small (≤ 16 bytes today). The ringbuf carries
-//! it by value; popping the consumer copies the value out of the buffer.
+//! Most commands are tiny `Copy` values (≤ 24 bytes). The exception is
+//! [`Command::DeckLoad`], which carries an `Arc<Track>`. The audio thread
+//! never drops this Arc — when it swaps it onto the deck, the *old* Arc
+//! is bounced back through the trash channel for disposal on the main
+//! thread (see crate-level docs in `lib.rs`).
+
+use std::sync::Arc;
+
+use dub_io::Track;
 
 /// One mutation request to the engine. Variants name the deck index where
 /// applicable; transport-wide commands use no index.
@@ -18,10 +25,10 @@
 /// Field naming is uniform across variants: `idx` is the deck index,
 /// other fields name the property being set.
 // All v1 commands target a deck. Engine-wide commands (master gain etc.)
-// will land in M3+ and use a different prefix; the `Deck` prefix here is
+// will land later and use a different prefix; the `Deck` prefix here is
 // load-bearing namespacing, not redundancy.
 #[allow(missing_docs, clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Command {
     /// Start playback on deck `idx`.
     DeckPlay { idx: u8 },
@@ -39,6 +46,12 @@ pub enum Command {
 
     /// Set deck `idx`'s linear gain. `1.0` = unity, `0.0` = silence.
     DeckSetGain { idx: u8, gain: f32 },
+
+    /// Load a new track on deck `idx`. The `Arc<Track>` is sent by value;
+    /// the engine swaps it onto the deck on the audio thread without
+    /// dropping the previous `Arc` — that goes back through the trash
+    /// channel.
+    DeckLoad { idx: u8, source: Arc<Track> },
 }
 
 #[cfg(test)]
@@ -46,19 +59,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_is_copy_and_small() {
-        // Commands are passed by value through the ringbuf, so they must
-        // not own heap allocations and should stay tight.
+    fn command_is_send_sync_and_bounded() {
+        // The non-DeckLoad commands are still Copy-equivalent in size,
+        // but we now carry an Arc<Track> in DeckLoad so the enum itself
+        // is not Copy. Send+Sync still required for cross-thread use.
         const _: fn() = || {
-            fn assert_copy<T: Copy>() {}
             fn assert_send_sync<T: Send + Sync>() {}
-            assert_copy::<Command>();
             assert_send_sync::<Command>();
         };
-        // 24 bytes today (variant tag + f64). Soft cap at 32 to catch
+        // 32 bytes upper bound today (DeckLoad: 1 tag + 1 idx + 8-byte
+        // pad + 8-byte Arc pointer = 24, padded). Cap at 64 to catch
         // accidental bloat — push variants above this through indirection.
         assert!(
-            std::mem::size_of::<Command>() <= 32,
+            std::mem::size_of::<Command>() <= 64,
             "Command grew to {} bytes; consider redesigning",
             std::mem::size_of::<Command>()
         );

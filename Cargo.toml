@@ -45,8 +45,24 @@ thiserror = "1"
 anyhow = "1"
 
 # Audio decoding. Add per-format features as we exercise them.
-# WAV/PCM are enabled in M1; MP3/FLAC/AAC/ALAC/AIFF land per format-test milestone.
-symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm"] }
+# WAV/PCM enabled in M1. MP3/FLAC/AIFF/M4A(+ALAC) added in M3 — the
+# real-world DJ format set per PRD §1.2.
+# - mp3:    `symphonia-bundle-mp3` (with sub-feature mp3 — mp2/mp1 left off)
+# - flac:   `symphonia-bundle-flac`
+# - aiff:   `symphonia-format-riff/aiff`
+# - aac:    `symphonia-codec-aac` (the codec inside .m4a/.mp4)
+# - alac:   `symphonia-codec-alac` (Apple Lossless, also inside .m4a)
+# - isomp4: `symphonia-format-isomp4` (the .m4a/.mp4 container)
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav",
+    "pcm",
+    "mp3",
+    "flac",
+    "aiff",
+    "aac",
+    "alac",
+    "isomp4",
+] }
 
 # WAV writer (for offline-render output in dub-cli; not used in the engine).
 hound = "3"

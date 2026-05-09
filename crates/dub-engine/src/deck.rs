@@ -143,6 +143,22 @@ impl Deck {
         self.shared.store_at_end(false);
     }
 
+    /// Swap the deck's track for `track`, returning the previous source
+    /// (if any) by value so the caller can dispose of it. Resets the
+    /// playhead to 0.
+    ///
+    /// Used by [`crate::Engine`] when applying [`crate::Command::DeckLoad`]:
+    /// the old `Arc<Track>` must escape the audio thread without being
+    /// dropped there. The engine sends it back through the trash channel.
+    #[must_use]
+    pub fn swap_source(&mut self, track: Arc<Track>) -> Option<Arc<Track>> {
+        let old = self.source.replace(track);
+        self.position = 0.0;
+        self.shared.store_position(0.0);
+        self.shared.store_at_end(false);
+        old
+    }
+
     /// Clear the loaded track. The deck renders silence afterward.
     pub fn clear_source(&mut self) {
         self.source = None;

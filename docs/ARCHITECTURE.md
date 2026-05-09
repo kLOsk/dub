@@ -104,19 +104,33 @@ Bidirectional, lock-free.
 pops at the start of each render block. Producer side lives in
 `dub_engine::EngineHandle`; consumer side is owned by `Engine`.
 
-- `Command` is a `#[repr]`-friendly enum (`Copy`, ≤ 32 bytes), no `Box`,
-  no `dyn Trait`. Variants today: `DeckPlay`, `DeckPause`, `DeckSeek`,
-  `DeckSetRate`, `DeckSetGain`. Adding a command is one variant + one
-  match arm in `apply_command`.
+- `Command` is a small enum, ≤ 64 bytes, no `Box`, no `dyn Trait`. Most
+  variants are `Copy`-equivalent; `DeckLoad` carries an `Arc<Track>`
+  by value. Variants today: `DeckPlay`, `DeckPause`, `DeckSeek`,
+  `DeckSetRate`, `DeckSetGain`, `DeckLoad`. Adding a command is one
+  variant + one match arm in `Engine::apply_command`.
 - The drain is RT-safe: `try_pop` is a load + index, and every variant
   applies in-place to the deck array. Verified by `rt-audit` with 100k
-  blocks and 10k pre-staged commands under `assert_no_alloc`.
-- Track loading is **not** a command yet. Tracks are pre-loaded before
-  `AudioOutput::start`. The reason: swapping `Arc<Track>` on the audio
-  thread risks dropping the old `Arc` to zero, which calls `dealloc`
-  (a syscall). M3 (disk streaming) introduces a "trash channel" sending
-  the old `Arc` back to the main thread for drop, then enables a
-  `LoadTrack` command.
+  blocks, 10k pre-staged transport commands, and 20 hot-loads, all
+  under `assert_no_alloc`.
+
+### Trash channel (audio → UI for `Arc<Track>` disposal) — M3
+
+`ringbuf::HeapRb<Arc<Track>>` (SPSC, capacity 32). The audio thread
+NEVER drops `Arc<Track>` — `Arc::drop` decrements the strong count and
+calls `dealloc()` if it hits zero. `dealloc` is a syscall, forbidden on
+the RT thread.
+
+When the engine applies `DeckLoad`, it `swap_source`s the new Arc onto
+the deck and pushes the old Arc into the trash channel. The main thread
+drains the channel via `EngineHandle::reclaim()` (called automatically
+inside `DeckCommand::load` and on `EngineHandle::drop`).
+
+If the trash channel ever overflows (UI not draining + storm of loads),
+the audio thread `mem::forget`s the rejected Arc (leaking it) and
+increments an atomic `trash_overflow_count`. Leaking is the lesser evil
+versus a forbidden `dealloc` on the RT thread, and the counter surfaces
+the contract violation to the UI for logging.
 
 ### Engine → UI (state snapshot) — implemented in M2
 

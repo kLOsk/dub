@@ -18,19 +18,30 @@
 //! `Result<(), CommandError>` because the channel is bounded — if the audio
 //! thread is gone or the buffer is full, the caller learns synchronously.
 
-use ringbuf::traits::{Producer, Split};
+use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::command::Command;
 use crate::deck::DeckSharedState;
 use crate::DECK_COUNT;
+use dub_io::Track;
 
 /// Capacity of the command channel. Sized for far more than any plausible
 /// burst of human input — at 60 Hz UI updates a deck would have to send a
 /// command on every frame for ~4 seconds to fill this. Real bursts are
 /// dozens of commands at most (a complex performance gesture).
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the trash channel that ferries old `Arc<Track>` from the
+/// audio thread back to the main thread for disposal. Sized so that a
+/// reasonable UI (calling `reclaim()` at ≥ 1 Hz) never approaches it.
+/// 32 means the user would have to perform 32 untracked load operations
+/// without the UI ever calling `reclaim()` to overflow — a programming
+/// error that we surface via the overflow counter rather than a silent
+/// memory leak or a forbidden audio-thread `dealloc`.
+const TRASH_CHANNEL_CAPACITY: usize = 32;
 
 /// Errors that can occur sending a command from the UI thread.
 #[allow(missing_docs)]
@@ -51,24 +62,48 @@ pub enum CommandError {
 /// Main-thread handle to control a running [`crate::Engine`].
 ///
 /// Drop semantics: dropping the handle drops the producer end of the
-/// channel. The audio thread keeps running on its last commanded state.
-/// Restoring control requires constructing a new engine + handle pair.
+/// command channel and the consumer end of the trash channel. Any
+/// `Arc<Track>` left in the trash buffer is dropped here on the main
+/// thread when this struct is dropped — *not* on the audio thread.
 pub struct EngineHandle {
     tx: HeapProd<Command>,
+    trash_rx: HeapCons<Arc<Track>>,
+    overflow_counter: Arc<AtomicU64>,
     deck_shared: [Arc<DeckSharedState>; DECK_COUNT],
 }
 
+/// Bundle returned to the engine constructor: the rx end of the command
+/// channel, the tx end of the trash channel, and the shared overflow
+/// counter. All three are owned by `Engine` after construction.
+pub(crate) struct EngineSide {
+    pub(crate) cmd_rx: HeapCons<Command>,
+    pub(crate) trash_tx: HeapProd<Arc<Track>>,
+    pub(crate) overflow_counter: Arc<AtomicU64>,
+}
+
 impl EngineHandle {
-    /// Construct a handle / engine-side consumer pair. Used by
+    /// Construct a handle / engine-side bundle. Used by
     /// [`crate::Engine::new_with_handle`]; not part of the public API on
-    /// its own because the consumer side is internal.
+    /// its own because the engine-side bundle is internal.
     #[must_use]
-    pub(crate) fn new(
-        deck_shared: [Arc<DeckSharedState>; DECK_COUNT],
-    ) -> (Self, HeapCons<Command>) {
-        let rb = HeapRb::<Command>::new(COMMAND_CHANNEL_CAPACITY);
-        let (tx, rx) = rb.split();
-        (Self { tx, deck_shared }, rx)
+    pub(crate) fn new(deck_shared: [Arc<DeckSharedState>; DECK_COUNT]) -> (Self, EngineSide) {
+        let cmd_buffer = HeapRb::<Command>::new(COMMAND_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = cmd_buffer.split();
+        let trash_buffer = HeapRb::<Arc<Track>>::new(TRASH_CHANNEL_CAPACITY);
+        let (trash_producer, trash_consumer) = trash_buffer.split();
+        let overflow_counter = Arc::new(AtomicU64::new(0));
+        let handle = Self {
+            tx: cmd_tx,
+            trash_rx: trash_consumer,
+            overflow_counter: overflow_counter.clone(),
+            deck_shared,
+        };
+        let engine_side = EngineSide {
+            cmd_rx,
+            trash_tx: trash_producer,
+            overflow_counter,
+        };
+        (handle, engine_side)
     }
 
     /// Get an ergonomic command builder for the given deck.
@@ -88,6 +123,35 @@ impl EngineHandle {
         })
     }
 
+    /// Drain any `Arc<Track>` the audio thread has bounced back through
+    /// the trash channel and drop them here on the main thread. Returns
+    /// the number of Arcs reclaimed.
+    ///
+    /// Call this regularly from the UI (e.g. once per UI frame, or
+    /// before every track-load attempt). It is also called automatically
+    /// by [`DeckCommand::load`] before sending a new load command, so
+    /// purely UI-driven workflows are safe without explicit calls.
+    pub fn reclaim(&mut self) -> usize {
+        let mut n = 0;
+        // Each `try_pop` returns `Option<Arc<Track>>`. The Arc drops at
+        // the end of this scope on the main thread — never on the audio
+        // thread.
+        while let Some(_arc) = self.trash_rx.try_pop() {
+            n += 1;
+        }
+        n
+    }
+
+    /// Total number of times the audio thread had to forget an old
+    /// `Arc<Track>` because the trash channel was full when a new track
+    /// was loaded. **Should always be zero in correct usage.** Non-zero
+    /// values mean memory has been leaked and the UI is not calling
+    /// [`reclaim`](Self::reclaim) frequently enough.
+    #[must_use]
+    pub fn trash_overflow_count(&self) -> u64 {
+        self.overflow_counter.load(Ordering::Relaxed)
+    }
+
     fn send(&mut self, cmd: Command) -> Result<(), CommandError> {
         self.tx.try_push(cmd).map_err(|_| CommandError::ChannelFull)
     }
@@ -102,6 +166,17 @@ impl EngineHandle {
             idx: idx as u8,
             count: self.deck_shared.len() as u8,
         })
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        // Belt-and-braces: any Arcs still in the trash buffer would be
+        // dropped by the ringbuf itself when the consumer goes out of
+        // scope (running on this main thread, which is fine), but
+        // explicit reclaim makes ordering clear and surfaces overflow
+        // diagnostics if the consumer wants to log them.
+        self.reclaim();
     }
 }
 
@@ -181,6 +256,42 @@ impl DeckCommand<'_> {
     pub fn set_gain(self, gain: f32) -> Result<(), CommandError> {
         let idx = self.handle.check_deck(self.idx)?;
         self.handle.send(Command::DeckSetGain { idx, gain })
+    }
+
+    /// Hot-load a track onto this deck while the engine is running.
+    ///
+    /// Auto-drains the trash channel before sending so the user never
+    /// has to call [`EngineHandle::reclaim`] manually for the load
+    /// path to stay safe.
+    ///
+    /// On the audio thread this swaps the deck's `Arc<Track>`; the
+    /// previous Arc (if any) is sent back through the trash channel
+    /// for disposal here on the main thread, never dropped on the
+    /// audio thread.
+    ///
+    /// Position/play state are not implicitly reset — pair this with
+    /// [`DeckCommand::seek`] / [`DeckCommand::pause`] to set up the
+    /// new track's transport.
+    ///
+    /// # Errors
+    /// On [`CommandError::ChannelFull`] the rejected `Arc<Track>` is
+    /// returned back to the caller (cheaper to retry than to re-decode).
+    /// On [`CommandError::InvalidDeck`] the Arc is dropped here on the
+    /// main thread.
+    pub fn load(self, source: Arc<Track>) -> Result<(), (CommandError, Arc<Track>)> {
+        let idx = match self.handle.check_deck(self.idx) {
+            Ok(idx) => idx,
+            Err(e) => return Err((e, source)),
+        };
+        self.handle.reclaim();
+        self.handle
+            .tx
+            .try_push(Command::DeckLoad { idx, source })
+            .map_err(|cmd| match cmd {
+                Command::DeckLoad { source, .. } => (CommandError::ChannelFull, source),
+                // Unreachable: we just constructed a DeckLoad above.
+                other => unreachable!("ringbuf returned wrong Command variant: {other:?}"),
+            })
     }
 
     /// Read the current snapshot for this deck. Cheap (atomic loads).

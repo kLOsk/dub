@@ -122,18 +122,16 @@ impl Track {
         let mut decoder =
             symphonia::default::get_codecs().make(&codec_params, &DecoderOptions::default())?;
 
-        let sample_rate = codec_params
-            .sample_rate
-            .ok_or_else(|| LoadError::Format("track has no sample rate".into()))?;
-        let channel_count = codec_params
+        // Sample rate / channels MAY come from codec params (typical for
+        // RIFF formats) or only become known after the first packet is
+        // decoded (typical for ISO MP4 / AAC where the channel count
+        // lives in the audio object type, not the sample entry box). We
+        // try params first, then fall back to the first decoded buffer's
+        // spec inside the loop below.
+        let mut sample_rate = codec_params.sample_rate;
+        let mut channels: Option<u8> = codec_params
             .channels
-            .ok_or_else(|| LoadError::Format("track has no channel layout".into()))?
-            .count();
-        let channels =
-            u8::try_from(channel_count).map_err(|_| LoadError::UnsupportedChannels(u8::MAX))?;
-        if !(1..=2).contains(&channels) {
-            return Err(LoadError::UnsupportedChannels(channels));
-        }
+            .map(|c| u8::try_from(c.count()).unwrap_or(u8::MAX));
 
         let mut samples: Vec<f32> = Vec::new();
         let mut sample_buf: Option<SampleBuffer<f32>> = None;
@@ -161,13 +159,32 @@ impl Track {
                 Err(e) => return Err(e.into()),
             };
 
-            // SampleBuffer handles type conversion (i16 → f32 with proper
-            // [-1.0, 1.0] scaling, etc.) and de-planarizes to interleaved.
-            let buf = sample_buf.get_or_insert_with(|| {
-                SampleBuffer::<f32>::new(audio.capacity() as u64, *audio.spec())
-            });
+            // First decoded packet: lock in any spec fields we couldn't
+            // get from codec_params. After this point, spec changes mean
+            // a stream-format-change which we don't support yet.
+            let spec = *audio.spec();
+            if sample_rate.is_none() {
+                sample_rate = Some(spec.rate);
+            }
+            if channels.is_none() {
+                let count = spec.channels.count();
+                channels = Some(u8::try_from(count).unwrap_or(u8::MAX));
+            }
+
+            // Capacity grows lazily here too — `audio.capacity()` is the
+            // packet's max frame count, fixed for the codec.
+            let buf = sample_buf
+                .get_or_insert_with(|| SampleBuffer::<f32>::new(audio.capacity() as u64, spec));
             buf.copy_interleaved_ref(audio);
             samples.extend_from_slice(buf.samples());
+        }
+
+        let sample_rate =
+            sample_rate.ok_or_else(|| LoadError::Format("no sample rate found".into()))?;
+        let channels =
+            channels.ok_or_else(|| LoadError::Format("no channel layout found".into()))?;
+        if !(1..=2).contains(&channels) {
+            return Err(LoadError::UnsupportedChannels(channels));
         }
 
         if samples.is_empty() {

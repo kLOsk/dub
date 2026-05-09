@@ -46,6 +46,12 @@ pub const DECK_COUNT: usize = 2;
 /// (M2), zeros the output buffer, renders each deck additively into it,
 /// and returns. CoreAudio (M1.4) calls this once per audio block from the
 /// IO proc.
+///
+/// When constructed via [`Engine::new_with_handle`] the engine also owns
+/// the producer end of the trash channel: any `Arc<Track>` swapped off a
+/// deck (M3) is bounced back to the main thread for disposal there. The
+/// audio thread *never* drops `Arc<Track>` (which would call `dealloc`,
+/// a syscall, on a real-time thread).
 pub struct Engine {
     sample_rate: f32,
     block_size: usize,
@@ -54,6 +60,13 @@ pub struct Engine {
     /// for offline/test engines built via [`Engine::new`]; populated by
     /// [`Engine::new_with_handle`].
     cmd_rx: Option<ringbuf::HeapCons<Command>>,
+    /// Producer end of the audio → main trash channel. `None` for
+    /// offline/test engines.
+    trash_tx: Option<ringbuf::HeapProd<std::sync::Arc<dub_io::Track>>>,
+    /// Atomic counter incremented every time the trash channel was full
+    /// when an old `Arc<Track>` needed to go back. Surfaced to the UI
+    /// via [`EngineHandle::trash_overflow_count`].
+    trash_overflow: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Engine {
@@ -69,6 +82,8 @@ impl Engine {
             block_size,
             decks: std::array::from_fn(|_| Deck::new()),
             cmd_rx: None,
+            trash_tx: None,
+            trash_overflow: None,
         }
     }
 
@@ -77,19 +92,21 @@ impl Engine {
     /// (typically via `dub_audio::AudioOutput::start`). This is the
     /// production constructor.
     ///
-    /// **Not the audio thread.** Allocates the ringbuf and the per-deck
+    /// **Not the audio thread.** Allocates the ringbufs and the per-deck
     /// shared state Arcs.
     #[must_use]
     pub fn new_with_handle(sample_rate: f32, block_size: usize) -> (Self, EngineHandle) {
         let decks: [Deck; DECK_COUNT] = std::array::from_fn(|_| Deck::new());
         let shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT] =
             std::array::from_fn(|i| decks[i].shared());
-        let (handle, rx) = EngineHandle::new(shared);
+        let (handle, side) = EngineHandle::new(shared);
         let engine = Self {
             sample_rate,
             block_size,
             decks,
-            cmd_rx: Some(rx),
+            cmd_rx: Some(side.cmd_rx),
+            trash_tx: Some(side.trash_tx),
+            trash_overflow: Some(side.overflow_counter),
         };
         (engine, handle)
     }
@@ -161,46 +178,88 @@ impl Engine {
     /// is no channel (returns immediately).
     fn drain_commands(&mut self) {
         use ringbuf::traits::Consumer;
-        let Some(rx) = self.cmd_rx.as_mut() else {
+        // `take()` lets us pop from `rx` while still mutating
+        // `self.decks` / `self.trash_tx` inside the loop. The Option is
+        // restored at the end; no allocation.
+        let Some(mut rx) = self.cmd_rx.take() else {
             return;
         };
         while let Some(cmd) = rx.try_pop() {
-            apply_command(&mut self.decks, cmd);
+            self.apply_command(cmd);
+        }
+        self.cmd_rx = Some(rx);
+    }
+
+    /// Apply a single command. Inlined as a method so
+    /// [`Command::DeckLoad`] can route the displaced `Arc<Track>`
+    /// through the trash channel without dropping it on the audio thread.
+    fn apply_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::DeckPlay { idx } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_playing(true);
+                }
+            }
+            Command::DeckPause { idx } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_playing(false);
+                }
+            }
+            Command::DeckSeek {
+                idx,
+                position_frames,
+            } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_position_frames(position_frames);
+                }
+            }
+            Command::DeckSetRate { idx, rate } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_rate(rate);
+                }
+            }
+            Command::DeckSetGain { idx, gain } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_gain(gain);
+                }
+            }
+            Command::DeckLoad { idx, source } => {
+                let Some(d) = self.decks.get_mut(idx as usize) else {
+                    // Bad idx: bounce the new Arc back through the trash
+                    // channel rather than drop here. Symmetric with the
+                    // valid path — the audio thread never drops Arcs.
+                    self.send_to_trash(source);
+                    return;
+                };
+                let old = d.swap_source(source);
+                if let Some(old) = old {
+                    self.send_to_trash(old);
+                }
+            }
         }
     }
-}
 
-/// Apply a single command to the deck array. Free function so it borrows
-/// only `decks`, leaving the rest of `Engine` untouched (avoids fighting
-/// the borrow checker over `cmd_rx` while we mutate decks during drain).
-fn apply_command(decks: &mut [Deck; DECK_COUNT], cmd: Command) {
-    match cmd {
-        Command::DeckPlay { idx } => {
-            if let Some(d) = decks.get_mut(idx as usize) {
-                d.set_playing(true);
-            }
-        }
-        Command::DeckPause { idx } => {
-            if let Some(d) = decks.get_mut(idx as usize) {
-                d.set_playing(false);
-            }
-        }
-        Command::DeckSeek {
-            idx,
-            position_frames,
-        } => {
-            if let Some(d) = decks.get_mut(idx as usize) {
-                d.set_position_frames(position_frames);
-            }
-        }
-        Command::DeckSetRate { idx, rate } => {
-            if let Some(d) = decks.get_mut(idx as usize) {
-                d.set_rate(rate);
-            }
-        }
-        Command::DeckSetGain { idx, gain } => {
-            if let Some(d) = decks.get_mut(idx as usize) {
-                d.set_gain(gain);
+    /// Push an old `Arc<Track>` back to the main thread for disposal.
+    /// On overflow (channel full) `mem::forget` the Arc and bump the
+    /// overflow counter — leaking is the lesser evil compared with a
+    /// `dealloc` on the audio thread, and the counter surfaces the
+    /// violation to the UI.
+    fn send_to_trash(&mut self, arc: std::sync::Arc<dub_io::Track>) {
+        use ringbuf::traits::Producer;
+        let Some(trash_tx) = self.trash_tx.as_mut() else {
+            // No trash channel — offline engine. `Engine::new` is by
+            // definition not the audio thread, so a `dealloc` here is
+            // acceptable. (DeckLoad is unreachable here in practice
+            // because it can only be sent through an EngineHandle, and
+            // EngineHandle is only paired with the channel-bearing
+            // Engine.)
+            drop(arc);
+            return;
+        };
+        if let Err(rejected) = trash_tx.try_push(arc) {
+            std::mem::forget(rejected);
+            if let Some(counter) = self.trash_overflow.as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -355,6 +414,85 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             engine.render(&mut rt, &mut buffer);
         });
+    }
+
+    #[test]
+    fn hot_load_swaps_source_and_returns_old_via_trash() {
+        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 8], 48_000, 2).unwrap());
+        let track_b = Arc::new(Track::from_interleaved(vec![0.25; 8], 48_000, 2).unwrap());
+
+        // Track-A starts with refcount 1 (us) + 0 = 1 + the Arc::clone
+        // we'll send into the engine = 2. Watch this go up to 2 then
+        // back down to 1 across load and reclaim.
+        let track_a_for_engine = track_a.clone();
+        assert_eq!(Arc::strong_count(&track_a), 2);
+
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
+        engine.deck_mut(0).set_source(track_a_for_engine);
+        engine.deck_mut(0).set_playing(true);
+        // First render uses track A → output = 0.5.
+        let mut buffer = vec![0.0f32; 8];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buffer);
+        for s in &buffer {
+            assert!((s - 0.5).abs() < 1e-6);
+        }
+
+        // Hot-load track B. Before reclaim the engine is holding the
+        // old A on its way through the trash channel — so strong_count
+        // is still 2 (ours + the trash buffer slot).
+        handle.deck(0).load(track_b.clone()).unwrap();
+        let mut buffer = vec![0.0f32; 8];
+        engine.render(&mut rt, &mut buffer);
+        for s in &buffer {
+            assert!((s - 0.25).abs() < 1e-6, "after swap expected 0.25, got {s}");
+        }
+        assert_eq!(Arc::strong_count(&track_a), 2, "old Arc still in trash");
+
+        // Reclaim drops the old Arc on the main thread → strong_count
+        // drops back to 1.
+        let n = handle.reclaim();
+        assert_eq!(n, 1, "reclaim should have dropped exactly one Arc");
+        assert_eq!(Arc::strong_count(&track_a), 1);
+        assert_eq!(handle.trash_overflow_count(), 0);
+    }
+
+    #[test]
+    fn hot_load_drain_is_alloc_free() {
+        let track_a = Arc::new(Track::from_interleaved(vec![0.1; 16], 48_000, 2).unwrap());
+        let track_b = Arc::new(Track::from_interleaved(vec![0.2; 16], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
+        engine.deck_mut(0).set_source(track_a);
+
+        // Pre-stage a load. The audio thread's drain must:
+        //  1. pop the DeckLoad command (no alloc),
+        //  2. swap the deck's Arc<Track> (no alloc — Arc::clone on
+        //     handoff was already done by the sender),
+        //  3. push the old Arc into the trash channel (no alloc — the
+        //     channel storage is pre-allocated).
+        handle.deck(0).load(track_b).unwrap();
+
+        let mut buffer = vec![0.0f32; 8];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render(&mut rt, &mut buffer);
+        });
+    }
+
+    #[test]
+    fn auto_reclaim_on_load_keeps_trash_drained() {
+        // A user-style usage: load 100 tracks back to back without ever
+        // calling reclaim explicitly. The auto-drain in `load()` should
+        // keep the trash channel from filling up (capacity is 32).
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
+        let mut buffer = vec![0.0f32; 8];
+        let mut rt = RealtimeContext::new();
+        for _ in 0..100 {
+            let t = Arc::new(Track::from_interleaved(vec![0.1; 8], 48_000, 2).unwrap());
+            handle.deck(0).load(t).unwrap();
+            engine.render(&mut rt, &mut buffer);
+        }
+        assert_eq!(handle.trash_overflow_count(), 0);
     }
 
     #[test]

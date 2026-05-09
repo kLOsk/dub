@@ -67,11 +67,14 @@ fn print_help() {
     eprintln!("                    [--buffer-size FRAMES]");
     eprintln!("                    [--pause-at SECS] [--resume-at SECS]");
     eprintln!("                    [--seek-at WALL=POS_SECS]");
+    eprintln!("                    [--hot-swap-at WALL=PATH_TO_TRACK]");
     eprintln!();
     eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
     eprintln!("    --pause-at, --resume-at, --seek-at drive the engine's lock-free");
     eprintln!("    command channel (M2 transport) from the main thread while audio runs.");
+    eprintln!("    --hot-swap-at sends a DeckLoad command (M3); the new track is decoded");
+    eprintln!("    pre-emptively, the old Arc<Track> is bounced through the trash channel.");
 }
 
 fn smoke() -> Result<()> {
@@ -189,6 +192,9 @@ struct PlayOpts {
     /// `WALL=POS` — at `WALL` wall-clock seconds, seek deck 0 to `POS`
     /// track-seconds. M2 demo of the seek command.
     seek_at: Option<(f64, f64)>,
+    /// `WALL=PATH` — at `WALL` wall-clock seconds, hot-load `PATH` onto
+    /// deck 0 via the lock-free command channel. M3 demo.
+    hot_swap_at: Option<(f64, PathBuf)>,
 }
 
 impl Default for PlayOpts {
@@ -206,6 +212,7 @@ impl Default for PlayOpts {
             pause_at: None,
             resume_at: None,
             seek_at: None,
+            hot_swap_at: None,
         }
     }
 }
@@ -293,6 +300,17 @@ impl PlayOpts {
                     let wall: f64 = wall.parse().context("--seek-at WALL not a number")?;
                     let pos: f64 = pos.parse().context("--seek-at POS not a number")?;
                     opts.seek_at = Some((wall, pos));
+                    i += 2;
+                }
+                "--hot-swap-at" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--hot-swap-at expects WALL=PATH"))?;
+                    let (wall, path) = v
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("--hot-swap-at expects WALL=PATH, got {v}"))?;
+                    let wall: f64 = wall.parse().context("--hot-swap-at WALL not a number")?;
+                    opts.hot_swap_at = Some((wall, PathBuf::from(path)));
                     i += 2;
                 }
                 s if s.starts_with('-') => {
@@ -509,7 +527,7 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     // single ringbuf push; the audio thread observes the change at the
     // start of its next render block (≤ buffer-size latency later).
     #[allow(clippy::cast_possible_truncation)]
-    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32);
+    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32)?;
     if !schedule.is_empty() {
         println!("  schedule:");
         for ev in &schedule {
@@ -528,19 +546,18 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     // and so on. Every command is sent from this thread, never from the
     // audio thread.
     let mut last_wall = 0.0f64;
-    for ev in &schedule {
+    for ev in schedule {
         let dt = (ev.wall_secs() - last_wall).max(0.0);
         thread::sleep(Duration::from_secs_f64(dt));
+        let wall = ev.wall_secs();
+        let label = ev.describe();
         ev.fire(&mut handle)?;
         let snap = handle.deck_state(0).unwrap();
         println!(
-            "    @{:.3}s applied {:<14} | pos={:.1}fr playing={}",
-            ev.wall_secs(),
-            ev.describe(),
-            snap.position_frames,
-            snap.is_playing
+            "    @{wall:.3}s applied {label:<22} | pos={:.1}fr playing={}",
+            snap.position_frames, snap.is_playing
         );
-        last_wall = ev.wall_secs();
+        last_wall = wall;
     }
     let remaining = (play_secs - last_wall).max(0.0);
     thread::sleep(Duration::from_secs_f64(remaining));
@@ -548,6 +565,8 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     let elapsed = start.elapsed();
     let cb_count = output.callback_count();
     let final_snap = handle.deck_state(0).unwrap();
+    let reclaimed = handle.reclaim();
+    let overflow = handle.trash_overflow_count();
     drop(output);
 
     println!(
@@ -558,6 +577,15 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
         "  final state:  pos={:.1}fr playing={} at_end={}",
         final_snap.position_frames, final_snap.is_playing, final_snap.at_end
     );
+    if reclaimed > 0 || overflow > 0 {
+        println!("  trash:        reclaimed={reclaimed} overflow={overflow}");
+        if overflow > 0 {
+            eprintln!(
+                "warning: trash channel overflowed {overflow} times — old Arc<Track> leaked. \
+                 The UI must call EngineHandle::reclaim() more frequently."
+            );
+        }
+    }
     if cb_count == 0 {
         anyhow::bail!("CoreAudio fired zero render callbacks; device probably failed to start");
     }
@@ -567,27 +595,50 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
 
 /// One transport event scheduled to fire from the main thread at a given
 /// wall-clock offset since playback start.
-#[derive(Debug, Clone, Copy)]
+///
+/// `HotSwap` carries an `Arc<Track>` (the new track to load), so the enum
+/// itself is not `Copy`. The list is consumed by value when fired so the
+/// Arc moves into the load command without being cloned.
+#[derive(Debug)]
 enum ScheduledEvent {
-    Pause { wall_secs: f64 },
-    Resume { wall_secs: f64 },
-    Seek { wall_secs: f64, pos_frames: f64 },
+    Pause {
+        wall_secs: f64,
+    },
+    Resume {
+        wall_secs: f64,
+    },
+    Seek {
+        wall_secs: f64,
+        pos_frames: f64,
+    },
+    HotSwap {
+        wall_secs: f64,
+        source: std::sync::Arc<Track>,
+        path: PathBuf,
+    },
 }
 
 impl ScheduledEvent {
-    fn wall_secs(self) -> f64 {
+    fn wall_secs(&self) -> f64 {
         match self {
             Self::Pause { wall_secs }
             | Self::Resume { wall_secs }
-            | Self::Seek { wall_secs, .. } => wall_secs,
+            | Self::Seek { wall_secs, .. }
+            | Self::HotSwap { wall_secs, .. } => *wall_secs,
         }
     }
 
-    fn describe(self) -> String {
+    fn describe(&self) -> String {
         match self {
             Self::Pause { .. } => "pause".to_string(),
             Self::Resume { .. } => "resume".to_string(),
             Self::Seek { pos_frames, .. } => format!("seek({pos_frames:.0}fr)"),
+            Self::HotSwap { path, .. } => {
+                format!(
+                    "load({})",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                )
+            }
         }
     }
 
@@ -596,33 +647,21 @@ impl ScheduledEvent {
             Self::Pause { .. } => handle.deck(0).pause()?,
             Self::Resume { .. } => handle.deck(0).play()?,
             Self::Seek { pos_frames, .. } => handle.deck(0).seek(pos_frames)?,
+            Self::HotSwap { source, .. } => handle
+                .deck(0)
+                .load(source)
+                .map_err(|(e, _arc)| e)
+                .context("hot-load command rejected")?,
         }
         Ok(())
     }
 }
 
-// `wall_secs` is a method, not a struct field, on a Copy enum — wrap it
-// for sorting since `partial_cmp` on `Self` returns Option (NaN guard).
-struct ScheduledEventList(Vec<ScheduledEvent>);
-
-impl ScheduledEventList {
-    fn iter(&self) -> std::slice::Iter<'_, ScheduledEvent> {
-        self.0.iter()
-    }
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl<'a> IntoIterator for &'a ScheduledEventList {
-    type Item = &'a ScheduledEvent;
-    type IntoIter = std::slice::Iter<'a, ScheduledEvent>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-fn build_transport_schedule(opts: &PlayOpts, play_secs: f64, track_sr: f32) -> ScheduledEventList {
+fn build_transport_schedule(
+    opts: &PlayOpts,
+    play_secs: f64,
+    track_sr: f32,
+) -> Result<Vec<ScheduledEvent>> {
     let mut events: Vec<ScheduledEvent> = Vec::new();
     if let Some(t) = opts.pause_at {
         if t >= 0.0 && t <= play_secs {
@@ -643,10 +682,23 @@ fn build_transport_schedule(opts: &PlayOpts, play_secs: f64, track_sr: f32) -> S
             });
         }
     }
+    if let Some((wall, ref path)) = opts.hot_swap_at {
+        if wall >= 0.0 && wall <= play_secs {
+            // Decode now (off the audio thread, on a not-yet-running
+            // playback) so the wall-clock fire is just a ringbuf push.
+            let track = Track::load_from_path(path)
+                .with_context(|| format!("decoding hot-swap source {}", path.display()))?;
+            events.push(ScheduledEvent::HotSwap {
+                wall_secs: wall,
+                source: std::sync::Arc::new(track),
+                path: path.clone(),
+            });
+        }
+    }
     events.sort_by(|a, b| {
         a.wall_secs()
             .partial_cmp(&b.wall_secs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    ScheduledEventList(events)
+    Ok(events)
 }
