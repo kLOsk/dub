@@ -99,7 +99,7 @@ Roadmap is detailed in [`docs/PRD.md`](docs/PRD.md). Bookmark order:
 | **M5.4.2** | ✅ shipped | Per-rig calibration + fingerprint-based auto-detection |
 | **M5.4.3** | 📋 planned | Calibration speed (≤5 s first-time, ≤1 s probe) — match Traktor |
 | **M5.4.4** | ✅ shipped | Independent per-deck calibration (probes + thresholds per deck, JSON keyed by `(device, deck, format)`, legacy fallback for M5.4.2/M6 files) |
-| **M5.4.5** | 📋 planned | Concurrent calibration + non-blocking startup (audio starts on first deck attach; per-deck calibrators run in parallel) |
+| **M5.4.5** | 📋 planned | Late-binding decks + non-blocking calibration — single-deck startup, mid-stream deck-add, parallel calibration. **Product gate**, not polish: required for the DJ-takeover use case (incoming DJ has no access to deck B's record). |
 | **M5.5.1** | ✅ shipped | Engine routing primitive (`render_routed`, `OutputRouting`) |
 | **M5.5.2** | ✅ shipped | External-mixer 4-channel output: SL3 (✅ verified) / Audio 6 (⚠️ unverified) profiles + manual override |
 | **M5.6** | ✅ shipped | Two-deck timecode (single CoreAudio input AU, IOProc demux into per-deck SPSC rings) |
