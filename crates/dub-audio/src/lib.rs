@@ -37,18 +37,27 @@ pub use error::AudioError;
 #[cfg(target_os = "macos")]
 pub use macos::{
     list_input_devices, query_default_input, query_default_output, AudioInput, AudioOutput,
-    BufferFrameRange, InputDeviceInfo, InputOptions,
+    BufferFrameRange, InputDeviceInfo, InputOptions, OutputOptions,
 };
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Information about an audio output device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DeviceInfo {
+    /// CoreAudio device name (e.g. `"SL 3"`, `"Traktor Audio 6"`,
+    /// `"MacBook Pro Speakers"`). Used by the CLI's known-device
+    /// table (M5.5.2) to decide on per-deck output channel routing.
+    pub device_name: String,
     /// Sample rate in Hz (e.g. 48000.0).
     pub sample_rate: f32,
-    /// Channel count (output channels). Currently always 2.
+    /// Physical output-channel count of this device (6 for an SL3,
+    /// 4 for a Traktor Audio 6, 2 for a MacBook's built-in
+    /// speakers). Up to M5.5.1 this was hardcoded to 2 because
+    /// `AudioOutput::start` only opened a stereo AU; M5.5.2 surfaces
+    /// the real count so the CLI can route deck audio to the right
+    /// physical pair.
     pub channels: u32,
     /// Current device buffer size, in frames per render callback.
     pub buffer_frames: u32,

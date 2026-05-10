@@ -100,7 +100,7 @@ Roadmap is detailed in [`docs/PRD.md`](docs/PRD.md). Bookmark order:
 | **M5.4.3** | 📋 planned | Calibration speed (≤5 s first-time, ≤1 s probe) — match Traktor |
 | **M5.4.4** | 📋 planned | Named per-cartridge profiles |
 | **M5.5.1** | ✅ shipped | Engine routing primitive (`render_routed`, `OutputRouting`) |
-| **M5.5.2** | 🔧 next | External-mixer 4-channel output: SL3 / Audio 6 known-device profiles |
+| **M5.5.2** | ✅ shipped | External-mixer 4-channel output: SL3 (✅ verified) / Audio 6 (⚠️ unverified) profiles + manual override |
 | **M5.5** | ◻ planned | External-mixer 4-channel output routing |
 | **M6** | ◻ planned | Traktor MK2 timecode |
 | **M7** | ◻ planned | Thru Mode (real records routed through Dub) |

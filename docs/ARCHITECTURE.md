@@ -750,11 +750,87 @@ whole multi-channel buffer at the end. Unrouted channels stay zero
 on an unrouted pair. Per-deck gain still composes multiplicatively
 upstream of master — same as M4.
 
-M5.5.2 will add the matching `OutputOptions` + `AudioOutput`
-multi-channel surface and a known-device routing table (SL3:
-deck A=ch3+4, deck B=ch5+6, aux=ch1+2; Traktor Audio 6: deck A=
-ch1+2, deck B=ch3+4) so `dub timecode-deck` auto-configures
-correctly when a recognised interface is connected.
+### External-mixer routing — M5.5.2 (CLI + CoreAudio + device profiles)
+
+M5.5.1's engine primitive runs all the way to physical hardware via
+three layered changes:
+
+1. **`dub_audio::OutputOptions` + `AudioOutput::start_with_options`.**
+   Mirror image of M5.2's `InputOptions`: configurable channel
+   count, buffer size, optional channel map, optional SR override.
+   Same SR-alignment guarantee as the legacy stereo path — the
+   device is forced to engine SR (or the call fails loudly) so
+   CoreAudio doesn't insert a silent SRC. The render callback
+   captures a `dub_engine::OutputRouting` (Copy) and calls
+   `Engine::render_routed` per block; no allocations on the audio
+   thread.
+
+2. **`DeviceInfo` learns `device_name`.** `query_default_output`
+   now returns the CoreAudio device name and the *physical*
+   channel count (queried via
+   `kAudioDevicePropertyStreamConfiguration` on the output scope —
+   the same property M5.2 uses on the input scope, generalised to
+   `device_channel_count(scope)` so input/output share one path).
+   This is what lets the CLI reason about which interface is
+   plugged in without touching the audio thread.
+
+3. **`device_profiles::KNOWN_DEVICES` table.** A small static list
+   of validated interfaces with their canonical per-deck routing.
+   Currently:
+
+   - **Serato SL 3** (verified): `output_channels = 6`, deck A on
+     ch 3+4, deck B on ch 5+6 (aux on 1+2). Matches the SL3's
+     internal per-deck wiring; the same physical pair carries deck
+     A's input (timecode in) and deck A's output (track audio
+     back to the mixer), so a user who's already wired
+     `--input-channels 3,4` for timecode automatically gets deck A
+     audio on the matching output pair. No `2N+1/2N+2` formula —
+     that formula is wrong for our reference device.
+   - **Traktor Audio 6** (unverified): best-effort guess
+     deck A 1+2, deck B 3+4. Warns at startup until validated.
+
+The CLI's resolution priority (in `timecode_deck.rs::resolve_output_routing`):
+
+```text
+  --internal-mixer
+    └─→ 2-ch internal mixer (debug only, "not for live" warning)
+
+  --deck-a-out-ch N + --deck-b-out-ch M (must be paired)
+    └─→ manual routing, channels = --output-channels or device.channels
+
+  --device-profile NAME (exact name_pattern match)
+    └─→ profile's routing
+
+  no flags + device.device_name matches a KNOWN_DEVICES pattern
+    └─→ profile's routing (auto-detect — the SL3 path)
+
+  no flags + unknown device
+    └─→ 2-ch internal mixer fallback (loud warning,
+        "for an external mixer pass --deck-a-out-ch / --deck-b-out-ch")
+```
+
+The fallback is opinionated about being a dev path: live
+performance on a laptop output isn't supported because there's no
+per-deck physical separation, which violates the "no mouse DJ
+ever" rule. The user can always hear playback for prep / library
+work; they just can't hand-mix.
+
+**Why a table, not a formula.** Earlier drafts assumed
+`2N+1, 2N+2` (deck 0 → ch 1+2, deck 1 → ch 3+4). That's wrong for
+the SL3 — its aux is on 1+2 and decks are on 3+4 / 5+6. A formula
+that's wrong for our reference device is worse than no formula:
+the CLI would silently send deck audio to the wrong physical
+pairs and the user would have a mystery-silence debug session.
+Explicit table + opt-in for unknown devices is the safer default.
+Adding a new device is one entry in `KNOWN_DEVICES` plus a unit
+test (see the module-level docs).
+
+**1-based vs. 0-based.** CLI flags are 1-based (`--deck-a-out-ch 3`
+matches what's printed on the back of the SL3, what the driver
+panel shows, and what every DJ knows by heart) but the engine
+routing is 0-based (`Some(2)` for ch 3+4). Conversion happens once
+in `device_profiles::one_based_to_zero_based`; tests pin the round
+trip.
 
 ### Engine → UI (state snapshot) — implemented in M2
 

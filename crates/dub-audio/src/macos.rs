@@ -34,9 +34,9 @@ use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectSetPropertyData,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioValueRange};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -72,11 +72,20 @@ pub fn query_default_output() -> Result<DeviceInfo, AudioError> {
     let device_id = device_id_from_audio_unit(&audio_unit)?;
     let buffer_frames = get_buffer_frame_size(device_id)?;
     let range = get_buffer_frame_size_range(device_id)?;
+    let device_name =
+        get_device_name(device_id).unwrap_or_else(|_| format!("<device {device_id}>"));
+    // M5.5.2: surface the real physical channel count so the CLI's
+    // known-device table can pick deck-routing offsets correctly. SL3
+    // is 6 outs; built-in MacBook is 2; Traktor Audio 6 is 4 (or 6
+    // depending on driver mode). Falls back to 2 if the HAL doesn't
+    // answer, matching the pre-M5.5.2 behaviour.
+    let channels = device_channel_count(device_id, kAudioObjectPropertyScopeOutput).unwrap_or(2);
 
     Ok(DeviceInfo {
+        device_name,
         #[allow(clippy::cast_possible_truncation)]
         sample_rate: sample_rate_f64 as f32,
-        channels: 2,
+        channels,
         buffer_frames,
         buffer_frame_range: range,
     })
@@ -94,6 +103,60 @@ pub struct AudioOutput {
     callback_count: Arc<AtomicU64>,
     sample_rate: f32,
     buffer_frames: u32,
+    /// Number of output channels currently open on the AU. 2 for the
+    /// legacy stereo path (`start` / `start_with_buffer_size`), N for
+    /// the M5.5.2 multi-channel path (`start_with_options`).
+    channels: u32,
+    /// CoreAudio device name (e.g. `"SL 3"`). Empty for the legacy
+    /// stereo path that didn't track this; populated from
+    /// [`OutputOptions`] / [`query_default_output`] in the multi-channel
+    /// path so the CLI can echo the routing it chose.
+    device_name: String,
+}
+
+/// Options for opening an [`AudioOutput`] in multi-channel mode.
+///
+/// Mirrors [`InputOptions`]: the M5.2 input-side struct. Defaults are
+/// chosen so that `start_with_options` with `OutputOptions::default()`
+/// behaves like `start`: stereo, default device, device's current SR
+/// and buffer size.
+///
+/// In v1 the *device* itself is always the system default output —
+/// there's no `device_name` here yet. Users target a specific
+/// interface via macOS Audio MIDI Setup → "Use this device for
+/// sound output". Per-device selection lands later.
+#[derive(Debug, Clone)]
+pub struct OutputOptions {
+    /// Number of physical output channels to open the AU with. 2 for
+    /// stereo / internal mixer; 4 for the canonical external-mixer
+    /// 2-deck topology; 6 for an SL3 / Audio 6 (so we can route deck
+    /// audio to its physical pair *plus* leave aux ch 1+2 untouched).
+    pub channels: u32,
+    /// Optional buffer size override (frames per render callback).
+    /// `None` keeps the device's current setting.
+    pub buffer_frames: Option<u32>,
+    /// Optional sample rate override. `None` uses the engine's SR
+    /// (matches the legacy path's behaviour).
+    pub sample_rate: Option<f32>,
+    /// Optional channel-map override (CoreAudio
+    /// `kAudioOutputUnitProperty_ChannelMap`). One entry per logical
+    /// AU output channel; the i32 names the physical hardware
+    /// channel, or -1 for "unmapped". `None` is identity (logical
+    /// channel N → physical channel N), which is what the user wants
+    /// for SL3 / Audio 6 since those devices already expose their
+    /// physical channels in order.
+    pub channel_map: Option<Vec<i32>>,
+}
+
+impl Default for OutputOptions {
+    fn default() -> Self {
+        Self {
+            channels: 2,
+            buffer_frames: None,
+            sample_rate: None,
+            channel_map: None,
+        }
+    }
 }
 
 impl AudioOutput {
@@ -200,6 +263,137 @@ impl AudioOutput {
             callback_count,
             sample_rate: engine_sr,
             buffer_frames,
+            channels: 2,
+            device_name: get_device_name(device_id).unwrap_or_default(),
+        })
+    }
+
+    /// Open the default output in multi-channel mode and start playback
+    /// with per-deck routing.
+    ///
+    /// `opts.channels` controls how many physical channels of the
+    /// device the AU exposes; `routing[deck_idx]` is the first
+    /// (0-based) output channel that deck's stereo pair lands on. See
+    /// [`dub_engine::OutputRouting`] for the full semantics. SL3
+    /// example: `opts.channels = 6`, `routing = [Some(2), Some(4)]`
+    /// puts deck A on out 3+4 and deck B on out 5+6.
+    ///
+    /// Same SR-alignment guarantee as [`Self::start_with_buffer_size`]:
+    /// the device is forced to the engine's nominal SR (or the call
+    /// fails loudly) so CoreAudio doesn't insert a silent SRC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError`] if the device can't be opened, the
+    /// requested stream format / channel count is rejected, the
+    /// channel map is invalid, the buffer size can't be applied, or
+    /// the callback can't be installed.
+    pub fn start_with_options(
+        engine: Engine,
+        opts: &OutputOptions,
+        routing: dub_engine::OutputRouting,
+    ) -> Result<Self, AudioError> {
+        let mut audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
+        let device_id = device_id_from_audio_unit(&audio_unit)?;
+        let device_name = get_device_name(device_id).unwrap_or_default();
+        let engine_sr = engine.sample_rate();
+
+        if opts.channels < 2 {
+            return Err(AudioError::Device(format!(
+                "OutputOptions.channels = {} is invalid; need at least 2 to hold a stereo pair",
+                opts.channels
+            )));
+        }
+        for (deck_idx, slot) in routing.iter().enumerate() {
+            if let Some(first) = slot {
+                if (*first).saturating_add(2) > opts.channels {
+                    return Err(AudioError::Device(format!(
+                        "deck {deck_idx} routed to first channel {first} but only {} channels \
+                         are open; need at least 2 channels for a stereo pair",
+                        opts.channels
+                    )));
+                }
+            }
+        }
+
+        // Same SR alignment as the legacy stereo path. See the long
+        // comment in start_with_buffer_size for the full rationale.
+        let device_sr = get_device_nominal_sample_rate(device_id)?;
+        let target_sr = opts.sample_rate.unwrap_or(engine_sr);
+        if (f64::from(target_sr) - device_sr).abs() > 0.5 {
+            set_device_sample_rate(device_id, f64::from(target_sr)).map_err(|e| {
+                AudioError::Device(format!(
+                    "output device '{device_name}' refused SR {target_sr} Hz \
+                     (was {device_sr} Hz): {e:?} — check Audio MIDI Setup \
+                     for supported rates",
+                ))
+            })?;
+        }
+
+        // Force interleaved f32 N-channel at the engine's SR. Same
+        // alignment guarantee as the stereo path; the only difference
+        // is `channels: opts.channels`.
+        let format = StreamFormat {
+            sample_rate: f64::from(target_sr),
+            sample_format: SampleFormat::F32,
+            flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
+            channels: opts.channels,
+        };
+        audio_unit.set_stream_format(format, Scope::Input, Element::Output)?;
+
+        // Optional channel map: reorder logical AU channels to physical
+        // device channels. Most users (including the SL3) don't need
+        // this — the device's physical layout is already in order, so
+        // logical out N == physical out N+1 (1-based). Provided for
+        // future quirky devices.
+        if let Some(map) = &opts.channel_map {
+            if map.len() != opts.channels as usize {
+                return Err(AudioError::Device(format!(
+                    "channel_map.len() = {} but opts.channels = {}; map must have one entry \
+                     per logical AU channel",
+                    map.len(),
+                    opts.channels
+                )));
+            }
+            set_output_channel_map(&audio_unit, map)?;
+        }
+
+        if let Some(frames) = opts.buffer_frames {
+            set_buffer_frame_size(device_id, frames)?;
+        }
+        let buffer_frames = get_buffer_frame_size(device_id)?;
+
+        let callback_count = Arc::new(AtomicU64::new(0));
+        let cb_count = callback_count.clone();
+
+        let mut engine = engine;
+        let mut rt = RealtimeContext::new();
+        let num_channels = opts.channels as usize;
+        // The routing array is Copy (it's [Option<u32>; 2]) so the
+        // closure captures by value — no Arc, no allocation. The
+        // engine is moved in. (No `let routing = routing` shadow
+        // needed — clippy flags the no-op rebind, and routing is
+        // already an owned value from the function argument.)
+        audio_unit.set_render_callback(
+            move |args: render_callback::Args<data::Interleaved<f32>>| {
+                // RT thread. No allocation, no locks, no syscalls.
+                // engine.render_routed is verified alloc-free by the
+                // M5.5.1 tests; AtomicU64::fetch_add is wait-free.
+                engine.render_routed(&mut rt, args.data.buffer, num_channels, &routing);
+                cb_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )?;
+
+        audio_unit.start()?;
+
+        Ok(Self {
+            audio_unit,
+            callback_count,
+            sample_rate: target_sr,
+            buffer_frames,
+            channels: opts.channels,
+            device_name,
         })
     }
 
@@ -207,6 +401,23 @@ impl AudioOutput {
     #[must_use]
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Number of physical output channels currently open on the AU.
+    /// 2 for the stereo paths (`start`, `start_with_buffer_size`); N
+    /// for the multi-channel path (`start_with_options`) where N
+    /// matches the `channels` field of [`OutputOptions`].
+    #[must_use]
+    pub fn channels(&self) -> u32 {
+        self.channels
+    }
+
+    /// CoreAudio device name (e.g. `"SL 3"`) for the device this
+    /// AudioOutput is driving. May be empty if the legacy stereo path
+    /// didn't track it; always populated for `start_with_options`.
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     /// Buffer size in frames per render callback, as accepted by the device.
@@ -513,7 +724,7 @@ pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
         out.push(InputDeviceInfo {
             name,
             sample_rate: sr as f32,
-            channels: input_channel_count(id).unwrap_or(0),
+            channels: device_channel_count(id, kAudioObjectPropertyScopeInput).unwrap_or(0),
             buffer_frames,
             buffer_frame_range,
         });
@@ -542,7 +753,7 @@ fn device_info_for_input(id: AudioObjectID) -> Result<InputDeviceInfo, AudioErro
     // (Querying via the AU returns the AU's internal default of 44.1 kHz,
     // not the device's actual rate. See `get_device_nominal_sample_rate`.)
     let sr = get_device_nominal_sample_rate(id)?;
-    let channels = input_channel_count(id).unwrap_or(2);
+    let channels = device_channel_count(id, kAudioObjectPropertyScopeInput).unwrap_or(2);
     #[allow(clippy::cast_possible_truncation)]
     Ok(InputDeviceInfo {
         name,
@@ -962,24 +1173,65 @@ fn set_input_channel_map(au: &AudioUnit, map: &[i32]) -> Result<(), AudioError> 
     Ok(())
 }
 
-/// Total input channel count of a device, queried via the HAL property
-/// `kAudioDevicePropertyStreamConfiguration` on the *device*'s input
-/// scope.
+/// Install a channel map on the output AU (M5.5.2). Writes
+/// `kAudioOutputUnitProperty_ChannelMap` with `Scope::Input,
+/// Element::Output` (the AU's *input* scope is what receives our
+/// render-callback samples; the *output* element is what sends them
+/// to the device). Each entry is a 0-based device output channel
+/// index, or `-1` to mute that slot.
 ///
-/// This is the **physical** channel count: 6 for an SL3, 4 for a
-/// Traktor Audio 6, 2 for a built-in mic. It is **not** the same as
-/// `AudioUnit::input_stream_format().channels`, which reports the AU's
-/// own (configurable) output count and defaults to 2 regardless of
-/// hardware. We need the physical count so the user can see "SL 3
-/// channels=6" in `dub list-inputs` and confidently say
-/// `--input-channels 3,4`.
+/// Note the scope/element flip vs. [`set_input_channel_map`] — for
+/// the input AU the channel map sits on `Scope::Output, Element::Input`
+/// (data comes *from* the device's input element and is *output* by the
+/// AU). For the output AU it's the mirror image.
+fn set_output_channel_map(au: &AudioUnit, map: &[i32]) -> Result<(), AudioError> {
+    let inner: RawAudioUnit = *au.as_ref();
+    #[allow(clippy::cast_possible_truncation)]
+    let size = std::mem::size_of_val(map) as u32;
+    // SAFETY: `inner` is a live AudioComponentInstance owned by `au`
+    // for this call; `map` is a borrowed slice; the property writes
+    // exactly `size` bytes from `in_data`. Returns OSStatus; non-zero
+    // means CoreAudio rejected the map.
+    let status = unsafe {
+        AudioUnitSetProperty(
+            inner,
+            kAudioOutputUnitProperty_ChannelMap,
+            Scope::Input as u32,
+            Element::Output as u32,
+            map.as_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if status != 0 {
+        return Err(AudioError::Device(format!(
+            "AudioUnitSetProperty(ChannelMap, output, len={}) failed: status {status}",
+            map.len(),
+        )));
+    }
+    Ok(())
+}
+
+/// Total channel count of a device on a given scope (input or output),
+/// queried via the HAL property `kAudioDevicePropertyStreamConfiguration`.
+///
+/// This is the **physical** channel count of the device for the given
+/// scope: 6 for an SL3 (both in and out), 4 for a Traktor Audio 6 (or
+/// 6 in some driver modes), 2 for a built-in MacBook mic / speakers.
+/// It is **not** the same as `AudioUnit::input_stream_format().channels`,
+/// which reports the AU's own (configurable) output count and defaults
+/// to 2 regardless of hardware. We need the physical count so the user
+/// can see "SL 3 outputs=6" in `dub list-outputs` (M5.5.2) and
+/// confidently route deck audio to physical pairs.
 ///
 /// Implementation: the property returns an `AudioBufferList`. We sum
 /// `mNumberChannels` across all of its `mBuffers[]` entries.
-fn input_channel_count(device: AudioObjectID) -> Option<u32> {
+///
+/// `scope` is `kAudioObjectPropertyScopeInput` for input channels,
+/// `kAudioObjectPropertyScopeOutput` for output channels.
+fn device_channel_count(device: AudioObjectID, scope: u32) -> Option<u32> {
     let address = AudioObjectPropertyAddress {
         mSelector: kAudioDevicePropertyStreamConfiguration,
-        mScope: kAudioObjectPropertyScopeInput,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementWildcard,
     };
     let mut data_size: u32 = 0;

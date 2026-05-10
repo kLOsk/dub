@@ -42,6 +42,7 @@ use crate::calibrate::{measure_inline, probe_carrier};
 use crate::calibration::{
     default_calibration_dir, Calibration, CalibrationThresholds, DEFAULT_FINGERPRINT_TOLERANCE,
 };
+use crate::device_profiles;
 use crate::input_cmds::{parse_input_args, InputArgs};
 
 /// Default duration if `--duration` isn't given. 60 s is comfortably
@@ -83,6 +84,30 @@ struct Opts {
     /// Output buffer size hint for CoreAudio output (frames). Smaller
     /// = lower output latency. None means "device default".
     output_buffer_size: Option<u32>,
+    /// M5.5.2 routing knobs. None = auto-resolve from the device name
+    /// against the known-device table; Some(_) overrides for
+    /// unknown devices or for testing alternative routings on a
+    /// known one.
+    /// Force the M4 internal mixer regardless of detected device.
+    /// Mutually exclusive with `--deck-a-out-ch` / `--deck-b-out-ch`
+    /// (mixing the two would silently change the routing semantics).
+    internal_mixer: bool,
+    /// Override the auto-detection by selecting a profile by its
+    /// `name_pattern` (e.g. `--device-profile "SL 3"`). Useful when
+    /// the user has multiple interfaces connected and the wrong one
+    /// is the system default.
+    device_profile: Option<String>,
+    /// Explicit total output channel count. For unknown devices this
+    /// is required when `--deck-a-out-ch`/`--deck-b-out-ch` are
+    /// given; for known devices it overrides the profile's default
+    /// (rare; mostly for debugging).
+    output_channels: Option<u32>,
+    /// 1-based first output channel for deck A's stereo pair (e.g.
+    /// `--deck-a-out-ch 3` → ch 3+4). Mutually exclusive with
+    /// `--internal-mixer`.
+    deck_a_out_ch: Option<u32>,
+    /// 1-based first output channel for deck B's stereo pair.
+    deck_b_out_ch: Option<u32>,
     /// Per-threshold explicit overrides. `None` = auto-resolve from
     /// the saved calibration (or auto-calibrate if missing /
     /// fingerprint mismatch); `Some(v)` = take this value verbatim,
@@ -124,6 +149,11 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let mut recalibrate = false;
     let mut no_probe = false;
     let mut no_calibrate = false;
+    let mut internal_mixer = false;
+    let mut device_profile: Option<String> = None;
+    let mut output_channels: Option<u32> = None;
+    let mut deck_a_out_ch: Option<u32> = None;
+    let mut deck_b_out_ch: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -189,6 +219,47 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 no_calibrate = true;
                 i += 1;
             }
+            "--internal-mixer" => {
+                internal_mixer = true;
+                i += 1;
+            }
+            "--device-profile" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--device-profile expects a name"))?;
+                device_profile = Some(v.clone());
+                i += 2;
+            }
+            "--output-channels" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--output-channels expects an integer"))?;
+                output_channels = Some(
+                    v.parse::<u32>()
+                        .with_context(|| format!("--output-channels {v}"))?,
+                );
+                i += 2;
+            }
+            "--deck-a-out-ch" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--deck-a-out-ch expects an integer (1-based)"))?;
+                deck_a_out_ch = Some(
+                    v.parse::<u32>()
+                        .with_context(|| format!("--deck-a-out-ch {v}"))?,
+                );
+                i += 2;
+            }
+            "--deck-b-out-ch" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--deck-b-out-ch expects an integer (1-based)"))?;
+                deck_b_out_ch = Some(
+                    v.parse::<u32>()
+                        .with_context(|| format!("--deck-b-out-ch {v}"))?,
+                );
+                i += 2;
+            }
             _ => {
                 filtered.push(args[i].clone());
                 i += 1;
@@ -202,7 +273,9 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             "usage: dub timecode-deck <track.wav> --input-channels N,M [--device NAME] \
              [--duration SECS] [--confidence T] [--disengage-threshold T] \
              [--sticky-blocks N] [--amplitude-threshold T] \
-             [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate]"
+             [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate] \
+             [--internal-mixer | (--deck-a-out-ch N --deck-b-out-ch N [--output-channels N])] \
+             [--device-profile NAME]"
         ));
     }
     if positional.len() > 1 {
@@ -219,6 +292,25 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             "--recalibrate and --no-calibrate are mutually exclusive"
         ));
     }
+    if internal_mixer && (deck_a_out_ch.is_some() || deck_b_out_ch.is_some()) {
+        return Err(anyhow!(
+            "--internal-mixer and --deck-a-out-ch / --deck-b-out-ch are mutually \
+             exclusive: internal-mixer pins both decks to ch 1+2"
+        ));
+    }
+    if internal_mixer && device_profile.is_some() {
+        return Err(anyhow!(
+            "--internal-mixer and --device-profile are mutually exclusive"
+        ));
+    }
+    // Mixed-set sanity: one of deck-a/deck-b without the other is
+    // almost always a typo. Require both or neither so the routing
+    // is symmetric and the user can see what they specified.
+    if deck_a_out_ch.is_some() != deck_b_out_ch.is_some() {
+        return Err(anyhow!(
+            "--deck-a-out-ch and --deck-b-out-ch must be specified together"
+        ));
+    }
     Ok(Opts {
         track: PathBuf::from(positional[0]),
         duration_secs: input.duration.unwrap_or(DEFAULT_RUN_SECS),
@@ -231,6 +323,11 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
         recalibrate,
         no_probe,
         no_calibrate,
+        internal_mixer,
+        device_profile,
+        output_channels,
+        deck_a_out_ch,
+        deck_b_out_ch,
     })
 }
 
@@ -336,10 +433,23 @@ pub fn run(args: &[String]) -> Result<()> {
         resolved.amplitude,
     );
 
-    // 6. Move the engine onto the audio thread. From here, AudioOutput
-    //    drives Engine::render which drives the decoder which drives
-    //    deck transport — no main-thread participation in the audio path.
-    let output = dub_audio::AudioOutput::start_with_buffer_size(engine, opts.output_buffer_size)
+    // 6. Resolve output routing: known-device auto-detect, manual
+    //    per-deck flags, or the M4 internal-mixer fallback. See
+    //    `resolve_output_routing` for the full priority order.
+    let routing = resolve_output_routing(&device, &opts)?;
+    println!("{}", routing.describe());
+
+    // 7. Move the engine onto the audio thread. From here, AudioOutput
+    //    drives Engine::render_routed which drives the decoder which
+    //    drives deck transport — no main-thread participation in the
+    //    audio path.
+    let output_opts = dub_audio::OutputOptions {
+        channels: routing.channels,
+        buffer_frames: opts.output_buffer_size,
+        sample_rate: None,
+        channel_map: None,
+    };
+    let output = dub_audio::AudioOutput::start_with_options(engine, &output_opts, routing.routing)
         .context("starting CoreAudio output for timecode-deck")?;
     let achieved = output.buffer_frames();
     let latency_ms = output.latency_seconds() * 1000.0;
@@ -406,6 +516,155 @@ fn print_stats(
         "  out_cb={out_cb} buf={buf_ms:.2}ms in_cb={in_cb} in_overflow={in_of} \
          in_buffered={avail_frames:.0} frames"
     );
+}
+
+/// Resolved output routing. Captured ahead of `AudioOutput::start_with_options`
+/// so we can print a clear "what we chose, and why" line before any
+/// audio starts — saves the user from wondering why deck B is silent
+/// on an unknown interface.
+struct ResolvedOutputRouting {
+    /// Total channels to open the AU with.
+    channels: u32,
+    /// Per-deck routing handed to `Engine::render_routed`.
+    routing: dub_engine::OutputRouting,
+    /// Human-readable summary, printed at startup.
+    summary: String,
+}
+
+impl ResolvedOutputRouting {
+    fn describe(&self) -> &str {
+        &self.summary
+    }
+}
+
+/// Resolve the M5.5.2 output routing in priority order:
+///
+/// 1. `--internal-mixer` → 2-ch internal mixer (debug only). Loud and
+///    explicit; mutually exclusive with all other routing flags.
+/// 2. Explicit `--deck-a-out-ch` + `--deck-b-out-ch` → manual routing
+///    over `--output-channels` (or the device's reported channel
+///    count). Most permissive — works for unknown devices.
+/// 3. `--device-profile NAME` → look up the profile by exact pattern
+///    and apply its routing. Useful when the system default is the
+///    wrong device.
+/// 4. Auto-detect by `device.device_name` against
+///    `device_profiles::KNOWN_DEVICES`. The path users hit when they
+///    plug in their SL3 and run `dub timecode-deck` with no flags.
+/// 5. Fallback (unknown device, no flags) → 2-ch internal mixer with a
+///    loud warning. Matches Serato's "preparation mode" semantics for
+///    laptop-only situations: the user can hear playback but should
+///    not run a live set.
+fn resolve_output_routing(
+    device: &dub_audio::DeviceInfo,
+    opts: &Opts,
+) -> Result<ResolvedOutputRouting> {
+    if opts.internal_mixer {
+        return Ok(ResolvedOutputRouting {
+            channels: 2,
+            routing: dub_engine::INTERNAL_MIXER_ROUTING,
+            summary: "output routing: internal mixer (2 ch, both decks → ch 1+2)\n\
+                 ⚠️  --internal-mixer is debug-only; not for live performance"
+                .to_string(),
+        });
+    }
+
+    if let (Some(a), Some(b)) = (opts.deck_a_out_ch, opts.deck_b_out_ch) {
+        let a0 = device_profiles::one_based_to_zero_based(a)
+            .ok_or_else(|| anyhow!("--deck-a-out-ch must be ≥ 1 (1-based), got {a}"))?;
+        let b0 = device_profiles::one_based_to_zero_based(b)
+            .ok_or_else(|| anyhow!("--deck-b-out-ch must be ≥ 1 (1-based), got {b}"))?;
+        let channels = opts.output_channels.unwrap_or(device.channels);
+        if channels < 2 {
+            return Err(anyhow!(
+                "--output-channels must be ≥ 2; got {channels} (device reports {} ch)",
+                device.channels
+            ));
+        }
+        if a0 + 2 > channels || b0 + 2 > channels {
+            return Err(anyhow!(
+                "deck-a-out-ch={a} or deck-b-out-ch={b} doesn't fit in {channels} channels \
+                 (each deck takes 2 channels). Pass --output-channels N if your device has \
+                 more outputs than the default detected."
+            ));
+        }
+        return Ok(ResolvedOutputRouting {
+            channels,
+            routing: [Some(a0), Some(b0)],
+            summary: format!(
+                "output routing: manual ({} ch, deck A → ch {}+{}, deck B → ch {}+{})",
+                channels,
+                a,
+                a + 1,
+                b,
+                b + 1,
+            ),
+        });
+    }
+
+    let profile = if let Some(pattern) = opts.device_profile.as_deref() {
+        device_profiles::profile_by_pattern(pattern).ok_or_else(|| {
+            anyhow!(
+                "--device-profile {pattern:?} not found in known-device table; \
+                 known patterns: {}",
+                device_profiles::KNOWN_DEVICES
+                    .iter()
+                    .map(|d| d.name_pattern)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?
+    } else if let Some(p) = device_profiles::match_device(&device.device_name) {
+        p
+    } else {
+        // Unknown device, no manual routing — fall back to internal
+        // mixer with a loud warning. Per the M5.5.2 design call: this
+        // is preparation-mode-equivalent (the user can audition tracks
+        // but the routing isn't right for an external mixer).
+        return Ok(ResolvedOutputRouting {
+            channels: 2,
+            routing: dub_engine::INTERNAL_MIXER_ROUTING,
+            summary: format!(
+                "output routing: unknown device '{}' — falling back to internal mixer.\n\
+                 ⚠️  no recognised interface profile; deck audio is summed to ch 1+2.\n\
+                 ⚠️  for an external mixer, pass --deck-a-out-ch / --deck-b-out-ch (1-based) \
+                 + --output-channels N, or --device-profile <name> if your interface is \
+                 listed in the known-device table",
+                device.device_name
+            ),
+        });
+    };
+
+    let channels = opts.output_channels.unwrap_or(profile.output_channels);
+    if profile.deck_a_first_channel + 2 > channels || profile.deck_b_first_channel + 2 > channels {
+        return Err(anyhow!(
+            "device profile '{}' wants {} channels but --output-channels {} is too small",
+            profile.display_name,
+            profile.output_channels,
+            channels
+        ));
+    }
+    let verified_note = if profile.verified {
+        ""
+    } else {
+        "\n⚠️  this profile is unverified against real hardware — double-check the routing"
+    };
+    Ok(ResolvedOutputRouting {
+        channels,
+        routing: [
+            Some(profile.deck_a_first_channel),
+            Some(profile.deck_b_first_channel),
+        ],
+        summary: format!(
+            "output routing: {} ({} ch, deck A → ch {}+{}, deck B → ch {}+{}){}",
+            profile.display_name,
+            channels,
+            profile.deck_a_first_channel + 1,
+            profile.deck_a_first_channel + 2,
+            profile.deck_b_first_channel + 1,
+            profile.deck_b_first_channel + 2,
+            verified_note,
+        ),
+    })
 }
 
 /// Resolve the four lift-policy thresholds from (in priority order):
@@ -624,7 +883,23 @@ mod tests {
             recalibrate: false,
             no_probe: false,
             no_calibrate: false,
+            internal_mixer: false,
+            device_profile: None,
+            output_channels: None,
+            deck_a_out_ch: None,
+            deck_b_out_ch: None,
             duration_secs: 0.0,
+        }
+    }
+
+    fn dev(name: &str, channels: u32) -> dub_audio::DeviceInfo {
+        dub_audio::DeviceInfo {
+            device_name: name.to_string(),
+            sample_rate: 48_000.0,
+            channels,
+            buffer_frames: 256,
+            #[cfg(target_os = "macos")]
+            buffer_frame_range: dub_audio::BufferFrameRange { min: 64, max: 4096 },
         }
     }
 
@@ -746,6 +1021,169 @@ mod tests {
             "t.wav",
         ]));
         assert!(r.is_err(), "mutually-exclusive flags should error");
+    }
+
+    // --- M5.5.2 output-routing resolution tests ------------------------
+
+    #[test]
+    fn resolve_output_routing_internal_mixer_flag() {
+        let mut opts = opts_default();
+        opts.internal_mixer = true;
+        let r = resolve_output_routing(&dev("SL 3", 6), &opts).unwrap();
+        assert_eq!(r.channels, 2);
+        assert_eq!(r.routing, dub_engine::INTERNAL_MIXER_ROUTING);
+        assert!(
+            r.summary.contains("internal mixer") && r.summary.contains("debug-only"),
+            "expected debug warning, got: {}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn resolve_output_routing_manual_overrides() {
+        let mut opts = opts_default();
+        opts.deck_a_out_ch = Some(3);
+        opts.deck_b_out_ch = Some(5);
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 6), &opts).unwrap();
+        // Device has 6 channels by default → channels=6.
+        assert_eq!(r.channels, 6);
+        // 1-based → 0-based: 3 → 2, 5 → 4.
+        assert_eq!(r.routing, [Some(2), Some(4)]);
+        assert!(r.summary.contains("manual"), "got: {}", r.summary);
+    }
+
+    #[test]
+    fn resolve_output_routing_manual_with_explicit_channels() {
+        let mut opts = opts_default();
+        opts.deck_a_out_ch = Some(1);
+        opts.deck_b_out_ch = Some(3);
+        opts.output_channels = Some(4);
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 8), &opts).unwrap();
+        assert_eq!(r.channels, 4);
+        assert_eq!(r.routing, [Some(0), Some(2)]);
+    }
+
+    #[test]
+    fn resolve_output_routing_manual_oob_errors() {
+        let mut opts = opts_default();
+        opts.deck_a_out_ch = Some(5);
+        opts.deck_b_out_ch = Some(7);
+        // Device only has 4 channels; deck B at ch 7 doesn't fit.
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 4), &opts);
+        assert!(r.is_err(), "deck-b-out-ch=7 with 4ch device should error");
+    }
+
+    #[test]
+    fn resolve_output_routing_auto_detects_sl3() {
+        let opts = opts_default();
+        let r = resolve_output_routing(&dev("Rane SL 3", 6), &opts).unwrap();
+        assert_eq!(r.channels, 6);
+        assert_eq!(r.routing, [Some(2), Some(4)]); // deck A 3+4, deck B 5+6
+        assert!(r.summary.contains("Serato SL 3"), "got: {}", r.summary);
+        assert!(
+            !r.summary.contains("unverified"),
+            "SL 3 is verified, should not warn: {}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn resolve_output_routing_auto_detects_audio6_warns_unverified() {
+        let opts = opts_default();
+        let r = resolve_output_routing(&dev("Traktor Audio 6", 6), &opts).unwrap();
+        assert_eq!(r.routing, [Some(0), Some(2)]);
+        assert!(
+            r.summary.contains("unverified"),
+            "Audio 6 should warn until validated: {}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn resolve_output_routing_unknown_device_falls_back_internal() {
+        let opts = opts_default();
+        let r = resolve_output_routing(&dev("MacBook Pro Speakers", 2), &opts).unwrap();
+        assert_eq!(r.channels, 2);
+        assert_eq!(r.routing, dub_engine::INTERNAL_MIXER_ROUTING);
+        assert!(
+            r.summary.contains("unknown device") && r.summary.contains("internal mixer"),
+            "expected fallback summary, got: {}",
+            r.summary
+        );
+    }
+
+    #[test]
+    fn resolve_output_routing_device_profile_override() {
+        // User has the SL3 connected but their default output is the
+        // built-in MacBook (oversight). --device-profile lets them
+        // pin the routing without changing macOS audio settings.
+        let mut opts = opts_default();
+        opts.device_profile = Some("SL 3".to_string());
+        let r = resolve_output_routing(&dev("MacBook Pro Speakers", 2), &opts).unwrap();
+        // We pin the SL3 profile but the *device* only has 2 outputs
+        // — that's an error; the user must also pass --output-channels
+        // or fix their default device. Pin the error semantic.
+        // Actually the user's profile says SL3 (output_channels=6),
+        // and we don't override-check against the device, we just
+        // open the AU with `channels`. The macOS default-output AU
+        // can still be opened with N channels even if the underlying
+        // device has fewer (the AU aggregates), so this is the
+        // user's own footgun. We pass through and let CoreAudio
+        // reject if it must.
+        assert_eq!(r.channels, 6);
+        assert_eq!(r.routing, [Some(2), Some(4)]);
+    }
+
+    #[test]
+    fn parse_opts_routing_flags_round_trip() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let opts = parse_opts(&s(&[
+            "--deck-a-out-ch",
+            "3",
+            "--deck-b-out-ch",
+            "5",
+            "--output-channels",
+            "6",
+            "--input-channels",
+            "3,4",
+            "t.wav",
+        ]))
+        .unwrap();
+        assert_eq!(opts.deck_a_out_ch, Some(3));
+        assert_eq!(opts.deck_b_out_ch, Some(5));
+        assert_eq!(opts.output_channels, Some(6));
+    }
+
+    #[test]
+    fn parse_opts_internal_mixer_with_deck_flags_errors() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--internal-mixer",
+            "--deck-a-out-ch",
+            "3",
+            "--deck-b-out-ch",
+            "5",
+            "--input-channels",
+            "3,4",
+            "t.wav",
+        ]));
+        assert!(r.is_err(), "internal-mixer + deck flags must conflict");
+    }
+
+    #[test]
+    fn parse_opts_partial_deck_flags_errors() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--deck-a-out-ch",
+            "3",
+            "--input-channels",
+            "3,4",
+            "t.wav",
+        ]));
+        assert!(
+            r.is_err(),
+            "deck-a alone (without deck-b) must error to avoid asymmetric routing"
+        );
     }
 
     /// Avoid unused-import lint when calibration types pull in.

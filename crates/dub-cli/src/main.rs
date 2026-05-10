@@ -28,6 +28,7 @@ mod analyze;
 mod calibrate;
 mod calibration;
 mod decode_timecode;
+mod device_profiles;
 mod input_cmds;
 mod scope;
 mod timecode_deck;
@@ -108,8 +109,11 @@ fn print_help() {
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
     eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
     eprintln!("                    [--recalibrate] [--no-probe] [--no-calibrate]");
+    eprintln!("                    [--internal-mixer | (--deck-a-out-ch N --deck-b-out-ch N");
+    eprintln!("                                         [--output-channels N])]");
+    eprintln!("                    [--device-profile NAME]");
     eprintln!(
-        "                                    live timecode \u{2192} deck-0 demo (M5.3+M5.4.2)"
+        "                                    live timecode \u{2192} deck-0 demo (M5.3+M5.4.2+M5.5.2)"
     );
     eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--duration SECS]");
@@ -170,6 +174,15 @@ fn print_help() {
     eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
     eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
     eprintln!("    to stop.");
+    eprintln!();
+    eprintln!("    Output routing (M5.5.2): on startup, the CoreAudio default-output device's");
+    eprintln!("    name is matched against the known-device table. SL3 routes deck A to physical");
+    eprintln!("    output channels 3+4 and deck B to 5+6 (matching SL3's per-deck wiring); aux");
+    eprintln!("    stays on 1+2. Audio 6 routes deck A to 1+2 and deck B to 3+4 (unverified).");
+    eprintln!("    Unknown devices fall back to the 2-ch internal mixer with a warning. Pass");
+    eprintln!("    --deck-a-out-ch / --deck-b-out-ch (1-based) for manual routing on unknown");
+    eprintln!("    interfaces, --device-profile NAME to pin a specific profile, or");
+    eprintln!("    --internal-mixer for the M4 debug path.");
     eprintln!();
     eprintln!("  scope (M5.4.1): live timecode-vinyl inspector. Opens the input device,");
     eprintln!("    decodes timecode in real time, and runs the same lift policy as");
@@ -260,6 +273,7 @@ fn measure_latency() -> Result<()> {
     let latency_ms = f64::from(info.buffer_frames) / f64::from(info.sample_rate) * 1000.0;
 
     println!("default output device:");
+    println!("  name:             {}", info.device_name);
     println!("  sample rate:      {} Hz", info.sample_rate);
     println!("  channels:         {}", info.channels);
     println!("  buffer (current): {} frames", info.buffer_frames);
