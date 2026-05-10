@@ -129,8 +129,10 @@ fn print_help() {
     eprintln!("                    [--buffer-size F] [--carrier-secs S] [--lift-secs S]");
     eprintln!("                    [--detect-timeout S]");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
-    eprintln!("                    [-o PATH] [--no-save]");
-    eprintln!("                                    auto-calibrate per rig + persist (M5.4.2)");
+    eprintln!("                    [--deck 0|1] [-o PATH] [--no-save]");
+    eprintln!(
+        "                                    auto-calibrate per rig + persist (M5.4.2+M5.4.4)"
+    );
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");

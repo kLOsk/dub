@@ -972,24 +972,52 @@ source); overlapping deck-A / deck-B pairs (would silently
 mis-route to the audio thread); deck-B channels without deck-A
 (ambiguous logical layout).
 
-**Calibration semantics.** Two-deck mode probes pair 0 (deck A)
-only, and shares the resulting `LiftPolicy` thresholds across
-both decks. This is correct when both turntables have matched
-cartridges (the common case). For mismatched cartridges, a
-startup line warns and the user can pin per-knob thresholds via
-`--confidence` / `--amplitude-threshold` etc., or fall back to
-M5.3 defaults via `--no-calibrate`. M5.4.4 will add independent
-per-deck calibration (probe + threshold-derive each deck on
-startup, key the JSON by `(device, deck_index, format)`), but
-it would have been premature to ship that before the two-deck
-*driver* landed — the most useful thing a per-deck calibration
-feature can do is have two decks to calibrate, which only makes
-sense once they're running. The earlier "library of named
-cartridge profiles" framing was dropped: with M5.4.3-fast
-calibration, "always recalibrate on startup" is simpler than
-"manage a profile library", has no UX surface, and matches what
-real DJs expect (auto-calibrate on app start, manual button on
-cartridge swap — the latter belongs in M10's UI).
+**Calibration semantics — per-deck since M5.4.4.** Two-deck mode
+runs `resolve_thresholds` once per deck — a full carrier+lift
+calibration if no JSON exists yet, otherwise the M5.4.2
+fingerprint-probe path against the saved file. Deck A's full
+calibration runs first, then deck B's, with per-deck status
+banners (`calibration A:`, `calibration B:`) so the user knows
+which side they're spinning/lifting at any moment. Each deck's
+thresholds land independently in `attach_timecode_input`'s
+`TimecodeInputConfig`, so a mismatched-cartridge rig (Concorde
+on A, Nightclub on B — common in scratch DJing where you want a
+more aggressive cartridge for routine play and a smoother one
+for cueing) gets correct lift behaviour on both sides.
+
+Calibration JSON keys by `(device, deck_index, format)`: the
+on-disk pattern is `~/.dub/calibration/<device>_deck_<idx>_<format>.json`.
+Pre-M5.4.4 single-deck files (`<device>_<format>.json`) still
+load as deck-0 fallbacks on first M5.4.4 use; the loader writes
+the calibration forward to the new path on next save so the
+fallback is a one-time migration path, not a permanent dual
+storage layout. Deck 1 has no legacy fallback (pre-M5.4.4 only
+stored deck A) so it always runs a fresh calibration on first
+M5.4.4 use, which is the correct behavior — deck B's hardware
+is *new* to the calibration system from a pre-M5.4.4 perspective.
+
+The `pair_idx` (which AudioInput pair to read on, M5.6 demuxing)
+and `deck_index` (on-disk metadata, which engine deck this
+calibration belongs to) are intentionally separate parameters in
+`measure_inline` and `probe_carrier`. They coincide in
+`dub timecode-deck`'s two-deck path (deck N reads from pair N)
+but diverge in `dub calibrate`: that command opens a dedicated
+2-channel input regardless of which deck the user wants the
+result to apply to (`dub calibrate --input-channels 5,6 --deck 1`
+opens a 2-channel SL3 input over physical channels 5/6 — that's
+still pair 0 of the AudioInput — and stamps the result as deck 1).
+Conflating them in the first M5.4.4 draft caused a self-found bug
+("user picked deck 1 → tried to read pair 1 → only pair 0 exists
+→ silent silence read"); the fix is the two-parameter signature
+preserved in the public API.
+
+The earlier "library of named cartridge profiles" framing was
+dropped: with M5.4.3-fast calibration on the way, "always
+recalibrate on startup" is simpler than "manage a profile
+library", has no UX surface, and matches what real DJs expect
+(auto-calibrate on app start, manual button on cartridge swap —
+the latter belongs in M10's UI; on the CLI today it's
+`dub calibrate --deck 0` or `--deck 1`).
 
 **Output side untouched.** M5.5.2's per-deck output routing
 already supports two decks — M5.6 just provides two real input

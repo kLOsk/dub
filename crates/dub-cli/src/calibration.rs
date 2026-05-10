@@ -162,14 +162,23 @@ pub struct CalibrationThresholds {
     pub sticky_blocks_to_disengage: u32,
 }
 
-/// Top-level calibration record. One file per (device_name, format).
+/// Top-level calibration record. One file per (device_name, deck_index, format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Calibration {
     /// On-disk schema version. See [`SCHEMA_VERSION`].
     pub schema_version: u32,
     /// CoreAudio HAL device name at calibration time (e.g. "SL 3").
-    /// Combined with `format` to derive the on-disk filename.
+    /// Combined with `deck_index` and `format` to derive the on-disk
+    /// filename.
     pub device_name: String,
+    /// Engine deck index this calibration is for (0 = deck A, 1 =
+    /// deck B). Per-deck since M5.4.4 — different turntables /
+    /// cartridges on the same audio interface need independent
+    /// thresholds. Old JSON files (M5.4.2 / M5.4.3 schema) lack
+    /// this field; `#[serde(default)]` reads them as deck 0, which
+    /// matches the legacy single-deck assumption.
+    #[serde(default)]
+    pub deck_index: u32,
     /// Timecode format; v1 = `"serato-cv02"`.
     pub format: String,
     /// RFC-3339 / ISO-8601 UTC timestamp. Read by the freshness
@@ -346,9 +355,38 @@ pub fn sanitize_device_name(name: &str) -> String {
         .collect()
 }
 
-/// Stable on-disk key for a (device, format) pair.
+/// Stable on-disk key for a (device, deck_index, format) triple.
+///
+/// Filename pattern: `{sanitized_device}_deck_{idx}_{format}` —
+/// e.g. `SL_3_deck_0_serato-cv02`. The `deck_` infix is not
+/// abbreviated because filenames are typed and read by humans
+/// inspecting `~/.dub/calibration/`; ambiguity (`SL_3_0_*` vs
+/// `SL_3_a_*`) costs more in support than two extra characters.
+///
+/// **Backward compat (M5.4.4):** The legacy key `{device}_{format}`
+/// (no `deck_N` infix) still exists on disk for users who calibrated
+/// before M5.4.4. [`Calibration::path_for_legacy`] returns the
+/// legacy path; the timecode-deck loader checks the legacy path as
+/// a deck-0 fallback when the new path is missing, so existing
+/// calibrations keep working without a migration step.
 #[must_use]
-pub fn device_key(device_name: &str, format: Format) -> String {
+pub fn device_key(device_name: &str, deck_index: u32, format: Format) -> String {
+    format!(
+        "{}_deck_{}_{}",
+        sanitize_device_name(device_name),
+        deck_index,
+        format_string(format)
+    )
+}
+
+/// Legacy (pre-M5.4.4) on-disk key for a `(device, format)` pair —
+/// no deck index. Only used as a deck-0 fallback by
+/// [`Calibration::path_for_legacy`]; new calibrations always use
+/// [`device_key`]. Kept as a public symbol so the `dub timecode-
+/// deck` loader can construct the legacy path explicitly when
+/// looking for migration candidates.
+#[must_use]
+pub fn legacy_device_key(device_name: &str, format: Format) -> String {
     format!(
         "{}_{}",
         sanitize_device_name(device_name),
@@ -368,11 +406,69 @@ pub fn default_calibration_dir() -> Result<PathBuf> {
 }
 
 impl Calibration {
-    /// On-disk path for a calibration with the given device + format
-    /// inside `base_dir`. Filename is `<device_key>.json`.
+    /// On-disk path for a calibration with the given device, deck
+    /// index, and format inside `base_dir`. Filename is
+    /// `<device_key>.json` — see [`device_key`] for the pattern
+    /// (`{device}_deck_{idx}_{format}.json`).
     #[must_use]
-    pub fn path_for(device_name: &str, format: Format, base_dir: &Path) -> PathBuf {
-        base_dir.join(format!("{}.json", device_key(device_name, format)))
+    pub fn path_for(
+        device_name: &str,
+        deck_index: u32,
+        format: Format,
+        base_dir: &Path,
+    ) -> PathBuf {
+        base_dir.join(format!(
+            "{}.json",
+            device_key(device_name, deck_index, format)
+        ))
+    }
+
+    /// Pre-M5.4.4 path for the same `(device, format)` pair (no
+    /// `deck_N` infix). Used as a deck-0 fallback by the timecode-
+    /// deck loader so users who calibrated before M5.4.4 don't have
+    /// to recalibrate. New calibrations always go through
+    /// [`Self::path_for`].
+    #[must_use]
+    pub fn path_for_legacy(device_name: &str, format: Format, base_dir: &Path) -> PathBuf {
+        base_dir.join(format!("{}.json", legacy_device_key(device_name, format)))
+    }
+
+    /// Load a calibration JSON, with a one-time fallback to the
+    /// legacy (pre-M5.4.4) `(device, format)`-only path when the
+    /// new per-deck path doesn't exist *and* `deck_index == 0`.
+    /// This preserves the migration story: a user upgrading from
+    /// M5.4.2 / M5.4.3 to M5.4.4 keeps their existing deck-0
+    /// calibration without re-running the probe.
+    ///
+    /// Deck 1 has no legacy fallback by design — pre-M5.4.4 only
+    /// stored deck-A's calibration, so deck B always needs a fresh
+    /// measurement on first run after the upgrade.
+    ///
+    /// Returns the same error shape as [`Self::load`] when both
+    /// paths are missing or unparseable.
+    ///
+    /// # Errors
+    /// Both new and legacy paths missing/unreadable, JSON parse
+    /// error, or schema version mismatch.
+    pub fn load_with_legacy_fallback(new_path: &Path, legacy_path: Option<&Path>) -> Result<Self> {
+        match Self::load(new_path) {
+            Ok(c) => Ok(c),
+            Err(primary_err) => {
+                if let Some(legacy) = legacy_path {
+                    if legacy.exists() {
+                        return Self::load(legacy).with_context(|| {
+                            format!(
+                                "loading legacy calibration at {} after primary {} \
+                                 was missing",
+                                legacy.display(),
+                                new_path.display()
+                            )
+                        });
+                    }
+                }
+                Err(primary_err)
+            }
+        }
     }
 
     /// Read + parse a calibration JSON file.
@@ -658,15 +754,133 @@ mod tests {
     }
 
     #[test]
-    fn device_key_includes_format() {
-        assert_eq!(device_key("SL 3", Format::SeratoCv02), "SL_3_serato-cv02");
+    fn device_key_includes_deck_index_and_format() {
+        assert_eq!(
+            device_key("SL 3", 0, Format::SeratoCv02),
+            "SL_3_deck_0_serato-cv02"
+        );
+        assert_eq!(
+            device_key("SL 3", 1, Format::TraktorMk1),
+            "SL_3_deck_1_traktor-mk1"
+        );
     }
 
     #[test]
-    fn path_for_uses_device_key_filename() {
+    fn legacy_device_key_omits_deck_index() {
+        // The legacy key is still computable so the M5.4.4 loader
+        // can find pre-M5.4.4 files. New writes never use this.
+        assert_eq!(
+            legacy_device_key("SL 3", Format::SeratoCv02),
+            "SL_3_serato-cv02"
+        );
+    }
+
+    #[test]
+    fn path_for_includes_deck_in_filename() {
         let base = Path::new("/tmp/whatever");
-        let p = Calibration::path_for("SL 3", Format::SeratoCv02, base);
+        let p0 = Calibration::path_for("SL 3", 0, Format::SeratoCv02, base);
+        let p1 = Calibration::path_for("SL 3", 1, Format::SeratoCv02, base);
+        assert_eq!(p0, Path::new("/tmp/whatever/SL_3_deck_0_serato-cv02.json"));
+        assert_eq!(p1, Path::new("/tmp/whatever/SL_3_deck_1_serato-cv02.json"));
+        assert_ne!(p0, p1, "deck 0 and deck 1 must have distinct paths");
+    }
+
+    #[test]
+    fn path_for_legacy_returns_pre_m544_filename() {
+        let base = Path::new("/tmp/whatever");
+        let p = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, base);
         assert_eq!(p, Path::new("/tmp/whatever/SL_3_serato-cv02.json"));
+    }
+
+    #[test]
+    fn load_with_legacy_fallback_reads_legacy_when_new_missing() {
+        // Simulates the user upgrading from M5.4.3 → M5.4.4: legacy
+        // file exists, new (per-deck) path doesn't. Loader must
+        // transparently use the legacy file as deck 0's calibration
+        // so the user keeps their existing thresholds without
+        // recalibrating.
+        let dir =
+            std::env::temp_dir().join(format!("dub-cal-legacy-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (carrier, lift) = sl3_fixture();
+        let cal = Calibration {
+            schema_version: SCHEMA_VERSION,
+            device_name: "SL 3".to_string(),
+            deck_index: 0,
+            format: format_string(Format::SeratoCv02).to_string(),
+            calibrated_at: "2026-05-10T07:00:00Z".to_string(),
+            input_sample_rate: 48_000.0,
+            block_frames: 256,
+            fingerprint: fp(0.31, 0.42, 0.99),
+            thresholds: derive_thresholds(&carrier, &lift).unwrap(),
+            measurements: CalibrationMeasurements { carrier, lift },
+            snr_margin: 100.0,
+        };
+        let new_path = Calibration::path_for("SL 3", 0, Format::SeratoCv02, &dir);
+        let legacy_path = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, &dir);
+        // Save *only* to the legacy path — simulating pre-M5.4.4 state.
+        cal.save(&legacy_path).expect("save legacy");
+        assert!(!new_path.exists(), "new path must not exist for this test");
+        assert!(legacy_path.exists());
+
+        let loaded = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path))
+            .expect("legacy fallback should load");
+        assert_eq!(loaded.device_name, "SL 3");
+        // deck_index defaults to 0 via #[serde(default)].
+        assert_eq!(loaded.deck_index, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_with_legacy_fallback_prefers_new_path_when_present() {
+        // When both files exist, the new (per-deck) one wins.
+        let dir =
+            std::env::temp_dir().join(format!("dub-cal-legacy-prefers-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (carrier, lift) = sl3_fixture();
+        let mk = |deck_index: u32, calibrated_at: &str| Calibration {
+            schema_version: SCHEMA_VERSION,
+            device_name: "SL 3".to_string(),
+            deck_index,
+            format: format_string(Format::SeratoCv02).to_string(),
+            calibrated_at: calibrated_at.to_string(),
+            input_sample_rate: 48_000.0,
+            block_frames: 256,
+            fingerprint: fp(0.31, 0.42, 0.99),
+            thresholds: derive_thresholds(&carrier, &lift).unwrap(),
+            measurements: CalibrationMeasurements { carrier, lift },
+            snr_margin: 100.0,
+        };
+        let new_path = Calibration::path_for("SL 3", 0, Format::SeratoCv02, &dir);
+        let legacy_path = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, &dir);
+        // Different timestamps so we can tell which one was loaded.
+        mk(0, "2026-05-15T07:00:00Z").save(&new_path).unwrap();
+        mk(0, "2025-01-01T07:00:00Z").save(&legacy_path).unwrap();
+
+        let loaded = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path))
+            .expect("should load new path");
+        assert_eq!(
+            loaded.calibrated_at, "2026-05-15T07:00:00Z",
+            "new (per-deck) path should win when both exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_with_legacy_fallback_errors_when_both_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "dub-cal-legacy-both-missing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let new_path = dir.join("new.json");
+        let legacy_path = dir.join("legacy.json");
+
+        let r = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path));
+        assert!(r.is_err(), "both missing should error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -675,6 +889,7 @@ mod tests {
         let cal = Calibration {
             schema_version: SCHEMA_VERSION,
             device_name: "SL 3".to_string(),
+            deck_index: 1,
             format: format_string(Format::SeratoCv02).to_string(),
             calibrated_at: "2026-05-10T07:00:00Z".to_string(),
             input_sample_rate: 48_000.0,
@@ -692,13 +907,14 @@ mod tests {
         // Save + load via a tempdir.
         let dir = std::env::temp_dir().join(format!("dub-calibration-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("SL_3_serato-cv02.json");
+        let path = Calibration::path_for("SL 3", 1, Format::SeratoCv02, &dir);
         cal.save(&path).expect("save");
         let loaded = Calibration::load(&path).expect("load");
 
         // Check round-trip fidelity on the structured fields.
         assert_eq!(loaded.schema_version, cal.schema_version);
         assert_eq!(loaded.device_name, cal.device_name);
+        assert_eq!(loaded.deck_index, 1, "deck_index must round-trip");
         assert_eq!(loaded.format, cal.format);
         assert!((loaded.thresholds.engage - cal.thresholds.engage).abs() < 1e-6);
         assert!((loaded.thresholds.amplitude - cal.thresholds.amplitude).abs() < 1e-6);
@@ -707,6 +923,36 @@ mod tests {
         assert!((loaded.snr_margin - cal.snr_margin).abs() < 0.1);
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_json_without_deck_index_loads_as_deck_zero() {
+        // Pre-M5.4.4 JSONs lack the `deck_index` field. With
+        // #[serde(default)] they must read as deck 0 — the implicit
+        // single-deck assumption that's correct for pre-M5.4.4 data.
+        let dir =
+            std::env::temp_dir().join(format!("dub-cal-legacy-no-deck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy_no_deck.json");
+        let json = r#"{
+            "schema_version": 1,
+            "device_name": "SL 3",
+            "format": "serato-cv02",
+            "calibrated_at": "2026-01-01T00:00:00Z",
+            "input_sample_rate": 48000.0,
+            "block_frames": 256,
+            "fingerprint": {"carrier_amp_p50": 0.1, "carrier_amp_p95": 0.2, "carrier_conf_p50": 0.99},
+            "thresholds": {"engage": 0.9, "disengage": 0.5, "amplitude": 0.05, "sticky_blocks_to_disengage": 4},
+            "measurements": {
+                "carrier": {"amplitude_p5": 0.1, "amplitude_p50": 0.15, "amplitude_p95": 0.2, "confidence_p5": 0.99, "confidence_p50": 0.99, "confidence_p95": 1.0, "n_blocks": 100},
+                "lift": {"amplitude_p5": 0.001, "amplitude_p50": 0.001, "amplitude_p95": 0.001, "confidence_p5": 0.0, "confidence_p50": 0.0, "confidence_p95": 0.5, "n_blocks": 100}
+            },
+            "snr_margin": 100.0
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let cal = Calibration::load(&path).expect("legacy load");
+        assert_eq!(cal.deck_index, 0, "missing deck_index must default to 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

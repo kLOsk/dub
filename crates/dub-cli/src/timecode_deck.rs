@@ -503,67 +503,126 @@ pub fn run(args: &[String]) -> Result<()> {
         deck.set_gain(1.0);
     }
 
-    // 4b. Resolve thresholds: load saved calibration if present and
-    //     fingerprint matches, auto-calibrate otherwise. CLI flag
-    //     overrides applied last so partial overrides work
+    // 4b. Resolve thresholds **per deck**. M5.4.4 makes calibration
+    //     independent across decks: deck B no longer borrows deck A's
+    //     thresholds, so a mismatched-cartridge rig (Concorde on A,
+    //     Nightclub on B — common in scratch DJing where you want a
+    //     more aggressive cartridge for routine play and a smoother
+    //     one for cueing) gets correct lift behaviour on both sides.
+    //
+    //     CLI flag overrides applied last so partial overrides work
     //     (calibration handles 3 of 4 thresholds, user pins one).
+    //     Overrides currently apply uniformly to both decks; if you
+    //     need asymmetric overrides, hand-edit the per-deck JSONs
+    //     under `~/.dub/calibration/`.
     //
-    //     Calibration must happen BEFORE we hand the input consumer
+    //     Calibration must happen BEFORE we hand the input consumers
     //     to the engine, because the calibration helpers consume
-    //     samples from the same input device. After
-    //     `take_consumer()` is called, the input is engine-owned.
+    //     samples from the input pairs. After `take_consumer_pair`
+    //     is called, that pair is engine-owned and the calibrator
+    //     can no longer reach it.
     //
-    //     **Two-deck note (M5.6)**: calibration probes pair 0
-    //     (deck A) only, and the same thresholds are reused for
-    //     deck B. This is correct when both decks have matched
-    //     cartridges (the common case). For mismatched cartridges,
-    //     M5.4.4 will add per-deck named profiles; today the user
-    //     can pass `--no-probe` and pin individual thresholds via
-    //     `--confidence` etc. See ARCHITECTURE.md / M5.6.
-    let resolved = resolve_thresholds(&mut input, &opts)?;
+    //     Sequencing matters in two-deck mode: deck A's full
+    //     calibration (carrier + lift) runs first, then deck B's.
+    //     The user lifts the needle on A before dropping it on B,
+    //     and the per-deck status banners (`calibration A:` /
+    //     `calibration B:`) make the two phases obvious.
+    let resolved_a = resolve_thresholds(&mut input, 0, &opts)?;
+    let resolved_b = if two_deck {
+        Some(resolve_thresholds(&mut input, 1, &opts)?)
+    } else {
+        None
+    };
 
-    // 5. Hand each input pair's consumer to its deck. Pair 0 always
+    // 5. Drain stale audio from every pair before handing the
+    //    consumers to the engine.
+    //
+    //    Why: the IOProc starts demuxing into all pair ringbuffers
+    //    the moment AudioInput::start_with_options succeeds, and it
+    //    keeps pushing whether or not anything is reading. During
+    //    M5.4.4 sequential per-deck calibration, pair 0 sits idle
+    //    while pair 1's full ~25 s carrier+lift runs (and pair 1
+    //    sits idle during pair 0's ~3 s probe). At 48 kHz a 4-second
+    //    ring fills up well inside that window, the IOProc's
+    //    `push_demuxed_frames` flips `in_overflow=true`, and from
+    //    that point on the *new* samples are dropped while the
+    //    *old* samples (the first ones pushed) stay buffered. The
+    //    user sees this in the live test as `in_overflow=2142` at
+    //    startup.
+    //
+    //    If we hand the consumer to the engine without draining, the
+    //    engine's first ~4 s of timecode after start are decode
+    //    output from samples ~25 s old — i.e. silence/lift-state
+    //    audio from the calibration phase. The user perceives this
+    //    as a 4-second lag before deck A responds to needle drops.
+    //
+    //    The drain is RT-safe (we're still on the main thread; no
+    //    audio callback yet) and idempotent: if the ring is already
+    //    empty (e.g. single-deck mode where the post-probe gap is
+    //    short) the loop exits immediately.
+    let drained_a = drain_input_pair(&mut input, 0);
+    let drained_b = if two_deck {
+        drain_input_pair(&mut input, 1)
+    } else {
+        0
+    };
+    if drained_a > 0 || drained_b > 0 {
+        println!(
+            "input drain:  flushed stale calibration-era audio (deck A: {drained_a} \
+             samples, deck B: {drained_b} samples) — engine starts on live audio"
+        );
+    }
+
+    // 6. Hand each input pair's consumer to its deck. Pair 0 always
     //    goes to engine deck 0 (deck A); pair 1, when present (M5.6
-    //    two-deck mode), goes to deck 1.
+    //    two-deck mode), goes to deck 1. Each deck attaches with its
+    //    own thresholds (M5.4.4).
     let rx_a = input
         .take_consumer_pair(0)
         .ok_or_else(|| anyhow!("AudioInput pair 0 consumer already taken"))?;
-    let cfg = |format: Format| TimecodeInputConfig {
+    let cfg = |format: Format, thresholds: &CalibrationThresholds| TimecodeInputConfig {
         format,
         input_sample_rate: input_sr,
         // CoreAudio output blocks vary; 4096 is a safe upper bound.
         max_block_frames: 4096,
-        confidence_threshold: resolved.engage,
-        disengage_threshold: resolved.disengage,
-        sticky_blocks_to_disengage: resolved.sticky_blocks_to_disengage,
-        amplitude_threshold: resolved.amplitude,
+        confidence_threshold: thresholds.engage,
+        disengage_threshold: thresholds.disengage,
+        sticky_blocks_to_disengage: thresholds.sticky_blocks_to_disengage,
+        amplitude_threshold: thresholds.amplitude,
     };
     engine
-        .attach_timecode_input(0, rx_a, cfg(opts.format))
+        .attach_timecode_input(0, rx_a, cfg(opts.format, &resolved_a))
         .context("attaching timecode input to deck 0")?;
-    if two_deck {
+    if let Some(resolved_b) = &resolved_b {
         let rx_b = input
             .take_consumer_pair(1)
             .ok_or_else(|| anyhow!("AudioInput pair 1 consumer already taken"))?;
         engine
-            .attach_timecode_input(1, rx_b, cfg(opts.format))
+            .attach_timecode_input(1, rx_b, cfg(opts.format, resolved_b))
             .context("attaching timecode input to deck 1")?;
     }
     println!(
-        "timecode:     format={} ({:.0} Hz carrier) engage={:.3} disengage={:.3} \
-         sticky={} blocks amp_floor={:.4}{}",
+        "timecode A:   format={} ({:.0} Hz) engage={:.3} disengage={:.3} \
+         sticky={} blocks amp_floor={:.4}",
         opts.format.cli_name(),
         opts.format.carrier_hz(),
-        resolved.engage,
-        resolved.disengage,
-        resolved.sticky_blocks_to_disengage,
-        resolved.amplitude,
-        if two_deck {
-            " (deck A + B share calibration; M5.4.4 will add per-deck profiles)"
-        } else {
-            ""
-        },
+        resolved_a.engage,
+        resolved_a.disengage,
+        resolved_a.sticky_blocks_to_disengage,
+        resolved_a.amplitude,
     );
+    if let Some(resolved_b) = &resolved_b {
+        println!(
+            "timecode B:   format={} ({:.0} Hz) engage={:.3} disengage={:.3} \
+             sticky={} blocks amp_floor={:.4}",
+            opts.format.cli_name(),
+            opts.format.carrier_hz(),
+            resolved_b.engage,
+            resolved_b.disengage,
+            resolved_b.sticky_blocks_to_disengage,
+            resolved_b.amplitude,
+        );
+    }
 
     // 6. Resolve output routing: known-device auto-detect, manual
     //    per-deck flags, or the M4 internal-mixer fallback. See
@@ -894,14 +953,70 @@ fn resolve_output_routing(
 /// signal levels) but was not the right calibration. Pinned by
 /// the regression test
 /// `resolve_thresholds_uses_opts_format_for_calibration_path` below.
-fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<CalibrationThresholds> {
+/// Human-friendly label for an engine deck index. `0 → "A"`,
+/// `1 → "B"`. Used in print statements so the user thinks in
+/// SL1200-style deck letters while the internals stay numeric.
+fn deck_label(deck_idx: u32) -> char {
+    char::from(b'A' + u8::try_from(deck_idx).unwrap_or(0))
+}
+
+/// Read-and-discard every sample currently buffered in
+/// `input`'s pair ring at `pair_idx`. Returns the total sample count
+/// drained for diagnostics.
+///
+/// Called between calibration and `take_consumer_pair`: the IOProc
+/// has been pushing into both pair rings since `AudioInput::start`,
+/// but only the pair currently being calibrated is being read. The
+/// idle pair's ring fills up (and overflows) during the time the
+/// other pair is being probed — see the `in_overflow` counter on
+/// the live test. Without this drain, the engine would consume
+/// stale calibration-era audio for the first few seconds after
+/// startup, and the user would perceive a multi-second lag before
+/// the deck responds to needle action.
+///
+/// Bounded by a generous loop cap so a misbehaving HAL that keeps
+/// returning samples can't hang the main thread; in practice the
+/// ring is drained in a handful of iterations and the cap is never
+/// reached.
+fn drain_input_pair(input: &mut dub_audio::AudioInput, pair_idx: usize) -> usize {
+    /// Per-iteration scratch buffer. 4096 stereo samples = 2048 frames =
+    /// ~43 ms at 48 kHz. Bigger than any plausible ring so two iterations
+    /// usually empty even a fully overflowed ring.
+    const SCRATCH_SAMPLES: usize = 4096;
+    /// Hard cap on iterations to avoid pathological loops if the
+    /// underlying ring keeps refilling faster than we can drain.
+    /// At ~43 ms drained per iter, 64 iters = ~2.7 s of audio,
+    /// plenty above any real ring capacity.
+    const MAX_ITERS: usize = 64;
+
+    if pair_idx >= input.pair_count() {
+        return 0;
+    }
+    let mut scratch = vec![0.0_f32; SCRATCH_SAMPLES];
+    let mut total = 0_usize;
+    for _ in 0..MAX_ITERS {
+        let n = input.read_into_pair(pair_idx, &mut scratch);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    total
+}
+
+fn resolve_thresholds(
+    input: &mut AudioInput,
+    deck_idx: u32,
+    opts: &Opts,
+) -> Result<CalibrationThresholds> {
     let format = opts.format;
     let dir = default_calibration_dir().context("resolving default calibration dir")?;
-    let path = calibration_path_for(input.device_name(), opts, &dir);
+    let path = calibration_path_for(input.device_name(), deck_idx, opts, &dir);
+    let label = deck_label(deck_idx);
 
     // Bypass-everything modes first.
     if opts.no_calibrate {
-        println!("calibration: skipped (--no-calibrate); using M5.3 defaults");
+        println!("calibration {label}: skipped (--no-calibrate); using M5.3 defaults");
         return Ok(apply_overrides(default_thresholds(), opts));
     }
 
@@ -910,30 +1025,55 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
     // the old file), preserving the always-on "what is this rig"
     // record on disk.
     if opts.recalibrate {
-        println!("calibration: --recalibrate forced; running fresh measurement");
-        let cal = run_full_calibration(input, format)?;
+        println!("calibration {label}: --recalibrate forced; running fresh measurement");
+        let cal = run_full_calibration(input, deck_idx, format)?;
         save_calibration(&cal, &path);
         return Ok(apply_overrides(cal.thresholds, opts));
     }
 
-    // Try to load. Missing → run a fresh calibration.
-    let cal = match Calibration::load(&path) {
+    // Try to load. M5.4.4 fallback: deck 0 falls back to the legacy
+    // `(device, format)`-only path so users who calibrated before
+    // the per-deck split don't have to re-run the probe. Deck 1
+    // has no legacy file (pre-M5.4.4 only stored deck A) so it
+    // always runs a fresh calibration on first M5.4.4 use.
+    let legacy_path =
+        (deck_idx == 0).then(|| legacy_calibration_path_for(input.device_name(), opts, &dir));
+    let cal = match Calibration::load_with_legacy_fallback(&path, legacy_path.as_deref()) {
         Ok(c) => c,
         Err(_) => {
             println!(
-                "calibration: no JSON at {} — running first-time calibration",
+                "calibration {label}: no JSON at {} — running first-time calibration",
                 path.display()
             );
-            let cal = run_full_calibration(input, format)?;
+            let cal = run_full_calibration(input, deck_idx, format)?;
             save_calibration(&cal, &path);
             return Ok(apply_overrides(cal.thresholds, opts));
         }
     };
 
+    // Was the load served by the legacy path? (deck-0 only.) If so,
+    // tell the user we'll keep using their existing calibration but
+    // also write it forward to the new path so the next startup
+    // skips the legacy lookup. Detected by file existence rather
+    // than a load-side flag because both paths return the same
+    // `Calibration` shape.
+    let migrated_from_legacy =
+        !path.exists() && legacy_path.as_deref().is_some_and(std::path::Path::exists);
+    if migrated_from_legacy {
+        println!(
+            "calibration {label}: migrated from pre-M5.4.4 single-deck file ({})",
+            legacy_path.as_deref().unwrap().display()
+        );
+        // Best-effort forward-write so the next run doesn't need
+        // the fallback. Failure here is non-fatal — we already have
+        // valid thresholds in memory.
+        save_calibration(&cal, &path);
+    }
+
     let age_days = calibration_age_days(&cal.calibrated_at);
     if age_days > STALE_CALIBRATION_DAYS {
         eprintln!(
-            "  ⚠ calibration is {age_days:.0} days old (>{:.0}); consider \
+            "  ⚠ deck {label} calibration is {age_days:.0} days old (>{:.0}); consider \
              `dub timecode-deck ... --recalibrate` for the current venue.",
             STALE_CALIBRATION_DAYS
         );
@@ -943,7 +1083,7 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
     // rig-swap detection — explicit opt-in via --no-probe.
     if opts.no_probe {
         println!(
-            "calibration: loaded {} (probe skipped); engage={:.3} amp={:.4}",
+            "calibration {label}: loaded {} (probe skipped); engage={:.3} amp={:.4}",
             path.display(),
             cal.thresholds.engage,
             cal.thresholds.amplitude
@@ -952,14 +1092,29 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
     }
 
     println!(
-        "calibration: loaded {} (calibrated {})",
+        "calibration {label}: loaded {} (calibrated {})",
         path.display(),
         cal.calibrated_at
     );
-    let observed = match probe_carrier(input, format, PROBE_SECS, PROBE_DETECT_TIMEOUT_SECS) {
+    // pair_idx == deck_idx in two-deck mode (M5.6 demuxing); the
+    // `dub timecode-deck` command opens a 4-channel input and
+    // `output_pairs` maps pair 0 → deck A, pair 1 → deck B. Using
+    // `pair_idx = deck_idx` here means the probe reads from the
+    // same physical input the engine will decode from at runtime.
+    let pair_idx = usize::try_from(deck_idx).expect("deck index fits in usize");
+    let observed = match probe_carrier(
+        input,
+        pair_idx,
+        format,
+        PROBE_SECS,
+        PROBE_DETECT_TIMEOUT_SECS,
+    ) {
         Ok(fp) => fp,
         Err(e) => {
-            eprintln!("  ⚠ probe failed: {e:#}\n  using saved thresholds without verification");
+            eprintln!(
+                "  ⚠ deck {label} probe failed: {e:#}\n  \
+                     using saved thresholds without verification"
+            );
             return Ok(apply_overrides(cal.thresholds, opts));
         }
     };
@@ -969,7 +1124,7 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
         .matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE)
     {
         println!(
-            "  ✓ fingerprint matches (max delta {:.1}%); engage={:.3} amp={:.4}",
+            "  ✓ deck {label} fingerprint matches (max delta {:.1}%); engage={:.3} amp={:.4}",
             delta * 100.0,
             cal.thresholds.engage,
             cal.thresholds.amplitude
@@ -981,7 +1136,7 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
     // this behavior: "the user can always play on a new cartridge,
     // it must work."
     println!(
-        "  ✗ fingerprint differs by {:.1}% (saved {:.4}/{:.4}/{:.3} vs observed \
+        "  ✗ deck {label} fingerprint differs by {:.1}% (saved {:.4}/{:.4}/{:.3} vs observed \
          {:.4}/{:.4}/{:.3}) — recalibrating",
         delta * 100.0,
         cal.fingerprint.carrier_amp_p50,
@@ -991,7 +1146,7 @@ fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<Calibration
         observed.carrier_amp_p95,
         observed.carrier_conf_p50,
     );
-    let new_cal = run_full_calibration(input, format)?;
+    let new_cal = run_full_calibration(input, deck_idx, format)?;
     save_calibration(&new_cal, &path);
     Ok(apply_overrides(new_cal.thresholds, opts))
 }
@@ -1025,11 +1180,17 @@ fn apply_overrides(base: CalibrationThresholds, opts: &Opts) -> CalibrationThres
 /// Run a full calibration against an open `AudioInput` and return
 /// the populated [`Calibration`]. A wrapper around
 /// [`measure_inline`] that pins the auto-startup defaults.
-fn run_full_calibration(input: &mut AudioInput, format: Format) -> Result<Calibration> {
+fn run_full_calibration(
+    input: &mut AudioInput,
+    deck_idx: u32,
+    format: Format,
+) -> Result<Calibration> {
     println!();
-    println!("=== auto-calibration ===");
+    println!("=== auto-calibration (deck {}) ===", deck_label(deck_idx));
     let cal = measure_inline(
         input,
+        usize::try_from(deck_idx).expect("deck index fits in usize"),
+        deck_idx,
         format,
         AUTO_CARRIER_SECS,
         AUTO_LIFT_SECS,
@@ -1064,24 +1225,44 @@ fn save_calibration(cal: &Calibration, path: &std::path::Path) {
 }
 
 /// Compute the on-disk path the calibration JSON should live at for
-/// the given input device + run options. Pure — no I/O, no audio
-/// device access — so the format-passthrough is unit-testable
-/// without a hardware fixture.
+/// the given input device + deck index + run options. Pure — no I/O,
+/// no audio device access — so the path-derivation contract is
+/// unit-testable without a hardware fixture.
 ///
 /// **Why this is its own helper.** An earlier draft of M6 inlined
-/// this logic inside `resolve_thresholds` and silently used
-/// `Format::SeratoCv02` instead of `opts.format`, which loaded the
-/// wrong calibration JSON and ran the carrier probe at the wrong
-/// nominal frequency when the user passed `--format traktor-mk1`.
-/// Extracting this lets us pin the contract ("the path always
-/// derives from `opts.format`") with a fast unit test that doesn't
-/// need a real audio device.
+/// the path computation inside `resolve_thresholds` and silently
+/// used `Format::SeratoCv02` instead of `opts.format`, which loaded
+/// the wrong calibration JSON and ran the carrier probe at the
+/// wrong nominal frequency when the user passed `--format
+/// traktor-mk1`. Extracting this helper means the contract ("the
+/// path always derives from `(device, deck_idx, opts.format)`") is
+/// pinned by fast unit tests that don't need a real audio device.
+///
+/// **Per-deck (M5.4.4).** `deck_idx` keys the path so deck A and
+/// deck B on the same SL3 + same format end up in distinct files
+/// (`SL_3_deck_0_serato-cv02.json` vs `SL_3_deck_1_serato-cv02
+/// .json`). Pre-M5.4.4 callers used the format-only path and
+/// shared deck B's thresholds with deck A; that's silently wrong
+/// when the two cartridges differ.
 fn calibration_path_for(
+    device_name: &str,
+    deck_idx: u32,
+    opts: &Opts,
+    dir: &std::path::Path,
+) -> std::path::PathBuf {
+    Calibration::path_for(device_name, deck_idx, opts.format, dir)
+}
+
+/// Legacy (pre-M5.4.4) calibration path for the same `(device,
+/// format)` pair — no `deck_N` infix. Returned as a deck-0 fallback
+/// only by `resolve_thresholds`; deck 1 has no legacy file because
+/// pre-M5.4.4 only stored deck-A's calibration.
+fn legacy_calibration_path_for(
     device_name: &str,
     opts: &Opts,
     dir: &std::path::Path,
 ) -> std::path::PathBuf {
-    Calibration::path_for(device_name, opts.format, dir)
+    Calibration::path_for_legacy(device_name, opts.format, dir)
 }
 
 /// Difference in days between `calibrated_at` (RFC-3339) and now.
@@ -1218,23 +1399,35 @@ mod tests {
     /// `Format::SeratoCv02` in `resolve_thresholds` instead of
     /// reading `opts.format`, so `dub timecode-deck --format
     /// traktor-mk1` silently loaded the Serato calibration JSON
-    /// (`SL_3_serato-cv02.json`) and ran the carrier probe at the
-    /// 1 kHz Serato carrier — which produced `rate ≈ 2.0×` against
-    /// the actual 2 kHz MK1 carrier and timed the probe out. This
-    /// test pins that the path always derives from `opts.format`.
+    /// and ran the carrier probe at the 1 kHz Serato carrier —
+    /// which produced `rate ≈ 2.0×` against the actual 2 kHz MK1
+    /// carrier and timed the probe out. This test pins that the
+    /// path always derives from `opts.format` *and* the deck index.
     #[test]
-    fn calibration_path_uses_opts_format_serato() {
+    fn calibration_path_uses_opts_format_and_deck_serato() {
         let dir = std::path::Path::new("/tmp/dub-test");
         let opts = Opts {
             format: Format::SeratoCv02,
             ..opts_default()
         };
-        let p = calibration_path_for("SL 3", &opts, dir);
+        let p0 = calibration_path_for("SL 3", 0, &opts, dir);
+        let p1 = calibration_path_for("SL 3", 1, &opts, dir);
         assert!(
-            p.to_string_lossy().contains("serato-cv02"),
+            p0.to_string_lossy().contains("serato-cv02"),
             "expected serato-cv02 in path, got {}",
-            p.display()
+            p0.display()
         );
+        assert!(
+            p0.to_string_lossy().contains("deck_0"),
+            "expected deck_0 in path, got {}",
+            p0.display()
+        );
+        assert!(
+            p1.to_string_lossy().contains("deck_1"),
+            "expected deck_1 in path, got {}",
+            p1.display()
+        );
+        assert_ne!(p0, p1, "decks A and B must have distinct calibration paths");
     }
 
     #[test]
@@ -1244,7 +1437,7 @@ mod tests {
             format: Format::TraktorMk1,
             ..opts_default()
         };
-        let p = calibration_path_for("SL 3", &opts, dir);
+        let p = calibration_path_for("SL 3", 0, &opts, dir);
         assert!(
             p.to_string_lossy().contains("traktor-mk1"),
             "expected traktor-mk1 in path, got {}",
@@ -1264,7 +1457,7 @@ mod tests {
             format: Format::TraktorMk2,
             ..opts_default()
         };
-        let p = calibration_path_for("SL 3", &opts, dir);
+        let p = calibration_path_for("SL 3", 0, &opts, dir);
         assert!(
             p.to_string_lossy().contains("traktor-mk2"),
             "expected traktor-mk2 in path, got {}",
@@ -1279,7 +1472,7 @@ mod tests {
 
     #[test]
     fn calibration_path_distinct_per_format_for_same_device() {
-        // Three formats × one device = three independent JSON files.
+        // Three formats × one deck = three independent JSON files.
         // Pin the disjointness so a future refactor can't accidentally
         // share calibration across formats.
         let dir = std::path::Path::new("/tmp/dub-test");
@@ -1289,12 +1482,59 @@ mod tests {
                 format,
                 ..opts_default()
             };
-            paths.push(calibration_path_for("SL 3", &opts, dir));
+            paths.push(calibration_path_for("SL 3", 0, &opts, dir));
         }
-        // All three must be distinct.
         assert_ne!(paths[0], paths[1]);
         assert_ne!(paths[1], paths[2]);
         assert_ne!(paths[0], paths[2]);
+    }
+
+    /// M5.4.4 regression: deck A's and deck B's calibration paths
+    /// must be disjoint across every (format, deck_idx) combination
+    /// the user can hit. The previous design borrowed deck A's
+    /// thresholds for deck B silently — pin the per-deck split so
+    /// that can't recur.
+    #[test]
+    fn calibration_path_distinct_per_deck_for_every_format() {
+        let dir = std::path::Path::new("/tmp/dub-test");
+        for format in [Format::SeratoCv02, Format::TraktorMk1, Format::TraktorMk2] {
+            let opts = Opts {
+                format,
+                ..opts_default()
+            };
+            let a = calibration_path_for("SL 3", 0, &opts, dir);
+            let b = calibration_path_for("SL 3", 1, &opts, dir);
+            assert_ne!(
+                a, b,
+                "{format:?}: deck A path == deck B path; per-deck calibration is broken"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_calibration_path_omits_deck_infix() {
+        // The legacy fallback path (used only for deck-0 migration
+        // from pre-M5.4.4 single-key files) must produce the
+        // historical `<device>_<format>.json` pattern so
+        // `Calibration::load_with_legacy_fallback` finds existing
+        // user files.
+        let dir = std::path::Path::new("/tmp/dub-test");
+        let opts = Opts {
+            format: Format::TraktorMk1,
+            ..opts_default()
+        };
+        let p = legacy_calibration_path_for("SL 3", &opts, dir);
+        assert_eq!(
+            p,
+            std::path::Path::new("/tmp/dub-test/SL_3_traktor-mk1.json"),
+            "legacy path must NOT include deck infix"
+        );
+    }
+
+    #[test]
+    fn deck_label_maps_index_to_letter() {
+        assert_eq!(deck_label(0), 'A');
+        assert_eq!(deck_label(1), 'B');
     }
 
     #[test]

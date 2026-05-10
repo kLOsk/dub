@@ -96,6 +96,15 @@ const STATUS_REFRESH_MS: u64 = 250;
 struct Opts {
     input: InputArgs,
     format: Format,
+    /// Engine deck index this calibration is for (0 = deck A, 1 =
+    /// deck B). Defaults to 0 — `dub calibrate` opens a single
+    /// 2-channel input and probes pair 0 regardless. The `deck`
+    /// number is purely for the on-disk filename + the
+    /// `deck_index` field inside the JSON, so a user calibrating
+    /// deck B's separate hardware (different cartridge, different
+    /// turntable) on the same SL3 picks up the right file at
+    /// `dub timecode-deck` startup. See M5.4.4 in the PRD.
+    deck: u32,
     /// Length of the carrier capture phase.
     carrier_secs: f64,
     /// Length of the lift capture phase.
@@ -116,6 +125,7 @@ impl Default for Opts {
         Self {
             input: InputArgs::default(),
             format: Format::SeratoCv02,
+            deck: 0,
             carrier_secs: 10.0,
             lift_secs: 5.0,
             detect_timeout_secs: DETECT_TIMEOUT_SECS,
@@ -179,6 +189,18 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                     .ok_or_else(|| anyhow!("--output expects a path"))?;
                 opts.output = Some(PathBuf::from(v));
             }
+            "--deck" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--deck expects 0 or 1"))?;
+                let deck = v.parse::<u32>().with_context(|| format!("--deck {v}"))?;
+                if deck >= 2 {
+                    return Err(anyhow!(
+                        "--deck must be 0 or 1 (engine has 2 decks today); got {deck}"
+                    ));
+                }
+                opts.deck = deck;
+            }
             "--no-save" => {
                 opts.no_save = true;
             }
@@ -223,15 +245,25 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "calibrating: device='{}' sr={} Hz channels={channels} format={}",
+        "calibrating: device='{}' sr={} Hz channels={channels} deck={} format={}",
         input.device_name(),
         input.sample_rate(),
+        opts.deck,
         format_string(opts.format),
     );
     println!();
 
+    // pair_idx=0 because `dub calibrate` opens a dedicated 2-channel
+    // AudioInput — only pair 0 exists. The `--deck` flag controls
+    // *only* the on-disk metadata so a user calibrating deck B's
+    // separate hardware on the same SL3 (different cartridge,
+    // different turntable) gets a `..._deck_1_<format>.json` file
+    // that `dub timecode-deck` will pick up automatically. See the
+    // pair_idx-vs-deck_index note in `measure_inline`'s doc.
     let cal = measure_inline(
         &mut input,
+        0,
+        opts.deck,
         opts.format,
         opts.carrier_secs,
         opts.lift_secs,
@@ -250,6 +282,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(p) => p,
         None => Calibration::path_for(
             input.device_name(),
+            opts.deck,
             opts.format,
             &default_calibration_dir().context("resolving default calibration dir")?,
         ),
@@ -278,8 +311,25 @@ pub fn run(args: &[String]) -> Result<()> {
 /// Detection timeout (no carrier / no lift), 0-block capture, or
 /// SNR below [`SNR_FAIL_THRESHOLD`] (rejected by
 /// [`derive_thresholds`]).
+/// `pair_idx` selects **which AudioInput pair** to read from (M5.6
+/// demuxing — pair 0 is deck A, pair 1 is deck B in two-deck mode).
+/// `deck_index` is the **on-disk metadata** identifying which
+/// engine deck this calibration is for; it lands in the
+/// [`Calibration::deck_index`] field and the path key.
+///
+/// In the timecode-deck two-deck path these are the same value
+/// (deck N reads from pair N), but `dub calibrate` opens a single-
+/// pair input regardless of which deck the user wants the file
+/// to apply to (e.g. `--input-channels 5,6 --deck 1` opens a
+/// 2-channel SL3 input over physical channels 5,6 — that's still
+/// pair 0 of the AudioInput — and stamps the result as deck 1).
+/// Keeping them separate avoids the trap of "the user picked deck
+/// 1 so we try to read pair 1, but only pair 0 exists, so we read
+/// silence".
 pub fn measure_inline(
     input: &mut AudioInput,
+    pair_idx: usize,
+    deck_index: u32,
     format: Format,
     carrier_secs: f64,
     lift_secs: f64,
@@ -289,16 +339,16 @@ pub fn measure_inline(
     let mut decoder = Decoder::new(format, sr);
 
     println!("step 1/2: carrier  —  spin the record at 33⅓ on a clean section");
-    wait_for_stable_carrier(input, &mut decoder, detect_timeout_secs)?;
+    wait_for_stable_carrier(input, pair_idx, &mut decoder, detect_timeout_secs)?;
     println!();
     let (carrier_amps, carrier_confs) =
-        capture_phase(input, &mut decoder, carrier_secs, "carrier")?;
+        capture_phase(input, pair_idx, &mut decoder, carrier_secs, "carrier")?;
     println!();
 
     println!("step 2/2: lift     —  lift the needle off and rest it");
-    wait_for_lift(input, &mut decoder, detect_timeout_secs)?;
+    wait_for_lift(input, pair_idx, &mut decoder, detect_timeout_secs)?;
     println!();
-    let (lift_amps, lift_confs) = capture_phase(input, &mut decoder, lift_secs, "lift")?;
+    let (lift_amps, lift_confs) = capture_phase(input, pair_idx, &mut decoder, lift_secs, "lift")?;
     println!();
 
     let mut carrier_amps_owned = carrier_amps;
@@ -335,6 +385,7 @@ pub fn measure_inline(
     Ok(Calibration {
         schema_version: SCHEMA_VERSION,
         device_name: input.device_name().to_string(),
+        deck_index,
         format: format_string(format).to_string(),
         calibrated_at,
         input_sample_rate: sr,
@@ -358,6 +409,7 @@ pub fn measure_inline(
 /// Detection timeout (no carrier observed), 0-block capture.
 pub fn probe_carrier(
     input: &mut AudioInput,
+    pair_idx: usize,
     format: Format,
     secs: f64,
     detect_timeout_secs: f64,
@@ -365,9 +417,9 @@ pub fn probe_carrier(
     let sr = input.sample_rate();
     let mut decoder = Decoder::new(format, sr);
     println!("probing carrier ({secs:.1} s)...");
-    wait_for_stable_carrier(input, &mut decoder, detect_timeout_secs)?;
+    wait_for_stable_carrier(input, pair_idx, &mut decoder, detect_timeout_secs)?;
     println!();
-    let (amps, confs) = capture_phase(input, &mut decoder, secs, "probe")?;
+    let (amps, confs) = capture_phase(input, pair_idx, &mut decoder, secs, "probe")?;
     println!();
     let mut amps_owned = amps;
     let mut confs_owned = confs;
@@ -386,6 +438,7 @@ pub fn probe_carrier(
 /// sees what the decoder is observing in real time.
 fn wait_for_stable_carrier(
     input: &mut AudioInput,
+    pair_idx: usize,
     decoder: &mut Decoder,
     timeout_secs: f64,
 ) -> Result<()> {
@@ -414,7 +467,7 @@ fn wait_for_stable_carrier(
         }
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into(&mut acc[acc_len..acc_len + space]);
+            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {
@@ -453,7 +506,12 @@ fn wait_for_stable_carrier(
 /// Wait until [`LIFT_BLOCKS`] consecutive blocks have amplitude
 /// below [`LIFT_DETECT_AMP`], or [`Opts::detect_timeout_secs`]
 /// elapses.
-fn wait_for_lift(input: &mut AudioInput, decoder: &mut Decoder, timeout_secs: f64) -> Result<()> {
+fn wait_for_lift(
+    input: &mut AudioInput,
+    pair_idx: usize,
+    decoder: &mut Decoder,
+    timeout_secs: f64,
+) -> Result<()> {
     let mut consecutive: u32 = 0;
     let block_samples = BLOCK_FRAMES * 2;
     let mut acc = vec![0_f32; block_samples * 4];
@@ -476,7 +534,7 @@ fn wait_for_lift(input: &mut AudioInput, decoder: &mut Decoder, timeout_secs: f6
         }
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into(&mut acc[acc_len..acc_len + space]);
+            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {
@@ -511,6 +569,7 @@ fn wait_for_lift(input: &mut AudioInput, decoder: &mut Decoder, timeout_secs: f6
 /// indicator at 4 Hz.
 fn capture_phase(
     input: &mut AudioInput,
+    pair_idx: usize,
     decoder: &mut Decoder,
     secs: f64,
     label: &str,
@@ -529,7 +588,7 @@ fn capture_phase(
     while start.elapsed() < dur {
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into(&mut acc[acc_len..acc_len + space]);
+            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {
@@ -649,5 +708,46 @@ fn print_summary(cal: &Calibration) {
             "  \u{2139} note: SNR is healthy but not abundant; recalibrate \
              at the venue if you experience ghost-noise during lifts."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_opts_default_deck_is_zero() {
+        // No `--deck` flag → opts.deck = 0 (the legacy default).
+        let opts = parse_opts(&s(&["--input-channels", "3,4"])).unwrap();
+        assert_eq!(opts.deck, 0);
+    }
+
+    #[test]
+    fn parse_opts_deck_flag_round_trips() {
+        let opts = parse_opts(&s(&["--input-channels", "5,6", "--deck", "1"])).unwrap();
+        assert_eq!(opts.deck, 1);
+    }
+
+    #[test]
+    fn parse_opts_deck_flag_rejects_out_of_range() {
+        // `--deck 2` is rejected because the engine only has 2 decks.
+        // Better than silently widening to a u32 range — a typo
+        // (e.g. `--deck 12` instead of `--deck 1 2`) would have
+        // gotten the user a useless `~/.dub/calibration/SL_3_deck_12_*.json`
+        // file that `dub timecode-deck` can never load.
+        let r = parse_opts(&s(&["--input-channels", "3,4", "--deck", "2"]));
+        assert!(r.is_err(), "--deck 2 must be rejected");
+        let r = parse_opts(&s(&["--input-channels", "3,4", "--deck", "99"]));
+        assert!(r.is_err(), "--deck 99 must be rejected");
+    }
+
+    #[test]
+    fn parse_opts_deck_flag_rejects_non_numeric() {
+        let r = parse_opts(&s(&["--input-channels", "3,4", "--deck", "B"]));
+        assert!(r.is_err(), "letters not accepted; user must use 0/1");
     }
 }
