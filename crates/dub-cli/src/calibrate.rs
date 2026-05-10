@@ -1,32 +1,46 @@
-//! `dub calibrate` — auto-detecting per-rig calibration (M5.4.2).
+//! `dub calibrate` — auto-detecting per-rig calibration (M5.4.2 +
+//! M5.4.3 speed pass).
 //!
-//! Two phases, no manual prompts:
+//! ## Default flow (single-phase, M5.4.3)
+//!
+//! One phase, no manual prompts:
 //!
 //! 1. **Carrier.** Wait until the input shows a stable carrier (high
-//!    confidence, near-unity rate, low amplitude variance for ≥
-//!    [`STABLE_BLOCKS`] consecutive blocks). Then capture
-//!    [`Opts::carrier_secs`] seconds of measurement.
-//! 2. **Lift.** Wait until amplitude drops below
-//!    [`LIFT_DETECT_AMP`] for ≥ [`LIFT_BLOCKS`] consecutive blocks.
-//!    Then capture [`Opts::lift_secs`] seconds.
+//!    confidence, near-unity rate, for ≥ [`STABLE_BLOCKS`]
+//!    consecutive blocks). Then capture [`Opts::carrier_secs`]
+//!    seconds of measurement. From P5/P50/P95 of amplitude +
+//!    confidence we derive thresholds via
+//!    [`crate::calibration::derive_thresholds`], stamp a
+//!    [`RigFingerprint`] for future cartridge-swap detection, and
+//!    write JSON to `~/.dub/calibration/<device>_deck_<idx>_<format>.json`.
 //!
-//! From the two phases we compute P5/P50/P95 percentiles for both
-//! amplitude + confidence, derive the thresholds via
-//! [`crate::calibration::derive_thresholds`], stamp a
-//! [`RigFingerprint`] for future cartridge-swap detection, and write
-//! the JSON to `~/.dub/calibration/<device>_<format>.json` (or the
-//! `--output` override).
+//! Lift stats are persisted as zeros for schema compatibility (and
+//! the loader already tolerates that — see
+//! [`crate::calibration::derive_thresholds`]'s SNR-skip path). The
+//! M5.4.3 hand-tuning analysis showed the carrier shape carries the
+//! threshold info: `amplitude = carrier_p5 * 0.5` matched the
+//! user's hand-found SL3 threshold within 1 % regardless of lift
+//! noise level. Lift was always the SNR safety net, never the
+//! signal source.
+//!
+//! ## Two-phase flow (`--two-phase`, legacy / diagnostic)
+//!
+//! `dub calibrate --two-phase` runs the M5.4.2 sequence: carrier,
+//! then **lift** (wait for stylus-up signature; capture
+//! [`Opts::lift_secs`] seconds), then derive with the SNR safety
+//! check enabled. Slower (≈ 25 s vs ≈ 5 s on a typical rig) but
+//! catches stylus / preamp / cabling problems that produce low
+//! SNR. Useful when troubleshooting "calibration succeeded but
+//! the deck won't engage at runtime".
 //!
 //! ## Why auto-detection rather than "press Enter"
 //!
 //! The user requested the lowest-friction calibration possible —
-//! Traktor-style "press calibrate, do the thing" rather than Serato-
-//! style "press calibrate, do the thing, click next, do the next
-//! thing". The decoder already gives us everything we need to detect
-//! "the user is showing me carrier" vs "the user is showing me
-//! silence", so auto-progression is straightforward and the UX is
-//! genuinely zero-input: drop the needle → wait ~10 s → lift the
-//! needle → wait ~5 s → done.
+//! Traktor-style "press calibrate, do the thing". The decoder
+//! already gives us everything we need to detect "the user is
+//! showing me carrier" vs "the user is showing me silence", so
+//! auto-progression is straightforward and the UX is genuinely
+//! zero-input: drop the needle → wait ~3 s → done.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,8 +54,8 @@ use time::OffsetDateTime;
 
 use crate::calibration::{
     default_calibration_dir, derive_thresholds, format_string, measurement_stats_from_samples,
-    snr_margin, Calibration, CalibrationMeasurements, RigFingerprint, SCHEMA_VERSION,
-    SNR_FAIL_THRESHOLD, SNR_WARN_THRESHOLD,
+    snr_margin, Calibration, CalibrationMeasurements, MeasurementStats, RigFingerprint,
+    SCHEMA_VERSION, SNR_FAIL_THRESHOLD, SNR_WARN_THRESHOLD,
 };
 use crate::input_cmds::{parse_input_args, InputArgs};
 
@@ -53,10 +67,14 @@ use crate::input_cmds::{parse_input_args, InputArgs};
 const BLOCK_FRAMES: usize = 256;
 
 /// Carrier-detection threshold: confidence the decoder must report
-/// to consider the current block "carrier present". Set well above
-/// noise + handling artifacts but well below "perfect lock"; we
-/// just need to recognize "the user dropped the needle".
-const CARRIER_DETECT_CONF: f32 = 0.85;
+/// to consider the current block "carrier present" (M5.4.3 tightened
+/// from 0.85 → 0.90 so [`STABLE_BLOCKS`] at 2 is unambiguous).
+/// 0.90 is well above the ~0.85 ceiling that handling/rumble noise
+/// can briefly produce, and clean rigs sit at 0.97-0.99 carrier
+/// confidence so detection still triggers within ~10 ms of needle
+/// drop. The user's deck-B SL3 carrier_conf_p5 ≈ 0.96 passes this
+/// criterion comfortably.
+const CARRIER_DETECT_CONF: f32 = 0.90;
 
 /// Carrier-detection rate band: |rate - 1.0| ≤ this. 0.10 allows for
 /// slight pitch fader off-zero (typical turntable users keep ±2 % at
@@ -64,10 +82,16 @@ const CARRIER_DETECT_CONF: f32 = 0.85;
 const CARRIER_DETECT_RATE_BAND: f64 = 0.10;
 
 /// Number of consecutive blocks meeting the carrier criteria before
-/// we declare "stable carrier". 5 blocks @ 256 frames @ 48 kHz =
-/// ~27 ms — short enough to be responsive, long enough to filter
-/// brief touches of the needle on the record.
-const STABLE_BLOCKS: u32 = 5;
+/// we declare "stable carrier" (M5.4.3 reduced from 5 → 2). 2 blocks
+/// @ 256 frames @ 48 kHz ≈ 11 ms — fast enough to feel instant on a
+/// known-good rig. Safe at 2 because [`CARRIER_DETECT_CONF`] was
+/// tightened to 0.90 in the same pass: 2 consecutive blocks of
+/// `conf ≥ 0.90 && |rate-1| < 0.10` cannot be produced by any of
+/// the M5.3 / M5.4.1 / M5.4.4 captured noise patterns (handling,
+/// dust ticks, brief stylus touches) — the rate gate alone catches
+/// transient stylus motion because handling produces near-zero or
+/// wildly varying rate, never the unity rate of a steady spin.
+const STABLE_BLOCKS: u32 = 2;
 
 /// Lift-detection amplitude threshold (RMS). Carriers through any
 /// reasonable rig sit ≥ 0.05; lift drops to ~0.0001-0.005 depending
@@ -105,9 +129,14 @@ struct Opts {
     /// turntable) on the same SL3 picks up the right file at
     /// `dub timecode-deck` startup. See M5.4.4 in the PRD.
     deck: u32,
-    /// Length of the carrier capture phase.
+    /// Length of the carrier capture phase. Default 3.0 s (M5.4.3
+    /// — see module docs); long enough for stable percentiles
+    /// within < 1 % of the M5.4.2-era 10 s capture, short enough
+    /// to feel responsive.
     carrier_secs: f64,
-    /// Length of the lift capture phase.
+    /// Length of the lift capture phase. Used only when
+    /// [`Opts::two_phase`] is `true`. Default 5.0 s preserved
+    /// from M5.4.2 for comparable two-phase output.
     lift_secs: f64,
     /// Detection timeout for both waits.
     detect_timeout_secs: f64,
@@ -118,6 +147,13 @@ struct Opts {
     /// when iterating on threshold formulas without polluting the
     /// real calibration dir.
     no_save: bool,
+    /// Run the legacy carrier+lift two-phase calibration (M5.4.2
+    /// flow) instead of the M5.4.3 single-phase default. Slower
+    /// (≈ 25 s vs ≈ 5 s on a typical rig) but enables the SNR
+    /// safety check in [`derive_thresholds`] — useful when the
+    /// rig is suspected of having a stylus / preamp / cabling
+    /// problem that single-phase wouldn't catch.
+    two_phase: bool,
 }
 
 impl Default for Opts {
@@ -126,14 +162,26 @@ impl Default for Opts {
             input: InputArgs::default(),
             format: Format::SeratoCv02,
             deck: 0,
-            carrier_secs: 10.0,
-            lift_secs: 5.0,
+            carrier_secs: DEFAULT_CARRIER_SECS,
+            lift_secs: DEFAULT_LIFT_SECS,
             detect_timeout_secs: DETECT_TIMEOUT_SECS,
             output: None,
             no_save: false,
+            two_phase: false,
         }
     }
 }
+
+/// Default carrier capture duration. M5.4.3 reduced this from 10.0 s
+/// (M5.4.2 era) to 3.0 s after fixture analysis showed the long-run
+/// percentiles converge within < 1 % by ≈ 2 s on a steady spin. We
+/// keep 3 s as the published default for a small safety margin.
+const DEFAULT_CARRIER_SECS: f64 = 3.0;
+
+/// Default lift capture duration in `--two-phase` mode. Preserved
+/// from M5.4.2 so two-phase output is directly comparable to old
+/// calibration files. Not used in the M5.4.3 single-phase default.
+const DEFAULT_LIFT_SECS: f64 = 5.0;
 
 fn parse_opts(args: &[String]) -> Result<Opts> {
     // Reuse the shared input-args parser (--device, --input-channels,
@@ -204,6 +252,11 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             "--no-save" => {
                 opts.no_save = true;
             }
+            "--two-phase" => {
+                // M5.4.3 opt-out: run the legacy carrier+lift flow
+                // with the SNR safety check. Slower; rarely needed.
+                opts.two_phase = true;
+            }
             other if other.starts_with("--") => {
                 return Err(anyhow!("unknown calibrate flag: {other}"));
             }
@@ -245,11 +298,16 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "calibrating: device='{}' sr={} Hz channels={channels} deck={} format={}",
+        "calibrating: device='{}' sr={} Hz channels={channels} deck={} format={} mode={}",
         input.device_name(),
         input.sample_rate(),
         opts.deck,
         format_string(opts.format),
+        if opts.two_phase {
+            "two-phase (carrier + lift, M5.4.2 legacy)"
+        } else {
+            "single-phase (carrier only, M5.4.3 default)"
+        },
     );
     println!();
 
@@ -265,9 +323,12 @@ pub fn run(args: &[String]) -> Result<()> {
         0,
         opts.deck,
         opts.format,
-        opts.carrier_secs,
-        opts.lift_secs,
-        opts.detect_timeout_secs,
+        MeasureOptions {
+            carrier_secs: opts.carrier_secs,
+            lift_secs: opts.lift_secs,
+            detect_timeout_secs: opts.detect_timeout_secs,
+            two_phase: opts.two_phase,
+        },
     )?;
 
     print_summary(&cal);
@@ -295,10 +356,31 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Run both phases of calibration against an already-open
-/// [`AudioInput`]. Returns the fully populated [`Calibration`]
-/// without saving — the caller decides where (and whether) to
-/// persist.
+/// Per-call options for [`measure_inline`]. Bundled to keep the
+/// function signature stable across the M5.4.2 (two-phase) →
+/// M5.4.3 (single-phase default) → future tuning passes.
+#[derive(Debug, Clone, Copy)]
+pub struct MeasureOptions {
+    pub carrier_secs: f64,
+    /// Used only when `two_phase == true`. Ignored otherwise.
+    pub lift_secs: f64,
+    pub detect_timeout_secs: f64,
+    /// `false` (M5.4.3 default) → carrier-only single-phase.
+    /// `true`  → legacy carrier+lift two-phase with SNR check.
+    pub two_phase: bool,
+}
+
+/// Run a calibration against an already-open [`AudioInput`].
+/// Returns the fully populated [`Calibration`] without saving —
+/// the caller decides where (and whether) to persist.
+///
+/// In single-phase mode (M5.4.3 default,
+/// [`MeasureOptions::two_phase`] = false), only the carrier phase
+/// runs; lift stats are written as [`MeasurementStats::zero()`]
+/// for schema compatibility. In two-phase mode
+/// ([`MeasureOptions::two_phase`] = true), the legacy M5.4.2 flow
+/// runs (carrier + lift) and the SNR safety net rejects rigs
+/// below [`SNR_FAIL_THRESHOLD`].
 ///
 /// Used by both `dub calibrate` (saves to
 /// `~/.dub/calibration/...`) and `dub timecode-deck`'s startup
@@ -307,10 +389,6 @@ pub fn run(args: &[String]) -> Result<()> {
 /// "you got auto-calibrated" produces a JSON file indistinguishable
 /// from "you ran `dub calibrate`".
 ///
-/// # Errors
-/// Detection timeout (no carrier / no lift), 0-block capture, or
-/// SNR below [`SNR_FAIL_THRESHOLD`] (rejected by
-/// [`derive_thresholds`]).
 /// `pair_idx` selects **which AudioInput pair** to read from (M5.6
 /// demuxing — pair 0 is deck A, pair 1 is deck B in two-deck mode).
 /// `deck_index` is the **on-disk metadata** identifying which
@@ -326,42 +404,62 @@ pub fn run(args: &[String]) -> Result<()> {
 /// Keeping them separate avoids the trap of "the user picked deck
 /// 1 so we try to read pair 1, but only pair 0 exists, so we read
 /// silence".
+///
+/// # Errors
+/// Detection timeout (no carrier / no lift in two-phase),
+/// 0-block capture, or — in two-phase mode only — SNR below
+/// [`SNR_FAIL_THRESHOLD`] (rejected by [`derive_thresholds`]).
 pub fn measure_inline(
     input: &mut AudioInput,
     pair_idx: usize,
     deck_index: u32,
     format: Format,
-    carrier_secs: f64,
-    lift_secs: f64,
-    detect_timeout_secs: f64,
+    opts: MeasureOptions,
 ) -> Result<Calibration> {
     let sr = input.sample_rate();
     let mut decoder = Decoder::new(format, sr);
 
-    println!("step 1/2: carrier  —  spin the record at 33⅓ on a clean section");
-    wait_for_stable_carrier(input, pair_idx, &mut decoder, detect_timeout_secs)?;
+    let step_label = if opts.two_phase {
+        "step 1/2: carrier"
+    } else {
+        "step 1/1: carrier"
+    };
+    println!("{step_label}  —  spin the record at 33\u{2153} on a clean section");
+    wait_for_stable_carrier(input, pair_idx, &mut decoder, opts.detect_timeout_secs)?;
     println!();
     let (carrier_amps, carrier_confs) =
-        capture_phase(input, pair_idx, &mut decoder, carrier_secs, "carrier")?;
-    println!();
-
-    println!("step 2/2: lift     —  lift the needle off and rest it");
-    wait_for_lift(input, pair_idx, &mut decoder, detect_timeout_secs)?;
-    println!();
-    let (lift_amps, lift_confs) = capture_phase(input, pair_idx, &mut decoder, lift_secs, "lift")?;
+        capture_phase(input, pair_idx, &mut decoder, opts.carrier_secs, "carrier")?;
     println!();
 
     let mut carrier_amps_owned = carrier_amps;
     let mut carrier_confs_owned = carrier_confs;
     let carrier = measurement_stats_from_samples(&mut carrier_amps_owned, &mut carrier_confs_owned);
-    let mut lift_amps_owned = lift_amps;
-    let mut lift_confs_owned = lift_confs;
-    let lift = measurement_stats_from_samples(&mut lift_amps_owned, &mut lift_confs_owned);
+
+    let lift = if opts.two_phase {
+        println!("step 2/2: lift     —  lift the needle off and rest it");
+        wait_for_lift(input, pair_idx, &mut decoder, opts.detect_timeout_secs)?;
+        println!();
+        let (lift_amps, lift_confs) =
+            capture_phase(input, pair_idx, &mut decoder, opts.lift_secs, "lift")?;
+        println!();
+        let mut lift_amps_owned = lift_amps;
+        let mut lift_confs_owned = lift_confs;
+        measurement_stats_from_samples(&mut lift_amps_owned, &mut lift_confs_owned)
+    } else {
+        // Single-phase: lift is unmeasured, persist zeros for schema
+        // compatibility. `n_blocks == 0` is the load-bearing signal
+        // to derive_thresholds that the SNR check should be skipped
+        // (it was always a lift-derived safety net, never the
+        // signal source — see calibration.rs module docs).
+        MeasurementStats::zero()
+    };
 
     let snr = snr_margin(&carrier, &lift);
     let Some(thresholds) = derive_thresholds(&carrier, &lift) else {
+        // Only reachable in two-phase mode; single-phase always
+        // returns `Some` because `lift.n_blocks == 0`.
         return Err(anyhow!(
-            "low SNR ({:.1}× < {:.0}× minimum) — likely cartridge, stylus, \
+            "low SNR ({:.1}\u{00d7} < {:.0}\u{00d7} minimum) — likely cartridge, stylus, \
              or cabling problem. Check the needle, preamp gain, and that \
              you've selected the right input channels (SL3 deck A is 3,4).\n\
              carrier amp_p5 = {:.4}, lift amp_p95 = {:.4}",
@@ -395,39 +493,6 @@ pub fn measure_inline(
         thresholds,
         measurements: CalibrationMeasurements { carrier, lift },
         snr_margin: snr,
-    })
-}
-
-/// Briefly observe the carrier and return its fingerprint. Used by
-/// `dub timecode-deck` startup to validate the saved fingerprint
-/// without doing the full ~25 s carrier+lift calibration. Three
-/// seconds of carrier capture (≈ 564 blocks @ 256 frames @ 48 kHz)
-/// gives stable percentiles within a fraction of a percent of the
-/// long-run values.
-///
-/// # Errors
-/// Detection timeout (no carrier observed), 0-block capture.
-pub fn probe_carrier(
-    input: &mut AudioInput,
-    pair_idx: usize,
-    format: Format,
-    secs: f64,
-    detect_timeout_secs: f64,
-) -> Result<RigFingerprint> {
-    let sr = input.sample_rate();
-    let mut decoder = Decoder::new(format, sr);
-    println!("probing carrier ({secs:.1} s)...");
-    wait_for_stable_carrier(input, pair_idx, &mut decoder, detect_timeout_secs)?;
-    println!();
-    let (amps, confs) = capture_phase(input, pair_idx, &mut decoder, secs, "probe")?;
-    println!();
-    let mut amps_owned = amps;
-    let mut confs_owned = confs;
-    let stats = measurement_stats_from_samples(&mut amps_owned, &mut confs_owned);
-    Ok(RigFingerprint {
-        carrier_amp_p50: stats.amplitude_p50,
-        carrier_amp_p95: stats.amplitude_p95,
-        carrier_conf_p50: stats.confidence_p50,
     })
 }
 
@@ -638,8 +703,8 @@ fn print_status_line(s: &str) {
 }
 
 /// Print the per-rig summary banner — derived thresholds, raw
-/// percentiles, fingerprint, and SNR margin with appropriate
-/// warnings.
+/// percentiles, fingerprint, and (when lift was measured) SNR margin
+/// with appropriate warnings.
 fn print_summary(cal: &Calibration) {
     let t = &cal.thresholds;
     let m = &cal.measurements;
@@ -665,15 +730,19 @@ fn print_summary(cal: &Calibration) {
         m.carrier.confidence_p50,
         m.carrier.confidence_p95,
     );
-    println!(
-        "  lift     amp p5/p50/p95 = {:.4} / {:.4} / {:.4}    conf p5/p50/p95 = {:.3} / {:.3} / {:.3}",
-        m.lift.amplitude_p5,
-        m.lift.amplitude_p50,
-        m.lift.amplitude_p95,
-        m.lift.confidence_p5,
-        m.lift.confidence_p50,
-        m.lift.confidence_p95,
-    );
+    if m.lift.n_blocks > 0 {
+        println!(
+            "  lift     amp p5/p50/p95 = {:.4} / {:.4} / {:.4}    conf p5/p50/p95 = {:.3} / {:.3} / {:.3}",
+            m.lift.amplitude_p5,
+            m.lift.amplitude_p50,
+            m.lift.amplitude_p95,
+            m.lift.confidence_p5,
+            m.lift.confidence_p50,
+            m.lift.confidence_p95,
+        );
+    } else {
+        println!("  lift     not measured (single-phase mode; --two-phase to enable SNR check)");
+    }
     println!();
     println!(
         "fingerprint  amp_p50 = {:.4}  amp_p95 = {:.4}  conf_p50 = {:.3}",
@@ -685,29 +754,35 @@ fn print_summary(cal: &Calibration) {
 
     // SNR rating + warnings. Three bands so the user knows whether
     // their rig will work in louder venues without re-calibration.
-    let snr = cal.snr_margin;
-    let snr_label = if snr >= 200.0 {
-        "excellent"
-    } else if snr >= SNR_WARN_THRESHOLD {
-        "good"
-    } else if snr >= SNR_FAIL_THRESHOLD {
-        "low"
-    } else {
-        "fail" // shouldn't reach here — derive_thresholds rejected it
-    };
-    println!("SNR margin: {snr:.0}× ({snr_label})");
-    if snr < SNR_WARN_THRESHOLD {
-        println!(
-            "  \u{26A0} warning: SNR below {:.0}× — clubs / loud venues may \
-             require recalibration in place. Consider checking preamp gain \
-             or stylus condition.",
-            SNR_WARN_THRESHOLD
-        );
-    } else if snr < 200.0 {
-        println!(
-            "  \u{2139} note: SNR is healthy but not abundant; recalibrate \
-             at the venue if you experience ghost-noise during lifts."
-        );
+    // Only meaningful when lift was actually measured — single-phase
+    // mode skips this entirely (lift.n_blocks == 0 ⇒ snr_margin
+    // trivially returns INFINITY, which would print "excellent" and
+    // mislead the user).
+    if m.lift.n_blocks > 0 {
+        let snr = cal.snr_margin;
+        let snr_label = if snr >= 200.0 {
+            "excellent"
+        } else if snr >= SNR_WARN_THRESHOLD {
+            "good"
+        } else if snr >= SNR_FAIL_THRESHOLD {
+            "low"
+        } else {
+            "fail" // shouldn't reach here — derive_thresholds rejected it
+        };
+        println!("SNR margin: {snr:.0}\u{00d7} ({snr_label})");
+        if snr < SNR_WARN_THRESHOLD {
+            println!(
+                "  \u{26A0} warning: SNR below {:.0}\u{00d7} — clubs / loud venues may \
+                 require recalibration in place. Consider checking preamp gain \
+                 or stylus condition.",
+                SNR_WARN_THRESHOLD
+            );
+        } else if snr < 200.0 {
+            println!(
+                "  \u{2139} note: SNR is healthy but not abundant; recalibrate \
+                 at the venue if you experience ghost-noise during lifts."
+            );
+        }
     }
 }
 
@@ -749,5 +824,57 @@ mod tests {
     fn parse_opts_deck_flag_rejects_non_numeric() {
         let r = parse_opts(&s(&["--input-channels", "3,4", "--deck", "B"]));
         assert!(r.is_err(), "letters not accepted; user must use 0/1");
+    }
+
+    #[test]
+    fn parse_opts_default_is_single_phase() {
+        // M5.4.3: single-phase is the default. A bare `dub calibrate
+        // --input-channels 3,4` must NOT pull in the legacy lift
+        // capture, which would silently bring back the ~25 s wall
+        // time the user complained about.
+        let opts = parse_opts(&s(&["--input-channels", "3,4"])).unwrap();
+        assert!(
+            !opts.two_phase,
+            "M5.4.3 default must be single-phase (carrier only)"
+        );
+    }
+
+    #[test]
+    fn parse_opts_two_phase_flag_round_trips() {
+        // Opt-in to the legacy two-phase flow for diagnostics.
+        let opts = parse_opts(&s(&["--input-channels", "3,4", "--two-phase"])).unwrap();
+        assert!(opts.two_phase);
+    }
+
+    #[test]
+    fn parse_opts_default_carrier_secs_is_3() {
+        // M5.4.3 reduced the default from 10 s → 3 s. Pin the
+        // value so a future "make it 4 s for safety" tweak is a
+        // visible PRD-level change rather than a silent default
+        // shift.
+        let opts = parse_opts(&s(&["--input-channels", "3,4"])).unwrap();
+        assert!(
+            (opts.carrier_secs - 3.0).abs() < 1e-9,
+            "default carrier_secs should be 3.0, got {}",
+            opts.carrier_secs
+        );
+    }
+
+    #[test]
+    fn carrier_detect_constants_match_m543_targets() {
+        // Lock the M5.4.3 detection-loop tightening in place. If
+        // any of these regress (e.g. STABLE_BLOCKS bumped back to
+        // 5), the calibration wall time grows back; if
+        // CARRIER_DETECT_CONF drops below 0.90, 2-block detection
+        // becomes prone to handling-noise false positives.
+        assert_eq!(STABLE_BLOCKS, 2, "STABLE_BLOCKS must be 2 (M5.4.3)");
+        assert!(
+            (CARRIER_DETECT_CONF - 0.90).abs() < 1e-6,
+            "CARRIER_DETECT_CONF must be 0.90 (M5.4.3)"
+        );
+        assert!(
+            (CARRIER_DETECT_RATE_BAND - 0.10).abs() < 1e-9,
+            "CARRIER_DETECT_RATE_BAND stays 0.10 — handles \u{00b1}10 % pitch fader"
+        );
     }
 }

@@ -97,9 +97,10 @@ Roadmap is detailed in [`docs/PRD.md`](docs/PRD.md). Bookmark order:
 | **M5.3** | ✅ shipped | Live timecode → deck (first scratch). 3-layer lift policy. |
 | **M5.4.1** | ✅ shipped | TUI scope + `LiftPolicy` refactor |
 | **M5.4.2** | ✅ shipped | Per-rig calibration + fingerprint-based auto-detection |
-| **M5.4.3** | 📋 planned | Calibration speed (≤5 s first-time, ≤1 s probe) — match Traktor |
+| **M5.4.3** | ✅ shipped | Calibration speed (single-phase carrier-only default, 3 s carrier capture, 1.5 s startup probe; legacy two-phase flow gated behind `--two-phase`) |
 | **M5.4.4** | ✅ shipped | Independent per-deck calibration (probes + thresholds per deck, JSON keyed by `(device, deck, format)`, legacy fallback for M5.4.2/M6 files) |
 | **M5.4.5** | 📋 planned | Late-binding decks + non-blocking calibration — single-deck startup, mid-stream deck-add, parallel calibration. **Product gate**, not polish: required for the DJ-takeover use case (incoming DJ has no access to deck B's record). |
+| **M5.4.6** | ✅ shipped | Always-fresh calibration — gut the load-from-disk + fingerprint-probe path. Touring DJs see a different rig at every venue, so the probe always mismatched and burnt ~1.7 s confirming what we already knew. Now the runtime always recalibrates on startup; JSON file is a diagnostic artifact only. Drops `--recalibrate` / `--no-probe` flags; `--no-calibrate` survives. |
 | **M5.5.1** | ✅ shipped | Engine routing primitive (`render_routed`, `OutputRouting`) |
 | **M5.5.2** | ✅ shipped | External-mixer 4-channel output: SL3 (✅ verified) / Audio 6 (⚠️ unverified) profiles + manual override |
 | **M5.6** | ✅ shipped | Two-deck timecode (single CoreAudio input AU, IOProc demux into per-deck SPSC rings) |

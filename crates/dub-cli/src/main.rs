@@ -111,7 +111,7 @@ fn print_help() {
     eprintln!("                    [--duration SECS] [--confidence T]");
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
     eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
-    eprintln!("                    [--recalibrate] [--no-probe] [--no-calibrate]");
+    eprintln!("                    [--no-calibrate]");
     eprintln!("                    [--internal-mixer | (--deck-a-out-ch N --deck-b-out-ch N");
     eprintln!("                                         [--output-channels N])]");
     eprintln!("                    [--device-profile NAME]");
@@ -127,11 +127,15 @@ fn print_help() {
     eprintln!("                                    live timecode scope (TUI) (M5.4.1+M6)");
     eprintln!("  calibrate         [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--carrier-secs S] [--lift-secs S]");
-    eprintln!("                    [--detect-timeout S]");
+    eprintln!("                    [--detect-timeout S] [--two-phase]");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--deck 0|1] [-o PATH] [--no-save]");
     eprintln!(
-        "                                    auto-calibrate per rig + persist (M5.4.2+M5.4.4)"
+        "                                    auto-calibrate per rig + persist (M5.4.2-M5.4.4)"
+    );
+    eprintln!("                                    M5.4.3: single-phase by default (~3 s),");
+    eprintln!(
+        "                                    --two-phase opts into legacy carrier+lift (~25 s)"
     );
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
@@ -169,15 +173,20 @@ fn print_help() {
     eprintln!("    lukewarm band down to disengage rides scratch transients; (3) sticky window");
     eprintln!("    — N consecutive below-floor blocks before muting.");
     eprintln!();
-    eprintln!("    Calibration (M5.4.2): on startup, looks for ~/.dub/calibration/<device>_");
-    eprintln!("    serato-cv02.json, probes the carrier briefly to validate the saved");
-    eprintln!("    fingerprint (cartridge + preamp signature), and uses those thresholds.");
-    eprintln!("    On mismatch (cartridge swap, preamp change) it auto-recalibrates and");
-    eprintln!("    overwrites the JSON. On first run it does a full calibration. Per-knob CLI");
-    eprintln!("    flags (--confidence, --amplitude-threshold, etc.) override individual");
-    eprintln!("    thresholds; --recalibrate forces fresh measurement; --no-probe skips the");
-    eprintln!("    fingerprint check (faster startup, no rig-swap detection); --no-calibrate");
-    eprintln!("    falls back entirely to M5.3 defaults.");
+    eprintln!("    Calibration (M5.4.6 always-fresh): on startup, runs a fresh single-phase");
+    eprintln!("    calibration against the actual rig in front of you (~3.5 s per deck) and");
+    eprintln!("    derives thresholds from the live measurement. Result is saved to");
+    eprintln!("    ~/.dub/calibration/<device>_deck_<idx>_<format>.json as a diagnostic");
+    eprintln!("    artifact \u{2014} nothing in the runtime path reads it back. The save model");
+    eprintln!("    used to be load-and-fingerprint-probe-on-startup (M5.4.2 \u{2026} M5.4.5),");
+    eprintln!("    but for touring DJs every venue brings a different turntable + cartridge");
+    eprintln!("    so the probe always mismatched and burnt ~1.7 s confirming what we already");
+    eprintln!("    knew. Always-measure-the-rig-in-front-of-you is simpler and faster on the");
+    eprintln!("    real-world production path. Per-knob CLI flags (--confidence,");
+    eprintln!("    --amplitude-threshold, --disengage-threshold, --sticky-blocks) override");
+    eprintln!("    individual thresholds on top of the fresh measurement; --no-calibrate");
+    eprintln!("    skips calibration entirely and falls back to M5.3 defaults (mostly useful");
+    eprintln!("    for testing the audio path without hardware).");
     eprintln!();
     eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
     eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
@@ -202,17 +211,26 @@ fn print_help() {
     eprintln!("    PgUp/PgDn disengage, \u{2190}/\u{2192} amplitude. SL3 deck A:");
     eprintln!("    --input-channels 3,4. Use `dub calibrate` to persist your tuning.");
     eprintln!();
-    eprintln!("  calibrate (M5.4.2): auto-detect per-rig thresholds + persist to");
-    eprintln!("    ~/.dub/calibration/<device>_serato-cv02.json. Two zero-prompt phases:");
-    eprintln!("    (1) drop the needle on a clean section at 33⅓ — calibrator detects");
-    eprintln!("    stable carrier and captures 10 s of percentile data; (2) lift the needle");
-    eprintln!("    onto the rest — calibrator detects lift and captures 5 s of noise floor.");
-    eprintln!("    From the two phases it derives engage / amplitude thresholds and stamps");
-    eprintln!("    a rig fingerprint (carrier amp + confidence percentiles) so future");
-    eprintln!("    timecode-deck startups can detect cartridge / preamp swaps and auto-");
-    eprintln!("    recalibrate. Auto-calibration runs the same code path, so a JSON saved");
-    eprintln!("    here is indistinguishable from one auto-saved by timecode-deck.");
-    eprintln!("    --no-save skips persistence (useful when iterating on threshold formulas).");
+    eprintln!("  calibrate (M5.4.2-M5.4.4 + M5.4.6): write a calibration JSON to");
+    eprintln!("    ~/.dub/calibration/<device>_deck_<idx>_<format>.json. As of M5.4.6 the");
+    eprintln!("    runtime no longer reads these files \u{2014} they're a diagnostic / inspection");
+    eprintln!("    artifact (\"what did this rig look like\") and the input to future analysis");
+    eprintln!("    tooling. M5.4.3 single-phase default: drop the needle on a clean section at");
+    eprintln!(
+        "    33\u{2153} \u{2014} calibrator detects stable carrier (\u{2248} 10 ms after the needle drops)"
+    );
+    eprintln!("    and captures 3 s of percentile data, derives engage / amplitude thresholds,");
+    eprintln!(
+        "    stamps a rig fingerprint, and saves. Total wall time \u{2248} 3.5 s on a known rig."
+    );
+    eprintln!("    --two-phase: legacy M5.4.2 flow (carrier + lift, ~25 s) which adds the");
+    eprintln!("    SNR safety check \u{2014} useful when troubleshooting cartridge / preamp /");
+    eprintln!("    cabling problems that single-phase wouldn't catch. --deck 0|1 controls");
+    eprintln!("    the on-disk slot for per-deck calibration (M5.4.4). --no-save skips");
+    eprintln!("    persistence (useful when iterating on threshold formulas).");
+    eprintln!("    `dub timecode-deck` runs the same calibration code path on every startup");
+    eprintln!("    (M5.4.6 always-fresh), so a JSON saved here is indistinguishable from one");
+    eprintln!("    auto-saved by timecode-deck.");
 }
 
 fn smoke() -> Result<()> {

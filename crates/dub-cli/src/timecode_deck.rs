@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::calibrate::{measure_inline, MeasureOptions};
+use crate::calibration::{default_calibration_dir, Calibration, CalibrationThresholds};
+use crate::device_profiles;
+use crate::input_cmds::{parse_input_args, InputArgs};
 use dub_audio::AudioInput;
 use dub_engine::{
     Engine, TimecodeInputConfig, DEFAULT_AMPLITUDE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD,
@@ -35,45 +39,20 @@ use dub_engine::{
 };
 use dub_io::Track;
 use dub_timecode::Format;
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
-
-use crate::calibrate::{measure_inline, probe_carrier};
-use crate::calibration::{
-    default_calibration_dir, Calibration, CalibrationThresholds, DEFAULT_FINGERPRINT_TOLERANCE,
-};
-use crate::device_profiles;
-use crate::input_cmds::{parse_input_args, InputArgs};
 
 /// Default duration if `--duration` isn't given. 60 s is comfortably
 /// long for a tactile validation run; the user can Ctrl-C earlier.
 const DEFAULT_RUN_SECS: f64 = 60.0;
 
-/// Length of the auto-startup carrier probe used to validate the
-/// saved fingerprint against the rig in front of the user. 3 s
-/// gives stable percentiles within < 1 % of the long-run values
-/// from the original calibration, so it's a meaningful comparison
-/// without holding the user up.
-const PROBE_SECS: f64 = 3.0;
-
-/// Detection timeout for the auto-startup probe. 30 s gives the
-/// user time to walk to the turntable and drop the needle without
-/// the timecode-deck startup feeling rushed.
-const PROBE_DETECT_TIMEOUT_SECS: f64 = 30.0;
-
-/// Length of the auto-startup full calibration phases. Match
-/// `dub calibrate`'s defaults — auto-calibration produces a
+/// Length of the auto-startup full calibration phases. Pin the
+/// M5.4.3 single-phase defaults so auto-calibration produces a
 /// JSON file indistinguishable from a manual `dub calibrate` run.
-const AUTO_CARRIER_SECS: f64 = 10.0;
+/// `AUTO_LIFT_SECS` is unused on the default M5.4.3 single-phase
+/// path; kept for parallelism with [`MeasureOptions`] in case the
+/// internal call sites later need to opt into two-phase.
+const AUTO_CARRIER_SECS: f64 = 3.0;
 const AUTO_LIFT_SECS: f64 = 5.0;
 const AUTO_DETECT_TIMEOUT_SECS: f64 = 30.0;
-
-/// Surface a warning when the saved calibration is older than this.
-/// 30 days is long enough that "set up at home, played one gig two
-/// weeks ago" doesn't trigger a warning, but short enough to flag
-/// "dusty stylus from six months of disuse" before the user gets
-/// surprised by ghost noise.
-const STALE_CALIBRATION_DAYS: f64 = 30.0;
 
 /// CLI options for `dub timecode-deck`. Built on top of the shared
 /// [`InputArgs`] so the `--input-channels`/`--device`/`--sr` flags
@@ -129,27 +108,21 @@ struct Opts {
     deck_a_out_ch: Option<u32>,
     /// 1-based first output channel for deck B's stereo pair.
     deck_b_out_ch: Option<u32>,
-    /// Per-threshold explicit overrides. `None` = auto-resolve from
-    /// the saved calibration (or auto-calibrate if missing /
-    /// fingerprint mismatch); `Some(v)` = take this value verbatim,
-    /// independent of calibration. Partial overrides are supported
-    /// so the user can pin one knob (e.g. amplitude=0.05 to test a
-    /// loud venue) and let the rest auto-resolve.
+    /// Per-threshold explicit overrides on top of the M5.4.6
+    /// always-fresh calibration. `None` = take the value the
+    /// calibrator just produced; `Some(v)` = override that knob
+    /// verbatim. Partial overrides are first-class so the user
+    /// can pin one knob (e.g. amplitude=0.05 to test a loud venue)
+    /// and let the rest auto-resolve from the actual measurement.
     confidence: Option<f32>,
     disengage: Option<f32>,
     sticky_blocks: Option<u32>,
     amplitude_threshold: Option<f32>,
-    /// Force fresh full measurement even if a matching calibration
-    /// JSON exists. Use after a known cartridge / cabling change.
-    recalibrate: bool,
-    /// Skip the fingerprint probe at startup. Faster (~3 s saved)
-    /// but loses rig-swap detection. Use only when iterating on
-    /// other things and you know the rig is unchanged.
-    no_probe: bool,
     /// Skip calibration entirely — fall back to the M5.3 defaults
-    /// regardless of what's on disk. Mostly useful for regression
-    /// testing the M5.3 path or for first-time users who want to
-    /// hear the deck immediately without touching the calibrator.
+    /// regardless. Mostly useful for regression testing the M5.3
+    /// engine path or for first-time users who want to hear the
+    /// deck immediately without touching the calibrator. Per-knob
+    /// overrides still apply on top.
     no_calibrate: bool,
     /// Wall-clock duration to run before stopping. Distinct from
     /// `InputArgs::duration` because we want timecode-deck to default
@@ -167,8 +140,6 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let mut sticky_blocks: Option<u32> = None;
     let mut amplitude_threshold: Option<f32> = None;
     let mut output_buffer_size: Option<u32> = None;
-    let mut recalibrate = false;
-    let mut no_probe = false;
     let mut no_calibrate = false;
     let mut internal_mixer = false;
     let mut device_profile: Option<String> = None;
@@ -229,14 +200,6 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                         .with_context(|| format!("--output-buffer-size {v}"))?,
                 );
                 i += 2;
-            }
-            "--recalibrate" => {
-                recalibrate = true;
-                i += 1;
-            }
-            "--no-probe" => {
-                no_probe = true;
-                i += 1;
             }
             "--no-calibrate" => {
                 no_calibrate = true;
@@ -330,7 +293,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
              [--device NAME] \
              [--duration SECS] [--confidence T] [--disengage-threshold T] \
              [--sticky-blocks N] [--amplitude-threshold T] \
-             [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate] \
+             [--output-buffer-size FRAMES] [--no-calibrate] \
              [--internal-mixer | (--deck-a-out-ch N --deck-b-out-ch N [--output-channels N])] \
              [--device-profile NAME]"
         ));
@@ -343,11 +306,6 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     }
     if let Some(unknown) = leftover.iter().find(|s| s.starts_with("--")) {
         return Err(anyhow!("unknown flag: {unknown}"));
-    }
-    if recalibrate && no_calibrate {
-        return Err(anyhow!(
-            "--recalibrate and --no-calibrate are mutually exclusive"
-        ));
     }
     if internal_mixer && (deck_a_out_ch.is_some() || deck_b_out_ch.is_some()) {
         return Err(anyhow!(
@@ -396,8 +354,6 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
         disengage,
         sticky_blocks,
         amplitude_threshold,
-        recalibrate,
-        no_probe,
         no_calibrate,
         internal_mixer,
         device_profile,
@@ -922,37 +878,6 @@ fn resolve_output_routing(
     })
 }
 
-/// Resolve the four lift-policy thresholds from (in priority order):
-///
-/// 1. Explicit CLI overrides (`--confidence`, `--amplitude-threshold`,
-///    `--disengage-threshold`, `--sticky-blocks`). Applied last so
-///    a partial override always wins over the auto-resolved value.
-/// 2. Saved calibration JSON, validated against the current rig
-///    via a brief carrier probe. Mismatch (cartridge swap, preamp
-///    change, …) triggers automatic recalibration.
-/// 3. A fresh full calibration if no JSON exists yet, or
-///    `--recalibrate` was passed.
-/// 4. The M5.3 defaults if `--no-calibrate` was passed (or the user
-///    cancels the calibration flow).
-///
-/// This is the entry point for the user's "auto-detect different
-/// rigs" requirement: even if the same SL3 is used across cartridge
-/// swaps, the fingerprint catches the change at startup and the
-/// thresholds are re-derived in place.
-///
-/// **Format-aware (M6 fix).** The calibration JSON path keys off
-/// `(device_name, opts.format)` so a user with both Serato and
-/// Traktor records on the same SL3 keeps independent calibrations
-/// per format. An earlier draft of M6 hardcoded `Format::SeratoCv02`
-/// here — which silently loaded the Serato JSON when the user passed
-/// `--format traktor-mk1`, then ran the carrier probe at the wrong
-/// nominal frequency (1 kHz Serato vs the 2 kHz the MK1 record was
-/// actually emitting), so the probe got `rate ≈ 2.0×` and timed out
-/// trying to find unity-rate stability. Fallback then used Serato
-/// thresholds against MK1 audio, which worked passably (similar
-/// signal levels) but was not the right calibration. Pinned by
-/// the regression test
-/// `resolve_thresholds_uses_opts_format_for_calibration_path` below.
 /// Human-friendly label for an engine deck index. `0 → "A"`,
 /// `1 → "B"`. Used in print statements so the user thinks in
 /// SL1200-style deck letters while the internals stay numeric.
@@ -1004,151 +929,75 @@ fn drain_input_pair(input: &mut dub_audio::AudioInput, pair_idx: usize) -> usize
     total
 }
 
+/// Resolve the four lift-policy thresholds for a single deck.
+///
+/// **M5.4.6 (always-fresh) flow:**
+///
+/// 1. **Explicit CLI overrides** (`--confidence`,
+///    `--amplitude-threshold`, `--disengage-threshold`,
+///    `--sticky-blocks`) are applied last so a partial override
+///    always wins over the auto-resolved value.
+/// 2. **`--no-calibrate`** — return the M5.3 defaults verbatim
+///    (with overrides on top). Useful for testing the audio path
+///    without hardware, or for first-time users who want to hear
+///    the deck immediately.
+/// 3. **Otherwise (default)** — run a fresh single-phase
+///    calibration (M5.4.3) against the actual rig in front of the
+///    user, save the result to
+///    `~/.dub/calibration/<device>_deck_<idx>_<format>.json` as a
+///    diagnostic artifact (best-effort; save failure is logged
+///    but non-fatal), and return the derived thresholds.
+///
+/// **Why no probe / no JSON load (M5.4.6).** The pre-M5.4.6
+/// design saved + fingerprint-probed-at-startup to skip the slow
+/// recalibration path on repeat sessions. With M5.4.3 making
+/// fresh calibration ≈ 3.5 s, the probe was only paying for
+/// itself in the bedroom-DJ scenario (one fixed rig, repeat
+/// sessions). For touring DJs every venue brings a different
+/// turntable + cartridge, the fingerprint mismatches, and the
+/// probe burns ~1.7 s confirming what we already know. Always-
+/// measure-the-rig-in-front-of-you is simpler, faster on the
+/// production path, and removes a class of "stale calibration
+/// silently used" failure modes.
+///
+/// **Format-aware (M6 fix preserved).** Calibration runs against
+/// `opts.format`, so two-deck mode with mixed formats (Serato on
+/// A, Traktor on B) gets the right carrier per deck. The save
+/// path keys off `(device_name, deck_idx, opts.format)`, so the
+/// per-format diagnostic JSONs accumulate independently.
+///
+/// **Pair / deck duality (M5.6 + M5.4.4).** `pair_idx == deck_idx`
+/// in two-deck mode because `dub timecode-deck` opens a
+/// 4-channel input with `output_pairs[(0, 1), (2, 3)]` mapping
+/// pair 0 → deck A, pair 1 → deck B. `run_full_calibration` reads
+/// from `pair_idx = deck_idx` so each deck calibrates against its
+/// own physical input pair.
 fn resolve_thresholds(
     input: &mut AudioInput,
     deck_idx: u32,
     opts: &Opts,
 ) -> Result<CalibrationThresholds> {
-    let format = opts.format;
-    let dir = default_calibration_dir().context("resolving default calibration dir")?;
-    let path = calibration_path_for(input.device_name(), deck_idx, opts, &dir);
     let label = deck_label(deck_idx);
 
-    // Bypass-everything modes first.
     if opts.no_calibrate {
         println!("calibration {label}: skipped (--no-calibrate); using M5.3 defaults");
         return Ok(apply_overrides(default_thresholds(), opts));
     }
 
-    // Force-fresh path. Same as "no file exists" but ignores any
-    // existing JSON. We still save the new measurement (overwrites
-    // the old file), preserving the always-on "what is this rig"
-    // record on disk.
-    if opts.recalibrate {
-        println!("calibration {label}: --recalibrate forced; running fresh measurement");
-        let cal = run_full_calibration(input, deck_idx, format)?;
-        save_calibration(&cal, &path);
-        return Ok(apply_overrides(cal.thresholds, opts));
-    }
+    println!("calibration {label}: running fresh measurement (M5.4.6 always-fresh)");
+    let cal = run_full_calibration(input, deck_idx, opts.format)?;
 
-    // Try to load. M5.4.4 fallback: deck 0 falls back to the legacy
-    // `(device, format)`-only path so users who calibrated before
-    // the per-deck split don't have to re-run the probe. Deck 1
-    // has no legacy file (pre-M5.4.4 only stored deck A) so it
-    // always runs a fresh calibration on first M5.4.4 use.
-    let legacy_path =
-        (deck_idx == 0).then(|| legacy_calibration_path_for(input.device_name(), opts, &dir));
-    let cal = match Calibration::load_with_legacy_fallback(&path, legacy_path.as_deref()) {
-        Ok(c) => c,
-        Err(_) => {
-            println!(
-                "calibration {label}: no JSON at {} — running first-time calibration",
-                path.display()
-            );
-            let cal = run_full_calibration(input, deck_idx, format)?;
-            save_calibration(&cal, &path);
-            return Ok(apply_overrides(cal.thresholds, opts));
-        }
-    };
+    // Best-effort diagnostic save. The runtime no longer reads
+    // these files (M5.4.6) but we still write them so a power user
+    // can inspect "what did this rig look like" after the fact, and
+    // so future analysis tooling has cross-session data to work
+    // with. A save failure is non-fatal — we already have the
+    // thresholds we need in memory.
+    let dir = default_calibration_dir().context("resolving default calibration dir")?;
+    let path = calibration_path_for(input.device_name(), deck_idx, opts, &dir);
+    save_calibration(&cal, &path);
 
-    // Was the load served by the legacy path? (deck-0 only.) If so,
-    // tell the user we'll keep using their existing calibration but
-    // also write it forward to the new path so the next startup
-    // skips the legacy lookup. Detected by file existence rather
-    // than a load-side flag because both paths return the same
-    // `Calibration` shape.
-    let migrated_from_legacy =
-        !path.exists() && legacy_path.as_deref().is_some_and(std::path::Path::exists);
-    if migrated_from_legacy {
-        println!(
-            "calibration {label}: migrated from pre-M5.4.4 single-deck file ({})",
-            legacy_path.as_deref().unwrap().display()
-        );
-        // Best-effort forward-write so the next run doesn't need
-        // the fallback. Failure here is non-fatal — we already have
-        // valid thresholds in memory.
-        save_calibration(&cal, &path);
-    }
-
-    let age_days = calibration_age_days(&cal.calibrated_at);
-    if age_days > STALE_CALIBRATION_DAYS {
-        eprintln!(
-            "  ⚠ deck {label} calibration is {age_days:.0} days old (>{:.0}); consider \
-             `dub timecode-deck ... --recalibrate` for the current venue.",
-            STALE_CALIBRATION_DAYS
-        );
-    }
-
-    // Probe path. Skipping the probe gives faster startup but no
-    // rig-swap detection — explicit opt-in via --no-probe.
-    if opts.no_probe {
-        println!(
-            "calibration {label}: loaded {} (probe skipped); engage={:.3} amp={:.4}",
-            path.display(),
-            cal.thresholds.engage,
-            cal.thresholds.amplitude
-        );
-        return Ok(apply_overrides(cal.thresholds, opts));
-    }
-
-    println!(
-        "calibration {label}: loaded {} (calibrated {})",
-        path.display(),
-        cal.calibrated_at
-    );
-    // pair_idx == deck_idx in two-deck mode (M5.6 demuxing); the
-    // `dub timecode-deck` command opens a 4-channel input and
-    // `output_pairs` maps pair 0 → deck A, pair 1 → deck B. Using
-    // `pair_idx = deck_idx` here means the probe reads from the
-    // same physical input the engine will decode from at runtime.
-    let pair_idx = usize::try_from(deck_idx).expect("deck index fits in usize");
-    let observed = match probe_carrier(
-        input,
-        pair_idx,
-        format,
-        PROBE_SECS,
-        PROBE_DETECT_TIMEOUT_SECS,
-    ) {
-        Ok(fp) => fp,
-        Err(e) => {
-            eprintln!(
-                "  ⚠ deck {label} probe failed: {e:#}\n  \
-                     using saved thresholds without verification"
-            );
-            return Ok(apply_overrides(cal.thresholds, opts));
-        }
-    };
-    let delta = cal.fingerprint.max_relative_delta(&observed);
-    if cal
-        .fingerprint
-        .matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE)
-    {
-        println!(
-            "  ✓ deck {label} fingerprint matches (max delta {:.1}%); engage={:.3} amp={:.4}",
-            delta * 100.0,
-            cal.thresholds.engage,
-            cal.thresholds.amplitude
-        );
-        return Ok(apply_overrides(cal.thresholds, opts));
-    }
-
-    // Mismatch — auto-recalibrate. The user explicitly requested
-    // this behavior: "the user can always play on a new cartridge,
-    // it must work."
-    println!(
-        "  ✗ deck {label} fingerprint differs by {:.1}% (saved {:.4}/{:.4}/{:.3} vs observed \
-         {:.4}/{:.4}/{:.3}) — recalibrating",
-        delta * 100.0,
-        cal.fingerprint.carrier_amp_p50,
-        cal.fingerprint.carrier_amp_p95,
-        cal.fingerprint.carrier_conf_p50,
-        observed.carrier_amp_p50,
-        observed.carrier_amp_p95,
-        observed.carrier_conf_p50,
-    );
-    let new_cal = run_full_calibration(input, deck_idx, format)?;
-    save_calibration(&new_cal, &path);
-    Ok(apply_overrides(new_cal.thresholds, opts))
+    Ok(apply_overrides(cal.thresholds, opts))
 }
 
 /// M5.3 defaults — the floor that every higher-priority source
@@ -1187,14 +1036,23 @@ fn run_full_calibration(
 ) -> Result<Calibration> {
     println!();
     println!("=== auto-calibration (deck {}) ===", deck_label(deck_idx));
+    // M5.4.3: auto-calibration uses single-phase mode (carrier-only).
+    // The two-phase opt-out is reachable from the `dub calibrate
+    // --two-phase` CLI; auto-calibration prioritizes "drop the needle,
+    // wait ~3 s, you're playing" over the SNR safety net (which
+    // catches stylus / preamp / cabling problems but adds ~25 s the
+    // user is unlikely to notice when something's already working).
     let cal = measure_inline(
         input,
         usize::try_from(deck_idx).expect("deck index fits in usize"),
         deck_idx,
         format,
-        AUTO_CARRIER_SECS,
-        AUTO_LIFT_SECS,
-        AUTO_DETECT_TIMEOUT_SECS,
+        MeasureOptions {
+            carrier_secs: AUTO_CARRIER_SECS,
+            lift_secs: AUTO_LIFT_SECS,
+            detect_timeout_secs: AUTO_DETECT_TIMEOUT_SECS,
+            two_phase: false,
+        },
     )?;
     println!(
         "  derived: engage={:.3} disengage={:.3} amp={:.4} sticky={} (SNR {:.0}×)",
@@ -1253,31 +1111,6 @@ fn calibration_path_for(
     Calibration::path_for(device_name, deck_idx, opts.format, dir)
 }
 
-/// Legacy (pre-M5.4.4) calibration path for the same `(device,
-/// format)` pair — no `deck_N` infix. Returned as a deck-0 fallback
-/// only by `resolve_thresholds`; deck 1 has no legacy file because
-/// pre-M5.4.4 only stored deck-A's calibration.
-fn legacy_calibration_path_for(
-    device_name: &str,
-    opts: &Opts,
-    dir: &std::path::Path,
-) -> std::path::PathBuf {
-    Calibration::path_for_legacy(device_name, opts.format, dir)
-}
-
-/// Difference in days between `calibrated_at` (RFC-3339) and now.
-/// Returns 0.0 if `calibrated_at` is unparseable so the freshness
-/// warning never spuriously fires for older / future-schema files.
-fn calibration_age_days(calibrated_at: &str) -> f64 {
-    let parsed = OffsetDateTime::parse(calibrated_at, &Rfc3339).ok();
-    let Some(t) = parsed else {
-        return 0.0;
-    };
-    let now = OffsetDateTime::now_utc();
-    let dur = now - t;
-    dur.as_seconds_f64() / 86_400.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,8 +1128,6 @@ mod tests {
             disengage: None,
             sticky_blocks: None,
             amplitude_threshold: None,
-            recalibrate: false,
-            no_probe: false,
             no_calibrate: false,
             internal_mixer: false,
             device_profile: None,
@@ -1370,30 +1201,9 @@ mod tests {
         assert_eq!(r.sticky_blocks_to_disengage, 8);
     }
 
-    #[test]
-    fn calibration_age_days_recent_is_near_zero() {
-        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        let age = calibration_age_days(&now);
-        assert!(age.abs() < 0.01, "expected near 0, got {age}");
-    }
-
-    #[test]
-    fn calibration_age_days_unparseable_is_zero() {
-        // Garbage string should be treated as "fresh" — we'd rather
-        // miss a freshness warning than spuriously cry wolf.
-        let age = calibration_age_days("not-a-date");
-        assert!(age.abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn calibration_age_days_30_days_ago_returns_30() {
-        let past = OffsetDateTime::now_utc() - time::Duration::days(30);
-        let s = past.format(&Rfc3339).unwrap();
-        let age = calibration_age_days(&s);
-        // Tolerance for sub-second clock drift across the test's
-        // own runtime.
-        assert!((age - 30.0).abs() < 0.01, "expected ~30, got {age}");
-    }
+    // M5.4.6 dropped `calibration_age_days` (and the surrounding
+    // age-warning logic) along with the load-from-disk path. The
+    // three calibration_age_days_* tests went with it.
 
     /// Regression: an earlier draft of M6 hardcoded
     /// `Format::SeratoCv02` in `resolve_thresholds` instead of
@@ -1511,30 +1321,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn legacy_calibration_path_omits_deck_infix() {
-        // The legacy fallback path (used only for deck-0 migration
-        // from pre-M5.4.4 single-key files) must produce the
-        // historical `<device>_<format>.json` pattern so
-        // `Calibration::load_with_legacy_fallback` finds existing
-        // user files.
-        let dir = std::path::Path::new("/tmp/dub-test");
-        let opts = Opts {
-            format: Format::TraktorMk1,
-            ..opts_default()
-        };
-        let p = legacy_calibration_path_for("SL 3", &opts, dir);
-        assert_eq!(
-            p,
-            std::path::Path::new("/tmp/dub-test/SL_3_traktor-mk1.json"),
-            "legacy path must NOT include deck infix"
-        );
-    }
+    // M5.4.6 dropped legacy_calibration_path_for + the legacy
+    // load-fallback; the runtime never reads disk on startup any
+    // more. The historical `<device>_<format>.json` pattern is no
+    // longer produced by any code path.
 
     #[test]
     fn deck_label_maps_index_to_letter() {
         assert_eq!(deck_label(0), 'A');
         assert_eq!(deck_label(1), 'B');
+    }
+
+    #[test]
+    fn m543_auto_calibration_constants_are_fast() {
+        // Lock the M5.4.3 single-phase wall-time tuning so a future
+        // edit can't silently regress the always-fresh M5.4.6 path
+        // back to the M5.4.2-era ~10 s carrier capture. (The M5.4.3
+        // probe constants went away entirely with M5.4.6 — there's
+        // no probe any more, so no `PROBE_SECS` to pin.)
+        assert!(
+            (AUTO_CARRIER_SECS - 3.0).abs() < 1e-9,
+            "M5.4.3 AUTO_CARRIER_SECS must stay 3.0 (was 10.0)"
+        );
     }
 
     #[test]
@@ -1559,25 +1367,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_opts_recalibrate_flag() {
+    fn parse_opts_no_calibrate_flag() {
+        // M5.4.6 reduced the calibration flag surface to a single
+        // boolean: --no-calibrate. --recalibrate / --no-probe were
+        // removed when the load-from-disk + fingerprint-probe path
+        // was deleted. Pin the survivor so a future regression
+        // ("oh let's add --recalibrate back") forces a deliberate
+        // PRD revisit.
         let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let opts = parse_opts(&s(&["--recalibrate", "--input-channels", "3,4", "t.wav"])).unwrap();
-        assert!(opts.recalibrate);
-        assert!(!opts.no_probe);
-        assert!(!opts.no_calibrate);
+        let opts = parse_opts(&s(&["--no-calibrate", "--input-channels", "3,4", "t.wav"])).unwrap();
+        assert!(opts.no_calibrate);
     }
 
     #[test]
-    fn parse_opts_recalibrate_and_no_calibrate_conflict() {
+    fn parse_opts_rejects_dropped_recalibrate_flag() {
+        // --recalibrate was removed in M5.4.6 (always-fresh model).
+        // The unknown-flag path should reject it cleanly so users
+        // who pasted an old invocation get a useful error rather
+        // than a silently-ignored flag.
         let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let r = parse_opts(&s(&[
-            "--recalibrate",
-            "--no-calibrate",
-            "--input-channels",
-            "3,4",
-            "t.wav",
-        ]));
-        assert!(r.is_err(), "mutually-exclusive flags should error");
+        let r = parse_opts(&s(&["--recalibrate", "--input-channels", "3,4", "t.wav"]));
+        assert!(r.is_err(), "removed --recalibrate should be rejected");
+    }
+
+    #[test]
+    fn parse_opts_rejects_dropped_no_probe_flag() {
+        // Same story as --recalibrate — --no-probe was the load-
+        // fingerprint-but-skip-the-verification opt-in. The probe
+        // is gone, so the flag is gone.
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&["--no-probe", "--input-channels", "3,4", "t.wav"]));
+        assert!(r.is_err(), "removed --no-probe should be rejected");
     }
 
     // --- M5.5.2 output-routing resolution tests ------------------------

@@ -609,13 +609,23 @@ display data through the audio thread would have meant a second
 ringbuf solely for visualization; not worth the surface area for
 a diagnostic.
 
-### Calibration + rig fingerprinting — M5.4.2
+### Calibration + rig fingerprinting — M5.4.2 → M5.4.6
 
-`dub calibrate` and `dub timecode-deck`'s startup auto-calibration
+`dub calibrate` and `dub timecode-deck`'s startup calibration
 share one code path (`calibrate::measure_inline`), so a JSON file
 written by either is indistinguishable. The data model + math live
 in `crates/dub-cli/src/calibration.rs` (pure, fully unit-tested);
 the interactive driver lives in `calibrate.rs`.
+
+**Status as of M5.4.6:** the JSON file is a *diagnostic artifact*
+only. `dub timecode-deck` always runs a fresh calibration on
+startup and writes a new file (overwriting any previous one); the
+runtime *never* loads it back at startup. The pre-M5.4.6 design
+loaded the JSON and probed the carrier briefly to validate a
+"rig fingerprint" before deciding whether the saved thresholds
+were still valid; that machinery is gone. See the M5.4.6 entry
+in `docs/PRD.md` and the M5.4.6 paragraphs further down for the
+rationale.
 
 **Why per-rig, not per-soundcard.** The user's literal request:
 "the user can always play on a new cartridge — we cannot assume
@@ -627,25 +637,20 @@ three together set the carrier amplitude that reaches Dub's input.
 A soundcard-only calibration would silently misfire on cartridge
 swap.
 
-**Two-phase measurement, zero prompts.**
+**Single-phase measurement, zero prompts (M5.4.3 default).**
 
 ```text
-  AudioInput  ──┬──► wait_for_stable_carrier
-                │     (5 consecutive blocks: conf ≥ 0.85, |rate-1|<0.10)
-                │
-                ├──► capture_phase("carrier", 10 s) ──► amps[], confs[]
-                │                                          │
-                ├──► wait_for_lift                         │
-                │     (10 consecutive blocks: amp < 0.005) │
-                │                                          │
-                └──► capture_phase("lift", 5 s) ──► amps[], confs[]
-                                                           │
-                              ┌────────────────────────────┘
-                              ▼
-              measurement_stats_from_samples → P5/P50/P95 each
+  AudioInput  ──► wait_for_stable_carrier
+                   (2 consecutive blocks: conf ≥ 0.90, |rate-1|<0.10)
                               │
-                ┌─────────────┴────────────┐
-                ▼                          ▼
+                              ▼
+              capture_phase("carrier", 3 s) ──► amps[], confs[]
+                              │
+                              ▼
+              measurement_stats_from_samples → P5/P50/P95
+                              │
+                ┌─────────────┴──────────┐
+                ▼                        ▼
    derive_thresholds ───►        RigFingerprint
    (engage = c.conf_p5 - 0.03,   (carrier_amp_p50,
     amplitude = c.amp_p5 / 2,     carrier_amp_p95,
@@ -654,30 +659,56 @@ swap.
         │                                │
         └──────────────┬─────────────────┘
                        ▼
-                  Calibration {schema_version,
-                               device_name, format,
-                               calibrated_at,
-                               input_sample_rate,
-                               block_frames,
-                               fingerprint, thresholds,
-                               measurements, snr_margin}
+                  Calibration { ..,
+                                measurements: { carrier, lift: zero() },
+                                .. }
                        │
                        ▼
             ~/.dub/calibration/<device_key>.json
 ```
 
-The detector uses fixed sensible defaults (carrier ≥ 0.85 conf,
-lift < 0.005 amp) — these are reliable across any rig that passes
-the SNR sanity check, so the user doesn't have to pre-tune
-calibration thresholds to calibrate.
+The single-phase mode is the M5.4.3 default. The lift slot in
+`CalibrationMeasurements` is filled with `MeasurementStats::zero()`
+(`n_blocks == 0`) for schema compatibility — the loader recognizes
+this sentinel and skips the SNR safety check (the lift's only role).
+Total wall time on a known-good rig: ≈ 3.5 s (was ~25 s pre-M5.4.3).
 
-**Threshold derivation.** Pure functions over the percentiles —
-`derive_thresholds(carrier, lift) -> Option<CalibrationThresholds>`.
-Returns `None` when carrier-to-lift SNR is below 10× (refusing to
-ship thresholds for a rig with a stylus / preamp / cabling
-problem). Pinned by tests against the user's actual hand-found
-M5.4.1 SL3 values (engage 0.95, amp 0.12) — the formula reproduces
-those within 1 % from the same input percentiles.
+**Two-phase measurement, opt-in via `--two-phase` (legacy / diagnostic).**
+
+```text
+  AudioInput  ──┬──► wait_for_stable_carrier (2 blocks)
+                ├──► capture_phase("carrier", 3 s) ──► amps[], confs[]
+                ├──► wait_for_lift (10 blocks below amp 0.005)
+                └──► capture_phase("lift", 5 s) ──► amps[], confs[]
+                                       │
+                                       ▼
+                  measurement_stats_from_samples → P5/P50/P95 each
+                                       │
+                          derive_thresholds (with SNR check)
+```
+
+Total wall time: ≈ 25 s. The SNR safety net rejects rigs below
+SNR 10× (almost always a stylus / preamp / cabling problem). Use
+when single-phase silently shipped thresholds that don't engage
+correctly at runtime, or when troubleshooting a misbehaving rig.
+
+The detector uses fixed sensible defaults (carrier ≥ 0.90 conf,
+|rate-1| < 0.10) — these are reliable across any rig that passes
+the SNR sanity check (in two-phase mode), and tightening to 0.90
+makes the M5.4.3 `STABLE_BLOCKS = 2` detection unambiguous.
+
+**Threshold derivation (M5.4.3 update).** Pure functions over the
+percentiles — `derive_thresholds(carrier, lift) ->
+Option<CalibrationThresholds>`. Returns `None` only when
+*both* (a) lift was measured (`n_blocks > 0`) and (b)
+carrier-to-lift SNR is below 10× — refusing to ship thresholds
+for a rig with a stylus / preamp / cabling problem. Single-phase
+mode (`lift.n_blocks == 0`) skips the SNR check by design;
+runtime ghost-noise warnings (M5.4.5+M10) take over the safety
+role from there. Pinned by tests against the user's actual
+hand-found M5.4.1 SL3 values (engage 0.95, amp 0.12) — the
+formula reproduces those within 1 % from the same input
+percentiles in either mode.
 
 **Fingerprint.** Three carrier-amplitude / confidence percentiles.
 Lift noise is *deliberately excluded*: lift noise rises by 10–100×
@@ -686,36 +717,58 @@ in clubs vs. lab, which would false-flag every venue change as
 dominant over ambient noise on the wire — so it tracks the rig
 identity, not the room.
 
-**Startup flow on `dub timecode-deck`.**
+**Startup flow on `dub timecode-deck` (always-fresh, M5.4.6).**
 
 1. Open input device.
-2. If `--no-calibrate`: use M5.3 defaults.
-3. Else if `--recalibrate`: run a fresh full measurement, save,
-   use those thresholds.
-4. Else: try to load `~/.dub/calibration/<device_key>.json`.
-    - **Missing**: run a fresh full measurement, save, use.
-    - **Stale (>30 d)**: warn but proceed.
-    - **Default**: probe carrier briefly (3 s) to compute observed
-      fingerprint, compare to saved at 30 % tolerance.
-        - **Match**: use saved.
-        - **Mismatch**: print delta, run a fresh measurement, save,
-          use.
-    - **`--no-probe`**: skip the probe, use saved as-is.
+2. If `--no-calibrate`: use M5.3 defaults + per-knob overrides.
+   Done.
+3. Else: run a fresh single-phase calibration against the rig
+   currently in front of the user (≈ 3.5 s wall time per deck).
+4. Save the result to
+   `~/.dub/calibration/<device>_deck_<idx>_<format>.json` as a
+   diagnostic artifact. Save failure is non-fatal (warned, then
+   ignored — the thresholds we need are already in memory).
 5. Apply per-knob CLI overrides on top so partial overrides
    ("auto-everything except force amplitude=0.05") still work.
 
+That's the whole flow. The pre-M5.4.6 design layered on top of
+this a *load-the-saved-JSON-and-fingerprint-probe-on-startup* path
+to skip recalibration on repeat sessions. M5.4.3 cut fresh
+calibration to ~3.5 s, at which point the probe (~1.7 s) was only
+saving wall-time when the rig was unchanged. **Touring DJs see a
+different rig at every venue**, the probe always mismatches, and
+the auto-recalibration runs anyway on top of the probe. So on the
+production path the save+probe model was *worse* than always-fresh
+(probe + recal = ~5.2 s vs. recal alone = ~3.5 s). Always-fresh
+is also a simpler mental model ("calibrate auto-runs on every
+start, period") and immune to "stale calibration silently used"
+failure modes.
+
 **Save semantics.** Atomic via temp-file + rename so a crash
-mid-write doesn't corrupt the previous calibration. Save failures
-(disk full, sandbox, …) are warnings, not fatal — a live
-performance setup must always remain usable, even with persistence
-broken.
+mid-write doesn't corrupt a previous file. Save failures (disk
+full, sandbox, …) are warnings, not fatal — runtime never reads
+these files anyway (M5.4.6), and a live performance setup must
+always remain usable even with persistence broken.
 
 **Schema version.** Bumped on incompatible format changes.
-Readers reject files with `schema_version > SCHEMA_VERSION`. The
-JSON deliberately stores the full P5/P50/P95 measurements, not just
-the derived thresholds; future formula changes (M5.4.3 continuous
-adaptation, M6 Traktor support) can re-derive thresholds from
-existing files without forcing a remeasurement.
+Readers (tests + future inspection tooling — `Calibration::load`
+remains `pub` for that purpose, marked `#[allow(dead_code)]` since
+the binary path doesn't reach it any more) reject files with
+`schema_version > SCHEMA_VERSION`. The JSON deliberately stores
+the full P5/P50/P95 measurements, not just the derived thresholds;
+future formula changes (M6 Traktor calibration tweaks, future
+analysis tooling) can re-derive without remeasurement.
+
+**`RigFingerprint` field — diagnostic only since M5.4.6.** The
+JSON still carries `fingerprint: { carrier_amp_p50, carrier_amp_p95,
+carrier_conf_p50 }` because (a) the schema is shared with M5.4.2 …
+M5.4.5 files (forward+backward compat without a schema bump), and
+(b) future analysis tooling that wants to compare carrier
+signatures across sessions / venues / cartridges can deserialize
+directly. The matching code (`RigFingerprint::matches /
+max_relative_delta / within_relative / relative_delta`,
+`DEFAULT_FINGERPRINT_TOLERANCE`) is gone — nothing compares
+fingerprints at runtime any more.
 
 ### Two decks + debug internal mixer — M4
 
@@ -972,52 +1025,61 @@ source); overlapping deck-A / deck-B pairs (would silently
 mis-route to the audio thread); deck-B channels without deck-A
 (ambiguous logical layout).
 
-**Calibration semantics — per-deck since M5.4.4.** Two-deck mode
-runs `resolve_thresholds` once per deck — a full carrier+lift
-calibration if no JSON exists yet, otherwise the M5.4.2
-fingerprint-probe path against the saved file. Deck A's full
-calibration runs first, then deck B's, with per-deck status
-banners (`calibration A:`, `calibration B:`) so the user knows
-which side they're spinning/lifting at any moment. Each deck's
-thresholds land independently in `attach_timecode_input`'s
-`TimecodeInputConfig`, so a mismatched-cartridge rig (Concorde
-on A, Nightclub on B — common in scratch DJing where you want a
-more aggressive cartridge for routine play and a smoother one
-for cueing) gets correct lift behaviour on both sides.
+**Calibration semantics — per-deck since M5.4.4, always-fresh
+since M5.4.6.** Two-deck mode runs `resolve_thresholds` once per
+deck. The flow is the M5.4.6 always-fresh path (no JSON load, no
+fingerprint probe): a full single-phase carrier-only calibration
+(M5.4.3, ≈ 3.5 s per deck) for each deck, deck A first then deck
+B, with per-deck status banners (`calibration A:`, `calibration
+B:`) so the user knows which side they're spinning at any moment.
+Each deck's thresholds land independently in
+`attach_timecode_input`'s `TimecodeInputConfig`, so a mismatched-
+cartridge rig (Concorde on A, Nightclub on B — common in scratch
+DJing where you want a more aggressive cartridge for routine play
+and a smoother one for cueing) gets correct lift behaviour on
+both sides. The legacy two-phase calibration flow remains
+reachable via `dub calibrate --two-phase` for diagnostics. The
+JSON file each deck writes is a *diagnostic artifact* only — the
+runtime never reads it back at the next startup. **Limitation
+(M5.4.5):** today both decks calibrate sequentially before audio
+starts; the takeover use case (incoming DJ has no access to deck
+B's record) requires per-deck independent readiness with audio
+starting on first-deck attach. M5.4.5 ships that.
 
 Calibration JSON keys by `(device, deck_index, format)`: the
 on-disk pattern is `~/.dub/calibration/<device>_deck_<idx>_<format>.json`.
-Pre-M5.4.4 single-deck files (`<device>_<format>.json`) still
-load as deck-0 fallbacks on first M5.4.4 use; the loader writes
-the calibration forward to the new path on next save so the
-fallback is a one-time migration path, not a permanent dual
-storage layout. Deck 1 has no legacy fallback (pre-M5.4.4 only
-stored deck A) so it always runs a fresh calibration on first
-M5.4.4 use, which is the correct behavior — deck B's hardware
-is *new* to the calibration system from a pre-M5.4.4 perspective.
+Pre-M5.4.4 single-deck files (`<device>_<format>.json`) used to
+load as deck-0 fallbacks during the M5.4.4 → M5.4.5 migration
+window; M5.4.6 deleted the load-from-disk path entirely so those
+files are now ignored (existing JSONs on disk remain harmless —
+just orphaned bytes).
 
 The `pair_idx` (which AudioInput pair to read on, M5.6 demuxing)
 and `deck_index` (on-disk metadata, which engine deck this
 calibration belongs to) are intentionally separate parameters in
-`measure_inline` and `probe_carrier`. They coincide in
-`dub timecode-deck`'s two-deck path (deck N reads from pair N)
-but diverge in `dub calibrate`: that command opens a dedicated
-2-channel input regardless of which deck the user wants the
-result to apply to (`dub calibrate --input-channels 5,6 --deck 1`
-opens a 2-channel SL3 input over physical channels 5/6 — that's
-still pair 0 of the AudioInput — and stamps the result as deck 1).
-Conflating them in the first M5.4.4 draft caused a self-found bug
-("user picked deck 1 → tried to read pair 1 → only pair 0 exists
-→ silent silence read"); the fix is the two-parameter signature
-preserved in the public API.
+`measure_inline`. They coincide in `dub timecode-deck`'s two-deck
+path (deck N reads from pair N) but diverge in `dub calibrate`:
+that command opens a dedicated 2-channel input regardless of
+which deck the user wants the result to apply to (`dub calibrate
+--input-channels 5,6 --deck 1` opens a 2-channel SL3 input over
+physical channels 5/6 — that's still pair 0 of the AudioInput —
+and stamps the result as deck 1). Conflating them in the first
+M5.4.4 draft caused a self-found bug ("user picked deck 1 →
+tried to read pair 1 → only pair 0 exists → silent silence
+read"); the fix is the two-parameter signature preserved in the
+public API.
 
 The earlier "library of named cartridge profiles" framing was
-dropped: with M5.4.3-fast calibration on the way, "always
+dropped during M5.4.4: with M5.4.3-fast calibration, "always
 recalibrate on startup" is simpler than "manage a profile
 library", has no UX surface, and matches what real DJs expect
 (auto-calibrate on app start, manual button on cartridge swap —
 the latter belongs in M10's UI; on the CLI today it's
-`dub calibrate --deck 0` or `--deck 1`).
+`dub calibrate --deck 0` or `--deck 1`). M5.4.6 took this one
+step further by gutting the entire load-from-disk + fingerprint-
+probe machinery — every startup runs a fresh calibration against
+the rig in front of the user, no caching, no per-rig migration
+plumbing.
 
 **Output side untouched.** M5.5.2's per-deck output routing
 already supports two decks — M5.6 just provides two real input

@@ -1,33 +1,37 @@
-//! Calibration data + math + IO (M5.4.2).
+//! Calibration data + math + IO (M5.4.2 → M5.4.6).
 //!
-//! Persisted as JSON at `~/.dub/calibration/<device_key>.json`. One
-//! file per (device_name, format) tuple. The file's `fingerprint`
-//! field captures the *rig* signature (carrier amplitude /
-//! confidence percentiles) — soundcard alone is insufficient because
-//! cartridge / preamp / cabling all change the carrier's
-//! characteristics. On startup `dub timecode-deck` probes the
-//! current carrier briefly and compares against this fingerprint;
-//! mismatch triggers automatic recalibration.
+//! Persisted as JSON at
+//! `~/.dub/calibration/<device>_deck_<idx>_<format>.json` —
+//! **as a diagnostic artifact** since M5.4.6. `dub timecode-deck`
+//! always runs a fresh calibration on startup and overwrites this
+//! file; nothing in the runtime path reads it back. The file
+//! exists for inspection ("what did this rig look like the last
+//! time I calibrated?"), `dub calibrate` ad-hoc runs that the user
+//! launches manually, and future tooling that may want to compare
+//! across sessions.
 //!
-//! ## Why all the percentile data
+//! ## Why we don't load this file at startup any more (M5.4.6)
 //!
-//! We deliberately store P5 / P50 / P95 of both amplitude and
-//! confidence for both phases (carrier + lift). The current
-//! [`derive_thresholds`] only consumes a handful of these, but the
-//! shape of the distribution is what makes the JSON forward-
-//! compatible: a future formula change (e.g. M5.4.3 continuous
-//! adaptation, M6 Traktor support) can re-derive thresholds from
-//! existing files without forcing a remeasurement.
+//! M5.4.2 saved-and-fingerprint-probed-on-startup with the goal
+//! of skipping the slow recalibration path on repeat sessions.
+//! With M5.4.3 making fresh calibration ≈ 3.5 s, the probe was
+//! paying for itself only in the bedroom-DJ case (one fixed rig,
+//! repeat sessions). For touring DJs — the actual production
+//! audience — every venue brings a different turntable +
+//! cartridge, the fingerprint mismatches, and the probe burns
+//! ~1.7 s confirming what we already know: this is a different
+//! rig. The honest, simpler model: always measure the rig in
+//! front of you. The JSON is then a record of the result, not a
+//! cache to short-circuit.
 //!
-//! ## What the fingerprint deliberately excludes
+//! ## Why the schema still carries fingerprint + lift
 //!
-//! Lift noise is *not* in the fingerprint. Lift noise is
-//! environment-dominated — a quiet bedroom and a thumping club
-//! through the same rig produce wildly different lift_p95 values.
-//! Including lift in the fingerprint would false-flag every venue
-//! change as "rig changed". Carrier amplitude is the right
-//! invariant: it's the cartridge's signal level, dominant over
-//! ambient noise on the wire.
+//! Backward compatibility with existing JSONs from M5.4.2 …
+//! M5.4.5, and to leave room for future analysis tooling that may
+//! want the percentile shapes. `RigFingerprint` is now pure
+//! data — three carrier percentiles recorded at calibration time
+//! — with no comparison code attached. `lift` may be all-zeros
+//! when single-phase calibration ran (M5.4.3 default).
 
 use std::path::{Path, PathBuf};
 
@@ -39,12 +43,6 @@ use serde::{Deserialize, Serialize};
 /// format changes incompatibly so readers can refuse old/new files
 /// rather than silently misinterpreting them.
 pub const SCHEMA_VERSION: u32 = 1;
-
-/// Default fingerprint match tolerance — `|saved - observed| / saved`.
-/// 30 % catches cartridge swaps (always ≥ 50 % output change) without
-/// false-flagging stylus age drift (typically 5-20 % over years) or
-/// preamp gain drift between sessions (typically < 10 %).
-pub const DEFAULT_FINGERPRINT_TOLERANCE: f32 = 0.30;
 
 /// Below this carrier-to-lift SNR we surface a warning at calibrate
 /// time: "OK for lab, may struggle in clubs". Clubs typically raise
@@ -58,13 +56,17 @@ pub const SNR_WARN_THRESHOLD: f32 = 50.0;
 /// an error than to ship thresholds that won't work.
 pub const SNR_FAIL_THRESHOLD: f32 = 10.0;
 
-/// Stored carrier statistics that uniquely identify the cartridge +
-/// preamp + cabling chain. Same soundcard with a different cartridge
-/// produces a totally different signature; same setup at home and at
-/// the club produces (almost exactly) the same signature, so venue
-/// changes do *not* trigger spurious recalibration.
+/// Carrier statistics recorded at calibration time. **Diagnostic
+/// only since M5.4.6** — written to the JSON to capture "what did
+/// this rig look like the last time we calibrated", but no longer
+/// compared against an observed probe at startup. (The probe and
+/// match logic was removed in M5.4.6; see module docs.)
 ///
-/// Lift values are deliberately absent — see module docs.
+/// Kept as a typed struct (rather than collapsed into the parent
+/// schema) because (a) older JSONs from M5.4.2 … M5.4.5 already
+/// have this shape, and (b) future analysis tooling that wants to
+/// compare carrier signatures across sessions / venues / cartridges
+/// can deserialize directly into this type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct RigFingerprint {
     /// Median carrier amplitude (RMS). Robust to brief dropouts.
@@ -75,55 +77,6 @@ pub struct RigFingerprint {
     /// Median carrier decoder confidence. Distinguishes a clean
     /// cartridge (≈ 0.99) from a worn / dirty one (≈ 0.85).
     pub carrier_conf_p50: f32,
-}
-
-impl RigFingerprint {
-    /// True iff `observed` is within `tolerance` (relative) of
-    /// `self` on each fingerprint dimension. Used at
-    /// `dub timecode-deck` startup to validate that the saved
-    /// thresholds still match the rig in front of the user.
-    #[must_use]
-    pub fn matches(&self, observed: &Self, tolerance: f32) -> bool {
-        within_relative(self.carrier_amp_p50, observed.carrier_amp_p50, tolerance)
-            && within_relative(self.carrier_amp_p95, observed.carrier_amp_p95, tolerance)
-            && within_relative(self.carrier_conf_p50, observed.carrier_conf_p50, tolerance)
-    }
-
-    /// Largest *relative* delta across the three fingerprint
-    /// dimensions. Returned by [`Self::matches`]'s diagnostic
-    /// twin so callers can show the user *how* far off they are
-    /// when a mismatch fires.
-    #[must_use]
-    pub fn max_relative_delta(&self, observed: &Self) -> f32 {
-        let d_amp_p50 = relative_delta(self.carrier_amp_p50, observed.carrier_amp_p50);
-        let d_amp_p95 = relative_delta(self.carrier_amp_p95, observed.carrier_amp_p95);
-        let d_conf_p50 = relative_delta(self.carrier_conf_p50, observed.carrier_conf_p50);
-        d_amp_p50.max(d_amp_p95).max(d_conf_p50)
-    }
-}
-
-/// Relative delta `|saved - observed| / |saved|`. `saved == 0`
-/// returns `f32::INFINITY` (so it's flagged as mismatched) unless
-/// `observed == 0` too (returns 0).
-fn relative_delta(saved: f32, observed: f32) -> f32 {
-    if !saved.is_finite() || !observed.is_finite() {
-        return f32::INFINITY;
-    }
-    let abs_saved = saved.abs();
-    if abs_saved < f32::EPSILON {
-        return if observed.abs() < f32::EPSILON {
-            0.0
-        } else {
-            f32::INFINITY
-        };
-    }
-    ((saved - observed).abs()) / abs_saved
-}
-
-/// Helper for [`RigFingerprint::matches`] — true iff the relative
-/// delta is at most `tolerance`.
-fn within_relative(saved: f32, observed: f32, tolerance: f32) -> bool {
-    relative_delta(saved, observed) <= tolerance
 }
 
 /// Statistics from one measurement phase. Captures the shape of the
@@ -139,8 +92,33 @@ pub struct MeasurementStats {
     pub confidence_p95: f32,
     /// Number of decoder blocks included in the percentiles. Small
     /// counts (< 100) should produce a warning at calibrate time —
-    /// the percentiles are too noisy to trust.
+    /// the percentiles are too noisy to trust. **`n_blocks == 0`
+    /// has a load-bearing meaning since M5.4.3**: it signals
+    /// "phase not measured" (e.g. single-phase calibration where
+    /// `lift` is persisted as zeros for schema compatibility).
+    /// [`derive_thresholds`] uses this signal to skip the SNR check.
     pub n_blocks: u32,
+}
+
+impl MeasurementStats {
+    /// All-zeros placeholder used by single-phase calibration
+    /// (M5.4.3) to fill the unmeasured `lift` slot in
+    /// [`CalibrationMeasurements`]. The `n_blocks == 0` field
+    /// signals "not measured" to [`derive_thresholds`] so the SNR
+    /// safety net is correctly skipped (rather than spuriously
+    /// computing INFINITY against zero lift amplitude).
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            amplitude_p5: 0.0,
+            amplitude_p50: 0.0,
+            amplitude_p95: 0.0,
+            confidence_p5: 0.0,
+            confidence_p50: 0.0,
+            confidence_p95: 0.0,
+            n_blocks: 0,
+        }
+    }
 }
 
 /// Both phases captured by `dub calibrate`.
@@ -278,23 +256,42 @@ pub fn measurement_stats_from_samples(
 /// is the value the user manually arrived at (~50 % of carrier
 /// minimum) during M5.4.1 SL3 testing — leaves margin against
 /// scratch-transient amplitude dips, well above lift noise on any
-/// rig that passes the [`SNR_FAIL_THRESHOLD`] check.
+/// rig with usable carrier output.
 ///
 /// **sticky**: 4 — the M5.3 default. Not measured.
 ///
+/// ## SNR check (M5.4.3 — soft, conditional)
+///
+/// When `lift.n_blocks > 0` (the legacy `--two-phase` calibrator
+/// captured a lift phase), the carrier-to-lift SNR is checked
+/// against [`SNR_FAIL_THRESHOLD`] and very low SNR (almost
+/// always a cartridge / preamp / cabling problem) returns `None`
+/// so the caller can surface a hard error instead of shipping
+/// useless thresholds. When `lift.n_blocks == 0` (the M5.4.3
+/// single-phase default — lift not measured), the check is
+/// skipped: `amplitude = carrier_p5 * 0.5` is independent of
+/// lift noise level by design (M5.4.1 SL3 hand-tuning showed
+/// the carrier shape carries the threshold information; lift
+/// was only ever the SNR safety net), so single-phase derived
+/// thresholds are correct without it. The trade-off is a lost
+/// safety net — M5.4.5 + M10 will surface ghost-noise warnings
+/// at runtime instead.
+///
 /// # Errors
-/// Returns `None` when carrier/lift SNR is below
-/// [`SNR_FAIL_THRESHOLD`] (typically a stylus / preamp / cabling
-/// problem); the caller surfaces this to the user instead of
-/// shipping thresholds that won't work.
+/// Returns `None` when (a) lift was measured (`n_blocks > 0`)
+/// AND (b) carrier/lift SNR is below [`SNR_FAIL_THRESHOLD`].
+/// Single-phase calibrations (`lift.n_blocks == 0`) always
+/// return `Some`.
 #[must_use]
 pub fn derive_thresholds(
     carrier: &MeasurementStats,
     lift: &MeasurementStats,
 ) -> Option<CalibrationThresholds> {
-    let snr = snr_margin(carrier, lift);
-    if snr < SNR_FAIL_THRESHOLD {
-        return None;
+    if lift.n_blocks > 0 {
+        let snr = snr_margin(carrier, lift);
+        if snr < SNR_FAIL_THRESHOLD {
+            return None;
+        }
     }
     let engage = (carrier.confidence_p5 - 0.03).clamp(0.7, 1.0);
     let amplitude = carrier.amplitude_p5 * 0.5;
@@ -363,33 +360,17 @@ pub fn sanitize_device_name(name: &str) -> String {
 /// inspecting `~/.dub/calibration/`; ambiguity (`SL_3_0_*` vs
 /// `SL_3_a_*`) costs more in support than two extra characters.
 ///
-/// **Backward compat (M5.4.4):** The legacy key `{device}_{format}`
-/// (no `deck_N` infix) still exists on disk for users who calibrated
-/// before M5.4.4. [`Calibration::path_for_legacy`] returns the
-/// legacy path; the timecode-deck loader checks the legacy path as
-/// a deck-0 fallback when the new path is missing, so existing
-/// calibrations keep working without a migration step.
+/// **M5.4.6 note:** the timecode-deck startup no longer reads
+/// these files at all — they're a write-only diagnostic artifact.
+/// `dub calibrate --deck N` still writes per-deck files, and
+/// future tooling could read them across sessions, but the
+/// runtime calibration flow ignores them entirely.
 #[must_use]
 pub fn device_key(device_name: &str, deck_index: u32, format: Format) -> String {
     format!(
         "{}_deck_{}_{}",
         sanitize_device_name(device_name),
         deck_index,
-        format_string(format)
-    )
-}
-
-/// Legacy (pre-M5.4.4) on-disk key for a `(device, format)` pair —
-/// no deck index. Only used as a deck-0 fallback by
-/// [`Calibration::path_for_legacy`]; new calibrations always use
-/// [`device_key`]. Kept as a public symbol so the `dub timecode-
-/// deck` loader can construct the legacy path explicitly when
-/// looking for migration candidates.
-#[must_use]
-pub fn legacy_device_key(device_name: &str, format: Format) -> String {
-    format!(
-        "{}_{}",
-        sanitize_device_name(device_name),
         format_string(format)
     )
 }
@@ -423,59 +404,18 @@ impl Calibration {
         ))
     }
 
-    /// Pre-M5.4.4 path for the same `(device, format)` pair (no
-    /// `deck_N` infix). Used as a deck-0 fallback by the timecode-
-    /// deck loader so users who calibrated before M5.4.4 don't have
-    /// to recalibrate. New calibrations always go through
-    /// [`Self::path_for`].
-    #[must_use]
-    pub fn path_for_legacy(device_name: &str, format: Format, base_dir: &Path) -> PathBuf {
-        base_dir.join(format!("{}.json", legacy_device_key(device_name, format)))
-    }
-
-    /// Load a calibration JSON, with a one-time fallback to the
-    /// legacy (pre-M5.4.4) `(device, format)`-only path when the
-    /// new per-deck path doesn't exist *and* `deck_index == 0`.
-    /// This preserves the migration story: a user upgrading from
-    /// M5.4.2 / M5.4.3 to M5.4.4 keeps their existing deck-0
-    /// calibration without re-running the probe.
-    ///
-    /// Deck 1 has no legacy fallback by design — pre-M5.4.4 only
-    /// stored deck-A's calibration, so deck B always needs a fresh
-    /// measurement on first run after the upgrade.
-    ///
-    /// Returns the same error shape as [`Self::load`] when both
-    /// paths are missing or unparseable.
-    ///
-    /// # Errors
-    /// Both new and legacy paths missing/unreadable, JSON parse
-    /// error, or schema version mismatch.
-    pub fn load_with_legacy_fallback(new_path: &Path, legacy_path: Option<&Path>) -> Result<Self> {
-        match Self::load(new_path) {
-            Ok(c) => Ok(c),
-            Err(primary_err) => {
-                if let Some(legacy) = legacy_path {
-                    if legacy.exists() {
-                        return Self::load(legacy).with_context(|| {
-                            format!(
-                                "loading legacy calibration at {} after primary {} \
-                                 was missing",
-                                legacy.display(),
-                                new_path.display()
-                            )
-                        });
-                    }
-                }
-                Err(primary_err)
-            }
-        }
-    }
-
     /// Read + parse a calibration JSON file.
     ///
     /// # Errors
     /// File not found, IO failure, JSON parse error, or schema
     /// version mismatch (bumped past `SCHEMA_VERSION`).
+    ///
+    /// **M5.4.6 status:** the runtime path no longer calls this —
+    /// `dub timecode-deck` always recalibrates from scratch. `load`
+    /// is retained for tests and for future inspection tooling
+    /// (`dub inspect-calibration` etc.). Marked `#[allow(dead_code)]`
+    /// because the binary build alone doesn't reach it.
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading calibration at {}", path.display()))?;
@@ -665,6 +605,56 @@ mod tests {
     }
 
     #[test]
+    fn derive_thresholds_skips_snr_when_lift_not_measured() {
+        // M5.4.3 single-phase mode: carrier captured, lift skipped.
+        // Lift placeholder is `MeasurementStats::zero()` (n_blocks=0),
+        // and derive_thresholds must NOT treat that as "low SNR" and
+        // reject. (Without the n_blocks guard the snr_margin would be
+        // f32::INFINITY which trivially passes the SNR_FAIL_THRESHOLD
+        // check anyway, but tightening the guard catches future
+        // formula changes that would tighten the SNR criterion.)
+        let (carrier, _) = sl3_fixture();
+        let lift = MeasurementStats::zero();
+        let t = derive_thresholds(&carrier, &lift);
+        assert!(
+            t.is_some(),
+            "single-phase calibration must derive thresholds without lift"
+        );
+        // Derived values must match the two-phase result for the same
+        // carrier — single-phase doesn't change the formula, only
+        // skips the safety net.
+        let (carrier2, lift2) = sl3_fixture();
+        let two_phase = derive_thresholds(&carrier2, &lift2).unwrap();
+        let single_phase = t.unwrap();
+        assert!((single_phase.engage - two_phase.engage).abs() < 1e-6);
+        assert!((single_phase.amplitude - two_phase.amplitude).abs() < 1e-6);
+    }
+
+    #[test]
+    fn derive_thresholds_still_rejects_low_snr_in_two_phase_mode() {
+        // Regression: single-phase support must NOT weaken the
+        // two-phase SNR check. With lift measured (n_blocks > 0)
+        // and SNR < 10×, derive_thresholds still returns None.
+        let mut carrier = sl3_fixture().0;
+        carrier.amplitude_p5 = 0.05;
+        let mut lift = sl3_fixture().1;
+        lift.amplitude_p95 = 0.01;
+        lift.n_blocks = 940; // simulate two-phase capture
+        let t = derive_thresholds(&carrier, &lift);
+        assert!(t.is_none(), "two-phase mode must still reject low-SNR rigs");
+    }
+
+    #[test]
+    fn measurement_stats_zero_signals_unmeasured() {
+        // The `n_blocks == 0` field is the load-bearing "not
+        // measured" signal; pin its construction.
+        let z = MeasurementStats::zero();
+        assert_eq!(z.n_blocks, 0);
+        assert_eq!(z.amplitude_p50, 0.0);
+        assert_eq!(z.confidence_p50, 0.0);
+    }
+
+    #[test]
     fn snr_margin_user_sl3_is_excellent() {
         let (carrier, lift) = sl3_fixture();
         let snr = snr_margin(&carrier, &lift);
@@ -680,7 +670,12 @@ mod tests {
         assert!(snr_margin(&carrier, &lift).is_infinite());
     }
 
-    // ---- fingerprint match -------------------------------------------
+    // M5.4.6 dropped fingerprint-comparison tests entirely (with
+    // `RigFingerprint::matches` / `max_relative_delta` /
+    // `relative_delta` / `within_relative` themselves). The fingerprint
+    // is still written to disk as a diagnostic but no longer drives
+    // any runtime decision. Helper retained for the JSON round-trip
+    // test below.
 
     fn fp(a50: f32, a95: f32, c50: f32) -> RigFingerprint {
         RigFingerprint {
@@ -688,55 +683,6 @@ mod tests {
             carrier_amp_p95: a95,
             carrier_conf_p50: c50,
         }
-    }
-
-    #[test]
-    fn fingerprint_same_rig_matches() {
-        let saved = fp(0.31, 0.42, 0.99);
-        let observed = fp(0.32, 0.41, 0.99);
-        assert!(saved.matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE));
-    }
-
-    #[test]
-    fn fingerprint_cartridge_swap_does_not_match() {
-        // Concorde → Nightclub (~2× output level): always flagged.
-        let saved = fp(0.31, 0.42, 0.99);
-        let observed = fp(0.78, 1.05, 0.99);
-        assert!(!saved.matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE));
-    }
-
-    #[test]
-    fn fingerprint_borderline_match_at_30_percent() {
-        // Saved 0.31, observed 0.40 → 29 % delta → matches at 30 %.
-        let saved = fp(0.31, 0.42, 0.99);
-        let observed = fp(0.40, 0.55, 0.99);
-        // p50 delta = 0.29 OK, p95 delta = 0.31 NOT OK at tolerance 0.30.
-        assert!(!saved.matches(&observed, 0.30));
-        // At tolerance 0.35 it passes.
-        assert!(saved.matches(&observed, 0.35));
-    }
-
-    #[test]
-    fn fingerprint_zero_saved_is_infinite_delta() {
-        let saved = fp(0.0, 0.42, 0.99);
-        let observed = fp(0.001, 0.41, 0.99);
-        assert!(!saved.matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE));
-        assert!(saved.max_relative_delta(&observed).is_infinite());
-    }
-
-    #[test]
-    fn fingerprint_both_zero_is_zero_delta() {
-        let saved = fp(0.0, 0.0, 0.0);
-        let observed = fp(0.0, 0.0, 0.0);
-        assert!(saved.matches(&observed, 0.0));
-    }
-
-    #[test]
-    fn fingerprint_max_delta_returns_largest_dimension() {
-        let saved = fp(0.5, 0.5, 0.5);
-        let observed = fp(0.55, 0.6, 0.51); // deltas 10 %, 20 %, 2 %
-        let d = saved.max_relative_delta(&observed);
-        assert!((d - 0.20).abs() < 0.01, "expected 0.20, got {d}");
     }
 
     // ---- IO: paths + serialization -----------------------------------
@@ -766,16 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_device_key_omits_deck_index() {
-        // The legacy key is still computable so the M5.4.4 loader
-        // can find pre-M5.4.4 files. New writes never use this.
-        assert_eq!(
-            legacy_device_key("SL 3", Format::SeratoCv02),
-            "SL_3_serato-cv02"
-        );
-    }
-
-    #[test]
     fn path_for_includes_deck_in_filename() {
         let base = Path::new("/tmp/whatever");
         let p0 = Calibration::path_for("SL 3", 0, Format::SeratoCv02, base);
@@ -783,104 +719,6 @@ mod tests {
         assert_eq!(p0, Path::new("/tmp/whatever/SL_3_deck_0_serato-cv02.json"));
         assert_eq!(p1, Path::new("/tmp/whatever/SL_3_deck_1_serato-cv02.json"));
         assert_ne!(p0, p1, "deck 0 and deck 1 must have distinct paths");
-    }
-
-    #[test]
-    fn path_for_legacy_returns_pre_m544_filename() {
-        let base = Path::new("/tmp/whatever");
-        let p = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, base);
-        assert_eq!(p, Path::new("/tmp/whatever/SL_3_serato-cv02.json"));
-    }
-
-    #[test]
-    fn load_with_legacy_fallback_reads_legacy_when_new_missing() {
-        // Simulates the user upgrading from M5.4.3 → M5.4.4: legacy
-        // file exists, new (per-deck) path doesn't. Loader must
-        // transparently use the legacy file as deck 0's calibration
-        // so the user keeps their existing thresholds without
-        // recalibrating.
-        let dir =
-            std::env::temp_dir().join(format!("dub-cal-legacy-fallback-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (carrier, lift) = sl3_fixture();
-        let cal = Calibration {
-            schema_version: SCHEMA_VERSION,
-            device_name: "SL 3".to_string(),
-            deck_index: 0,
-            format: format_string(Format::SeratoCv02).to_string(),
-            calibrated_at: "2026-05-10T07:00:00Z".to_string(),
-            input_sample_rate: 48_000.0,
-            block_frames: 256,
-            fingerprint: fp(0.31, 0.42, 0.99),
-            thresholds: derive_thresholds(&carrier, &lift).unwrap(),
-            measurements: CalibrationMeasurements { carrier, lift },
-            snr_margin: 100.0,
-        };
-        let new_path = Calibration::path_for("SL 3", 0, Format::SeratoCv02, &dir);
-        let legacy_path = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, &dir);
-        // Save *only* to the legacy path — simulating pre-M5.4.4 state.
-        cal.save(&legacy_path).expect("save legacy");
-        assert!(!new_path.exists(), "new path must not exist for this test");
-        assert!(legacy_path.exists());
-
-        let loaded = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path))
-            .expect("legacy fallback should load");
-        assert_eq!(loaded.device_name, "SL 3");
-        // deck_index defaults to 0 via #[serde(default)].
-        assert_eq!(loaded.deck_index, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn load_with_legacy_fallback_prefers_new_path_when_present() {
-        // When both files exist, the new (per-deck) one wins.
-        let dir =
-            std::env::temp_dir().join(format!("dub-cal-legacy-prefers-new-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (carrier, lift) = sl3_fixture();
-        let mk = |deck_index: u32, calibrated_at: &str| Calibration {
-            schema_version: SCHEMA_VERSION,
-            device_name: "SL 3".to_string(),
-            deck_index,
-            format: format_string(Format::SeratoCv02).to_string(),
-            calibrated_at: calibrated_at.to_string(),
-            input_sample_rate: 48_000.0,
-            block_frames: 256,
-            fingerprint: fp(0.31, 0.42, 0.99),
-            thresholds: derive_thresholds(&carrier, &lift).unwrap(),
-            measurements: CalibrationMeasurements { carrier, lift },
-            snr_margin: 100.0,
-        };
-        let new_path = Calibration::path_for("SL 3", 0, Format::SeratoCv02, &dir);
-        let legacy_path = Calibration::path_for_legacy("SL 3", Format::SeratoCv02, &dir);
-        // Different timestamps so we can tell which one was loaded.
-        mk(0, "2026-05-15T07:00:00Z").save(&new_path).unwrap();
-        mk(0, "2025-01-01T07:00:00Z").save(&legacy_path).unwrap();
-
-        let loaded = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path))
-            .expect("should load new path");
-        assert_eq!(
-            loaded.calibrated_at, "2026-05-15T07:00:00Z",
-            "new (per-deck) path should win when both exist"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn load_with_legacy_fallback_errors_when_both_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "dub-cal-legacy-both-missing-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let new_path = dir.join("new.json");
-        let legacy_path = dir.join("legacy.json");
-
-        let r = Calibration::load_with_legacy_fallback(&new_path, Some(&legacy_path));
-        assert!(r.is_err(), "both missing should error");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -918,7 +756,7 @@ mod tests {
         assert_eq!(loaded.format, cal.format);
         assert!((loaded.thresholds.engage - cal.thresholds.engage).abs() < 1e-6);
         assert!((loaded.thresholds.amplitude - cal.thresholds.amplitude).abs() < 1e-6);
-        assert!(loaded.fingerprint.matches(&cal.fingerprint, 1e-6));
+        assert_eq!(loaded.fingerprint, cal.fingerprint);
         // SNR is f32, so allow a tiny rounding tolerance.
         assert!((loaded.snr_margin - cal.snr_margin).abs() < 0.1);
 
