@@ -692,12 +692,69 @@ inside the render loop — no separate "channel strip" abstraction —
 because v1's debug mixer doesn't need EQ/filters/sends and a flat
 implementation keeps the audio thread's data dependency graph tiny.
 
-External-mixer 4-channel routing (deck 0 → output channels 1+2,
-deck 1 → output channels 3+4) is **deliberately deferred** to M5/M6.
-That's the milestone where the timecode hardware (SL3, Audio 6) makes
-multi-channel routing actually testable. v1's debug mixer covers
-single-stereo-output development and is what every existing CLI
-analyze workflow runs against.
+External-mixer multi-channel routing arrives in M5.5 and reuses the
+same primitive — see the next section.
+
+### External-mixer routing — M5.5.1 (engine primitive)
+
+The M4 internal mixer is a *special case* of a more general
+multi-channel routing primitive that lands in M5.5.1. The two
+mechanics — sum into one stereo bus (M4) vs. send each deck to its
+own physical output pair (M5.5) — are unified under
+`Engine::render_routed(rt, out, num_channels, &OutputRouting)`,
+where `OutputRouting = [Option<u32>; DECK_COUNT]`. Each deck either
+gets a *first-channel index* into the multi-channel buffer or
+`None` (don't render).
+
+```text
+                                   ┌─ render_routed(out, 4, [Some(0), Some(2)])
+                                   │
+  Deck 0 ──gain──► render_into(stride=4, offset=0) ──► out[ch 0+1]
+                                                            ▲
+  Deck 1 ──gain──► render_into(stride=4, offset=2) ──► out[ch 2+3]
+                                   │
+                                   └─ master_gain × whole 4-ch buffer ──► CoreAudio
+```
+
+Two decks routing to the *same* `Some(c)` sum (= internal mixer);
+non-overlapping `Some` values isolate them (= external-mixer
+routing). `Engine::render` is now a thin wrapper around
+`render_routed(out, 2, INTERNAL_MIXER_ROUTING)` where
+`INTERNAL_MIXER_ROUTING = [Some(0), Some(0)]`, so M0–M5 callers
+keep working byte-identically.
+
+The strided write happens on the deck side: `Deck::render_into(rt,
+out, sr, stride, offset)` iterates `out.chunks_exact_mut(stride)`
+and writes the L/R samples at `chunk[offset]` and
+`chunk[offset+1]`. The dense-stereo case (`stride=2, offset=0`)
+matches the legacy code path exactly; the strided case adds zero
+allocations and one extra arithmetic op per frame (`offset` is a
+constant per-block, so LLVM hoists it).
+
+**`None` semantics.** A deck with `routing[i] == None` is skipped
+entirely — its transport state does NOT advance for that block.
+This is deliberate: routing is a *hardware-mapping* concern, not a
+mute mechanism. To silence a deck while keeping its transport
+running (so the playhead stays in sync for when the user un-mutes),
+use the M2 per-deck `Deck::set_gain(0.0)` knob. Reusing routing as
+mute would couple unrelated concerns (declick envelope progress,
+EngineHandle position snapshot, end-of-track flagging) and make
+routing flips click. The
+`render_routed_none_does_not_advance_transport` and
+`render_routed_mute_via_gain_keeps_transport_advancing` tests pin
+this distinction.
+
+**Master gain in routed mode.** Master applies once across the
+whole multi-channel buffer at the end. Unrouted channels stay zero
+(zero × g == zero), so master never accidentally introduces signal
+on an unrouted pair. Per-deck gain still composes multiplicatively
+upstream of master — same as M4.
+
+M5.5.2 will add the matching `OutputOptions` + `AudioOutput`
+multi-channel surface and a known-device routing table (SL3:
+deck A=ch3+4, deck B=ch5+6, aux=ch1+2; Traktor Audio 6: deck A=
+ch1+2, deck B=ch3+4) so `dub timecode-deck` auto-configures
+correctly when a recognised interface is connected.
 
 ### Engine → UI (state snapshot) — implemented in M2
 

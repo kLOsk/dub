@@ -397,11 +397,52 @@ impl Deck {
     /// **RT-safety**: no allocation, no locks, no syscalls. The only
     /// inputs are the deck's pre-allocated state and the input buffer.
     pub fn render(&mut self, rt: &mut RealtimeContext<'_>, out: &mut [f32], engine_sr: f32) {
+        self.render_into(rt, out, engine_sr, 2, 0);
+    }
+
+    /// Strided variant of [`Self::render`]. Writes the deck's stereo
+    /// frames into `out` at `stride`-sample stride, with the L sample
+    /// at `out[offset + n*stride]` and the R sample at
+    /// `out[offset + n*stride + 1]`. The deck always *adds* into the
+    /// destination cells (`+=`), so two decks with the same
+    /// `(stride, offset)` sum (= M4 internal mixer); two decks with
+    /// non-overlapping `(stride, offset)` are isolated (= M5.5
+    /// external-mixer routing).
+    ///
+    /// `stride == 2, offset == 0` is the dense-stereo case, identical
+    /// in behavior to [`Self::render`] (which is a thin wrapper around
+    /// this method).
+    ///
+    /// **RT-safety**: same as `render` — the only difference is the
+    /// stride argument to the inner chunk iteration, no extra
+    /// allocation or branching on the hot path.
+    // The function is long but it's a single linear render — splitting
+    // into "fade phase" and "steady-state phase" helpers would force
+    // shared state (`pos`, `frames_consumed_in_fade`) into a struct
+    // and obscure the per-frame data flow. Clippy's threshold catches
+    // genuinely tangled functions; this isn't one.
+    #[allow(clippy::too_many_lines)]
+    pub fn render_into(
+        &mut self,
+        rt: &mut RealtimeContext<'_>,
+        out: &mut [f32],
+        engine_sr: f32,
+        stride: usize,
+        offset: usize,
+    ) {
         rt.tick();
+        debug_assert!(
+            stride >= 2,
+            "stride must be at least 2 to hold a stereo pair"
+        );
+        debug_assert!(
+            offset + 2 <= stride,
+            "offset {offset} + 2 must fit inside stride {stride}"
+        );
         debug_assert_eq!(
-            out.len() % 2,
+            out.len() % stride,
             0,
-            "stereo output buffer must have even length"
+            "output buffer length must be a multiple of stride"
         );
 
         let engine_sr_f = f64::from(engine_sr);
@@ -429,7 +470,7 @@ impl Deck {
             // Index into the envelope of the *next* sample to apply.
             // After this method runs, we want `i` to have advanced by
             // however many fade samples we render here.
-            let total_frames = out.len() / 2;
+            let total_frames = out.len() / stride;
             let prev_increment = prev_source.as_ref().map_or(0.0, |t| {
                 *prev_rate * (f64::from(t.sample_rate()) / engine_sr_f)
             });
@@ -437,7 +478,7 @@ impl Deck {
             #[allow(clippy::cast_possible_truncation)]
             let fade_frames = (*samples_remaining as usize).min(total_frames);
 
-            for chunk in out.chunks_exact_mut(2).take(fade_frames) {
+            for chunk in out.chunks_exact_mut(stride).take(fade_frames) {
                 let i = n_total - *samples_remaining;
                 let fade_in = env.fade_in(i);
                 let fade_out = 1.0 - fade_in;
@@ -478,8 +519,8 @@ impl Deck {
 
                 let l = old_l * fade_out + new_l * fade_in;
                 let r = old_r * fade_out + new_r * fade_in;
-                chunk[0] += l * gain;
-                chunk[1] += r * gain;
+                chunk[offset] += l * gain;
+                chunk[offset + 1] += r * gain;
 
                 // Each side only advances when its play-state was true:
                 // a paused side reads silence and stays at its position.
@@ -507,11 +548,11 @@ impl Deck {
                 let track_len = track.frames() as f64;
                 let env = &self.declick_envelope;
 
-                for chunk in out.chunks_exact_mut(2).skip(frames_consumed_in_fade) {
+                for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
                     let (l, r) = read_stereo_at(track, pos);
                     let edge = track_tail_fade_scale(track_len, pos, env);
-                    chunk[0] += l * gain * edge;
-                    chunk[1] += r * gain * edge;
+                    chunk[offset] += l * gain * edge;
+                    chunk[offset + 1] += r * gain * edge;
                     pos += new_increment;
                 }
 

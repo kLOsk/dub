@@ -47,6 +47,29 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Number of decks in v1 (PRD §3 / §6).
 pub const DECK_COUNT: usize = 2;
 
+/// Per-deck output routing for [`Engine::render_routed`].
+///
+/// Each entry is an `Option<u32>` naming the *first* (0-based) output
+/// channel for that deck:
+///
+/// - `None`  — the deck is not routed; its audio is dropped this block.
+/// - `Some(c)` — the deck's stereo pair is added into channels
+///   `c, c+1` of the multi-channel output buffer.
+///
+/// Two decks with the same `Some(c)` *sum* into the same channel pair
+/// (= M4 internal mixer). Two decks with non-overlapping `Some(c)`
+/// values are isolated (= M5.5 external-mixer routing — deck A on
+/// physical mixer's channel 1, deck B on channel 2, etc.). The
+/// internal-mixer behaviour is therefore not a special case in the
+/// engine: it's just the routing
+/// `[Some(0), Some(0)]` over a 2-channel buffer, which is what
+/// [`Engine::render`] produces for backward compatibility.
+pub type OutputRouting = [Option<u32>; DECK_COUNT];
+
+/// Internal-mixer routing: both decks summed into channels 0+1 of a
+/// 2-channel buffer. This is what [`Engine::render`] produces.
+pub const INTERNAL_MIXER_ROUTING: OutputRouting = [Some(0), Some(0)];
+
 /// Top-level engine. Sits between the platform audio I/O and the audio graph.
 ///
 /// Holds [`DECK_COUNT`] decks. The render method drains the command queue
@@ -232,7 +255,7 @@ impl Engine {
         &self.decks[idx]
     }
 
-    /// Render one block of audio.
+    /// Render one block of audio in stereo internal-mixer mode.
     ///
     /// Called from the audio thread. The [`RealtimeContext`] argument is
     /// the only way to invoke RT-safe APIs.
@@ -244,11 +267,51 @@ impl Engine {
     /// `block_size` on the engine is a hint, not a hard constraint:
     /// CoreAudio (and other host APIs) may hand us variable buffer sizes
     /// on each callback, and we honour whatever we're given.
+    ///
+    /// Equivalent to `render_routed(rt, out, 2, &INTERNAL_MIXER_ROUTING)`
+    /// — preserved as a top-level method so all the M0-M5 callers stay
+    /// untouched.
     pub fn render(&mut self, rt: &mut RealtimeContext<'_>, out: &mut [f32]) {
+        self.render_routed(rt, out, 2, &INTERNAL_MIXER_ROUTING);
+    }
+
+    /// Render one block with per-deck routing onto an N-channel output
+    /// buffer.
+    ///
+    /// `num_channels` is the device's output channel count (2 for the
+    /// debug stereo path, 4 / 6 / … for external-mixer routing on
+    /// multi-channel hardware). `out` is interleaved across all N
+    /// channels, length must be a multiple of `num_channels`.
+    ///
+    /// `routing[deck_idx]` controls where each deck's stereo output
+    /// lands. See [`OutputRouting`] for the full semantics. Decks with
+    /// `routing[i] == None` are skipped entirely — their transport
+    /// state does NOT advance for that block. This matches the M5.5
+    /// design intent: routing is a *hardware-mapping* concern, not a
+    /// muting mechanism. Use per-deck `Deck::set_gain(0.0)` to mute
+    /// while keeping the transport running; reserve `routing[i] = None`
+    /// for the case where the deck genuinely has no output destination
+    /// (e.g. a 2-channel device with deck B physically disconnected).
+    ///
+    /// The buffer is zeroed at the start; deck contributions are added
+    /// (`+=`); master gain applies once across the whole multi-channel
+    /// buffer at the end (so unrouted channels stay zero, and routed
+    /// channels are scaled identically to the M4 stereo path).
+    pub fn render_routed(
+        &mut self,
+        rt: &mut RealtimeContext<'_>,
+        out: &mut [f32],
+        num_channels: usize,
+        routing: &OutputRouting,
+    ) {
+        debug_assert!(
+            num_channels >= 2,
+            "num_channels must be at least 2 to hold a stereo pair"
+        );
         debug_assert_eq!(
-            out.len() % 2,
+            out.len() % num_channels,
             0,
-            "stereo output buffer must have even length"
+            "output buffer length must be a multiple of num_channels"
         );
         rt.tick();
 
@@ -267,15 +330,24 @@ impl Engine {
             *sample = 0.0;
         }
         let sr = self.sample_rate;
-        for deck in &mut self.decks {
-            deck.render(rt, out, sr);
+        for (idx, deck) in self.decks.iter_mut().enumerate() {
+            let Some(first) = routing[idx] else { continue };
+            let first_us = first as usize;
+            debug_assert!(
+                first_us + 2 <= num_channels,
+                "deck {idx} routed to first channel {first_us} but only {num_channels} \
+                 channels are available; needs at least 2 channels for stereo"
+            );
+            deck.render_into(rt, out, sr, num_channels, first_us);
         }
 
-        // Master gain (M4): single multiplicative scale across the entire
-        // summed stereo bus. Applied after deck mixing so per-deck gains
-        // and the master compose multiplicatively. Skipping the multiply
-        // when master==1.0 saves a per-block branch on the common case
-        // and lets future LTO inline this loop away entirely.
+        // Master gain (M4 / M5.5): single multiplicative scale across the
+        // entire summed N-channel bus. Applied after deck mixing so
+        // per-deck gains and the master compose multiplicatively.
+        // Unrouted channels stay zero (zero × master == zero) so master
+        // never accidentally introduces signal on an unrouted pair.
+        // Skipping the multiply when master==1.0 saves a per-block branch
+        // on the common case.
         if (self.master_gain - 1.0).abs() > f32::EPSILON {
             let g = self.master_gain;
             for sample in out.iter_mut() {
@@ -539,6 +611,226 @@ mod tests {
         for (got, want) in buffer.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1e-6, "got {got} want {want}");
         }
+    }
+
+    // --- M5.5 routing tests --------------------------------------------
+    //
+    // These pin the contract that:
+    //  1. `render` and `render_routed(2, INTERNAL_MIXER_ROUTING)` produce
+    //     bit-identical output (M4 backwards compatibility).
+    //  2. With non-overlapping routing on a 4-channel buffer, each deck's
+    //     audio lands ONLY in its assigned channel pair — the other half
+    //     is exactly zero (no cross-talk between deck A and deck B).
+    //  3. Both decks routed to the same channel pair sum (= internal
+    //     mixer); same as the M4 path.
+    //  4. `None` in routing fully drops a deck's contribution (transport
+    //     state continues to advance, but the buffer stays zero where
+    //     that deck would have written).
+
+    /// Build an engine with two decks loaded with distinct constant-
+    /// valued tracks. Deck 0 outputs 0.4 on every sample; deck 1
+    /// outputs 0.7. With unity gain + master gain, the engine output
+    /// reflects deck 0's L=0.4 R=0.4 + deck 1's L=0.7 R=0.7 in the
+    /// internal mixer (= 1.1 per sample).
+    fn engine_with_two_decks(deck0_v: f32, deck1_v: f32) -> Engine {
+        let t0 = Arc::new(Track::from_interleaved(vec![deck0_v; 64], 48_000, 2).unwrap());
+        let t1 = Arc::new(Track::from_interleaved(vec![deck1_v; 64], 48_000, 2).unwrap());
+        let mut engine = Engine::new(48_000.0, 16);
+        engine.deck_mut(0).set_source(t0);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(1).set_source(t1);
+        engine.deck_mut(1).set_playing(true);
+        engine.deck_mut(1).quiesce_declick_for_test();
+        engine
+    }
+
+    #[test]
+    fn render_routed_internal_mixer_matches_render() {
+        // M4 backward compat: render_routed with INTERNAL_MIXER_ROUTING
+        // and 2 channels must produce the same samples as render().
+        let mut engine_a = engine_with_two_decks(0.3, 0.5);
+        let mut engine_b = engine_with_two_decks(0.3, 0.5);
+        let mut buf_a = vec![0.0_f32; 32];
+        let mut buf_b = vec![0.0_f32; 32];
+        let mut rt = RealtimeContext::new();
+        engine_a.render(&mut rt, &mut buf_a);
+        engine_b.render_routed(&mut rt, &mut buf_b, 2, &INTERNAL_MIXER_ROUTING);
+        for (i, (a, b)) in buf_a.iter().zip(buf_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "frame {i}: render={a} render_routed={b}"
+            );
+        }
+        // Both should equal 0.3 + 0.5 = 0.8 on every sample (deck 0 and
+        // deck 1 sum into ch 0+1).
+        for s in &buf_a {
+            assert!((s - 0.8).abs() < 1e-6, "got {s}, expected 0.8");
+        }
+    }
+
+    #[test]
+    fn render_routed_external_4ch_isolates_decks() {
+        // Deck 0 → ch 0+1, Deck 1 → ch 2+3 (the M5.5 SL3 / external-
+        // mixer scenario). Each deck's audio MUST land ONLY in its
+        // pair; the other pair MUST be exactly the level it would be
+        // without that deck (i.e. 0 here, because the OTHER deck isn't
+        // routed there).
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        // 16 frames × 4 channels = 64 samples
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            assert!(
+                (frame[0] - 0.3).abs() < 1e-6 && (frame[1] - 0.3).abs() < 1e-6,
+                "frame {i}: deck 0 should be on ch 0+1, got [{}, {}, {}, {}]",
+                frame[0],
+                frame[1],
+                frame[2],
+                frame[3],
+            );
+            assert!(
+                (frame[2] - 0.7).abs() < 1e-6 && (frame[3] - 0.7).abs() < 1e-6,
+                "frame {i}: deck 1 should be on ch 2+3, got [{}, {}, {}, {}]",
+                frame[0],
+                frame[1],
+                frame[2],
+                frame[3],
+            );
+        }
+    }
+
+    #[test]
+    fn render_routed_overlapping_decks_sum_like_internal_mixer() {
+        // Both decks → ch 0+1 of a 4-channel buffer. Behaves exactly
+        // like the internal mixer for the first pair; ch 2+3 stay
+        // zero. This is the property that lets the engine support both
+        // M4 and M5.5 with one primitive.
+        let mut engine = engine_with_two_decks(0.3, 0.5);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(0)]);
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            assert!(
+                (frame[0] - 0.8).abs() < 1e-6 && (frame[1] - 0.8).abs() < 1e-6,
+                "frame {i}: ch 0+1 should sum to 0.8, got {frame:?}",
+            );
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(frame[2], 0.0, "frame {i}: ch 2 must stay zero");
+                assert_eq!(frame[3], 0.0, "frame {i}: ch 3 must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn render_routed_none_drops_deck() {
+        // Deck 0 routed; deck 1 = None (dropped). Deck 1's audio never
+        // appears in the buffer. Deck 1's transport state does NOT
+        // advance — see render_routed_none_does_not_advance_transport
+        // for the rationale (routing is hardware-mapping, not muting;
+        // use Deck::set_gain(0.0) for mute semantics that preserve
+        // transport ticking).
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), None]);
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            assert!(
+                (frame[0] - 0.3).abs() < 1e-6 && (frame[1] - 0.3).abs() < 1e-6,
+                "frame {i}: deck 0 on ch 0+1 expected 0.3, got {frame:?}",
+            );
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(frame[2], 0.0, "frame {i}: ch 2 must stay zero");
+                assert_eq!(frame[3], 0.0, "frame {i}: ch 3 must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn render_routed_none_does_not_advance_transport() {
+        // Unrouted decks are skipped end-to-end — their transport
+        // doesn't tick. This pins the M5.5 design choice: routing is a
+        // hardware-mapping concern, not a mute mechanism. If the user
+        // wants to silence a deck while letting it play through, the
+        // M2 per-deck gain knob (`Deck::set_gain(0.0)`) is the right
+        // tool. Reusing routing as a mute would couple unrelated
+        // concerns and invite weird gotchas (declick envelope state
+        // continues to advance on a deck the user thinks is "off",
+        // making the next routing flip click).
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        let pos_before = engine.deck(1).position_frames();
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), None]);
+        let pos_after = engine.deck(1).position_frames();
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                pos_before, pos_after,
+                "deck 1 routed=None must not advance: before={pos_before}, after={pos_after}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_routed_mute_via_gain_keeps_transport_advancing() {
+        // Companion to render_routed_none_does_not_advance_transport:
+        // gain==0 silences the deck's contribution to the output but
+        // its transport keeps ticking, so the playhead is in the right
+        // place when gain comes back up.
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        engine.deck_mut(1).set_gain(0.0);
+        let pos_before = engine.deck(1).position_frames();
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        let pos_after = engine.deck(1).position_frames();
+        // Deck 1 is routed but muted; its samples should be zero on
+        // ch 2+3, but its position must have advanced ~16 frames.
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(frame[2], 0.0, "frame {i}: muted deck 1 should be zero");
+                assert_eq!(frame[3], 0.0, "frame {i}: muted deck 1 should be zero");
+            }
+        }
+        assert!(
+            (pos_after - pos_before - 16.0).abs() < 0.5,
+            "deck 1 with gain=0 still advances: before={pos_before}, after={pos_after}"
+        );
+    }
+
+    #[test]
+    fn render_routed_master_gain_applies_only_to_routed_channels() {
+        // Master gain scales the whole buffer (zero × g == zero) so
+        // unrouted channels stay zero. Routed channels are scaled.
+        let mut engine = engine_with_two_decks(0.4, 0.4);
+        engine.set_master_gain(0.5);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            // 0.4 deck output × 0.5 master = 0.2.
+            for (ch, s) in frame.iter().enumerate() {
+                assert!(
+                    (s - 0.2).abs() < 1e-6,
+                    "frame {i} ch {ch}: expected 0.2 with master 0.5, got {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_routed_4ch_is_alloc_free() {
+        let mut engine = engine_with_two_decks(0.3, 0.5);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        });
     }
 
     #[test]
