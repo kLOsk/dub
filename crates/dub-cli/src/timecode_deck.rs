@@ -35,12 +35,44 @@ use dub_engine::{
 };
 use dub_io::Track;
 use dub_timecode::Format;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
+use crate::calibrate::{measure_inline, probe_carrier};
+use crate::calibration::{
+    default_calibration_dir, Calibration, CalibrationThresholds, DEFAULT_FINGERPRINT_TOLERANCE,
+};
 use crate::input_cmds::{parse_input_args, InputArgs};
 
 /// Default duration if `--duration` isn't given. 60 s is comfortably
 /// long for a tactile validation run; the user can Ctrl-C earlier.
 const DEFAULT_RUN_SECS: f64 = 60.0;
+
+/// Length of the auto-startup carrier probe used to validate the
+/// saved fingerprint against the rig in front of the user. 3 s
+/// gives stable percentiles within < 1 % of the long-run values
+/// from the original calibration, so it's a meaningful comparison
+/// without holding the user up.
+const PROBE_SECS: f64 = 3.0;
+
+/// Detection timeout for the auto-startup probe. 30 s gives the
+/// user time to walk to the turntable and drop the needle without
+/// the timecode-deck startup feeling rushed.
+const PROBE_DETECT_TIMEOUT_SECS: f64 = 30.0;
+
+/// Length of the auto-startup full calibration phases. Match
+/// `dub calibrate`'s defaults — auto-calibration produces a
+/// JSON file indistinguishable from a manual `dub calibrate` run.
+const AUTO_CARRIER_SECS: f64 = 10.0;
+const AUTO_LIFT_SECS: f64 = 5.0;
+const AUTO_DETECT_TIMEOUT_SECS: f64 = 30.0;
+
+/// Surface a warning when the saved calibration is older than this.
+/// 30 days is long enough that "set up at home, played one gig two
+/// weeks ago" doesn't trigger a warning, but short enough to flag
+/// "dusty stylus from six months of disuse" before the user gets
+/// surprised by ghost noise.
+const STALE_CALIBRATION_DAYS: f64 = 30.0;
 
 /// CLI options for `dub timecode-deck`. Built on top of the shared
 /// [`InputArgs`] so the `--input-channels`/`--device`/`--sr` flags
@@ -51,14 +83,28 @@ struct Opts {
     /// Output buffer size hint for CoreAudio output (frames). Smaller
     /// = lower output latency. None means "device default".
     output_buffer_size: Option<u32>,
-    /// Upper hysteresis edge (engage threshold).
-    confidence: f32,
-    /// Lower hysteresis edge (disengage threshold).
-    disengage: f32,
-    /// Consecutive sub-disengage blocks required to disengage.
-    sticky_blocks: u32,
-    /// RMS floor below which the carrier is treated as dead.
-    amplitude_threshold: f32,
+    /// Per-threshold explicit overrides. `None` = auto-resolve from
+    /// the saved calibration (or auto-calibrate if missing /
+    /// fingerprint mismatch); `Some(v)` = take this value verbatim,
+    /// independent of calibration. Partial overrides are supported
+    /// so the user can pin one knob (e.g. amplitude=0.05 to test a
+    /// loud venue) and let the rest auto-resolve.
+    confidence: Option<f32>,
+    disengage: Option<f32>,
+    sticky_blocks: Option<u32>,
+    amplitude_threshold: Option<f32>,
+    /// Force fresh full measurement even if a matching calibration
+    /// JSON exists. Use after a known cartridge / cabling change.
+    recalibrate: bool,
+    /// Skip the fingerprint probe at startup. Faster (~3 s saved)
+    /// but loses rig-swap detection. Use only when iterating on
+    /// other things and you know the rig is unchanged.
+    no_probe: bool,
+    /// Skip calibration entirely — fall back to the M5.3 defaults
+    /// regardless of what's on disk. Mostly useful for regression
+    /// testing the M5.3 path or for first-time users who want to
+    /// hear the deck immediately without touching the calibrator.
+    no_calibrate: bool,
     /// Wall-clock duration to run before stopping. Distinct from
     /// `InputArgs::duration` because we want timecode-deck to default
     /// to 60 s, not the 5 s default of capture/levels.
@@ -66,15 +112,18 @@ struct Opts {
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts> {
-    // Pull --confidence and --output-buffer-size out before delegating
-    // to the shared input-args parser; everything else (device, channels,
+    // Pull threshold/calibration flags out before delegating to the
+    // shared input-args parser; everything else (device, channels,
     // input-channels, sr, duration) goes through the shared path.
     let mut filtered: Vec<String> = Vec::with_capacity(args.len());
-    let mut confidence: f32 = DEFAULT_CONFIDENCE_THRESHOLD;
-    let mut disengage: f32 = DEFAULT_DISENGAGE_THRESHOLD;
-    let mut sticky_blocks: u32 = DEFAULT_STICKY_BLOCKS_TO_DISENGAGE;
-    let mut amplitude_threshold: f32 = DEFAULT_AMPLITUDE_THRESHOLD;
+    let mut confidence: Option<f32> = None;
+    let mut disengage: Option<f32> = None;
+    let mut sticky_blocks: Option<u32> = None;
+    let mut amplitude_threshold: Option<f32> = None;
     let mut output_buffer_size: Option<u32> = None;
+    let mut recalibrate = false;
+    let mut no_probe = false;
+    let mut no_calibrate = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -82,36 +131,40 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("--confidence expects a number"))?;
-                confidence = v
-                    .parse::<f32>()
-                    .with_context(|| format!("--confidence {v}"))?;
+                confidence = Some(
+                    v.parse::<f32>()
+                        .with_context(|| format!("--confidence {v}"))?,
+                );
                 i += 2;
             }
             "--disengage-threshold" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("--disengage-threshold expects a number"))?;
-                disengage = v
-                    .parse::<f32>()
-                    .with_context(|| format!("--disengage-threshold {v}"))?;
+                disengage = Some(
+                    v.parse::<f32>()
+                        .with_context(|| format!("--disengage-threshold {v}"))?,
+                );
                 i += 2;
             }
             "--sticky-blocks" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("--sticky-blocks expects an integer"))?;
-                sticky_blocks = v
-                    .parse::<u32>()
-                    .with_context(|| format!("--sticky-blocks {v}"))?;
+                sticky_blocks = Some(
+                    v.parse::<u32>()
+                        .with_context(|| format!("--sticky-blocks {v}"))?,
+                );
                 i += 2;
             }
             "--amplitude-threshold" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("--amplitude-threshold expects a number"))?;
-                amplitude_threshold = v
-                    .parse::<f32>()
-                    .with_context(|| format!("--amplitude-threshold {v}"))?;
+                amplitude_threshold = Some(
+                    v.parse::<f32>()
+                        .with_context(|| format!("--amplitude-threshold {v}"))?,
+                );
                 i += 2;
             }
             "--output-buffer-size" => {
@@ -123,6 +176,18 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                         .with_context(|| format!("--output-buffer-size {v}"))?,
                 );
                 i += 2;
+            }
+            "--recalibrate" => {
+                recalibrate = true;
+                i += 1;
+            }
+            "--no-probe" => {
+                no_probe = true;
+                i += 1;
+            }
+            "--no-calibrate" => {
+                no_calibrate = true;
+                i += 1;
             }
             _ => {
                 filtered.push(args[i].clone());
@@ -137,7 +202,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             "usage: dub timecode-deck <track.wav> --input-channels N,M [--device NAME] \
              [--duration SECS] [--confidence T] [--disengage-threshold T] \
              [--sticky-blocks N] [--amplitude-threshold T] \
-             [--output-buffer-size FRAMES]"
+             [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate]"
         ));
     }
     if positional.len() > 1 {
@@ -149,6 +214,11 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     if let Some(unknown) = leftover.iter().find(|s| s.starts_with("--")) {
         return Err(anyhow!("unknown flag: {unknown}"));
     }
+    if recalibrate && no_calibrate {
+        return Err(anyhow!(
+            "--recalibrate and --no-calibrate are mutually exclusive"
+        ));
+    }
     Ok(Opts {
         track: PathBuf::from(positional[0]),
         duration_secs: input.duration.unwrap_or(DEFAULT_RUN_SECS),
@@ -158,6 +228,9 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
         disengage,
         sticky_blocks,
         amplitude_threshold,
+        recalibrate,
+        no_probe,
+        no_calibrate,
     })
 }
 
@@ -226,6 +299,17 @@ pub fn run(args: &[String]) -> Result<()> {
         deck.set_gain(1.0);
     }
 
+    // 4b. Resolve thresholds: load saved calibration if present and
+    //     fingerprint matches, auto-calibrate otherwise. CLI flag
+    //     overrides applied last so partial overrides work
+    //     (calibration handles 3 of 4 thresholds, user pins one).
+    //
+    //     Calibration must happen BEFORE we hand the input consumer
+    //     to the engine, because the calibration helpers consume
+    //     samples from the same input device. After
+    //     `take_consumer()` is called, the input is engine-owned.
+    let resolved = resolve_thresholds(&mut input, &opts)?;
+
     // 5. Hand the input ringbuf consumer to the engine.
     let rx = input
         .take_consumer()
@@ -235,18 +319,21 @@ pub fn run(args: &[String]) -> Result<()> {
         input_sample_rate: input_sr,
         // CoreAudio output blocks vary; 4096 is a safe upper bound.
         max_block_frames: 4096,
-        confidence_threshold: opts.confidence,
-        disengage_threshold: opts.disengage,
-        sticky_blocks_to_disengage: opts.sticky_blocks,
-        amplitude_threshold: opts.amplitude_threshold,
+        confidence_threshold: resolved.engage,
+        disengage_threshold: resolved.disengage,
+        sticky_blocks_to_disengage: resolved.sticky_blocks_to_disengage,
+        amplitude_threshold: resolved.amplitude,
     };
     engine
         .attach_timecode_input(0, rx, cfg)
         .context("attaching timecode input to deck 0")?;
     println!(
-        "timecode:     format=SeratoCv02 engage={:.2} disengage={:.2} \
+        "timecode:     format=SeratoCv02 engage={:.3} disengage={:.3} \
          sticky={} blocks amp_floor={:.4}",
-        opts.confidence, opts.disengage, opts.sticky_blocks, opts.amplitude_threshold,
+        resolved.engage,
+        resolved.disengage,
+        resolved.sticky_blocks_to_disengage,
+        resolved.amplitude,
     );
 
     // 6. Move the engine onto the audio thread. From here, AudioOutput
@@ -319,4 +406,351 @@ fn print_stats(
         "  out_cb={out_cb} buf={buf_ms:.2}ms in_cb={in_cb} in_overflow={in_of} \
          in_buffered={avail_frames:.0} frames"
     );
+}
+
+/// Resolve the four lift-policy thresholds from (in priority order):
+///
+/// 1. Explicit CLI overrides (`--confidence`, `--amplitude-threshold`,
+///    `--disengage-threshold`, `--sticky-blocks`). Applied last so
+///    a partial override always wins over the auto-resolved value.
+/// 2. Saved calibration JSON, validated against the current rig
+///    via a brief carrier probe. Mismatch (cartridge swap, preamp
+///    change, …) triggers automatic recalibration.
+/// 3. A fresh full calibration if no JSON exists yet, or
+///    `--recalibrate` was passed.
+/// 4. The M5.3 defaults if `--no-calibrate` was passed (or the user
+///    cancels the calibration flow).
+///
+/// This is the entry point for the user's "auto-detect different
+/// rigs" requirement: even if the same SL3 is used across cartridge
+/// swaps, the fingerprint catches the change at startup and the
+/// thresholds are re-derived in place.
+fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<CalibrationThresholds> {
+    let format = Format::SeratoCv02;
+    let dir = default_calibration_dir().context("resolving default calibration dir")?;
+    let path = Calibration::path_for(input.device_name(), format, &dir);
+
+    // Bypass-everything modes first.
+    if opts.no_calibrate {
+        println!("calibration: skipped (--no-calibrate); using M5.3 defaults");
+        return Ok(apply_overrides(default_thresholds(), opts));
+    }
+
+    // Force-fresh path. Same as "no file exists" but ignores any
+    // existing JSON. We still save the new measurement (overwrites
+    // the old file), preserving the always-on "what is this rig"
+    // record on disk.
+    if opts.recalibrate {
+        println!("calibration: --recalibrate forced; running fresh measurement");
+        let cal = run_full_calibration(input, format)?;
+        save_calibration(&cal, &path);
+        return Ok(apply_overrides(cal.thresholds, opts));
+    }
+
+    // Try to load. Missing → run a fresh calibration.
+    let cal = match Calibration::load(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            println!(
+                "calibration: no JSON at {} — running first-time calibration",
+                path.display()
+            );
+            let cal = run_full_calibration(input, format)?;
+            save_calibration(&cal, &path);
+            return Ok(apply_overrides(cal.thresholds, opts));
+        }
+    };
+
+    let age_days = calibration_age_days(&cal.calibrated_at);
+    if age_days > STALE_CALIBRATION_DAYS {
+        eprintln!(
+            "  ⚠ calibration is {age_days:.0} days old (>{:.0}); consider \
+             `dub timecode-deck ... --recalibrate` for the current venue.",
+            STALE_CALIBRATION_DAYS
+        );
+    }
+
+    // Probe path. Skipping the probe gives faster startup but no
+    // rig-swap detection — explicit opt-in via --no-probe.
+    if opts.no_probe {
+        println!(
+            "calibration: loaded {} (probe skipped); engage={:.3} amp={:.4}",
+            path.display(),
+            cal.thresholds.engage,
+            cal.thresholds.amplitude
+        );
+        return Ok(apply_overrides(cal.thresholds, opts));
+    }
+
+    println!(
+        "calibration: loaded {} (calibrated {})",
+        path.display(),
+        cal.calibrated_at
+    );
+    let observed = match probe_carrier(input, format, PROBE_SECS, PROBE_DETECT_TIMEOUT_SECS) {
+        Ok(fp) => fp,
+        Err(e) => {
+            eprintln!("  ⚠ probe failed: {e:#}\n  using saved thresholds without verification");
+            return Ok(apply_overrides(cal.thresholds, opts));
+        }
+    };
+    let delta = cal.fingerprint.max_relative_delta(&observed);
+    if cal
+        .fingerprint
+        .matches(&observed, DEFAULT_FINGERPRINT_TOLERANCE)
+    {
+        println!(
+            "  ✓ fingerprint matches (max delta {:.1}%); engage={:.3} amp={:.4}",
+            delta * 100.0,
+            cal.thresholds.engage,
+            cal.thresholds.amplitude
+        );
+        return Ok(apply_overrides(cal.thresholds, opts));
+    }
+
+    // Mismatch — auto-recalibrate. The user explicitly requested
+    // this behavior: "the user can always play on a new cartridge,
+    // it must work."
+    println!(
+        "  ✗ fingerprint differs by {:.1}% (saved {:.4}/{:.4}/{:.3} vs observed \
+         {:.4}/{:.4}/{:.3}) — recalibrating",
+        delta * 100.0,
+        cal.fingerprint.carrier_amp_p50,
+        cal.fingerprint.carrier_amp_p95,
+        cal.fingerprint.carrier_conf_p50,
+        observed.carrier_amp_p50,
+        observed.carrier_amp_p95,
+        observed.carrier_conf_p50,
+    );
+    let new_cal = run_full_calibration(input, format)?;
+    save_calibration(&new_cal, &path);
+    Ok(apply_overrides(new_cal.thresholds, opts))
+}
+
+/// M5.3 defaults — the floor that every higher-priority source
+/// (saved JSON, fresh measurement) overrides.
+fn default_thresholds() -> CalibrationThresholds {
+    CalibrationThresholds {
+        engage: DEFAULT_CONFIDENCE_THRESHOLD,
+        disengage: DEFAULT_DISENGAGE_THRESHOLD,
+        amplitude: DEFAULT_AMPLITUDE_THRESHOLD,
+        sticky_blocks_to_disengage: DEFAULT_STICKY_BLOCKS_TO_DISENGAGE,
+    }
+}
+
+/// Apply per-knob CLI overrides on top of an auto-resolved set.
+/// Each override replaces exactly one value, leaving the others
+/// untouched — partial overrides ("auto-everything except force
+/// amplitude=0.05") are first-class.
+fn apply_overrides(base: CalibrationThresholds, opts: &Opts) -> CalibrationThresholds {
+    CalibrationThresholds {
+        engage: opts.confidence.unwrap_or(base.engage),
+        disengage: opts.disengage.unwrap_or(base.disengage),
+        amplitude: opts.amplitude_threshold.unwrap_or(base.amplitude),
+        sticky_blocks_to_disengage: opts
+            .sticky_blocks
+            .unwrap_or(base.sticky_blocks_to_disengage),
+    }
+}
+
+/// Run a full calibration against an open `AudioInput` and return
+/// the populated [`Calibration`]. A wrapper around
+/// [`measure_inline`] that pins the auto-startup defaults.
+fn run_full_calibration(input: &mut AudioInput, format: Format) -> Result<Calibration> {
+    println!();
+    println!("=== auto-calibration ===");
+    let cal = measure_inline(
+        input,
+        format,
+        AUTO_CARRIER_SECS,
+        AUTO_LIFT_SECS,
+        AUTO_DETECT_TIMEOUT_SECS,
+    )?;
+    println!(
+        "  derived: engage={:.3} disengage={:.3} amp={:.4} sticky={} (SNR {:.0}×)",
+        cal.thresholds.engage,
+        cal.thresholds.disengage,
+        cal.thresholds.amplitude,
+        cal.thresholds.sticky_blocks_to_disengage,
+        cal.snr_margin,
+    );
+    println!("=== end calibration ===");
+    println!();
+    Ok(cal)
+}
+
+/// Save the calibration to disk; report failures as warnings rather
+/// than fatal errors. The user's session can proceed even if disk
+/// is full / read-only / sandboxed — they just lose the persistence
+/// for next startup. This trade-off keeps the calibration flow
+/// "always recoverable" for a live performance setup.
+fn save_calibration(cal: &Calibration, path: &std::path::Path) {
+    match cal.save(path) {
+        Ok(()) => println!("  saved → {}", path.display()),
+        Err(e) => eprintln!(
+            "  ⚠ failed to save calibration to {}: {e:#}",
+            path.display()
+        ),
+    }
+}
+
+/// Difference in days between `calibrated_at` (RFC-3339) and now.
+/// Returns 0.0 if `calibrated_at` is unparseable so the freshness
+/// warning never spuriously fires for older / future-schema files.
+fn calibration_age_days(calibrated_at: &str) -> f64 {
+    let parsed = OffsetDateTime::parse(calibrated_at, &Rfc3339).ok();
+    let Some(t) = parsed else {
+        return 0.0;
+    };
+    let now = OffsetDateTime::now_utc();
+    let dur = now - t;
+    dur.as_seconds_f64() / 86_400.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibration::SCHEMA_VERSION;
+
+    fn opts_default() -> Opts {
+        Opts {
+            track: PathBuf::new(),
+            input: InputArgs::default(),
+            output_buffer_size: None,
+            confidence: None,
+            disengage: None,
+            sticky_blocks: None,
+            amplitude_threshold: None,
+            recalibrate: false,
+            no_probe: false,
+            no_calibrate: false,
+            duration_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn apply_overrides_replaces_only_set_fields() {
+        let base = CalibrationThresholds {
+            engage: 0.95,
+            disengage: 0.50,
+            amplitude: 0.12,
+            sticky_blocks_to_disengage: 4,
+        };
+        let mut opts = opts_default();
+        opts.amplitude_threshold = Some(0.05);
+        let r = apply_overrides(base, &opts);
+        // amplitude overridden, everything else preserved.
+        assert!((r.amplitude - 0.05).abs() < 1e-6);
+        assert!((r.engage - 0.95).abs() < 1e-6);
+        assert!((r.disengage - 0.50).abs() < 1e-6);
+        assert_eq!(r.sticky_blocks_to_disengage, 4);
+    }
+
+    #[test]
+    fn apply_overrides_no_explicit_keeps_base() {
+        let base = CalibrationThresholds {
+            engage: 0.95,
+            disengage: 0.50,
+            amplitude: 0.12,
+            sticky_blocks_to_disengage: 4,
+        };
+        let opts = opts_default();
+        let r = apply_overrides(base, &opts);
+        assert!((r.engage - base.engage).abs() < 1e-6);
+        assert!((r.amplitude - base.amplitude).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_overrides_full_override_wins() {
+        let base = CalibrationThresholds {
+            engage: 0.95,
+            disengage: 0.50,
+            amplitude: 0.12,
+            sticky_blocks_to_disengage: 4,
+        };
+        let mut opts = opts_default();
+        opts.confidence = Some(0.80);
+        opts.disengage = Some(0.40);
+        opts.amplitude_threshold = Some(0.03);
+        opts.sticky_blocks = Some(8);
+        let r = apply_overrides(base, &opts);
+        assert!((r.engage - 0.80).abs() < 1e-6);
+        assert!((r.disengage - 0.40).abs() < 1e-6);
+        assert!((r.amplitude - 0.03).abs() < 1e-6);
+        assert_eq!(r.sticky_blocks_to_disengage, 8);
+    }
+
+    #[test]
+    fn calibration_age_days_recent_is_near_zero() {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let age = calibration_age_days(&now);
+        assert!(age.abs() < 0.01, "expected near 0, got {age}");
+    }
+
+    #[test]
+    fn calibration_age_days_unparseable_is_zero() {
+        // Garbage string should be treated as "fresh" — we'd rather
+        // miss a freshness warning than spuriously cry wolf.
+        let age = calibration_age_days("not-a-date");
+        assert!(age.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn calibration_age_days_30_days_ago_returns_30() {
+        let past = OffsetDateTime::now_utc() - time::Duration::days(30);
+        let s = past.format(&Rfc3339).unwrap();
+        let age = calibration_age_days(&s);
+        // Tolerance for sub-second clock drift across the test's
+        // own runtime.
+        assert!((age - 30.0).abs() < 0.01, "expected ~30, got {age}");
+    }
+
+    #[test]
+    fn parse_opts_explicit_thresholds_round_trip() {
+        // Sanity check: --confidence on the CLI lands as
+        // Some(_) (used to test the override path).
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let args = s(&[
+            "--confidence",
+            "0.93",
+            "--amplitude-threshold",
+            "0.04",
+            "--input-channels",
+            "3,4",
+            "track.wav",
+        ]);
+        let opts = parse_opts(&args).unwrap();
+        assert_eq!(opts.confidence, Some(0.93));
+        assert_eq!(opts.amplitude_threshold, Some(0.04));
+        assert!(opts.disengage.is_none());
+        assert!(opts.sticky_blocks.is_none());
+    }
+
+    #[test]
+    fn parse_opts_recalibrate_flag() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let opts = parse_opts(&s(&["--recalibrate", "--input-channels", "3,4", "t.wav"])).unwrap();
+        assert!(opts.recalibrate);
+        assert!(!opts.no_probe);
+        assert!(!opts.no_calibrate);
+    }
+
+    #[test]
+    fn parse_opts_recalibrate_and_no_calibrate_conflict() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--recalibrate",
+            "--no-calibrate",
+            "--input-channels",
+            "3,4",
+            "t.wav",
+        ]));
+        assert!(r.is_err(), "mutually-exclusive flags should error");
+    }
+
+    /// Avoid unused-import lint when calibration types pull in.
+    #[allow(dead_code)]
+    fn _keep_schema_version_alive() {
+        let _ = SCHEMA_VERSION;
+    }
 }

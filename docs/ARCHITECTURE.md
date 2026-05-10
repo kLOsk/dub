@@ -547,8 +547,8 @@ On every change the policy is rebuilt via `LiftPolicy::new` —
 which resets `engaged` to `false` so the user sees what would
 happen *with these new thresholds, starting from a cold lock*
 rather than carrying engagement over from the old thresholds.
-This is the calibration sandbox; M5.4.2 (`dub calibrate`) will
-persist the resulting values per-cartridge.
+This is the calibration sandbox; M5.4.2 (`dub calibrate`)
+persists the resulting values per-rig.
 
 **Why not a Lissajous on the audio thread?** The trail buffer
 (1024 frame pairs) is tiny enough that pulling it from the
@@ -556,6 +556,114 @@ ringbuf consumer on the main thread costs ~µs per frame. Pushing
 display data through the audio thread would have meant a second
 ringbuf solely for visualization; not worth the surface area for
 a diagnostic.
+
+### Calibration + rig fingerprinting — M5.4.2
+
+`dub calibrate` and `dub timecode-deck`'s startup auto-calibration
+share one code path (`calibrate::measure_inline`), so a JSON file
+written by either is indistinguishable. The data model + math live
+in `crates/dub-cli/src/calibration.rs` (pure, fully unit-tested);
+the interactive driver lives in `calibrate.rs`.
+
+**Why per-rig, not per-soundcard.** The user's literal request:
+"the user can always play on a new cartridge — we cannot assume
+that because the SL3 is connected, the cartridge and turntable are
+the same." Cartridges differ by output level (Concorde Pro ≈ 250 mV
+nominal vs. Nightclub MK2 ≈ 500 mV), preamps differ by gain
+structure, and turntable cabling has its own loss profile. All
+three together set the carrier amplitude that reaches Dub's input.
+A soundcard-only calibration would silently misfire on cartridge
+swap.
+
+**Two-phase measurement, zero prompts.**
+
+```text
+  AudioInput  ──┬──► wait_for_stable_carrier
+                │     (5 consecutive blocks: conf ≥ 0.85, |rate-1|<0.10)
+                │
+                ├──► capture_phase("carrier", 10 s) ──► amps[], confs[]
+                │                                          │
+                ├──► wait_for_lift                         │
+                │     (10 consecutive blocks: amp < 0.005) │
+                │                                          │
+                └──► capture_phase("lift", 5 s) ──► amps[], confs[]
+                                                           │
+                              ┌────────────────────────────┘
+                              ▼
+              measurement_stats_from_samples → P5/P50/P95 each
+                              │
+                ┌─────────────┴────────────┐
+                ▼                          ▼
+   derive_thresholds ───►        RigFingerprint
+   (engage = c.conf_p5 - 0.03,   (carrier_amp_p50,
+    amplitude = c.amp_p5 / 2,     carrier_amp_p95,
+    disengage = 0.50,             carrier_conf_p50)
+    sticky = 4)                          │
+        │                                │
+        └──────────────┬─────────────────┘
+                       ▼
+                  Calibration {schema_version,
+                               device_name, format,
+                               calibrated_at,
+                               input_sample_rate,
+                               block_frames,
+                               fingerprint, thresholds,
+                               measurements, snr_margin}
+                       │
+                       ▼
+            ~/.dub/calibration/<device_key>.json
+```
+
+The detector uses fixed sensible defaults (carrier ≥ 0.85 conf,
+lift < 0.005 amp) — these are reliable across any rig that passes
+the SNR sanity check, so the user doesn't have to pre-tune
+calibration thresholds to calibrate.
+
+**Threshold derivation.** Pure functions over the percentiles —
+`derive_thresholds(carrier, lift) -> Option<CalibrationThresholds>`.
+Returns `None` when carrier-to-lift SNR is below 10× (refusing to
+ship thresholds for a rig with a stylus / preamp / cabling
+problem). Pinned by tests against the user's actual hand-found
+M5.4.1 SL3 values (engage 0.95, amp 0.12) — the formula reproduces
+those within 1 % from the same input percentiles.
+
+**Fingerprint.** Three carrier-amplitude / confidence percentiles.
+Lift noise is *deliberately excluded*: lift noise rises by 10–100×
+in clubs vs. lab, which would false-flag every venue change as
+"rig changed". Carrier amplitude is the cartridge's signal level —
+dominant over ambient noise on the wire — so it tracks the rig
+identity, not the room.
+
+**Startup flow on `dub timecode-deck`.**
+
+1. Open input device.
+2. If `--no-calibrate`: use M5.3 defaults.
+3. Else if `--recalibrate`: run a fresh full measurement, save,
+   use those thresholds.
+4. Else: try to load `~/.dub/calibration/<device_key>.json`.
+    - **Missing**: run a fresh full measurement, save, use.
+    - **Stale (>30 d)**: warn but proceed.
+    - **Default**: probe carrier briefly (3 s) to compute observed
+      fingerprint, compare to saved at 30 % tolerance.
+        - **Match**: use saved.
+        - **Mismatch**: print delta, run a fresh measurement, save,
+          use.
+    - **`--no-probe`**: skip the probe, use saved as-is.
+5. Apply per-knob CLI overrides on top so partial overrides
+   ("auto-everything except force amplitude=0.05") still work.
+
+**Save semantics.** Atomic via temp-file + rename so a crash
+mid-write doesn't corrupt the previous calibration. Save failures
+(disk full, sandbox, …) are warnings, not fatal — a live
+performance setup must always remain usable, even with persistence
+broken.
+
+**Schema version.** Bumped on incompatible format changes.
+Readers reject files with `schema_version > SCHEMA_VERSION`. The
+JSON deliberately stores the full P5/P50/P95 measurements, not just
+the derived thresholds; future formula changes (M5.4.3 continuous
+adaptation, M6 Traktor support) can re-derive thresholds from
+existing files without forcing a remeasurement.
 
 ### Two decks + debug internal mixer — M4
 

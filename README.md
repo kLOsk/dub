@@ -59,10 +59,20 @@ make ci
 # Live timecode → deck (M5.3). SL3 deck A is on input channels 3 & 4.
 ./target/release/dub timecode-deck path/to/track.mp3 --input-channels 3,4
 
-# TUI inspector for calibrating your cartridge against your specific rig
+# TUI inspector for tuning your rig against the live timecode signal
 # (M5.4.1). Same LiftPolicy as `timecode-deck`, so what you see here is what
 # you'd hear during playback.
 ./target/release/dub scope --input-channels 3,4
+
+# One-shot per-rig calibration (M5.4.2). Drop the needle, lift the needle —
+# the calibrator detects each phase, derives engage / amplitude thresholds,
+# and stamps a rig fingerprint. Stored at ~/.dub/calibration/<device>_<format>.json.
+./target/release/dub calibrate --input-channels 3,4
+
+# After calibrate has run once, `timecode-deck` auto-loads it on startup
+# and probes the carrier briefly to detect rig swaps (cartridge change,
+# preamp change). Mismatch → automatic recalibration before playback.
+./target/release/dub timecode-deck path/to/track.mp3 --input-channels 3,4
 ```
 
 `dub scope` keys: `q`/`Esc` quit, `c` clear lissajous, `↑/↓` engage threshold,
@@ -86,7 +96,9 @@ Roadmap is detailed in [`docs/PRD.md`](docs/PRD.md). Bookmark order:
 | **M5.2** | ✅ shipped | Audio input plumbing (`AudioInput`, `dub capture`, `dub levels`) |
 | **M5.3** | ✅ shipped | Live timecode → deck (first scratch). 3-layer lift policy. |
 | **M5.4.1** | ✅ shipped | TUI scope + `LiftPolicy` refactor |
-| **M5.4.2** | 🔧 next | Per-cartridge calibration UX + JSON persistence |
+| **M5.4.2** | ✅ shipped | Per-rig calibration + fingerprint-based auto-detection |
+| **M5.4.3** | 📋 planned | Calibration speed (≤5 s first-time, ≤1 s probe) — match Traktor |
+| **M5.4.4** | 📋 planned | Named per-cartridge profiles |
 | **M5.5** | ◻ planned | External-mixer 4-channel output routing |
 | **M6** | ◻ planned | Traktor MK2 timecode |
 | **M7** | ◻ planned | Thru Mode (real records routed through Dub) |
@@ -163,8 +175,8 @@ These are validated end-to-end on real hardware as each milestone lands.
 
 | Hardware | Used for | Status |
 |---|---|---|
-| Serato SL3 | Stereo input pair (deck A on ch 3+4) | ✅ M5.2, M5.3, M5.4.1 |
-| Serato CV02 control vinyl | Timecode source (relative mode) | ✅ M5.1, M5.3, M5.4.1 |
+| Serato SL3 | Stereo input pair (deck A on ch 3+4) | ✅ M5.2, M5.3, M5.4.1, M5.4.2 |
+| Serato CV02 control vinyl | Timecode source (relative mode) | ✅ M5.1, M5.3, M5.4.1, M5.4.2 |
 | Native Instruments Audio 6 | Input device alternative | ◻ planned for M5.5 |
 | Phase DJ | HID controller | ◻ planned for v1.1 |
 | Rane mixers (any) | External mixer | ✅ M5.3 (line-out compatible) |

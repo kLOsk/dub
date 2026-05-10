@@ -25,6 +25,8 @@ use dub_engine::{Engine, EngineHandle, RealtimeContext};
 use dub_io::Track;
 
 mod analyze;
+mod calibrate;
+mod calibration;
 mod decode_timecode;
 mod input_cmds;
 mod scope;
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
         "capture" => input_cmds::capture(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
         "scope" => scope::run(&args[2..]),
+        "calibrate" => calibrate::run(&args[2..]),
         "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
@@ -104,12 +107,20 @@ fn print_help() {
     eprintln!("                    [--duration SECS] [--confidence T]");
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
     eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
-    eprintln!("                                    live timecode \u{2192} deck-0 demo (M5.3)");
+    eprintln!("                    [--recalibrate] [--no-probe] [--no-calibrate]");
+    eprintln!(
+        "                                    live timecode \u{2192} deck-0 demo (M5.3+M5.4.2)"
+    );
     eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--duration SECS]");
     eprintln!("                    [--engage T] [--disengage T] [--sticky N]");
     eprintln!("                    [--amplitude T] [--format serato-cv02]");
     eprintln!("                                    live timecode scope (TUI) (M5.4.1)");
+    eprintln!("  calibrate         [--device NAME] [--input-channels N,M] [--sr SR]");
+    eprintln!("                    [--buffer-size F] [--carrier-secs S] [--lift-secs S]");
+    eprintln!("                    [--detect-timeout S] [--format serato-cv02]");
+    eprintln!("                    [-o PATH] [--no-save]");
+    eprintln!("                                    auto-calibrate per rig + persist (M5.4.2)");
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
@@ -136,15 +147,26 @@ fn print_help() {
     eprintln!("    --synthetic and no input path, decodes a built-in test scenario instead");
     eprintln!("    (sanity-check the decoder math without a turntable).");
     eprintln!();
-    eprintln!("  timecode-deck (M5.3): live wiring — open the input device, route timecode");
-    eprintln!("    through the dub-timecode decoder into deck 0's transport, play the loaded");
-    eprintln!("    track through the default output. Forward platter motion plays forward,");
+    eprintln!("  timecode-deck (M5.3 + M5.4.2): live wiring — open the input device, route");
+    eprintln!("    timecode through the dub-timecode decoder into deck 0's transport, play the");
+    eprintln!("    loaded track through the default output. Forward platter motion plays forward,");
     eprintln!("    scratching scratches, lifting the stylus mutes the deck. Lift is detected");
-    eprintln!("    via three layers: (1) amplitude gate — RMS below --amplitude-threshold means");
+    eprintln!("    via three layers: (1) amplitude gate — RMS below the amp threshold means");
     eprintln!("    carrier is dead regardless of confidence (catches lift's quiet-but-coherent");
-    eprintln!("    handling-noise); (2) confidence hysteresis — engage at --confidence, lukewarm");
-    eprintln!("    band down to --disengage-threshold rides scratch transients; (3) sticky");
-    eprintln!("    window — --sticky-blocks consecutive below-floor blocks before muting.");
+    eprintln!("    handling-noise); (2) confidence hysteresis — engage at the upper threshold,");
+    eprintln!("    lukewarm band down to disengage rides scratch transients; (3) sticky window");
+    eprintln!("    — N consecutive below-floor blocks before muting.");
+    eprintln!();
+    eprintln!("    Calibration (M5.4.2): on startup, looks for ~/.dub/calibration/<device>_");
+    eprintln!("    serato-cv02.json, probes the carrier briefly to validate the saved");
+    eprintln!("    fingerprint (cartridge + preamp signature), and uses those thresholds.");
+    eprintln!("    On mismatch (cartridge swap, preamp change) it auto-recalibrates and");
+    eprintln!("    overwrites the JSON. On first run it does a full calibration. Per-knob CLI");
+    eprintln!("    flags (--confidence, --amplitude-threshold, etc.) override individual");
+    eprintln!("    thresholds; --recalibrate forces fresh measurement; --no-probe skips the");
+    eprintln!("    fingerprint check (faster startup, no rig-swap detection); --no-calibrate");
+    eprintln!("    falls back entirely to M5.3 defaults.");
+    eprintln!();
     eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
     eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
     eprintln!("    to stop.");
@@ -157,7 +179,19 @@ fn print_help() {
     eprintln!("      - Live thresholds, mutable in-place via arrow keys for tuning your rig.");
     eprintln!("    Key bindings: q/Esc quit, c clear lissajous, \u{2191}/\u{2193} engage,");
     eprintln!("    PgUp/PgDn disengage, \u{2190}/\u{2192} amplitude. SL3 deck A:");
-    eprintln!("    --input-channels 3,4. Calibration UX in M5.4.2 will persist these.");
+    eprintln!("    --input-channels 3,4. Use `dub calibrate` to persist your tuning.");
+    eprintln!();
+    eprintln!("  calibrate (M5.4.2): auto-detect per-rig thresholds + persist to");
+    eprintln!("    ~/.dub/calibration/<device>_serato-cv02.json. Two zero-prompt phases:");
+    eprintln!("    (1) drop the needle on a clean section at 33⅓ — calibrator detects");
+    eprintln!("    stable carrier and captures 10 s of percentile data; (2) lift the needle");
+    eprintln!("    onto the rest — calibrator detects lift and captures 5 s of noise floor.");
+    eprintln!("    From the two phases it derives engage / amplitude thresholds and stamps");
+    eprintln!("    a rig fingerprint (carrier amp + confidence percentiles) so future");
+    eprintln!("    timecode-deck startups can detect cartridge / preamp swaps and auto-");
+    eprintln!("    recalibrate. Auto-calibration runs the same code path, so a JSON saved");
+    eprintln!("    here is indistinguishable from one auto-saved by timecode-deck.");
+    eprintln!("    --no-save skips persistence (useful when iterating on threshold formulas).");
 }
 
 fn smoke() -> Result<()> {

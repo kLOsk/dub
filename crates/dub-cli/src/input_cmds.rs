@@ -50,7 +50,7 @@ impl InputArgs {
     /// number of channels we open the AU with equals the number of
     /// entries in the map, and the map itself is converted from
     /// 1-based (user-facing) to 0-based (CoreAudio).
-    pub(crate) fn to_options(&self) -> InputOptions {
+    pub fn to_options(&self) -> InputOptions {
         let (channels, channel_map) = match &self.input_channels {
             Some(v) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -78,7 +78,7 @@ impl InputArgs {
 /// Parse the shared input flags out of `args`. Unknown flags or
 /// command-specific positionals are returned via the second tuple
 /// element so callers can interpret them.
-pub(crate) fn parse_input_args(args: &[String]) -> Result<(InputArgs, Vec<String>)> {
+pub fn parse_input_args(args: &[String]) -> Result<(InputArgs, Vec<String>)> {
     let mut input = InputArgs::default();
     let mut leftover: Vec<String> = Vec::new();
     let mut i = 0;
