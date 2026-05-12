@@ -203,7 +203,7 @@ struct DeckHeader: View {
         switch state.source {
         case .off:      return "OFF"
         case .thru:     return state.isLive ? "THRU · LIVE" : "THRU"
-        case .timecode: return "TIMECODE"
+        case .timecode: return state.isLive ? "TIMECODE · LIVE" : "TIMECODE"
         case .file:     return "FILE"
         }
     }
@@ -323,9 +323,16 @@ extension DeckHeaderState {
         }
 
         if thruMode {
+            // Timecode engine mode + no File track loaded → the deck
+            // is in "Real Record" Thru mode. The pill reads
+            // `TIMECODE` because that's the *engine mode* the user
+            // picked (PRD §1: "real records are first-class citizens
+            // via Thru mode auto-detection") — even though M5.6's
+            // actual timecode decoder isn't wired through the UI
+            // yet, this is the milestone the surface advertises.
             return DeckHeaderState(
                 isLive: true,
-                source: .thru,
+                source: .timecode,
                 trackTitle: "Real Record",
                 trackArtist: "capturing live",
                 formatChip: nil,

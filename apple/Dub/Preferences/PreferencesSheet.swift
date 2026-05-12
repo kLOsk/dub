@@ -102,7 +102,6 @@ struct PreferencesSheet: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .disabled(model.isRunning)
 
                 Button {
                     model.refreshDevices()
@@ -110,7 +109,6 @@ struct PreferencesSheet: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .help("Re-scan input devices")
-                .disabled(model.isRunning)
             }
         }
     }
@@ -158,7 +156,15 @@ struct PreferencesSheet: View {
                 Button("Stop", role: .destructive) {
                     model.stop()
                 }
-                .keyboardShortcut(.escape, modifiers: [])
+                Button("Apply") {
+                    model.stop()
+                    model.start()
+                    if model.lastError == nil {
+                        dismiss()
+                    }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(applyDisabled)
             } else {
                 Button("Start") {
                     model.start()
@@ -167,12 +173,24 @@ struct PreferencesSheet: View {
                     }
                 }
                 .keyboardShortcut(.return, modifiers: [])
-                .disabled(model.selectedDevice == nil)
+                .disabled(startDisabled)
             }
             Button("Close") { dismiss() }
                 .keyboardShortcut(.cancelAction)
         }
     }
+
+    /// Start is unavailable when the chosen mode lacks the inputs
+    /// it needs. Timecode needs an input device; Prep mode needs
+    /// nothing beyond the system audio output.
+    private var startDisabled: Bool {
+        switch model.engineMode {
+        case .timecode: return model.selectedDevice == nil
+        case .prep:     return false
+        }
+    }
+
+    private var applyDisabled: Bool { startDisabled }
 
     // MARK: - Helpers
 

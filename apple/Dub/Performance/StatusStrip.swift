@@ -32,6 +32,10 @@ struct StatusStripState: Equatable {
     /// at ~1 Hz. `nil` means "unknown" and the strip renders
     /// nothing (rather than a misleading "100 %" or "0 %").
     let power: PowerState?
+    /// Transient error / status message surfaced by the model
+    /// (load failures, engine start errors). `nil` when nothing
+    /// is being surfaced.
+    let lastError: String?
 
     /// Sample rate formatted as "48.0 kHz" or `nil` if `0` (engine
     /// not running yet).
@@ -57,6 +61,9 @@ struct PowerState: Equatable {
 struct StatusStrip: View {
 
     let state: StatusStripState
+    /// Tap target for the gear button → opens Preferences. `nil`
+    /// hides the button (used by previews / snapshot tests).
+    let openPreferences: (() -> Void)?
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
@@ -65,13 +72,49 @@ struct StatusStrip: View {
                 .frame(height: 12)
                 .overlay(DubColor.divider)
             statusText
+            if let err = state.lastError {
+                errorBadge(err)
+            }
             Spacer(minLength: 0)
             clockView
             batteryView
+            if let openPreferences {
+                gearButton(action: openPreferences)
+            }
         }
         .padding(.horizontal, DubSpacing.lg)
         .frame(height: DubLayout.statusStripHeight)
         .background(DubColor.surface1)
+    }
+
+    /// Inline error pill — same colour palette as the deck-pane
+    /// red-flash so the two surfaces feel related. Truncates long
+    /// errors so the strip never wraps.
+    private func errorBadge(_ text: String) -> some View {
+        HStack(spacing: DubSpacing.xs) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+            Text(text)
+                .font(DubFont.caps)
+                .tracking(0.6)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(DubColor.stateError)
+        .padding(.horizontal, DubSpacing.sm)
+        .padding(.vertical, 2)
+        .background(DubColor.stateError.opacity(0.15))
+        .clipShape(Capsule())
+    }
+
+    private func gearButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 13, weight: .medium))
+        }
+        .buttonStyle(.borderless)
+        .help("Preferences (⌘,)")
+        .foregroundStyle(DubColor.textSecondary)
     }
 
     private var wordmark: some View {
@@ -172,6 +215,8 @@ struct StatusStripContainer: View {
     let engineVersion: String
     let sampleRate: UInt32
     let isRunning: Bool
+    let lastError: String?
+    let openPreferences: () -> Void
 
     @State private var clockText: String? = nil
     @State private var power: PowerState? = nil
@@ -184,14 +229,17 @@ struct StatusStripContainer: View {
     private let tick = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        StatusStrip(state: StatusStripState(
-            engineVersion: engineVersion,
-            sampleRate: sampleRate,
-            isRunning: isRunning,
-            clockText: clockText,
-            power: power))
-        .onAppear(perform: refresh)
-        .onReceive(tick) { _ in refresh() }
+        StatusStrip(
+            state: StatusStripState(
+                engineVersion: engineVersion,
+                sampleRate: sampleRate,
+                isRunning: isRunning,
+                clockText: clockText,
+                power: power,
+                lastError: lastError),
+            openPreferences: openPreferences)
+            .onAppear(perform: refresh)
+            .onReceive(tick) { _ in refresh() }
     }
 
     private func refresh() {
@@ -252,25 +300,34 @@ enum PowerSourcePoller {
 }
 
 #Preview("idle") {
-    StatusStrip(state: StatusStripState(
-        engineVersion: "0.0.1", sampleRate: 0, isRunning: false,
-        clockText: "21:47",
-        power: PowerState(isCharging: false, percent: 87)))
+    StatusStrip(
+        state: StatusStripState(
+            engineVersion: "0.0.1", sampleRate: 0, isRunning: false,
+            clockText: "21:47",
+            power: PowerState(isCharging: false, percent: 87),
+            lastError: nil),
+        openPreferences: nil)
         .frame(width: 1440)
 }
 
 #Preview("running 48 kHz, low battery") {
-    StatusStrip(state: StatusStripState(
-        engineVersion: "0.0.1", sampleRate: 48000, isRunning: true,
-        clockText: "23:12",
-        power: PowerState(isCharging: false, percent: 14)))
+    StatusStrip(
+        state: StatusStripState(
+            engineVersion: "0.0.1", sampleRate: 48000, isRunning: true,
+            clockText: "23:12",
+            power: PowerState(isCharging: false, percent: 14),
+            lastError: nil),
+        openPreferences: nil)
         .frame(width: 1440)
 }
 
-#Preview("running 48 kHz, plugged in") {
-    StatusStrip(state: StatusStripState(
-        engineVersion: "0.0.1", sampleRate: 48000, isRunning: true,
-        clockText: "23:12",
-        power: PowerState(isCharging: true, percent: 100)))
+#Preview("running 48 kHz, error surfaced") {
+    StatusStrip(
+        state: StatusStripState(
+            engineVersion: "0.0.1", sampleRate: 48000, isRunning: true,
+            clockText: "23:12",
+            power: PowerState(isCharging: true, percent: 100),
+            lastError: "Couldn't decode that track."),
+        openPreferences: {})
         .frame(width: 1440)
 }

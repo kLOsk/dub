@@ -130,7 +130,10 @@ final class WaveformAppModel: ObservableObject {
     // MARK: Live engine state
 
     @Published private(set) var isRunning: Bool = false
-    @Published var lastError: String? = nil
+    /// Most recent transient error to surface to the user. Mutated
+    /// only via `surfaceError(_:)` so the auto-clear timer stays
+    /// consistent. Status-strip + Preferences both read this.
+    @Published private(set) var lastError: String? = nil
     /// True iff the most recent Start opened the engine in
     /// two-deck mode (Timecode + non-empty deck-B channels).
     @Published private(set) var twoDeckMode: Bool = false
@@ -165,6 +168,12 @@ final class WaveformAppModel: ObservableObject {
     /// isn't running.
     private var pollTimer: Timer?
     private static let pollIntervalSecs: TimeInterval = 1.0 / 30.0
+
+    /// Pending auto-clear task for `lastError`. Cancelled if a new
+    /// error supersedes the previous one within the visibility
+    /// window.
+    private var lastErrorClearTask: Task<Void, Never>?
+    private static let errorVisibilitySecs: UInt64 = 5_000_000_000
 
     // MARK: Init / deinit
 
@@ -210,8 +219,20 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: Engine lifecycle
 
+    /// Reapply the current configuration to the engine. Used when
+    /// the user changes mode in Preferences — we stop the running
+    /// session, then start a fresh one in the new mode. Stays a
+    /// no-op when the engine is stopped (so a mode toggle in
+    /// Preferences before the first Start doesn't surprise the
+    /// user by spinning the engine up on its own).
+    func restartIfRunning() {
+        guard isRunning else { return }
+        stop()
+        start()
+    }
+
     func start() {
-        lastError = nil
+        surfaceError(nil)
         switch engineMode {
         case .timecode: startTimecode()
         case .prep:     startPrep()
@@ -233,14 +254,14 @@ final class WaveformAppModel: ObservableObject {
 
     private func startTimecode() {
         guard let device = selectedDevice, !device.isEmpty else {
-            lastError = "Pick an input device first."
+            surfaceError("Pick an input device first.")
             return
         }
         let channelsA: [UInt32]
         switch parseChannels(channelsAText, side: "A") {
         case .success(let cs): channelsA = cs
         case .failure(let msg):
-            lastError = msg
+            surfaceError(msg)
             return
         }
         let trimmedB = channelsBText.trimmingCharacters(in: .whitespaces)
@@ -253,7 +274,7 @@ final class WaveformAppModel: ObservableObject {
                 switch parseChannels(trimmedB, side: "B") {
                 case .success(let cs): channelsB = cs
                 case .failure(let msg):
-                    lastError = msg
+                    surfaceError(msg)
                     return
                 }
                 try engine.startThruTwoDeck(
@@ -263,9 +284,9 @@ final class WaveformAppModel: ObservableObject {
             isRunning = true
             masterDeck = stickyMaster
         } catch let error as EngineError {
-            lastError = describe(error)
+            surfaceError(describe(error))
         } catch {
-            lastError = "Unexpected error: \(error.localizedDescription)"
+            surfaceError("Unexpected error: \(error.localizedDescription)")
         }
     }
 
@@ -276,9 +297,9 @@ final class WaveformAppModel: ObservableObject {
             twoDeckMode = false
             masterDeck = stickyMaster
         } catch let error as EngineError {
-            lastError = describe(error)
+            surfaceError(describe(error))
         } catch {
-            lastError = "Unexpected error: \(error.localizedDescription)"
+            surfaceError("Unexpected error: \(error.localizedDescription)")
         }
     }
 
@@ -368,7 +389,7 @@ final class WaveformAppModel: ObservableObject {
     @discardableResult
     func loadTrack(side: DeckSide, url: URL) -> Bool {
         guard isRunning else {
-            lastError = "Engine not running. Start it from Preferences (⌘,)."
+            surfaceError("Engine not running. Open Preferences (⌘,) and Start.")
             return false
         }
         let target = state(for: side)
@@ -395,10 +416,10 @@ final class WaveformAppModel: ObservableObject {
             recomputeMaster()
             return true
         } catch let error as EngineError {
-            lastError = describe(error)
+            surfaceError(describe(error))
             return false
         } catch {
-            lastError = "Unexpected load error: \(error.localizedDescription)"
+            surfaceError("Unexpected load error: \(error.localizedDescription)")
             return false
         }
     }
@@ -408,7 +429,7 @@ final class WaveformAppModel: ObservableObject {
     func loadBrowserSelectionIntoNonMaster() {
         guard isRunning else { return }
         guard let url = browserSelection else {
-            lastError = "Select a file in the browser first."
+            surfaceError("Select a file in the browser first.")
             return
         }
         let candidate = nonMasterSide()
@@ -439,9 +460,9 @@ final class WaveformAppModel: ObservableObject {
             setState(s, for: side)
             recomputeMaster()
         } catch let error as EngineError {
-            lastError = describe(error)
+            surfaceError(describe(error))
         } catch {
-            lastError = "Play failed: \(error.localizedDescription)"
+            surfaceError("Play failed: \(error.localizedDescription)")
         }
     }
 
@@ -454,13 +475,32 @@ final class WaveformAppModel: ObservableObject {
             setState(s, for: side)
             recomputeMaster()
         } catch let error as EngineError {
-            lastError = describe(error)
+            surfaceError(describe(error))
         } catch {
-            lastError = "Pause failed: \(error.localizedDescription)"
+            surfaceError("Pause failed: \(error.localizedDescription)")
         }
     }
 
     // MARK: Helpers
+
+    /// Single sink for surfaceable user-facing errors. Updates
+    /// `lastError` and schedules a `Task` to clear it after
+    /// `errorVisibilitySecs`, cancelling any prior pending clear.
+    /// Passing `nil` clears immediately.
+    func surfaceError(_ message: String?) {
+        lastErrorClearTask?.cancel()
+        lastErrorClearTask = nil
+        lastError = message
+        guard message != nil else { return }
+        let task = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.errorVisibilitySecs)
+            guard let self else { return }
+            if !Task.isCancelled {
+                self.lastError = nil
+            }
+        }
+        lastErrorClearTask = task
+    }
 
     private func flashLoadError(side: DeckSide) {
         // 200 ms red flash per PRD §5.5: "deck is playing — lift the
@@ -536,29 +576,31 @@ final class WaveformAppModel: ObservableObject {
 // MARK: - Top-level shell
 
 /// Top-level shell: the performance surface plus a `⌘,`-triggered
-/// Preferences sheet. The Preferences sheet is the *only* way to
-/// start / stop the engine in M10.3 — the performance surface is
-/// read-only, by design (PRD §2 "No Mouse DJ Ever").
+/// Preferences sheet.
 struct MainView: View {
 
     @StateObject private var model = WaveformAppModel()
     @State private var showingPreferences: Bool = false
 
     var body: some View {
-        PerformanceView(model: model)
+        PerformanceView(model: model, openPreferences: { showingPreferences = true })
             .frame(minWidth: 960, minHeight: 600)
             .sheet(isPresented: $showingPreferences) {
                 PreferencesSheet(model: model)
             }
             .background(
-                CommandShortcuts(
+                KeyEventMonitorHost(
                     showingPreferences: $showingPreferences,
                     model: model)
             )
+            .onChange(of: model.engineMode) { _ in
+                // Mode toggles in Preferences should apply
+                // immediately — no Stop-then-Start dance. If the
+                // engine isn't running, this is a no-op; the user's
+                // next Start uses the new mode.
+                model.restartIfRunning()
+            }
             .onAppear {
-                // Auto-open Preferences on first launch when the
-                // engine hasn't been configured yet. Avoids the
-                // "blank screen, what do I do?" trap.
                 if !model.isRunning {
                     showingPreferences = true
                 }
@@ -566,33 +608,100 @@ struct MainView: View {
     }
 }
 
-// MARK: - Keyboard shortcuts
+// MARK: - Keyboard event monitor
 
-/// Invisible host that registers app-level keyboard shortcuts.
-/// `⌘,` toggles Preferences; `Space` loads the FS-browser selection
-/// into the non-master stopped deck (PRD §5.5).
-///
-/// We can't put `.keyboardShortcut` on a `.sheet` modifier directly,
-/// so we attach it to invisible `Button` rows that fire the binding.
-private struct CommandShortcuts: View {
+/// Hidden NSView host that installs an `NSEvent.addLocalMonitorForEvents`
+/// handler at view-mount. Keyboard shortcuts placed on SwiftUI
+/// `Button`s with `.opacity(0)` are unreliable — when a child view
+/// (the FileBrowserView's scroll-view, a TextField, etc.) holds
+/// keyboard focus, the synthetic Button doesn't fire. NSEvent's
+/// local monitor intercepts every keyDown delivered to the
+/// application before any first responder gets it, which is the
+/// only way to make `Space` work the way `⌘,` does in macOS.
+private struct KeyEventMonitorHost: NSViewRepresentable {
     @Binding var showingPreferences: Bool
     let model: WaveformAppModel
 
-    var body: some View {
-        ZStack {
-            Button("Preferences") {
-                showingPreferences.toggle()
-            }
-            .keyboardShortcut(",", modifiers: .command)
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
-            Button("Load selection") {
-                model.loadBrowserSelectionIntoNonMaster()
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.install(
+            onSpace: {
+                Task { @MainActor in
+                    model.loadBrowserSelectionIntoNonMaster()
+                }
+                return true
+            },
+            onCmdComma: {
+                Task { @MainActor in
+                    showingPreferences.toggle()
+                }
+                return true
+            })
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // Bindings are captured by reference; no per-update work
+        // required — the monitor stays installed for the
+        // coordinator's lifetime.
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var monitor: Any?
+
+        func install(
+            onSpace: @escaping () -> Bool,
+            onCmdComma: @escaping () -> Bool
+        ) {
+            uninstall()
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self else { return event }
+                let isCmd = event.modifierFlags.contains(.command)
+                if isCmd, event.charactersIgnoringModifiers == "," {
+                    if onCmdComma() { return nil }
+                    return event
+                }
+                // Don't intercept Space while the user is typing
+                // into a TextField (Preferences channel fields,
+                // future search boxes, etc.). `⌘,` is a global
+                // shortcut so it always wins.
+                if self.isTextFirstResponder() {
+                    return event
+                }
+                // `keyCode 49` is the spacebar on every Apple keyboard
+                // layout (the keyCodes are layout-independent for the
+                // physical-key tier of NSEvent).
+                if !isCmd, event.keyCode == 49 {
+                    if onSpace() { return nil }
+                }
+                return event
             }
-            .keyboardShortcut(.space, modifiers: [])
         }
-        .frame(width: 0, height: 0)
-        .opacity(0)
-        .accessibilityHidden(true)
+
+        func uninstall() {
+            if let m = monitor { NSEvent.removeMonitor(m) }
+            monitor = nil
+        }
+
+        private func isTextFirstResponder() -> Bool {
+            guard let responder = NSApp.keyWindow?.firstResponder else {
+                return false
+            }
+            return responder is NSText || responder is NSTextView
+        }
+
+        deinit {
+            if let m = monitor { NSEvent.removeMonitor(m) }
+        }
     }
 }
 

@@ -38,6 +38,10 @@ import DubCore
 struct PerformanceView: View {
 
     @ObservedObject var model: WaveformAppModel
+    /// Callback the status-strip gear button hits to open the
+    /// Preferences sheet — owned by `MainView`, passed down so
+    /// `PerformanceView` itself stays free of sheet bindings.
+    let openPreferences: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -59,17 +63,25 @@ struct PerformanceView: View {
         StatusStripContainer(
             engineVersion: engineVersion(),
             sampleRate: model.engine.sampleRate(),
-            isRunning: model.isRunning)
+            isRunning: model.isRunning,
+            lastError: model.lastError,
+            openPreferences: openPreferences)
     }
 
     // MARK: - Deck headers
 
+    @ViewBuilder
     private var deckHeaders: some View {
-        HStack(spacing: 1) {
+        if model.engineMode == .prep {
             DeckHeader(side: .a, state: headerState(side: .a))
-            DeckHeader(side: .b, state: headerState(side: .b))
+                .background(DubColor.divider)
+        } else {
+            HStack(spacing: 1) {
+                DeckHeader(side: .a, state: headerState(side: .a))
+                DeckHeader(side: .b, state: headerState(side: .b))
+            }
+            .background(DubColor.divider)
         }
-        .background(DubColor.divider)
     }
 
     private func headerState(side: DeckSide) -> DeckHeaderState {
@@ -90,18 +102,26 @@ struct PerformanceView: View {
 
     // MARK: - Waveform region
 
-    /// Centre region: always two side-by-side deck panes (PRD §9.2
-    /// symmetric layout invariant). Each pane renders its own Metal
-    /// waveform when its deck has *any* source (Thru capture or File
-    /// track); otherwise an idle placeholder. The layout never
-    /// collapses to a single pane.
+    /// Centre region. **Two-deck modes** keep the §9.2 symmetric
+    /// layout invariant (both deck panes side-by-side, idle
+    /// placeholder when one deck has no source). **Prep mode**
+    /// collapses to a single full-width deck-A pane — Prep mode
+    /// is a single-deck shell (PRD §3.1 / M10.8); a phantom "OFF"
+    /// deck-B pane is just noise.
+    @ViewBuilder
     private var waveformRegion: some View {
-        HStack(spacing: 1) {
+        if model.engineMode == .prep {
             deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
-            deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
+                .frame(minHeight: DubLayout.waveformMinHeight)
+                .background(DubColor.divider)
+        } else {
+            HStack(spacing: 1) {
+                deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
+                deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
+            }
+            .frame(minHeight: DubLayout.waveformMinHeight)
+            .background(DubColor.divider)
         }
-        .frame(minHeight: DubLayout.waveformMinHeight)
-        .background(DubColor.divider)
     }
 
     /// One deck's pane — Metal waveform when the deck has any
@@ -128,8 +148,23 @@ struct PerformanceView: View {
             loadErrorOverlay(side: side, deckState: deckState)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            handleDrop(side: side, providers: providers)
+        // macOS 13+ Transferable drop API. The legacy `.onDrop(of:
+        // [.fileURL])` path silently failed on Finder drags here
+        // because the system doesn't auto-coerce
+        // `NSItemProvider`-backed URLs to a typed payload; using
+        // `dropDestination(for: URL.self)` routes the drop through
+        // `Transferable`'s `URL` conformance which understands
+        // `public.file-url` and `public.url` natively. Drops from
+        // Finder and from the in-app FileBrowserView both arrive
+        // here as `[URL]`.
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            Task { @MainActor in
+                if model.loadTrack(side: side, url: url) {
+                    model.play(side: side)
+                }
+            }
+            return true
         }
     }
 
@@ -155,18 +190,6 @@ struct PerformanceView: View {
             .transition(.opacity)
             .animation(.easeOut(duration: 0.15), value: until)
         }
-    }
-
-    private func handleDrop(side: DeckSide, providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        _ = provider.loadObject(ofClass: URL.self) { url, _ in
-            guard let url else { return }
-            Task { @MainActor in
-                _ = model.loadTrack(side: side, url: url)
-                model.play(side: side)
-            }
-        }
-        return true
     }
 
     /// Is deck A enabled for the current engine mode?
@@ -255,6 +278,6 @@ struct PerformanceView: View {
 }
 
 #Preview("Performance — idle") {
-    PerformanceView(model: WaveformAppModel())
+    PerformanceView(model: WaveformAppModel(), openPreferences: {})
         .frame(width: 1440, height: 900)
 }
