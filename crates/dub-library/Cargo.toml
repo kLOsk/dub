@@ -12,6 +12,7 @@ rusqlite = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
+dub-fingerprint = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

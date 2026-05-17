@@ -20,7 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use dub_fingerprint::Fingerprint;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{LibraryError, Result};
 use crate::paths::default_library_db_path;
@@ -33,6 +34,30 @@ use crate::volumes::DiscoveredVolume;
 pub struct Library {
     conn: Connection,
     db_path: PathBuf,
+}
+
+/// A fingerprint row read back from the `fingerprints` table.
+/// Carries the deserialised [`Fingerprint`] alongside the row id and
+/// the supplementary columns the M11b dedupe pipeline doesn't strictly
+/// need but later analysis (M11c filesystem scanner, M11e Serato
+/// importer) does.
+#[derive(Debug, Clone)]
+pub struct StoredFingerprint {
+    /// `fingerprints.id` — the primary key. This is what
+    /// `tracks.fingerprint_id` references.
+    pub id: i64,
+    /// The fingerprint itself, ready for [`dub_fingerprint::similarity`].
+    pub fingerprint: Fingerprint,
+    /// Sample rate of the source audio at fingerprint time. Optional
+    /// because the importer may not yet know it (e.g. when computing
+    /// fingerprints from a pre-decoded buffer without metadata).
+    pub sample_rate: Option<u32>,
+    /// Channel count of the source audio at fingerprint time.
+    pub channel_count: Option<u32>,
+    /// File size in bytes for the source file. Used as a fast first-
+    /// pass dedupe filter (different sizes → almost certainly
+    /// different recordings, and we can skip the Hamming compare).
+    pub file_size: Option<u64>,
 }
 
 impl Library {
@@ -126,6 +151,85 @@ impl Library {
         Ok(())
     }
 
+    /// Insert a freshly computed fingerprint into the `fingerprints`
+    /// table and return the row's id. M11b's dedupe pipeline calls
+    /// this when registering a new canonical recording; the returned
+    /// id is what `tracks.fingerprint_id` points at.
+    ///
+    /// We do not deduplicate the `fingerprints` table at the SQL
+    /// level — two different canonical tracks may produce two
+    /// fingerprint rows even though their Hamming distance is tiny.
+    /// The collapsing happens at the `tracks` layer via the §8.1
+    /// dedupe decision.
+    pub fn upsert_fingerprint(
+        &self,
+        fingerprint: &Fingerprint,
+        sample_rate: Option<u32>,
+        channel_count: Option<u32>,
+        file_size: Option<u64>,
+    ) -> Result<i64> {
+        let blob = fingerprint.to_blob();
+        self.conn
+            .execute(
+                "INSERT INTO fingerprints \
+                 (chromaprint_blob, duration_ms, file_size, sample_rate, channel_count, computed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))",
+                params![
+                    blob,
+                    fingerprint.duration_ms() as i64,
+                    file_size.map(|v| v as i64),
+                    sample_rate.map(|v| v as i64),
+                    channel_count.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e| LibraryError::sqlite("insert_fingerprint", e))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Look up a stored fingerprint by its primary key. Used by the
+    /// dedupe pipeline to materialise the existing-track side of a
+    /// near-match comparison.
+    pub fn load_fingerprint(&self, id: i64) -> Result<Option<StoredFingerprint>> {
+        self.conn
+            .query_row(
+                "SELECT chromaprint_blob, duration_ms, sample_rate, channel_count, file_size \
+                 FROM fingerprints WHERE id = ?1",
+                params![id],
+                |r| {
+                    let blob: Vec<u8> = r.get(0)?;
+                    let duration_ms: i64 = r.get(1)?;
+                    let sample_rate: Option<i64> = r.get(2)?;
+                    let channel_count: Option<i64> = r.get(3)?;
+                    let file_size: Option<i64> = r.get(4)?;
+                    Ok((blob, duration_ms, sample_rate, channel_count, file_size))
+                },
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("load_fingerprint", e))?
+            .map(
+                |(blob, duration_ms, sample_rate, channel_count, file_size)| {
+                    let fp = Fingerprint::from_blob(&blob, duration_ms as u32).map_err(|e| {
+                        // Surface as Sqlite-context error rather than a
+                        // separate variant; the BLOB came from the DB
+                        // so a malformed value is a corruption-class
+                        // condition rather than a typed library error.
+                        LibraryError::Sqlite {
+                            context: "load_fingerprint_blob",
+                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
+                        }
+                    })?;
+                    Ok(StoredFingerprint {
+                        id,
+                        fingerprint: fp,
+                        sample_rate: sample_rate.map(|v| v as u32),
+                        channel_count: channel_count.map(|v| v as u32),
+                        file_size: file_size.map(|v| v as u64),
+                    })
+                },
+            )
+            .transpose()
+    }
+
     /// Look up a volume row by UUID. Returns `None` if the volume
     /// is not registered.
     pub fn find_volume(&self, volume_uuid: &str) -> Result<Option<DiscoveredVolume>> {
@@ -199,6 +303,44 @@ mod tests {
         assert_eq!(got.display_name, v.display_name);
         assert_eq!(got.mount_point, v.mount_point);
         assert!(!got.is_internal);
+    }
+
+    /// Build a small but real fingerprint for round-trip tests.
+    /// Mirrors the `tone` helper in `dub-fingerprint::tests`; we
+    /// can't import a test-only helper from another crate so the
+    /// minimal copy lives here.
+    fn fingerprint_for(freq: f32, secs: f32) -> Fingerprint {
+        let n = (11025_f32 * secs) as usize;
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / 11025_f32;
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * freq * t).sin());
+        }
+        Fingerprint::compute_from_f32(&samples, 11025, 1).expect("compute")
+    }
+
+    #[test]
+    fn fingerprint_round_trip_via_sqlite() {
+        let lib = Library::open_in_memory().unwrap();
+        let fp = fingerprint_for(440.0, 10.0);
+        let id = lib
+            .upsert_fingerprint(&fp, Some(44_100), Some(2), Some(8_000_000))
+            .expect("insert fingerprint");
+        let stored = lib
+            .load_fingerprint(id)
+            .expect("query fingerprint")
+            .expect("row exists");
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.fingerprint, fp);
+        assert_eq!(stored.sample_rate, Some(44_100));
+        assert_eq!(stored.channel_count, Some(2));
+        assert_eq!(stored.file_size, Some(8_000_000));
+    }
+
+    #[test]
+    fn load_fingerprint_returns_none_for_missing_id() {
+        let lib = Library::open_in_memory().unwrap();
+        assert!(lib.load_fingerprint(999).unwrap().is_none());
     }
 
     #[test]

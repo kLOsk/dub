@@ -52,7 +52,7 @@ crates/
                      The Thru *passthrough itself* (ThruSource) lives in dub-engine.
   dub-bpm/           M7.5 + M8 — BpmEstimator (DSP core), BpmTracker (estimator + hysteresis), BpmStream (per-deck off-RT analysis thread), analyze_bpm (offline). Pure-Rust spectral-flux + harmonic-summed autocorrelation. Aubio backend deferred to a future opt-in feature flag.
                      Aubio's LGPL boundary is confined to this leaf crate.
-  dub-fingerprint/   Chromaprint FFI (v1.1).
+  dub-fingerprint/   Pure-Rust Chromaprint via rusty-chromaprint. Used for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1).
   dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
   dub-ffi/           UniFFI Swift bindings (placeholder; M0.5).
@@ -162,7 +162,7 @@ We run TDD on Rust code. See PRD §2.2 for full philosophy. Quick rules:
 - `rubberband` (FFI, **GPL-3.0**) — time-stretch (forces project to GPL)
 - `aubio` (FFI, LGPL-3.0) — *not currently linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
 - `realfft` / `rustfft` (MIT/Apache) — pure-Rust FFT used by `dub-bpm` for spectral-flux onset detection
-- `chromaprint` (FFI, LGPL-2.1) — fingerprinting (v1.1)
+- `rusty-chromaprint` (MIT/Apache) — pure-Rust port of the Chromaprint algorithm (algorithm 2). Used in `dub-fingerprint` for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1). M11b chose pure-Rust over the LGPL-2.1 C library (`chromaprint`) for the same reasons `dub-bpm` chose pure-Rust over aubio: license isolation, no C build dep, no unsafe FFI surface, simpler distribution.
 - `assert_no_alloc` (MIT) — RT-safety enforcement
 - `ringbuf` (MIT) — lock-free SPSC
 

@@ -64,6 +64,21 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 libc = "0.2"
 
+# Chromaprint algorithm (the `rusty_chromaprint` crate). Pure-Rust
+# implementation of Lukáš Lalinský's Chromaprint algorithm (the
+# same algorithm AcoustID uses). M11b chose this over the C library
+# (`chromaprint`, LGPL-2.1, via FFI) for the same reason `dub-bpm`
+# chose pure-Rust over aubio (M7.5): license isolation, no C build
+# dep, no unsafe FFI surface, simpler distribution. Our use case is
+# library-internal dedupe via similarity — we do not ship AcoustID
+# lookup, so cross-implementation bit-identity is not a requirement.
+# The Chromaprint algorithm (algorithm 2, 11025 Hz mono, 4096-frame
+# FFT) is documented in `docs/LIBRARY-SCHEMA.md` so the schema is
+# implementation-portable: a third party reading `library.sqlite`
+# can re-derive Dub's fingerprints with any algorithm-2-faithful
+# implementation.
+rusty-chromaprint = "0.3"
+
 # UniFFI for the Apple FFI surface (M0.5 onward). Pinned to a recent 0.28.x
 # because that's the release the Apple build script generates bindings with.
 # `cli` feature is only enabled on the `dub-ffi`'s `uniffi-bindgen` binary —

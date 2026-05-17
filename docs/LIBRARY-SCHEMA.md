@@ -575,30 +575,58 @@ through the priority chain.
 
 ## Fingerprint parameters
 
-Per PRD §8.7, the Chromaprint parameters Dub uses are documented so a
-third party can re-derive Dub's fingerprints.
+Per PRD §8.7, the Chromaprint algorithm parameters Dub uses are
+documented so a third party can re-derive Dub's fingerprints with
+any algorithm-2-faithful implementation.
 
-* **Library**: `chromaprint` (LGPL-2.1) via FFI in `dub-fingerprint`.
-* **Algorithm**: `CHROMAPRINT_ALGORITHM_DEFAULT` (algorithm 2 as of
-  Chromaprint 1.5.x). This is the same algorithm AcoustID uses.
-* **Sample rate**: 11025 Hz mono input (Chromaprint resamples
-  internally; we resample once at the import stage and pass the
-  result to the same function the streaming and offline drivers use).
-* **Channel mix**: stereo mixed to mono via 0.5 × (L + R) before
-  resampling.
+* **Crate**: `rusty-chromaprint` 0.3.x (pure-Rust, MIT/Apache) via
+  `dub-fingerprint`. M11b chose this over an FFI wrapper around the
+  reference C library (`chromaprint`, LGPL-2.1) for the reasons
+  documented in PRD §10.2: license isolation, no C build dep, no
+  unsafe FFI surface, simpler distribution. The Chromaprint
+  **algorithm** is unchanged; only the implementation crate differs.
+* **Algorithm**: Chromaprint algorithm 2 — the same one AcoustID
+  uses. `rusty_chromaprint::Configuration::preset_test1()` is the
+  invocation that materialises this preset.
+* **Sample rate**: 11025 Hz. Multi-channel input is supported
+  natively by the algorithm (we pass `channels = 1` or `2`); the
+  Chromaprint algorithm internally collapses to mono before its
+  chroma analysis.
+* **Frame size**: 4096 samples, 2/3 overlap. These are the algorithm-
+  2 defaults baked into the preset.
 * **Duration window**: full track. Long tracks are not truncated; the
-  full fingerprint is what AcoustID-class lookups expect and what the
-  similarity comparison in §8.1 dedupe runs against.
-* **Storage**: the `chromaprint_blob` column holds the raw
-  `uint32_t[]` output of `chromaprint_get_raw_fingerprint`, little-
-  endian, in its native length (typically 200-400 uint32 per track).
+  full fingerprint is what the §8.1 dedupe similarity comparison
+  runs against.
+* **Storage**: the `chromaprint_blob` column holds the algorithm
+  output as little-endian `u32` items, native length (typically
+  200–400 items per track), with no header. Length is recoverable
+  as `bytes.len() / 4`. Round-trip via
+  `Fingerprint::to_blob` / `Fingerprint::from_blob`.
 
-The similarity comparison for dedupe (§8.1) computes the bitwise
-Hamming distance between two fingerprint blobs aligned at the longest-
-common-prefix, divided by the bit count, subtracted from 1. The
-result is in `[0, 1]`; the threshold for auto-merge is `≥ 0.98`. The
-algorithm is the standard one used by AcoustID and Beets; no
-proprietary tweaks.
+The similarity comparison for dedupe (§8.1) is in
+`dub_fingerprint::similarity(&Fingerprint, &Fingerprint) -> f32`:
+
+* Sliding-window alignment over ±30 items (≈ ±3.7 s) so two
+  encodings of the same recording with differing lead-in / silence
+  trim still register as the same recording.
+* At each candidate offset, the overlap-region bitwise Hamming
+  distance is normalised to `[0, 1]` as
+  `1.0 − (popcount(a XOR b) / (32 × overlap_items))`.
+* The window-best score is returned. Empty fingerprints (zero items)
+  score `0.0` by definition; overlaps shorter than 8 items also
+  return `0.0` because below that the bit count is too small to be
+  meaningful and noise produces spurious high scores.
+* The threshold for auto-merge is `≥ 0.98` per PRD §8.1.
+
+A third-party reader can compare Dub-stored fingerprints with any
+algorithm-2-faithful implementation by deserialising the
+`chromaprint_blob` to `u32` items and running the same Hamming
+distance computation. Cross-implementation bit-identity is not
+guaranteed (the C library and `rusty-chromaprint` differ in the
+resampler and in a handful of edge-case bugs the Rust port did not
+reproduce), but for our use case — library-internal dedupe — the
+fingerprint generator's **self-consistency** is what matters, and
+that is preserved.
 
 ## File system locations
 

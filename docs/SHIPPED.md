@@ -1768,4 +1768,155 @@ This entry corresponds to the M11a commit set. PRD §8 + §12 (M11a row marked s
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11b onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11b — Canonical fingerprint + version-aware dedupe
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days &nbsp;·&nbsp; **Actual:** ~1 day
+
+M11b lands the fingerprint and dedupe primitives that gate every importer (M11c filesystem, M11e Serato, M12a–c Traktor / rekordbox / iTunes) from creating duplicate `tracks` rows or, much worse, silently collapsing distinct version cuts. The §8.1 dedupe decision is now a pure function with a clear contract; importers feed it and act on the outcome.
+
+### Architectural pivot: pure-Rust Chromaprint
+
+The single notable architectural decision in M11b: **`dub-fingerprint` ships on `rusty-chromaprint` (pure-Rust, MIT/Apache)** rather than an FFI binding to the reference C `chromaprint` library (LGPL-2.1). The PRD originally documented the LGPL FFI path; M11b changed the call.
+
+**Rationale (parallels M7.5's `dub-bpm` over aubio):**
+
+* **License isolation.** Pure-Rust removes the LGPL-2.1 boundary from the build graph entirely. We are already GPL-3.0 because of Rubber Band (PRD §11) and the LGPL boundary is compatible, but eliminating it simplifies the license story and reduces the "what dynamically-linked library do we ship" surface.
+* **No C build dependency.** macOS ships ancient `chromaprint` builds via Homebrew (when present at all); reproducing the bundled-source model we use for `rusqlite` would mean compiling the C library as part of the workspace build, with its own FFmpeg subdependencies.
+* **No unsafe FFI surface.** `rusty-chromaprint` is safe-only; `dub-fingerprint` is now `#![forbid(unsafe_code)]`.
+* **Use case fit.** Dub uses fingerprints for library-internal similarity-based dedupe, not AcoustID database lookup. Cross-implementation bit-identity to the C library is not load-bearing for us; the generator's self-consistency is.
+
+The Chromaprint **algorithm** is unchanged (algorithm 2, the same one AcoustID uses). The schema's `chromaprint_blob` storage format is the same little-endian `u32` array. A third-party tool reading `library.sqlite` can re-derive Dub's fingerprints with any algorithm-2-faithful implementation; documented in the updated `docs/LIBRARY-SCHEMA.md` § "Fingerprint parameters" and PRD §10.2.
+
+Documentation pivots: PRD §10.2 dependency table (chromaprint LGPL row replaced with `rusty-chromaprint` MIT/Apache row), PRD §5.2.5 (real-record recognition references the pure-Rust path), PRD §10.1 crate-layout entry for `dub-fingerprint`, PRD §12 M11b row, `AGENTS.md` external-libraries section, `AGENTS.md` repo-layout entry, `docs/LIBRARY-SCHEMA.md` § "Fingerprint parameters".
+
+### What shipped — `dub-fingerprint` crate
+
+Previously a stub with a `VERSION` const and nothing else. Now ships:
+
+* **`Fingerprint`** — owns a `Vec<u32>` of Chromaprint items plus the source `duration_ms`. Duration is captured at compute time from the input sample count rather than from any per-file metadata field (which can disagree across encodings).
+* **`Fingerprint::compute(samples: &[i16], sample_rate, channels)`** — direct path matching `rusty_chromaprint`'s native input type.
+* **`Fingerprint::compute_from_f32(samples: &[f32], sample_rate, channels)`** — convenience path with saturating `[-1.0, 1.0]` → `[i16::MIN, i16::MAX]` clamp. NaN / out-of-range values clamp rather than wrap. Off-RT by construction; allocations are fine.
+* **`Fingerprint::to_blob() / from_blob(bytes, duration_ms)`** — round-trip serialisation to little-endian `u32`s for the `fingerprints.chromaprint_blob` column. `from_blob` rejects empty input and any byte length not a multiple of 4, with a typed `FingerprintError::MalformedBlob`.
+* **`similarity(&Fingerprint, &Fingerprint) -> f32`** — sliding-window Hamming-distance similarity in `[0.0, 1.0]`. Window radius ±30 items (≈ ±3.7 s) absorbs encoder start-offset variation. Overlaps shorter than 8 items return 0.0 (anti-noise floor). PRD §8.1 dedupe threshold is `≥ 0.98`.
+* **`similarity_with_window(a, b, window_items)`** — same with explicit window radius. Used by v1.1 real-record recognition where the turntable start position is arbitrary and the window must be larger.
+* **`FingerprintError`** — typed errors via `thiserror`: `InvalidInput` (rate / channel rejected at `start()`) and `MalformedBlob` (BLOB deserialisation).
+
+12 unit tests + 1 doctest, all green. Coverage: deterministic compute (`same_input_produces_identical_fingerprint`), validity of similarity at zero offset and at shifted alignment, distinct-recording floor (two pure tones at 220 vs 1760 Hz score below the 0.98 dedupe threshold), full BLOB round-trip (`to_blob` → `from_blob` → identical), every error path.
+
+### What shipped — `dub-library::version_tokens`
+
+The §8.1 / §8.4 version-token parser. Recognises the full v1 vocabulary (22 canonical tokens; PRD §8.1 wording):
+
+```text
+clean, dirty, explicit, instrumental, acapella, radio, edit, extended,
+club, dub, vip, remix, remaster, mono, stereo, intro, outro, short,
+long, 7in, 12in, lp
+```
+
+**Recognition rules** (priority order):
+
+1. Parenthesised segment at the end of the title: `Lady (Clean).mp3`.
+2. Square-bracketed segment at the end of the title: `Lady [Dirty].mp3`.
+3. Trailing ` - TOKEN` segment before the file extension: `Song - Instrumental.mp3`.
+
+Recognition is **case-insensitive but word-boundary-strict**. Phrase-level patterns (`radio edit`, `extended mix`, `club mix`, `clean version`, `instrumental version`, `vip mix`, `lp version`, `7" mix`, `12 inch`, etc.) are matched before single-word fallbacks and normalise to their head token. Common misspellings (`acappella`, `accapella`) are recognised. Extensions ≤ 5 ASCII-alphanumeric chars are stripped before scanning so `J Dilla feat. Madlib - Track.mp3` parses as a title containing `feat.` rather than mistakenly stripping `Madlib - Track` as the extension.
+
+**False-positive guards (load-bearing tests):**
+
+* `Clean Bandit - Symphony.mp3` → no tokens (artist name in unbracketed prefix).
+* `Radiohead - Karma Police.mp3` → no tokens.
+* `Nine Inch Nails - Hurt.mp3` → no tokens.
+* `Dirty Vegas - Days Go By.mp3` → no tokens.
+* `Dirty Dancing OST.mp3` → no tokens.
+* `Radio Department - Pulling Our Weight.mp3` → no tokens.
+
+The price for this strictness: exotic naming schemes (`Song.Clean.mp3`) don't get tagged. Per PRD §8.1 those land in the "no token, rely on fingerprint + duration" path, which is correct behaviour (no false-positive merge, just no token to disqualify either).
+
+16 unit tests cover the recognition rules and the false-positive guards.
+
+### What shipped — `dub-library::dedupe`
+
+Pure-function dedupe decision per PRD §8.1. No I/O; the caller supplies a candidate (the file being imported) and an existing-track side (the row whose fingerprint was returned as a near-match by the SQLite lookup) and gets back a `DedupeDecision`.
+
+```rust
+pub enum DedupeDecision {
+    Merge,
+    SiblingVersion { reason: SiblingReason },
+    Distinct,
+}
+
+pub enum SiblingReason {
+    DurationDelta { delta_ms: u32 },
+    VersionTokenMismatch {
+        candidate_tokens: BTreeSet<VersionToken>,
+        existing_tokens: BTreeSet<VersionToken>,
+    },
+}
+```
+
+Auto-merge fires only when **all** of:
+
+1. `dub_fingerprint::similarity(...) >= SIMILARITY_THRESHOLD` (`0.98`).
+2. Duration delta `< DURATION_DELTA_MS` (`200` ms).
+3. Parsed version-token sets are equal (which includes both-empty).
+
+Otherwise `SiblingVersion` with a reason, or `Distinct` (below similarity floor). The caller wires `Merge` to "add a `track_files` row against the existing `tracks.id`", `SiblingVersion` to "new `tracks` row with `duplicate_link_track_id` set", `Distinct` to "new `tracks` row, no link". M11c filesystem importer will be the first consumer.
+
+9 unit tests cover the truth table:
+
+* Distinct recordings → `Distinct`.
+* Same recording + same tokens → `Merge`.
+* Same recording + `(Clean)` vs `(Dirty)` → `SiblingVersion::VersionTokenMismatch` (the load-bearing test for PRD §8.1's "the cost of silently collapsing 'Clean' and 'Dirty' is 'the DJ played the explicit version at a wedding'").
+* Same recording + `(Clean)` vs `(Instrumental)` → `SiblingVersion::VersionTokenMismatch`.
+* `(Radio Edit)` vs `(Extended Mix)` (different durations) → `SiblingVersion` (either reason; both fire, the test asserts the disqualifier without caring which gate caught it).
+* Duration delta of 150 ms (within threshold) + matching tokens → `Merge`.
+* Duration delta of 200 ms (at threshold) → `SiblingVersion::DurationDelta` with `delta_ms = 200`.
+* Both-empty token sets are not a mismatch → `Merge` when similarity + duration allow.
+* One-sided token (`Lady (Clean).mp3` vs `Lady.mp3`) → `SiblingVersion::VersionTokenMismatch`.
+
+### What shipped — `dub-library::Library` extensions
+
+The `Library` handle gained two methods that write into the M11a `fingerprints` table:
+
+* **`upsert_fingerprint(&Fingerprint, sample_rate, channel_count, file_size) -> Result<i64>`** — inserts a fingerprint row, returns the rowid that `tracks.fingerprint_id` will reference. We do *not* SQL-level dedupe the `fingerprints` table itself; the collapsing happens at the `tracks` layer via the §8.1 dedupe decision (two near-identical fingerprints can correspond to two distinct `tracks` rows when version tokens disagree).
+* **`load_fingerprint(id) -> Result<Option<StoredFingerprint>>`** — materialises the existing-track side of a near-match comparison. `StoredFingerprint` carries the deserialised `Fingerprint` plus the sample-rate / channel-count / file-size columns the M11c filesystem scanner and M11e Serato importer will need.
+
+2 new unit tests cover the round-trip and the not-found case.
+
+### Tests (38 new, all green)
+
+* `dub-fingerprint`: 12 unit tests + 1 doctest.
+* `dub-library::version_tokens`: 16 unit tests.
+* `dub-library::dedupe`: 9 unit tests.
+* `dub-library::db` (fingerprint methods): 2 unit tests.
+
+Workspace test count: **588 → 626** (`+38`). Workspace clippy clean (`-D warnings`) after fixing one cosmetic `manual_is_multiple_of` lint flagged on the BLOB length check.
+
+### Workspace dependency additions
+
+| Crate | Version | Why |
+|---|---|---|
+| `rusty-chromaprint` | `0.3` | Pure-Rust port of Chromaprint algorithm 2. See §10.2 pivot rationale. Transitively pulls `rubato 0.16` (already a transitive dep elsewhere) for its resampler. |
+
+`dub-library` also gained a direct dependency on `dub-fingerprint`; `lib.rs` re-exports `Fingerprint`, `similarity`, and `FingerprintError` so callers don't have to add `dub-fingerprint` to their own `Cargo.toml` just to construct a `DedupeInput`.
+
+### Out of scope for M11b (queued for M11c onward)
+
+* The filesystem scanner that *uses* the fingerprint pipeline to populate the library (M11c).
+* The ID3 / filename metadata reader (M11c).
+* The §8.4 filename-pattern parser that maps `ARTIST - TITLE (VERSION) [YEAR].ext` to the metadata fields (M11c). M11b's `version_tokens::parse` is a building block for that parser, not the whole parser; the filename parser will compose token-recognition with the artist/title/year split logic.
+* `analysis_cache` row population (M11c — LUFS-I, true-peak, waveform sidecar pointer come from the analysis pipeline, not the fingerprint compute).
+* Source-app importer paths (M11e Serato, M12a–c Traktor / rekordbox / iTunes).
+* Apple-side surfacing of "potential duplicate" link glyphs in the browser (M11d).
+
+### Forward shape
+
+M11c is now unblocked. It walks a folder, decodes audio via `symphonia` (already wired in workspace), computes a fingerprint per file via `Fingerprint::compute_from_f32`, calls `Library::find_fingerprint_neighbours` (to be added at M11c, indexed first-pass on duration delta), runs `dedupe::decide` against each near-match, and acts on the outcome (`upsert_fingerprint` → register `tracks` row → register `track_files` row, or attach to an existing track). The M10.5b ID3-streaming code path is replaced wholesale.
+
+### Commit boundary
+
+This entry corresponds to the M11b commit set. PRD §5.2.5 + §8.2 + §10.1 + §10.2 + §12 (M11b row), `AGENTS.md` (key external libraries + repo layout), `docs/LIBRARY-SCHEMA.md` (Fingerprint parameters section), `crates/dub-fingerprint/` (new crate body), and `crates/dub-library/` (version_tokens, dedupe, db extensions) are all part of the same logical change.
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11c onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

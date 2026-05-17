@@ -26,16 +26,28 @@
 #![warn(missing_docs)]
 
 mod db;
+mod dedupe;
 mod error;
 mod paths;
 mod schema;
+mod version_tokens;
 mod volumes;
 
-pub use db::Library;
+pub use db::{Library, StoredFingerprint};
+pub use dedupe::{
+    decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,
+    SIMILARITY_THRESHOLD,
+};
 pub use error::{LibraryError, Result};
 pub use paths::{default_library_db_path, default_waveforms_cache_dir};
 pub use schema::SCHEMA_VERSION;
+pub use version_tokens::{parse as parse_version_tokens, VersionToken};
 pub use volumes::{discover_for_path, DiscoveredVolume};
+
+// Re-export the fingerprint primitives so callers don't have to add
+// `dub-fingerprint` to their own Cargo.toml just to construct a
+// `DedupeInput`.
+pub use dub_fingerprint::{similarity as fingerprint_similarity, Fingerprint, FingerprintError};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

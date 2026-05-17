@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Audio fingerprinting for real-record recognition (v1.1). Chromaprint FFI."
+description = "Audio fingerprinting (Chromaprint algorithm 2, pure-Rust). Used by the library subsystem for dedupe (M11b) and by Thru-mode real-record recognition (v1.1)."
 
 [dependencies]
+rusty-chromaprint = { workspace = true }
+thiserror = { workspace = true }

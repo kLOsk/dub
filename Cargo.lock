@@ -670,6 +670,10 @@ dependencies = [
 [[package]]
 name = "dub-fingerprint"
 version = "0.0.1"
+dependencies = [
+ "rusty-chromaprint",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "dub-io"
@@ -686,6 +690,7 @@ name = "dub-library"
 version = "0.0.1"
 dependencies = [
  "dirs",
+ "dub-fingerprint",
  "libc",
  "rusqlite",
  "tempfile",
@@ -1894,6 +1899,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rubato"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5258099699851cfd0082aeb645feb9c084d9a5e1f1b8d5372086b989fc5e56a1"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "realfft",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1948,6 +1965,16 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "rusty-chromaprint"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59e4234523e38d9c12201955f8216e1a60313e64c5077f4e1cf49b0db77bd7e8"
+dependencies = [
+ "rubato",
+ "rustfft",
+]
 
 [[package]]
 name = "rusty-fork"
