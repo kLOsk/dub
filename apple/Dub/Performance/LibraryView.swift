@@ -407,8 +407,21 @@ struct LibraryView: View {
     /// `KeyPathComparator` direction. Selection is bound to
     /// `selectedTrackId` so clicking a row routes through
     /// `model.selectLibraryTrack(_:)` for Space + drag plumbing.
+    ///
+    /// The leftmost gutter column carries the M11d.3 indicator
+    /// glyphs: loaded-now `A` / `B` badge, missing-file glyph,
+    /// potential-duplicate link. The grid-disagreement glyph is
+    /// reserved on the BPM column but always off in v1.0 — the
+    /// auto-grid that would drive it is gated on the M11c
+    /// `dub-bpm` follow-up that wires offline analysis into the
+    /// importer.
     private var trackList: some View {
         Table(sortedTracks, selection: $selectedTrackId, sortOrder: $sortOrder) {
+            TableColumn("") { track in
+                rowIndicators(for: track)
+            }
+            .width(36)
+
             TableColumn("Title", value: \.titleSortKey) { track in
                 VStack(alignment: .leading, spacing: 1) {
                     Text(displayTitle(track))
@@ -494,6 +507,80 @@ struct LibraryView: View {
                 model.selectedLibraryTrackId = nil
             }
         }
+    }
+
+    /// PRD §8.5.3 leftmost-gutter indicators. Order, top to
+    /// bottom of visual priority:
+    ///
+    /// * `A` / `B` accent-tinted badge — track is loaded on
+    ///   that deck right now. Two badges when both decks carry
+    ///   the same track (Instant Doubles, §7.3).
+    /// * Link glyph — `potentialDuplicateId` is non-nil; sibling-
+    ///   version per §8.1 dedupe. Click navigates to the sibling.
+    /// * Dim red exclamation — primary volume isn't reachable
+    ///   per the model's `volumeReachability` cache; the track
+    ///   is currently missing.
+    ///
+    /// Glyphs are deliberately small (10–11 pt) so they fit in
+    /// the 36 pt gutter without crowding the title row.
+    @ViewBuilder
+    private func rowIndicators(for track: LibraryTrack) -> some View {
+        HStack(spacing: 2) {
+            if model.deckA.loadedLibraryTrackId == track.id {
+                deckBadge("A", tint: DubColor.deckATint)
+            }
+            if model.deckB.loadedLibraryTrackId == track.id {
+                deckBadge("B", tint: DubColor.deckBTint)
+            }
+            if track.potentialDuplicateId != nil {
+                Button {
+                    if let sibling = track.potentialDuplicateId {
+                        navigateToSibling(sibling)
+                    }
+                } label: {
+                    Image(systemName: "link")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(DubColor.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("Potential duplicate — click to jump to sibling.")
+            }
+            if model.libraryIsOpen && !model.isTrackReachable(track) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.red.opacity(0.65))
+                    .help(missingFileTooltip(for: track))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func deckBadge(_ letter: String, tint: Color) -> some View {
+        Text(letter)
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .frame(width: 13, height: 13)
+            .background(tint)
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            .help("Loaded on deck \(letter).")
+    }
+
+    private func missingFileTooltip(for track: LibraryTrack) -> String {
+        if track.primaryVolumeMountPoint == nil {
+            return "Source volume is not mounted."
+        }
+        return "Source volume is offline — plug it back in or use Relocate."
+    }
+
+    /// Highlight a track id in the visible list, scrolling it
+    /// into view if necessary. Used by the sibling-version link
+    /// glyph. When the sibling isn't currently visible (e.g.
+    /// filtered out by an active search) the navigation no-ops
+    /// gracefully — clearing the search would surface it but
+    /// auto-clearing on click would be too aggressive.
+    private func navigateToSibling(_ trackId: String) {
+        guard tracks.contains(where: { $0.id == trackId }) else { return }
+        selectedTrackId = trackId
     }
 
     /// Resolve a track's drag URL synchronously. Returns `nil`
@@ -664,6 +751,11 @@ struct LibraryView: View {
             await MainActor.run {
                 self.tracks = rows
                 self.isLoading = false
+                // Recompute the per-volume reachability cache for
+                // the volumes referenced by the new track set. One
+                // syscall per unique mount point — cheap on a
+                // typical 3 to 5 volume DJ rig.
+                self.model.refreshVolumeReachability(for: rows)
             }
         }
     }

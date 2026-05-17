@@ -138,6 +138,17 @@ struct DeckState: Equatable {
     /// loaded on each deck.
     var sourceURL: URL? = nil
 
+    /// M11d.3 — canonical UUID of the library track currently
+    /// loaded on this deck, when the source was a library row
+    /// (i.e. `selectedLibraryTrackId` matched the load URL).
+    /// `nil` for Finder-drag loads that bypass the library. The
+    /// LibraryView reads this to render the loaded-now A / B
+    /// glyph in the leftmost gutter column per PRD §8.5.3,
+    /// preventing the "I just loaded the track that's already
+    /// playing" mistake and visually confirming Instant Doubles
+    /// (§7.3).
+    var loadedLibraryTrackId: String? = nil
+
     /// M10.5d. `true` while a `load_track` FFI call is in flight on
     /// this deck (decode + offline-peaks-compute happens on a
     /// background `Task.detached` so the SwiftUI main actor stays
@@ -290,6 +301,19 @@ final class WaveformAppModel: ObservableObject {
     /// Kept in lockstep with [`browserSelection`] inside
     /// [`selectLibraryTrack`].
     @Published var selectedLibraryTrackId: String? = nil
+
+    /// M11d.3 — per-volume reachability cache. The LibraryView
+    /// reads this to drive the missing-file indicator without a
+    /// `FileManager.fileExists` round-trip per visible row. Keys
+    /// are mount paths (e.g. `"/"`, `"/Volumes/Touring SSD"`);
+    /// values are `true` when the mount point is a directory
+    /// that currently exists, `false` when it does not. A track
+    /// is missing iff its primary volume's mount point is absent
+    /// from the cache (no recorded answer yet) or maps to
+    /// `false`. Recomputed on a coarse cadence in
+    /// `refreshVolumeReachability()` rather than per-keystroke
+    /// or per-frame.
+    @Published private(set) var volumeReachability: [String: Bool] = [:]
 
     // MARK: Private state
 
@@ -739,6 +763,54 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Recompute the per-volume reachability cache for the set of
+    /// mount points present in the supplied track list. Each
+    /// unique non-nil mount point hits the filesystem exactly
+    /// once via `FileManager.fileExists(atPath:isDirectory:)`.
+    /// `nil` mount points (volumes the library has on record but
+    /// can't currently locate) implicitly map to unreachable
+    /// without a syscall.
+    ///
+    /// Called by the LibraryView whenever the displayed track
+    /// set changes (source switch, search, post-import refresh).
+    /// Per-frame polling is intentionally avoided — an SSD
+    /// staying plugged in is the common case and we don't want
+    /// to syscall every scroll tick.
+    func refreshVolumeReachability(for tracks: [LibraryTrack]) {
+        var mountPoints = Set<String>()
+        for t in tracks {
+            if let m = t.primaryVolumeMountPoint, !m.isEmpty {
+                mountPoints.insert(m)
+            }
+        }
+        var next = volumeReachability
+        // Drop entries for mount points no longer in view so the
+        // cache stays bounded.
+        next = next.filter { mountPoints.contains($0.key) }
+        for m in mountPoints {
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: m, isDirectory: &isDir)
+            next[m] = exists && isDir.boolValue
+        }
+        if next != volumeReachability {
+            volumeReachability = next
+        }
+    }
+
+    /// `true` when the supplied track resolves to a path on a
+    /// currently-reachable volume per the cached reachability
+    /// map. Used by the LibraryView to render the missing-file
+    /// glyph. Conservative — returns `false` for any track
+    /// without a primary mount point on record, or whose mount
+    /// point hasn't been probed yet (the LibraryView calls
+    /// `refreshVolumeReachability` *before* rendering the first
+    /// frame, so "not yet probed" is a transient state and a
+    /// false positive on the glyph is acceptable in that window).
+    func isTrackReachable(_ track: LibraryTrack) -> Bool {
+        guard let m = track.primaryVolumeMountPoint else { return false }
+        return volumeReachability[m] == true
+    }
+
     /// Walk the supplied folder via the M11c importer. Runs on a
     /// detached background queue so the UI stays responsive; the
     /// completion handler hops back to the main actor to update
@@ -816,6 +888,14 @@ final class WaveformAppModel: ObservableObject {
     /// cosmetic glitch on the smart-crate, not a load failure
     /// the DJ needs to see.
     private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
+        // Always clear the previous loaded-now glyph for this
+        // deck; we re-set it below if the load came from the
+        // library. Finder drags leave the field nil, which the
+        // browser reads as "no library track loaded here".
+        var next = state(for: side)
+        next.loadedLibraryTrackId = nil
+        setState(next, for: side)
+
         guard libraryIsOpen, let trackId = selectedLibraryTrackId else { return }
         do {
             if let path = (try library.trackPath(trackId: trackId)) {
@@ -824,6 +904,14 @@ final class WaveformAppModel: ObservableObject {
             } else {
                 return
             }
+            // Stamp the loaded-now glyph + write the play_history
+            // row. Same URL-equality guard is the source of truth
+            // for both: if the user changed selection between
+            // selection and load, neither side runs.
+            var stamped = state(for: side)
+            stamped.loadedLibraryTrackId = trackId
+            setState(stamped, for: side)
+
             let deck: UInt32 = (side == .a) ? 0 : 1
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             try library.recordLoad(trackId: trackId, deck: deck, timestampMs: nowMs)

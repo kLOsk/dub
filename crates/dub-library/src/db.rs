@@ -85,6 +85,25 @@ pub struct TrackRow {
     /// future M11e+ importers. Synthesised from the per-source
     /// metadata-row `source` column.
     pub source: String,
+    /// Volume UUID of the most-recently-confirmed file row for
+    /// this track. `None` only for tracks with no `track_files`
+    /// row (a state the importer never produces but a hand-
+    /// inserted row could). The M11d.3 browser uses this to
+    /// drive the missing-file glyph via a per-volume reachability
+    /// cache — checking 5 volumes is cheap; checking 5 000 files
+    /// per refresh would not be.
+    pub primary_volume_uuid: Option<String>,
+    /// Last-known mount point of the primary volume. Combined
+    /// with `primary_relative_path` to reconstruct an absolute
+    /// path on the Apple side without a per-row FFI round-trip.
+    /// `None` when the volume is currently unmounted (the
+    /// `volumes.last_known_mount_point` schema column is
+    /// nullable for exactly this reason).
+    pub primary_volume_mount_point: Option<String>,
+    /// Volume-relative path of the primary file. Combined with
+    /// `primary_volume_mount_point` to reconstruct the absolute
+    /// path the browser drags / Space-loads.
+    pub primary_relative_path: Option<String>,
 }
 
 /// Sort columns the M11d.2 browser table header can drive.
@@ -140,6 +159,15 @@ impl TrackSortKey {
 /// across the per-source rows produces a deterministic "best"
 /// source label until a real source-priority column lands at
 /// M11e.
+///
+/// `pf.*` is a single-row subquery exposing the most-recently-
+/// confirmed file for the track (ordered by `last_seen_at DESC`).
+/// A track with zero file rows leaves these columns NULL, which
+/// the browser renders as "missing"; a track with multiple file
+/// rows resolves to the last one we touched. Volume mount point
+/// is fetched via a correlated subquery against `volumes` so the
+/// JOIN order doesn't reshuffle the per-row cost on huge
+/// libraries.
 const TRACK_ROW_SELECT: &str = "\
     SELECT t.id, \
            COALESCE(fn.title,    i3.title)    AS title, \
@@ -155,12 +183,34 @@ const TRACK_ROW_SELECT: &str = "\
            ( \
                SELECT MIN(source) FROM track_metadata_source ms \
                WHERE ms.track_id = t.id \
-           )                                   AS source \
+           )                                   AS source, \
+           pf.volume_uuid                      AS primary_volume_uuid, \
+           ( \
+               SELECT v.last_known_mount_point \
+               FROM volumes v \
+               WHERE v.volume_uuid = pf.volume_uuid \
+           )                                   AS primary_volume_mount_point, \
+           pf.relative_path                    AS primary_relative_path \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
     LEFT JOIN track_metadata_source i3 \
               ON i3.track_id = t.id AND i3.source = 'id3' \
+    LEFT JOIN ( \
+        SELECT tf.track_id, tf.volume_uuid, tf.relative_path \
+        FROM track_files tf \
+        JOIN ( \
+            SELECT track_id, MAX(id) AS max_id \
+            FROM track_files \
+            WHERE last_seen_at = ( \
+                SELECT MAX(last_seen_at) FROM track_files tf2 \
+                WHERE tf2.track_id = track_files.track_id \
+            ) \
+            GROUP BY track_id \
+        ) latest \
+          ON latest.track_id = tf.track_id \
+          AND latest.max_id   = tf.id \
+    ) pf ON pf.track_id = t.id \
     ";
 
 /// Map a SELECT-shaped row to [`TrackRow`]. Used by every
@@ -183,6 +233,9 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         source: r
             .get::<_, Option<String>>(11)?
             .unwrap_or_else(|| "unknown".to_string()),
+        primary_volume_uuid: r.get(12)?,
+        primary_volume_mount_point: r.get(13)?,
+        primary_relative_path: r.get(14)?,
     })
 }
 
@@ -783,7 +836,7 @@ impl Library {
                  FROM track_files tf \
                  JOIN volumes v ON v.volume_uuid = tf.volume_uuid \
                  WHERE tf.track_id = ?1 \
-                 ORDER BY tf.last_seen_at DESC LIMIT 1",
+                 ORDER BY tf.last_seen_at DESC, tf.id DESC LIMIT 1",
                 params![track_id],
                 |r| {
                     let mount: Option<String> = r.get(0)?;
@@ -1216,6 +1269,53 @@ mod tests {
         // No play_history rows seeded → empty result, *not* a fallback
         // to all-tracks. Keeps the smart-crate semantics honest.
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_tracks_populates_primary_file_columns() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["First"]);
+        let rows = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, ids[0]);
+        assert_eq!(
+            rows[0].primary_volume_uuid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        // seed_tracks registers the volume with mount_point = "/".
+        assert_eq!(rows[0].primary_volume_mount_point.as_deref(), Some("/"));
+        assert_eq!(
+            rows[0].primary_relative_path.as_deref(),
+            Some("test/First.wav")
+        );
+    }
+
+    #[test]
+    fn track_row_returns_most_recent_track_file_on_multi_file_track() {
+        // A track gets re-imported from a different path (e.g. the
+        // DJ moved it). track_files now has two rows; the browser
+        // must surface the *newer* one because that's the one the
+        // user can still reach.
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Workinonit"]);
+        // Second file row, newer `last_seen_at`.
+        lib.upsert_track_file(
+            &ids[0],
+            "11111111-1111-1111-1111-111111111111",
+            "moved/Workinonit.wav",
+            Some("wav"),
+            Some(44_100),
+            None,
+            Some(1),
+            Some(123_456),
+            Some(2_000_000_000),
+        )
+        .unwrap();
+        let rows = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(
+            rows[0].primary_relative_path.as_deref(),
+            Some("moved/Workinonit.wav")
+        );
     }
 
     #[test]

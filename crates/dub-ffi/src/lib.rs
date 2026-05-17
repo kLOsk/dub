@@ -2572,6 +2572,20 @@ pub struct LibraryTrack {
     /// rows; future Serato / Traktor / rekordbox / iTunes importers
     /// land their own labels.
     pub source: String,
+    /// Volume UUID of the most-recently-confirmed file for this
+    /// track. `None` only for tracks with no `track_files` row.
+    /// The M11d.3 browser uses this to drive the missing-file
+    /// glyph via a per-volume reachability cache.
+    pub primary_volume_uuid: Option<String>,
+    /// Last-known mount point of the primary volume. `None` when
+    /// the volume is currently unmounted (the
+    /// `volumes.last_known_mount_point` schema column is nullable
+    /// for that reason).
+    pub primary_volume_mount_point: Option<String>,
+    /// Volume-relative path of the primary file. Combined with
+    /// `primary_volume_mount_point` to reconstruct the absolute
+    /// path the browser drags / Space-loads.
+    pub primary_relative_path: Option<String>,
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -2628,6 +2642,9 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             version_tokens: r.version_tokens,
             potential_duplicate_id: r.potential_duplicate_id,
             source: r.source,
+            primary_volume_uuid: r.primary_volume_uuid,
+            primary_volume_mount_point: r.primary_volume_mount_point,
+            primary_relative_path: r.primary_relative_path,
         }
     }
 }

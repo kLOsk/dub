@@ -2216,4 +2216,92 @@ This entry corresponds to the M11d.2 commit set: `docs/PRD.md` (M11d row update)
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11d.3 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11d.3 — Per-row indicators
+
+Third slice of PRD §12 M11d. Closes the §8.5.3 promise that browser rows carry per-track visual cues for "is this loaded right now?", "does the dedupe pass think this is a duplicate of another row?" and "is the source file currently reachable?". Adds the three indicator glyphs in a leftmost-gutter Table column; defers the fourth (grid-disagreement ⚠) until the M11c `dub-bpm` follow-up wires offline beat-grid analysis into the importer.
+
+### Architecture choices
+
+1. **Primary file info travels on `TrackRow`, not via per-row FFI calls.** The naive implementation of the missing-file glyph is "for every visible row, call `library.trackPath(trackId)` and check existence." On a Lexicon-scale 100k-track library that's a stampede of FFI traffic for every scroll tick. Instead, `TrackRow` grows three fields populated by a single subquery: `primary_volume_uuid`, `primary_volume_mount_point`, `primary_relative_path`. The Apple side does one filesystem syscall per *unique volume mount point* (typically 3 to 5 on a touring DJ rig) and caches the answer. Scroll is then pure UI work.
+
+2. **The subquery picks the most-recent file deterministically.** When a track has multiple `track_files` rows (the DJ moved a file and re-imported it, or the same file lives on two volumes), the browser must surface a single canonical path. The subquery in `TRACK_ROW_SELECT` filters by `MAX(last_seen_at)` first, then breaks ties with `MAX(id)` (the row's auto-increment primary key, monotonic across all inserts). Without the tiebreaker, two file rows inserted in the same wall-clock second produced a non-deterministic primary; the tiebreaker pins it to "the row we touched last". `resolve_track_path` gets the same `ORDER BY last_seen_at DESC, id DESC LIMIT 1` treatment so the browser and the load path agree on which path is canonical.
+
+3. **Loaded-now glyph keys off a per-deck library track id, not URL comparison.** `DeckState` grows `loadedLibraryTrackId: String?` set by `recordLibraryLoadIfApplicable` on a successful library-sourced load and explicitly cleared on every load (Finder drag or otherwise) so the indicator never lies. Comparing URLs would force the LibraryView to resolve every visible row's UUID to a URL and compare against the deck's URL on every render — slow and bug-prone (path normalisation). UUID comparison is one string equality per row.
+
+4. **Per-volume reachability cache lives on `WaveformAppModel`, not in `LibraryView` state.** Other views (deck headers, future Played From / Played Into panel) will want the same answer. Putting it on the model means a single source of truth + one published value the LibraryView observes. Recompute cadence: once per track-list refresh (source switch, search, post-import). Not per-frame; a DJ unplugging a USB stick mid-set is a once-per-session event, not a 60Hz one. M11d.4's background scanner will tighten this cadence with `access()` per file.
+
+5. **`isTrackReachable` is conservative (false-positive on the glyph).** The cache is asynchronously populated alongside `refreshTracks`; between "switch source" and "first render", every row reads as unreachable. The alternative would be a synchronous syscall on first render; the conservative default is fine because the transient window is small (one detached `Task` round-trip), the glyph is dim (not alarming), and the user's actual answer arrives within ~10 ms. A DJ briefly seeing a missing-file glyph that resolves to "reachable" within a frame is much less harmful than a `FileManager.fileExists` stall on the SwiftUI main actor.
+
+6. **Sibling-version click navigates within the visible list rather than auto-clearing search.** Per §8.5.3 spec, clicking the link glyph "expands a sibling row showing the candidate duplicate." For M11d.3 we land the simpler behaviour: clicking selects the sibling row if it's currently in view. If the sibling is filtered out by an active search, the click no-ops gracefully — auto-clearing search would be too aggressive (the DJ might be intentionally narrowed in on a subset). The full "expand sibling inline" UI is M11d.4 polish.
+
+7. **Grid-disagreement glyph slot is reserved but always-off in v1.0.** PRD §8.3 says the glyph fires when an id3 BPM and an auto-derived `dub-bpm` BPM disagree beyond a threshold. The auto BPM is computed by the M11c `dub-bpm::analyze_bpm` integration which is still deferred; without an auto-grid in `track_beatgrids(source='auto')`, there's no disagreement to surface. The visual slot in the BPM column is preserved so the next milestone doesn't have to reshuffle column widths.
+
+### Implementation
+
+**Rust (`dub-library`).** `TrackRow` gains three optional fields backed by a new subquery in `TRACK_ROW_SELECT`:
+
+```sql
+LEFT JOIN (
+    SELECT tf.track_id, tf.volume_uuid, tf.relative_path
+    FROM track_files tf
+    JOIN (
+        SELECT track_id, MAX(id) AS max_id
+        FROM track_files
+        WHERE last_seen_at = (
+            SELECT MAX(last_seen_at) FROM track_files tf2
+            WHERE tf2.track_id = track_files.track_id
+        )
+        GROUP BY track_id
+    ) latest
+      ON latest.track_id = tf.track_id
+      AND latest.max_id  = tf.id
+) pf ON pf.track_id = t.id
+```
+
+The inner correlated subquery picks rows with the max `last_seen_at` per track; the `MAX(id)` outer aggregation picks the last-inserted row among those, giving a fully deterministic primary. The `primary_volume_mount_point` field reaches `volumes.last_known_mount_point` via a separate correlated subquery so the JOIN order is identical to the M11d.1 baseline (no surprise plan changes on large libraries).
+
+`resolve_track_path` is updated with the matching tiebreaker (`ORDER BY tf.last_seen_at DESC, tf.id DESC LIMIT 1`) so the load path and the browser agree on the canonical file.
+
+**Rust (`dub-ffi`).** `LibraryTrack` mirrors the three new fields. The Swift bindings regenerate via `scripts/build-xcframework.sh`; no new methods or enums on the FFI surface this milestone.
+
+**Swift (`WaveformAppModel`).**
+* `DeckState.loadedLibraryTrackId: String?` — the deck's currently-loaded canonical UUID, set in `recordLibraryLoadIfApplicable` after a successful library-sourced load. Cleared on every load (including Finder drags) so a Finder load can't inherit the previous library track's "A" badge.
+* `@Published private(set) var volumeReachability: [String: Bool]` — per-mount-point cache, repopulated by `refreshVolumeReachability(for: tracks)`. Bounded — entries for mount points no longer in view are dropped.
+* `refreshVolumeReachability(for: [LibraryTrack])` — one `FileManager.fileExists(atPath:isDirectory:)` per unique mount point in the supplied list. `isDirectory` must be true (an existing file at the mount path doesn't mean the volume is mounted).
+* `isTrackReachable(_:)` — `false` when the track has no recorded primary mount point, when the mount point isn't in the cache, or when the cache says it's offline. Conservative default; the LibraryView calls `refreshVolumeReachability` immediately after `refreshTracks`'s result lands.
+
+**Swift (`LibraryView`).** New leftmost gutter column (36 pt fixed) hosting `rowIndicators(for:)`:
+
+* Loaded-now `A` / `B` badge — small rounded square, accent-tinted via `DubColor.deckATint` / `deckBTint`, shown when `model.deckA.loadedLibraryTrackId == track.id` or `deckB` respectively. Two badges side-by-side when both decks carry the same track (Instant Doubles).
+* Potential-duplicate link — `Image(systemName: "link")` wrapped in a plain-style `Button` that calls `navigateToSibling(_:)`. Navigates by setting `selectedTrackId` to the sibling's id; no-ops when the sibling isn't currently in view.
+* Missing-file glyph — `Image(systemName: "exclamationmark.triangle.fill")` in `.red.opacity(0.65)`, shown when `model.isTrackReachable(track) == false`. Tooltip differentiates "volume not mounted" (no recorded mount point) from "volume offline" (recorded but currently absent).
+
+`refreshTracks` now also calls `model.refreshVolumeReachability(for:)` on the main-actor hop with the freshly-fetched rows, so reachability is up-to-date by the time the Table re-renders.
+
+### Tests
+
+* `dub-library::db` grows two new tests:
+  - `list_tracks_populates_primary_file_columns` — proves the three new TrackRow fields surface volume UUID, mount point, and relative path correctly for a single-file track.
+  - `track_row_returns_most_recent_track_file_on_multi_file_track` — proves the multi-file deterministic resolution. A track gets a second `track_files` row at a different `relative_path`; the browser must surface the newer one (the user moved the file).
+* Workspace test count: **670 / 670 passing** (M11d.2 baseline was 668; +2 in `dub-library`).
+* `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* `xcodebuild -project apple/Dub.xcodeproj -scheme Dub -configuration Debug` builds clean (same benign macOS-version-mismatch ld warning from bundled SQLite).
+
+### Deferred
+
+* **Grid-disagreement glyph (§8.3)** — gated on the M11c `dub-bpm::analyze_bpm` follow-up. Without an auto-grid in `track_beatgrids(source='auto')` there's no disagreement signal.
+* **Inline sibling-row expansion (§8.5.3 "click expands a sibling row")** — M11d.3 ships click-to-navigate-within-list; the "expand into a sibling row" affordance lands with M11d.4 polish.
+* **Real per-file reachability via `access()`** — M11d.3 ships per-volume reachability only. A file that lives on a mounted volume but has been deleted from disk (or moved out from under the library) currently reads as "reachable" until the next import surfaces the loss. M11d.4 lands the background scanner that does the per-file check + drives the missing-files footer + Relocate panel.
+* **Indicator glyphs on Finder-drag-loaded tracks** — Finder drags leave `selectedLibraryTrackId` nil so the loaded-now badge doesn't fire even when the same file happens to exist in the library. Fixing this would require reverse-resolving a URL to a library track UUID on every load, which is doable but not v1.0 priority — most loads in real use come through the library.
+
+### PRD churn
+
+* §12 M11d row updated: M11d.3 marked ✅ shipped with deferred-glyph note.
+
+### Commit boundary
+
+This entry corresponds to the M11d.3 commit set: `docs/PRD.md` (M11d row update), `docs/SHIPPED.md` (this section), `crates/dub-library/src/db.rs` (`TRACK_ROW_SELECT` subquery + `TrackRow` field additions + tiebreaker on `resolve_track_path` + tests), `crates/dub-ffi/src/lib.rs` (`LibraryTrack` field additions), `apple/Dub/MainView.swift` (`DeckState.loadedLibraryTrackId`, `volumeReachability` cache, `refreshVolumeReachability`, `isTrackReachable`, indicator-clear in `recordLibraryLoadIfApplicable`), `apple/Dub/Performance/LibraryView.swift` (indicator column + `rowIndicators` / `deckBadge` / `navigateToSibling` helpers + reachability refresh on track-set change), `apple/DubCore.xcframework/` + `apple/DubShared/Sources/DubCore/Generated/` (rebuilt from the new FFI surface).
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11d.4 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
