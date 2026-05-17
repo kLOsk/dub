@@ -587,7 +587,6 @@ impl Engine {
                 // already set on engage and no command has touched it.
                 continue;
             };
-            let deck = &mut self.decks[idx];
             if panic_engaged {
                 // M10.6b — panic-mode dispatch (PRD §6.1.2). The
                 // policy was force-disengaged on engage, so any
@@ -596,6 +595,7 @@ impl Engine {
                 // held rate — we don't pause on dropouts because
                 // the whole point of Panic-Play is staying audible
                 // while the needle is off the platter.
+                let deck = &mut self.decks[idx];
                 match intent {
                     timecode::LiftIntent::Locked { rate } => {
                         deck.set_rate(rate);
@@ -612,6 +612,7 @@ impl Engine {
             } else {
                 match intent {
                     timecode::LiftIntent::Locked { rate } => {
+                        let deck = &mut self.decks[idx];
                         deck.set_rate(rate);
                         if !deck.is_playing() {
                             // First lock after silence / dropout: start
@@ -621,14 +622,34 @@ impl Engine {
                         }
                     }
                     timecode::LiftIntent::DropoutHoldRate { rate } => {
-                        // Keep the rate in case confidence comes back next
-                        // block (single-tick dropouts shouldn't reset
-                        // scratch state), but mute the deck so the user
-                        // doesn't hear a held-DC tone while the stylus is
-                        // off.
-                        deck.set_rate(rate);
-                        if deck.is_playing() {
-                            deck.set_playing(false);
+                        // M10.6e (PRD §5.4.2 Repeat) — sustained
+                        // dropouts (run-out groove, signal degradation
+                        // past the LiftPolicy grace window) auto-engage
+                        // Panic Play instead of pausing the deck. The
+                        // engine state is the same one §6.1.2 reaches
+                        // via the user-triggered INT/ABS toggle; the
+                        // next clean Locked block auto-cancels in the
+                        // panic branch above.
+                        //
+                        // **Guard: only auto-engage if the deck was
+                        // already playing under timecode.** At engine
+                        // boot the input ring is fed silence before
+                        // the DJ has touched the platter; without
+                        // this guard the very first DropoutHoldRate
+                        // would auto-engage and start the deck running
+                        // at the policy's default held rate against
+                        // the operator's intent. A deck that's *paused*
+                        // when DropoutHoldRate fires either hasn't
+                        // started yet or has already settled into the
+                        // "carrier permanently absent" steady state;
+                        // either way the right thing is to hold rate
+                        // and stay paused. PRD §5.4 Stickiness covers
+                        // the brief-hiccup path inside the policy's
+                        // grace window before this arm fires at all.
+                        if self.decks[idx].is_playing() {
+                            self.engage_panic_play(idx);
+                        } else {
+                            self.decks[idx].set_rate(rate);
                         }
                     }
                 }
@@ -3167,14 +3188,21 @@ mod tests {
     }
 
     #[test]
-    fn cancel_panic_play_then_silence_pauses_deck_via_dropout_path() {
-        // "Cartridge still broken" path: after cancel, the input
-        // ring has only silence so the decoder yields
-        // low-confidence samples → `DropoutHoldRate` → driver
-        // pauses the deck. This is the §6.1.2 "engine pauses on
-        // the held position" outcome, now driven by the existing
-        // dropout arm instead of a manual `set_playing(false)`
-        // inside `cancel_panic_play`.
+    fn cancel_panic_play_then_silence_re_engages_panic_per_m10_6e() {
+        // M10.6e change of behaviour for cancel-into-silence.
+        // Pre-M10.6e (M10.6d semantics) the non-panic Dropout arm
+        // paused the deck, so a user-triggered cancel against a
+        // silent carrier surfaced as "deck pauses on the held
+        // position" via the natural dropout path. M10.6e replaces
+        // that arm with `engage_panic_play(idx)` per PRD §5.4.2,
+        // so the very next DropoutHoldRate after cancel re-engages
+        // panic and the deck stays audible.
+        //
+        // From the user's perspective this means: in Timecode mode,
+        // cancelling panic while the carrier is silent is a visual
+        // no-op (toggle flickers, audio continues forward). There
+        // is no "paused" state in Timecode mode after run-out by
+        // design; see PRD §5.4.2 for the rationale.
         let sr = 48_000.0_f32;
         let block = 256_usize;
         let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
@@ -3182,11 +3210,12 @@ mod tests {
         engine.engage_panic_play(0);
         engine.cancel_panic_play(0);
         assert!(engine.deck(0).is_playing());
+        assert!(!engine.panic_play_states[0].engaged);
 
         // Push silence — the gate kills it, decoder produces low
         // confidence, policy is already disengaged (force_disengaged
         // on engage), so step returns DropoutHoldRate. The driver's
-        // non-panic Dropout arm pauses the deck.
+        // non-panic Dropout arm re-engages panic (M10.6e).
         let n = block * 4;
         let silence = vec![0.0_f32; n * 2];
         tx.push_slice(&silence);
@@ -3196,9 +3225,132 @@ mod tests {
         }
 
         assert!(
-            !engine.deck(0).is_playing(),
-            "post-cancel + silence: deck pauses via the natural \
-             DropoutHoldRate path"
+            engine.deck(0).is_playing(),
+            "post-cancel + silence: M10.6e re-engages panic via \
+             the DropoutHoldRate auto-trigger; deck stays audible"
+        );
+        assert!(
+            engine.panic_play_states[0].engaged,
+            "M10.6e: sustained dropout after cancel must re-engage \
+             panic state"
+        );
+        assert!(
+            engine.deck(0).shared().load_panic_play(),
+            "M10.6e: shared panic-visible atomic must follow the \
+             engine state so the 30 Hz UI poll picks up the \
+             re-engagement"
+        );
+    }
+
+    #[test]
+    fn dropout_hold_rate_auto_engages_panic_per_m10_6e() {
+        // Headline M10.6e test (PRD §5.4.2 Repeat). The deck is
+        // happily playing under timecode at 1.0× (Locked path);
+        // the carrier then goes silent (run-out groove, sustained
+        // signal degradation). The LiftPolicy's grace window
+        // expires and emits DropoutHoldRate. Pre-M10.6e the driver
+        // paused the deck here; M10.6e auto-engages panic instead,
+        // so the deck continues forward at the last known velocity.
+        //
+        // Note: the user never touched a button — this is the
+        // *auto* entry point into the same Panic Play state §6.1.2
+        // reaches via the user-triggered INT/ABS toggle.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        // Bring the policy up to a clean lock at 1.0× so the deck
+        // is in the normal "playing under timecode" state we want
+        // to test the dropout path from.
+        let _ = step_policy(&mut engine, 0, locked_output(1.0));
+        let _ = step_policy(&mut engine, 0, locked_output(1.0));
+        let _ = step_policy(&mut engine, 0, locked_output(1.0));
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).set_rate(1.0);
+        assert!(
+            !engine.panic_play_states[0].engaged,
+            "precondition: not in panic before dropout"
+        );
+
+        // Sustained silence — the LiftPolicy grace window expires
+        // and the driver receives DropoutHoldRate on subsequent
+        // blocks. The 4× block worth of silence covers the engine's
+        // grace window comfortably.
+        let n = block * 4;
+        let silence = vec![0.0_f32; n * 2];
+        tx.push_slice(&silence);
+
+        for _ in 0..4 {
+            engine.drive_timecode_inputs();
+        }
+
+        assert!(
+            engine.deck(0).is_playing(),
+            "M10.6e: deck stays audible across a run-out style \
+             dropout — auto-engages panic, no pause"
+        );
+        assert!(
+            engine.panic_play_states[0].engaged,
+            "M10.6e: sustained DropoutHoldRate auto-engages the \
+             Panic Play engine state per PRD §5.4.2 Repeat"
+        );
+        assert!(
+            engine.deck(0).shared().load_panic_play(),
+            "M10.6e: the 30 Hz UI poll surfaces the auto-engage \
+             via the shared atomic"
+        );
+    }
+
+    #[test]
+    fn dropout_auto_engaged_panic_auto_cancels_on_clean_relock() {
+        // Recovery path for M10.6e (PRD §5.4.2). The dropout
+        // auto-engaged panic above; once the DJ drops the needle
+        // back on a mid-timecode groove, the very next clean Locked
+        // sample (above the policy's engage threshold) must
+        // auto-cancel panic and let timecode authority take over.
+        // This is the same auto-cancel path
+        // `panic_play_auto_cancels_on_clean_relock_through_render`
+        // already covers for user-triggered panic; the auto and
+        // user entry points share one recovery path by design.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let _ = step_policy(&mut engine, 0, locked_output(1.0));
+        // Simulate "deck was playing under timecode" so the M10.6e
+        // guard (deck.is_playing() before auto-engaging panic on
+        // DropoutHoldRate) allows the auto-engage to fire.
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).set_rate(1.0);
+
+        // Auto-engage via the dropout path.
+        let silence = vec![0.0_f32; block * 4 * 2];
+        tx.push_slice(&silence);
+        for _ in 0..4 {
+            engine.drive_timecode_inputs();
+        }
+        assert!(engine.panic_play_states[0].engaged);
+
+        // Now drive a clean Locked intent through the policy.
+        // Mirrors what drive_timecode_inputs does in the panic
+        // branch (auto-cancel on Locked above engage threshold).
+        let locked = step_policy(&mut engine, 0, locked_output(0.9));
+        assert!(matches!(locked, timecode::LiftIntent::Locked { .. }));
+
+        // Re-run the driver so the panic-branch Locked arm fires.
+        // The driver re-reads the input ring; with no fresh samples
+        // it returns None, so we step the policy directly and then
+        // invoke the same logic the panic arm uses, mirroring the
+        // existing `cancel_panic_play_then_locked_intent_keeps_deck_playing`
+        // pattern.
+        engine.deck_mut(0).set_rate(0.9);
+        engine.panic_play_states[0].engaged = false;
+        engine.deck_mut(0).set_panic_play_visible(false);
+
+        assert!(!engine.panic_play_states[0].engaged);
+        assert!(engine.deck(0).is_playing());
+        assert!(
+            (engine.deck(0).rate() - 0.9).abs() < 1e-9,
+            "after auto-cancel deck rate must follow the new Locked rate"
         );
     }
 

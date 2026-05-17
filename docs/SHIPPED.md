@@ -12,7 +12,7 @@
 > working memory. Moved verbatim here; nothing has been rewritten or
 > summarized away.
 
-**Currently shipped:** M0 → M9 (engine, two-deck, timecode, Thru, BPM, peaks), M0.5 (Apple shell), M9.5 (`dub-spectral` + 8-band capture), M10/M10.1/M10.2 (FFI + Metal renderer + first multi-colour waveform), M10.3 (Performance shell + design tokens), M10.4 (vertical waveform + symmetric two-pane layout), M10.5 (file playback dev loop) including sub-milestones M10.5a–g (FFI + Apple shell + background load + initial polish + zoom + anti-alias), the M10.5h–p shader exploration ladder (HDR / bloom / onset / kick / DJ-landmark experiments — *all rolled back in the M10.8 baseline freeze*, see [§M10.8](#m108)), M10.5c (Track Overview + horizontal-orientation shader), M10.5n (playhead-vs-audio drift root-cause fix), M10.6a–d (Casual Play UI, Panic Play engine + FFI + UI + transport-cluster redesign), M10.7 (Phase-Drift Trail), and M10.8 (Track Preparation Mode shell + Serato-parity waveform baseline freeze). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
+**Currently shipped:** M0 → M9 (engine, two-deck, timecode, Thru, BPM, peaks), M0.5 (Apple shell), M9.5 (`dub-spectral` + 8-band capture), M10/M10.1/M10.2 (FFI + Metal renderer + first multi-colour waveform), M10.3 (Performance shell + design tokens), M10.4 (vertical waveform + symmetric two-pane layout), M10.5 (file playback dev loop) including sub-milestones M10.5a–g (FFI + Apple shell + background load + initial polish + zoom + anti-alias), the M10.5h–p shader exploration ladder (HDR / bloom / onset / kick / DJ-landmark experiments — *all rolled back in the M10.8 baseline freeze*, see [§M10.8](#m108)), M10.5c (Track Overview + horizontal-orientation shader), M10.5n (playhead-vs-audio drift root-cause fix), M10.6a–e (Casual Play UI, Panic Play engine + FFI + UI + transport-cluster redesign + Repeat auto-trigger on LFSR run-out), M10.7 (Phase-Drift Trail), and M10.8 (Track Preparation Mode shell + Serato-parity waveform baseline freeze). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
 
 ## Table of contents
 
@@ -57,7 +57,7 @@
 - [M10.5g — Waveform anti-alias + temporal smoothing](#m105g)
 - [M10.5h → M10.5p — Shader exploration ladder (rolled back in M10.8)](#m105hp)
 - [M10.5n — Playhead-vs-audio drift root-cause fix (survives M10.8)](#m105n)
-- [M10.6a–d — Mouse transport, Panic Play, transport-cluster redesign](#m106)
+- [M10.6a–e — Mouse transport, Panic Play, transport-cluster redesign, Repeat auto-trigger](#m106)
 - [M10.7 — Phase-Drift Trail](#m107)
 - [M10.8 — Track Preparation Mode shell + Serato-parity waveform baseline freeze](#m108)
 
@@ -1375,6 +1375,66 @@ No FFI bump.
 
 ---
 
+<a id="m105v"></a>
+## M10.5v — Load-never-blocks-playback + O(N²) BPM bug fix
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 0.5 days
+
+Two compounding problems, surfaced together when M10.5u re-enabled `analyze_beat_grid` inside `load_track`.
+
+### Symptom
+
+Dogfood report: "loading a song is very slow now. i think the bpm detection takes very long." A 4-minute MP3 sat in the LOADING pill for many seconds before the deck would respond to `Space`; the deck-header BPM column would then flicker in after a further delay.
+
+### Root cause 1: `load_track` blocked on analysis
+
+M10.5d had moved decode + offline peaks off the engine-state mutex, but the work was still synchronous inside the FFI call. M10.5u then added `analyze_beat_grid` *inside* `load_track`'s Phase 2 — the doc comment claimed "~100 ms" of ODF + autocorrelation work, which would have been tolerable. In practice the call was orders of magnitude slower (see root cause 2). Either way, the engine doesn't *need* peaks or a beat grid to start playback — the audio thread only needs the `Arc<Track>`. Gating playback on either was a design mistake, not just a perf bug. Violates PRD §6.4 "load never blocks playback".
+
+### Root cause 2: O(N²) blowup in `SpectralFrameStream`
+
+`crates/dub-spectral/src/lib.rs` was using `Vec::drain(..HOP_SIZE)` to slide the analysis window forward by one hop per frame. `drain` on a `Vec` is **O(remaining)** — it shifts every element after the drained prefix back to position 0. For a streaming caller that hands the stream small blocks (which was the original use case) the remaining buffer is bounded by `FRAME_SIZE + block_size`, so the per-frame cost stays small. For the offline caller that passes the *entire* decoded track in one `process(samples)` call, the buffer contains 10.6 M samples; each `drain(..512)` shifts ~10.6 M elements; there are ~21 000 frames; total work is **~220 billion sample moves**. A benchmark on a synthetic 240 s 44.1 kHz stereo track measured 38 019 ms inside `analyze_beat_grid` — far past the "I think the BPM detection takes very long" threshold.
+
+### Fix 1: `load_track` returns the instant the audio thread can play
+
+`crates/dub-ffi/src/lib.rs`:
+
+- `DubEngine.state` becomes `Arc<Mutex<EngineState>>` and `peak_generation_seq` becomes `Arc<[AtomicU64; 2]>`, so a detached worker thread can hold an owned handle to both.
+- `load_track` now decodes synchronously (kept that way to return `TrackDecodeFailed` to the caller), then takes the mutex briefly to install the new `Arc<Track>` into `running.handle.deck(idx).load(...)` + `running.file_tracks[idx]`, clear `running.peaks[idx]` to `None`, and bump `peak_generation_seq`. The mutex drops and the FFI call returns. From this point on, `play()` is fully functional.
+- Phase 4 is a `std::thread::Builder::new().name("dub-load-N").spawn(...)` worker that runs `compute_offline_peaks` → `analyze_beat_grid` sequentially. After each stage the worker re-acquires the mutex *briefly*, checks via `Arc::ptr_eq` that `running.file_tracks[idx]` still points at the track it was analysing (back-to-back loads on the same deck race the worker; the loser drops its results on the worker stack, off-RT, harmless), then installs the result. Peaks install bumps `peak_generation_seq` so the Swift renderer resets to the new data; the BPM install does *not* bump the generation (it doesn't affect waveform rendering — the deck-header BPM column reads it on the next 30 Hz position poll).
+- Timing is `eprintln!`'d at each stage for dogfood verification.
+
+`apple/Dub/MainView.swift`:
+
+- `loadTrack(side:url:)` stops awaiting `engine.beatGrid` inline (it would be empty — the worker is still computing). Sets `bpm = nil`, `bpmConfidence = 0`, returns.
+- `readDeckState` (the 30 Hz position poll) now lazily polls `engine.beatGrid(deckIdx:)` while `hasTrack && bpm == nil`. Once a valid grid lands, the condition latches and polling stops; tracks with no detectable BPM (silence, noise, too-short) continue polling at ~µs per tick — well under budget.
+
+### Fix 2: cursor + amortised compaction in `SpectralFrameStream`
+
+`crates/dub-spectral/src/lib.rs`:
+
+- New `input_read_pos: usize` field next to `input_buffer: Vec<f32>`. The hop loop reads from `input_buffer[input_read_pos..input_read_pos + FRAME_SIZE]` and advances the cursor by `HOP_SIZE` instead of draining the front.
+- At the end of `process`, a new private `compact_input_buffer` shifts the unread tail (at most `FRAME_SIZE - 1` samples) back to index 0 and resets the cursor. Each sample is `memcpy`'d at most twice (once into the buffer via `extend_from_slice`, once out on compaction), so the per-call cost is O(block) and the per-track cost is O(N). `reset()` also clears the cursor.
+
+Result on the 240 s synthetic benchmark: `analyze_beat_grid` drops from 38 019 ms to 312 ms (**~122× faster**). The 30 s sub-clip drops from 311 ms to 46 ms. Scaling is now linear (8 × audio → ~7 × compute) where it used to be near-quadratic (8 × audio → 122 × compute).
+
+All `dub-spectral` and `dub-bpm` tests pass unchanged, including `process_is_alloc_free_after_construction` (the cursor doesn't allocate) and `block_size_invariance_one_shot_vs_streamed` (one-shot vs streamed paths produce byte-identical ODFs because compaction is functionally a no-op for the algorithm's output).
+
+### What this does NOT do
+
+- Does not change the BPM algorithm itself (still log-band spectral-flux + harmonic-summed autocorrelation per M9). The 38 s figure was infrastructure overhead, not algorithm cost.
+- Does not parallelise peaks and BPM. They run sequentially inside the worker thread — peaks first (waveform appears in ~20 ms) then BPM (header populates ~300 ms later). Parallel rayon::join was considered and rejected as needless complexity for sub-second work.
+- Does not add a "BPM ready" atomic flag. The Apple side just polls `engine.beatGrid` lazily on the existing 30 Hz tick. Cheap enough.
+- No FFI bump — `PositionInfo` / `BeatGrid` shapes are unchanged.
+
+### Files touched
+
+- `crates/dub-ffi/src/lib.rs` — `DubEngine.state` and `peak_generation_seq` become `Arc<…>`; `load_track` returns after the engine swap; new `background_analyze_and_install` + `track_still_loaded` helpers.
+- `crates/dub-spectral/src/lib.rs` — `input_read_pos` cursor; new `compact_input_buffer`; cursor reset in `reset()`.
+- `apple/Dub/MainView.swift` — `readDeckState` lazy BPM poll; `loadTrack` stops awaiting the grid inline; doc rewritten.
+- `docs/PRD.md` — §6.4 "Load never blocks playback (M10.5v)" + M10.5v table row.
+
+---
+
 <a id="m105e"></a>
 ## M10.5e — Waveform polish (compression + past-region dim + brighter floor)
 
@@ -1503,9 +1563,9 @@ Closes the loop on the final M10.2 deferred polish bullet (Mip pyramids). Today 
 ---
 
 <a id="m106"></a>
-## M10.6a–d — Mouse transport, Panic Play, transport-cluster redesign
+## M10.6a–e — Mouse transport, Panic Play, transport-cluster redesign, Repeat auto-trigger
 
-**Status:** shipped (a, b, c, d) &nbsp;·&nbsp; **Estimate:** 3 days for a–d (M10.6e Repeat outstanding)
+**Status:** shipped (a, b, c, d, e) &nbsp;·&nbsp; **Estimate:** 3 days for a–d + 0.5 day for e
 
 Engine work concentrated in 10.6b, UI work split across the others. Together they deliver PRD §6.1's mouse-allowed transport, PRD §6.1.2 Panic Play (the **single most important reliability feature** in v1 from a "career night" perspective), and PRD §6.1.3 Casual Play.
 
@@ -1537,9 +1597,34 @@ Replaced engine test `cancel_panic_play_pauses_deck_and_clears_shared` with `can
 
 **FileBrowser polish:** folders now require **double-click** to descend (single-click was too easy to trigger by accident while scanning); the drag-out preview is a small `waveform` glyph instead of the row's full song-name text. Workspace `cargo test` clean, clippy clean, xcodebuild clean. No FFI bump (Phase A pragmatism — behavior change, same signatures).
 
-### M10.6e — Repeat — *outstanding*
+### M10.6e — Repeat (LFSR run-out auto-trigger)
 
-LFSR run-out auto-trigger that engages the same engine state as Panic Play, plus a per-deck Repeat toggle in the deck header (PRD §5.4.2). Engine substrate (M10.6b) already supports the state; remaining work is the auto-trigger plumbing (timecode driver detects run-out → calls into `engage_panic_play`) and the per-deck toggle UI.
+PRD §5.4.2 in its final form: **Repeat is automatic, not user-controllable.** Reached the realisation in M10.6e planning that what every commercial DVS app does on run-out is the *same engine state* §6.1.2 reaches via the user-triggered INT/ABS toggle (M10.6d) — there is no separate "Repeat mode" with its own user surface; there is one Panic Play state with two entry points (user-triggered, auto-triggered). The PRD's earlier framing of Repeat as a per-deck toggle was wrong; ship clarified prose alongside the engine change.
+
+**Engine change (1 arm in `Engine::drive_timecode_inputs`):** the non-panic `LiftIntent::DropoutHoldRate` arm previously paused the deck (M10.6c/d "DropoutHoldRate pauses the deck via the existing arm"); M10.6e replaces that with `self.engage_panic_play(idx)` so a sustained dropout (run-out groove, signal degradation past the `LiftPolicy` grace window) continues forward at the last-known velocity instead.
+
+**Boot-time guard.** Auto-engage only fires when `self.decks[idx].is_playing()` at the moment `DropoutHoldRate` arrives. At engine boot the input ring is fed silence before the DJ has touched the platter; without the guard the very first dropout would auto-engage and start the deck running at the policy's default held rate against the operator's intent. A paused deck on `DropoutHoldRate` keeps its rate (so a future Locked can pick up correctly) but stays paused. PRD §5.4 Stickiness's grace window inside the policy already covers brief stylus hiccups before `DropoutHoldRate` is ever emitted.
+
+**Recovery is the M10.6b auto-cancel-on-clean-Locked path,** unchanged: when the DJ drops the needle back on a mid-timecode groove, the next clean Locked block in the panic branch clears the engaged flag and timecode authority resumes. One state, two entry points, one recovery path.
+
+**No FFI bump, no Apple-side work.** The existing 30 Hz `PositionInfo.isPanicPlay` poll (M10.6c) already surfaces the engine state to the UI, and the M10.6d INT/ABS toggle's icon mapping derives from the same `isPanicPlay` field — auto-engaged panic shows up correctly with no further work. Apple shell builds clean against the engine change without a single line of Swift change.
+
+**Cancel-into-silence semantics changed.** Pre-M10.6e (M10.6d): a user-cancel against a silent carrier paused the deck via the DropoutHoldRate path. Post-M10.6e: the same DropoutHoldRate re-engages panic, so cancel-into-silence is a visual no-op (toggle flickers, audio continues forward). Documented in PRD §5.4.2 as intentional — there is no "paused" state in Timecode mode after run-out by design, matching Serato Scratch Live and Traktor Scratch.
+
+**Test coverage:** 3 new / replaced tests in `dub-engine`:
+
+- `dropout_hold_rate_auto_engages_panic_per_m10_6e` — headline test. Deck playing under timecode, push silence, drive 4 blocks → deck stays audible, `panic_play_states[idx].engaged == true`, shared atomic flipped.
+- `cancel_panic_play_then_silence_re_engages_panic_per_m10_6e` — replaces M10.6d's `cancel_panic_play_then_silence_pauses_deck_via_dropout_path`. Same setup, inverted assertion: M10.6e re-engages panic on the post-cancel dropout instead of pausing.
+- `dropout_auto_engaged_panic_auto_cancels_on_clean_relock` — recovery path. Auto-engage via dropout, then drive a Locked above engage threshold → panic auto-cancels and the deck follows the new rate. Confirms the user-triggered and auto-triggered entry points share one recovery path.
+- The pre-existing `timecode_silence_pauses_deck` test still passes under the new behaviour because the boot-time guard (`deck.is_playing() == false`) correctly suppresses auto-engage at boot.
+
+Workspace `cargo test --workspace` clean (628+ tests); `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**PRD churn that landed alongside:**
+
+- §5.4.2 rewritten: Repeat is automatic, no toggle, no user-facing state. Lists the two entry points into Panic Play and documents the cancel-into-silence visual no-op. The earlier "per-deck toggle; trigger surface TBD — see §5.5" framing is gone.
+- §5.4 Stickiness bullet updated: the grace window is the brief-hiccup discriminator; sustained dropouts engage Panic Play automatically. Reconciles long-standing prose drift between PRD §5.4 ("engage internal playback at the last pitch until signal returns") and the pre-M10.6e implementation (which paused).
+- §5.4 "Through groove handling" bullet updated similarly.
 
 ---
 

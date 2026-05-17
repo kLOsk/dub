@@ -125,9 +125,27 @@ pub const LAMBDA: f32 = 1000.0;
 pub struct SpectralFrameStream {
     r2c: Arc<dyn RealToComplex<f32>>,
 
-    /// Hop-overlap buffer. Holds at most `FRAME_SIZE + HOP_SIZE - 1`
-    /// samples between calls.
+    /// Hop-overlap buffer.
+    ///
+    /// Read with a cursor (`input_read_pos`) rather than draining from
+    /// the front. `drain(..HOP_SIZE)` on a `Vec` is O(remaining), which
+    /// in the offline path (a single `process(samples)` call with the
+    /// whole track) compounds into O(N²) total work — a 4-minute
+    /// 44.1 k track ran in ~38 s on M-series silicon before this
+    /// became a cursor. With the cursor + amortised compaction the
+    /// cost is O(N) (each sample is `memcpy`'d at most twice — once
+    /// into the buffer, once out on compaction), restoring linear
+    /// scaling.
+    ///
+    /// Steady-state size between calls is `< FRAME_SIZE` thanks to the
+    /// post-loop compaction; transiently grows to `extend_from_slice`
+    /// block size during a call.
     input_buffer: Vec<f32>,
+    /// Read position into `input_buffer`. The next FFT frame begins at
+    /// `input_buffer[input_read_pos..input_read_pos + FRAME_SIZE]`.
+    /// Reset to 0 by `compact_input_buffer` at the end of each
+    /// `process` call.
+    input_read_pos: usize,
 
     fft_in: Vec<f32>,
     fft_out: Vec<Complex<f32>>,
@@ -176,6 +194,7 @@ impl SpectralFrameStream {
         Self {
             r2c,
             input_buffer: Vec::with_capacity(FRAME_SIZE * 4),
+            input_read_pos: 0,
             fft_in,
             fft_out,
             fft_scratch,
@@ -251,9 +270,10 @@ impl SpectralFrameStream {
     {
         self.input_buffer.extend_from_slice(block);
 
-        while self.input_buffer.len() >= FRAME_SIZE {
+        while self.input_buffer.len() - self.input_read_pos >= FRAME_SIZE {
+            let start = self.input_read_pos;
             for i in 0..FRAME_SIZE {
-                self.fft_in[i] = self.input_buffer[i] * self.window[i];
+                self.fft_in[i] = self.input_buffer[start + i] * self.window[i];
             }
 
             self.r2c
@@ -276,12 +296,32 @@ impl SpectralFrameStream {
 
             on_frame(&self.compressed_mags, &self.bands);
 
-            // Slide the analysis window forward by HOP_SIZE. `drain` is
-            // O(remaining); for offline / per-block processing this is
-            // fine. Streaming drivers (M8 `BpmStream`, M9 `PeakStream`)
-            // already amortise the cost across their poll cadence.
-            self.input_buffer.drain(..HOP_SIZE);
+            // Advance the cursor instead of draining. With a `Vec::drain`
+            // every frame, the offline path's single huge `process`
+            // call would re-shift the whole buffer ~ N/HOP times,
+            // giving O(N²) total cost. The cursor makes the per-frame
+            // cost O(FRAME_SIZE); compaction at the end amortises the
+            // book-keeping back into O(block).
+            self.input_read_pos += HOP_SIZE;
         }
+
+        self.compact_input_buffer();
+    }
+
+    /// Slide the unread tail of `input_buffer` back to index 0 so the
+    /// buffer doesn't grow unboundedly across calls. Cheap — moves at
+    /// most `FRAME_SIZE - 1` samples (the leftover that didn't complete
+    /// a frame), the rest has already been consumed by `process`.
+    fn compact_input_buffer(&mut self) {
+        if self.input_read_pos == 0 {
+            return;
+        }
+        let remaining = self.input_buffer.len() - self.input_read_pos;
+        if remaining > 0 {
+            self.input_buffer.copy_within(self.input_read_pos.., 0);
+        }
+        self.input_buffer.truncate(remaining);
+        self.input_read_pos = 0;
     }
 
     /// Clear all per-stream state — the input buffer and the previous
@@ -290,6 +330,7 @@ impl SpectralFrameStream {
     /// re-computing the band-bin map.
     pub fn reset(&mut self) {
         self.input_buffer.clear();
+        self.input_read_pos = 0;
         for m in &mut self.compressed_mags {
             *m = 0.0;
         }

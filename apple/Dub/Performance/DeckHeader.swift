@@ -41,6 +41,14 @@ struct DeckHeaderState: Equatable {
     let trackTitle: String?
     let trackArtist: String?
 
+    /// M10.5u. Estimated tempo for the loaded track, populated
+    /// from `engine.beatGrid(deckIdx:)` after a successful
+    /// `loadTrack`. `nil` when no track is loaded, when analysis
+    /// bailed (silence / non-musical / too-short input), or when
+    /// the estimator's confidence dropped to zero. The BPM stat
+    /// column renders the dash in that case.
+    let bpm: Double?
+
     /// Format / SR caption ("MP3 · 44.1 kHz · stereo"). `nil` for
     /// Thru / off decks.
     let formatChip: String?
@@ -133,7 +141,7 @@ struct DeckHeaderState: Equatable {
     /// Convenience: idle / cold-launch state.
     static let idle = DeckHeaderState(
         isLive: false, source: .off,
-        trackTitle: nil, trackArtist: nil, formatChip: nil,
+        trackTitle: nil, trackArtist: nil, bpm: nil, formatChip: nil,
         timeRow: nil, isMaster: false, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false
     )
@@ -226,12 +234,26 @@ struct DeckHeader: View {
     private var row2: some View {
         HStack(spacing: DubSpacing.lg) {
             statColumn(label: "PITCH", value: "—")
-            statColumn(label: "BPM",   value: "—")
+            statColumn(label: "BPM",   value: formattedBPM)
             statColumn(label: "KEY",   value: "—")
             Spacer(minLength: 0)
             fxChip
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Render the BPM column. The Stage-1 estimator delivers two
+    /// decimals' worth of precision but DJs read tempo as a
+    /// whole-number "around 128" cue at glance distance, so the
+    /// column shows one decimal (e.g. `128.0`, `92.5`) — enough
+    /// to disambiguate adjacent half-time tracks (88 vs 88.5)
+    /// without forcing the eye to parse a `127.94` digit string
+    /// every time. The dash falls out naturally when
+    /// `state.bpm == nil`: no track / analysis bailed / zero
+    /// confidence.
+    private var formattedBPM: String {
+        guard let bpm = state.bpm, bpm > 0 else { return "—" }
+        return String(format: "%.1f", bpm)
     }
 
     // MARK: - Row 3 — track time + transport glyphs (track loaded)
@@ -533,6 +555,7 @@ extension DeckHeaderState {
                 source: .loading,
                 trackTitle: resolvedTitle,
                 trackArtist: nil,
+                bpm: nil,
                 formatChip: nil,
                 timeRow: nil,
                 isMaster: isMaster,
@@ -574,6 +597,7 @@ extension DeckHeaderState {
                 source: source,
                 trackTitle: resolvedTitle,
                 trackArtist: resolvedArtist,
+                bpm: deckState.bpm,
                 formatChip: deckState.formatChip,
                 timeRow: time,
                 isMaster: isMaster,
@@ -599,6 +623,7 @@ extension DeckHeaderState {
                 source: .timecode,
                 trackTitle: "Real Record",
                 trackArtist: "capturing live",
+                bpm: nil,
                 formatChip: nil,
                 timeRow: nil,
                 isMaster: isMaster,
@@ -612,6 +637,7 @@ extension DeckHeaderState {
             source: .off,
             trackTitle: nil,
             trackArtist: nil,
+            bpm: nil,
             formatChip: nil,
             timeRow: nil,
             isMaster: false,
@@ -632,6 +658,7 @@ extension DeckHeaderState {
     DeckHeader(side: .a, state: DeckHeaderState(
         isLive: true, source: .thru,
         trackTitle: "Real Record", trackArtist: "capturing live",
+        bpm: nil,
         formatChip: nil, timeRow: nil,
         isMaster: true, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false))
@@ -645,6 +672,7 @@ extension DeckHeaderState {
         isLive: true, source: .file,
         trackTitle: "Stakes Is High",
         trackArtist: "De La Soul",
+        bpm: 92.5,
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly(remainingText: "-02:22"),
         isMaster: false, isPlaying: true,
@@ -659,6 +687,7 @@ extension DeckHeaderState {
         isLive: true, source: .file,
         trackTitle: "Stakes Is High",
         trackArtist: "De La Soul",
+        bpm: 92.5,
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .elapsedAndRemaining(
             elapsedText: "01:23",
@@ -675,6 +704,7 @@ extension DeckHeaderState {
         isLive: true, source: .tcHold,
         trackTitle: "Stakes Is High",
         trackArtist: nil,
+        bpm: 92.5,
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly(remainingText: "-02:22"),
         isMaster: true, isPlaying: true,

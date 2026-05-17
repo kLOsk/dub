@@ -88,6 +88,22 @@ struct DeckState: Equatable {
     /// Total track duration. 0 if no track loaded.
     var durationSecs: Double = 0
 
+    /// M10.5u. Estimated tempo for the loaded track, populated
+    /// from `engine.beatGrid(deckIdx:)` after a successful
+    /// `loadTrack`. `nil` when no track is loaded, when BPM
+    /// analysis failed (silence / non-musical / too-short input),
+    /// or when the estimator's confidence collapsed to zero. The
+    /// deck-header BPM column renders `—` in that case.
+    var bpm: Double? = nil
+
+    /// M10.5u. Confidence the BPM estimator returned alongside
+    /// `bpm`, in `[0, 1]`. `0` when no usable estimate exists.
+    /// Currently informational only — the header doesn't gate
+    /// the digits on this — but it's plumbed through so a future
+    /// "BPM ?" low-confidence affordance can read it without
+    /// another FFI poll.
+    var bpmConfidence: Double = 0
+
     /// Wall-clock elapsed from track start. 0 if no track.
     /// Clamped to `[0, durationSecs]` so it's safe to use in time
     /// displays and as a seek target. The waveform renderer uses
@@ -459,6 +475,23 @@ final class WaveformAppModel: ObservableObject {
         if let until = next.errorFlashUntil, Date() >= until {
             next.errorFlashUntil = nil
         }
+        // M10.5v — `load_track` no longer blocks on
+        // `analyze_beat_grid`; the engine spawns the BPM compute
+        // on a detached worker thread so playback can start
+        // immediately (PRD §6.4 "load never blocks playback").
+        // The grid arrives asynchronously, so we poll for it
+        // here.  Once we've captured a valid grid we stop polling
+        // (the `next.bpm != nil` condition latches).  Tracks with
+        // no detectable BPM (silence / too-short / non-musical)
+        // keep polling — the cost is one FFI call returning an
+        // empty `BeatGrid` per tick (~µs), well below the budget.
+        if next.hasTrack, next.bpm == nil {
+            let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
+            if grid.confidence > 0, grid.bpm > 0 {
+                next.bpm = grid.bpm
+                next.bpmConfidence = Double(grid.confidence)
+            }
+        }
         return next
     }
 
@@ -511,21 +544,29 @@ final class WaveformAppModel: ObservableObject {
     /// same deck (avoids racing two decoders against each other
     /// and stomping the deck's `Arc<Track>`).
     ///
-    /// **Concurrency.** `engine.loadTrack` is the Rust FFI, which
-    /// in M10.5d does its decode + offline-peaks compute outside
-    /// the engine-state mutex (see `dub-ffi` `load_track` docs).
-    /// We wrap the FFI call in `Task.detached` so it runs off the
-    /// SwiftUI main actor — the 30 Hz position poll + waveform
-    /// rendering both stay responsive throughout. Returns `true`
-    /// on success.
+    /// **Concurrency (M10.5v).** `engine.loadTrack` is the Rust
+    /// FFI, which since M10.5v returns the *instant* the audio
+    /// thread receives the new `Arc<Track>` (~50 ms decode +
+    /// near-zero swap). Offline peaks (~10–30 ms) and
+    /// `analyze_beat_grid` (~100–400 ms) run on a detached
+    /// `std::thread` inside the engine, so playback is never
+    /// gated on analysis (PRD §6.4 "load never blocks playback").
+    /// We still wrap the FFI call in `Task.detached` so the
+    /// decode itself doesn't block the SwiftUI main actor.
+    /// Returns `true` once the engine has accepted the track and
+    /// playback is possible — the waveform + BPM may still be a
+    /// few frames behind.
     ///
     /// **Optimistic UI.** Title + format chip flip to the *new*
     /// file before decode starts (so the deck immediately reads
     /// "Loading… MyTrack.mp3"); duration / has-track land once the
-    /// FFI call returns. If a previous track was loaded, its
-    /// waveform stays visible until the new peaks arrive — the
+    /// FFI call returns. The previous track's waveform is cleared
+    /// at swap time (engine sets `peaks[idx] = None`); the
     /// renderer's `peaksGeneration` mismatch handler resets the
-    /// view at the moment of swap.
+    /// view at that moment, then re-populates when the detached
+    /// peaks thread installs the new data. The BPM column shows
+    /// "—" until the detached BPM thread finishes, then populates
+    /// via the 30 Hz position poll.
     @discardableResult
     func loadTrack(side: DeckSide, url: URL) async -> Bool {
         guard isRunning else {
@@ -554,6 +595,8 @@ final class WaveformAppModel: ObservableObject {
         starting.displayName = url.deletingPathExtension().lastPathComponent
         starting.trackTitle = nil
         starting.trackArtist = nil
+        starting.bpm = nil
+        starting.bpmConfidence = 0
         starting.errorFlashUntil = nil
         setState(starting, for: side)
 
@@ -583,6 +626,15 @@ final class WaveformAppModel: ObservableObject {
                 next.trackTitle = info.title.isEmpty ? nil : info.title
                 next.trackArtist = info.artist.isEmpty ? nil : info.artist
             }
+            // M10.5v — BPM analysis is no longer awaited inline.
+            // The engine returns from `load_track` the instant the
+            // audio thread can play (decode + Arc<Track> install,
+            // ~50 ms total) and spawns peaks + `analyze_beat_grid`
+            // on a detached worker thread.  The deck-header BPM
+            // column is populated by `readDeckState` on the next
+            // 30 Hz poll tick(s) once the grid lands.
+            next.bpm = nil
+            next.bpmConfidence = 0
             setState(next, for: side)
             recomputeMaster()
             return true

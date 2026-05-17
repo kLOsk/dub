@@ -7,7 +7,7 @@
 //  M10.5b dev-loop testing. **Intentionally below M11** — no library
 //  database, no crate concept, no Serato / Traktor import.
 //
-//  PRD §9.7 (TBD) + M10.5b spec:
+//  PRD §8.5 (full library browser — M11d replacement) + M10.5b spec:
 //      • Folder picker at the top (NSOpenPanel — directory only).
 //      • Listing pane: subfolders first, then audio files.
 //      • Single-click on **any row** (file *or* folder) selects it —

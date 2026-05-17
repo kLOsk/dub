@@ -57,16 +57,41 @@ implement the importers. Each section below should end up with:
 ## Common concerns
 
 - **Dub never modifies source library files or databases.** Read-only always.
-- **Dedupe by canonical identity:** `(audio_fingerprint_hash, file_size, duration_ms)`.
-  Same track imported from multiple sources merges into one Dub entry, with
-  per-source metadata preserved.
-- **Beatgrid priority:** if multiple sources have a grid for the same canonical
-  track, prefer Serato (most accurate for the urban music scene), then
-  rekordbox, then Traktor, then auto-detect.
-- **Failure modes:** corrupted file → graceful error, never crash. PRD §2.2.5
-  fuzz targets must cover every parser in this doc.
+  Source files open with `O_RDONLY` semantics; no advisory locks; concurrent
+  use of Serato / Traktor / rekordbox is fine.
+- **Canonical track identity** lives in `tracks` as a stable UUID; the
+  fingerprint match is `chromaprint_similarity ≥ 0.98 AND duration_delta <
+  200 ms AND no version-token differs`. See PRD §8.1 for the version-token
+  list (`clean / dirty / instrumental / acapella / radio / edit / extended
+  / club / dub / vip / remix / remaster / mono / stereo / intro / outro
+  / short / long / 7" / 12" / lp`).
+- **Per-source metadata is preserved verbatim,** not destructively merged.
+  Each source's row in `track_metadata_source` carries that source's
+  opinion (artist / title / album / comment / bpm / key / gain /
+  version_token); the browser's displayed value is chosen by the priority
+  chain `serato > rekordbox > traktor > id3 > filename` but every source's
+  raw value remains queryable. Re-import refreshes the per-source row only.
+- **Beatgrid priority:** default order `Serato > rekordbox > Traktor >
+  auto-detect`, user-configurable in Preferences (PRD §8.3). Per-track
+  override available from the browser context menu. Every imported grid
+  is cross-validated against `dub-bpm`; disagreement flags a ⚠ on the
+  row.
+- **Imported hot cues and loops** are written to `track_cues` /
+  `track_loops` from v1.0 day one even though the v1 UI does not surface
+  them (PRD §6.6, §8.6). This is what makes the rekordbox-XML export at
+  M11f a lossless round-trip (Serato in → rekordbox XML out, cues
+  preserved).
+- **Path-by-volume-UUID.** `track_files` stores `(volume_uuid,
+  relative_path_from_volume_root)`; resolution falls back through
+  last-known mount → basename + fingerprint search → prompt the user.
+  PRD §8.2.
+- **Failure modes:** corrupted file → graceful error, never crash. PRD
+  §2.2.5 fuzz targets must cover every parser in this doc.
 
 ## See also
 
-- `docs/PRD.md` §8 — Library
+- `docs/PRD.md` §8 — Library (philosophy, imports, schema, beatgrids,
+  analysis, browser UX, export, schema-as-public-API)
+- `docs/LIBRARY-SCHEMA.md` — public SQLite schema reference (lands in
+  M11a)
 - `crates/dub-library/src/` — implementations

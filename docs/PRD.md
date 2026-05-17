@@ -482,8 +482,8 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 - **Pitch range** as wide as the user's turntable (typically ±8 / ±16 / ±50 %)
 - Slow-down to stop: tracks pitch through zero cleanly without click/glitch
 - Backspin: tracks negative pitch with no audible artifact up to the resampler's limits
-- **Drop-out detection (Stickiness)**: if signal quality degrades (dust, scratch, end of run-out groove), hold last known velocity for a grace window (default 250 ms), then engage internal playback at the last pitch until signal returns. See §6.1.2 (Panic Play) for the user-driven extension of this state.
-- **Through groove handling**: detect run-out and hold position. See §5.4.2 (Repeat) for the user-driven extension that keeps audio playing forward instead of holding.
+- **Drop-out detection (Stickiness)**: if signal quality degrades (dust, scratch, end of run-out groove), hold the last known velocity for a grace window (default 250 ms). If the signal does not recover within the window, the engine auto-engages Panic Play (§6.1.2 / §5.4.2 Repeat), continuing forward at the last known rate until the signal returns. The grace window discriminates brief stylus hiccups (held, no state change) from sustained dropouts (auto-engaged internal playback).
+- **Through groove handling**: when the needle reaches the end of the encoded area, Stickiness's grace window expires, and the engine engages Panic Play per §5.4.2 — audio continues forward at the last known rate. Recovery is automatic on the next clean Locked sample (DJ drops the needle back on a mid-timecode groove).
 - **Calibration UI**: show signal scope, S/N ratio, RPM detection, pitch readout. Live calibration with vinyl spinning. **No A/B side toggle, no abs/rel mode selector** — relative mode is universal.
 - **Tracking quality indicator (UI)**: a per-deck signal-health glyph in the deck header source pill (PRD §9) — green dot = clean lock, amber = degraded signal, red = no lock. Read off the M5.4.6 `LiftPolicy` confidence the engine already publishes. Note: it is **expected** for tracking to be red while cueing or scratching, identical to Serato's behaviour — the dot reports signal quality, not user intent.
 
@@ -497,9 +497,16 @@ The auto-detect path handles 33⅓ and 45 RPM transparently in 99 % of cases. Ed
 
 #### 5.4.2 Repeat (timecode run-out)
 
-When the needle reaches the end of the timecode-encoded area of the control record, the LFSR signal disappears and Stickiness (§5.4) ordinarily engages, holding the playhead at the last known position. **Repeat** is the user-controlled alternative: when enabled (per-deck toggle; trigger surface TBD — see §5.5), the engine instead continues playing the audio track forward at the last-known velocity, decoupling track playback from the (now-absent) timecode entirely. Useful when the audio track is longer than the timecode record's playable area.
+When the needle reaches the end of the timecode-encoded area of the control record, the LFSR signal disappears. **Repeat** is the automatic engine behavior at that moment: the engine continues playing the audio track forward at the last-known velocity, decoupling audio from the (now-absent) timecode. There is no user-facing toggle. Useful and unavoidable, because the audio track is frequently longer than the timecode record's playable area; this matches the behavior of every commercial DVS app and is what the target user already expects.
 
-Engine-side this is the same state as Panic Play (§6.1.2): "decouple audio from timecode, run forward at last-known rate, re-engage on signal return." Repeat is the *auto-triggered* form (triggered by run-out), Panic Play the *user-triggered* form (button press). One state, two entry points; both exit on clean signal return.
+**Engine-side this is the same state as Panic Play (§6.1.2)**: "decouple audio from timecode, run forward at last-known rate, re-engage on the next clean Locked signal." Two entry points into one state:
+
+- **Auto-trigger** (Repeat, this section): the timecode driver emits `DropoutHoldRate` after its grace window expires (PRD §5.4 Stickiness). The engine engages Panic Play instead of pausing the deck. M10.6e.
+- **User-trigger** (Panic Play, §6.1.2): the deck-header Play button in Timecode mode (Serato-style INT/ABS toggle from M10.6d). Used for needle-dirt recovery during the encoded area of the record.
+
+**Recovery is identical for both entry points.** The user lifts the needle, drops it back on a mid-timecode groove of the encoded area; the next clean Locked intent auto-cancels Panic Play and timecode authority resumes. If the user clicks the INT/ABS toggle while the carrier is silent, the cancel call clears the engaged flag but the very next `DropoutHoldRate` block re-engages — visually a no-op, semantically correct (timecode cannot be handed back to something that isn't there).
+
+**There is no "paused" state in Timecode mode after run-out.** The deck either follows the platter (Locked) or runs internally forward (Panic / Repeat). To stop a track that has run past the encoded area, the user either lets the audio finish, drops the needle back on the groove and pulls it off the platter (lift → Stickiness pauses → re-engage on the dropped needle), or unloads the track from the deck. This is consistent with Serato Scratch Live and Traktor Scratch.
 
 #### 5.4.3 Reverse Input Control
 
@@ -523,7 +530,7 @@ v1.0 ships an **intentionally minimal** keymap. Performance keys (Quick Scratch,
 | Key | Action | Milestone |
 |---|---|---|
 | `⌘,` | Open Preferences | M10.3 |
-| `Space` | Load the **library selection** (highlighted row in the file browser, §9.7) into the **stopped, non-master deck**. If the non-master deck is currently playing, the deck pane flashes red with a "deck is playing — lift the needle" overlay; the user lifts the needle (or stops Casual Play) and tries again. See §6.4 Master deck. | M10.5 |
+| `Space` | Load the **library selection** (highlighted row in the file / library browser, §8.5) into the **stopped, non-master deck**. If the non-master deck is currently playing, the deck pane flashes red with a "deck is playing — lift the needle" overlay; the user lifts the needle (or stops Casual Play) and tries again. See §6.4 Master deck. | M10.5 |
 
 Every other key — performance and otherwise — is **TBD** and will be added to this table as its feature ships. The PRD does not commit to a binding before the feature exists, because we've learned that DJ keyboard muscle memory is heavily anchored to Serato / Traktor conventions and we want to choose deliberately, not preemptively.
 
@@ -608,6 +615,8 @@ The master is **not** chosen by mouse or by a focus ring. There is no `Tab` to c
 **Load-into-non-master rule (M10.5):** pressing `Space` with a library row selected loads that file into the **non-master, stopped** deck. If the non-master deck is currently playing (rare, but possible if both decks were just playing and the DJ touched the other), the deck pane flashes red for 200 ms with a "deck is playing — lift the needle" overlay. The user lifts the needle (or pauses Casual Play), and the next `Space` succeeds. We do not auto-stop the deck — silently dropping a track on a deck that's mid-air is the kind of bug-prone helpfulness §2 rejects.
 
 **Opt-out for the load-into-playing guard (M10.5r):** Preferences exposes an `Allow loading onto a playing deck (Performance mode)` toggle, default off. When on, drops / Space-loads onto a playing deck succeed silently — the new track replaces the old one mid-play. The toggle exists for the rehearsal-style workflow where a single DJ is bouncing between two decks and wants to drop the next track without lifting the needle first. The default stays "refuse + red flash" because that matches the on-stage muscle memory of every other DVS app and prevents accidental cue-track loss. **Prep mode always allows the load** regardless of the toggle — Prep is a single-deck shell where the "currently playing in front of an audience" concern doesn't apply.
+
+**Load never blocks playback (M10.5v).** `load_track` returns to the caller the moment the audio thread has the new `Arc<Track>` (~50 ms decode + a sub-millisecond engine-state swap). Offline peaks and `analyze_beat_grid` move to a detached `std::thread::spawn` inside `dub-ffi`, which installs its results back through `Arc<Mutex<EngineState>>` and bumps the per-deck `peak_generation_seq`. The Apple shell calls `loadTrack` from a `Task.detached`, then drops back into the 30 Hz position poll; the waveform appears within ~30 ms of swap, the deck-header BPM within ~300 ms. The user can press `Space` immediately after the load completes — playback is *never* gated on analysis. Cancellation against a back-to-back load on the same deck is by `Arc::ptr_eq`: if a newer track has displaced the in-flight `Arc<Track>` in `running.file_tracks[idx]` by the time the worker thread finishes, the stale peaks / grid are dropped on the worker's stack. **Performance budget**: a 4-minute track must reach a fully populated BPM column in ≤ 1 s on M-series silicon end-to-end; before M10.5v the `Vec::drain(..HOP_SIZE)` in `dub-spectral::SpectralFrameStream::process` made this 38 s for a clean synthetic track (O(N²) collapse on the offline path), which M10.5v fixed with a read cursor + amortised compaction (now O(N)).
 
 #### 6.1.1 Key Lock with scratch-aware auto-bypass
 
@@ -730,34 +739,84 @@ v1 ships with **no bundled samples**. UI prompts user to load samples on first r
 
 ## 8. Library
 
+The library is the user's set of tracks (filesystem files + metadata) and the relationships between them (crates, beatgrids, cues, mix history). Dub reads from external libraries, never writes to them, owns its own SQLite database for Dub-originated user data, and exports to standard interchange formats so the user is never trapped.
+
+Three principles govern the whole subsystem:
+
+1. **Local-first.** The library lives entirely on the user's machine. Zero telemetry on library content, no metadata fetched over the network, no phone-home. The user's library is never an asset Dub syncs, sells, or transmits. The target audience has been burned by Serato Cloud, rekordbox Cloud, and Beatport LINK; "your library never leaves your machine" is both a discipline and a positioning commitment.
+2. **Source libraries are sacred.** Dub never modifies source library files (Serato GEOB tags inside audio files, Traktor `collection.nml`, rekordbox `master.db`, iTunes `Library.xml`) and never writes a sidecar file into a source library directory. Source files are opened read-only.
+3. **No lock-in.** Everything the user does inside Dub (Dub crates, tap-to-grid corrections, future hot cues, future saved loops, custom tags) is exportable to a documented, standard format (§8.6). The Dub SQLite schema is itself documented and treated as a public API surface (§8.7).
+
 ### 8.1 Imports
 
 Dub reads (does not own) external libraries. **One-shot import + manual re-scan**, no continuous live sync.
 
 | Source | Format | What we read |
 |---|---|---|
-| Serato | ID3 GEOB tags, `_Serato_/database V2`, crate files | Tracks, BPM, beatgrids, hot cues (stored for v2), cue points, loops, file paths, custom tags |
+| Serato | ID3 GEOB tags, `_Serato_/database V2`, crate files | Tracks, BPM, beatgrids, hot cues (stored for v2 export round-trip), cue points, loops, file paths, custom tags |
 | Traktor | `collection.nml` (XML) | Tracks, BPM, beatgrids, cues, key, comments, gain |
-| rekordbox | `master.db` (SQLite, encrypted), XML export | Tracks, BPM, beatgrids, cues, key |
+| rekordbox | XML export (v1.0); `master.db` (SQLite, encrypted, v1.1) | Tracks, BPM, beatgrids, cues, key |
 | iTunes / Apple Music | `Library.xml` | Tracks, BPM (often missing), playlists, ratings |
-| Lexicon DJ | Indirect — reads its rekordbox / Serato exports | As above |
+| Lexicon DJ | Indirect, reads its rekordbox / Serato exports | As above |
 
-**rekordbox `master.db` decryption:** the DB6 key is community-known. We will use a clean-room implementation. **Risk:** Pioneer could change the format; we degrade to XML-export-only if the DB6 path breaks.
+**rekordbox `master.db` decryption:** the DB6 key is community-known. We will use a clean-room implementation when we tackle it. **v1.0 ships XML-export-only**; DB6 lands in v1.1 if the format is still stable then. Pioneer can change the format at any time; the XML path is the durable contract.
 
-**Format-specific gotchas documented in `docs/library-formats.md`** (to be written during implementation).
+**Read-only access discipline.** Source files and library databases are opened with `O_RDONLY` semantics. We never advisory-lock a source library file; the user can have Serato / Traktor / rekordbox running while Dub imports.
 
-### 8.2 Dub's own data
+**Per-source metadata preserved verbatim.** Different sources hold different opinions about the same track (Serato says "Dilla, J", rekordbox says "J Dilla", the ID3 frame in the file says "James Yancey"). Dub does not collapse these on import; each source's opinion is stored as a separate row in `track_metadata_source` keyed against the canonical track (§8.2). The browser picks a displayed value via a documented per-column priority chain (`serato > rekordbox > traktor > id3 > filename`) but every source's value is preserved and available for "what does each app think this is called?" UI in v1.x.
 
-- SQLite database for: imported tracks, dedupe (canonical track identity = audio fingerprint hash + size + duration), Dub-specific data (cues for v2, custom crates, play history, gain analysis cache), beatgrid cache (whether imported or computed), Thru-mode fingerprint index (v1.1).
-- File: `~/Library/Application Support/Dub/library.sqlite`.
-- We **never modify source files or source library databases**.
-- Re-import is idempotent: matches by canonical identity, updates metadata, preserves Dub-only data.
+**Idempotent re-import.** Re-running an importer against the same source matches existing tracks by canonical identity (§8.2), refreshes the per-source metadata row, and preserves Dub-only data (Dub crates, play history, tap-to-grid corrections, prepared flag).
+
+**Version-aware dedupe.** Hip-hop, reggae, dnb, and dubstep libraries characteristically contain multiple distinct files of the same recording: `(Clean)`, `(Dirty)`, `(Instrumental)`, `(Acapella)`, `(Radio Edit)`, `(Extended Mix)`, `(12" Mix)` etc. These have near-identical fingerprints and often near-identical durations, but the DJ must be able to pick between them on stage. Auto-merge fires only when **all** hold:
+
+- Chromaprint similarity ≥ 0.98
+- Duration delta < 200 ms
+- No version token differs between the two filenames or ID3 titles. The version-token list is `clean, dirty, explicit, instrumental, acapella, radio, edit, extended, club, dub, vip, remix, remaster, mono, stereo, intro, outro, short, long, 7", 12", lp`.
+
+Otherwise the second file is registered as a separate `track` row with a "potential duplicate" link to the first, surfaced in the browser as a small link glyph the user can expand. A manual merge UI is v1.x. v1 is content to show two rows; that is strictly better than the wrong merge. The cost of silently collapsing "Clean" and "Dirty" into one row is "the DJ played the explicit version at a wedding"; we will not pay that cost.
+
+**Format-specific gotchas documented in `docs/LIBRARY-FORMATS.md`,** filled in during M11 / M12 as the importers land.
+
+### 8.2 Data model
+
+The Dub library is a SQLite database at `~/Library/Application Support/Dub/library.sqlite`. The schema separates three independent concerns: canonical track identity, per-source metadata (verbatim from external libraries), and Dub-originated user data.
+
+**Canonical track identity** is a stable UUID assigned to a recording, not to a file. A canonical track may correspond to multiple on-disk files (different encodings, different drives) and multiple per-source metadata rows. The canonical identity survives file moves, drive renames, and re-encodes. Dedupe (§8.1) is what populates and merges this layer.
+
+**Path-by-volume-UUID.** Each `track_files` row stores `(volume_uuid, relative_path_from_volume_root)` rather than an absolute path. On track load, Dub resolves files via the volume UUID first (handles the "the SSD mounted at `/Volumes/Touring` today but `/Volumes/Touring 1` tomorrow" case), falls back to last-known mount + relative path, then a basename + fingerprint search across known volumes, then prompts the user. Working DJs run libraries off external SSDs; absolute paths are fragile by construction. Engineering cost is one afternoon; trust earned is significant.
+
+**Tables (v1.0 shape, with empty tables present for forward-compat).**
+
+| Table | Purpose | v1 use |
+|---|---|---|
+| `tracks` | Canonical track row: UUID, created/updated timestamps, fingerprint reference, optional explicit-merge marker. | Populated. |
+| `track_files` | One canonical track to many on-disk files. Stores `(volume_uuid, relative_path, codec, sample_rate, bit_depth, file_size, mtime, last_seen_at)`. | Populated. |
+| `track_metadata_source` | Per-source verbatim metadata snapshots: one row per `(track, source)` with artist / title / album / comment / bpm / key / gain / version_token as that source reports them. | Populated. |
+| `track_beatgrids` | One-to-many per track: `(source, anchor_seconds, bpm, is_active, captured_at)`. Multiple grids preserved (imported + auto-detected + tap-corrected); user can switch the active grid per track. | Populated. |
+| `track_loops` | Saved loop slots per track. | Empty in v1; populated in v1.x without migration. |
+| `track_cues` | Hot cues per track. | Empty in v1 *as far as the UI is concerned*; **imported Serato / Traktor / rekordbox cues are written here from v1 day one** so they round-trip on export (§8.6), they are simply not surfaced in the v1 UI per §6.6. |
+| `crates` | User-created Dub crates: `(id, name, parent_crate_id, created_at)`. | Populated. |
+| `crate_tracks` | Many-to-many membership Dub crates ↔ canonical tracks, with ordering. | Populated. |
+| `imported_crates` | Read-only mirror of source-library crates (Serato `_Serato_/Subcrates/*.crate`, Traktor playlists, rekordbox playlists). Re-import rewrites this table; no user edits. | Populated. |
+| `imported_crate_tracks` | Mirror membership. | Populated. |
+| `fingerprints` | Chromaprint hash + duration + size + bitrate signature. Keyed against `tracks` for dedupe and analysis-cache lookup. | Populated. |
+| `volumes` | Known external volumes for path resolution: `(volume_uuid, last_known_mount_point, display_name, last_seen_at)`. | Populated. |
+| `play_history` | Every load, play-start, play-end, deck-to-deck transition: `(track_id, deck, event_type, timestamp, duration_played_ms, from_track_id, to_track_id)`. | Populated from v1.0 day one (data capture). Surfaces as "Last Played" sort + Recently Played smart crate in v1.0; surfaces as "Played From / Played Into" in v1.x. |
+| `analysis_cache` | LUFS-I, true-peak, prepared-flag inputs, waveform-sidecar pointer. Keyed by canonical fingerprint so the cache survives file moves and dedupe merges. | Populated. |
+| `smart_crates` | Future user-defined smart crates: `(name, sql_predicate)`. | Empty in v1; v1 ships two hardcoded smart crates as code, not data (§8.5.2). |
+
+The schema is documented in `docs/LIBRARY-SCHEMA.md` (lands in M11a) and is part of Dub's public API surface (§8.7).
+
+**Mix-history capture.** From v1.0 day one, Dub writes a `play_history` event on every load, play-start, play-end, and deck-to-deck transition. The data drives "Recently Played" and "Last Played" sort immediately; it drives the "Played From / Played Into" surface in v1.x. Capture is local; nothing leaves the machine. The user can disable mix-history capture in Preferences (the table is still present, just not written to); the default is on.
 
 ### 8.3 Beatgrids
 
-- **Prefer imported.** When importing from Serato/Traktor/rekordbox, we use their grid as authoritative.
-- **Fall back to auto-detect** when no grid exists. Algorithm: the M7.5 `dub-bpm::analyze_bpm` offline driver (shipped — pure-Rust spectral-flux + autocorrelation; see [`docs/SHIPPED.md#m75`](SHIPPED.md#m75)) feeds a grid placement step (anchor point + BPM, with downbeat detection from low-frequency emphasis). Same `BpmEstimator` core as the Thru streaming driver in §5.2.3 — one DSP implementation, two front-ends.
-- **Manual correction = tap-to-grid only in v1.** That's the entire user-facing tooling.
+- **Prefer imported.** When importing from Serato / Traktor / rekordbox, we use their grid as authoritative for the row's displayed BPM and the active grid in `track_beatgrids`.
+- **Fall back to auto-detect** when no grid exists. Algorithm: the M7.5 `dub-bpm::analyze_bpm` offline driver (shipped, pure-Rust spectral-flux + autocorrelation; see [`docs/SHIPPED.md#m75`](SHIPPED.md#m75)) feeds a grid placement step (anchor point + BPM, with downbeat detection from low-frequency emphasis). Same `BpmEstimator` core as the Thru streaming driver in §5.2.3, one DSP implementation, two front-ends.
+- **Cross-validate every imported grid against `dub-bpm`.** Even on tracks that arrive with a Serato / Traktor / rekordbox grid, the analyzer runs once and the result is stored alongside the imported grid in `track_beatgrids`. When the imported and auto-detected grids disagree by more than 5 % BPM or 50 ms anchor over the first 32 bars, the row shows a small ⚠ "grid disagreement" indicator. The DJ would rather know "Serato says 92 BPM but the audio looks like 184 BPM" before they queue the track. The analysis cost is one-time per fingerprint and cached in `analysis_cache`, so re-imports are free.
+- **Per-genre priority is user-configurable.** Default priority order is `Serato > rekordbox > Traktor > auto`, matching the typical urban-DJ workflow (Serato dominates pre-analyzed hip-hop / reggae catalogs). The priority is exposed in Preferences for users coming from rekordbox-first (techno / house: Pioneer's analyzer is tuned for 4/4 quantized grids) or Traktor-first (dnb / breakbeat: NI's analyzer handles syncopation and half-time better) workflows.
+- **Active grid is overridable per-track** from the row's context menu. One database column flip, one menu item.
+- **Manual correction = tap-to-grid only in v1.** That's the entire user-facing grid-editing tooling.
 
 #### 8.3.1 Tap-to-grid (the only manual editing)
 
@@ -772,7 +831,7 @@ If the user taps multiple times (`G G G G`):
 - Three+ taps with consistent intervals = explicit BPM (`60 / interval_seconds`). Anchor at the **first** tap.
 - Useful for very sparse-beat tracks where the auto-detect can't lock.
 
-That's the whole feature. No drag, no halve/double, no nudge. **If the auto-detected grid is wrong, the user re-taps once and Dub re-fits everything around the new anchor.**
+That's the whole feature. No drag, no halve/double, no nudge. **If the auto-detected grid is wrong, the user re-taps once and Dub re-fits everything around the new anchor.** The tap result is written to `track_beatgrids` as `source=user_tap` and becomes the active grid; previous grids (imported, auto-detected) are preserved on the same row so the user can revert.
 
 #### 8.3.2 Drift on non-quantized recordings
 
@@ -784,21 +843,116 @@ Honest disclosure: tracks that drift (vintage soul cuts, live-played reggae band
 
 ### 8.4 Track analysis
 
-On import, on-demand, or background:
-- Waveform (multi-resolution overview + zoom) — pre-rendered, cached on disk in `~/Library/Caches/Dub/waveforms/{hash}.wf`
-- Loudness (LUFS-I) for auto-gain
-- Beatgrid (if not imported)
-- Key detection — **deferred to v1.x** (use existing key from imports if available)
+On import, on-demand, or background. Analysis is keyed by canonical fingerprint so the work runs once per recording, ever, regardless of how many file copies the user has or how many sources reference it.
+
+- **Waveform** (multi-resolution overview + zoom), pre-rendered, cached on disk via the M10.5j sidecar at `~/Library/Caches/Dub/waveforms/{fingerprint}.wf`. The sidecar key migrates from the M10.5b path-based hash to the canonical fingerprint at M11a so the cache survives file moves and dedupe merges. The renderer reads through `analysis_cache.waveform_sidecar_path`.
+- **Loudness (LUFS-I) and true-peak** measured and stored in `analysis_cache`. **Measured, not applied** in v1. A LUFS column in the browser lets the DJ scan for outliers before loading and adjust trim in their head at the hardware mixer. Auto-trim is deliberately not in v1: the external mixer is the product (§2.1), the DJ's trim knob is their gain control, and a software gain that overrides them creates the "fighting the app" failure mode the rest of the PRD militates against. Opt-in "auto-trim hint" (information only, no signal-path change) is a v1.x consideration if beta feedback supports it.
+- **Beatgrid** if not imported (§8.3). Cross-validation runs even when imported (§8.3 bullet).
+- **Filename-derived metadata.** When ID3 tags are absent or matched against a junk pattern (`Track 01`, `Unknown`, the bare filename without extension, `downloaded from xyzblog.com`-class garbage), Dub parses the filename for common DJ patterns:
+  - `ARTIST - TITLE.ext`
+  - `ARTIST - TITLE (VERSION).ext`
+  - `ARTIST_-_TITLE_(VERSION)_[YEAR].ext`
+  - `[LABEL CAT#] ARTIST - TITLE.ext`
+
+  The parsed result is stored as the `filename` source row in `track_metadata_source`. The browser falls back through the priority chain (§8.1). This is load-bearing for the bootleg, mixtape, and blogspot-era files that the target audience has in bulk; ID3 on these is absent or actively wrong.
+- **Prepared / unprepared flag.** Derived: a track is `prepared` when it has all of (verified active beatgrid, LUFS-I cached, waveform cached). Surfaced as a browser column and a filter chip so the DJ can see what's ready for tonight and what needs attention. The flag is meaningful in both Performance and Prep modes; full Prep tooling (beatgrid editor, hot-cue prep, gain UI) is v1.x (§3, M10.8).
+- **Key detection** deferred to v1.x. Imported key is used when present (Mixed In Key writes key into ID3 comment fields; we read those too as a legitimate pre-analyzed source).
 
 ### 8.5 Browser UI
 
-- Source tree (left): All Tracks, Crates (Dub), Imported Sources (Serato/Traktor/rekordbox/iTunes — each as a top-level node with their crates/playlists nested), Real Records (v1.1 — fingerprint-recognized records the user has played).
-- Track list (center): file, artist, BPM, key, length, last-played, source. Sortable. Filterable by search box (artist + title + comment).
-- Load: drag-to-deck or `Enter` to load to focused deck.
+This is the §6.4 keyboard-load target and the M11 replacement for the M10.5b slim filesystem browser (`apple/Dub/Performance/FileBrowserView.swift`).
 
-**No in-browser preview.** Cueing happens *in the deck*, on the user's hardware mixer headphones, exactly as a real DJ pulls a record out of a crate, drops it on the deck, and cues with their headphone monitor. The browser's job is finding tracks, not previewing them.
+**Layout.** Source tree on the left (collapsible), virtualized track list on the right. **No in-browser preview.** Cueing happens *in the deck*, on the user's hardware mixer headphones, exactly as a real DJ pulls a record out of a crate, drops it on the deck, and cues with their headphone monitor. The browser's job is finding tracks, not previewing them.
 
-Performance: list virtualization required (Lexicon-class libraries can hit 100k+ tracks).
+Performance: list virtualization required. Lexicon-class libraries hit 100k+ tracks; we only realize visible rows.
+
+#### 8.5.1 Source tree
+
+Top to bottom:
+
+- **All Tracks** (every canonical track, regardless of source).
+- **Smart Crates** (v1.0 hardcoded list, §8.5.2).
+- **Dub Crates** (user-created, full-color icon, editable). Drag tracks in from any source. Nestable. Persisted in `crates` / `crate_tracks`.
+- **Imported Sources**, one node per configured source (Serato, Traktor, rekordbox, iTunes), each containing a **read-only mirror** of that source's crates / playlists. Visually distinguished from Dub Crates (greyscale icon + lock glyph). Re-import rewrites this subtree without touching anything else.
+- **Real Records** (v1.1, fingerprint-recognized records the user has played in Thru mode; see §5.2.2, M21).
+
+The split between Dub Crates (editable, owned) and Imported Sources (read-only, mirrored) is non-negotiable. The user already has 200 Serato crates that took them eight years to organize; we are not the system of record for that. If we let the user "edit" an imported crate, the next re-import clobbers the edit and the DJ loses trust forever. Imported crates are sacred mirrors of the source app's truth; Dub Crates are the user's free space.
+
+#### 8.5.2 Smart crates
+
+v1.0 ships exactly two hardcoded smart crates, no user-defined rule builder:
+
+- **Recently Played**: last 200 tracks across all sessions, newest first. Backed by `play_history`. The single most-used sort column in pro Serato workflows.
+- **Just Imported**: tracks added since the last app launch. Catches the "USB stick dropped on the machine 10 minutes before the gig" workflow.
+
+**Played From / Played Into** lands in v1.x as a context-bound side panel on the browser: when a track is loaded on Deck A, the panel shows the N most-common tracks the DJ has previously mixed *into* it from Deck B, and the N most-common tracks they have mixed *from* it. Backed by the same `play_history` table that is populated from v1.0 day one (§8.2). **No commercial DJ app surfaces this**; it is a genuine differentiator for Dub and a load-bearing feature for the working scratch DJ who plays the same tracks across many sets and wants to remember which transitions worked.
+
+A user-defined smart-crate rule builder is parked until v1.x at the earliest. The `smart_crates` table exists empty in v1.0 so v1.x lands without a migration. Every DJ app that shipped a rule builder in v1 (Serato, Traktor, Lexicon) ate a quarter of product roadmap on it and ended up with users who didn't know how to use it; we wait for real demand.
+
+#### 8.5.3 Track list
+
+- **Columns** (sortable, user-reorderable in v1.x): Title, Artist, Album, BPM, Key, Length, Last Played, LUFS, Source, Prepared.
+- **Loaded-now badges.** Tracks currently loaded on Deck A or Deck B carry a small accent-colored `A` / `B` glyph in the leftmost gutter. Prevents the "I just loaded the track that was already playing" mistake and visually confirms an Instant Doubles call (§7.3).
+- **Grid-disagreement indicator** (§8.3) as a small ⚠ in the BPM column.
+- **Potential-duplicate indicator** (§8.1 dedupe) as a small link glyph on the row; click expands a sibling row showing the candidate duplicate.
+- **Missing-file indicator** (§8.5.5) as a small dim red glyph on the row.
+- **Virtualized rendering** is a hard requirement; only visible rows are realized.
+
+#### 8.5.4 Search
+
+SQLite FTS5 over `(artist, title, album, filename, comment)`.
+
+- **Default**: case-insensitive substring, `AND` across whitespace-separated tokens. No Levenshtein, no "did you mean", no fancy fuzziness. Pro DJs type fast on stage and reward predictability; false positives during a set are worse than zero hits.
+- **Operators** (power-user, additive to substring), available in v1.0:
+  - `bpm:90-100`
+  - `key:Am`, `key:~Am` (key-compatible neighbours)
+  - `source:serato` / `source:traktor` / `source:rekordbox` / `source:itunes` / `source:dub` / `source:filesystem`
+  - `played:<7d` / `played:never`
+  - `prepared:no` / `prepared:yes`
+  - `version:clean` / `version:dirty` / `version:instrumental` / `version:acapella` etc.
+
+  Documented in the README and accessible via a `?` glyph next to the search field.
+
+Search target latency: < 50 ms on a 100k-track library on M2 Air. SQLite FTS5 handles this easily; the engineering risk is zero.
+
+#### 8.5.5 Missing files
+
+External SSDs unmount. Files get moved by Finder. Networked volumes disappear. The library handles this gracefully:
+
+- On app startup and at low-priority intervals, a background task confirms file existence for `track_files` rows via `access()` (no read I/O). Rate-limited so it does not trash SSD lifetime.
+- A small footer in the browser: `247 tracks missing. Click to relocate.`
+- The Relocate panel accepts a directory and tries to match missing files by `(fingerprint hash, filename, duration)`. Matches update the `track_files` volume + relative-path columns; mismatches stay missing.
+- **Metadata is never deleted when a file goes missing.** The user will plug the drive back in. Losing a year of `last_played` history and tap-to-grid corrections because the touring SSD got ejected is unacceptable.
+
+#### 8.5.6 Load + drag
+
+- **Drag** a row onto a deck pane to load (existing M10.5b drag path).
+- **`Space`** loads the focused row into the stopped, non-master deck per §6.4 (see also §5.5).
+- **`Enter`** focused-deck-load semantics are reserved for v1.x; v1.0 only commits to Drag and Space.
+
+### 8.6 Export and interop
+
+Dub never writes to source libraries (§8.1). To prevent lock-in of Dub-originated user data (Dub crates, tap-to-grid corrections, future hot cues, future saved loops, custom tags), Dub ships first-class exporters. The user owns their work and can take it elsewhere with one click.
+
+| Format | What it carries | Read by | Milestone |
+|---|---|---|---|
+| **rekordbox XML** (`.xml`) | Tracks, BPM, key, beatgrid (BPM + first-beat anchor), hot cues, loops, nested playlists | Serato, Traktor, rekordbox, Lexicon | M11f |
+| **M3U / M3U8** | File paths only (lossy on cues / grid / metadata) | Universal | M11f |
+| **Dub JSON** | Dub-specific data: mix history, play history, grid-disagreement notes, prepared flag, custom tags. Schema documented publicly. | Dub only; future tools by anyone willing to read the schema | v1.x |
+
+The rekordbox XML format is the de facto DJ-library interchange standard (documented schema, accepted as an import source by Serato, Traktor, rekordbox, and Lexicon's own primary output). Shipping a competent rekordbox-XML exporter at M11f makes approximately 90 % of Dub-originated data portable to any other DJ app: the user exports a Dub crate, drops the XML into their alternative app, and the cues / loops / grid corrections come with them. **This is the load-bearing anti-lock-in commitment.**
+
+The remaining 10 % (mix history, play history, prepared flag) is data that exists in Dub because no competing product models it. Losing it on migration costs the user nothing they had before Dub; we still export it as JSON so the data is not trapped.
+
+Export is a one-click `File → Export Crate As...` UI surface with the target format as a dropdown. Making leaving easy is the load-bearing behaviour: the DJ trusts a tool that doesn't try to trap them. Bury this and the trust goes.
+
+**Round-trip discipline.** Imported hot cues / loops are stored in `track_cues` / `track_loops` from v1.0 day one (§8.2) so an export at M11f preserves them losslessly, even though the v1 UI does not surface or edit them. A user who imports a Serato library, builds a Dub crate, and exports to rekordbox XML gets their Serato hot cues back on the other side.
+
+### 8.7 Schema as public API
+
+The Dub SQLite schema is documented in [`docs/LIBRARY-SCHEMA.md`](LIBRARY-SCHEMA.md) (lands in M11a) and is treated as a public API surface: we will not break it without a documented migration path and a stable version bump. Third-party tools may read `library.sqlite` directly. The Chromaprint parameters Dub uses are similarly documented so a third party can re-derive Dub's fingerprints.
+
+This is the ultimate anti-lock-in commitment: even if Dub disappears, the user's data is in an open, documented file format they can hand to any SQLite tool. No competing DJ app makes this commitment (Apple Music's schema is opaque, Serato's GEOB blobs are undocumented and version-coupled, Traktor's NML evolves silently, rekordbox actively encrypts to prevent it). It costs us nothing engineering-wise and is a genuine differentiator for the target audience, which has been burned by closed-format DJ tools for two decades.
 
 ---
 
@@ -1225,6 +1379,7 @@ Each milestone has a **demo criterion** — a single sentence describing what th
 | **M10.5** | **File playback dev loop** | ✅ shipped — M10.5a (FFI: `start_engine`, `load_track`, `play/pause/seek`, `position`, `compute_offline_peaks`, `FFI_VERSION` 5) + M10.5b (Apple shell: auto-detect lifecycle, single-pass renderer, drag-and-drop, slim FS browser, master-deck tracking, Space-key load per §6.4, `FFI_VERSION` 7). → [SHIPPED §M10.5](SHIPPED.md#m105). | 4–5 days |
 | **M10.5c** | **Track Overview + horizontal-orientation shader** | ✅ shipped — per-deck thin vertical overview strip with playhead bracket + File-mode click-to-jump (§9.6.1); `orientation: u32` uniform plumbed end-to-end so M10.8 Prep mode reuses the same shader. → [SHIPPED §M10.5c](SHIPPED.md#m105c). | 2 days |
 | **M10.5d** | **Background load (decode + peaks off-thread)** | ✅ shipped — `load_track` split into three phases so decode + peaks compute mutex-free; Swift `loadTrack` becomes `async`; concurrent-load guards + optimistic UI. No FFI bump. → [SHIPPED §M10.5d](SHIPPED.md#m105d). | 0.5 day |
+| **M10.5v** | **Load-never-blocks-playback + O(N²) BPM bug fix** | ✅ shipped — `load_track` returns the instant the audio thread has the new `Arc<Track>` (~50 ms decode + tiny mutex-protected swap); offline peaks and `analyze_beat_grid` move to a detached `std::thread::spawn` inside `dub-ffi`, installing their results via `Arc<Mutex<EngineState>>` with `Arc::ptr_eq` cancellation against newer loads. `dub-spectral::SpectralFrameStream::process` rewritten with a read cursor + amortised compaction in place of `Vec::drain(..HOP_SIZE)` (O(N²) → O(N); 4-minute synthetic track 38 s → 0.3 s ≈ 122× faster). Apple shell stops awaiting BPM inline and lazily polls the grid via the 30 Hz position loop. No FFI bump. → [SHIPPED §M10.5v](SHIPPED.md#m105v). | 0.5 day |
 | **M10.5e** | **Waveform polish — compression + past-region dim + brighter floor** | ✅ shipped — soft amplitude compression, past-region dim, brighter luminance floor, zero-crossing hairline overlay. No FFI changes. → [SHIPPED §M10.5e](SHIPPED.md#m105e). | 0.5 day |
 | **M10.5f** | **Waveform 2× zoom-in** | ✅ shipped — one-line `chunksPerPixel` 4.0 → 2.0; click-scrub gesture stays calibrated via shared helper. → [SHIPPED §M10.5f](SHIPPED.md#m105f). | 0.1 day |
 | **M10.5g** | **Anti-alias + temporal smoothing** | ✅ shipped — 4× MSAA enabled end-to-end; vertex stage convolves min/max/rms with a `[1, 2, 1] / 4` Gaussian across ±1 neighbour chunks (honest-state flags still read the raw centre chunk). Survives into M10.8. → [SHIPPED §M10.5g](SHIPPED.md#m105g). | 0.5 day |
@@ -1234,11 +1389,19 @@ Each milestone has a **demo criterion** — a single sentence describing what th
 | **M10.5k** | **Mip pyramid in `dub-peaks`** | *Planned.* Five mip levels in `OfflinePeaks` so zoom changes animate smoothly and `TrackOverviewView` reads mip-4 directly. Pairs with M10.5j sidecar. → [SHIPPED §M10.5k](SHIPPED.md#m105hp). | 1 day (after j) |
 | **M10.5m(b)** | **9-band sub-bass split** | *Deferred to M11.* Bumps `dub-spectral::NUM_BANDS` 8 → 9 by splitting the lowest log-band into sub-bass (30–60 Hz) and kick-band (60–200 Hz); breaks the M8.1 BPM fixtures and the `BandPeakChunk` wire format. Parked until M11 lands DJ-curated content to validate against. → [SHIPPED §M10.5m(b)](SHIPPED.md#m105hp). | 1.5–2 days |
 | **M10.5p-grid** | **Beat-grid v2 — own milestone** | *Deferred.* Tempo-drift tracking, downbeat detection, manual phase correction, library sidecar persistence, and a streaming Thru-mode variant. Re-scoped out of M10.5p when the Stage 1 overlay's static phase proved insufficient for tempo-drifting material. → [SHIPPED §M10.5p-grid](SHIPPED.md#m105hp). | 2–3 days (when scheduled) |
-| **M10.6** | **Mouse transport + position navigation + Repeat** | ✅ shipped a–d; M10.6e Repeat outstanding. **M10.6a** Casual Play UI + zoomed click-scrub (Prep-only per §6.1). **M10.6b** Panic Play engine + FFI (`PanicPlayState`, `LiftPolicy::force_disengaged`, panic-aware `drive_timecode_inputs` branching, `FFI_VERSION` 8). **M10.6c** Panic Play UI + Timecode overview un-gate. **M10.6d** Transport-cluster redesign as Serato-style INT/ABS toggle; `cancel_panic_play` hands authority back to the timecode driver instead of pausing. **M10.6e** LFSR run-out auto-trigger (Repeat, §5.4.2) outstanding. → [SHIPPED §M10.6](SHIPPED.md#m106). | 3 days (a–d shipped, e remaining) |
+| **M10.6** | **Mouse transport + position navigation + Repeat** | ✅ shipped a–e. **M10.6a** Casual Play UI + zoomed click-scrub (Prep-only per §6.1). **M10.6b** Panic Play engine + FFI (`PanicPlayState`, `LiftPolicy::force_disengaged`, panic-aware `drive_timecode_inputs` branching, `FFI_VERSION` 8). **M10.6c** Panic Play UI + Timecode overview un-gate. **M10.6d** Transport-cluster redesign as Serato-style INT/ABS toggle; `cancel_panic_play` hands authority back to the timecode driver instead of pausing. **M10.6e** Repeat auto-trigger (PRD §5.4.2): sustained `DropoutHoldRate` auto-engages Panic Play state instead of pausing the deck (boot-time guard on `deck.is_playing()` prevents engine-boot silence from kicking the deck). No FFI bump, no Apple-side change. → [SHIPPED §M10.6](SHIPPED.md#m106). | 3.5 days (a–e all shipped) |
 | **M10.7** | **Phase-Drift Trail** | ✅ shipped — new `dub-match` crate (cross-correlation of both decks' `dub-bpm` ODFs off-RT, 30 Hz `MatchSample` ring); `apple/Dub/Performance/PhaseDriftView.swift` Metal-rendered centre-gutter strip with `Δ BPM` / `Δ ms` overlays; grid-agnostic per §9.4. `FFI_VERSION` 9. Single mode only — no numeric-only Preferences variant in v1. → [SHIPPED §M10.7](SHIPPED.md#m107). | 5 days |
 | **M10.8** | **Track Preparation Mode shell + Serato-parity waveform baseline freeze** | ✅ shipped — Prep-mode auto-detection + alternate root view (`apple/Dub/Prep/PrepView.swift`) with horizontal full-width zoomed waveform + overview band stacked above; load + play / pause only (no editor / hot-cue prep / gain UI — those are v1.x per §3). Concurrently, the M10.5h–p shader ladder is **rolled back wholesale** in favour of a single-pass Serato-parity shader per [§9.6.0](#960-waveform-baseline-freeze-m108-cleanup); `WaveformTuning` / `WaveformTuningPanel` deleted, HDR / bloom / ACES post-processing deleted, palettes collapsed to `.serato`. Future waveform work is **additive and reversible** relative to this baseline. → [SHIPPED §M10.8](SHIPPED.md#m108). | 2 days (Prep shell) + 1–2 days (freeze) |
-| **M11** | **Library import: Serato** | Import Serato library, browse it, load tracks, beatgrids appear. | 1 week |
-| **M12** | **Library import: rest** | Traktor + rekordbox + iTunes + Lexicon. | 1–2 weeks |
+| **M11a** | **Library schema + path-by-volume-UUID** | `library.sqlite` initialized with the §8.2 table set; volume UUIDs discovered and persisted; `docs/LIBRARY-SCHEMA.md` published as the public API contract per §8.7. M10.5j sidecar key migrated from path-hash to canonical fingerprint. | 2 days |
+| **M11b** | **Canonical fingerprint + version-aware dedupe** | Chromaprint wrapped in a `dub-fingerprint` crate; §8.1 version-token-aware dedupe implemented (`clean` / `dirty` / `instrumental` / etc. never auto-merge); `analysis_cache` keyed by fingerprint. | 2 days |
+| **M11c** | **Filesystem importer + filename parser** | Walk-a-folder importer with the §8.4 filename pattern parser; tracks land in `tracks` / `track_files` / `track_metadata_source` (sources `filename` + `id3`). No source-app dependency; works on a folder of loose files. Replaces the M10.5b ID3-streaming code path inside the new SQLite-backed model. | 2–3 days |
+| **M11d** | **Library browser shell** | Replaces M10.5b `FileBrowserView` with the §8.5 surface: source tree (All Tracks, Smart Crates, Dub Crates, Real Records placeholder), virtualized track list with sortable columns + loaded-now badges + missing-file indicator + grid-disagreement indicator + potential-duplicate indicator; FTS5-backed search per §8.5.4; missing-files footer + Relocate panel per §8.5.5. `Space` and Drag load paths preserved from M10.5b. | 4–5 days |
+| **M11e** | **Serato importer** | Read `_Serato_/database V2`, `_Serato_/Subcrates/*.crate`, ID3 GEOB tags (`Serato Markers_`, `Serato Markers2`, `Serato BeatGrid`, `Serato Autotags`); populate `track_metadata_source(source=serato)`, `track_beatgrids(source=serato)`, `imported_crates` / `imported_crate_tracks`; imported hot cues + loops stored to `track_cues` / `track_loops` for §8.6 export round-trip (not surfaced in v1 UI per §6.6). Cross-validation against `dub-bpm` per §8.3 produces the grid-disagreement indicator. | 4–5 days |
+| **M11f** | **Export: rekordbox XML + M3U / M3U8** | One-click `File → Export Crate As...` per §8.6; emits rekordbox XML and M3U / M3U8. Round-trip test: import a Serato crate → export to rekordbox XML → re-import on a fresh DB → canonical identity preserved, hot cues / loops / grid intact. Documented in `docs/LIBRARY-FORMATS.md`. | 3 days |
+| **M12a** | **rekordbox XML importer** | Read user-exported rekordbox XML. (DB6 `master.db` clean-room implementation deferred to v1.1 per §8.1.) | 2 days |
+| **M12b** | **Traktor NML importer** | Read `collection.nml`. Populate metadata + beatgrids + imported playlists. | 2 days |
+| **M12c** | **iTunes XML importer** | Read `Library.xml`. Mostly useful for playlists and ratings; BPM frequently missing. | 1–2 days |
+| **M12d** | **Lexicon path documented** | Implicit, no new code: Lexicon exports to rekordbox / Serato, which M11e / M12a / M12b already cover. Documentation only in `docs/LIBRARY-FORMATS.md`. | 0.5 day |
 | **M13** | **Looping** | Manual + auto-loop, halve/double, behaves correctly under timecode. | 4–6 days |
 | **M14** | **Key Lock + auto-bypass** | Rubber Band integrated, on/off per deck, scratch-aware auto-bypass per §6.1.1. | 1 week |
 | **M15** | **Smart FX: Echo-Out** | Tap-and-hold echo-out works on both decks (incl. on a Thru deck — FX modules live inside the per-deck chain with per-module declick, see §5.2.1). | 4–5 days |
@@ -1248,7 +1411,7 @@ Each milestone has a **demo criterion** — a single sentence describing what th
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases. Feature-frozen for v1.0. **Hotfix discipline active: any crash → patch within 24h.** Soak test logs publicly viewable. | 2–4 weeks (gated by gig-time accumulation) |
 | **M20** | **v1.0 Stable Release** | All §2.2.6 SLOs met (100 cumulative gig-hours zero-crash, zero xruns in soak, zero fuzz crashes, manual rig checklist signed off). DMG on GitHub Releases (unsigned dev build acceptable per current decision), README, docs site stub, demo video. | 3–5 days once SLOs met |
 
-**Aggregate:** ~ 16–22 weeks of focused work for v1.0, including beta-gated promotion. The Beta → Stable gap is **deliberately variable**: we ship Stable when the SLOs are met, not on a schedule. This is the load-bearing protection against the "DJ on stage" failure mode.
+**Aggregate:** ~ 19–25 weeks of focused work for v1.0, including beta-gated promotion. The library milestones (M11 + M12) expanded from "1 + 1–2 weeks" to ~5 weeks total in the §8 rewrite once the schema, browser UX, export, and round-trip discipline were fully scoped; the rest of the schedule is unchanged. The Beta → Stable gap is **deliberately variable**: we ship Stable when the SLOs are met, not on a schedule. This is the load-bearing protection against the "DJ on stage" failure mode.
 
 ### 12.1 v1.1 (post-launch follow-up, ~6–8 weeks after v1.0 stable)
 

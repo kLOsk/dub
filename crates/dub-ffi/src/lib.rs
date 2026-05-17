@@ -35,11 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
-// `dub_bpm::analyze_beat_grid` import is intentionally removed
-// alongside M10.5p Stage 1's beat-grid disable (see `load_track`
-// for the re-enable path). The `BeatGrid` UniFFI Record itself is
-// crate-local and doesn't need the upstream `BeatGrid as CoreBeatGrid`
-// alias until computation comes back online.
+use dub_bpm::{analyze_beat_grid, BeatGrid as CoreBeatGrid};
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
@@ -220,7 +216,16 @@ pub enum EngineError {
 ///    automatically)
 #[derive(uniffi::Object)]
 pub struct DubEngine {
-    state: Mutex<EngineState>,
+    /// `Arc<Mutex<…>>` rather than a plain `Mutex<…>` since M10.5v
+    /// because the slow-work portion of `load_track` (offline
+    /// peaks + `analyze_beat_grid`) now runs on a detached
+    /// `std::thread::spawn` so playback can start the instant the
+    /// audio thread sees the new `Arc<Track>`, and that detached
+    /// thread needs an owned handle to the same state mutex to
+    /// install the peaks / beat grid when it finishes (PRD §6.4
+    /// "load never blocks playback"). Cloning the `Arc` is free
+    /// and the `Mutex` itself is unchanged.
+    state: Arc<Mutex<EngineState>>,
     /// Per-deck monotonic generation counter for the `PeakSource`
     /// slot. Bumps every time the slot is *assigned* a new source
     /// (Thru session start, `load_track` swap, etc.). Lives on
@@ -230,9 +235,13 @@ pub struct DubEngine {
     /// counter inside it would reset to 0 and the renderer might
     /// miss the transition.
     ///
+    /// `Arc<…>` for the same M10.5v reason as `state` — the
+    /// detached peaks-compute thread bumps the counter when its
+    /// results land, and needs an owned handle to do so.
+    ///
     /// The Swift renderer reads this via `peaks_generation(deck)`
     /// and `reset()`s its ring + cadence cache on every change.
-    peak_generation_seq: [AtomicU64; 2],
+    peak_generation_seq: Arc<[AtomicU64; 2]>,
 }
 
 /// Internal state machine for the engine.
@@ -517,8 +526,8 @@ impl DubEngine {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(EngineState::Stopped),
-            peak_generation_seq: [AtomicU64::new(0), AtomicU64::new(0)],
+            state: Arc::new(Mutex::new(EngineState::Stopped)),
+            peak_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
         })
     }
 
@@ -761,6 +770,7 @@ impl DubEngine {
     ///   the channel is sized for hundreds of pending commands).
     pub fn load_track(&self, deck_idx: u64, path: String) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
+        let t_total = std::time::Instant::now();
 
         // Phase 1: quick mutex-protected check that the engine is
         // running. Mutex drops at the end of this scope so the
@@ -772,102 +782,80 @@ impl DubEngine {
             }
         }
 
-        // Phase 2: slow work, mutex-free. Both `Track::load_from_path`
-        // (symphonia decode + Vec<f32> allocation) and
-        // `compute_offline_peaks` (broadband + band ring fills) are
-        // heap-heavy; running them under the engine mutex would
-        // block every UI poll for the duration of the load.
+        // Phase 2: decode (symphonia + Vec<f32> allocation). ~50 ms
+        // for a typical 4-minute MP3. Kept synchronous so we can
+        // surface decode errors to the caller before returning;
+        // the rest of the heavy work moves to a detached thread
+        // in Phase 4.
+        let t_decode = std::time::Instant::now();
         let track = Track::load_from_path(&path)
             .map_err(|e| EngineError::TrackDecodeFailed(format!("{path}: {e}")))?;
         let track = Arc::new(track);
+        let decode_ms = t_decode.elapsed().as_millis();
 
-        let OfflinePeaks {
-            broadband,
-            bands,
-            onset,
-            filtered,
-            sample_rate,
-            samples_per_broadband_chunk,
-            samples_per_band_chunk,
-            samples_per_onset_chunk,
-            samples_per_filtered_chunk,
-        } = compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
-            .map_err(|e| EngineError::TrackDecodeFailed(format!("peaks: {e}")))?;
-
-        // Beat grid (M10.5p) — *temporarily disabled* alongside the
-        // Stage 1 tick overlay (parked for a dedicated future
-        // "beat-grid v2" milestone — tempo-drift handling, manual
-        // phase correction, downbeat detection, all the sub-tasks
-        // a real grid feature needs). The original M10.5p Stage 1
-        // pass added ~100 ms per `load_track` (BPM + ODF + phase
-        // search on the whole sample buffer) for a feature that's
-        // not currently rendered. Skipping it here keeps loads
-        // snappy. The `BeatGrid` FFI Record + the
-        // `DubEngine::beat_grid` accessor stay in place so the
-        // future grid milestone can wire the computation back in
-        // without an FFI version bump.
+        // Phase 3: install the `Arc<Track>` into the deck *now*.
+        // From this point on, the audio thread can render audio,
+        // so `play()` is usable immediately — long before peaks +
+        // BPM finish (PRD §6.4 "load never blocks playback").
         //
-        // Re-enable path: replace the line below with
-        //
-        //     let beat_grid = match dub_bpm::analyze_beat_grid(
-        //         track.samples(),
-        //         track.sample_rate(),
-        //         track.channels(),
-        //     ) {
-        //         Ok(g) => BeatGrid::from_core(g),
-        //         Err(_) => BeatGrid::empty(),
-        //     };
-        //
-        // and re-add the `analyze_beat_grid` import at the top.
-        // `dub_bpm::analyze_beat_grid` and its tests stay live
-        // (see `dub-bpm/src/beats.rs`) so the contract doesn't
-        // bit-rot in the meantime.
-        let beat_grid = BeatGrid::empty();
+        // We clear `running.peaks[idx]` so the renderer drops the
+        // previous track's peaks; the waveform falls back to the
+        // empty-groove rendering until Phase 4 fills the slot.
+        // `peak_generation_seq` is bumped so the Swift renderer
+        // resets its ring + cadence cache on the next frame.
+        {
+            let mut state = lock_state(&self.state);
+            let EngineState::Running(running) = &mut *state else {
+                return Err(EngineError::EngineNotRunning);
+            };
 
-        // Phase 3: quick mutex-protected swap. Re-validate that the
-        // engine is still running — it may have been stopped while
-        // we were decoding, in which case we drop the freshly-built
-        // Arc<Track> + peaks here (off-RT, harmless).
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
-        };
+            running
+                .handle
+                .deck(idx)
+                .load(track.clone())
+                .map_err(|(e, _arc)| match e {
+                    dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
+                    dub_engine::CommandError::InvalidDeck { idx, .. } => {
+                        EngineError::InvalidDeckIndex(u64::from(idx))
+                    }
+                })?;
 
-        running
-            .handle
-            .deck(idx)
-            .load(track.clone())
-            .map_err(|(e, _arc)| match e {
-                dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
-                dub_engine::CommandError::InvalidDeck { idx, .. } => {
-                    EngineError::InvalidDeckIndex(u64::from(idx))
-                }
-            })?;
-
-        running.file_tracks[idx] = Some(track);
-        running.peaks[idx] = Some(PeakSource::File(FilePeaks {
-            broadband,
-            bands,
-            onset,
-            filtered,
-            sample_rate,
-            samples_per_broadband_chunk: u32::try_from(samples_per_broadband_chunk)
-                .unwrap_or(u32::MAX),
-            samples_per_band_chunk: u32::try_from(samples_per_band_chunk).unwrap_or(u32::MAX),
-            samples_per_onset_chunk: u32::try_from(samples_per_onset_chunk).unwrap_or(u32::MAX),
-            samples_per_filtered_chunk: u32::try_from(samples_per_filtered_chunk)
-                .unwrap_or(u32::MAX),
-            beat_grid,
-        }));
-        // The generation atomic lives on `DubEngine` directly, not
-        // inside `Mutex<EngineState>`, so this access doesn't
-        // re-acquire the state mutex (which would deadlock us). We
-        // bump it while still holding the guard so a renderer poll
-        // that sees the new peaks also sees the new generation —
-        // no torn-read window.
-        if let Some(a) = self.peak_generation_seq.get(idx) {
-            a.fetch_add(1, Ordering::Release);
+            running.file_tracks[idx] = Some(track.clone());
+            running.peaks[idx] = None;
+            if let Some(a) = self.peak_generation_seq.get(idx) {
+                a.fetch_add(1, Ordering::Release);
+            }
         }
+        let swap_ms = t_total.elapsed().as_millis();
+        eprintln!(
+            "dub-ffi: load_track deck={idx} decode={decode_ms}ms swap={swap_ms}ms (playback ready)"
+        );
+
+        // Phase 4: heavy analysis on a detached worker thread.
+        // Two stages, sequential:
+        //
+        //   4a. Offline peaks (~10–30 ms).  After install, the
+        //       zoomed and overview waveforms appear.
+        //
+        //   4b. Beat-grid analysis (~100–400 ms depending on
+        //       length).  After install, the deck-header BPM
+        //       column populates.
+        //
+        // Cancellation: if a newer track gets loaded onto the same
+        // deck while this thread is running, the new Phase 3 swap
+        // will replace `running.file_tracks[idx]` with a different
+        // `Arc<Track>`.  We compare via `Arc::ptr_eq` before each
+        // install and drop the stale data if so — no risk of stale
+        // peaks landing on top of the new track.
+        let state_handle = Arc::clone(&self.state);
+        let gen_handle = Arc::clone(&self.peak_generation_seq);
+        let track_for_thread = Arc::clone(&track);
+        let thread_name = format!("dub-load-{idx}");
+        let _ = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                background_analyze_and_install(idx, track_for_thread, state_handle, gen_handle);
+            });
 
         Ok(())
     }
@@ -1596,10 +1584,20 @@ impl BeatGrid {
         }
     }
 
-    // `from_core(g: dub_bpm::BeatGrid) -> Self` was removed alongside
-    // the M10.5p Stage 1 disable. Re-add when wiring beat-grid
-    // computation back into `load_track`; the conversion is a
-    // straight field copy with `beats_per_bar: u32::from(g.beats_per_bar)`.
+    /// Lift the upstream `dub_bpm::BeatGrid` into the FFI Record.
+    /// Restored in M10.5u alongside the `analyze_beat_grid`
+    /// re-enable in `load_track`. Straight field copy; the only
+    /// non-trivial bit is the `u8 → u32` widening for
+    /// `beats_per_bar` (UniFFI doesn't carry `u8` as a primitive
+    /// across the boundary).
+    fn from_core(g: CoreBeatGrid) -> Self {
+        Self {
+            bpm: g.bpm,
+            confidence: g.confidence,
+            beats: g.beats,
+            beats_per_bar: u32::from(g.beats_per_bar),
+        }
+    }
 }
 
 /// Metadata for a File-mode loaded track (M10.5 / M10.5r).
@@ -1713,6 +1711,128 @@ fn lock_state(state: &Mutex<EngineState>) -> std::sync::MutexGuard<'_, EngineSta
 fn peak_source_for(running: &RunningState, deck_idx: u64) -> Option<&PeakSource> {
     let idx: usize = deck_idx.try_into().ok()?;
     running.peaks.get(idx).and_then(|s| s.as_ref())
+}
+
+/// Worker function spawned by `DubEngine::load_track` on a detached
+/// `std::thread` so playback can start the instant the audio thread
+/// receives the new `Arc<Track>` (PRD §6.4 "load never blocks
+/// playback").
+///
+/// Runs two sequential analyses; after each, briefly re-acquires
+/// the engine-state mutex and installs the result if (and only if)
+/// the deck still holds the same `Arc<Track>` we were analysing.
+/// A newer track loaded on the same deck races us to phase 3; if
+/// it wins we drop the stale peaks / beat grid on the worker's
+/// stack — off-RT, harmless.
+///
+/// All time logging is `eprintln!` for now; M10.5v dogfood is using
+/// the numbers to validate the non-blocking load contract.
+fn background_analyze_and_install(
+    idx: usize,
+    track: Arc<Track>,
+    state: Arc<Mutex<EngineState>>,
+    peak_generation_seq: Arc<[AtomicU64; 2]>,
+) {
+    // Stage 1: offline peaks.
+    let t_peaks = std::time::Instant::now();
+    let peaks_result =
+        compute_offline_peaks(track.samples(), track.sample_rate(), track.channels());
+    let peaks_ms = t_peaks.elapsed().as_millis();
+
+    let OfflinePeaks {
+        broadband,
+        bands,
+        onset,
+        filtered,
+        sample_rate,
+        samples_per_broadband_chunk,
+        samples_per_band_chunk,
+        samples_per_onset_chunk,
+        samples_per_filtered_chunk,
+    } = match peaks_result {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("dub-ffi: offline peaks failed on deck {idx}: {e}");
+            return;
+        }
+    };
+
+    {
+        let mut guard = lock_state(&state);
+        let EngineState::Running(running) = &mut *guard else {
+            return;
+        };
+        if !track_still_loaded(running, idx, &track) {
+            return;
+        }
+        running.peaks[idx] = Some(PeakSource::File(FilePeaks {
+            broadband,
+            bands,
+            onset,
+            filtered,
+            sample_rate,
+            samples_per_broadband_chunk: u32::try_from(samples_per_broadband_chunk)
+                .unwrap_or(u32::MAX),
+            samples_per_band_chunk: u32::try_from(samples_per_band_chunk).unwrap_or(u32::MAX),
+            samples_per_onset_chunk: u32::try_from(samples_per_onset_chunk).unwrap_or(u32::MAX),
+            samples_per_filtered_chunk: u32::try_from(samples_per_filtered_chunk)
+                .unwrap_or(u32::MAX),
+            beat_grid: BeatGrid::empty(),
+        }));
+        if let Some(a) = peak_generation_seq.get(idx) {
+            a.fetch_add(1, Ordering::Release);
+        }
+    }
+    eprintln!("dub-ffi: peaks deck={idx} installed in {peaks_ms}ms");
+
+    // Stage 2: beat-grid analysis (BPM + downbeat).
+    //
+    // Single-pass on the full sample buffer: spectral-flux ODF +
+    // harmonic-summed autocorrelation BPM estimate, then a phase
+    // search for the downbeat. ~100–400 ms depending on track
+    // length and channel count. Analysis errors (silence,
+    // non-musical, too-short, channel-mismatch) collapse to an
+    // empty grid; the UI falls back to the dash.
+    let t_bpm = std::time::Instant::now();
+    let grid_result = analyze_beat_grid(track.samples(), track.sample_rate(), track.channels());
+    let bpm_ms = t_bpm.elapsed().as_millis();
+    let grid = match grid_result {
+        Ok(g) => BeatGrid::from_core(g),
+        Err(e) => {
+            eprintln!("dub-ffi: beat-grid analysis bailed on deck {idx} after {bpm_ms}ms: {e}");
+            BeatGrid::empty()
+        }
+    };
+
+    {
+        let mut guard = lock_state(&state);
+        let EngineState::Running(running) = &mut *guard else {
+            return;
+        };
+        if !track_still_loaded(running, idx, &track) {
+            return;
+        }
+        // Only mutate the in-place `FilePeaks`; if some other code
+        // path replaced the slot (e.g. Thru session start) we
+        // silently drop the grid. No `peak_generation_seq` bump —
+        // the grid doesn't affect waveform rendering, and the
+        // Apple side polls `beat_grid` lazily.
+        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            fp.beat_grid = grid;
+        }
+    }
+    eprintln!("dub-ffi: beat-grid deck={idx} installed in {bpm_ms}ms");
+}
+
+/// Phase-4 cancellation check: is the deck still holding the same
+/// `Arc<Track>` we were analysing?  If a newer `load_track` swap
+/// landed first, `running.file_tracks[idx]` now points elsewhere
+/// and we must drop our stale results.
+fn track_still_loaded(running: &RunningState, idx: usize, track: &Arc<Track>) -> bool {
+    matches!(
+        running.file_tracks.get(idx).and_then(|t| t.as_ref()),
+        Some(current) if Arc::ptr_eq(current, track)
+    )
 }
 
 fn deck_idx_to_usize(deck_idx: u64) -> Result<usize, EngineError> {
