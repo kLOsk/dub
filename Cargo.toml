@@ -51,6 +51,19 @@ ringbuf = "0.4"
 thiserror = "1"
 anyhow = "1"
 
+# Library / catalog stack (M11a onward). `rusqlite` with the bundled
+# SQLite source so we don't depend on the host's SQLite version (macOS
+# ships ancient builds via /usr/lib). Cost: ~5 s extra first-build,
+# deterministic schema behaviour across machines. `uuid` v4 is enough
+# for canonical track identity — random + universally-recognised; v7
+# (time-ordered) is a future consideration if index locality becomes
+# a measured bottleneck. `dirs` gives us platform-correct paths
+# (`~/Library/Application Support/Dub/`).
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+libc = "0.2"
+
 # UniFFI for the Apple FFI surface (M0.5 onward). Pinned to a recent 0.28.x
 # because that's the release the Apple build script generates bindings with.
 # `cli` feature is only enabled on the `dub-ffi`'s `uniffi-bindgen` binary —

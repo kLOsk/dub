@@ -2,17 +2,49 @@
 //!
 //! Owns a SQLite database describing the user's tracks. Imports from
 //! Serato, Traktor (NML), rekordbox (DB6 + XML), iTunes XML, and Lexicon
-//! (via its rekordbox/Serato exports). See PRD §8.
+//! (via its rekordbox/Serato exports). See PRD §8 and the normative
+//! schema reference at `docs/LIBRARY-SCHEMA.md`.
 //!
-//! Implementation lands in M11–M12 (see PRD §12).
+//! M11a (this commit) ships:
+//!
+//! * The full v1 SQLite schema with migration runner.
+//! * Path-by-volume-UUID model via [`volumes::discover_for_path`]
+//!   on macOS.
+//! * [`Library`] handle with default-path open + volume upsert.
+//! * Public source / event-type enums (used by callers building
+//!   per-source metadata rows).
+//!
+//! M11b–M11f grow the surface to fingerprint cache, file
+//! registration, metadata writes, crate management, browser
+//! queries, and exporters (PRD §12).
 
-#![forbid(unsafe_code)]
+// Volume discovery on macOS calls `getattrlist(2)` via a small unsafe
+// FFI shim (see `volumes::macos`). The rest of the crate is
+// safe-only; we'd rather grant `unsafe` here than smuggle a CFString
+// dependency into every workspace consumer just to avoid one syscall.
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
+
+mod db;
+mod error;
+mod paths;
+mod schema;
+mod volumes;
+
+pub use db::Library;
+pub use error::{LibraryError, Result};
+pub use paths::{default_library_db_path, default_waveforms_cache_dir};
+pub use schema::SCHEMA_VERSION;
+pub use volumes::{discover_for_path, DiscoveredVolume};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// External library sources we import from.
+/// External library sources we import from. These map onto the
+/// `track_metadata_source.source`, `track_beatgrids.source`, and
+/// `imported_crates.source` enum strings in the SQL schema. The
+/// `as_str` method gives the canonical lowercase string used in
+/// every `CHECK (source IN (...))` constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// Serato (ID3 GEOB tags + crate files + database V2).
@@ -25,6 +57,21 @@ pub enum Source {
     ITunes,
     /// Lexicon DJ exports (re-imported via Serato or rekordbox path).
     Lexicon,
+}
+
+impl Source {
+    /// The canonical lowercase string used in the SQL schema. Lexicon
+    /// has no direct SQL identity (it round-trips through Serato or
+    /// rekordbox); callers map it before persisting.
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            Source::Serato => Some("serato"),
+            Source::Traktor => Some("traktor"),
+            Source::Rekordbox => Some("rekordbox"),
+            Source::ITunes => Some("itunes"),
+            Source::Lexicon => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -40,5 +87,14 @@ mod tests {
     fn sources_are_distinct() {
         assert_ne!(Source::Serato, Source::Traktor);
         assert_ne!(Source::Rekordbox, Source::ITunes);
+    }
+
+    #[test]
+    fn source_strings_match_schema_check_constraints() {
+        assert_eq!(Source::Serato.as_str(), Some("serato"));
+        assert_eq!(Source::Traktor.as_str(), Some("traktor"));
+        assert_eq!(Source::Rekordbox.as_str(), Some("rekordbox"));
+        assert_eq!(Source::ITunes.as_str(), Some("itunes"));
+        assert_eq!(Source::Lexicon.as_str(), None);
     }
 }

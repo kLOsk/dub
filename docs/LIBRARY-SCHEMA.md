@@ -1,0 +1,685 @@
+# Dub library schema — public API reference
+
+> This document is normative. The Dub SQLite schema is part of Dub's
+> public API surface per [PRD §8.7](PRD.md#87-schema-as-public-api). We
+> do not break the contract here without a documented migration path
+> and a `schema_version` bump.
+
+The Dub library is a single SQLite database at
+`~/Library/Application Support/Dub/library.sqlite`. It holds the user's
+canonical track identity, per-source metadata, beatgrids, cues, loops,
+Dub crates, mirrors of imported source-library crates, fingerprints,
+play history, and analysis cache.
+
+Goals (in priority order):
+
+1. **Survive file system events.** Renames, drive moves, re-encodes,
+   ejected SSDs, drives mounting at slightly different paths between
+   reboots. The `volumes` + `track_files` design (path-by-volume-UUID,
+   PRD §8.2) means none of these break a track's identity.
+2. **Per-source opinion preservation.** We never collapse Serato's
+   "Dilla, J" and rekordbox's "J Dilla" into one row at import time.
+   The browser picks a winner per column via a documented priority
+   chain, but every source's verbatim opinion is queryable.
+3. **Lossless round-trip on export.** Imported hot cues and loops are
+   stored from v1.0 day one even though the v1 UI does not edit them,
+   so the M11f rekordbox-XML exporter can round-trip them back into
+   Serato / Traktor / rekordbox.
+4. **Documented, open, queryable by third parties.** No encryption, no
+   binary blobs except where standard (fingerprints), no proprietary
+   formats. A user who wants to leave Dub takes their data with them.
+
+## Schema versioning and migration policy
+
+A single `schema_version` row tracks the current applied schema. The
+v1.0 baseline is **version 1**. Any change to the table set, column
+set, indexes, FTS5 definition, or trigger logic requires a version
+bump and a migration step.
+
+### Backward compatibility contract
+
+* **Additive changes** (new tables, new columns with sensible defaults,
+  new indexes) are version bumps but do not break third-party readers
+  that ignore unknown tables / columns.
+* **Renames, removals, type changes** require a version bump and a
+  documented migration. We will not silently change a column's
+  semantics. We will not delete data on migration; renamed columns
+  retain their old column under an `_legacy` suffix for at least one
+  full minor-version cycle.
+* **Forward compatibility is not guaranteed.** A database touched by
+  a newer Dub may have a `schema_version > 1`; an older Dub that
+  opens it must refuse to write but may read the tables it understands.
+  v1.0 ships a strict `schema_version == 1` write guard.
+
+### Migration runner
+
+The migration runner is a sorted list of `(target_version, sql_script)`
+pairs. The runner reads the current version, applies every script
+with `target_version > current_version` inside a single transaction
+per script, and bumps `schema_version` at the end of each. The
+migration runner is itself versioned: each migration script is
+idempotent against partial application (every `CREATE TABLE` uses
+`IF NOT EXISTS`, etc.) so a crash mid-migration leaves a consistent
+state.
+
+```sql
+CREATE TABLE IF NOT EXISTS schema_version (
+    -- single-row table; one INSERT at initial schema creation,
+    -- one UPDATE per migration applied.
+    version    INTEGER NOT NULL,
+    applied_at INTEGER NOT NULL  -- unix epoch seconds
+);
+```
+
+## Conventions
+
+### Identifiers and timestamps
+
+* **Canonical track identity** (`tracks.id`) is a 36-character lowercase
+  RFC 4122 UUID stored as `TEXT`. We choose TEXT over BLOB because
+  third-party tools that read `library.sqlite` benefit from a
+  human-readable identifier in `EXPLAIN` output and ad-hoc queries.
+* **Volume identity** (`volumes.volume_uuid`) is whatever the
+  filesystem returns. On macOS this is the volume UUID from
+  `NSURL`'s `volumeUUIDStringKey` resource key (also available via
+  `statfs(2)` + `getattrlist(2)`). Stored as `TEXT`. We do not
+  generate volume UUIDs ourselves.
+* **All timestamps are unix epoch seconds (`INTEGER`)** unless
+  documented otherwise. `play_history.timestamp` is unix epoch
+  *milliseconds* because the analysis (Played From / Played Into in
+  v1.x) needs sub-second event ordering when a load is followed
+  rapidly by a play-start.
+* **Integer surrogate keys** are `INTEGER PRIMARY KEY` (which in
+  SQLite is the implicit `rowid` alias and gives us auto-increment
+  for free). Canonical tracks use a TEXT UUID instead of an INTEGER
+  surrogate because the UUID is the stable identity across export
+  round-trips (M11f rekordbox-XML) and is the natural foreign key in
+  per-source metadata rows.
+
+### Soft enums (TEXT-as-enum)
+
+Several columns hold one of a small enumerated set of values. We store
+these as `TEXT` rather than `INTEGER` for self-documenting queries,
+guarded by `CHECK` constraints. The cost of a few bytes per row is
+negligible at our scale and the readability win on ad-hoc inspection
+is substantial.
+
+| Column | Allowed values |
+|---|---|
+| `track_metadata_source.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'id3'`, `'filename'` |
+| `track_beatgrids.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'auto'`, `'user_tap'` |
+| `track_cues.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'user'` |
+| `track_loops.source` | Same as `track_cues.source` |
+| `imported_crates.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'` |
+| `play_history.event_type` | `'load'`, `'play_start'`, `'play_end'`, `'transition_in'`, `'transition_out'` |
+
+### Cascading deletes
+
+Foreign keys use `ON DELETE CASCADE` for child rows whose existence is
+meaningless without the parent (e.g. `track_files` rows orphan if a
+`tracks` row is explicitly deleted by future v1.x merge / consolidate
+operations). Foreign keys to siblings (`play_history.from_track_id`,
+`tracks.duplicate_link_track_id`) use `ON DELETE SET NULL` so the
+historical event survives the loss of the referenced track.
+
+**`PRAGMA foreign_keys = ON`** must be set on every connection. SQLite's
+default is OFF for historical reasons; the migration runner sets it
+unconditionally.
+
+### `PRAGMA`s
+
+The library opens each connection with:
+
+```
+PRAGMA journal_mode = WAL;        -- concurrent readers, single writer
+PRAGMA synchronous = NORMAL;      -- WAL recommendation; durability across crashes
+PRAGMA foreign_keys = ON;         -- enforce all FKs declared in the schema
+PRAGMA temp_store = MEMORY;       -- temp tables in RAM
+PRAGMA mmap_size = 268435456;     -- 256 MB; the file is small, this is fine
+```
+
+WAL is critical: the importer worker thread writes while the browser
+read query streams rows. Without WAL the writer blocks all readers
+for the duration of an import.
+
+## Tables
+
+### `tracks` — canonical track identity
+
+```sql
+CREATE TABLE IF NOT EXISTS tracks (
+    id                          TEXT    PRIMARY KEY NOT NULL,
+    fingerprint_id              INTEGER REFERENCES fingerprints(id) ON DELETE SET NULL,
+    duration_ms                 INTEGER,
+    -- Set when version-aware dedupe (§8.1) detects a "potential
+    -- duplicate" of an existing track. NULL otherwise. The link is
+    -- bidirectional: A->B implies B->A.
+    duplicate_link_track_id     TEXT    REFERENCES tracks(id) ON DELETE SET NULL,
+    -- Set when the user manually merges two tracks (v1.x). The
+    -- merge target is the survivor; the merged-from row is kept
+    -- as a tombstone so re-import doesn't resurrect it.
+    explicit_merge_target_id    TEXT    REFERENCES tracks(id) ON DELETE SET NULL,
+    created_at                  INTEGER NOT NULL,
+    updated_at                  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint    ON tracks(fingerprint_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_duplicate_link ON tracks(duplicate_link_track_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_merge_target   ON tracks(explicit_merge_target_id);
+```
+
+A `tracks` row is the canonical identity. `duration_ms` is denormalised
+here for fast browsing-list rendering (computed from the active grid
+or from any `track_files.sample_rate × file_size / bytes_per_sample`
+estimate at import time; refined when the file is decoded for waveform
+analysis).
+
+### `fingerprints` — Chromaprint identity
+
+```sql
+CREATE TABLE IF NOT EXISTS fingerprints (
+    id                INTEGER PRIMARY KEY,
+    -- Chromaprint fingerprint as raw uint32 vector, little-endian.
+    -- See "Fingerprint parameters" below for the exact Chromaprint
+    -- configuration used.
+    chromaprint_blob  BLOB    NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    -- Auxiliary signature data used for fast first-pass filtering
+    -- before a full Chromaprint similarity comparison.
+    file_size         INTEGER,
+    sample_rate       INTEGER,
+    channel_count     INTEGER,
+    computed_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_duration ON fingerprints(duration_ms);
+```
+
+The fingerprint is **keyed against the canonical recording, not the
+file**. Two `track_files` rows pointing at the same recording from
+different drives share one `fingerprints` row via their `tracks.fingerprint_id`.
+This is what makes the `analysis_cache` (keyed by `fingerprint_id`)
+survive file moves and dedupe merges.
+
+### `volumes` — path-by-volume-UUID directory
+
+```sql
+CREATE TABLE IF NOT EXISTS volumes (
+    volume_uuid             TEXT    PRIMARY KEY NOT NULL,
+    display_name            TEXT    NOT NULL,
+    last_known_mount_point  TEXT,
+    last_seen_at            INTEGER NOT NULL,
+    -- 1 for the boot volume / internal drive, 0 for external drives.
+    -- Drives the missing-files UI: external drive ejected = expected,
+    -- internal drive "missing" = problem.
+    is_internal             INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0, 1))
+);
+```
+
+The `volume_uuid` is whatever the filesystem returns. On macOS it is
+the volume UUID from `NSURL.resourceValues(forKeys: [.volumeUUIDStringKey])`,
+or equivalently from `statfs(2)` + `getattrlist(2)` on the
+`f_mntfromname`. We never generate volume UUIDs ourselves; if a volume
+exposes no UUID (rare; some network filesystems), the import refuses
+to register tracks from it with a clear error.
+
+### `track_files` — files on disk
+
+```sql
+CREATE TABLE IF NOT EXISTS track_files (
+    id              INTEGER PRIMARY KEY,
+    track_id        TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    volume_uuid     TEXT    NOT NULL REFERENCES volumes(volume_uuid) ON DELETE CASCADE,
+    -- Path relative to the volume root, no leading slash. Stored
+    -- verbatim (case-sensitive on case-sensitive filesystems).
+    relative_path   TEXT    NOT NULL,
+    codec           TEXT,
+    sample_rate     INTEGER,
+    bit_depth       INTEGER,
+    channel_count   INTEGER,
+    file_size       INTEGER,
+    mtime           INTEGER,
+    last_seen_at    INTEGER NOT NULL,
+    UNIQUE (volume_uuid, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_track_files_track  ON track_files(track_id);
+CREATE INDEX IF NOT EXISTS idx_track_files_volume ON track_files(volume_uuid);
+```
+
+One canonical track can have many `track_files` (different encodings,
+backup copies, files on the touring SSD and the studio drive). The
+resolution order on load (per PRD §8.2):
+
+1. Volume UUID lookup → mount point + relative path.
+2. Last-known mount point (volumes table) + relative path.
+3. Basename + fingerprint search across known volumes.
+4. Prompt the user.
+
+### `track_metadata_source` — per-source verbatim opinion
+
+```sql
+CREATE TABLE IF NOT EXISTS track_metadata_source (
+    id              INTEGER PRIMARY KEY,
+    track_id        TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source          TEXT    NOT NULL CHECK (source IN
+                    ('serato', 'traktor', 'rekordbox', 'itunes', 'id3', 'filename')),
+    artist          TEXT,
+    title           TEXT,
+    album           TEXT,
+    genre           TEXT,
+    comment         TEXT,
+    composer        TEXT,
+    year            INTEGER,
+    track_number    INTEGER,
+    bpm             REAL,
+    -- Camelot / Open Key / classical notation; stored as the source
+    -- reports it. Browser normalises for display only.
+    key             TEXT,
+    gain_db         REAL,
+    -- 0-5 stars. Sources that use 0-100 or 0-255 are normalised on
+    -- import. NULL for sources that don't carry ratings.
+    rating          INTEGER,
+    -- The version-token recognised by §8.1's parser
+    -- ('clean' / 'dirty' / 'instrumental' / 'acapella' / 'radio' /
+    -- 'edit' / 'extended' / 'club' / 'dub' / 'vip' / 'remix' /
+    -- 'remaster' / 'mono' / 'stereo' / 'intro' / 'outro' / 'short' /
+    -- 'long' / '7in' / '12in' / 'lp'). NULL if no token detected.
+    -- Stored as canonical lowercase form.
+    version_token   TEXT,
+    imported_at     INTEGER NOT NULL,
+    UNIQUE (track_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_metadata_source ON track_metadata_source(source);
+```
+
+Per PRD §8.1, displayed-value priority chain is
+`serato > rekordbox > traktor > id3 > filename`. The browser computes
+the displayed value at query time using a `COALESCE` chain over a
+pivoted view; there is no materialized "winner" column to keep in
+sync.
+
+### `track_beatgrids` — one grid per source per track
+
+```sql
+CREATE TABLE IF NOT EXISTS track_beatgrids (
+    id            INTEGER PRIMARY KEY,
+    track_id      TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source        TEXT    NOT NULL CHECK (source IN
+                  ('serato', 'traktor', 'rekordbox', 'itunes', 'auto', 'user_tap')),
+    -- Downbeat anchor in seconds from track start.
+    anchor_secs   REAL    NOT NULL,
+    bpm           REAL    NOT NULL,
+    -- Exactly one grid per track is_active at a time. Enforced
+    -- by the partial unique index below.
+    is_active     INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    captured_at   INTEGER NOT NULL,
+    UNIQUE (track_id, source)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_grid_per_track
+    ON track_beatgrids(track_id) WHERE is_active = 1;
+```
+
+Single-anchor flex grid only in v1 per PRD §8.3.2. Multi-anchor warp
+is a v2 consideration. The browser surfaces a ⚠ on tracks where the
+imported and `auto` grids disagree by more than 5 % BPM or 50 ms
+anchor over the first 32 bars (PRD §8.3 cross-validation; the
+comparison is computed at query time, not stored).
+
+### `track_cues` — hot cues (stored from v1, surfaced in v2)
+
+```sql
+CREATE TABLE IF NOT EXISTS track_cues (
+    id              INTEGER PRIMARY KEY,
+    track_id        TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source          TEXT    NOT NULL CHECK (source IN
+                    ('serato', 'traktor', 'rekordbox', 'itunes', 'user')),
+    -- 0-based slot index. Serato 0-7, rekordbox 0-7, Traktor 0-15.
+    cue_index       INTEGER NOT NULL,
+    position_secs   REAL    NOT NULL,
+    name            TEXT,
+    -- "#RRGGBB" hex string when source carries it; NULL otherwise.
+    color           TEXT,
+    kind            TEXT    NOT NULL DEFAULT 'hot_cue' CHECK (kind IN
+                    ('hot_cue', 'memory', 'load', 'loop_in', 'loop_out')),
+    imported_at     INTEGER NOT NULL,
+    UNIQUE (track_id, source, cue_index)
+);
+CREATE INDEX IF NOT EXISTS idx_track_cues_track ON track_cues(track_id);
+```
+
+Per PRD §6.6, hot cues are deferred to v2. We store imported cues from
+v1.0 day one so the M11f rekordbox-XML exporter round-trips them
+losslessly. The v1 UI does not surface or edit cues.
+
+### `track_loops` — saved loops (stored from v1, surfaced in v1.x)
+
+```sql
+CREATE TABLE IF NOT EXISTS track_loops (
+    id              INTEGER PRIMARY KEY,
+    track_id        TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source          TEXT    NOT NULL CHECK (source IN
+                    ('serato', 'traktor', 'rekordbox', 'itunes', 'user')),
+    loop_index      INTEGER NOT NULL,
+    in_secs         REAL    NOT NULL,
+    out_secs        REAL    NOT NULL,
+    name            TEXT,
+    color           TEXT,
+    is_locked       INTEGER NOT NULL DEFAULT 0 CHECK (is_locked IN (0, 1)),
+    imported_at     INTEGER NOT NULL,
+    UNIQUE (track_id, source, loop_index)
+);
+CREATE INDEX IF NOT EXISTS idx_track_loops_track ON track_loops(track_id);
+```
+
+Per PRD §6.6, saved loop slots are v1.x. Imported loops stored from
+v1.0 day one for round-trip discipline (same rationale as
+`track_cues`). v1 ships ephemeral loops only.
+
+### `crates` and `crate_tracks` — Dub crates (user-editable)
+
+```sql
+CREATE TABLE IF NOT EXISTS crates (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT    NOT NULL,
+    parent_crate_id INTEGER REFERENCES crates(id) ON DELETE CASCADE,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (parent_crate_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS crate_tracks (
+    crate_id    INTEGER NOT NULL REFERENCES crates(id) ON DELETE CASCADE,
+    track_id    TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    -- 0-based position within the crate. Reorder by rewriting the
+    -- ordinal column; we don't use floating-point sort keys.
+    ordinal     INTEGER NOT NULL,
+    added_at    INTEGER NOT NULL,
+    PRIMARY KEY (crate_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crate_tracks_ord ON crate_tracks(crate_id, ordinal);
+```
+
+Dub crates are user-editable, full-color, nestable. Per PRD §8.5.1
+these are explicitly separated from the read-only `imported_crates`
+table so a Serato re-import never clobbers user edits.
+
+### `imported_crates` and `imported_crate_tracks` — source mirror
+
+```sql
+CREATE TABLE IF NOT EXISTS imported_crates (
+    id                          INTEGER PRIMARY KEY,
+    source                      TEXT    NOT NULL CHECK (source IN
+                                ('serato', 'traktor', 'rekordbox', 'itunes')),
+    name                        TEXT    NOT NULL,
+    parent_imported_crate_id    INTEGER REFERENCES imported_crates(id) ON DELETE CASCADE,
+    imported_at                 INTEGER NOT NULL,
+    UNIQUE (source, parent_imported_crate_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS imported_crate_tracks (
+    imported_crate_id   INTEGER NOT NULL REFERENCES imported_crates(id) ON DELETE CASCADE,
+    track_id            TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    ordinal             INTEGER NOT NULL,
+    PRIMARY KEY (imported_crate_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS idx_imported_crate_tracks_ord
+    ON imported_crate_tracks(imported_crate_id, ordinal);
+```
+
+Read-only mirror of source-library crate/playlist trees. Re-import
+truncates and rewrites the subtree for the affected source; never
+edited by the user.
+
+### `play_history` — every event, milliseconds
+
+```sql
+CREATE TABLE IF NOT EXISTS play_history (
+    id                  INTEGER PRIMARY KEY,
+    track_id            TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    deck                INTEGER NOT NULL CHECK (deck IN (0, 1)),
+    event_type          TEXT    NOT NULL CHECK (event_type IN
+                        ('load', 'play_start', 'play_end',
+                         'transition_in', 'transition_out')),
+    -- Unix epoch MILLISECONDS — not seconds — so rapid event
+    -- sequences (load -> play_start within ~200 ms) order
+    -- deterministically.
+    timestamp_ms        INTEGER NOT NULL,
+    duration_played_ms  INTEGER,
+    -- Mix-history edges. Set on transition_in / transition_out
+    -- events to the other-deck track at the moment of transition.
+    from_track_id       TEXT    REFERENCES tracks(id) ON DELETE SET NULL,
+    to_track_id         TEXT    REFERENCES tracks(id) ON DELETE SET NULL,
+    -- Opaque per-session marker. Same across all events of one
+    -- gig / practice run. Lets the future Played From / Played
+    -- Into analysis (v1.x) restrict to a single session if needed.
+    session_id          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_play_history_track
+    ON play_history(track_id, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_play_history_timestamp
+    ON play_history(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_play_history_session
+    ON play_history(session_id, timestamp_ms);
+```
+
+Capture starts at v1.0 day one (PRD §8.2). The user can disable capture
+in Preferences (the table is still present, just not written to). The
+v1.0 user-visible surface is "Last Played" sort + "Recently Played"
+smart crate; the v1.x surface is Played From / Played Into.
+
+### `analysis_cache` — derived per-recording data
+
+```sql
+CREATE TABLE IF NOT EXISTS analysis_cache (
+    fingerprint_id          INTEGER PRIMARY KEY
+                            REFERENCES fingerprints(id) ON DELETE CASCADE,
+    -- ITU-R BS.1770 integrated loudness in LUFS (negative dB).
+    lufs_i                  REAL,
+    -- True-peak in dBTP per BS.1770.
+    true_peak_dbtp          REAL,
+    -- Path under ~/Library/Caches/Dub/waveforms/ to the M10.5j sidecar.
+    -- Stored relative to that directory; missing-file detection
+    -- on this is independent of the track_files volume-UUID path.
+    waveform_sidecar_path   TEXT,
+    -- Booleans cached for the prepared-flag computation. Sourced
+    -- from the presence/absence of the corresponding data; we cache
+    -- the booleans here to avoid joining across multiple tables on
+    -- every browser-row render.
+    has_lufs                INTEGER NOT NULL DEFAULT 0 CHECK (has_lufs IN (0, 1)),
+    has_waveform            INTEGER NOT NULL DEFAULT 0 CHECK (has_waveform IN (0, 1)),
+    has_active_grid         INTEGER NOT NULL DEFAULT 0 CHECK (has_active_grid IN (0, 1)),
+    analyzed_at             INTEGER
+);
+```
+
+Keyed by canonical `fingerprint_id` (not `track_id`) so the cache
+survives file moves and dedupe merges. A "prepared" track is one
+where `has_lufs AND has_waveform AND has_active_grid`; the prepared
+flag in the browser is computed at query time from these three
+columns.
+
+### `smart_crates` — user-defined smart crates (v1.x)
+
+```sql
+CREATE TABLE IF NOT EXISTS smart_crates (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT    NOT NULL UNIQUE,
+    -- A SQL fragment usable as a WHERE clause against the canonical
+    -- track-query view. Validated at insert time against an allow-list
+    -- of columns and operators (v1.x); v1.0 leaves the table empty.
+    sql_predicate   TEXT    NOT NULL,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+```
+
+Empty in v1.0 (PRD §8.5.2). The two v1 smart crates ("Recently Played",
+"Just Imported") ship as code, not data. The table exists in v1.0 so
+the v1.x rule builder lands without a migration.
+
+## Full-text search (FTS5)
+
+Search per PRD §8.5.4. Substring match with `AND` across whitespace-
+separated tokens. Operators (`bpm:90-100`, `key:Am`, etc.) are parsed
+out of the query string before the FTS5 call and applied as separate
+SQL predicates.
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS track_metadata_fts USING fts5(
+    artist,
+    title,
+    album,
+    comment,
+    -- UNINDEXED columns are not full-text-tokenised; they are stored
+    -- as-is for projection in the query result.
+    track_metadata_source_id UNINDEXED,
+    track_id UNINDEXED,
+    source UNINDEXED,
+    -- unicode61 with diacritic removal so "Beyoncé" matches "Beyonce"
+    -- and vice versa, which is what the DJ types in either form.
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+-- Triggers keep the FTS table in sync with track_metadata_source.
+CREATE TRIGGER IF NOT EXISTS trg_metadata_fts_insert
+AFTER INSERT ON track_metadata_source BEGIN
+    INSERT INTO track_metadata_fts (
+        artist, title, album, comment,
+        track_metadata_source_id, track_id, source
+    ) VALUES (
+        new.artist, new.title, new.album, new.comment,
+        new.id, new.track_id, new.source
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_metadata_fts_delete
+AFTER DELETE ON track_metadata_source BEGIN
+    DELETE FROM track_metadata_fts
+        WHERE track_metadata_source_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_metadata_fts_update
+AFTER UPDATE ON track_metadata_source BEGIN
+    UPDATE track_metadata_fts SET
+        artist  = new.artist,
+        title   = new.title,
+        album   = new.album,
+        comment = new.comment,
+        source  = new.source
+    WHERE track_metadata_source_id = old.id;
+END;
+```
+
+The FTS table indexes every per-source row (so a track with three
+imported sources has three FTS rows). Search returns
+`DISTINCT track_id`. The browser then resolves the displayed metadata
+through the priority chain.
+
+## Fingerprint parameters
+
+Per PRD §8.7, the Chromaprint parameters Dub uses are documented so a
+third party can re-derive Dub's fingerprints.
+
+* **Library**: `chromaprint` (LGPL-2.1) via FFI in `dub-fingerprint`.
+* **Algorithm**: `CHROMAPRINT_ALGORITHM_DEFAULT` (algorithm 2 as of
+  Chromaprint 1.5.x). This is the same algorithm AcoustID uses.
+* **Sample rate**: 11025 Hz mono input (Chromaprint resamples
+  internally; we resample once at the import stage and pass the
+  result to the same function the streaming and offline drivers use).
+* **Channel mix**: stereo mixed to mono via 0.5 × (L + R) before
+  resampling.
+* **Duration window**: full track. Long tracks are not truncated; the
+  full fingerprint is what AcoustID-class lookups expect and what the
+  similarity comparison in §8.1 dedupe runs against.
+* **Storage**: the `chromaprint_blob` column holds the raw
+  `uint32_t[]` output of `chromaprint_get_raw_fingerprint`, little-
+  endian, in its native length (typically 200-400 uint32 per track).
+
+The similarity comparison for dedupe (§8.1) computes the bitwise
+Hamming distance between two fingerprint blobs aligned at the longest-
+common-prefix, divided by the bit count, subtracted from 1. The
+result is in `[0, 1]`; the threshold for auto-merge is `≥ 0.98`. The
+algorithm is the standard one used by AcoustID and Beets; no
+proprietary tweaks.
+
+## File system locations
+
+| What | Where |
+|---|---|
+| Library database | `~/Library/Application Support/Dub/library.sqlite` |
+| WAL companion | `~/Library/Application Support/Dub/library.sqlite-wal` |
+| SHM companion | `~/Library/Application Support/Dub/library.sqlite-shm` |
+| Waveform sidecars (M10.5j → M11a) | `~/Library/Caches/Dub/waveforms/{fingerprint_hex}.wf` |
+| Per-session log | `~/Library/Logs/Dub/session.log` (per PRD §2.2.7) |
+
+The Caches directory is intentionally separate from Application
+Support: macOS treats `~/Library/Caches/Dub/` as evictable under disk
+pressure, which is correct for the waveform sidecars (regeneratable
+from the audio files). The library database is in Application Support
+which macOS does not evict, which is correct for the user's
+irreplaceable Dub-crate / mix-history / tap-grid data.
+
+## Query examples
+
+### Browser default sort: Last Played
+
+```sql
+SELECT
+    t.id AS track_id,
+    COALESCE(s.title, r.title, k.title, i3.title, f.title)        AS title,
+    COALESCE(s.artist, r.artist, k.artist, i3.artist, f.artist)   AS artist,
+    g.bpm AS active_bpm,
+    g.source AS active_grid_source,
+    (SELECT MAX(timestamp_ms) FROM play_history p WHERE p.track_id = t.id)
+        AS last_played_ms
+FROM tracks t
+LEFT JOIN track_metadata_source s  ON s.track_id  = t.id AND s.source  = 'serato'
+LEFT JOIN track_metadata_source r  ON r.track_id  = t.id AND r.source  = 'rekordbox'
+LEFT JOIN track_metadata_source k  ON k.track_id  = t.id AND k.source  = 'traktor'
+LEFT JOIN track_metadata_source i3 ON i3.track_id = t.id AND i3.source = 'id3'
+LEFT JOIN track_metadata_source f  ON f.track_id  = t.id AND f.source  = 'filename'
+LEFT JOIN track_beatgrids g        ON g.track_id  = t.id AND g.is_active = 1
+ORDER BY last_played_ms DESC NULLS LAST;
+```
+
+### FTS substring search
+
+```sql
+SELECT DISTINCT track_id
+FROM track_metadata_fts
+WHERE track_metadata_fts MATCH 'donuts dilla';
+```
+
+### Played From / Played Into (v1.x)
+
+```sql
+-- Given a track loaded on Deck A, find the N tracks the DJ has most
+-- often mixed *into* it from Deck B in the past.
+SELECT to_track_id, COUNT(*) AS n
+FROM play_history
+WHERE event_type = 'transition_in'
+  AND from_track_id = :loaded_track_id
+GROUP BY to_track_id
+ORDER BY n DESC
+LIMIT 10;
+```
+
+## What v1.0 does not commit to
+
+* **Forward compatibility with v1.x writers from a v1.0 binary.** A
+  v1.0 binary that opens a database written by a v1.x binary detects
+  the higher `schema_version` and refuses to write (read-only fallback).
+* **A schema migration tool independent of the Dub binary.** The
+  migration runner lives inside `dub-library`; third-party readers that
+  want forward-compat can implement their own (the schema is open) but
+  Dub does not promise a CLI tool until v1.x.
+* **Encrypted-at-rest support.** macOS FileVault handles disk-level
+  encryption. We do not encrypt the SQLite file; the user's library is
+  not a secret from themselves.
+
+## See also
+
+* [PRD §8](PRD.md#8-library) — library subsystem spec
+* [PRD §8.7](PRD.md#87-schema-as-public-api) — public-API commitment
+* [docs/LIBRARY-FORMATS.md](LIBRARY-FORMATS.md) — source-format notes
+  for the M11e Serato importer and M12 Traktor / rekordbox / iTunes
+  importers
+* [docs/SHIPPED.md](SHIPPED.md) — milestone history

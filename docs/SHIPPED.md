@@ -1695,4 +1695,77 @@ The freeze was committed as `4a31363` (`feat(apple,engine): freeze M10.8 wavefor
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11a — Library schema + path-by-volume-UUID
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days &nbsp;·&nbsp; **Actual:** 1 day
+
+M11a is the foundation under all subsequent library work. It stands up the SQLite schema, the migration runner, the on-disk locations, and the macOS volume-UUID discovery primitive. No importers and no UI yet; those land at M11c (filesystem importer) and M11d (browser shell). The deliberate sequencing is that **every later milestone reads and writes against a frozen, documented schema** rather than refactoring the table set in the middle of importer work.
+
+### What shipped
+
+**`dub-library` crate** (previously a stub with the `Source` enum and nothing else).
+
+* **`schema::open_and_migrate`** — connection-level PRAGMA bootstrap (`journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = ON`, `temp_store = MEMORY`, `mmap_size = 256 MB`) followed by the migration runner. Each migration applies inside its own transaction; idempotent via `CREATE TABLE IF NOT EXISTS` so a crash mid-migration is safe.
+* **v1 schema, 16 tables + 1 FTS5 virtual table:** `schema_version`, `fingerprints`, `tracks`, `volumes`, `track_files`, `track_metadata_source`, `track_beatgrids`, `track_cues`, `track_loops`, `crates`, `crate_tracks`, `imported_crates`, `imported_crate_tracks`, `play_history`, `analysis_cache`, `smart_crates`, `track_metadata_fts`. Plus 11 supporting indexes and 3 FTS5 sync triggers. Byte-for-byte mirror of the `CREATE TABLE` blocks in `docs/LIBRARY-SCHEMA.md`.
+* **`SCHEMA_VERSION = 1` baseline + write guard.** A DB on disk at `schema_version > 1` raises `LibraryError::SchemaTooNew { found, supported }`; v1.0 binaries refuse to write older-version DBs per PRD §8.7 ("What v1.0 does not commit to" — forward compatibility from a v1.0 binary opening v1.x DBs).
+* **Partial unique index** `idx_one_active_grid_per_track ON track_beatgrids(track_id) WHERE is_active = 1` enforces "exactly one active grid per track" at the SQL level rather than relying on importer discipline.
+* **`Library::open_default`** resolves to `~/Library/Application Support/Dub/library.sqlite`; **`Library::open_at`** for tests and CLI tools; **`Library::open_in_memory`** for unit tests that don't touch the disk. Parent directory chain auto-created.
+* **macOS volume UUID discovery** via direct `getattrlist(2)` syscall with `ATTR_VOL_INFO | ATTR_VOL_UUID`, paired with `statfs(2)` for the mount-point and display-name fields. Implemented inline (≈100 lines, the only unsafe code in the crate) rather than pulling Foundation / CoreFoundation into the workspace just for one read. `DiscoveredVolume { volume_uuid, mount_point, display_name, is_internal }` is the surfaced type.
+* **`Library::upsert_volume`** with `ON CONFLICT(volume_uuid) DO UPDATE`. Re-mounting the same external drive at a different mount point (the typical case when a USB slot moves) updates `last_known_mount_point` and `last_seen_at` without duplicating the row. The UUID is the stable identity; the mount point is descriptive.
+* **`docs/LIBRARY-SCHEMA.md`** published as the **public API contract** per PRD §8.7. Documents the migration policy, the backward-compatibility contract, every table's columns and constraints, the soft-enum allowed values for `source` / `event_type` / `kind`, the Chromaprint fingerprint parameters (algorithm 2, 11025 Hz mono, full-track window, raw `uint32_t[]` storage), the FTS5 tokenizer (`unicode61 remove_diacritics 2`), the connection-level PRAGMAs, and three canonical query examples (browser default sort, FTS substring search, Played-From-Played-Into aggregation).
+
+### What was descoped from M11a (and why)
+
+The original M11a row in PRD §12 listed "M10.5j sidecar key migrated from path-hash to canonical fingerprint" as a sub-deliverable. This is **deferred** because the M10.5j sidecar cache itself has not been built yet (it's still *planned* in §12). The new schema's `analysis_cache.waveform_sidecar_path TEXT` column reserves the right shape for the future migration; when M10.5j actually lands, it can be born fingerprint-keyed in one shot rather than path-hash-then-rewritten.
+
+This is not laziness; it is the right boundary. Shipping a "migrate from format X to format Y" deliverable before format X exists would produce dead code that is hard to test against and obscures M11a's actual contribution (the schema + path-by-volume-UUID model).
+
+### Tests (16 new, all green)
+
+* `schema::migration_to_v1_lands_schema_version_row` — DB is at `SCHEMA_VERSION` after a fresh `open_and_migrate`.
+* `schema::migration_is_idempotent_on_re_open` — running the runner twice on the same DB is a no-op.
+* `schema::migration_creates_every_documented_table` — spot-check that every table from `docs/LIBRARY-SCHEMA.md` exists. Catches typos in the embedded SQL at unit-test time, not at first-import time.
+* `schema::refuses_to_open_db_with_newer_schema` — simulates a v1.x DB opened by a v1.0 binary; asserts `LibraryError::SchemaTooNew { found: 999, supported: 1 }`.
+* `schema::fts_trigger_propagates_metadata_inserts` — load-bearing for M11d browser search; an `INSERT INTO track_metadata_source` lands a corresponding FTS5 row that responds to substring `MATCH`.
+* `schema::one_active_grid_per_track_constraint_holds` — partial unique index rejects a second `is_active = 1` row for the same track.
+* `db::open_at_creates_parent_directory_chain` — `Library::open_at(path)` creates `path`'s parent directories via `create_dir_all`.
+* `db::re_open_is_idempotent` — closing and reopening the same on-disk DB succeeds.
+* `db::upsert_volume_round_trip` — round-trip a volume through `upsert_volume` + `find_volume`.
+* `db::upsert_volume_updates_mount_point_on_remount` — same UUID at a different mount point updates in place; no duplicate row.
+* `volumes::macos::home_dir_resolves_to_some_uuid` — discovers a UUID for the user's home directory at 36-char RFC 4122 form.
+* `volumes::macos::root_path_resolves_internal` — `/` resolves to `is_internal = true` with display name `"Macintosh HD"`.
+* `volumes::macos::uuid_round_trip_formatting` — 16-byte UUID format converts to canonical hyphenated lowercase string.
+* `tests::version_is_nonempty`, `tests::sources_are_distinct`, `tests::source_strings_match_schema_check_constraints` — sanity tests on the `Source` enum and its `as_str()` mapping to schema enum strings.
+
+Workspace test count: **574 → 588** (`+14` net; 16 new in `dub-library`, 2 of which replace prior stub tests via expanded coverage). Workspace clippy clean (`-D warnings`) on first pass; one cosmetic `cmp_owned` lint fixed during M11a iteration.
+
+### Workspace dependency additions
+
+| Crate | Version | Why |
+|---|---|---|
+| `rusqlite` | `0.32` with `bundled` + `blob` | The de-facto Rust SQLite binding. `bundled` compiles SQLite from source rather than depending on the host's version (macOS ships ancient builds in `/usr/lib`); deterministic across machines, ~5 s extra first-build. `blob` is needed for `chromaprint_blob` storage at M11b. |
+| `uuid` | `1` with `v4` | Canonical track identity. v4 (random) is universally recognised; v7 (time-ordered, better index locality) is parked as a future consideration if benchmarks demand it. |
+| `dirs` | `5` | Platform-correct user-config and user-cache directories. macOS resolves to `~/Library/Application Support/` and `~/Library/Caches/` respectively. |
+| `libc` | `0.2` (macOS only) | `statfs(2)` binding for the volume discovery path. `getattrlist` is bound inline via a small `extern "C"` block; libc doesn't expose it. |
+| `tempfile` | `3` (dev-dep) | Fixture DBs for `Library::open_at` tests without polluting the developer's real library. |
+
+### Out of scope for M11a (queued for M11b onward)
+
+* Chromaprint FFI wrapping (M11b).
+* Filename-pattern parser per PRD §8.4 (M11c).
+* The walk-a-folder importer + ID3 reader (M11c).
+* Browser UI (M11d) — `apple/Dub/Performance/FileBrowserView.swift` continues to use the M10.5b code path until M11d's replacement.
+* `apple` shell integration of `dub-library` via the UniFFI surface (slated for the M11d shell rollout; M11a's FFI surface is empty by design).
+* Any actual data writes beyond `volumes` upserts — M11a stands up the schema; M11b–M11f populate it.
+
+### Forward shape
+
+M11b will introduce `dub-fingerprint` (Chromaprint FFI, LGPL-2.1, leaf-crate license isolation per PRD §11) and the version-aware dedupe logic that consumes the fingerprint plus the per-source metadata rows. M11a's schema already has the `fingerprints` table and `tracks.fingerprint_id` reference; M11b lands the writers.
+
+### Commit boundary
+
+This entry corresponds to the M11a commit set. PRD §8 + §12 (M11a row marked shipped), `docs/LIBRARY-SCHEMA.md` (new), and `crates/dub-library/` (new crate body) are all part of the same logical change.
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11b onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

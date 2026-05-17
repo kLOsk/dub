@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Track library: SQLite + import adapters (Serato, Traktor, rekordbox, iTunes, Lexicon)."
+description = "Track library: SQLite + path-by-volume-UUID + import adapters (M11a onward)."
 
 [dependencies]
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# Temp dirs for fixture-driven tests of the migration runner /
+# fresh-DB workflow without polluting the developer's real library.
+tempfile = "3"
