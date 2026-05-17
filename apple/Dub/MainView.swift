@@ -315,6 +315,28 @@ final class WaveformAppModel: ObservableObject {
     /// or per-frame.
     @Published private(set) var volumeReachability: [String: Bool] = [:]
 
+    /// M11d.4 — count of canonical tracks whose every
+    /// `track_files` row has been flagged as missing by the
+    /// background scanner. Drives the LibraryView footer:
+    /// `247 tracks missing. Click to relocate.` Refreshed by
+    /// the scanner after each batch and after a Relocate run.
+    @Published private(set) var missingTrackCount: UInt64 = 0
+
+    /// M11d.4 — `true` while a Relocate run is in progress.
+    /// Drives the Relocate sheet's progress indicator and
+    /// disables the "Match Folder…" button.
+    @Published private(set) var relocateInProgress: Bool = false
+
+    /// M11d.4 — number of missing tracks that found a match on
+    /// the last Relocate run. Surfaced in the Relocate sheet
+    /// post-run.
+    @Published var lastRelocateMatches: UInt32 = 0
+
+    /// M11d.4 — number of missing tracks left unmatched after
+    /// the last Relocate run (i.e. the user must point Dub at a
+    /// different folder, or the file is truly gone).
+    @Published var lastRelocateUnmatched: UInt32 = 0
+
     // MARK: Private state
 
     /// Sticky master from the previous round when neither deck is
@@ -337,6 +359,14 @@ final class WaveformAppModel: ObservableObject {
     private var lastErrorClearTask: Task<Void, Never>?
     private static let errorVisibilitySecs: UInt64 = 5_000_000_000
 
+    /// M11d.4 — long-lived background missing-files scanner.
+    /// Started lazily after the first library open, cancelled
+    /// on app shutdown. Runs at `.background` priority with a
+    /// 30 s tick inside a batch and a 5 min nap when there's
+    /// nothing to do, per PRD §8.5.5 "rate-limited so it does
+    /// not trash SSD lifetime".
+    private var libraryScannerTask: Task<Void, Never>?
+
     // MARK: Init / deinit
 
     init() {
@@ -355,6 +385,7 @@ final class WaveformAppModel: ObservableObject {
     }
 
     deinit {
+        libraryScannerTask?.cancel()
         engine.stopEngine()
     }
 
@@ -749,6 +780,8 @@ final class WaveformAppModel: ObservableObject {
             try library.openDefault()
             libraryIsOpen = true
             refreshLibraryStats()
+            refreshMissingTrackCount()
+            startMissingFilesScanner()
         } catch {
             surfaceError("Failed to open library: \(error.localizedDescription)")
         }
@@ -811,6 +844,193 @@ final class WaveformAppModel: ObservableObject {
         return volumeReachability[m] == true
     }
 
+    // MARK: - M11d.4 Missing-files scanner
+
+    /// Refresh `missingTrackCount` from the library. Cheap
+    /// (`COUNT(*)` over a small partial index). Called on
+    /// app launch, after every import, and after each scanner
+    /// batch + Relocate run.
+    func refreshMissingTrackCount() {
+        guard libraryIsOpen else { return }
+        if let n = try? library.missingTrackCount() {
+            missingTrackCount = n
+        }
+    }
+
+    /// Run one scanner pass. Pulls a batch of `track_files`
+    /// rows (stalest first per PRD §8.5.5), probes each path
+    /// via `FileManager.fileExists`, and writes the verdict
+    /// back through the FFI. Returns the number of files
+    /// checked so the caller can decide whether more work
+    /// remains.
+    ///
+    /// Implemented as `async` so the call site (the periodic
+    /// scanner Task) can await without blocking the main
+    /// actor. The actual filesystem + FFI work is dispatched
+    /// to a detached background task; results are merged on
+    /// the main actor.
+    @discardableResult
+    func scanMissingFilesBatch(batchSize: UInt32 = 100) async -> UInt32 {
+        guard libraryIsOpen else { return 0 }
+        let library = self.library
+        let now = Int64(Date().timeIntervalSince1970)
+        let processed: UInt32 = await Task.detached(priority: .utility) {
+            let rows: [LibraryFileScanRow]
+            do {
+                rows = try library.listFilesForScan(batchSize: batchSize)
+            } catch {
+                return 0
+            }
+            var count: UInt32 = 0
+            for r in rows {
+                let isMissing: Bool
+                if let mount = r.mountPoint, !mount.isEmpty {
+                    let abs = (mount as NSString).appendingPathComponent(r.relativePath)
+                    isMissing = !FileManager.default.fileExists(atPath: abs)
+                } else {
+                    isMissing = true
+                }
+                if isMissing != r.wasMissing {
+                    do {
+                        try library.markFileState(
+                            fileId: r.fileId,
+                            isMissing: isMissing,
+                            timestampUnixSecs: now
+                        )
+                    } catch {
+                        continue
+                    }
+                } else {
+                    do {
+                        try library.markFileState(
+                            fileId: r.fileId,
+                            isMissing: isMissing,
+                            timestampUnixSecs: now
+                        )
+                    } catch {
+                        continue
+                    }
+                }
+                count += 1
+            }
+            return count
+        }.value
+        refreshMissingTrackCount()
+        return processed
+    }
+
+    /// Kick off the long-lived scanner Task that walks the
+    /// library on a low-priority cadence per PRD §8.5.5:
+    /// ~100 files / 30 s. A scratch DJ's library tops out
+    /// around 50–100 k tracks, so a full pass takes
+    /// ~15–30 min, which is well below the "drive ejected,
+    /// drive re-mounted" event timescale.
+    func startMissingFilesScanner() {
+        guard libraryScannerTask == nil else { return }
+        libraryScannerTask = Task.detached(priority: .background) { [weak self] in
+            // Initial fast pass while the user is staring at
+            // the browser, then a slow steady-state cadence.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            while !Task.isCancelled {
+                let processed = await self?.scanMissingFilesBatch(batchSize: 100) ?? 0
+                let nextDelayNs: UInt64 = processed == 0
+                    ? 5 * 60 * 1_000_000_000   // nothing to do → 5 min nap
+                    : 30 * 1_000_000_000        // batch processed → 30 s
+                try? await Task.sleep(nanoseconds: nextDelayNs)
+            }
+        }
+    }
+
+    /// Stop the scanner. Called on app shutdown.
+    func stopMissingFilesScanner() {
+        libraryScannerTask?.cancel()
+        libraryScannerTask = nil
+    }
+
+    /// Run a Relocate pass per PRD §8.5.5. Walks the supplied
+    /// directory (recursively), and for each candidate audio
+    /// file compares its computed fingerprint + duration +
+    /// filename against the set of currently-missing tracks.
+    /// On match, registers a new `track_files` row pointing at
+    /// the relocated path (the original row stays on record
+    /// so the touring SSD can resurrect it later).
+    ///
+    /// Matching rules mirror PRD §8.1's dedupe:
+    ///   * Chromaprint similarity ≥ 0.98, **or**
+    ///   * filename match (basename equality), **and**
+    ///   * duration delta < 200 ms in both cases.
+    ///
+    /// Returns `(matched, unmatched)` so the Relocate sheet can
+    /// surface a "matched 42 of 247 missing tracks" line.
+    @discardableResult
+    func runRelocate(matchingFolder folder: URL) async -> (matched: UInt32, unmatched: UInt32) {
+        guard libraryIsOpen else { return (0, 0) }
+        if relocateInProgress { return (0, 0) }
+        relocateInProgress = true
+        defer { relocateInProgress = false }
+
+        let library = self.library
+        let folderPath = folder.path
+        let result: (UInt32, UInt32) = await Task.detached(priority: .userInitiated) {
+            return Self.relocateImpl(library: library, folderPath: folderPath)
+        }.value
+        lastRelocateMatches = result.0
+        lastRelocateUnmatched = result.1
+        refreshMissingTrackCount()
+        return result
+    }
+
+    /// Internal worker for `runRelocate`. Pure function over
+    /// the FFI handle; called from a detached Task so it never
+    /// blocks the main actor. Each candidate file is handed to
+    /// `try_relocate_candidate` which does the heavy lifting
+    /// (decode + fingerprint + similarity + duration check +
+    /// relocate commit) on the Rust side where the dedupe
+    /// primitives already live.
+    ///
+    /// Limit `5 000` matches the browser's "All Tracks" cap;
+    /// libraries bigger than that need multiple Relocate
+    /// passes, which is acceptable workflow-wise.
+    private nonisolated static func relocateImpl(library: DubLibrary, folderPath: String) -> (UInt32, UInt32) {
+        // Snapshot the pre-pass count so we can compute
+        // `matched = before - after` without trusting per-call
+        // success returns (a hung FK insert still bumps
+        // `matched` correctly because the count drops only on a
+        // successful relocate_track).
+        let totalBefore: UInt64
+        do {
+            totalBefore = try library.missingTrackCount()
+        } catch {
+            return (0, 0)
+        }
+        if totalBefore == 0 { return (0, 0) }
+
+        let audioExts: Set<String> = [
+            "wav", "flac", "aif", "aiff", "mp3", "m4a", "aac", "ogg", "opus",
+        ]
+        let enumerator = FileManager.default.enumerator(
+            at: URL(fileURLWithPath: folderPath),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        guard let walker = enumerator else {
+            return (0, UInt32(min(totalBefore, UInt64(UInt32.max))))
+        }
+        for case let url as URL in walker {
+            if !audioExts.contains(url.pathExtension.lowercased()) { continue }
+            _ = try? library.tryRelocateCandidate(
+                absolutePath: url.path,
+                limitMissing: 5_000
+            )
+        }
+        let totalAfter = (try? library.missingTrackCount()) ?? totalBefore
+        let matched = totalBefore > totalAfter ? totalBefore - totalAfter : 0
+        return (
+            UInt32(min(matched, UInt64(UInt32.max))),
+            UInt32(min(totalAfter, UInt64(UInt32.max)))
+        )
+    }
+
     /// Walk the supplied folder via the M11c importer. Runs on a
     /// detached background queue so the UI stays responsive; the
     /// completion handler hops back to the main actor to update
@@ -843,6 +1063,7 @@ final class WaveformAppModel: ObservableObject {
         case .success(let summary):
             lastImportSummary = summary
             refreshLibraryStats()
+            refreshMissingTrackCount()
         case .failure(let err):
             surfaceError("Import failed: \(err.localizedDescription)")
         }

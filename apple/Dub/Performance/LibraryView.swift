@@ -176,6 +176,10 @@ struct LibraryView: View {
     /// `model.browserSelection` / `model.selectedLibraryTrackId`.
     @State private var selectedTrackId: LibraryTrack.ID? = nil
 
+    /// M11d.4 — `true` while the Relocate sheet is presented.
+    /// Bound to the missing-files footer button.
+    @State private var showRelocateSheet: Bool = false
+
     /// Listing fetch limit. Sized for the M11d.1/2 single-page
     /// model; real virtualization + paging lands at M11d.4.
     private static let listingLimit: UInt32 = 5_000
@@ -207,6 +211,9 @@ struct LibraryView: View {
         }
         .onChange(of: searchText) { _ in
             refreshTracks()
+        }
+        .sheet(isPresented: $showRelocateSheet) {
+            RelocateSheet(model: model, isPresented: $showRelocateSheet)
         }
     }
 
@@ -423,24 +430,7 @@ struct LibraryView: View {
             .width(36)
 
             TableColumn("Title", value: \.titleSortKey) { track in
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(displayTitle(track))
-                        .font(DubFont.body)
-                        .foregroundStyle(DubColor.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(displaySubtitle(track))
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .draggable(libraryDragURL(for: track) ?? URL(fileURLWithPath: "/dev/null")) {
-                    Text(displayTitle(track))
-                        .font(DubFont.body)
-                        .padding(4)
-                        .background(DubColor.surface2)
-                }
+                titleCell(for: track)
             }
             .width(min: 180, ideal: 280)
 
@@ -584,18 +574,64 @@ struct LibraryView: View {
     }
 
     /// Resolve a track's drag URL synchronously. Returns `nil`
-    /// when the source volume is unmounted; the Table column's
-    /// `draggable` modifier falls back to a no-op URL in that
-    /// case so the drag still starts but the drop target rejects
-    /// it cleanly. The previous M10.5b AppKit drag path
-    /// (`onDrag { NSItemProvider }`) only existed because
-    /// SwiftUI's `.draggable` rendered an animation we didn't
-    /// want; SwiftUI Table's row drag respects the cursor
-    /// anchor, so the modern API is fine here.
+    /// when the source volume is unmounted or the canonical row
+    /// no longer resolves to an on-disk path. The Title column
+    /// uses this to decide whether to install `.draggable` at
+    /// all: unreachable rows are non-draggable rather than
+    /// dragging a sentinel that the deck loader would only
+    /// reject after a decode failure. Pre-fix this returned a
+    /// `/dev/null` fallback for the modifier, which violated the
+    /// "drop target rejects cleanly" contract because
+    /// `/dev/null` is a real filesystem path that hands the
+    /// audio decoder a zero-byte stream — the deck would flash
+    /// a decoder error mid-load instead of silently doing
+    /// nothing. The visible row already carries the missing-
+    /// file glyph (see `rowIndicators`) and the Space-load path
+    /// in `selectLibraryTrack` already refuses unreachable
+    /// tracks, so disabling drag here is consistent with the
+    /// rest of the unreachable-row affordances. The previous
+    /// M10.5b AppKit drag path (`onDrag { NSItemProvider }`)
+    /// only existed because SwiftUI's `.draggable` rendered an
+    /// animation we didn't want; SwiftUI Table's row drag
+    /// respects the cursor anchor, so the modern API is fine
+    /// here.
     private func libraryDragURL(for track: LibraryTrack) -> URL? {
         guard let path = (try? model.library.trackPath(trackId: track.id)) ?? nil
         else { return nil }
         return URL(fileURLWithPath: path)
+    }
+
+    /// Title-column cell. Conditionally installs `.draggable`
+    /// so unreachable tracks (`libraryDragURL` → `nil`) simply
+    /// don't participate in drag-and-drop. The shared title /
+    /// subtitle layout is the same on both branches; only the
+    /// drag affordance differs. Extracted from the inline
+    /// column body so the conditional doesn't fight the column
+    /// builder's type inference.
+    @ViewBuilder
+    private func titleCell(for track: LibraryTrack) -> some View {
+        let body = VStack(alignment: .leading, spacing: 1) {
+            Text(displayTitle(track))
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(displaySubtitle(track))
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        if let dragURL = libraryDragURL(for: track) {
+            body.draggable(dragURL) {
+                Text(displayTitle(track))
+                    .font(DubFont.body)
+                    .padding(4)
+                    .background(DubColor.surface2)
+            }
+        } else {
+            body
+        }
     }
 
     private var footer: some View {
@@ -609,6 +645,20 @@ struct LibraryView: View {
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textSecondary)
             }
+            if model.missingTrackCount > 0 {
+                Button(action: { showRelocateSheet = true }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red.opacity(0.85))
+                        Text(missingFooterLine(model.missingTrackCount))
+                            .underline()
+                    }
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("Open the Relocate panel to point Dub at the directory that holds the missing files.")
+            }
             Spacer(minLength: 0)
             Text("\(tracks.count) shown · \(model.libraryTrackCount) total")
                 .font(DubFont.micro)
@@ -617,6 +667,11 @@ struct LibraryView: View {
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.xs)
         .background(DubColor.surface1)
+    }
+
+    private func missingFooterLine(_ n: UInt64) -> String {
+        let label = n == 1 ? "track missing" : "tracks missing"
+        return "\(n) \(label) · Click to relocate"
     }
 
     // MARK: - Helpers
@@ -773,6 +828,121 @@ struct LibraryView: View {
             Task { @MainActor in
                 await model.importLibraryFolder(url)
             }
+        }
+    }
+}
+
+// MARK: - Relocate sheet
+
+/// Modal sheet driving the M11d.4 Relocate workflow per PRD §8.5.5.
+///
+/// The user points Dub at a directory; the sheet walks the directory
+/// via the FFI's `try_relocate_candidate`, which decodes each
+/// candidate file, computes its Chromaprint fingerprint, and commits
+/// a fresh `track_files` row for every missing track that matches
+/// the candidate's `(fingerprint similarity ≥ 0.98, |duration| < 200 ms)`
+/// pair. The original (missing) `track_files` row is left intact —
+/// PRD §8.5.5 mandates that metadata is never deleted when a file
+/// goes missing, so when the touring SSD comes back online the
+/// previous path resurrects on its own.
+private struct RelocateSheet: View {
+    @ObservedObject var model: WaveformAppModel
+    @Binding var isPresented: Bool
+    @State private var lastRunSummary: (matched: UInt32, unmatched: UInt32)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.lg) {
+            HStack(spacing: DubSpacing.sm) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red.opacity(0.85))
+                Text("Relocate Missing Files")
+                    .font(DubFont.title)
+            }
+            Text(headline)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let summary = lastRunSummary {
+                summaryView(summary)
+            }
+
+            if model.relocateInProgress {
+                HStack(spacing: DubSpacing.sm) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Scanning candidate folder…")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                }
+            }
+
+            HStack {
+                Button("Close") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(action: presentMatchFolderPicker) {
+                    Text("Match Folder…")
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.relocateInProgress || model.missingTrackCount == 0)
+            }
+        }
+        .padding(DubSpacing.xl)
+        .frame(minWidth: 460, idealWidth: 520, maxWidth: 640)
+        .background(DubColor.surface0)
+    }
+
+    private var headline: String {
+        if model.missingTrackCount == 0 {
+            return "All known files are reachable. Nothing to relocate right now."
+        }
+        let n = model.missingTrackCount
+        let label = n == 1 ? "track is" : "tracks are"
+        return "\(n) \(label) currently flagged as missing. Pick a folder Dub should search — files matching by fingerprint and duration will be reattached without disturbing the original library entries."
+    }
+
+    @ViewBuilder
+    private func summaryView(_ summary: (matched: UInt32, unmatched: UInt32)) -> some View {
+        if summary.matched == 0 && summary.unmatched == 0 {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: summary.matched > 0
+                          ? "checkmark.circle.fill"
+                          : "info.circle")
+                        .foregroundStyle(summary.matched > 0 ? Color.green : DubColor.textSecondary)
+                    Text(
+                        summary.matched > 0
+                            ? "Relocated \(summary.matched) of \(summary.matched + summary.unmatched) missing tracks."
+                            : "No matches in the supplied folder."
+                    )
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textPrimary)
+                }
+                if summary.unmatched > 0 {
+                    Text("\(summary.unmatched) still missing. Try another folder or re-import.")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .padding(.leading, 20)
+                }
+            }
+            .padding(.vertical, DubSpacing.xs)
+        }
+    }
+
+    private func presentMatchFolderPicker() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Match"
+        panel.message = "Choose the folder that now holds the relocated files."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { @MainActor in
+            let result = await model.runRelocate(matchingFolder: url)
+            lastRunSummary = result
         }
     }
 }

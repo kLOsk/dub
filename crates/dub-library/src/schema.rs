@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -53,10 +53,16 @@ struct Migration {
 
 /// All migrations in version order. Empty on a freshly created DB
 /// means no work; `SCHEMA_VERSION` is the target.
-static MIGRATIONS: &[Migration] = &[Migration {
-    target_version: 1,
-    sql: V1_SCHEMA,
-}];
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        target_version: 1,
+        sql: V1_SCHEMA,
+    },
+    Migration {
+        target_version: 2,
+        sql: V2_MIGRATION,
+    },
+];
 
 /// Open + migrate the library schema on the given connection. Idempotent.
 ///
@@ -425,6 +431,31 @@ AFTER UPDATE ON track_metadata_source BEGIN
         source  = new.source
     WHERE track_metadata_source_id = old.id;
 END;
+"#;
+
+/// Schema v2 migration — M11d.4 missing-file tracking (PRD §8.5.5).
+///
+/// Adds `track_files.is_missing` so the background scanner can flag
+/// individual file rows without dropping them (PRD §8.5.5: "Metadata
+/// is never deleted when a file goes missing"). Also stamps
+/// `last_checked_at` so the rate-limiter knows when each row was
+/// last probed, and a partial index for the "list missing files"
+/// query pattern.
+///
+/// `last_checked_at` is nullable on purpose — rows imported under v1
+/// schema have never been checked, and surfacing that as
+/// "unknown / due for next scan" is more honest than back-stamping
+/// the import time.
+const V2_MIGRATION: &str = r#"
+ALTER TABLE track_files ADD COLUMN is_missing INTEGER NOT NULL DEFAULT 0
+    CHECK (is_missing IN (0, 1));
+ALTER TABLE track_files ADD COLUMN last_checked_at INTEGER;
+
+CREATE INDEX IF NOT EXISTS idx_track_files_missing
+    ON track_files(is_missing) WHERE is_missing = 1;
+
+CREATE INDEX IF NOT EXISTS idx_track_files_last_checked
+    ON track_files(last_checked_at);
 "#;
 
 #[cfg(test)]

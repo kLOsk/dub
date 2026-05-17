@@ -661,6 +661,7 @@ dependencies = [
  "dub-audio",
  "dub-bpm",
  "dub-engine",
+ "dub-fingerprint",
  "dub-io",
  "dub-library",
  "dub-peaks",

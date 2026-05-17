@@ -44,6 +44,56 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
     })
 }
 
+/// One row returned by [`Library::list_files_for_scan`] for the
+/// M11d.4 background missing-files scanner. The scanner reads the
+/// rows, calls `access()` per absolute path, and feeds the result
+/// back into [`Library::mark_file_state`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileScanRow {
+    /// Primary key of the `track_files` row. Re-used by
+    /// `mark_file_state` to address the same row without
+    /// re-resolving by `(volume_uuid, relative_path)`.
+    pub file_id: i64,
+    /// Canonical track this file belongs to.
+    pub track_id: String,
+    /// Volume the file lives on.
+    pub volume_uuid: String,
+    /// Volume-relative path.
+    pub relative_path: String,
+    /// Current `is_missing` flag. The scanner uses this to skip
+    /// no-op writes when the verdict hasn't changed.
+    pub was_missing: bool,
+    /// `volumes.last_known_mount_point` joined-in for caller
+    /// convenience. `None` means the volume itself is offline,
+    /// in which case the scanner treats the row as missing
+    /// without paying a `stat()` syscall.
+    pub mount_point: Option<String>,
+}
+
+/// One row returned by [`Library::list_missing_tracks`] for the
+/// M11d.4 Relocate panel. Carries the identity signals the matcher
+/// uses to confirm a candidate file on the user-supplied directory
+/// matches one of the missing tracks: fingerprint, duration, and
+/// the original filename.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingTrack {
+    /// Canonical track UUID.
+    pub track_id: String,
+    /// `fingerprints.id` for [`Library::load_fingerprint`].
+    pub fingerprint_id: i64,
+    /// Original track duration in milliseconds. Matcher uses
+    /// `|cand.duration - track.duration| < 200 ms` (mirrors
+    /// PRD §8.1 dedupe threshold).
+    pub duration_ms: u32,
+    /// The relative path the track was last seen at, if any.
+    /// Useful UX context for the Relocate panel.
+    pub last_relative_path: Option<String>,
+    /// Just the basename of `last_relative_path` for filename
+    /// matching. Cached at SELECT-time so the Apple side doesn't
+    /// parse paths twice.
+    pub last_filename: Option<String>,
+}
+
 /// One row in the M11d browser's track list. The PRD §8.1
 /// priority chain ("filename source preferred over id3 source for
 /// title/artist; id3 preferred for everything else") is baked in at
@@ -680,6 +730,196 @@ impl Library {
         Ok(())
     }
 
+    // === M11d.4 missing-files scanner =====================================
+
+    /// List `track_files` rows for the background scanner per
+    /// PRD §8.5.5. Returns a batch ordered by "stalest first" —
+    /// `last_checked_at ASC NULLS FIRST` so rows that were never
+    /// checked (just imported) get the earliest priority. The
+    /// Apple shell calls this with a small `batch_size` (typically
+    /// 100) on a low-priority interval, then for each result
+    /// runs `access(absolute_path)` and calls `mark_file_state`.
+    /// Rate-limiting is the caller's responsibility — the SQL is
+    /// stateless w.r.t. how often you ask.
+    pub fn list_files_for_scan(&self, batch_size: u32) -> Result<Vec<FileScanRow>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT tf.id, tf.track_id, tf.volume_uuid, tf.relative_path, \
+                        tf.is_missing, v.last_known_mount_point \
+                 FROM track_files tf \
+                 LEFT JOIN volumes v ON v.volume_uuid = tf.volume_uuid \
+                 ORDER BY tf.last_checked_at IS NOT NULL, tf.last_checked_at ASC \
+                 LIMIT ?1",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_list_files_for_scan", e))?;
+        let rows = stmt
+            .query_map(params![batch_size as i64], |r| {
+                let id: i64 = r.get(0)?;
+                let was_missing: i64 = r.get(4)?;
+                Ok(FileScanRow {
+                    file_id: id,
+                    track_id: r.get(1)?,
+                    volume_uuid: r.get(2)?,
+                    relative_path: r.get(3)?,
+                    was_missing: was_missing != 0,
+                    mount_point: r.get(5)?,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("query_list_files_for_scan", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| LibraryError::sqlite("collect_list_files_for_scan", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Stamp a `track_files` row with the scanner's verdict.
+    /// `is_missing = true` when `access()` failed; `false` when
+    /// the file is present. `last_checked_at` is always updated
+    /// to the supplied unix-seconds value so the rate-limiter
+    /// can skip recently-checked rows.
+    pub fn mark_file_state(
+        &self,
+        file_id: i64,
+        is_missing: bool,
+        last_checked_at: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE track_files \
+                 SET is_missing = ?1, last_checked_at = ?2 \
+                 WHERE id = ?3",
+                params![if is_missing { 1 } else { 0 }, last_checked_at, file_id],
+            )
+            .map_err(|e| LibraryError::sqlite("mark_file_state", e))?;
+        Ok(())
+    }
+
+    /// Count of tracks the browser should flag as missing —
+    /// canonical tracks where *every* `track_files` row is
+    /// `is_missing = 1` (or the track has no files at all). A
+    /// track with one missing and one healthy file is *not*
+    /// missing because the user can still reach it through the
+    /// healthy path. Drives the M11d browser footer per §8.5.5.
+    pub fn missing_track_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks t \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM track_files tf \
+                    WHERE tf.track_id = t.id AND tf.is_missing = 0 \
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("missing_track_count", e))?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// List missing canonical tracks for the M11d.4 Relocate
+    /// panel. Returns up to `limit` rows, each carrying enough
+    /// signal for the matcher: original filename (last path
+    /// component of the most-recent `track_files.relative_path`),
+    /// duration in milliseconds, and `fingerprint_id` so the
+    /// matcher can pull the stored Chromaprint blob via
+    /// [`Library::load_fingerprint`] without re-decoding.
+    pub fn list_missing_tracks(&self, limit: u32) -> Result<Vec<MissingTrack>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT t.id, t.fingerprint_id, t.duration_ms, \
+                        ( \
+                            SELECT tf.relative_path FROM track_files tf \
+                            WHERE tf.track_id = t.id \
+                            ORDER BY tf.last_seen_at DESC, tf.id DESC LIMIT 1 \
+                        ) AS last_relative_path \
+                 FROM tracks t \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM track_files tf \
+                    WHERE tf.track_id = t.id AND tf.is_missing = 0 \
+                 ) \
+                 ORDER BY t.created_at ASC LIMIT ?1",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_list_missing_tracks", e))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let dur: i64 = r.get(2)?;
+                let path: Option<String> = r.get(3)?;
+                let filename = path.as_deref().and_then(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .map(str::to_string)
+                });
+                Ok(MissingTrack {
+                    track_id: r.get(0)?,
+                    fingerprint_id: r.get(1)?,
+                    duration_ms: dur.max(0) as u32,
+                    last_relative_path: path,
+                    last_filename: filename,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("query_list_missing_tracks", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| LibraryError::sqlite("collect_list_missing_tracks", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Register a new on-disk location for an existing canonical
+    /// track, used by the M11d.4 Relocate panel after the matcher
+    /// has confirmed the file's identity. Inserts a fresh
+    /// `track_files` row (rather than mutating an existing one)
+    /// so the original location stays on record — when the
+    /// touring SSD comes back online, the previous file row is
+    /// already there, the scanner flips it back to
+    /// `is_missing = 0`, and the user has both locations
+    /// available. PRD §8.5.5: "Metadata is never deleted when a
+    /// file goes missing."
+    #[allow(clippy::too_many_arguments)]
+    pub fn relocate_track(
+        &self,
+        track_id: &str,
+        volume_uuid: &str,
+        relative_path: &str,
+        codec: Option<&str>,
+        sample_rate: Option<u32>,
+        channel_count: Option<u32>,
+        file_size: Option<u64>,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        // upsert_track_file already handles the
+        // (volume_uuid, relative_path) UNIQUE conflict by
+        // refreshing the existing row; relocate uses the same
+        // path so a re-relocate to a path Dub already knew about
+        // becomes a no-op refresh. last_checked_at is stamped to
+        // "now" + is_missing reset to 0 so the row leaves
+        // "missing" status immediately.
+        self.upsert_track_file(
+            track_id,
+            volume_uuid,
+            relative_path,
+            codec,
+            sample_rate,
+            None,
+            channel_count,
+            file_size,
+            mtime,
+        )?;
+        self.conn
+            .execute(
+                "UPDATE track_files \
+                 SET is_missing = 0, last_checked_at = strftime('%s','now') \
+                 WHERE track_id = ?1 AND volume_uuid = ?2 AND relative_path = ?3",
+                params![track_id, volume_uuid, relative_path],
+            )
+            .map_err(|e| LibraryError::sqlite("relocate_track_clear_missing", e))?;
+        Ok(())
+    }
+
     /// Total canonical-track count. Backs the M11d browser footer
     /// and the §8.5 source-tree "All Tracks" badge.
     pub fn track_count(&self) -> Result<u64> {
@@ -1269,6 +1509,114 @@ mod tests {
         // No play_history rows seeded → empty result, *not* a fallback
         // to all-tracks. Keeps the smart-crate semantics honest.
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_files_for_scan_returns_unchecked_first() {
+        // PRD §8.5.5: the scanner prioritises rows that have
+        // never been checked. Two seeded tracks → two file rows
+        // → first batch returns both with `was_missing = false`
+        // and `last_checked_at = NULL`-ordered first.
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B"]);
+        let rows = lib.list_files_for_scan(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert!(!r.was_missing);
+            assert!(ids.contains(&r.track_id));
+            assert_eq!(r.mount_point.as_deref(), Some("/"));
+        }
+    }
+
+    #[test]
+    fn mark_file_state_flips_is_missing_and_stamps_checked_at() {
+        let lib = Library::open_in_memory().unwrap();
+        let _ids = seed_tracks(&lib, &["A"]);
+        let row = lib.list_files_for_scan(1).unwrap().pop().unwrap();
+        assert!(!row.was_missing);
+        lib.mark_file_state(row.file_id, true, 1_700_000_000)
+            .unwrap();
+        // Re-list: same row should now have was_missing=true and
+        // sort *last* because it's been checked once.
+        let next = lib.list_files_for_scan(1).unwrap().pop().unwrap();
+        assert!(next.was_missing);
+        assert_eq!(next.file_id, row.file_id);
+    }
+
+    #[test]
+    fn missing_track_count_only_counts_fully_unreachable_tracks() {
+        // Two tracks; one gets a second healthy file row before
+        // its first is marked missing, the other only ever had
+        // one file row.
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["StillReachable", "Lost"]);
+        // Second healthy file for the first track.
+        lib.upsert_track_file(
+            &ids[0],
+            "11111111-1111-1111-1111-111111111111",
+            "test/StillReachable-copy.wav",
+            Some("wav"),
+            Some(44_100),
+            None,
+            Some(1),
+            Some(123_456),
+            Some(1_700_000_000),
+        )
+        .unwrap();
+        // Mark every file of the first track *except* the new one
+        // missing; mark the only file of the second track missing.
+        let all = lib.list_files_for_scan(10).unwrap();
+        for r in all {
+            if r.relative_path != "test/StillReachable-copy.wav" {
+                lib.mark_file_state(r.file_id, true, 1_700_000_001).unwrap();
+            }
+        }
+        // The first track has at least one healthy file → not
+        // missing. The second has zero → missing.
+        let n = lib.missing_track_count().unwrap();
+        assert_eq!(n, 1);
+        let rows = lib.list_missing_tracks(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].track_id, ids[1]);
+        // Filename derived from the most-recent relative_path.
+        assert_eq!(rows[0].last_filename.as_deref(), Some("Lost.wav"));
+    }
+
+    #[test]
+    fn relocate_track_inserts_new_path_and_clears_missing_state() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Workinonit"]);
+        // Mark the original file missing.
+        let orig = lib.list_files_for_scan(1).unwrap().pop().unwrap();
+        lib.mark_file_state(orig.file_id, true, 1_700_000_000)
+            .unwrap();
+        assert_eq!(lib.missing_track_count().unwrap(), 1);
+
+        // Relocate to a new path. PRD §8.5.5: the original row
+        // stays on record (no deletion); a new track_files row
+        // appears and the track count drops back to 0 missing.
+        lib.relocate_track(
+            &ids[0],
+            "11111111-1111-1111-1111-111111111111",
+            "relocated/Workinonit.wav",
+            Some("wav"),
+            Some(44_100),
+            Some(1),
+            Some(234_567),
+            Some(1_700_000_100),
+        )
+        .unwrap();
+        assert_eq!(lib.missing_track_count().unwrap(), 0);
+        // Both file rows still exist (original + relocated).
+        let count: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM track_files WHERE track_id = ?1",
+                params![ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

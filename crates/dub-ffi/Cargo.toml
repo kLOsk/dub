@@ -41,6 +41,7 @@ dub-bpm = { workspace = true }
 dub-io = { workspace = true }
 dub-peaks = { workspace = true }
 dub-library = { workspace = true }
+dub-fingerprint = { workspace = true }
 uniffi = { workspace = true }
 thiserror = { workspace = true }
 

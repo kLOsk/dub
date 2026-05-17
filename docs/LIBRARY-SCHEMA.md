@@ -32,9 +32,18 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**. Any change to the table set, column
-set, indexes, FTS5 definition, or trigger logic requires a version
-bump and a migration step.
+v1.0 baseline is **version 1**; **version 2** ships with M11d.4 and
+adds the missing-files columns + indexes on `track_files` documented
+inline in the [`track_files`](#track_files--files-on-disk) section.
+Any change to the table set, column set, indexes, FTS5 definition,
+or trigger logic requires a version bump and a migration step.
+
+### Version history
+
+| Version | Milestone | Change |
+| --- | --- | --- |
+| 1       | M11a   | Initial schema. |
+| 2       | M11d.4 | `track_files.is_missing INTEGER NOT NULL DEFAULT 0` + `track_files.last_checked_at INTEGER` + partial index `idx_track_files_missing` + index `idx_track_files_last_checked`. Backs PRD §8.5.5 missing-files scanner + Relocate panel. Additive only — third-party readers that ignore the new columns keep working. |
 
 ### Backward compatibility contract
 
@@ -47,9 +56,11 @@ bump and a migration step.
   retain their old column under an `_legacy` suffix for at least one
   full minor-version cycle.
 * **Forward compatibility is not guaranteed.** A database touched by
-  a newer Dub may have a `schema_version > 1`; an older Dub that
-  opens it must refuse to write but may read the tables it understands.
-  v1.0 ships a strict `schema_version == 1` write guard.
+  a newer Dub may have a `schema_version > SCHEMA_VERSION`; an older
+  Dub that opens it must refuse to write but may read the tables it
+  understands. Dub currently ships a strict
+  `schema_version <= SCHEMA_VERSION` write guard
+  (`LibraryError::SchemaTooNew`).
 
 ### Migration runner
 
@@ -238,10 +249,32 @@ CREATE TABLE IF NOT EXISTS track_files (
     file_size       INTEGER,
     mtime           INTEGER,
     last_seen_at    INTEGER NOT NULL,
+    -- M11d.4 / schema v2 — set by the background scanner (PRD §8.5.5).
+    -- 1 = `access()` confirmed the file is gone (or the parent volume
+    -- is offline). 0 = file resolves cleanly on the current mount
+    -- point. Reset to 0 by `relocate_track` on a successful re-attach.
+    is_missing      INTEGER NOT NULL DEFAULT 0
+                    CHECK (is_missing IN (0, 1)),
+    -- M11d.4 / schema v2 — wall-clock (unix-seconds) of the most
+    -- recent scanner probe. NULL means "never probed" — scanner
+    -- prioritises those rows first via the
+    -- `idx_track_files_last_checked` index below.
+    last_checked_at INTEGER,
     UNIQUE (volume_uuid, relative_path)
 );
 CREATE INDEX IF NOT EXISTS idx_track_files_track  ON track_files(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_files_volume ON track_files(volume_uuid);
+-- M11d.4 / schema v2 — partial index over rows the missing-files
+-- footer query reads (`COUNT(*)` over track_files where every row
+-- has is_missing = 1). Storing only `is_missing = 1` rows keeps the
+-- index size bounded by the *missing* set, not the library.
+CREATE INDEX IF NOT EXISTS idx_track_files_missing
+    ON track_files(is_missing) WHERE is_missing = 1;
+-- M11d.4 / schema v2 — backs the scanner's `ORDER BY
+-- last_checked_at IS NOT NULL, last_checked_at ASC` predicate. NULL
+-- rows sort first (never probed), then stamped rows ascending.
+CREATE INDEX IF NOT EXISTS idx_track_files_last_checked
+    ON track_files(last_checked_at);
 ```
 
 One canonical track can have many `track_files` (different encodings,
@@ -252,6 +285,18 @@ resolution order on load (per PRD §8.2):
 2. Last-known mount point (volumes table) + relative path.
 3. Basename + fingerprint search across known volumes.
 4. Prompt the user.
+
+**Missing-file lifecycle** (PRD §8.5.5, M11d.4): the background scanner
+batches `track_files` rows ordered "stalest first" (`last_checked_at IS
+NOT NULL, last_checked_at ASC`), probes each absolute path via the
+platform `fileExists` primitive, and writes the verdict back through
+`mark_file_state`. A track is reported as missing in the browser
+footer iff *every* `track_files` row for it has `is_missing = 1` — a
+track with one missing and one healthy file is still reachable. The
+Relocate panel calls `relocate_track`, which inserts a *fresh*
+`track_files` row at the user-supplied path (never deletes the
+original) so the touring SSD coming back online resurrects the
+previous path on the next scanner pass.
 
 ### `track_metadata_source` — per-source verbatim opinion
 

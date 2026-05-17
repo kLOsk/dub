@@ -70,7 +70,7 @@ use crate::dedupe::{decide, DedupeDecision, DedupeInput, DURATION_DELTA_MS};
 use crate::error::{LibraryError, Result};
 use crate::filename_parser::{self, ParsedFilename};
 use crate::version_tokens::VersionToken;
-use crate::volumes::{discover_for_path, DiscoveredVolume};
+use crate::volumes::discover_for_path;
 use dub_fingerprint::Fingerprint;
 
 /// File extensions the importer recognises as audio. Lowercase; the
@@ -194,7 +194,8 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
     // UUID shouldn't prevent the rest of the import from running.
     let volume = discover_for_path(path).map_err(|e| format!("volume UUID unavailable: {e}"))?;
     library.upsert_volume(&volume).map_err(|e| e.to_string())?;
-    let relative_path = relative_to_volume(&volume, path)
+    let relative_path = volume
+        .relative_to(path)
         .ok_or_else(|| format!("path {path:?} is not under volume {:?}", volume.mount_point))?;
 
     // Idempotent re-import shortcut: if we've seen this exact
@@ -577,15 +578,6 @@ fn detect_codec_from_extension(path: &Path) -> Option<&'static str> {
         "aac" => Some("aac"),
         _ => None,
     }
-}
-
-/// Compute the path relative to the volume's mount point, with
-/// any leading `/` stripped. Returns `None` if the path is not
-/// under the volume (which the caller treats as a registration
-/// failure).
-fn relative_to_volume(volume: &DiscoveredVolume, path: &Path) -> Option<String> {
-    let stripped = path.strip_prefix(&volume.mount_point).ok()?;
-    Some(stripped.to_string_lossy().to_string())
 }
 
 /// Compose the title-or-filename string the dedupe parser scans

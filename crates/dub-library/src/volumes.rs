@@ -40,6 +40,19 @@ pub struct DiscoveredVolume {
     pub is_internal: bool,
 }
 
+impl DiscoveredVolume {
+    /// Compute the path relative to this volume's mount point.
+    /// Returns `None` if `path` is not under `mount_point`, which
+    /// the caller (importer / FFI relocate path) treats as a
+    /// registration failure. Used by both the importer and the
+    /// M11d.4 Relocate panel to derive the `relative_path` column
+    /// from a user-supplied absolute path.
+    pub fn relative_to(&self, path: &Path) -> Option<String> {
+        let stripped = path.strip_prefix(&self.mount_point).ok()?;
+        Some(stripped.to_string_lossy().to_string())
+    }
+}
+
 /// Discover the volume containing the given path. Returns a
 /// `DiscoveredVolume` describing the volume's UUID and current
 /// mount-point.

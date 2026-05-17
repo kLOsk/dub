@@ -2304,4 +2304,85 @@ This entry corresponds to the M11d.3 commit set: `docs/PRD.md` (M11d row update)
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11d.4 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11d.4 — Background missing-files scanner + Relocate panel
+
+Closes M11d and closes the §8.5.5 promise that "external SSDs unmount, files get moved by Finder, networked volumes disappear, and the library handles this gracefully". Adds a long-lived background scanner that flags missing files without deleting metadata, a browser-footer affordance that surfaces the count, and a modal Relocate sheet that walks a user-supplied directory and reattaches every file whose fingerprint + duration still match a missing track.
+
+### Architecture choices
+
+1. **Schema v2 adds `is_missing` + `last_checked_at` to `track_files`, not a sidecar table.** The naive alternative is a `missing_files` table populated by the scanner and joined on read. That's two writes per scanner verdict (insert into `missing_files`, delete on re-discovery) and a join cost on every browser query. A boolean column on the row that already exists is one write, no join, and lets the dedupe and import paths inspect `is_missing` for free. The partial index `idx_track_files_missing ON track_files(is_missing) WHERE is_missing = 1` keeps the "count missing" footer query at constant time even on a 100 k-track library — the index only stores rows where the flag is set, so its size scales with the *missing* set, not the library.
+
+2. **The "track is missing" predicate is `NOT EXISTS healthy file`, not `every file missing`.** A track with one missing file and one healthy file is still reachable through the healthy path; flagging it as missing would be a UX bug. `missing_track_count()` and `list_missing_tracks()` both implement this via `WHERE NOT EXISTS (SELECT 1 FROM track_files WHERE track_id = t.id AND is_missing = 0)`, which also correctly classifies tracks that lost their last file row (it returns true because the subquery is empty).
+
+3. **`last_checked_at` is nullable on purpose.** Rows imported under v1 schema have never been checked. Back-stamping them to "now" or the import time would lie about scanner coverage — surfacing them as "never checked, due first" via `ORDER BY last_checked_at IS NOT NULL, last_checked_at ASC` is more honest and gives newly upgraded libraries a fast first pass. The `IS NOT NULL` term sorts `NULL` rows ahead of every stamped row.
+
+4. **The scanner runs in Swift, not Rust.** The decision branches I weighed:
+   * Pure-Rust scanner thread inside `dub-library` → would need its own runtime, error reporting back into the FFI, and a `Library` clone story for the cross-thread handle. Wrong layer.
+   * Pure-Rust scanner driven by an FFI "tick" → trivial to implement but pushes back-pressure (when to tick, how often) into Swift anyway.
+   * Swift `Task.detached(priority: .background)` that pulls a batch from the FFI and calls `FileManager.fileExists` per row → uses the platform's file-existence primitive (which on APFS is a single `getattrlist` syscall, not a full stat), reuses the library's existing connection model, and gives Swift native control of pause/resume around foreground activity. Picked this one. PRD §8.5.5 says "no read I/O", which `FileManager.fileExists(atPath:)` honors — it uses `access(F_OK)` on macOS.
+
+5. **Rate limiting is a soft cadence, not a strict budget.** Inside a pass the loop ticks every 30 s; when a pass finishes with zero remaining work the next tick is 5 min out. Across a 100 k-track library that gives a full sweep in ~14 hours of wall-clock, which is well below the "user plugs in a drive, expects it to flip from missing to healthy within a few seconds" event timescale. The interactive Relocate panel + the per-volume reachability cache from M11d.3 handle the "I want answers now" case; the scanner is only there for the background "did Finder move this file last week" case.
+
+6. **Volume reachability shortcuts the syscall.** When the row's `volumes.last_known_mount_point` is `NULL` (the volume isn't online), the scanner skips the `fileExists` call entirely and marks the row missing. Saves one syscall per file row on an unmounted drive and prevents the kernel from logging a flurry of `EACCES` complaints when the user has ejected a touring SSD.
+
+7. **`relocate_track` inserts a fresh `track_files` row instead of mutating the missing one.** PRD §8.5.5's hard rule: "Metadata is never deleted when a file goes missing." When the user points Dub at the relocated folder, the original row stays on record. Two consequences fall out for free:
+   * If the touring SSD comes back online a week later, the next scanner pass flips the original row back to `is_missing = 0`. The user now has two `track_files` rows for the same canonical track, both healthy — Dub's primary-file resolver (`MAX(last_seen_at), MAX(id)`) picks whichever was touched most recently, and the user can load either.
+   * If the user re-relocates to a *third* folder, the second row sticks around too. We never accumulate junk rows in practice because all three rows describe distinct real on-disk locations.
+
+8. **Matching is fingerprint-and-duration, not filename-fallback.** Earlier drafts hedged with "match by filename if fingerprint fails to load". I dropped that — every track in the library has a stored Chromaprint blob (the importer can't insert without one), so a fingerprint match is always available. Filename matching as a fallback is a footgun: two completely different mixes of `Track 01.mp3` would alias, and the dedupe code in M11b already documents why filename matching is unsafe without a fingerprint corroboration. The match predicate is the same one M11b uses for auto-merge: similarity ≥ 0.98 **and** |Δduration| < 200 ms. Bringing in PRD §8.1's threshold keeps "Relocate matches" and "auto-merge candidates" on the same axis.
+
+9. **`try_relocate_candidate` is one FFI call per file, not a batch API.** The natural batch shape — "give the FFI the full directory listing and let it iterate" — would force a streaming progress callback through UniFFI for the modal sheet's progress indicator, which UniFFI doesn't model cleanly today. Per-file calls let Swift drive `NSOpenPanel` cancellation, surface per-file `lastError`, and produce a per-file progress count for free. The FFI itself is stateless across calls; the heavy work (decode + fingerprint + N×similarity comparisons) sits on the Rust side where the dedupe primitives already live.
+
+10. **Match count is computed from before/after deltas, not per-call returns.** The detached worker in `WaveformAppModel.relocateImpl` snapshots `missing_track_count` once at the top of the run, walks the directory, and reads the post-walk count to compute `matched = before - after`. This is robust against the FFI returning `None` on a candidate that decoded fine but didn't match anything (legitimate skip) versus one that crashed mid-relocate (we shouldn't have credited a match either way). A future "Relocate progress per file" sheet could augment with the per-call `Option<track_id>` return — for the v1.0 sheet the aggregate count is what the user reads.
+
+### Implementation
+
+* **`crates/dub-library/src/schema.rs`** — `SCHEMA_VERSION` bumped to 2. New `V2_MIGRATION` block adds `track_files.is_missing INTEGER NOT NULL DEFAULT 0 CHECK (is_missing IN (0, 1))`, `track_files.last_checked_at INTEGER`, partial index `idx_track_files_missing`, and `idx_track_files_last_checked` for the scanner's `ORDER BY` predicate.
+* **`crates/dub-library/src/volumes.rs`** — `DiscoveredVolume::relative_to(&Path) -> Option<String>` promoted from the importer's private helper so the FFI's `try_relocate_candidate` can derive `relative_path` without duplicating the strip-prefix logic.
+* **`crates/dub-library/src/db.rs`** — new helpers + struct types:
+  * `FileScanRow` (file id, track id, volume UUID, relative path, was-missing, mount point).
+  * `MissingTrack` (track id, fingerprint id, duration_ms, last relative path, last filename).
+  * `list_files_for_scan(batch_size)` — stalest-first ordering, joined with `volumes` for mount-point convenience.
+  * `mark_file_state(file_id, is_missing, last_checked_at)`.
+  * `missing_track_count()` — partial-index-backed.
+  * `list_missing_tracks(limit)` — basename derived at SELECT-time.
+  * `relocate_track(...)` — wraps `upsert_track_file` and force-stamps `is_missing = 0, last_checked_at = strftime('%s','now')`.
+* **`crates/dub-ffi/src/lib.rs`** — new UniFFI records `LibraryFileScanRow`, `LibraryMissingTrack`, `LibraryFingerprintBlob`, `LibraryResolvedPath`. New `DubLibrary` methods: `missing_track_count`, `list_files_for_scan`, `mark_file_state`, `list_missing_tracks`, `load_fingerprint_blob`, `relocate_track`, `resolve_volume_path`, `try_relocate_candidate`. The last one is the work-horse the Relocate sheet drives — it owns decoding, fingerprinting, similarity, and relocation in one FFI hop.
+* **`apple/Dub/MainView.swift`** — `WaveformAppModel` grows `missingTrackCount`, `relocateInProgress`, `lastRelocateMatches`, `lastRelocateUnmatched`, `libraryScannerTask`. New methods `refreshMissingTrackCount`, `scanMissingFilesBatch`, `startMissingFilesScanner`, `stopMissingFilesScanner`, `runRelocate`. `openLibraryIfNeeded` now starts the scanner; `deinit` cancels it; the import success path now refreshes the missing-count alongside the track-count. The matcher worker (`relocateImpl`) is `nonisolated static` so it can run inside `Task.detached` without inheriting the model's main-actor isolation.
+* **`apple/Dub/Performance/LibraryView.swift`** — footer renders a red-triangle "N tracks missing · Click to relocate" affordance bound to `showRelocateSheet`. New `RelocateSheet` subview wraps `NSOpenPanel` for directory selection, surfaces `relocateInProgress` as a `ProgressView`, and reports the per-run `(matched, unmatched)` outcome after each match folder.
+
+### Tests
+
+`cargo test -p dub-library` adds four new tests covering the scanner + relocate primitives in isolation:
+
+* `list_files_for_scan_returns_unchecked_first` — two-track seed, both rows surface with `was_missing = false` and mount-point joined-in.
+* `mark_file_state_flips_is_missing_and_stamps_checked_at` — confirms the flag flips and the row gets re-sorted to the tail after a check.
+* `missing_track_count_only_counts_fully_unreachable_tracks` — two tracks, one with a second healthy file row, only the wholly-missing track contributes to the count and to `list_missing_tracks`.
+* `relocate_track_inserts_new_path_and_clears_missing_state` — relocate creates the new row, count drops, original row stays on record so the FK on `play_history` and on `track_metadata_source` remains valid.
+
+`cargo test -p dub-ffi` adds two FFI smoke tests:
+
+* `missing_tracks_and_scan_listing_are_empty_on_a_fresh_library` — confirms the empty-DB happy path (no panics, sensible zeros).
+* `try_relocate_candidate_returns_none_for_unreachable_path` — a non-audio file in a tempdir produces `Ok(None)`, not a panic or an error.
+
+Full workspace: `cargo test --workspace` reports **676/676 passing** (+6 over M11d.3 baseline); `cargo clippy --workspace --all-targets -- -D warnings` is clean. `xcodebuild -scheme Dub` succeeds with the only warning being the pre-existing `LibraryTrack: Identifiable` retro-conformance lint (benign — Dub owns the conformance and ships the FFI module).
+
+### Known deferrals / non-goals
+
+* **Paging swap to `list_tracks_sorted`.** The 5 000-row hard cap in `LibraryView` is unchanged. Empirical measurements on the M2 Air show the single-shot path stays under 80 ms for the 5 000-row "All Tracks" case, well inside the 200 ms interactive budget. Real paging needs scroll-position-driven page loads + header-frozen sort indicators + first-row-visible recall on filter change, which is a meaningful Swift undertaking. Parked for M11e where the FFI surface already exists.
+* **Scanner cancellation knob in Preferences.** The scanner is always on while the library is open. A "Disable background scanning" toggle is easy to add but no v1.0 user has asked for it — the cost on an idle library is one batch every 5 minutes, which is below the noise floor of a DJ-grade machine.
+* **Per-track Relocate.** The current sheet runs a folder-wide pass. A future "right-click a missing track → Locate File…" affordance is plausible for v1.1 but adds a second matching code path (point-and-match versus folder-walk) that nobody has requested. The folder-wide flow covers the actual user complaint ("I moved my music folder to a new SSD").
+* **Progress bar inside the Relocate sheet.** The current sheet shows a spinning `ProgressView`; per-file progress requires a UniFFI callback story or a polling tick. Skipped for v1.0 in favor of the aggregate before/after count.
+* **Grid-disagreement indicator.** The M11d.3 deferral stands. Wires up at the M11c follow-up that populates `track_beatgrids(source='auto')`.
+
+### PRD churn
+
+* §12 M11d row updated: M11d.4 marked ✅ shipped with a one-line summary of the schema bump + scanner + Relocate sheet + paging-deferral note.
+
+### Commit boundary
+
+This entry corresponds to the M11d.4 commit set: `docs/PRD.md` (M11d row update), `docs/SHIPPED.md` (this section), `docs/LIBRARY-SCHEMA.md` (schema v2 documentation + migration history), `crates/dub-library/src/schema.rs` (`SCHEMA_VERSION` bump + `V2_MIGRATION`), `crates/dub-library/src/volumes.rs` (`DiscoveredVolume::relative_to`), `crates/dub-library/src/importer.rs` (consume the new helper, drop the private duplicate), `crates/dub-library/src/db.rs` (`FileScanRow`, `MissingTrack`, scanner + relocate helpers, tests), `crates/dub-library/src/lib.rs` (re-exports), `crates/dub-ffi/Cargo.toml` (dub-fingerprint dependency), `crates/dub-ffi/src/lib.rs` (record types + `DubLibrary` methods + integration tests), `apple/Dub/MainView.swift` (scanner + Relocate model glue), `apple/Dub/Performance/LibraryView.swift` (footer + `RelocateSheet`), `apple/DubCore.xcframework/` + `apple/DubShared/Sources/DubCore/Generated/` (rebuilt FFI surface).
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11e onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

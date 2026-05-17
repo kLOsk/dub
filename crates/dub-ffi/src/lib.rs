@@ -2673,6 +2673,103 @@ pub struct LibraryImportSummary {
     pub errors: Vec<String>,
 }
 
+/// One row returned by [`DubLibrary::list_files_for_scan`] for the
+/// M11d.4 missing-files scanner. Mirrors
+/// [`dub_library::FileScanRow`] across the FFI.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryFileScanRow {
+    /// Opaque primary key — round-trip back into
+    /// [`DubLibrary::mark_file_state`] unchanged.
+    pub file_id: i64,
+    /// Canonical track this file belongs to.
+    pub track_id: String,
+    /// Volume the file lives on.
+    pub volume_uuid: String,
+    /// Volume-relative path.
+    pub relative_path: String,
+    /// Current `is_missing` flag. Lets the Apple scanner skip
+    /// a write when its verdict matches the stored value.
+    pub was_missing: bool,
+    /// Mount point joined-in from the `volumes` table. `None`
+    /// means the volume is offline; the scanner should treat
+    /// the row as missing without a `stat()` syscall.
+    pub mount_point: Option<String>,
+}
+
+impl From<dub_library::FileScanRow> for LibraryFileScanRow {
+    fn from(r: dub_library::FileScanRow) -> Self {
+        Self {
+            file_id: r.file_id,
+            track_id: r.track_id,
+            volume_uuid: r.volume_uuid,
+            relative_path: r.relative_path,
+            was_missing: r.was_missing,
+            mount_point: r.mount_point,
+        }
+    }
+}
+
+/// One row returned by [`DubLibrary::list_missing_tracks`] for
+/// the M11d.4 Relocate panel. Mirrors
+/// [`dub_library::MissingTrack`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryMissingTrack {
+    /// Canonical track UUID.
+    pub track_id: String,
+    /// `fingerprints.id`. Pair with
+    /// [`DubLibrary::load_fingerprint_blob`] to fetch the
+    /// stored Chromaprint blob for matching.
+    pub fingerprint_id: i64,
+    /// Original duration in milliseconds.
+    pub duration_ms: u32,
+    /// Last-known relative path (for display).
+    pub last_relative_path: Option<String>,
+    /// Last-known filename (basename of `last_relative_path`).
+    /// Filename matching is one of the three signals the Relocate
+    /// matcher uses.
+    pub last_filename: Option<String>,
+}
+
+impl From<dub_library::MissingTrack> for LibraryMissingTrack {
+    fn from(r: dub_library::MissingTrack) -> Self {
+        Self {
+            track_id: r.track_id,
+            fingerprint_id: r.fingerprint_id,
+            duration_ms: r.duration_ms,
+            last_relative_path: r.last_relative_path,
+            last_filename: r.last_filename,
+        }
+    }
+}
+
+/// Stored Chromaprint blob + duration, as returned by
+/// [`DubLibrary::load_fingerprint_blob`]. The Apple-side
+/// Relocate matcher computes the same blob shape for a
+/// candidate file via the importer pipeline and compares.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryFingerprintBlob {
+    /// Little-endian `u32` blob, identical to what
+    /// [`dub_fingerprint::Fingerprint::to_blob`] emits.
+    pub blob: Vec<u8>,
+    /// Stored duration in milliseconds. Used as a fast
+    /// pre-filter — durations more than 200 ms apart cannot
+    /// match per PRD §8.1.
+    pub duration_ms: u32,
+}
+
+/// Result of [`DubLibrary::resolve_volume_path`]: the
+/// volume-UUID + relative-path pair the library key-space uses.
+/// `None` (from the wrapping `Option`) when the supplied path
+/// can't be resolved (volume discovery failure on macOS, or the
+/// path doesn't lie under a known mount point).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryResolvedPath {
+    /// Canonical volume UUID per `volumes.volume_uuid`.
+    pub volume_uuid: String,
+    /// Path relative to the volume's mount point.
+    pub relative_path: String,
+}
+
 impl From<dub_library::ImportSummary> for LibraryImportSummary {
     fn from(s: dub_library::ImportSummary) -> Self {
         let errors = s
@@ -2851,6 +2948,260 @@ impl DubLibrary {
         })
     }
 
+    // === M11d.4 — missing-files scanner + Relocate ========================
+
+    /// Total count of canonical tracks the browser should flag as
+    /// missing. A track is missing iff every `track_files` row
+    /// for it has `is_missing = 1` (a track with one missing and
+    /// one healthy file is still reachable through the healthy
+    /// path). Drives the "247 tracks missing. Click to relocate."
+    /// footer per PRD §8.5.5.
+    pub fn missing_track_count(&self) -> std::result::Result<u64, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.missing_track_count()?))
+    }
+
+    /// Fetch the next batch of `track_files` rows for the
+    /// background scanner. Rows are ordered "stalest first"
+    /// (`last_checked_at IS NULL` then ASC). The Apple shell
+    /// calls this on a low-priority interval with a small batch
+    /// size (typically 100), runs `access()` per absolute path,
+    /// and feeds the verdict back via [`mark_file_state`].
+    pub fn list_files_for_scan(
+        &self,
+        batch_size: u32,
+    ) -> std::result::Result<Vec<LibraryFileScanRow>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_files_for_scan(batch_size)?;
+            Ok(rows.into_iter().map(LibraryFileScanRow::from).collect())
+        })
+    }
+
+    /// Stamp a `track_files` row with the scanner's verdict.
+    /// `isMissing = true` when the file's parent volume is
+    /// unmounted OR `access()` failed; `false` when the file
+    /// resolves cleanly. `timestampUnixSecs` is the wall-clock
+    /// at probe time, captured by Swift before the FFI hop so
+    /// rate-limiting decisions are made against the same clock
+    /// the user sees.
+    pub fn mark_file_state(
+        &self,
+        file_id: i64,
+        is_missing: bool,
+        timestamp_unix_secs: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.mark_file_state(file_id, is_missing, timestamp_unix_secs)?;
+            Ok(())
+        })
+    }
+
+    /// List missing canonical tracks for the Relocate panel.
+    /// Each row carries the identity signals the matcher uses
+    /// (fingerprint id, duration, original filename). The matcher
+    /// (running Apple-side via the importer pipeline) confirms a
+    /// candidate file's identity by computing its fingerprint
+    /// and comparing against [`load_fingerprint_blob`].
+    pub fn list_missing_tracks(
+        &self,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryMissingTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_missing_tracks(limit)?;
+            Ok(rows.into_iter().map(LibraryMissingTrack::from).collect())
+        })
+    }
+
+    /// Load the Chromaprint blob + duration for a stored
+    /// fingerprint by row id. Used by the Relocate matcher to
+    /// compare a candidate file's fingerprint against a missing
+    /// track without re-running the original import.
+    pub fn load_fingerprint_blob(
+        &self,
+        fingerprint_id: i64,
+    ) -> std::result::Result<Option<LibraryFingerprintBlob>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let stored = lib.load_fingerprint(fingerprint_id)?;
+            Ok(stored.map(|s| LibraryFingerprintBlob {
+                blob: s.fingerprint.to_blob(),
+                duration_ms: s.fingerprint.duration_ms(),
+            }))
+        })
+    }
+
+    /// Register a relocated file for a missing track. PRD §8.5.5:
+    /// the original `track_files` row stays on record so the
+    /// touring SSD coming back online can resurrect the previous
+    /// path. The new path arrives as a fresh row + the new row
+    /// is stamped `is_missing = 0, last_checked_at = now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relocate_track(
+        &self,
+        track_id: String,
+        volume_uuid: String,
+        relative_path: String,
+        codec: Option<String>,
+        sample_rate: Option<u32>,
+        channel_count: Option<u32>,
+        file_size: Option<u64>,
+        mtime: Option<i64>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.relocate_track(
+                &track_id,
+                &volume_uuid,
+                &relative_path,
+                codec.as_deref(),
+                sample_rate,
+                channel_count,
+                file_size,
+                mtime,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Attempt to relocate one candidate file against the
+    /// current set of missing tracks. PRD §8.5.5 Relocate
+    /// matching: compute the candidate's fingerprint + duration,
+    /// scan up to `limit_missing` missing tracks (loaded in
+    /// `created_at ASC` order so a stable workflow surfaces
+    /// older imports first), and commit on the first match
+    /// satisfying Chromaprint similarity ≥ 0.98 **and** duration
+    /// delta < 200 ms (mirrors PRD §8.1 dedupe).
+    ///
+    /// Returns `Some(track_id)` on success; `None` when no
+    /// missing track matches the candidate or the candidate
+    /// could not be fingerprinted (corrupt file, unsupported
+    /// codec). The original `track_files` row is **never**
+    /// deleted — `relocate_track` inserts a fresh row instead
+    /// so the touring SSD coming back online can resurrect the
+    /// previous path.
+    ///
+    /// Designed for the inner loop of the Relocate panel:
+    /// Swift enumerates audio files in the user-supplied
+    /// directory and calls this once per file; the FFI is
+    /// stateless across calls so progress reporting / Cancel
+    /// stay on the Swift side.
+    pub fn try_relocate_candidate(
+        &self,
+        absolute_path: String,
+        limit_missing: u32,
+    ) -> std::result::Result<Option<String>, LibraryFfiError> {
+        // Step 1: decode + fingerprint the candidate. Done
+        // before locking the library so a slow decode doesn't
+        // block the scanner. `dub-io::Track::load` is the same
+        // entry point the importer uses, so any file the
+        // importer accepts here is matchable.
+        let candidate_blob =
+            match dub_io::Track::load_from_path(std::path::Path::new(&absolute_path)) {
+                Ok(track) => match dub_fingerprint::Fingerprint::compute_from_f32(
+                    track.samples(),
+                    track.sample_rate(),
+                    u32::from(track.channels()),
+                ) {
+                    Ok(fp) => fp,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+
+        // Step 2: resolve the candidate path to the
+        // (volume_uuid, relative_path) key Dub uses.
+        let p = std::path::Path::new(&absolute_path);
+        let disc = match dub_library::discover_for_path(p) {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        let rel = match disc.relative_to(p) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Step 3: gather file attrs for the upsert.
+        let (file_size, mtime) = match std::fs::metadata(p) {
+            Ok(md) => (
+                Some(md.len()),
+                md.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64),
+            ),
+            Err(_) => (None, None),
+        };
+        let codec = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+
+        // Step 4: scan missing tracks against the candidate
+        // fingerprint. The library lock is held only across
+        // this section.
+        self.with_library(|lib| {
+            lib.upsert_volume(&disc)?;
+            let missing = lib.list_missing_tracks(limit_missing)?;
+            for m in missing {
+                let stored = match lib.load_fingerprint(m.fingerprint_id)? {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let delta = candidate_blob
+                    .duration_ms()
+                    .abs_diff(stored.fingerprint.duration_ms());
+                if delta >= 200 {
+                    continue;
+                }
+                let sim = dub_fingerprint::similarity(&stored.fingerprint, &candidate_blob);
+                if sim < 0.98 {
+                    continue;
+                }
+                lib.relocate_track(
+                    &m.track_id,
+                    &disc.volume_uuid,
+                    &rel,
+                    codec.as_deref(),
+                    None,
+                    None,
+                    file_size,
+                    mtime,
+                )?;
+                return Ok(Some(m.track_id));
+            }
+            Ok(None)
+        })
+    }
+
+    /// Resolve an absolute filesystem path to the
+    /// `(volume_uuid, relative_path)` pair Dub stores in
+    /// `track_files`. Apple-side equivalent of
+    /// `volumes::discover_for_path`. Used by the Relocate panel
+    /// to insert correctly-keyed rows after the matcher confirms
+    /// a candidate file's identity.
+    pub fn resolve_volume_path(
+        &self,
+        absolute_path: String,
+    ) -> std::result::Result<Option<LibraryResolvedPath>, LibraryFfiError> {
+        let p = std::path::Path::new(&absolute_path);
+        let disc = match dub_library::discover_for_path(p) {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        let rel = match disc.relative_to(p) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // Side-effect: register the discovered volume so the FK on
+        // the relocate insert holds even when the user resolves a
+        // path on a brand-new external drive.
+        self.with_library(|lib| {
+            lib.upsert_volume(&disc)?;
+            Ok(())
+        })?;
+        Ok(Some(LibraryResolvedPath {
+            volume_uuid: disc.volume_uuid,
+            relative_path: rel,
+        }))
+    }
+
     /// Record a deck-load event in `play_history`. The Apple
     /// shell calls this immediately after a successful
     /// `load_track` when the source URL came from the library
@@ -2953,5 +3304,33 @@ mod library_ffi_tests {
         // that as `QueryFailed` rather than panicking.
         let err = lib.record_load("ffffffff-0000-0000-0000-000000000000".into(), 0, 1);
         assert!(matches!(err, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    // === M11d.4 missing-files smoke tests ====================================
+
+    #[test]
+    fn missing_tracks_and_scan_listing_are_empty_on_a_fresh_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(lib.missing_track_count().unwrap(), 0);
+        assert!(lib.list_files_for_scan(10).unwrap().is_empty());
+        assert!(lib.list_missing_tracks(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn try_relocate_candidate_returns_none_for_unreachable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // Empty library + non-audio file → no panic, no match.
+        let stub = tmp.path().join("not-an-audio-file.txt");
+        std::fs::write(&stub, b"hello").unwrap();
+        let r = lib
+            .try_relocate_candidate(stub.to_string_lossy().to_string(), 10)
+            .unwrap();
+        assert!(r.is_none());
     }
 }
