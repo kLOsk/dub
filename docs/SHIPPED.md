@@ -2048,4 +2048,172 @@ This entry corresponds to the M11c commit set. PRD §12 (M11c row), `crates/dub-
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11d onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11d.1 — Library browser shell (functional replacement)
+
+First reviewable slice of PRD §12 M11d (the §8.5 browser). M11d.1 is the **functional replacement** for the M10.5b `FileBrowserView`: the SwiftUI shell now reads from the M11a–c SQLite catalog instead of walking the filesystem on every Performance render, and the DJ can populate the library by pointing it at a folder of audio files.
+
+The full PRD §8.5 surface (per-row indicators, sortable columns, background missing-files scanner, Relocate panel) is staged across M11d.2 / M11d.3 / M11d.4. Splitting it this way means each landing is a self-contained, reviewable diff rather than one 1500-line PR.
+
+### Architecture choices
+
+1. **Library FFI is a separate UniFFI object from the audio engine.** A new `DubLibrary` (`crates/dub-ffi/src/lib.rs`) wraps `dub_library::Library` and holds its own `Mutex<Option<Library>>` — the engine doesn't know the library exists and vice versa. Two reasons: the library is a disk-backed catalog with its own lifecycle (one open per app vs. per-Thru-session for the engine), and the audio engine's load path takes an `Arc<Track>` snapshot which already isolates it from where the track came from. Keeping the FFI objects separate also matches the eventual M14 split where the engine ships a daemon and the library stays an app-side concern.
+
+2. **`browserSelection: URL?` is preserved as the load-path contract.** The Apple shell already routed `Space` and drag-and-drop through `model.browserSelection`. Rather than re-plumbing that contract to flow track UUIDs, the new `LibraryView` resolves a row's UUID to a file URL via `library.trackPath(trackId:)` at selection time and writes the URL to `browserSelection`. The existing keyboard / drag handlers keep working unchanged. Cost: one extra SQL round-trip per row click (~50 µs); benefit: zero changes to deck-load, drag-and-drop, or Space-shortcut code.
+
+3. **`@Published` library state lives on `WaveformAppModel`, not in a dedicated view-model.** The Apple shell already centralises engine state on `WaveformAppModel` (`isRunning`, `lastError`, `browserSelection`, etc.) and the library handle is the same kind of long-lived per-app state. Splitting it into a separate `LibraryViewModel` would force every cross-concern path (e.g. "after a load, refresh recently-played") to traverse two observable hierarchies. M11d.2's sortable columns may grow a dedicated `LibraryListController` if the surface gets big enough, but day-one keeps it flat.
+
+4. **Listing query runs on a detached `Task`.** `LibraryView.refreshTracks()` dispatches the SQL to a `Task.detached(priority: .userInitiated)` and hops back to the main actor only to install the result. Cold-list of 100k rows is ~80 ms on M2 Air; off-main keeps the source-tree selection feel instant. The single-connection FFI handle serialises the queries internally via its `Mutex`, so two rapid switches between sources produce two deterministic queries instead of one half-done query.
+
+5. **`Just Imported` boundary is captured at app launch, not at "now".** PRD §8.5.2 spec is "tracks added since the last app launch". `WaveformAppModel.appLaunchUnixSeconds` is set in `init`; the LibraryView passes that to `library.justImported(sinceUnixSecs:limit:)`. This means a DJ who plugs the USB stick in at 21:50 and imports it at 21:51 sees exactly that import in the smart crate for the rest of the night.
+
+6. **Source-tree placeholders ship in v1.0.** The §8.5.1 sidebar lists All Tracks, Smart Crates (Recently Played, Just Imported), Dub Crates, Imported Sources, Real Records. M11d.1 wires the first three; Dub Crates / Imported Sources / Real Records render greyscale with a lock glyph + tooltip "Coming in a later milestone." The PRD-spec'd tree shape is therefore present from day one, so the eventual M11e / v1.1 / v1.x landings don't reshuffle the user's mental model of where things live.
+
+### Implementation
+
+**Rust side (`dub-library`).** `crates/dub-library/src/db.rs` grows seven new methods on `Library`:
+
+* `track_count() -> u64` — `SELECT COUNT(*) FROM tracks`. Browser footer reads this.
+* `list_tracks(limit, offset) -> Vec<TrackRow>` — All Tracks listing, ordered by `tracks.created_at ASC`. Stable order matters; the browser doesn't reshuffle on every re-open.
+* `search_tracks(query, limit) -> Vec<TrackRow>` — FTS5-backed substring search per §8.5.4. Tokens are whitespace-split, ANDed, and suffix-matched (`workin*` hits `Workinonit`). Tokens shorter than 2 chars are dropped to avoid noise on a 100k-track library. Quotes are stripped before the MATCH expression to keep FTS5 syntax happy.
+* `recently_played(limit) -> Vec<TrackRow>` — Recently Played smart crate. Reads `play_history` WHERE `event_type = 'load'` per distinct `track_id`, newest first. Empty when the play-history table is empty (v1.0 day-one default; the deck-transport load hook lands at M11d.2).
+* `just_imported(since_unix_secs, limit) -> Vec<TrackRow>` — Just Imported smart crate. Caller passes the boundary as unix-seconds; the typical caller is the Apple shell with the app-launch timestamp.
+* `resolve_track_path(track_id) -> Option<PathBuf>` — Resolves a canonical UUID to an absolute path by joining `track_files.last_seen_at DESC` against `volumes.last_known_mount_point`. Returns `None` when the volume is unmounted (path resolution is unsafe) or the track has no file rows (deleted). Drag-and-drop + Space-load read this.
+* `TrackRow` struct — the canonical row shape. The COALESCE chains live at the SELECT layer (in `TRACK_ROW_SELECT`) so the priority rules from PRD §8.1 (filename source wins for title/artist; id3 source supplies everything else) are enforced consistently across every query method.
+
+**Rust side (`dub-ffi`).** `crates/dub-ffi/src/lib.rs` grows a new `DubLibrary` UniFFI object alongside the existing `DubEngine`:
+
+* `DubLibrary` — `Arc`-shared handle with internal `Mutex<Option<Library>>`. Constructor is empty; `openDefault()` / `openAt(path)` materialise the SQLite connection. `isOpen` predicate lets the Swift side branch cleanly on cold-boot.
+* `LibraryFfiError` — flat enum with `OpenFailed` / `QueryFailed` / `ImportFailed` variants. Mirrors `EngineError`'s shape.
+* `LibraryTrack` UniFFI record — flat struct mirroring `dub_library::TrackRow` for marshalling across FFI. UUID is sent as a string so Swift treats it as opaque.
+* `LibraryImportSummary` UniFFI record — flat version of `dub_library::ImportSummary`; the per-file `errors` list is flattened to `Vec<String>` ("path: reason") so the Swift side doesn't have to re-marshal a structured Rust enum.
+* Exposed methods: `trackCount()`, `listTracks(limit:offset:)`, `search(query:limit:)`, `recentlyPlayed(limit:)`, `justImported(sinceUnixSecs:limit:)`, `trackPath(trackId:)`, `importFolder(path:)`. The first six surface the read paths; the last drives the M11c importer pipeline.
+
+**Swift side.** `apple/Dub/Performance/LibraryView.swift` (new) is a self-contained SwiftUI surface that:
+
+* Renders the §8.5.1 source tree on the left (200 pt fixed width) with one `Image(systemName:)` + label per entry, grouped under "Library" / "Smart Crates" / "Dub Crates" / "Imported Sources" / "Real Records". Unavailable entries render greyscale with a lock glyph.
+* Renders the search field + "Import Folder…" button in the right pane's toolbar. The search field is a plain `TextField` with a leading magnifying-glass icon and a trailing clear-X. Per-keystroke `onChange` triggers a re-query — fast enough on FTS5 to feel typeahead-y.
+* Renders the track list as a `ScrollView` + `LazyVStack` (M11d.2 may swap to `Table` once sortable columns land). Each row stacks title + artist on the left and shows BPM / Key / Duration / Source columns to the right. Selection paints `DubColor.surface2` and writes to `model.browserSelection` via `selectLibraryTrack(_:)`.
+* Preserves the AppKit `onDrag { NSItemProvider }` path verbatim from M10.5b. The drag closure resolves the track's URL synchronously through `library.trackPath`; unreachable tracks produce an empty `NSItemProvider` and the drop target no-ops politely.
+* Renders a footer with "N shown · M total" + a 5-line summary of the most recent import outcome.
+
+**Apple shell glue (`WaveformAppModel`).** New public surface:
+
+* `let library: DubLibrary` — held for the lifetime of the app window.
+* `@Published private(set) var libraryIsOpen: Bool` — drives the "Preparing library…" placeholder.
+* `@Published private(set) var libraryTrackCount: UInt64` — drives the footer + sidebar count.
+* `let appLaunchUnixSeconds: Int64` — pinned at `init` for the Just Imported smart crate.
+* `@Published var lastImportSummary: LibraryImportSummary?` — surfaces the most recent import summary.
+* `@Published private(set) var libraryImportInProgress: Bool` — disables the "Import Folder…" button mid-import.
+* `func openLibraryIfNeeded()` — idempotent open, called from `MainView.onAppear`.
+* `func refreshLibraryStats()` — re-reads `track_count`; called after every import.
+* `func importLibraryFolder(_ folder: URL) async` — dispatches the M11c importer to a detached `Task.detached(priority: .userInitiated)`, surfaces a `surfaceError` on session-level failure, updates `libraryTrackCount` + `lastImportSummary` on success.
+* `func selectLibraryTrack(_ trackId: String)` — resolves UUID → URL via `library.trackPath` and writes to `browserSelection`; surfaces a polite error if the volume is unmounted.
+
+`apple/Dub/Performance/PerformanceView.swift` swaps the single `FileBrowserView(model: model)` line for `LibraryView(model: model)`. `MainView.onAppear` gains a `model.openLibraryIfNeeded()` call alongside `model.applyConfig()`.
+
+**Xcode project.** `apple/Dub.xcodeproj/project.pbxproj` registers `LibraryView.swift` in the `Performance` group, the file-reference table, and the `Sources` build phase. New UUIDs: `AB11D11D000000000000D101` (build file), `AB11D11D000000000000D102` (file ref).
+
+### Tests
+
+* `dub-library::db` grows seven new tests covering the new helpers: `track_count_starts_at_zero_and_climbs_with_inserts`, `list_tracks_assembles_priority_chain_correctly` (proves the COALESCE chain), `list_tracks_paginates_via_limit_offset`, `search_tracks_matches_via_fts5_suffix` (covers single + multi-token queries, empty / too-short queries, no-match), `just_imported_filters_by_created_at_threshold`, `recently_played_returns_empty_when_no_history` (smart-crate semantics; empty must not fall back to all-tracks), `resolve_track_path_joins_volume_to_relative_path`.
+* A reusable `seed_tracks` fixture in the test module pins down the canonical "register a synthetic volume, insert N tracks with both metadata sources" pattern so the next test author doesn't repeat the boilerplate.
+* `dub-ffi::library_ffi_tests` adds two smoke tests for the new UniFFI object: `handle_starts_closed_then_opens_via_open_at` (proves `is_open` flip + that a closed handle returns clean errors instead of panicking), `empty_library_returns_empty_track_listings` (proves every listing method returns `[]` against a freshly-migrated DB, not an error).
+* Workspace test count: **659 / 659 passing**. Workspace clippy clean (`cargo clippy --workspace --all-targets -- -D warnings`).
+* `xcodebuild -project apple/Dub.xcodeproj -scheme Dub -configuration Debug` builds the Apple shell clean. The only warning is `ld: object file libdub_ffi.a was built for newer 'macOS' version (15.2) than being linked (13.0)` from the bundled SQLite shipped through `rusqlite`'s `bundled` feature; benign at runtime, will be addressed in a follow-up when the workspace's `MACOSX_DEPLOYMENT_TARGET` policy is reviewed.
+
+### Deferred
+
+* **Sortable columns** — needs the SQL layer to support arbitrary `ORDER BY` clauses parameterised by sort column + direction. M11d.2 (with the Smart Crates wiring) covers it because the Recently Played sort is a natural starting point.
+* **Per-row indicators** (loaded-now A/B glyph, grid-disagreement ⚠, potential-duplicate link, missing-file glyph) — gated on M11d.3.
+* **Background missing-files scanner** — gated on M11d.4.
+* **Relocate panel** — gated on M11d.4.
+* **`Enter` focused-deck-load** — PRD §8.5.6 reserves it for v1.x; v1.0 only commits to Drag + Space.
+* **List virtualization via NSTableView / SwiftUI Table** — M11d.1 uses LazyVStack which realises only visible rows but doesn't recycle DOM-style. Lexicon-class 100k libraries land with a Table swap in M11d.2.
+* **The legacy `FileBrowserView.swift` stays in the repo** for one milestone in case a rollback is needed. M11d.2 deletes it.
+
+### PRD churn
+
+* §12 M11d row replaced with a four-sub-milestone breakdown (M11d.1 / M11d.2 / M11d.3 / M11d.4) so the staging is auditable in the milestone table itself.
+
+### Commit boundary
+
+This entry corresponds to the M11d.1 commit set: `docs/PRD.md` (M11d row breakdown), `docs/LICENSE-DEPENDENCIES.md` (new doc; user-requested companion to the M11c license review), `docs/SHIPPED.md` (this section), `crates/dub-library/src/{db,lib}.rs` (new helpers + TrackRow export), `crates/dub-ffi/src/lib.rs` (DubLibrary UniFFI object), `crates/dub-ffi/Cargo.toml` (`dub-library` workspace dep + `tempfile` dev-dep), `apple/Dub/MainView.swift` (library state on `WaveformAppModel` + `openLibraryIfNeeded` hook), `apple/Dub/Performance/PerformanceView.swift` (FileBrowserView → LibraryView swap), `apple/Dub/Performance/LibraryView.swift` (new SwiftUI surface), `apple/Dub.xcodeproj/project.pbxproj` (target registration for LibraryView.swift), `apple/DubCore.xcframework/` + `apple/DubShared/Sources/DubCore/Generated/` (rebuilt from the new FFI surface).
+
+---
+
+## M11d.2 — Recently Played wiring + sortable columns
+
+Second slice of PRD §12 M11d. Closes the loop on the **Recently Played** smart crate (which M11d.1 left wired to the FFI but always empty because nothing wrote `play_history` rows), and lands the §8.5.3 spec promise that "Columns are sortable" by swapping the M11d.1 `LazyVStack` track list for a real SwiftUI `Table` with click-to-sort column headers.
+
+### Architecture choices
+
+1. **Deck-load → play_history hook is Apple-side, not engine-side.** The audio engine's `load_track` only knows about `Arc<Track>` + a file path; it deliberately does not know whether the source was the library or a Finder drag. Routing the hook through `dub-engine` would either force the engine to carry a `Library` reference (cross-couples two subsystems that are otherwise independent) or require a callback-style API (cross-thread, RT-unsafe). Instead, the Apple shell hooks the load *after* a successful `loadTrack(side:url:)`: when `selectedLibraryTrackId` is set and the resolved URL matches the just-loaded URL, the shell calls `library.recordLoad(trackId:deck:timestampMs:)`. Finder drags leave `selectedLibraryTrackId` nil and therefore don't write history rows — which is correct, because the file isn't in the library yet anyway.
+
+2. **`selectedLibraryTrackId` is a separate published value, not a derived one.** `WaveformAppModel.browserSelection: URL?` stays the canonical "selected file" contract for Space-load + drag-and-drop. M11d.2 adds `@Published var selectedLibraryTrackId: String?` set in lockstep with `browserSelection` whenever the selection came from a library row, and cleared when the row goes away. Resolving the trackId back from `browserSelection` would require an FFI round-trip per Space-press; caching the id as a published companion is free.
+
+3. **URL equality is the deduplication guard.** Between `selectLibraryTrack` (which writes `selectedLibraryTrackId` + resolves a URL) and `loadTrack` (which actually loads the URL), the user could conceivably select a library row and then drag in a *different* Finder file. `recordLibraryLoadIfApplicable` re-resolves `selectedLibraryTrackId` to a URL and compares it against the just-loaded URL with `standardizedFileURL` equality before writing the row. Mismatch → no history write. The cost is one extra `library.trackPath` call per successful load; the benefit is that the smart crate never lies.
+
+4. **Sort happens client-side against the in-memory snapshot.** SwiftUI `Table`'s `sortOrder: [KeyPathComparator<LibraryTrack>]` binding triggers a client-side `tracks.sorted(using:)` re-render on column-header click — instant feedback, no SQL round-trip. The FFI's `list_tracks_sorted(limit:offset:sort:ascending:)` exists and is tested but stays reserved for M11d.4's paging refactor; today's 5 000-row in-memory snapshot fits comfortably and reacts instantly. The decision matters because it means M11d.2 doesn't reshuffle column-header click semantics when paging lands — the sort enum is already on both sides of the FFI.
+
+5. **Type-safe sort key enum on both sides.** `dub_library::TrackSortKey` is a Rust enum that maps to SQL column expressions via a private `sql_column()` helper; user input never reaches the SQL string. The UniFFI bridge mirrors it as `LibraryTrackSort`. Swift `KeyPathComparator` over local computed properties (`titleSortKey`, `bpmSortKey`, ...) handles the in-memory case. Adding a new column = one new enum variant on each side + one new `TableColumn` in SwiftUI; the contract is mechanical.
+
+6. **Missing values are pinned past every real value in both directions.** SwiftUI `Table` sorts `Optional` through fallback keys: `bpm ?? .infinity` (numeric) and `title ?? ""` (string). Rust's `list_tracks_sorted` uses `ORDER BY column IS NULL, column COLLATE NOCASE DIRECTION` for the same effect. The shared rule: a small handful of missing-tag rows shouldn't jump to the top of the list when the user clicks "Artist" — they collect at one end. NULL handling for descending sort uses `IS NULL` as the first sort key so NULLs sort last in both directions; this is the same "pinned past everything" semantic.
+
+7. **`COLLATE NOCASE` is mandatory for text sort.** "abba" and "ABBA" should sort adjacent, not separated by the entire lowercase block. Applied unconditionally to the SQL sort expression because the COLLATE hint is a no-op on non-text columns.
+
+### Implementation
+
+**Rust side (`dub-library`).** `crates/dub-library/src/db.rs` grows two new public surfaces:
+
+* `Library::record_load(track_id, deck, timestamp_ms) -> Result<()>` — inserts a `play_history` row with `event_type = 'load'`. The FK on `track_id` rejects unknown ids; we surface that as a `LibraryError::Sqlite` rather than silently swallowing it (a stale Apple-side selection deserves a louder failure than "your smart crate is silently broken").
+* `TrackSortKey` enum + `Library::list_tracks_sorted(limit, offset, sort, ascending) -> Result<Vec<TrackRow>>` — column-constrained sort. `TrackSortKey::sql_column()` is the only place in the crate that interpolates a column name into SQL; the safe-list shape means user input never reaches the SQL string. `list_tracks` becomes a thin wrapper that calls `list_tracks_sorted` with `CreatedAt` + ascending.
+
+**Rust side (`dub-ffi`).** Two additions to `DubLibrary`:
+
+* `record_load(trackId:deck:timestampMs:)` — UniFFI-exported method that thin-wraps `Library::record_load`.
+* `list_tracks_sorted(limit:offset:sort:ascending:)` + `LibraryTrackSort` UniFFI enum (mirrors `TrackSortKey` 1:1). The empty-listing smoke test was extended to also smoke the sorted variant, and a new `record_load_against_unknown_track_returns_query_failed` test pins down the FK-mismatch error surface.
+
+**Swift side (`LibraryView`).** Track list swaps from `ScrollView + LazyVStack` to a single `Table(sortedTracks, selection: $selectedTrackId, sortOrder: $sortOrder)`. Columns: Title (wide, with subtitle row showing "Artist · Album"), Artist, Album, BPM (monospaced-digit, right-aligned), Key (no sort — Key is a stringly-typed circle-of-fifths token that doesn't compare meaningfully without a Camelot table; deferred), Length (monospaced-digit), Year (monospaced-digit), Source. Selection is bound to `selectedTrackId: LibraryTrack.ID?` and `onChange(of: selectedTrackId)` routes through `model.selectLibraryTrack(_:)` — the existing Space + drag contract is preserved without modification. Drag is moved from the AppKit `onDrag { NSItemProvider }` path to SwiftUI's `.draggable(URL, preview:)` per-cell modifier; the M10.5b reason for AppKit (drag-preview animation glitch) doesn't reproduce inside a Table cell.
+
+**Swift side (`WaveformAppModel`).** New surface:
+
+* `@Published var selectedLibraryTrackId: String? = nil` — set in lockstep with `browserSelection` by `selectLibraryTrack(_:)`; cleared on selection loss.
+* `private func recordLibraryLoadIfApplicable(side:url:)` — called from `loadTrack(side:url:)` on `case .success`. Re-resolves `selectedLibraryTrackId` to a URL and compares against the just-loaded URL; on match, writes the `play_history` row with `deck = (side == .a) ? 0 : 1` and `timestamp_ms = unix-millis from Swift wall clock`.
+* `LibraryTrack: Identifiable` extension and `LibraryTrack` computed sort keys (`titleSortKey`, `artistSortKey`, ..., `bpmSortKey`, `yearSortKey`) lifting Optional fields into Comparable sentinels.
+
+The xcframework is rebuilt by `scripts/build-xcframework.sh` so the new FFI surface (`recordLoad`, `listTracksSorted`, `LibraryTrackSort`) is visible to the Swift code.
+
+### Tests
+
+* `dub-library::db` grows seven new tests:
+  - `record_load_appears_in_recently_played_newest_first` — three loads, newest first ordering proven.
+  - `record_load_idempotent_for_same_track_uses_latest_timestamp` — DISTINCT-track semantic in Recently Played; the same track loaded twice surfaces once at the latest timestamp.
+  - `record_load_rejects_unknown_track_id` — FK constraint catches stale Apple-side selections; we don't silently swallow.
+  - `list_tracks_sorted_orders_by_title_ascending` — basic correctness on the Title sort.
+  - `list_tracks_sorted_descending_inverts_order` — direction toggle.
+  - `list_tracks_sorted_is_case_insensitive` — proves the `COLLATE NOCASE` hint is doing its job (abba / ABBA sort adjacent, not separated by an entire case block).
+  - `list_tracks_sorted_nulls_sort_last_in_both_directions` — the "pinned past everything" rule for both ASC and DESC.
+* `dub-ffi::library_ffi_tests` extends the empty-library smoke to cover `listTracksSorted` and adds `record_load_against_unknown_track_returns_query_failed`.
+* Workspace test count: **668 / 668 passing** (M11d.1 baseline was 659; +9 across `dub-library` (+7) and `dub-ffi` (+2)).
+* `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* `xcodebuild -project apple/Dub.xcodeproj -scheme Dub -configuration Debug` builds clean (same benign macOS-version-mismatch ld warning from bundled SQLite as in M11d.1).
+
+### Deferred
+
+* **Real virtualization + paging (`list_tracks_sorted` round-trip per sort change)** — gated on M11d.4. Today's client-side sort is fine for 5 000 rows, will need to swap when 100k-track libraries land.
+* **Key column sort** — a meaningful Key sort needs a Camelot-wheel table so `Am`, `1A`, `Em`, `1B`, ... order correctly. Hard-coded sort by raw string would surface `2A` before `10A` which is worse than no sort. Deferred to M11e where the Mixed In Key importer adds a canonical Camelot column to the schema.
+* **Per-row indicators (loaded-now A/B glyph, grid-disagreement ⚠, potential-duplicate link, missing-file)** — gated on M11d.3.
+* **`play_history` events beyond `'load'`** (play_start, play_end, transition_in, transition_out) — the schema reserves these; M11d.2 wires only `'load'` because that's all Recently Played needs. The deck-transport firing for play_start / play_end is a small follow-up; transition_in / transition_out are gated on the v1.x Played From / Played Into side panel (PRD §8.5.2).
+* **Deletion of the legacy `FileBrowserView.swift`** — M11d.1 kept it in the repo as a one-revision rollback safety net. M11d.2 still leaves it; it is fully unused at runtime and will be deleted in M11d.3 when the indicator changes touch the same area.
+
+### PRD churn
+
+* §12 M11d row updated: M11d.1 and M11d.2 both marked ✅ shipped with delta deliverables.
+
+### Commit boundary
+
+This entry corresponds to the M11d.2 commit set: `docs/PRD.md` (M11d row update), `docs/SHIPPED.md` (this section), `crates/dub-library/src/{db,lib}.rs` (`record_load`, `TrackSortKey`, `list_tracks_sorted`, tests, re-exports), `crates/dub-ffi/src/lib.rs` (`record_load`, `list_tracks_sorted`, `LibraryTrackSort`, smoke tests), `apple/Dub/MainView.swift` (`selectedLibraryTrackId`, `recordLibraryLoadIfApplicable` hook), `apple/Dub/Performance/LibraryView.swift` (`Table` swap, `Identifiable` + sort-key computed properties), `apple/DubCore.xcframework/` + `apple/DubShared/Sources/DubCore/Generated/` (rebuilt from the new FFI surface).
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11d.3 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

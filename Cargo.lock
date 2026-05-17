@@ -662,7 +662,9 @@ dependencies = [
  "dub-bpm",
  "dub-engine",
  "dub-io",
+ "dub-library",
  "dub-peaks",
+ "tempfile",
  "thiserror 1.0.69",
  "uniffi",
 ]

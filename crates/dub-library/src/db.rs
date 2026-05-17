@@ -44,6 +44,187 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
     })
 }
 
+/// One row in the M11d browser's track list. The PRD §8.1
+/// priority chain ("filename source preferred over id3 source for
+/// title/artist; id3 preferred for everything else") is baked in at
+/// the SELECT level via COALESCE so the browser doesn't have to
+/// reimplement the chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackRow {
+    /// Canonical UUID from `tracks.id`.
+    pub id: String,
+    /// Display title (filename source preferred over id3 per §8.1).
+    pub title: Option<String>,
+    /// Display artist (filename source preferred over id3 per §8.1).
+    pub artist: Option<String>,
+    /// Album (id3 source).
+    pub album: Option<String>,
+    /// Genre (id3 source).
+    pub genre: Option<String>,
+    /// Year (filename source preferred over id3; the filename
+    /// `[YYYY]` tail is the more reliable signal in DJ-rip-naming
+    /// conventions).
+    pub year: Option<i32>,
+    /// BPM from the id3 source (auto-grid lands as part of the
+    /// M11c follow-up that wires `dub-bpm` into the importer).
+    pub bpm: Option<f64>,
+    /// Musical key from the id3 source (or Mixed In Key's comment
+    /// field via M11e Serato importer at a later milestone).
+    pub key: Option<String>,
+    /// Duration in milliseconds, from `tracks.duration_ms`.
+    pub duration_ms: u32,
+    /// Comma-separated canonical version-tokens (filename source
+    /// preferred). `None` when no tokens were detected.
+    pub version_tokens: Option<String>,
+    /// `Some(other_track_id)` when this row has a sibling-version
+    /// link per §8.1 dedupe. Drives the M11d.3 potential-duplicate
+    /// indicator.
+    pub potential_duplicate_id: Option<String>,
+    /// Origin source — `"filesystem"` for M11c-imported rows;
+    /// `"serato"` / `"traktor"` / `"rekordbox"` / `"itunes"` for
+    /// future M11e+ importers. Synthesised from the per-source
+    /// metadata-row `source` column.
+    pub source: String,
+}
+
+/// Sort columns the M11d.2 browser table header can drive.
+///
+/// Constrained to an enum (rather than an open string) so user
+/// input never reaches the SQL string — only the `sql_column`
+/// helper below maps an enum variant to a column expression.
+/// Every variant resolves to a column that exists in
+/// `TRACK_ROW_SELECT` so SQLite's planner picks it up without a
+/// re-prepare on each direction toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackSortKey {
+    /// `tracks.created_at` — the natural "import order" sort.
+    /// Default in [`Library::list_tracks`].
+    CreatedAt,
+    /// Display title (filename source preferred over id3).
+    Title,
+    /// Display artist (filename source preferred over id3).
+    Artist,
+    /// Album name (id3 source).
+    Album,
+    /// BPM (id3 source). `None` BPMs sort last in both directions.
+    Bpm,
+    /// Duration in milliseconds.
+    Duration,
+    /// Year (filename source preferred over id3).
+    Year,
+}
+
+impl TrackSortKey {
+    /// SQL column expression for this sort key. Every value is
+    /// either a stable canonical column or the same COALESCE
+    /// chain that `TRACK_ROW_SELECT` exposes — keeping the
+    /// expressions identical means SQLite's expression cache can
+    /// re-use the prepared statement across direction flips.
+    fn sql_column(self) -> &'static str {
+        match self {
+            Self::CreatedAt => "t.created_at",
+            Self::Title => "COALESCE(fn.title, i3.title)",
+            Self::Artist => "COALESCE(fn.artist, i3.artist)",
+            Self::Album => "i3.album",
+            Self::Bpm => "i3.bpm",
+            Self::Duration => "t.duration_ms",
+            Self::Year => "COALESCE(fn.year, i3.year)",
+        }
+    }
+}
+
+/// Canonical SELECT for a [`TrackRow`]. The COALESCE chains
+/// implement the §8.1 source-priority for the display fields. We
+/// LEFT JOIN both metadata sources (filename + id3) so a track
+/// with only one source still surfaces correctly. `MIN(source)`
+/// across the per-source rows produces a deterministic "best"
+/// source label until a real source-priority column lands at
+/// M11e.
+const TRACK_ROW_SELECT: &str = "\
+    SELECT t.id, \
+           COALESCE(fn.title,    i3.title)    AS title, \
+           COALESCE(fn.artist,   i3.artist)   AS artist, \
+           i3.album                            AS album, \
+           i3.genre                            AS genre, \
+           COALESCE(fn.year,     i3.year)     AS year, \
+           i3.bpm                              AS bpm, \
+           i3.key                              AS key, \
+           t.duration_ms                       AS duration_ms, \
+           COALESCE(fn.version_token, i3.version_token) AS version_tokens, \
+           t.duplicate_link_track_id           AS potential_duplicate_id, \
+           ( \
+               SELECT MIN(source) FROM track_metadata_source ms \
+               WHERE ms.track_id = t.id \
+           )                                   AS source \
+    FROM tracks t \
+    LEFT JOIN track_metadata_source fn \
+              ON fn.track_id = t.id AND fn.source = 'filename' \
+    LEFT JOIN track_metadata_source i3 \
+              ON i3.track_id = t.id AND i3.source = 'id3' \
+    ";
+
+/// Map a SELECT-shaped row to [`TrackRow`]. Used by every
+/// `list_*` / `search_*` / `recently_*` method so column order
+/// stays in lockstep with `TRACK_ROW_SELECT`.
+fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
+    let duration_ms: i64 = r.get(8)?;
+    Ok(TrackRow {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        artist: r.get(2)?,
+        album: r.get(3)?,
+        genre: r.get(4)?,
+        year: r.get(5)?,
+        bpm: r.get(6)?,
+        key: r.get(7)?,
+        duration_ms: duration_ms.max(0) as u32,
+        version_tokens: r.get(9)?,
+        potential_duplicate_id: r.get(10)?,
+        source: r
+            .get::<_, Option<String>>(11)?
+            .unwrap_or_else(|| "unknown".to_string()),
+    })
+}
+
+/// Collect a row-mapped iterator into `Vec<TrackRow>`, propagating
+/// the first SQL error with the calling context tag for `Library
+/// Error::Sqlite`.
+fn collect_track_rows<I>(rows: I, context: &'static str) -> Result<Vec<TrackRow>>
+where
+    I: Iterator<Item = rusqlite::Result<TrackRow>>,
+{
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| LibraryError::sqlite(context, e))?;
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Build an FTS5 MATCH expression from a free-text query per PRD
+/// §8.5.4. Whitespace-separated tokens are ANDed; each token is
+/// suffix-matched (`workin*` hits `Workinonit`). Tokens shorter
+/// than 2 ASCII chars are dropped to avoid noise on a 100k-track
+/// library. Returns the empty string when the input yields no
+/// usable tokens; callers treat that as "no search → no results".
+fn build_fts_query(query: &str) -> String {
+    let mut tokens = Vec::new();
+    for raw in query.split_whitespace() {
+        // FTS5's syntax is unhappy with bare quotes and dashes
+        // glued to tokens; strip them before suffix-matching.
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '\'' || *c == '-' || *c == '.')
+            .collect();
+        let trimmed = cleaned.trim_matches(|c: char| !c.is_alphanumeric());
+        if trimmed.chars().count() < 2 {
+            continue;
+        }
+        tokens.push(format!("\"{}\"*", trimmed.replace('"', "")));
+    }
+    tokens.join(" AND ")
+}
+
 /// A handle to an open Dub library database. Owns one SQLite
 /// connection in WAL mode with PRAGMAs applied per
 /// `docs/LIBRARY-SCHEMA.md`.
@@ -425,6 +606,206 @@ impl Library {
         Ok(())
     }
 
+    /// Record a deck-load event in `play_history`. Backs the
+    /// "Recently Played" smart crate (§8.5.2) and the v1.x
+    /// Played From / Played Into side panel. `deck` is 0 (= A)
+    /// or 1 (= B); `timestamp_ms` is unix-millis (the caller is
+    /// responsible for capturing the wall clock — usually
+    /// `Date().timeIntervalSince1970 * 1000`). No-op when
+    /// `track_id` doesn't match any canonical row (the FK
+    /// constraint rejects the insert; we surface that as a
+    /// query error so a stale Apple-side selection doesn't
+    /// silently swallow plays).
+    pub fn record_load(&self, track_id: &str, deck: u32, timestamp_ms: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO play_history (track_id, deck, event_type, timestamp_ms) \
+                 VALUES (?1, ?2, 'load', ?3)",
+                params![track_id, deck as i64, timestamp_ms],
+            )
+            .map_err(|e| LibraryError::sqlite("record_load", e))?;
+        Ok(())
+    }
+
+    /// Total canonical-track count. Backs the M11d browser footer
+    /// and the §8.5 source-tree "All Tracks" badge.
+    pub fn track_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+            .map_err(|e| LibraryError::sqlite("track_count", e))?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// List canonical tracks for the M11d browser "All Tracks"
+    /// surface. Returns the assembled [`TrackRow`] (filename →
+    /// id3 priority chain per §8.1) sliced by `limit` / `offset`.
+    /// Ordering is stable by `tracks.created_at` ascending so the
+    /// browser doesn't reshuffle on every re-open.
+    ///
+    /// Convenience wrapper over [`list_tracks_sorted`] for callers
+    /// who don't care about column sort.
+    pub fn list_tracks(&self, limit: u32, offset: u32) -> Result<Vec<TrackRow>> {
+        self.list_tracks_sorted(limit, offset, TrackSortKey::CreatedAt, true)
+    }
+
+    /// Sortable variant of [`list_tracks`] for the M11d.2 browser
+    /// table header. The sort key is picked from the safe-list
+    /// enum so user input never reaches the SQL string; this is
+    /// the only place in the crate where a sort column is
+    /// interpolated. NULL handling is deterministic — NULLs sort
+    /// last in both directions so a few missing-tag rows don't
+    /// jump to the top when the user clicks "Artist". A stable
+    /// secondary key (`t.created_at ASC`) keeps the order
+    /// reproducible across re-queries.
+    pub fn list_tracks_sorted(
+        &self,
+        limit: u32,
+        offset: u32,
+        sort: TrackSortKey,
+        ascending: bool,
+    ) -> Result<Vec<TrackRow>> {
+        let direction = if ascending { "ASC" } else { "DESC" };
+        let column = sort.sql_column();
+        // COLLATE NOCASE on text columns so "abba" sorts next to
+        // "ABBA", not after the entire lowercase block. Numeric
+        // columns ignore the collate hint, so adding it
+        // unconditionally is harmless and keeps the SQL shape
+        // identical across sort keys.
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             ORDER BY {column} IS NULL, {column} COLLATE NOCASE {direction}, \
+                      t.created_at ASC \
+             LIMIT ?1 OFFSET ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_list_tracks_sorted", e))?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("query_list_tracks_sorted", e))?;
+        collect_track_rows(rows, "list_tracks_sorted")
+    }
+
+    /// FTS5-backed substring search per PRD §8.5.4. Whitespace-
+    /// separated tokens are ANDed; tokens are wrapped with `*`
+    /// suffix-match so a partial query (`workin`) hits `Workinonit`.
+    /// Tokens shorter than 2 chars are dropped (single-letter
+    /// suffix-matches would produce noise on a 100k-track library).
+    /// Quotes are stripped to keep the FTS5 syntax happy.
+    pub fn search_tracks(&self, query: &str, limit: u32) -> Result<Vec<TrackRow>> {
+        let fts_query = build_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             WHERE t.id IN (\
+                SELECT DISTINCT track_id FROM track_metadata_fts \
+                WHERE track_metadata_fts MATCH ?1\
+             ) \
+             ORDER BY t.created_at ASC LIMIT ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_search_tracks", e))?;
+        let rows = stmt
+            .query_map(params![fts_query, limit as i64], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("query_search_tracks", e))?;
+        collect_track_rows(rows, "search_tracks")
+    }
+
+    /// Recently Played smart crate per §8.5.2. Reads `play_history`
+    /// for the last `limit` distinct tracks, newest first; only
+    /// `event_type = 'load'` rows count (we don't want a single
+    /// 5-second play_start to overshadow earlier real loads).
+    /// Empty when `play_history` carries no rows (v1.0 day-one
+    /// default state until the deck transport actually fires the
+    /// history-write hook in a follow-up sub-milestone).
+    pub fn recently_played(&self, limit: u32) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             JOIN (\
+                SELECT track_id, MAX(timestamp_ms) AS last_loaded \
+                FROM play_history \
+                WHERE event_type = 'load' \
+                GROUP BY track_id\
+             ) ph ON ph.track_id = t.id \
+             ORDER BY ph.last_loaded DESC LIMIT ?1"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_recently_played", e))?;
+        let rows = stmt
+            .query_map(params![limit as i64], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("query_recently_played", e))?;
+        collect_track_rows(rows, "recently_played")
+    }
+
+    /// Just Imported smart crate per §8.5.2. Tracks whose
+    /// `tracks.created_at` is >= the given unix-seconds boundary.
+    /// Caller chooses the boundary (typically: app-launch time).
+    pub fn just_imported(&self, since_unix_secs: i64, limit: u32) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             WHERE t.created_at >= ?1 \
+             ORDER BY t.created_at DESC LIMIT ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_just_imported", e))?;
+        let rows = stmt
+            .query_map(
+                params![since_unix_secs, limit as i64],
+                track_row_from_columns,
+            )
+            .map_err(|e| LibraryError::sqlite("query_just_imported", e))?;
+        collect_track_rows(rows, "just_imported")
+    }
+
+    /// Resolve a canonical `track_id` to one of its on-disk paths.
+    /// Returns the *first* `track_files` row by `last_seen_at`
+    /// descending (so the most-recently-confirmed path wins),
+    /// joined against the `volumes` table to reconstruct the
+    /// absolute path. Returns `None` when the track has no file
+    /// rows (deleted from disk) or the volume isn't mounted.
+    /// Used by the M11d browser to back drag-and-drop and Space-
+    /// load with a real file URL.
+    pub fn resolve_track_path(&self, track_id: &str) -> Result<Option<std::path::PathBuf>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT v.last_known_mount_point, tf.relative_path \
+                 FROM track_files tf \
+                 JOIN volumes v ON v.volume_uuid = tf.volume_uuid \
+                 WHERE tf.track_id = ?1 \
+                 ORDER BY tf.last_seen_at DESC LIMIT 1",
+                params![track_id],
+                |r| {
+                    let mount: Option<String> = r.get(0)?;
+                    let rel: String = r.get(1)?;
+                    Ok((mount, rel))
+                },
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("resolve_track_path", e))?;
+        // `last_known_mount_point` is nullable in the schema — a
+        // volume that's currently unmounted has no path to attach.
+        // We treat that as "track is unreachable right now" and
+        // return None; the M11d.4 missing-files panel will flag it.
+        Ok(row.and_then(|(mount, rel)| {
+            mount.map(|m| {
+                let mut p = std::path::PathBuf::from(m);
+                p.push(rel);
+                p
+            })
+        }))
+    }
+
     /// Resolve a fingerprint row id to `(track_uuid, display_string)`
     /// for one of the tracks pointing at it. Used by the M11c
     /// importer's dedupe step: a `find_fingerprint_neighbours` hit
@@ -668,5 +1049,294 @@ mod tests {
         assert_eq!(count, 1, "upsert must not duplicate rows");
         let got = lib.find_volume(uuid).unwrap().unwrap();
         assert_eq!(got.mount_point, PathBuf::from("/Volumes/Touring SSD 1"));
+    }
+
+    /// Seed a library with N synthetic tracks (filename source only;
+    /// fingerprint, track_file row, both metadata rows). Returns the
+    /// minted UUIDs in insertion order so tests can assert on them.
+    /// Used by every M11d.1 browser-query test below.
+    fn seed_tracks(lib: &Library, titles: &[&str]) -> Vec<String> {
+        // Register a synthetic volume so the (volume_uuid, relative_path)
+        // FK on track_files holds.
+        let volume = DiscoveredVolume {
+            volume_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            mount_point: PathBuf::from("/"),
+            display_name: "Macintosh HD".into(),
+            is_internal: true,
+        };
+        lib.upsert_volume(&volume).unwrap();
+
+        // Each track needs a unique fingerprint blob so the
+        // `fingerprints` table doesn't reject duplicates via the
+        // future fingerprints-uniqueness index; today's schema does
+        // not enforce that but the rows are still semantically
+        // distinct.
+        let mut uuids = Vec::new();
+        for (i, title) in titles.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let fp_blob: Vec<u8> = (0..32_u8).map(|b| b.wrapping_add(i as u8)).collect();
+            let fp = dub_fingerprint::Fingerprint::from_blob(&fp_blob, 10_000).unwrap();
+            let fp_id = lib
+                .upsert_fingerprint(&fp, Some(44_100), Some(1), Some(123_456))
+                .unwrap();
+            lib.insert_track(&id, fp_id, 10_000, None).unwrap();
+            lib.upsert_track_file(
+                &id,
+                &volume.volume_uuid,
+                &format!("test/{title}.wav"),
+                Some("wav"),
+                Some(44_100),
+                None,
+                Some(1),
+                Some(123_456),
+                Some(1_700_000_000 + i as i64),
+            )
+            .unwrap();
+            lib.upsert_metadata_source(
+                &id,
+                "filename",
+                Some("Test Artist"),
+                Some(title),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // ID3 source has only album + bpm so the COALESCE chains
+            // exercise both sources independently.
+            lib.upsert_metadata_source(
+                &id,
+                "id3",
+                None,
+                None,
+                Some("Test Album"),
+                Some("Test Genre"),
+                None,
+                None,
+                None,
+                None,
+                Some(123.45),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            uuids.push(id);
+        }
+        uuids
+    }
+
+    #[test]
+    fn track_count_starts_at_zero_and_climbs_with_inserts() {
+        let lib = Library::open_in_memory().unwrap();
+        assert_eq!(lib.track_count().unwrap(), 0);
+        seed_tracks(&lib, &["A", "B", "C"]);
+        assert_eq!(lib.track_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn list_tracks_assembles_priority_chain_correctly() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["First", "Second"]);
+        let rows = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, ids[0]);
+        // Title comes from the filename source (preferred over id3).
+        assert_eq!(rows[0].title.as_deref(), Some("First"));
+        // Artist same: filename source wins.
+        assert_eq!(rows[0].artist.as_deref(), Some("Test Artist"));
+        // Album from id3.
+        assert_eq!(rows[0].album.as_deref(), Some("Test Album"));
+        // BPM from id3.
+        assert!((rows[0].bpm.unwrap() - 123.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn list_tracks_paginates_via_limit_offset() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["A", "B", "C", "D", "E"]);
+        let page1 = lib.list_tracks(2, 0).unwrap();
+        let page2 = lib.list_tracks(2, 2).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    #[test]
+    fn search_tracks_matches_via_fts5_suffix() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["Workinonit", "Stakes Is High", "Donuts"]);
+        let hits = lib.search_tracks("workin", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Workinonit"));
+
+        // Multi-token query ANDs the tokens.
+        let hits = lib.search_tracks("stakes high", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Stakes Is High"));
+
+        // Empty / too-short queries return empty.
+        let hits = lib.search_tracks("", 10).unwrap();
+        assert!(hits.is_empty());
+        let hits = lib.search_tracks("a", 10).unwrap();
+        assert!(hits.is_empty());
+
+        // No-match query returns empty.
+        let hits = lib.search_tracks("nonexistent", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn just_imported_filters_by_created_at_threshold() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["A", "B"]);
+        // strftime('%s','now') is the seed time → all rows are
+        // "since the dawn of time"; from-the-future threshold
+        // returns empty.
+        let none = lib.just_imported(i64::MAX - 1, 10).unwrap();
+        assert!(none.is_empty());
+        let all = lib.just_imported(0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn recently_played_returns_empty_when_no_history() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["A", "B"]);
+        let rows = lib.recently_played(10).unwrap();
+        // No play_history rows seeded → empty result, *not* a fallback
+        // to all-tracks. Keeps the smart-crate semantics honest.
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn record_load_appears_in_recently_played_newest_first() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["First", "Second", "Third"]);
+        // Three loads, oldest → newest. Recently Played should
+        // return newest first (last load wins).
+        lib.record_load(&ids[0], 0, 1_700_000_000_000).unwrap();
+        lib.record_load(&ids[1], 1, 1_700_000_001_000).unwrap();
+        lib.record_load(&ids[2], 0, 1_700_000_002_000).unwrap();
+
+        let rows = lib.recently_played(10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, ids[2]);
+        assert_eq!(rows[1].id, ids[1]);
+        assert_eq!(rows[2].id, ids[0]);
+    }
+
+    #[test]
+    fn record_load_idempotent_for_same_track_uses_latest_timestamp() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B"]);
+        // Two loads of the same track; "Recently Played" must
+        // show it once (DISTINCT track_id) at the *latest*
+        // timestamp.
+        lib.record_load(&ids[0], 0, 1_700_000_000_000).unwrap();
+        lib.record_load(&ids[1], 0, 1_700_000_001_000).unwrap();
+        lib.record_load(&ids[0], 1, 1_700_000_002_000).unwrap();
+        let rows = lib.recently_played(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, ids[0]);
+        assert_eq!(rows[1].id, ids[1]);
+    }
+
+    #[test]
+    fn record_load_rejects_unknown_track_id() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["A"]);
+        // FK constraint catches a stale Apple-side selection
+        // pointing at a track that was deleted between selection
+        // and load.
+        let err = lib.record_load("ffffffff-0000-0000-0000-000000000000", 0, 1_700_000_000_000);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn list_tracks_sorted_orders_by_title_ascending() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["Cherry", "Apple", "Banana"]);
+        let rows = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Title, true)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].title.as_deref(), Some("Apple"));
+        assert_eq!(rows[1].title.as_deref(), Some("Banana"));
+        assert_eq!(rows[2].title.as_deref(), Some("Cherry"));
+    }
+
+    #[test]
+    fn list_tracks_sorted_descending_inverts_order() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["Cherry", "Apple", "Banana"]);
+        let rows = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Title, false)
+            .unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Cherry"));
+        assert_eq!(rows[2].title.as_deref(), Some("Apple"));
+    }
+
+    #[test]
+    fn list_tracks_sorted_is_case_insensitive() {
+        let lib = Library::open_in_memory().unwrap();
+        // "abba" and "ABBA" should sort adjacent under NOCASE
+        // collation; without it, the entire uppercase block would
+        // precede the lowercase block.
+        seed_tracks(&lib, &["abba", "Zoso", "ABBA"]);
+        let rows = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Title, true)
+            .unwrap();
+        // abba / ABBA in some order, Zoso last.
+        assert!(matches!(rows[0].title.as_deref(), Some("abba" | "ABBA")));
+        assert!(matches!(rows[1].title.as_deref(), Some("abba" | "ABBA")));
+        assert_eq!(rows[2].title.as_deref(), Some("Zoso"));
+    }
+
+    #[test]
+    fn list_tracks_sorted_nulls_sort_last_in_both_directions() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["With Bpm", "Also With Bpm"]);
+        // Seed inserts BPM=123.45 for every row via the id3
+        // metadata. Strip it from one row to test NULL handling.
+        lib.connection()
+            .execute(
+                "UPDATE track_metadata_source SET bpm = NULL \
+                 WHERE track_id = ?1 AND source = 'id3'",
+                params![ids[0]],
+            )
+            .unwrap();
+        let asc = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Bpm, true)
+            .unwrap();
+        // NULL row must be last in ASC.
+        assert_eq!(asc[1].id, ids[0]);
+        let desc = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Bpm, false)
+            .unwrap();
+        // NULL row stays last in DESC too.
+        assert_eq!(desc[1].id, ids[0]);
+    }
+
+    #[test]
+    fn resolve_track_path_joins_volume_to_relative_path() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Workinonit"]);
+        let path = lib.resolve_track_path(&ids[0]).unwrap().unwrap();
+        assert_eq!(path, PathBuf::from("/").join("test/Workinonit.wav"));
+        // Bogus id → None, not error.
+        let missing = lib
+            .resolve_track_path("00000000-0000-0000-0000-000000000000")
+            .unwrap();
+        assert!(missing.is_none());
     }
 }

@@ -40,5 +40,11 @@ dub-audio = { workspace = true }
 dub-bpm = { workspace = true }
 dub-io = { workspace = true }
 dub-peaks = { workspace = true }
+dub-library = { workspace = true }
 uniffi = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tempdirs for the library-FFI smoke tests so they don't pollute the
+# developer's real `~/Library/Application Support/Dub/library.sqlite`.
+tempfile = "3"

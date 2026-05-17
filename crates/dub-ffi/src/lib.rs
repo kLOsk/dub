@@ -228,7 +228,9 @@ pub struct DubEngine {
     state: Arc<Mutex<EngineState>>,
     /// Per-deck monotonic generation counter for the `PeakSource`
     /// slot. Bumps every time the slot is *assigned* a new source
-    /// (Thru session start, `load_track` swap, etc.). Lives on
+    /// (Thru session start, `load_track` swap, etc.) **and** every
+    /// time a previously-occupied slot is cleared by a Running →
+    /// Stopped transition (see [`Self::stop_thru`]). Lives on
     /// `DubEngine` (not `RunningState`) so the value survives
     /// stop/start cycles — a Thru→Prep restart must trigger a
     /// renderer reset, but `RunningState` is dropped on stop so a
@@ -516,6 +518,27 @@ impl DubEngine {
             a.fetch_add(1, Ordering::Release);
         }
     }
+
+    /// Bump `peak_generation_seq[idx]` for every deck slot that
+    /// currently holds a [`PeakSource`]. Called from
+    /// [`Self::stop_thru`] on the Running → Stopped transition so
+    /// the Swift renderer's "generation change → reset" invariant
+    /// fires the moment the source goes away, not lazily on the
+    /// next `start_thru` / `load_track`.
+    ///
+    /// Slots that were already `None` (e.g. a `start_engine` call
+    /// that never had a `load_track`) are *not* bumped — calling
+    /// `stop_thru` on a session that never assigned a source stays
+    /// a true renderer no-op. This keeps the existing idempotent-
+    /// `stop_thru` contract (two consecutive `stop_thru`s on a
+    /// stopped engine produce zero observable side effects).
+    fn bump_peak_generation_for_occupied(&self, peaks: &[Option<PeakSource>; 2]) {
+        for (idx, slot) in peaks.iter().enumerate() {
+            if slot.is_some() {
+                self.bump_peak_generation(idx);
+            }
+        }
+    }
 }
 
 #[uniffi::export]
@@ -657,9 +680,30 @@ impl DubEngine {
     }
 
     /// Tear down the Thru session. Idempotent — calling `stop_thru`
-    /// on an already-stopped engine is a no-op (no error).
+    /// on an already-stopped engine is a no-op (no error, no side
+    /// effects observable to the renderer).
+    ///
+    /// **Renderer-reset signalling.** When transitioning from
+    /// `Running` to `Stopped`, every deck slot that currently holds
+    /// a [`PeakSource`] has its `peak_generation_seq` entry bumped
+    /// before the [`RunningState`] is dropped. Without this bump
+    /// the Swift renderer's "generation change → reset" invariant
+    /// would not fire on the teardown path (the `Arc<Mutex<…>>`
+    /// holding the engine state is dropped, but the
+    /// `peak_generation_seq` lives on `DubEngine` and survives the
+    /// state replace, so it stays at whatever value the last
+    /// `start_thru` / `load_track` left it at). The renderer would
+    /// then keep displaying the previous session's peaks — its
+    /// length-monotonicity guard noting that the new `peaks_len`
+    /// dropped to zero is *not* enough to trigger a ring reset —
+    /// until the next `start_thru` / `load_track` finally bumped
+    /// the counter. Bumping on stop closes the gap so a quit-then-
+    /// restart sequence renders cleanly from frame zero.
     pub fn stop_thru(&self) {
         let mut state = lock_state(&self.state);
+        if let EngineState::Running(running) = &*state {
+            self.bump_peak_generation_for_occupied(&running.peaks);
+        }
         // Move out the running state so its drop order runs while
         // the mutex is held. Dropping the inner state runs the
         // shutdown sequence documented on `RunningState`.
@@ -2251,6 +2295,72 @@ mod tests {
         engine.stop_thru();
         // Still stopped, still functional.
         assert_eq!(engine.peaks_len(0), 0);
+        // And — critically for the M10.5v renderer-reset path —
+        // a `stop_thru` against an engine that never assigned a
+        // peak source must not advance the generation counter.
+        // The Swift renderer treats every counter change as "the
+        // source slot mutated, reset my ring + cadence cache". A
+        // spurious bump on an idle-stopped engine would cause one
+        // wasted reset per `stop_thru` call, observable as a brief
+        // flicker on the cold-launch + immediate-quit path where
+        // the Apple `Drop` impl auto-invokes `stop_thru`.
+        assert_eq!(engine.peaks_generation(0), 0);
+        assert_eq!(engine.peaks_generation(1), 0);
+    }
+
+    #[test]
+    fn bump_for_occupied_only_bumps_some_slots() {
+        // Synthetic exercise of the helper that backs
+        // `stop_thru`'s renderer-reset signal. We can't construct
+        // a real `RunningState` in a unit test (it owns CoreAudio
+        // `AudioOutput` / `AudioInput` handles which require a
+        // live device), but the bump logic itself takes the
+        // `[Option<PeakSource>; 2]` slice directly, so we feed it
+        // a synthetic File source on deck 0 and a None on deck 1.
+        //
+        // Pre-fix `stop_thru` skipped the bump entirely on the
+        // Running → Stopped transition, so the deck-0 generation
+        // counter stayed flat after a Thru session ended and the
+        // Swift renderer kept showing stale peaks until the next
+        // `start_thru` / `load_track` finally moved it. This test
+        // pins the per-slot bump contract: occupied slots advance,
+        // empty slots stay put.
+        let engine = DubEngine::new();
+        assert_eq!(engine.peaks_generation(0), 0);
+        assert_eq!(engine.peaks_generation(1), 0);
+
+        let synthetic_file_peaks = FilePeaks {
+            broadband: Vec::new(),
+            bands: Vec::new(),
+            onset: Vec::new(),
+            filtered: Vec::new(),
+            sample_rate: 44_100,
+            samples_per_broadband_chunk: 512,
+            samples_per_band_chunk: 512,
+            samples_per_onset_chunk: 512,
+            samples_per_filtered_chunk: 512,
+            beat_grid: BeatGrid::empty(),
+        };
+        let peaks: [Option<PeakSource>; 2] = [Some(PeakSource::File(synthetic_file_peaks)), None];
+        engine.bump_peak_generation_for_occupied(&peaks);
+
+        assert_eq!(
+            engine.peaks_generation(0),
+            1,
+            "deck 0 had a source assigned, generation must advance"
+        );
+        assert_eq!(
+            engine.peaks_generation(1),
+            0,
+            "deck 1 was None, generation must stay put"
+        );
+
+        // Calling again exercises the bump-twice path (idempotent
+        // at the function level: counter advances by exactly one
+        // per occupied slot per call).
+        engine.bump_peak_generation_for_occupied(&peaks);
+        assert_eq!(engine.peaks_generation(0), 2);
+        assert_eq!(engine.peaks_generation(1), 0);
     }
 
     #[test]
@@ -2372,5 +2482,459 @@ mod tests {
         assert!(band_peak_chunks_to_bytes(&[]).is_empty());
         assert!(onset_chunks_to_bytes(&[]).is_empty());
         assert!(filtered_peak_chunks_to_bytes(&[]).is_empty());
+    }
+}
+
+// ===========================================================================
+// M11d.1 — Library FFI surface (DubLibrary)
+// ===========================================================================
+//
+// The Apple shell talks to the M11a–c library subsystem through this
+// object. It's deliberately separated from `DubEngine`: the library
+// lives on disk, has its own lifecycle (one open per-app vs.
+// per-Thru-session for the engine), and the engine doesn't need to
+// know it exists (load paths take an `Arc<Track>`, not a library row).
+//
+// The Swift side holds a single `DubLibrary` for the application's
+// lifetime, calls `openDefault()` once on startup, then queries
+// against it from the UI thread. Writes (importer runs) come in from
+// a background queue and the SQLite WAL mode (set in
+// `dub_library::schema::open_and_migrate`) keeps them off the
+// read-path's critical section.
+
+/// Errors surfaced from the library FFI. Mirrors the structure of
+/// [`EngineError`] — `flat_error` because Swift consumers only need a
+/// human-readable description, not a typed switch.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+#[allow(missing_docs, clippy::enum_variant_names)]
+pub enum LibraryFfiError {
+    /// The library failed to open / migrate. Path or schema-version
+    /// error from `dub_library::open_default` / `open_at`.
+    #[error("library open failed: {0}")]
+    OpenFailed(String),
+    /// A query against the open library failed at the SQL layer.
+    /// Always indicates a programming / schema problem rather than
+    /// user-recoverable state.
+    #[error("library query failed: {0}")]
+    QueryFailed(String),
+    /// The M11c importer failed to walk the supplied folder (the
+    /// folder is missing, unreadable, or a non-recoverable IO error
+    /// surfaced from `dub_library::import_folder`). Per-file failures
+    /// do *not* land here; they're surfaced in
+    /// [`LibraryImportSummary::errors`].
+    #[error("library import failed: {0}")]
+    ImportFailed(String),
+}
+
+impl From<dub_library::LibraryError> for LibraryFfiError {
+    fn from(e: dub_library::LibraryError) -> Self {
+        Self::QueryFailed(e.to_string())
+    }
+}
+
+/// One row in the M11d browser. Fields mirror
+/// [`dub_library::TrackRow`] but cross the FFI as a flat Swift
+/// struct UniFFI can auto-marshal. The optional fields all
+/// translate to `Optional<T>` on the Swift side.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryTrack {
+    /// Canonical UUID (string form so Swift treats it as opaque).
+    pub id: String,
+    /// Display title per §8.1 priority chain. `None` when both
+    /// metadata sources are absent (very rare; only for
+    /// hand-inserted rows).
+    pub title: Option<String>,
+    /// Display artist per §8.1 priority chain.
+    pub artist: Option<String>,
+    /// Album name (id3 source).
+    pub album: Option<String>,
+    /// Genre (id3 source).
+    pub genre: Option<String>,
+    /// Year (filename source preferred over id3).
+    pub year: Option<i32>,
+    /// BPM from the id3 source. `None` until either the id3 tag
+    /// supplied one or the M11c follow-up wires `dub-bpm` into the
+    /// importer to populate `track_beatgrids(source='auto')`.
+    pub bpm: Option<f64>,
+    /// Musical key (Mixed In Key writes this into the id3 comment
+    /// field today; M11e Serato importer adds a dedicated source).
+    pub key: Option<String>,
+    /// Duration in milliseconds. Always present.
+    pub duration_ms: u32,
+    /// Comma-separated canonical version-token list
+    /// (`"clean,radio"`). `None` when no tokens were detected.
+    pub version_tokens: Option<String>,
+    /// Track UUID of the sibling version if §8.1 dedupe registered
+    /// a potential duplicate. The M11d.3 indicator surfaces this.
+    pub potential_duplicate_id: Option<String>,
+    /// Origin source label — `"filesystem"` for M11c-imported
+    /// rows; future Serato / Traktor / rekordbox / iTunes importers
+    /// land their own labels.
+    pub source: String,
+}
+
+/// Column the M11d.2 browser table can sort by. Mirrors
+/// [`dub_library::TrackSortKey`] across the FFI as a UniFFI enum
+/// so the Swift side gets a `LibraryTrackSort` value type rather
+/// than passing free strings (which would land us in
+/// SQL-injection-bait territory even though the SQL surface is
+/// already enum-safe). Order of variants is the same as the
+/// browser's column order.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum LibraryTrackSort {
+    /// Import order — `tracks.created_at`. The default.
+    CreatedAt,
+    /// Display title.
+    Title,
+    /// Display artist.
+    Artist,
+    /// Album name.
+    Album,
+    /// BPM.
+    Bpm,
+    /// Duration in milliseconds.
+    Duration,
+    /// Year.
+    Year,
+}
+
+impl From<LibraryTrackSort> for dub_library::TrackSortKey {
+    fn from(s: LibraryTrackSort) -> Self {
+        match s {
+            LibraryTrackSort::CreatedAt => Self::CreatedAt,
+            LibraryTrackSort::Title => Self::Title,
+            LibraryTrackSort::Artist => Self::Artist,
+            LibraryTrackSort::Album => Self::Album,
+            LibraryTrackSort::Bpm => Self::Bpm,
+            LibraryTrackSort::Duration => Self::Duration,
+            LibraryTrackSort::Year => Self::Year,
+        }
+    }
+}
+
+impl From<dub_library::TrackRow> for LibraryTrack {
+    fn from(r: dub_library::TrackRow) -> Self {
+        Self {
+            id: r.id,
+            title: r.title,
+            artist: r.artist,
+            album: r.album,
+            genre: r.genre,
+            year: r.year,
+            bpm: r.bpm,
+            key: r.key,
+            duration_ms: r.duration_ms,
+            version_tokens: r.version_tokens,
+            potential_duplicate_id: r.potential_duplicate_id,
+            source: r.source,
+        }
+    }
+}
+
+/// Aggregate result of [`DubLibrary::import_folder`]. Mirrors
+/// [`dub_library::ImportSummary`] with the per-file `errors` list
+/// flattened to a `Vec<String>` so the Swift side gets ergonomic
+/// strings rather than a structured Rust enum it would have to
+/// re-marshal.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryImportSummary {
+    /// Files that produced a new canonical `tracks` row.
+    pub added: u32,
+    /// Files that merged into an existing canonical track.
+    pub merged: u32,
+    /// Files registered as sibling versions (potential duplicate).
+    pub sibling_versions: u32,
+    /// Files already known by `(volume_uuid, relative_path)` whose
+    /// metadata rows were refreshed in place.
+    pub refreshed: u32,
+    /// Files skipped because decoding failed or volume resolution
+    /// failed. Detailed reasons live in `errors`.
+    pub skipped: u32,
+    /// Per-file failure descriptions ("/path/to/file.mp3: decode
+    /// failed: ...").
+    pub errors: Vec<String>,
+}
+
+impl From<dub_library::ImportSummary> for LibraryImportSummary {
+    fn from(s: dub_library::ImportSummary) -> Self {
+        let errors = s
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.reason))
+            .collect();
+        Self {
+            added: s.added,
+            merged: s.merged,
+            sibling_versions: s.sibling_versions,
+            refreshed: s.refreshed,
+            skipped: s.skipped,
+            errors,
+        }
+    }
+}
+
+/// The Apple-side handle to the Dub library.
+///
+/// Construct one with `DubLibrary()` (UniFFI emits Swift's
+/// `DubLibrary()`) then call `openDefault()` to materialise the
+/// SQLite connection at `~/Library/Application Support/Dub/library.sqlite`.
+/// All query methods are safe to call from any Swift thread; the
+/// internal `Mutex` serialises access to the underlying `rusqlite`
+/// connection.
+///
+/// Lifecycle:
+///
+/// 1. `let library = DubLibrary()`
+/// 2. `library.openDefault()` (or `openAt(path)` for tests)
+/// 3. Browser polls `trackCount()` / `listTracks(limit:offset:)` /
+///    `search(query:limit:)` etc.
+/// 4. The Apple shell pushes import jobs via `importFolder(path:)`
+///    on a background queue; UI thread keeps reading.
+/// 5. UniFFI drops the handle and closes the connection when the
+///    last Swift reference is released.
+#[derive(uniffi::Object)]
+pub struct DubLibrary {
+    /// `None` until `open_default` / `open_at` succeeds. The
+    /// `Mutex` is held during every query so two background imports
+    /// don't interleave write transactions on the same `rusqlite`
+    /// connection (WAL mode keeps reader-vs-writer concurrent
+    /// across *separate* connections; this single-connection model
+    /// is fine for v1.0 where the writer is single-shot).
+    inner: Mutex<Option<dub_library::Library>>,
+}
+
+#[uniffi::export]
+impl DubLibrary {
+    /// Construct an empty handle. Call `open_default()` or
+    /// `open_at(path)` to materialise a connection.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(None),
+        })
+    }
+
+    /// Open the canonical library at
+    /// `~/Library/Application Support/Dub/library.sqlite`. Idempotent
+    /// — repeated calls re-open the same file. Runs the schema
+    /// migration if the file is fresh.
+    pub fn open_default(&self) -> std::result::Result<(), LibraryFfiError> {
+        let lib = dub_library::Library::open_default()
+            .map_err(|e| LibraryFfiError::OpenFailed(e.to_string()))?;
+        *self.inner.lock().unwrap() = Some(lib);
+        Ok(())
+    }
+
+    /// Open a library at an explicit path. Used by tests and by
+    /// the Apple shell's "Choose Library..." menu (a v1.x affordance
+    /// for DJs who want to keep their library on an external SSD).
+    pub fn open_at(&self, path: String) -> std::result::Result<(), LibraryFfiError> {
+        let lib = dub_library::Library::open_at(std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::OpenFailed(e.to_string()))?;
+        *self.inner.lock().unwrap() = Some(lib);
+        Ok(())
+    }
+
+    /// `true` once `open_default` or `open_at` has succeeded.
+    pub fn is_open(&self) -> bool {
+        self.inner.lock().unwrap().is_some()
+    }
+
+    /// Total canonical-track count. The browser footer reads this.
+    pub fn track_count(&self) -> std::result::Result<u64, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.track_count()?))
+    }
+
+    /// "All Tracks" listing for the M11d browser. `limit` /
+    /// `offset` paginate; the browser realises only visible rows.
+    /// Natural order — `tracks.created_at ASC`. Use
+    /// [`list_tracks_sorted`] for column-header sort.
+    pub fn list_tracks(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_tracks(limit, offset)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Sortable variant of [`list_tracks`]. The M11d.2 browser
+    /// table uses this when the user clicks a column header.
+    /// `sort` is the enum-constrained sort key; `ascending` is
+    /// the direction. NULLs sort last in both directions so
+    /// missing-tag rows don't jump to the top of the list.
+    pub fn list_tracks_sorted(
+        &self,
+        limit: u32,
+        offset: u32,
+        sort: LibraryTrackSort,
+        ascending: bool,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_tracks_sorted(limit, offset, sort.into(), ascending)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// FTS5-backed substring search per PRD §8.5.4. Returns at most
+    /// `limit` rows. Empty / too-short queries return an empty list
+    /// (not an error) so the search bar can degrade gracefully.
+    pub fn search(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.search_tracks(&query, limit)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Recently Played smart crate per §8.5.2. Empty until the deck
+    /// transport actually writes `play_history` rows (M11d.2 wires
+    /// the load hook; until then the smart crate renders empty).
+    pub fn recently_played(
+        &self,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.recently_played(limit)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Just Imported smart crate per §8.5.2. Caller passes the
+    /// boundary as unix-seconds; typical value is the app's launch
+    /// timestamp captured by Swift.
+    pub fn just_imported(
+        &self,
+        since_unix_secs: i64,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.just_imported(since_unix_secs, limit)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Resolve a track UUID to its on-disk path. Returns `None`
+    /// when the volume is unmounted or the track has been deleted.
+    /// The Apple shell uses this to back drag-and-drop and Space-
+    /// load.
+    pub fn track_path(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<String>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let p = lib.resolve_track_path(&track_id)?;
+            Ok(p.map(|pb| pb.to_string_lossy().to_string()))
+        })
+    }
+
+    /// Record a deck-load event in `play_history`. The Apple
+    /// shell calls this immediately after a successful
+    /// `load_track` when the source URL came from the library
+    /// (i.e. the user clicked a row in `LibraryView` rather than
+    /// dragging a file from Finder). `deck` is 0 (= A) or 1 (= B);
+    /// `timestamp_ms` is unix-millis from the Swift wall clock.
+    pub fn record_load(
+        &self,
+        track_id: String,
+        deck: u32,
+        timestamp_ms: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.record_load(&track_id, deck, timestamp_ms)?;
+            Ok(())
+        })
+    }
+
+    /// Walk a folder recursively, importing every audio file per
+    /// M11c. Blocks the caller until the import finishes; the
+    /// Apple shell calls this on a background queue. Per-file
+    /// failures land in [`LibraryImportSummary::errors`]; only a
+    /// session-level abort (missing root) returns `ImportFailed`.
+    pub fn import_folder(
+        &self,
+        path: String,
+    ) -> std::result::Result<LibraryImportSummary, LibraryFfiError> {
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        let summary = dub_library::import_folder(lib, std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
+        Ok(LibraryImportSummary::from(summary))
+    }
+}
+
+impl DubLibrary {
+    /// Internal helper: take the library lock, surface a clean
+    /// "not open" error if the handle wasn't opened first, and
+    /// run the supplied closure against the live connection.
+    /// Centralises the lock-handling boilerplate every
+    /// `#[uniffi::export]` method would otherwise duplicate.
+    fn with_library<F, T>(&self, f: F) -> std::result::Result<T, LibraryFfiError>
+    where
+        F: FnOnce(&dub_library::Library) -> std::result::Result<T, LibraryFfiError>,
+    {
+        let guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_ref()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        f(lib)
+    }
+}
+
+#[cfg(test)]
+mod library_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn handle_starts_closed_then_opens_via_open_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        assert!(!lib.is_open());
+        // Closed handle → every query is a clean error, not a panic.
+        assert!(matches!(
+            lib.track_count(),
+            Err(LibraryFfiError::QueryFailed(_))
+        ));
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert!(lib.is_open());
+        assert_eq!(lib.track_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_library_returns_empty_track_listings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert!(lib.list_tracks(100, 0).unwrap().is_empty());
+        assert!(lib
+            .list_tracks_sorted(100, 0, LibraryTrackSort::Title, true)
+            .unwrap()
+            .is_empty());
+        assert!(lib.recently_played(100).unwrap().is_empty());
+        assert!(lib.just_imported(0, 100).unwrap().is_empty());
+        assert!(lib.search("anything".into(), 100).unwrap().is_empty());
+        assert!(lib.track_path("nonexistent".into()).unwrap().is_none());
+    }
+
+    #[test]
+    fn record_load_against_unknown_track_returns_query_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // No tracks seeded → FK rejects the insert; we surface
+        // that as `QueryFailed` rather than panicking.
+        let err = lib.record_load("ffffffff-0000-0000-0000-000000000000".into(), 0, 1);
+        assert!(matches!(err, Err(LibraryFfiError::QueryFailed(_))));
     }
 }

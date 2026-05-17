@@ -246,6 +246,51 @@ final class WaveformAppModel: ObservableObject {
     /// loads this into the non-master, stopped deck (PRD §5.5).
     @Published var browserSelection: URL? = nil
 
+    // MARK: Library (M11d)
+
+    /// Shared library handle backing the M11d browser. Construction
+    /// is cheap (no SQLite connection until `openLibrary()` lands).
+    /// The handle outlives any one browser view, so search results
+    /// and import progress survive transient view churn (sidebar
+    /// switches, window resize, etc.).
+    let library: DubLibrary = DubLibrary()
+
+    /// `true` once `library.openDefault()` has succeeded. Drives
+    /// the browser's "Open library" affordance — until this flips,
+    /// the LibraryView shows a one-shot "preparing library…"
+    /// placeholder rather than a blank list (which a DJ would read
+    /// as "Dub forgot everything").
+    @Published private(set) var libraryIsOpen: Bool = false
+
+    /// Total canonical-track count, refreshed after every import.
+    /// Browser footer reads this directly.
+    @Published private(set) var libraryTrackCount: UInt64 = 0
+
+    /// Unix-seconds boundary for the "Just Imported" smart crate
+    /// per PRD §8.5.2. Captured at app launch so a DJ who plugs in
+    /// a USB stick 10 minutes before the gig sees exactly the
+    /// tracks they imported during this session.
+    let appLaunchUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
+
+    /// Most recent import outcome, surfaced in the LibraryView
+    /// footer for ~5 s after an import-folder run completes.
+    /// `nil` while no import has run this session.
+    @Published var lastImportSummary: LibraryImportSummary? = nil
+
+    /// `true` while an import is in progress. Drives the
+    /// browser's progress indicator and disables the
+    /// "Import Folder…" button to prevent overlapping runs (the
+    /// importer is safe to run twice but the UX is confusing).
+    @Published private(set) var libraryImportInProgress: Bool = false
+
+    /// Canonical UUID of the LibraryView's currently selected
+    /// row, or `nil` when the current selection is a Finder drag.
+    /// Used by [`recordLibraryLoadIfApplicable`] to decide whether
+    /// a successful `loadTrack` deserves a `play_history` row.
+    /// Kept in lockstep with [`browserSelection`] inside
+    /// [`selectLibraryTrack`].
+    @Published var selectedLibraryTrackId: String? = nil
+
     // MARK: Private state
 
     /// Sticky master from the previous round when neither deck is
@@ -637,6 +682,13 @@ final class WaveformAppModel: ObservableObject {
             next.bpmConfidence = 0
             setState(next, for: side)
             recomputeMaster()
+            // M11d.2: record a play_history row when the source
+            // URL came from the library (i.e. the user clicked a
+            // row in LibraryView, which populated
+            // `selectedLibraryTrackId`). Finder drags don't write
+            // history because there's no library row yet; the
+            // background importer can pull them in later.
+            recordLibraryLoadIfApplicable(side: side, url: url)
             return true
         case .failure(let error):
             var failed = state(for: side)
@@ -661,6 +713,125 @@ final class WaveformAppModel: ObservableObject {
     ///   A. Prep mode by definition has no deck B, and single-
     ///   channel Timecode never spins one up, so "non-master" isn't
     ///   meaningful and Space loads onto the only deck that exists.
+    // MARK: - Library access (M11d)
+
+    /// Open the canonical library at
+    /// `~/Library/Application Support/Dub/library.sqlite`. Safe to
+    /// call repeatedly; the FFI handle is idempotent on re-open.
+    /// Called once from `MainView.onAppear`.
+    func openLibraryIfNeeded() {
+        guard !libraryIsOpen else { return }
+        do {
+            try library.openDefault()
+            libraryIsOpen = true
+            refreshLibraryStats()
+        } catch {
+            surfaceError("Failed to open library: \(error.localizedDescription)")
+        }
+    }
+
+    /// Refresh `libraryTrackCount`. Cheap (`SELECT COUNT(*) FROM
+    /// tracks`); called on app launch and after every import.
+    func refreshLibraryStats() {
+        guard libraryIsOpen else { return }
+        if let count = try? library.trackCount() {
+            libraryTrackCount = count
+        }
+    }
+
+    /// Walk the supplied folder via the M11c importer. Runs on a
+    /// detached background queue so the UI stays responsive; the
+    /// completion handler hops back to the main actor to update
+    /// `libraryTrackCount` and `lastImportSummary`. Idempotent —
+    /// re-importing the same folder refreshes metadata without
+    /// duplicating identity rows (proven by
+    /// `re_import_is_idempotent` in `dub-library`).
+    func importLibraryFolder(_ folder: URL) async {
+        guard libraryIsOpen else {
+            surfaceError("Library is not open yet.")
+            return
+        }
+        if libraryImportInProgress {
+            surfaceError("An import is already running.")
+            return
+        }
+        libraryImportInProgress = true
+        let library = self.library
+        let path = folder.path
+        let result: Result<LibraryImportSummary, Error> = await Task.detached(priority: .userInitiated) {
+            do {
+                let s = try library.importFolder(path: path)
+                return .success(s)
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        libraryImportInProgress = false
+        switch result {
+        case .success(let summary):
+            lastImportSummary = summary
+            refreshLibraryStats()
+        case .failure(let err):
+            surfaceError("Import failed: \(err.localizedDescription)")
+        }
+    }
+
+    /// Resolve a canonical track id to its on-disk URL and store it
+    /// in `browserSelection` so the existing Space-load + drag
+    /// paths (PRD §6.4) Just Work. Surfaces a polite error when
+    /// the file is currently unreachable (volume unmounted, track
+    /// deleted) instead of writing a bogus URL.
+    func selectLibraryTrack(_ trackId: String) {
+        guard libraryIsOpen else { return }
+        do {
+            if let path = try library.trackPath(trackId: trackId) {
+                browserSelection = URL(fileURLWithPath: path)
+                selectedLibraryTrackId = trackId
+            } else {
+                browserSelection = nil
+                selectedLibraryTrackId = nil
+                surfaceError("Track is unreachable — the source volume may be unmounted.")
+            }
+        } catch {
+            surfaceError("Failed to resolve track: \(error.localizedDescription)")
+        }
+    }
+
+    /// Write a `play_history` row when the just-loaded URL came
+    /// from the M11d library (i.e. the user clicked a row in
+    /// `LibraryView` rather than dragging a file from Finder).
+    /// The matching is done by URL equality against the
+    /// previously-cached `selectedLibraryTrackId` — robust to
+    /// the Apple shell's path-normalisation foibles because
+    /// both sides went through the same
+    /// `library.trackPath(trackId:)` → URL conversion.
+    ///
+    /// The deck index is mapped from `DeckSide` to the
+    /// `(0 = A, 1 = B)` convention `play_history.deck`
+    /// enforces. `timestamp_ms` is unix-millis from the Swift
+    /// wall clock.
+    ///
+    /// Failures are surfaced silently to `lastError` instead of
+    /// flashing the deck pane — a missed history row is a
+    /// cosmetic glitch on the smart-crate, not a load failure
+    /// the DJ needs to see.
+    private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
+        guard libraryIsOpen, let trackId = selectedLibraryTrackId else { return }
+        do {
+            if let path = (try library.trackPath(trackId: trackId)) {
+                let cached = URL(fileURLWithPath: path).standardizedFileURL
+                guard cached == url.standardizedFileURL else { return }
+            } else {
+                return
+            }
+            let deck: UInt32 = (side == .a) ? 0 : 1
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            try library.recordLoad(trackId: trackId, deck: deck, timestampMs: nowMs)
+        } catch {
+            surfaceError("Failed to record play history: \(error.localizedDescription)")
+        }
+    }
+
     func loadBrowserSelectionIntoTargetDeck() async {
         guard isRunning else {
             surfaceError("Engine not running.")
@@ -1300,6 +1471,13 @@ struct MainView: View {
                 if !model.isRunning {
                     model.applyConfig()
                 }
+                // M11d.1: open the library handle on cold boot so
+                // the LibraryView can render rows without forcing
+                // the user through an explicit "open library"
+                // affordance. Idempotent; safe if the engine
+                // applyConfig path also touched something library-
+                // adjacent in a future milestone.
+                model.openLibraryIfNeeded()
             }
     }
 }

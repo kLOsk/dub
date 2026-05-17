@@ -52,7 +52,7 @@ struct PerformanceView: View {
             Rectangle().fill(DubColor.divider).frame(height: 1)
             FXBarPlaceholder()
             Rectangle().fill(DubColor.divider).frame(height: 1)
-            FileBrowserView(model: model)
+            LibraryView(model: model)
         }
         .background(DubColor.surface0)
     }
