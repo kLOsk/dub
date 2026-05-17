@@ -156,17 +156,29 @@ We run TDD on Rust code. See PRD §2.2 for full philosophy. Quick rules:
 
 ## Key external libraries (with license notes)
 
+Currently wired (in the actual `Cargo.toml` dependency graph):
+
 - `coreaudio-rs` (MIT/Apache) — CoreAudio I/O
-- `symphonia` (MPL-2.0) — audio decoding
-- `rubato` (MIT) — sinc resampling
-- `rubberband` (FFI, **GPL-3.0**) — time-stretch (forces project to GPL)
-- `aubio` (FFI, LGPL-3.0) — *not currently linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
-- `realfft` / `rustfft` (MIT/Apache) — pure-Rust FFT used by `dub-bpm` for spectral-flux onset detection
+- `objc2-core-audio` / `objc2-core-audio-types` / `objc2-audio-toolbox` (MIT) — CoreAudio FFI for the bits `coreaudio-rs` doesn't wrap
+- `symphonia` (MPL-2.0) — audio decoding (features: wav, pcm, mp3, flac, aiff, aac, alac, isomp4)
+- `realfft` (MIT/Apache, thin wrapper on `rustfft`) — pure-Rust FFT used by `dub-bpm` for spectral-flux onset detection
 - `rusty-chromaprint` (MIT/Apache) — pure-Rust port of the Chromaprint algorithm (algorithm 2). Used in `dub-fingerprint` for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1). M11b chose pure-Rust over the LGPL-2.1 C library (`chromaprint`) for the same reasons `dub-bpm` chose pure-Rust over aubio: license isolation, no C build dep, no unsafe FFI surface, simpler distribution.
+- `rusqlite` (MIT, feature `bundled`) — SQLite for the M11 library catalog
+- `uuid` (MIT/Apache), `dirs` (MIT/Apache), `libc` (MIT/Apache), `walkdir` (MIT/Unlicense) — library plumbing
+- `uniffi` (MPL-2.0) — Swift FFI surface generator
 - `assert_no_alloc` (MIT) — RT-safety enforcement
 - `ringbuf` (MIT) — lock-free SPSC
+- `hound` (Apache-2.0) — WAV writer for offline render + test fixtures
+- `thiserror` / `anyhow` (MIT/Apache) — error plumbing
+- `ratatui` / `crossterm` / `serde` / `serde_json` / `time` (MIT/Apache) — `dub-cli` only
 
-We are GPLv3 because of Rubber Band. This is a deliberate choice. See PRD §11.
+Planned but **not** in the dep graph yet (placeholder crates exist):
+
+- `rubberband` (FFI, **GPL-3.0**) — time-stretch. Slated for M14 in `crates/dub-stretch/` (currently empty). The workspace `license = "GPL-3.0-or-later"` reservation anticipates this dependency landing; until it does, the actual dep graph is fully permissive (MIT / Apache / MPL-2.0 only). Commercial-license alternatives exist if a closed-source distribution model is chosen — see PRD §11.
+- `aubio` (FFI, LGPL-3.0) — *deliberately not linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
+- `chromaprint` (FFI, LGPL-2.1) — *deliberately not linked.* Replaced at M11b by `rusty-chromaprint` (pure-Rust, MIT/Apache) for license isolation + no C build dep.
+
+We are GPLv3 because of the planned Rubber Band integration. This is a deliberate choice. See PRD §11. The license posture stays flexible until M14 ships Rubber Band: today nothing in the dep graph forces GPL.
 
 ---
 

@@ -28,6 +28,22 @@ use crate::paths::default_library_db_path;
 use crate::schema::open_and_migrate;
 use crate::volumes::DiscoveredVolume;
 
+/// Normalise an optional metadata string: trim whitespace, return
+/// `None` when the result is empty. Matches the schema's
+/// "absent = NULL, not empty string" convention so a downstream
+/// `COALESCE(artist, ...)` chain doesn't accidentally pick an
+/// empty string as a real value.
+fn nonempty(s: Option<&str>) -> Option<&str> {
+    s.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(v.trim())
+        }
+    })
+}
+
 /// A handle to an open Dub library database. Owns one SQLite
 /// connection in WAL mode with PRAGMAs applied per
 /// `docs/LIBRARY-SCHEMA.md`.
@@ -184,6 +200,282 @@ impl Library {
             )
             .map_err(|e| LibraryError::sqlite("insert_fingerprint", e))?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Return every stored fingerprint whose `duration_ms` falls
+    /// within `[duration_ms - delta_ms, duration_ms + delta_ms]`.
+    /// This is the M11c importer's fast first-pass dedupe filter:
+    /// the duration window is cheap to query (the
+    /// `idx_fingerprints_duration` index makes it index-only) and
+    /// dramatically reduces the number of candidates we Hamming-
+    /// compare. The §8.1 dedupe-merge threshold is 200 ms; the
+    /// caller typically passes that, but loosening the window for
+    /// "potential duplicate" detection is supported.
+    pub fn find_fingerprint_neighbours(
+        &self,
+        duration_ms: u32,
+        delta_ms: u32,
+    ) -> Result<Vec<StoredFingerprint>> {
+        let lo = duration_ms.saturating_sub(delta_ms) as i64;
+        let hi = duration_ms.saturating_add(delta_ms) as i64;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT id, chromaprint_blob, duration_ms, sample_rate, channel_count, file_size \
+                 FROM fingerprints \
+                 WHERE duration_ms BETWEEN ?1 AND ?2",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_find_fingerprint_neighbours", e))?;
+        let rows = stmt
+            .query_map(params![lo, hi], |r| {
+                let id: i64 = r.get(0)?;
+                let blob: Vec<u8> = r.get(1)?;
+                let duration_ms: i64 = r.get(2)?;
+                let sample_rate: Option<i64> = r.get(3)?;
+                let channel_count: Option<i64> = r.get(4)?;
+                let file_size: Option<i64> = r.get(5)?;
+                Ok((id, blob, duration_ms, sample_rate, channel_count, file_size))
+            })
+            .map_err(|e| LibraryError::sqlite("query_find_fingerprint_neighbours", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, blob, duration_ms, sample_rate, channel_count, file_size) =
+                row.map_err(|e| LibraryError::sqlite("row_find_fingerprint_neighbours", e))?;
+            let fp = Fingerprint::from_blob(&blob, duration_ms as u32).map_err(|e| {
+                LibraryError::Sqlite {
+                    context: "find_fingerprint_neighbours_blob",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
+                }
+            })?;
+            out.push(StoredFingerprint {
+                id,
+                fingerprint: fp,
+                sample_rate: sample_rate.map(|v| v as u32),
+                channel_count: channel_count.map(|v| v as u32),
+                file_size: file_size.map(|v| v as u64),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Insert a canonical `tracks` row. The caller supplies a
+    /// freshly minted UUID (typically `uuid::Uuid::new_v4()`); we
+    /// don't generate it here so the caller can record the UUID
+    /// in their in-memory work queue before any SQL fires.
+    /// `duplicate_link_track_id` is `Some(other_uuid)` for sibling-
+    /// version registration; `None` otherwise.
+    pub fn insert_track(
+        &self,
+        track_uuid: &str,
+        fingerprint_id: i64,
+        duration_ms: u32,
+        duplicate_link_track_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO tracks \
+                 (id, fingerprint_id, duration_ms, duplicate_link_track_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'), strftime('%s','now'))",
+                params![
+                    track_uuid,
+                    fingerprint_id,
+                    duration_ms as i64,
+                    duplicate_link_track_id,
+                ],
+            )
+            .map_err(|e| LibraryError::sqlite("insert_track", e))?;
+        Ok(())
+    }
+
+    /// Upsert a `track_files` row for the given canonical track and
+    /// `(volume_uuid, relative_path)`. The UNIQUE index on
+    /// `(volume_uuid, relative_path)` enforces single-file identity;
+    /// re-import refreshes the codec / sample_rate / mtime fields
+    /// without duplicating rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_track_file(
+        &self,
+        track_uuid: &str,
+        volume_uuid: &str,
+        relative_path: &str,
+        codec: Option<&str>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<u32>,
+        channel_count: Option<u32>,
+        file_size: Option<u64>,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO track_files \
+                 (track_id, volume_uuid, relative_path, codec, sample_rate, bit_depth, \
+                  channel_count, file_size, mtime, last_seen_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now')) \
+                 ON CONFLICT(volume_uuid, relative_path) DO UPDATE SET \
+                     track_id      = excluded.track_id, \
+                     codec         = excluded.codec, \
+                     sample_rate   = excluded.sample_rate, \
+                     bit_depth     = excluded.bit_depth, \
+                     channel_count = excluded.channel_count, \
+                     file_size     = excluded.file_size, \
+                     mtime         = excluded.mtime, \
+                     last_seen_at  = strftime('%s','now')",
+                params![
+                    track_uuid,
+                    volume_uuid,
+                    relative_path,
+                    codec,
+                    sample_rate.map(|v| v as i64),
+                    bit_depth.map(|v| v as i64),
+                    channel_count.map(|v| v as i64),
+                    file_size.map(|v| v as i64),
+                    mtime,
+                ],
+            )
+            .map_err(|e| LibraryError::sqlite("upsert_track_file", e))?;
+        Ok(())
+    }
+
+    /// Find the `track_id` that owns the given
+    /// `(volume_uuid, relative_path)`. Used by idempotent re-import:
+    /// when a previously-seen file is re-encountered, the
+    /// `track_files` lookup tells us the canonical track without
+    /// needing to re-decode and re-fingerprint.
+    pub fn find_track_file_owner(
+        &self,
+        volume_uuid: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT track_id FROM track_files \
+                 WHERE volume_uuid = ?1 AND relative_path = ?2",
+                params![volume_uuid, relative_path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("find_track_file_owner", e))
+    }
+
+    /// Upsert a per-source metadata row. The UNIQUE index on
+    /// `(track_id, source)` means re-import overwrites the existing
+    /// row (refreshes the metadata) rather than duplicating it.
+    /// Empty strings in any field are stored as `NULL` to match the
+    /// schema's "absent = NULL" convention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_metadata_source(
+        &self,
+        track_uuid: &str,
+        source: &str,
+        artist: Option<&str>,
+        title: Option<&str>,
+        album: Option<&str>,
+        genre: Option<&str>,
+        comment: Option<&str>,
+        composer: Option<&str>,
+        year: Option<i32>,
+        track_number: Option<i32>,
+        bpm: Option<f64>,
+        key: Option<&str>,
+        gain_db: Option<f64>,
+        rating: Option<i32>,
+        version_token: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO track_metadata_source \
+                 (track_id, source, artist, title, album, genre, comment, composer, year, \
+                  track_number, bpm, key, gain_db, rating, version_token, imported_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                         strftime('%s','now')) \
+                 ON CONFLICT(track_id, source) DO UPDATE SET \
+                     artist        = excluded.artist, \
+                     title         = excluded.title, \
+                     album         = excluded.album, \
+                     genre         = excluded.genre, \
+                     comment       = excluded.comment, \
+                     composer      = excluded.composer, \
+                     year          = excluded.year, \
+                     track_number  = excluded.track_number, \
+                     bpm           = excluded.bpm, \
+                     key           = excluded.key, \
+                     gain_db       = excluded.gain_db, \
+                     rating        = excluded.rating, \
+                     version_token = excluded.version_token, \
+                     imported_at   = strftime('%s','now')",
+                params![
+                    track_uuid,
+                    source,
+                    nonempty(artist),
+                    nonempty(title),
+                    nonempty(album),
+                    nonempty(genre),
+                    nonempty(comment),
+                    nonempty(composer),
+                    year,
+                    track_number,
+                    bpm,
+                    nonempty(key),
+                    gain_db,
+                    rating,
+                    nonempty(version_token),
+                ],
+            )
+            .map_err(|e| LibraryError::sqlite("upsert_metadata_source", e))?;
+        Ok(())
+    }
+
+    /// Resolve a fingerprint row id to `(track_uuid, display_string)`
+    /// for one of the tracks pointing at it. Used by the M11c
+    /// importer's dedupe step: a `find_fingerprint_neighbours` hit
+    /// gives us the candidate fingerprint but not the canonical
+    /// track UUID; this method bridges that gap and assembles a
+    /// title-or-filename string from the per-source metadata rows
+    /// for the version-token check.
+    ///
+    /// Returns `None` for orphan fingerprints (rows whose owning
+    /// track has been deleted but whose fingerprint row survives
+    /// — possible during the brief window of a v1.x merge UI).
+    /// When multiple tracks reference the same fingerprint id
+    /// (only possible via the duplicate_link path), the first by
+    /// `tracks.created_at` wins; in normal operation only one row
+    /// per fingerprint exists.
+    pub fn find_track_owner_by_fingerprint_id(
+        &self,
+        fingerprint_id: i64,
+    ) -> Result<Option<(String, String)>> {
+        // Display-string assembly: prefer the filename source's
+        // title (carries version tokens verbatim) over id3 (which
+        // may have been written by a tag editor that stripped
+        // them). The COALESCE chain picks the first non-NULL.
+        self.conn
+            .query_row(
+                "SELECT t.id, \
+                        COALESCE(\
+                            CASE WHEN fn.artist IS NOT NULL AND fn.title IS NOT NULL \
+                                 THEN fn.artist || ' - ' || fn.title \
+                                 ELSE fn.title END, \
+                            CASE WHEN i3.artist IS NOT NULL AND i3.title IS NOT NULL \
+                                 THEN i3.artist || ' - ' || i3.title \
+                                 ELSE i3.title END, \
+                            '') AS display \
+                 FROM tracks t \
+                 LEFT JOIN track_metadata_source fn \
+                          ON fn.track_id = t.id AND fn.source = 'filename' \
+                 LEFT JOIN track_metadata_source i3 \
+                          ON i3.track_id = t.id AND i3.source = 'id3' \
+                 WHERE t.fingerprint_id = ?1 \
+                 ORDER BY t.created_at ASC \
+                 LIMIT 1",
+                params![fingerprint_id],
+                |r| {
+                    let uuid: String = r.get(0)?;
+                    let display: String = r.get(1)?;
+                    Ok((uuid, display))
+                },
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("find_track_owner_by_fingerprint_id", e))
     }
 
     /// Look up a stored fingerprint by its primary key. Used by the

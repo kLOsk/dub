@@ -1919,4 +1919,133 @@ This entry corresponds to the M11b commit set. PRD §5.2.5 + §8.2 + §10.1 + §
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11c onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+## M11c — Filesystem importer + filename parser
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 2–3 days &nbsp;·&nbsp; **Actual:** ~1 day
+
+The end-to-end walk-a-folder importer that closes the loop between the M11a schema, the M11b fingerprint + dedupe primitives, and the symphonia-backed `dub-io` decoder. The importer is the first M11 deliverable that actually populates a working library: hand it a folder of loose audio files and you get a SQLite database with canonical `tracks` rows, idempotent `track_files` registrations, per-source `track_metadata_source` rows for `filename` + `id3`, and §8.1-correct dedupe / sibling-version handling for repeat content.
+
+### Pipeline
+
+```text
+walk folder (recursive, deterministic alphabetical order, audio-ext filter)
+   │
+   ▼  per file
+discover macOS volume UUID for path  (firmlink-normalised: /System/Volumes/Data → /)
+   │
+   ▼
+check track_files for (volume_uuid, relative_path) → already imported?
+   ├─ hit → refresh per-source metadata rows, touch last_seen_at, done
+   └─ miss
+       ▼
+   decode samples + extended ID3 metadata via dub_io::Track::load_from_path
+       ▼
+   compute Chromaprint fingerprint via dub_fingerprint::Fingerprint::compute_from_f32
+       ▼
+   find_fingerprint_neighbours(duration_ms, 200 ms) → candidate set
+       ▼
+   for each neighbour: dedupe::decide(candidate, neighbour)
+       ├─ Merge          → add a track_files row against the existing tracks.id
+       ├─ SiblingVersion → new tracks row with duplicate_link_track_id populated
+       └─ Distinct       → fall through
+       ▼
+   no merge / sibling? mint a new canonical UUID and INSERT tracks + track_files
+       ▼
+   UPSERT track_metadata_source(source='id3')      from container tags
+   UPSERT track_metadata_source(source='filename') from filename_parser output
+```
+
+Single-threaded. Deterministic. Composable: every step is an isolated, unit-tested function in `dub-library`. The end-to-end driver `import_folder(&mut Library, &Path) -> Result<ImportSummary>` is the only public entry point on the importer surface.
+
+### `dub-library::filename_parser` (new module)
+
+Pure function `parse(&str) -> ParsedFilename` implementing PRD §8.4:
+
+* **Patterns recognised** — all four documented forms, layered:
+   1. `ARTIST - TITLE.ext`
+   2. `ARTIST - TITLE (VERSION).ext`
+   3. `ARTIST_-_TITLE_(VERSION)_[YEAR].ext` (underscored separator variant)
+   4. `[LABEL CAT#] ARTIST - TITLE.ext`
+* **Extension stripping** — bounded to ≤ 5 ASCII-alphanumeric chars so `J Dilla feat. Madlib - Track.mp3` keeps the `feat.` dot and only `.mp3` falls.
+* **Leading bracket** — captures `[LABEL CAT#]` verbatim into `ParsedFilename::label_catalog`; the importer writes it into `track_metadata_source(source='filename').comment` (the verbatim text path until M11e ships a stronger Discogs / label resolver).
+* **Trailing year** — `(YYYY)` or `[YYYY]` recognised only for `1900..=2099`; five-digit numbers and out-of-range years stay in the title slot. Cross-pattern: `Roxanne - Roxanne (Radio Edit) [2003].mp3` produces `version_tokens={radio}` *and* `year=2003` because the year-strip and version-strip stages run in order.
+* **Trailing version segment** — bracketed tail consumed and passed to `version_tokens::parse_plain` (new entry point added to the M11b parser, scans bracket-stripped inner content directly rather than re-requiring brackets).
+* **Separator tolerance** — `trim_trailing_separators` strips trailing `_` / `-` / whitespace before the trailing-bracket checks, so `Modeselektor_-_Berlin_(VIP Mix)_[2014].mp3` parses cleanly even though the dangling `_` would otherwise mask the `]` close-bracket.
+* **Artist/title split** — first ` - ` separator after `_` → ` ` normalisation; either side may be empty.
+* **Whitespace collapse** — runs of whitespace collapse to a single space (rip-naming-convention safety).
+
+`is_junk_title(&str) -> bool` implements the §8.4 ID3 junk-pattern detection so the importer can decide when to demote ID3 in the §8.1 priority chain. Matches `Track 01`, `Track14`, `Unknown`, `Untitled`, empty / all-whitespace; matches blogspot-era noise (`downloaded from xyzblog.com`, `xyzblog.blogspot.com`, `http://example.com`, `Free Download by Producer`). Critical false-positive guards: `is_junk_title("23")`, `is_junk_title("99 Problems")`, `is_junk_title("Track 1 (Live)")`, `is_junk_title("Donuts")` all return `false`. The "all-digits is junk" rule is tightened to require either a period (`01.02`) or a leading-zero short numeric (`01`, `02`); standalone `23` (Blonde Redhead's track) stays a legitimate title.
+
+14 unit tests cover every pattern arm, the year-range edge, unicode artist names (`Björk - Hyperballad`), titles with embedded dots (`feat.`), title-only files (no ` - ` separator), and the full junk-detection truth table.
+
+### `dub-library::importer` (new module)
+
+The end-to-end driver. `ImportSummary { added, merged, sibling_versions, refreshed, skipped, errors }` is the structured result; per-file failures land in `errors: Vec<ImportError>` rather than aborting the whole run — a permissions error on one file shouldn't stop a 10 000-file folder.
+
+Key design decisions:
+
+* **Idempotent re-import shortcut.** `Library::find_track_file_owner(volume_uuid, relative_path)` is checked first. On hit we refresh both per-source metadata rows via the *fast* `dub_io::read_metadata` probe (no full decode) and touch `last_seen_at`. On miss we fall through to the cold decode + fingerprint + dedupe path. A second `import_folder` over the same content costs ~1 ms / file (metadata probe + four SQL UPSERTs) instead of ~100 ms (decode 10 s of audio at 44.1 kHz). Verified by `re_import_is_idempotent`: counts go from `(added=2, merged=0)` first run to `(added=0, merged=0, refreshed=2)` second run with `tracks`/`track_files` row counts unchanged.
+* **Dedupe display-string assembly.** `Library::find_track_owner_by_fingerprint_id` resolves a neighbour fingerprint row to `(track_uuid, display_string)` via a `COALESCE` chain that prefers the filename source's title (carries version tokens verbatim from the file system) over the ID3 source (which may have been tag-edited and lost them). The composed string is what the §8.1 version-token check parses, so a tag-stripped ID3 title can't fake-merge a Clean version into a Dirty one when the filename still says `(Clean)`.
+* **First-match-wins dedupe choice.** Across the neighbour set, the first `Merge` candidate wins. If no merge is possible, the first `SiblingVersion` candidate wins. Otherwise `Distinct`. Deterministic because `find_fingerprint_neighbours` orders by primary key and the candidate set is small (everything within ±200 ms of the same duration).
+* **macOS firmlink normalisation.** `volumes::discover_for_path` was extended to map the raw `statfs(2)` mount-point `/System/Volumes/Data` (the APFS data-volume mount) to `/` (the user-visible boot-volume root). Without this, `/var/folders/...` tempdir paths used in tests and `/Users/...` user-music paths would both fail the `strip_prefix(volume.mount_point)` check used to compute `track_files.relative_path`, because the user-visible path doesn't include the `/System/Volumes/Data` prefix. The volume UUID itself is unchanged — same physical APFS volume — only the mount-point string is normalised. `is_internal` becomes `true` for both `/` and `/System/Volumes/Data` so the homogeneity is preserved through the volumes table.
+* **Codec detection from extension.** `detect_codec_from_extension` writes `track_files.codec` from the path extension (`wav` / `mp3` / `flac` / `aiff` / `alac` / `aac`); peeking inside the container for a more precise codec id would need symphonia internals and isn't load-bearing for v1.
+* **Audio-extension allowlist.** `AUDIO_EXTS = ["wav", "mp3", "flac", "aif", "aiff", "m4a", "alac", "aac"]` mirrors the workspace's enabled symphonia features. Cover art / sidecar files / notes.txt are skipped.
+
+### `dub-io::TrackMetadata` extensions
+
+The container-metadata snapshot grew from 3 fields (title, artist, album) to 11 to cover the §8.2 `track_metadata_source` column set: `genre`, `comment`, `composer`, `year`, `track_number`, `bpm`, `key`, `gain_db`. Mapping done via `symphonia::core::meta::StandardTagKey`:
+
+* `Date` → `year` (4-char prefix parsed as `i32`, tolerates `"1996"` and `"1996-04-23"`; rejects garbage).
+* `TrackNumber` → `track_number` (the `"3/12"` form keeps only the lead component).
+* `Bpm` → `bpm` (range-checked `0 < b < 500`).
+* `ReplayGainTrackGain` → `gain_db` (`"-7.20 dB"` → `-7.20` after `dB` / `Db` / `DB` / `db` suffix strip).
+* `Genre`, `Comment`, `Composer` → direct strings.
+
+`StandardTagKey` does not expose a musical-key variant in symphonia 0.5.5, so `key` stays `None` from container-tag reading. Per PRD §8.4 ("Key detection deferred to v1.x; Mixed In Key writes key data into ID3 comment fields, which we read"), the v1 key path is `Comment` — already covered. M11e Serato importer adds key reading from Serato's `Autotags` GEOB frame.
+
+`Track` was refactored to store the full `TrackMetadata` snapshot internally rather than three loose fields; `extended_metadata() -> &TrackMetadata` is the new accessor the importer uses. The existing `title()` / `artist()` / `album()` accessors stay as the cheap surface for the rest of the codebase (deck headers, file browser).
+
+### `dub-library::Library` new write paths
+
+* `find_fingerprint_neighbours(duration_ms, delta_ms) -> Vec<StoredFingerprint>` — duration-windowed first-pass dedupe filter. The `idx_fingerprints_duration` index makes this index-only at the SQLite level. Caller iterates the result and Hamming-compares each candidate via `dub_fingerprint::similarity`.
+* `find_track_owner_by_fingerprint_id(id) -> Option<(uuid, display_string)>` — the dedupe → version-token-check bridge described above.
+* `insert_track(uuid, fingerprint_id, duration_ms, duplicate_link_track_id) -> Result<()>` — single canonical row insert.
+* `upsert_track_file(track_uuid, volume_uuid, relative_path, codec, sample_rate, bit_depth, channel_count, file_size, mtime) -> Result<()>` — idempotent on `(volume_uuid, relative_path)` UNIQUE index. Refreshes the file metadata fields and bumps `last_seen_at` on conflict.
+* `find_track_file_owner(volume_uuid, relative_path) -> Option<String>` — the idempotent-re-import lookup.
+* `upsert_metadata_source(track_uuid, source, artist, title, album, genre, comment, composer, year, track_number, bpm, key, gain_db, rating, version_token) -> Result<()>` — idempotent on `(track_id, source)` UNIQUE index. The internal `nonempty` helper normalises empty / whitespace-only strings to `NULL` so the schema's "absent = NULL, not empty string" convention is honoured even when callers pass `Some("")`.
+
+### Test coverage
+
+8 importer integration tests using `tempfile::tempdir` + `hound` synthetic WAV fixtures (no shipped audio binaries):
+
+* `imports_a_fresh_folder_with_one_track` — 1 file → `(added=1, merged=0, skipped=0)`, 1 tracks row, 1 track_files row, 2 metadata rows (id3 + filename).
+* `re_import_is_idempotent` — second run produces `(added=0, refreshed=2)` and no new identity rows.
+* `two_identical_files_merge` — same audio under two filenames → `(added=1, merged=1)`, 1 tracks row, 2 track_files rows.
+* `clean_and_dirty_register_as_siblings` — same audio, version-token mismatch on filename → `(added=1, sibling_versions=1)`, 2 tracks rows (one with `duplicate_link_track_id` populated), 2 track_files rows.
+* `skips_non_audio_files` — `notes.txt`, `cover.jpg` in the folder don't bump any counter.
+* `rejects_missing_root_path` — calling `import_folder` against a non-existent path returns `LibraryError::Io`.
+* `metadata_rows_are_written_per_source` — confirms the filename row carries `artist="J Dilla"`, `title="Workinonit"`, `version_token="instrumental"` from `J Dilla - Workinonit (Instrumental).wav`; the id3 row exists with all-NULL fields because hound-generated WAVs carry no INFO chunk.
+
+14 filename_parser unit tests cover every documented pattern, year-range edges, unicode, separator tolerance, junk-pattern recognition, and the false-positive guard set.
+
+Workspace test count: 626 → 648.
+
+### What this milestone defers
+
+* `analysis_cache` LUFS / waveform / `has_active_grid` row writes — slated for the M10.5j follow-up that rebuilds the analysis pipeline on the new SQLite-backed model. The schema column reservations are already there.
+* `track_beatgrids(source='auto')` cross-validation row write — needs `dub-bpm::analyze_bpm` wired into the importer. Trivial follow-up (1–2 hours); kept separate from M11c so the scope stays auditable.
+* Background / parallel scanning — single-threaded driver stays the v1 default per PRD §8.4 "deterministic + easy to reason about". A parallel walker is a v1.x ergonomics improvement, not a v1 correctness one.
+* Progress reporting beyond the returned summary — `ImportSummary` already carries everything M11d's browser shell will need; in-flight progress callbacks land with M11d when there's a UI consuming them.
+
+### PRD churn
+
+* §12 M11c row marked `✅ shipped` with deliverable list and deferred-items list.
+* §8.4 ("Filename-derived metadata") stays correct as written — the implementation matches the spec verbatim.
+
+### Commit boundary
+
+This entry corresponds to the M11c commit set. PRD §12 (M11c row), `crates/dub-io/src/track.rs` (TrackMetadata extensions + Track refactor), `crates/dub-library/src/{filename_parser,importer}.rs` (new modules), `crates/dub-library/src/{db,lib,volumes,version_tokens}.rs` (Library write paths, re-exports, firmlink fix, parse_plain entry), workspace + crate `Cargo.toml` (walkdir dep + dub-io crate-internal dep + hound dev-dep) are all part of the same logical change.
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11d onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

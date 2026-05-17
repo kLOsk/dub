@@ -72,15 +72,20 @@ pub struct Track {
     channels: u8,
     frames: usize,
     bpm: Option<f64>,
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
+    metadata: TrackMetadata,
 }
 
 /// Lightweight metadata-only snapshot of an audio file. Returned by
 /// [`read_metadata`] for library browsing where decoding the whole
-/// file would be wasteful.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// file would be wasteful, and exposed on every fully loaded
+/// [`Track`] via the `title()` / `artist()` / `album()` accessors plus
+/// the [`Track::extended_metadata`] surface for the larger field set.
+///
+/// Field-naming follows the [`StandardTagKey`] enum and maps onto the
+/// columns in the `track_metadata_source` table documented in
+/// `docs/LIBRARY-SCHEMA.md`. The dub-library M11c importer is the
+/// primary consumer of the extended fields.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackMetadata {
     /// Track title (`TIT2` ID3 / `TITLE` Vorbis / `©nam` MP4).
     pub title: Option<String>,
@@ -88,13 +93,51 @@ pub struct TrackMetadata {
     pub artist: Option<String>,
     /// Album (`TALB` / `ALBUM` / `©alb`).
     pub album: Option<String>,
+    /// Genre (`TCON` ID3 / `GENRE` Vorbis / `©gen` MP4).
+    pub genre: Option<String>,
+    /// Free-text comment (`COMM` ID3 / `COMMENT` Vorbis / `©cmt` MP4).
+    /// Some apps (Mixed In Key) write structured data here; the
+    /// importer stores the verbatim text.
+    pub comment: Option<String>,
+    /// Composer (`TCOM` ID3 / `COMPOSER` Vorbis / `©wrt` MP4).
+    pub composer: Option<String>,
+    /// Year (`TYER` ID3 / `DATE` Vorbis / `©day` MP4). Parsed to an
+    /// `i32` from whatever ISO-style string the container carries
+    /// (typical forms: `"1996"`, `"1996-04-23"`); `None` on parse
+    /// failure rather than a partial value.
+    pub year: Option<i32>,
+    /// Track number (`TRCK` ID3 / `TRACKNUMBER` Vorbis / `trkn` MP4).
+    /// Tag-side strings of the form `"3/12"` keep only the lead
+    /// component.
+    pub track_number: Option<i32>,
+    /// BPM as reported by the file's tag (`TBPM` ID3 / `BPM` Vorbis /
+    /// `tmpo` MP4). Stored alongside Dub's own measured grid in
+    /// `track_beatgrids(source='id3')` per PRD §8.3.
+    pub bpm: Option<f64>,
+    /// Musical key in whatever notation the source uses (`TKEY`
+    /// ID3 / `INITIALKEY` Vorbis). Browser normalises for display.
+    pub key: Option<String>,
+    /// Track-gain in dB from a `ReplayGain` frame (`RVA2` /
+    /// `REPLAYGAIN_TRACK_GAIN`). The importer stores it but does
+    /// not apply it (PRD §8.4: "Measured, not applied" in v1).
+    pub gain_db: Option<f64>,
 }
 
 impl TrackMetadata {
     /// `true` when no field carries any tag text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.title.is_none() && self.artist.is_none() && self.album.is_none()
+        self.title.is_none()
+            && self.artist.is_none()
+            && self.album.is_none()
+            && self.genre.is_none()
+            && self.comment.is_none()
+            && self.composer.is_none()
+            && self.year.is_none()
+            && self.track_number.is_none()
+            && self.bpm.is_none()
+            && self.key.is_none()
+            && self.gain_db.is_none()
     }
 }
 
@@ -175,6 +218,55 @@ fn copy_tag(out: &mut TrackMetadata, tag: &Tag) {
             out.artist = Some(owned);
         }
         StandardTagKey::Album if out.album.is_none() => out.album = Some(owned),
+        StandardTagKey::Genre if out.genre.is_none() => out.genre = Some(owned),
+        StandardTagKey::Comment if out.comment.is_none() => out.comment = Some(owned),
+        StandardTagKey::Composer if out.composer.is_none() => out.composer = Some(owned),
+        StandardTagKey::Date if out.year.is_none() => {
+            // The Date tag may carry a full ISO string ("1996-04-23"),
+            // a four-digit year ("1996"), or junk. Take the first
+            // 4 chars that parse as an i32; ignore otherwise.
+            if let Some(prefix) = trimmed.get(..4) {
+                if let Ok(year) = prefix.parse::<i32>() {
+                    out.year = Some(year);
+                }
+            }
+        }
+        StandardTagKey::TrackNumber if out.track_number.is_none() => {
+            // ID3 TRCK can be "3" or "3/12"; keep the lead.
+            let lead = trimmed.split('/').next().unwrap_or(trimmed);
+            if let Ok(n) = lead.parse::<i32>() {
+                out.track_number = Some(n);
+            }
+        }
+        StandardTagKey::Bpm if out.bpm.is_none() => {
+            if let Ok(b) = trimmed.parse::<f64>() {
+                if b > 0.0 && b < 500.0 {
+                    out.bpm = Some(b);
+                }
+            }
+        }
+        // Note: symphonia 0.5.5's `StandardTagKey` does not expose a
+        // musical-key variant; native ID3 `TKEY` / Vorbis `INITIALKEY`
+        // reading would require matching on the format-specific
+        // `tag.key` string. PRD §8.4 defers key detection to v1.x,
+        // and Mixed In Key (the source the v1 importer cares about)
+        // writes its key data into the `Comment` field which we read
+        // above. The dedicated `key` column on TrackMetadata stays
+        // `None` from container-tag reading; M11e Serato importer
+        // populates it from Serato's `Autotags` GEOB frame.
+        StandardTagKey::ReplayGainTrackGain if out.gain_db.is_none() => {
+            // ReplayGain frames carry strings like "-7.20 dB". Strip
+            // the unit suffix before parsing.
+            let cleaned = trimmed
+                .trim_end_matches("dB")
+                .trim_end_matches("Db")
+                .trim_end_matches("DB")
+                .trim_end_matches("db")
+                .trim();
+            if let Ok(g) = cleaned.parse::<f64>() {
+                out.gain_db = Some(g);
+            }
+        }
         _ => {}
     }
 }
@@ -200,9 +292,7 @@ impl Track {
             channels,
             frames,
             bpm: None,
-            title: None,
-            artist: None,
-            album: None,
+            metadata: TrackMetadata::default(),
         })
     }
 
@@ -343,9 +433,7 @@ impl Track {
             channels,
             frames,
             bpm: None,
-            title: metadata.title,
-            artist: metadata.artist,
-            album: metadata.album,
+            metadata,
         })
     }
 
@@ -371,21 +459,32 @@ impl Track {
     /// `TITLE`, MP4 `©nam`, …). `None` when the file is untagged.
     #[must_use]
     pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+        self.metadata.title.as_deref()
     }
 
     /// Track artist from container metadata. Falls back to album
     /// artist when only that tag was present.
     #[must_use]
     pub fn artist(&self) -> Option<&str> {
-        self.artist.as_deref()
+        self.metadata.artist.as_deref()
     }
 
     /// Album name from container metadata. `None` when the file is
     /// untagged.
     #[must_use]
     pub fn album(&self) -> Option<&str> {
-        self.album.as_deref()
+        self.metadata.album.as_deref()
+    }
+
+    /// Full container-metadata snapshot (`genre` / `comment` /
+    /// `composer` / `year` / `track_number` / `bpm` / `key` /
+    /// `gain_db` in addition to the title / artist / album surfaced
+    /// by the dedicated accessors). Used by the M11c library
+    /// importer to populate the `track_metadata_source(source='id3')`
+    /// row per `docs/LIBRARY-SCHEMA.md`.
+    #[must_use]
+    pub fn extended_metadata(&self) -> &TrackMetadata {
+        &self.metadata
     }
 
     /// Number of audio frames (one frame = one sample per channel).

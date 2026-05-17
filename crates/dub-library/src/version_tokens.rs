@@ -143,6 +143,23 @@ impl VersionToken {
     }
 }
 
+/// Scan free text for the version-token vocabulary, returning a
+/// sorted deduplicated set. Unlike [`parse`], this function does
+/// **not** require the text to be surrounded by brackets or
+/// preceded by ` - `; it scans the input directly. Intended for
+/// callers (like the M11c filename parser) that have already
+/// stripped the bracket / dash delimiters and need to scan the
+/// inner content for tokens.
+///
+/// Per the same word-boundary rule as [`parse`], an artist string
+/// passed here will still match tokens that appear as standalone
+/// words ("Clean Bandit" would surface a `clean` token). Callers
+/// are responsible for restricting input to text that has already
+/// been classified as a version segment rather than free metadata.
+pub fn parse_plain(input: &str) -> BTreeSet<VersionToken> {
+    scan_segment(input).into_iter().collect()
+}
+
 /// Parse the version tokens from a filename or title string.
 ///
 /// Returns a sorted, deduplicated set. Empty when nothing is

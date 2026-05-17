@@ -79,6 +79,13 @@ libc = "0.2"
 # implementation.
 rusty-chromaprint = "0.3"
 
+# Recursive filesystem walker for the M11c folder importer. Stable
+# iteration order (depth-first, alphabetical within directories) is
+# important so re-imports replay in a deterministic order and the
+# `play_history` capture sequence (PRD §8.2) doesn't reshuffle on
+# re-scan.
+walkdir = "2"
+
 # UniFFI for the Apple FFI surface (M0.5 onward). Pinned to a recent 0.28.x
 # because that's the release the Apple build script generates bindings with.
 # `cli` feature is only enabled on the `dub-ffi`'s `uniffi-bindgen` binary —

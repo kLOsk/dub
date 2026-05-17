@@ -180,9 +180,23 @@ mod macos {
             });
         }
 
-        let mount_point = statfs_mount_point(path)?;
+        let raw_mount_point = statfs_mount_point(path)?;
+        // macOS APFS firmlink reality: the boot volume's data
+        // partition mounts at `/System/Volumes/Data`, but
+        // user-visible paths like `/Users/...`, `/var/...`,
+        // `/tmp/...` are firmlinked into `/` and don't include the
+        // `/System/Volumes/Data` prefix. Treating that mount-point
+        // string literally would break every path-relative-to-
+        // volume computation. Normalise to `/` (the user-visible
+        // boot-volume root) so the rest of the system Just Works.
+        let (mount_point, is_internal) = if raw_mount_point == Path::new("/System/Volumes/Data")
+            || raw_mount_point == Path::new("/")
+        {
+            (PathBuf::from("/"), true)
+        } else {
+            (raw_mount_point, false)
+        };
         let display_name = derive_display_name(&mount_point);
-        let is_internal = mount_point == Path::new("/");
 
         Ok(DiscoveredVolume {
             volume_uuid: uuid_bytes_to_string(response.uuid),

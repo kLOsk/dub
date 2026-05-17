@@ -851,11 +851,40 @@ impl DubEngine {
         let gen_handle = Arc::clone(&self.peak_generation_seq);
         let track_for_thread = Arc::clone(&track);
         let thread_name = format!("dub-load-{idx}");
-        let _ = std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 background_analyze_and_install(idx, track_for_thread, state_handle, gen_handle);
             });
+
+        // Spawn can fail (process thread limit reached, OOM at
+        // thread-stack allocation, etc.). It is rare but not
+        // impossible, and silently swallowing the error here would
+        // leave the deck playable but permanently missing its
+        // waveform peaks and BPM digits — the Swift shell polls for
+        // those every 30 Hz and would never see them arrive. That
+        // half-broken state is unrecoverable without re-loading the
+        // track, which is worse UX than the alternative below.
+        //
+        // Fallback: run the analysis synchronously on the caller's
+        // thread. Phase 3 has already installed the `Arc<Track>` on
+        // the audio thread, so playback is live and unaffected; the
+        // only observable change is that this FFI call returns
+        // ~100–400 ms later than usual. The Swift shell already
+        // dispatches `load_track` on a `Task.detached`, so this
+        // does not block the SwiftUI main actor.
+        if let Err(e) = spawn_result {
+            eprintln!(
+                "dub-ffi: failed to spawn dub-load-{idx} background thread: {e}; \
+                 running peaks + beat-grid analysis synchronously on the caller"
+            );
+            background_analyze_and_install(
+                idx,
+                Arc::clone(&track),
+                Arc::clone(&self.state),
+                Arc::clone(&self.peak_generation_seq),
+            );
+        }
 
         Ok(())
     }

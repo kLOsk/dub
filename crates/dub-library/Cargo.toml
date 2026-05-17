@@ -12,7 +12,9 @@ rusqlite = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
+walkdir = { workspace = true }
 dub-fingerprint = { workspace = true }
+dub-io = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
@@ -21,3 +23,8 @@ libc = { workspace = true }
 # Temp dirs for fixture-driven tests of the migration runner /
 # fresh-DB workflow without polluting the developer's real library.
 tempfile = "3"
+# Synthetic WAV fixture generation for the M11c importer integration
+# tests. `hound` is the standard-in-the-workspace WAV writer; we
+# generate small mono sine-wave files on the fly rather than ship
+# binary fixtures.
+hound = { workspace = true }

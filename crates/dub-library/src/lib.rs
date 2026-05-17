@@ -28,6 +28,8 @@
 mod db;
 mod dedupe;
 mod error;
+mod filename_parser;
+mod importer;
 mod paths;
 mod schema;
 mod version_tokens;
@@ -39,6 +41,8 @@ pub use dedupe::{
     SIMILARITY_THRESHOLD,
 };
 pub use error::{LibraryError, Result};
+pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
+pub use importer::{import_folder, ImportError, ImportSummary};
 pub use paths::{default_library_db_path, default_waveforms_cache_dir};
 pub use schema::SCHEMA_VERSION;
 pub use version_tokens::{parse as parse_version_tokens, VersionToken};
