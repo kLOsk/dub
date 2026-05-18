@@ -115,38 +115,64 @@ struct TrackOverviewView: View {
         // calculation. SwiftUI gestures don't expose the view
         // bounds; reading them off the geo proxy is the
         // idiomatic workaround.
-        GeometryReader { geo in
-            Canvas { ctx, size in
-                drawBackground(ctx: ctx, size: size)
-                if let buckets, !buckets.isEmpty {
-                    drawBars(ctx: ctx, size: size, buckets: buckets)
-                    drawPlayhead(ctx: ctx, size: size)
-                } else {
-                    drawEmptyState(ctx: ctx, size: size)
+        //
+        // M11d.5 round 5: the Canvas is wrapped in a 2 Hz
+        // `TimelineView` and reads the playhead position from
+        // `engine.position(deckIdx:)` directly. Pre-fix the
+        // bracket advanced because `DeckState.elapsedSecs`
+        // republished every second, which invalidated the parent
+        // `PerformanceView` and triggered a full-tree body
+        // re-eval — that was the residual "subtle leftward jump
+        // every second" the user reported after round 3. With the
+        // self-driven timeline, only this Canvas closure re-runs
+        // on the bracket cadence; nothing above the timeline ever
+        // observes the per-second tick.
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            GeometryReader { geo in
+                Canvas { ctx, size in
+                    // **Critical** — referencing `context.date`
+                    // inside the Canvas closure is what forces
+                    // SwiftUI to re-invoke this draw block on every
+                    // TimelineView tick. Canvas's closure is
+                    // opaque to SwiftUI's diff machinery, so
+                    // without a per-tick captured dependency the
+                    // draw output is cached across body
+                    // re-evaluations and the playhead bracket
+                    // freezes at its first-frame position even
+                    // though the engine's playhead is advancing.
+                    // The read is otherwise unused — the engine
+                    // FFI is the real data source — but it pins
+                    // the Canvas to the animation schedule (same
+                    // idiom Apple's TimelineView + Canvas
+                    // examples document).
+                    _ = context.date
+                    drawBackground(ctx: ctx, size: size)
+                    if let buckets, !buckets.isEmpty {
+                        drawBars(ctx: ctx, size: size, buckets: buckets)
+                        drawPlayhead(ctx: ctx, size: size)
+                    } else {
+                        drawEmptyState(ctx: ctx, size: size)
+                    }
                 }
+                .contentShape(Rectangle())
+                .gesture(
+                    // Click-to-jump only on the overview. The overview
+                    // is a "where am I in the whole track" map, not a
+                    // fine-positioning tool — continuous drag-scrub +
+                    // audio-under-cursor lives on the zoomed waveform
+                    // (PRD §6.1 / §9.6). Single-tap on the overview
+                    // seeks the deck to that absolute track position
+                    // and leaves transport alone.
+                    DragGesture(minimumDistance: 0)
+                        .onEnded { value in
+                            handleClickJump(at: value.location, in: geo.size)
+                        })
             }
-            .contentShape(Rectangle())
-            .gesture(
-                // Click-to-jump only on the overview. The overview
-                // is a "where am I in the whole track" map, not a
-                // fine-positioning tool — continuous drag-scrub +
-                // audio-under-cursor lives on the zoomed waveform
-                // (PRD §6.1 / §9.6). Single-tap on the overview
-                // seeks the deck to that absolute track position
-                // and leaves transport alone.
-                DragGesture(minimumDistance: 0)
-                    .onEnded { value in
-                        handleClickJump(at: value.location, in: geo.size)
-                    })
         }
         .modifier(OverviewSizing(orientation: orientation))
         .onAppear(perform: reloadIfStale)
         .onChange(of: deckState.sourceURL) { _ in reloadIfStale() }
         .onChange(of: deckState.hasTrack) { _ in reloadIfStale() }
-        // The 30 Hz position poll mutates `elapsedSecs` — that's
-        // what advances the playhead bracket. We don't need a
-        // separate timer; SwiftUI re-evaluates `body` on the
-        // @Published deck-state change.
     }
 
     // MARK: - Drawing
@@ -308,8 +334,18 @@ struct TrackOverviewView: View {
     /// isn't loaded yet (e.g. Thru mode, fresh deck before
     /// `reloadIfStale` finishes); returns `nil` when nothing
     /// useful can be computed.
+    ///
+    /// **M11d.5 round 5**: reads `engine.position(deckIdx:)`
+    /// directly instead of `deckState.elapsedSecs`. The deck-state
+    /// field was removed as part of the per-second-republish fix
+    /// (the `TimelineView` wrapping this Canvas now drives the
+    /// playhead's own update cadence). The duration fallback also
+    /// reads `pos.durationSecs` instead of `deckState.durationSecs`
+    /// for the same reason — keeps the fraction calculation in
+    /// sync with the engine on the same tick.
     private func playheadFraction() -> Double? {
-        let elapsed = deckState.elapsedSecs
+        let pos = model.engine.position(deckIdx: deckIdx)
+        let elapsed = pos.elapsedSecs
         let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
         let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
         if peaksLen > 0 && chunkDur > 0 {
@@ -317,8 +353,8 @@ struct TrackOverviewView: View {
             guard totalSecs > 0 else { return nil }
             return max(0, min(1, elapsed / totalSecs))
         }
-        guard deckState.durationSecs > 0 else { return nil }
-        return max(0, min(1, elapsed / deckState.durationSecs))
+        guard pos.durationSecs > 0 else { return nil }
+        return max(0, min(1, elapsed / pos.durationSecs))
     }
 
     private func drawEmptyState(ctx: GraphicsContext, size: CGSize) {

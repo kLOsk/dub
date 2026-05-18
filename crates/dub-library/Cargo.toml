@@ -15,6 +15,15 @@ thiserror = { workspace = true }
 walkdir = { workspace = true }
 dub-fingerprint = { workspace = true }
 dub-io = { workspace = true }
+# M11c.1 — auto-beatgrid analysis hook lives in `dub-library::analysis`
+# and delegates to `dub_bpm::analyze_beat_grid`. The BPM DSP shipped in
+# M7.5 / M8.1; we are wiring it into the import-and-load lifecycle.
+dub-bpm = { workspace = true }
+# M11c.2 — key detection lives in `dub-spectral::key`. The
+# `dub-library::analysis` pipeline calls `analyze_key` in the same
+# pass that runs `analyze_beat_grid`, so the file decodes exactly
+# once per analysis call.
+dub-spectral = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

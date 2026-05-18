@@ -57,6 +57,12 @@ use std::sync::Arc;
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 
+pub mod key;
+pub use key::{
+    analyze_key, camelot_keys_disagree, parse_camelot, KeyAnalysisError, KeyEstimate, A4_HZ,
+    MAX_KEY_HZ, MIN_ANALYSIS_SECS, MIN_KEY_HZ,
+};
+
 /// Window size for each FFT frame, in samples. 1024 is ≈ 21 ms at 48 kHz
 /// — long enough for stable spectral magnitudes, short enough that onset
 /// localisation isn't smeared.

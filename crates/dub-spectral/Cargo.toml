@@ -9,3 +9,8 @@ description = "Shared STFT + log-band + magnitude-compression pipeline for dub-b
 
 [dependencies]
 realfft = { workspace = true }
+# M11c.2 — typed errors for `key::analyze_key` (invalid SR / channels /
+# short input). Aligns with `dub-bpm::AnalysisError` so the
+# `dub-library::analysis` pipeline can `?`-bubble both into its own
+# `LibraryError::DecodeFailed` variant.
+thiserror = { workspace = true }

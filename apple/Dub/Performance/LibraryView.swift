@@ -54,7 +54,7 @@ import DubCore
 /// by SwiftUI `Table` to track row identity across sorts.
 extension LibraryTrack: Identifiable {}
 
-/// Computed accessors for SwiftUI `Table` sort. `KeyPathComparator`
+/// Computed accessors for client-side column sort.
 /// requires `Comparable` end values; raw `Optional<String>` is not
 /// `Comparable` in Swift's standard library. Folding to "" /
 /// sentinel values keeps the column-header click sort working
@@ -72,6 +72,14 @@ extension LibraryTrack {
     var bpmSortKey:      Double { bpm ?? .infinity }
     var durationSortKey: UInt32 { durationMs }
     var yearSortKey:     Int32  { year ?? Int32.max }
+    /// M11d.5 comment column. Missing values fold to `""` so
+    /// header-click sort puts unannotated tracks first, matching
+    /// the title / artist sort behaviour.
+    var commentSortKey:  String { comment ?? "" }
+}
+
+private enum TrackSortColumn: Hashable {
+    case artist, title, bpm, comment
 }
 
 /// Sections in the left-hand source tree per PRD §8.5.1.
@@ -118,6 +126,23 @@ private enum LibrarySource: Hashable, Identifiable {
         }
     }
 
+    /// `true` when the FFI returns rows in a meaningful natural
+    /// order that a default column sort would destroy — Recently
+    /// Played returns rows in descending `play_history.timestamp`
+    /// order (most-recent first), Just Imported in descending
+    /// `tracks.created_at` order. Applying the LibraryView's
+    /// default title-ascending sort on top would clobber the
+    /// reason the user opened the smart crate in the first place.
+    /// `allTracks` returns rows ordered by `tracks.created_at`
+    /// ASC, which is a stable but not user-meaningful order, so
+    /// the default title sort still applies there.
+    var preservesNaturalOrder: Bool {
+        switch self {
+        case .recentlyPlayed, .justImported: return true
+        default: return false
+        }
+    }
+
     /// Per §8.5.1, the sidebar groups sections under a heading.
     var group: String {
         switch self {
@@ -147,6 +172,13 @@ struct LibraryView: View {
     /// track list runs against.
     @State private var selectedSource: LibrarySource = .allTracks
 
+    /// Notation mode for the Key column (M11c.2, PRD §8.3.2).
+    /// Camelot is canonical; musical notation is opt-in via a
+    /// click on the column header. `@AppStorage` makes the
+    /// choice persist across app launches per PRD §9 ("settings
+    /// the user has set stick").
+    @AppStorage("libraryKeyNotationMode") private var keyNotationMode: KeyNotationMode = .camelot
+
     /// Current search input. Empty string → show the source's
     /// natural listing (no search filter). The PRD §8.5.4
     /// substring rule says "AND across whitespace-separated
@@ -164,17 +196,24 @@ struct LibraryView: View {
     /// at the top of the list.
     @State private var isLoading: Bool = false
 
-    /// Current SwiftUI `Table` sort order. The Table view binds
-    /// this to its column headers; on change, we re-query the
-    /// library with the mapped `LibraryTrackSort` enum.
+    /// Client-side sort column + direction. Drives `sortOrder`
+    /// which feeds `sortedTracks`. Empty `activeSortColumn` preserves
+    /// the FFI's natural order (Recently Played / Just Imported).
+    @State private var activeSortColumn: TrackSortColumn? = .title
+    @State private var sortAscending: Bool = true
     @State private var sortOrder: [KeyPathComparator<LibraryTrack>] = [
-        KeyPathComparator(\.title, order: .forward)
+        KeyPathComparator(\.titleSortKey, order: .forward),
     ]
 
-    /// Currently selected row id (canonical UUID). Used to keep
-    /// the `Table` selection model in sync with
-    /// `model.browserSelection` / `model.selectedLibraryTrackId`.
+    /// Currently selected row id (canonical UUID). Kept in sync with
+    /// `model.selectedLibraryTrackId` via `onChange`.
     @State private var selectedTrackId: LibraryTrack.ID? = nil
+
+    /// Drives a minimal keyboard scroll — set only by ↑/↓, never
+    /// on mouse click (centering the selection was the huge header
+    /// gap in the screenshot).
+    @State private var keyboardScrollTarget: LibraryTrack.ID?
+    @State private var keyboardScrollDelta: Int = 0
 
     /// M11d.4 — `true` while the Relocate sheet is presented.
     /// Bound to the missing-files footer button.
@@ -197,7 +236,23 @@ struct LibraryView: View {
         .onAppear {
             refreshTracks()
         }
-        .onChange(of: selectedSource) { _ in
+        .onChange(of: selectedSource) { newSource in
+            // Smart crates with a meaningful natural order
+            // (Recently Played, Just Imported) start out
+            // *unsorted* so the FFI's recency order survives.
+            // `allTracks` falls back to title-ascending as
+            // before. The user can still click a column header
+            // afterwards to override either default — that's
+            // what the comparator binding is for.
+            sortOrder = newSource.preservesNaturalOrder
+                ? []
+                : [KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward)]
+            if newSource.preservesNaturalOrder {
+                activeSortColumn = nil
+            } else {
+                activeSortColumn = .title
+                sortAscending = true
+            }
             refreshTracks()
         }
         .onChange(of: model.libraryIsOpen) { _ in
@@ -211,6 +266,15 @@ struct LibraryView: View {
         }
         .onChange(of: searchText) { _ in
             refreshTracks()
+        }
+        .onChange(of: model.analysisGeneration) { _ in
+            // M11c.1 — a deck-load or batch analyze finished and
+            // wrote at least one new grid. Re-fetch the current
+            // listing so the BPM column lights up and the dim
+            // overlay drops on the rows that just transitioned.
+            // Preserve selection — the rows haven't moved, the
+            // user shouldn't lose their Space-load target.
+            refreshTracks(preserveSelection: true)
         }
         .sheet(isPresented: $showRelocateSheet) {
             RelocateSheet(model: model, isPresented: $showRelocateSheet)
@@ -406,96 +470,202 @@ struct LibraryView: View {
     /// header-click feedback — the FFI is reserved for the
     /// initial fetch + page boundaries.
     private var sortedTracks: [LibraryTrack] {
-        tracks.sorted(using: sortOrder)
+        // Empty comparator → preserve the FFI's natural order
+        // (Recently Played / Just Imported). `sorted(using: [])`
+        // would still be a stable no-op but constructing the
+        // sorted copy is wasted work on every render.
+        guard !sortOrder.isEmpty else { return tracks }
+        return tracks.sorted(using: sortOrder)
     }
 
-    /// SwiftUI `Table` per PRD §8.5.3. Columns auto-render sort
-    /// indicators on click; the `sortOrder` binding flips the
-    /// `KeyPathComparator` direction. Selection is bound to
-    /// `selectedTrackId` so clicking a row routes through
-    /// `model.selectLibraryTrack(_:)` for Space + drag plumbing.
-    ///
-    /// The leftmost gutter column carries the M11d.3 indicator
-    /// glyphs: loaded-now `A` / `B` badge, missing-file glyph,
-    /// potential-duplicate link. The grid-disagreement glyph is
-    /// reserved on the BPM column but always off in v1.0 — the
-    /// auto-grid that would drive it is gated on the M11c
-    /// `dub-bpm` follow-up that wires offline analysis into the
-    /// importer.
+    /// Scrollable track list. Uses the same row pattern as
+    /// `FileBrowserView` (full-row `onTapGesture` + AppKit
+    /// `onDrag`) because SwiftUI `Table` was dropping ~4/5
+    /// clicks and turning drags outside the Title column into
+    /// arrow-key-style selection changes.
     private var trackList: some View {
-        Table(sortedTracks, selection: $selectedTrackId, sortOrder: $sortOrder) {
-            TableColumn("") { track in
-                rowIndicators(for: track)
+        VStack(spacing: 0) {
+            trackListHeader
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(sortedTracks) { track in
+                            trackRow(for: track)
+                                .id(track.id)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .onChange(of: keyboardScrollTarget) { targetId in
+                    guard let targetId else { return }
+                    let anchor = keyboardScrollDelta > 0
+                        ? UnitPoint(x: 0.5, y: 0.92)
+                        : UnitPoint(x: 0.5, y: 0.08)
+                    proxy.scrollTo(targetId, anchor: anchor)
+                    keyboardScrollTarget = nil
+                }
             }
-            .width(36)
-
-            TableColumn("Title", value: \.titleSortKey) { track in
-                titleCell(for: track)
-            }
-            .width(min: 180, ideal: 280)
-
-            TableColumn("Artist", value: \.artistSortKey) { track in
-                Text(track.artist ?? "—")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .width(min: 100, ideal: 160)
-
-            TableColumn("Album", value: \.albumSortKey) { track in
-                Text(track.album ?? "—")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .width(min: 100, ideal: 160)
-
-            TableColumn("BPM", value: \.bpmSortKey) { track in
-                Text(formatBpm(track.bpm))
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .monospacedDigit()
-            }
-            .width(60)
-
-            TableColumn("Key") { track in
-                Text(track.key ?? "—")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-            }
-            .width(40)
-
-            TableColumn("Length", value: \.durationSortKey) { track in
-                Text(formatDuration(track.durationMs))
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .monospacedDigit()
-            }
-            .width(60)
-
-            TableColumn("Year", value: \.yearSortKey) { track in
-                Text(track.year.map { String($0) } ?? "—")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .monospacedDigit()
-            }
-            .width(50)
-
-            TableColumn("Source") { track in
-                Text(track.source.uppercased())
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-            }
-            .width(70)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(
+            LibraryArrowKeyView(
+                selectedTrackId: $selectedTrackId,
+                trackIds: sortedTracks.map(\.id),
+                onArrowNavigate: { trackId, delta in
+                    keyboardScrollDelta = delta
+                    keyboardScrollTarget = trackId
+                })
+        )
         .onChange(of: selectedTrackId) { newId in
             if let trackId = newId {
-                model.selectLibraryTrack(trackId)
+                let snapshot = tracks.first(where: { $0.id == trackId })
+                model.selectLibraryTrack(trackId, snapshot: snapshot)
             } else {
                 model.selectedLibraryTrackId = nil
+                model.selectedLibraryTrack = nil
             }
+        }
+    }
+
+    private var trackListHeader: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: 36)
+            sortHeader("Artist", column: .artist)
+                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            sortHeader("Title", column: .title)
+                .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+            sortHeader("BPM", column: .bpm)
+                .frame(width: 60, alignment: .leading)
+            sortHeader("Comment", column: .comment)
+                .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, 2)
+        .frame(height: 22)
+        .background(DubColor.surface1)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(DubColor.divider).frame(height: 1)
+        }
+    }
+
+    private func sortHeader(_ label: String, column: TrackSortColumn) -> some View {
+        let isActive = activeSortColumn == column
+        return Button {
+            toggleSort(column)
+        } label: {
+            HStack(spacing: 3) {
+                Text(label.uppercased())
+                    .font(DubFont.micro.weight(.semibold))
+                    .foregroundStyle(isActive ? DubColor.textPrimary : DubColor.textSecondary)
+                if isActive {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(DubColor.textSecondary)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggleSort(_ column: TrackSortColumn) {
+        if activeSortColumn == column {
+            if sortAscending {
+                sortAscending = false
+            } else {
+                activeSortColumn = nil
+                sortAscending = true
+                sortOrder = []
+            }
+        } else {
+            activeSortColumn = column
+            sortAscending = true
+        }
+        if activeSortColumn != nil {
+            syncSortOrderFromHeader()
+        }
+    }
+
+    private func syncSortOrderFromHeader() {
+        guard let column = activeSortColumn else {
+            sortOrder = []
+            return
+        }
+        let order: SortOrder = sortAscending ? .forward : .reverse
+        switch column {
+        case .artist:
+            sortOrder = [KeyPathComparator(\.artistSortKey, order: order)]
+        case .title:
+            sortOrder = [KeyPathComparator(\.titleSortKey, order: order)]
+        case .bpm:
+            sortOrder = [KeyPathComparator(\.bpmSortKey, order: order)]
+        case .comment:
+            sortOrder = [KeyPathComparator(\.commentSortKey, order: order)]
+        }
+    }
+
+    @ViewBuilder
+    private func trackRow(for track: LibraryTrack) -> some View {
+        let isSelected = selectedTrackId == track.id
+        let dragURL = libraryDragURL(for: track)
+        HStack(spacing: 0) {
+            rowIndicators(for: track)
+                .frame(width: 36, alignment: .leading)
+            Text(track.artist ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .modifier(DimUnanalyzed(track: track))
+                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            Text(displayTitle(track))
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .modifier(DimUnanalyzed(track: track))
+                .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+            Text(formatBpm(track.bpm))
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .monospacedDigit()
+                .modifier(DimUnanalyzed(track: track))
+                .frame(width: 60, alignment: .leading)
+            Text(track.comment ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(track.comment ?? "")
+                .modifier(DimUnanalyzed(track: track))
+                .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .contentShape(Rectangle())
+        .if(dragURL != nil) { view in
+            view.onDrag {
+                NSItemProvider(object: dragURL! as NSURL)
+            }
+        }
+        .contextMenu {
+            Button("Analyze") {
+                Task { @MainActor in
+                    await model.analyzeTracks([track.id], forceReanalyze: false)
+                }
+            }
+            .disabled(model.analysisBatchTotal > 0)
+            Button("Re-analyze") {
+                Task { @MainActor in
+                    await model.analyzeTracks([track.id], forceReanalyze: true)
+                }
+            }
+            .disabled(model.analysisBatchTotal > 0)
+        }
+        .onTapGesture {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            selectedTrackId = track.id
         }
     }
 
@@ -570,68 +740,54 @@ struct LibraryView: View {
     /// auto-clearing on click would be too aggressive.
     private func navigateToSibling(_ trackId: String) {
         guard tracks.contains(where: { $0.id == trackId }) else { return }
+        NSApp.keyWindow?.makeFirstResponder(nil)
         selectedTrackId = trackId
     }
 
     /// Resolve a track's drag URL synchronously. Returns `nil`
     /// when the source volume is unmounted or the canonical row
-    /// no longer resolves to an on-disk path. The Title column
-    /// uses this to decide whether to install `.draggable` at
-    /// all: unreachable rows are non-draggable rather than
-    /// dragging a sentinel that the deck loader would only
-    /// reject after a decode failure. Pre-fix this returned a
-    /// `/dev/null` fallback for the modifier, which violated the
-    /// "drop target rejects cleanly" contract because
-    /// `/dev/null` is a real filesystem path that hands the
-    /// audio decoder a zero-byte stream — the deck would flash
-    /// a decoder error mid-load instead of silently doing
-    /// nothing. The visible row already carries the missing-
+    /// no longer resolves to an on-disk path. Every table cell
+    /// uses this to decide whether to install `.onDrag` at all:
+    /// unreachable rows are non-draggable rather than dragging a
+    /// sentinel that the deck loader would only reject after a
+    /// decode failure. Pre-fix this returned a `/dev/null` fallback
+    /// for the modifier, which violated the "drop target rejects
+    /// cleanly" contract because `/dev/null` is a real filesystem
+    /// path that hands the audio decoder a zero-byte stream — the
+    /// deck would flash a decoder error mid-load instead of silently
+    /// doing nothing. The visible row already carries the missing-
     /// file glyph (see `rowIndicators`) and the Space-load path
-    /// in `selectLibraryTrack` already refuses unreachable
-    /// tracks, so disabling drag here is consistent with the
-    /// rest of the unreachable-row affordances. The previous
-    /// M10.5b AppKit drag path (`onDrag { NSItemProvider }`)
-    /// only existed because SwiftUI's `.draggable` rendered an
-    /// animation we didn't want; SwiftUI Table's row drag
-    /// respects the cursor anchor, so the modern API is fine
-    /// here.
+    /// in `selectLibraryTrack` already refuses unreachable tracks,
+    /// so disabling drag here is consistent with the rest of the
+    /// unreachable-row affordances.
+    ///
+    /// Drag uses the AppKit `onDrag { NSItemProvider }` path on
+    /// every column (see `libraryRowCell`) so the OS snapshots the
+    /// row under the cursor. SwiftUI's `.draggable(_:preview:)`
+    /// rendered the preview at the row's layout position first and
+    /// then animated it toward the cursor — the "fly-in from row"
+    /// effect the user reported on library → deck drops.
+    ///
+    /// Pre-fix this called `library.trackPath(trackId:)` per
+    /// row per render — a SQLite round-trip executed thousands
+    /// of times when scrolling a 5 000 track listing. The fields
+    /// we need (`primaryVolumeMountPoint`, `primaryRelativePath`)
+    /// are already in the `LibraryTrack` row from the FFI's
+    /// `TRACK_ROW_SELECT`, so reconstruct the URL locally and
+    /// keep the FFI for paths the row doesn't carry (e.g. the
+    /// `selectLibraryTrack` resolve-on-click guard, where we
+    /// also want the FFI's "volume unmounted right now" check).
     private func libraryDragURL(for track: LibraryTrack) -> URL? {
-        guard let path = (try? model.library.trackPath(trackId: track.id)) ?? nil
+        guard let mount = track.primaryVolumeMountPoint, !mount.isEmpty,
+              let rel   = track.primaryRelativePath,    !rel.isEmpty
         else { return nil }
-        return URL(fileURLWithPath: path)
-    }
-
-    /// Title-column cell. Conditionally installs `.draggable`
-    /// so unreachable tracks (`libraryDragURL` → `nil`) simply
-    /// don't participate in drag-and-drop. The shared title /
-    /// subtitle layout is the same on both branches; only the
-    /// drag affordance differs. Extracted from the inline
-    /// column body so the conditional doesn't fight the column
-    /// builder's type inference.
-    @ViewBuilder
-    private func titleCell(for track: LibraryTrack) -> some View {
-        let body = VStack(alignment: .leading, spacing: 1) {
-            Text(displayTitle(track))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Text(displaySubtitle(track))
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textTertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        if let dragURL = libraryDragURL(for: track) {
-            body.draggable(dragURL) {
-                Text(displayTitle(track))
-                    .font(DubFont.body)
-                    .padding(4)
-                    .background(DubColor.surface2)
-            }
-        } else {
-            body
-        }
+        // Mirror `Library::resolve_track_path` — concatenate
+        // mount + relative without re-running the FFI. The
+        // unmounted-volume case falls out naturally: an
+        // unmounted volume publishes a nil mount point in the
+        // row, so we return nil here without touching SQLite.
+        let base = URL(fileURLWithPath: mount, isDirectory: true)
+        return base.appendingPathComponent(rel)
     }
 
     private var footer: some View {
@@ -644,6 +800,23 @@ struct LibraryView: View {
                 Text("Importing…")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textSecondary)
+            }
+            // M11c.1 — batch-analyze progress. Shown only while a
+            // batch is in flight (single deck-load analyses bump
+            // `analysisInFlightCount` without setting
+            // `analysisBatchTotal`, so they don't crowd the
+            // footer with one-second blips).
+            if model.analysisBatchTotal > 0 {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                    Text(analyzeProgressLine(
+                        completed: model.analysisBatchCompleted,
+                        total: model.analysisBatchTotal))
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                }
             }
             if model.missingTrackCount > 0 {
                 Button(action: { showRelocateSheet = true }) {
@@ -672,6 +845,20 @@ struct LibraryView: View {
     private func missingFooterLine(_ n: UInt64) -> String {
         let label = n == 1 ? "track missing" : "tracks missing"
         return "\(n) \(label) · Click to relocate"
+    }
+
+    /// "Analyzing N of M…" — N is the 1 based index of the track
+    /// currently being processed, M is the batch total. The
+    /// model publishes `analysisBatchCompleted` as the count of
+    /// tracks already *finished* (success or failure), so the
+    /// active track is `completed + 1`, clamped to `total` so we
+    /// never render "Analyzing 11 of 10…" on the boundary tick
+    /// between the last per-track completion and the deferred
+    /// batch cleanup.
+    private func analyzeProgressLine(completed: UInt32, total: UInt32) -> String {
+        guard total > 0 else { return "Analyzing…" }
+        let active = min(completed + 1, total)
+        return "Analyzing \(active) of \(total)…"
     }
 
     // MARK: - Helpers
@@ -730,14 +917,6 @@ struct LibraryView: View {
         return "Untitled"
     }
 
-    private func displaySubtitle(_ track: LibraryTrack) -> String {
-        let artist = (track.artist?.isEmpty == false) ? track.artist! : "Unknown Artist"
-        if let album = track.album, !album.isEmpty {
-            return "\(artist) · \(album)"
-        }
-        return artist
-    }
-
     private func formatBpm(_ bpm: Double?) -> String {
         guard let b = bpm, b > 0 else { return "—" }
         return String(format: "%.1f", b)
@@ -764,7 +943,7 @@ struct LibraryView: View {
 
     // MARK: - Async refresh
 
-    private func refreshTracks() {
+    private func refreshTracks(preserveSelection: Bool = false) {
         guard model.libraryIsOpen else {
             tracks = []
             selectedTrackId = nil
@@ -774,7 +953,14 @@ struct LibraryView: View {
         // visible selection — drop both the local Table selection
         // and the model-level browserSelection so a Space-load
         // doesn't fire on a row that's no longer in view.
-        selectedTrackId = nil
+        //
+        // M11c.1 — when the refresh is triggered by an analysis-
+        // completion bump (BPM landed on a row), the selection
+        // *should* persist; the rows haven't moved. The caller
+        // opts into that via `preserveSelection: true`.
+        if !preserveSelection {
+            selectedTrackId = nil
+        }
         let source = selectedSource
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let limit = Self.listingLimit
@@ -828,6 +1014,232 @@ struct LibraryView: View {
             Task { @MainActor in
                 await model.importLibraryFolder(url)
             }
+        }
+    }
+}
+
+// MARK: - DimUnanalyzed modifier
+
+/// PRD §8.5.3 visual cue for the M11c.1 lazy-analysis lifecycle.
+///
+/// Tracks that have never been analyzed (no `analysis_cache` row
+/// stamped yet) render at reduced opacity. Once auto-analysis
+/// completes (whether or not a grid was found) the row flips
+/// back to full opacity. Imported grids from a future Serato /
+/// Traktor / rekordbox milestone also drop the dim because the
+/// importer stamps `analysis_cache` as it lands the grid.
+///
+/// Implemented as a `ViewModifier` so the same opacity rule
+/// applies uniformly to every column in the LibraryView table
+/// without duplicating the `.opacity(...)` call across cells.
+/// Notation mode for the LibraryView Key column. Persisted across
+/// app launches via `@AppStorage("libraryKeyNotationMode")`.
+/// Canonical Camelot is the default — it's the dominant
+/// scratch-DJ convention (MixedInKey + Serato display) and the
+/// notation Dub stores internally (`track_keys.key_notation`).
+/// Musical notation (e.g. `C major`) is opt-in for users who
+/// learned theory before they learned the wheel.
+enum KeyNotationMode: String, CaseIterable, Identifiable {
+    case camelot
+    case musical
+
+    var id: String { rawValue }
+
+    /// Display name for the column header.
+    var columnLabel: String {
+        switch self {
+        case .camelot: return "Key"
+        case .musical: return "Key (♪)"
+        }
+    }
+
+    /// Toggle helper — keeps the click handler's mutation logic
+    /// out of the cell body so the cell stays a pure function of
+    /// `(track, mode)`.
+    var toggled: KeyNotationMode {
+        switch self {
+        case .camelot: return .musical
+        case .musical: return .camelot
+        }
+    }
+}
+
+/// Render a Camelot key as either Camelot (default) or musical
+/// notation (opt-in). Returns `"—"` for `nil` keys; the visual
+/// "we have no key" cue is the em-dash, not an empty cell.
+private extension LibraryView {
+    var keyColumnHeader: String { keyNotationMode.columnLabel }
+
+    func renderKey(_ camelot: String?) -> String {
+        guard let camelot, !camelot.isEmpty else { return "—" }
+        switch keyNotationMode {
+        case .camelot: return camelot
+        case .musical: return musicalFromCamelot(camelot) ?? camelot
+        }
+    }
+
+    /// Tooltip = the *other* notation, so the user always sees
+    /// both at a glance without re-clicking. Empty for nil keys.
+    func keyTooltip(_ camelot: String?) -> String {
+        guard let camelot, !camelot.isEmpty else { return "" }
+        switch keyNotationMode {
+        case .camelot: return musicalFromCamelot(camelot) ?? ""
+        case .musical: return camelot
+        }
+    }
+
+    /// Convert a canonical Camelot string (e.g. `"8B"`) to its
+    /// musical equivalent (e.g. `"C major"`). Returns `nil` for
+    /// malformed inputs; the renderer falls back to the raw
+    /// Camelot string in that case.
+    func musicalFromCamelot(_ camelot: String) -> String? {
+        // Camelot → (pitch class, is_major).
+        // Same wheel layout as `dub-spectral::key::CAMELOT_MAJOR`
+        // and `CAMELOT_MINOR`. Kept here as a static lookup
+        // because pushing this across the FFI for every row
+        // render would be silly — the table is 24 entries.
+        let table: [String: String] = [
+            "8B": "C major", "3B": "C♯ major", "10B": "D major",
+            "5B": "D♯ major", "12B": "E major", "7B": "F major",
+            "2B": "F♯ major", "9B": "G major", "4B": "G♯ major",
+            "11B": "A major", "6B": "A♯ major", "1B": "B major",
+            "5A": "C minor", "12A": "C♯ minor", "7A": "D minor",
+            "2A": "D♯ minor", "9A": "E minor", "4A": "F minor",
+            "11A": "F♯ minor", "6A": "G minor", "1A": "G♯ minor",
+            "8A": "A minor", "3A": "A♯ minor", "10A": "B minor",
+        ]
+        return table[camelot.uppercased()]
+    }
+}
+
+private struct DimUnanalyzed: ViewModifier {
+    let track: LibraryTrack
+    func body(content: Content) -> some View {
+        // 0.55 chosen to read as "this row is waiting for
+        // analysis" without losing legibility of the title /
+        // artist text. Slightly higher than the 0.40 we use for
+        // disabled controls; rows are still selectable +
+        // draggable, just visually deferred.
+        content.opacity(track.isAnalyzed ? 1.0 : 0.55)
+    }
+}
+
+// MARK: - Conditional view modifier
+
+private extension View {
+    @ViewBuilder
+    func `if`<Transform: View>(
+        _ condition: Bool,
+        transform: (Self) -> Transform
+    ) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
+    }
+}
+
+// MARK: - Library arrow-key navigation
+
+/// Local ↑/↓ handler for the library list.
+private struct LibraryArrowKeyView: NSViewRepresentable {
+    @Binding var selectedTrackId: LibraryTrack.ID?
+    let trackIds: [LibraryTrack.ID]
+    var onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            selectedTrackId: $selectedTrackId,
+            onArrowNavigate: onArrowNavigate)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.install()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.trackIds = trackIds
+        context.coordinator.onArrowNavigate = onArrowNavigate
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    @MainActor
+    final class Coordinator {
+        @Binding var selectedTrackId: LibraryTrack.ID?
+        var trackIds: [LibraryTrack.ID] = []
+        var onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+        private var monitor: Any?
+
+        init(
+            selectedTrackId: Binding<LibraryTrack.ID?>,
+            onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+        ) {
+            _selectedTrackId = selectedTrackId
+            self.onArrowNavigate = onArrowNavigate
+        }
+
+        func install() {
+            uninstall()
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+                [weak self] event in
+                guard let self else { return event }
+                guard !Self.isTextFirstResponder() else { return event }
+                guard !event.modifierFlags.contains(.command) else { return event }
+                let delta: Int?
+                switch event.keyCode {
+                case 126: delta = -1   // ↑
+                case 125: delta = 1    // ↓
+                default: delta = nil
+                }
+                guard let delta, self.moveSelection(by: delta) else { return event }
+                return nil
+            }
+        }
+
+        func uninstall() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        private func moveSelection(by delta: Int) -> Bool {
+            guard !trackIds.isEmpty else { return false }
+            let currentIdx: Int
+            if let id = selectedTrackId, let idx = trackIds.firstIndex(of: id) {
+                currentIdx = idx
+            } else {
+                let firstId = trackIds[0]
+                NSApp.keyWindow?.makeFirstResponder(nil)
+                selectedTrackId = firstId
+                onArrowNavigate?(firstId, delta)
+                return true
+            }
+            let next = max(0, min(trackIds.count - 1, currentIdx + delta))
+            guard next != currentIdx else { return false }
+            let nextId = trackIds[next]
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            selectedTrackId = nextId
+            onArrowNavigate?(nextId, delta)
+            return true
+        }
+
+        private static func isTextFirstResponder() -> Bool {
+            guard let responder = NSApp.keyWindow?.firstResponder else {
+                return false
+            }
+            if responder is NSText || responder is NSTextView { return true }
+            // SwiftUI `TextField` hosts an `NSTextField` — while the
+            // user is editing search, ↑/↓ should move the caret, not
+            // the library selection.
+            if let field = responder as? NSTextField, field.isEditable {
+                return true
+            }
+            return false
         }
     }
 }

@@ -57,6 +57,47 @@ struct PerformanceView: View {
         .background(DubColor.surface0)
     }
 
+    // MARK: - Deck headers
+    //
+    // M11d.5: the header view tree gets the same `DeckDropTarget`
+    // modifier the waveform pane uses, so dragging a file onto the
+    // deck header lands the same load the user would get dropping
+    // on the strip itself. Pre-fix the drop was on the 80 px
+    // waveform column only, which the user reported as "I keep
+    // missing the strip — drag should also accept on the header".
+
+    @ViewBuilder
+    private var deckHeaders: some View {
+        if model.engineMode == .prep {
+            DeckHeader(side: .a,
+                       state: headerState(side: .a),
+                       callbacks: headerCallbacks(side: .a),
+                       mirrored: false,
+                       liveEngine: model.engine,
+                       liveDeckIdx: 0)
+                .background(DubColor.divider)
+                .modifier(DeckDropTarget(model: model, side: .a))
+        } else {
+            HStack(spacing: 1) {
+                DeckHeader(side: .a,
+                           state: headerState(side: .a),
+                           callbacks: headerCallbacks(side: .a),
+                           mirrored: headerMirrored(side: .a),
+                           liveEngine: model.engine,
+                           liveDeckIdx: 0)
+                    .modifier(DeckDropTarget(model: model, side: .a))
+                DeckHeader(side: .b,
+                           state: headerState(side: .b),
+                           callbacks: headerCallbacks(side: .b),
+                           mirrored: headerMirrored(side: .b),
+                           liveEngine: model.engine,
+                           liveDeckIdx: 1)
+                    .modifier(DeckDropTarget(model: model, side: .b))
+            }
+            .background(DubColor.divider)
+        }
+    }
+
     // MARK: - Status strip
 
     private var statusStrip: some View {
@@ -68,27 +109,7 @@ struct PerformanceView: View {
             openPreferences: openPreferences)
     }
 
-    // MARK: - Deck headers
-
-    @ViewBuilder
-    private var deckHeaders: some View {
-        if model.engineMode == .prep {
-            DeckHeader(side: .a,
-                       state: headerState(side: .a),
-                       callbacks: headerCallbacks(side: .a))
-                .background(DubColor.divider)
-        } else {
-            HStack(spacing: 1) {
-                DeckHeader(side: .a,
-                           state: headerState(side: .a),
-                           callbacks: headerCallbacks(side: .a))
-                DeckHeader(side: .b,
-                           state: headerState(side: .b),
-                           callbacks: headerCallbacks(side: .b))
-            }
-            .background(DubColor.divider)
-        }
-    }
+    // MARK: - Deck header derivation
 
     private func headerState(side: DeckSide) -> DeckHeaderState {
         let enabled: Bool
@@ -105,6 +126,16 @@ struct PerformanceView: View {
             thruMode: model.engineMode == .timecode,
             isMaster: model.masterDeck == side,
             prepMode: model.engineMode == .prep)
+    }
+
+    /// Should this deck's header render horizontally mirrored?
+    /// Two-deck Performance / Timecode mode mirrors deck B so its
+    /// identity cluster ends up on the window's right edge instead
+    /// of pinned against the divider. Prep mode is single-deck and
+    /// never mirrors. See `DeckHeader.mirrored` for the rationale.
+    private func headerMirrored(side: DeckSide) -> Bool {
+        guard model.engineMode == .timecode else { return false }
+        return side == .b
     }
 
     /// M10.6a Casual-Play transport callbacks for the deck header.
@@ -126,15 +157,15 @@ struct PerformanceView: View {
     /// collapses to a single full-width deck-A pane — Prep mode
     /// is a single-deck shell (PRD §3.1 / M10.8); a phantom "OFF"
     /// deck-B pane is just noise.
+    /// Centre region. **Two-deck modes** keep the §9.2 symmetric
+    /// layout invariant (both deck panes side-by-side, idle
+    /// placeholder when one deck has no source). **Prep mode**
+    /// collapses to a single full-width deck-A pane — Prep mode
+    /// is a single-deck shell (PRD §3.1 / M10.8); a phantom "OFF"
+    /// deck-B pane is just noise.
     @ViewBuilder
     private var waveformRegion: some View {
         if model.engineMode == .prep {
-            // Prep mode: horizontal Track-Overview band stacked
-            // *above* the horizontal scrolling playing waveform.
-            // Both span the full window width. Time runs left →
-            // right; playhead at 25 % from the left edge of the
-            // playing strip, at the elapsed-fraction position on
-            // the overview band.
             VStack(spacing: 1) {
                 prepOverviewBand
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
@@ -198,36 +229,46 @@ struct PerformanceView: View {
             case .vertical:
                 // Per-deck vertical-mode row layout (PRD §9.2 /
                 // §9.6.1):
-                //   Deck A: [filler] [playing] [filler] [overview] [edge]
-                //   Deck B: [edge]   [overview] [filler] [playing] [filler]
-                // The overview sits on the deck's **outside** edge,
-                // matching Serato / Traktor / rekordbox. The filler
-                // regions are reserved for forthcoming info chips
-                // (RPM toggle, key-lock, beatgrid offset) and the
-                // M10.7 centre-gutter Phase-Drift Trail.
+                //   Deck A: [overview] [gap] [filler] [playing] [filler]
+                //   Deck B: [filler] [playing] [filler] [gap] [overview]
+                // The overview sits on each deck's **outer** edge —
+                // window-left for deck A, window-right for deck B —
+                // matching Serato Scratch Live, Traktor Scratch, and
+                // rekordbox DVS. Pre-fix, both overviews were pinned
+                // against the centre divider, which crowded the
+                // beatmatch surface and read as "deck B is mirrored
+                // wrong" at glance distance. Filler regions remain
+                // reserved for forthcoming info chips (RPM toggle,
+                // key-lock, beatgrid offset) and the M10.7 centre-
+                // gutter Phase-Drift Trail.
+                // M11d.5: the overview always renders, even with
+                // no track loaded — its empty-state path draws a
+                // faint dashed midline so the strip reads as
+                // chrome the user can drop a track onto rather
+                // than as "where did my overview go?". Pre-fix
+                // the overview was conditional on
+                // `deckState.hasTrack`, which left the strip
+                // invisible at cold launch and made the deck
+                // pane look bare in screenshots.
                 HStack(spacing: 0) {
                     if side == .a {
+                        TrackOverviewView(
+                            model: model, side: side, deckIdx: deckIdx)
+                        Color.clear.frame(width: DubLayout.deckOverviewGap)
                         Spacer(minLength: 0)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
                         Spacer(minLength: 0)
-                        if deckState.hasTrack {
-                            Spacer().frame(width: DubLayout.deckOverviewGap)
-                            TrackOverviewView(
-                                model: model, side: side, deckIdx: deckIdx)
-                        }
                     } else {
-                        if deckState.hasTrack {
-                            TrackOverviewView(
-                                model: model, side: side, deckIdx: deckIdx)
-                            Spacer().frame(width: DubLayout.deckOverviewGap)
-                        }
                         Spacer(minLength: 0)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
                         Spacer(minLength: 0)
+                        Color.clear.frame(width: DubLayout.deckOverviewGap)
+                        TrackOverviewView(
+                            model: model, side: side, deckIdx: deckIdx)
                     }
                 }
             case .horizontal:
@@ -245,28 +286,7 @@ struct PerformanceView: View {
             loadErrorOverlay(side: side, deckState: deckState)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // macOS 13+ Transferable drop API. The legacy `.onDrop(of:
-        // [.fileURL])` path silently failed on Finder drags here
-        // because the system doesn't auto-coerce
-        // `NSItemProvider`-backed URLs to a typed payload; using
-        // `dropDestination(for: URL.self)` routes the drop through
-        // `Transferable`'s `URL` conformance which understands
-        // `public.file-url` and `public.url` natively. Drops from
-        // Finder and from the in-app FileBrowserView both arrive
-        // here as `[URL]`.
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            Task { @MainActor in
-                // M10.5d: loadTrack is async (decode + peaks on a
-                // background Task.detached). Await it so we only
-                // auto-start Casual Play after the new track is
-                // actually swapped in.
-                if await model.loadTrack(side: side, url: url) {
-                    model.play(side: side)
-                }
-            }
-            return true
-        }
+        .modifier(DeckDropTarget(model: model, side: side))
     }
 
     /// The width-capped centre column inside a `deckPane` —
@@ -276,6 +296,7 @@ struct PerformanceView: View {
     /// rendering.
     @ViewBuilder
     private func playingColumn(side: DeckSide, deckIdx: UInt64, hasSource: Bool) -> some View {
+        let deckState = (side == .a) ? model.deckA : model.deckB
         let orientation = waveformOrientation
         let content = Group {
             if hasSource {
@@ -283,7 +304,9 @@ struct PerformanceView: View {
                     engine: model.engine, deckIdx: deckIdx,
                     palette: model.palette, side: side,
                     orientation: orientation,
-                    scrubHandler: scrubHandler(side: side))
+                    scrubHandler: scrubHandler(side: side),
+                    continuouslyRendering:
+                        deckState.isPlaying || model.scratchingDeck == side)
                     .background(DubColor.surface0)
             } else {
                 idlePane(side: side)
@@ -456,6 +479,32 @@ struct PerformanceView: View {
             case .prep:
                 return "Prep mode shows a single deck. Switch to Performance in Preferences for two decks."
             }
+        }
+    }
+}
+
+/// Per-deck drop modifier. M11d.5: applied to each deck's
+/// vertical column (header + waveform + FX strip) so dragging
+/// onto any part of the deck lands the load. Pre-fix the drop
+/// modifier was scoped to the 80 px waveform strip only, which
+/// the user reported as "I keep missing the strip; the header
+/// should also accept drops". Behaviour matches the prior path:
+/// macOS 13+ Transferable API, auto-play on a successful load
+/// (matches the drag-to-play idiom from M10.5d), and a `true`
+/// return value so SwiftUI knows the drop was consumed.
+private struct DeckDropTarget: ViewModifier {
+    let model: WaveformAppModel
+    let side: DeckSide
+
+    func body(content: Content) -> some View {
+        content.dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            Task { @MainActor in
+                if await model.loadTrack(side: side, url: url) {
+                    model.play(side: side)
+                }
+            }
+            return true
         }
     }
 }

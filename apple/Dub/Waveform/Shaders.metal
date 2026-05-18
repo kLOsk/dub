@@ -124,6 +124,20 @@ struct Uniforms {
     /// at `chunkOffset + chunkInWindow * chunksPerColumn` and emits
     /// the max envelope + max per-band-group for that range.
     uint chunksPerColumn;
+    /// Band-slot phase offset, in samples, of the visible region's
+    /// first peak chunk inside its containing band chunk. The shader
+    /// uses this to compute the correct band slot for every column,
+    /// not just the first one. See the doc comment on the host-side
+    /// `WaveformUniforms.bandStartPhaseSamples` for the off-by-one
+    /// bug it closes.
+    uint bandStartPhaseSamples;
+    /// Sub-chunk geometry shift in NDC for this region. Added to
+    /// every vertex's `timeNDC` so the displayed waveform position
+    /// advances by the *continuous* playhead delta per frame even
+    /// though the chunk indexing snaps to integer-pair boundaries.
+    /// See the host-side `WaveformUniforms.subChunkOffsetNDC` doc
+    /// for the smoothness rationale.
+    float subChunkOffsetNDC;
 };
 
 /// One element of the broadband-peak ring. CPU-side
@@ -194,36 +208,127 @@ vertex VertexOut waveformVertex(uint vid                       [[vertex_id]],
     const uint colStart = u.chunkOffset + chunkInWindow * u.chunksPerColumn;
     const uint nAgg     = max(u.chunksPerColumn, 1u);
 
+    // **3-tap horizontal envelope smoothing (M11d.5 follow-up).**
+    //
+    // The raw `max(chunk.maxSample / |chunk.minSample|)` aggregate
+    // jumps wildly between adjacent drawn columns because each
+    // column samples only ~ 2.9 ms of audio at 44.1 kHz × 64-
+    // sample peak chunks × 2 chunks/column. Music's true envelope
+    // is a continuous curve, so the eye reads our raw envelope as
+    // "tiny vertical sticks of different heights" instead of one
+    // smooth wave shape — the Mixxx-style look that fails the
+    // Serato side-by-side test.
+    //
+    // Fix: emit each column's amplitude as a weighted average of
+    // (column N-1, column N, column N+1) with weights (¼, ½, ¼).
+    // This is the cheapest possible spline approximation that
+    // still preserves transient peaks (because the centre weight
+    // dominates and the neighbours, being smaller, only soften
+    // the silhouette into the adjacent column instead of erasing
+    // the peak entirely). Boundary columns clamp to the centre's
+    // own value via `chunkInWindow > 0` / `< chunksVisible - 1`
+    // tests so we don't leak past the visible region.
+    //
+    // The kernel runs on the post-aggregation envelope so each
+    // tap is the same `nAgg`-chunk max we already trust. Cost is
+    // 2× extra `nAgg`-chunk loops per drawn vertex — negligible
+    // on Apple Silicon (the vertex shader is currently bandwidth-
+    // bound, not ALU-bound).
     float maxPos  = 0.0;
     float maxNeg  = 0.0;
-    float maxBass = 0.0;
-    float maxMid  = 0.0;
-    float maxHigh = 0.0;
-    float maxSubBass = 0.0;
+    {
+        float centrePos = 0.0;
+        float centreNeg = 0.0;
+        for (uint i = 0u; i < nAgg; ++i) {
+            const PeakChunk pc = chunks[(colStart + i) & (1048576u - 1u)];
+            centrePos = max(centrePos, pc.maxSample);
+            centreNeg = max(centreNeg, fabs(pc.minSample));
+        }
 
-    for (uint i = 0u; i < nAgg; ++i) {
-        const uint chunkIdx = colStart + i;
-        // chunkCapacity is fixed at 2^20 on the host; mirroring
-        // that here as a bitmask keeps the modulo free.
-        const PeakChunk pc = chunks[chunkIdx & (1048576u - 1u)];
-        maxPos = max(maxPos, pc.maxSample);
-        maxNeg = max(maxNeg, fabs(pc.minSample));
+        float leftPos  = centrePos;
+        float leftNeg  = centreNeg;
+        if (chunkInWindow > 0u) {
+            const uint leftStart = colStart - u.chunksPerColumn;
+            leftPos = 0.0;
+            leftNeg = 0.0;
+            for (uint i = 0u; i < nAgg; ++i) {
+                const PeakChunk pc = chunks[(leftStart + i) & (1048576u - 1u)];
+                leftPos = max(leftPos, pc.maxSample);
+                leftNeg = max(leftNeg, fabs(pc.minSample));
+            }
+        }
 
-        // Band-chunk lookup within the visible region. `chunkIdx`
-        // above is a broadband *ring offset*, not a global timeline
-        // index. The host already computed the first visible band
-        // ring offset (`u.bandChunkOffset`), so add the local
-        // broadband sample offset from the start of this draw.
-        const uint localChunkInWindow = chunkInWindow * u.chunksPerColumn + i;
-        const uint localSampleIdx = localChunkInWindow * u.samplesPerPeakChunk;
-        const uint bandIdx = u.bandChunkOffset + localSampleIdx / u.samplesPerBandChunk;
-        const BandPeakChunk bc = bands[bandIdx & (u.bandCapacity - 1u)];
+        float rightPos = centrePos;
+        float rightNeg = centreNeg;
+        if (chunkInWindow + 1u < u.chunksVisible) {
+            const uint rightStart = colStart + u.chunksPerColumn;
+            rightPos = 0.0;
+            rightNeg = 0.0;
+            for (uint i = 0u; i < nAgg; ++i) {
+                const PeakChunk pc = chunks[(rightStart + i) & (1048576u - 1u)];
+                rightPos = max(rightPos, pc.maxSample);
+                rightNeg = max(rightNeg, fabs(pc.minSample));
+            }
+        }
 
-        maxSubBass = max(maxSubBass, bc.b0);
-        maxBass = max(maxBass, max(bc.b0, bc.b1));
-        maxMid  = max(maxMid,  max(max(max(bc.b2, bc.b3), bc.b4), bc.b5 * 0.92));
-        maxHigh = max(maxHigh, max(max(bc.b5 * 0.35, bc.b6), bc.b7));
+        maxPos = 0.25 * leftPos + 0.5 * centrePos + 0.25 * rightPos;
+        maxNeg = 0.25 * leftNeg + 0.5 * centreNeg + 0.25 * rightNeg;
     }
+
+    // Per-column band lookup with phase-correct slot indexing.
+    //
+    // **The bug this closes.** The band ring is cadenced at one
+    // slot per `samplesPerBandChunk` (512 at 44.1/48 kHz), an
+    // order of magnitude coarser than the broadband peak ring
+    // (64 samples). The host's `bandChunkOffset` points at the
+    // band slot that *contains* the visible region's first peak
+    // chunk, but that first peak chunk is generally **not** band-
+    // chunk-aligned — it sits some `bandStartPhaseSamples` into
+    // its band slot. The previous formula
+    //
+    //   bandIdx = bandChunkOffset + localSampleIdx
+    //                                / samplesPerBandChunk
+    //
+    // ignored that phase, so for any column whose local sample
+    // offset pushed past the next band-chunk boundary inside the
+    // region (which is `samplesPerBandChunk − bandStartPhase
+    // Samples` samples away, not `samplesPerBandChunk`), the
+    // shader read the band slot *one earlier* than the slot that
+    // actually contained that column's audio.
+    //
+    // As the playhead advanced, `bandStartPhaseSamples` cycled
+    // frame to frame, which moved the boundary column back and
+    // forth across every visible transient — the same audio
+    // position alternated between reading its correct band slot
+    // and the slot before it. Those two slots have different
+    // spectral content on any sharp transient, so the column's
+    // colour flipped at frame rate (most visibly purple ↔
+    // light-blue on hi-hats and cymbals, where the `b5` presence
+    // band feeds both `mid` and `high`).
+    //
+    // **The fix.** Add the phase offset before the integer
+    // division so each column's band slot lookup is computed
+    // against the same band-chunk grid the host used to place
+    // the region:
+    //
+    //   bandIdx = bandChunkOffset
+    //           + (bandStartPhaseSamples + localSampleIdx)
+    //             / samplesPerBandChunk
+    //
+    // With this, a specific audio chunk always lands in the same
+    // band slot regardless of where the playhead sits relative to
+    // band-chunk boundaries, and the flicker goes away without
+    // any smoothing kernel disturbing the colour palette. The
+    // amplitude path above is unaffected.
+    const uint localBaseChunk = chunkInWindow * u.chunksPerColumn;
+    const uint localSampleIdx = localBaseChunk * u.samplesPerPeakChunk;
+    const uint bandIdx = u.bandChunkOffset
+        + (u.bandStartPhaseSamples + localSampleIdx) / u.samplesPerBandChunk;
+    const BandPeakChunk bc = bands[bandIdx & (u.bandCapacity - 1u)];
+    const float maxSubBass = bc.b0;
+    const float maxBass    = max(bc.b0, bc.b1);
+    const float maxMid     = max(max(max(bc.b2, bc.b3), bc.b4), bc.b5 * 0.92);
+    const float maxHigh    = max(max(bc.b5 * 0.35, bc.b6), bc.b7);
 
     out.bands = float3(maxBass, maxMid, maxHigh);
     out.subBass = maxSubBass;
@@ -252,6 +357,19 @@ vertex VertexOut waveformVertex(uint vid                       [[vertex_id]],
         // Future: top of future region at +0.5, bottom at -1.0.
         timeNDC = 0.5 - 1.5 * frac;
     }
+
+    // Add the sub-chunk geometry shift so the displayed waveform
+    // moves continuously between integer-chunk snap positions. This
+    // is the "make 60 fps actually look like 60 fps" fix. See the
+    // host-side `WaveformUniforms.subChunkOffsetNDC` doc for the
+    // full derivation. Sign-wise: past content needs to move toward
+    // +y (older direction) as the playhead advances continuously,
+    // and so does future content (toward +y, toward the playhead),
+    // so both regions get the same additive shift. The horizontal
+    // path below mirrors `timeNDC` into `xNDC = -timeNDC`, which
+    // turns `+y` into `-x` (leftward) — the correct scroll direction
+    // for the Prep-mode horizontal layout.
+    timeNDC += u.subChunkOffsetNDC;
 
     // Vertical (default) puts time on y, amplitude on x.
     // Horizontal swaps the two — the playhead lives at x = -0.5
@@ -353,4 +471,30 @@ fragment float4 waveformFragment(VertexOut in [[stage_in]]) {
     const float3 rgb = saturate(hue * finalBrightness);
 
     return float4(rgb, 1.0);
+}
+
+// MARK: - Beat grid (B-24 Metal pass)
+
+/// Per-vertex data for beat-grid tick quads. Positions are already
+/// in clip-space NDC; the vertex shader is a passthrough.
+struct BeatGridVertex {
+    float2 position;
+    float4 color;
+};
+
+struct BeatGridVertexOut {
+    float4 position [[position]];
+    float4 color;
+};
+
+vertex BeatGridVertexOut beatGridVertex(uint vid [[vertex_id]],
+                                        constant BeatGridVertex* verts [[buffer(0)]]) {
+    BeatGridVertexOut out;
+    out.position = float4(verts[vid].position, 0.0, 1.0);
+    out.color = verts[vid].color;
+    return out;
+}
+
+fragment float4 beatGridFragment(BeatGridVertexOut in [[stage_in]]) {
+    return in.color;
 }

@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -61,6 +61,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 2,
         sql: V2_MIGRATION,
+    },
+    Migration {
+        target_version: 3,
+        sql: V3_MIGRATION,
     },
 ];
 
@@ -458,6 +462,49 @@ CREATE INDEX IF NOT EXISTS idx_track_files_last_checked
     ON track_files(last_checked_at);
 "#;
 
+/// V3 migration (M11c.2) — adds the `track_keys` table parallel to
+/// `track_beatgrids` and a partial unique index that enforces "one
+/// active key per track". Also extends `analysis_cache` with a
+/// `has_active_key` flag so the prepared-flag predicate
+/// (§8.3 / §8.5) can be computed without a join.
+///
+/// Why parallel to `track_beatgrids` rather than a column on
+/// `tracks`: the same per-source/`is_active` shape applies (Serato
+/// / Traktor / rekordbox can each claim a key; auto from M11c.2
+/// runs alongside; future user override has its own source string).
+/// One row per `(track_id, source)` keeps cross-source preservation
+/// trivial and matches the structure the LibraryView's
+/// disagreement indicator already understands from `track_beatgrids`.
+///
+/// `key_notation` is canonical Camelot (e.g. `8B`). `original_notation`
+/// preserves whatever the source wrote verbatim (`C major`, `Cm`,
+/// `5d`, `8B`) so rekordbox-XML export round-trips exactly.
+/// `confidence` is `[0.0, 1.0]` for auto-detected rows; NULL for
+/// imported / user rows (which by definition carry no algorithmic
+/// confidence).
+const V3_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS track_keys (
+    id                INTEGER PRIMARY KEY,
+    track_id          TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source            TEXT    NOT NULL CHECK (source IN
+                      ('serato', 'traktor', 'rekordbox', 'itunes',
+                       'mixedinkey', 'id3', 'auto', 'user')),
+    key_notation      TEXT    NOT NULL,
+    original_notation TEXT,
+    confidence        REAL,
+    is_active         INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    captured_at       INTEGER NOT NULL,
+    UNIQUE (track_id, source)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_key_per_track
+    ON track_keys(track_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_track_keys_track_id
+    ON track_keys(track_id);
+
+ALTER TABLE analysis_cache ADD COLUMN has_active_key INTEGER NOT NULL DEFAULT 0
+    CHECK (has_active_key IN (0, 1));
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +559,7 @@ mod tests {
             "track_files",
             "track_metadata_source",
             "track_beatgrids",
+            "track_keys",
             "track_cues",
             "track_loops",
             "crates",
@@ -596,6 +644,65 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(hits, vec![track_uuid]);
+    }
+
+    #[test]
+    fn one_active_key_per_track_constraint_holds() {
+        // V3 mirror of the active-grid constraint. The partial
+        // unique index must reject a second `is_active = 1` row
+        // for the same track — two active keys would be a data-
+        // correctness bug that every browser query would step on.
+        let conn = fresh_db();
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO volumes (volume_uuid, display_name, last_seen_at) \
+             VALUES ('TEST-VOLUME', 'Macintosh HD', ?1)",
+            params![now],
+        )
+        .unwrap();
+        let track_uuid = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO tracks (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            params![track_uuid, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_keys \
+             (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+             VALUES (?1, 'serato', '8B', 'C major', NULL, 1, ?2)",
+            params![track_uuid, now],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO track_keys \
+             (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+             VALUES (?1, 'auto', '5A', '5A', 0.7, 1, ?2)",
+            params![track_uuid, now],
+        );
+        assert!(
+            result.is_err(),
+            "two active keys on one track must be rejected"
+        );
+    }
+
+    #[test]
+    fn analysis_cache_has_active_key_column_lands_on_v3() {
+        // Smoke test: the V3 migration must add `has_active_key` to
+        // `analysis_cache`. A direct `SELECT has_active_key` would
+        // be a compile-time TODO; we check column existence via
+        // `PRAGMA table_info` so the test breaks loudly if a future
+        // migration drops the column.
+        let conn = fresh_db();
+        let mut stmt = conn.prepare("PRAGMA table_info(analysis_cache)").unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            rows.iter().any(|c| c == "has_active_key"),
+            "v3 migration must add has_active_key to analysis_cache; saw {rows:?}"
+        );
     }
 
     #[test]

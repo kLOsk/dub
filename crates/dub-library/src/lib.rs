@@ -25,6 +25,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+mod analysis;
 mod db;
 mod dedupe;
 mod error;
@@ -35,6 +36,7 @@ mod schema;
 mod version_tokens;
 mod volumes;
 
+pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
 pub use db::{FileScanRow, Library, MissingTrack, StoredFingerprint, TrackRow, TrackSortKey};
 pub use dedupe::{
     decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,

@@ -115,11 +115,24 @@ pub struct TrackRow {
     /// `[YYYY]` tail is the more reliable signal in DJ-rip-naming
     /// conventions).
     pub year: Option<i32>,
-    /// BPM from the id3 source (auto-grid lands as part of the
-    /// M11c follow-up that wires `dub-bpm` into the importer).
+    /// BPM from the active beat grid (`track_beatgrids` where
+    /// `is_active = 1`). Honours PRD §8.3 priority: an imported
+    /// Serato / rekordbox / Traktor grid wins over the auto grid;
+    /// the auto grid wins over nothing. `None` for tracks that
+    /// have never been analyzed (M11c.1 onward). The browser
+    /// renders `None` as an em-dash; ID3 BPM is **not** used as a
+    /// fallback here because ID3 carries no anchor and is too
+    /// unreliable to bind to the deck (PRD §8.3).
     pub bpm: Option<f64>,
-    /// Musical key from the id3 source (or Mixed In Key's comment
-    /// field via M11e Serato importer at a later milestone).
+    /// Musical key from the active row of `track_keys` (M11c.2).
+    /// Always Camelot when present (e.g. `8B`); the per-source
+    /// original notation is preserved in
+    /// `track_keys.original_notation` for export round-trip but
+    /// is **not** what the browser displays. `None` for tracks
+    /// that have never been analysed (M11c.2 onward). The
+    /// browser renders `None` as an em-dash; ID3 `TKEY` is **not**
+    /// used as a fallback because it would break the
+    /// "unanalysed = no key shown" visual contract.
     pub key: Option<String>,
     /// Duration in milliseconds, from `tracks.duration_ms`.
     pub duration_ms: u32,
@@ -130,6 +143,16 @@ pub struct TrackRow {
     /// link per §8.1 dedupe. Drives the M11d.3 potential-duplicate
     /// indicator.
     pub potential_duplicate_id: Option<String>,
+    /// Free-form per-track comment from `track_metadata_source.
+    /// comment` (id3 source today; M11e+ importers add Serato /
+    /// Traktor / rekordbox comment fields under their own sources
+    /// and we'll switch to COALESCE once the priority is settled).
+    /// `None` when the file carries no comment frame, which is
+    /// common for DJ rips. Surfaced in the M11d.5 LibraryView
+    /// rebuild so DJs can read the per-track notes Mixed In Key
+    /// / Lexicon / hand-written tooling stamps in there (cue
+    /// timestamps, version hints, "energy 7", etc).
+    pub comment: Option<String>,
     /// Origin source — `"filesystem"` for M11c-imported rows;
     /// `"serato"` / `"traktor"` / `"rekordbox"` / `"itunes"` for
     /// future M11e+ importers. Synthesised from the per-source
@@ -154,6 +177,29 @@ pub struct TrackRow {
     /// `primary_volume_mount_point` to reconstruct the absolute
     /// path the browser drags / Space-loads.
     pub primary_relative_path: Option<String>,
+    /// `true` once auto-analysis (M11c.1) has run against this
+    /// track's fingerprint, regardless of whether a grid was
+    /// found. Derived from `analysis_cache.analyzed_at IS NOT NULL`
+    /// in the SELECT below. Drives the M11c.1 browser dimming:
+    /// unanalyzed rows render at reduced opacity; analyzed rows
+    /// render at full opacity even when the analyser declined to
+    /// place a grid (silence stems, ambient pieces). Imported
+    /// grids (M11e Serato/Traktor/rekordbox) also flip this flag
+    /// because the importer writes `analysis_cache.has_active_grid
+    /// = 1` for the fingerprint as it lands the imported grid.
+    pub is_analyzed: bool,
+    /// `true` when at least two `track_keys` rows for this track
+    /// hold non-equivalent Camelot families per the relative-major-
+    /// aware predicate in `dub_spectral::camelot_keys_disagree`
+    /// (PRD §8.3.2). Two sources that round to the same Camelot
+    /// *number* — e.g. C major (8B) vs A minor (8A) — are not
+    /// flagged (legitimate K-K template ambiguity). Parallel
+    /// disagreements — e.g. C major (8B) vs C minor (5A) — are.
+    /// In M11c.2 only the `auto` source writes; this flag will
+    /// always be `false` until M11e (Serato importer) lands a
+    /// second source. The plumbing ships now so M11e is a pure
+    /// data-load milestone with no UI changes required.
+    pub key_disagreement: bool,
 }
 
 /// Sort columns the M11d.2 browser table header can drive.
@@ -175,7 +221,8 @@ pub enum TrackSortKey {
     Artist,
     /// Album name (id3 source).
     Album,
-    /// BPM (id3 source). `None` BPMs sort last in both directions.
+    /// BPM from the active beat grid (`track_beatgrids` where
+    /// `is_active = 1`). `None` BPMs sort last in both directions.
     Bpm,
     /// Duration in milliseconds.
     Duration,
@@ -195,7 +242,7 @@ impl TrackSortKey {
             Self::Title => "COALESCE(fn.title, i3.title)",
             Self::Artist => "COALESCE(fn.artist, i3.artist)",
             Self::Album => "i3.album",
-            Self::Bpm => "i3.bpm",
+            Self::Bpm => "ag.bpm",
             Self::Duration => "t.duration_ms",
             Self::Year => "COALESCE(fn.year, i3.year)",
         }
@@ -225,8 +272,8 @@ const TRACK_ROW_SELECT: &str = "\
            i3.album                            AS album, \
            i3.genre                            AS genre, \
            COALESCE(fn.year,     i3.year)     AS year, \
-           i3.bpm                              AS bpm, \
-           i3.key                              AS key, \
+           ag.bpm                              AS bpm, \
+           ak.key_notation                     AS key, \
            t.duration_ms                       AS duration_ms, \
            COALESCE(fn.version_token, i3.version_token) AS version_tokens, \
            t.duplicate_link_track_id           AS potential_duplicate_id, \
@@ -240,12 +287,28 @@ const TRACK_ROW_SELECT: &str = "\
                FROM volumes v \
                WHERE v.volume_uuid = pf.volume_uuid \
            )                                   AS primary_volume_mount_point, \
-           pf.relative_path                    AS primary_relative_path \
+           pf.relative_path                    AS primary_relative_path, \
+           CASE WHEN ac.analyzed_at IS NOT NULL THEN 1 ELSE 0 END AS is_analyzed, \
+           ( \
+               SELECT CASE WHEN COUNT(DISTINCT \
+                   CASE substr(key_notation, 1, length(key_notation) - 1) \
+                        WHEN '' THEN NULL ELSE \
+                          substr(key_notation, 1, length(key_notation) - 1) \
+                   END) > 1 THEN 1 ELSE 0 END \
+               FROM track_keys tk WHERE tk.track_id = t.id \
+           )                                   AS key_disagreement, \
+           i3.comment                          AS comment \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
     LEFT JOIN track_metadata_source i3 \
               ON i3.track_id = t.id AND i3.source = 'id3' \
+    LEFT JOIN track_beatgrids ag \
+              ON ag.track_id = t.id AND ag.is_active = 1 \
+    LEFT JOIN track_keys ak \
+              ON ak.track_id = t.id AND ak.is_active = 1 \
+    LEFT JOIN analysis_cache ac \
+              ON ac.fingerprint_id = t.fingerprint_id \
     LEFT JOIN ( \
         SELECT tf.track_id, tf.volume_uuid, tf.relative_path \
         FROM track_files tf \
@@ -286,6 +349,15 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         primary_volume_uuid: r.get(12)?,
         primary_volume_mount_point: r.get(13)?,
         primary_relative_path: r.get(14)?,
+        is_analyzed: {
+            let flag: i64 = r.get(15)?;
+            flag != 0
+        },
+        key_disagreement: {
+            let flag: i64 = r.get(16)?;
+            flag != 0
+        },
+        comment: r.get(17)?,
     })
 }
 
@@ -1449,8 +1521,129 @@ mod tests {
         assert_eq!(rows[0].artist.as_deref(), Some("Test Artist"));
         // Album from id3.
         assert_eq!(rows[0].album.as_deref(), Some("Test Album"));
-        // BPM from id3.
-        assert!((rows[0].bpm.unwrap() - 123.45).abs() < 1e-6);
+        // BPM now comes from the active beatgrid (M11c.1) — a
+        // seeded track with no `track_beatgrids` row reports
+        // `None`. ID3 BPM stays preserved verbatim in
+        // `track_metadata_source` but never bleeds into the
+        // browser column (PRD §8.3: ID3 BPM has no anchor and
+        // can't be bound to the deck).
+        assert!(rows[0].bpm.is_none());
+        // No `analysis_cache` row yet → row reads as unanalyzed.
+        assert!(!rows[0].is_analyzed);
+    }
+
+    #[test]
+    fn list_tracks_bpm_column_reads_from_active_beatgrid() {
+        // M11c.1 contract: TrackRow.bpm comes from
+        // `track_beatgrids WHERE is_active = 1`, not from
+        // id3.bpm. Land an auto grid by hand (mirrors what the
+        // analysis module would do) and assert the row reflects
+        // it. Also assert `is_analyzed` flips once `analysis_cache`
+        // is stamped.
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["First"]);
+        let now = 1_700_000_000_i64;
+        lib.connection()
+            .execute(
+                "INSERT INTO track_beatgrids \
+                 (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+                 VALUES (?1, 'auto', 0.0, 92.5, 1, ?2)",
+                params![ids[0], now],
+            )
+            .unwrap();
+        let fp_id: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT fingerprint_id FROM tracks WHERE id = ?1",
+                params![ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        lib.connection()
+            .execute(
+                "INSERT INTO analysis_cache \
+                 (fingerprint_id, has_active_grid, analyzed_at) \
+                 VALUES (?1, 1, ?2)",
+                params![fp_id, now],
+            )
+            .unwrap();
+
+        let rows = lib.list_tracks(10, 0).unwrap();
+        let row = rows.iter().find(|r| r.id == ids[0]).unwrap();
+        assert!((row.bpm.unwrap() - 92.5).abs() < 1e-6);
+        assert!(row.is_analyzed);
+    }
+
+    #[test]
+    fn list_tracks_key_column_reads_from_active_track_keys() {
+        // M11c.2 contract: TrackRow.key comes from
+        // `track_keys WHERE is_active = 1`, *always* Camelot.
+        // ID3 TKEY is never read into TrackRow.key (it would
+        // break the unanalysed = no key visual contract).
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["KeyTrack"]);
+        let now = 1_700_000_000_i64;
+        lib.connection()
+            .execute(
+                "INSERT INTO track_keys \
+                 (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+                 VALUES (?1, 'auto', '8B', '8B', 0.42, 1, ?2)",
+                params![ids[0], now],
+            )
+            .unwrap();
+        let rows = lib.list_tracks(10, 0).unwrap();
+        let row = rows.iter().find(|r| r.id == ids[0]).unwrap();
+        assert_eq!(row.key.as_deref(), Some("8B"));
+        assert!(
+            !row.key_disagreement,
+            "single source -> never flagged disagreement"
+        );
+    }
+
+    #[test]
+    fn list_tracks_flags_key_disagreement_only_on_parallel_pairs() {
+        // PRD §8.3.2 relative-major-aware rule: same Camelot
+        // *number* across sources is never flagged (legitimate
+        // K-K template ambiguity, e.g. 8B vs 8A). Different
+        // Camelot numbers (e.g. 8B vs 5A — C major vs C minor)
+        // do flag.
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Relative", "Parallel"]);
+        let now = 1_700_000_000_i64;
+
+        // Track 0: 8B (auto) + 8A (serato) — same family,
+        // should NOT flag.
+        lib.connection()
+            .execute(
+                "INSERT INTO track_keys (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+                 VALUES (?1, 'auto', '8B', '8B', 0.5, 1, ?2), \
+                        (?1, 'serato', '8A', '8A', NULL, 0, ?2)",
+                params![ids[0], now],
+            )
+            .unwrap();
+
+        // Track 1: 8B (auto) + 5A (serato) — different families,
+        // SHOULD flag.
+        lib.connection()
+            .execute(
+                "INSERT INTO track_keys (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+                 VALUES (?1, 'auto', '8B', '8B', 0.5, 1, ?2), \
+                        (?1, 'serato', '5A', 'C minor', NULL, 0, ?2)",
+                params![ids[1], now],
+            )
+            .unwrap();
+
+        let rows = lib.list_tracks(10, 0).unwrap();
+        let relative = rows.iter().find(|r| r.id == ids[0]).unwrap();
+        let parallel = rows.iter().find(|r| r.id == ids[1]).unwrap();
+        assert!(
+            !relative.key_disagreement,
+            "8B vs 8A is a relative-key pair; must not flag"
+        );
+        assert!(
+            parallel.key_disagreement,
+            "8B vs 5A is a parallel-key pair; must flag"
+        );
     }
 
     #[test]
@@ -1752,21 +1945,26 @@ mod tests {
 
     #[test]
     fn list_tracks_sorted_nulls_sort_last_in_both_directions() {
+        // M11c.1 changed TrackRow.bpm to read from
+        // `track_beatgrids` (active row), not from
+        // `track_metadata_source.bpm`. Seed two tracks, give one
+        // of them an active auto grid; the row without a grid is
+        // the NULL-BPM case and must sort last in both directions.
         let lib = Library::open_in_memory().unwrap();
         let ids = seed_tracks(&lib, &["With Bpm", "Also With Bpm"]);
-        // Seed inserts BPM=123.45 for every row via the id3
-        // metadata. Strip it from one row to test NULL handling.
+        let now = 1_700_000_000_i64;
         lib.connection()
             .execute(
-                "UPDATE track_metadata_source SET bpm = NULL \
-                 WHERE track_id = ?1 AND source = 'id3'",
-                params![ids[0]],
+                "INSERT INTO track_beatgrids \
+                 (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+                 VALUES (?1, 'auto', 0.0, 140.0, 1, ?2)",
+                params![ids[1], now],
             )
             .unwrap();
         let asc = lib
             .list_tracks_sorted(10, 0, TrackSortKey::Bpm, true)
             .unwrap();
-        // NULL row must be last in ASC.
+        // NULL row (ids[0] — no grid) must be last in ASC.
         assert_eq!(asc[1].id, ids[0]);
         let desc = lib
             .list_tracks_sorted(10, 0, TrackSortKey::Bpm, false)

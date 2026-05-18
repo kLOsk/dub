@@ -119,6 +119,7 @@ is substantial.
 |---|---|
 | `track_metadata_source.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'id3'`, `'filename'` |
 | `track_beatgrids.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'auto'`, `'user_tap'` |
+| `track_keys.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'mixedinkey'`, `'id3'`, `'auto'`, `'user'` |
 | `track_cues.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'`, `'user'` |
 | `track_loops.source` | Same as `track_cues.source` |
 | `imported_crates.source` | `'serato'`, `'traktor'`, `'rekordbox'`, `'itunes'` |
@@ -368,6 +369,41 @@ imported and `auto` grids disagree by more than 5 % BPM or 50 ms
 anchor over the first 32 bars (PRD §8.3 cross-validation; the
 comparison is computed at query time, not stored).
 
+### `track_keys` — one musical key per source per track (schema v3, M11c.2)
+
+```sql
+CREATE TABLE IF NOT EXISTS track_keys (
+    id                INTEGER PRIMARY KEY,
+    track_id          TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    source            TEXT    NOT NULL CHECK (source IN
+                      ('serato', 'traktor', 'rekordbox', 'itunes',
+                       'mixedinkey', 'id3', 'auto', 'user')),
+    -- Canonical Camelot, e.g. '8B' for C major, '5A' for C minor.
+    key_notation      TEXT    NOT NULL,
+    -- Whatever the source wrote verbatim ('C major', 'Cm', '5d',
+    -- '8B'). Preserved so rekordbox-XML export round-trips exactly.
+    original_notation TEXT,
+    -- [0.0, 1.0] for auto-detected rows; NULL for imported / user
+    -- rows (which by definition carry no algorithmic confidence).
+    confidence        REAL,
+    is_active         INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    captured_at       INTEGER NOT NULL,
+    UNIQUE (track_id, source)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_key_per_track
+    ON track_keys(track_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_track_keys_track_id
+    ON track_keys(track_id);
+```
+
+Same `(source, is_active, captured_at)` shape as `track_beatgrids`.
+PRD §8.3.2 cross-validation is relative-major aware: the browser only
+flags ⚠ when two sources sit in **different** Camelot families (`8B`
+vs `5A`); relative-major pairs (`8B` vs `8A` — C major vs A minor)
+are a legitimate Krumhansl-Kessler template ambiguity and are not
+flagged. The flag is computed at query time in `TRACK_ROW_SELECT`
+via `COUNT(DISTINCT substr(key_notation, 1, length-1)) > 1`.
+
 ### `track_cues` — hot cues (stored from v1, surfaced in v2)
 
 ```sql
@@ -531,15 +567,19 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
     has_lufs                INTEGER NOT NULL DEFAULT 0 CHECK (has_lufs IN (0, 1)),
     has_waveform            INTEGER NOT NULL DEFAULT 0 CHECK (has_waveform IN (0, 1)),
     has_active_grid         INTEGER NOT NULL DEFAULT 0 CHECK (has_active_grid IN (0, 1)),
+    -- Schema v3 (M11c.2): mirrors `has_active_grid` for the key
+    -- pipeline. `1` once an `is_active = 1` row lands in
+    -- `track_keys` for this fingerprint.
+    has_active_key          INTEGER NOT NULL DEFAULT 0 CHECK (has_active_key IN (0, 1)),
     analyzed_at             INTEGER
 );
 ```
 
 Keyed by canonical `fingerprint_id` (not `track_id`) so the cache
 survives file moves and dedupe merges. A "prepared" track is one
-where `has_lufs AND has_waveform AND has_active_grid`; the prepared
-flag in the browser is computed at query time from these three
-columns.
+where `has_lufs AND has_waveform AND has_active_grid AND
+has_active_key`; the prepared flag in the browser is computed at
+query time from these columns.
 
 ### `smart_crates` — user-defined smart crates (v1.x)
 

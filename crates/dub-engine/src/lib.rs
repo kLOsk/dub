@@ -183,6 +183,27 @@ struct PanicPlayState {
     /// rate (PRD §6.1.2: "runs the audio track forward").
     #[allow(dead_code)]
     held_rate: f64,
+    /// M11d.5: `true` when the user explicitly engaged panic via
+    /// the FFI / UI (`EngineHandle::panic_play` ⇢
+    /// `Command::DeckPanicPlay`). The auto-engage path from
+    /// `DropoutHoldRate` (PRD §5.4.2 Repeat / §6.1.2) leaves this
+    /// `false` so the next clean `Locked` block still auto-cancels
+    /// — that's the canonical "carrier came back, hand transport
+    /// to platter" behaviour and shouldn't change.
+    ///
+    /// When `true`, the panic-branch's `Locked`-handler skips its
+    /// auto-cancel **and** does not push the platter rate onto
+    /// the deck. The deck stays at its held internal rate until
+    /// the user explicitly cancels via `cancel_panic_play`. This
+    /// is the only sane semantic for the pre-alpha dogfooding
+    /// path where the engine sits in Timecode mode without a real
+    /// platter — any signal on the input (noise, mic bleed, line-
+    /// in from the next room) would otherwise cancel panic the
+    /// moment the user pressed Play, and the deck would either
+    /// follow nonsense rates or pause on the next `DropoutHoldRate`
+    /// arm. The user reported this as "deck A play still doesn't
+    /// work in Performance mode".
+    user_initiated: bool,
 }
 
 impl PanicPlayState {
@@ -595,15 +616,40 @@ impl Engine {
                 // held rate — we don't pause on dropouts because
                 // the whole point of Panic-Play is staying audible
                 // while the needle is off the platter.
+                //
+                // **M11d.5 carve-out for user-initiated panic.**
+                // When the user *explicitly* engaged panic via the
+                // UI's Play button (`Command::DeckPanicPlay`), we
+                // suppress the auto-cancel. Without this carve-out
+                // the pre-alpha dogfooding path was broken: the
+                // engine sits in Timecode mode without a real
+                // platter, any noise on the input is decoded as
+                // `Locked` at a nonsense rate, and the very next
+                // render block cancels panic + clobbers the rate.
+                // The user saw "Play does nothing in Performance
+                // mode". For user-initiated panic the only way
+                // out is `cancel_panic_play`. The auto-engage
+                // path (DropoutHoldRate Repeat hookup at PRD
+                // §5.4.2) leaves `user_initiated == false`, so the
+                // existing carrier-return-cancels-panic behaviour
+                // is preserved for the canonical timecode flow.
+                let user_initiated = self.panic_play_states[idx].user_initiated;
                 let deck = &mut self.decks[idx];
                 match intent {
                     timecode::LiftIntent::Locked { rate } => {
-                        deck.set_rate(rate);
-                        if !deck.is_playing() {
-                            deck.set_playing(true);
+                        if user_initiated {
+                            // Stay in user-initiated panic; do not
+                            // touch the deck transport even on a
+                            // clean re-lock. The user committed to
+                            // internal play.
+                        } else {
+                            deck.set_rate(rate);
+                            if !deck.is_playing() {
+                                deck.set_playing(true);
+                            }
+                            deck.set_panic_play_visible(false);
+                            self.panic_play_states[idx].engaged = false;
                         }
-                        deck.set_panic_play_visible(false);
-                        self.panic_play_states[idx].engaged = false;
                     }
                     timecode::LiftIntent::DropoutHoldRate { .. } => {
                         // Stay in panic; do not touch deck transport.
@@ -618,7 +664,23 @@ impl Engine {
                             // First lock after silence / dropout: start
                             // playing. The 2 ms declick handles the
                             // smooth fade-in from silence.
-                            deck.set_playing(true);
+                            //
+                            // **M11d.5 guard: only auto-start if a
+                            // track is actually loaded.** Without a
+                            // source the deck renders silence; flipping
+                            // `is_playing = true` only confuses the UI
+                            // ("Deck B is playing without me doing
+                            // anything") because the position poll
+                            // reflects the flag verbatim. Loaded
+                            // tracks still get the canonical "platter
+                            // started ⇒ deck plays" behaviour. Thru-
+                            // mode decks render through `thru_sources`
+                            // independently of the deck transport, so
+                            // suppressing the play flag here doesn't
+                            // mute live capture.
+                            if deck.source().is_some() {
+                                deck.set_playing(true);
+                            }
                         }
                     }
                     timecode::LiftIntent::DropoutHoldRate { rate } => {
@@ -647,7 +709,10 @@ impl Engine {
                         // the brief-hiccup path inside the policy's
                         // grace window before this arm fires at all.
                         if self.decks[idx].is_playing() {
-                            self.engage_panic_play(idx);
+                            // Engine-auto-engage path: `false` so a
+                            // clean re-lock still auto-cancels (PRD
+                            // §5.4.2 Repeat semantic).
+                            self.engage_panic_play(idx, false);
                         } else {
                             self.decks[idx].set_rate(rate);
                         }
@@ -666,7 +731,15 @@ impl Engine {
     /// disengaged so the *next* `LiftIntent::Locked` is a fresh
     /// re-engagement that auto-cancels panic. RT-safe: no
     /// allocations, no syscalls.
-    fn engage_panic_play(&mut self, idx: usize) {
+    ///
+    /// M11d.5: `user_initiated` distinguishes the FFI / UI path
+    /// (user pressed Play / engaged INT) from the engine-internal
+    /// auto-engage (PRD §5.4.2 Repeat hookup from DropoutHoldRate).
+    /// The flag is stored on `PanicPlayState`; see its doc comment
+    /// for how the timecode-driver dispatch loop uses it to gate
+    /// auto-cancel on `Locked`. The auto-engage path passes
+    /// `false` so the canonical timecode flow is unchanged.
+    fn engage_panic_play(&mut self, idx: usize, user_initiated: bool) {
         if idx >= DECK_COUNT {
             return;
         }
@@ -698,6 +771,7 @@ impl Engine {
         self.panic_play_states[idx] = PanicPlayState {
             engaged: true,
             held_rate,
+            user_initiated,
         };
     }
 
@@ -730,6 +804,11 @@ impl Engine {
             return;
         }
         self.panic_play_states[idx].engaged = false;
+        // M11d.5: also clear `user_initiated` so a subsequent
+        // auto-engage from `DropoutHoldRate` doesn't inherit the
+        // sticky "no auto-cancel" semantic. Each engage event
+        // sets the flag explicitly from its caller's context.
+        self.panic_play_states[idx].user_initiated = false;
         self.decks[idx].set_panic_play_visible(false);
     }
 
@@ -782,7 +861,11 @@ impl Engine {
                 }
             }
             Command::DeckPanicPlay { idx } => {
-                self.engage_panic_play(idx as usize);
+                // FFI / UI path: `true` flags this engagement as
+                // user-initiated so the timecode driver's
+                // panic-branch doesn't auto-cancel on the next
+                // `Locked` block. See `PanicPlayState.user_initiated`.
+                self.engage_panic_play(idx as usize, true);
             }
             Command::DeckCancelPanicPlay { idx } => {
                 self.cancel_panic_play(idx as usize);
@@ -2887,7 +2970,7 @@ mod tests {
             timecode::LiftIntent::Locked { .. }
         ));
 
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
 
         let deck = engine.deck(0);
         assert!(deck.is_playing(), "engage_panic_play must start the deck");
@@ -2934,7 +3017,7 @@ mod tests {
         // "history before the dust tick" the panic snapshot
         // captures.
         let _ = step_policy(&mut engine, 0, locked_output(1.05));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         assert!(engine.panic_play_states[0].engaged);
         assert!((engine.deck(0).rate() - 1.05).abs() < 1e-9);
 
@@ -2973,6 +3056,139 @@ mod tests {
         );
     }
 
+    /// M11d.5 — user-initiated panic must NOT auto-cancel on a
+    /// clean re-lock. This is the pre-alpha dogfooding path: the
+    /// engine sits in Timecode mode without a real platter, and
+    /// the very first noisy block on the input would otherwise
+    /// flip the deck back under timecode control and clobber the
+    /// internal rate. The user explicitly committed to internal
+    /// play by pressing the UI Play button; only an explicit
+    /// `cancel_panic_play` should hand transport back to the
+    /// platter. The opposite (`user_initiated == false`) case is
+    /// covered by `panic_play_auto_cancels_on_clean_relock_through_render`.
+    #[test]
+    fn panic_play_user_initiated_survives_clean_relock() {
+        use ringbuf::traits::Producer;
+        let sr = 48_000.0_f32;
+        let block = 64;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let _ = step_policy(&mut engine, 0, locked_output(1.05));
+        engine.engage_panic_play(0, true);
+        assert!(engine.panic_play_states[0].engaged);
+        assert!(engine.panic_play_states[0].user_initiated);
+        let held_rate = engine.deck(0).rate();
+        assert!((held_rate - 1.05).abs() < 1e-9);
+
+        let n = block * 4;
+        let mut sig = vec![0.0_f32; n * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        gen.render(&mut sig, 1.0, 0.5);
+        tx.push_slice(&sig);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        assert!(
+            engine.panic_play_states[0].engaged,
+            "user-initiated panic must survive a clean re-lock; only cancel_panic_play should exit"
+        );
+        assert!(
+            engine.panic_play_states[0].user_initiated,
+            "user_initiated flag must stay set across the render loop"
+        );
+        assert!(
+            engine.deck(0).shared().load_panic_play(),
+            "shared atomic must stay asserted while user-initiated panic is engaged"
+        );
+        assert!(
+            engine.deck(0).is_playing(),
+            "deck must keep playing throughout user-initiated panic"
+        );
+        assert!(
+            (engine.deck(0).rate() - held_rate).abs() < 1e-9,
+            "deck rate must NOT be clobbered by the timecode-driven Locked intent while user_initiated is true; got {}, expected {}",
+            engine.deck(0).rate(),
+            held_rate
+        );
+    }
+
+    /// M11d.5 — a deck with **no track loaded** must NOT have its
+    /// `is_playing` flag flipped on by the timecode driver's non-
+    /// panic `Locked` branch. The user observed deck B "playing"
+    /// without any user input after engaging Timecode mode on an
+    /// audio interface where some signal (mic bleed / noise) on
+    /// deck B's pair was decoded by the policy as a clean carrier.
+    /// Without this guard the position poll's `is_playing` was
+    /// truthy on a deck that had no audible output, surfacing a
+    /// confusing "deck is playing nothing" state. Loaded tracks
+    /// still get the canonical auto-start (covered by
+    /// `timecode_lock_drives_deck_rate_and_plays`).
+    #[test]
+    fn timecode_locked_does_not_auto_start_deck_without_source() {
+        use ringbuf::traits::Producer;
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        // No `set_source` — deck is sourceless on purpose.
+        engine.deck_mut(0).quiesce_declick_for_test();
+        assert!(!engine.deck(0).is_playing());
+        assert!(engine.deck(0).source().is_none());
+
+        // Push enough synthetic carrier that the policy locks.
+        let n = block * 4;
+        let mut sig = vec![0.0_f32; n * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        gen.render(&mut sig, 1.0, 0.5);
+        tx.push_slice(&sig);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        // Policy must have locked (sanity check the test).
+        let last = engine
+            .timecode_last_output(0)
+            .expect("decoder ran at least once");
+        assert!(last.confidence > 0.99);
+
+        // The crux: the deck must remain paused because nothing is
+        // loaded. Without the guard `is_playing` would be true and
+        // the UI would render a phantom playback indicator.
+        assert!(
+            !engine.deck(0).is_playing(),
+            "sourceless deck must stay paused even when the policy emits Locked"
+        );
+    }
+
+    /// M11d.5 — `cancel_panic_play` must clear the
+    /// `user_initiated` flag so a subsequent engine-internal
+    /// auto-engage from `DropoutHoldRate` (PRD §5.4.2 Repeat
+    /// hookup) inherits the canonical "auto-cancel on clean
+    /// re-lock" semantic instead of the sticky user-initiated
+    /// behaviour.
+    #[test]
+    fn cancel_panic_clears_user_initiated_flag() {
+        let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
+        let _ = step_policy(&mut engine, 0, locked_output(1.0));
+        engine.engage_panic_play(0, true);
+        assert!(engine.panic_play_states[0].engaged);
+        assert!(engine.panic_play_states[0].user_initiated);
+
+        engine.cancel_panic_play(0);
+        assert!(!engine.panic_play_states[0].engaged);
+        assert!(
+            !engine.panic_play_states[0].user_initiated,
+            "cancel_panic_play must clear the user-initiated sticky flag"
+        );
+    }
+
     #[test]
     fn panic_play_locked_intent_clears_engaged_flag() {
         // Direct test of the panic-mode `Locked` branch inside
@@ -2989,7 +3205,7 @@ mod tests {
         //      same way drive_timecode_inputs would.
         let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
         let _ = step_policy(&mut engine, 0, locked_output(1.0));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         assert!(engine.panic_play_states[0].engaged);
 
         // Step the policy with a fresh confident sample. Because
@@ -3029,7 +3245,7 @@ mod tests {
         // audience hears the track keep playing).
         let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
         let _ = step_policy(&mut engine, 0, locked_output(1.0));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         assert!(engine.deck(0).is_playing());
 
         // Force-disengage was applied; a low-confidence sample now
@@ -3067,7 +3283,7 @@ mod tests {
         let mut engine = Engine::new(48_000.0, 64);
         engine.deck_mut(0).set_rate(0.85);
 
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
 
         assert!(engine.deck(0).is_playing());
         assert!(
@@ -3087,7 +3303,7 @@ mod tests {
         let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
         let _ = step_policy(&mut engine, 0, locked_output(-1.2));
 
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
 
         assert!(
             (engine.deck(0).rate() - 1.2).abs() < 1e-9,
@@ -3103,7 +3319,7 @@ mod tests {
         let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
         let _ = step_policy(&mut engine, 0, locked_output(0.01));
 
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
 
         assert!(
             (engine.deck(0).rate() - 1.0).abs() < 1e-9,
@@ -3120,7 +3336,7 @@ mod tests {
         // Dropout → pauses naturally (see follow-up tests).
         let (mut engine, _tx) = engine_with_tc_deck0(48_000.0, 64);
         let _ = step_policy(&mut engine, 0, locked_output(1.0));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         assert!(engine.deck(0).is_playing());
         assert!(engine.deck(0).shared().load_panic_play());
         let pre_rate = engine.deck(0).rate();
@@ -3156,7 +3372,7 @@ mod tests {
         // Pre-seed last_locked_rate so the panic snapshot has
         // a meaningful rate to hold.
         let _ = step_policy(&mut engine, 0, locked_output(1.05));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         engine.cancel_panic_play(0);
         assert!(engine.deck(0).is_playing());
         assert!(!engine.panic_play_states[0].engaged);
@@ -3207,7 +3423,7 @@ mod tests {
         let block = 256_usize;
         let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
         let _ = step_policy(&mut engine, 0, locked_output(1.0));
-        engine.engage_panic_play(0);
+        engine.engage_panic_play(0, false);
         engine.cancel_panic_play(0);
         assert!(engine.deck(0).is_playing());
         assert!(!engine.panic_play_states[0].engaged);
@@ -3390,7 +3606,7 @@ mod tests {
         let _ = step_policy(&mut engine, 0, locked_output(1.0));
 
         assert_no_alloc::assert_no_alloc(|| {
-            engine.engage_panic_play(0);
+            engine.engage_panic_play(0, false);
             engine.cancel_panic_play(0);
         });
     }

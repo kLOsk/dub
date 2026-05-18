@@ -161,10 +161,17 @@ struct PreferencesSheet: View {
             // M10.5b: single Close button. Every config change in
             // this sheet (mode picker, device picker, channel fields)
             // auto-applies via `model.applyConfig()`, so there's
-            // never anything for the user to manually commit.
+            // never anything for the user to manually commit. The
+            // button binds *only* to `.cancelAction` (Esc) — having
+            // both `.cancelAction` *and* `.defaultAction` (Enter)
+            // on the same button is a SwiftUI footgun: only the
+            // last-applied shortcut wins reliably, leaving Esc
+            // dead and Enter behaving weirdly on macOS 14 with
+            // text fields focused. Esc-to-dismiss matches every
+            // other macOS modal; Enter is the wrong key for a
+            // sheet that has nothing to commit anyway.
             Button("Close") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-                .keyboardShortcut(.defaultAction)
         }
     }
 

@@ -123,7 +123,15 @@ uniffi::setup_scaffolding!();
 ///       the Apple shell can render a real platter's lead-in /
 ///       lead-out groove when a scratch pushes the playhead
 ///       outside `[0, duration_secs]` (PRD §6.1 / §9.6).
-pub const FFI_VERSION: u32 = 14;
+///   15. M11d.5 round 4 — `DubEngine::load_track` gains an optional
+///       `LibraryBeatGrid` parameter and `DubLibrary::active_beat_grid`
+///       is added. When supplied, the engine adopts the library's
+///       stored `(bpm, anchor_secs)` directly and skips
+///       `dub_bpm::analyze_beat_grid`; this is the single source
+///       of truth that eliminates the ±0.02 BPM drift between the
+///       DeckHeader and LibraryView and removes the per-load
+///       redundant 100–400 ms analysis on already-analyzed tracks.
+pub const FFI_VERSION: u32 = 15;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -812,7 +820,32 @@ impl DubEngine {
     /// * [`EngineError::CommandChannelFull`] if the audio thread is
     ///   not draining commands (implausible in normal operation —
     ///   the channel is sized for hundreds of pending commands).
-    pub fn load_track(&self, deck_idx: u64, path: String) -> Result<(), EngineError> {
+    ///
+    /// # Beat-grid source (M11d.5 round 4)
+    ///
+    /// When `library_beat_grid` is `Some(LibraryBeatGrid)`, the
+    /// background analysis worker installs the supplied
+    /// `(bpm, anchor_secs)` directly into `FilePeaks.beat_grid`
+    /// (synthesising the `Vec<f64>` of per-beat timestamps from
+    /// the fixed-tempo formula `anchor + i · 60 / bpm` clamped to
+    /// `[0, duration_secs]`) and skips the ~100–400 ms BPM
+    /// analysis step entirely. The deck's grid is then identical
+    /// to what `DubLibrary::active_beat_grid` would return,
+    /// eliminating the historical ±0.02 BPM drift between the
+    /// DeckHeader (which used to read the engine's in-memory
+    /// grid) and the LibraryView (which reads `track_beatgrids`).
+    ///
+    /// When `library_beat_grid` is `None`, the worker runs
+    /// `analyze_beat_grid` as before. Finder-drag loads (no
+    /// library row to consult) and library-track loads where the
+    /// library has not yet analysed the track both take this
+    /// branch.
+    pub fn load_track(
+        &self,
+        deck_idx: u64,
+        path: String,
+        library_beat_grid: Option<LibraryBeatGrid>,
+    ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let t_total = std::time::Instant::now();
 
@@ -894,11 +927,18 @@ impl DubEngine {
         let state_handle = Arc::clone(&self.state);
         let gen_handle = Arc::clone(&self.peak_generation_seq);
         let track_for_thread = Arc::clone(&track);
+        let supplied_grid_for_thread = library_beat_grid.clone();
         let thread_name = format!("dub-load-{idx}");
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                background_analyze_and_install(idx, track_for_thread, state_handle, gen_handle);
+                background_analyze_and_install(
+                    idx,
+                    track_for_thread,
+                    state_handle,
+                    gen_handle,
+                    supplied_grid_for_thread,
+                );
             });
 
         // Spawn can fail (process thread limit reached, OOM at
@@ -927,6 +967,7 @@ impl DubEngine {
                 Arc::clone(&track),
                 Arc::clone(&self.state),
                 Arc::clone(&self.peak_generation_seq),
+                library_beat_grid,
             );
         }
 
@@ -1805,6 +1846,7 @@ fn background_analyze_and_install(
     track: Arc<Track>,
     state: Arc<Mutex<EngineState>>,
     peak_generation_seq: Arc<[AtomicU64; 2]>,
+    library_grid: Option<LibraryBeatGrid>,
 ) {
     // Stage 1: offline peaks.
     let t_peaks = std::time::Instant::now();
@@ -1858,23 +1900,54 @@ fn background_analyze_and_install(
     }
     eprintln!("dub-ffi: peaks deck={idx} installed in {peaks_ms}ms");
 
-    // Stage 2: beat-grid analysis (BPM + downbeat).
+    // Stage 2: beat grid.
     //
-    // Single-pass on the full sample buffer: spectral-flux ODF +
-    // harmonic-summed autocorrelation BPM estimate, then a phase
-    // search for the downbeat. ~100–400 ms depending on track
-    // length and channel count. Analysis errors (silence,
-    // non-musical, too-short, channel-mismatch) collapse to an
-    // empty grid; the UI falls back to the dash.
-    let t_bpm = std::time::Instant::now();
-    let grid_result = analyze_beat_grid(track.samples(), track.sample_rate(), track.channels());
-    let bpm_ms = t_bpm.elapsed().as_millis();
-    let grid = match grid_result {
-        Ok(g) => BeatGrid::from_core(g),
-        Err(e) => {
-            eprintln!("dub-ffi: beat-grid analysis bailed on deck {idx} after {bpm_ms}ms: {e}");
-            BeatGrid::empty()
-        }
+    // Two paths, selected by whether the load handshake supplied a
+    // library-sourced grid:
+    //
+    //   2a. Library-sourced (`library_grid = Some(_)`). Synthesise
+    //       the per-beat positions vector from the fixed-tempo
+    //       formula `anchor + i · 60 / bpm`, clamped to the track's
+    //       duration. Confidence is set to 1.0 (any row that lives
+    //       in `track_beatgrids` is by definition authoritative —
+    //       it was either auto-analysed with non-zero confidence
+    //       or hand-written by an importer or the user). Cost:
+    //       a few microseconds for a typical 4-minute track at
+    //       128 BPM (~512 beats). No DSP, no decode, no I/O.
+    //
+    //   2b. No library grid (`library_grid = None`). Run the
+    //       single-pass `analyze_beat_grid` on the full sample
+    //       buffer: spectral-flux ODF + harmonic-summed
+    //       autocorrelation BPM estimate + phase search for the
+    //       downbeat. ~100–400 ms depending on track length and
+    //       channel count. Errors (silence, non-musical, too-short,
+    //       channel-mismatch) collapse to an empty grid; the UI
+    //       falls back to the dash.
+    //
+    // Either way, the result is installed in place into the
+    // `FilePeaks.beat_grid` slot. No `peak_generation_seq` bump:
+    // the grid doesn't affect waveform geometry, only the beat-
+    // line overlay, and the renderer is already polling the grid
+    // each frame.
+    let (grid, bpm_ms, source_label): (BeatGrid, u128, &'static str) = if let Some(supplied) =
+        library_grid
+    {
+        let duration_secs = track.samples().len() as f64
+            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let synthesised = synthesise_beat_grid(supplied.bpm, supplied.anchor_secs, duration_secs);
+        (synthesised, 0, "library")
+    } else {
+        let t_bpm = std::time::Instant::now();
+        let grid_result = analyze_beat_grid(track.samples(), track.sample_rate(), track.channels());
+        let bpm_ms = t_bpm.elapsed().as_millis();
+        let grid = match grid_result {
+            Ok(g) => BeatGrid::from_core(g),
+            Err(e) => {
+                eprintln!("dub-ffi: beat-grid analysis bailed on deck {idx} after {bpm_ms}ms: {e}");
+                BeatGrid::empty()
+            }
+        };
+        (grid, bpm_ms, "analyzed")
     };
 
     {
@@ -1885,16 +1958,76 @@ fn background_analyze_and_install(
         if !track_still_loaded(running, idx, &track) {
             return;
         }
-        // Only mutate the in-place `FilePeaks`; if some other code
-        // path replaced the slot (e.g. Thru session start) we
-        // silently drop the grid. No `peak_generation_seq` bump —
-        // the grid doesn't affect waveform rendering, and the
-        // Apple side polls `beat_grid` lazily.
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
             fp.beat_grid = grid;
         }
     }
-    eprintln!("dub-ffi: beat-grid deck={idx} installed in {bpm_ms}ms");
+    eprintln!("dub-ffi: beat-grid deck={idx} installed ({source_label}, {bpm_ms}ms DSP)");
+}
+
+/// Materialise a [`BeatGrid`] from the scalar `(bpm, anchor_secs)`
+/// that the library schema stores, clamped to the track's known
+/// duration. Used by [`background_analyze_and_install`] on the
+/// library-sourced load path.
+///
+/// Walks **backwards** from `anchor_secs` until the candidate beat
+/// time goes negative (so the renderer can paint beat lines in the
+/// lead-in region when the playhead sits in the empty groove), then
+/// forwards until it would land past `duration_secs`. The resulting
+/// vector contains every beat in `[0, duration_secs]` plus the one
+/// immediately to the left of zero when the anchor is positive
+/// (the renderer clips out-of-window beats anyway, but a single
+/// extra timestamp makes the empty-groove fade-in look right at
+/// `t = 0`).
+///
+/// Defensive against pathological inputs:
+///
+/// * `bpm <= 0` or non-finite → returns the empty grid (no rows
+///   should ever land in `track_beatgrids` with such a value, but
+///   surfacing it as an empty grid is the least-bad behaviour if
+///   someone bypasses the upsert constraints).
+/// * `duration_secs <= 0` → returns the empty grid.
+/// * `bpm` so high that the beat period rounds to 0 → returns
+///   empty rather than infinite-looping.
+fn synthesise_beat_grid(bpm: f64, anchor_secs: f64, duration_secs: f64) -> BeatGrid {
+    if !bpm.is_finite() || bpm <= 0.0 || duration_secs <= 0.0 {
+        return BeatGrid::empty();
+    }
+    let period = 60.0 / bpm;
+    if !period.is_finite() || period <= 0.0 {
+        return BeatGrid::empty();
+    }
+    // Beat 0 is `anchor_secs`. Walk back to the first beat at or
+    // before 0, then forward to the last beat ≤ duration_secs.
+    // Floor-divide guards against a runaway loop if anchor is far
+    // outside the track for some reason.
+    let k_start_f = ((-anchor_secs) / period).ceil();
+    let k_start = if k_start_f.is_finite() {
+        k_start_f as i64
+    } else {
+        0
+    };
+    let mut beats = Vec::with_capacity(((duration_secs / period) as usize).saturating_add(2));
+    let mut k = k_start.saturating_sub(1);
+    loop {
+        let t = anchor_secs + (k as f64) * period;
+        if t > duration_secs {
+            break;
+        }
+        if t >= -period {
+            beats.push(t);
+        }
+        k = match k.checked_add(1) {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    BeatGrid {
+        bpm,
+        confidence: 1.0,
+        beats,
+        beats_per_bar: 4,
+    }
 }
 
 /// Phase-4 cancellation check: is the deck still holding the same
@@ -2164,7 +2297,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_fourteen_after_unclamped_playhead() {
+    fn ffi_version_is_fifteen_after_library_sourced_beat_grid() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
         // (start_engine, load_track, play, pause, seek, position,
@@ -2185,7 +2318,7 @@ mod tests {
         // M10.5s 12→13 (set_deck_rate — mouse-scratch primitive),
         // M10.5t 13→14 (PositionInfo.playhead_secs_unclamped — UI
         // shell can render lead-in / lead-out empty-groove regions).
-        assert_eq!(FFI_VERSION, 14);
+        assert_eq!(FFI_VERSION, 15);
     }
 
     #[test]
@@ -2200,7 +2333,7 @@ mod tests {
     fn load_track_on_stopped_engine_returns_not_running() {
         let engine = DubEngine::new();
         let err = engine
-            .load_track(0, "/nonexistent.wav".to_string())
+            .load_track(0, "/nonexistent.wav".to_string(), None)
             .unwrap_err();
         assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
     }
@@ -2219,7 +2352,9 @@ mod tests {
         // Stopped engine: EngineNotRunning is checked first only after
         // the deck index validates. We check `deck_idx_to_usize` happens
         // first so a clearly-bad deck idx surfaces as InvalidDeckIndex.
-        let err = engine.load_track(99, "/tmp/x.wav".to_string()).unwrap_err();
+        let err = engine
+            .load_track(99, "/tmp/x.wav".to_string(), None)
+            .unwrap_err();
         assert!(matches!(err, EngineError::InvalidDeckIndex(99)));
     }
 
@@ -2239,6 +2374,61 @@ mod tests {
         let engine = DubEngine::new();
         assert!(engine.track_info(0).is_none());
         assert!(engine.track_info(1).is_none());
+    }
+
+    // ===== M11d.5 round 4: library-sourced grid synthesis =====
+    //
+    // These tests cover the pure `synthesise_beat_grid` function
+    // that turns the library's scalar `(bpm, anchor_secs)` into the
+    // `BeatGrid { bpm, confidence, beats, beats_per_bar }` record
+    // the renderer consumes. Live in the same `tests` module so
+    // they can see the private function.
+
+    #[test]
+    fn synthesise_beat_grid_emits_uniform_120bpm_grid() {
+        let grid = synthesise_beat_grid(120.0, 0.0, 10.0);
+        assert!((grid.bpm - 120.0).abs() < 1e-9);
+        assert_eq!(grid.confidence, 1.0);
+        assert_eq!(grid.beats_per_bar, 4);
+        // 10 s at 120 BPM = 20 beat periods. The synthesizer emits
+        // every beat in `[-period, duration_secs]` inclusive, so we
+        // get the pre-zero beat at -0.5, then 0.0, 0.5, …, 10.0 →
+        // 22 beats total. The renderer clips out-of-window beats,
+        // but the half-period pre-roll and the exact-end beat keep
+        // the empty-groove paint looking right at either edge.
+        assert_eq!(grid.beats.len(), 22);
+        assert!((grid.beats[0] + 0.5).abs() < 1e-9);
+        assert!((grid.beats[1] - 0.0).abs() < 1e-9);
+        assert!((grid.beats[21] - 10.0).abs() < 1e-9);
+        for w in grid.beats.windows(2) {
+            assert!((w[1] - w[0] - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn synthesise_beat_grid_walks_back_from_positive_anchor() {
+        // 174 BPM (~0.345 s period), anchor at 1.0 s, 3 s duration.
+        // The grid must include at least one beat <= 0 so the
+        // pre-anchor region paints, and stop before duration.
+        let grid = synthesise_beat_grid(174.0, 1.0, 3.0);
+        let period = 60.0_f64 / 174.0;
+        assert!(grid.beats.first().copied().unwrap() <= 0.0);
+        assert!(grid.beats.last().copied().unwrap() <= 3.0);
+        for w in grid.beats.windows(2) {
+            assert!((w[1] - w[0] - period).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn synthesise_beat_grid_returns_empty_on_degenerate_inputs() {
+        assert!(synthesise_beat_grid(0.0, 0.0, 10.0).beats.is_empty());
+        assert!(synthesise_beat_grid(-120.0, 0.0, 10.0).beats.is_empty());
+        assert!(synthesise_beat_grid(f64::NAN, 0.0, 10.0).beats.is_empty());
+        assert!(synthesise_beat_grid(f64::INFINITY, 0.0, 10.0)
+            .beats
+            .is_empty());
+        assert!(synthesise_beat_grid(120.0, 0.0, 0.0).beats.is_empty());
+        assert!(synthesise_beat_grid(120.0, 0.0, -1.0).beats.is_empty());
     }
 
     #[test]
@@ -2553,9 +2743,12 @@ pub struct LibraryTrack {
     pub genre: Option<String>,
     /// Year (filename source preferred over id3).
     pub year: Option<i32>,
-    /// BPM from the id3 source. `None` until either the id3 tag
-    /// supplied one or the M11c follow-up wires `dub-bpm` into the
-    /// importer to populate `track_beatgrids(source='auto')`.
+    /// BPM from the active beat grid (`track_beatgrids` where
+    /// `is_active = 1`). `None` for tracks that have never been
+    /// auto-analyzed or had a grid imported. ID3 BPM is **not**
+    /// surfaced here (PRD §8.3: ID3 carries no anchor and is too
+    /// unreliable to bind to the deck). The browser renders
+    /// `None` as an em-dash.
     pub bpm: Option<f64>,
     /// Musical key (Mixed In Key writes this into the id3 comment
     /// field today; M11e Serato importer adds a dedicated source).
@@ -2586,6 +2779,33 @@ pub struct LibraryTrack {
     /// `primary_volume_mount_point` to reconstruct the absolute
     /// path the browser drags / Space-loads.
     pub primary_relative_path: Option<String>,
+    /// `true` once M11c.1 auto-analysis (or an imported grid from
+    /// a future Serato / Traktor / rekordbox milestone) has run
+    /// against this track's fingerprint. Drives the LibraryView
+    /// dim / full-opacity visual cue: unanalyzed rows render at
+    /// reduced opacity. Surfaces here so the Swift side never has
+    /// to issue a per-row FFI call to check.
+    pub is_analyzed: bool,
+    /// M11c.2: `true` when two or more `track_keys` rows for this
+    /// track sit in different Camelot families (relative-key
+    /// pairs do not count). Drives the LibraryView "Key column ⚠"
+    /// indicator. Always `false` in v1.0 because only the `auto`
+    /// source writes; importers (M11e+) will flip this for
+    /// auto vs Serato disagreements without any Swift code
+    /// changes.
+    pub key_disagreement: bool,
+    /// M11d.5: free-form per-track comment from
+    /// `track_metadata_source.comment` (id3 source today; M11e+
+    /// importers add Serato / Traktor / rekordbox under their
+    /// own source labels and we'll COALESCE once the priority
+    /// is settled). `None` when the file carries no comment
+    /// frame, which is common for DJ rips. Surfaced in the
+    /// rebuilt LibraryView so the per-track notes Mixed In Key /
+    /// Lexicon / hand-written tooling stamp into the COMM frame
+    /// (cue timestamps, version hints, "energy 7", etc.) are
+    /// readable in the browser without round-tripping to the OS
+    /// file inspector.
+    pub comment: Option<String>,
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -2627,6 +2847,119 @@ impl From<LibraryTrackSort> for dub_library::TrackSortKey {
     }
 }
 
+/// Result of a single [`DubLibrary::analyze_track`] call.
+///
+/// Mirrors [`dub_library::AnalysisOutcome`] across the FFI.
+/// Carries both the auto-grid outcome (M11c.1) and the auto-key
+/// outcome (M11c.2); one analyse call decodes the file once and
+/// runs both DSPs. The LibraryView consumes this to refresh the
+/// BPM badge + Key cell on the row that just finished analyzing
+/// without re-querying the whole listing.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryAnalysisOutcome {
+    // ---- Grid (M11c.1) --------------------------------------
+    /// Auto-detected tempo. Meaningful iff `bpm_confidence > 0.0`.
+    pub bpm: f64,
+    /// First-beat offset in seconds from sample 0. Meaningful iff
+    /// `bpm_confidence > 0.0`.
+    pub anchor_secs: f64,
+    /// `dub-bpm` confidence in `[0.0, 1.0]`. `0.0` means no
+    /// periodic structure detected (silence, non-musical input).
+    pub bpm_confidence: f32,
+    /// `true` iff the auto-grid row was made `is_active = 1`.
+    /// Honours PRD §8.3 priority: if another source was already
+    /// active, the auto row is recorded but `is_active = 0`.
+    pub grid_auto_is_active: bool,
+    /// `true` iff a beat-grid row was written (confidence > 0).
+    /// `false` for silence / non-musical input — the track is
+    /// still marked `is_analyzed` (no auto-retry) but carries
+    /// no BPM.
+    pub wrote_grid: bool,
+
+    // ---- Key (M11c.2) ---------------------------------------
+    /// Auto-detected key in canonical Camelot notation (e.g.
+    /// `"8B"` for C major). Empty string for the no-key
+    /// outcome (silence / pure-noise / < 5 s of audio).
+    pub camelot: String,
+    /// `dub-spectral::analyze_key` confidence in `[0.0, 1.0]`.
+    /// `0.0` means no key detected; `camelot` is empty.
+    pub key_confidence: f32,
+    /// `true` iff the auto-key row was made `is_active = 1`.
+    /// Same §8.3-priority semantics as the beat grid.
+    pub key_auto_is_active: bool,
+    /// `true` iff a key row was written (confidence > 0).
+    /// `false` for non-musical input.
+    pub wrote_key: bool,
+}
+
+/// Read-only projection of the active row in `track_beatgrids` for
+/// a single track. Mirrors [`dub_library::ActiveBeatgrid`] across
+/// the FFI.
+///
+/// Returned by [`DubLibrary::active_beat_grid`]. Used by
+/// [`DubEngine::load_track`] (via the Apple shell) as the single
+/// source of truth for the deck's beat grid: when a library row
+/// exists for the track being loaded, the engine installs the
+/// row's `(bpm, anchor_secs)` directly and skips
+/// `dub_bpm::analyze_beat_grid`. This kills both the ~100–400 ms
+/// re-analysis on every deck load and the ±0.02 BPM consistency
+/// drift between the DeckHeader and LibraryView.
+///
+/// **Per-beat positions are not carried.** The library schema
+/// stores only `(bpm, anchor_secs)`; the engine synthesises the
+/// `Vec<f64>` of beat timestamps for [`BeatGrid::beats`] at the
+/// install site using the track's known duration. A future
+/// tempo-drifting grid format (PRD M10.5p-grid) would carry a
+/// separate `beats: Vec<f64>` field here once the schema grows
+/// the column.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryBeatGrid {
+    /// Source enum string from `track_beatgrids.source` —
+    /// `"serato"`, `"traktor"`, `"rekordbox"`, `"itunes"`,
+    /// `"auto"`, or `"user_tap"`. Surfaced so the Swift shell can
+    /// badge the grid origin (e.g. "imported" vs "auto" vs
+    /// "tap-corrected") without a second query.
+    pub source: String,
+    /// Tempo in beats per minute. Always finite and > 0 for any
+    /// row that is in `track_beatgrids` (the upserts on every
+    /// path reject `bpm <= 0` or non-finite values).
+    pub bpm: f64,
+    /// First-beat offset in seconds from sample 0 of the track.
+    pub anchor_secs: f64,
+    /// Unix seconds (UTC) at which the row was upserted. Plumbed
+    /// for diagnostics and a future "loaded grid is stale, want
+    /// to re-analyze?" affordance; not consumed by the engine
+    /// install path.
+    pub captured_at: i64,
+}
+
+impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
+    fn from(g: dub_library::ActiveBeatgrid) -> Self {
+        Self {
+            source: g.source,
+            bpm: g.bpm,
+            anchor_secs: g.anchor_secs,
+            captured_at: g.captured_at,
+        }
+    }
+}
+
+impl From<dub_library::AnalysisOutcome> for LibraryAnalysisOutcome {
+    fn from(o: dub_library::AnalysisOutcome) -> Self {
+        Self {
+            bpm: o.bpm,
+            anchor_secs: o.anchor_secs,
+            bpm_confidence: o.bpm_confidence,
+            grid_auto_is_active: o.grid_auto_is_active,
+            wrote_grid: o.wrote_grid,
+            camelot: o.camelot.to_string(),
+            key_confidence: o.key_confidence,
+            key_auto_is_active: o.key_auto_is_active,
+            wrote_key: o.wrote_key,
+        }
+    }
+}
+
 impl From<dub_library::TrackRow> for LibraryTrack {
     fn from(r: dub_library::TrackRow) -> Self {
         Self {
@@ -2645,6 +2978,9 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             primary_volume_uuid: r.primary_volume_uuid,
             primary_volume_mount_point: r.primary_volume_mount_point,
             primary_relative_path: r.primary_relative_path,
+            is_analyzed: r.is_analyzed,
+            key_disagreement: r.key_disagreement,
+            comment: r.comment,
         }
     }
 }
@@ -3237,6 +3573,63 @@ impl DubLibrary {
             .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
         Ok(LibraryImportSummary::from(summary))
     }
+
+    /// Run M11c.1 auto-analysis against `track_id`. Decodes the
+    /// track's primary file, runs `dub-bpm::analyze_beat_grid`,
+    /// and upserts `track_beatgrids(source='auto')` +
+    /// `analysis_cache`. Returns the outcome so the LibraryView
+    /// can refresh the affected row's BPM badge inline.
+    ///
+    /// The call holds the library lock for the duration of the
+    /// decode + analysis pass (typically 1–3 seconds for a 3-min
+    /// MP3). Swift callers drive batch analysis by looping over
+    /// this method on a background `Task`, releasing the lock
+    /// between tracks so the LibraryView can keep refreshing.
+    pub fn analyze_track(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<LibraryAnalysisOutcome, LibraryFfiError> {
+        self.with_library(|lib| {
+            let outcome = lib.analyze_track(&track_id)?;
+            Ok(LibraryAnalysisOutcome::from(outcome))
+        })
+    }
+
+    /// `true` once auto-analysis (or an imported grid) has run for
+    /// this track. Backs the LibraryView dim / full-opacity cue.
+    /// Cheap (single indexed query); callers may invoke it
+    /// per-row without batching.
+    pub fn is_track_analyzed(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<bool, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.is_track_analyzed(&track_id)?))
+    }
+
+    /// Fetch the active row in `track_beatgrids` for `track_id`.
+    ///
+    /// Returns `Ok(None)` when the track has no `is_active = 1`
+    /// row yet (unanalyzed, or analyzed-but-silent so nothing was
+    /// written), and `Ok(Some(LibraryBeatGrid))` when one exists.
+    /// The unknown-track-id case also returns `Ok(None)` rather
+    /// than an error so the Swift caller can use this as a "fast
+    /// path the engine load" probe without first verifying the id
+    /// against `tracks`.
+    ///
+    /// Cheap: single indexed SELECT against the partial unique
+    /// index on `track_beatgrids(track_id) WHERE is_active = 1`.
+    /// Safe to call from the deck-load handshake on the main actor
+    /// (~sub-millisecond on any size of library).
+    pub fn active_beat_grid(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<LibraryBeatGrid>, LibraryFfiError> {
+        self.with_library(|lib| {
+            Ok(lib
+                .active_beatgrid_for_track(&track_id)?
+                .map(LibraryBeatGrid::from))
+        })
+    }
 }
 
 impl DubLibrary {
@@ -3306,6 +3699,25 @@ mod library_ffi_tests {
         assert!(matches!(err, Err(LibraryFfiError::QueryFailed(_))));
     }
 
+    // === M11d.5 round 4: active_beat_grid FFI smoke tests ====================
+
+    #[test]
+    fn active_beat_grid_on_closed_library_returns_query_failed() {
+        let lib = DubLibrary::new();
+        let res = lib.active_beat_grid("anything".into());
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn active_beat_grid_for_unknown_track_returns_none_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let res = lib.active_beat_grid("ffffffff-0000-0000-0000-000000000000".into());
+        assert!(matches!(res, Ok(None)));
+    }
+
     // === M11d.4 missing-files smoke tests ====================================
 
     #[test]
@@ -3317,6 +3729,33 @@ mod library_ffi_tests {
         assert_eq!(lib.missing_track_count().unwrap(), 0);
         assert!(lib.list_files_for_scan(10).unwrap().is_empty());
         assert!(lib.list_missing_tracks(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn analyze_track_on_closed_library_returns_query_failed() {
+        // M11c.1 FFI surface: every analyze entry point must
+        // refuse cleanly when the handle hasn't been opened
+        // (rather than panicking on the `unwrap` of the inner
+        // Option). Mirrors the existing closed-handle contract
+        // for record_load / list_tracks.
+        let lib = DubLibrary::new();
+        let analyze = lib.analyze_track("ffffffff-0000-0000-0000-000000000000".into());
+        assert!(matches!(analyze, Err(LibraryFfiError::QueryFailed(_))));
+        let is_analyzed = lib.is_track_analyzed("ffffffff-0000-0000-0000-000000000000".into());
+        assert!(matches!(is_analyzed, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn is_track_analyzed_returns_false_for_unknown_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // Unknown track id → underlying library returns
+        // TrackNotFound, which flattens to QueryFailed across
+        // the FFI boundary.
+        let res = lib.is_track_analyzed("ffffffff-0000-0000-0000-000000000000".into());
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
     }
 
     #[test]

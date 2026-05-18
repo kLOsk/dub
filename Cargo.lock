@@ -693,8 +693,10 @@ name = "dub-library"
 version = "0.0.1"
 dependencies = [
  "dirs",
+ "dub-bpm",
  "dub-fingerprint",
  "dub-io",
+ "dub-spectral",
  "hound",
  "libc",
  "rusqlite",
@@ -718,6 +720,7 @@ name = "dub-spectral"
 version = "0.0.1"
 dependencies = [
  "realfft",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

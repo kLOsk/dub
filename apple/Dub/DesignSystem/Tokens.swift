@@ -217,7 +217,18 @@ enum DubRadius {
 /// "natural" heights everything is balanced around.
 enum DubLayout {
     static let statusStripHeight: CGFloat = 28
-    static let deckHeaderHeight: CGFloat = 92
+    /// Fixed height for the deck header (M11d.5 refresh). Sized to
+    /// accommodate the 3-row layout (identity / stats / transport-
+    /// and-time) at the worst-case font metric inside SwiftUI's
+    /// `padding(.vertical, .md)`. Previously a `minHeight` of 92,
+    /// which let Row 3 grow the header when a track was loaded —
+    /// the user saw "the header changes size when a track is
+    /// loaded" because the un-loaded sibling deck B in two-deck
+    /// mode then stretched its 2-row content over the now-taller
+    /// HStack height. Pinning the height keeps the layout
+    /// invariant and lets the un-loaded deck reserve the same
+    /// vertical slot with an empty `Color.clear` placeholder.
+    static let deckHeaderHeight: CGFloat = 108
     static let fxBarHeight: CGFloat = 100
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280

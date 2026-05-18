@@ -104,28 +104,6 @@ struct DeckState: Equatable {
     /// another FFI poll.
     var bpmConfidence: Double = 0
 
-    /// Wall-clock elapsed from track start. 0 if no track.
-    /// Clamped to `[0, durationSecs]` so it's safe to use in time
-    /// displays and as a seek target. The waveform renderer uses
-    /// `playheadSecsUnclamped` instead so the playhead can drift
-    /// into the lead-in / lead-out empty groove during a hard
-    /// scratch off either edge (PRD §6.1 / §9.6).
-    var elapsedSecs: Double = 0
-
-    /// M10.5t. Raw playhead position in seconds, NOT clamped to
-    /// `[0, durationSecs]`. Goes negative when a mouse-scratch
-    /// has pushed the deck backwards past `t = 0`, and exceeds
-    /// `durationSecs` when it has been pushed past the end. The
-    /// audio thread already renders silence outside the track's
-    /// frame range; this field lets the waveform render the
-    /// playhead in the empty-groove region instead of pinning it
-    /// to the nearest edge. **Only the renderer should read it.**
-    /// Time-display consumers stay on `elapsedSecs`.
-    var playheadSecsUnclamped: Double = 0
-
-    /// Wall-clock remaining to track end. 0 if no track.
-    var remainingSecs: Double = 0
-
     /// When set in the future, the deck pane renders a red overlay
     /// with a "deck is playing — lift the needle" message until
     /// this timestamp elapses. Used to surface a load failure
@@ -148,6 +126,18 @@ struct DeckState: Equatable {
     /// playing" mistake and visually confirming Instant Doubles
     /// (§7.3).
     var loadedLibraryTrackId: String? = nil
+
+    /// M11c.2 — canonical Camelot key of the loaded library track
+    /// (`"8B"` for C major, `"5A"` for C minor, etc.). Stamped from
+    /// the `selectedLibraryTrack` snapshot at load time alongside
+    /// `loadedLibraryTrackId`. `nil` for Finder drags (no library
+    /// row → no `track_keys` association), for tracks whose key
+    /// analysis returned zero confidence, and for tracks that
+    /// haven't been analyzed yet. The deck header's KEY column
+    /// renders an em-dash in that case. Surfaced through
+    /// `DeckHeaderState.key` so the deck header doesn't have to
+    /// reach into the library on every render.
+    var key: String? = nil
 
     /// M10.5d. `true` while a `load_track` FFI call is in flight on
     /// this deck (decode + offline-peaks-compute happens on a
@@ -302,6 +292,21 @@ final class WaveformAppModel: ObservableObject {
     /// [`selectLibraryTrack`].
     @Published var selectedLibraryTrackId: String? = nil
 
+    /// M11c.2 — full row snapshot for the currently-selected
+    /// library track. LibraryView writes this alongside
+    /// `selectedLibraryTrackId` so the load path can stamp the
+    /// track's key (and any future per-track-attribute) onto
+    /// `DeckState` without an extra FFI round-trip. `nil` when
+    /// no library row is selected (Finder-drag selection clears
+    /// it). The snapshot is intentionally untracked vs. live
+    /// library mutations: if the user analyzes the track *after*
+    /// selecting but *before* loading it, the cached key may lag
+    /// by one analysis cycle. The 30 Hz position poll's grid
+    /// refresh covers BPM staleness for the same window; key
+    /// staleness is a known minor cost of avoiding a per-load
+    /// FFI lookup.
+    @Published var selectedLibraryTrack: LibraryTrack? = nil
+
     /// M11d.3 — per-volume reachability cache. The LibraryView
     /// reads this to drive the missing-file indicator without a
     /// `FileManager.fileExists` round-trip per visible row. Keys
@@ -321,6 +326,50 @@ final class WaveformAppModel: ObservableObject {
     /// `247 tracks missing. Click to relocate.` Refreshed by
     /// the scanner after each batch and after a Relocate run.
     @Published private(set) var missingTrackCount: UInt64 = 0
+
+    /// M11c.1 — analysis-completion generation counter. Bumped
+    /// every time `ensureTrackAnalyzed` or `analyzeTracks` finishes
+    /// a run that wrote at least one new grid. LibraryView
+    /// observes this via `.onChange` and re-runs `refreshTracks()`
+    /// so the BPM badge / dim-state on the affected rows lands
+    /// without a per-row push channel. A single counter is enough
+    /// because the work happens on a background actor; the
+    /// LibraryView's debounced refresh path collapses bursts.
+    @Published private(set) var analysisGeneration: UInt64 = 0
+
+    /// M11c.1 — count of analyses currently in flight, batch or
+    /// not. Drives the spinner-vs-quiescent decision on the
+    /// LibraryView footer ("any work happening at all?"). NOT
+    /// the right value for "N of M" progress — analyses inside
+    /// `analyzeTracks` run serially, so this counter is at most 1
+    /// for the duration of a batch even when 200 tracks are
+    /// queued. Use `analysisBatchCompleted` for the visible "N of
+    /// M" line.
+    @Published private(set) var analysisInFlightCount: UInt32 = 0
+
+    /// M11c.1 — number of tracks already processed in the current
+    /// batch (post-fix for the "Analyzing 5 of 5…" bug where the
+    /// view tried to derive `done` from `analysisInFlightCount`).
+    /// Incremented after each track in `analyzeTracks` finishes —
+    /// success or failure both count, because the user-visible
+    /// thing is "how much of the batch is left". Reset to 0 when
+    /// the batch starts; the deferred cleanup also zeroes it when
+    /// the batch ends.
+    @Published private(set) var analysisBatchCompleted: UInt32 = 0
+
+    /// M11c.1 — total tracks queued for the current batch-analyze
+    /// run. The view renders `"Analyzing \(analysisBatchCompleted
+    /// + 1) of \(analysisBatchTotal)…"` while the batch is live.
+    /// `0` when no batch is active (single-deck-load analyses
+    /// fire through `ensureTrackAnalyzed` and don't show a batch
+    /// progress line).
+    @Published private(set) var analysisBatchTotal: UInt32 = 0
+
+    /// M11c.1 — set of track UUIDs currently in flight. Guards
+    /// against double-analyzing the same track when the user
+    /// rapid-fires Space + Right-click → Analyze, and is consulted
+    /// before queueing each batch-analyze entry.
+    private var analyzingTrackIds: Set<String> = []
 
     /// M11d.4 — `true` while a Relocate run is in progress.
     /// Drives the Relocate sheet's progress indicator and
@@ -352,6 +401,14 @@ final class WaveformAppModel: ObservableObject {
     /// isn't running.
     private var pollTimer: Timer?
     private static let pollIntervalSecs: TimeInterval = 1.0 / 30.0
+
+    /// Throttles the lazy `engine.beatGrid` poll in `readDeckState`
+    /// while BPM is still pending. The Metal renderer already
+    /// refreshes the grid every draw frame until latched; hitting
+    /// the FFI on every 30 Hz deck poll as well was redundant main-
+    /// thread work that occasionally stacked with a Metal draw and
+    /// delayed transport clicks.
+    private var bpmPollTick: [DeckSide: UInt] = [.a: 0, .b: 0]
 
     /// Pending auto-clear task for `lastError`. Cancelled if a new
     /// error supersedes the previous one within the visibility
@@ -533,7 +590,7 @@ final class WaveformAppModel: ObservableObject {
         let timer = Timer.scheduledTimer(
             withTimeInterval: Self.pollIntervalSecs, repeats: true
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.pollDecks() }
+            self?.pollDecks()
         }
         timer.tolerance = Self.pollIntervalSecs * 0.25
         RunLoop.main.add(timer, forMode: .common)
@@ -565,9 +622,19 @@ final class WaveformAppModel: ObservableObject {
         next.isPlaying = nowPlaying
         next.atEnd = pos.atEnd
         next.durationSecs = pos.durationSecs
-        next.elapsedSecs = pos.elapsedSecs
-        next.playheadSecsUnclamped = pos.playheadSecsUnclamped
-        next.remainingSecs = pos.remainingSecs
+        // M11d.5 round 5 — `elapsedSecs` / `remainingSecs` are no
+        // longer carried through `DeckState`. The deck-header time
+        // text (`LiveDeckTimeText`) and the Track-Overview playhead
+        // each read `engine.position(deckIdx:)` directly from
+        // inside their own `TimelineView`, so per-second M:SS
+        // rollover no longer flows through the `@Published`
+        // `model.deck{A,B}` channel and no longer invalidates
+        // `PerformanceView`'s body. Round 3 left a 1 Hz residual
+        // republish that the user perceived as a subtle leftward
+        // jump every second; this fully eliminates that path. See
+        // `LiveDeckTimeText` in `DeckHeader.swift` and the
+        // `TimelineView` wrapping `TrackOverviewView`'s Canvas for
+        // the new consumer-side wiring.
         next.isPanicPlay = pos.isPanicPlay
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
@@ -586,11 +653,19 @@ final class WaveformAppModel: ObservableObject {
         // keep polling — the cost is one FFI call returning an
         // empty `BeatGrid` per tick (~µs), well below the budget.
         if next.hasTrack, next.bpm == nil {
-            let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-            if grid.confidence > 0, grid.bpm > 0 {
-                next.bpm = grid.bpm
-                next.bpmConfidence = Double(grid.confidence)
+            let tick = (bpmPollTick[side] ?? 0) &+ 1
+            bpmPollTick[side] = tick
+            // ~1 Hz is enough for the deck-header BPM chip to light
+            // up; the Metal beat-grid pass handles its own refresh.
+            if tick % 30 == 0 {
+                let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
+                if grid.confidence > 0, grid.bpm > 0 {
+                    next.bpm = grid.bpm
+                    next.bpmConfidence = Double(grid.confidence)
+                }
             }
+        } else {
+            bpmPollTick[side] = 0
         }
         return next
     }
@@ -697,14 +772,47 @@ final class WaveformAppModel: ObservableObject {
         starting.trackArtist = nil
         starting.bpm = nil
         starting.bpmConfidence = 0
+        starting.key = nil
         starting.errorFlashUntil = nil
         setState(starting, for: side)
 
         let deckIdx = side.ffiDeckIdx
         let engineRef = engine
+        // M11d.5 round 4 — single source of truth for the deck's
+        // beat grid. If the load came from a library row (selection
+        // + Space, or a library drag where the user selected the
+        // row first), look up the active row in `track_beatgrids`
+        // and hand it to the engine in the same FFI call. The
+        // engine's background worker then installs the library
+        // row's `(bpm, anchor_secs)` directly and skips the
+        // ~100–400 ms `dub_bpm::analyze_beat_grid` step. The
+        // DeckHeader and the LibraryView now read the same number
+        // by construction (closes UI-BACKLOG C-26), and the
+        // renderer's `confidence > 0` latch on the beat-grid poll
+        // fires on the first Metal frame after load instead of
+        // polling indefinitely on tracks the engine analyser
+        // legitimately rejects (closes UI-BACKLOG B-25). The
+        // lookup is a single indexed SELECT, sub-millisecond on
+        // any size of library; safe on the main actor.
+        //
+        // Returns `nil` for the Finder-drag case (no library row),
+        // for the library-load-of-fresh-track case (no auto row
+        // yet — `ensureTrackAnalyzed` will write one a few seconds
+        // after load completes, so subsequent loads of the same
+        // file take the fast path), and for the explicit
+        // "library row exists but no active grid yet" case
+        // (silence-track that the analyser legitimately
+        // produced no grid for). All three cases fall through to
+        // the engine's existing `analyze_beat_grid` path with no
+        // behaviour change.
+        let preloadedGrid = libraryBeatGridForPendingLoad(url: url)
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
-                try engineRef.loadTrack(deckIdx: deckIdx, path: url.path)
+                try engineRef.loadTrack(
+                    deckIdx: deckIdx,
+                    path: url.path,
+                    libraryBeatGrid: preloadedGrid
+                )
                 return .success(())
             } catch {
                 return .failure(error)
@@ -717,8 +825,6 @@ final class WaveformAppModel: ObservableObject {
             next.hasTrack = true
             next.atEnd = false
             next.isPlaying = false
-            next.elapsedSecs = 0
-            next.remainingSecs = 0
             next.isLoading = false
             if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
@@ -1075,14 +1181,27 @@ final class WaveformAppModel: ObservableObject {
     /// the file is currently unreachable (volume unmounted, track
     /// deleted) instead of writing a bogus URL.
     func selectLibraryTrack(_ trackId: String) {
+        selectLibraryTrack(trackId, snapshot: nil)
+    }
+
+    /// Selection variant that also takes the full `LibraryTrack`
+    /// row snapshot, so the load path can stamp the track's key
+    /// (and future per-track attributes) onto `DeckState` without
+    /// an extra FFI round-trip. LibraryView calls this when the
+    /// user clicks a row, passing the row it already has in
+    /// memory. The id-only overload above is kept for callers
+    /// that haven't yet been threaded with row snapshots.
+    func selectLibraryTrack(_ trackId: String, snapshot: LibraryTrack?) {
         guard libraryIsOpen else { return }
         do {
             if let path = try library.trackPath(trackId: trackId) {
                 browserSelection = URL(fileURLWithPath: path)
                 selectedLibraryTrackId = trackId
+                selectedLibraryTrack = snapshot
             } else {
                 browserSelection = nil
                 selectedLibraryTrackId = nil
+                selectedLibraryTrack = nil
                 surfaceError("Track is unreachable — the source volume may be unmounted.")
             }
         } catch {
@@ -1108,6 +1227,64 @@ final class WaveformAppModel: ObservableObject {
     /// flashing the deck pane — a missed history row is a
     /// cosmetic glitch on the smart-crate, not a load failure
     /// the DJ needs to see.
+    /// M11d.5 round 4 — fetch the active row from
+    /// `track_beatgrids` for the track that's about to be loaded,
+    /// if any. Called from `loadTrack` to feed the new
+    /// `DubEngine.loadTrack(deckIdx:path:libraryBeatGrid:)` FFI so
+    /// the engine adopts the library's stored `(bpm, anchor_secs)`
+    /// instead of running `dub_bpm::analyze_beat_grid` from
+    /// scratch.
+    ///
+    /// Returns `nil` in three legitimate cases, all of which fall
+    /// back to the engine's own analyser without any visible UX
+    /// change:
+    ///
+    /// * **Library not open.** The Apple shell can run without an
+    ///   open library (early-launch state before the user has
+    ///   picked one); the engine path is independent.
+    /// * **No matching selection.** The current
+    ///   `selectedLibraryTrackId` doesn't resolve to `url`, which
+    ///   means the load came via Finder drag or a stale selection.
+    ///   The engine analyses the file and `ensureTrackAnalyzed`
+    ///   then writes the result back to `track_beatgrids` so the
+    ///   *next* load of the same file gets the fast path.
+    /// * **Track in library but unanalyzed (or silent).** The row
+    ///   exists in `tracks` but `track_beatgrids` has no
+    ///   `is_active = 1` row yet (or the analyser legitimately
+    ///   found no grid — silence, non-musical input). The engine
+    ///   runs analysis as before; same write-back as the previous
+    ///   case once `ensureTrackAnalyzed` lands.
+    ///
+    /// The lookup is a single SELECT against the partial unique
+    /// index on `track_beatgrids(track_id) WHERE is_active = 1`,
+    /// well under a millisecond on any size of library, so it's
+    /// safe to call on the main actor immediately before the
+    /// detached `Task` that runs `loadTrack`.
+    private func libraryBeatGridForPendingLoad(url: URL) -> LibraryBeatGrid? {
+        guard libraryIsOpen, let trackId = selectedLibraryTrackId else {
+            return nil
+        }
+        do {
+            guard let resolved = try library.trackPath(trackId: trackId) else {
+                return nil
+            }
+            let resolvedUrl = URL(fileURLWithPath: resolved).standardizedFileURL
+            guard resolvedUrl == url.standardizedFileURL else {
+                return nil
+            }
+            return try library.activeBeatGrid(trackId: trackId)
+        } catch {
+            // A failed read here is non-fatal: the engine will
+            // analyse the file itself, and any database problem
+            // worth surfacing (lock contention, schema mismatch)
+            // will resurface from a hundred other call sites. We
+            // log so a dogfooding session can spot a regression,
+            // but we do not block the load.
+            print("dub: libraryBeatGridForPendingLoad failed for \(trackId): \(error)")
+            return nil
+        }
+    }
+
     private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
         // Always clear the previous loaded-now glyph for this
         // deck; we re-set it below if the load came from the
@@ -1128,16 +1305,136 @@ final class WaveformAppModel: ObservableObject {
             // Stamp the loaded-now glyph + write the play_history
             // row. Same URL-equality guard is the source of truth
             // for both: if the user changed selection between
-            // selection and load, neither side runs.
+            // selection and load, neither side runs. The key (if
+            // any) comes from the LibraryTrack snapshot that
+            // LibraryView captured alongside the id — see
+            // `selectLibraryTrack(_:snapshot:)`.
             var stamped = state(for: side)
             stamped.loadedLibraryTrackId = trackId
+            if let snap = selectedLibraryTrack, snap.id == trackId {
+                stamped.key = snap.key
+            }
             setState(stamped, for: side)
 
             let deck: UInt32 = (side == .a) ? 0 : 1
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             try library.recordLoad(trackId: trackId, deck: deck, timestampMs: nowMs)
+            // M11c.1 — fire-and-forget lazy analysis for the
+            // freshly-loaded track. Runs on a detached background
+            // task so the deck keeps playing while `dub-bpm`
+            // chews through the file (~1–3 s for a 3 minute MP3).
+            // Idempotent: the inner guard against
+            // `analyzingTrackIds` collapses races, and the
+            // `is_track_analyzed` check skips no-ops without
+            // touching the heavy decode path.
+            ensureTrackAnalyzed(trackId: trackId)
         } catch {
             surfaceError("Failed to record play history: \(error.localizedDescription)")
+        }
+    }
+
+    /// M11c.1 — kick off lazy analysis for `trackId` if it has
+    /// not been analyzed yet. Returns immediately; analysis runs
+    /// on a background task and bumps `analysisGeneration` when
+    /// the row finishes so the LibraryView refreshes its BPM /
+    /// dim cue. Safe to call repeatedly: the in-flight set
+    /// guarantees one analysis run per track at a time, and the
+    /// `is_track_analyzed` predicate skips fast-path once the
+    /// track has been processed once.
+    func ensureTrackAnalyzed(trackId: String) {
+        guard libraryIsOpen else { return }
+        guard !analyzingTrackIds.contains(trackId) else { return }
+        // Cheap synchronous check on the calling actor — if the
+        // track is already analyzed, skip the background task
+        // entirely. Avoids spawning a Task for every Space-load
+        // on a fully-analyzed library.
+        if let analyzed = try? library.isTrackAnalyzed(trackId: trackId), analyzed {
+            return
+        }
+        analyzingTrackIds.insert(trackId)
+        analysisInFlightCount &+= 1
+        let library = self.library
+        Task.detached(priority: .background) { [weak self] in
+            let result: Result<LibraryAnalysisOutcome, Error>
+            do {
+                let outcome = try library.analyzeTrack(trackId: trackId)
+                result = .success(outcome)
+            } catch {
+                result = .failure(error)
+            }
+            await MainActor.run {
+                guard let self = self else { return }
+                self.analyzingTrackIds.remove(trackId)
+                if self.analysisInFlightCount > 0 {
+                    self.analysisInFlightCount -= 1
+                }
+                switch result {
+                case .success:
+                    self.analysisGeneration &+= 1
+                case .failure(let err):
+                    // Per-track failure is surfaced silently to
+                    // the error toast; the next Space-load
+                    // retries (the track stays unanalyzed in
+                    // analysis_cache because analyze_track only
+                    // stamps on success).
+                    self.surfaceError(
+                        "Analysis failed for track: \(err.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// M11c.1 — batch-analyze entry point. Drives the LibraryView
+    /// right-click context menu's "Analyze Selected" /
+    /// "Re-analyze Selected" actions. Iterates serially so each
+    /// analysis releases the library lock before the next acquires
+    /// it (other UI queries can interleave). Skips tracks already
+    /// analyzed unless `forceReanalyze` is `true`. Updates the
+    /// footer progress counters as it goes.
+    func analyzeTracks(_ trackIds: [String], forceReanalyze: Bool) async {
+        guard libraryIsOpen, !trackIds.isEmpty else { return }
+        let library = self.library
+        analysisBatchTotal = UInt32(trackIds.count)
+        analysisBatchCompleted = 0
+        defer {
+            self.analysisBatchTotal = 0
+            self.analysisBatchCompleted = 0
+        }
+        for trackId in trackIds {
+            if analyzingTrackIds.contains(trackId) {
+                analysisBatchCompleted &+= 1
+                continue
+            }
+            if !forceReanalyze {
+                if let analyzed = try? library.isTrackAnalyzed(trackId: trackId), analyzed {
+                    analysisBatchCompleted &+= 1
+                    continue
+                }
+            }
+            analyzingTrackIds.insert(trackId)
+            analysisInFlightCount &+= 1
+            let result = await Task.detached(priority: .userInitiated) {
+                () -> Result<LibraryAnalysisOutcome, Error> in
+                do {
+                    let outcome = try library.analyzeTrack(trackId: trackId)
+                    return .success(outcome)
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            analyzingTrackIds.remove(trackId)
+            if analysisInFlightCount > 0 { analysisInFlightCount -= 1 }
+            analysisBatchCompleted &+= 1
+            // Bump the generation *per track* (not once at the
+            // end of the batch as the pre-fix code did) so the
+            // LibraryView's BPM / key badges land row by row as
+            // the batch runs. Users analyzing a 200 track folder
+            // need to see progress; a single end-of-batch refresh
+            // makes the table look frozen.
+            analysisGeneration &+= 1
+            if case .failure(let err) = result {
+                surfaceError("Analysis failed for track: \(err.localizedDescription)")
+            }
         }
     }
 
@@ -1172,12 +1469,29 @@ final class WaveformAppModel: ObservableObject {
 
     /// `true` when a load is allowed to land on a deck that is
     /// currently playing. See `loadTrack(side:url:)` for the policy:
-    /// Prep mode always allows; Performance mode checks
-    /// `allowLoadIntoRunningDeckInPerformance`.
+    ///
+    /// * **Prep mode** always allows the load — Prep is a single-
+    ///   deck rehearsal shell, no audience-cue concern.
+    /// * **Single-deck Performance** (no `twoDeckMode`) — pre-
+    ///   M11d.5 this enforced the "lift the needle" safety which
+    ///   the user-perceived as "Space-load is broken" because the
+    ///   auto-play-on-drop made the only deck "playing" within ~50
+    ///   ms of the previous load. With only one deck on the
+    ///   surface there is no master / cue split, so the safety has
+    ///   nothing to protect; treat it like Prep and always allow.
+    /// * **Two-deck Performance** — the canonical PRD §5.5 + §6.4
+    ///   safety still applies. The user must lift the needle /
+    ///   pause first; the 200 ms red flash signals the rejection.
+    ///   `allowLoadIntoRunningDeckInPerformance` is the user-level
+    ///   opt-out for users who consciously want to relax even this
+    ///   case (rehearsing transitions, etc.).
     private func canLoadIntoPlayingDeck() -> Bool {
         switch engineMode {
-        case .prep:     return true
-        case .timecode: return allowLoadIntoRunningDeckInPerformance
+        case .prep:
+            return true
+        case .timecode:
+            if !twoDeckMode { return true }
+            return allowLoadIntoRunningDeckInPerformance
         }
     }
 
@@ -1189,14 +1503,46 @@ final class WaveformAppModel: ObservableObject {
         return m == .a ? .b : .a
     }
 
+    /// Start audible playback on `side`. M11d.5: in Performance /
+    /// Timecode mode this also engages Panic Play so the next
+    /// `DropoutHoldRate` render block doesn't pause the deck for
+    /// lack of a timecode carrier. Pre-fix, calling `play` in
+    /// Performance mode appeared to do nothing because the engine
+    /// dutifully started the transport then immediately paused it
+    /// on the next audio render (no carrier → DropoutHoldRate
+    /// pauses the deck per PRD §6.1.2). Engaging Panic here makes
+    /// the play button "just work" without a timecode platter
+    /// connected, which is the dominant use case during pre-alpha
+    /// dogfooding. The user can later disengage Panic to hand
+    /// control to a timecode driver once the disengage UI ships
+    /// (see `DeckHeaderState.useTimecodeToggle` doc comment).
     func play(side: DeckSide) {
         guard isRunning else { return }
+        // M11d.5: Performance mode's PanicPlay path requires a
+        // loaded track (engine returns an error otherwise — the
+        // platter has nothing to advance). Prep allows playing
+        // out an empty deck via `engine.play`, which is fine
+        // because that path is a no-op when there's no source
+        // attached. Guard here so a stray click on a cold deck
+        // doesn't flash a confusing error banner.
+        let deck = state(for: side)
+        guard deck.hasTrack else { return }
         do {
-            try engine.play(deckIdx: side.ffiDeckIdx)
+            switch engineMode {
+            case .prep:
+                try engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0)
+                try engine.play(deckIdx: side.ffiDeckIdx)
+                var s = state(for: side)
+                s.isPlaying = true
+                setState(s, for: side)
+            case .timecode:
+                try engine.panicPlay(deckIdx: side.ffiDeckIdx)
+                var s = state(for: side)
+                s.isPlaying = true
+                s.isPanicPlay = true
+                setState(s, for: side)
+            }
             lastPlayStart[side] = Date()
-            var s = state(for: side)
-            s.isPlaying = true
-            setState(s, for: side)
             recomputeMaster()
         } catch let error as EngineError {
             surfaceError(describe(error))
@@ -1205,19 +1551,37 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Pause `side`. M11d.5: in Performance mode this also clears
+    /// any engaged Panic flag so the deck doesn't surprise the
+    /// user by silently re-starting when they later disengage
+    /// Panic from the (forthcoming) INT/ABS button. The pair
+    /// `play` + `pause` round-trips cleanly: Pause then Play
+    /// leaves the deck in the same logical state Play would have
+    /// produced from cold.
     func pause(side: DeckSide) {
         guard isRunning else { return }
+        let idx = side.ffiDeckIdx
+        // Silence first — `try_push` is non-blocking and the audio
+        // thread picks this up within one buffer. Keep this ahead of
+        // any `@Published` state writes so a main-thread frame busy
+        // in Metal draw doesn't defer the command behind UI work.
         do {
-            try engine.pause(deckIdx: side.ffiDeckIdx)
-            var s = state(for: side)
-            s.isPlaying = false
-            setState(s, for: side)
-            recomputeMaster()
+            try engine.pause(deckIdx: idx)
         } catch let error as EngineError {
             surfaceError(describe(error))
+            return
         } catch {
             surfaceError("Pause failed: \(error.localizedDescription)")
+            return
         }
+        if engineMode == .timecode, state(for: side).isPanicPlay {
+            try? engine.cancelPanicPlay(deckIdx: idx)
+        }
+        var s = state(for: side)
+        s.isPlaying = false
+        s.isPanicPlay = false
+        setState(s, for: side)
+        recomputeMaster()
     }
 
     /// M10.6a Casual-Play "Restart" (PRD §6.1.3). Seeks the deck to
@@ -1232,7 +1596,6 @@ final class WaveformAppModel: ObservableObject {
             try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: 0)
             try engine.play(deckIdx: side.ffiDeckIdx)
             var s = state(for: side)
-            s.elapsedSecs = 0
             s.atEnd = false
             s.isPlaying = true
             setState(s, for: side)
@@ -1251,11 +1614,20 @@ final class WaveformAppModel: ObservableObject {
     /// `WaveformView` only invokes this when the parent
     /// `PerformanceView` opts in (Prep mode in M10.6a; Timecode-mode
     /// click-scrub is intentionally disabled per the PRD).
+    ///
+    /// **Reads the engine directly, not the polled `DeckState`.**
+    /// `DeckState` no longer carries the playhead (M11d.5 round 5
+    /// removed `elapsedSecs` / `remainingSecs` to stop the
+    /// per-second republish from invalidating the deck pane); the
+    /// jog seek queries `engine.position(deckIdx:)` here at the
+    /// moment of the gesture so it gets the freshest sub-sample-
+    /// accurate playhead available.
     func scrub(side: DeckSide, relativeSecs: TimeInterval) {
         guard isRunning else { return }
         let deck = state(for: side)
         guard deck.hasTrack, deck.durationSecs > 0 else { return }
-        let target = max(0, min(deck.durationSecs, deck.elapsedSecs + relativeSecs))
+        let pos = engine.position(deckIdx: side.ffiDeckIdx)
+        let target = max(0, min(pos.durationSecs, pos.elapsedSecs + relativeSecs))
         seekDeck(side: side, absoluteSecs: target)
     }
 
@@ -1324,6 +1696,11 @@ final class WaveformAppModel: ObservableObject {
         let side: DeckSide
         let priorIsPlaying: Bool
         let engagedPanic: Bool
+        /// Playhead position (seconds) captured at scratch begin.
+        /// Used on end to snap the engine to the gesture cursor
+        /// before restoring unity rate, so any rate-integration
+        /// drift doesn't carry into resumed playback.
+        let scratchStartElapsed: Double
         /// Most recent cursor offset (in audio seconds) reported
         /// by the gesture overlay. Reset to 0 on begin.
         var lastEventOffsetSecs: Double = 0
@@ -1338,13 +1715,26 @@ final class WaveformAppModel: ObservableObject {
         /// to check what rate is currently in flight.
         var smoothedRate: Double = 0
 
-        init(side: DeckSide, priorIsPlaying: Bool, engagedPanic: Bool, startedAt: Date) {
+        init(
+            side: DeckSide,
+            priorIsPlaying: Bool,
+            engagedPanic: Bool,
+            scratchStartElapsed: Double,
+            startedAt: Date
+        ) {
             self.side = side
             self.priorIsPlaying = priorIsPlaying
             self.engagedPanic = engagedPanic
+            self.scratchStartElapsed = scratchStartElapsed
             self.lastEventAt = startedAt
         }
     }
+
+    /// Deck currently receiving a vinyl-style scratch gesture.
+    /// Published so `WaveformView` can keep the Metal draw loop
+    /// running during scratch even when the deck was paused before
+    /// the drag began.
+    @Published private(set) var scratchingDeck: DeckSide? = nil
 
     /// In-flight scratch per deck. Keyed by side so deck A and B
     /// can be scratched independently (rare in practice — the
@@ -1365,22 +1755,44 @@ final class WaveformAppModel: ObservableObject {
     private static let scratchTickIntervalSecs: TimeInterval = 1.0 / 60.0
     /// If no `scratchPointerOffset` event has fired within this
     /// window, the watchdog treats the cursor as "still" and
-    /// ramps the deck's rate toward zero. 25 ms is comfortably
-    /// longer than the inter-arrival time of a smooth drag
-    /// (≈ 8–17 ms on a 60–120 Hz event stream) so a normal drag
-    /// never trips it, but short enough that letting go of a
-    /// pushed scratch produces immediate silence rather than
-    /// drifting at the last-seen velocity.
-    private static let scratchStallThresholdSecs: TimeInterval = 0.025
-    /// Per-event EMA factor applied to the instantaneous rate.
-    /// `0.35` was chosen empirically: high enough that fast
-    /// direction changes still feel direct (one event lands ~⅓ of
-    /// the new direction in the output rate), low enough that
-    /// single-event outliers from coalesced or jittered cursor
-    /// motion don't get punched through into the engine. Lower
-    /// values feel mushy / lagged; higher values reintroduce the
-    /// pre-M10.5t "jumping".
-    private static let scratchRateEMAAlpha: Double = 0.35
+    /// ramps the deck's rate toward zero. 50 ms is longer than a
+    /// smooth drag's inter-arrival time (≈ 8–17 ms at 60–120 Hz)
+    /// but tolerates main-thread stalls from Metal redraw without
+    /// falsely decaying the rate mid-drag; still short enough that
+    /// holding the cursor still after a fast scratch reads as
+    /// immediate silence.
+    private static let scratchStallThresholdSecs: TimeInterval = 0.050
+    /// Smoothing time constant for the **time-invariant** EMA on
+    /// the scratch's per-event instantaneous rate (M11d.5 round 6).
+    ///
+    /// Previously this was a fixed `alpha = 0.35` per-event constant,
+    /// which weighted each event equally regardless of how long it
+    /// took to arrive. On a 60 Hz cursor stream that gives the
+    /// intended ~50 ms smoothing window, but when macOS delivers
+    /// gesture events in bursts (multiple `onChanged` within ~1 ms
+    /// after the main thread was busy — a normal occurrence under
+    /// any Canvas / Metal redraw load) each burst event still landed
+    /// 35 % of the new instantaneous rate even though its `dt` was
+    /// 1/16 of a normal frame. The result was that `delta / dt`
+    /// spiked toward the rate clamp on each burst sample, the EMA
+    /// pulled the smoothed rate up by several ×, and the user heard
+    /// "scrubbing is accelerating crazy" — sudden audio rate surges
+    /// on what felt like a steady physical drag.
+    ///
+    /// Fix: compute the EMA alpha from `dt` as
+    /// `1 − exp(−dt / scratchRateEMATauSecs)`. Each event then
+    /// contributes proportional to the slice of time it represents,
+    /// so a 1-ms burst event lands ~2 % weight (vs the old 35 %)
+    /// while a normal 16.67-ms event lands ~28 % — the same as the
+    /// pre-rework feel for steady drags. Bursts get averaged into
+    /// the running rate at their fair time weight, not at the
+    /// inflated event-count weight.
+    ///
+    /// `0.030 s` (30 ms) chosen so the smoothing window is ~2 frames
+    /// at 60 Hz: short enough to read as direct (a deliberate
+    /// direction change is in the output rate within 2 frames),
+    /// long enough that random burst patterns average out cleanly.
+    private static let scratchRateEMATauSecs: Double = 0.030
     /// Multiplicative decay applied to the smoothed rate on each
     /// watchdog tick when the cursor is still. Picked so the rate
     /// halves in ~3 ticks (≈ 50 ms): fast enough to read as
@@ -1435,8 +1847,14 @@ final class WaveformAppModel: ObservableObject {
             side: side,
             priorIsPlaying: prior,
             engagedPanic: engagedPanic,
+            scratchStartElapsed: engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs,
             startedAt: Date())
         ensureScratchTimerRunning()
+        // Publish last — flipping `scratchingDeck` enables the 60 Hz
+        // Metal draw loop and can invalidate a large SwiftUI subtree;
+        // keep it after the engine commands so the first scrub sample
+        // lands before we pay for rendering.
+        scratchingDeck = side
     }
 
     /// Report the mouse cursor's running offset (in audio seconds)
@@ -1463,17 +1881,25 @@ final class WaveformAppModel: ObservableObject {
         // first real velocity sample.
         guard dt > 0, abs(delta) > 0 else { return }
 
-        // Reject impossible inter-event gaps. macOS occasionally
-        // batches multiple cursor events into one onChanged
-        // callback after a stall (e.g. the app was descheduled);
-        // those produce a huge delta over a near-zero dt that
-        // would saturate the rate clamp at ±8× on a single sample.
-        // Treat dt < 1 ms as "coalesced event" and use the most
-        // recent realistic dt instead.
+        // Floor dt so coalesced cursor events (macOS sometimes
+        // delivers several gesture events within < 1 ms of each
+        // other after a stall) don't divide by an absurdly small
+        // number on the way to `instantRate`. The time-invariant
+        // EMA below also limits how much such a sample can move
+        // the smoothed rate (its `alpha` collapses toward zero as
+        // `dt` shrinks), but flooring `dt` here keeps
+        // `instantRate` itself from saturating.
         let effectiveDt = max(dt, 0.001)
         let instantRate = delta / effectiveDt
-        // EMA smoothing — see `scratchRateEMAAlpha` rationale.
-        let alpha = Self.scratchRateEMAAlpha
+        // Time-invariant exponential moving average. See the
+        // `scratchRateEMATauSecs` doc above for why this replaced
+        // the previous fixed `alpha = 0.35`. The identity
+        // `1 − exp(−dt/τ)` is the standard continuous-time RC-style
+        // low-pass discretised at irregular event timestamps; for
+        // very small `dt` it linearises to `dt/τ`, which is what
+        // forces burst events to land sub-3 % weight on the
+        // smoothed rate.
+        let alpha = 1.0 - exp(-dt / Self.scratchRateEMATauSecs)
         let smoothed =
             alpha * instantRate + (1.0 - alpha) * state.smoothedRate
         // Clamp to a sane range so a glitched event burst doesn't
@@ -1494,19 +1920,51 @@ final class WaveformAppModel: ObservableObject {
     /// we engaged it on `scratchBegin`. No-op on a side that
     /// isn't currently scratching.
     func scratchEnd(side: DeckSide) {
-        guard let state = scratchStates.removeValue(forKey: side) else { return }
-        // Restore the deck rate first so the brief window between
-        // here and the play / pause switch below renders at unity.
-        try? engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0)
-        if state.engagedPanic {
-            cancelPanic(side: side)
+        guard scratchStates[side] != nil else { return }
+
+        // Tear down the watchdog before restoring transport. A tick
+        // that's already iterating holds a strong ref to the deck's
+        // ScratchState and can otherwise issue a decayed rate *after*
+        // we send unity here — the "pitch dropped after scrub" bug.
+        if scratchStates.count == 1 {
+            scratchTimer?.invalidate()
+            scratchTimer = nil
         }
-        if !state.priorIsPlaying {
-            pause(side: side)
-        }
+
+        guard let ended = scratchStates.removeValue(forKey: side) else { return }
+        scratchingDeck = scratchStates.isEmpty ? nil : scratchStates.keys.first
         if scratchStates.isEmpty {
             scratchTimer?.invalidate()
             scratchTimer = nil
+        }
+
+        let idx = side.ffiDeckIdx
+        let targetSecs = ended.scratchStartElapsed + ended.lastEventOffsetSecs
+        do {
+            seekDeck(side: side, absoluteSecs: targetSecs)
+            try engine.setDeckRate(deckIdx: idx, rate: 1.0)
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Scratch end failed: \(error.localizedDescription)")
+        }
+
+        if ended.engagedPanic {
+            cancelPanic(side: side)
+        }
+        if ended.priorIsPlaying {
+            do {
+                try engine.play(deckIdx: idx)
+                var s = state(for: side)
+                s.isPlaying = true
+                setState(s, for: side)
+            } catch let error as EngineError {
+                surfaceError(describe(error))
+            } catch {
+                surfaceError("Scratch end failed: \(error.localizedDescription)")
+            }
+        } else {
+            pause(side: side)
         }
     }
 
@@ -1515,7 +1973,7 @@ final class WaveformAppModel: ObservableObject {
         let timer = Timer.scheduledTimer(
             withTimeInterval: Self.scratchTickIntervalSecs, repeats: true
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.scratchTick() }
+            self?.scratchTick()
         }
         // No tolerance — the watchdog catches cursor-still windows
         // and needs predictable cadence to ramp the rate down on
@@ -1531,7 +1989,8 @@ final class WaveformAppModel: ObservableObject {
             return
         }
         let now = Date()
-        for (_, state) in scratchStates {
+        for side in scratchStates.keys {
+            guard let state = scratchStates[side] else { continue }
             let stalledFor = now.timeIntervalSince(state.lastEventAt)
             guard stalledFor > Self.scratchStallThresholdSecs else { continue }
             // Cursor is still — ramp the rate toward zero. The
@@ -1545,8 +2004,11 @@ final class WaveformAppModel: ObservableObject {
             var next = state.smoothedRate * Self.scratchRateStallDecay
             if abs(next) < 0.01 { next = 0 }
             state.smoothedRate = next
+            // scratchEnd may have removed this deck while we were
+            // computing `next`; don't clobber a unity-rate restore.
+            guard scratchStates[side] != nil else { continue }
             try? engine.setDeckRate(
-                deckIdx: state.side.ffiDeckIdx,
+                deckIdx: side.ffiDeckIdx,
                 rate: next)
         }
     }
@@ -1563,8 +2025,6 @@ final class WaveformAppModel: ObservableObject {
         do {
             try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: clamped)
             var s = state(for: side)
-            s.elapsedSecs = clamped
-            s.remainingSecs = max(0, s.durationSecs - clamped)
             s.atEnd = false
             setState(s, for: side)
         } catch let error as EngineError {

@@ -49,6 +49,17 @@ struct DeckHeaderState: Equatable {
     /// column renders the dash in that case.
     let bpm: Double?
 
+    /// M11c.2. Canonical Camelot key of the loaded library track
+    /// (e.g. `"8B"` for C major). `nil` when no track is loaded,
+    /// when key analysis returned zero confidence, **or** when the
+    /// load originated from a Finder drag (no library row means no
+    /// `track_keys` association). The KEY stat column renders the
+    /// dash in that case. The deck header always shows Camelot —
+    /// the LibraryView's column-level click-to-toggle is the right
+    /// surface for the musical-notation preference, not the deck
+    /// header which DJs read at glance distance during a mix.
+    let key: String?
+
     /// Format / SR caption ("MP3 · 44.1 kHz · stereo"). `nil` for
     /// Thru / off decks.
     let formatChip: String?
@@ -81,16 +92,20 @@ struct DeckHeaderState: Equatable {
     /// latency.
     let isPanicPlay: Bool
 
-    /// M10.6d: whether the transport cluster's primary button should
-    /// behave as a Serato-style INT/ABS toggle (engage / cancel
-    /// Panic Play) rather than as a Play/Pause toggle. True iff
-    /// the engine is in Timecode mode with a loaded track — Panic
-    /// Play needs audible audio to recover *to* (PRD §6.1.2) so
-    /// the toggle is meaningless without a track, and Prep mode
-    /// never engages timecode in the first place. In Timecode mode
-    /// the toggle subsumes Casual Play: tap once to engage internal
-    /// playback (= start the track when the platter is silent / mid-
-    /// fix), tap again to hand control back to the timecode driver.
+    /// M10.6d / M11d.5: reserved for a future INT/ABS toggle
+    /// surface. The primary transport button is now *always* a
+    /// plain Play / Pause toggle (pre-M11d.5 it switched to a
+    /// Serato-style INT/ABS toggle in Timecode mode, which felt
+    /// broken to the user during pre-alpha dogfooding because no
+    /// carrier was present and the deck paused on the next
+    /// `DropoutHoldRate` render block). The Play action engages
+    /// Panic Play internally in Performance mode so the deck
+    /// actually advances; disengaging Panic to hand control back
+    /// to a timecode driver moves to a separate affordance once
+    /// the matching hardware UX lands. Kept in `DeckHeaderState`
+    /// (rather than fully removed) so the equatable snapshot
+    /// stays stable across the transition; setter callers pass
+    /// `false`.
     let useTimecodeToggle: Bool
 
     enum Source: Equatable {
@@ -121,11 +136,25 @@ struct DeckHeaderState: Equatable {
     /// drop them. **Prep mode** shows both elapsed and remaining
     /// because the rehearsal surface has the screen real-estate
     /// and the DJ uses elapsed time for hot-cue placement.
+    ///
+    /// **M11d.5 round 5 — payload dropped.** The cases used to
+    /// carry pre-formatted `elapsedText` / `remainingText` strings
+    /// derived from `DeckState.elapsedSecs` / `.remainingSecs`. Those
+    /// fields are gone (the time text now reads
+    /// `engine.position(deckIdx:)` directly via the
+    /// `LiveDeckTimeText` subview, keeping per-second updates
+    /// confined to a `TimelineView` subtree). The enum survives
+    /// as a *layout selector* — which slots the header should
+    /// reserve and how to mirror them — without carrying the text
+    /// itself. The `liveEngine` / `liveDeckIdx` params on
+    /// `DeckHeader` supply the data; the preview / cold-launch
+    /// path renders `"--:--"` placeholders via the live view's
+    /// own zero-position fallback.
     enum TimeRow: Equatable {
-        /// Performance-mode minimal display: `"-02:22"` only.
-        case remainingOnly(remainingText: String)
-        /// Prep-mode full display: `"01:23 · -02:22"`.
-        case elapsedAndRemaining(elapsedText: String, remainingText: String)
+        /// Performance-mode minimal display: `"-MM:SS"` only.
+        case remainingOnly
+        /// Prep-mode full display: `"MM:SS"` + `"-MM:SS"`.
+        case elapsedAndRemaining
 
         /// True when the time row should render at all. Equivalent
         /// to the old `timeRow != nil` check; kept on the enum so
@@ -141,8 +170,8 @@ struct DeckHeaderState: Equatable {
     /// Convenience: idle / cold-launch state.
     static let idle = DeckHeaderState(
         isLive: false, source: .off,
-        trackTitle: nil, trackArtist: nil, bpm: nil, formatChip: nil,
-        timeRow: nil, isMaster: false, isPlaying: false,
+        trackTitle: nil, trackArtist: nil, bpm: nil, key: nil,
+        formatChip: nil, timeRow: nil, isMaster: false, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false
     )
 }
@@ -172,6 +201,17 @@ struct DeckHeaderCallbacks {
 
 /// The deck header. Stateless — caller supplies a `DeckHeaderState`
 /// per render.
+///
+/// `mirrored` flips the row layouts horizontally so the deck-identity
+/// cluster (`DECK A` / `DECK B` label + source pill + MASTER chip)
+/// renders on the *outer* edge of the deck's pane rather than against
+/// the inner divider. Every two-deck DJ application (Serato, Traktor,
+/// rekordbox) does this — without it, deck A's label sits at the
+/// window's left edge while deck B's label is pinned against the
+/// divider in the middle of the window, which reads as "deck B is
+/// misaligned" at glance distance. Performance/Timecode mode passes
+/// `mirrored: true` for deck B; Prep mode (single deck) never
+/// mirrors.
 struct DeckHeader: View {
 
     let side: DeckSide
@@ -179,67 +219,167 @@ struct DeckHeader: View {
     /// M10.6a Casual-Play transport callbacks. Defaults to no-op so
     /// the cold-launch / preview path doesn't have to wire anything.
     var callbacks: DeckHeaderCallbacks = .noop
+    /// `true` to render this header as a horizontal mirror of the
+    /// canonical layout. Deck identity moves to the trailing edge;
+    /// format chip / FX chip / transport glyphs move to the leading
+    /// edge. See the `DeckHeader` doc comment for why this matters.
+    var mirrored: Bool = false
+    /// M11d.5 round 5 — engine reference + deck index for the
+    /// self-driven time-row text. When supplied, the time row
+    /// renders a `LiveDeckTimeText` subview that reads
+    /// `engine.position(deckIdx:)` directly inside its own
+    /// `TimelineView` instead of consuming pre-formatted strings
+    /// from `state.timeRow`. This is what stops `model.deckA` from
+    /// republishing once a second when the M:SS rolls over — the
+    /// time-text updates are confined to a small `TimelineView`
+    /// subtree, and the rest of the deck pane (DeckHeader, parent
+    /// `PerformanceView`, the Metal view's wrapper hierarchy)
+    /// stays inert at that cadence.
+    ///
+    /// `nil` for the preview / cold-launch path: `state.timeRow`'s
+    /// embedded strings render as fallback so the SwiftUI previews
+    /// stay self-contained without spinning up an engine.
+    var liveEngine: DubEngine? = nil
+    var liveDeckIdx: UInt64? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+        // M11d.5 fix: header height is **fixed**, not min-heighted.
+        // Pre-fix the header used `minHeight:` and added Row 3 only
+        // when a track was loaded, so loading a track grew the
+        // header by ~24 px and visually jumped the whole layout.
+        // The user saw this as "header changes size when a track is
+        // loaded". The fix: always reserve Row 3's vertical slot
+        // (renders empty content when no track) so loaded vs idle
+        // decks share the same header height inside the same HStack.
+        VStack(alignment: mirrored ? .trailing : .leading,
+               spacing: DubSpacing.sm) {
             row1
             row2
-            if let time = state.timeRow, time.hasTime {
-                timeRow(time)
-            }
+            row3Reserved
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(minHeight: DubLayout.deckHeaderHeight)
+        .frame(maxWidth: .infinity,
+               alignment: mirrored ? .trailing : .leading)
+        .frame(height: DubLayout.deckHeaderHeight)
         .background(DubColor.surface1)
+        .clipped()
+    }
+
+    /// Row 3 wrapped so it always occupies the same vertical slot.
+    /// When a track is loaded the actual transport + time content
+    /// renders inside; when nothing is loaded an empty
+    /// `Color.clear` placeholder of the same intrinsic height
+    /// occupies the slot so the header height stays constant. The
+    /// transport glyph's `frame(height: 20)` sets the intrinsic
+    /// height we reserve.
+    @ViewBuilder
+    private var row3Reserved: some View {
+        if let time = state.timeRow, time.hasTime {
+            timeRow(time)
+        } else {
+            Color.clear
+                .frame(height: 20)
+                .frame(maxWidth: .infinity)
+        }
     }
 
     // MARK: - Row 1 — identity
 
     @ViewBuilder
     private var row1: some View {
+        // M11d.5 fix: explicit `layoutPriority` on the identity
+        // cluster (deckLabel + sourcePill + masterChip) so SwiftUI
+        // never compresses them when the title / artist / format-
+        // chip cluster runs out of horizontal room. Without these
+        // priorities, a long title pushed `DECK A` to zero width
+        // and the user saw "the deck label disappeared after I
+        // loaded a track". The title-artist group keeps the
+        // default priority so it's the one that truncates first
+        // (its `.lineLimit(1).truncationMode(.middle)` is already
+        // wired for that). The format chip gets a mid priority so
+        // it survives mild squeezes but yields before identity.
         HStack(spacing: DubSpacing.md) {
-            deckLabel
-            sourcePill
-            if state.isMaster {
-                masterChip
-            }
-            if let title = state.trackTitle {
-                Text(title)
-                    .font(DubFont.title)
-                    .foregroundStyle(DubColor.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            if mirrored {
+                if let chip = state.formatChip {
+                    formatChipView(chip).layoutPriority(1)
+                }
+                Spacer(minLength: 0)
+                titleArtistGroup
+                if state.isMaster {
+                    masterChip.layoutPriority(2)
+                }
+                sourcePill.layoutPriority(2)
+                deckLabel.layoutPriority(2)
             } else {
-                placeholderText("—", font: DubFont.title)
-            }
-            if let artist = state.trackArtist {
-                Text("· \(artist)")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            if let chip = state.formatChip {
-                formatChipView(chip)
+                deckLabel.layoutPriority(2)
+                sourcePill.layoutPriority(2)
+                if state.isMaster {
+                    masterChip.layoutPriority(2)
+                }
+                titleArtistGroup
+                Spacer(minLength: 0)
+                if let chip = state.formatChip {
+                    formatChipView(chip).layoutPriority(1)
+                }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity,
+               alignment: mirrored ? .trailing : .leading)
+    }
+
+    /// Title + artist text pair. Pulled out of `row1` so the mirror /
+    /// non-mirror branches don't duplicate the rendering decisions.
+    /// The artist text keeps its leading `"· "` separator in both
+    /// orientations — even when the cluster is right-aligned the
+    /// title still precedes the artist in reading order, so the
+    /// separator stays a *post*-title glyph.
+    @ViewBuilder
+    private var titleArtistGroup: some View {
+        if let title = state.trackTitle {
+            Text(title)
+                .font(DubFont.title)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        } else {
+            placeholderText("—", font: DubFont.title)
+        }
+        if let artist = state.trackArtist {
+            Text("· \(artist)")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+        }
     }
 
     // MARK: - Row 2 — live stats
+    //
+    // Stat order (PITCH → BPM → KEY) stays the same on both decks —
+    // reversing it would force the user to learn two reading orders
+    // for the same labelled values, which is a worse cost than the
+    // mild asymmetry of having the cluster be right-aligned on the
+    // mirrored side. Only the FX chip's position swaps so it stays
+    // on the *inner* (divider-adjacent) edge, mirroring Row 1's
+    // format-chip behaviour.
 
     @ViewBuilder
     private var row2: some View {
         HStack(spacing: DubSpacing.lg) {
-            statColumn(label: "PITCH", value: "—")
-            statColumn(label: "BPM",   value: formattedBPM)
-            statColumn(label: "KEY",   value: "—")
-            Spacer(minLength: 0)
-            fxChip
+            if mirrored {
+                fxChip
+                Spacer(minLength: 0)
+                statColumn(label: "BPM", value: formattedBPM)
+                statColumn(label: "KEY", value: formattedKey)
+            } else {
+                statColumn(label: "BPM", value: formattedBPM)
+                statColumn(label: "KEY", value: formattedKey)
+                Spacer(minLength: 0)
+                fxChip
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity,
+               alignment: mirrored ? .trailing : .leading)
     }
 
     /// Render the BPM column. The Stage-1 estimator delivers two
@@ -256,29 +396,77 @@ struct DeckHeader: View {
         return String(format: "%.1f", bpm)
     }
 
+    /// Render the KEY column. M11c.2: the active `track_keys` row
+    /// is canonical Camelot. We surface it verbatim on the deck
+    /// header — there's no per-deck "which notation" preference (the
+    /// LibraryView's column-level toggle is the right surface for
+    /// that). Em-dash for `nil` / empty / Finder-drag loads where
+    /// the source isn't a library row.
+    private var formattedKey: String {
+        guard let k = state.key, !k.isEmpty else { return "—" }
+        return k
+    }
+
     // MARK: - Row 3 — track time + transport glyphs (track loaded)
+    //
+    // Mirror: when `mirrored == true`, transport glyphs move to the
+    // trailing edge so they sit directly under the DECK B label in
+    // Row 1. Elapsed/remaining swap correspondingly so the layout
+    // reads "remaining ··· elapsed [transport]" on the mirrored
+    // side. The numeric strings themselves are not reversed — only
+    // their positions inside the HStack.
 
     @ViewBuilder
     private func timeRow(_ time: DeckHeaderState.TimeRow) -> some View {
         HStack(spacing: DubSpacing.md) {
-            transportGlyphs
-            switch time {
-            case .remainingOnly(let remainingText):
-                Spacer(minLength: 0)
-                Text(remainingText)
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(DubColor.textPrimary)
-            case .elapsedAndRemaining(let elapsedText, let remainingText):
-                Text(elapsedText)
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(DubColor.textPrimary)
-                Spacer(minLength: 0)
-                Text(remainingText)
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(DubColor.textSecondary)
+            if mirrored {
+                switch time {
+                case .remainingOnly:
+                    liveTime(slot: .remaining, textColor: DubColor.textPrimary)
+                    Spacer(minLength: 0)
+                case .elapsedAndRemaining:
+                    liveTime(slot: .remaining, textColor: DubColor.textSecondary)
+                    Spacer(minLength: 0)
+                    liveTime(slot: .elapsed, textColor: DubColor.textPrimary)
+                }
+                transportGlyphs
+            } else {
+                transportGlyphs
+                switch time {
+                case .remainingOnly:
+                    Spacer(minLength: 0)
+                    liveTime(slot: .remaining, textColor: DubColor.textPrimary)
+                case .elapsedAndRemaining:
+                    liveTime(slot: .elapsed, textColor: DubColor.textPrimary)
+                    Spacer(minLength: 0)
+                    liveTime(slot: .remaining, textColor: DubColor.textSecondary)
+                }
             }
         }
         .monospacedDigit()
+    }
+
+    /// Render one time-slot. Production callers (Performance /
+    /// Prep modes) supply `liveEngine` + `liveDeckIdx`, in which
+    /// case we hand off to `LiveDeckTimeText`, a `TimelineView`-
+    /// driven subview that reads `engine.position(deckIdx:)`
+    /// directly. Preview callers leave the live params `nil`; we
+    /// render an `"--:--"` placeholder so static SwiftUI previews
+    /// still look correct without booting an engine.
+    @ViewBuilder
+    private func liveTime(
+        slot: LiveDeckTimeText.Slot,
+        textColor: Color
+    ) -> some View {
+        if let engine = liveEngine, let deckIdx = liveDeckIdx {
+            LiveDeckTimeText(engine: engine, deckIdx: deckIdx, slot: slot)
+                .font(DubFont.numericInline)
+                .foregroundStyle(textColor)
+        } else {
+            Text(slot == .remaining ? "-00:00" : "00:00")
+                .font(DubFont.numericInline)
+                .foregroundStyle(textColor)
+        }
     }
 
     /// Transport-cluster primary button (PRD §6.1).
@@ -315,11 +503,11 @@ struct DeckHeader: View {
 
     @ViewBuilder
     private var primaryButton: some View {
-        if state.useTimecodeToggle {
-            timecodeToggleButton
-        } else {
-            playPauseButton
-        }
+        // M11d.5: primary button is always Play / Pause. The
+        // pre-fix INT/ABS toggle is kept as a private subview for
+        // when the matching hardware UX ships (see
+        // `useTimecodeToggle` doc comment).
+        playPauseButton
     }
 
     /// Prep-mode Play/Pause toggle (PRD §6.1.3).
@@ -511,6 +699,86 @@ enum DeckTimeFormat {
     }
 }
 
+// MARK: - LiveDeckTimeText (M11d.5 round 5)
+
+/// Self-driven SwiftUI text view for one slot of the deck-header
+/// time row.
+///
+/// Reads `engine.position(deckIdx:)` from inside a `TimelineView`
+/// so the elapsed / remaining digits update on their own cadence,
+/// independently of any `@Published` deck-state stream. The whole
+/// point of the indirection is to keep the per-second M:SS
+/// rollover from invalidating the parent `PerformanceView` and
+/// triggering a full deck-pane body re-eval (which was the
+/// residual cause of the "subtle leftward jump every second"
+/// reported after M11d.5 round 3 — see SHIPPED for the bisection).
+///
+/// `TimelineView(.periodic(from: .now, by: 0.5))` is used over a
+/// per-frame `.animation` schedule on purpose: the rendered text
+/// only changes once a second (the integer-second floor of the
+/// FFI's `elapsedSecs` / `remainingSecs`), so 2 Hz is more than
+/// enough to keep the rollover visually fresh and the closure
+/// stays cheap (one FFI position read, two integer divisions,
+/// one `String(format:)` call per tick). The text widget already
+/// carries `.monospacedDigit()` from the parent so per-tick layout
+/// is byte-stable; the only main-thread work is a Text-node
+/// content swap when the second crosses, which SwiftUI handles in
+/// microseconds and which does **not** propagate up to invalidate
+/// any ancestor that doesn't directly read `engine.position`.
+///
+/// The view is intentionally tiny: one `Text` widget per slot. Use
+/// `.font(...)` and `.foregroundStyle(...)` modifiers on the
+/// `LiveDeckTimeText` instance to customise appearance; both are
+/// inherited by the inner `Text` per SwiftUI's environment rules.
+struct LiveDeckTimeText: View {
+    /// Which side of the time row this instance renders. Picks
+    /// which field of `PositionInfo` to read and whether to
+    /// prefix the rendered string with a `-` sign (per the
+    /// `DeckTimeFormat.format(_:signed:)` convention).
+    enum Slot {
+        /// Wall-clock seconds from track start; rendered as
+        /// `"01:23"` (unsigned).
+        case elapsed
+        /// Wall-clock seconds remaining until track end; rendered
+        /// as `"-02:22"` (signed). Mirrors what
+        /// `DeckTimeFormat.format(_:signed: true)` produces
+        /// elsewhere so the visual cue is unchanged from the
+        /// pre-decoupling code path.
+        case remaining
+    }
+
+    let engine: DubEngine
+    let deckIdx: UInt64
+    let slot: Slot
+
+    var body: some View {
+        // 2 Hz timeline is enough — the integer-second-floor of the
+        // position only changes once a second, and a 0.5 s tick keeps
+        // the M:SS rollover visually fresh without paying the cost of
+        // a per-display-refresh closure body re-eval. The Apple shell
+        // never asks for sub-second precision on this surface (per the
+        // M11d.5 round 3 user sign-off: "nothing is relevant sub
+        // seconds" on the deck-header time display).
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            let pos = engine.position(deckIdx: deckIdx)
+            Text(formattedText(for: pos))
+        }
+    }
+
+    private func formattedText(for pos: PositionInfo) -> String {
+        // Defensive against unloaded / cold-launch decks where
+        // `has_track` is false: the engine reports zero for both
+        // fields, which renders as "00:00" / "-00:00". Same
+        // behaviour as the historical pre-decoupling path.
+        switch slot {
+        case .elapsed:
+            return DeckTimeFormat.format(pos.elapsedSecs)
+        case .remaining:
+            return DeckTimeFormat.format(pos.remainingSecs, signed: true)
+        }
+    }
+}
+
 // MARK: - Derivation from DeckState
 
 extension DeckHeaderState {
@@ -556,6 +824,7 @@ extension DeckHeaderState {
                 trackTitle: resolvedTitle,
                 trackArtist: nil,
                 bpm: nil,
+                key: nil,
                 formatChip: nil,
                 timeRow: nil,
                 isMaster: isMaster,
@@ -565,15 +834,13 @@ extension DeckHeaderState {
         }
 
         if deckState.hasTrack {
-            let time: DeckHeaderState.TimeRow
-            if prepMode {
-                time = .elapsedAndRemaining(
-                    elapsedText: DeckTimeFormat.format(deckState.elapsedSecs),
-                    remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
-            } else {
-                time = .remainingOnly(
-                    remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
-            }
+            // M11d.5 round 5: time-row payload is a layout selector
+            // only — the actual M:SS strings come from
+            // `LiveDeckTimeText` inside the header, reading
+            // `engine.position(deckIdx:)` on its own timeline. See
+            // `TimeRow`'s doc comment.
+            let time: DeckHeaderState.TimeRow =
+                prepMode ? .elapsedAndRemaining : .remainingOnly
             // M10.6c: in Timecode mode + Panic Play engaged, the
             // source pill flips from FILE → TC · HOLD (PRD §6.1.2).
             // M10.5d: a replace-load (new file decoded while the
@@ -598,12 +865,17 @@ extension DeckHeaderState {
                 trackTitle: resolvedTitle,
                 trackArtist: resolvedArtist,
                 bpm: deckState.bpm,
+                key: deckState.key,
                 formatChip: deckState.formatChip,
                 timeRow: time,
                 isMaster: isMaster,
                 isPlaying: deckState.isPlaying,
                 isPanicPlay: inPanic,
-                useTimecodeToggle: thruMode)
+                // M11d.5: primary transport button is always
+                // plain Play / Pause. Panic Play state is folded
+                // into the Play action in the model. See
+                // `useTimecodeToggle` doc comment for rationale.
+                useTimecodeToggle: false)
         }
 
         if thruMode {
@@ -624,6 +896,7 @@ extension DeckHeaderState {
                 trackTitle: "Real Record",
                 trackArtist: "capturing live",
                 bpm: nil,
+                key: nil,
                 formatChip: nil,
                 timeRow: nil,
                 isMaster: isMaster,
@@ -638,6 +911,7 @@ extension DeckHeaderState {
             trackTitle: nil,
             trackArtist: nil,
             bpm: nil,
+            key: nil,
             formatChip: nil,
             timeRow: nil,
             isMaster: false,
@@ -658,7 +932,7 @@ extension DeckHeaderState {
     DeckHeader(side: .a, state: DeckHeaderState(
         isLive: true, source: .thru,
         trackTitle: "Real Record", trackArtist: "capturing live",
-        bpm: nil,
+        bpm: nil, key: nil,
         formatChip: nil, timeRow: nil,
         isMaster: true, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false))
@@ -667,16 +941,17 @@ extension DeckHeaderState {
         .padding()
 }
 
-#Preview("Deck B — File, mid-track (Performance)") {
+#Preview("Deck B — File, mid-track (Performance, mirrored)") {
     DeckHeader(side: .b, state: DeckHeaderState(
         isLive: true, source: .file,
         trackTitle: "Stakes Is High",
         trackArtist: "De La Soul",
-        bpm: 92.5,
+        bpm: 92.5, key: "8B",
         formatChip: "MP3 · 44.1 kHz · stereo",
-        timeRow: .remainingOnly(remainingText: "-02:22"),
+        timeRow: .remainingOnly,
         isMaster: false, isPlaying: true,
-        isPanicPlay: false, useTimecodeToggle: true))
+        isPanicPlay: false, useTimecodeToggle: true),
+        mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -687,11 +962,9 @@ extension DeckHeaderState {
         isLive: true, source: .file,
         trackTitle: "Stakes Is High",
         trackArtist: "De La Soul",
-        bpm: 92.5,
+        bpm: 92.5, key: "8B",
         formatChip: "MP3 · 44.1 kHz · stereo",
-        timeRow: .elapsedAndRemaining(
-            elapsedText: "01:23",
-            remainingText: "-02:22"),
+        timeRow: .elapsedAndRemaining,
         isMaster: true, isPlaying: true,
         isPanicPlay: false, useTimecodeToggle: false))
         .frame(width: 720)
@@ -699,16 +972,17 @@ extension DeckHeaderState {
         .padding()
 }
 
-#Preview("Deck B — Timecode, Panic Play engaged") {
+#Preview("Deck B — Timecode, Panic Play engaged (mirrored)") {
     DeckHeader(side: .b, state: DeckHeaderState(
         isLive: true, source: .tcHold,
         trackTitle: "Stakes Is High",
         trackArtist: nil,
-        bpm: 92.5,
+        bpm: 92.5, key: "8B",
         formatChip: "MP3 · 44.1 kHz · stereo",
-        timeRow: .remainingOnly(remainingText: "-02:22"),
+        timeRow: .remainingOnly,
         isMaster: true, isPlaying: true,
-        isPanicPlay: true, useTimecodeToggle: true))
+        isPanicPlay: true, useTimecodeToggle: true),
+        mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()

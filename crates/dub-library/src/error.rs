@@ -89,6 +89,53 @@ pub enum LibraryError {
         /// error message.
         reason: &'static str,
     },
+
+    /// `analyze_track` was called with a canonical UUID that is not
+    /// present in `tracks`. Indicates a stale id on the caller side
+    /// (UI raced a delete) rather than a library bug.
+    #[error("no track with id {track_id} found")]
+    TrackNotFound {
+        /// The canonical UUID the caller asked for.
+        track_id: String,
+    },
+
+    /// `analyze_track` was called for a track that has no
+    /// `fingerprint_id`. Should not happen via M11c imports
+    /// (the importer always fingerprints first), but checked
+    /// explicitly because `analysis_cache` is keyed by fingerprint
+    /// id and we'd rather refuse than write a NULL FK row.
+    #[error("track {track_id} has no fingerprint; cannot run analysis")]
+    TrackHasNoFingerprint {
+        /// The canonical UUID we tried to analyse.
+        track_id: String,
+    },
+
+    /// `analyze_track` was called for a track whose primary file
+    /// is currently unreachable (volume unmounted, file moved).
+    /// Caller surfaces this as "file missing; relocate first";
+    /// after a successful Relocate run, re-analysis works.
+    #[error("track {track_id} has no resolvable file on disk")]
+    TrackHasNoFile {
+        /// The canonical UUID we tried to analyse.
+        track_id: String,
+    },
+
+    /// `analyze_track` failed because `dub-io` could not decode the
+    /// underlying file (corrupt container, unsupported codec) or
+    /// `dub-bpm` rejected the buffer (sample-rate / channel-count
+    /// invariants violated by a degraded file). Surfaces a one-line
+    /// reason so the user-facing error message can read "Decode
+    /// failed: …" instead of swallowing the cause.
+    #[error("decode or analysis failed for track {track_id} at {path:?}: {reason}")]
+    DecodeFailed {
+        /// The canonical UUID we tried to analyse.
+        track_id: String,
+        /// The file we tried to decode.
+        path: PathBuf,
+        /// Short reason string from the underlying decoder /
+        /// analyser.
+        reason: String,
+    },
 }
 
 impl LibraryError {
