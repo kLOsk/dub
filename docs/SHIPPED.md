@@ -1,18 +1,18 @@
-# Dub — Shipped Milestones (M0 → M10.8)
+# Dub — Shipped Milestones
 
 > Companion to [`docs/PRD.md`](PRD.md). The PRD's milestone table keeps shipped rows
 > short; this doc holds the detailed write-ups, design history, and rationale
-> for each milestone that has landed. Forward-looking milestones (M11 onward)
-> stay in the PRD.
+> for each milestone and dogfooding round that has landed. Forward-looking
+> milestones stay in the PRD.
 >
 > **Why split?** Shipped milestones accumulate prose that's load-bearing for
 > "why is the code this way" archaeology but is no longer load-bearing for
 > "what are we building next." Keeping them in the PRD bloated it past the
 > point where a reader (or AI assistant) could keep the whole roadmap in
-> working memory. Moved verbatim here; nothing has been rewritten or
-> summarized away.
+> working memory. Load this file by anchor; do not read the whole file unless
+> doing a history audit.
 
-**Currently shipped:** M0 → M9 (engine, two-deck, timecode, Thru, BPM, peaks), M0.5 (Apple shell), M9.5 (`dub-spectral` + 8-band capture), M10/M10.1/M10.2 (FFI + Metal renderer + first multi-colour waveform), M10.3 (Performance shell + design tokens), M10.4 (vertical waveform + symmetric two-pane layout), M10.5 (file playback dev loop) including sub-milestones M10.5a–g (FFI + Apple shell + background load + initial polish + zoom + anti-alias), the M10.5h–p shader exploration ladder (HDR / bloom / onset / kick / DJ-landmark experiments — *all rolled back in the M10.8 baseline freeze*, see [§M10.8](#m108)), M10.5c (Track Overview + horizontal-orientation shader), M10.5n (playhead-vs-audio drift root-cause fix), M10.6a–e (Casual Play UI, Panic Play engine + FFI + UI + transport-cluster redesign + Repeat auto-trigger on LFSR run-out), M10.7 (Phase-Drift Trail), and M10.8 (Track Preparation Mode shell + Serato-parity waveform baseline freeze). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
+**Currently shipped:** engine/audio/timecode/Thru/BPM/waveform foundations (M0 → M10.8), library schema/import/dedupe/browser/scanner/analysis/key detection (M11a → M11d.x + M11c.x), and several M11d.5 dogfooding rounds for playback, beat-grid, waveform, and library polish. The current build/test status belongs in the latest commit or PR, not in this historical overview.
 
 ## Table of contents
 
@@ -60,6 +60,16 @@
 - [M10.6a–e — Mouse transport, Panic Play, transport-cluster redesign, Repeat auto-trigger](#m106)
 - [M10.7 — Phase-Drift Trail](#m107)
 - [M10.8 — Track Preparation Mode shell + Serato-parity waveform baseline freeze](#m108)
+- [M11a — Library schema + path-by-volume-UUID](#m11a)
+- [M11b — Canonical fingerprint + version-aware dedupe](#m11b)
+- [M11c — Filesystem importer + filename parser](#m11c)
+- [M11d.1 — Library browser shell](#m11d1)
+- [M11d.2 — Recently Played wiring + sortable columns](#m11d2)
+- [M11d.3 — Per-row indicators](#m11d3)
+- [M11d.4 — Background missing-files scanner + Relocate panel](#m11d4)
+- [M11d.5 — Dogfooding bug-fix and waveform/library polish rounds](#m11d5)
+- [M11c.2 — Key detection (Camelot canonical)](#m11c2)
+- [M11c.1 — Lazy auto-beatgrid + analysis lifecycle](#m11c1)
 
 ---
 
@@ -1695,6 +1705,7 @@ The freeze was committed as `4a31363` (`feat(apple,engine): freeze M10.8 wavefor
 
 ---
 
+<a id="m11a"></a>
 ## M11a — Library schema + path-by-volume-UUID
 
 **Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days &nbsp;·&nbsp; **Actual:** 1 day
@@ -1768,6 +1779,7 @@ This entry corresponds to the M11a commit set. PRD §8 + §12 (M11a row marked s
 
 ---
 
+<a id="m11b"></a>
 ## M11b — Canonical fingerprint + version-aware dedupe
 
 **Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days &nbsp;·&nbsp; **Actual:** ~1 day
@@ -1919,6 +1931,7 @@ This entry corresponds to the M11b commit set. PRD §5.2.5 + §8.2 + §10.1 + §
 
 ---
 
+<a id="m11c"></a>
 ## M11c — Filesystem importer + filename parser
 
 **Status:** shipped &nbsp;·&nbsp; **Estimate:** 2–3 days &nbsp;·&nbsp; **Actual:** ~1 day
@@ -2048,6 +2061,7 @@ This entry corresponds to the M11c commit set. PRD §12 (M11c row), `crates/dub-
 
 ---
 
+<a id="m11d1"></a>
 ## M11d.1 — Library browser shell (functional replacement)
 
 First reviewable slice of PRD §12 M11d (the §8.5 browser). M11d.1 is the **functional replacement** for the M10.5b `FileBrowserView`: the SwiftUI shell now reads from the M11a–c SQLite catalog instead of walking the filesystem on every Performance render, and the DJ can populate the library by pointing it at a folder of audio files.
@@ -2141,6 +2155,7 @@ This entry corresponds to the M11d.1 commit set: `docs/PRD.md` (M11d row breakdo
 
 ---
 
+<a id="m11d2"></a>
 ## M11d.2 — Recently Played wiring + sortable columns
 
 Second slice of PRD §12 M11d. Closes the loop on the **Recently Played** smart crate (which M11d.1 left wired to the FFI but always empty because nothing wrote `play_history` rows), and lands the §8.5.3 spec promise that "Columns are sortable" by swapping the M11d.1 `LazyVStack` track list for a real SwiftUI `Table` with click-to-sort column headers.
@@ -2216,6 +2231,7 @@ This entry corresponds to the M11d.2 commit set: `docs/PRD.md` (M11d row update)
 
 ---
 
+<a id="m11d3"></a>
 ## M11d.3 — Per-row indicators
 
 Third slice of PRD §12 M11d. Closes the §8.5.3 promise that browser rows carry per-track visual cues for "is this loaded right now?", "does the dedupe pass think this is a duplicate of another row?" and "is the source file currently reachable?". Adds the three indicator glyphs in a leftmost-gutter Table column; defers the fourth (grid-disagreement ⚠) until the M11c `dub-bpm` follow-up wires offline beat-grid analysis into the importer.
@@ -2304,6 +2320,7 @@ This entry corresponds to the M11d.3 commit set: `docs/PRD.md` (M11d row update)
 
 ---
 
+<a id="m11d4"></a>
 ## M11d.4 — Background missing-files scanner + Relocate panel
 
 Closes M11d and closes the §8.5.5 promise that "external SSDs unmount, files get moved by Finder, networked volumes disappear, and the library handles this gracefully". Adds a long-lived background scanner that flags missing files without deleting metadata, a browser-footer affordance that surfaces the count, and a modal Relocate sheet that walks a user-supplied directory and reattaches every file whose fingerprint + duration still match a missing track.
@@ -2385,6 +2402,7 @@ This entry corresponds to the M11d.4 commit set: `docs/PRD.md` (M11d row update)
 
 ---
 
+<a id="m11d5"></a>
 ## M11d.5 — Dogfooding bug-fix round (Performance-mode play, deck-B phantom playback, beatgrid overlay)
 
 Bundles three pre-alpha bug fixes the user surfaced during the M11d.5 dogfooding pass. None of them are headline features; together they unblock the "load a track in Performance mode, hit Play, see the audio play and the beats line up with the kicks" loop that every subsequent test session depends on. Treated as a coherent unit because all three trace back to the same lacuna: the engine was designed around the assumption that a real timecode platter is always attached, and the pre-alpha workflow (sans hardware) walks straight into the gaps that assumption left.
@@ -2635,6 +2653,17 @@ Why not "just fix the shader"? Changing `chunksVisible - 1` to `chunksVisible` i
 
 The `LiveDeckTimeText` view is not affected because its content (`Text(...)`) is not opaque to SwiftUI's diff — when the formatted string changes, SwiftUI's structural compare picks it up and re-renders the text widget. The `Canvas` opacity is the specific reason that pattern needs the explicit `context.date` token.
 
+### Follow-up — waveform scrub responsiveness and playback smoothness (closed)
+
+Dogfood validation (2026-05-20) confirmed the M11d.5 follow-up work is done:
+playing-deck scrub is immediate again, idle playback scroll is smooth, and the
+library browser selection/drag rewrite from the same pass holds up in daily use.
+Landed in `01291cd` (`CVDisplayLink` + input yield + ingest skip + GPU
+catch-up). **Beat-grid overlay sub-pixel jitter** remains as deferred polish
+(`UI-BACKLOG` U-18); it does not block further grid/BPM work.
+
+---
+
 ### Known deferrals after round 5
 
 * **`DeckState.durationSecs` is still on `model.deck{A,B}`.** It republishes once at load time (deck transitions from `hasTrack = false` to `hasTrack = true` with a non-zero duration) and never again during normal playback. That's not a per-second cost path so it's not worth moving onto the `TimelineView` side; the `seekDeck` and `scrub` clamps both consume it at gesture time and reading from `pos.durationSecs` instead would just add an FFI call to those handlers without a real benefit.
@@ -2643,6 +2672,7 @@ The `LiveDeckTimeText` view is not affected because its content (`Text(...)`) is
 
 ---
 
+<a id="m11c2"></a>
 ## M11c.2 — Key detection (Camelot canonical)
 
 Extends the M11c.1 lazy-analysis chassis with musical-key detection. `analyze_track` now decodes the file once and runs both `dub-bpm::analyze_beat_grid` and the new `dub-spectral::analyze_key` pipeline, upserting the auto results into `track_beatgrids` and `track_keys` respectively. The browser Key column reads from the active `track_keys` row in canonical Camelot, with a click-to-toggle musical-notation mode that persists across launches.
@@ -2724,6 +2754,7 @@ Same partial-unique-index trick as `track_beatgrids` enforces "one active key pe
 
 ---
 
+<a id="m11c1"></a>
 ## M11c.1 — Lazy auto-beatgrid + analysis lifecycle
 
 Closes the M11c follow-up gap that left `dub-bpm` (shipped in M7.5 + M8.1) disconnected from the library. The Dub-native auto-grid is now produced lazily on first deck load (or via the LibraryView right-click batch action), persisted to `track_beatgrids(source='auto')`, and surfaced everywhere the browser reads BPM. Tracks that have never been analyzed dim out and show an em-dash in the BPM column; once analysis completes the row snaps to full opacity and the BPM badge fills in.
@@ -2800,4 +2831,4 @@ This entry corresponds to the M11c.1 commit set: `docs/PRD.md` (M11c.1 row updat
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M11e onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+*End of shipped milestone history. Forward-looking planning lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

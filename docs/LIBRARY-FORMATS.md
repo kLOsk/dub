@@ -5,8 +5,12 @@
 
 ## Status
 
-This document is a stub. It will be filled in M11–M12 (PRD §12) as we
-implement the importers. Each section below should end up with:
+This document is a format-notes stub for external DJ libraries. Dub-native
+filesystem import has shipped; Serato / Traktor / rekordbox / iTunes importers
+are still forward-looking. Fill each section as its importer lands, and keep
+format-specific quirks here rather than expanding PRD §8.
+
+Each section should end up with:
 
 - Where the format lives on disk
 - Schema overview (with examples)
@@ -92,6 +96,5 @@ implement the importers. Each section below should end up with:
 
 - `docs/PRD.md` §8 — Library (philosophy, imports, schema, beatgrids,
   analysis, browser UX, export, schema-as-public-API)
-- `docs/LIBRARY-SCHEMA.md` — public SQLite schema reference (lands in
-  M11a)
+- `docs/LIBRARY-SCHEMA.md` — public SQLite schema reference
 - `crates/dub-library/src/` — implementations

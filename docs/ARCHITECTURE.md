@@ -40,9 +40,9 @@ buffers, never callbacks across thread boundaries.
 ```
               ┌────────────────┐         ┌────────────────┐
               │     dub-cli    │         │     dub-ffi    │  (UniFFI Swift bindings;
-              │ (binary;       │         │  placeholder   │   wired up in M0.5)
-              │  smoke /       │         │  in v1 — empty │
-              │  play /        │         │  shell)        │
+              │ (binary;       │         │  DubEngine +   │   Apple engine/library
+              │  smoke /       │         │  DubLibrary    │   surface)
+              │  play /        │         │  objects)      │
               │  timecode-deck/│         └───────┬────────┘
               │  thru / scope /│                 │
               │  capture /     │                 ▼
@@ -70,19 +70,19 @@ buffers, never callbacks across thread boundaries.
                                                                            picker)           rendering)
 
           ┌─────────────────────────────────────────────────────────────────────┐
-          │ Off-RT / placeholder for v1:                                        │
+          │ Off-RT / app-side services and future features:                     │
           │   dub-thru        (source-detection classifier, §5.1.1 — empty)     │
-          │   dub-fingerprint (Chromaprint FFI for v1.1)                        │
-          │   dub-library     (SQLite + import adapters for M11/M12)            │
+          │   dub-fingerprint (pure-Rust Chromaprint for library dedupe)         │
+          │   dub-library     (SQLite catalog, importer, analysis cache)         │
           │   dub-controller  (HID/MIDI abstractions for v1.x+)                 │
           └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Two things to note that aren't obvious from the diagram:**
 
-1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M9 per-Thru-deck peak decimators via `dub_peaks::PeakStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). Crates with FFI dependencies — `dub-stretch` (GPLv3) and `dub-fingerprint` (LGPL planned) — are deliberately leaf crates so license boundaries don't leak upstream. `dub-bpm` shipped M7.5+M8 as pure-Rust so it has no FFI obligation today; `dub-peaks` is pure-Rust too. If an aubio backend ever lands behind a feature flag it would stay confined to that same leaf crate.
+1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M9 per-Thru-deck peak decimators via `dub_peaks::PeakStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). FFI-heavy or license-sensitive code stays in leaf crates. `dub-bpm`, `dub-peaks`, and `dub-fingerprint` are pure Rust today; if an aubio backend ever lands behind a feature flag it stays confined to `dub-bpm`.
 
-2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only. As of M10-A it ships a UniFFI 0.28 surface (proc-macros, no UDL) exposing `greeting()` + `engine_version()` (the M0.5 smoke functions) **plus** a full `DubEngine` interface for the M10-B waveform UI: `list_input_devices`, `start_thru(device, channels)` (throws `EngineError`), `stop_thru`, `peaks_extend(deck, start_idx) -> Vec<u8>` plus its `len` / `chunk_duration_secs` siblings, and the matching `band_peaks_*` trio for M10.1's multi-colour shader. All bytes are `#[repr(C)]` little-endian (`PeakChunk` = 12 B, `BandPeakChunk` = 32 B) so Swift can reinterpret-cast `Data` straight into an `MTLBuffer` upload.
+2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only. It exposes the `DubEngine` surface for engine lifecycle, deck control, waveform peaks, beat grids, and loads, plus a separate `DubLibrary` surface for the SQLite catalog, import, scanner, Relocate, and analysis actions. The two FFI objects stay separate so disk-backed library work never becomes an engine or audio-thread dependency.
 
 ## RT-safety enforcement
 
@@ -1689,5 +1689,7 @@ covers everything we need through M4.
 ## See also
 
 - [`docs/PRD.md`](PRD.md) — product spec (source of truth)
-- [`docs/SHIPPED.md`](SHIPPED.md) — full design history of M0 → M7 (per-milestone rationale, what was deliberately removed, etc.)
+- [`docs/README.md`](README.md) — routing guide for context-efficient doc loading
+- [`docs/SHIPPED.md`](SHIPPED.md) — shipped design history; load by anchor for rationale / archaeology
+- [`docs/LIBRARY-SCHEMA.md`](LIBRARY-SCHEMA.md) — public SQLite schema contract
 - [`docs/LIBRARY-FORMATS.md`](LIBRARY-FORMATS.md) — Serato / Traktor / rekordbox / iTunes / Lexicon parsing notes

@@ -22,6 +22,41 @@ re-discovering the issue.
 
 ## 1. Real bugs (correctness or visible user pain)
 
+### ~~B-26. Waveform scrub lag and playback stutter~~ — fixed (M11d.5 follow-up)
+
+Closed after dogfood validation (2026-05-20). Playing-deck scrub is responsive
+again; idle playback scroll is smooth. Landed in `01291cd` via demand-driven
+Metal rendering (`CVDisplayLink` on the main run loop), input yield during
+press/drag, redundant peak-ingest skip when the playhead is stable, and GPU
+catch-up when frames are deferred. No further action unless regression.
+
+---
+
+### B-11. Auto BPM locks at 2× tempo on real hip-hop / rap
+
+**Symptom:** Library analysis and deck header report ~190 BPM on tracks that
+audibly sit around 90–100 BPM (classic kick/snare half-time feel). Synthetic
+fixtures in `crates/dub-bpm/tests/genre_octave.rs` pass; real mastered rap
+with bright hi-hats / percussion still loses the octave to the faster
+candidate.
+
+**Likely cause:** `dub-bpm::tempo::estimate_tempo` prefers the *faster* tempo
+when harmonic-mean scores tie within 1 % (`SCORE_TIE_REL_TOL`). Real tracks
+with strong off-beat high-band content can still score the 2× period as high
+as the kick period despite M8.1's log-band ODF.
+
+**Fix direction (engine):**
+* Add a real-music regression corpus (3–5 known-BPM rap cuts) beside the
+  synthetic `genre_octave` suite.
+* Revisit tie-break: prefer slower tempo when scores agree within tolerance
+  for urban genres, or add a low-band-weighted tie-break pass.
+* Optional: post-analysis octave sanity check against ID3 / filename BPM when
+  within ±20 % (PRD §8.3.1 tap-to-grid step 3 already assumes this window).
+
+**Location:** `crates/dub-bpm/src/tempo.rs`, `crates/dub-library/src/analysis.rs`.
+
+---
+
 ### B-7. `scanMissingFilesBatch` has identical `if/else` branches
 
 `MainView.swift` ~L957–985 — the loop that reconciles the
@@ -71,10 +106,10 @@ preserve path already exists; only the call site is wrong.
 `LibraryView.swift` — the `onChange(of: searchText)` handler
 re-queries the FTS5 index synchronously on every keystroke. On a
 100 k row library this is fast enough today, but the keystroke
-that fires the FTS query *also* causes a `Table` re-layout, which
-is the bottleneck. On a 500 ms-long word the user types six FTS
-queries plus six full table layouts; we want one query plus one
-layout, ~250 ms after the last keystroke.
+that fires the FTS query *also* causes a full list refresh and
+layout. On a 500 ms-long word the user types six FTS queries plus
+six list rebuilds; we want one query plus one rebuild, ~250 ms
+after the last keystroke.
 
 **Fix**: wrap the `onChange` in a SwiftUI `.task(id: searchText)`
 that sleeps 250 ms before firing `refreshTracks()`. Cancel-on-
@@ -83,20 +118,17 @@ torn down when `id` changes).
 
 ---
 
-### B-10. Key column tap-to-toggle fires on every cell tap
+### ~~B-10. Key column tap-to-toggle fires on every cell tap~~ — stale after browser column reset
 
-`LibraryView.swift` — the Camelot/musical-notation toggle is
-attached to the *cell* via `onTapGesture`, so any click on the KEY
-column cell flips notation *and* races with `Table`'s row
-selection model. Users trying to single-click a row to select it
-sometimes flip notation instead, depending on which sub-region of
-the cell catches the tap.
+The current performance browser no longer renders the Key column
+by default (Artist / Title / BPM / Comment only), and the SwiftUI
+`Table` selection model has been replaced by a custom
+`ScrollView + LazyVStack` row model. If the Key column comes back
+through customizable columns, re-open this as a header-toggle
+affordance rather than a row-cell gesture.
 
-**Fix**: move the toggle to the column *header* via a
-`TableColumn` header builder that wraps a `Button` with no
-chrome. Headers don't compete with row selection, and "click the
-column title to change the column's display" is a familiar
-affordance on macOS (mail/finder both do versions of this).
+Original fix still stands: the notation toggle belongs in the
+column header, not on individual row cells.
 
 ---
 
@@ -120,6 +152,40 @@ removed the ±0.02 BPM cross-deck drift and the redundant
 
 ## 2. UX polish (works, but feels rough)
 
+### U-18. Beat-grid overlay lines jitter slightly during playback
+
+**Symptom:** Grid lines on the zoomed waveform wobble sub-pixel against the
+scrolling envelope when the deck is playing. Not blocking; beats are readable.
+
+**Likely cause:** Residual mismatch between Metal playhead extrapolation and
+SwiftUI Canvas grid draw cadence, or fractional-chunk NDC rounding at the
+playhead boundary (see M11d.5 round-5 follow-ups in `SHIPPED.md`).
+
+**Fix:** Revisit `WaveformRenderer.drawBeatGrid` / `WaveformView.drawBeatGrid`
+shared playhead source; consider drawing grid lines in Metal alongside the
+envelope so both layers share one sub-chunk offset.
+
+**Deferred:** polish pass after tap-to-grid and BPM octave work land.
+
+---
+
+### U-19. Tap-to-grid not implemented (PRD §8.3.1)
+
+**Symptom:** No `G`-key (or equivalent) affordance to set downbeat anchor and
+re-fit BPM from user taps. Schema supports `source = 'user_tap'`; UI and
+`dub-bpm` refit hook are missing.
+
+**Intended remediation:** Keyboard handler in Performance/Prep mode → record
+tap timestamp → snap to nearest transient (±200 ms) → search ±20 BPM around
+active/imported BPM → write `track_beatgrids(source='user_tap')` → reload deck
+grid without full reanalysis. Multi-tap path for sparse tracks per PRD.
+
+**Blocked on:** B-11 fix is high leverage first (wrong auto BPM makes taps
+harder to trust); tap-to-grid then becomes the user escape hatch for the
+remaining edge cases.
+
+---
+
 ### U-12. Dev-facing placeholder text leaks into Casual-Play
 
 `Placeholders.swift` — strings like "Phase-Drift Trail lands at
@@ -134,16 +200,13 @@ behind a debug flag.
 
 ---
 
-### U-13. LibraryView duplicates info that's already in the header
+### ~~U-13. LibraryView duplicates info that's already in the header~~ — stale after list rewrite
 
-The header line at the top of the right pane reads
-`5 000 shown · 12 743 total` while the footer also reads
-`5 000 shown · 12 743 total`. One of them is enough; the footer
-is the more conventional spot (Finder, Mail) and aligns with
-the analyze-progress + missing-files lines that already live
-there.
+The current browser keeps the right-pane count in the footer. The
+sidebar still shows the library total beside "All Tracks", which
+is a different navigation cue and not this duplicate-header bug.
 
-**Fix**: drop the header copy. Keep the footer.
+No action unless the right-pane header count is reintroduced.
 
 ---
 
@@ -193,9 +256,10 @@ arrow-key navigation in tables.
 
 ### U-17. The notation-toggle affordance is invisible
 
-KEY column header reads `KEY` whether you're in Camelot or
-musical notation. Users have no way to know that clicking it
-flips between the two notations.
+The Key column is currently not part of the default performance
+browser. When it returns via customizable columns, the header must
+make the notation mode visible; a hidden click target on `KEY`
+will not be discoverable.
 
 **Fix**: render the header as `KEY (Camelot)` / `KEY (Musical)`
 or a small toggle pill. Tooltip already explains it; the visible
@@ -365,19 +429,14 @@ Trivial follow-up; can land with the next library-related PR.
 
 ---
 
-### C-29. `Table` selection model double-fires on programmatic set
+### ~~C-29. `Table` selection model double-fires on programmatic set~~ — obsolete after Table removal
 
-When `selectedLibraryTrackId` is set programmatically (e.g. after
-an import lands and we auto-select the new row) the `Table`'s
-`selection` binding fires `onChange(of: selectedTrackId)` which
-then re-calls `model.selectLibraryTrack`, which re-publishes
-`selectedLibraryTrackId`, which fires the `Table` again. The
-cycle settles in two ticks but wastes work and risks priority-
-inversion on the main actor for large listings.
+The current browser no longer uses SwiftUI `Table` selection.
+Selection is owned by the row model and `LibraryArrowKeyView`, so
+this exact double-fire path is gone.
 
-**Fix**: gate the `onChange` body with a "did this id actually
-change?" check, or drive the binding through a single
-`@Published` field so SwiftUI's de-dup catches the self-echo.
+Re-open only if a future NSTableView/SwiftUI Table paging rewrite
+reintroduces a binding echo.
 
 ---
 
@@ -401,8 +460,12 @@ want a baseline so regressions are visible.
 
 * Buckets are roughly ordered by priority within each section
   (top of list → fix first).
-* Items B-7 through B-10 + B-25 should land before any new
-  user-facing feature, since they affect existing functionality.
+* Items B-7 through B-9 should land before major new library UI
+  features, since they affect existing functionality. B-10, B-25,
+  and B-26 are retained only as closed context.
+* B-11 (BPM octave) and U-19 (tap-to-grid) are the next beat-grid
+  cluster; U-18 (grid-line jitter) can follow once the grid source
+  of truth stabilises.
 * The UX bucket can land alongside M11e (Library polish) — most
   items are surface-level copy or layout tweaks.
 * Code-health items are not blocking but should be ticked off
