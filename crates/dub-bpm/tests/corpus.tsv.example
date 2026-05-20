@@ -1,0 +1,22 @@
+# Real-music BPM regression corpus — schema example.
+#
+# Copy this file to a location outside the repo (the audio paths are
+# user-specific and the audio itself is not redistributable), then
+# point the test or the diagnostic at it via the DUB_BPM_REAL_CORPUS
+# env var or the `--manifest` CLI flag.
+#
+# Format: TAB-separated. Header row is REQUIRED. Lines starting with
+# `#` and blank lines are ignored.
+#
+# Columns:
+#   path           absolute path to the audio file
+#   expected_bpm   the human-audible BPM (integer or decimal)
+#   notes          short free-text genre / mix observation
+#
+# Tolerance: 5 % of `expected_bpm`. Octave errors (2×, 1/2, 3×, ...)
+# are reported as a distinct failure mode so the picker bug stays
+# visible against other classes of analysis failure.
+
+path	expected_bpm	notes
+/Users/klos/Music/The Best Of Westside Connection_ The Gangsta, The Killa, The Dope Dealer [2007] [320 kbps]/05. Gangsta Nation (feat. Nate Dogg).mp3	95	west coast rap, hi-hat heavy, detected at 2x in M11c.3 baseline
+/Users/klos/Music/The Best Of Westside Connection_ The Gangsta, The Killa, The Dope Dealer [2007] [320 kbps]/07. Connected For Life (Mack 10 feat. Ice Cube, WC & Butch Cassidy).mp3	95	g-funk, 2x detected with 16% higher confidence than the half-tempo
