@@ -42,6 +42,9 @@ struct PerformanceView: View {
     /// Preferences sheet — owned by `MainView`, passed down so
     /// `PerformanceView` itself stays free of sheet bindings.
     let openPreferences: () -> Void
+    /// Callback the status-strip wordmark hits to open the About
+    /// sheet — also owned by `MainView`.
+    let openAbout: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -73,6 +76,7 @@ struct PerformanceView: View {
                        state: headerState(side: .a),
                        callbacks: headerCallbacks(side: .a),
                        mirrored: false,
+                       prepMode: true,
                        liveEngine: model.engine,
                        liveDeckIdx: 0)
                 .background(DubColor.divider)
@@ -106,7 +110,8 @@ struct PerformanceView: View {
             sampleRate: model.engine.sampleRate(),
             isRunning: model.isRunning,
             lastError: model.lastError,
-            openPreferences: openPreferences)
+            openPreferences: openPreferences,
+            openAbout: openAbout)
     }
 
     // MARK: - Deck header derivation
@@ -146,7 +151,20 @@ struct PerformanceView: View {
         DeckHeaderCallbacks(
             onPlay:    { model.play(side: side) },
             onPause:   { model.pause(side: side) },
-            onPanicToggle: { model.panicToggle(side: side) })
+            onPanicToggle: { model.panicToggle(side: side) },
+            onNudgePhase: { direction, modifiers in
+                let tier = BeatgridNudgeTier(modifiers: modifiers)
+                let delta = Double(direction) * tier.phaseStepSecs
+                model.nudgeBeatGridPhase(side, deltaSecs: delta, tier: tier)
+            },
+            onNudgeBpm: { direction, modifiers in
+                let tier = BeatgridNudgeTier(modifiers: modifiers)
+                let delta = Double(direction) * tier.bpmStep
+                model.nudgeBeatGridBpm(side, deltaBpm: delta, tier: tier)
+            },
+            onMarkDownbeat: {
+                model.markDownbeat(side)
+            })
     }
 
     // MARK: - Waveform region
@@ -306,7 +324,12 @@ struct PerformanceView: View {
                     orientation: orientation,
                     scrubHandler: scrubHandler(side: side),
                     continuouslyRendering:
-                        deckState.isPlaying || model.scratchingDeck == side)
+                        deckState.isPlaying || model.scratchingDeck == side,
+                    seekGeneration: deckState.seekGeneration,
+                    peaksGeneration: deckState.peaksGeneration,
+                    timeAxisZoom: model.engineMode == .prep
+                        ? WaveformRenderer.prepModeTimeAxisZoom
+                        : 1.0)
                     .background(DubColor.surface0)
             } else {
                 idlePane(side: side)
@@ -413,22 +436,10 @@ struct PerformanceView: View {
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 DubColor.surface0
-                Group {
-                    switch orientation {
-                    case .vertical:
-                        Rectangle()
-                            .fill(DubColor.deckTint(side).opacity(0.35))
-                            .frame(width: geo.size.width, height: 1)
-                            .offset(y: geo.size.height
-                                * CGFloat(WaveformRenderer.pastRegionFraction))
-                    case .horizontal:
-                        Rectangle()
-                            .fill(DubColor.deckTint(side).opacity(0.35))
-                            .frame(width: 1, height: geo.size.height)
-                            .offset(x: geo.size.width
-                                * CGFloat(WaveformRenderer.pastRegionFraction))
-                    }
-                }
+                PlayheadMarker(
+                    orientation: orientation,
+                    size: geo.size,
+                    subdued: true)
                 VStack(spacing: DubSpacing.sm) {
                     Text(side.label)
                         .font(DubFont.caps)
@@ -510,6 +521,9 @@ private struct DeckDropTarget: ViewModifier {
 }
 
 #Preview("Performance — idle") {
-    PerformanceView(model: WaveformAppModel(), openPreferences: {})
+    PerformanceView(
+        model: WaveformAppModel(),
+        openPreferences: {},
+        openAbout: {})
         .frame(width: 1440, height: 900)
 }

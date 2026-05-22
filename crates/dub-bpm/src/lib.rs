@@ -53,6 +53,7 @@
 mod beats;
 mod confidence;
 mod estimator;
+mod octave_profile;
 mod offline;
 mod onset;
 mod stream;
@@ -60,14 +61,18 @@ pub mod synthetic;
 mod tempo;
 mod tracker;
 
-pub use beats::{analyze_beat_grid, BeatGrid};
+pub use beats::{
+    analyze_beat_grid, analyze_beat_grid_with_profile, latch_beat_grid_at_downbeat,
+    median_bpm_from_beats, uniform_beats, BeatGrid,
+};
 pub use confidence::{
     ConfidenceTracker, TrackerEvent, TrackerState, LOCK_CONSECUTIVE, LOCK_THRESHOLD,
     LOCK_TOLERANCE_BPM, LOST_LOCKED_CONSECUTIVE, LOST_TENTATIVE_CONSECUTIVE, REJECT_TOLERANCE_BPM,
     TENTATIVE_THRESHOLD,
 };
 pub use estimator::{BpmEstimator, BpmEstimatorError};
-pub use offline::{analyze_bpm, analyze_bpm_with_range, AnalysisError};
+pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
+pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};
 pub use stream::BpmStream;
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
 

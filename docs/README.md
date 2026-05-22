@@ -12,6 +12,22 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 - `LICENSE-DEPENDENCIES.md` is the source of truth for dependency licenses and
   binary attribution.
 
+## Human-facing HTML views (read-only, optional)
+
+`docs/html/` holds an HTML dashboard generated from the Markdown sources for
+human reading and sharing. Open `docs/html/index.html` in a browser. **These
+are not the source of truth and AI agents should not load them**: agents read
+the Markdown directly (cheaper, anchorable, single source). Refresh manually
+when the Markdown diverges.
+
+| View | Backs the Markdown |
+| --- | --- |
+| `html/index.html` | Project landing + non-negotiables + doc routing card |
+| `html/architecture.html` | `ARCHITECTURE.md` (visual crate graph, RT-safety layers, messaging) |
+| `html/roadmap.html` | `PRD.md` §12 + `SHIPPED.md` TOC (milestone timeline) |
+| `html/schema.html` | `LIBRARY-SCHEMA.md` (interactive ER diagram + table reference) |
+| `html/backlog.html` | `UI-BACKLOG.md` (kanban with filter chips) |
+
 ## Load By Task
 
 | Task | Read |
@@ -40,3 +56,8 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 
 When adding a new doc, update this routing guide in the same change. When a
 backlog item ships, either remove it or mark it fixed with the shipped anchor.
+When the Markdown source of an HTML view in `docs/html/` changes in a way that
+materially alters the view (new milestone, new schema table, retired backlog
+item, new architecture diagram), refresh the corresponding HTML by re-reading
+the source and updating the static page. HTML refresh is manual; the Markdown
+remains canonical.

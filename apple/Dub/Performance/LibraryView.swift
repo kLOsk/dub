@@ -64,22 +64,94 @@ extension LibraryTrack {
     var titleSortKey:    String { title ?? "" }
     var artistSortKey:   String { artist ?? "" }
     var albumSortKey:    String { album ?? "" }
+    var genreSortKey:    String { genre ?? "" }
+    var sourceSortKey:   String { source }
     /// BPM sort: missing values pinned past every real BPM in
     /// either direction so they collect at one end of the table
     /// rather than punching holes through the middle. `Double`
     /// `.infinity` is the canonical "biggest plausible value"
     /// sentinel.
     var bpmSortKey:      Double { bpm ?? .infinity }
-    var durationSortKey: UInt32 { durationMs }
+    /// Unknown imported duration is marshalled as `0` until lazy
+    /// analysis measures the file. Sort unknowns after real tracks.
+    var durationSortKey: UInt32 { durationMs == 0 ? UInt32.max : durationMs }
     var yearSortKey:     Int32  { year ?? Int32.max }
+    var keySortKey:      String { key ?? "" }
     /// M11d.5 comment column. Missing values fold to `""` so
     /// header-click sort puts unannotated tracks first, matching
     /// the title / artist sort behaviour.
     var commentSortKey:  String { comment ?? "" }
+    var versionTokensSortKey: String { versionTokens ?? "" }
+    var composerSortKey: String { composer ?? "" }
+    var trackNumberSortKey: Int32 { trackNumber ?? Int32.max }
 }
 
-private enum TrackSortColumn: Hashable {
-    case artist, title, bpm, comment
+// MARK: - Configurable library columns (PRD §8.5.3.1 lite)
+
+/// Display + sort identity for a library browser column. Artist
+/// and title are always shown; the trailing set is user-configurable
+/// via header right-click and persisted in `@AppStorage`.
+private enum LibraryColumnField: String, CaseIterable, Identifiable {
+    case artist
+    case title
+    case duration
+    case bpm
+    case album
+    case genre
+    case year
+    case key
+    case comment
+    case composer
+    case trackNumber
+    case versionTokens
+    case source
+
+    var id: String { rawValue }
+
+    /// Always pinned left; not toggleable from the column picker.
+    var isFixed: Bool {
+        self == .artist || self == .title
+    }
+
+    static let fixedPrefix: [LibraryColumnField] = [.artist, .title]
+
+    /// Default trailing columns: Length before BPM (user request).
+    static let defaultTrailing: [LibraryColumnField] = [.duration, .bpm, .comment]
+
+    /// Columns the user can show/hide via header right-click.
+    static let configurable: [LibraryColumnField] = [
+        .duration, .bpm, .album, .genre, .year, .key,
+        .comment, .composer, .trackNumber, .versionTokens, .source,
+    ]
+
+    var pickerCategory: String {
+        switch self {
+        case .artist, .title, .source, .versionTokens:
+            return "Library"
+        case .album, .genre, .year, .comment, .composer, .trackNumber:
+            return "ID3 metadata"
+        case .duration, .bpm, .key:
+            return "Analysis"
+        }
+    }
+
+    var headerLabel: String {
+        switch self {
+        case .artist: return "Artist"
+        case .title: return "Title"
+        case .duration: return "Length"
+        case .bpm: return "BPM"
+        case .album: return "Album"
+        case .genre: return "Genre"
+        case .year: return "Year"
+        case .key: return "Key"
+        case .comment: return "Comment"
+        case .composer: return "Composer"
+        case .trackNumber: return "Track #"
+        case .versionTokens: return "Version"
+        case .source: return "Source"
+        }
+    }
 }
 
 /// Sections in the left-hand source tree per PRD §8.5.1.
@@ -179,6 +251,41 @@ struct LibraryView: View {
     /// the user has set stick").
     @AppStorage("libraryKeyNotationMode") private var keyNotationMode: KeyNotationMode = .camelot
 
+    /// Visible column order (comma-separated raw values). Includes
+    /// Artist + Title; user-reorderable via header drag (PRD §8.5.3.1).
+    @AppStorage("libraryVisibleColumns") private var visibleColumnsStorage: String =
+        "artist,title,duration,bpm,comment"
+
+    /// Per-column widths keyed by `LibraryColumnField.rawValue` JSON.
+    @AppStorage("libraryColumnWidths") private var columnWidthsStorage: String = ""
+
+    /// In-progress resize width for one column. Header and row cells
+    /// both use this preview so the table tracks the resize live.
+    @State private var columnResizePreview: (field: LibraryColumnField, width: CGFloat)?
+
+    /// Screen-space drag origin. Lives on `LibraryView`, not on the
+    /// resize handle, so it survives header `NSHostingView` rebuilds
+    /// while dragging. Width is derived from this anchor plus the
+    /// current global X — not from `DragGesture` translation in the
+    /// handle's local space (the handle moves when the column grows,
+    /// which was causing ~1/3 travel and left-right jitter).
+    @State private var columnResizeDragOrigin: (
+        field: LibraryColumnField,
+        width: CGFloat,
+        globalX: CGFloat
+    )?
+
+    /// Header drag-to-reorder (PRD §8.5.3.1). Global frames come from
+    /// `ColumnHeaderFramesKey` so hit-testing survives horizontal scroll.
+    @State private var columnReorderDrag: LibraryColumnField?
+    @State private var columnReorderDropTarget: LibraryColumnField?
+    @State private var columnReorderInsertBefore: Bool = true
+    /// Computed drop result while dragging. Rows do not use this
+    /// until mouse-up, which keeps column reordering cheap even for
+    /// large `LazyVStack` listings.
+    @State private var columnReorderPendingOrder: [LibraryColumnField]?
+    @State private var columnHeaderFrames: [LibraryColumnField: CGRect] = [:]
+
     /// Current search input. Empty string → show the source's
     /// natural listing (no search filter). The PRD §8.5.4
     /// substring rule says "AND across whitespace-separated
@@ -199,15 +306,27 @@ struct LibraryView: View {
     /// Client-side sort column + direction. Drives `sortOrder`
     /// which feeds `sortedTracks`. Empty `activeSortColumn` preserves
     /// the FFI's natural order (Recently Played / Just Imported).
-    @State private var activeSortColumn: TrackSortColumn? = .title
+    @State private var activeSortColumn: LibraryColumnField? = .title
     @State private var sortAscending: Bool = true
     @State private var sortOrder: [KeyPathComparator<LibraryTrack>] = [
         KeyPathComparator(\.titleSortKey, order: .forward),
     ]
 
-    /// Currently selected row id (canonical UUID). Kept in sync with
-    /// `model.selectedLibraryTrackId` via `onChange`.
-    @State private var selectedTrackId: LibraryTrack.ID? = nil
+    /// Currently selected row ids (canonical UUIDs). Cmd+click toggles
+    /// membership; Shift+click selects a contiguous range in the
+    /// current sort order. The primary id drives Space-load.
+    @State private var selectedTrackIds: Set<String> = []
+
+    /// Anchor for Shift+click range selection in the current sort order.
+    @State private var selectionAnchorId: String? = nil
+
+    /// Primary selected row for Space-load + model sync.
+    private var primarySelectedTrackId: String? {
+        if let anchor = selectionAnchorId, selectedTrackIds.contains(anchor) {
+            return anchor
+        }
+        return selectedTrackIds.sorted().first
+    }
 
     /// Drives a minimal keyboard scroll — set only by ↑/↓, never
     /// on mouse click (centering the selection was the huge header
@@ -275,6 +394,10 @@ struct LibraryView: View {
             // Preserve selection — the rows haven't moved, the
             // user shouldn't lose their Space-load target.
             refreshTracks(preserveSelection: true)
+        }
+        .onChange(of: model.libraryRowAnalysisUpdate) { update in
+            guard let update else { return }
+            applyAnalysisUpdate(update)
         }
         .sheet(isPresented: $showRelocateSheet) {
             RelocateSheet(model: model, isPresented: $showRelocateSheet)
@@ -485,73 +608,297 @@ struct LibraryView: View {
     /// arrow-key-style selection changes.
     private var trackList: some View {
         VStack(spacing: 0) {
-            trackListHeader
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(sortedTracks) { track in
-                            trackRow(for: track)
-                                .id(track.id)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-                .onChange(of: keyboardScrollTarget) { targetId in
-                    guard let targetId else { return }
-                    let anchor = keyboardScrollDelta > 0
-                        ? UnitPoint(x: 0.5, y: 0.92)
-                        : UnitPoint(x: 0.5, y: 0.08)
-                    proxy.scrollTo(targetId, anchor: anchor)
-                    keyboardScrollTarget = nil
-                }
-            }
+            LibraryTableScrollContainer(
+                tableWidth: tableContentWidth,
+                columnOrderKey: visibleColumns.map(\.rawValue).joined(separator: ","),
+                headerStateKey: columnReorderHeaderStateKey,
+                selectedTrackIds: selectedTrackIds,
+                header: AnyView(trackListHeader),
+                rows: AnyView(trackRowsStack),
+                scrollToTrackId: keyboardScrollTarget,
+                scrollDelta: keyboardScrollDelta,
+                trackIds: sortedTracks.map(\.id),
+                onScrollHandled: { keyboardScrollTarget = nil }
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
             LibraryArrowKeyView(
-                selectedTrackId: $selectedTrackId,
+                selectedTrackIds: $selectedTrackIds,
+                selectionAnchorId: $selectionAnchorId,
                 trackIds: sortedTracks.map(\.id),
                 onArrowNavigate: { trackId, delta in
                     keyboardScrollDelta = delta
                     keyboardScrollTarget = trackId
-                })
+                },
+                onSelectionChanged: syncModelPrimarySelection)
+            .allowsHitTesting(false)
         )
-        .onChange(of: selectedTrackId) { newId in
-            if let trackId = newId {
-                let snapshot = tracks.first(where: { $0.id == trackId })
-                model.selectLibraryTrack(trackId, snapshot: snapshot)
-            } else {
-                model.selectedLibraryTrackId = nil
-                model.selectedLibraryTrack = nil
+        .onChange(of: selectedTrackIds) { _ in
+            syncModelPrimarySelection()
+        }
+    }
+
+    private var trackRowsStack: some View {
+        LazyVStack(spacing: 0) {
+            ForEach(sortedTracks) { track in
+                trackRow(for: track)
+                    .id(track.id)
             }
         }
+    }
+
+    /// Changes when the header-only reorder affordance changes.
+    /// The scroll container uses this to refresh only the sticky
+    /// header while a column is being dragged, leaving the row host
+    /// alone until the drop commits.
+    private var columnReorderHeaderStateKey: String {
+        [
+            columnReorderDrag?.rawValue ?? "",
+            columnReorderDropTarget?.rawValue ?? "",
+            columnReorderInsertBefore ? "before" : "after",
+        ].joined(separator: "|")
+    }
+
+    /// Gutter + columns + horizontal padding. Header and rows share
+    /// this width, including the in-progress resize preview.
+    private var tableContentWidth: CGFloat {
+        let columnSum = visibleColumns.map { columnWidth($0) }.reduce(0, +)
+        return 36 + columnSum + DubSpacing.lg * 2
     }
 
     private var trackListHeader: some View {
         HStack(spacing: 0) {
             Color.clear.frame(width: 36)
-            sortHeader("Artist", column: .artist)
-                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
-            sortHeader("Title", column: .title)
-                .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
-            sortHeader("BPM", column: .bpm)
-                .frame(width: 60, alignment: .leading)
-            sortHeader("Comment", column: .comment)
-                .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .trailing) {
+                    columnHeaderDivider
+                }
+            ForEach(visibleColumns) { field in
+                resizableColumnHeader(for: field)
+            }
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, 2)
         .frame(height: 22)
+        .frame(width: tableContentWidth, alignment: .leading)
         .background(DubColor.surface1)
+        .contentShape(Rectangle())
+        .contextMenu {
+            libraryColumnContextMenu()
+        }
         .overlay(alignment: .bottom) {
             Rectangle().fill(DubColor.divider).frame(height: 1)
         }
+        .onPreferenceChange(ColumnHeaderFramesKey.self) { columnHeaderFrames = $0 }
     }
 
-    private func sortHeader(_ label: String, column: TrackSortColumn) -> some View {
-        let isActive = activeSortColumn == column
+    private func resizableColumnHeader(for field: LibraryColumnField) -> some View {
+        let width = columnWidth(field)
+        let isReorderSource = columnReorderDrag == field
+        let isReorderTarget = columnReorderDropTarget == field
+            && columnReorderDrag != nil
+            && columnReorderDrag != field
+        return ZStack(alignment: .leading) {
+            sortHeaderContent(for: field)
+                .padding(.leading, LibraryColumnLayout.columnLeadingInset)
+                .frame(
+                    width: max(0, width - LibraryColumnLayout.resizeHandleTotalWidth),
+                    alignment: .leading
+                )
+                .padding(.trailing, LibraryColumnLayout.resizeHandleTotalWidth)
+                .simultaneousGesture(columnReorderGesture(for: field))
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                LibraryColumnResizeHandle(
+                    onDragChanged: { startX, locationX in
+                        columnResizeLive(
+                            field: field,
+                            dragStartGlobalX: startX,
+                            locationGlobalX: locationX)
+                    },
+                    onDragEnded: { startX, locationX in
+                        endColumnResize(
+                            field: field,
+                            dragStartGlobalX: startX,
+                            locationGlobalX: locationX)
+                    }
+                )
+            }
+        }
+        .frame(width: width, alignment: .leading)
+        .frame(maxHeight: .infinity)
+        .opacity(isReorderSource ? 0.72 : 1)
+        .overlay {
+            RoundedRectangle(cornerRadius: 3)
+                .stroke(
+                    isReorderSource
+                        ? DubColor.deckATint
+                        : .clear,
+                    lineWidth: 2
+                )
+                .padding(1)
+        }
+        .background(
+            isReorderSource
+                ? DubColor.deckATint.opacity(0.10)
+                : Color.clear
+        )
+        .overlay(alignment: .trailing) {
+            columnHeaderDivider
+        }
+        .overlay(alignment: columnReorderInsertBefore ? .leading : .trailing) {
+            if isReorderTarget {
+                Rectangle()
+                    .fill(DubColor.deckATint)
+                    .frame(width: 3)
+                    .shadow(color: DubColor.deckATint.opacity(0.5), radius: 2)
+            }
+        }
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: ColumnHeaderFramesKey.self,
+                    value: [field: proxy.frame(in: .global)]
+                )
+            }
+        )
+        .contentShape(Rectangle())
+        .contextMenu {
+            libraryColumnContextMenu()
+        }
+    }
+
+    /// User-ordered visible columns. Artist + Title are always present
+    /// but may be swapped relative to each other (PRD §8.5.3.1).
+    private var visibleColumns: [LibraryColumnField] {
+        let raw = visibleColumnsStorage
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        var parsed = raw.compactMap { LibraryColumnField(rawValue: $0) }
+        if parsed.isEmpty {
+            parsed = LibraryColumnField.fixedPrefix + LibraryColumnField.defaultTrailing
+        }
+        // Migrate older trailing-only storage (`duration,bpm,…`).
+        if !parsed.contains(.artist) || !parsed.contains(.title) {
+            parsed = LibraryColumnField.fixedPrefix + parsed.filter { !$0.isFixed }
+        }
+        var seen = Set<String>()
+        parsed = parsed.filter { seen.insert($0.rawValue).inserted }
+        for fixed in LibraryColumnField.fixedPrefix where !parsed.contains(fixed) {
+            parsed.insert(fixed, at: 0)
+        }
+        return parsed
+    }
+
+    private func persistColumnOrder(_ columns: [LibraryColumnField]) {
+        var cols = columns
+        for fixed in LibraryColumnField.fixedPrefix where !cols.contains(fixed) {
+            cols.insert(fixed, at: 0)
+        }
+        visibleColumnsStorage = cols.map(\.rawValue).joined(separator: ",")
+    }
+
+    private func setColumnVisibility(_ field: LibraryColumnField, visible: Bool) {
+        guard !field.isFixed else { return }
+        var cols = visibleColumns
+        let isVisible = cols.contains(field)
+        if visible {
+            guard !isVisible else { return }
+            cols.append(field)
+            persistColumnOrder(cols)
+        } else {
+            let removable = cols.filter { !$0.isFixed }
+            guard isVisible, removable.count > 1 else { return }
+            cols.removeAll { $0 == field }
+            if activeSortColumn == field {
+                activeSortColumn = nil
+                sortOrder = []
+            }
+            persistColumnOrder(cols)
+        }
+    }
+
+    private func columnVisibilityBinding(_ field: LibraryColumnField) -> Binding<Bool> {
+        Binding(
+            get: { visibleColumns.contains(field) },
+            set: { setColumnVisibility(field, visible: $0) }
+        )
+    }
+
+    private func columnReorderGesture(for field: LibraryColumnField) -> some Gesture {
+        DragGesture(minimumDistance: 8, coordinateSpace: .global)
+            .onChanged { value in
+                guard columnResizeDragOrigin == nil else { return }
+                if columnReorderDrag == nil {
+                    columnReorderDrag = field
+                    columnReorderPendingOrder = visibleColumns
+                }
+                guard let source = columnReorderDrag else { return }
+                if let hit = columnHit(atGlobalX: value.location.x) {
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        columnReorderDropTarget = hit.field
+                        columnReorderInsertBefore = hit.insertBefore
+                        columnReorderPendingOrder = previewColumnOrder(
+                            moving: source,
+                            over: hit.field,
+                            insertBefore: hit.insertBefore
+                        )
+                    }
+                }
+            }
+            .onEnded { _ in
+                defer {
+                    columnReorderDrag = nil
+                    columnReorderDropTarget = nil
+                    columnReorderPendingOrder = nil
+                }
+                guard columnResizeDragOrigin == nil,
+                      let order = columnReorderPendingOrder,
+                      order != visibleColumns
+                else { return }
+                persistColumnOrder(order)
+            }
+    }
+
+    private func columnHit(atGlobalX x: CGFloat) -> (
+        field: LibraryColumnField,
+        insertBefore: Bool
+    )? {
+        for (field, frame) in columnHeaderFrames {
+            guard frame.minX <= x, x <= frame.maxX else { continue }
+            return (field, x < frame.midX)
+        }
+        return nil
+    }
+
+    private func previewColumnOrder(
+        moving source: LibraryColumnField,
+        over target: LibraryColumnField,
+        insertBefore: Bool
+    ) -> [LibraryColumnField] {
+        var cols = visibleColumns
+        guard let fromIdx = cols.firstIndex(of: source) else { return cols }
+        guard source != target else { return cols }
+        let moved = cols.remove(at: fromIdx)
+        guard var toIdx = cols.firstIndex(of: target) else {
+            cols.append(moved)
+            return cols
+        }
+        if !insertBefore {
+            toIdx += 1
+        }
+        toIdx = min(max(0, toIdx), cols.count)
+        cols.insert(moved, at: toIdx)
+        return cols
+    }
+
+    private func sortHeaderContent(for field: LibraryColumnField) -> some View {
+        let label = field == .key ? keyColumnHeader : field.headerLabel
+        let isActive = activeSortColumn == field
         return Button {
-            toggleSort(column)
+            toggleSort(field)
         } label: {
             HStack(spacing: 3) {
                 Text(label.uppercased())
@@ -562,12 +909,59 @@ struct LibraryView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(DubColor.textSecondary)
                 }
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
-    private func toggleSort(_ column: TrackSortColumn) {
+    @ViewBuilder
+    private func libraryColumnContextMenu() -> some View {
+        columnVisibilityPicker()
+        if visibleColumns.contains(.key) {
+            Divider()
+            Button("Toggle Key Notation (\(keyNotationMode == .camelot ? "Musical" : "Camelot"))") {
+                keyNotationMode = keyNotationMode.toggled
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func columnVisibilityPicker() -> some View {
+        Section("Fixed") {
+            Toggle("Artist", isOn: .constant(true))
+                .toggleStyle(.checkbox)
+                .disabled(true)
+            Toggle("Title", isOn: .constant(true))
+                .toggleStyle(.checkbox)
+                .disabled(true)
+        }
+        ForEach(columnPickerCategories, id: \.self) { category in
+            Section(category) {
+                ForEach(LibraryColumnField.configurable.filter { $0.pickerCategory == category }) { candidate in
+                    Toggle(isOn: columnVisibilityBinding(candidate)) {
+                        Text(candidate.headerLabel)
+                    }
+                    .toggleStyle(.checkbox)
+                }
+            }
+        }
+    }
+
+    private var columnPickerCategories: [String] {
+        ["Analysis", "ID3 metadata", "Library"]
+    }
+
+    private var columnHeaderDivider: some View {
+        Rectangle()
+            .fill(DubColor.divider)
+            .frame(width: 1)
+            .frame(maxHeight: .infinity)
+    }
+
+    private func toggleSort(_ column: LibraryColumnField) {
         if activeSortColumn == column {
             if sortAscending {
                 sortAscending = false
@@ -596,77 +990,309 @@ struct LibraryView: View {
             sortOrder = [KeyPathComparator(\.artistSortKey, order: order)]
         case .title:
             sortOrder = [KeyPathComparator(\.titleSortKey, order: order)]
+        case .duration:
+            sortOrder = [KeyPathComparator(\.durationSortKey, order: order)]
         case .bpm:
             sortOrder = [KeyPathComparator(\.bpmSortKey, order: order)]
+        case .album:
+            sortOrder = [KeyPathComparator(\.albumSortKey, order: order)]
+        case .genre:
+            sortOrder = [KeyPathComparator(\.genreSortKey, order: order)]
+        case .year:
+            sortOrder = [KeyPathComparator(\.yearSortKey, order: order)]
+        case .key:
+            sortOrder = [KeyPathComparator(\.keySortKey, order: order)]
         case .comment:
             sortOrder = [KeyPathComparator(\.commentSortKey, order: order)]
+        case .versionTokens:
+            sortOrder = [KeyPathComparator(\.versionTokensSortKey, order: order)]
+        case .source:
+            sortOrder = [KeyPathComparator(\.sourceSortKey, order: order)]
+        case .composer:
+            sortOrder = [KeyPathComparator(\.composerSortKey, order: order)]
+        case .trackNumber:
+            sortOrder = [KeyPathComparator(\.trackNumberSortKey, order: order)]
         }
     }
 
+    private func defaultColumnWidth(_ field: LibraryColumnField) -> CGFloat {
+        switch field {
+        case .artist: return 120
+        case .title: return 180
+        case .duration: return 52
+        case .bpm: return 56
+        case .year: return 48
+        case .key: return 56
+        case .comment, .album, .genre, .versionTokens, .source: return 140
+        case .composer: return 120
+        case .trackNumber: return 52
+        }
+    }
+
+    private var parsedColumnWidths: [String: CGFloat] {
+        guard let data = columnWidthsStorage.data(using: .utf8),
+              let dict = try? JSONDecoder().decode([String: CGFloat].self, from: data)
+        else {
+            return [:]
+        }
+        return dict
+    }
+
+    private func storedColumnWidth(_ field: LibraryColumnField) -> CGFloat {
+        let stored = parsedColumnWidths[field.rawValue]
+        let width = stored ?? defaultColumnWidth(field)
+        return clampColumnWidth(width)
+    }
+
+    private func columnWidth(_ field: LibraryColumnField) -> CGFloat {
+        if let preview = columnResizePreview, preview.field == field {
+            return preview.width
+        }
+        return storedColumnWidth(field)
+    }
+
+    private func clampColumnWidth(_ width: CGFloat) -> CGFloat {
+        min(max(width, LibraryColumnLayout.minWidth), LibraryColumnLayout.maxWidth)
+    }
+
+    private func columnResizeLive(
+        field: LibraryColumnField,
+        dragStartGlobalX: CGFloat,
+        locationGlobalX: CGFloat
+    ) {
+        if columnResizeDragOrigin?.field != field {
+            columnResizeDragOrigin = (field, storedColumnWidth(field), dragStartGlobalX)
+        }
+        guard let origin = columnResizeDragOrigin, origin.field == field else { return }
+        columnResizePreview = (
+            field,
+            clampColumnWidth(origin.width + locationGlobalX - origin.globalX)
+        )
+    }
+
+    private func endColumnResize(
+        field: LibraryColumnField,
+        dragStartGlobalX: CGFloat,
+        locationGlobalX: CGFloat
+    ) {
+        if columnResizeDragOrigin?.field != field {
+            columnResizeDragOrigin = (field, storedColumnWidth(field), dragStartGlobalX)
+        }
+        guard let origin = columnResizeDragOrigin, origin.field == field else {
+            columnResizeDragOrigin = nil
+            columnResizePreview = nil
+            return
+        }
+        persistColumnWidth(
+            field,
+            to: origin.width + locationGlobalX - origin.globalX
+        )
+        columnResizeDragOrigin = nil
+    }
+
+    private func persistColumnWidth(_ field: LibraryColumnField, to width: CGFloat) {
+        let clamped = clampColumnWidth(width)
+        columnResizePreview = nil
+        var dict = parsedColumnWidths
+        dict[field.rawValue] = clamped
+        guard let data = try? JSONEncoder().encode(dict),
+              let encoded = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        columnWidthsStorage = encoded
+    }
+
     @ViewBuilder
-    private func trackRow(for track: LibraryTrack) -> some View {
-        let isSelected = selectedTrackId == track.id
-        let dragURL = libraryDragURL(for: track)
-        HStack(spacing: 0) {
-            rowIndicators(for: track)
-                .frame(width: 36, alignment: .leading)
+    private func columnCell(for field: LibraryColumnField, track: LibraryTrack) -> some View {
+        switch field {
+        case .artist:
             Text(track.artist ?? "—")
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .modifier(DimUnanalyzed(track: track))
-                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+        case .title:
             Text(displayTitle(track))
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textPrimary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .modifier(DimUnanalyzed(track: track))
-                .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+        case .duration:
+            Text(formatDuration(track.durationMs))
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .monospacedDigit()
+        case .bpm:
             Text(formatBpm(track.bpm))
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
                 .monospacedDigit()
-                .modifier(DimUnanalyzed(track: track))
-                .frame(width: 60, alignment: .leading)
+        case .album:
+            Text(track.album ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .genre:
+            Text(track.genre ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .year:
+            Text(track.year.map { String($0) } ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .monospacedDigit()
+        case .key:
+            Text(renderKey(track.key))
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .help(keyTooltip(track.key))
+        case .comment:
             Text(track.comment ?? "—")
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(track.comment ?? "")
-                .modifier(DimUnanalyzed(track: track))
-                .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
+        case .versionTokens:
+            Text(track.versionTokens ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .source:
+            Text(track.source)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .composer:
+            Text(track.composer ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .trackNumber:
+            Text(track.trackNumber.map { String($0) } ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .monospacedDigit()
+        }
+    }
+
+    @ViewBuilder
+    private func trackRow(for track: LibraryTrack) -> some View {
+        let isSelected = selectedTrackIds.contains(track.id)
+        let dragURL = libraryDragURL(for: track)
+        HStack(spacing: 0) {
+            rowIndicators(for: track)
+                .frame(width: 36, alignment: .leading)
+            ForEach(visibleColumns) { field in
+                columnCell(for: field, track: track)
+                    .padding(.leading, LibraryColumnLayout.columnLeadingInset)
+                    .modifier(DimUnanalyzed(track: track))
+                    .frame(width: columnWidth(field), alignment: .leading)
+            }
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.xs)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: tableContentWidth, alignment: .leading)
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .contentShape(Rectangle())
         .if(dragURL != nil) { view in
             view.onDrag {
-                NSItemProvider(object: dragURL! as NSURL)
+                if !selectedTrackIds.contains(track.id) {
+                    selectedTrackIds = [track.id]
+                    selectionAnchorId = track.id
+                    syncModelPrimarySelection()
+                }
+                return NSItemProvider(object: dragURL! as NSURL)
             }
+        }
+        .onTapGesture(count: 1) {
+            handleRowClick(track)
         }
         .contextMenu {
-            Button("Analyze") {
+            let targets = analyzeTargets(for: track)
+            let count = targets.count
+            Button(count > 1 ? "Analyze Selected (\(count))" : "Analyze") {
                 Task { @MainActor in
-                    await model.analyzeTracks([track.id], forceReanalyze: false)
+                    await model.analyzeTracks(targets, forceReanalyze: false)
                 }
             }
             .disabled(model.analysisBatchTotal > 0)
-            Button("Re-analyze") {
+            Button(count > 1 ? "Re-analyze Selected (\(count))" : "Re-analyze") {
                 Task { @MainActor in
-                    await model.analyzeTracks([track.id], forceReanalyze: true)
+                    await model.analyzeTracks(targets, forceReanalyze: true)
                 }
             }
             .disabled(model.analysisBatchTotal > 0)
         }
-        .onTapGesture {
-            NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedTrackId = track.id
+    }
+
+    private func analyzeTargets(for track: LibraryTrack) -> [String] {
+        if selectedTrackIds.contains(track.id), selectedTrackIds.count > 1 {
+            return Array(selectedTrackIds)
         }
+        return [track.id]
+    }
+
+    private func handleRowClick(_ track: LibraryTrack) {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) {
+            if selectedTrackIds.contains(track.id) {
+                selectedTrackIds.remove(track.id)
+                if selectionAnchorId == track.id {
+                    selectionAnchorId = selectedTrackIds.sorted().first
+                }
+            } else {
+                selectedTrackIds.insert(track.id)
+                selectionAnchorId = track.id
+            }
+        } else if flags.contains(.shift) {
+            let anchor = selectionAnchorId ?? primarySelectedTrackId ?? track.id
+            selectRange(from: anchor, to: track.id)
+            selectionAnchorId = track.id
+        } else {
+            selectedTrackIds = [track.id]
+            selectionAnchorId = track.id
+        }
+        syncModelPrimarySelection()
+    }
+
+    private func selectRange(from anchorId: String, to targetId: String) {
+        let ids = sortedTracks.map(\.id)
+        guard let a = ids.firstIndex(of: anchorId),
+              let b = ids.firstIndex(of: targetId)
+        else {
+            selectedTrackIds = [targetId]
+            return
+        }
+        let lo = min(a, b)
+        let hi = max(a, b)
+        selectedTrackIds = Set(ids[lo...hi])
+    }
+
+    private func syncModelPrimarySelection() {
+        if let trackId = primarySelectedTrackId,
+           let snapshot = tracks.first(where: { $0.id == trackId })
+        {
+            model.selectLibraryTrack(trackId, snapshot: snapshot)
+        } else if selectedTrackIds.isEmpty {
+            model.selectedLibraryTrackId = nil
+            model.selectedLibraryTrack = nil
+        }
+    }
+
+    private func applyAnalysisUpdate(_ update: LibraryRowAnalysisUpdate) {
+        guard let idx = tracks.firstIndex(where: { $0.id == update.trackId }) else {
+            return
+        }
+        tracks[idx] = tracks[idx].patchedAfterAnalysis(update)
     }
 
     /// PRD §8.5.3 leftmost-gutter indicators. Order, top to
@@ -741,7 +1367,9 @@ struct LibraryView: View {
     private func navigateToSibling(_ trackId: String) {
         guard tracks.contains(where: { $0.id == trackId }) else { return }
         NSApp.keyWindow?.makeFirstResponder(nil)
-        selectedTrackId = trackId
+        selectedTrackIds = [trackId]
+        selectionAnchorId = trackId
+        syncModelPrimarySelection()
     }
 
     /// Resolve a track's drag URL synchronously. Returns `nil`
@@ -919,10 +1547,11 @@ struct LibraryView: View {
 
     private func formatBpm(_ bpm: Double?) -> String {
         guard let b = bpm, b > 0 else { return "—" }
-        return String(format: "%.1f", b)
+        return String(format: "%.0f", b)
     }
 
     private func formatDuration(_ ms: UInt32) -> String {
+        guard ms > 0 else { return "—" }
         let totalSecs = Int(ms) / 1000
         let minutes = totalSecs / 60
         let seconds = totalSecs % 60
@@ -946,7 +1575,8 @@ struct LibraryView: View {
     private func refreshTracks(preserveSelection: Bool = false) {
         guard model.libraryIsOpen else {
             tracks = []
-            selectedTrackId = nil
+            selectedTrackIds = []
+            selectionAnchorId = nil
             return
         }
         // Switching source / search / library state invalidates the
@@ -959,8 +1589,11 @@ struct LibraryView: View {
         // *should* persist; the rows haven't moved. The caller
         // opts into that via `preserveSelection: true`.
         if !preserveSelection {
-            selectedTrackId = nil
+            selectedTrackIds = []
+            selectionAnchorId = nil
         }
+        let preservedSelection = selectedTrackIds
+        let preservedAnchor = selectionAnchorId
         let source = selectedSource
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let limit = Self.listingLimit
@@ -987,11 +1620,27 @@ struct LibraryView: View {
                     }
                 }
             } catch {
+                let message = error.localizedDescription
+                await MainActor.run {
+                    model.surfaceError("Library refresh failed: \(message)")
+                }
                 rows = []
             }
             await MainActor.run {
                 self.tracks = rows
                 self.isLoading = false
+                if preserveSelection {
+                    let visible = Set(rows.map(\.id))
+                    self.selectedTrackIds = preservedSelection.intersection(visible)
+                    if let anchor = preservedAnchor,
+                       self.selectedTrackIds.contains(anchor)
+                    {
+                        self.selectionAnchorId = anchor
+                    } else {
+                        self.selectionAnchorId = self.selectedTrackIds.sorted().first
+                    }
+                    self.syncModelPrimarySelection()
+                }
                 // Recompute the per-volume reachability cache for
                 // the volumes referenced by the new track set. One
                 // syscall per unique mount point — cheap on a
@@ -1112,6 +1761,290 @@ private extension LibraryView {
     }
 }
 
+private struct LibraryColumnLayout {
+    static let minWidth: CGFloat = 48
+    static let maxWidth: CGFloat = 480
+    /// Interactive hit target on the trailing edge (wider than the
+    /// 1 px divider so the resize cursor is easy to acquire).
+    static let resizeHandleHitWidth: CGFloat = 14
+    /// Extends the hit zone left into the column label area.
+    static let resizeHandleHitPadding: CGFloat = 6
+    static var resizeHandleTotalWidth: CGFloat {
+        resizeHandleHitPadding + resizeHandleHitWidth
+    }
+    /// Breathing room between the column divider (`|`) and the
+    /// header label / row text. Without this the uppercase micro
+    /// headers sit flush against the 1 px rule.
+    static let columnLeadingInset: CGFloat = DubSpacing.sm
+}
+
+private struct ColumnHeaderFramesKey: PreferenceKey {
+    static var defaultValue: [LibraryColumnField: CGRect] = [:]
+    static func reduce(
+        value: inout [LibraryColumnField: CGRect],
+        nextValue: () -> [LibraryColumnField: CGRect]
+    ) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// Drag handle on the trailing edge of a library column header.
+private struct LibraryColumnResizeHandle: View {
+    let onDragChanged: (_ dragStartGlobalX: CGFloat, _ locationGlobalX: CGFloat) -> Void
+    let onDragEnded: (_ dragStartGlobalX: CGFloat, _ locationGlobalX: CGFloat) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: LibraryColumnLayout.resizeHandleHitPadding)
+            Rectangle()
+                .fill(Color.clear)
+                .frame(width: LibraryColumnLayout.resizeHandleHitWidth)
+        }
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { value in
+                        onDragChanged(value.startLocation.x, value.location.x)
+                    }
+                    .onEnded { value in
+                        onDragEnded(value.startLocation.x, value.location.x)
+                    }
+            )
+    }
+}
+
+private enum LibraryRowLayout {
+    static let estimatedHeight: CGFloat = 28
+    static let headerHeight: CGFloat = 22
+}
+
+/// Sticky header + vertically/horizontally scrollable rows. The body
+/// `NSScrollView` owns the horizontal scroller; the header clips and
+/// tracks the body's horizontal offset.
+private struct LibraryTableScrollContainer: NSViewRepresentable {
+    let tableWidth: CGFloat
+    let columnOrderKey: String
+    let headerStateKey: String
+    let selectedTrackIds: Set<String>
+    let header: AnyView
+    let rows: AnyView
+    let scrollToTrackId: String?
+    let scrollDelta: Int
+    let trackIds: [String]
+    let onScrollHandled: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let headerHost = NSHostingView(rootView: header)
+        headerHost.translatesAutoresizingMaskIntoConstraints = false
+
+        let headerWrapper = NSView()
+        headerWrapper.wantsLayer = true
+        headerWrapper.layer?.masksToBounds = true
+        headerWrapper.translatesAutoresizingMaskIntoConstraints = false
+        headerWrapper.addSubview(headerHost)
+
+        let bodyScroll = NSScrollView()
+        bodyScroll.hasVerticalScroller = true
+        bodyScroll.hasHorizontalScroller = true
+        bodyScroll.autohidesScrollers = true
+        bodyScroll.scrollerStyle = .legacy
+        bodyScroll.borderType = .noBorder
+        bodyScroll.drawsBackground = false
+        bodyScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let bodyHost = NSHostingView(rootView: rows)
+        bodyHost.translatesAutoresizingMaskIntoConstraints = false
+        bodyScroll.documentView = bodyHost
+
+        let widthConstraint = headerHost.widthAnchor.constraint(
+            equalToConstant: max(tableWidth, 1))
+
+        NSLayoutConstraint.activate([
+            headerWrapper.heightAnchor.constraint(equalToConstant: LibraryRowLayout.headerHeight),
+            headerHost.leadingAnchor.constraint(equalTo: headerWrapper.leadingAnchor),
+            headerHost.topAnchor.constraint(equalTo: headerWrapper.topAnchor),
+            headerHost.heightAnchor.constraint(equalToConstant: LibraryRowLayout.headerHeight),
+            widthConstraint,
+        ])
+
+        let stack = NSStackView(views: [headerWrapper, bodyScroll])
+        stack.orientation = .vertical
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        headerWrapper.setContentHuggingPriority(.required, for: .vertical)
+        bodyScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        context.coordinator.install(
+            bodyScroll: bodyScroll,
+            headerHost: headerHost,
+            bodyHost: bodyHost,
+            headerWidthConstraint: widthConstraint
+        )
+        context.coordinator.recordSnapshot(
+            tableWidth: tableWidth,
+            columnOrderKey: columnOrderKey,
+            headerStateKey: headerStateKey,
+            selectedTrackIds: selectedTrackIds,
+            trackIds: trackIds)
+        context.coordinator.updateBodyHeight()
+        return stack
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
+        let tableWidthChanged = coordinator.lastTableWidth != tableWidth
+        let tracksChanged = coordinator.lastTrackIds != trackIds
+        let columnsChanged = coordinator.lastColumnOrderKey != columnOrderKey
+        let headerStateChanged = coordinator.lastHeaderStateKey != headerStateKey
+        let selectionChanged = coordinator.lastSelectedTrackIds != selectedTrackIds
+        let bodyPresentationChanged = tracksChanged
+            || tableWidthChanged
+            || columnsChanged
+            || selectionChanged
+
+        if tableWidthChanged || tracksChanged || columnsChanged || headerStateChanged {
+            coordinator.headerHost?.rootView = header
+            coordinator.headerWidthConstraint?.constant = max(tableWidth, 1)
+        }
+
+        if bodyPresentationChanged {
+            coordinator.bodyHost?.rootView = rows
+            coordinator.updateWidths(tableWidth)
+            if tracksChanged {
+                coordinator.updateBodyHeight()
+            }
+        }
+
+        coordinator.recordSnapshot(
+            tableWidth: tableWidth,
+            columnOrderKey: columnOrderKey,
+            headerStateKey: headerStateKey,
+            selectedTrackIds: selectedTrackIds,
+            trackIds: trackIds)
+        coordinator.syncHeaderOffset()
+
+        if let id = scrollToTrackId {
+            coordinator.scrollToTrack(id: id, trackIds: trackIds, delta: scrollDelta)
+            DispatchQueue.main.async {
+                onScrollHandled()
+            }
+        }
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        weak var bodyScroll: NSScrollView?
+        weak var headerHost: NSHostingView<AnyView>?
+        weak var bodyHost: NSHostingView<AnyView>?
+        weak var headerWidthConstraint: NSLayoutConstraint?
+        private var boundsObserver: NSObjectProtocol?
+        fileprivate var lastTableWidth: CGFloat = -1
+        fileprivate var lastColumnOrderKey: String = ""
+        fileprivate var lastHeaderStateKey: String = ""
+        fileprivate var lastSelectedTrackIds: Set<String> = []
+        fileprivate var lastTrackIds: [String] = []
+
+        func recordSnapshot(
+            tableWidth: CGFloat,
+            columnOrderKey: String,
+            headerStateKey: String,
+            selectedTrackIds: Set<String>,
+            trackIds: [String]
+        ) {
+            lastTableWidth = tableWidth
+            lastColumnOrderKey = columnOrderKey
+            lastHeaderStateKey = headerStateKey
+            lastSelectedTrackIds = selectedTrackIds
+            lastTrackIds = trackIds
+        }
+
+        func install(
+            bodyScroll: NSScrollView,
+            headerHost: NSHostingView<AnyView>,
+            bodyHost: NSHostingView<AnyView>,
+            headerWidthConstraint: NSLayoutConstraint
+        ) {
+            self.bodyScroll = bodyScroll
+            self.headerHost = headerHost
+            self.bodyHost = bodyHost
+            self.headerWidthConstraint = headerWidthConstraint
+            bodyScroll.contentView.postsBoundsChangedNotifications = true
+            boundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: bodyScroll.contentView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.syncHeaderOffset()
+            }
+        }
+
+        func uninstall() {
+            if let boundsObserver {
+                NotificationCenter.default.removeObserver(boundsObserver)
+            }
+        }
+
+        func syncHeaderOffset() {
+            guard let bodyScroll, let headerHost else { return }
+            let x = bodyScroll.contentView.bounds.origin.x
+            var frame = headerHost.frame
+            frame.origin.x = -x
+            headerHost.frame = frame
+        }
+
+        func updateWidths(_ tableWidth: CGFloat) {
+            guard let bodyHost else { return }
+            var frame = bodyHost.frame
+            frame.size.width = max(tableWidth, 1)
+            bodyHost.frame = frame
+        }
+
+        func updateBodyHeight() {
+            guard let bodyHost, let bodyScroll else { return }
+            bodyHost.invalidateIntrinsicContentSize()
+            let height = max(bodyHost.fittingSize.height, 1)
+            var frame = bodyHost.frame
+            frame.size.height = height
+            bodyHost.frame = frame
+            bodyScroll.documentView = bodyHost
+        }
+
+        func scrollToTrack(id: String, trackIds: [String], delta: Int) {
+            guard let bodyScroll,
+                  let idx = trackIds.firstIndex(of: id)
+            else { return }
+            let clipView = bodyScroll.contentView
+            let rowY = CGFloat(idx) * LibraryRowLayout.estimatedHeight
+            let viewport = clipView.documentVisibleRect.height
+            var targetY = rowY
+            if delta > 0 {
+                targetY = rowY - viewport * 0.92
+            } else if delta < 0 {
+                targetY = rowY - viewport * 0.08
+            }
+            let maxY = max(0, clipView.documentRect.height - viewport)
+            targetY = min(max(0, targetY), maxY)
+            clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: targetY))
+            bodyScroll.reflectScrolledClipView(clipView)
+        }
+    }
+}
+
 private struct DimUnanalyzed: ViewModifier {
     let track: LibraryTrack
     func body(content: Content) -> some View {
@@ -1140,18 +2073,50 @@ private extension View {
     }
 }
 
+// MARK: - LibraryTrack analysis patch
+
+private extension LibraryTrack {
+    func patchedAfterAnalysis(_ update: LibraryRowAnalysisUpdate) -> LibraryTrack {
+        LibraryTrack(
+            id: id,
+            title: title,
+            artist: artist,
+            album: album,
+            genre: genre,
+            year: year,
+            bpm: update.bpm ?? bpm,
+            key: update.key ?? key,
+            durationMs: durationMs,
+            versionTokens: versionTokens,
+            potentialDuplicateId: potentialDuplicateId,
+            source: source,
+            primaryVolumeUuid: primaryVolumeUuid,
+            primaryVolumeMountPoint: primaryVolumeMountPoint,
+            primaryRelativePath: primaryRelativePath,
+            isAnalyzed: update.isAnalyzed || isAnalyzed,
+            keyDisagreement: keyDisagreement,
+            comment: comment,
+            composer: composer,
+            trackNumber: trackNumber)
+    }
+}
+
 // MARK: - Library arrow-key navigation
 
 /// Local ↑/↓ handler for the library list.
 private struct LibraryArrowKeyView: NSViewRepresentable {
-    @Binding var selectedTrackId: LibraryTrack.ID?
-    let trackIds: [LibraryTrack.ID]
-    var onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+    @Binding var selectedTrackIds: Set<String>
+    @Binding var selectionAnchorId: String?
+    let trackIds: [String]
+    var onArrowNavigate: ((String, Int) -> Void)?
+    var onSelectionChanged: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
-            selectedTrackId: $selectedTrackId,
-            onArrowNavigate: onArrowNavigate)
+            selectedTrackIds: $selectedTrackIds,
+            selectionAnchorId: $selectionAnchorId,
+            onArrowNavigate: onArrowNavigate,
+            onSelectionChanged: onSelectionChanged)
     }
 
     func makeNSView(context: Context) -> NSView {
@@ -1163,6 +2128,7 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.trackIds = trackIds
         context.coordinator.onArrowNavigate = onArrowNavigate
+        context.coordinator.onSelectionChanged = onSelectionChanged
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -1171,17 +2137,23 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
 
     @MainActor
     final class Coordinator {
-        @Binding var selectedTrackId: LibraryTrack.ID?
-        var trackIds: [LibraryTrack.ID] = []
-        var onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+        @Binding var selectedTrackIds: Set<String>
+        @Binding var selectionAnchorId: String?
+        var trackIds: [String] = []
+        var onArrowNavigate: ((String, Int) -> Void)?
+        var onSelectionChanged: () -> Void
         private var monitor: Any?
 
         init(
-            selectedTrackId: Binding<LibraryTrack.ID?>,
-            onArrowNavigate: ((LibraryTrack.ID, Int) -> Void)?
+            selectedTrackIds: Binding<Set<String>>,
+            selectionAnchorId: Binding<String?>,
+            onArrowNavigate: ((String, Int) -> Void)?,
+            onSelectionChanged: @escaping () -> Void
         ) {
-            _selectedTrackId = selectedTrackId
+            _selectedTrackIds = selectedTrackIds
+            _selectionAnchorId = selectionAnchorId
             self.onArrowNavigate = onArrowNavigate
+            self.onSelectionChanged = onSelectionChanged
         }
 
         func install() {
@@ -1209,13 +2181,16 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
 
         private func moveSelection(by delta: Int) -> Bool {
             guard !trackIds.isEmpty else { return false }
+            let primary = selectionAnchorId ?? selectedTrackIds.sorted().first
             let currentIdx: Int
-            if let id = selectedTrackId, let idx = trackIds.firstIndex(of: id) {
+            if let id = primary, let idx = trackIds.firstIndex(of: id) {
                 currentIdx = idx
             } else {
                 let firstId = trackIds[0]
                 NSApp.keyWindow?.makeFirstResponder(nil)
-                selectedTrackId = firstId
+                selectedTrackIds = [firstId]
+                selectionAnchorId = firstId
+                onSelectionChanged()
                 onArrowNavigate?(firstId, delta)
                 return true
             }
@@ -1223,7 +2198,9 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
             guard next != currentIdx else { return false }
             let nextId = trackIds[next]
             NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedTrackId = nextId
+            selectedTrackIds = [nextId]
+            selectionAnchorId = nextId
+            onSelectionChanged()
             onArrowNavigate?(nextId, delta)
             return true
         }

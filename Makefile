@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci app app-release run-app open-app
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci app app-release run-app open-app xcframework
 
 help:
 	@echo "Dub — common targets"
@@ -86,7 +86,27 @@ clean:
 $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj: apple/project.yml
 	./scripts/bootstrap.sh
 
-app: $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
+# The Swift target links against this universal static lib. If any
+# Rust FFI source is newer than it, the Apple build will silently
+# pick up stale Rust behaviour (this exact trap shipped a "library
+# looks empty" bug in M11d once already). Guard with shell `find`
+# so an up-to-date tree pays only a few millisecond stat walk and
+# skips the (slow) cargo + lipo + uniffi-bindgen pipeline.
+XCFRAMEWORK_LIB := $(CURDIR)/apple/DubCore.xcframework/macos-arm64_x86_64/libdub_ffi.a
+
+xcframework:
+	@if [ ! -f "$(XCFRAMEWORK_LIB)" ] \
+	    || [ -n "$$(find crates -name '*.rs' -not -path '*/target/*' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
+	    || [ -n "$$(find crates -name 'Cargo.toml' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
+	    || [ Cargo.toml -nt $(XCFRAMEWORK_LIB) ] \
+	    || [ Cargo.lock -nt $(XCFRAMEWORK_LIB) ]; then \
+	    echo "==> Rust FFI sources changed; rebuilding DubCore.xcframework"; \
+	    ./scripts/build-xcframework.sh; \
+	else \
+	    echo "==> DubCore.xcframework up to date"; \
+	fi
+
+app: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 	@mkdir -p $(APP_BUILD_DIR)
 	xcodebuild build \
 	    -project apple/Dub.xcodeproj \
@@ -123,8 +143,12 @@ run-app: app
 	    pkill -x Dub || true; \
 	    sleep 0.25; \
 	fi
+	@# Re-register with Launch Services so Finder/Dock drop stale icons
+	@# cached against an older copy (Xcode DerivedData, pre-icon builds).
+	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -R "$(APP_BUNDLE)" >/dev/null 2>&1 || true
+	@touch "$(APP_BUNDLE)"
 	@echo "Launching $(APP_BUNDLE)"
-	open $(APP_BUNDLE)
+	open "$(APP_BUNDLE)"
 
 open-app:
 	@if [ -d "$(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)" ]; then \

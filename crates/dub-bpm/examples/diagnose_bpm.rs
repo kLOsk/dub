@@ -34,6 +34,15 @@
 //! cargo run --release --example diagnose_bpm -- --manifest /path/to/corpus.tsv
 //! ```
 //!
+//! Folder sweep (batch diagnosis of every audio file in a directory):
+//!
+//! ```sh
+//! cargo run --release --example diagnose_bpm -- --folder /path/to/DrumnBass
+//! ```
+//!
+//! Set `DUB_BPM_DEBUG=1` to dump per-lag PASS1/PASS2 scoring from
+//! `estimate_tempo` on stderr (single-file / verbose modes only).
+//!
 //! The manifest mode prints per-track pass/fail (±5 % of expected,
 //! halving the detected value when needed to absorb the octave
 //! error we're hunting) and a final aggregate. Exit code is non-zero
@@ -44,7 +53,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use dub_bpm::{analyze_beat_grid, analyze_bpm_with_range, BpmRange};
+use dub_bpm::{
+    analyze_beat_grid, analyze_beat_grid_with_profile, analyze_bpm_with_range,
+    octave_profile_from_label, BpmRange, OctaveProfile,
+};
 use dub_io::Track;
 
 /// Acceptance tolerance for "the detected BPM matches the expected
@@ -70,6 +82,19 @@ fn main() -> ExitCode {
         return run_manifest(Path::new(manifest_path));
     }
 
+    if args[0] == "--folder" {
+        let Some(folder_path) = args.get(1) else {
+            eprintln!("--folder requires a path argument");
+            print_usage();
+            return ExitCode::from(2);
+        };
+        let profile = args
+            .get(2)
+            .map(|label| octave_profile_from_label(label))
+            .unwrap_or(OctaveProfile::Default);
+        return run_folder(Path::new(folder_path), profile);
+    }
+
     let mut failed = false;
     for arg in &args {
         if let Err(err) = diagnose_one(Path::new(arg)) {
@@ -89,8 +114,95 @@ fn print_usage() {
     eprintln!(
         "usage:\n  \
          diagnose_bpm <audio-file> [<audio-file>...]\n  \
-         diagnose_bpm --manifest <corpus.tsv>"
+         diagnose_bpm --manifest <corpus.tsv>\n  \
+         diagnose_bpm --folder <directory> [profile-label]\n\n\
+         env:\n  \
+         DUB_BPM_DEBUG=1  dump per-lag PASS1/PASS2 scoring to stderr"
     );
+}
+
+/// Batch-scan every audio file directly under `folder` (non-recursive)
+/// and print a compact `bpm  conf  filename` table on stdout.
+fn run_folder(folder: &Path, profile: OctaveProfile) -> ExitCode {
+    if !folder.is_dir() {
+        eprintln!("--folder path is not a directory: {}", folder.display());
+        return ExitCode::from(2);
+    }
+
+    let read = match fs::read_dir(folder) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("read_dir {}: {e}", folder.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut paths: Vec<PathBuf> = read
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_audio_file(path))
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        eprintln!("no audio files found in {}", folder.display());
+        return ExitCode::from(2);
+    }
+
+    eprintln!(
+        "scanning {} audio file(s) in {} (profile={profile:?})",
+        paths.len(),
+        folder.display()
+    );
+
+    let mut failed = false;
+    for path in paths {
+        match analyze_folder_row(&path, profile) {
+            Ok(line) => println!("{line}"),
+            Err(err) => {
+                eprintln!("ERROR  {}  ({err})", path.display());
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mp3" | "flac" | "wav" | "aiff" | "aif" | "m4a" | "aac" | "alac"
+            )
+        })
+}
+
+fn analyze_folder_row(
+    path: &Path,
+    profile: OctaveProfile,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let track = Track::load_from_path(path)?;
+    let grid = analyze_beat_grid_with_profile(
+        track.samples(),
+        track.sample_rate(),
+        track.channels(),
+        profile,
+    )?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    Ok(format!(
+        "{:<8.3}  {:<6.4}  {}",
+        grid.bpm, grid.confidence, name
+    ))
 }
 
 /// One-off diagnostic on a single file: dump the picker's verdict

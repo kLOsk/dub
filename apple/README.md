@@ -3,30 +3,23 @@
 This directory hosts the AppKit/SwiftUI shell that consumes the Rust core
 through UniFFI.
 
-## Status: M10.2 — polish (first wave shipped)
+## Status: M11d — library browser + branding
 
-The app opens a 1280×800 window with a real input-device picker, two
-channel fields (`chA` defaults to `1,2`; `chB` empty = single-deck,
-or e.g. `5,6` to wire a second deck), a palette menu
-(Serato-faithful / high-contrast / monochrome), and a Metal-rendered
-multi-colour waveform that scrolls in real time at 60 fps once you
-hit Start. The shader mixes the 8-band perceptual loudness data
-(M9.5b) into RGB — bass → red, mids → green, highs → blue — with
-broadband-RMS luminance preserving the amplitude shape. Clipped
-bars paint solid red; silent stretches drop to a thin neutral
-hairline. When deck B is configured, the waveform area splits
-vertically via `VSplitView` and renders both decks
-independently. The M0.5 `"Dub engine OK · v<version>"` text now
-lives as a thin debug overlay at the bottom of the waveform
-(also includes the current sample rate).
+The app opens a performance window with two deck columns, a library browser,
+Metal waveforms, and a status strip. On cold boot a brief launch splash fades
+out once the engine and library are ready. Click **DUB** in the top-left status
+strip, or choose **Dub → About Dub**, for the About sheet (splash artwork,
+version info, links to the repo and PRD). App icon and splash live in
+`Dub/Assets.xcassets/`.
 
 ## One-shot bootstrap
 
 ```bash
 brew install xcodegen                  # one-time
 ./scripts/bootstrap.sh                 # xcframework + Swift bindings + Xcode project
-open apple/Dub.xcodeproj
-# ⌘R, pick an input, set channels (e.g. 1,2 or 3,4 for SL3), Start.
+make app                               # build Dub.app into apple/build/
+make run-app                           # build + launch
+# Or: open apple/Dub.xcodeproj and ⌘R
 ```
 
 Re-run `./scripts/bootstrap.sh` whenever:
@@ -47,7 +40,11 @@ apple/
 ├── Dub/
 │   ├── DubAppDelegate.swift       AppKit @main lifecycle
 │   ├── MainWindowController.swift NSWindow holding an NSHostingController(MainView)
-│   ├── MainView.swift             SwiftUI: device picker + chA/chB channels + palette menu + Start/Stop + waveform(s)
+│   ├── MainView.swift             SwiftUI shell + WaveformAppModel
+│   ├── About/AboutSheet.swift     About sheet (status-strip wordmark + menu)
+│   ├── About/LaunchSplashOverlay.swift  Cold-boot splash
+│   ├── App/AppNotifications.swift Menu-bar → SwiftUI notification bridge
+│   ├── Assets.xcassets/           AppIcon + AboutSplash image sets
 │   ├── Waveform/
 │   │   ├── Shaders.metal          Vertex (instanced quads) + fragment shaders
 │   │   ├── WaveformRenderer.swift @MainActor Metal renderer (chunks ring, triple-buffered uniforms)

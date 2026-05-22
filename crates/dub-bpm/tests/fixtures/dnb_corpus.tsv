@@ -1,0 +1,21 @@
+path	expected_bpm	profile	notes
+/Users/klos/Music/Music/DrumnBass/Adam F - Brand New Funk Revisited (Bladerunner Reboot).mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Benny L & Shimon - Sharks VIP.mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Chase & Status - Baddadan (extended mix) (feat..mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Chase & Status & Stormzy - Backbone.mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Dj Fresh, Bou & Used - Gold Dust (Bou & Used remix).mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/King Tubby - Burial (Think Tonk Remix) (fea.mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Kutz:Mp3 - Soundboy.mp3	172	default	
+/Users/klos/Music/Music/DrumnBass/Roni Size:Reprazent - Brown Paper Bag (Crissy Criss Plastic Bag instrumental remix).mp3	173	default	
+/Users/klos/Music/Music/DrumnBass/Serum - Heavy & Dark (feat MC Bassman - Serum's VIP).mp3	176	default	
+/Users/klos/Music/Music/DrumnBass/Total Science:S.P.Y. - Gangsta (Watch The Ride remix).mp3	174	default	
+/Users/klos/Music/Music/DrumnBass/Upgrade - Trigga Finga (feat Trigga).mp3	173	default	
+/Users/klos/Music/Music/DrumnBass/Bad Company - Planet Dust.mp3	174	default	half-time false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Benny Page - Turn Down The Lights (Benny Page VIP mix).mp3	174	default	half-time false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Bou - Mankind.mp3	174	default	half-time false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Dj Marky & Xrs - LK (feat. Stamina MC).mp3	174	default	half-time false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Bredren - Evacuation.mp3	174	default	triplet false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Coda - H20.mp3	174	default	triplet false peak; known fail
+/Users/klos/Music/Music/DrumnBass/Benny Page - Crying Out (Serial Killaz remix).mp3	176	default	mixed-tempo edge
+/Users/klos/Music/Music/DrumnBass/Bvnquet X General Levy - OG Reppa.mp3	174	default	ragga-dnb; known fail
+/Users/klos/Music/Music/DrumnBass/Champion, Bushbaby Feat. Killa P - We Multiply.mp3	174	default	ragga-dnb; known fail

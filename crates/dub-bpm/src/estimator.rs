@@ -14,7 +14,7 @@
 
 use crate::onset::OnsetDetector;
 use crate::tempo::estimate_tempo;
-use crate::{BpmEstimate, BpmRange, HOP_SIZE};
+use crate::{BpmEstimate, BpmRange, OctaveProfile, HOP_SIZE};
 
 /// Errors that can occur while constructing a streaming estimator.
 #[derive(Debug, thiserror::Error)]
@@ -113,8 +113,12 @@ impl BpmEstimator {
     ///
     /// [`process`]: Self::process
     pub fn recompute(&mut self) {
-        if let Some(est) = estimate_tempo(self.detector.odf(), self.odf_sample_rate, self.bpm_range)
-        {
+        if let Some(est) = estimate_tempo(
+            self.detector.odf(),
+            self.odf_sample_rate,
+            self.bpm_range,
+            OctaveProfile::Default,
+        ) {
             self.last_estimate = Some(est);
         }
     }

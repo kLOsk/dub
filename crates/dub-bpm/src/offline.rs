@@ -7,7 +7,7 @@
 //! cross-checks itself against in tests — same algorithm internals,
 //! different driving pattern.
 
-use crate::onset::OnsetDetector;
+use crate::octave_profile::OctaveProfile;
 use crate::tempo::estimate_tempo;
 use crate::{BpmEstimate, BpmRange, FRAME_SIZE, HOP_SIZE};
 
@@ -85,7 +85,30 @@ pub fn analyze_bpm(
     sample_rate: u32,
     channels: u8,
 ) -> Result<BpmEstimate, AnalysisError> {
-    analyze_bpm_with_range(samples, sample_rate, channels, BpmRange::DEFAULT)
+    analyze_bpm_with_profile(samples, sample_rate, channels, OctaveProfile::Default)
+}
+
+/// Like [`analyze_bpm`] but applies a genre-derived [`OctaveProfile`]
+/// during pass-2 octave disambiguation (M11c.3d).
+pub fn analyze_bpm_with_profile(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    profile: OctaveProfile,
+) -> Result<BpmEstimate, AnalysisError> {
+    analyze_bpm_with_range_and_profile(samples, sample_rate, channels, BpmRange::DEFAULT, profile)
+        .map(|(est, _)| est)
+}
+
+/// Like [`analyze_bpm_with_range`] but also applies `profile`.
+pub(crate) fn analyze_bpm_with_range_and_profile(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    range: BpmRange,
+    profile: OctaveProfile,
+) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
+    analyze_bpm_with_range_profile_and_odf(samples, sample_rate, channels, range, profile)
 }
 
 /// Like [`analyze_bpm`] but restricts the tempo search to `range`.
@@ -105,40 +128,63 @@ pub fn analyze_bpm_with_range(
     channels: u8,
     range: BpmRange,
 ) -> Result<BpmEstimate, AnalysisError> {
-    analyze_bpm_with_range_and_odf(samples, sample_rate, channels, range).map(|(est, _)| est)
+    analyze_bpm_with_range_and_profile(
+        samples,
+        sample_rate,
+        channels,
+        range,
+        OctaveProfile::Default,
+    )
+    .map(|(est, _)| est)
 }
 
-/// Like [`analyze_bpm_with_range`] but also returns the computed
-/// ODF (the same one the tempo estimator ran on).
-///
-/// Exposed so downstream beat-grid analysis (`beats::analyze_beat_grid`)
-/// can reuse the ODF for phase finding instead of computing it again —
-/// the ODF pass dominates `analyze_bpm`'s cost on real tracks, so
-/// sharing it halves the per-load CPU bill.
-///
-/// `pub(crate)` only — the public surface stays `analyze_bpm` /
-/// `analyze_bpm_with_range`; this is an internal optimisation hook.
-///
-/// # Errors
-///
-/// Same as [`analyze_bpm_with_range`].
+/// Internal hook shared by offline BPM + beat-grid analysis.
+#[allow(dead_code)]
 pub(crate) fn analyze_bpm_with_range_and_odf(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     range: BpmRange,
 ) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
+    analyze_bpm_with_range_profile_and_odf(
+        samples,
+        sample_rate,
+        channels,
+        range,
+        OctaveProfile::Default,
+    )
+}
+
+fn analyze_bpm_with_range_profile_and_odf(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    range: BpmRange,
+    profile: OctaveProfile,
+) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
+    let (estimate, detector) = analyze_bpm_with_range_profile_into_detector(
+        samples,
+        sample_rate,
+        channels,
+        range,
+        profile,
+    )?;
+    Ok((estimate, detector.into_odf()))
+}
+
+fn analyze_bpm_with_range_profile_into_detector(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    range: BpmRange,
+    profile: OctaveProfile,
+) -> Result<(BpmEstimate, crate::onset::OnsetDetector), AnalysisError> {
     if sample_rate == 0 {
         return Err(AnalysisError::ZeroSampleRate);
     }
     if !(1..=2).contains(&channels) {
         return Err(AnalysisError::InvalidChannels(channels));
     }
-    // Validate the interleaved-layout contract before computing
-    // `frames` via integer division. Without this the trailing
-    // unpaired sample of a malformed stereo buffer would be silently
-    // dropped twice (once by `len / channels`, once by
-    // `chunks_exact(2)`) and the caller would never know.
     if !samples.len().is_multiple_of(usize::from(channels)) {
         return Err(AnalysisError::NonInterleavedFrames {
             sample_count: samples.len(),
@@ -165,13 +211,10 @@ pub(crate) fn analyze_bpm_with_range_and_odf(
         });
     }
 
-    let mut detector = OnsetDetector::new(sample_rate);
+    let mut detector = crate::onset::OnsetDetector::new(sample_rate);
     if channels == 1 {
         detector.process(samples);
     } else {
-        // Stereo: downmix on the fly. Allocating a mono Vec is fine —
-        // we're already in an off-RT context (file just loaded; the
-        // streaming path uses BpmEstimator, not this function).
         let mono: Vec<f32> = samples
             .chunks_exact(2)
             .map(|c| 0.5 * (c[0] + c[1]))
@@ -179,13 +222,9 @@ pub(crate) fn analyze_bpm_with_range_and_odf(
         detector.process(&mono);
     }
 
-    let estimate = estimate_tempo(detector.odf(), odf_sr, range).unwrap_or(BpmEstimate::NONE);
-    // Take ownership of the ODF vec without a re-clone. `detector`
-    // is about to be dropped anyway — the explicit destructure
-    // (`let odf = detector.into_odf()`) avoids a redundant copy
-    // of what can be ~50 k f32 samples on a 5-min track.
-    let odf = detector.into_odf();
-    Ok((estimate, odf))
+    let estimate =
+        estimate_tempo(detector.odf(), odf_sr, range, profile).unwrap_or(BpmEstimate::NONE);
+    Ok((estimate, detector))
 }
 
 #[cfg(test)]

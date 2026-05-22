@@ -339,6 +339,21 @@ final class WaveformRenderer: NSObject {
     /// static is the public contract.
     nonisolated public static let pixelsPerDrawnColumn: Int = 2
 
+    /// Prep-mode horizontal waveform shows 20 % more audio than the
+    /// performance default (`timeAxisZoom = 1.0`). Values > 1.0
+    /// divide `pixelsPerDrawnColumn` so more drawn columns fit in
+    /// the same viewport.
+    nonisolated public static let prepModeTimeAxisZoom: Double = 1.2
+
+    /// Effective drawable pixels per drawn column for a given
+    /// time-axis zoom. Values > 1.0 zoom out (more seconds visible).
+    nonisolated public static func effectivePixelsPerDrawnColumn(
+        timeAxisZoom: Double
+    ) -> Double {
+        let zoom = max(1.0, timeAxisZoom)
+        return max(1.0, Double(pixelsPerDrawnColumn) / zoom)
+    }
+
     /// Default broadband samples-per-chunk emitted by `dub-peaks`'s
     /// stream tap (M9.5b). Used for the host-side gesture-→-secs
     /// helper; the actual cadence the renderer uses is captured
@@ -474,6 +489,10 @@ final class WaveformRenderer: NSObject {
     /// Which deck column this renderer belongs to. Drives beat-grid tint.
     var side: DeckSide = .a
 
+    /// Time-axis zoom multiplier. `1.0` = performance default;
+    /// `prepModeTimeAxisZoom` (1.2) shows 20 % more audio in prep.
+    var timeAxisZoom: Double = 1.0
+
     /// When `true`, beat ticks render in the Metal pass after waveform
     /// geometry each frame.
     var beatGridEnabled: Bool = true
@@ -481,13 +500,26 @@ final class WaveformRenderer: NSObject {
     /// Cached beat grid from the engine. Refreshed on peaks-generation
     /// bumps and until `confidence > 0` latches.
     private var cachedBeats: [Double] = []
+    private var cachedBpm: Double = 0
     private var cachedBeatsPerBar: Int = 4
     private var cachedBeatsConfidence: Float = 0
     private var cachedBeatsGeneration: UInt64 = 0
+    private var cachedBeatGridGeneration: UInt64 = 0
 
     /// Countdown between `engine.beatGrid` FFI calls while analysis
     /// is still pending. Avoids cloning the beat `Vec` at 60 Hz.
     private var beatGridFetchCooldown: Int = 0
+
+    private var debugLastFrameLogUptime: TimeInterval = 0
+    private var debugLastVisibleBeatLogUptime: TimeInterval = 0
+    private var debugLastGridSummaryLogUptime: TimeInterval = 0
+    private var debugLastGridStabilityLogUptime: TimeInterval = 0
+    private var debugStableBeatIdx: Int?
+    private var debugStableBeatPixel: Double = 0
+    private var debugStableBeatPlayheadSecs: Double = 0
+    private var debugBeatPixelMaxError: Double = 0
+    private var debugBeatPixelLastError: Double = 0
+    private var debugBeatPixelErrorSamples: Int = 0
 
     /// Frames since the last peak-source swap. Beat-grid Metal
     /// work is skipped briefly so the first post-load scrubs aren't
@@ -637,10 +669,22 @@ final class WaveformRenderer: NSObject {
         samplesPerBandChunk = 512
         peakChunkDurationSecs = 0.0
         cachedBeats = []
+        cachedBpm = 0
         cachedBeatsPerBar = 4
         cachedBeatsConfidence = 0
         cachedBeatsGeneration = 0
+        cachedBeatGridGeneration = 0
         beatGridFetchCooldown = 0
+        debugLastFrameLogUptime = 0
+        debugLastVisibleBeatLogUptime = 0
+        debugLastGridSummaryLogUptime = 0
+        debugLastGridStabilityLogUptime = 0
+        debugStableBeatIdx = nil
+        debugStableBeatPixel = 0
+        debugStableBeatPlayheadSecs = 0
+        debugBeatPixelMaxError = 0
+        debugBeatPixelLastError = 0
+        debugBeatPixelErrorSamples = 0
         framesSinceSourceSwap = 0
         lastBroadbandIngestPhChunk = UInt64.max
         lastBandIngestPhChunk = UInt64.max
@@ -686,6 +730,7 @@ final class WaveformRenderer: NSObject {
         //    otherwise silently no-op and the renderer would keep
         //    drawing stale Thru capture forever.
         let currentGeneration = engine.peaksGeneration(deckIdx: deckIdx)
+        let beatGridGeneration = engine.beatGridGeneration(deckIdx: deckIdx)
         if currentGeneration != lastSeenPeaksGeneration {
             reset()
             lastSeenPeaksGeneration = currentGeneration
@@ -720,17 +765,16 @@ final class WaveformRenderer: NSObject {
         let futurePixels =
             max(0, Int((Double(timeAxisPixels)
                 * (1.0 - WaveformRenderer.pastRegionFraction)).rounded()))
-        // 2× zoom-in: each drawn column spans **two** drawable
-        // pixels along the time axis, so total visible time
-        // halves to ≈ 0.93 s (≈ 2 beats at 128 BPM) and individual
-        // transients double in apparent length on screen — what
-        // the eye registers as a "fat" kick in Serato. The
-        // per-column `chunksPerColumn` aggregation is preserved
-        // (2 raw chunks per drawn column → 1 trapezoid every 2 px,
-        // no sub-pixel comb).
-        let pixelsPerDrawnColumn = 2
-        let drawnAbovePixels = pastPixels / pixelsPerDrawnColumn
-        let drawnBelowPixels = futurePixels / pixelsPerDrawnColumn
+        // Zoom: each drawn column spans `effectivePixelsPerDrawnColumn`
+        // drawable pixels along the time axis. Performance mode uses
+        // the base `pixelsPerDrawnColumn` (= 2); prep mode divides
+        // by `timeAxisZoom` (1.2) so ~20 % more audio is visible.
+        let pixelsPerDrawnColumn =
+            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: timeAxisZoom)
+        let drawnAbovePixels = max(
+            0, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
+        let drawnBelowPixels = max(
+            0, Int((Double(futurePixels) / pixelsPerDrawnColumn).rounded(.down)))
         let agg = Int(WaveformRenderer.chunksPerColumn)
 
         // Playhead chunk + chunks past it. In File mode this is
@@ -830,7 +874,8 @@ final class WaveformRenderer: NSObject {
         }
         if beatGridEnabled || renderSnapshot != nil {
             refreshBeatGridIfNeeded(
-                generation: currentGeneration,
+                peaksGeneration: currentGeneration,
+                beatGridGeneration: beatGridGeneration,
                 hasTrack: pos.hasTrack,
                 mirrorIntoSnapshot: renderSnapshot)
         }
@@ -1040,6 +1085,40 @@ final class WaveformRenderer: NSObject {
         let pastSubChunkOffsetNDC = Float(epsChunks * 0.5 / pastChunksDenom)
         let futureSubChunkOffsetNDC = Float(epsChunks * 1.5 / futureChunksDenom)
 
+        let debugNow = ProcessInfo.processInfo.systemUptime
+        if debugNow - debugLastFrameLogUptime >= 1.0 {
+            debugLastFrameLogUptime = debugNow
+            // #region agent log
+            agentDebugLog(
+                hypothesisId: "H2,H3,H4",
+                location: "WaveformRenderer.swift:draw(in:)",
+                message: "beatgrid frame geometry",
+                data: [
+                    "deckIdx": Int(deckIdx),
+                    "orientation": orientation == .vertical ? "vertical" : "horizontal",
+                    "hasTrack": pos.hasTrack,
+                    "isPlaying": pos.isPlaying,
+                    "playheadSecsUnclamped": pos.playheadSecsUnclamped,
+                    "elapsedSecs": pos.elapsedSecs,
+                    "durationSecs": pos.durationSecs,
+                    "engineSampleRate": Int(engine.sampleRate()),
+                    "peakDurSecs": peakChunkDurationSecs,
+                    "peaksLen": Int(peaksLenGlobal),
+                    "samplesPerPeakChunk": Int(samplesPerPeakChunk),
+                    "timeAxisPixels": timeAxisPixels,
+                    "pixelsPerDrawnColumn": pixelsPerDrawnColumn,
+                    "drawnAbove": drawnAbove,
+                    "drawnBelow": drawnBelow,
+                    "continuousChunkF": continuousChunkF,
+                    "snappedChunkF": Double(playheadChunkSigned),
+                    "epsChunks": epsChunks,
+                    "pastSubChunkOffsetNDC": Double(pastSubChunkOffsetNDC),
+                    "futureSubChunkOffsetNDC": Double(futureSubChunkOffsetNDC),
+                    "zeroPadFits": zeroPadFits
+                ])
+            // #endregion
+        }
+
         // 3. Fill both region slots in the per-frame uniform buffer.
         //
         // Past draw sets `chunksAbovePlayhead = chunksAbove` (> 0).
@@ -1152,6 +1231,7 @@ final class WaveformRenderer: NSObject {
             drawBeatGrid(
                 encoder: encoder,
                 drawableSize: drawableSize,
+                playheadSecs: pos.playheadSecsUnclamped,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
                 drawnBelow: drawnBelow,
@@ -1329,15 +1409,19 @@ final class WaveformRenderer: NSObject {
     // MARK: - Beat grid (B-24 Metal pass)
 
     private func refreshBeatGridIfNeeded(
-        generation: UInt64,
+        peaksGeneration: UInt64,
+        beatGridGeneration: UInt64,
         hasTrack: Bool,
         mirrorIntoSnapshot snapshot: WaveformRenderSnapshot?
     ) {
         let needsRefresh =
-            cachedBeatsGeneration != generation
+            cachedBeatsGeneration != peaksGeneration
+            || cachedBeatGridGeneration != beatGridGeneration
             || (cachedBeatsConfidence == 0 && hasTrack)
         guard needsRefresh else { return }
-        if cachedBeatsGeneration != generation {
+        if cachedBeatsGeneration != peaksGeneration
+            || cachedBeatGridGeneration != beatGridGeneration
+        {
             beatGridFetchCooldown = 0
         } else if beatGridFetchCooldown > 0 {
             beatGridFetchCooldown -= 1
@@ -1346,14 +1430,29 @@ final class WaveformRenderer: NSObject {
         beatGridFetchCooldown = 15
         let grid = engine.beatGrid(deckIdx: deckIdx)
         cachedBeats = grid.beats
+        cachedBpm = grid.bpm
         cachedBeatsPerBar = max(1, Int(grid.beatsPerBar))
         cachedBeatsConfidence = grid.confidence
-        cachedBeatsGeneration = generation
+        cachedBeatsGeneration = peaksGeneration
+        cachedBeatGridGeneration = beatGridGeneration
+        logBeatGridSummary(
+            gridBpm: grid.bpm,
+            beats: grid.beats,
+            beatsPerBar: Int(grid.beatsPerBar),
+            confidence: grid.confidence,
+            peaksGeneration: peaksGeneration,
+            beatGridGeneration: beatGridGeneration)
+        logWholeTrackBeatPeakAlignment(
+            gridBpm: grid.bpm,
+            beats: grid.beats,
+            confidence: grid.confidence,
+            peaksGeneration: peaksGeneration,
+            beatGridGeneration: beatGridGeneration)
         if let snapshot {
             snapshot.beats = cachedBeats
             snapshot.beatsPerBar = cachedBeatsPerBar
             snapshot.beatsConfidence = cachedBeatsConfidence
-            snapshot.beatsGeneration = generation
+            snapshot.beatsGeneration = peaksGeneration
         }
     }
 
@@ -1414,9 +1513,432 @@ final class WaveformRenderer: NSObject {
         return lo
     }
 
+    private func logBeatGridSummary(
+        gridBpm: Double,
+        beats: [Double],
+        beatsPerBar: Int,
+        confidence: Float,
+        peaksGeneration: UInt64,
+        beatGridGeneration: UInt64
+    ) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard confidence > 0 || now - debugLastGridSummaryLogUptime >= 1.0 else { return }
+        debugLastGridSummaryLogUptime = now
+
+        let intervals = zip(beats.dropFirst(), beats).map { next, prev in next - prev }
+        func avg(_ values: ArraySlice<Double>) -> Double {
+            guard !values.isEmpty else { return 0 }
+            return values.reduce(0, +) / Double(values.count)
+        }
+        let firstIntervals = intervals.prefix(16)
+        let lastIntervals = intervals.suffix(16)
+        let firstAvg = avg(firstIntervals)
+        let lastAvg = avg(lastIntervals)
+        let bpmFirst = firstAvg > 0 ? 60.0 / firstAvg : 0
+        let bpmLast = lastAvg > 0 ? 60.0 / lastAvg : 0
+
+        // #region agent log
+        agentDebugLog(
+            hypothesisId: "H1,H3",
+            location: "WaveformRenderer.swift:refreshBeatGridIfNeeded",
+            message: "beatgrid estimator summary",
+            data: [
+                "deckIdx": Int(deckIdx),
+                "gridBpm": gridBpm,
+                "confidence": Double(confidence),
+                "beatsPerBar": beatsPerBar,
+                "beatCount": beats.count,
+                "firstBeats": Array(beats.prefix(8)),
+                "lastBeats": Array(beats.suffix(8)),
+                "firstIntervalAvgSecs": firstAvg,
+                "lastIntervalAvgSecs": lastAvg,
+                "firstIntervalBpm": bpmFirst,
+                "lastIntervalBpm": bpmLast,
+                "intervalBpmDelta": bpmLast - bpmFirst,
+                "peaksGeneration": Int(peaksGeneration),
+                "beatGridGeneration": Int(beatGridGeneration),
+                "peakDurSecs": peakChunkDurationSecs,
+                "peaksLen": Int(lastSeenPeaksLen)
+            ])
+        // #endregion
+    }
+
+    private func logWholeTrackBeatPeakAlignment(
+        gridBpm: Double,
+        beats: [Double],
+        confidence: Float,
+        peaksGeneration: UInt64,
+        beatGridGeneration: UInt64
+    ) {
+        guard confidence > 0,
+              gridBpm > 0,
+              peakChunkDurationSecs > 0,
+              !beats.isEmpty
+        else { return }
+
+        let peakData = engine.peaksExtend(deckIdx: deckIdx, startIdx: 0)
+        let stride = MemoryLayout<PeakChunkLayout>.stride
+        let chunkCount = peakData.count / stride
+        guard chunkCount > 0, peakData.count % stride == 0 else { return }
+
+        let period = 60.0 / gridBpm
+        let windowSecs = min(0.18, max(0.04, period * 0.25))
+        let radius = max(4, Int((windowSecs / peakChunkDurationSecs).rounded()))
+        var offsets: [Double] = []
+        var weighted: [(idx: Int, offset: Double, amp: Double)] = []
+        var boundaryHits = 0
+        var sampleRows: [[String: Any]] = []
+
+        peakData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: PeakChunkLayout.self)
+            else { return }
+
+            for (idx, beatSecs) in beats.enumerated() {
+                let centre = Int((beatSecs / peakChunkDurationSecs).rounded())
+                guard centre >= 0, centre < chunkCount else { continue }
+                let lo = max(0, centre - radius)
+                let hi = min(chunkCount - 1, centre + radius)
+                var bestAmp = -1.0
+                var bestChunk = centre
+                for c in lo...hi {
+                    let p = base[c]
+                    let amp = Double(max(abs(p.minSample), abs(p.maxSample)))
+                    if amp > bestAmp {
+                        bestAmp = amp
+                        bestChunk = c
+                    }
+                }
+                let offsetChunks = bestChunk - centre
+                if abs(offsetChunks) >= radius - 1 {
+                    boundaryHits += 1
+                }
+                let offsetSecs = Double(offsetChunks) * peakChunkDurationSecs
+                offsets.append(offsetSecs)
+                if bestAmp >= 0.05 && abs(offsetChunks) < radius - 1 {
+                    weighted.append((idx: idx, offset: offsetSecs, amp: bestAmp))
+                }
+                let includeSample =
+                    idx < 8
+                    || abs(idx - beats.count / 2) <= 4
+                    || idx >= max(0, beats.count - 8)
+                if includeSample {
+                    sampleRows.append([
+                        "idx": idx,
+                        "beatSecs": beatSecs,
+                        "offsetSecs": offsetSecs,
+                        "offsetChunks": offsetChunks,
+                        "bestAmp": bestAmp,
+                        "boundaryHit": abs(offsetChunks) >= radius - 1
+                    ])
+                }
+            }
+        }
+
+        func average(_ values: ArraySlice<Double>) -> Double {
+            guard !values.isEmpty else { return 0 }
+            return values.reduce(0, +) / Double(values.count)
+        }
+
+        let firstAvg = average(offsets.prefix(16))
+        let midStart = max(0, offsets.count / 2 - 8)
+        let midEnd = min(offsets.count, midStart + 16)
+        let midAvg = midStart < midEnd ? average(offsets[midStart..<midEnd]) : 0
+        let lastAvg = average(offsets.suffix(16))
+        let blockSize = 64
+        var blockSummaries: [[String: Any]] = []
+        if !weighted.isEmpty {
+            let blockCount = (beats.count + blockSize - 1) / blockSize
+            for block in 0..<blockCount {
+                let lo = block * blockSize
+                let hi = min(beats.count, lo + blockSize)
+                let rows = weighted.filter { $0.idx >= lo && $0.idx < hi }
+                guard !rows.isEmpty else { continue }
+                let sumW = rows.reduce(0.0) { $0 + $1.amp }
+                guard sumW > 0 else { continue }
+                let avgOffset = rows.reduce(0.0) { $0 + $1.offset * $1.amp } / sumW
+                let avgAmp = sumW / Double(rows.count)
+                blockSummaries.append([
+                    "startBeatIdx": lo,
+                    "endBeatIdx": hi - 1,
+                    "startSecs": beats[lo],
+                    "endSecs": beats[hi - 1],
+                    "avgOffsetSecs": avgOffset,
+                    "avgAmp": avgAmp,
+                    "usableCount": rows.count
+                ])
+            }
+        }
+
+        let slopeSecsPerBeat: Double = {
+            guard weighted.count >= 2 else { return 0 }
+            let sumW = weighted.reduce(0.0) { $0 + $1.amp }
+            guard sumW > 0 else { return 0 }
+            let meanX = weighted.reduce(0.0) { $0 + Double($1.idx) * $1.amp } / sumW
+            let meanY = weighted.reduce(0.0) { $0 + $1.offset * $1.amp } / sumW
+            let denom = weighted.reduce(0.0) {
+                let dx = Double($1.idx) - meanX
+                return $0 + $1.amp * dx * dx
+            }
+            guard denom > 0 else { return 0 }
+            return weighted.reduce(0.0) {
+                let dx = Double($1.idx) - meanX
+                return $0 + $1.amp * dx * ($1.offset - meanY)
+            } / denom
+        }()
+
+        // #region agent log
+        agentDebugLog(
+            hypothesisId: "H1,H2,H3",
+            location: "WaveformRenderer.swift:logWholeTrackBeatPeakAlignment",
+            message: "whole-track beat-to-peak alignment",
+            data: [
+                "deckIdx": Int(deckIdx),
+                "gridBpm": gridBpm,
+                "confidence": Double(confidence),
+                "beatCount": beats.count,
+                "chunkCount": chunkCount,
+                "peakDurSecs": peakChunkDurationSecs,
+                "windowSecs": windowSecs,
+                "radiusChunks": radius,
+                "boundaryHitFraction": offsets.isEmpty ? 0 : Double(boundaryHits) / Double(offsets.count),
+                "usableFitCount": weighted.count,
+                "first16AvgOffsetSecs": firstAvg,
+                "middle16AvgOffsetSecs": midAvg,
+                "last16AvgOffsetSecs": lastAvg,
+                "firstToLastAvgDeltaSecs": lastAvg - firstAvg,
+                "slopeSecsPerBeat": slopeSecsPerBeat,
+                "projectedDriftOverTrackSecs": slopeSecsPerBeat * Double(max(0, beats.count - 1)),
+                "blockSummaries": blockSummaries,
+                "sampleOffsets": sampleRows,
+                "peaksGeneration": Int(peaksGeneration),
+                "beatGridGeneration": Int(beatGridGeneration)
+            ])
+        // #endregion
+    }
+
+    private func peakWindowAround(globalChunk: Int64, radius: Int) -> [String: Any]? {
+        guard globalChunk >= 0,
+              globalChunk < Int64(lastSeenPeaksLen)
+        else { return nil }
+
+        let chunks = chunksBuffer.contents().assumingMemoryBound(to: PeakChunkLayout.self)
+        var centreAmp: Double = 0
+        var maxAmp: Double = -1
+        var maxOffset = 0
+        for offset in -radius...radius {
+            let g = globalChunk + Int64(offset)
+            guard g >= 0, g < Int64(lastSeenPeaksLen) else { continue }
+            let c = chunks[Int(g) & (WaveformRenderer.chunkCapacity - 1)]
+            let amp = Double(max(abs(c.minSample), abs(c.maxSample)))
+            if offset == 0 { centreAmp = amp }
+            if amp > maxAmp {
+                maxAmp = amp
+                maxOffset = offset
+            }
+        }
+
+        return [
+            "centreChunk": Int(globalChunk),
+            "centreAmp": centreAmp,
+            "maxAmp": maxAmp,
+            "maxOffsetChunks": maxOffset,
+            "maxOffsetSecs": Double(maxOffset) * peakChunkDurationSecs
+        ]
+    }
+
+    private func logVisibleBeatAlignment(
+        playheadSecs: Double,
+        snappedChunkF: Double,
+        drawnAbove: Int,
+        drawnBelow: Int,
+        pastSubChunkOffsetNDC: Float,
+        futureSubChunkOffsetNDC: Float,
+        drawableSize: CGSize
+    ) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - debugLastVisibleBeatLogUptime >= 1.0 else { return }
+        debugLastVisibleBeatLogUptime = now
+        guard cachedBeatsConfidence > 0, !cachedBeats.isEmpty, peakChunkDurationSecs > 0 else {
+            return
+        }
+
+        let nextIdx = firstBeatIndex(atOrAfter: playheadSecs)
+        let candidates = [nextIdx - 1, nextIdx].filter {
+            $0 >= 0 && $0 < cachedBeats.count
+        }
+        guard let closestIdx = candidates.min(by: {
+            abs(cachedBeats[$0] - playheadSecs) < abs(cachedBeats[$1] - playheadSecs)
+        }) else { return }
+
+        let beatSecs = cachedBeats[closestIdx]
+        let timeNDC = Self.beatTimeNDC(
+            beatSecs: beatSecs,
+            peakDur: peakChunkDurationSecs,
+            snappedChunkF: snappedChunkF,
+            drawnAbove: drawnAbove,
+            drawnBelow: drawnBelow,
+            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+        let timeAxisPixels: Double
+        switch orientation {
+        case .vertical:
+            timeAxisPixels = max(1, Double(drawableSize.height))
+        case .horizontal:
+            timeAxisPixels = max(1, Double(drawableSize.width))
+        }
+        let drawablePixel = (1.0 - timeNDC) * timeAxisPixels * 0.5
+        let beatPeriod = cachedBpm > 0 ? 60.0 / cachedBpm : 0
+        let beatChunk = Int64((beatSecs / peakChunkDurationSecs).rounded(.down))
+        var peakProbe = peakWindowAround(globalChunk: beatChunk, radius: 32) ?? [:]
+        peakProbe["radiusChunks"] = 32
+
+        // #region agent log
+        agentDebugLog(
+            hypothesisId: "H1,H2,H4",
+            location: "WaveformRenderer.swift:drawBeatGrid",
+            message: "nearest beat render alignment",
+            data: [
+                "deckIdx": Int(deckIdx),
+                "orientation": orientation == .vertical ? "vertical" : "horizontal",
+                "playheadSecs": playheadSecs,
+                "closestBeatIdx": closestIdx,
+                "closestBeatSecs": beatSecs,
+                "deltaBeatToPlayheadSecs": beatSecs - playheadSecs,
+                "deltaBeatPeriods": beatPeriod > 0 ? (beatSecs - playheadSecs) / beatPeriod : 0,
+                "timeNDC": timeNDC,
+                "drawablePixelFromLeadingEdge": drawablePixel,
+                "timeAxisPixels": timeAxisPixels,
+                "snappedChunkF": snappedChunkF,
+                "peakDurSecs": peakChunkDurationSecs,
+                "beatChunk": Int(beatChunk),
+                "localPeakProbe": peakProbe
+            ])
+        // #endregion
+    }
+
+    private func logBeatGridPixelStability(
+        playheadSecs: Double,
+        snappedChunkF: Double,
+        drawnAbove: Int,
+        drawnBelow: Int,
+        pastSubChunkOffsetNDC: Float,
+        futureSubChunkOffsetNDC: Float,
+        drawableSize: CGSize
+    ) {
+        guard cachedBeatsConfidence > 0, !cachedBeats.isEmpty, peakChunkDurationSecs > 0 else {
+            return
+        }
+
+        let nextIdx = firstBeatIndex(atOrAfter: playheadSecs)
+        let candidates = [nextIdx - 1, nextIdx].filter {
+            $0 >= 0 && $0 < cachedBeats.count
+        }
+        guard let closestIdx = candidates.min(by: {
+            abs(cachedBeats[$0] - playheadSecs) < abs(cachedBeats[$1] - playheadSecs)
+        }) else { return }
+
+        let beatSecs = cachedBeats[closestIdx]
+        let timeNDC = Self.beatTimeNDC(
+            beatSecs: beatSecs,
+            peakDur: peakChunkDurationSecs,
+            snappedChunkF: snappedChunkF,
+            drawnAbove: drawnAbove,
+            drawnBelow: drawnBelow,
+            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+        let timeAxisPixels: Double
+        switch orientation {
+        case .vertical:
+            timeAxisPixels = max(1, Double(drawableSize.height))
+        case .horizontal:
+            timeAxisPixels = max(1, Double(drawableSize.width))
+        }
+        let pixel = (1.0 - timeNDC) * timeAxisPixels * 0.5
+
+        if debugStableBeatIdx == closestIdx {
+            let secondsPerPixel = peakChunkDurationSecs
+                * Double(WaveformRenderer.chunksPerColumn)
+                / Self.effectivePixelsPerDrawnColumn(timeAxisZoom: timeAxisZoom)
+            if secondsPerPixel > 0 {
+                let expectedPixel = debugStableBeatPixel
+                    - (playheadSecs - debugStableBeatPlayheadSecs) / secondsPerPixel
+                let error = pixel - expectedPixel
+                debugBeatPixelLastError = error
+                debugBeatPixelMaxError = max(debugBeatPixelMaxError, abs(error))
+                debugBeatPixelErrorSamples += 1
+            }
+        } else {
+            debugStableBeatIdx = closestIdx
+            debugBeatPixelMaxError = 0
+            debugBeatPixelLastError = 0
+            debugBeatPixelErrorSamples = 0
+        }
+        debugStableBeatPixel = pixel
+        debugStableBeatPlayheadSecs = playheadSecs
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - debugLastGridStabilityLogUptime >= 1.0 else { return }
+        debugLastGridStabilityLogUptime = now
+
+        // #region agent log
+        agentDebugLog(
+            hypothesisId: "H4",
+            location: "WaveformRenderer.swift:logBeatGridPixelStability",
+            message: "beatgrid pixel stability",
+            data: [
+                "deckIdx": Int(deckIdx),
+                "orientation": orientation == .vertical ? "vertical" : "horizontal",
+                "trackedBeatIdx": closestIdx,
+                "trackedBeatSecs": beatSecs,
+                "playheadSecs": playheadSecs,
+                "pixelFromLeadingEdge": pixel,
+                "lastFrameErrorPixels": debugBeatPixelLastError,
+                "maxAbsErrorPixels": debugBeatPixelMaxError,
+                "samples": debugBeatPixelErrorSamples,
+                "timeAxisPixels": timeAxisPixels,
+                "snappedChunkF": snappedChunkF,
+                "peakDurSecs": peakChunkDurationSecs
+            ])
+        // #endregion
+    }
+
+    private func agentDebugLog(
+        hypothesisId: String,
+        location: String,
+        message: String,
+        data: [String: Any]
+    ) {
+        // #region agent log
+        let payload: [String: Any] = [
+            "sessionId": "c73978",
+            "runId": "beatgrid-pre-fix",
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let json = try? JSONSerialization.data(withJSONObject: payload),
+              let line = String(data: json, encoding: .utf8),
+              let bytes = (line + "\n").data(using: .utf8)
+        else { return }
+
+        let url = URL(fileURLWithPath: "/Users/klos/Development/dub/.cursor/debug-c73978.log")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            try? handle.seekToEnd()
+            try? handle.write(contentsOf: bytes)
+        } else {
+            try? bytes.write(to: url, options: .atomic)
+        }
+        // #endregion
+    }
+
     private func drawBeatGrid(
         encoder: MTLRenderCommandEncoder,
         drawableSize: CGSize,
+        playheadSecs: Double,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
@@ -1475,6 +1997,23 @@ final class WaveformRenderer: NSObject {
                 halfThickness: half,
                 color: color)
         }
+
+        logVisibleBeatAlignment(
+            playheadSecs: playheadSecs,
+            snappedChunkF: snappedChunkF,
+            drawnAbove: drawnAbove,
+            drawnBelow: drawnBelow,
+            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
+            drawableSize: drawableSize)
+        logBeatGridPixelStability(
+            playheadSecs: playheadSecs,
+            snappedChunkF: snappedChunkF,
+            drawnAbove: drawnAbove,
+            drawnBelow: drawnBelow,
+            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
+            drawableSize: drawableSize)
 
         guard !beatGridScratchVertices.isEmpty else { return }
 

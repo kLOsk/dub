@@ -68,8 +68,15 @@
 - [M11d.3 — Per-row indicators](#m11d3)
 - [M11d.4 — Background missing-files scanner + Relocate panel](#m11d4)
 - [M11d.5 — Dogfooding bug-fix and waveform/library polish rounds](#m11d5)
+- [M11c.4 — Lazy fingerprint (import-fast, analyze-on-demand)](#m11c4)
+- [M11c.3a — BPM octave fix (perceptual tempo prior)](#m11c3a)
+- [M11c.3c — Reggae skank double-time rejection](#m11c3c)
+- [M11c.3d — Genre-aware octave profile (library analysis)](#m11c3d)
+- [M11c.3e — Hip-hop double-time rejection (Default profile)](#m11c3e)
+- [M11c.3f — FourOnFloor profile (house / garage library)](#m11c3f)
 - [M11c.2 — Key detection (Camelot canonical)](#m11c2)
 - [M11c.1 — Lazy auto-beatgrid + analysis lifecycle](#m11c1)
+- [M11d.6 — Full-screen on launch + windowed snap-back](#m11d6)
 
 ---
 
@@ -2828,6 +2835,348 @@ Full workspace: `cargo test --workspace` reports **685/685 passing** (+9 over M1
 ### Commit boundary
 
 This entry corresponds to the M11c.1 commit set: `docs/PRD.md` (M11c.1 row update), `docs/SHIPPED.md` (this section), `crates/dub-library/Cargo.toml` (dub-bpm dependency), `crates/dub-library/src/analysis.rs` (new module + tests), `crates/dub-library/src/lib.rs` (re-exports), `crates/dub-library/src/error.rs` (four new typed variants), `crates/dub-library/src/db.rs` (`TrackRow.is_analyzed`, SELECT rewrite, two updated tests + one new test), `crates/dub-ffi/src/lib.rs` (`LibraryAnalysisOutcome` record, `LibraryTrack.is_analyzed`, two new methods + two new tests), `apple/Dub/MainView.swift` (model glue + `ensureTrackAnalyzed` + `analyzeTracks`), `apple/Dub/Performance/LibraryView.swift` (`DimUnanalyzed` modifier + contextMenu + footer progress + `preserveSelection` refresh knob), `apple/DubCore.xcframework/` + `apple/DubShared/Sources/DubCore/Generated/` (rebuilt FFI surface).
+
+---
+
+<a id="m11c4"></a>
+## M11c.4 — Lazy fingerprint (import-fast, analyze-on-demand)
+
+Defers Chromaprint computation and dedupe from the cold import path to the first-deck-load analysis pass. Imports become metadata-only: no decode, no fingerprint, no dedupe at the moment the user drops a folder on the app. The fingerprint materialises later, inside the `Library::analyze_track` pass the deck already triggers on first load.
+
+### Why
+
+A user reported that importing a large drum and bass folder was "very slow" even though the app deliberately does not run BPM or waveform analysis at import. Profiling with the M11c.4-era `crates/dub-library/examples/profile_import.rs` confirmed the cost breakdown on commodity SSDs:
+
+* `decode` (full file → `Vec<f32>` via `dub-io`): ~70 % of import wall-clock.
+* `fingerprint` (Chromaprint over the decoded samples): ~25 %.
+* Everything else (stat, SQL writes, metadata-source rows): ~5 %.
+
+The decoded samples are not used during import for anything except feeding Chromaprint. The fingerprint is only consumed by the dedupe-merge decision (which the v1.0 policy explicitly refuses to auto-fire) and by `analysis_cache` keying (which is keyed by fingerprint id but doesn't need the id at import time). The full ~95 % decode + Chromaprint cost was therefore being paid for work that is either unused in v1.0 (auto-merge) or paid for redundantly anyway (the deck-load analyzer decodes the same file again to compute BPM + key).
+
+The fix is straightforward: stop doing that.
+
+### What changed
+
+**Import (cold path) is metadata-only.** `dub_library::importer::import_one` now calls `dub_io::read_metadata(path)` (a symphonia probe with no sample decode) and writes a `tracks` row with `fingerprint_id = NULL` and `duration_ms = NULL`, plus a `track_files` row, plus the `id3` and `filename` rows in `track_metadata_source`. No `Fingerprint::compute_from_f32` call, no `find_fingerprint_neighbours` query, no `dedupe::decide` loop. The `summary.merged` and `summary.sibling_versions` counters stay in the `ImportSummary` struct for API stability but always come back zero.
+
+**`Library::insert_track` and `tracks.duration_ms` accept NULL.** `insert_track`'s signature changed from `(fingerprint_id: i64, duration_ms: u32, ...)` to `(fingerprint_id: Option<i64>, duration_ms: Option<u32>, ...)`. The schema's `tracks.fingerprint_id` and `tracks.duration_ms` columns were already nullable since M11a, so no migration was required.
+
+**`Library::attach_fingerprint(track_id, fingerprint_id, duration_ms)`** is the new bridge: idempotently updates `tracks.fingerprint_id` and `tracks.duration_ms` for a track that was inserted with NULL. The `WHERE fingerprint_id IS NULL` guard closes the race window when two `analyze_track` calls happen concurrently against the same UUID (the loser's UPDATE matches zero rows; it then re-reads the winner's id from `tracks`).
+
+**`Library::analyze_track` computes and attaches the fingerprint inline.** The flow now is:
+
+1. Look up the track's path + (optional) existing fingerprint id.
+2. Decode the file via `dub_io::Track::load_from_path`.
+3. **If `fingerprint_id` was NULL**: compute Chromaprint over the just-decoded samples, `upsert_fingerprint`, `attach_fingerprint`. The resulting id keys the rest of the pass.
+4. Run BPM analysis (`dub_bpm::analyze_beat_grid`) and key analysis (`dub_spectral::analyze_key`) on the same decoded buffer.
+5. Stamp `analysis_cache` keyed by fingerprint id.
+
+The fingerprint pass is bolted onto work the user already paid for by loading the deck (the file is decoded once for BPM + key regardless), so the marginal cost is just the Chromaprint pass itself (~25–40 ms for a 5 min track on an M1).
+
+**`list_missing_tracks` filters out NULL-fingerprint rows.** The Relocate matcher needs a stored fingerprint to compare against; tracks that have never been analyzed and have gone missing are not surfaced in the Relocate panel until they're analyzed. In practice tracks that have never been deck-loaded are also rarely ones the user cares enough about to relocate; a future v1.x sweep can analyze them on-demand from the Relocate UI.
+
+### What does *not* happen at import any more
+
+* **No auto-merge.** Two byte-identical files now both land as distinct `tracks` rows; v1.0 makes no attempt to collapse them. The `dedupe::decide` primitives and `find_fingerprint_neighbours` query are unchanged; a future "Find duplicates" library action (deferred to v1.x) will surface near-matches for manual user review.
+* **No sibling-version registration.** A `Clean` / `Dirty` pair shows up as two unrelated rows. The version-token parser still records the per-source `version_token` column verbatim, so the existing browser indicator (PRD §8.5.3) keeps working as soon as a user opens the manual-review affordance.
+* **No `sample_rate` / `channels` / per-codec stamping on `track_files` at import time.** The metadata-only probe doesn't reveal those without decoding. They get populated on first analyze pass as a side-effect of `Track::load_from_path` walking the codec params. This change is invisible to v1.0 UX because the LibraryView reads display data from `track_metadata_source`, not from `track_files`.
+
+### Measured impact
+
+`profile_import` against the user's 12-track `OST Guardians of the Galaxy` folder (a representative mid-bitrate MP3 set):
+
+* Pre-M11c.4 (decode + fingerprint + dedupe + write): tens of seconds total, dominated by decode.
+* Post-M11c.4 (metadata probe + write): **59 ms total wall-clock** for the same 12 files. ~5 ms / file, ~200 file/s throughput.
+
+The PRD's §8.4 "lazy by design" rule now applies symmetrically to fingerprint, BPM, and key — none of them block the import.
+
+### Architecture notes
+
+1. **Race-safe attach.** The `WHERE fingerprint_id IS NULL` guard on `attach_fingerprint` makes the "two `analyze_track` calls land at the same time" case correctness-clean: at most one UPDATE succeeds, the loser re-reads the winning id from `tracks`. The losing call's `upsert_fingerprint` row becomes an orphan (a `fingerprints` row no `tracks` row points at), which a future v1.x sweeper can garbage-collect — the cost is one extra ~1.5 KB blob per race, which is fine.
+2. **`duration_ms` populated lazily too.** The same `attach_fingerprint` call also writes `tracks.duration_ms` from the fingerprint's `duration_ms()`. Before first analyze, the browser's Duration column shows `—` (per the existing `Option<u32>` rendering rule); after analyze it shows the canonical value. This matches the existing BPM and Key column behaviour and stays consistent with the M11c.1 "row dims until analyzed" cue.
+3. **Reverted the M11c diagram comment, kept the dedupe primitives.** The `crates/dub-library/src/dedupe.rs` module and `find_fingerprint_neighbours` / `find_track_owner_by_fingerprint_id` queries are unchanged and the dedupe unit tests still pass. M11c.4 strictly removes the **call site** in the importer, not the primitives, so the future "Find duplicates" action can reuse them verbatim.
+4. **The `LibraryImportSummary` FFI record is unchanged.** Apple-side code that already reads `summary.merged` / `summary.sibling_versions` keeps compiling. Those fields just always come back zero from a v1.0 cold import.
+
+### Files touched
+
+* `crates/dub-library/src/db.rs` — `insert_track` signature now `Option<i64>` / `Option<u32>`; new `attach_fingerprint` helper; `list_missing_tracks` filters `fingerprint_id IS NOT NULL`.
+* `crates/dub-library/src/importer.rs` — `import_one` rewritten to use `dub_io::read_metadata`; removed `run_dedupe`, `DedupeResolution`, `composed_display_string`; `write_metadata_rows` now takes `&TrackMetadata` not `&Track`; importer tests rewritten for the no-auto-merge behaviour.
+* `crates/dub-library/src/analysis.rs` — `analyze_track` computes + attaches the fingerprint when missing, with a race-safe re-read; `track_analysis_keys` returns `Option<i64>` for the fingerprint id; two new tests (`analyze_track_attaches_fingerprint_when_missing`, `analyze_track_is_idempotent_when_fingerprint_already_attached`).
+* `crates/dub-library/examples/profile_import.rs` — replaced the per-phase synthetic profiler with a real `import_folder` driver that reports the user-visible wall-clock.
+* `docs/PRD.md` — §8.1 adds the "Lazy fingerprint" paragraph; §8.4 marks track analysis as "not at import time since M11c.4"; §12 milestones row.
+* `docs/SHIPPED.md` — this section.
+
+### Commit boundary
+
+This entry corresponds to the M11c.4 commit set: `crates/dub-library/src/{db,importer,analysis}.rs`, `crates/dub-library/examples/profile_import.rs`, `docs/PRD.md`, `docs/SHIPPED.md`.
+
+### Deferred
+
+* **"Find duplicates" library action.** Once two tracks have been analyzed, their fingerprints are both in `fingerprints`; a future action queries `find_fingerprint_neighbours` and surfaces near-matches for manual review. v1.x, on demand.
+* **Orphaned fingerprint sweep.** The race-loser side of `attach_fingerprint` leaves an unreferenced `fingerprints` row behind. The leak rate is bounded by the rate of concurrent analyse_track calls on the same UUID, which is roughly zero in single-user usage; a periodic `DELETE FROM fingerprints WHERE id NOT IN (SELECT fingerprint_id FROM tracks WHERE fingerprint_id IS NOT NULL)` sweep can run lazily at app launch in v1.x.
+* **`tracks.duration_ms` from a fast probe.** Symphonia exposes `codec_params.n_frames` for most container formats, which would let `read_metadata` report duration without a decode. Wiring it in (and gracefully handling the VBR-MP3-without-Xing-header case where `n_frames` is `None`) is a one-afternoon follow-up. Until then, freshly-imported tracks show `—` in the Duration column until first deck-load.
+
+---
+
+<a id="m11c3a"></a>
+## M11c.3a — BPM octave fix (perceptual tempo prior)
+
+The first algorithmic slice of PRD §12 M11c.3 (perceptual tempo prior). Tap-to-grid shipped as [M11c.3b](#m11c3b), closing the milestone. After M11c.3a–f, real hip-hop / rap catalogs analyze at the audible tempo (95 BPM, not 190 BPM) on Default; DnB and genre-tagged library analysis use profile-aware passes documented in M11c.3c–f.
+
+### Why
+
+Two symmetric octave-error failure modes were dominating the user's library after M11c.1's auto-grid lifecycle landed:
+
+* **Hip-hop / rap detected at 2x.** Westside Connection's "Gangsta Nation" (real 95 BPM, kick on 1+3, snare on 2+4, hi-hat 8th-note ostinato) was detecting at 191 BPM. The 8th-note hi-hat is louder in the spectral-flux ODF than the kick / snare backbeat, so the autocorrelation at the 190 BPM rate (2x the perceived tempo) had a higher harmonic-mean score than the autocorrelation at 95 BPM. The picker's tie-break ("prefer smaller lag = faster BPM on ties") biased that further toward 190.
+* **Drum-and-bass detected at 1/2x.** Chase & Status "Baddadan" (real 175 BPM, kick on 1+3, snare on 2+4) was detecting at 87.54 BPM. The K-K skip-1 autocorrelation peak (kicks two beats apart) is structurally stronger than the K-S alternation peak (kick-to-snare one beat apart) because snares are quieter than kicks in the ODF. The autocorrelation at 87 BPM has higher confidence than at 174 BPM, and the picker reports the louder peak.
+
+The two failure modes have the same root cause and **opposite required corrections**: rap wants the lower-BPM octave, DnB wants the upper-BPM octave. Pure autocorrelation cannot distinguish them without a perceptual prior — both peaks are legitimate periodic structure, and there is no signal in the spectral-flux ODF that says "this is rap, prefer the lower octave" vs "this is DnB, prefer the upper octave".
+
+The PRD §8.3 fallback (`BpmRange` escape hatch via `dub thru --bpm-range MIN,MAX`) addressed this for power users on the CLI but offered nothing for the library importer's default behaviour. Real users have mixed-genre libraries — rap at 95, house at 125, DnB at 175 — and the default auto-detect path must land them all at the right octave without per-track CLI invocation.
+
+### What changed
+
+**Perceptual tempo prior** in `crates/dub-bpm/src/tempo.rs`. A piecewise-linear weight function `tempo_prior_weight(bpm)` multiplies each candidate's raw harmonic-mean score before lag selection:
+
+* `bpm ≤ 60`: 0.20 (penalty floor — barely-musical territory)
+* `60 → 95`: linear 0.20 → 1.00 (lifts 80 to 0.66, 86 to 0.79, 87.59 to 0.83, 90 to 0.89, 92 to 0.93)
+* `95 → 175`: 1.00 (plateau covers hip-hop 95–105, house, techno, DnB 165–175)
+* `175 → 200`: linear 1.00 → 0.30 (180 → 0.86, 190 → 0.58)
+* `bpm ≥ 200`: 0.20
+
+The plateau boundaries are not arbitrary. The lower edge sits at exactly 95 BPM because real-DnB raw-score ratios `score(high) / score(low)` measured across the M11c.3 corpus sit in [0.76, 0.94], and the worst-case clean DnB sample is Total Science / S.P.Y. "Gangsta" (Watch The Ride remix) at lag 59 / 87.59 BPM (raw 5.121) vs lag 30 / 172.27 BPM (raw 4.454), ratio 0.870. The prior must therefore drive `weight(87.59) < 0.87` so the upper octave wins on weighted score, which forces the plateau start at 95 BPM. The upper edge sits at 175 BPM because the symmetric double-time hip-hop failure modes peak at 180–195 BPM (8th-note hi-hat candidates); pulling the ramp start to 175 puts 180 cleanly into the ramp zone (weight 0.86) while still keeping every DnB candidate ≤ 175 BPM at full plateau. Algorithm parameter calibration sits inline in the function's doc comment for future readers.
+
+**Plateau calibration history.** Three iterations were required to converge on the [95, 175] boundaries:
+
+1. **Initial plateau [90, 178].** Resolved Bedhead / Baddadan / Backbone / Apocalypse but missed Chase & Status "Come Back": its lower-octave detection at lag 59 (87.59 BPM, just above the 90 plateau-start) received `weight = 0.94`, leaving the weighted score 1.4 % above the 172 BPM candidate. Come Back's raw ratio is 0.922 — close enough to 1.00 that a 0.94 weight wasn't sufficient to flip it.
+2. **Plateau [92, 175].** Dropped `weight(87.59)` to 0.89, fixing Come Back. Total Science / S.P.Y. "Gangsta" still detected at 87.59 BPM because its raw ratio is 0.870 — even harsher than Come Back's 0.922 — and 0.89 × raw(low) still beat 1.00 × raw(high) by 2.3 %.
+3. **Plateau [95, 175] (current).** Drops `weight(87.59)` to 0.83, below the 0.87 margin required by Total Science. The 174 BPM candidate now wins by 4.7 %, comfortably above the `SCORE_TIE_REL_TOL` floor. All eight clean DnB tracks in the corpus plus every rap doubling case now resolve correctly.
+
+Both regressions are covered by inline assertions in the `tempo_prior_lower_ramp_flips_dnb_halftime` unit test: `prior(87.59) < 0.87` (Total Science gate) and `prior(86) < 0.85` (Bedhead gate). Future plateau changes must satisfy both.
+
+**Two-pass selection** in `estimate_tempo`. The previous picker mixed the prior into a single comparison, which let off-peak lags whose harmonic-mean partially benefited from a single harmonic-window-aligned peak win the comparison (the synthetic spike-train test at lag 75, raw_score ≈ 50 % of max, qualified). The new flow is:
+
+1. **Pass 1 — find the raw maximum.** Score every candidate by harmonic-mean local energy (unchanged from M8.1). Track `max_raw_score` separately so pass 2 can gate off-peak lags.
+2. **Pass 2 — prior-weighted selection among qualifying candidates.** Only lags whose raw harmonic-mean clears `0.70 × max_raw_score` are eligible. Among those, the picker maximises `raw_score × tempo_prior_weight(bpm_at_lag)`. The existing "prefer smaller lag on tie" rule (`SCORE_TIE_REL_TOL = 0.01`) is preserved verbatim for the residual case where two octaves are both at full plateau weight (e.g. clean synthetic DnB at 174 vs 87).
+
+A defensive fallback returns the pass-1 raw winner if pass 2 picks nothing — unreachable in normal operation, but it means the prior cannot introduce a new "no detection" failure mode on healthy inputs.
+
+**Confidence reporting unchanged.** `BpmEstimate::confidence` is still computed from `raw_peak / acf_zero` at the picked lag, which means the streaming confidence-tracker hysteresis in `dub-bpm::tracker` (the LOCKING / LOCKED state machine, M8) continues to gate on a number that reflects autocorrelation strength rather than perceptual preference. Only the lag *selection* uses the prior; the lag's reported confidence is still the raw signal.
+
+### Measured impact
+
+`diagnose_bpm` against the user-reported corpus:
+
+| Track | Real BPM | Before M11c.3a | After M11c.3a |
+|---|---|---|---|
+| Cause4Concern "Bedhead" (DnB) | 172 | 86.03 | **172.11** |
+| Chase & Status "Baddadan" (DnB) | 175 | 87.54 | **174.39** |
+| Chase & Status & Stormzy "Backbone" (DnB) | 176 | 87.84 | **176.95** |
+| Chase & Status "Come Back" feat. Top Cat (DnB) | 174 | 87.52 | **174.34** |
+| Excel "Apocalypse" (Nick The Lot remix) (DnB) | 173 | 87.52 | **173.46** |
+| Total Science / S.P.Y. "Gangsta" (DnB) | 175 | 87.52 | **174.54** |
+| Westside Connection "Gangsta Nation" | 95 | 191.11 | **95.43** |
+| Westside Connection "Connected For Life" | 95 | (2×) | **95.15** |
+
+**Mixed-tempo edge case (Benny Page).** Benny Page "Crying Out" (Serial Killaz remix) is a DnB track with a literal half-tempo reggae break in the middle. The autocorrelation accumulates real energy at both the DnB rate (~175 BPM) and the reggae rate (~87 BPM), and the raw-score ratio against the upper octave drops to 0.757 — too low for any prior that doesn't also break legitimate 90 BPM hip-hop. The algorithm reports 87.92 BPM (the reggae octave) and the user uses tap-to-grid (M11c.3b) to double the BPM if mixing the track at DnB tempo. This is a structural limitation of one-pass whole-track analysis; a future per-section beat-grid (PRD M10.5p-grid) would let the engine carry two grid segments and switch authority across the reggae break.
+
+The synthetic `genre_octave.rs` suite also reflects the move:
+
+* `hip_hop_90_bpm_locks_at_90_not_180` — now passes (used to detect 180 because the 8th-note hi-hat ostinato lands at exactly 180 BPM, inside the upper ramp where weight drops to 0.94 vs 90's plateau weight of 1.00).
+* `hip_hop_100_bpm_locks_at_100_not_200` — still passes (200 BPM weight drops to 0.30).
+* `drum_n_bass_174_bpm_locks_at_174_not_87` — still passes (174 in plateau, smaller-lag tiebreak resolves the tie correctly).
+
+### Known limitations
+
+**Reggae one-drop and slow soul at < 80 BPM detect at 2x.** Tracks like Marvin Gaye "Ain't No Mountain High Enough" (perceived 65 BPM) and the synthetic reggae one-drop fixture (65 BPM with hi-hat skanks at the 130-BPM rate) still resolve to 130 BPM because the prior weights 65 at 0.34 and 130 at 1.00. The autocorrelation alone cannot distinguish "65 BPM soul" from "130 BPM house" — both have identical periodic structure at lag 32 and lag 64. The 130 BPM detection is the *worse* answer for a DJ ("if a DJ plays a real 130 BPM house tune and mixes this in it kills the vibe", per the user), but the prior cannot pull 65 above 130 without also pulling DnB's 86 above 172 — which would re-introduce the half-time bug. The M11c.3 plan addresses this via tap-to-grid (M11c.3b, shipped): one keystroke to halve / double the detected BPM and re-anchor the grid with `Shift+G` / `Option+G` / `G`. A future M11c.5+ snare-emphasis ODF could in principle distinguish "65 BPM snare-on-2-and-4 of a 4/4 with 8th-note hi-hat" from "130 BPM kick on every beat", but the cost / payoff trade-off favours shipping tap-to-grid first and re-evaluating once the corpus shows what still falls through.
+
+The synthetic `reggae_one_drop_65_bpm_locks_at_65` test was renamed to `reggae_one_drop_65_bpm_locks_at_an_octave_family_of_65` and now accepts either 65 ± 4 (preferred) or 130 ± 4 (M11c.3a known limitation), so it still rejects "garbage / non-detection" regressions while documenting the limitation in test code.
+
+### Architecture notes
+
+1. **Why a piecewise-linear prior, not a Gaussian.** Klapuri 2003 / 2006 use a log-normal tempo prior centered at ~120 BPM with σ_log ≈ 1, which gives a smooth-bell shape. We tried it; the bell is too gentle to flip the DnB Bedhead case (raw-score ratio 0.92 needs a prior ratio under 0.92, which a σ_log = 1 Gaussian centered at 120 doesn't deliver at 86 vs 172 because both points are roughly equidistant from the center). A steeper bell pushes hip-hop 95 BPM out of the preferred zone, which we don't want. Piecewise-linear with hand-tuned plateau boundaries gave the cleanest separation: 86 inside the ramp, 88+ inside the plateau, 178 inside the plateau, 180 inside the ramp.
+2. **Why `OCTAVE_CANDIDATE_THRESHOLD = 0.70`.** The synthetic spike-train test exercises an off-peak lag (75 lag, BPM 80, raw_score ≈ 50 % of max) whose harmonic-mean catches a single peak-aligned harmonic without being a real beat-period candidate. A threshold of 0.50 lets that lag qualify and the prior-weighted comparison picks it because BPM 80 has higher prior weight than BPM 60 (the true period). 0.70 cleanly excludes it. Every real-music octave-conflict candidate sits at raw_score ≥ 0.83 of max, comfortably above the gate.
+3. **Why the prior doesn't touch the confidence.** The streaming tracker (`dub-bpm::tracker`) gates LOCKING → LOCKED transitions on confidence reaching a target (`TARGET_CONFIDENCE = 0.30` in `TrackerConfig`). Folding the prior into confidence would change those thresholds' meaning — a 95 BPM rap track with raw confidence 0.37 would suddenly report `0.37 × 1.00 = 0.37` (unchanged for rap) but a 190 BPM detection would drop to `0.38 × 0.62 = 0.24` (below threshold) and the tracker would never lock. That looks like correctness from the rap side but breaks legitimate fast-tempo material that genuinely lives at 185–195 BPM (e.g. happy hardcore, gabber, footwork). Keeping confidence unweighted preserves the tracker's per-genre robustness.
+4. **The unit-test gate on the prior shape.** `crates/dub-bpm/src/tempo.rs` now has four prior-specific unit tests (`tempo_prior_plateau_covers_mixable_genres`, `tempo_prior_lower_ramp_flips_dnb_halftime`, `tempo_prior_upper_ramp_flips_rap_doubletime`, `tempo_prior_floor_at_extremes`). The boundary asserts are stated as inequalities tied to the M11c.3 corpus raw-score ratios so future curve adjustments must continue to satisfy them — i.e. dropping the ramp start below 90 will trip `tempo_prior_lower_ramp_flips_dnb_halftime`'s `< 0.92` assert at 86 BPM.
+
+### Files touched
+
+* `crates/dub-bpm/src/tempo.rs` — adds `tempo_prior_weight` with full calibration rationale; rewrites `estimate_tempo`'s picker as a two-pass (raw + prior-weighted) selection with an `OCTAVE_CANDIDATE_THRESHOLD` gate; four new prior-shape unit tests.
+* `crates/dub-bpm/tests/genre_octave.rs` — renames the reggae one-drop test to acknowledge the half-time octave-family acceptance; updates the assert to allow either 65 ± 4 or 130 ± 4.
+* `docs/PRD.md` — §5.2.3 mentions the M11c.3a perceptual prior in the algorithm summary; §12 milestones row updated.
+* `docs/SHIPPED.md` — this section.
+
+### Commit boundary
+
+This entry corresponds to the M11c.3a commit set: `crates/dub-bpm/src/tempo.rs`, `crates/dub-bpm/tests/genre_octave.rs`, `docs/PRD.md`, `docs/SHIPPED.md`.
+
+### Deferred
+
+* **M11c.3b tap-to-grid.** *(Shipped — see [M11c.3b](#m11c3b).)*
+* **Snare-emphasis ODF (M11c.5+ candidate).** A high-frequency band-emphasis ODF (3–8 kHz) would weight snare hits more than kicks and shift the K-S autocorrelation peak above the K-K skip-1 peak in DnB, in principle removing the need for the lower-ramp penalty. The trade-off: it would also amplify hi-hat ostinato in hip-hop, re-introducing the 2× failure mode the M8.1 log-band ODF was specifically designed to suppress. Real-world evaluation against the M11c.3 corpus is needed before committing.
+* **Real-music corpus expansion.** Reggae (24/24), rap (19/19), house (16/16 + 1 known fail), dubstep (13/13 + 1 known fail), and DnB (12/12 + 8 known fails) corpora are seeded; residual Default-profile DnB failures are documented as tap-to-grid cases.
+
+---
+
+<a id="m11c3c"></a>
+## M11c.3c — Reggae skank double-time rejection
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11c.3 BPM octave fix
+
+M11c.3a's perceptual prior fixed hip-hop at 2× and DnB at 1/2× on real catalogs, but roots reggae still locked onto the hi-hat skank (~130 BPM) instead of the kick one-drop (~65 BPM). The autocorrelation sees both peaks at full plateau weight while the lower ramp crushes 65 BPM.
+
+Pass 2 now hard-rejects skank-rate candidates in the 118–160 BPM band when a credible one-drop sibling exists at the 2:1 ratio in 60–80 BPM with raw score ≥ 85 % of the skank peak. A gap-based variant (71–75 BPM sibling only, ≥ 5 % raw gap) catches Murderer-style cases without flipping 128 BPM click trains whose half-time harmonic lands near 70 BPM. Dancehall tracks with phantom ~180 BPM peaks get a separate near-tie rejection (175–185 vs 85–95) that spares DnB when the low octave clearly wins on raw (Who Am I).
+
+**Thru / streaming:** these rules apply on [`OctaveProfile::Default`] — no genre tag on live wax.
+
+**Validation:** author's reggae folder (24 tracks) on Default profile moved most one-drop material into 65–104 BPM; five tracks still needed genre context (M11c.3d). Rap folder (19 tracks, Default) unchanged vs pre-M11c.3d baseline — no regression on the agreed next gate.
+
+**Files:** `crates/dub-bpm/src/tempo.rs` (`skank_doubletime_rejected`, `dancehall_doubletime_rejected`, `linked_halftime_penalty` tuning).
+
+---
+
+<a id="m11c3d"></a>
+## M11c.3d — Genre-aware octave profile (library analysis)
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11c.3 BPM octave fix
+
+Offline library analysis can read ID3 genre tags and pass an [`OctaveProfile`] into pass 2. Thru-mode streaming keeps [`OctaveProfile::Default`] because live wax has no tag until fingerprint match (v1.1).
+
+### Profiles
+
+| Profile | Source tags (substring) | Behaviour |
+| --- | --- | --- |
+| `RootsReggae` | reggae, rocksteady, roots, lovers, ska | Rejects 135–180 BPM when a 60–100 BPM sibling carries ≥ 75 % of the upper raw score (Here I Come, Jump Nyabinghi). Keeps the default perceptual prior — lifting the whole 60–100 band would flip true ~95 BPM tracks to ~72 half-time. |
+| `Dub` | dub, dubstep | Rejects upper octave on near-tie (≤ 2 % raw gap) or when lower sibling ≥ 80 % raw. Lifts 65–80 BPM to full prior weight so a rejected ~140 peak does not lose to ~93 (Blind Prophet). |
+| `Dancehall` | dancehall, ragga | No profile rejection — preserves full-tempo detections like All Night at 133 BPM. |
+| `Default` | everything else, untagged | M11c.3a prior + M11c.3c skank/dancehall rules only. |
+
+### Wiring
+
+* `crates/dub-bpm/src/octave_profile.rs` — profile enum + genre/label mappers + `profile_doubletime_rejected`.
+* `estimate_tempo(..., profile)` — profile-aware pass 2; streaming/offline Default unchanged.
+* `analyze_beat_grid_with_profile` / `analyze_bpm_with_profile` — public API for library + corpus tests.
+* `crates/dub-library/src/analysis.rs` — `track_id3_genre()` → `octave_profile_from_genre()` on lazy analyze.
+
+### Corpus
+
+`crates/dub-bpm/tests/fixtures/reggae_corpus.tsv` (24 tracks, absolute paths) + env-gated `real_music_corpus` test:
+
+```sh
+DUB_BPM_REAL_CORPUS=/path/to/reggae_corpus.tsv cargo nextest run -p dub-bpm real_music_corpus
+```
+
+**Result:** 24/24 pass with profile column. Known exceptions preserved: All Night at 133 (`dancehall`), Here I Come at 85 (`roots`, half-time controversy).
+
+### Deferred (unchanged from M11c.3a)
+
+* **FourOnFloor profile** (candidate) for house/techno library analysis — opposite failure mode to reggae. *(Shipped M11c.3f.)*
+* **Rap 2× outliers** on Default (5/19 in author corpus) — next validation gate before house. *(Shipped M11c.3e.)*
+* **Tap-to-grid** for genuinely ambiguous tracks — *(Shipped M11c.3b.)*
+
+**Files:** `octave_profile.rs`, `tempo.rs`, `offline.rs`, `beats.rs`, `lib.rs`, `dub-library/src/analysis.rs`, `tests/real_music_corpus.rs`, `tests/fixtures/reggae_corpus.tsv`.
+
+---
+
+<a id="m11c3e"></a>
+## M11c.3e — Hip-hop double-time rejection (Default profile)
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11c.3 BPM octave fix
+
+Four tracks in the author's rap corpus (`Cappadonna`, `Charizma`, `Charles Bradley`, `Dangermouse — Daydream`) reported at 2× the audible tempo while fourteen others were already correct on Default. Chestra — Honey Dripper at 112 BPM was confirmed correct by ear and must not flip.
+
+Pass 2 now hard-rejects upper-octave candidates in 160–185 BPM when a 2:1 sibling in 80–95 BPM carries ≥ 96 % of the upper peak's raw score and the raw gap sits in [0.5 %, 6 %]. The lower bound spares the rolling-DnB synthetic fixture (perfect 0.3 % tie); real rap errors start at ≈ 0.6 %. DnB at 172+ is spared when the half-time gap exceeds 6 % (Gangsta ≈ 13 %) or when two or more peers cluster in the 168–182 BPM core band.
+
+When a triplet candidate was rejected and the linked half-time penalty would fire, the penalty is skipped if the high-octave sibling would itself be rejected by this pass (Charizma: 178 rejected → 89 beats 120).
+
+**Corpus:** `crates/dub-bpm/tests/fixtures/rap_corpus.tsv` (19 tracks) — **19/19 pass** on Default profile.
+
+**Files:** `crates/dub-bpm/src/tempo.rs` (`hiphop_doubletime_rejected`, `linked_halftime_penalty` guard), `tests/fixtures/rap_corpus.tsv`.
+
+---
+
+<a id="m11c3f"></a>
+## M11c.3f — FourOnFloor profile (house / garage library)
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11c.3 BPM octave fix
+
+House and UK garage in the author's corpus locked onto ~85–93 BPM (half-bar / shuffle subdivision) when the mixable 4/4 kick grid sits at ~120–140. The reggae skank pass (M11c.3c) made this worse by rejecting the true ~129 BPM peak as a false skank rate.
+
+### `OctaveProfile::FourOnFloor`
+
+* ID3 tags: `house`, `garage`, `techno`, `trance`, `electro`, `club` → `FourOnFloor` (library analysis only; Thru stays `Default`).
+* **Skip skank pass** so ~129 BPM house kicks are not discarded.
+* **Half-bar rejection:** discard 80–100 BPM when a 115–145 BPM sibling exists at the 3:2 ratio with ≥ 85 % raw score (Molly shape: 86 vs 129).
+* **Shuffle-high rejection:** discard 152–170 BPM when a 118–130 BPM sibling exists at the 4:3 ratio (Jaden shape: 164 vs 123).
+
+### Dub mid-band (same commit)
+
+Extended `OctaveProfile::Dub` with mid-band rejection: discard 85–100 BPM when a 65–74 BPM sibling exists at the 4:3 ratio (~93 vs ~70 dubstep corpus). Fixes 13/14 dubstep tracks on the `Dub` profile; Burial — Endorphin remains a known sparse-material fail.
+
+### Corpora
+
+| Corpus | Profile | Result |
+|--------|---------|--------|
+| `house_corpus.tsv` (17) | `four_on_floor` | **16/16** gated (+ 1 `known fail`: Good Neighbours slow house) |
+| `dubstep_corpus.tsv` (14) | `dub` | **13/13** gated (+ 1 `known fail`: Burial Endorphin) |
+
+`diagnose_bpm --folder PATH four_on_floor` / `dub` added for profile-aware folder sweeps.
+
+**Files:** `octave_profile.rs`, `tempo.rs`, `examples/diagnose_bpm.rs`, `tests/fixtures/house_corpus.tsv`, `tests/fixtures/dubstep_corpus.tsv`.
+
+---
+
+<a id="m11c3b"></a>
+## M11c.3b — Tap-to-grid (manual BPM override)
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11c.3 BPM octave fix (closes M11c.3)
+
+Keyboard-only manual beat-grid correction per PRD §8.3.1 / §8.3 milestone scope. The v1 surface is intentionally minimal: re-anchor at the playhead and halve/double the tempo. Full transient snap, ±20 BPM refit, and multi-tap BPM inference remain PRD spec for a future beatgrid-editor pass (M24); this milestone ships the escape hatch the DJ needs when auto-detect lands on the wrong octave.
+
+### Keystrokes (master deck)
+
+| Key | Action |
+|-----|--------|
+| `G` | Re-anchor grid at playhead; keep current BPM |
+| `Shift+G` | Halve BPM; re-anchor at playhead |
+| `Option+G` | Double BPM; re-anchor at playhead |
+
+Target deck is `masterDeck ?? stickyMaster` (same deck the DJ is actively mixing).
+
+### Engine + library path
+
+* `DubEngine::install_beat_grid(deck_idx, bpm, anchor_secs)` synthesises per-beat timestamps in place on the loaded File deck and bumps `beat_grid_generation` so the Metal renderer refetches without resetting the waveform peak ring.
+* `DubLibrary::upsert_user_tap_beatgrid(track_id, anchor_secs, bpm)` deactivates other grid rows and writes `source = 'user_tap'` as the sole active grid when the deck holds a library track.
+* Swift `KeyEventMonitorHost` intercepts `G` / `Shift+G` / `Option+G` before first-responder routing (No Mouse DJ).
+
+### DnB corpus (M11c.3 close-out)
+
+`crates/dub-bpm/tests/fixtures/dnb_corpus.tsv` (20 tracks, Default profile):
+
+```sh
+DUB_BPM_REAL_CORPUS=/path/to/dnb_corpus.tsv cargo test -p dub-bpm real_music_corpus
+```
+
+**Result:** 12/12 gated pass + 8 `known fail` (half-time ~87, triplet ~116, ragga-dnb ~90 on Default). Tap-to-grid is the intended override for those rows until/unless a DnB-specific profile lands.
+
+**Files:** `crates/dub-ffi/src/lib.rs` (`install_beat_grid`, `beat_grid_generation`), `crates/dub-library/src/analysis.rs` (`upsert_user_tap_beatgrid`), `apple/Dub/MainView.swift`, `apple/Dub/Waveform/WaveformRenderer.swift`, `tests/fixtures/dnb_corpus.tsv`.
+
+---
+
+<a id="m11d6"></a>
+## M11d.6 — Full-screen on launch + windowed snap-back
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M10.3 Performance shell
+
+PRD §2.1 "No Mouse DJ Ever" is now the default boot state. `DubAppDelegate.applicationDidFinishLaunching` calls `controller.window?.toggleFullScreen(nil)` after `NSApp.activate(ignoringOtherApps: true)` so a DJ who launches Dub onstage lands directly in the performance surface without reaching for the green traffic-light button. The window's `collectionBehavior` gains `.fullScreenPrimary` so the standard macOS `Cmd+Ctrl+F` shortcut and the new `View → Enter Full Screen` menu item both route through `NSWindow.toggleFullScreen(_:)`. Exiting full-screen calls `windowDidExitFullScreen` on the `MainWindowController` (now `NSWindowDelegate`), which forces the window back to the documented 1440x900 reference rectangle (`MainWindowController.defaultContentSize`) and re-centers it — Dub never carries a drag-resized windowed size across a full-screen toggle or across launches. `.resizable` stays in the style mask because removing it would also strip the green button and disable `toggleFullScreen:` entirely; the snap-back hook makes that resize affordance effectively cosmetic.
+
+### Fix-at-the-cause: clear `NSHostingController.sizingOptions`
+
+First-cut testing surfaced the actual headline bug: full-screen "worked" (the window expanded to the display) but the SwiftUI performance surface stayed at 1440x900 with the window background painting a black frame around it. Cause: on macOS 13+, `NSHostingController.sizingOptions` defaults to `[.preferredContentSize, .intrinsicContentSize]`, which exposes SwiftUI's computed intrinsic size to AppKit Auto Layout as a hard intrinsic content size on the hosting view. Combined with `MainWindowController` setting `hostingController.preferredContentSize = NSSize(1440, 900)` (a workaround introduced when the embedded `MTKView` had no intrinsic size and the toolbar collapsed the window to ~514x87), the hosting view's intrinsic content size was pinned at 1440x900 and won the constraint fight against AppKit's auto-installed edge-pinning constraints between `window.contentView` and `contentViewController.view`. The black frame was the SwiftUI hierarchy refusing to grow.
+
+Fix: set `hostingController.sizingOptions = []` and drop the `preferredContentSize` assignment. With no SwiftUI-driven intrinsic size, the standard edge-pinning constraints take over and the SwiftUI hierarchy fills whatever frame AppKit hands it — windowed at 1440x900 (still set by the window's `contentRect` + `setContentSize`, which are window-level concerns independent of the hosting controller), full-screen at every display the user can reach (Retina laptop, 5K Studio Display, 6K Pro Display XDR, ultrawide). The old `preferredContentSize` workaround for the "collapses to toolbar size" symptom is obsolete because `PerformanceView` and the M11d.5 deck-header layout both carry their own `frame(maxWidth: .infinity, maxHeight: .infinity)` and `frame(minWidth: 960, minHeight: 600)` floors, so SwiftUI no longer collapses without external prodding.
+
+Files: `apple/Dub/DubAppDelegate.swift`, `apple/Dub/MainWindowController.swift`.
 
 ---
 

@@ -5,9 +5,10 @@
 //  M10.5c per-deck Track Overview. A thin vertical strip
 //  (`DubLayout.deckOverviewWidth` ≈ 36 px) on the deck's *outside*
 //  edge showing the *whole* track top→bottom with a playhead
-//  bracket at the current position. Click-to-jump seeks the deck
-//  in File mode (PRD §6.1); Timecode click-jump waits on M10.6's
-//  Panic Play wiring.
+//  bracket at the current position. Click or click-and-drag on the
+//  overview seeks the deck to absolute track positions (Traktor-
+//  style overview scrub). Transport is left alone — paused stays
+//  paused, playing keeps playing from each new position.
 //
 //  Design notes (PRD §9.6.1):
 //      • Vertical orientation, time runs **top → bottom**. This
@@ -101,6 +102,18 @@ struct TrackOverviewView: View {
     /// second load) and re-decimate.
     @State private var lastSeenGeneration: UInt64 = 0
 
+    /// While the user drags on the overview, the playhead bracket
+    /// tracks the finger immediately instead of waiting for the
+    /// engine seek + TimelineView tick. Cleared on gesture end.
+    @State private var dragPlayheadFraction: Double? = nil
+
+    /// Throttle engine seeks during a drag so fast mouse motion
+    /// doesn't flood the FFI layer; the bracket still follows the
+    /// finger every frame via `dragPlayheadFraction`.
+    @State private var lastOverviewSeekUptime: TimeInterval = 0
+
+    private static let overviewSeekMinInterval: TimeInterval = 1.0 / 30.0
+
     private var deckState: DeckState {
         switch side {
         case .a: return model.deckA
@@ -116,7 +129,7 @@ struct TrackOverviewView: View {
         // bounds; reading them off the geo proxy is the
         // idiomatic workaround.
         //
-        // M11d.5 round 5: the Canvas is wrapped in a 2 Hz
+        // M11d.5 round 5: the Canvas is wrapped in a 10 Hz
         // `TimelineView` and reads the playhead position from
         // `engine.position(deckIdx:)` directly. Pre-fix the
         // bracket advanced because `DeckState.elapsedSecs`
@@ -127,7 +140,7 @@ struct TrackOverviewView: View {
         // self-driven timeline, only this Canvas closure re-runs
         // on the bracket cadence; nothing above the timeline ever
         // observes the per-second tick.
-        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+        TimelineView(.periodic(from: .now, by: 0.1)) { context in
             GeometryReader { geo in
                 Canvas { ctx, size in
                     // **Critical** — referencing `context.date`
@@ -156,16 +169,25 @@ struct TrackOverviewView: View {
                 }
                 .contentShape(Rectangle())
                 .gesture(
-                    // Click-to-jump only on the overview. The overview
-                    // is a "where am I in the whole track" map, not a
-                    // fine-positioning tool — continuous drag-scrub +
-                    // audio-under-cursor lives on the zoomed waveform
-                    // (PRD §6.1 / §9.6). Single-tap on the overview
-                    // seeks the deck to that absolute track position
-                    // and leaves transport alone.
+                    // Traktor-style overview scrub: click or click-and-
+                    // drag to seek to absolute track positions. Unlike
+                    // the zoomed waveform's rate-driven vinyl scratch,
+                    // this is coarse position navigation — the deck
+                    // jumps to each point under the cursor. Transport
+                    // is left alone (paused stays paused; playing
+                    // keeps playing from each new position).
                     DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            handleOverviewScrub(
+                                at: value.location,
+                                in: geo.size,
+                                isFinal: false)
+                        }
                         .onEnded { value in
-                            handleClickJump(at: value.location, in: geo.size)
+                            handleOverviewScrub(
+                                at: value.location,
+                                in: geo.size,
+                                isFinal: true)
                         })
             }
         }
@@ -173,6 +195,7 @@ struct TrackOverviewView: View {
         .onAppear(perform: reloadIfStale)
         .onChange(of: deckState.sourceURL) { _ in reloadIfStale() }
         .onChange(of: deckState.hasTrack) { _ in reloadIfStale() }
+        .onChange(of: deckState.peaksGeneration) { _ in reloadIfStale() }
     }
 
     // MARK: - Drawing
@@ -261,15 +284,22 @@ struct TrackOverviewView: View {
 
     private func drawPlayhead(ctx: GraphicsContext, size: CGSize) {
         guard let fraction = playheadFraction() else { return }
-        let chevronSize: CGFloat = 4
+        let chevronSize = DubLayout.playheadChevronSize
+        let coreW = DubLayout.playheadCoreWidth
+        let haloW = DubLayout.playheadHaloWidth
+        let accent = DubColor.playheadAccent
+        let haloColor = Color.black.opacity(0.55)
         let pad = OverviewLayout.endPadding
         switch orientation {
         case .vertical:
             let axisLength = max(0, size.height - 2 * pad)
             let y = pad + axisLength * CGFloat(fraction)
-            let line = CGRect(x: 0, y: max(0, y - 0.5),
-                              width: size.width, height: 1)
-            ctx.fill(Path(line), with: .color(DubColor.playheadAccent))
+            let halo = CGRect(x: 0, y: y - haloW * 0.5,
+                              width: size.width, height: haloW)
+            ctx.fill(Path(halo), with: .color(haloColor))
+            let line = CGRect(x: 0, y: y - coreW * 0.5,
+                              width: size.width, height: coreW)
+            ctx.fill(Path(line), with: .color(accent))
             let leftChevron = Path { p in
                 p.move(to: CGPoint(x: 0, y: y - chevronSize))
                 p.addLine(to: CGPoint(x: chevronSize, y: y))
@@ -282,14 +312,17 @@ struct TrackOverviewView: View {
                 p.addLine(to: CGPoint(x: size.width, y: y + chevronSize))
                 p.closeSubpath()
             }
-            ctx.fill(leftChevron, with: .color(DubColor.playheadAccent))
-            ctx.fill(rightChevron, with: .color(DubColor.playheadAccent))
+            ctx.fill(leftChevron, with: .color(accent))
+            ctx.fill(rightChevron, with: .color(accent))
         case .horizontal:
             let axisLength = max(0, size.width - 2 * pad)
             let x = pad + axisLength * CGFloat(fraction)
-            let line = CGRect(x: max(0, x - 0.5), y: 0,
-                              width: 1, height: size.height)
-            ctx.fill(Path(line), with: .color(DubColor.playheadAccent))
+            let halo = CGRect(x: x - haloW * 0.5, y: 0,
+                              width: haloW, height: size.height)
+            ctx.fill(Path(halo), with: .color(haloColor))
+            let line = CGRect(x: x - coreW * 0.5, y: 0,
+                              width: coreW, height: size.height)
+            ctx.fill(Path(line), with: .color(accent))
             let topChevron = Path { p in
                 p.move(to: CGPoint(x: x - chevronSize, y: 0))
                 p.addLine(to: CGPoint(x: x, y: chevronSize))
@@ -302,8 +335,8 @@ struct TrackOverviewView: View {
                 p.addLine(to: CGPoint(x: x + chevronSize, y: size.height))
                 p.closeSubpath()
             }
-            ctx.fill(topChevron, with: .color(DubColor.playheadAccent))
-            ctx.fill(bottomChevron, with: .color(DubColor.playheadAccent))
+            ctx.fill(topChevron, with: .color(accent))
+            ctx.fill(bottomChevron, with: .color(accent))
         }
     }
 
@@ -344,6 +377,9 @@ struct TrackOverviewView: View {
     /// for the same reason — keeps the fraction calculation in
     /// sync with the engine on the same tick.
     private func playheadFraction() -> Double? {
+        if let dragPlayheadFraction {
+            return max(0, min(1, dragPlayheadFraction))
+        }
         let pos = model.engine.position(deckIdx: deckIdx)
         let elapsed = pos.elapsedSecs
         let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
@@ -403,71 +439,72 @@ struct TrackOverviewView: View {
         DubColor.deckTint(side).opacity(0.95)
     }
 
-    // MARK: - Click-to-jump
+    // MARK: - Overview scrub (click + drag)
 
-    /// Click-to-jump on the overview (PRD §6.1 / §9.6). Maps the
-    /// click's position along the strip's time axis to an absolute
-    /// track position and seeks the deck there. Transport state is
-    /// left alone — a paused deck stays paused at the new position,
-    /// a playing deck keeps playing from the new position.
-    ///
-    /// Two M10.5t fixes layered on the previous behaviour:
-    ///
-    /// 1. **Padding-aware.** The click is measured in *axis* space
-    ///    (between `endPadding` and `size - endPadding`), matching
-    ///    the layout the bars and the playhead bracket use. A
-    ///    click inside the padding clamps to the nearest bar
-    ///    rather than snapping to `0` or `durationSecs`.
-    /// 2. **Chunk-grid-canonical seek.** The seek target is
-    ///    computed as `fraction × peaksLen × chunkDurationSecs`,
-    ///    not `fraction × durationSecs`. The bars are laid out on
-    ///    the peak-chunk grid (`peaksLen × chunkDurationSecs`
-    ///    seconds total) so the click must map back through the
-    ///    *same* grid — clicking the visual position of bar `b`
-    ///    must seek to the audio time bar `b` actually represents,
-    ///    regardless of any sub-millisecond delta between the bar
-    ///    grid's total and `track.frames() / track_sr`. Mirrors
-    ///    the M10.5n root-cause-fix principle for the main
-    ///    waveform: peaks are cadenced in track frames, do all
-    ///    seek/playhead math on that grid.
-    ///
-    /// Also goes through `WaveformAppModel.seekDeck` so the
-    /// playhead bracket moves on the same SwiftUI tick as the
-    /// click instead of waiting up to 33 ms for the next 30 Hz
-    /// position poll.
-    ///
-    /// Works in both Performance and Prep mode. In two-deck
-    /// Timecode the seek lands instantly and the timecode driver
-    /// re-locks on the next confident sample.
-    private func handleClickJump(at point: CGPoint, in size: CGSize) {
-        guard deckState.hasTrack, deckState.durationSecs > 0 else { return }
+    /// Maps a point in overview coordinates to a `[0, 1]` fraction
+    /// along the padded time axis (same grid as the bars).
+    private func overviewFraction(at point: CGPoint, in size: CGSize) -> Double? {
         let pad = OverviewLayout.endPadding
-        let fraction: Double
         switch orientation {
         case .vertical:
             let axisLength = size.height - 2 * pad
-            guard axisLength > 0 else { return }
+            guard axisLength > 0 else { return nil }
             let local = max(0, min(axisLength, point.y - pad))
-            fraction = Double(local / axisLength)
+            return Double(local / axisLength)
         case .horizontal:
             let axisLength = size.width - 2 * pad
-            guard axisLength > 0 else { return }
+            guard axisLength > 0 else { return nil }
             let local = max(0, min(axisLength, point.x - pad))
-            fraction = Double(local / axisLength)
+            return Double(local / axisLength)
         }
-        let seekSecs: Double
+    }
+
+    /// Converts an overview fraction to absolute seek seconds on
+    /// the peak-chunk grid (M10.5t canonical mapping).
+    private func overviewSeekSecs(for fraction: Double) -> Double? {
+        guard deckState.hasTrack, deckState.durationSecs > 0 else { return nil }
         let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
         let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
         if peaksLen > 0 && chunkDur > 0 {
-            let totalSecs = Double(peaksLen) * chunkDur
-            seekSecs = fraction * totalSecs
-        } else {
-            // Pre-peaks fallback (e.g. Thru-mode source): use the
-            // header's reported duration. Same math as before the
-            // M10.5t fix; only fires when peak data is missing.
-            seekSecs = fraction * deckState.durationSecs
+            return fraction * Double(peaksLen) * chunkDur
         }
+        return fraction * deckState.durationSecs
+    }
+
+    /// Traktor-style overview scrub. Single tap is a one-shot seek;
+    /// click-and-drag continuously seeks as the finger moves.
+    /// Transport state is left alone — paused stays paused, playing
+    /// keeps playing from each new position.
+    ///
+    /// During a drag the playhead bracket follows the finger
+    /// immediately via `dragPlayheadFraction`; engine seeks are
+    /// throttled to ~30 Hz so fast motion doesn't flood the FFI.
+    /// The final `onEnded` seek is always unthrottled.
+    private func handleOverviewScrub(
+        at point: CGPoint,
+        in size: CGSize,
+        isFinal: Bool
+    ) {
+        guard let fraction = overviewFraction(at: point, in: size),
+              let seekSecs = overviewSeekSecs(for: fraction)
+        else {
+            if isFinal { dragPlayheadFraction = nil }
+            return
+        }
+
+        dragPlayheadFraction = fraction
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let shouldSeek = isFinal
+            || now - lastOverviewSeekUptime >= Self.overviewSeekMinInterval
+        guard shouldSeek else { return }
+
+        lastOverviewSeekUptime = now
         model.seekDeck(side: side, absoluteSecs: seekSecs)
+
+        if isFinal {
+            dragPlayheadFraction = nil
+        }
     }
 
     // MARK: - Decimation

@@ -49,7 +49,10 @@
 //! no grid". Trying again is always allowed (right-click →
 //! Re-analyze) but won't fire automatically.
 
+use std::path::PathBuf;
+
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 
 use crate::db::Library;
 use crate::error::{LibraryError, Result};
@@ -182,10 +185,6 @@ impl Library {
     ///
     /// * [`LibraryError::TrackNotFound`] — `track_id` is not in
     ///   `tracks`.
-    /// * [`LibraryError::TrackHasNoFingerprint`] — the track has no
-    ///   `fingerprint_id`. Should not happen via M11c imports but is
-    ///   guarded explicitly because `analysis_cache` is keyed by
-    ///   fingerprint id.
     /// * [`LibraryError::TrackHasNoFile`] — the track has no
     ///   resolvable on-disk path. Caller (the Swift scanner) should
     ///   surface this as "file is missing"; the next Relocate run
@@ -193,8 +192,21 @@ impl Library {
     /// * [`LibraryError::DecodeFailed`] — `dub-io` couldn't decode
     ///   the file (corrupt / unsupported codec).
     /// * [`LibraryError::Sqlite`] — any underlying database error.
+    ///
+    /// # M11c.4 lazy fingerprint
+    ///
+    /// As of M11c.4 the importer leaves `tracks.fingerprint_id =
+    /// NULL` so the import phase stays metadata-only. When this
+    /// method sees a NULL fingerprint, it computes the Chromaprint
+    /// over the just-decoded samples, upserts a `fingerprints` row,
+    /// and writes the id back into `tracks` via
+    /// [`Library::attach_fingerprint`] **before** stamping
+    /// `analysis_cache` (which is keyed by fingerprint id). The
+    /// fingerprint pass costs ~30 % of the analysis budget on top
+    /// of the decode + BPM + key passes the user already paid for
+    /// by loading the deck.
     pub fn analyze_track(&self, track_id: &str) -> Result<AnalysisOutcome> {
-        let (fingerprint_id, file_path) = self.track_analysis_keys(track_id)?;
+        let (existing_fingerprint_id, file_path) = self.track_analysis_keys(track_id)?;
         let track =
             dub_io::Track::load_from_path(&file_path).map_err(|e| LibraryError::DecodeFailed {
                 track_id: track_id.to_string(),
@@ -202,14 +214,74 @@ impl Library {
                 reason: format!("{e}"),
             })?;
 
-        // ---- Beat grid (M11c.1) ----------------------------------
-        let grid =
-            dub_bpm::analyze_beat_grid(track.samples(), track.sample_rate(), track.channels())
+        // ---- Fingerprint (M11c.4 lazy attach) --------------------
+        // If the importer left `fingerprint_id = NULL`, compute the
+        // Chromaprint now and write it back to `tracks` (and
+        // `fingerprints`). The race window (two concurrent
+        // analyse_track calls on the same UUID) is closed by
+        // `attach_fingerprint`'s `WHERE fingerprint_id IS NULL`
+        // guard: the loser's UPDATE matches zero rows and we read
+        // the winner's id back from `tracks`.
+        let fingerprint_id = match existing_fingerprint_id {
+            Some(id) => id,
+            None => {
+                let fp = dub_fingerprint::Fingerprint::compute_from_f32(
+                    track.samples(),
+                    track.sample_rate(),
+                    u32::from(track.channels()),
+                )
                 .map_err(|e| LibraryError::DecodeFailed {
                     track_id: track_id.to_string(),
                     path: file_path.clone(),
-                    reason: format!("beat-grid analysis failed: {e}"),
+                    reason: format!("fingerprint failed: {e}"),
                 })?;
+                let new_fp_id = self.upsert_fingerprint(
+                    &fp,
+                    Some(track.sample_rate()),
+                    Some(u32::from(track.channels())),
+                    None,
+                )?;
+                let attached = self.attach_fingerprint(track_id, new_fp_id, fp.duration_ms())?;
+                if attached {
+                    new_fp_id
+                } else {
+                    // A concurrent caller won the race. Re-read the
+                    // winning id from `tracks`. (Cheaper than
+                    // re-computing and the `fingerprints` row we
+                    // just inserted becomes an orphan, which the
+                    // future "Find duplicates" tool / a v1.x
+                    // sweeper can garbage-collect.)
+                    self.connection()
+                        .query_row(
+                            "SELECT fingerprint_id FROM tracks WHERE id = ?1",
+                            params![track_id],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )
+                        .map_err(|e| LibraryError::sqlite("reread_fingerprint_after_race", e))?
+                        .ok_or_else(|| LibraryError::TrackHasNoFingerprint {
+                            track_id: track_id.to_string(),
+                        })?
+                }
+            }
+        };
+
+        // ---- Beat grid (M11c.1) ----------------------------------
+        let profile = self
+            .track_id3_genre(track_id)?
+            .as_deref()
+            .map(dub_bpm::octave_profile_from_genre)
+            .unwrap_or(dub_bpm::OctaveProfile::Default);
+        let grid = dub_bpm::analyze_beat_grid_with_profile(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            profile,
+        )
+        .map_err(|e| LibraryError::DecodeFailed {
+            track_id: track_id.to_string(),
+            path: file_path.clone(),
+            reason: format!("beat-grid analysis failed: {e}"),
+        })?;
 
         let mut outcome = AnalysisOutcome::EMPTY;
         if grid.confidence > 0.0 {
@@ -345,11 +417,13 @@ impl Library {
     }
 
     /// Resolve the `(fingerprint_id, absolute_path)` pair we need
-    /// to run analysis: the fingerprint id keys `analysis_cache`,
-    /// the path keys the decode. Returns typed errors for the
-    /// two distinct "can't analyze this" cases so the FFI surfaces
-    /// them cleanly.
-    fn track_analysis_keys(&self, track_id: &str) -> Result<(i64, std::path::PathBuf)> {
+    /// to run analysis. The fingerprint id is optional under the
+    /// M11c.4 lazy-fingerprint model: a NULL value means the
+    /// importer hasn't paid the Chromaprint cost yet, and
+    /// `analyze_track` computes + attaches it inline. The path
+    /// is mandatory — analysis without bytes to read is a
+    /// `TrackHasNoFile`.
+    fn track_analysis_keys(&self, track_id: &str) -> Result<(Option<i64>, std::path::PathBuf)> {
         let fingerprint_id: Option<i64> = self
             .connection()
             .query_row(
@@ -363,15 +437,27 @@ impl Library {
                 },
                 other => LibraryError::sqlite("analyze_lookup_fingerprint", other),
             })?;
-        let fingerprint_id = fingerprint_id.ok_or_else(|| LibraryError::TrackHasNoFingerprint {
-            track_id: track_id.to_string(),
-        })?;
         let path =
             self.resolve_track_path(track_id)?
                 .ok_or_else(|| LibraryError::TrackHasNoFile {
                     track_id: track_id.to_string(),
                 })?;
         Ok((fingerprint_id, path))
+    }
+
+    /// ID3 genre tag for octave-profile selection (M11c.3d).
+    fn track_id3_genre(&self, track_id: &str) -> Result<Option<String>> {
+        let genre: Option<String> = self
+            .connection()
+            .query_row(
+                "SELECT genre FROM track_metadata_source \
+                 WHERE track_id = ?1 AND source = 'id3'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("analyze_lookup_genre", e))?;
+        Ok(genre.filter(|g| !g.trim().is_empty()))
     }
 
     /// `true` iff the track has an `is_active = 1` row in
@@ -431,6 +517,61 @@ impl Library {
                 params![track_id, anchor_secs, bpm, if is_active { 1 } else { 0 }],
             )
             .map_err(|e| LibraryError::sqlite("upsert_auto_beatgrid", e))?;
+        Ok(())
+    }
+
+    /// Upsert a user tap-to-grid correction (M11c.3b). Deactivates
+    /// every other grid row for the track, then writes
+    /// `source = 'user_tap'` as the sole active grid.
+    pub fn upsert_user_tap_beatgrid(
+        &self,
+        track_id: &str,
+        anchor_secs: f64,
+        bpm: f64,
+    ) -> Result<()> {
+        if !bpm.is_finite() || bpm <= 0.0 {
+            return Err(LibraryError::DecodeFailed {
+                track_id: track_id.to_string(),
+                path: PathBuf::new(),
+                reason: format!("non-positive BPM ({bpm})"),
+            });
+        }
+        if !anchor_secs.is_finite() {
+            return Err(LibraryError::DecodeFailed {
+                track_id: track_id.to_string(),
+                path: PathBuf::new(),
+                reason: format!("non-finite anchor ({anchor_secs})"),
+            });
+        }
+        let conn = self.connection();
+        conn.execute(
+            "UPDATE track_beatgrids SET is_active = 0 WHERE track_id = ?1",
+            params![track_id],
+        )
+        .map_err(|e| LibraryError::sqlite("upsert_user_tap_beatgrid_deactivate", e))?;
+        conn.execute(
+            "INSERT INTO track_beatgrids \
+             (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+             VALUES (?1, 'user_tap', ?2, ?3, 1, strftime('%s','now')) \
+             ON CONFLICT(track_id, source) DO UPDATE SET \
+                 anchor_secs = excluded.anchor_secs, \
+                 bpm         = excluded.bpm, \
+                 is_active   = 1, \
+                 captured_at = excluded.captured_at",
+            params![track_id, anchor_secs, bpm],
+        )
+        .map_err(|e| LibraryError::sqlite("upsert_user_tap_beatgrid", e))?;
+        if let Ok((Some(fp_id), _path)) = self.track_analysis_keys(track_id) {
+            let has_active_key: bool = conn
+                .query_row(
+                    "SELECT COALESCE(has_active_key, 0) FROM analysis_cache WHERE fingerprint_id = ?1",
+                    params![fp_id],
+                    |r| r.get::<_, i32>(0),
+                )
+                .map(|v| v != 0)
+                .unwrap_or(false);
+            self.stamp_analysis_cache(fp_id, true, has_active_key)?;
+        }
         Ok(())
     }
 
@@ -588,7 +729,7 @@ mod tests {
             )
             .unwrap();
         let track_id = uuid::Uuid::new_v4().to_string();
-        lib.insert_track(&track_id, fp_id, fp.duration_ms(), None)
+        lib.insert_track(&track_id, Some(fp_id), Some(fp.duration_ms()), None)
             .unwrap();
         // Strip the tempdir prefix to get the volume-relative path.
         let rel = path
@@ -609,6 +750,132 @@ mod tests {
         )
         .unwrap();
         (track_id, fp_id, path)
+    }
+
+    /// M11c.4 helper: seed a `tracks` row with **no** fingerprint
+    /// id and **no** duration_ms, mirroring the state the importer
+    /// leaves behind under the lazy-fingerprint model. Returns the
+    /// track UUID + file path so the test can call
+    /// `analyze_track` and assert the attach side-effect.
+    fn seed_track_without_fingerprint(
+        lib: &Library,
+        tmp: &tempfile::TempDir,
+        bpm: f64,
+        secs: f64,
+    ) -> (String, std::path::PathBuf) {
+        let filename = format!("click-{bpm}.wav");
+        let path = tmp.path().join(&filename);
+        write_click_track(&path, bpm, secs);
+
+        let boot_uuid = "00000000-0000-0000-0000-000000000000";
+        lib.connection()
+            .execute(
+                "INSERT INTO volumes (volume_uuid, display_name, last_known_mount_point, last_seen_at, is_internal) \
+                 VALUES (?1, 'Macintosh HD', '/', strftime('%s','now'), 1) \
+                 ON CONFLICT(volume_uuid) DO NOTHING",
+                params![boot_uuid],
+            )
+            .unwrap();
+
+        let track_id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&track_id, None, None, None).unwrap();
+        let rel = path
+            .strip_prefix("/")
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        lib.upsert_track_file(
+            &track_id,
+            boot_uuid,
+            &rel,
+            Some("wav"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        (track_id, path)
+    }
+
+    #[test]
+    fn analyze_track_attaches_fingerprint_when_missing() {
+        // M11c.4: a fresh-from-importer track has fingerprint_id
+        // NULL. `analyze_track` must compute the Chromaprint over
+        // the just-decoded samples, write it to `fingerprints`,
+        // and link the new id back into `tracks` so the
+        // analysis_cache stamp can use it as a key.
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 8.0);
+
+        // Pre-analysis: NULL fingerprint, NULL duration, 0 rows
+        // in `fingerprints`.
+        let (fp_id_before, dur_before): (Option<i64>, Option<i64>) = lib
+            .connection()
+            .query_row(
+                "SELECT fingerprint_id, duration_ms FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(fp_id_before.is_none(), "precondition: NULL fingerprint");
+        assert!(dur_before.is_none(), "precondition: NULL duration");
+        let fp_rows_before: i64 = lib
+            .connection()
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fp_rows_before, 0);
+
+        let outcome = lib.analyze_track(&track_id).unwrap();
+        assert!(outcome.wrote_grid, "click track must produce a grid");
+
+        // Post-analysis: fingerprint attached, duration populated,
+        // one row in `fingerprints`, analysis_cache stamped.
+        let (fp_id_after, dur_after): (Option<i64>, Option<i64>) = lib
+            .connection()
+            .query_row(
+                "SELECT fingerprint_id, duration_ms FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            fp_id_after.is_some(),
+            "analyze_track must attach a fingerprint"
+        );
+        assert!(
+            dur_after.is_some_and(|d| d > 0),
+            "analyze_track must populate duration"
+        );
+        let fp_rows_after: i64 = lib
+            .connection()
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fp_rows_after, 1);
+        assert!(lib.is_track_analyzed(&track_id).unwrap());
+    }
+
+    #[test]
+    fn analyze_track_is_idempotent_when_fingerprint_already_attached() {
+        // Re-running analyze on a track that already has a
+        // fingerprint id must NOT mint a second `fingerprints` row.
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 8.0);
+
+        lib.analyze_track(&track_id).unwrap();
+        lib.analyze_track(&track_id).unwrap();
+
+        let fp_rows: i64 = lib
+            .connection()
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fp_rows, 1,
+            "second analyze must reuse the existing fingerprint id"
+        );
     }
 
     #[test]
@@ -796,7 +1063,7 @@ mod tests {
             )
             .unwrap();
         let track_id = uuid::Uuid::new_v4().to_string();
-        lib.insert_track(&track_id, fp_id, fp.duration_ms(), None)
+        lib.insert_track(&track_id, Some(fp_id), Some(fp.duration_ms()), None)
             .unwrap();
         let rel = path
             .strip_prefix("/")
@@ -960,7 +1227,7 @@ mod tests {
             )
             .unwrap();
         let track_id = uuid::Uuid::new_v4().to_string();
-        lib.insert_track(&track_id, fp_id, fp.duration_ms(), None)
+        lib.insert_track(&track_id, Some(fp_id), Some(fp.duration_ms()), None)
             .unwrap();
         let rel = path
             .strip_prefix("/")
@@ -1161,6 +1428,35 @@ mod tests {
             row.is_none(),
             "an id with no matching track resolves to no active row (not an error)"
         );
+    }
+
+    #[test]
+    fn upsert_user_tap_beatgrid_becomes_active_and_deactivates_auto() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+
+        lib.upsert_user_tap_beatgrid(&track_id, 1.25, 65.0).unwrap();
+
+        let row = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("user tap row must be active");
+        assert_eq!(row.source, "user_tap");
+        assert!((row.bpm - 65.0).abs() < 1e-9);
+        assert!((row.anchor_secs - 1.25).abs() < 1e-9);
+
+        let auto_active: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT is_active FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'auto'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_active, 0, "auto row must be deactivated");
     }
 
     #[test]

@@ -207,6 +207,12 @@ enum DubRadius {
 
     /// Outer card (whole deck header background, FX bar background).
     static let card: CGFloat = 10
+
+    /// Hero banners (About splash, launch splash).
+    static let lg: CGFloat = 12
+
+    /// Full-bleed overlay cards with macOS-like soft corners.
+    static let xl: CGFloat = 16
 }
 
 // MARK: - Layout constants
@@ -283,6 +289,12 @@ enum DubLayout {
     /// playhead bracket on the overview to not collide visually
     /// with the playing strip's edge.
     static let deckOverviewGap: CGFloat = 12
+
+    /// Zoomed-waveform playhead chrome (M11d.5). Kept distinct from
+    /// the 1 px beat-grid ticks: cream core, dark halo, edge chevrons.
+    static let playheadCoreWidth: CGFloat = 2
+    static let playheadHaloWidth: CGFloat = 5
+    static let playheadChevronSize: CGFloat = 6
 }
 
 // MARK: - Color hex initialiser

@@ -1,10 +1,10 @@
-//! Filesystem importer (M11c).
+//! Filesystem importer (M11c, lazy-fingerprint variant from M11c.4).
 //!
-//! Walks a folder, decodes each audio file via `dub-io`, computes a
-//! canonical Chromaprint fingerprint via `dub-fingerprint`, parses
-//! ID3 / filename metadata, runs the §8.1 dedupe decision against
-//! existing library rows, and writes the result into the SQLite
-//! schema landed in M11a.
+//! Walks a folder, parses ID3 / filename metadata via a fast
+//! metadata-only probe, and writes the result into the SQLite
+//! schema landed in M11a. **No decode, no fingerprint, no dedupe**
+//! at import time — those costs are paid lazily when the user first
+//! loads the track on a deck (PRD §8.4 "lazy by design").
 //!
 //! # Pipeline (per file)
 //!
@@ -16,31 +16,38 @@
 //!     ├─ hit → refresh metadata rows, mark seen, done
 //!     └─ miss
 //!         ▼
-//!     decode samples + tags via dub_io::Track::load_from_path
+//!     dub_io::read_metadata(path)  ← metadata-only probe, no decode
 //!         ▼
-//!     compute Chromaprint fingerprint
+//!     mint new tracks row (fingerprint_id = NULL, duration_ms = NULL)
 //!         ▼
-//!     find_fingerprint_neighbours(duration_ms, 200 ms)
-//!         ▼
-//!     for each neighbour: dedupe::decide(...)
-//!         ├─ Merge          → register additional track_files row
-//!         ├─ SiblingVersion → new tracks row + duplicate_link_track_id
-//!         └─ Distinct       → fall through
-//!         ▼
-//!     no merge / sibling? → new canonical tracks row
+//!     upsert track_files row (codec from extension, file_size, mtime)
 //!         ▼
 //!     write track_metadata_source('id3') from container tags
 //!     write track_metadata_source('filename') from filename parser
 //! ```
+//!
+//! # Why lazy?
+//!
+//! Empirically (`crates/dub-library/examples/profile_import.rs`),
+//! the cold-path decode and Chromaprint pass together account for
+//! ~95 % of import wall-clock time on commodity SSDs. Importing a
+//! 500-track DnB folder used to take ~3–4 minutes; the metadata-
+//! only path lands it in <2 s. The user-visible "import fast,
+//! analyze on demand" contract is the PRD's §8.4 default.
+//!
+//! The deferred work runs in [`Library::analyze_track`]: that path
+//! already decodes the file once for BPM + key analysis, so adding
+//! the Chromaprint pass to it (M11c.4) costs nothing on top of
+//! work the user has already paid for by loading the deck.
 //!
 //! # What this milestone delivers vs. defers
 //!
 //! Delivered:
 //! * Walk-a-folder driver (recursive, deterministic alphabetical
 //!   order, extension-filtered).
-//! * Decode + fingerprint + dedupe + write for every supported
-//!   audio format the workspace's symphonia features cover (WAV,
-//!   MP3, FLAC, AIFF, ALAC, AAC).
+//! * Metadata-only ingest for every supported audio format the
+//!   workspace's symphonia features cover (WAV, MP3, FLAC, AIFF,
+//!   ALAC, AAC).
 //! * Idempotent re-import via the `track_files` unique-by-path
 //!   index.
 //! * Per-source metadata rows for `source='id3'` (container tags)
@@ -51,27 +58,25 @@
 //!   browser-displayed value via the §8.1 priority chain.
 //!
 //! Deferred to later milestones:
-//! * `analysis_cache` LUFS / waveform / has_active_grid (M10.5j +
-//!   subsequent analysis pipeline).
-//! * `track_beatgrids(source='auto')` cross-validation (needs
-//!   `dub-bpm::analyze_bpm` wired in — slated for follow-up to
-//!   M11c).
+//! * Auto-merge / sibling-version dedupe at import time. The
+//!   `dedupe::decide` primitives still exist and run lazily during
+//!   `Library::analyze_track`; the user-facing "Find duplicates"
+//!   action (which surfaces near-duplicate fingerprints for a
+//!   manual merge decision) is parked for v1.x.
 //! * Background / parallel scanning (v1.x; the M11c driver is
 //!   single-threaded, deterministic, easy to reason about).
 //! * Progress reporting beyond the returned [`ImportSummary`].
 
 use std::path::{Path, PathBuf};
 
-use dub_io::{LoadError, Track};
+use dub_io::{LoadError, TrackMetadata};
 use uuid::Uuid;
 
-use crate::db::{Library, StoredFingerprint};
-use crate::dedupe::{decide, DedupeDecision, DedupeInput, DURATION_DELTA_MS};
+use crate::db::Library;
 use crate::error::{LibraryError, Result};
 use crate::filename_parser::{self, ParsedFilename};
 use crate::version_tokens::VersionToken;
 use crate::volumes::discover_for_path;
-use dub_fingerprint::Fingerprint;
 
 /// File extensions the importer recognises as audio. Lowercase; the
 /// matcher case-insensitives the candidate path. Mirrors the
@@ -79,22 +84,27 @@ use dub_fingerprint::Fingerprint;
 const AUDIO_EXTS: &[&str] = &["wav", "mp3", "flac", "aif", "aiff", "m4a", "alac", "aac"];
 
 /// Aggregate result of an [`import_folder`] run.
+///
+/// Since M11c.4 the importer no longer auto-merges duplicates at
+/// import time (the fingerprint isn't computed until first
+/// deck-load). `merged` and `sibling_versions` are retained in the
+/// summary for API compatibility but always come back zero from
+/// the cold-path import; a future "Find duplicates" library action
+/// will surface near-duplicate fingerprints for manual user review.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportSummary {
     /// Files that produced a new canonical `tracks` row.
     pub added: u32,
-    /// Files that merged into an existing canonical `tracks` row
-    /// (additional `track_files` row written; canonical identity
-    /// unchanged).
+    /// Always `0` since M11c.4. Retained for API compatibility.
     pub merged: u32,
-    /// Files registered as sibling versions (new `tracks` row with
-    /// `duplicate_link_track_id` populated).
+    /// Always `0` since M11c.4. Retained for API compatibility.
     pub sibling_versions: u32,
     /// Files already known by `(volume_uuid, relative_path)` —
     /// metadata rows were refreshed but no new identity was added.
     pub refreshed: u32,
-    /// Files skipped because decoding failed or the volume could
-    /// not be resolved. Detailed reasons live in `errors`.
+    /// Files skipped because the metadata probe failed or the
+    /// volume could not be resolved. Detailed reasons live in
+    /// `errors`.
     pub skipped: u32,
     /// Per-file failures (path + short reason). Sized for log
     /// emission; the driver never aborts on a single failure.
@@ -161,8 +171,6 @@ pub fn import_folder(library: &mut Library, root: &Path) -> Result<ImportSummary
         match import_one(library, path) {
             Ok(outcome) => match outcome {
                 FileOutcome::Added => summary.added += 1,
-                FileOutcome::Merged => summary.merged += 1,
-                FileOutcome::SiblingVersion => summary.sibling_versions += 1,
                 FileOutcome::Refreshed => summary.refreshed += 1,
             },
             Err(reason) => {
@@ -183,8 +191,6 @@ pub fn import_folder(library: &mut Library, root: &Path) -> Result<ImportSummary
 /// counters directly.
 enum FileOutcome {
     Added,
-    Merged,
-    SiblingVersion,
     Refreshed,
 }
 
@@ -198,6 +204,13 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
         .relative_to(path)
         .ok_or_else(|| format!("path {path:?} is not under volume {:?}", volume.mount_point))?;
 
+    let stats = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+    let mtime = stats
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
     // Idempotent re-import shortcut: if we've seen this exact
     // `(volume_uuid, relative_path)` before, the canonical track
     // identity is already known. We refresh the per-source
@@ -209,9 +222,6 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
     {
         refresh_metadata_for_known_track(library, &existing_uuid, path)
             .map_err(|e| e.to_string())?;
-        // We still update the file row's last_seen_at + mtime via
-        // a touch upsert; the track owner stays the same.
-        let stats = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
         library
             .upsert_track_file(
                 &existing_uuid,
@@ -222,32 +232,18 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
                 None,
                 None,
                 Some(stats.len()),
-                stats
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64),
+                mtime,
             )
             .map_err(|e| e.to_string())?;
         return Ok(FileOutcome::Refreshed);
     }
 
-    // Cold path: decode + fingerprint + dedupe + write.
-    let track = Track::load_from_path(path)
-        .map_err(|e| format!("decode failed: {}", summarise_load_error(&e)))?;
-    let fingerprint = Fingerprint::compute_from_f32(
-        track.samples(),
-        track.sample_rate(),
-        u32::from(track.channels()),
-    )
-    .map_err(|e| format!("fingerprint failed: {e}"))?;
-
-    let stats = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
-    let mtime = stats
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
+    // Cold path (M11c.4 lazy-fingerprint variant): metadata-only
+    // probe, no decode, no fingerprint, no dedupe. The fingerprint
+    // and `tracks.duration_ms` get filled in on first deck-load
+    // via [`Library::analyze_track`].
+    let meta = dub_io::read_metadata(path)
+        .map_err(|e| format!("metadata probe failed: {}", summarise_load_error(&e)))?;
 
     let parsed_filename = filename_parser::parse(
         path.file_name()
@@ -255,171 +251,39 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
             .unwrap_or_default(),
     );
 
-    let duration_ms = fingerprint.duration_ms();
-    let neighbours = library
-        .find_fingerprint_neighbours(duration_ms, DURATION_DELTA_MS)
+    let new_track_uuid = Uuid::new_v4().to_string();
+    library
+        .insert_track(&new_track_uuid, None, None, None)
         .map_err(|e| e.to_string())?;
-
-    // Stable display string for the dedupe call: prefer the parsed
-    // filename, fall back to the ID3 title. The dedupe parser only
-    // looks for version tokens, so either suffices in practice.
-    let candidate_display = composed_display_string(&parsed_filename, track.title());
-
-    let (dedupe_outcome, sibling_target) = run_dedupe(
-        library,
-        &fingerprint,
-        duration_ms,
-        &candidate_display,
-        &neighbours,
-    )?;
-
-    let codec = detect_codec_from_extension(path);
-    let sample_rate = Some(track.sample_rate());
-    let channels = Some(u32::from(track.channels()));
-
-    let outcome = match dedupe_outcome {
-        DedupeResolution::MergeInto(existing_track_uuid) => {
-            library
-                .upsert_track_file(
-                    &existing_track_uuid,
-                    &volume.volume_uuid,
-                    &relative_path,
-                    codec,
-                    sample_rate,
-                    None,
-                    channels,
-                    Some(stats.len()),
-                    mtime,
-                )
-                .map_err(|e| e.to_string())?;
-            write_metadata_rows(library, &existing_track_uuid, &track, &parsed_filename)?;
-            FileOutcome::Merged
-        }
-        DedupeResolution::SiblingOf(_) | DedupeResolution::Distinct => {
-            // Either way, we mint a new canonical track. Sibling
-            // case additionally sets the duplicate_link.
-            let new_track_uuid = Uuid::new_v4().to_string();
-            let fingerprint_id = library
-                .upsert_fingerprint(
-                    &fingerprint,
-                    Some(track.sample_rate()),
-                    Some(u32::from(track.channels())),
-                    Some(stats.len()),
-                )
-                .map_err(|e| e.to_string())?;
-            let duplicate_link = match dedupe_outcome {
-                DedupeResolution::SiblingOf(ref existing) => Some(existing.as_str()),
-                _ => None,
-            };
-            library
-                .insert_track(&new_track_uuid, fingerprint_id, duration_ms, duplicate_link)
-                .map_err(|e| e.to_string())?;
-            library
-                .upsert_track_file(
-                    &new_track_uuid,
-                    &volume.volume_uuid,
-                    &relative_path,
-                    codec,
-                    sample_rate,
-                    None,
-                    channels,
-                    Some(stats.len()),
-                    mtime,
-                )
-                .map_err(|e| e.to_string())?;
-            write_metadata_rows(library, &new_track_uuid, &track, &parsed_filename)?;
-            let _ = sibling_target;
-            if matches!(dedupe_outcome, DedupeResolution::SiblingOf(_)) {
-                FileOutcome::SiblingVersion
-            } else {
-                FileOutcome::Added
-            }
-        }
-    };
-    Ok(outcome)
-}
-
-/// Internal dedupe resolution carrying any neighbour track UUID we
-/// need to write to a foreign key.
-enum DedupeResolution {
-    /// Auto-merge: register an additional `track_files` row against
-    /// the given existing track UUID.
-    MergeInto(String),
-    /// Sibling version: new `tracks` row with
-    /// `duplicate_link_track_id` pointing at the given UUID.
-    SiblingOf(String),
-    /// Distinct: new `tracks` row, no duplicate link.
-    Distinct,
-}
-
-/// Iterate the duration-neighbour fingerprints and pick the best
-/// dedupe outcome. The first auto-merge candidate wins; if none
-/// merge, the first sibling-version candidate wins (so the user
-/// gets a single deterministic "potential duplicate" link even
-/// when several near-matches exist); otherwise Distinct.
-fn run_dedupe(
-    library: &Library,
-    candidate_fp: &Fingerprint,
-    candidate_duration_ms: u32,
-    candidate_display: &str,
-    neighbours: &[StoredFingerprint],
-) -> std::result::Result<(DedupeResolution, Option<String>), String> {
-    let mut first_sibling: Option<String> = None;
-    for neighbour in neighbours {
-        // The neighbour fingerprint row tells us the fingerprint
-        // and duration; we still need the track UUID and a display
-        // string for the version-token check.
-        let owner = library
-            .find_track_owner_by_fingerprint_id(neighbour.id)
-            .map_err(|e| e.to_string())?;
-        let Some((owner_uuid, owner_display)) = owner else {
-            // Fingerprint row exists with no tracks pointing at it
-            // (orphaned by a delete + re-import race). Skip; we
-            // don't auto-resurrect orphans.
-            continue;
-        };
-        let decision = decide(
-            &DedupeInput {
-                fingerprint: candidate_fp,
-                duration_ms: candidate_duration_ms,
-                title_or_filename: candidate_display,
-            },
-            &DedupeInput {
-                fingerprint: &neighbour.fingerprint,
-                duration_ms: neighbour.fingerprint.duration_ms(),
-                title_or_filename: &owner_display,
-            },
-        );
-        match decision {
-            DedupeDecision::Merge => {
-                return Ok((DedupeResolution::MergeInto(owner_uuid), None));
-            }
-            DedupeDecision::SiblingVersion { .. } => {
-                if first_sibling.is_none() {
-                    first_sibling = Some(owner_uuid);
-                }
-            }
-            DedupeDecision::Distinct => {}
-        }
-    }
-    if let Some(uuid) = first_sibling {
-        Ok((DedupeResolution::SiblingOf(uuid.clone()), Some(uuid)))
-    } else {
-        Ok((DedupeResolution::Distinct, None))
-    }
+    library
+        .upsert_track_file(
+            &new_track_uuid,
+            &volume.volume_uuid,
+            &relative_path,
+            detect_codec_from_extension(path),
+            None,
+            None,
+            None,
+            Some(stats.len()),
+            mtime,
+        )
+        .map_err(|e| e.to_string())?;
+    write_metadata_rows(library, &new_track_uuid, &meta, &parsed_filename)?;
+    Ok(FileOutcome::Added)
 }
 
 /// Write the `id3` and `filename` per-source metadata rows for the
 /// given canonical track UUID. UPSERT semantics mean a re-import
-/// refreshes both rows in place.
+/// refreshes both rows in place. Operates on a [`TrackMetadata`]
+/// (from the metadata-only probe) since M11c.4; the importer
+/// never decodes samples on the cold path.
 fn write_metadata_rows(
     library: &Library,
     track_uuid: &str,
-    track: &Track,
+    meta: &TrackMetadata,
     parsed_filename: &ParsedFilename,
 ) -> std::result::Result<(), String> {
-    let ext = track.extended_metadata();
-    let id3_title = ext.title.as_deref();
+    let id3_title = meta.title.as_deref();
     let filename_token = format_token_for_storage(&parsed_filename.version_tokens);
     let id3_token = format_token_for_storage(&BTreeSetFromTitle::tokens(id3_title));
 
@@ -427,17 +291,17 @@ fn write_metadata_rows(
         .upsert_metadata_source(
             track_uuid,
             "id3",
-            ext.artist.as_deref(),
+            meta.artist.as_deref(),
             id3_title,
-            ext.album.as_deref(),
-            ext.genre.as_deref(),
-            ext.comment.as_deref(),
-            ext.composer.as_deref(),
-            ext.year,
-            ext.track_number,
-            ext.bpm,
-            ext.key.as_deref(),
-            ext.gain_db,
+            meta.album.as_deref(),
+            meta.genre.as_deref(),
+            meta.comment.as_deref(),
+            meta.composer.as_deref(),
+            meta.year,
+            meta.track_number,
+            meta.bpm,
+            meta.key.as_deref(),
+            meta.gain_db,
             None,
             id3_token.as_deref(),
         )
@@ -577,43 +441,6 @@ fn detect_codec_from_extension(path: &Path) -> Option<&'static str> {
         "m4a" | "alac" => Some("alac"),
         "aac" => Some("aac"),
         _ => None,
-    }
-}
-
-/// Compose the title-or-filename string the dedupe parser scans
-/// for version tokens. Prefers the parsed filename (carries the
-/// `(Clean)` / `(Dirty)` / etc. tag verbatim); falls back to the
-/// ID3 title; falls back to "" so the dedupe still runs on
-/// fingerprint + duration alone.
-fn composed_display_string(parsed: &ParsedFilename, id3_title: Option<&str>) -> String {
-    match (parsed.title.as_deref(), id3_title) {
-        (Some(t), _) => {
-            let mut out = String::new();
-            if let Some(a) = parsed.artist.as_deref() {
-                out.push_str(a);
-                out.push_str(" - ");
-            }
-            out.push_str(t);
-            // Re-attach a synthetic "(VERSION)" tail when the
-            // parsed-filename token set is non-empty so the
-            // version_tokens parser inside dedupe re-discovers
-            // them on the composed string.
-            if !parsed.version_tokens.is_empty() {
-                out.push_str(" (");
-                let mut first = true;
-                for tok in &parsed.version_tokens {
-                    if !first {
-                        out.push(' ');
-                    }
-                    out.push_str(tok.as_str());
-                    first = false;
-                }
-                out.push(')');
-            }
-            out
-        }
-        (None, Some(id3)) => id3.to_string(),
-        (None, None) => String::new(),
     }
 }
 
@@ -803,11 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn two_identical_files_merge() {
-        // Same audio content, different filenames → fingerprint
-        // matches, duration matches, no version-token mismatch:
-        // §8.1 auto-merge. Second file lands as additional
-        // track_files row against the same tracks row.
+    fn identical_files_do_not_merge_at_import() {
+        // M11c.4 lazy-fingerprint contract: the importer does not
+        // decode, does not fingerprint, and does not dedupe at
+        // import time. Two byte-identical files therefore land as
+        // two distinct `tracks` rows with `fingerprint_id = NULL`.
+        // A future "Find duplicates" library action surfaces near-
+        // duplicate fingerprints once `Library::analyze_track` has
+        // filled them in on first deck-load.
         let tmp = tempdir().unwrap();
         let music = tmp.path().join("music");
         std::fs::create_dir_all(&music).unwrap();
@@ -816,21 +646,45 @@ mod tests {
 
         let mut lib = open_lib(tmp.path());
         let summary = import_folder(&mut lib, &music).expect("import");
-        assert_eq!(
-            (summary.added, summary.merged),
-            (1, 1),
-            "summary: {summary:?}"
-        );
-        assert_eq!(row_count(&lib, "tracks"), 1);
+        assert_eq!(summary.added, 2, "summary: {summary:?}");
+        assert_eq!(summary.merged, 0, "no auto-merge in M11c.4");
+        assert_eq!(summary.sibling_versions, 0, "no sibling at import");
+        assert_eq!(row_count(&lib, "tracks"), 2);
         assert_eq!(row_count(&lib, "track_files"), 2);
+        // No fingerprint rows yet — they materialize on
+        // `analyze_track`.
+        assert_eq!(row_count(&lib, "fingerprints"), 0);
+
+        // Both tracks: fingerprint_id IS NULL, duration_ms IS NULL.
+        let null_fp: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE fingerprint_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_fp, 2);
+        let null_dur: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE duration_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_dur, 2);
     }
 
     #[test]
-    fn clean_and_dirty_register_as_siblings() {
-        // Same audio content (so fingerprint matches), same
-        // duration, but version-token disagreement on the
-        // filename: §8.1 must refuse to merge and instead register
-        // a `duplicate_link_track_id`.
+    fn clean_and_dirty_are_separate_at_import() {
+        // M11c.4: §8.1 version-token disagreement is no longer
+        // resolved at import time. Both files land as distinct
+        // `tracks` rows with NULL fingerprint and no
+        // `duplicate_link_track_id`. The disagreement only matters
+        // once both fingerprints have been computed via
+        // `analyze_track`, at which point the "Find duplicates"
+        // action (deferred to v1.x) can surface the near-match.
         let tmp = tempdir().unwrap();
         let music = tmp.path().join("music");
         std::fs::create_dir_all(&music).unwrap();
@@ -839,12 +693,10 @@ mod tests {
 
         let mut lib = open_lib(tmp.path());
         let summary = import_folder(&mut lib, &music).expect("import");
-        assert_eq!(summary.added, 1);
-        assert_eq!(summary.sibling_versions, 1);
+        assert_eq!(summary.added, 2);
+        assert_eq!(summary.sibling_versions, 0);
         assert_eq!(summary.merged, 0);
         assert_eq!(row_count(&lib, "tracks"), 2);
-        assert_eq!(row_count(&lib, "track_files"), 2);
-        // The sibling row has duplicate_link_track_id populated.
         let linked: i64 = lib
             .connection()
             .query_row(
@@ -853,7 +705,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(linked, 1);
+        assert_eq!(linked, 0, "no sibling links at import in M11c.4");
     }
 
     #[test]

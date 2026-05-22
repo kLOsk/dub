@@ -95,17 +95,35 @@ pub struct MissingTrack {
 }
 
 /// One row in the M11d browser's track list. The PRD §8.1
-/// priority chain ("filename source preferred over id3 source for
-/// title/artist; id3 preferred for everything else") is baked in at
-/// the SELECT level via COALESCE so the browser doesn't have to
-/// reimplement the chain.
+/// priority chain (`serato > rekordbox > traktor > id3 > filename`)
+/// is baked in at the SELECT level via COALESCE so the browser
+/// doesn't have to reimplement the chain. v1 only has the `id3`
+/// and `filename` sources wired; the Serato / rekordbox / Traktor
+/// importers slot in at M11e by extending the COALESCE chain.
+///
+/// **Per-column carve-outs.** `year` deviates and is filename-first
+/// because the `[YYYY]` filename tail is more reliable than ID3
+/// year in DJ-rip-naming conventions (file-format-stamped year,
+/// not ripper-stamped). The deviation is documented per-field.
+///
+/// **Junk ID3 titles** (PRD §8.4: `Track 01`, `Unknown`, blogspot
+/// noise, …) are not yet filtered at display time. When the user
+/// has junk ID3 titles, the browser will show the junk title
+/// instead of falling through to the filename source. A future
+/// patch will register an `is_junk_title` SQL scalar function so
+/// the COALESCE skips junk verbatim-preserved ID3 titles per
+/// §8.1's "preserved verbatim" rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackRow {
     /// Canonical UUID from `tracks.id`.
     pub id: String,
-    /// Display title (filename source preferred over id3 per §8.1).
+    /// Display title. PRD §8.1 priority: id3 source preferred over
+    /// filename source. Falls through to filename when ID3 row has
+    /// no title.
     pub title: Option<String>,
-    /// Display artist (filename source preferred over id3 per §8.1).
+    /// Display artist. PRD §8.1 priority: id3 source preferred over
+    /// filename source. Falls through to filename when ID3 row has
+    /// no artist.
     pub artist: Option<String>,
     /// Album (id3 source).
     pub album: Option<String>,
@@ -135,6 +153,11 @@ pub struct TrackRow {
     /// "unanalysed = no key shown" visual contract.
     pub key: Option<String>,
     /// Duration in milliseconds, from `tracks.duration_ms`.
+    ///
+    /// `0` means "unknown yet". M11c.4 imports are metadata-only:
+    /// fresh rows keep `tracks.duration_ms = NULL` until first
+    /// deck-load analysis attaches the fingerprint and measured
+    /// duration. The browser must still list those rows.
     pub duration_ms: u32,
     /// Comma-separated canonical version-tokens (filename source
     /// preferred). `None` when no tokens were detected.
@@ -153,6 +176,11 @@ pub struct TrackRow {
     /// / Lexicon / hand-written tooling stamps in there (cue
     /// timestamps, version hints, "energy 7", etc).
     pub comment: Option<String>,
+    /// Composer (`TCOM` ID3 / equivalent). id3 source only in v1.
+    pub composer: Option<String>,
+    /// Track number (`TRCK` ID3 / equivalent). id3 source only in
+    /// v1. `None` when the tag is absent.
+    pub track_number: Option<i32>,
     /// Origin source — `"filesystem"` for M11c-imported rows;
     /// `"serato"` / `"traktor"` / `"rekordbox"` / `"itunes"` for
     /// future M11e+ importers. Synthesised from the per-source
@@ -215,9 +243,13 @@ pub enum TrackSortKey {
     /// `tracks.created_at` — the natural "import order" sort.
     /// Default in [`Library::list_tracks`].
     CreatedAt,
-    /// Display title (filename source preferred over id3).
+    /// Display title. id3 source preferred over filename per PRD
+    /// §8.1; expression matches the COALESCE chain in
+    /// `TRACK_ROW_SELECT` so SQLite reuses the prepared statement
+    /// across direction flips.
     Title,
-    /// Display artist (filename source preferred over id3).
+    /// Display artist. id3 source preferred over filename per PRD
+    /// §8.1.
     Artist,
     /// Album name (id3 source).
     Album,
@@ -228,6 +260,10 @@ pub enum TrackSortKey {
     Duration,
     /// Year (filename source preferred over id3).
     Year,
+    /// Composer (id3 source).
+    Composer,
+    /// Track number (id3 source).
+    TrackNumber,
 }
 
 impl TrackSortKey {
@@ -239,12 +275,14 @@ impl TrackSortKey {
     fn sql_column(self) -> &'static str {
         match self {
             Self::CreatedAt => "t.created_at",
-            Self::Title => "COALESCE(fn.title, i3.title)",
-            Self::Artist => "COALESCE(fn.artist, i3.artist)",
+            Self::Title => "COALESCE(i3.title, fn.title)",
+            Self::Artist => "COALESCE(i3.artist, fn.artist)",
             Self::Album => "i3.album",
             Self::Bpm => "ag.bpm",
             Self::Duration => "t.duration_ms",
             Self::Year => "COALESCE(fn.year, i3.year)",
+            Self::Composer => "i3.composer",
+            Self::TrackNumber => "i3.track_number",
         }
     }
 }
@@ -267,8 +305,8 @@ impl TrackSortKey {
 /// libraries.
 const TRACK_ROW_SELECT: &str = "\
     SELECT t.id, \
-           COALESCE(fn.title,    i3.title)    AS title, \
-           COALESCE(fn.artist,   i3.artist)   AS artist, \
+           COALESCE(i3.title,    fn.title)    AS title, \
+           COALESCE(i3.artist,   fn.artist)   AS artist, \
            i3.album                            AS album, \
            i3.genre                            AS genre, \
            COALESCE(fn.year,     i3.year)     AS year, \
@@ -297,7 +335,9 @@ const TRACK_ROW_SELECT: &str = "\
                    END) > 1 THEN 1 ELSE 0 END \
                FROM track_keys tk WHERE tk.track_id = t.id \
            )                                   AS key_disagreement, \
-           i3.comment                          AS comment \
+           i3.comment                          AS comment, \
+           i3.composer                         AS composer, \
+           i3.track_number                     AS track_number \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
@@ -330,7 +370,7 @@ const TRACK_ROW_SELECT: &str = "\
 /// `list_*` / `search_*` / `recently_*` method so column order
 /// stays in lockstep with `TRACK_ROW_SELECT`.
 fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
-    let duration_ms: i64 = r.get(8)?;
+    let duration_ms: Option<i64> = r.get(8)?;
     Ok(TrackRow {
         id: r.get(0)?,
         title: r.get(1)?,
@@ -340,7 +380,7 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         year: r.get(5)?,
         bpm: r.get(6)?,
         key: r.get(7)?,
-        duration_ms: duration_ms.max(0) as u32,
+        duration_ms: duration_ms.unwrap_or(0).max(0) as u32,
         version_tokens: r.get(9)?,
         potential_duplicate_id: r.get(10)?,
         source: r
@@ -358,6 +398,8 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
             flag != 0
         },
         comment: r.get(17)?,
+        composer: r.get(18)?,
+        track_number: r.get(19)?,
     })
 }
 
@@ -620,11 +662,18 @@ impl Library {
     /// in their in-memory work queue before any SQL fires.
     /// `duplicate_link_track_id` is `Some(other_uuid)` for sibling-
     /// version registration; `None` otherwise.
+    ///
+    /// Both `fingerprint_id` and `duration_ms` are nullable. The
+    /// M11c.4 lazy-fingerprint model uses `None` for both at import
+    /// time and fills them in on the first deck-load via
+    /// [`Library::attach_fingerprint`]. Importers that *do* have a
+    /// fingerprint at registration time (e.g. the M11d.4 Relocate
+    /// path) pass `Some(...)` as before.
     pub fn insert_track(
         &self,
         track_uuid: &str,
-        fingerprint_id: i64,
-        duration_ms: u32,
+        fingerprint_id: Option<i64>,
+        duration_ms: Option<u32>,
         duplicate_link_track_id: Option<&str>,
     ) -> Result<()> {
         self.conn
@@ -635,12 +684,45 @@ impl Library {
                 params![
                     track_uuid,
                     fingerprint_id,
-                    duration_ms as i64,
+                    duration_ms.map(|v| v as i64),
                     duplicate_link_track_id,
                 ],
             )
             .map_err(|e| LibraryError::sqlite("insert_track", e))?;
         Ok(())
+    }
+
+    /// Attach a freshly-computed fingerprint to a track that was
+    /// imported with `fingerprint_id = NULL` under the M11c.4 lazy
+    /// model. Idempotent: if the track already has a fingerprint
+    /// (e.g. a concurrent analyse won the race) the existing row
+    /// is left in place and `Ok(false)` is returned. Otherwise the
+    /// fingerprint id and duration are written and `Ok(true)`.
+    ///
+    /// The `duration_ms` parameter is the authoritative duration
+    /// measured during decode — the same value used to populate
+    /// `fingerprints.duration_ms`. We update `tracks.duration_ms`
+    /// in the same statement so the browser's duration column
+    /// stops showing "—" the instant analysis completes.
+    pub fn attach_fingerprint(
+        &self,
+        track_uuid: &str,
+        fingerprint_id: i64,
+        duration_ms: u32,
+    ) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tracks \
+                    SET fingerprint_id = ?1, \
+                        duration_ms    = ?2, \
+                        updated_at     = strftime('%s','now') \
+                  WHERE id = ?3 \
+                    AND fingerprint_id IS NULL",
+                params![fingerprint_id, duration_ms as i64, track_uuid],
+            )
+            .map_err(|e| LibraryError::sqlite("attach_fingerprint", e))?;
+        Ok(updated > 0)
     }
 
     /// Upsert a `track_files` row for the given canonical track and
@@ -912,6 +994,7 @@ impl Library {
                     SELECT 1 FROM track_files tf \
                     WHERE tf.track_id = t.id AND tf.is_missing = 0 \
                  ) \
+                   AND t.fingerprint_id IS NOT NULL \
                  ORDER BY t.created_at ASC LIMIT ?1",
             )
             .map_err(|e| LibraryError::sqlite("prepare_list_missing_tracks", e))?;
@@ -1169,6 +1252,24 @@ impl Library {
                 p
             })
         }))
+    }
+
+    /// Reverse of [`Self::resolve_track_path`]: given an absolute
+    /// on-disk path, return the canonical `tracks.id` when the file
+    /// is registered in `track_files`. Used by the Apple shell to
+    /// stamp `loadedLibraryTrackId` and fire lazy analysis when a
+    /// deck load came from a library drag that didn't update the
+    /// browser selection first.
+    pub fn track_id_for_absolute_path(&self, path: &Path) -> Result<Option<String>> {
+        let volume = crate::volumes::discover_for_path(path)?;
+        let relative_path = volume.relative_to(path).ok_or_else(|| LibraryError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path is not under discovered volume mount point",
+            ),
+        })?;
+        self.find_track_file_owner(&volume.volume_uuid, &relative_path)
     }
 
     /// Resolve a fingerprint row id to `(track_uuid, display_string)`
@@ -1444,7 +1545,8 @@ mod tests {
             let fp_id = lib
                 .upsert_fingerprint(&fp, Some(44_100), Some(1), Some(123_456))
                 .unwrap();
-            lib.insert_track(&id, fp_id, 10_000, None).unwrap();
+            lib.insert_track(&id, Some(fp_id), Some(10_000), None)
+                .unwrap();
             lib.upsert_track_file(
                 &id,
                 &volume.volume_uuid,
@@ -1476,7 +1578,15 @@ mod tests {
             )
             .unwrap();
             // ID3 source has only album + bpm so the COALESCE chains
-            // exercise both sources independently.
+            // exercise both sources independently. id3.title is
+            // left NULL on purpose so the `list_tracks_*` sort /
+            // search / pagination tests can keep asserting against
+            // the raw `title` input string — the COALESCE falls
+            // through to the filename row in that case regardless
+            // of which source the priority chain prefers. The
+            // priority-chain tests below override id3.title
+            // explicitly to exercise PRD §8.1's `id3 > filename`
+            // contract.
             lib.upsert_metadata_source(
                 &id,
                 "id3",
@@ -1515,9 +1625,12 @@ mod tests {
         let rows = lib.list_tracks(10, 0).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, ids[0]);
-        // Title comes from the filename source (preferred over id3).
+        // `seed_tracks` leaves id3.title NULL → COALESCE falls
+        // through to filename per PRD §8.4 fallback. The priority
+        // direction itself (id3 > filename when both present) is
+        // exercised by `list_tracks_prefers_id3_title_over_filename`
+        // below.
         assert_eq!(rows[0].title.as_deref(), Some("First"));
-        // Artist same: filename source wins.
         assert_eq!(rows[0].artist.as_deref(), Some("Test Artist"));
         // Album from id3.
         assert_eq!(rows[0].album.as_deref(), Some("Test Album"));
@@ -1530,6 +1643,93 @@ mod tests {
         assert!(rows[0].bpm.is_none());
         // No `analysis_cache` row yet → row reads as unanalyzed.
         assert!(!rows[0].is_analyzed);
+    }
+
+    #[test]
+    fn list_tracks_tolerates_unknown_import_duration() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Fresh Import", "Known Duration"]);
+        lib.connection()
+            .execute(
+                "UPDATE tracks SET duration_ms = NULL WHERE id = ?1",
+                params![ids[0]],
+            )
+            .unwrap();
+
+        let rows = lib.list_tracks(10, 0).unwrap();
+        let fresh = rows.iter().find(|r| r.id == ids[0]).unwrap();
+        let known = rows.iter().find(|r| r.id == ids[1]).unwrap();
+
+        assert_eq!(fresh.title.as_deref(), Some("Fresh Import"));
+        assert_eq!(fresh.duration_ms, 0);
+        assert_eq!(known.duration_ms, 10_000);
+    }
+
+    /// Regression for the M11d.6 fix: PRD §8.1 priority chain has
+    /// `id3 > filename` for title and artist. The previous SQL
+    /// (`COALESCE(fn.title, i3.title)`) inverted this and surfaced
+    /// the parsed filename even when the file carried a perfectly
+    /// good ID3 title — the user-visible "library shows filename
+    /// instead of ID3 title" report. This test overrides the id3
+    /// row's title/artist (the default `seed_tracks` leaves them
+    /// NULL) and asserts the id3 row's value wins over the
+    /// filename row.
+    #[test]
+    fn list_tracks_prefers_id3_title_over_filename() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Filename Title"]);
+        // Stamp distinct id3.title / id3.artist. The filename
+        // source already carries "Filename Title" / "Test Artist"
+        // via `seed_tracks`. With the §8.1 chain (id3 > filename)
+        // the browser must surface the id3 values.
+        lib.connection()
+            .execute(
+                "UPDATE track_metadata_source \
+                 SET title = 'ID3 Title', artist = 'ID3 Artist' \
+                 WHERE track_id = ?1 AND source = 'id3'",
+                params![ids[0]],
+            )
+            .unwrap();
+        let row = lib
+            .list_tracks(10, 0)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == ids[0])
+            .unwrap();
+        assert_eq!(row.title.as_deref(), Some("ID3 Title"));
+        assert_eq!(row.artist.as_deref(), Some("ID3 Artist"));
+    }
+
+    /// Sort companion to the priority-chain regression: the sort
+    /// column expression in `TrackSortKey::sql_column` must use
+    /// the same COALESCE order as the SELECT, otherwise rows can
+    /// sort by one source's value but display another's. Seed
+    /// three tracks with id3 titles that intentionally invert the
+    /// filename alphabetical order and assert the rows come back
+    /// sorted by id3 (the displayed value), not by filename.
+    #[test]
+    fn list_tracks_sort_by_title_uses_id3_when_present() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["AAA filename", "BBB filename", "CCC filename"]);
+        // Filename order ascending is AAA, BBB, CCC. Stamp id3
+        // titles that reverse the order so an id3-first sort
+        // surfaces ZZZ, YYY, XXX while a filename-first sort
+        // would keep AAA, BBB, CCC.
+        for (id, t) in ids.iter().zip(["ZZZ id3", "YYY id3", "XXX id3"]) {
+            lib.connection()
+                .execute(
+                    "UPDATE track_metadata_source SET title = ?2 \
+                     WHERE track_id = ?1 AND source = 'id3'",
+                    params![id, t],
+                )
+                .unwrap();
+        }
+        let rows = lib
+            .list_tracks_sorted(10, 0, TrackSortKey::Title, true)
+            .unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("XXX id3"));
+        assert_eq!(rows[1].title.as_deref(), Some("YYY id3"));
+        assert_eq!(rows[2].title.as_deref(), Some("ZZZ id3"));
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //  in from `PerformanceView` via a `DeckHeaderCallbacks` value.
 //
 
+import AppKit
 import SwiftUI
 import DubCore
 
@@ -108,6 +109,10 @@ struct DeckHeaderState: Equatable {
     /// `false`.
     let useTimecodeToggle: Bool
 
+    /// M11d.6 — whether the user marked beat 1 at the playhead this
+    /// session. Drives button highlight in prep.
+    let downbeatMarked: Bool
+
     enum Source: Equatable {
         case off
         case thru
@@ -172,8 +177,8 @@ struct DeckHeaderState: Equatable {
         isLive: false, source: .off,
         trackTitle: nil, trackArtist: nil, bpm: nil, key: nil,
         formatChip: nil, timeRow: nil, isMaster: false, isPlaying: false,
-        isPanicPlay: false, useTimecodeToggle: false
-    )
+        isPanicPlay: false, useTimecodeToggle: false,
+        downbeatMarked: false)
 }
 
 /// M10.6a transport callbacks the deck header invokes when the user
@@ -193,6 +198,15 @@ struct DeckHeaderCallbacks {
     /// `PerformanceView` routes this to
     /// `WaveformAppModel.panicToggle(side:)`.
     var onPanicToggle: () -> Void = {}
+
+    /// M11d.6 manual beat-grid phase nudge. `direction` is −1 (left)
+    /// or +1 (right). Modifiers pick the step tier at fire time.
+    var onNudgePhase: ((_ direction: Int, _ modifiers: NSEvent.ModifierFlags) -> Void)? = nil
+    /// M11d.6 manual BPM nudge. `direction` is −1 (slower) or +1
+    /// (faster).
+    var onNudgeBpm: ((_ direction: Int, _ modifiers: NSEvent.ModifierFlags) -> Void)? = nil
+    /// M11d.6 mark beat 1 at the current playhead and relatch grid.
+    var onMarkDownbeat: (() -> Void)? = nil
 
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
@@ -224,6 +238,8 @@ struct DeckHeader: View {
     /// format chip / FX chip / transport glyphs move to the leading
     /// edge. See the `DeckHeader` doc comment for why this matters.
     var mirrored: Bool = false
+    /// Prep mode shows BPM to two decimals; Performance mode one.
+    var prepMode: Bool = false
     /// M11d.5 round 5 — engine reference + deck index for the
     /// self-driven time-row text. When supplied, the time row
     /// renders a `LiveDeckTimeText` subview that reads
@@ -368,18 +384,79 @@ struct DeckHeader: View {
         HStack(spacing: DubSpacing.lg) {
             if mirrored {
                 fxChip
+                gridNudgeCluster
                 Spacer(minLength: 0)
                 statColumn(label: "BPM", value: formattedBPM)
                 statColumn(label: "KEY", value: formattedKey)
             } else {
                 statColumn(label: "BPM", value: formattedBPM)
                 statColumn(label: "KEY", value: formattedKey)
+                gridNudgeCluster
                 Spacer(minLength: 0)
                 fxChip
             }
         }
         .frame(maxWidth: .infinity,
                alignment: mirrored ? .trailing : .leading)
+    }
+
+    /// M11d.6 manual beatgrid-nudge cluster. Click = regular step;
+    /// Shift+click = coarse; Shift+Option+click = fine. Hold to
+    /// repeat. Only renders when wired and a track is loaded.
+    @ViewBuilder
+    private var gridNudgeCluster: some View {
+        if state.bpm != nil,
+           let onPhase = callbacks.onNudgePhase,
+           let onBpm = callbacks.onNudgeBpm,
+           let onMarkDownbeat = callbacks.onMarkDownbeat
+        {
+            HStack(spacing: DubSpacing.xs) {
+                RepeatModifierButton(
+                    systemImage: "chevron.left",
+                    help: "Shift grid left (hold to repeat; Shift = coarse; Shift+Option = fine)"
+                ) { mods in
+                    onPhase(-1, mods)
+                }
+                RepeatModifierButton(
+                    systemImage: "chevron.right",
+                    help: "Shift grid right (hold to repeat; Shift = coarse; Shift+Option = fine)"
+                ) { mods in
+                    onPhase(1, mods)
+                }
+                downbeatMarkButton(
+                    marked: state.downbeatMarked,
+                    action: onMarkDownbeat)
+                RepeatModifierButton(
+                    systemImage: "minus",
+                    help: "Slow BPM (hold to repeat; Shift = coarse; Shift+Option = fine)"
+                ) { mods in
+                    onBpm(-1, mods)
+                }
+                RepeatModifierButton(
+                    systemImage: "plus",
+                    help: "Speed BPM (hold to repeat; Shift = coarse; Shift+Option = fine)"
+                ) { mods in
+                    onBpm(1, mods)
+                }
+            }
+        }
+    }
+
+    private func downbeatMarkButton(
+        marked: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text("1")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(
+                    marked ? DubColor.surface0 : DubColor.textSecondary)
+                .frame(width: 22, height: 22)
+                .background(marked ? DubColor.deckTint(side) : DubColor.surface2)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+        .help("Mark downbeat at playhead — relatches the full grid from onsets")
     }
 
     /// Render the BPM column. The Stage-1 estimator delivers two
@@ -393,6 +470,9 @@ struct DeckHeader: View {
     /// confidence.
     private var formattedBPM: String {
         guard let bpm = state.bpm, bpm > 0 else { return "—" }
+        if prepMode {
+            return String(format: "%.2f", bpm)
+        }
         return String(format: "%.1f", bpm)
     }
 
@@ -830,7 +910,8 @@ extension DeckHeaderState {
                 isMaster: isMaster,
                 isPlaying: false,
                 isPanicPlay: false,
-                useTimecodeToggle: false)
+                useTimecodeToggle: false,
+                downbeatMarked: false)
         }
 
         if deckState.hasTrack {
@@ -875,7 +956,8 @@ extension DeckHeaderState {
                 // plain Play / Pause. Panic Play state is folded
                 // into the Play action in the model. See
                 // `useTimecodeToggle` doc comment for rationale.
-                useTimecodeToggle: false)
+                useTimecodeToggle: false,
+                downbeatMarked: deckState.downbeatMarked)
         }
 
         if thruMode {
@@ -902,7 +984,8 @@ extension DeckHeaderState {
                 isMaster: isMaster,
                 isPlaying: false,
                 isPanicPlay: false,
-                useTimecodeToggle: false)
+                useTimecodeToggle: false,
+                downbeatMarked: false)
         }
 
         return DeckHeaderState(
@@ -917,7 +1000,8 @@ extension DeckHeaderState {
             isMaster: false,
             isPlaying: false,
             isPanicPlay: false,
-            useTimecodeToggle: false)
+            useTimecodeToggle: false,
+            downbeatMarked: false)
     }
 }
 
@@ -935,7 +1019,7 @@ extension DeckHeaderState {
         bpm: nil, key: nil,
         formatChip: nil, timeRow: nil,
         isMaster: true, isPlaying: false,
-        isPanicPlay: false, useTimecodeToggle: false))
+        isPanicPlay: false, useTimecodeToggle: false, downbeatMarked: false))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -950,7 +1034,7 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly,
         isMaster: false, isPlaying: true,
-        isPanicPlay: false, useTimecodeToggle: true),
+        isPanicPlay: false, useTimecodeToggle: true, downbeatMarked: true),
         mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)
@@ -966,7 +1050,7 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .elapsedAndRemaining,
         isMaster: true, isPlaying: true,
-        isPanicPlay: false, useTimecodeToggle: false))
+        isPanicPlay: false, useTimecodeToggle: false, downbeatMarked: false))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -981,7 +1065,7 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly,
         isMaster: true, isPlaying: true,
-        isPanicPlay: true, useTimecodeToggle: true),
+        isPanicPlay: true, useTimecodeToggle: true, downbeatMarked: false),
         mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)

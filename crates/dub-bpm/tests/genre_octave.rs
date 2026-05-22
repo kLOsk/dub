@@ -122,24 +122,13 @@ fn drum_n_bass_174_bpm_locks_at_174_not_87() {
 // Sparse / slow / low-end-heavy: reggae one-drop at 65 BPM
 // ============================================================
 //
-// The reggae one-drop is the most pathological case we expect to
-// see in the wild: a single kick per bar (0.92-s period at 65 BPM,
-// effective tempo ≈ 16 BPM if you counted only kicks) with off-beat
-// hi-hat skanks providing the periodicity. The ODF has to weight
-// the hi-hat skanks at the half-beat period to give the autocorre-
-// lation a strong peak — *and* not overweight the kick to the point
-// of locking at the bar-period (16 BPM, far below `MIN_BPM`).
-//
-// The user explicitly mentioned reggae as part of their genre mix
-// (reggae often gets played alongside hip-hop and dnb in sets), so
-// this is on the acceptance gate, not an aspirational test.
+// M11c.3c skank double-time rejection resolves the 130 BPM false
+// octave when a credible 65 BPM one-drop sibling exists.
 
 #[test]
-fn reggae_one_drop_65_bpm_locks_at_65() {
+fn reggae_one_drop_65_bpm_locks_at_one_drop_tempo() {
     let sr = 48_000u32;
     let audio = synthetic::drum_pattern_reggae_one_drop(65.0, TEST_DURATION_SECS, sr);
     let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
-    // Reggae's sparseness gives the autocorrelation peak a wider
-    // shoulder; allow ±3 here (still rejects ½× = 32.5 and 2× = 130).
-    assert_within(65.0, est, 3.0, "reggae one-drop 65 BPM");
+    assert_within(65.0, est, TOLERANCE_BPM, "reggae one-drop 65 BPM");
 }

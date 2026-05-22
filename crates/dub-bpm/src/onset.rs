@@ -99,7 +99,7 @@ impl OnsetDetector {
             // averaged over the band's bin count. Equal-weighted sum
             // across bands gives the ODF sample.
             let mut flux = 0.0f32;
-            for &(lo, hi) in bands {
+            for &(lo, hi) in bands.iter() {
                 let mut band_sum = 0.0f32;
                 for b in lo..hi {
                     if *have_prev {

@@ -133,12 +133,29 @@ struct WaveformView: View {
     /// `WaveformRenderer.draw`.
     let continuouslyRendering: Bool
 
+    /// Mirrors `DeckState.seekGeneration`. Any successful seek
+    /// bumps this so `updateNSView` runs while paused and can
+    /// issue a one-shot `setNeedsDisplay`.
+    let seekGeneration: UInt64
+
+    /// Mirrors `DeckState.peaksGeneration`. Bumps when offline
+    /// peaks land after load so a paused deck redraws its zoomed
+    /// waveform without waiting for Play.
+    let peaksGeneration: UInt64
+
+    /// Time-axis zoom. Prep mode passes `prepModeTimeAxisZoom` (1.2)
+    /// so the horizontal strip shows 20 % more audio.
+    let timeAxisZoom: Double
+
     init(engine: DubEngine, deckIdx: UInt64 = 0,
          palette: WaveformPalette = .serato,
          side: DeckSide = .a,
          orientation: WaveformOrientation = .vertical,
          scrubHandler: WaveformScrubHandler? = nil,
-         continuouslyRendering: Bool = true) {
+         continuouslyRendering: Bool = true,
+         seekGeneration: UInt64 = 0,
+         peaksGeneration: UInt64 = 0,
+         timeAxisZoom: Double = 1.0) {
         self.engine = engine
         self.deckIdx = deckIdx
         self.palette = palette
@@ -146,6 +163,9 @@ struct WaveformView: View {
         self.orientation = orientation
         self.scrubHandler = scrubHandler
         self.continuouslyRendering = continuouslyRendering
+        self.seekGeneration = seekGeneration
+        self.peaksGeneration = peaksGeneration
+        self.timeAxisZoom = timeAxisZoom
     }
 
     var body: some View {
@@ -161,6 +181,9 @@ struct WaveformView: View {
                     palette: palette, orientation: orientation,
                     side: side,
                     continuouslyRendering: continuouslyRendering,
+                    seekGeneration: seekGeneration,
+                    peaksGeneration: peaksGeneration,
+                    timeAxisZoom: timeAxisZoom,
                     renderSnapshot: beatGridOverlayEnabled ? renderSnapshot : nil)
                 if let handler = scrubHandler {
                     scrubGestureOverlay(in: geo.size, handler: handler)
@@ -234,7 +257,7 @@ struct WaveformView: View {
         handler: WaveformScrubHandler
     ) -> some View {
         let secsPerPixel = Double(WaveformRenderer.secsPerPixel(
-            sampleRate: engine.sampleRate()))
+            sampleRate: engine.sampleRate())) * timeAxisZoom
         Color.clear
             .contentShape(Rectangle())
             .gesture(
@@ -482,7 +505,9 @@ struct WaveformView: View {
         //     forward with the waveform's geometry inside each
         //     chunk-pair quantum.
         let chunksPerColumn = Int(WaveformRenderer.chunksPerColumn)
-        let pixelsPerDrawnColumn = WaveformRenderer.pixelsPerDrawnColumn
+        let pixelsPerDrawnColumn =
+            WaveformRenderer.effectivePixelsPerDrawnColumn(
+                timeAxisZoom: timeAxisZoom)
         let pastFrac = WaveformRenderer.pastRegionFraction
         let axisLengthLogical: Double
         switch orientation {
@@ -498,8 +523,10 @@ struct WaveformView: View {
             1, Int((Double(timeAxisDrawablePixels) * pastFrac).rounded()))
         let futurePixels = max(
             0, Int((Double(timeAxisDrawablePixels) * (1.0 - pastFrac)).rounded()))
-        let drawnAbove = max(2, pastPixels / pixelsPerDrawnColumn)
-        let drawnBelow = max(2, futurePixels / pixelsPerDrawnColumn)
+        let drawnAbove = max(
+            2, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
+        let drawnBelow = max(
+            2, Int((Double(futurePixels) / pixelsPerDrawnColumn).rounded(.down)))
 
         // Snap to the chunk-pair the renderer's data path uses.
         // `chunksPerColumn = 2` ⇒ snap to multiples of 2 chunks.
@@ -654,21 +681,7 @@ struct WaveformView: View {
     /// columns stay disambiguated at a glance.
     @ViewBuilder
     private func playheadOverlay(in size: CGSize) -> some View {
-        let fraction = CGFloat(WaveformRenderer.pastRegionFraction)
-        switch orientation {
-        case .vertical:
-            Rectangle()
-                .fill(DubColor.deckTint(side))
-                .frame(width: size.width, height: 1)
-                .offset(y: size.height * fraction)
-                .allowsHitTesting(false)
-        case .horizontal:
-            Rectangle()
-                .fill(DubColor.deckTint(side))
-                .frame(width: 1, height: size.height)
-                .offset(x: size.width * fraction)
-                .allowsHitTesting(false)
-        }
+        PlayheadMarker(orientation: orientation, size: size)
     }
 }
 
@@ -685,6 +698,12 @@ private struct WaveformMetalView: NSViewRepresentable {
     /// When `false`, the MTKView stops its continuous draw loop
     /// and only repaints on demand (see `updateNSView`).
     let continuouslyRendering: Bool
+    /// See `WaveformView.seekGeneration`.
+    let seekGeneration: UInt64
+    /// See `WaveformView.peaksGeneration`.
+    let peaksGeneration: UInt64
+    /// See `WaveformView.timeAxisZoom`.
+    let timeAxisZoom: Double
     /// Shared snapshot the renderer publishes draw state into for
     /// the B-24 beat-grid overlay. See the `@StateObject` on
     /// `WaveformView` for the lifecycle reasoning. `nil` when the
@@ -830,10 +849,21 @@ private struct WaveformMetalView: NSViewRepresentable {
         context.coordinator.renderer?.palette = palette
         context.coordinator.renderer?.orientation = orientation
         context.coordinator.renderer?.side = side
+        context.coordinator.renderer?.timeAxisZoom = timeAxisZoom
         context.coordinator.renderer?.renderSnapshot = renderSnapshot
 
         // Demand-driven vsync via run-loop-integrated `CVDisplayLink`
         // while playing/scratching (no `DispatchQueue.main.async` hop).
         context.coordinator.setContinuousRendering(continuouslyRendering, on: nsView)
+
+        // Paused decks stop the display link; force a one-shot redraw
+        // whenever SwiftUI pushes new generation ticks (seek,
+        // offline peaks landing) so click-to-jump updates the visible
+        // playhead without requiring Play.
+        _ = seekGeneration
+        _ = peaksGeneration
+        if !continuouslyRendering {
+            nsView.setNeedsDisplay(nsView.bounds)
+        }
     }
 }

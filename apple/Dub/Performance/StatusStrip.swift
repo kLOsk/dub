@@ -14,8 +14,8 @@
 //  (`StatusStripContainer`) refreshes the clock + battery on a
 //  timer and re-renders.
 //
-//  See PRD §9.3 for the design intent (read-only contract, no
-//  interactive elements).
+//  See PRD §9.3 for the design intent (read-only contract). The
+//  wordmark is the sole exception — it opens the About sheet.
 //
 
 import SwiftUI
@@ -64,6 +64,9 @@ struct StatusStrip: View {
     /// Tap target for the gear button → opens Preferences. `nil`
     /// hides the button (used by previews / snapshot tests).
     let openPreferences: (() -> Void)?
+    /// Tap target for the wordmark → opens the About sheet. `nil`
+    /// hides the affordance (previews / snapshot tests).
+    let openAbout: (() -> Void)?
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
@@ -117,11 +120,23 @@ struct StatusStrip: View {
         .foregroundStyle(DubColor.textSecondary)
     }
 
+    @ViewBuilder
     private var wordmark: some View {
-        Text("DUB")
-            .font(DubFont.display)
-            .tracking(1.5)
-            .foregroundStyle(DubColor.textPrimary)
+        if let openAbout {
+            Button(action: openAbout) {
+                Text("DUB")
+                    .font(DubFont.display)
+                    .tracking(1.5)
+                    .foregroundStyle(DubColor.textPrimary)
+            }
+            .buttonStyle(.plain)
+            .help("About Dub")
+        } else {
+            Text("DUB")
+                .font(DubFont.display)
+                .tracking(1.5)
+                .foregroundStyle(DubColor.textPrimary)
+        }
     }
 
     @ViewBuilder
@@ -217,6 +232,7 @@ struct StatusStripContainer: View {
     let isRunning: Bool
     let lastError: String?
     let openPreferences: () -> Void
+    let openAbout: () -> Void
 
     @State private var clockText: String? = nil
     @State private var power: PowerState? = nil
@@ -237,7 +253,8 @@ struct StatusStripContainer: View {
                 clockText: clockText,
                 power: power,
                 lastError: lastError),
-            openPreferences: openPreferences)
+            openPreferences: openPreferences,
+            openAbout: openAbout)
             .onAppear(perform: refresh)
             .onReceive(tick) { _ in refresh() }
     }
@@ -306,7 +323,8 @@ enum PowerSourcePoller {
             clockText: "21:47",
             power: PowerState(isCharging: false, percent: 87),
             lastError: nil),
-        openPreferences: nil)
+        openPreferences: nil,
+        openAbout: nil)
         .frame(width: 1440)
 }
 
@@ -317,7 +335,8 @@ enum PowerSourcePoller {
             clockText: "23:12",
             power: PowerState(isCharging: false, percent: 14),
             lastError: nil),
-        openPreferences: nil)
+        openPreferences: nil,
+        openAbout: nil)
         .frame(width: 1440)
 }
 
@@ -328,6 +347,7 @@ enum PowerSourcePoller {
             clockText: "23:12",
             power: PowerState(isCharging: true, percent: 100),
             lastError: "Couldn't decode that track."),
-        openPreferences: {})
+        openPreferences: {},
+        openAbout: nil)
         .frame(width: 1440)
 }

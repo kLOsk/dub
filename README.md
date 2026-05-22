@@ -12,6 +12,8 @@
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#status)
 [![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#milestone-progress)
 
+<img src="apple/Dub/Assets.xcassets/AboutSplash.imageset/AboutSplash.png" alt="Dub splash artwork" width="480">
+
 </div>
 
 > Dub is the spiritual successor to Serato Scratch Live for the urban music scene
@@ -97,9 +99,11 @@ make ci
 # Bootstrap the macOS app (M0.5 / M10). One-time: `brew install xcodegen`.
 # Generates DubCore.xcframework + Swift UniFFI bindings + Dub.xcodeproj.
 ./scripts/bootstrap.sh
-open apple/Dub.xcodeproj    # ⌘R → live multicolour-roadmap M10-B waveform window:
-#                            pick an input device + channels (e.g. "3,4" for SL3),
-#                            hit Start, watch the broadband peaks scroll at 60 fps.
+make app                              # or: open apple/Dub.xcodeproj and ⌘R
+open apple/build/Build/Products/Debug/Dub.app
+#                            Two-deck performance surface with library browser,
+#                            Metal waveforms, launch splash, app icon, and
+#                            About sheet (DUB wordmark or Dub → About Dub).
 ```
 
 `dub scope` keys: `q`/`Esc` quit, `c` clear lissajous, `↑/↓` engage threshold,
@@ -153,8 +157,8 @@ dub/                                 repo root (workspace)
 │   ├── dub-bpm/                     M7.5 + M8 + M8.1 — BpmEstimator, BpmTracker, BpmStream, log-band ODF (pure-Rust, shipped)
 │   ├── dub-spectral/                M9.5a — SpectralFrameStream (shared STFT + log-bands + magnitude compression), pure-Rust
 │   ├── dub-peaks/                   M9 + M9.5b — Decimator + BandDecimator, PeakBuffer (broadband + bands), PeakStream — live waveform capture
-│   ├── dub-fingerprint/             Chromaprint FFI (v1.1, placeholder)
-│   ├── dub-library/                 SQLite + library imports (M11/M12, placeholder)
+│   ├── dub-fingerprint/             Pure-Rust Chromaprint (M11b library dedupe; v1.1 recognition parked)
+│   ├── dub-library/                 SQLite catalog + import adapters (M11, shipped)
 │   ├── dub-controller/              HID/MIDI abstractions (v1.x+, placeholder)
 │   ├── dub-ffi/                     UniFFI Swift bindings (M0.5 greeting + M10-A DubEngine / EngineError / peaks_extend / band_peaks_extend)
 │   └── dub-cli/                     `dub` binary (smoke / play / capture /
@@ -163,6 +167,7 @@ dub/                                 repo root (workspace)
 ├── apple/                           AppKit + SwiftUI shell (M0.5 + M10-B shipped — XcodeGen-managed)
 │   ├── project.yml                  XcodeGen manifest (links CoreAudio + Metal SDK frameworks)
 │   ├── Dub/                         AppKit @main + SwiftUI MainView + Waveform/{Shaders.metal,WaveformRenderer,WaveformView}
+│   │   └── Assets.xcassets/         App icon + About splash artwork
 │   └── DubShared/                   Swift Package wrapping DubCore.xcframework
 ├── tools/
 │   └── rt-audit/                    RT-thread allocation auditor
@@ -200,6 +205,8 @@ make rt-audit      # run the RT-safety harness
 make ci            # everything CI runs (fmt-check + clippy + test + rt-audit)
 make clippy        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt           # cargo fmt
+make app           # build Dub.app (Debug) — also regenerates xcodeproj if project.yml changed
+make run-app       # build + launch Dub.app from apple/build/
 ```
 
 See the [Makefile](Makefile) for more targets.

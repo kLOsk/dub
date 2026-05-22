@@ -35,7 +35,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
-use dub_bpm::{analyze_beat_grid, BeatGrid as CoreBeatGrid};
+use dub_bpm::{
+    analyze_beat_grid_with_profile, latch_beat_grid_at_downbeat, octave_profile_from_genre,
+    BeatGrid as CoreBeatGrid, OctaveProfile,
+};
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
@@ -131,7 +134,12 @@ uniffi::setup_scaffolding!();
 ///       of truth that eliminates the ±0.02 BPM drift between the
 ///       DeckHeader and LibraryView and removes the per-load
 ///       redundant 100–400 ms analysis on already-analyzed tracks.
-pub const FFI_VERSION: u32 = 15;
+///   18. M11d.6 — `load_track` gains optional `genre` for
+///       genre-aware octave profiles during auto analysis;
+///       `relatch_beat_grid_at_downbeat` for the one-button
+///       downbeat calibration path; beat grids are onset-latched
+///       instead of uniform `anchor + i × period`.
+pub const FFI_VERSION: u32 = 18;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -203,6 +211,16 @@ pub enum EngineError {
     /// `start_thru` succeeded. M10.5.
     #[error("engine is not running; call start_engine first")]
     EngineNotRunning,
+
+    /// `install_beat_grid` called on a deck with no File-mode track
+    /// loaded (empty deck or Thru source). M11c.3b.
+    #[error("no file track loaded on deck {0}")]
+    NoTrackLoaded(u64),
+
+    /// `install_beat_grid` rejected non-finite or non-positive BPM,
+    /// or a synthesised grid that collapsed to empty. M11c.3b.
+    #[error("invalid beat grid parameters")]
+    InvalidBeatGridParams,
 }
 
 /// The Apple-side handle to the Dub audio engine.
@@ -252,6 +270,12 @@ pub struct DubEngine {
     /// The Swift renderer reads this via `peaks_generation(deck)`
     /// and `reset()`s its ring + cadence cache on every change.
     peak_generation_seq: Arc<[AtomicU64; 2]>,
+    /// Per-deck monotonic counter bumped whenever the in-memory
+    /// [`BeatGrid`] on a File deck is replaced in place (M11c.3b
+    /// tap-to-grid, or the async grid install at the end of
+    /// `load_track`). Separate from `peak_generation_seq` so a
+    /// grid correction does not wipe the waveform ring.
+    beat_grid_generation_seq: Arc<[AtomicU64; 2]>,
 }
 
 /// Internal state machine for the engine.
@@ -527,6 +551,12 @@ impl DubEngine {
         }
     }
 
+    fn bump_beat_grid_generation(&self, deck_idx: usize) {
+        if let Some(a) = self.beat_grid_generation_seq.get(deck_idx) {
+            a.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Bump `peak_generation_seq[idx]` for every deck slot that
     /// currently holds a [`PeakSource`]. Called from
     /// [`Self::stop_thru`] on the Running → Stopped transition so
@@ -559,6 +589,7 @@ impl DubEngine {
         Arc::new(Self {
             state: Arc::new(Mutex::new(EngineState::Stopped)),
             peak_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
+            beat_grid_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
         })
     }
 
@@ -823,17 +854,13 @@ impl DubEngine {
     ///
     /// # Beat-grid source (M11d.5 round 4)
     ///
-    /// When `library_beat_grid` is `Some(LibraryBeatGrid)`, the
+    /// When `library_beat_grid` is imported or user-authored, the
     /// background analysis worker installs the supplied
-    /// `(bpm, anchor_secs)` directly into `FilePeaks.beat_grid`
-    /// (synthesising the `Vec<f64>` of per-beat timestamps from
-    /// the fixed-tempo formula `anchor + i · 60 / bpm` clamped to
-    /// `[0, duration_secs]`) and skips the ~100–400 ms BPM
-    /// analysis step entirely. The deck's grid is then identical
-    /// to what `DubLibrary::active_beat_grid` would return,
-    /// eliminating the historical ±0.02 BPM drift between the
-    /// DeckHeader (which used to read the engine's in-memory
-    /// grid) and the LibraryView (which reads `track_beatgrids`).
+    /// `(bpm, anchor_secs)` directly into `FilePeaks.beat_grid`.
+    /// Auto-generated library rows are deliberately re-analysed:
+    /// the schema stores only scalar BPM + anchor, while the engine
+    /// renderer needs the analyser's per-beat onset refinement to
+    /// keep visible beat ticks locked to local transients.
     ///
     /// When `library_beat_grid` is `None`, the worker runs
     /// `analyze_beat_grid` as before. Finder-drag loads (no
@@ -845,6 +872,7 @@ impl DubEngine {
         deck_idx: u64,
         path: String,
         library_beat_grid: Option<LibraryBeatGrid>,
+        genre: Option<String>,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let t_total = std::time::Instant::now();
@@ -926,8 +954,10 @@ impl DubEngine {
         // peaks landing on top of the new track.
         let state_handle = Arc::clone(&self.state);
         let gen_handle = Arc::clone(&self.peak_generation_seq);
+        let beat_grid_gen_handle = Arc::clone(&self.beat_grid_generation_seq);
         let track_for_thread = Arc::clone(&track);
         let supplied_grid_for_thread = library_beat_grid.clone();
+        let genre_for_thread = genre.clone();
         let thread_name = format!("dub-load-{idx}");
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
@@ -937,7 +967,9 @@ impl DubEngine {
                     track_for_thread,
                     state_handle,
                     gen_handle,
+                    beat_grid_gen_handle,
                     supplied_grid_for_thread,
+                    genre_for_thread,
                 );
             });
 
@@ -967,7 +999,9 @@ impl DubEngine {
                 Arc::clone(&track),
                 Arc::clone(&self.state),
                 Arc::clone(&self.peak_generation_seq),
+                Arc::clone(&self.beat_grid_generation_seq),
                 library_beat_grid,
+                genre,
             );
         }
 
@@ -1289,6 +1323,232 @@ impl DubEngine {
             Some(PeakSource::File(f)) => f.beat_grid.clone(),
             _ => BeatGrid::empty(),
         }
+    }
+
+    /// Replace the loaded File deck's beat grid in place (M11c.3b).
+    ///
+    /// Synthesises per-beat timestamps from `(bpm, anchor_secs)` and
+    /// the track's known duration, then bumps
+    /// [`Self::beat_grid_generation`] so the Metal renderer refetches
+    /// without resetting the waveform peak ring.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::InvalidDeckIndex`]
+    /// * [`EngineError::NoTrackLoaded`] when the deck has no File source
+    pub fn install_beat_grid(
+        &self,
+        deck_idx: u64,
+        bpm: f64,
+        anchor_secs: f64,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if !bpm.is_finite() || bpm <= 0.0 || !anchor_secs.is_finite() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
+        let duration_secs = track.samples().len() as f64
+            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs);
+        if grid.confidence <= 0.0 || grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        fp.beat_grid = grid;
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        Ok(())
+    }
+
+    /// Anchor the beat grid at a user-supplied downbeat (beat 1)
+    /// at `downbeat_secs`, refining the period locally around the
+    /// current BPM. The result is a strictly uniform 4/4 grid —
+    /// "press 1 at the kick" is the only manual phase correction
+    /// the user needs to make (M11d.6).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::install_beat_grid`].
+    pub fn relatch_beat_grid_at_downbeat(
+        &self,
+        deck_idx: u64,
+        downbeat_secs: f64,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if !downbeat_secs.is_finite() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        if fp.beat_grid.confidence <= 0.0 || fp.beat_grid.bpm <= 0.0 {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let bpm = fp.beat_grid.bpm;
+        let grid = run_downbeat_relatch(track.as_ref(), bpm, downbeat_secs, OctaveProfile::Default)
+            .ok_or(EngineError::InvalidBeatGridParams)?;
+        fp.beat_grid = grid;
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        Ok(())
+    }
+
+    /// Shift the loaded File deck's beat grid forward (positive
+    /// `delta_secs`) or backward (negative) by an arbitrary amount.
+    /// BPM is preserved; only the phase anchor moves.
+    ///
+    /// Implementation: read the current synthesised grid's first
+    /// beat as the existing anchor, add `delta_secs`, and re-emit
+    /// the grid via `synthesise_beat_grid`. The new anchor is then
+    /// walked back into `[0, period)` by `synthesise_beat_grid`'s
+    /// own normaliser, so calling `nudge_beat_grid_phase` many
+    /// times in the same direction stays well-conditioned: large
+    /// accumulated deltas don't drift the grid off the front of
+    /// the track.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::InvalidDeckIndex`]
+    /// * [`EngineError::NoTrackLoaded`] when the deck has no File source
+    /// * [`EngineError::InvalidBeatGridParams`] when the current
+    ///   grid has zero confidence (no BPM was detected) or
+    ///   `delta_secs` isn't finite
+    pub fn nudge_beat_grid_phase(&self, deck_idx: u64, delta_secs: f64) -> Result<(), EngineError> {
+        // #region agent log
+        agent_debug_log_nudge("phase", "entry", deck_idx, delta_secs, 0.0, 0.0, 0);
+        // #endregion
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if !delta_secs.is_finite() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx))?;
+        };
+        if fp.beat_grid.confidence <= 0.0 || fp.beat_grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let current_anchor = fp.beat_grid.beats[0];
+        for beat in &mut fp.beat_grid.beats {
+            *beat += delta_secs;
+        }
+        let new_first = fp.beat_grid.beats[0];
+        let beat_count = fp.beat_grid.beats.len();
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        // #region agent log
+        agent_debug_log_nudge(
+            "phase",
+            "applied",
+            deck_idx,
+            delta_secs,
+            current_anchor,
+            new_first,
+            beat_count,
+        );
+        // #endregion
+        Ok(())
+    }
+
+    /// Adjust the loaded File deck's beat grid tempo by `delta_bpm`,
+    /// preserving the on-screen anchor (first visible beat) so the
+    /// stretch is anchored at the head of the track. Positive
+    /// `delta_bpm` shrinks the grid (faster tempo, beats closer
+    /// together); negative widens it.
+    ///
+    /// Implementation mirrors `nudge_beat_grid_phase` but stretches
+    /// the period instead of shifting the phase. The first beat
+    /// stays put; subsequent beats fan out from there at the new
+    /// period.
+    ///
+    /// # Errors
+    ///
+    /// Same as `nudge_beat_grid_phase`. Additionally
+    /// [`EngineError::InvalidBeatGridParams`] when the resulting
+    /// BPM would be non-positive or non-finite.
+    pub fn nudge_beat_grid_bpm(&self, deck_idx: u64, delta_bpm: f64) -> Result<(), EngineError> {
+        // #region agent log
+        agent_debug_log_nudge("bpm", "entry", deck_idx, delta_bpm, 0.0, 0.0, 0);
+        // #endregion
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if !delta_bpm.is_finite() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
+        let duration_secs = track.samples().len() as f64
+            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        if fp.beat_grid.confidence <= 0.0 || fp.beat_grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let new_bpm = fp.beat_grid.bpm + delta_bpm;
+        if !new_bpm.is_finite() || new_bpm <= 0.0 {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let anchor = fp.beat_grid.beats[0];
+        let grid = synthesise_beat_grid(new_bpm, anchor, duration_secs);
+        if grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let new_first = grid.beats.first().copied().unwrap_or(0.0);
+        let beat_count = grid.beats.len();
+        fp.beat_grid = grid;
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        // #region agent log
+        agent_debug_log_nudge(
+            "bpm", "applied", deck_idx, delta_bpm, anchor, new_first, beat_count,
+        );
+        // #endregion
+        Ok(())
+    }
+
+    /// Monotonic generation counter for in-place beat-grid updates on
+    /// `deck_idx`. The waveform renderer compares this alongside
+    /// [`Self::peaks_generation`] to decide when to refetch
+    /// [`Self::beat_grid`].
+    #[must_use]
+    pub fn beat_grid_generation(&self, deck_idx: u64) -> u64 {
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return 0;
+        };
+        self.beat_grid_generation_seq
+            .get(idx)
+            .map_or(0, |a| a.load(Ordering::Acquire))
     }
 
     /// Monotonic generation counter for the deck's [`PeakSource`].
@@ -1841,13 +2101,51 @@ fn peak_source_for(running: &RunningState, deck_idx: u64) -> Option<&PeakSource>
 ///
 /// All time logging is `eprintln!` for now; M10.5v dogfood is using
 /// the numbers to validate the non-blocking load contract.
+fn octave_profile_from_optional_genre(genre: Option<&str>) -> OctaveProfile {
+    genre
+        .map(octave_profile_from_genre)
+        .unwrap_or(OctaveProfile::Default)
+}
+
+/// Run `dub_bpm::latch_beat_grid_at_downbeat` against `track`,
+/// returning the engine-shape grid or `None` when the analyser
+/// rejects the input (silence, pathological samples). The dub-bpm
+/// helper produces a **uniform** 4/4 grid anchored at
+/// `anchor_secs`, refining the period locally around `bpm` so a
+/// slightly-off auto BPM gets corrected on press-1.
+fn run_downbeat_relatch(
+    track: &Track,
+    bpm: f64,
+    anchor_secs: f64,
+    profile: OctaveProfile,
+) -> Option<BeatGrid> {
+    let core = latch_beat_grid_at_downbeat(
+        track.samples(),
+        track.sample_rate(),
+        track.channels(),
+        bpm,
+        anchor_secs,
+        profile,
+    )
+    .ok()?;
+    let grid = BeatGrid::from_core(core);
+    if grid.confidence <= 0.0 || grid.beats.is_empty() {
+        None
+    } else {
+        Some(grid)
+    }
+}
+
 fn background_analyze_and_install(
     idx: usize,
     track: Arc<Track>,
     state: Arc<Mutex<EngineState>>,
     peak_generation_seq: Arc<[AtomicU64; 2]>,
+    beat_grid_generation_seq: Arc<[AtomicU64; 2]>,
     library_grid: Option<LibraryBeatGrid>,
+    genre: Option<String>,
 ) {
+    let profile = octave_profile_from_optional_genre(genre.as_deref());
     // Stage 1: offline peaks.
     let t_peaks = std::time::Instant::now();
     let peaks_result =
@@ -1905,24 +2203,19 @@ fn background_analyze_and_install(
     // Two paths, selected by whether the load handshake supplied a
     // library-sourced grid:
     //
-    //   2a. Library-sourced (`library_grid = Some(_)`). Synthesise
-    //       the per-beat positions vector from the fixed-tempo
-    //       formula `anchor + i · 60 / bpm`, clamped to the track's
-    //       duration. Confidence is set to 1.0 (any row that lives
-    //       in `track_beatgrids` is by definition authoritative —
-    //       it was either auto-analysed with non-zero confidence
-    //       or hand-written by an importer or the user). Cost:
-    //       a few microseconds for a typical 4-minute track at
-    //       128 BPM (~512 beats). No DSP, no decode, no I/O.
+    //   2a. Library-sourced (`library_grid = Some(_)` with
+    //       `source != "auto"`). The library row carries a trusted
+    //       `(bpm, anchor_secs)` (imported from Serato/Traktor/
+    //       rekordbox or hand-corrected by the user). We emit the
+    //       uniform 4/4 grid directly from those scalars — no
+    //       ODF, no analysis. Microseconds.
     //
-    //   2b. No library grid (`library_grid = None`). Run the
-    //       single-pass `analyze_beat_grid` on the full sample
-    //       buffer: spectral-flux ODF + harmonic-summed
-    //       autocorrelation BPM estimate + phase search for the
-    //       downbeat. ~100–400 ms depending on track length and
-    //       channel count. Errors (silence, non-musical, too-short,
-    //       channel-mismatch) collapse to an empty grid; the UI
-    //       falls back to the dash.
+    //   2b. No library grid, or `source == "auto"` (re-analyse
+    //       with genre-aware octave profile). Runs
+    //       `analyze_beat_grid_with_profile`: spectral-flux ODF +
+    //       autocorrelation + Traktor-style period + phase
+    //       refinement → uniform 4/4 grid. ~100–400 ms depending
+    //       on track length.
     //
     // Either way, the result is installed in place into the
     // `FilePeaks.beat_grid` slot. No `peak_generation_seq` bump:
@@ -1930,15 +2223,20 @@ fn background_analyze_and_install(
     // line overlay, and the renderer is already polling the grid
     // each frame.
     let (grid, bpm_ms, source_label): (BeatGrid, u128, &'static str) = if let Some(supplied) =
-        library_grid
+        library_grid.as_ref().filter(|grid| grid.source != "auto")
     {
         let duration_secs = track.samples().len() as f64
             / (f64::from(track.sample_rate()) * f64::from(track.channels()));
-        let synthesised = synthesise_beat_grid(supplied.bpm, supplied.anchor_secs, duration_secs);
-        (synthesised, 0, "library")
+        let grid = synthesise_beat_grid(supplied.bpm, supplied.anchor_secs, duration_secs);
+        (grid, 0, "library")
     } else {
         let t_bpm = std::time::Instant::now();
-        let grid_result = analyze_beat_grid(track.samples(), track.sample_rate(), track.channels());
+        let grid_result = analyze_beat_grid_with_profile(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            profile,
+        );
         let bpm_ms = t_bpm.elapsed().as_millis();
         let grid = match grid_result {
             Ok(g) => BeatGrid::from_core(g),
@@ -1947,7 +2245,15 @@ fn background_analyze_and_install(
                 BeatGrid::empty()
             }
         };
-        (grid, bpm_ms, "analyzed")
+        let source_label = if library_grid
+            .as_ref()
+            .is_some_and(|grid| grid.source == "auto")
+        {
+            "library-auto-reanalyzed"
+        } else {
+            "analyzed"
+        };
+        (grid, bpm_ms, source_label)
     };
 
     {
@@ -1962,7 +2268,108 @@ fn background_analyze_and_install(
             fp.beat_grid = grid;
         }
     }
+    if let Some(a) = beat_grid_generation_seq.get(idx) {
+        a.fetch_add(1, Ordering::Release);
+    }
     eprintln!("dub-ffi: beat-grid deck={idx} installed ({source_label}, {bpm_ms}ms DSP)");
+
+    // #region agent log
+    let snapshot = installed_grid_snapshot(&state, idx);
+    agent_log_beatgrid_install(idx, source_label, bpm_ms, &snapshot);
+    // #endregion
+}
+
+fn installed_grid_snapshot(
+    state: &Arc<Mutex<EngineState>>,
+    idx: usize,
+) -> (f64, f32, usize, Vec<f64>, Vec<f64>) {
+    let guard = lock_state(state);
+    let EngineState::Running(running) = &*guard else {
+        return (0.0, 0.0, 0, Vec::new(), Vec::new());
+    };
+    let Some(PeakSource::File(fp)) = running.peaks.get(idx).and_then(|p| p.as_ref()) else {
+        return (0.0, 0.0, 0, Vec::new(), Vec::new());
+    };
+    let beats = &fp.beat_grid.beats;
+    let head: Vec<f64> = beats.iter().take(8).copied().collect();
+    let tail: Vec<f64> = beats.iter().rev().take(8).rev().copied().collect();
+    (
+        fp.beat_grid.bpm,
+        fp.beat_grid.confidence,
+        beats.len(),
+        head,
+        tail,
+    )
+}
+
+// #region agent log
+/// NDJSON appender for the manual beat-grid nudge debug session.
+/// Best-effort: silent on any I/O failure.
+fn agent_debug_log_nudge(
+    kind: &str,
+    phase: &str,
+    deck_idx: u64,
+    delta: f64,
+    old_first_beat: f64,
+    new_first_beat: f64,
+    beat_count: usize,
+) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/klos/Development/dub/.cursor/debug-c73978.log")
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!(
+        "{{\"sessionId\":\"c73978\",\"runId\":\"beatgrid-nudge\",\"hypothesisId\":\"paused-deck-no-redraw\",\"location\":\"dub-ffi/lib.rs:nudge_beat_grid_{kind}\",\"message\":\"nudge {phase}\",\"data\":{{\"deckIdx\":{deck_idx},\"delta\":{delta},\"oldFirstBeat\":{old_first_beat},\"newFirstBeat\":{new_first_beat},\"beatCount\":{beat_count}}},\"timestamp\":{ts}}}\n"
+    );
+    let _ = f.write_all(line.as_bytes());
+}
+// #endregion
+
+fn agent_log_beatgrid_install(
+    idx: usize,
+    source_label: &str,
+    bpm_ms: u128,
+    snapshot: &(f64, f32, usize, Vec<f64>, Vec<f64>),
+) {
+    use std::io::Write;
+    let path = "/Users/klos/Development/dub/.cursor/debug-c73978.log";
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let (bpm, confidence, beat_count, head, tail) = snapshot;
+    let fmt_arr = |xs: &[f64]| -> String {
+        let mut s = String::from("[");
+        for (i, v) in xs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{v}"));
+        }
+        s.push(']');
+        s
+    };
+    let line = format!(
+        "{{\"sessionId\":\"c73978\",\"runId\":\"beatgrid-refine\",\"hypothesisId\":\"H1\",\"location\":\"dub-ffi/lib.rs:background_analyze_and_install\",\"message\":\"beat-grid installed\",\"data\":{{\"deckIdx\":{idx},\"sourceLabel\":\"{source_label}\",\"bpmAnalysisMs\":{bpm_ms},\"bpm\":{bpm},\"confidence\":{confidence},\"beatCount\":{beat_count},\"firstBeats\":{first},\"lastBeats\":{last}}},\"timestamp\":{timestamp_ms}}}\n",
+        first = fmt_arr(head),
+        last = fmt_arr(tail),
+    );
+    let _ = f.write_all(line.as_bytes());
 }
 
 /// Materialise a [`BeatGrid`] from the scalar `(bpm, anchor_secs)`
@@ -2297,7 +2704,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_fifteen_after_library_sourced_beat_grid() {
+    fn ffi_version_is_sixteen_after_tap_to_grid() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
         // (start_engine, load_track, play, pause, seek, position,
@@ -2318,7 +2725,11 @@ mod tests {
         // M10.5s 12→13 (set_deck_rate — mouse-scratch primitive),
         // M10.5t 13→14 (PositionInfo.playhead_secs_unclamped — UI
         // shell can render lead-in / lead-out empty-groove regions).
-        assert_eq!(FFI_VERSION, 15);
+        // M11d.5 round 4 14→15 (LibraryBeatGrid + active_beat_grid),
+        // M11c.3b 15→16 (install_beat_grid, beat_grid_generation,
+        // upsert_user_tap_beatgrid).
+        // M11d.5 round 5 16→17 (track_id_for_path reverse lookup).
+        assert_eq!(FFI_VERSION, 18);
     }
 
     #[test]
@@ -2333,7 +2744,7 @@ mod tests {
     fn load_track_on_stopped_engine_returns_not_running() {
         let engine = DubEngine::new();
         let err = engine
-            .load_track(0, "/nonexistent.wav".to_string(), None)
+            .load_track(0, "/nonexistent.wav".to_string(), None, None)
             .unwrap_err();
         assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
     }
@@ -2353,7 +2764,7 @@ mod tests {
         // the deck index validates. We check `deck_idx_to_usize` happens
         // first so a clearly-bad deck idx surfaces as InvalidDeckIndex.
         let err = engine
-            .load_track(99, "/tmp/x.wav".to_string(), None)
+            .load_track(99, "/tmp/x.wav".to_string(), None, None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidDeckIndex(99)));
     }
@@ -2753,7 +3164,9 @@ pub struct LibraryTrack {
     /// Musical key (Mixed In Key writes this into the id3 comment
     /// field today; M11e Serato importer adds a dedicated source).
     pub key: Option<String>,
-    /// Duration in milliseconds. Always present.
+    /// Duration in milliseconds. `0` means "unknown yet" for
+    /// fresh metadata-only imports whose duration has not been
+    /// measured by lazy analysis.
     pub duration_ms: u32,
     /// Comma-separated canonical version-token list
     /// (`"clean,radio"`). `None` when no tokens were detected.
@@ -2806,6 +3219,10 @@ pub struct LibraryTrack {
     /// readable in the browser without round-tripping to the OS
     /// file inspector.
     pub comment: Option<String>,
+    /// Composer from id3 (`TCOM` and equivalents).
+    pub composer: Option<String>,
+    /// Track number from id3 (`TRCK` and equivalents).
+    pub track_number: Option<i32>,
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -2831,6 +3248,10 @@ pub enum LibraryTrackSort {
     Duration,
     /// Year.
     Year,
+    /// Composer (id3).
+    Composer,
+    /// Track number (id3).
+    TrackNumber,
 }
 
 impl From<LibraryTrackSort> for dub_library::TrackSortKey {
@@ -2843,6 +3264,8 @@ impl From<LibraryTrackSort> for dub_library::TrackSortKey {
             LibraryTrackSort::Bpm => Self::Bpm,
             LibraryTrackSort::Duration => Self::Duration,
             LibraryTrackSort::Year => Self::Year,
+            LibraryTrackSort::Composer => Self::Composer,
+            LibraryTrackSort::TrackNumber => Self::TrackNumber,
         }
     }
 }
@@ -2906,12 +3329,11 @@ pub struct LibraryAnalysisOutcome {
 /// drift between the DeckHeader and LibraryView.
 ///
 /// **Per-beat positions are not carried.** The library schema
-/// stores only `(bpm, anchor_secs)`; the engine synthesises the
-/// `Vec<f64>` of beat timestamps for [`BeatGrid::beats`] at the
-/// install site using the track's known duration. A future
-/// tempo-drifting grid format (PRD M10.5p-grid) would carry a
-/// separate `beats: Vec<f64>` field here once the schema grows
-/// the column.
+/// stores only `(bpm, anchor_secs)`. Imported and user-authored
+/// rows are materialised from that scalar pair. Auto rows are
+/// treated as a tempo cache and re-analysed on deck load so the
+/// engine can recover per-beat onset-refined timestamps until the
+/// schema grows a separate `beats: Vec<f64>` column.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct LibraryBeatGrid {
     /// Source enum string from `track_beatgrids.source` —
@@ -2981,6 +3403,8 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             is_analyzed: r.is_analyzed,
             key_disagreement: r.key_disagreement,
             comment: r.comment,
+            composer: r.composer,
+            track_number: r.track_number,
         }
     }
 }
@@ -3282,6 +3706,16 @@ impl DubLibrary {
             let p = lib.resolve_track_path(&track_id)?;
             Ok(p.map(|pb| pb.to_string_lossy().to_string()))
         })
+    }
+
+    /// Resolve a library track id from an absolute file path, when
+    /// the file is registered in `track_files`. Returns `Ok(None)`
+    /// for Finder-drag paths or files not yet imported.
+    pub fn track_id_for_path(
+        &self,
+        path: String,
+    ) -> std::result::Result<Option<String>, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.track_id_for_absolute_path(std::path::Path::new(&path))?))
     }
 
     // === M11d.4 — missing-files scanner + Relocate ========================
@@ -3628,6 +4062,21 @@ impl DubLibrary {
             Ok(lib
                 .active_beatgrid_for_track(&track_id)?
                 .map(LibraryBeatGrid::from))
+        })
+    }
+
+    /// Persist a user tap-to-grid correction (M11c.3b). Deactivates
+    /// every other grid row for the track and writes
+    /// `source = 'user_tap'` as the sole active grid.
+    pub fn upsert_user_tap_beatgrid(
+        &self,
+        track_id: String,
+        anchor_secs: f64,
+        bpm: f64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.upsert_user_tap_beatgrid(&track_id, anchor_secs, bpm)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }
 }

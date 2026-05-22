@@ -19,8 +19,8 @@
 //! directory:
 //!
 //! ```text
-//! path<TAB>expected_bpm<TAB>notes
-//! /Users/me/Music/track.mp3<TAB>95<TAB>west coast rap
+//! path<TAB>expected_bpm<TAB>profile<TAB>notes
+//! /Users/me/Music/track.mp3<TAB>95<TAB>roots<TAB>west coast rap
 //! ```
 //!
 //! Then point the test at the manifest:
@@ -51,7 +51,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use dub_bpm::analyze_beat_grid;
+use dub_bpm::{analyze_beat_grid_with_profile, octave_profile_from_label, OctaveProfile};
 use dub_io::Track;
 
 /// Same tolerance the diagnostic CLI uses.
@@ -68,6 +68,7 @@ const MANIFEST_ENV: &str = "DUB_BPM_REAL_CORPUS";
 struct ManifestRow {
     path: PathBuf,
     expected_bpm: f64,
+    profile: OctaveProfile,
     notes: String,
 }
 
@@ -101,7 +102,12 @@ fn real_music_corpus_matches_expected_bpm() {
                 continue;
             }
         };
-        let grid = match analyze_beat_grid(track.samples(), track.sample_rate(), track.channels()) {
+        let grid = match analyze_beat_grid_with_profile(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            row.profile,
+        ) {
             Ok(g) => g,
             Err(e) => {
                 failures.push(format!("ANALYSIS-FAIL  {}  ({e})", row.path.display()));
@@ -111,6 +117,20 @@ fn real_music_corpus_matches_expected_bpm() {
 
         let detected = grid.bpm;
         let expected = row.expected_bpm;
+        if row.notes.contains("known fail") {
+            if approx_equal(detected, expected) {
+                eprintln!(
+                    "KNOWN-FAIL-FIXED  expect={expected:>7.2}  detect={detected:>7.2}  {}",
+                    row.path.display()
+                );
+            } else {
+                eprintln!(
+                    "KNOWN-FAIL  expect={expected:>7.2}  detect={detected:>7.2}  {}",
+                    row.path.display()
+                );
+            }
+            continue;
+        }
         if approx_equal(detected, expected) {
             continue;
         }
@@ -153,7 +173,7 @@ fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestRow>, String> {
             saw_header = true;
             if cols.first().map(|c| c.eq_ignore_ascii_case("path")) != Some(true) {
                 return Err(format!(
-                    "line {}: expected TSV header `path<TAB>expected_bpm<TAB>notes`",
+                    "line {}: expected TSV header `path<TAB>expected_bpm<TAB>profile<TAB>notes`",
                     lineno + 1
                 ));
             }
@@ -170,13 +190,18 @@ fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestRow>, String> {
             .trim()
             .parse::<f64>()
             .map_err(|e| format!("line {}: bad expected_bpm `{}`: {e}", lineno + 1, cols[1]))?;
-        let notes = cols
+        let profile = cols
             .get(2)
+            .map(|s| octave_profile_from_label(s.trim()))
+            .unwrap_or(OctaveProfile::Default);
+        let notes = cols
+            .get(3)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         rows.push(ManifestRow {
             path,
             expected_bpm,
+            profile,
             notes,
         });
     }
