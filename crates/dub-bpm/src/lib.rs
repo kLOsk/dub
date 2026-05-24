@@ -62,8 +62,9 @@ mod tempo;
 mod tracker;
 
 pub use beats::{
-    analyze_beat_grid, analyze_beat_grid_with_profile, latch_beat_grid_at_downbeat,
-    median_bpm_from_beats, uniform_beats, BeatGrid,
+    analyze_beat_grid, analyze_beat_grid_from_taps, analyze_beat_grid_with_profile,
+    bar_phase_from_tap, latch_beat_grid_at_downbeat, median_bpm_from_beats, uniform_beats,
+    BeatGrid, GridQuality,
 };
 pub use confidence::{
     ConfidenceTracker, TrackerEvent, TrackerState, LOCK_CONSECUTIVE, LOCK_THRESHOLD,

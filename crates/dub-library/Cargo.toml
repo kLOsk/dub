@@ -24,9 +24,24 @@ dub-bpm = { workspace = true }
 # pass that runs `analyze_beat_grid`, so the file decodes exactly
 # once per analysis call.
 dub-spectral = { workspace = true }
+# PRD-BEATS C1 (round 4) — analyze_track also renders the waveform
+# peaks and writes a sidecar so the next `loadTrack` on this
+# fingerprint hits the cache and the deck shows the waveform
+# instantly.
+dub-peaks = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
+
+# PRD-BEATS C1 (round 4) — `Library::open_in_memory` mints a
+# per-Library tempdir for waveform-sidecar writes so the test
+# suite never pollutes the developer's `~/Library/Caches/Dub/
+# waveforms/` tree. `open_in_memory` is technically a public
+# constructor, but in production we always go through
+# `open_default` / `open_at`; the tempdir cost is paid only by
+# the test-only in-memory path.
+[dependencies.tempfile]
+version = "3"
 
 [dev-dependencies]
 # Temp dirs for fixture-driven tests of the migration runner /

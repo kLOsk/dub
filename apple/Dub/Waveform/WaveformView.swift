@@ -567,6 +567,7 @@ struct WaveformView: View {
 
         let bpb = renderSnapshot.beatsPerBar
         let beats = renderSnapshot.beats
+        let barPhase = max(0, min(renderSnapshot.barPhase, max(0, bpb - 1)))
         let tint = DubColor.deckTint(side)
         let beatStroke = GraphicsContext.Shading.color(tint.opacity(0.35))
         let barStroke = GraphicsContext.Shading.color(tint.opacity(0.85))
@@ -647,7 +648,7 @@ struct WaveformView: View {
 
             let drawablePixel = (1.0 - timeNDC) * axisDrawablePx * 0.5
             let logicalPixel = drawablePixel / scale
-            let isDownbeat = bpb > 0 && (idx % bpb == 0)
+            let isDownbeat = bpb > 0 && (idx % bpb == barPhase)
             switch orientation {
             case .vertical:
                 let y = CGFloat(logicalPixel)

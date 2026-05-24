@@ -19,4 +19,7 @@ ringbuf = { workspace = true }
 dub-spectral = { workspace = true }
 
 [dev-dependencies]
-# nothing yet; we use std-only synthetic helpers
+# Sidecar round-trip tests want a per-test tempdir + tempfile that
+# clean up automatically; this is the standard crate for it and is
+# already cheap to compile.
+tempfile = "3"

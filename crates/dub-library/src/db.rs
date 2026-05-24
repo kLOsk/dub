@@ -228,6 +228,10 @@ pub struct TrackRow {
     /// second source. The plumbing ships now so M11e is a pure
     /// data-load milestone with no UI changes required.
     pub key_disagreement: bool,
+    /// M11d.7: locked grids skip auto re-analysis on reload.
+    pub grid_locked: bool,
+    /// M11d.7: LSQ drift slope (ms/min) for the ⚠ indicator.
+    pub grid_drift_quality: Option<f32>,
 }
 
 /// Sort columns the M11d.2 browser table header can drive.
@@ -337,7 +341,9 @@ const TRACK_ROW_SELECT: &str = "\
            )                                   AS key_disagreement, \
            i3.comment                          AS comment, \
            i3.composer                         AS composer, \
-           i3.track_number                     AS track_number \
+           i3.track_number                     AS track_number, \
+           t.grid_locked                       AS grid_locked, \
+           t.grid_drift_quality                AS grid_drift_quality \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
@@ -400,6 +406,11 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         comment: r.get(17)?,
         composer: r.get(18)?,
         track_number: r.get(19)?,
+        grid_locked: {
+            let flag: i64 = r.get(20)?;
+            flag != 0
+        },
+        grid_drift_quality: r.get(21)?,
     })
 }
 
@@ -448,6 +459,21 @@ fn build_fts_query(query: &str) -> String {
 pub struct Library {
     conn: Connection,
     db_path: PathBuf,
+    /// PRD-BEATS C1 (round 4) — per-Library override for the
+    /// waveform-sidecar cache directory. `None` falls back to
+    /// [`crate::paths::default_waveforms_cache_dir`] (i.e.
+    /// `~/Library/Caches/Dub/waveforms/`). Tests that exercise
+    /// `analyze_track` set this to a per-test tempdir so the
+    /// suite stays hermetic against concurrent fp-id collisions.
+    waveforms_cache_dir_override: Option<PathBuf>,
+    /// Owned tempdir backing
+    /// [`Self::waveforms_cache_dir_override`] when the override
+    /// was minted by [`Self::open_in_memory`]. Stored on the
+    /// struct so the dir is deleted when the Library is dropped
+    /// (i.e. when the test ends). `None` for libraries opened
+    /// via `open_default` / `open_at` (those use the platform
+    /// cache and want it persisted across runs).
+    _owned_waveforms_tempdir: Option<tempfile::TempDir>,
 }
 
 /// A fingerprint row read back from the `fingerprints` table.
@@ -500,19 +526,58 @@ impl Library {
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
+            waveforms_cache_dir_override: None,
+            _owned_waveforms_tempdir: None,
         })
     }
 
     /// Open an in-memory database (`:memory:`). Migrations applied;
     /// used by tests that never touch the disk.
+    ///
+    /// PRD-BEATS C1 (round 4): in-memory libraries also mint their
+    /// own per-Library tempdir for waveform-sidecar writes. Without
+    /// this, every test that calls `analyze_track` would write
+    /// into the developer's `~/Library/Caches/Dub/waveforms/` and
+    /// races between parallel tests sharing the same
+    /// `fingerprint_id` (in-memory DBs reset the autoincrement
+    /// counter) would cause flaky cache content.
     pub fn open_in_memory() -> Result<Self> {
         let mut conn =
             Connection::open_in_memory().map_err(|e| LibraryError::sqlite("open_in_memory", e))?;
         open_and_migrate(&mut conn)?;
+        let tempdir =
+            tempfile::tempdir().map_err(|e| LibraryError::io(Path::new("<tempdir>"), e))?;
+        let dir_path = tempdir.path().to_path_buf();
         Ok(Self {
             conn,
             db_path: PathBuf::from(":memory:"),
+            waveforms_cache_dir_override: Some(dir_path),
+            _owned_waveforms_tempdir: Some(tempdir),
         })
+    }
+
+    /// Redirect waveform-sidecar writes to `dir` instead of the
+    /// platform default. Returns a new Library with the override
+    /// applied. Used by the dub-library test suite (so
+    /// concurrent tests don't collide on `~/Library/Caches/...`)
+    /// and reserved for a future Preferences "Cache location"
+    /// setting.
+    #[must_use]
+    pub fn with_waveforms_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.waveforms_cache_dir_override = Some(dir);
+        self._owned_waveforms_tempdir = None;
+        self
+    }
+
+    /// Resolve the waveform-sidecar cache directory, honouring
+    /// any per-Library override set via
+    /// [`Self::with_waveforms_cache_dir`].
+    pub(crate) fn waveforms_cache_dir(&self) -> Result<PathBuf> {
+        if let Some(dir) = &self.waveforms_cache_dir_override {
+            std::fs::create_dir_all(dir).map_err(|e| LibraryError::io(dir, e))?;
+            return Ok(dir.clone());
+        }
+        crate::paths::default_waveforms_cache_dir()
     }
 
     /// Read-only access to the on-disk path the library was opened

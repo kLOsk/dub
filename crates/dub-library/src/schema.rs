@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -65,6 +65,14 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 3,
         sql: V3_MIGRATION,
+    },
+    Migration {
+        target_version: 4,
+        sql: V4_MIGRATION,
+    },
+    Migration {
+        target_version: 5,
+        sql: V5_MIGRATION,
     },
 ];
 
@@ -505,6 +513,40 @@ ALTER TABLE analysis_cache ADD COLUMN has_active_key INTEGER NOT NULL DEFAULT 0
     CHECK (has_active_key IN (0, 1));
 "#;
 
+/// M11d.7 — per-track beatgrid lock + drift-quality indicator.
+const V4_MIGRATION: &str = r#"
+ALTER TABLE tracks ADD COLUMN grid_locked INTEGER NOT NULL DEFAULT 0
+    CHECK (grid_locked IN (0, 1));
+ALTER TABLE tracks ADD COLUMN grid_drift_quality REAL;
+"#;
+
+/// PRD-BEATS C2 (round 4) — beat-grid `bar_phase` becomes a
+/// first-class scalar on every row in `track_beatgrids`.
+///
+/// `bar_phase ∈ [0, beats_per_bar)` is the index `i` such that
+/// `beats[i]`, `beats[i + beats_per_bar]`, … are the downbeats
+/// (bar position 1). Prior to v5 the column did not exist; phase
+/// was implicit ("`beats[0]` is the downbeat") and "set the 1"
+/// rebuilt the whole grid by re-anchoring. With v5, "set the 1"
+/// becomes a pure rotation (bpm + anchor unchanged) and the
+/// renderer reads phase explicitly via `(idx mod beats_per_bar)
+/// == bar_phase`.
+///
+/// Default `0` preserves the v4 behaviour for any rows analyzed
+/// before this migration: those rows already had `beats[0]` as
+/// the downbeat (auto path shifted anchor; tap path used first
+/// tap as anchor). The CHECK constraint enforces the 4/4
+/// assumption that the rest of the codebase already encodes.
+///
+/// PRD-BEATS round 4 ships in dev only; per the user's
+/// "we are not in production yet" go-ahead the migration is a
+/// simple `ALTER TABLE` with a safe default rather than a
+/// re-analysis-required schema bump.
+const V5_MIGRATION: &str = r#"
+ALTER TABLE track_beatgrids ADD COLUMN bar_phase INTEGER NOT NULL DEFAULT 0
+    CHECK (bar_phase >= 0 AND bar_phase < 16);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +558,25 @@ mod tests {
         let mut conn = Connection::open_in_memory().expect("open in-memory DB");
         open_and_migrate(&mut conn).expect("migration must succeed on fresh DB");
         conn
+    }
+
+    #[test]
+    fn migration_v4_adds_grid_lock_columns() {
+        let conn = fresh_db();
+        let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            rows.iter().any(|c| c == "grid_locked"),
+            "v4 migration must add grid_locked to tracks; saw {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|c| c == "grid_drift_quality"),
+            "v4 migration must add grid_drift_quality to tracks; saw {rows:?}"
+        );
     }
 
     #[test]
@@ -683,6 +744,63 @@ mod tests {
             result.is_err(),
             "two active keys on one track must be rejected"
         );
+    }
+
+    #[test]
+    fn track_beatgrids_has_bar_phase_column_lands_on_v5() {
+        // PRD-BEATS C2 (round 4): the V5 migration must add a
+        // non-null `bar_phase` column with a default of 0 to
+        // `track_beatgrids`. The default is what lets the
+        // migration land on an existing dev DB without forcing a
+        // re-analyze of every track (anything analyzed before v5
+        // already had `beats[0]` as the downbeat → bar_phase 0).
+        let conn = fresh_db();
+        let mut stmt = conn.prepare("PRAGMA table_info(track_beatgrids)").unwrap();
+        let cols = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i32>(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, i32)>>>()
+            .unwrap();
+        let bar_phase = cols.iter().find(|(name, _)| name == "bar_phase");
+        let (_, notnull) = bar_phase.unwrap_or_else(|| {
+            panic!("v5 migration must add bar_phase to track_beatgrids; saw {cols:?}")
+        });
+        assert_eq!(
+            *notnull, 1,
+            "bar_phase must be NOT NULL so renderer code never sees a sentinel"
+        );
+
+        // The default must be 0 so a re-open of an existing v4 DB
+        // doesn't suddenly drop every row's downbeat phase to NULL.
+        // Insert a row without supplying bar_phase; expect 0.
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO volumes (volume_uuid, display_name, last_seen_at) \
+             VALUES ('TEST-VOLUME', 'Macintosh HD', ?1)",
+            params![now],
+        )
+        .unwrap();
+        let track_uuid = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO tracks (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            params![track_uuid, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_beatgrids \
+             (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+             VALUES (?1, 'auto', 0.0, 120.0, 1, ?2)",
+            params![track_uuid, now],
+        )
+        .unwrap();
+        let stored: i64 = conn
+            .query_row(
+                "SELECT bar_phase FROM track_beatgrids WHERE track_id = ?1",
+                params![track_uuid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "v5 default for bar_phase must be 0");
     }
 
     #[test]

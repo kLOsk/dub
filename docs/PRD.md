@@ -825,18 +825,17 @@ The schema is documented in `docs/LIBRARY-SCHEMA.md` (published with M11a) and i
 
 #### 8.3.1 Tap-to-grid (the only manual editing)
 
-The user plays a track. They listen. When they hear a downbeat they like, they tap a key (default `G`). Dub:
+> **Sub-spec:** the precise contract for tap-to-grid, set-the-1,
+> tempo, beat grids, and the waveform overlay lives in
+> [`PRD-BEATS.md`](PRD-BEATS.md) (visual companion at
+> [`html/beats.html`](html/beats.html)). This section is a
+> one-paragraph summary; PRD-BEATS.md is binding.
 
-1. Records the timestamp of the tap as the **downbeat anchor**.
-2. Searches a window of ±200 ms around the tap for the strongest transient (snapping to the actual onset, not the user's reaction time).
-3. Looks at transients within ±20 BPM of any imported BPM (or auto-detected BPM, or 120 if nothing). Picks the BPM that minimizes per-beat error over the next 8 bars.
-4. Done. Grid is set.
+The user plays a track. The deck-header BPM column accepts taps. **One or two taps** within a 2 s window is "set the 1" — pure bar-phase rotation: the existing beat nearest the tap becomes the downbeat. BPM and beat positions are unchanged; only which 1-in-4 beats are flagged yellow rotates. **Three or more taps** within a 2 s window run a **constrained re-analysis** in the tap-median ±15 % BPM window: the full estimator runs again with the search range pinned by the user's hint, the strongest real autocorrelation peak in that window is the BPM (snapped to integer if residuals don't get worse), the first tap snaps to the nearest transient as the anchor, and `bar_phase` is the value that best fits the user's tap times across the four candidates. The tap is a search hint, never the BPM — a 2 s window of 3–8 taps cannot beat a full-track spectral-flux estimator on precision.
 
-If the user taps multiple times (`G G G G`):
-- Three+ taps with consistent intervals = explicit BPM (`60 / interval_seconds`). Anchor at the **first** tap.
-- Useful for very sparse-beat tracks where the auto-detect can't lock.
+The tap result is written to `track_beatgrids` as `source=user_tap` and becomes the active grid; previous grids (imported, auto-detected) are preserved on the same row so the user can revert. **`grid_locked = true` is absolute**: no analyze, re-analyze, tap-tempo, or set-the-1 mutates a locked grid. The user explicitly toggles Lock grid off before any edit. The right-click menu shows a single Analyze / Re-analyze entry whose label switches on whether the track has been analyzed before, and whose enabled state follows `grid_locked`. Library row BPM and deck-header BPM are always the same value (single source of truth: the active `track_beatgrids` row); the waveform sidecar at `~/Library/Caches/Dub/waveforms/{fingerprint}.wf` is written by analyze passes and read synchronously on deck load so the waveform paints on the first frame.
 
-That's the whole feature. No drag, no halve/double, no nudge. **If the auto-detected grid is wrong, the user re-taps once and Dub re-fits everything around the new anchor.** The tap result is written to `track_beatgrids` as `source=user_tap` and becomes the active grid; previous grids (imported, auto-detected) are preserved on the same row so the user can revert.
+Per PRD-BEATS.md, beat-grid edits never trim beats, never advance the anchor past pre-roll silence, and never make the user's tap the "first beat" of the track. The grid is continuous across the whole track at all times.
 
 #### 8.3.2 Key detection (Camelot canonical)
 

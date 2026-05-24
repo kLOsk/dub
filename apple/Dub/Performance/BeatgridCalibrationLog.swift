@@ -94,49 +94,55 @@ enum BeatgridCalibrationLog {
         append(payload)
     }
 
-    static func logDownbeatMark(
-        side: String,
-        trackId: String?,
-        path: String?,
-        title: String?,
-        playheadSecs: Double,
-        autoBpm: Double?,
-        autoAnchorSecs: Double?
-    ) {
-        var payload: [String: Any] = [
-            "event": "downbeat_mark",
-            "timestampMs": nowMs(),
-            "side": side,
-            "trackId": trackId as Any,
-            "path": path as Any,
-            "title": title as Any,
-            "playheadSecs": playheadSecs,
-        ]
-        if let autoBpm { payload["autoBpm"] = autoBpm }
-        if let autoAnchorSecs { payload["autoAnchorSecs"] = autoAnchorSecs }
-        append(payload)
-    }
-
-    static func logDownbeatRelatched(
+    static func logTapDownbeat(
         side: String,
         trackId: String?,
         path: String?,
         title: String?,
         downbeatSecs: Double,
-        resultBpm: Double,
-        resultAnchorSecs: Double,
+        tapCount: Int,
         autoBpm: Double?,
         autoAnchorSecs: Double?,
-        durationSecs: Double
+        resultBpm: Double,
+        resultAnchorSecs: Double
     ) {
         var payload: [String: Any] = [
-            "event": "downbeat_relatch",
+            "event": "tap_downbeat",
             "timestampMs": nowMs(),
             "side": side,
             "trackId": trackId as Any,
             "path": path as Any,
             "title": title as Any,
             "downbeatSecs": downbeatSecs,
+            "tapCount": tapCount,
+            "resultBpm": resultBpm,
+            "resultAnchorSecs": resultAnchorSecs,
+        ]
+        if let autoBpm { payload["autoBpm"] = autoBpm }
+        if let autoAnchorSecs { payload["autoAnchorSecs"] = autoAnchorSecs }
+        append(payload)
+    }
+
+    static func logTapTempoRecalc(
+        side: String,
+        trackId: String?,
+        path: String?,
+        title: String?,
+        tapTimes: [Double],
+        autoBpm: Double?,
+        autoAnchorSecs: Double?,
+        resultBpm: Double,
+        resultAnchorSecs: Double,
+        durationSecs: Double
+    ) {
+        var payload: [String: Any] = [
+            "event": "tap_tempo_recalc",
+            "timestampMs": nowMs(),
+            "side": side,
+            "trackId": trackId as Any,
+            "path": path as Any,
+            "title": title as Any,
+            "tapTimes": tapTimes,
             "resultBpm": resultBpm,
             "resultAnchorSecs": resultAnchorSecs,
             "durationSecs": durationSecs,

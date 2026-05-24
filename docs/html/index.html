@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dub — Docs</title>
+    <link rel="stylesheet" href="_assets/dub.css">
+</head>
+<body>
+
+<nav class="dub-nav">
+    <a class="dub-nav__brand" href="index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.4"/>
+            <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+            <line x1="12" y1="2.2" x2="12" y2="6" stroke="currentColor" stroke-width="1.4"/>
+        </svg>
+        Dub
+    </a>
+    <span class="dub-nav__sep"></span>
+    <div class="dub-nav__links">
+        <a href="index.html">Overview</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="beats.html">Beat grid</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="schema.html">Library schema</a>
+        <a href="backlog.html">UI backlog</a>
+    </div>
+    <span class="dub-nav__source">file://docs/html</span>
+</nav>
+
+<main class="dub-shell">
+
+<header class="dub-page-head">
+    <div class="dub-page-head__eyebrow">Pre-alpha · Phase A · macOS</div>
+    <h1>Dub — timecode-vinyl DJ application for scratch DJs</h1>
+    <p class="dub-page-head__lede">
+        Mac-first, Rust-cored, GPLv3. Built around one uncompromising commitment:
+        best-in-class control-vinyl latency and feel on macOS, plus first-class
+        support for playing real records <em>through</em> the software with FX,
+        auto-BPM, and (eventually) automatic waveform recognition. The audience
+        is the urban / sound-system / scratch DJ; reliability is the primary
+        feature, not a feature.
+    </p>
+    <div class="dub-page-head__meta">
+        <span>15 Rust crates</span>
+        <span>·</span>
+        <span>SwiftUI / AppKit shell</span>
+        <span>·</span>
+        <span>v0.1 working spec · 2026-05-20</span>
+    </div>
+</header>
+
+<section>
+    <h2>Non-negotiable design principles</h2>
+    <p style="color: var(--dub-text-muted); max-width: 72ch;">
+        These are load-bearing. The PRD treats them as binding for every line
+        of code. Anything that contradicts one of these needs explicit
+        agreement before it lands.
+    </p>
+    <div class="dub-grid">
+
+        <div class="dub-card">
+            <h3>No Mouse DJ Ever</h3>
+            <p style="color: var(--dub-text-muted);">
+                Performance gestures (pitch, scratch, crossfade, EQ, gain, cue)
+                never go through the mouse. They live on the turntable +
+                external mixer + keyboard. The mouse is welcome for navigation,
+                config, and the explicit transport / recovery affordances.
+            </p>
+        </div>
+
+        <div class="dub-card">
+            <h3>External mixer is the product</h3>
+            <p style="color: var(--dub-text-muted);">
+                No software mixer / EQ / crossfader in v1 or v2. Dub requires
+                a ≥4-in/4-out audio interface; the user's hardware mixer does
+                the mixing.
+            </p>
+        </div>
+
+        <div class="dub-card">
+            <h3>Real records are first-class</h3>
+            <p style="color: var(--dub-text-muted);">
+                Thru mode auto-detects when a real record is on the deck and
+                switches transparently. FX work on real records the same way
+                they work on files.
+            </p>
+        </div>
+
+        <div class="dub-card">
+            <h3>Reliability over features</h3>
+            <p style="color: var(--dub-text-muted);">
+                A crash on stage is a career moment for a DJ. We accept
+                ~20–30 % slower velocity to never ship a show-stopper. TDD is
+                not optional and the audio thread is statically guarded.
+            </p>
+        </div>
+
+        <div class="dub-card">
+            <h3>Symmetric playback</h3>
+            <p style="color: var(--dub-text-muted);">
+                Forward and backward playback are byte-for-byte symmetric.
+                Manual rewinds are a first-class gesture. Whole tracks are
+                decoded into RAM on load (no per-block disk streaming).
+            </p>
+        </div>
+
+        <div class="dub-card">
+            <h3>The audio thread is sacred</h3>
+            <p style="color: var(--dub-text-muted);">
+                No alloc, no lock, no syscall, no logging, no I/O, no
+                <code>unwrap()</code>, no <code>dyn Trait</code> heap allocation.
+                Enforced at compile time via the <code>RealtimeContext</code>
+                token and at runtime via <code>assert_no_alloc</code>.
+            </p>
+        </div>
+
+    </div>
+</section>
+
+<section>
+    <h2>Where to look</h2>
+    <p style="color: var(--dub-text-muted); max-width: 72ch;">
+        The HTML views below are human-facing dashboards generated from the
+        Markdown sources in <code>docs/</code>. The Markdown stays the source
+        of truth (agents and the build read it directly); these are for you
+        and anyone you share a link with.
+    </p>
+    <div class="dub-grid">
+
+        <div class="dub-card">
+            <h3><a href="architecture.html">Architecture</a></h3>
+            <p style="color: var(--dub-text-muted);">
+                Crate dependency graph, audio thread isolation, RT-safety
+                layers, UI ↔ Engine messaging shape. Visual companion to
+                <code><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a></code>.
+            </p>
+            <div style="margin-top: var(--sp-md);">
+                <span class="pill">15 crates</span>
+                <span class="pill">3 RT-safety layers</span>
+            </div>
+        </div>
+
+        <div class="dub-card">
+            <h3><a href="roadmap.html">Roadmap</a></h3>
+            <p style="color: var(--dub-text-muted);">
+                Milestone timeline from M0 through v1.0 and v1.1. Shipped
+                milestones link into <code><a href="../SHIPPED.md">SHIPPED.md</a></code>
+                anchors; planned milestones link into
+                <code><a href="../PRD.md">PRD.md</a></code> §12.
+            </p>
+            <div style="margin-top: var(--sp-md);">
+                <span class="pill pill--shipped">M0 → M11d.5 shipped</span>
+                <span class="pill pill--inprog">M11c.3 in flight</span>
+            </div>
+        </div>
+
+        <div class="dub-card">
+            <h3><a href="schema.html">Library schema</a></h3>
+            <p style="color: var(--dub-text-muted);">
+                Interactive ER diagram of the SQLite library, table by table.
+                Companion to
+                <code><a href="../LIBRARY-SCHEMA.md">LIBRARY-SCHEMA.md</a></code>;
+                the schema is part of Dub's public API per PRD §8.7.
+            </p>
+            <div style="margin-top: var(--sp-md);">
+                <span class="pill">Schema v2</span>
+                <span class="pill">15 tables</span>
+            </div>
+        </div>
+
+        <div class="dub-card">
+            <h3><a href="backlog.html">UI backlog</a></h3>
+            <p style="color: var(--dub-text-muted);">
+                Kanban view of <code><a href="../UI-BACKLOG.md">UI-BACKLOG.md</a></code>:
+                bugs, polish, and code-health buckets with filter chips and a
+                triage search box.
+            </p>
+            <div style="margin-top: var(--sp-md);">
+                <span class="pill pill--bug">Real bugs</span>
+                <span class="pill pill--polish">UX polish</span>
+                <span class="pill pill--health">Code health</span>
+            </div>
+        </div>
+
+    </div>
+</section>
+
+<section>
+    <h2>Markdown source of truth</h2>
+    <p style="color: var(--dub-text-muted); max-width: 72ch;">
+        The HTML above is a reading surface. Anything load-bearing lives in
+        the Markdown source. When the two disagree, the Markdown wins by
+        construction.
+    </p>
+    <table class="dub-table">
+        <thead>
+            <tr>
+                <th>File</th>
+                <th>Role</th>
+                <th>Loading guidance</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><a href="../PRD.md"><code>PRD.md</code></a></td>
+                <td>Product source of truth: scope, non-goals, milestone plan, acceptance criteria.</td>
+                <td>Load by anchored section, not whole file.</td>
+            </tr>
+            <tr>
+                <td><a href="../ARCHITECTURE.md"><code>ARCHITECTURE.md</code></a></td>
+                <td>How the crates fit together; threading and FFI shape.</td>
+                <td>Read overview, then jump to the relevant section.</td>
+            </tr>
+            <tr>
+                <td><a href="../SHIPPED.md"><code>SHIPPED.md</code></a></td>
+                <td>Per-milestone shipped history and design rationale.</td>
+                <td>Anchor-only. Never load whole file.</td>
+            </tr>
+            <tr>
+                <td><a href="../LIBRARY-SCHEMA.md"><code>LIBRARY-SCHEMA.md</code></a></td>
+                <td>Public SQLite schema contract.</td>
+                <td>Load for library / migration / FFI work only.</td>
+            </tr>
+            <tr>
+                <td><a href="../LIBRARY-FORMATS.md"><code>LIBRARY-FORMATS.md</code></a></td>
+                <td>Serato / Traktor / rekordbox / iTunes / Lexicon format quirks.</td>
+                <td>Load only for importer / format work.</td>
+            </tr>
+            <tr>
+                <td><a href="../LICENSE-DEPENDENCIES.md"><code>LICENSE-DEPENDENCIES.md</code></a></td>
+                <td>Dependency license posture and binary attribution.</td>
+                <td>Load for license review / release work.</td>
+            </tr>
+            <tr>
+                <td><a href="../UI-BACKLOG.md"><code>UI-BACKLOG.md</code></a></td>
+                <td>SwiftUI polish backlog; bugs / polish / code-health.</td>
+                <td>UI work only.</td>
+            </tr>
+            <tr>
+                <td><a href="../README.md"><code>README.md</code></a></td>
+                <td>Docs routing guide for context-budgeted reading.</td>
+                <td>Start here when picking which doc to load.</td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+<footer class="dub-footer">
+    Generated from the Markdown sources in <code>docs/</code>. Refresh manually
+    when the source diverges. The Markdown wins; this surface is a reading
+    aid.
+</footer>
+
+</main>
+
+<script src="_assets/dub.js"></script>
+</body>
+</html>

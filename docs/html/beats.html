@@ -1,0 +1,1294 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dub — Beat grid, tempo and waveform</title>
+    <link rel="stylesheet" href="_assets/dub.css">
+    <style>
+        /* Beat-grid SVG palette. Mirrors apple/Dub/DesignSystem/Tokens.swift:
+           DubColor.gridBeat / gridDownbeat / accent. */
+        :root {
+            --gd-bg:        rgba(255, 255, 255, 0.03);
+            --gd-silence:   rgba(255, 255, 255, 0.04);
+            --gd-wave:      rgba(231, 236, 243, 0.55);
+            --gd-wave-kick: rgba(255, 106, 61, 0.7);
+            --gd-beat:      rgba(231, 236, 243, 0.38);
+            --gd-down:      #f2c14e;
+            --gd-down-glow: rgba(242, 193, 78, 0.18);
+            --gd-anchor:    #4ea1ff;
+            --gd-tap:       #ff6a3d;
+            --gd-warn:      #e85a5a;
+            --gd-axis:      rgba(231, 236, 243, 0.18);
+        }
+        svg.dub-diagram { background: var(--dub-bg-elev-1); padding: 0; }
+        svg.beats-diag text { fill: var(--dub-text); font-size: 11px; font-family: var(--font-sans); }
+        svg.beats-diag .ax-label { fill: var(--dub-text-faint); font-size: 10px; font-family: var(--font-mono); }
+        svg.beats-diag .hint { fill: var(--dub-text-muted); font-size: 11px; font-family: var(--font-mono); }
+        svg.beats-diag .badge {
+            fill: var(--dub-bg-elev-2);
+            stroke: var(--dub-stroke-strong);
+            stroke-width: 1;
+        }
+        svg.beats-diag .badge-text {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            fill: var(--dub-text);
+        }
+        .beats-caption {
+            margin: var(--sp-sm) 0 var(--sp-xl) 0;
+            color: var(--dub-text-muted);
+            font-size: 13px;
+            max-width: 80ch;
+        }
+        .beats-caption strong { color: var(--dub-text); font-weight: 500; }
+
+        .glossary-table td:first-child {
+            font-family: var(--font-mono);
+            color: var(--dub-text);
+            white-space: nowrap;
+            vertical-align: top;
+            width: 220px;
+        }
+        .glossary-table td:nth-child(2) { color: var(--dub-text-muted); }
+
+        .compare-table .col-app { color: var(--dub-text); font-weight: 500; }
+        .compare-table td      { vertical-align: top; }
+
+        .legend-row {
+            display: flex; flex-wrap: wrap; gap: var(--sp-md);
+            margin: var(--sp-md) 0 var(--sp-lg);
+            font-family: var(--font-mono); font-size: 12px;
+            color: var(--dub-text-muted);
+        }
+        .legend-row span { display: inline-flex; align-items: center; gap: 6px; }
+        .legend-swatch {
+            display: inline-block; width: 14px; height: 14px;
+            border-radius: 3px; border: 1px solid currentColor;
+        }
+    </style>
+</head>
+<body>
+
+<nav class="dub-nav">
+    <a class="dub-nav__brand" href="index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.4"/>
+            <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+            <line x1="12" y1="2.2" x2="12" y2="6" stroke="currentColor" stroke-width="1.4"/>
+        </svg>
+        Dub
+    </a>
+    <span class="dub-nav__sep"></span>
+    <div class="dub-nav__links">
+        <a href="index.html">Overview</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="beats.html" class="is-active">Beat grid</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="schema.html">Library schema</a>
+        <a href="backlog.html">UI backlog</a>
+    </div>
+    <span class="dub-nav__source">source: PRD-BEATS.md</span>
+</nav>
+
+<main class="dub-shell">
+
+<header class="dub-page-head">
+    <div class="dub-page-head__eyebrow">Beat grid · tempo · waveform contract</div>
+    <h1>Beat grid, tempo and the waveform</h1>
+    <p class="dub-page-head__lede">
+        Everything Dub does about tempo and beat phase. The data
+        model is three fields; the waveform draws what the data
+        model says; the user has six gestures. This page exists
+        so the team and the docs all use the same vocabulary.
+    </p>
+    <div class="dub-page-head__meta">
+        <span>v0.1 working spec · 2026-05-24</span>
+        <span>·</span>
+        <span>Replaces PRD §8.3.1</span>
+        <span>·</span>
+        <span><a href="../PRD-BEATS.md">PRD-BEATS.md</a></span>
+    </div>
+</header>
+
+<!-- =================================================================
+     Legend
+     ================================================================= -->
+<div class="legend-row">
+    <span><span class="legend-swatch" style="background: var(--gd-wave); color: var(--gd-wave)"></span> waveform</span>
+    <span><span class="legend-swatch" style="background: var(--gd-silence); color: var(--gd-axis)"></span> silence</span>
+    <span><span class="legend-swatch" style="background: var(--gd-beat); color: var(--gd-beat)"></span> beat tick</span>
+    <span><span class="legend-swatch" style="background: var(--gd-down); color: var(--gd-down)"></span> downbeat (the 1)</span>
+    <span><span class="legend-swatch" style="background: var(--gd-anchor); color: var(--gd-anchor)"></span> beat anchor</span>
+    <span><span class="legend-swatch" style="background: var(--gd-tap); color: var(--gd-tap)"></span> user tap</span>
+    <span><span class="legend-swatch" style="background: var(--gd-warn); color: var(--gd-warn)"></span> drift indicator</span>
+</div>
+
+<!-- =================================================================
+     Section 1: Anatomy of a beat grid
+     ================================================================= -->
+<section>
+    <h2>1 · Anatomy of a beat grid</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        A beat grid is three fields: <code>bpm</code>,
+        <code>beat_anchor_secs</code>, and <code>bar_phase</code>.
+        Everything else is derived. The grid is continuous,
+        uniform, and covers the entire track — including silence.
+        The yellow downbeats are a separate property of the
+        grid; rotating them does not move beats.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 240" role="img"
+         aria-label="A track with leading silence, an audible section of four kicks, and trailing silence. Beat ticks extend through silence on both ends; downbeats land every fourth beat.">
+        <!-- background strip -->
+        <rect x="80" y="60" width="1040" height="80" fill="var(--gd-bg)" stroke="var(--gd-axis)" stroke-width="0.5"/>
+
+        <!-- silence shading: 0–1.5 s and 6.5–8 s -->
+        <rect x="80"  y="60" width="195" height="80" fill="var(--gd-silence)"/>
+        <rect x="925" y="60" width="195" height="80" fill="var(--gd-silence)"/>
+
+        <!-- waveform: 4 kicks at 2s, 4s, 6s + envelope between -->
+        <!-- 130 px per second; t=0 at x=80, so t=2 at x=340, t=4 at x=600, t=6 at x=860 -->
+        <g fill="var(--gd-wave)">
+            <!-- low-amp pad between kicks -->
+            <rect x="275" y="92" width="650" height="16" rx="2" opacity="0.4"/>
+        </g>
+        <g fill="var(--gd-wave-kick)">
+            <!-- kick at t=2 (x=340) -->
+            <ellipse cx="340" cy="100" rx="14" ry="32"/>
+            <!-- kick at t=4 (x=600) -->
+            <ellipse cx="600" cy="100" rx="14" ry="32"/>
+            <!-- kick at t=6 (x=860) -->
+            <ellipse cx="860" cy="100" rx="14" ry="32"/>
+        </g>
+
+        <!-- beat ticks every 0.5 s (120 BPM): SHORT ticks ABOVE the waveform only -->
+        <g stroke="var(--gd-beat)" stroke-width="1">
+            <line x1="145"  y1="44" x2="145"  y2="58"/>
+            <line x1="210"  y1="44" x2="210"  y2="58"/>
+            <line x1="275"  y1="44" x2="275"  y2="58"/>
+            <line x1="405"  y1="44" x2="405"  y2="58"/>
+            <line x1="470"  y1="44" x2="470"  y2="58"/>
+            <line x1="535"  y1="44" x2="535"  y2="58"/>
+            <line x1="665"  y1="44" x2="665"  y2="58"/>
+            <line x1="730"  y1="44" x2="730"  y2="58"/>
+            <line x1="795"  y1="44" x2="795"  y2="58"/>
+            <line x1="925"  y1="44" x2="925"  y2="58"/>
+            <line x1="990"  y1="44" x2="990"  y2="58"/>
+            <line x1="1055" y1="44" x2="1055" y2="58"/>
+        </g>
+        <!-- downbeats every 4th beat: Serato-style FULL-HEIGHT yellow line THROUGH the waveform. -->
+        <g stroke="var(--gd-down)" stroke-width="3">
+            <line x1="80"   y1="44" x2="80"   y2="148"/>
+            <line x1="340"  y1="44" x2="340"  y2="148"/>
+            <line x1="600"  y1="44" x2="600"  y2="148"/>
+            <line x1="860"  y1="44" x2="860"  y2="148"/>
+            <line x1="1120" y1="44" x2="1120" y2="148"/>
+        </g>
+        <!-- downbeat soft glow (matches new full-height line extent) -->
+        <g fill="var(--gd-down-glow)">
+            <rect x="77"   y="44" width="6" height="104" rx="1.5"/>
+            <rect x="337"  y="44" width="6" height="104" rx="1.5"/>
+            <rect x="597"  y="44" width="6" height="104" rx="1.5"/>
+            <rect x="857"  y="44" width="6" height="104" rx="1.5"/>
+            <rect x="1117" y="44" width="6" height="104" rx="1.5"/>
+        </g>
+
+        <!-- beat_anchor marker at t=0 -->
+        <g>
+            <line x1="80" y1="30" x2="80" y2="42" stroke="var(--gd-anchor)" stroke-width="2"/>
+            <circle cx="80" cy="28" r="4" fill="var(--gd-anchor)"/>
+            <text x="86" y="25" class="hint" fill="var(--gd-anchor)">beat_anchor_secs = 0.0</text>
+        </g>
+
+        <!-- bar_phase badge -->
+        <g transform="translate(960, 18)">
+            <rect class="badge" x="0" y="0" width="170" height="22" rx="6"/>
+            <text class="badge-text" x="10" y="15">bar_phase = 0 · 120 BPM</text>
+        </g>
+
+        <!-- silence labels -->
+        <text x="178" y="180" class="ax-label" text-anchor="middle">leading silence</text>
+        <text x="1022" y="180" class="ax-label" text-anchor="middle">tail silence</text>
+        <text x="600" y="180" class="ax-label" text-anchor="middle">audible content</text>
+
+        <!-- time axis -->
+        <line x1="80" y1="200" x2="1120" y2="200" stroke="var(--gd-axis)" stroke-width="0.5"/>
+        <g class="ax-label">
+            <text x="80"   y="216" text-anchor="middle">0 s</text>
+            <text x="340"  y="216" text-anchor="middle">2 s</text>
+            <text x="600"  y="216" text-anchor="middle">4 s</text>
+            <text x="860"  y="216" text-anchor="middle">6 s</text>
+            <text x="1120" y="216" text-anchor="middle">8 s</text>
+        </g>
+    </svg>
+    <p class="beats-caption">
+        <strong>Read the picture this way:</strong> short grey
+        ticks <em>above</em> the waveform are beats; the full-height
+        yellow lines <em>through</em> the waveform are downbeats
+        (Serato-style rendering — see §5 for the contract). The
+        grid runs from <code>t = 0</code> to <code>t = 8 s</code>;
+        the audio only plays between 1.5 s and 6.5 s. The first
+        downbeat at <code>t = 0</code> is in silence — that is
+        correct and expected. The next three downbeats (at 2, 4,
+        6 s) land on the audible kicks, which is the visible
+        payoff. The waveform is clipped vertically so the ticks
+        and downbeat marker are always visible, even on busy
+        tracks.
+    </p>
+</section>
+
+<!-- =================================================================
+     Section 2: Glossary
+     ================================================================= -->
+<section>
+    <h2>2 · Vocabulary</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Binding for Rust code, FFI structs, Swift UI copy, log
+        lines, error messages, and bug reports. Defined once
+        here, referenced everywhere else.
+    </p>
+    <table class="dub-table glossary-table">
+        <tbody>
+            <tr><td>BPM</td><td>Tempo in beats per minute. Scalar, positive.</td></tr>
+            <tr><td>period</td><td>Seconds per beat = 60 / BPM. Derived; never stored.</td></tr>
+            <tr><td>beat</td><td>One tick on the grid. A single point in time.</td></tr>
+            <tr><td>bar / measure</td><td>A group of N consecutive beats. v1 hard-codes N = 4.</td></tr>
+            <tr><td>bar position</td><td>Integer 1..4 identifying a beat's place inside its bar.</td></tr>
+            <tr><td>downbeat / "the 1"</td><td>Beat whose bar position is 1.</td></tr>
+            <tr><td>beat_anchor_secs</td><td>One known beat's timestamp. All other beats derived: <code>beat[i] = anchor + i × period</code>.</td></tr>
+            <tr><td>bar_phase</td><td>Integer 0..3 saying <em>which</em> beat in every group of 4 is the downbeat. Independent of <code>beat_anchor_secs</code>.</td></tr>
+            <tr><td>grid</td><td>The full uniform set of beat timestamps for one track, clipped to <code>[0, duration]</code>.</td></tr>
+            <tr><td>drift</td><td>Measured deviation between grid beats and audible transients, accumulating over time.</td></tr>
+            <tr><td>grid lock</td><td>User-blessed frozen grid. Absolute: no analyze, re-analyze, tap-tempo, or set-the-1 mutates a locked grid. The user must explicitly unlock first.</td></tr>
+            <tr><td>library row</td><td>The active <code>track_beatgrids</code> row for a track. Single source of truth for BPM in both the library list cell and the deck header.</td></tr>
+            <tr><td>waveform sidecar</td><td>Pre-rendered peaks file at <code>~/Library/Caches/Dub/waveforms/{fingerprint}.wf</code>. Written by analyze passes, read on deck load so the waveform paints before the first frame.</td></tr>
+            <tr><td>ODF</td><td>Onset-detection function. Per-band spectral-flux signal that peaks at musical transients.</td></tr>
+            <tr><td>transient snap</td><td>Refining a user-supplied time onto the nearest real transient inside a bounded window.</td></tr>
+            <tr><td>noise floor (snap)</td><td>Minimum ODF magnitude a peak must clear to count as real. Adaptive: 12% of track-wide p95 ODF.</td></tr>
+        </tbody>
+    </table>
+</section>
+
+<!-- =================================================================
+     Section 3: The data model
+     ================================================================= -->
+<section>
+    <h2>3 · The data model</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Three fields. Two are stored, one is integer phase, and
+        the rest of the world (renderer, FX, library) reads only
+        derived data.
+    </p>
+
+<pre><code>struct BeatGrid {
+    bpm:              f64,    // tempo, &gt; 0
+    beat_anchor_secs: f64,    // one known beat's time
+    bar_phase:        u8,     // 0..3, which beat is the downbeat
+}
+
+beats     = { beat_anchor_secs + i × (60 / bpm)
+              for all integer i, clipped to [0, duration] }
+downbeats = { beats[i] where i mod 4 == bar_phase }</code></pre>
+
+    <div class="dub-grid dub-grid--2">
+        <div class="dub-card">
+            <h3>What this buys us</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Continuous grid across the entire track. No "where does the grid start" debate.</li>
+                <li><code>bar_phase</code> rotates without moving beats.</li>
+                <li>Renderer never infers downbeats from <code>beats[0]</code>.</li>
+                <li>Lock / unlock flips a flag; the data is unchanged.</li>
+                <li>Library round-trip is three numbers per track, plus the lock flag.</li>
+            </ul>
+        </div>
+        <div class="dub-card">
+            <h3>What it forbids</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Trimming beats around silence. Beats cover <code>[0, duration]</code>, period.</li>
+                <li>Inferring downbeats from "first audible beat." Bar phase is explicit.</li>
+                <li>Tempo curves. One BPM per track.</li>
+                <li>Half-bars, swing, or time-signature changes. v1 is strict 4/4.</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<!-- =================================================================
+     Section 4: User actions
+     ================================================================= -->
+<section>
+    <h2>4 · User actions</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Exhaustive surface. Each action mutates a known subset of
+        the three fields; the others stay untouched.
+    </p>
+
+    <div class="dub-card" style="border-left: 3px solid var(--gd-warn);">
+        <h3>Lock guard</h3>
+        <p style="color: var(--dub-text-muted); margin-bottom: 0;">
+            Every grid-mutating action below is a <strong>no-op
+            when <code>grid_locked = true</code></strong>. The only
+            action available on a locked grid is Toggle lock. See
+            §11 for the full lock-and-menu contract.
+        </p>
+    </div>
+
+    <table class="dub-table" style="margin-top: var(--sp-md);">
+        <thead>
+            <tr>
+                <th>Action</th>
+                <th>Trigger</th>
+                <th>bpm</th>
+                <th>beat_anchor</th>
+                <th>bar_phase</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Auto analyze</code></td>
+                <td>First deck-load of an un-analyzed track · right-click <strong>Analyze</strong> (when never analyzed)</td>
+                <td>set from estimator</td>
+                <td>set from estimator</td>
+                <td>set from kick-band emphasis</td>
+                <td>writes <code>auto</code> row; rejected if locked</td>
+            </tr>
+            <tr>
+                <td><code>Re-analyze</code></td>
+                <td>right-click <strong>Re-analyze</strong> (when analyzed before <em>and</em> <code>grid_locked = false</code>)</td>
+                <td>recomputed</td>
+                <td>recomputed</td>
+                <td>recomputed</td>
+                <td>writes new <code>auto</code> row; demotes any active <code>user_tap</code> row</td>
+            </tr>
+            <tr>
+                <td><code>Tap tempo</code> (3+ taps)</td>
+                <td>deck-header BPM column (when <code>grid_locked = false</code> <strong>and transport is playing</strong>); session window is dynamic (§6)</td>
+                <td>constrained re-analysis in tap-median ±15 % (§6)</td>
+                <td>snap first tap to nearest transient (noise-floor gated)</td>
+                <td>argmin residual over 4 candidate phases vs tap times</td>
+                <td>writes <code>user_tap</code> row; tap is a <em>hint</em>, never the answer; deck header shows rolling preview during the session</td>
+            </tr>
+            <tr>
+                <td><code>Set the 1</code> (1–2 taps)</td>
+                <td>deck-header BPM column (when <code>grid_locked = false</code>) — works in any transport state (playing, paused, cued)</td>
+                <td>unchanged</td>
+                <td>unchanged</td>
+                <td>rotated: nearest beat to tap becomes the 1</td>
+                <td>writes <code>user_tap</code> row</td>
+            </tr>
+            <tr>
+                <td><code>Toggle lock</code></td>
+                <td>right-click <strong>Lock grid</strong></td>
+                <td>unchanged</td>
+                <td>unchanged</td>
+                <td>unchanged</td>
+                <td>flips <code>tracks.grid_locked</code>; only action available on a locked grid</td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+<!-- =================================================================
+     Section 5: Set the 1 (illustrated)
+     ================================================================= -->
+<section>
+    <h2>5 · Set the 1 — pure bar-phase rotation</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        The most-misunderstood gesture. One tap rotates which
+        1-in-4 beats are yellow. Beat positions do not change,
+        BPM does not change, the grid does not shift. The user's
+        tap defines which existing beat is "the 1"; everything
+        else is identical to before.
+    </p>
+
+    <!-- BEFORE -->
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 200" role="img"
+         aria-label="Before set-the-1: bar_phase 0 puts the downbeat on the first kick. Tap arrow positioned at the third beat.">
+        <text x="80" y="22" class="hint">BEFORE — bar_phase = 0 · downbeats on beats 0, 4, 8, 12 · 120 BPM</text>
+        <rect x="80" y="44" width="1040" height="80" fill="var(--gd-bg)" stroke="var(--gd-axis)" stroke-width="0.5"/>
+
+        <!-- kicks visible at 2, 3, 4, 5, 6, 7 (so every beat after 4 sits on a kick) -->
+        <g fill="var(--gd-wave-kick)">
+            <ellipse cx="340" cy="84" rx="11" ry="26"/>
+            <ellipse cx="470" cy="84" rx="11" ry="26"/>
+            <ellipse cx="600" cy="84" rx="11" ry="26"/>
+            <ellipse cx="730" cy="84" rx="11" ry="26"/>
+            <ellipse cx="860" cy="84" rx="11" ry="26"/>
+            <ellipse cx="990" cy="84" rx="11" ry="26"/>
+        </g>
+
+        <!-- beats: SHORT ticks ABOVE waveform only -->
+        <g stroke="var(--gd-beat)" stroke-width="1">
+            <line x1="145"  y1="30" x2="145"  y2="42"/>
+            <line x1="210"  y1="30" x2="210"  y2="42"/>
+            <line x1="275"  y1="30" x2="275"  y2="42"/>
+            <line x1="405"  y1="30" x2="405"  y2="42"/>
+            <line x1="470"  y1="30" x2="470"  y2="42"/>
+            <line x1="535"  y1="30" x2="535"  y2="42"/>
+            <line x1="665"  y1="30" x2="665"  y2="42"/>
+            <line x1="730"  y1="30" x2="730"  y2="42"/>
+            <line x1="795"  y1="30" x2="795"  y2="42"/>
+            <line x1="925"  y1="30" x2="925"  y2="42"/>
+            <line x1="990"  y1="30" x2="990"  y2="42"/>
+            <line x1="1055" y1="30" x2="1055" y2="42"/>
+        </g>
+        <!-- downbeats: 0, 4, 8, 12 = 0, 2, 4, 6 s. Serato-style FULL-HEIGHT yellow line. -->
+        <g stroke="var(--gd-down)" stroke-width="3">
+            <line x1="80"   y1="30" x2="80"   y2="130"/>
+            <line x1="340"  y1="30" x2="340"  y2="130"/>
+            <line x1="600"  y1="30" x2="600"  y2="130"/>
+            <line x1="860"  y1="30" x2="860"  y2="130"/>
+            <line x1="1120" y1="30" x2="1120" y2="130"/>
+        </g>
+
+        <!-- user tap arrow at t=2.5 (x=405) targeting the next-after-first-kick beat -->
+        <g>
+            <line x1="405" y1="148" x2="405" y2="165" stroke="var(--gd-tap)" stroke-width="2"/>
+            <polygon points="402,148 408,148 405,142" fill="var(--gd-tap)"/>
+            <text x="405" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">TAP at t = 2.5 s</text>
+        </g>
+
+        <!-- time axis -->
+        <g class="ax-label">
+            <text x="80"   y="195" text-anchor="middle">0</text>
+            <text x="340"  y="195" text-anchor="middle">2 s</text>
+            <text x="600"  y="195" text-anchor="middle">4 s</text>
+            <text x="860"  y="195" text-anchor="middle">6 s</text>
+            <text x="1120" y="195" text-anchor="middle">8 s</text>
+        </g>
+    </svg>
+
+    <!-- AFTER -->
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 200" role="img"
+         aria-label="After set-the-1: bar_phase 1 puts the downbeat on beat 5 and every fourth thereafter. Beat positions are identical to before.">
+        <text x="80" y="22" class="hint">AFTER — bar_phase = 1 · downbeats on beats 1, 5, 9, 13 · BPM and beat positions unchanged</text>
+        <rect x="80" y="44" width="1040" height="80" fill="var(--gd-bg)" stroke="var(--gd-axis)" stroke-width="0.5"/>
+
+        <g fill="var(--gd-wave-kick)">
+            <ellipse cx="340" cy="84" rx="11" ry="26"/>
+            <ellipse cx="470" cy="84" rx="11" ry="26"/>
+            <ellipse cx="600" cy="84" rx="11" ry="26"/>
+            <ellipse cx="730" cy="84" rx="11" ry="26"/>
+            <ellipse cx="860" cy="84" rx="11" ry="26"/>
+            <ellipse cx="990" cy="84" rx="11" ry="26"/>
+        </g>
+
+        <!-- same beat ticks as BEFORE: above waveform only -->
+        <g stroke="var(--gd-beat)" stroke-width="1">
+            <line x1="80"   y1="30" x2="80"   y2="42"/>
+            <line x1="210"  y1="30" x2="210"  y2="42"/>
+            <line x1="275"  y1="30" x2="275"  y2="42"/>
+            <line x1="340"  y1="30" x2="340"  y2="42"/>
+            <line x1="470"  y1="30" x2="470"  y2="42"/>
+            <line x1="535"  y1="30" x2="535"  y2="42"/>
+            <line x1="600"  y1="30" x2="600"  y2="42"/>
+            <line x1="730"  y1="30" x2="730"  y2="42"/>
+            <line x1="795"  y1="30" x2="795"  y2="42"/>
+            <line x1="860"  y1="30" x2="860"  y2="42"/>
+            <line x1="990"  y1="30" x2="990"  y2="42"/>
+            <line x1="1120" y1="30" x2="1120" y2="42"/>
+        </g>
+        <!-- downbeats rotated: i = 1, 5, 9, 13 = 0.5, 2.5, 4.5, 6.5 s. Serato-style full-height. -->
+        <g stroke="var(--gd-down)" stroke-width="3">
+            <line x1="145" y1="30" x2="145" y2="130"/>
+            <line x1="405" y1="30" x2="405" y2="130"/>
+            <line x1="665" y1="30" x2="665" y2="130"/>
+            <line x1="925" y1="30" x2="925" y2="130"/>
+        </g>
+
+        <!-- annotation: the beat at x=405 is now the new yellow downbeat -->
+        <g>
+            <line x1="405" y1="148" x2="405" y2="165" stroke="var(--gd-tap)" stroke-width="2" opacity="0.5"/>
+            <text x="405" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">i = 5  · 5 mod 4 = 1 → new bar_phase</text>
+        </g>
+
+        <g class="ax-label">
+            <text x="80"   y="195" text-anchor="middle">0</text>
+            <text x="340"  y="195" text-anchor="middle">2 s</text>
+            <text x="600"  y="195" text-anchor="middle">4 s</text>
+            <text x="860"  y="195" text-anchor="middle">6 s</text>
+            <text x="1120" y="195" text-anchor="middle">8 s</text>
+        </g>
+    </svg>
+
+    <p class="beats-caption">
+        <strong>What changed:</strong> only <code>bar_phase</code>.
+        Every beat is in the exact same place. The yellow rotated
+        right by one beat because the nearest beat to the user's
+        tap (at 2.5 s, beat index 5) is now the downbeat, and 5
+        mod 4 = 1. <strong>BPM, beat anchor, and waveform are
+        untouched.</strong>
+    </p>
+</section>
+
+<!-- =================================================================
+     Section 6: Tap tempo
+     ================================================================= -->
+<section>
+    <h2>6 · Tap tempo — constrained re-analysis driven by the user's hint</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Three or more taps inside the 2 s window tell the algorithm
+        <em>where to look</em>: a ±15 % BPM window around the tap
+        median. The full estimator runs again inside that window;
+        the strongest real autocorrelation peak is the answer.
+        First tap snaps to the nearest transient to seed the
+        anchor; <code>bar_phase</code> is the value that best fits
+        the user's tap times across the four candidates.
+        <strong>The tap is never the BPM</strong> — a 2 s window
+        of 3–8 taps cannot beat a full-track spectral-flux
+        estimator on precision (human reaction-time jitter is
+        ~25 ms 1σ per tap edge). The taps disambiguate; the
+        algorithm answers.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 240" role="img"
+         aria-label="Four user taps drive a new beat grid. The first tap snaps to the nearest kick transient and becomes the downbeat. BPM is the weighted median of the tap intervals.">
+        <text x="80" y="22" class="hint">4 taps over 1.5 s · weighted median interval = 0.5 s → 120 BPM · first tap snaps to nearest kick</text>
+        <rect x="80" y="60" width="1040" height="80" fill="var(--gd-bg)" stroke="var(--gd-axis)" stroke-width="0.5"/>
+
+        <!-- audible region: kicks at 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6 (every 0.5 s) -->
+        <g fill="var(--gd-wave-kick)">
+            <ellipse cx="340"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="405"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="470"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="535"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="600"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="665"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="730"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="795"  cy="100" rx="11" ry="26"/>
+            <ellipse cx="860"  cy="100" rx="11" ry="26"/>
+        </g>
+
+        <!-- user taps at t ≈ 2.02, 2.51, 3.04, 3.49 -->
+        <g>
+            <line x1="343" y1="148" x2="343" y2="165" stroke="var(--gd-tap)" stroke-width="2"/>
+            <polygon points="340,148 346,148 343,142" fill="var(--gd-tap)"/>
+            <line x1="406" y1="148" x2="406" y2="165" stroke="var(--gd-tap)" stroke-width="2"/>
+            <polygon points="403,148 409,148 406,142" fill="var(--gd-tap)"/>
+            <line x1="475" y1="148" x2="475" y2="165" stroke="var(--gd-tap)" stroke-width="2"/>
+            <polygon points="472,148 478,148 475,142" fill="var(--gd-tap)"/>
+            <line x1="534" y1="148" x2="534" y2="165" stroke="var(--gd-tap)" stroke-width="2"/>
+            <polygon points="531,148 537,148 534,142" fill="var(--gd-tap)"/>
+            <text x="343" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">tap 1</text>
+            <text x="406" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">tap 2</text>
+            <text x="475" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">tap 3</text>
+            <text x="534" y="180" class="hint" fill="var(--gd-tap)" text-anchor="middle">tap 4</text>
+        </g>
+
+        <!-- snap arrow: tap 1 at 343 snaps to kick at 340 -->
+        <g>
+            <path d="M 343 200 Q 341 210 340 138" stroke="var(--gd-anchor)" stroke-width="1.2" fill="none" stroke-dasharray="3 2"/>
+            <text x="220" y="206" class="hint" fill="var(--gd-anchor)">snap tap 1 → nearest kick (3 ms pull)</text>
+        </g>
+
+        <!-- resulting beat grid: anchor at t=2, period 0.5, bar_phase 0. Beat ticks above waveform only. -->
+        <g stroke="var(--gd-beat)" stroke-width="1">
+            <line x1="80"   y1="44" x2="80"   y2="58"/>
+            <line x1="145"  y1="44" x2="145"  y2="58"/>
+            <line x1="210"  y1="44" x2="210"  y2="58"/>
+            <line x1="275"  y1="44" x2="275"  y2="58"/>
+            <line x1="405"  y1="44" x2="405"  y2="58"/>
+            <line x1="470"  y1="44" x2="470"  y2="58"/>
+            <line x1="535"  y1="44" x2="535"  y2="58"/>
+            <line x1="665"  y1="44" x2="665"  y2="58"/>
+            <line x1="730"  y1="44" x2="730"  y2="58"/>
+            <line x1="795"  y1="44" x2="795"  y2="58"/>
+            <line x1="925"  y1="44" x2="925"  y2="58"/>
+            <line x1="990"  y1="44" x2="990"  y2="58"/>
+            <line x1="1055" y1="44" x2="1055" y2="58"/>
+        </g>
+        <!-- downbeats at i=4,8,12 = t=2,4,6. Serato-style FULL-HEIGHT yellow line. -->
+        <g stroke="var(--gd-down)" stroke-width="3">
+            <line x1="80"   y1="44" x2="80"   y2="148"/>
+            <line x1="340"  y1="44" x2="340"  y2="148"/>
+            <line x1="600"  y1="44" x2="600"  y2="148"/>
+            <line x1="860"  y1="44" x2="860"  y2="148"/>
+            <line x1="1120" y1="44" x2="1120" y2="148"/>
+        </g>
+
+        <!-- BPM badge -->
+        <g transform="translate(960, 18)">
+            <rect class="badge" x="0" y="0" width="170" height="22" rx="6"/>
+            <text class="badge-text" x="10" y="15">new BPM = 120 · bar_phase = 0</text>
+        </g>
+
+        <g class="ax-label">
+            <text x="80"   y="224" text-anchor="middle">0</text>
+            <text x="340"  y="224" text-anchor="middle">2 s</text>
+            <text x="600"  y="224" text-anchor="middle">4 s</text>
+            <text x="860"  y="224" text-anchor="middle">6 s</text>
+            <text x="1120" y="224" text-anchor="middle">8 s</text>
+        </g>
+    </svg>
+
+    <p class="beats-caption">
+        Tap 1 lands a few ms past the kick because of human reaction
+        time plus audio latency. The transient snap (12 % p95 noise
+        floor) pulls it onto the actual kick. The four taps fix the
+        BPM neighborhood; the algorithm then runs constrained
+        autocorrelation over the full track inside that window.
+    </p>
+
+    <div class="dub-card" style="margin-top: var(--sp-md);">
+        <h3>Constrained re-analysis (M11d.7 round 3)</h3>
+        <p style="color: var(--dub-text-muted);">
+            The tap median is a search hint, not the answer. The
+            full estimator runs again with the search range pinned
+            to the tap-median neighborhood; the strongest real ODF
+            peak in that window is the BPM, snapped to integer if
+            residuals don't get worse.
+        </p>
+<pre><code>tap_median   = weighted_median(60 / interval(taps))     // outlier-filtered
+
+# ±15 % around tap median. Wider than human tap noise
+# (~5 BPM 1σ at 100 BPM); tight enough to exclude
+# half/double octaves (at ±50 % / +100 %).
+search_range = BpmRange::new(tap_median * 0.85, tap_median * 1.15)
+
+(bpm_raw, broadband_odf, kick_odf) =
+    analyze_bpm_with_range_profile_and_odfs(
+        samples, sample_rate, channels, search_range, profile)
+
+bpm_final = snap_to_integer_if_safe(bpm_raw, residuals)
+new_anchor = snap_to_nearest_transient(first_tap, kick_odf, broadband_odf,
+                                        noise_floor = 12% of p95)
+bar_phase  = argmin_p Σ |t_i − nearest_downbeat(t_i, anchor, period, p)|²
+                                                       // p ∈ {0,1,2,3}</code></pre>
+        <table class="dub-table" style="margin-top: var(--sp-md);">
+            <thead>
+                <tr><th>Scenario</th><th>What the algorithm sees</th><th>Result</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Auto says 109.3, user taps 108 (small error)</td>
+                    <td>Search 91.8–124.2; the strongest peak is still 109.3</td>
+                    <td>109.3 unchanged (the user's slight misread doesn't disturb a good auto BPM)</td>
+                </tr>
+                <tr>
+                    <td>Auto says 87 (octave error), user taps 174</td>
+                    <td>Search 148–200; auto's wrong-octave peak is excluded by construction</td>
+                    <td>174.3 → 174 after integer snap (the user's tap unstuck the algorithm from the wrong octave)</td>
+                </tr>
+                <tr>
+                    <td>DnB tune detected at 174, user wants half-time reference (87)</td>
+                    <td>Search 73.9–100.0; the peak at 87.0 wins</td>
+                    <td>87.0 (taps pick which octave is the musical reference)</td>
+                </tr>
+                <tr>
+                    <td>Breakbeat with bar 1 mis-placed by the kick-emphasis scorer</td>
+                    <td>Constrained search confirms the auto BPM; tap-residual rotates bar_phase</td>
+                    <td>BPM unchanged, <code>bar_phase</code> rotates so the user's tapped 1 is the 1</td>
+                </tr>
+            </tbody>
+        </table>
+        <p style="color: var(--dub-text-muted); font-size: 13px; margin-top: var(--sp-md); margin-bottom: 0;">
+            The previous <code>reconcile_tap_bpm_with_hint</code>
+            with its ±5 % "keep hint" band and ±5 % "octave detect"
+            branches is removed entirely. One rule replaces four
+            cases; octave errors are handled structurally by the
+            search-range constraint rather than by a special branch.
+        </p>
+    </div>
+
+    <div class="dub-card" style="margin-top: var(--sp-md); border-left: 3px solid var(--gd-tap);">
+        <h3>Session window — dynamic, not 2 seconds</h3>
+        <p style="color: var(--dub-text-muted);">
+            A tap session opens on the first tap. Subsequent taps
+            belong to the same session as long as they arrive
+            within <code>max(1.5 s, 1.5 × median tap interval so
+            far)</code> of the previous tap. This is a dynamic
+            ceiling that follows the music: tight on dnb, generous
+            on slow reggae.
+        </p>
+        <table class="dub-table" style="margin-top: var(--sp-sm);">
+            <thead>
+                <tr><th>Tempo</th><th>Period</th><th>Window after each tap</th><th>4-tap session total</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>174 BPM (dnb)</td><td>345 ms</td><td>≥ 1.5 s</td><td>≈ 1.0 s</td></tr>
+                <tr><td>130 BPM (house)</td><td>462 ms</td><td>≥ 1.5 s</td><td>≈ 1.4 s</td></tr>
+                <tr><td>90 BPM (boom bap)</td><td>667 ms</td><td>1.5 s</td><td>≈ 2.0 s</td></tr>
+                <tr><td>75 BPM (slow reggae)</td><td>800 ms</td><td>1.5 s</td><td>≈ 2.4 s · <span style="color: var(--gd-warn);">was timing out at 2 s</span></td></tr>
+                <tr><td>60 BPM (dubwise)</td><td>1000 ms</td><td>1.5 s</td><td>≈ 3.0 s · <span style="color: var(--gd-warn);">was timing out at 2 s</span></td></tr>
+            </tbody>
+        </table>
+        <p style="color: var(--dub-text-muted); font-size: 13px; margin-top: var(--sp-md); margin-bottom: 0;">
+            The previous fixed 2 s window from M11c.3b cut off
+            slow-music users (any ≤ 90 BPM with a 4-tap minimum
+            exceeded the ceiling), silently firing Set the 1
+            instead of tap tempo. Reggae and slow hip-hop are in
+            the target audience, so this had to go.
+        </p>
+    </div>
+
+    <div class="dub-card" style="margin-top: var(--sp-md); border-left: 3px solid var(--gd-tap);">
+        <h3>Rolling preview during the session (Traktor pattern)</h3>
+        <p style="color: var(--dub-text-muted);">
+            From tap 3 onward, the deck-header BPM column shows
+            <code>60 / median(tap_intervals_so_far)</code>, updated
+            after each new tap. This is a rough live estimate, not
+            the committed value — visually distinguished (italic,
+            accent-orange, "TAPPING · N" badge) so the user knows
+            it isn't final. On commit (constrained re-analysis
+            completes) the deck header replaces the preview with
+            the precise value AND the library row updates to match,
+            both in the same publisher tick.
+        </p>
+        <p style="color: var(--dub-text-muted);">
+            <strong>The library row does NOT show the preview.</strong>
+            Library row updates only on commit. This solves the
+            "I'm trying to fix my last wrong tap but the wrong
+            BPM is still on the screen" mental-model breakdown
+            from the prior UX round.
+        </p>
+        <table class="dub-table" style="margin-top: var(--sp-sm);">
+            <thead>
+                <tr><th>Tap count</th><th>Deck-header BPM column</th><th>Library row BPM</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>session idle</td><td>committed BPM</td><td>committed BPM</td></tr>
+                <tr><td>tap 1</td><td>committed BPM (still — no preview yet, could be Set the 1)</td><td>committed BPM</td></tr>
+                <tr><td>tap 2</td><td>committed BPM (still — Set the 1 dispatch territory)</td><td>committed BPM</td></tr>
+                <tr><td>tap 3</td><td><em>rolling preview</em> + TAPPING badge</td><td>committed BPM</td></tr>
+                <tr><td>tap 4+</td><td>rolling preview updates after each tap</td><td>committed BPM</td></tr>
+                <tr><td>session commits</td><td>final BPM (preview replaced)</td><td>final BPM (matches deck header)</td></tr>
+                <tr><td>session times out at 1–2 taps</td><td>committed BPM (preview never shown; Set the 1 fires)</td><td>committed BPM (unchanged)</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="dub-card" style="margin-top: var(--sp-md); border-left: 3px solid var(--gd-anchor);">
+        <h3>Recovery path: "tap again" fixes any tap mistake</h3>
+        <p style="color: var(--dub-text-muted);">
+            If the user taps a wrong BPM (misheard the kick on a
+            syncopated hi-hat, latched onto the off-beat, picked
+            the wrong octave on a half-time tune), the recovery
+            gesture is identical to the original gesture: tap
+            again. Each tap session is fully independent.
+        </p>
+        <ul style="color: var(--dub-text-muted);">
+            <li>New session's tap median is the <strong>only</strong> BPM hint. Previous <code>user_tap</code> BPM is not consulted, blended, or used as a fallback.</li>
+            <li>New session's first tap is the <strong>only</strong> anchor seed.</li>
+            <li>New session writes a new <code>user_tap</code> row; demotes the previous <code>user_tap</code> row for this track to <code>is_active = 0</code> in the same transaction.</li>
+            <li>Demoted rows stay in the table for audit. v1 ships no "revert" UI; the data is ready for it.</li>
+        </ul>
+        <p style="color: var(--dub-text-muted); font-size: 13px; margin-bottom: 0;">
+            The function signature enforces this:
+            <code>analyze_beat_grid_from_taps(samples, sr, ch,
+            tap_times, profile)</code>. No "previous BPM" parameter.
+            No "previous tap session" parameter. There is no way
+            for prior tap state to leak into the new computation.
+        </p>
+    </div>
+</section>
+
+<!-- =================================================================
+     Section 7: Detection pipeline
+     ================================================================= -->
+<section>
+    <h2>7 · How auto-analysis arrives at the grid</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        The estimator already shipped; this is the contract
+        between its stages and the data model.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 220" role="img"
+         aria-label="Auto-analysis pipeline: decode, ODF, BPM estimate, beat anchor, LSQ refit, integer-BPM snap, bar phase from kick emphasis.">
+        <g class="ax-label" font-size="11">
+            <!-- Pipeline stages -->
+            <rect x="40"   y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="110" y="86" text-anchor="middle" fill="var(--dub-text)">decode</text>
+            <text x="110" y="102" text-anchor="middle">dub-io</text>
+
+            <rect x="220"  y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="290" y="86" text-anchor="middle" fill="var(--dub-text)">ODFs</text>
+            <text x="290" y="102" text-anchor="middle">broadband + kick</text>
+
+            <rect x="400"  y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="470" y="86" text-anchor="middle" fill="var(--dub-text)">estimate BPM</text>
+            <text x="470" y="102" text-anchor="middle">autocorr · prior</text>
+
+            <rect x="580"  y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="650" y="86" text-anchor="middle" fill="var(--dub-text)">find anchor</text>
+            <text x="650" y="102" text-anchor="middle">score_grid sweep</text>
+
+            <rect x="760"  y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="830" y="86" text-anchor="middle" fill="var(--dub-text)">LSQ refit</text>
+            <text x="830" y="102" text-anchor="middle">GridQuality</text>
+
+            <rect x="940"  y="60" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="1010" y="86" text-anchor="middle" fill="var(--dub-text)">integer snap</text>
+            <text x="1010" y="102" text-anchor="middle">±0.10 BPM</text>
+
+            <rect x="400"  y="140" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="470" y="166" text-anchor="middle" fill="var(--dub-text)">bar_phase</text>
+            <text x="470" y="182" text-anchor="middle">kick emphasis</text>
+
+            <rect x="940"  y="140" width="140" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--gd-down)" stroke-width="2"/>
+            <text x="1010" y="166" text-anchor="middle" fill="var(--gd-down)">BeatGrid</text>
+            <text x="1010" y="182" text-anchor="middle">bpm · anchor · bar_phase</text>
+
+            <!-- arrows -->
+            <g stroke="var(--dub-stroke-strong)" stroke-width="1.4" fill="none">
+                <line x1="180" y1="88" x2="220" y2="88"/>
+                <line x1="360" y1="88" x2="400" y2="88"/>
+                <line x1="540" y1="88" x2="580" y2="88"/>
+                <line x1="720" y1="88" x2="760" y2="88"/>
+                <line x1="900" y1="88" x2="940" y2="88"/>
+                <line x1="1010" y1="116" x2="1010" y2="140"/>
+                <line x1="470" y1="116" x2="470" y2="140"/>
+                <path d="M 540 168 L 940 168" stroke-dasharray="3 3"/>
+                <polygon points="940,165 940,171 947,168" fill="var(--dub-stroke-strong)"/>
+            </g>
+        </g>
+    </svg>
+
+    <p class="beats-caption">
+        Six stages, two outputs (BPM/anchor on top row, bar_phase
+        on bottom row), one combined <code>BeatGrid</code>.
+        Integer-BPM snap fires only when the LSQ residuals don't
+        get worse — protects 0.5-increment tempos (87.5, 128.5)
+        from being clobbered.
+    </p>
+</section>
+
+<!-- =================================================================
+     Section 8: Drift indicator
+     ================================================================= -->
+<section>
+    <h2>8 · Drift — what we tell the DJ when uniform isn't enough</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Vintage soul, live-band reggae, drummer-played breakbeats
+        will not stay grid-locked over a long mix. Dub is honest
+        about that: the grid stays uniform, the ⚠ indicator
+        warns, and the mitigation lives on the pitch slider. Per
+        PRD §8.3.3, warp markers are explicitly out of v1.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 200" role="img"
+         aria-label="A track whose true tempo accelerates from 130 to 132 BPM. The uniform grid stays at 130 BPM; by the end of the viewport the downbeats no longer align with the kicks.">
+        <text x="80" y="22" class="hint">Track recorded at 130 BPM → accelerates to 132 BPM by end · uniform grid drifts off the kicks · ⚠ indicator surfaces</text>
+        <rect x="80" y="44" width="1040" height="80" fill="var(--gd-bg)" stroke="var(--gd-axis)" stroke-width="0.5"/>
+
+        <!-- kicks: start at t=2 aligned, by t=6 they're 60 ms ahead. Place: 2.0, 2.45, 2.9, 3.35, 3.78, 4.20, 4.61, 5.01, 5.40, 5.78, 6.15 -->
+        <g fill="var(--gd-wave-kick)">
+            <ellipse cx="340"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="399"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="457"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="515"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="571"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="626"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="679"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="731"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="782"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="831"  cy="84" rx="9" ry="22"/>
+            <ellipse cx="880"  cy="84" rx="9" ry="22"/>
+        </g>
+
+        <!-- uniform grid at 130 BPM. Beat ticks above waveform only. -->
+        <g stroke="var(--gd-beat)" stroke-width="1">
+            <line x1="280"  y1="30" x2="280"  y2="42"/>
+            <line x1="220"  y1="30" x2="220"  y2="42"/>
+            <line x1="160"  y1="30" x2="160"  y2="42"/>
+            <line x1="100"  y1="30" x2="100"  y2="42"/>
+            <line x1="400"  y1="30" x2="400"  y2="42"/>
+            <line x1="460"  y1="30" x2="460"  y2="42"/>
+            <line x1="520"  y1="30" x2="520"  y2="42"/>
+            <line x1="580"  y1="30" x2="580"  y2="42"/>
+            <line x1="640"  y1="30" x2="640"  y2="42"/>
+            <line x1="700"  y1="30" x2="700"  y2="42"/>
+            <line x1="760"  y1="30" x2="760"  y2="42"/>
+            <line x1="820"  y1="30" x2="820"  y2="42"/>
+            <line x1="880"  y1="30" x2="880"  y2="42"/>
+            <line x1="940"  y1="30" x2="940"  y2="42"/>
+            <line x1="1000" y1="30" x2="1000" y2="42"/>
+            <line x1="1060" y1="30" x2="1060" y2="42"/>
+        </g>
+        <!-- downbeats every 4. Serato-style full-height yellow line through waveform. -->
+        <g stroke="var(--gd-down)" stroke-width="3">
+            <line x1="340"  y1="30" x2="340"  y2="130"/>
+            <line x1="580"  y1="30" x2="580"  y2="130"/>
+            <line x1="820"  y1="30" x2="820"  y2="130"/>
+            <line x1="1060" y1="30" x2="1060" y2="130"/>
+        </g>
+
+        <!-- drift indicator badge -->
+        <g transform="translate(960, 145)">
+            <rect class="badge" x="0" y="0" width="170" height="22" rx="6" stroke="var(--gd-warn)"/>
+            <text class="badge-text" x="10" y="15" fill="var(--gd-warn)">⚠ May drift · 9 ms/min</text>
+        </g>
+
+        <g class="ax-label">
+            <text x="80"   y="195" text-anchor="middle">0</text>
+            <text x="340"  y="195" text-anchor="middle">2 s</text>
+            <text x="600"  y="195" text-anchor="middle">4 s</text>
+            <text x="860"  y="195" text-anchor="middle">6 s</text>
+            <text x="1120" y="195" text-anchor="middle">8 s</text>
+        </g>
+    </svg>
+
+    <p class="beats-caption">
+        First downbeat (2 s) lands square on the kick. By the
+        third downbeat (6 s) the kick is visibly ahead of the
+        grid; by the fourth, the displacement is ~50 ms. The
+        ⚠ "May drift" indicator surfaces when the LSQ drift
+        slope crosses 3 ms/min. We do not invent fake beats; we
+        tell the truth and let the DJ mix.
+    </p>
+</section>
+
+<!-- =================================================================
+     Section 9: Industry comparison
+     ================================================================= -->
+<section>
+    <h2>9 · How we compare against the industry</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        All four major DJ apps ship a version of the same
+        uniform-4/4 contract. The differences are mostly UX
+        ceiling — how much the GUI lets the user push beyond
+        uniform. Dub takes the Serato bar-rotation model, runs
+        the full estimator on every tap-tempo gesture (further
+        than Traktor's hint reconcile), enforces lock-is-absolute
+        end-to-end, and adds integer-BPM snapping by default for
+        dance music.
+    </p>
+
+    <table class="dub-table compare-table">
+        <thead>
+            <tr>
+                <th>App</th>
+                <th>Tempo model</th>
+                <th>Set-the-1 gesture</th>
+                <th>Warp markers</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td class="col-app">Serato</td>
+                <td>Single BPM per track</td>
+                <td>Drag BPM box · BAR key rotates downbeat</td>
+                <td>Yes (BAR markers post-2018)</td>
+            </tr>
+            <tr>
+                <td class="col-app">rekordbox</td>
+                <td>Single BPM + downbeat anchor</td>
+                <td>Auto-grid + memory cue correction</td>
+                <td>Yes (memory cue + per-region BPM)</td>
+            </tr>
+            <tr>
+                <td class="col-app">Traktor</td>
+                <td>Single BPM per track</td>
+                <td>Manual nudge keys for grid offset</td>
+                <td>Limited (Auto-Grid Lock)</td>
+            </tr>
+            <tr>
+                <td class="col-app">Engine DJ</td>
+                <td>Single BPM + first downbeat</td>
+                <td>Beatgrid editor (drag)</td>
+                <td>No (perform-time grid is read-only)</td>
+            </tr>
+            <tr style="background: var(--dub-bg-elev-2);">
+                <td class="col-app" style="color: var(--gd-down);">Dub (v1)</td>
+                <td>Single BPM + arbitrary-position anchor + explicit bar_phase</td>
+                <td>1 tap = pure phase rotation · 3+ taps = constrained re-analysis (tap is search hint, not BPM)</td>
+                <td>No (parked for v2)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="dub-grid dub-grid--2" style="margin-top: var(--sp-lg);">
+        <div class="dub-card">
+            <h3>Where we lean Serato</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Bar-rotation: 1 tap = pure phase rotation, never moves beats.</li>
+                <li>Tap-tempo writes a <code>user_tap</code> row as the active grid; previous grids preserved for revert.</li>
+                <li>Grid lock = "this is the truth, don't touch it."</li>
+            </ul>
+        </div>
+        <div class="dub-card">
+            <h3>Where we go further than Traktor</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Traktor's "Set Beatgrid" reconciles tap-derived BPM with the existing one inside a tolerance band. Dub instead runs the <em>full estimator</em> again with the tap median as a search constraint — same precision as auto-analyze, with the user's hint disambiguating octaves.</li>
+                <li>Strict no-warp: drift indicator instead of multi-anchor grids.</li>
+            </ul>
+        </div>
+        <div class="dub-card">
+            <h3>Where we go our own way</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Integer-BPM snap by default — dance music dominates the target catalog.</li>
+                <li>Adaptive noise floor on transient snap so the 1 never lands on silence.</li>
+                <li><strong>Lock is absolute.</strong> No "force re-analyze" bypass. A locked grid is a frozen contract; the user must explicitly unlock first. Silently working around a user-set lock is the same trust violation as silently re-pitching a track.</li>
+                <li><strong>Library row and deck-header BPM are the same value, always.</strong> One source of truth, two observers. Most apps cheat on this (rekordbox shows the original BPM in the library while the deck shows the corrected one); Dub does not.</li>
+                <li>No mouse-driven grid editing in v1. Tap-to-grid + lock toggle covers the contract for the urban / scratch DJ.</li>
+            </ul>
+        </div>
+        <div class="dub-card">
+            <h3>Where we say "not v1"</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Warp markers / multi-anchor flex grids — v2, gated by user demand.</li>
+                <li>Time-signature support beyond 4/4 — v2.</li>
+                <li>Per-section BPMs for tempo-changing songs — v2.</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<!-- =================================================================
+     Section 10: Reliability gates
+     ================================================================= -->
+<section>
+    <h2>10 · Reliability gates</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Anything that contradicts these is a bug. They restate
+        PRD §1, §2.2.6, §8.3.3 in the local terms of this spec.
+    </p>
+    <ol style="color: var(--dub-text-muted); max-width: 80ch;">
+        <li><strong>Uniform 4/4 only in v1.</strong> No warp, no tempo curves, no swing modeling, no half-bars.</li>
+        <li><strong>The grid is the whole track.</strong> No code path may trim beats, advance the anchor past silence, or render fewer beats than <code>[0, duration]</code> implies.</li>
+        <li><strong><code>bar_phase</code> is independent.</strong> Never inferred from <code>beats[0]</code>, "first audible," or "first tap" outside the explicit tap-tempo rule.</li>
+        <li><strong><code>grid_locked = true</code> is absolute.</strong> No code path — analyze, re-analyze, tap-tempo, set-the-1, anchor nudge, BPM nudge — may mutate <code>bpm</code>, <code>beat_anchor_secs</code>, or <code>bar_phase</code> while locked. The previous <code>force</code> re-analyze parameter is removed. See §11.</li>
+        <li><strong>Unlocking is an explicit gesture.</strong> Right-click Lock grid (to unlock) before any grid edit. No combined "unlock-and-do-X" affordances; lock toggle is its own audit event.</li>
+        <li><strong>Re-analyze on an unlocked track demotes the active <code>user_tap</code> row.</strong> Previous tap-derived grid stays in the table for audit.</li>
+        <li><strong>Each tap-tempo session demotes any prior <code>user_tap</code> row for the same track</strong> and is fully independent of all prior tap sessions. New session's tap median is the only BPM hint; prior <code>user_tap</code> BPM is never consulted, blended, or used as a fallback. Only one <code>user_tap</code> row per track is active at a time. <strong>The user's recovery path for any tap mistake is "tap again."</strong></li>
+        <li><strong>Tap input is rejected on locked grids before crossing the FFI boundary.</strong> Swift gates on <code>deckState.gridLocked</code>; the Rust engine independently rejects (defense in depth). The deck-header BPM column visually signals "tap disabled."</li>
+        <li><strong>Tap tempo (3+ taps) requires deck transport playing.</strong> The first 1–2 taps are accepted in any transport state (Set the 1 path); a 3rd tap on a paused / cued / stopped deck is rejected with a brief "Press play to tap tempo" hint. Set the 1 is unaffected by transport state.</li>
+        <li><strong>Lock toggle is intentionally a mouse-only / prep-mode gesture.</strong> No keyboard shortcut. Right-click Lock grid on the library row or the loaded deck is the only entry point. Lock is "I'm done editing this grid" — a prep gesture, not a performance gesture.</li>
+        <li><strong>Tap session window is dynamic.</strong> <code>max(1.5 s, 1.5 × median tap interval so far)</code> after each tap. Replaces the fixed 2 s window that cut off slow-music users.</li>
+        <li><strong>Deck-header BPM column shows a rolling preview during an active tap session</strong> from tap 3 onward. Library row stays at the committed BPM until commit. Preview is visually distinguished (italic + accent + "TAPPING · N" badge) so the user never confuses it with a final value.</li>
+        <li><strong>Right-click menu uses one Analyze / Re-analyze entry</strong> whose label and enabled state follow §11. Parallel entries are removed.</li>
+        <li><strong>Library row BPM and deck-header BPM are always in sync</strong> for the loaded track. Single source of truth: the active <code>track_beatgrids</code> row. See §12.</li>
+        <li><strong>Analyze pre-renders the waveform sidecar</strong> at <code>~/Library/Caches/Dub/waveforms/{fingerprint}.wf</code>. Deck load reads it synchronously and paints before the first frame. "Waveform building…" on a track with a sidecar is a regression. See §12.</li>
+        <li><strong>Drift &gt; 5 % gets the ⚠ indicator.</strong> Pitch slider is the mitigation.</li>
+        <li><strong>The audio thread never touches grid edits.</strong> All grid mutation is off-RT; the audio thread reads an atomic snapshot.</li>
+    </ol>
+</section>
+
+<!-- =================================================================
+     Section 11: Lock semantics and the right-click menu
+     ================================================================= -->
+<section>
+    <h2>11 · Lock semantics and the right-click menu</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        Lock is absolute, by design. We don't ship a "force"
+        bypass. The user explicitly unlocks before any grid edit.
+        The right-click menu reflects the lock state through one
+        entry whose label switches on whether the track has been
+        analyzed before.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 320" role="img"
+         aria-label="Three states of the right-click menu: never analyzed shows 'Analyze' enabled; analyzed and unlocked shows 'Re-analyze' enabled; analyzed and locked shows 'Re-analyze' disabled with an unlock tooltip.">
+        <!-- column 1: never analyzed -->
+        <g transform="translate(40, 20)">
+            <text x="0" y="14" class="hint">State: never analyzed</text>
+            <rect x="0" y="30" width="320" height="220" rx="10" fill="var(--dub-bg-elev-1)" stroke="var(--dub-stroke-strong)"/>
+            <rect x="12" y="50" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="71" fill="var(--dub-text)" font-size="12">Play in deck A</text>
+            <rect x="12" y="90" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="111" fill="var(--dub-text)" font-size="12">Play in deck B</text>
+            <line x1="12" y1="132" x2="308" y2="132" stroke="var(--dub-stroke-strong)" stroke-width="0.5"/>
+            <rect x="12" y="142" width="296" height="32" rx="6" fill="var(--gd-down)" opacity="0.18"/>
+            <text x="24" y="163" fill="var(--gd-down)" font-size="12" font-weight="600">Analyze</text>
+            <rect x="12" y="182" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="203" fill="var(--dub-text)" font-size="12">Lock grid</text>
+            <text x="0" y="280" class="hint">→ "Analyze" enabled · single label, single purpose</text>
+        </g>
+
+        <!-- column 2: analyzed + unlocked -->
+        <g transform="translate(420, 20)">
+            <text x="0" y="14" class="hint">State: analyzed, grid_locked = false</text>
+            <rect x="0" y="30" width="320" height="220" rx="10" fill="var(--dub-bg-elev-1)" stroke="var(--dub-stroke-strong)"/>
+            <rect x="12" y="50" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="71" fill="var(--dub-text)" font-size="12">Play in deck A</text>
+            <rect x="12" y="90" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="111" fill="var(--dub-text)" font-size="12">Play in deck B</text>
+            <line x1="12" y1="132" x2="308" y2="132" stroke="var(--dub-stroke-strong)" stroke-width="0.5"/>
+            <rect x="12" y="142" width="296" height="32" rx="6" fill="var(--gd-down)" opacity="0.18"/>
+            <text x="24" y="163" fill="var(--gd-down)" font-size="12" font-weight="600">Re-analyze</text>
+            <rect x="12" y="182" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="203" fill="var(--dub-text)" font-size="12">Lock grid</text>
+            <text x="0" y="280" class="hint">→ "Re-analyze" enabled · label switches from "Analyze"</text>
+        </g>
+
+        <!-- column 3: analyzed + locked -->
+        <g transform="translate(800, 20)">
+            <text x="0" y="14" class="hint" fill="var(--gd-warn)">State: analyzed, grid_locked = true</text>
+            <rect x="0" y="30" width="320" height="220" rx="10" fill="var(--dub-bg-elev-1)" stroke="var(--dub-stroke-strong)"/>
+            <rect x="12" y="50" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="71" fill="var(--dub-text)" font-size="12">Play in deck A</text>
+            <rect x="12" y="90" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)"/>
+            <text x="24" y="111" fill="var(--dub-text)" font-size="12">Play in deck B</text>
+            <line x1="12" y1="132" x2="308" y2="132" stroke="var(--dub-stroke-strong)" stroke-width="0.5"/>
+            <rect x="12" y="142" width="296" height="32" rx="6" fill="var(--dub-bg-elev-2)" opacity="0.5"/>
+            <text x="24" y="163" fill="var(--dub-text-faint)" font-size="12" font-style="italic">Re-analyze</text>
+            <text x="180" y="163" fill="var(--dub-text-faint)" font-size="10">⌥ disabled</text>
+            <rect x="12" y="182" width="296" height="32" rx="6" fill="var(--gd-down)" opacity="0.18"/>
+            <text x="24" y="203" fill="var(--gd-down)" font-size="12" font-weight="600">Lock grid ✓</text>
+            <text x="0" y="280" class="hint" fill="var(--gd-warn)">→ "Re-analyze" disabled · tooltip: "Unlock the grid first"</text>
+        </g>
+    </svg>
+
+    <table class="dub-table" style="margin-top: var(--sp-md);">
+        <thead>
+            <tr><th>Track state</th><th>Menu label</th><th>Enabled?</th><th>Tooltip on hover</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Never analyzed (no row in <code>track_beatgrids</code>)</td>
+                <td><strong>Analyze</strong></td>
+                <td>Yes</td>
+                <td>—</td>
+            </tr>
+            <tr>
+                <td>Has analysis, unlocked</td>
+                <td><strong>Re-analyze</strong></td>
+                <td>Yes</td>
+                <td>—</td>
+            </tr>
+            <tr>
+                <td>Has analysis, locked</td>
+                <td><strong>Re-analyze</strong></td>
+                <td>No</td>
+                <td>"Unlock the grid first"</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="dub-card" style="margin-top: var(--sp-md);">
+        <h3>Why two clicks instead of a combined "unlock and re-analyze"</h3>
+        <p style="color: var(--dub-text-muted); margin-bottom: 0;">
+            Combining the gestures hides the lock-state change.
+            The lock toggle is its own observable event in the
+            <code>track_beatgrids</code> audit trail; a DJ who
+            unlocks intentionally and a DJ who re-analyzes
+            intentionally are doing two different things, and
+            the system records each. Two clicks is the price of
+            keeping the audit trail honest.
+        </p>
+    </div>
+</section>
+
+<!-- =================================================================
+     Section 12: Library / deck-header BPM parity + waveform sidecar
+     ================================================================= -->
+<section>
+    <h2>12 · BPM parity and the waveform sidecar</h2>
+    <p style="color: var(--dub-text-muted); max-width: 80ch;">
+        The BPM in the library row and the BPM in the deck header
+        are always the same number, sourced from the same active
+        <code>track_beatgrids</code> row. The waveform sidecar is
+        the parallel guarantee for the visual: analyze writes it,
+        deck load reads it synchronously, the first frame paints
+        with peaks already in place. "Loading…" on a track with a
+        cache is a bug.
+    </p>
+
+    <svg class="dub-diagram beats-diag" viewBox="0 0 1200 280" role="img"
+         aria-label="Data flow: analysis writes to the library row and the waveform sidecar; both the library list cell and the deck header read BPM from the same library row; the deck waveform reads peaks from the sidecar.">
+        <g class="ax-label" font-size="11">
+            <!-- left: analysis -->
+            <rect x="40" y="40" width="180" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--gd-down)" stroke-width="1.6"/>
+            <text x="130" y="66" text-anchor="middle" fill="var(--gd-down)" font-weight="600">Analyze / Re-analyze</text>
+            <text x="130" y="82" text-anchor="middle">writes BPM + sidecar</text>
+
+            <!-- center top: library row -->
+            <rect x="320" y="20" width="220" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--gd-anchor)" stroke-width="1.6"/>
+            <text x="430" y="46" text-anchor="middle" fill="var(--gd-anchor)" font-weight="600">library row (publisher)</text>
+            <text x="430" y="62" text-anchor="middle">active track_beatgrids row</text>
+
+            <!-- center bottom: sidecar -->
+            <rect x="320" y="120" width="220" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--gd-anchor)" stroke-width="1.6"/>
+            <text x="430" y="146" text-anchor="middle" fill="var(--gd-anchor)" font-weight="600">waveform sidecar</text>
+            <text x="430" y="162" text-anchor="middle">{fingerprint}.wf</text>
+
+            <!-- right top: library cell -->
+            <rect x="640" y="0" width="220" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="750" y="26" text-anchor="middle" fill="var(--dub-text)" font-weight="600">library list cell</text>
+            <text x="750" y="42" text-anchor="middle">"127 BPM"</text>
+
+            <!-- right middle: deck header -->
+            <rect x="640" y="68" width="220" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="750" y="94" text-anchor="middle" fill="var(--dub-text)" font-weight="600">deck header BPM</text>
+            <text x="750" y="110" text-anchor="middle">"127 BPM" (same value)</text>
+
+            <!-- right bottom: deck waveform -->
+            <rect x="640" y="136" width="220" height="56" rx="8" fill="var(--dub-bg-elev-2)" stroke="var(--dub-stroke-strong)"/>
+            <text x="750" y="162" text-anchor="middle" fill="var(--dub-text)" font-weight="600">deck waveform</text>
+            <text x="750" y="178" text-anchor="middle">first frame, no spinner</text>
+
+            <!-- arrows -->
+            <g stroke="var(--gd-down)" style="color: var(--gd-down)" stroke-width="1.4" fill="none" marker-end="url(#arrow)">
+                <path d="M 220 60 Q 270 30 320 40"/>
+                <path d="M 220 80 Q 270 130 320 140"/>
+            </g>
+            <g stroke="var(--gd-anchor)" style="color: var(--gd-anchor)" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#arrow)">
+                <path d="M 540 36 Q 595 18 640 22"/>
+                <path d="M 540 60 Q 595 90 640 90"/>
+                <path d="M 540 152 Q 595 160 640 162"/>
+            </g>
+
+            <!-- legend -->
+            <g transform="translate(40, 200)">
+                <line x1="0" y1="0" x2="40" y2="0" stroke="var(--gd-down)" stroke-width="1.4"/>
+                <text x="50" y="4" fill="var(--dub-text-muted)">analyze writes</text>
+                <line x1="180" y1="0" x2="220" y2="0" stroke="var(--gd-anchor)" stroke-width="1.4" stroke-dasharray="4 3"/>
+                <text x="230" y="4" fill="var(--dub-text-muted)">UI subscribes (publisher)</text>
+            </g>
+
+            <!-- callouts -->
+            <text x="940" y="32" fill="var(--dub-text-muted)" font-size="10">←  same publisher</text>
+            <text x="940" y="100" fill="var(--dub-text-muted)" font-size="10">←  same value, always</text>
+            <text x="940" y="170" fill="var(--dub-text-muted)" font-size="10">←  synchronous load</text>
+        </g>
+        <defs>
+            <marker id="arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+                <path d="M 0 0 L 8 4 L 0 8 Z" fill="currentColor"/>
+            </marker>
+        </defs>
+    </svg>
+
+    <div class="dub-grid dub-grid--2" style="margin-top: var(--sp-md);">
+        <div class="dub-card">
+            <h3>BPM parity — what we guarantee</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Library has a BPM → deck header shows it instantly on load. No nil-and-wait.</li>
+                <li>Auto analyze completes → library row publishes → both bindings refresh same frame.</li>
+                <li>Tap-tempo commits → both update together.</li>
+                <li>Re-analyze commits → both update together.</li>
+                <li>Lock toggle → BPM unchanged → neither display changes.</li>
+            </ul>
+        </div>
+        <div class="dub-card">
+            <h3>Waveform sidecar — what we guarantee</h3>
+            <ul style="color: var(--dub-text-muted);">
+                <li>Analyze and Re-analyze write <code>~/Library/Caches/Dub/waveforms/{fingerprint}.wf</code> before returning.</li>
+                <li><code>DeckState.loadTrack</code> reads the sidecar synchronously when present.</li>
+                <li>Deck waveform paints with sidecar data on the first frame; live <code>PeakBuffer</code> takes over after.</li>
+                <li>"Waveform building…" on a track that has a sidecar is a regression against this spec.</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<!-- =================================================================
+     Source attribution
+     ================================================================= -->
+<div class="dub-source-row">
+    <a href="../PRD-BEATS.md">PRD-BEATS.md</a>
+    <a href="../PRD.md">PRD.md §8.3 (parent)</a>
+    <a href="../SHIPPED.md">SHIPPED.md (M11d.7)</a>
+    <a href="../../crates/dub-bpm/src/beats.rs">crates/dub-bpm/src/beats.rs</a>
+    <a href="../../crates/dub-ffi/src/lib.rs">crates/dub-ffi/src/lib.rs</a>
+    <a href="../../apple/Dub/Performance/TapToGridController.swift">apple/Dub/Performance/TapToGridController.swift</a>
+</div>
+
+<footer class="dub-footer">
+    Dub — beat-grid spec · v0.1 · 2026-05-24 · source of truth for tempo, grids, and the waveform contract
+</footer>
+
+</main>
+
+</body>
+</html>

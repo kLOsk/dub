@@ -97,6 +97,7 @@ mod decimator;
 mod filtered;
 mod offline;
 mod onset;
+mod sidecar;
 mod stream;
 pub mod synthetic;
 
@@ -106,6 +107,7 @@ pub use decimator::Decimator;
 pub use filtered::FilteredDecimator;
 pub use offline::{compute_offline_peaks, OfflinePeaks};
 pub use onset::OnsetDecimator;
+pub use sidecar::{read_sidecar, write_sidecar, SidecarWriteError};
 pub use stream::{PeakStream, PeakStreamConfig, PeakStreamError};
 
 /// Number of frequency bands carried by each [`BandPeakChunk`].

@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dub — UI backlog</title>
+    <link rel="stylesheet" href="_assets/dub.css">
+    <style>
+        .filter-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: var(--sp-lg);
+        }
+        .filter-bar input {
+            flex: 1;
+            min-width: 240px;
+            background: var(--dub-bg-elev-2);
+            border: 1px solid var(--dub-stroke);
+            color: var(--dub-text);
+            font: inherit;
+            padding: 8px 12px;
+            border-radius: var(--r-md);
+        }
+        .filter-bar input:focus { outline: none; border-color: var(--dub-info); }
+        .chip {
+            background: var(--dub-bg-elev-2);
+            border: 1px solid var(--dub-stroke);
+            color: var(--dub-text-muted);
+            font: inherit;
+            font-size: 12px;
+            font-family: var(--font-mono);
+            padding: 6px 12px;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: background 100ms, color 100ms, border-color 100ms;
+        }
+        .chip:hover { color: var(--dub-text); border-color: var(--dub-stroke-strong); }
+        .chip.is-active {
+            background: rgba(78, 161, 255, 0.12);
+            border-color: var(--dub-info);
+            color: var(--dub-text);
+        }
+        .chip.chip--bug.is-active    { background: var(--bucket-bug);    border-color: var(--bucket-bug-edge);    color: #ff8a8a; }
+        .chip.chip--polish.is-active { background: var(--bucket-polish); border-color: var(--bucket-polish-edge); color: #ffd28a; }
+        .chip.chip--health.is-active { background: var(--bucket-health); border-color: var(--bucket-health-edge); color: #97c6ff; }
+
+        .kanban {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: var(--sp-md);
+            margin-top: var(--sp-lg);
+        }
+        @media (max-width: 1100px) {
+            .kanban { grid-template-columns: 1fr; }
+        }
+        .column {
+            background: var(--dub-bg-elev-1);
+            border: 1px solid var(--dub-stroke);
+            border-radius: var(--r-lg);
+            padding: var(--sp-md);
+            min-height: 300px;
+        }
+        .column--bug    { border-top: 3px solid var(--dub-err); }
+        .column--polish { border-top: 3px solid var(--dub-warn); }
+        .column--health { border-top: 3px solid var(--dub-info); }
+        .column__head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: var(--sp-md);
+            padding-bottom: var(--sp-sm);
+            border-bottom: 1px dashed var(--dub-stroke);
+        }
+        .column__name {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--dub-text);
+            letter-spacing: 0.04em;
+        }
+        .column__count {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--dub-text-faint);
+        }
+
+        .card {
+            background: var(--dub-bg-elev-2);
+            border: 1px solid var(--dub-stroke);
+            border-radius: var(--r-md);
+            padding: var(--sp-md);
+            margin-bottom: var(--sp-sm);
+        }
+        .card--bug    { border-left: 3px solid var(--dub-err); }
+        .card--polish { border-left: 3px solid var(--dub-warn); }
+        .card--health { border-left: 3px solid var(--dub-info); }
+        .card__head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: var(--sp-sm);
+            margin-bottom: 6px;
+        }
+        .card__id {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--dub-text);
+            font-weight: 600;
+        }
+        .card__id .dup-tag {
+            margin-left: 6px;
+            font-size: 9px;
+            background: rgba(241, 176, 76, 0.18);
+            color: var(--dub-warn);
+            border-radius: 3px;
+            padding: 1px 5px;
+            font-weight: 500;
+        }
+        .card__title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--dub-text);
+            margin-bottom: 6px;
+        }
+        .card__body { color: var(--dub-text-muted); font-size: 13px; }
+        .card__body strong { color: var(--dub-text); font-weight: 600; }
+        .card__meta {
+            margin-top: var(--sp-sm);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            font-family: var(--font-mono);
+            font-size: 11px;
+        }
+        .card__meta span {
+            padding: 2px 8px;
+            background: var(--dub-bg-elev-3);
+            border-radius: 999px;
+            color: var(--dub-text-faint);
+        }
+        .card__meta a {
+            padding: 2px 8px;
+            border-radius: 999px;
+            color: var(--dub-text-faint);
+            border-bottom: 0;
+        }
+        .card__meta a:hover { color: var(--dub-info); background: var(--dub-bg-elev-3); }
+    </style>
+</head>
+<body>
+
+<nav class="dub-nav">
+    <a class="dub-nav__brand" href="index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.4"/>
+            <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+            <line x1="12" y1="2.2" x2="12" y2="6" stroke="currentColor" stroke-width="1.4"/>
+        </svg>
+        Dub
+    </a>
+    <span class="dub-nav__sep"></span>
+    <div class="dub-nav__links">
+        <a href="index.html">Overview</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="beats.html">Beat grid</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="schema.html">Library schema</a>
+        <a href="backlog.html">UI backlog</a>
+    </div>
+    <span class="dub-nav__source">source: UI-BACKLOG.md · triaged 2026-05-17</span>
+</nav>
+
+<main class="dub-shell">
+
+<header class="dub-page-head">
+    <div class="dub-page-head__eyebrow">UI / UX backlog · SwiftUI shell</div>
+    <h1>UI backlog</h1>
+    <p class="dub-page-head__lede">
+        Items found during the 2026-05-17 SwiftUI review that were
+        <em>not</em> immediately fixed in-session. Triaged into three buckets
+        ordered roughly by priority within each. Closed and stale items are
+        kept at the bottom for archaeology; the kanban above only shows
+        open work.
+    </p>
+</header>
+
+<section>
+    <div class="filter-bar">
+        <button class="chip is-active" data-filter-tag="all">All</button>
+        <button class="chip chip--bug" data-filter-tag="bug">Real bugs</button>
+        <button class="chip chip--polish" data-filter-tag="polish">UX polish</button>
+        <button class="chip chip--health" data-filter-tag="health">Code health</button>
+        <input type="text" placeholder="Search backlog · press / to focus" data-filter-target="#kanban">
+    </div>
+
+    <div id="kanban" class="kanban">
+
+        <!-- =============== Bugs =============== -->
+        <div class="column column--bug">
+            <div class="column__head">
+                <span class="column__name">1 · Real bugs</span>
+                <span class="column__count">correctness or visible user pain</span>
+            </div>
+
+            <article class="card card--bug" data-tags="bug" data-filter-text="B-11 BPM octave 2x hip-hop rap audible tempo half-time">
+                <div class="card__head"><span class="card__id">B-11</span><span class="pill pill--blocked">Blocks tap-to-grid</span></div>
+                <div class="card__title">Auto BPM locks at 2× tempo on real hip-hop / rap</div>
+                <div class="card__body">
+                    <strong>Symptom:</strong> Library analysis and deck header report ~190 BPM on tracks audibly around 90–100 (kick/snare half-time feel). Synthetic <code>genre_octave</code> fixtures pass; real mastered rap with bright hi-hats still loses the octave.<br><br>
+                    <strong>Likely cause:</strong> <code>estimate_tempo</code> prefers the faster tempo on a 1 % harmonic-mean tie (<code>SCORE_TIE_REL_TOL</code>).<br><br>
+                    <strong>Fix direction:</strong> add a real-music regression corpus next to the synthetic suite, slow-side tie-break for urban genres or a low-band-weighted tie-break pass, and an optional post-analysis octave sanity check against ID3 / filename BPM within ±20 %.
+                </div>
+                <div class="card__meta">
+                    <span>engine</span>
+                    <span>dub-bpm/tempo.rs</span>
+                    <span>dub-library/analysis.rs</span>
+                    <a href="../UI-BACKLOG.md">→ MD source</a>
+                </div>
+            </article>
+
+            <article class="card card--bug" data-tags="bug" data-filter-text="B-7 scanMissingFilesBatch identical if else branches">
+                <div class="card__head"><span class="card__id">B-7</span><span class="pill">low impact · wasteful</span></div>
+                <div class="card__title"><code>scanMissingFilesBatch</code> has identical if / else branches</div>
+                <div class="card__body">
+                    Both arms call <code>library.markFileState</code> with the same arguments. Behaviour is correct; it just writes the same row to SQLite twice the database hits otherwise would on first-import days.<br><br>
+                    <strong>Fix:</strong> collapse the branches, or split the FFI so the unchanged path is a cheap <code>UPDATE … SET last_seen_at = ?</code>.
+                </div>
+                <div class="card__meta">
+                    <span>swift</span>
+                    <span>MainView.swift ~L957</span>
+                </div>
+            </article>
+
+            <article class="card card--bug" data-tags="bug" data-filter-text="B-8 libraryTrackCount refresh clobbers user selection">
+                <div class="card__head"><span class="card__id">B-8</span><span class="pill">selection</span></div>
+                <div class="card__title"><code>libraryTrackCount</code> refresh clobbers selection</div>
+                <div class="card__body">
+                    The <code>onChange(of: model.libraryTrackCount)</code> path calls <code>refreshTracks()</code> with <code>preserveSelection: false</code>. Intended trigger is "another window just imported tracks"; in practice it also fires during the user's own session and loses the highlighted row.<br><br>
+                    <strong>Fix:</strong> pass <code>preserveSelection: true</code> from this <code>onChange</code>. The preserve path already exists.
+                </div>
+                <div class="card__meta"><span>swift</span><span>LibraryView.swift</span></div>
+            </article>
+
+            <article class="card card--bug" data-tags="bug" data-filter-text="B-9 search field debounce FTS5 250ms keystroke">
+                <div class="card__head"><span class="card__id">B-9</span><span class="pill">scales to 100 k rows</span></div>
+                <div class="card__title">Search field has no debounce</div>
+                <div class="card__body">
+                    Every keystroke re-queries FTS5 synchronously and triggers a full list rebuild. Fast today, but a 500 ms-long word means six queries plus six rebuilds.<br><br>
+                    <strong>Fix:</strong> wrap the <code>onChange</code> in <code>.task(id: searchText)</code> with a 250 ms sleep. Cancel-on-new-input is automatic with that pattern.
+                </div>
+                <div class="card__meta"><span>swift</span><span>LibraryView.swift</span></div>
+            </article>
+        </div>
+
+        <!-- =============== Polish =============== -->
+        <div class="column column--polish">
+            <div class="column__head">
+                <span class="column__name">2 · UX polish</span>
+                <span class="column__count">works, but feels rough</span>
+            </div>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-19 tap to grid keyboard G PRD 8.3.1 downbeat anchor">
+                <div class="card__head"><span class="card__id">U-19</span><span class="pill pill--blocked">Blocked on B-11</span></div>
+                <div class="card__title">Tap-to-grid not implemented (PRD §8.3.1)</div>
+                <div class="card__body">
+                    Schema supports <code>source = 'user_tap'</code>; UI affordance and <code>dub-bpm</code> refit hook are both missing. Multi-tap path for sparse tracks is part of the spec.<br><br>
+                    <strong>Flow:</strong> keyboard handler → record tap → snap to nearest transient (±200 ms) → search ±20 BPM around imported/active → write <code>track_beatgrids(source='user_tap')</code> → reload deck grid without full reanalysis.<br><br>
+                    <strong>Blocked:</strong> B-11 first (a wrong auto BPM makes taps harder to trust).
+                </div>
+                <div class="card__meta"><span>swift + rust</span><a href="roadmap.html">→ M11c.3</a></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-18 beatgrid overlay lines jitter playback waveform metal">
+                <div class="card__head"><span class="card__id">U-18</span></div>
+                <div class="card__title">Beat-grid overlay lines jitter sub-pixel during playback</div>
+                <div class="card__body">
+                    Grid lines wobble sub-pixel against the scrolling envelope when the deck is playing. Beats are readable.<br><br>
+                    <strong>Likely cause:</strong> residual mismatch between the Metal playhead extrapolation and the SwiftUI Canvas grid draw cadence, or fractional-chunk NDC rounding at the playhead boundary (see M11d.5 round-5 follow-ups).<br><br>
+                    <strong>Fix:</strong> consider drawing grid lines in Metal alongside the envelope so both layers share one sub-chunk offset.
+                </div>
+                <div class="card__meta"><span>swift</span><span>WaveformView · WaveformRenderer</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-12 dev placeholder casual play strings M10.7 M14">
+                <div class="card__head"><span class="card__id">U-12</span></div>
+                <div class="card__title">Dev-facing placeholder text leaks into Casual Play</div>
+                <div class="card__body">
+                    Strings like "Phase-Drift Trail lands at M10.7" and "Filter ladder ships with M14" appear verbatim in the UI. Meaningful to us; confusing to a DJ who just opened the app.<br><br>
+                    <strong>Fix:</strong> replace with user-facing copy that names the feature, not the milestone, or hide placeholders entirely in Casual-Play builds behind a debug flag.
+                </div>
+                <div class="card__meta"><span>swift</span><span>Placeholders.swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-14 analysis feedback ensureTrackAnalyzed footer spinner single deck load">
+                <div class="card__head"><span class="card__id">U-14</span></div>
+                <div class="card__title">No feedback while a single-deck-load analysis is running</div>
+                <div class="card__body">
+                    <code>ensureTrackAnalyzed</code> fires on track load but doesn't surface progress; BPM column shows "—" until the worker thread completes.<br><br>
+                    <strong>Fix:</strong> bump <code>analysisInFlightCount</code> for single loads (already done), and render a quiet "Analyzing 1 track…" line in the LibraryView footer when <code>analysisInFlightCount &gt; 0 &amp;&amp; analysisBatchTotal == 0</code>.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-15 error toasts banner aggressive surfaceError lastError">
+                <div class="card__head"><span class="card__id">U-15</span></div>
+                <div class="card__title">Error toasts are too aggressive</div>
+                <div class="card__body">
+                    <code>surfaceError</code> lights up a full-width banner for any FFI hiccup (transient unmounted volume, stale path lookup, short-track analysis failure). Users in the middle of a mix should not get attention-stealing surfaces.<br><br>
+                    <strong>Fix:</strong> split into user-actionable (banner) vs informational (status-strip glyph or quiet log line). Engine / library open / Preferences errors stay in the banner; analysis and resolve failures go to the log.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-16 navigateToSibling arrow key silent NSSound beep top bottom list">
+                <div class="card__head"><span class="card__id">U-16</span></div>
+                <div class="card__title"><code>navigateToSibling</code> fails silently at list edges</div>
+                <div class="card__body">
+                    Arrow-key sibling navigation in LibraryView is a no-op when there's no next sibling. No glyph flash, no system beep.<br><br>
+                    <strong>Fix:</strong> <code>NSSound.beep()</code> on hard-stop, matching the rest of macOS arrow-key navigation.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-17 notation toggle Camelot Musical invisible header column">
+                <div class="card__head"><span class="card__id">U-17</span></div>
+                <div class="card__title">Notation-toggle affordance is invisible</div>
+                <div class="card__body">
+                    Key column is not in the default performance browser. When it returns via customizable columns, the header must make the notation mode visible; a hidden click target on KEY will not be discoverable.<br><br>
+                    <strong>Fix:</strong> render the header as <code>KEY (Camelot)</code> / <code>KEY (Musical)</code> or a small toggle pill.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-18 sort semantics FFI client KeyPathComparator NULL ordering">
+                <div class="card__head"><span class="card__id">U-18 <span class="dup-tag">dup ID in MD</span></span></div>
+                <div class="card__title">Sort semantics differ between FFI and client sort</div>
+                <div class="card__body">
+                    FFI's <code>list_tracks_sorted</code> puts NULLs last both directions. Client-side <code>KeyPathComparator</code> over optional keys puts NULLs last for ASC and first for DESC, so clicking Artist twice gives different NULL placement than the initial open.<br><br>
+                    <strong>Fix:</strong> build a NULL-always-last comparator, or push the sort back through the FFI so there's one source of truth. FFI path is preferable once paging lands.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-19 idle pane hint truncated lineLimit minimumScaleFactor narrow window">
+                <div class="card__head"><span class="card__id">U-19 <span class="dup-tag">dup ID in MD</span></span></div>
+                <div class="card__title">Idle-pane hint text gets truncated</div>
+                <div class="card__body">
+                    Below ~840 px window width, the second line of <code>Placeholders.idleHint</code> truncates mid-word ("…drop a track to load i").<br><br>
+                    <strong>Fix:</strong> drop <code>.lineLimit(2)</code> in favour of <code>.lineLimit(nil)</code> + <code>.minimumScaleFactor(0.8)</code>. Allowing the hint to wrap to three lines on narrow windows is better than truncated text.
+                </div>
+                <div class="card__meta"><span>swift</span><span>Placeholders.idleHint</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-20 PerformanceView idle pane redundant copy left right deck">
+                <div class="card__head"><span class="card__id">U-20</span></div>
+                <div class="card__title">PerformanceView idle pane shows redundant copy</div>
+                <div class="card__body">
+                    Both decks render the same idle hint on the two-deck layout. The copy reads twice.<br><br>
+                    <strong>Fix:</strong> render the hint only on the left (or master) deck; the right deck stays blank.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-21 StatusStrip engine library state mix glance distance">
+                <div class="card__head"><span class="card__id">U-21</span></div>
+                <div class="card__title">StatusStrip mixes engine + library state</div>
+                <div class="card__body">
+                    Engine-running, master-deck, and library-imported counts share one horizontal row. Engine state is a "what's playing right now" cue; library counts are "how big is my collection". Mixing them forces glance-distance disambiguation.<br><br>
+                    <strong>Fix:</strong> move library counts to the LibraryView footer (already echoed there); keep the status strip for live engine state only.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-22 tooltip dev leaky milestone names M11c.2 Camelot">
+                <div class="card__head"><span class="card__id">U-22</span></div>
+                <div class="card__title">Tooltip text is dev-leaky</div>
+                <div class="card__body">
+                    Several tooltips embed milestone names ("M11c.2 Camelot key detection") that are meaningless to a DJ.<br><br>
+                    <strong>Fix:</strong> sweep <code>.help("M…")</code> strings and rewrite them in user language.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--polish" data-tags="polish" data-filter-text="U-23 onboarding first run sheet device routing import">
+                <div class="card__head"><span class="card__id">U-23</span></div>
+                <div class="card__title">Onboarding doesn't exist</div>
+                <div class="card__body">
+                    First-run experience is "open the app, see empty library, figure it out". For a DJ tool with a strict ≥4 in / 4 out hardware prerequisite this is hostile.<br><br>
+                    <strong>Fix:</strong> first-run sheet for device selection, channel routing, and "drop a folder here to import". Skippable; lives behind Preferences so power users can re-open it.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+        </div>
+
+        <!-- =============== Code health =============== -->
+        <div class="column column--health">
+            <div class="column__head">
+                <span class="column__name">3 · Code health</span>
+                <span class="column__count">no symptom yet · architectural debt</span>
+            </div>
+
+            <article class="card card--health" data-tags="health" data-filter-text="C-24 FileBrowserView dead code M10.5b M11d superseded">
+                <div class="card__head"><span class="card__id">C-24</span></div>
+                <div class="card__title"><code>FileBrowserView.swift</code> is dead code</div>
+                <div class="card__body">
+                    The M10.5b file-browser sidebar was superseded by the M11d library. The file remains in the target with no call sites.<br><br>
+                    <strong>Fix:</strong> delete the file; verify no references in the Xcode project's filelist.
+                </div>
+                <div class="card__meta"><span>swift</span><span>FileBrowserView.swift</span></div>
+            </article>
+
+            <article class="card card--health" data-tags="health" data-filter-text="C-25 LibraryPlaceholder dead code M11d.2">
+                <div class="card__head"><span class="card__id">C-25</span></div>
+                <div class="card__title"><code>LibraryPlaceholder</code> is dead code</div>
+                <div class="card__body">
+                    Pre-M11d.2 empty-state placeholder; the new LibraryView's empty states cover all paths.<br><br>
+                    <strong>Fix:</strong> delete.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--health" data-tags="health" data-filter-text="C-27 selectLibraryTrack trackPath called twice FFI">
+                <div class="card__head"><span class="card__id">C-27</span></div>
+                <div class="card__title"><code>selectLibraryTrack</code> calls <code>trackPath</code> twice</div>
+                <div class="card__body">
+                    Selection path: <code>selectLibraryTrack</code> calls <code>trackPath</code> to set <code>browserSelection</code>; on Space (or drag), <code>recordLibraryLoadIfApplicable</code> calls <code>trackPath</code> again to verify the URL hasn't changed. Same SELECT executed twice within a few ms.<br><br>
+                    <strong>Fix:</strong> cache the resolved URL on <code>selectedLibraryTrack</code> (snapshot already published) and have <code>recordLibraryLoadIfApplicable</code> compare against the cached value. The unmounted-mid-action edge case still trips the engine error.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--health" data-tags="health" data-filter-text="C-28 analysisInFlightCount naming misleading documentation comment">
+                <div class="card__head"><span class="card__id">C-28</span></div>
+                <div class="card__title"><code>analysisInFlightCount</code> naming is misleading post-fix</div>
+                <div class="card__body">
+                    Post-fix for B-3/B-4 the counter is "any analysis in flight, batch or not" but the doc comment still says "divides batch total for progress fraction". Right value for batch progress is now <code>analysisBatchCompleted</code>.<br><br>
+                    <strong>Fix:</strong> rename to <code>analysisInFlight: Bool</code> (we never use count &gt; 1; analyses are serial). Trivial; lands with the next library-related PR.
+                </div>
+                <div class="card__meta"><span>swift</span></div>
+            </article>
+
+            <article class="card card--health" data-tags="health" data-filter-text="C-30 RT thread audit SwiftUI render path Instruments allocations">
+                <div class="card__head"><span class="card__id">C-30</span></div>
+                <div class="card__title">RT-thread audit doesn't cover the SwiftUI render path</div>
+                <div class="card__body">
+                    The RT-thread auditor walks the engine's audio callback. The 30 Hz UI poll is RT-safe by construction (main actor) but the path between an audio-thread BPM update and a deck-header refresh routes through several FFI hops auditable only on the Rust side. Swift-side allocations during the poll are uncharacterised.<br><br>
+                    <strong>Fix:</strong> add a Swift-side <code>MainActor</code> profile pass that runs the 30 Hz poll for 60 s under Instruments' Allocations template. Not a hard "must be zero" gate; we want a baseline so regressions are visible.
+                </div>
+                <div class="card__meta"><span>tooling</span></div>
+            </article>
+
+        </div>
+
+    </div>
+</section>
+
+<!-- =================================================================
+     Triage notes
+     ================================================================= -->
+<section>
+    <h2>Triage notes</h2>
+    <div class="dub-card">
+        <ul style="color: var(--dub-text-muted); padding-left: 1.2em;">
+            <li>Buckets are roughly ordered by priority within each section (top of list → fix first).</li>
+            <li><strong>B-7 → B-9</strong> should land before major new library UI features, since they affect existing functionality.</li>
+            <li><strong>B-11 (BPM octave)</strong> and <strong>U-19 (tap-to-grid)</strong> are the next beat-grid cluster; <strong>U-18 (grid-line jitter)</strong> follows once the grid source of truth stabilises.</li>
+            <li>The UX bucket can land alongside <strong>M11e (Library polish)</strong> — most items are surface-level copy or layout tweaks.</li>
+            <li>Code-health items are not blocking but should be ticked off as PRs touch the affected files.</li>
+            <li><strong>Hygiene note:</strong> <code>UI-BACKLOG.md</code> has two cards each at <code>U-18</code> and <code>U-19</code> (beat-grid jitter / sort semantics, and tap-to-grid / idle-hint truncation). Preserved as written here; worth a one-line renumber when the next backlog pass lands.</li>
+        </ul>
+    </div>
+</section>
+
+<!-- =================================================================
+     Closed / stale archaeology
+     ================================================================= -->
+<section>
+    <h2>Closed / stale (archaeology)</h2>
+    <p style="color: var(--dub-text-muted); max-width: 72ch;">
+        Preserved so a future contributor can read why a bug doesn't show up
+        on the active board. Marked closed in the MD source with a strike
+        through; this view collapses them out of the way.
+    </p>
+    <details class="dub-details">
+        <summary><strong>Show closed / stale items (6)</strong></summary>
+        <div>
+            <div class="dub-grid dub-grid--2">
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-26</span> · Waveform scrub lag · <span class="pill pill--shipped">closed M11d.5</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Demand-driven Metal rendering (CVDisplayLink on the main run loop), input yield during press/drag, redundant peak-ingest skip when the playhead is stable, GPU catch-up when frames are deferred. Landed in 01291cd.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-25</span> · BPM-grid polling never latches · <span class="pill pill--shipped">closed M11d.5 round 4</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Library-sourced beat grid is now the single source of truth; deck-load handshake delivers the final grid before the first Metal frame after load. Removed the ±0.02 BPM cross-deck drift and the redundant 100–400 ms per-load BPM analysis as a side effect.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-10</span> · Key column tap-to-toggle · <span class="pill">stale</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Stale after browser column reset; current performance browser doesn't render Key by default. Re-open when Key returns via customizable columns; original fix (toggle in column header, not row cells) still stands.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">U-13</span> · LibraryView header duplication · <span class="pill">stale</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Stale after list rewrite; the right-pane header count is gone. No action unless reintroduced.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">C-26</span> · BPM lookup differs DeckHeader / LibraryView · <span class="pill pill--shipped">closed M11d.5 round 4</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Engine now adopts the library's <code>track_beatgrids(is_active = 1)</code> via a new <code>LibraryBeatGrid</code> parameter on <code>DubEngine.loadTrack</code> instead of re-running <code>analyze_beat_grid</code>. Both reads converge on the same SQLite row by construction.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">C-29</span> · Table selection double-fires · <span class="pill">obsolete</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Obsolete after SwiftUI <code>Table</code> removal. Selection is owned by the row model and <code>LibraryArrowKeyView</code> now. Re-open only if a future NSTableView/SwiftUI Table paging rewrite reintroduces the binding echo.</p>
+                </div>
+            </div>
+        </div>
+    </details>
+</section>
+
+<div class="dub-source-row">
+    <span>Generated from</span>
+    <a href="../UI-BACKLOG.md">docs/UI-BACKLOG.md</a>
+    <span>·</span>
+    <span>review date 2026-05-17</span>
+</div>
+
+</main>
+
+<script src="_assets/dub.js"></script>
+</body>
+</html>

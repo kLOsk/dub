@@ -236,6 +236,14 @@ final class WaveformRenderSnapshot: ObservableObject {
     /// other values; the overlay's downbeat phase reads this
     /// rather than hard-coding 4.
     var beatsPerBar: Int = 4
+    /// PRD-BEATS C2 (round 4) — explicit bar-phase scalar. The
+    /// downbeat is the beat at index `i` such that
+    /// `i % beatsPerBar == barPhase`. Mirrors the Rust
+    /// `dub_bpm::BeatGrid::bar_phase` field. Updated on every
+    /// `set the 1` tap without moving `beats[]`, so the grid
+    /// lines stay locked to the audible kick while the yellow
+    /// downbeat rotates with the user's tap.
+    var barPhase: Int = 0
     /// `confidence > 0` ⇒ draw the grid; `confidence == 0` ⇒ the
     /// estimator didn't lock and the overlay paints nothing
     /// (B-24 spec point 4).
@@ -502,6 +510,8 @@ final class WaveformRenderer: NSObject {
     private var cachedBeats: [Double] = []
     private var cachedBpm: Double = 0
     private var cachedBeatsPerBar: Int = 4
+    /// PRD-BEATS C2 (round 4) — see `WaveformRenderSnapshot.barPhase`.
+    private var cachedBarPhase: Int = 0
     private var cachedBeatsConfidence: Float = 0
     private var cachedBeatsGeneration: UInt64 = 0
     private var cachedBeatGridGeneration: UInt64 = 0
@@ -671,6 +681,7 @@ final class WaveformRenderer: NSObject {
         cachedBeats = []
         cachedBpm = 0
         cachedBeatsPerBar = 4
+        cachedBarPhase = 0
         cachedBeatsConfidence = 0
         cachedBeatsGeneration = 0
         cachedBeatGridGeneration = 0
@@ -1432,6 +1443,9 @@ final class WaveformRenderer: NSObject {
         cachedBeats = grid.beats
         cachedBpm = grid.bpm
         cachedBeatsPerBar = max(1, Int(grid.beatsPerBar))
+        cachedBarPhase = min(
+            max(0, Int(grid.barPhase)),
+            max(0, cachedBeatsPerBar - 1))
         cachedBeatsConfidence = grid.confidence
         cachedBeatsGeneration = peaksGeneration
         cachedBeatGridGeneration = beatGridGeneration
@@ -1451,6 +1465,7 @@ final class WaveformRenderer: NSObject {
         if let snapshot {
             snapshot.beats = cachedBeats
             snapshot.beatsPerBar = cachedBeatsPerBar
+            snapshot.barPhase = cachedBarPhase
             snapshot.beatsConfidence = cachedBeatsConfidence
             snapshot.beatsGeneration = peaksGeneration
         }
@@ -1965,13 +1980,15 @@ final class WaveformRenderer: NSObject {
         case .horizontal:
             timeAxisPixels = max(1, Float(drawableSize.width))
         }
-        // Thicker + more opaque than the first Metal pass (0.35 /
-        // 0.85 @ 1 / 2 px) — on a busy Serato-colour waveform in
-        // Prep-mode horizontal layout the old ticks read as nearly
-        // invisible. These values target "readable at glance distance"
-        // without obscuring transients.
+        // PRD-BEATS §5.1 Serato-style rendering. Beat ticks now
+        // live in a narrow strip above the waveform; downbeats
+        // span the full cross axis with a thicker, brighter
+        // stroke so they read at glance distance. Pre-round-3
+        // both tick variants spanned the full cross axis with
+        // only thickness + alpha to differentiate them, which
+        // made downbeats hard to spot against a busy waveform.
         let beatHalfNDC = 0.75 / timeAxisPixels
-        let barHalfNDC = 1.5 / timeAxisPixels
+        let barHalfNDC = 2.0 / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
         let startIdx = firstBeatIndex(atOrAfter: visibleStart)
@@ -1987,15 +2004,18 @@ final class WaveformRenderer: NSObject {
                 drawnBelow: drawnBelow,
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                 futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
-            let isDownbeat = cachedBeatsPerBar > 0 && (idx % cachedBeatsPerBar == 0)
+            let isDownbeat =
+                cachedBeatsPerBar > 0
+                && (idx % cachedBeatsPerBar == cachedBarPhase)
             let half = isDownbeat ? barHalfNDC : beatHalfNDC
-            let alpha: Float = isDownbeat ? 1.0 : 0.65
+            let alpha: Float = isDownbeat ? 1.0 : 0.85
             let color = Self.deckTintRGBA(side: side, alpha: alpha)
             appendBeatLineQuad(
                 vertices: &beatGridScratchVertices,
                 timeNDC: Float(timeNDC),
                 halfThickness: half,
-                color: color)
+                color: color,
+                isDownbeat: isDownbeat)
         }
 
         logVisibleBeatAlignment(
@@ -2042,20 +2062,46 @@ final class WaveformRenderer: NSObject {
             vertexCount: beatGridScratchVertices.count)
     }
 
+    /// PRD-BEATS §5.1 Serato-style cross-axis ranges. A beat tick
+    /// is a short mark in the "headroom" outside the waveform; a
+    /// downbeat is a full-height line that cuts through the
+    /// waveform. The waveform shader uses cross-axis ∈ [-1, +1]
+    /// for amplitude, so beat ticks live in the top 12 % strip
+    /// (y/x ∈ [0.76, 1.0]) where the waveform's positive lobe
+    /// rarely reaches even on hot masters — keeps the ticks
+    /// readable without competing with the waveform's bright
+    /// envelope. Downbeats keep the full [-1, +1] span so the bar
+    /// boundary is unmistakable at a glance.
+    private static let beatTickInnerNDC: Float = 0.76
+    private static let beatTickOuterNDC: Float = 1.0
+
     /// Append one axis-aligned tick quad (two triangles, six
-    /// vertices) spanning the full amplitude axis at `timeNDC`.
+    /// vertices) at `timeNDC`. Downbeats span the full amplitude
+    /// axis; beat ticks span only the headroom strip
+    /// (`beatTickInnerNDC ... beatTickOuterNDC`), keeping the
+    /// waveform readable underneath.
     private func appendBeatLineQuad(
         vertices: inout [BeatGridVertexLayout],
         timeNDC: Float,
         halfThickness: Float,
-        color: SIMD4<Float>
+        color: SIMD4<Float>,
+        isDownbeat: Bool
     ) {
+        let crossLow: Float
+        let crossHigh: Float
+        if isDownbeat {
+            crossLow = -1.0
+            crossHigh = 1.0
+        } else {
+            crossLow = Self.beatTickInnerNDC
+            crossHigh = Self.beatTickOuterNDC
+        }
         switch orientation {
         case .vertical:
             let y0 = timeNDC - halfThickness
             let y1 = timeNDC + halfThickness
-            let x0: Float = -1.0
-            let x1: Float = 1.0
+            let x0 = crossLow
+            let x1 = crossHigh
             vertices.append(.init(position: SIMD2(x0, y0), color: color))
             vertices.append(.init(position: SIMD2(x1, y0), color: color))
             vertices.append(.init(position: SIMD2(x0, y1), color: color))
@@ -2065,8 +2111,8 @@ final class WaveformRenderer: NSObject {
         case .horizontal:
             let x0 = -timeNDC - halfThickness
             let x1 = -timeNDC + halfThickness
-            let y0: Float = -1.0
-            let y1: Float = 1.0
+            let y0 = crossLow
+            let y1 = crossHigh
             vertices.append(.init(position: SIMD2(x0, y0), color: color))
             vertices.append(.init(position: SIMD2(x1, y0), color: color))
             vertices.append(.init(position: SIMD2(x0, y1), color: color))

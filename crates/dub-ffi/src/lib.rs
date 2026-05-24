@@ -36,8 +36,9 @@ use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
 use dub_bpm::{
-    analyze_beat_grid_with_profile, latch_beat_grid_at_downbeat, octave_profile_from_genre,
-    BeatGrid as CoreBeatGrid, OctaveProfile,
+    analyze_beat_grid_from_taps, analyze_beat_grid_with_profile, bar_phase_from_tap,
+    latch_beat_grid_at_downbeat, octave_profile_from_genre, uniform_beats,
+    BeatGrid as CoreBeatGrid, GridQuality as CoreGridQuality, OctaveProfile,
 };
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
 use dub_io::{
@@ -136,10 +137,10 @@ uniffi::setup_scaffolding!();
 ///       redundant 100–400 ms analysis on already-analyzed tracks.
 ///   18. M11d.6 — `load_track` gains optional `genre` for
 ///       genre-aware octave profiles during auto analysis;
-///       `relatch_beat_grid_at_downbeat` for the one-button
+///       `set_bar_phase` for the one-button
 ///       downbeat calibration path; beat grids are onset-latched
 ///       instead of uniform `anchor + i × period`.
-pub const FFI_VERSION: u32 = 18;
+pub const FFI_VERSION: u32 = 19;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -221,6 +222,18 @@ pub enum EngineError {
     /// or a synthesised grid that collapsed to empty. M11c.3b.
     #[error("invalid beat grid parameters")]
     InvalidBeatGridParams,
+
+    /// A beatgrid-mutating call (`install_beat_grid_from_taps`,
+    /// `set_bar_phase`) hit a deck whose loaded
+    /// track has `grid_locked = true`. PRD-BEATS §3.5 "lock is
+    /// absolute". The Swift shell is expected to gate this on
+    /// `deckState.gridLocked` *before* crossing the FFI boundary;
+    /// reaching this error means the Swift gate was bypassed (a
+    /// CLI tool, a test harness, or a race between a lock toggle
+    /// and an in-flight tap session). The deck's grid is
+    /// unchanged on error.
+    #[error("deck {0} grid is locked; unlock first")]
+    GridLocked(u64),
 }
 
 /// The Apple-side handle to the Dub audio engine.
@@ -359,6 +372,17 @@ struct FilePeaks {
     /// via [`dub_bpm::analyze_beat_grid`]. Empty (confidence = 0)
     /// for tracks whose tempo couldn't be estimated.
     beat_grid: BeatGrid,
+    /// PRD-BEATS §3.5 ("lock is absolute"). Mirrors the
+    /// `tracks.grid_locked` column for the track currently loaded
+    /// on this deck. When `true`, [`DubEngine::
+    /// install_beat_grid_from_taps`] and [`DubEngine::
+    /// set_bar_phase`] refuse with
+    /// [`EngineError::GridLocked`] — defense in depth behind the
+    /// Swift `deckState.gridLocked` gate. Set at load time from
+    /// `library_grid.grid_locked`; mutated later by
+    /// [`DubEngine::set_deck_grid_locked`] when the Apple shell
+    /// toggles the lock from the library UI without reloading.
+    grid_locked: bool,
 }
 
 impl PeakSource {
@@ -1358,7 +1382,10 @@ impl DubEngine {
             .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
         let duration_secs = track.samples().len() as f64
             / (f64::from(track.sample_rate()) * f64::from(track.channels()));
-        let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs);
+        // `install_beat_grid` is the manual "BPM + first downbeat
+        // anchor" affordance. The user is asserting beats[0] is
+        // the downbeat (bar position 1), so bar_phase is 0.
+        let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs, 0);
         if grid.confidence <= 0.0 || grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
@@ -1371,22 +1398,36 @@ impl DubEngine {
         Ok(())
     }
 
-    /// Anchor the beat grid at a user-supplied downbeat (beat 1)
-    /// at `downbeat_secs`, refining the period locally around the
-    /// current BPM. The result is a strictly uniform 4/4 grid —
-    /// "press 1 at the kick" is the only manual phase correction
-    /// the user needs to make (M11d.6).
+    /// PRD-BEATS §4.1 — "set the 1" (1–2 taps in a session).
+    ///
+    /// Re-anchors the uniform grid so the snapped kick at
+    /// `tap_secs` becomes bar position 1. BPM is preserved and
+    /// lightly refined; beat positions are rebuilt across the
+    /// full track via [`dub_bpm::latch_beat_grid_at_downbeat`]
+    /// (ODF transient snap + `uniform_beats`). This replaces
+    /// the round-4 pure `bar_phase` rotation, which could not
+    /// fix a misaligned auto grid: rotating phase only moves
+    /// which *existing* tick is yellow, so a tap on a kick
+    /// landed on the nearest grid line in dead air when the
+    /// auto anchor was offset.
     ///
     /// # Errors
     ///
-    /// Same as [`Self::install_beat_grid`].
-    pub fn relatch_beat_grid_at_downbeat(
+    /// * [`EngineError::InvalidDeckIndex`] when `deck_idx` is out of range.
+    /// * [`EngineError::EngineNotRunning`] when the engine isn't running.
+    /// * [`EngineError::NoTrackLoaded`] when no file is loaded on the deck.
+    /// * [`EngineError::GridLocked`] when the deck's grid is locked
+    ///   (PRD-BEATS §3.5: lock is absolute).
+    /// * [`EngineError::InvalidBeatGridParams`] when `tap_secs` is
+    ///   non-finite or no grid has been installed yet.
+    pub fn set_bar_phase(
         &self,
         deck_idx: u64,
-        downbeat_secs: f64,
+        tap_secs: f64,
+        genre: Option<String>,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
-        if !downbeat_secs.is_finite() {
+        if !tap_secs.is_finite() {
             return Err(EngineError::InvalidBeatGridParams);
         }
         let mut state = lock_state(&self.state);
@@ -1397,17 +1438,141 @@ impl DubEngine {
             .file_tracks
             .get(idx)
             .and_then(|t| t.as_ref())
-            .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
-        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?
+            .clone();
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
             return Err(EngineError::NoTrackLoaded(deck_idx));
         };
+        if fp.grid_locked {
+            return Err(EngineError::GridLocked(deck_idx));
+        }
         if fp.beat_grid.confidence <= 0.0 || fp.beat_grid.bpm <= 0.0 {
             return Err(EngineError::InvalidBeatGridParams);
         }
         let bpm = fp.beat_grid.bpm;
-        let grid = run_downbeat_relatch(track.as_ref(), bpm, downbeat_secs, OctaveProfile::Default)
-            .ok_or(EngineError::InvalidBeatGridParams)?;
-        fp.beat_grid = grid;
+        let profile = octave_profile_from_optional_genre(genre.as_deref());
+        drop(state);
+
+        let core = latch_beat_grid_at_downbeat(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            bpm,
+            tap_secs,
+            profile,
+        )
+        .map_err(|e| EngineError::TrackDecodeFailed(format!("set-the-1 relatch: {e}")))?;
+        let grid = BeatGrid::from_core(core);
+        if grid.confidence <= 0.0 || grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            fp.beat_grid = grid;
+        }
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        Ok(())
+    }
+
+    /// Mirror the library's `tracks.grid_locked` state onto the
+    /// engine deck. The Apple shell calls this whenever the user
+    /// toggles the lock from the right-click menu (or any other
+    /// affordance that flips the library-side flag without
+    /// re-loading the deck). When set to `true`, subsequent
+    /// [`Self::install_beat_grid_from_taps`] and
+    /// [`Self::set_bar_phase`] calls reject with
+    /// [`EngineError::GridLocked`] (PRD-BEATS §3.5).
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`] when the engine isn't running.
+    /// * [`EngineError::InvalidDeckIndex`] when `deck_idx` is out of range.
+    /// * [`EngineError::NoTrackLoaded`] when the deck has no File source.
+    pub fn set_deck_grid_locked(&self, deck_idx: u64, locked: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        fp.grid_locked = locked;
+        Ok(())
+    }
+
+    /// M11d.7 — rebuild the deck grid from user tap times (≥3 taps).
+    /// Anchor is the first tap; tempo is ODF-refined from tap seed.
+    pub fn install_beat_grid_from_taps(
+        &self,
+        deck_idx: u64,
+        tap_times: Vec<f64>,
+        genre: Option<String>,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if tap_times.len() < 3 {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        if !tap_times.iter().all(|t| t.is_finite() && *t >= 0.0) {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?
+            .clone();
+        // Sanity-check that the deck still holds a File-mode
+        // track with a peak buffer. The prior round of this code
+        // captured the deck's current grid BPM as a tap-tempo
+        // hint; PRD-BEATS round 3 (§6.1) removes that hint
+        // entirely in favor of constrained re-analysis purely
+        // from the new tap session, so we no longer read the
+        // existing BPM here. Tap idempotence (§4.6) demands no
+        // carry-over state from prior sessions.
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        // PRD-BEATS §3.5 lock-is-absolute (gate 8 defense in
+        // depth): refuse the tap install when the loaded track
+        // is locked. Swift is expected to short-circuit before
+        // calling us, but the FFI must independently reject so a
+        // raced lock toggle can't slip a write past us.
+        if fp.grid_locked {
+            return Err(EngineError::GridLocked(deck_idx));
+        }
+        let profile = octave_profile_from_optional_genre(genre.as_deref());
+        drop(state);
+
+        let core = analyze_beat_grid_from_taps(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            &tap_times,
+            profile,
+        )
+        .map_err(|e| EngineError::TrackDecodeFailed(format!("tap grid analysis: {e}")))?;
+        let grid = BeatGrid::from_core(core);
+        if grid.confidence <= 0.0 || grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            fp.beat_grid = grid;
+        }
         drop(state);
         self.bump_beat_grid_generation(idx);
         Ok(())
@@ -1520,7 +1685,11 @@ impl DubEngine {
             return Err(EngineError::InvalidBeatGridParams);
         }
         let anchor = fp.beat_grid.beats[0];
-        let grid = synthesise_beat_grid(new_bpm, anchor, duration_secs);
+        // Preserve the existing bar_phase when nudging BPM —
+        // changing tempo should not move the user's set-the-1
+        // choice (rotation invariance, PRD-BEATS §4.3).
+        let preserved_phase = u8::try_from(fp.beat_grid.bar_phase).unwrap_or(0);
+        let grid = synthesise_beat_grid(new_bpm, anchor, duration_secs, preserved_phase);
         if grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
@@ -1917,6 +2086,33 @@ impl PositionInfo {
     };
 }
 
+/// LSQ residual statistics from beat-grid analysis (M11d.7).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct GridQuality {
+    /// RMS residual in milliseconds.
+    pub rms_ms: f32,
+    /// 95th percentile of |residual| in milliseconds.
+    pub p95_ms: f32,
+    /// Worst single-beat residual in milliseconds.
+    pub max_abs_ms: f32,
+    /// Fraction of beats with a usable ODF peak.
+    pub kept_fraction: f32,
+    /// Signed linear drift of residuals vs time (ms per minute).
+    pub drift_slope_ms_per_min: f32,
+}
+
+impl From<CoreGridQuality> for GridQuality {
+    fn from(q: CoreGridQuality) -> Self {
+        Self {
+            rms_ms: q.rms_ms,
+            p95_ms: q.p95_ms,
+            max_abs_ms: q.max_abs_ms,
+            kept_fraction: q.kept_fraction,
+            drift_slope_ms_per_min: q.drift_slope_ms_per_min,
+        }
+    }
+}
+
 /// Per-track beat grid: BPM, confidence, and per-beat time stamps
 /// in seconds (M10.5p).
 ///
@@ -1946,6 +2142,20 @@ pub struct BeatGrid {
     /// Beats per bar. v0 always reports `4`. Reserved for future
     /// time-signature inference (M11+).
     pub beats_per_bar: u32,
+    /// PRD-BEATS C2 (round 4) — explicit bar-phase scalar.
+    /// `bar_phase ∈ [0, beats_per_bar)` is the index `i` such
+    /// that `beats[i]`, `beats[i + beats_per_bar]`, … are
+    /// downbeats. Mirrors [`dub_bpm::BeatGrid::bar_phase`]; the
+    /// renderer uses it to decide which ticks render as
+    /// full-height yellow downbeat lines vs. short white beat
+    /// ticks. v0 analyzers all stamp `0` (existing semantics
+    /// preserved); the field exists so set-the-1 can rotate
+    /// phase without re-anchoring the grid.
+    pub bar_phase: u32,
+    /// M11d.7 LSQ fit quality. `None` when analysis bailed early.
+    pub quality: Option<GridQuality>,
+    /// M11d.7 kick-band downbeat confidence (`best / second_best`).
+    pub downbeat_confidence: f32,
 }
 
 impl BeatGrid {
@@ -1955,21 +2165,22 @@ impl BeatGrid {
             confidence: 0.0,
             beats: Vec::new(),
             beats_per_bar: 4,
+            bar_phase: 0,
+            quality: None,
+            downbeat_confidence: 0.0,
         }
     }
 
     /// Lift the upstream `dub_bpm::BeatGrid` into the FFI Record.
-    /// Restored in M10.5u alongside the `analyze_beat_grid`
-    /// re-enable in `load_track`. Straight field copy; the only
-    /// non-trivial bit is the `u8 → u32` widening for
-    /// `beats_per_bar` (UniFFI doesn't carry `u8` as a primitive
-    /// across the boundary).
     fn from_core(g: CoreBeatGrid) -> Self {
         Self {
             bpm: g.bpm,
             confidence: g.confidence,
             beats: g.beats,
             beats_per_bar: u32::from(g.beats_per_bar),
+            bar_phase: u32::from(g.bar_phase),
+            quality: g.quality.map(GridQuality::from),
+            downbeat_confidence: g.downbeat_confidence,
         }
     }
 }
@@ -2107,35 +2318,6 @@ fn octave_profile_from_optional_genre(genre: Option<&str>) -> OctaveProfile {
         .unwrap_or(OctaveProfile::Default)
 }
 
-/// Run `dub_bpm::latch_beat_grid_at_downbeat` against `track`,
-/// returning the engine-shape grid or `None` when the analyser
-/// rejects the input (silence, pathological samples). The dub-bpm
-/// helper produces a **uniform** 4/4 grid anchored at
-/// `anchor_secs`, refining the period locally around `bpm` so a
-/// slightly-off auto BPM gets corrected on press-1.
-fn run_downbeat_relatch(
-    track: &Track,
-    bpm: f64,
-    anchor_secs: f64,
-    profile: OctaveProfile,
-) -> Option<BeatGrid> {
-    let core = latch_beat_grid_at_downbeat(
-        track.samples(),
-        track.sample_rate(),
-        track.channels(),
-        bpm,
-        anchor_secs,
-        profile,
-    )
-    .ok()?;
-    let grid = BeatGrid::from_core(core);
-    if grid.confidence <= 0.0 || grid.beats.is_empty() {
-        None
-    } else {
-        Some(grid)
-    }
-}
-
 fn background_analyze_and_install(
     idx: usize,
     track: Arc<Track>,
@@ -2147,9 +2329,48 @@ fn background_analyze_and_install(
 ) {
     let profile = octave_profile_from_optional_genre(genre.as_deref());
     // Stage 1: offline peaks.
+    //
+    // PRD-BEATS §4.5 / C1 round 4 — if the library hands us a
+    // waveform sidecar path (recorded by `analyze_track`'s
+    // best-effort `write_sidecar` pass), read it before doing
+    // anything CPU-bound. A hit replaces the 100–300 ms full
+    // recompute with a ~10 ms file read + deserialise; a miss
+    // (corrupted file, schema mismatch, file deleted out of band)
+    // falls through to the same compute path as the cold-load
+    // case, so the user never sees a worse state than today.
+    let sidecar_path_for_thread = library_grid
+        .as_ref()
+        .and_then(|g| g.waveform_sidecar_path.clone());
     let t_peaks = std::time::Instant::now();
-    let peaks_result =
-        compute_offline_peaks(track.samples(), track.sample_rate(), track.channels());
+    let (peaks_result, peaks_from_cache) = match sidecar_path_for_thread.as_deref() {
+        Some(path) => match dub_peaks::read_sidecar(std::path::Path::new(path)) {
+            Ok(Some(peaks)) => (Ok(peaks), true),
+            Ok(None) => {
+                eprintln!(
+                    "dub-ffi: waveform sidecar miss for deck {idx} at {path}; \
+                     recomputing offline peaks"
+                );
+                (
+                    compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+                    false,
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "dub-ffi: waveform sidecar read failed for deck {idx} at {path}: {e}; \
+                     recomputing offline peaks"
+                );
+                (
+                    compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+                    false,
+                )
+            }
+        },
+        None => (
+            compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+            false,
+        ),
+    };
     let peaks_ms = t_peaks.elapsed().as_millis();
 
     let OfflinePeaks {
@@ -2191,12 +2412,21 @@ fn background_analyze_and_install(
             samples_per_filtered_chunk: u32::try_from(samples_per_filtered_chunk)
                 .unwrap_or(u32::MAX),
             beat_grid: BeatGrid::empty(),
+            grid_locked: library_grid
+                .as_ref()
+                .map(|g| g.grid_locked)
+                .unwrap_or(false),
         }));
         if let Some(a) = peak_generation_seq.get(idx) {
             a.fetch_add(1, Ordering::Release);
         }
     }
-    eprintln!("dub-ffi: peaks deck={idx} installed in {peaks_ms}ms");
+    let peaks_source_label = if peaks_from_cache {
+        "sidecar cache"
+    } else {
+        "computed"
+    };
+    eprintln!("dub-ffi: peaks deck={idx} installed in {peaks_ms}ms ({peaks_source_label})");
 
     // Stage 2: beat grid.
     //
@@ -2223,11 +2453,18 @@ fn background_analyze_and_install(
     // line overlay, and the renderer is already polling the grid
     // each frame.
     let (grid, bpm_ms, source_label): (BeatGrid, u128, &'static str) = if let Some(supplied) =
-        library_grid.as_ref().filter(|grid| grid.source != "auto")
+        library_grid
+            .as_ref()
+            .filter(|grid| grid.source != "auto" || grid.grid_locked)
     {
         let duration_secs = track.samples().len() as f64
             / (f64::from(track.sample_rate()) * f64::from(track.channels()));
-        let grid = synthesise_beat_grid(supplied.bpm, supplied.anchor_secs, duration_secs);
+        let grid = synthesise_beat_grid(
+            supplied.bpm,
+            supplied.anchor_secs,
+            duration_secs,
+            u8::try_from(supplied.bar_phase).unwrap_or(0),
+        );
         (grid, 0, "library")
     } else {
         let t_bpm = std::time::Instant::now();
@@ -2396,7 +2633,7 @@ fn agent_log_beatgrid_install(
 /// * `duration_secs <= 0` → returns the empty grid.
 /// * `bpm` so high that the beat period rounds to 0 → returns
 ///   empty rather than infinite-looping.
-fn synthesise_beat_grid(bpm: f64, anchor_secs: f64, duration_secs: f64) -> BeatGrid {
+fn synthesise_beat_grid(bpm: f64, anchor_secs: f64, duration_secs: f64, bar_phase: u8) -> BeatGrid {
     if !bpm.is_finite() || bpm <= 0.0 || duration_secs <= 0.0 {
         return BeatGrid::empty();
     }
@@ -2404,36 +2641,42 @@ fn synthesise_beat_grid(bpm: f64, anchor_secs: f64, duration_secs: f64) -> BeatG
     if !period.is_finite() || period <= 0.0 {
         return BeatGrid::empty();
     }
-    // Beat 0 is `anchor_secs`. Walk back to the first beat at or
-    // before 0, then forward to the last beat ≤ duration_secs.
-    // Floor-divide guards against a runaway loop if anchor is far
-    // outside the track for some reason.
-    let k_start_f = ((-anchor_secs) / period).ceil();
-    let k_start = if k_start_f.is_finite() {
-        k_start_f as i64
-    } else {
-        0
-    };
-    let mut beats = Vec::with_capacity(((duration_secs / period) as usize).saturating_add(2));
-    let mut k = k_start.saturating_sub(1);
-    loop {
-        let t = anchor_secs + (k as f64) * period;
-        if t > duration_secs {
-            break;
-        }
-        if t >= -period {
-            beats.push(t);
-        }
-        k = match k.checked_add(1) {
-            Some(v) => v,
-            None => break,
-        };
+    if !anchor_secs.is_finite() {
+        return BeatGrid::empty();
     }
+    // `anchor_secs` persisted in SQLite is `beats[0]` from the
+    // analyzer / relatch path (`uniform_beats`). The downbeat is
+    // `beats[bar_phase] = beats[0] + bar_phase × period`. Rebuild
+    // via `uniform_beats` from that downbeat so library reload
+    // round-trips the same beat positions as the in-memory grid
+    // (the forward-only loop here was dropping pre-roll beats and
+    // shifting every line when `bar_phase != 0`).
+    let downbeat_secs = anchor_secs + f64::from(bar_phase) * period;
+    let beats = uniform_beats(bpm, downbeat_secs, duration_secs);
+    if beats.is_empty() {
+        return BeatGrid::empty();
+    }
+    // Recompute phase after `uniform_beats` wrap-back: persisted
+    // `anchor_secs` is `beats[0]` from the analyzer, not the
+    // downbeat time. The downbeat lands at `beats[recomputed]`.
+    let core_view = CoreBeatGrid {
+        bpm,
+        confidence: 1.0,
+        beats: beats.clone(),
+        beats_per_bar: 4,
+        bar_phase: 0,
+        quality: None,
+        downbeat_confidence: 1.0,
+    };
+    let recomputed_phase = bar_phase_from_tap(&core_view, downbeat_secs);
     BeatGrid {
         bpm,
         confidence: 1.0,
         beats,
         beats_per_bar: 4,
+        bar_phase: u32::from(recomputed_phase),
+        quality: None,
+        downbeat_confidence: 1.0,
     }
 }
 
@@ -2729,7 +2972,7 @@ mod tests {
         // M11c.3b 15→16 (install_beat_grid, beat_grid_generation,
         // upsert_user_tap_beatgrid).
         // M11d.5 round 5 16→17 (track_id_for_path reverse lookup).
-        assert_eq!(FFI_VERSION, 18);
+        assert_eq!(FFI_VERSION, 19);
     }
 
     #[test]
@@ -2797,49 +3040,66 @@ mod tests {
 
     #[test]
     fn synthesise_beat_grid_emits_uniform_120bpm_grid() {
-        let grid = synthesise_beat_grid(120.0, 0.0, 10.0);
+        let grid = synthesise_beat_grid(120.0, 0.0, 10.0, 0);
         assert!((grid.bpm - 120.0).abs() < 1e-9);
         assert_eq!(grid.confidence, 1.0);
         assert_eq!(grid.beats_per_bar, 4);
-        // 10 s at 120 BPM = 20 beat periods. The synthesizer emits
-        // every beat in `[-period, duration_secs]` inclusive, so we
-        // get the pre-zero beat at -0.5, then 0.0, 0.5, …, 10.0 →
-        // 22 beats total. The renderer clips out-of-window beats,
-        // but the half-period pre-roll and the exact-end beat keep
-        // the empty-groove paint looking right at either edge.
-        assert_eq!(grid.beats.len(), 22);
-        assert!((grid.beats[0] + 0.5).abs() < 1e-9);
-        assert!((grid.beats[1] - 0.0).abs() < 1e-9);
-        assert!((grid.beats[21] - 10.0).abs() < 1e-9);
+        assert_eq!(grid.bar_phase, 0);
+        // 10 s at 120 BPM = 20 beat periods. Anchor at 0 → beats
+        // at 0.0, 0.5, …, 10.0 = 21 beats. M11d.7b dropped the
+        // pre-zero half-period beat: `beats[0]` equals the anchor
+        // and never goes negative.
+        assert_eq!(grid.beats.len(), 21);
+        assert!((grid.beats[0] - 0.0).abs() < 1e-9);
+        assert!((grid.beats[20] - 10.0).abs() < 1e-9);
         for w in grid.beats.windows(2) {
             assert!((w[1] - w[0] - 0.5).abs() < 1e-9);
         }
     }
 
     #[test]
-    fn synthesise_beat_grid_walks_back_from_positive_anchor() {
-        // 174 BPM (~0.345 s period), anchor at 1.0 s, 3 s duration.
-        // The grid must include at least one beat <= 0 so the
-        // pre-anchor region paints, and stop before duration.
-        let grid = synthesise_beat_grid(174.0, 1.0, 3.0);
+    fn synthesise_beat_grid_starts_at_positive_anchor() {
+        // Persisted `(anchor=1.0, bar_phase=0)` means downbeat at
+        // 1.0 s. `uniform_beats` wraps pre-roll; yellow marker is
+        // `beats[recomputed_bar_phase]`, not `beats[0]`.
+        let grid = synthesise_beat_grid(174.0, 1.0, 3.0, 0);
         let period = 60.0_f64 / 174.0;
-        assert!(grid.beats.first().copied().unwrap() <= 0.0);
+        let downbeat = grid.beats[grid.bar_phase as usize];
+        assert!(
+            (downbeat - 1.0).abs() < 1e-6,
+            "downbeat must land at 1.0 s, got {downbeat}"
+        );
+        assert!(grid.beats[0] < 1.0, "pre-roll beats must exist");
         assert!(grid.beats.last().copied().unwrap() <= 3.0);
         for w in grid.beats.windows(2) {
             assert!((w[1] - w[0] - period).abs() < 1e-9);
         }
     }
 
+    /// Library round-trip: two `(anchor, bar_phase)` encodings of
+    /// the same downbeat must decode to identical beat vectors.
+    #[test]
+    fn synthesise_beat_grid_round_trips_bar_phase_encoding() {
+        let enc_a = synthesise_beat_grid(120.0, 0.5, 4.0, 2);
+        let enc_b = synthesise_beat_grid(120.0, 1.5, 4.0, 0);
+        assert_eq!(enc_a.beats, enc_b.beats);
+        assert_eq!(enc_a.bar_phase, enc_b.bar_phase);
+        let downbeat = enc_a.beats[enc_a.bar_phase as usize];
+        assert!((downbeat - 1.5).abs() < 1e-9);
+    }
+
     #[test]
     fn synthesise_beat_grid_returns_empty_on_degenerate_inputs() {
-        assert!(synthesise_beat_grid(0.0, 0.0, 10.0).beats.is_empty());
-        assert!(synthesise_beat_grid(-120.0, 0.0, 10.0).beats.is_empty());
-        assert!(synthesise_beat_grid(f64::NAN, 0.0, 10.0).beats.is_empty());
-        assert!(synthesise_beat_grid(f64::INFINITY, 0.0, 10.0)
+        assert!(synthesise_beat_grid(0.0, 0.0, 10.0, 0).beats.is_empty());
+        assert!(synthesise_beat_grid(-120.0, 0.0, 10.0, 0).beats.is_empty());
+        assert!(synthesise_beat_grid(f64::NAN, 0.0, 10.0, 0)
             .beats
             .is_empty());
-        assert!(synthesise_beat_grid(120.0, 0.0, 0.0).beats.is_empty());
-        assert!(synthesise_beat_grid(120.0, 0.0, -1.0).beats.is_empty());
+        assert!(synthesise_beat_grid(f64::INFINITY, 0.0, 10.0, 0)
+            .beats
+            .is_empty());
+        assert!(synthesise_beat_grid(120.0, 0.0, 0.0, 0).beats.is_empty());
+        assert!(synthesise_beat_grid(120.0, 0.0, -1.0, 0).beats.is_empty());
     }
 
     #[test]
@@ -2941,6 +3201,7 @@ mod tests {
             samples_per_onset_chunk: 512,
             samples_per_filtered_chunk: 512,
             beat_grid: BeatGrid::empty(),
+            grid_locked: false,
         };
         let peaks: [Option<PeakSource>; 2] = [Some(PeakSource::File(synthetic_file_peaks)), None];
         engine.bump_peak_generation_for_occupied(&peaks);
@@ -3126,11 +3387,24 @@ pub enum LibraryFfiError {
     /// [`LibraryImportSummary::errors`].
     #[error("library import failed: {0}")]
     ImportFailed(String),
+    /// `analyze_track` (or another beatgrid-mutating call) was
+    /// invoked on a track whose grid is locked. PRD-BEATS §3.5
+    /// "lock is absolute" requires explicit unlocking before the
+    /// algorithm may touch the grid. The Apple shell turns this
+    /// into a no-op (the right-click menu item is already greyed
+    /// out for locked tracks; getting this error means the UI
+    /// guard was bypassed somehow). Carries the track UUID for
+    /// log-trace.
+    #[error("track {0} grid is locked; unlock first")]
+    GridLocked(String),
 }
 
 impl From<dub_library::LibraryError> for LibraryFfiError {
     fn from(e: dub_library::LibraryError) -> Self {
-        Self::QueryFailed(e.to_string())
+        match e {
+            dub_library::LibraryError::GridLocked { track_id } => Self::GridLocked(track_id),
+            other => Self::QueryFailed(other.to_string()),
+        }
     }
 }
 
@@ -3223,6 +3497,10 @@ pub struct LibraryTrack {
     pub composer: Option<String>,
     /// Track number from id3 (`TRCK` and equivalents).
     pub track_number: Option<i32>,
+    /// M11d.7: beatgrid frozen against auto re-analysis.
+    pub grid_locked: bool,
+    /// M11d.7: LSQ drift slope when unlocked (ms/min).
+    pub grid_drift_quality: Option<f32>,
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -3353,6 +3631,24 @@ pub struct LibraryBeatGrid {
     /// to re-analyze?" affordance; not consumed by the engine
     /// install path.
     pub captured_at: i64,
+    /// M11d.7: locked grids skip deck-load re-analysis.
+    pub grid_locked: bool,
+    /// M11d.7: LSQ drift slope for the ⚠ indicator (ms/min).
+    pub grid_drift_quality: Option<f32>,
+    /// PRD-BEATS C1 (round 4) — absolute path to the `.wf`
+    /// waveform sidecar that the last `analyze_track` pass wrote.
+    /// When `Some` the engine's `background_analyze_and_install`
+    /// reads it instead of running `compute_offline_peaks`, which
+    /// is what makes the load look "instant" after analysis
+    /// (PRD-BEATS §4.5). `None` for tracks that pre-date the
+    /// sidecar column or that never went through `analyze_track`.
+    pub waveform_sidecar_path: Option<String>,
+    /// PRD-BEATS C2 (round 4) — explicit bar phase persisted
+    /// alongside `(bpm, anchor_secs)`. `bar_phase ∈ [0,
+    /// beats_per_bar)`; the engine plumbs this to
+    /// [`synthesise_beat_grid`] so a load round-trips set-the-1
+    /// edits without re-anchoring the grid.
+    pub bar_phase: u32,
 }
 
 impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
@@ -3362,6 +3658,10 @@ impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
             bpm: g.bpm,
             anchor_secs: g.anchor_secs,
             captured_at: g.captured_at,
+            grid_locked: g.grid_locked,
+            grid_drift_quality: g.grid_drift_quality,
+            waveform_sidecar_path: g.waveform_sidecar_path,
+            bar_phase: u32::from(g.bar_phase),
         }
     }
 }
@@ -3405,6 +3705,8 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             comment: r.comment,
             composer: r.composer,
             track_number: r.track_number,
+            grid_locked: r.grid_locked,
+            grid_drift_quality: r.grid_drift_quality,
         }
     }
 }
@@ -4068,14 +4370,73 @@ impl DubLibrary {
     /// Persist a user tap-to-grid correction (M11c.3b). Deactivates
     /// every other grid row for the track and writes
     /// `source = 'user_tap'` as the sole active grid.
+    ///
+    /// PRD-BEATS C2 (round 4) — `bar_phase` is the explicit
+    /// downbeat-phase scalar that travels alongside `(bpm,
+    /// anchor_secs)`. Apple-side callers read it off the engine's
+    /// current grid (post-tap or post-set-the-1) and forward it
+    /// here so it round-trips through library reload.
     pub fn upsert_user_tap_beatgrid(
         &self,
         track_id: String,
         anchor_secs: f64,
         bpm: f64,
+        bar_phase: u32,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let phase = u8::try_from(bar_phase).unwrap_or(0);
+        self.with_library(|lib| {
+            lib.upsert_user_tap_beatgrid(&track_id, anchor_secs, bpm, phase)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// M11d.7 — lock or unlock a track's beatgrid against auto
+    /// re-analysis.
+    pub fn set_grid_locked(
+        &self,
+        track_id: String,
+        locked: bool,
     ) -> std::result::Result<(), LibraryFfiError> {
         self.with_library(|lib| {
-            lib.upsert_user_tap_beatgrid(&track_id, anchor_secs, bpm)
+            lib.set_grid_locked(&track_id, locked)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// M11d.7 — read the per-track grid lock flag.
+    pub fn is_grid_locked(&self, track_id: String) -> std::result::Result<bool, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.is_grid_locked(&track_id)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// M11d.7 — read stored drift slope (ms/min) for the ⚠ indicator.
+    pub fn grid_drift_quality(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<f32>, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.grid_drift_quality(&track_id)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// M11d.7 — apply auto-lock thresholds after tap/relatch analysis.
+    pub fn apply_grid_quality_lock(
+        &self,
+        track_id: String,
+        quality: GridQuality,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            let core = CoreGridQuality {
+                rms_ms: quality.rms_ms,
+                p95_ms: quality.p95_ms,
+                max_abs_ms: quality.max_abs_ms,
+                kept_fraction: quality.kept_fraction,
+                drift_slope_ms_per_min: quality.drift_slope_ms_per_min,
+            };
+            lib.apply_grid_quality_lock(&track_id, &core)
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }

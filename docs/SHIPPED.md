@@ -77,6 +77,7 @@
 - [M11c.2 — Key detection (Camelot canonical)](#m11c2)
 - [M11c.1 — Lazy auto-beatgrid + analysis lifecycle](#m11c1)
 - [M11d.6 — Full-screen on launch + windowed snap-back](#m11d6)
+- [M11d.7 — Beatgrid precision, auto downbeat, tap-to-grid, drift lock](#m11d7)
 
 ---
 
@@ -3177,6 +3178,19 @@ First-cut testing surfaced the actual headline bug: full-screen "worked" (the wi
 Fix: set `hostingController.sizingOptions = []` and drop the `preferredContentSize` assignment. With no SwiftUI-driven intrinsic size, the standard edge-pinning constraints take over and the SwiftUI hierarchy fills whatever frame AppKit hands it — windowed at 1440x900 (still set by the window's `contentRect` + `setContentSize`, which are window-level concerns independent of the hosting controller), full-screen at every display the user can reach (Retina laptop, 5K Studio Display, 6K Pro Display XDR, ultrawide). The old `preferredContentSize` workaround for the "collapses to toolbar size" symptom is obsolete because `PerformanceView` and the M11d.5 deck-header layout both carry their own `frame(maxWidth: .infinity, maxHeight: .infinity)` and `frame(minWidth: 960, minHeight: 600)` floors, so SwiftUI no longer collapses without external prodding.
 
 Files: `apple/Dub/DubAppDelegate.swift`, `apple/Dub/MainWindowController.swift`.
+
+---
+
+<a id="m11d7"></a>
+## M11d.7 — Beatgrid precision, auto downbeat, tap-to-grid, drift lock
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11d beatgrid calibration
+
+Seven-stage auto pipeline in `dub-bpm`: autocorr → coarse sweep → parabolic vertex → zoom sweep → LSQ refit → kick-band downbeat → kick-only intro/outro tie-breaker for four-on-floor ambiguity. `GridQuality` (RMS / p95 / kept fraction / drift slope) drives auto-lock on analysis.
+
+**Tap-to-grid:** deck-header BPM column replaces the press-1 button. 1–2 taps within 2 s relatch downbeat at the first tap; 3+ taps recompute tempo via `analyze_beat_grid_from_taps` (tap median seeds BPM range, ODF refines). Persists `user_tap` rows; does not implicitly lock.
+
+**Grid lock:** schema v4 adds `tracks.grid_locked` + `tracks.grid_drift_quality`. Locked tracks skip auto re-analysis on reload. Library row context menu Lock/Unlock grid; lock.fill / ⚠ on BPM when drift ≥ 3 ms/min and unlocked. `FFI_VERSION` 19.
 
 ---
 

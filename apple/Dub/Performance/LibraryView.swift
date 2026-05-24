@@ -1124,10 +1124,23 @@ struct LibraryView: View {
                 .foregroundStyle(DubColor.textSecondary)
                 .monospacedDigit()
         case .bpm:
-            Text(formatBpm(track.bpm))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
+            HStack(spacing: 4) {
+                Text(formatBpm(track.bpm))
+                if track.gridLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(DubColor.textSecondary)
+                } else if let drift = track.gridDriftQuality, abs(drift) >= 3 {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                        .help(
+                            "May drift over a long mix · right-click → Lock grid to accept")
+                }
+            }
+            .font(DubFont.body)
+            .foregroundStyle(DubColor.textSecondary)
+            .monospacedDigit()
         case .album:
             Text(track.album ?? "—")
                 .font(DubFont.body)
@@ -1218,19 +1231,44 @@ struct LibraryView: View {
         .contextMenu {
             let targets = analyzeTargets(for: track)
             let count = targets.count
-            Button(count > 1 ? "Analyze Selected (\(count))" : "Analyze") {
+            let label = analyzeMenuLabel(for: track, count: count)
+            Button(label) {
                 Task { @MainActor in
-                    await model.analyzeTracks(targets, forceReanalyze: false)
+                    await model.analyzeTracks(targets)
                 }
             }
-            .disabled(model.analysisBatchTotal > 0)
-            Button(count > 1 ? "Re-analyze Selected (\(count))" : "Re-analyze") {
-                Task { @MainActor in
-                    await model.analyzeTracks(targets, forceReanalyze: true)
+            .disabled(model.analysisBatchTotal > 0 || track.gridLocked)
+            Divider()
+            if track.gridLocked {
+                Button("Unlock grid") {
+                    Task { @MainActor in
+                        await model.setGridLocked(trackId: track.id, locked: false)
+                    }
+                }
+            } else {
+                Button("Lock grid") {
+                    Task { @MainActor in
+                        await model.setGridLocked(trackId: track.id, locked: true)
+                    }
                 }
             }
-            .disabled(model.analysisBatchTotal > 0)
         }
+    }
+
+    /// PRD-BEATS §4.4 single menu entry. Label resolves from the
+    /// right-clicked row's analysis state. Multi-selection uses
+    /// the right-clicked row's state for the verb (Analyze vs
+    /// Re-analyze) and appends the selection count. Locked tracks
+    /// keep the "Re-analyze" verb (the lock toggle below is what
+    /// the user reaches for) and rely on the `.disabled` modifier
+    /// to enforce "lock is absolute" at the UI layer; the Rust
+    /// FFI rejects any call that slips past anyway (gate 8).
+    private func analyzeMenuLabel(for track: LibraryTrack, count: Int) -> String {
+        let verb = track.isAnalyzed ? "Re-analyze" : "Analyze"
+        if count > 1 {
+            return "\(verb) Selected (\(count))"
+        }
+        return verb
     }
 
     private func analyzeTargets(for track: LibraryTrack) -> [String] {
@@ -2097,7 +2135,9 @@ private extension LibraryTrack {
             keyDisagreement: keyDisagreement,
             comment: comment,
             composer: composer,
-            trackNumber: trackNumber)
+            trackNumber: trackNumber,
+            gridLocked: gridLocked,
+            gridDriftQuality: gridDriftQuality)
     }
 }
 

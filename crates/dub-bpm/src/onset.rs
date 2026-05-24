@@ -70,6 +70,9 @@ pub(crate) struct OnsetDetector {
     prev_log_mag: Vec<f32>,
     have_prev: bool,
     odf: Vec<f32>,
+    /// Band-0 (≈30–68 Hz kick fundamental) flux only. Used by the
+    /// M11d.7 downbeat picker without a second FFT pass.
+    kick_odf: Vec<f32>,
 }
 
 impl OnsetDetector {
@@ -81,6 +84,7 @@ impl OnsetDetector {
             prev_log_mag: vec![0.0; half_spectrum],
             have_prev: false,
             odf: Vec::new(),
+            kick_odf: Vec::new(),
         }
     }
 
@@ -93,13 +97,15 @@ impl OnsetDetector {
         let prev = &mut self.prev_log_mag;
         let have_prev = &mut self.have_prev;
         let odf = &mut self.odf;
+        let kick_odf = &mut self.kick_odf;
 
         self.spectral.process(block, |compressed, bands| {
             // For each band: `Σ_b max(0, compressed[b] - prev[b])`,
             // averaged over the band's bin count. Equal-weighted sum
             // across bands gives the ODF sample.
             let mut flux = 0.0f32;
-            for &(lo, hi) in bands.iter() {
+            let mut kick_flux = 0.0f32;
+            for (band_idx, &(lo, hi)) in bands.iter().enumerate() {
                 let mut band_sum = 0.0f32;
                 for b in lo..hi {
                     if *have_prev {
@@ -113,16 +119,22 @@ impl OnsetDetector {
                 if *have_prev {
                     #[allow(clippy::cast_precision_loss)]
                     let bin_count = (hi - lo) as f32;
-                    flux += band_sum / bin_count;
+                    let band_avg = band_sum / bin_count;
+                    flux += band_avg;
+                    if band_idx == 0 {
+                        kick_flux = band_avg;
+                    }
                 }
             }
 
             if *have_prev {
                 odf.push(flux);
+                kick_odf.push(kick_flux);
             } else {
                 // First frame has nothing to diff against → emit 0 so
                 // the ODF index lines up with hop boundaries.
                 odf.push(0.0);
+                kick_odf.push(0.0);
                 *have_prev = true;
             }
         });
@@ -133,12 +145,9 @@ impl OnsetDetector {
         &self.odf
     }
 
-    /// Consume the detector and return its accumulated ODF by
-    /// move. Used by the offline beat-grid path
-    /// (`analyze_bpm_with_range_and_odf`) to avoid cloning what
-    /// can be ~50 k f32 samples on a 5-minute track.
-    pub(crate) fn into_odf(self) -> Vec<f32> {
-        self.odf
+    /// Consume the detector and return broadband + kick ODFs.
+    pub(crate) fn into_odfs(self) -> (Vec<f32>, Vec<f32>) {
+        (self.odf, self.kick_odf)
     }
 
     /// Clear all state. Same `OnsetDetector` instance can then analyze a
@@ -151,6 +160,7 @@ impl OnsetDetector {
         }
         self.have_prev = false;
         self.odf.clear();
+        self.kick_odf.clear();
     }
 }
 

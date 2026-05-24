@@ -182,13 +182,25 @@ struct DeckState: Equatable {
     var autoGridCaptured: Bool = false
     /// `"auto"`, `"user_tap"`, import source, or `"pending_auto"`.
     var beatGridLoadSource: String? = nil
-    /// Count of manual nudge actions this session (phase / BPM /
-    /// downbeat).
+    /// Count of manual nudge actions this session (phase / BPM / tap).
     var manualGridEditCount: Int = 0
 
-    /// M11d.6 downbeat calibration — `true` after the user marks
-    /// beat 1 at the playhead this session. Cleared on track load.
-    var downbeatMarked: Bool = false
+    /// M11d.7 — open BPM tap window count for deck-header feedback.
+    var tapGridCount: Int = 0
+
+    /// PRD-BEATS §4.2 round 3 + gate 12 — rolling BPM preview while
+    /// a tap session is open. `nil` when no session is open, when
+    /// the session has fewer than 3 taps, or when the running
+    /// median tap interval implies a BPM outside `[40, 240]` (the
+    /// same bound the Rust tap-tempo path uses). Driven by the
+    /// `TapToGridController.onRollingBpmChanged` callback; cleared
+    /// on commit (the deck's authoritative BPM lands on the next
+    /// poll tick) and on session cancel.
+    var tapRollingBpm: Double? = nil
+
+    /// M11d.7 — stamped from library row at load time.
+    var gridLocked: Bool = false
+    var gridDriftQuality: Float? = nil
 
     /// M10.6c. `true` while the engine is in Panic-Play (PRD
     /// §6.1.2): the deck is decoupled from its timecode input and
@@ -292,6 +304,90 @@ final class WaveformAppModel: ObservableObject {
     /// and import progress survive transient view churn (sidebar
     /// switches, window resize, etc.).
     let library: DubLibrary = DubLibrary()
+
+    /// M11d.7 per-deck tap-to-grid controllers.
+    private let tapToGridA = TapToGridController()
+    private let tapToGridB = TapToGridController()
+
+    private func tapToGrid(for side: DeckSide) -> TapToGridController {
+        side == .a ? tapToGridA : tapToGridB
+    }
+
+    private func wireTapToGridControllers() {
+        tapToGridA.onTapCountChanged = { [weak self] count in
+            guard let self else { return }
+            var deck = self.deckA
+            deck.tapGridCount = count
+            self.deckA = deck
+        }
+        tapToGridA.onCommit = { [weak self] taps in
+            self?.commitTapGrid(side: .a, playheadTimes: taps)
+        }
+        tapToGridA.onRollingBpmChanged = { [weak self] bpm in
+            guard let self else { return }
+            var deck = self.deckA
+            deck.tapRollingBpm = bpm
+            self.deckA = deck
+        }
+        tapToGridB.onTapCountChanged = { [weak self] count in
+            guard let self else { return }
+            var deck = self.deckB
+            deck.tapGridCount = count
+            self.deckB = deck
+        }
+        tapToGridB.onCommit = { [weak self] taps in
+            self?.commitTapGrid(side: .b, playheadTimes: taps)
+        }
+        tapToGridB.onRollingBpmChanged = { [weak self] bpm in
+            guard let self else { return }
+            var deck = self.deckB
+            deck.tapRollingBpm = bpm
+            self.deckB = deck
+        }
+    }
+
+    /// PRD-BEATS §4.2 + §7 gates 8 & 9. The deck-header BPM column
+    /// is the only entry point for tap-tempo. We gate the tap here
+    /// rather than inside `TapToGridController` so the controller
+    /// stays a pure session collector: locked-grid rejection (§3.5
+    /// "lock is absolute") and transport-playing precondition for
+    /// the 3+ tap dispatch (§4.2 "no audible reference") live in
+    /// the UI layer where the deck state is authoritative.
+    func handleTapForGrid(_ side: DeckSide) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack, deck.bpm != nil else { return }
+        if deck.gridLocked {
+            return
+        }
+        let tapController = tapToGrid(for: side)
+        let isPlaying = deck.isPlaying
+        let playhead = engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs
+        // Paused decks dispatch a single set-the-1 immediately
+        // through a dedicated path that drops any stale buffered
+        // session first. PRD-BEATS §4.2 + gate 9 already rejects
+        // the 3+ tap upgrade on paused decks (the user can't hear
+        // the track), so the 1.5 s idle window adds zero value;
+        // worse, when the user pauses inside a still-fresh playing
+        // tap window the buffered playing-tap playhead would leak
+        // into the paused commit and the yellow downbeat would
+        // land at the prior tap's position instead of the user's
+        // current click. `commitSingleTap` cancels that buffer
+        // before dispatching the fresh playhead, and the
+        // `persistTapGrid` `seekGeneration` bump forces a paused
+        // MTKView redraw on the same vsync so the marker snaps
+        // into place without requiring Play.
+        if !isPlaying {
+            tapController.commitSingleTap(playheadSecs: playhead)
+            return
+        }
+        // Playing-deck tap session: 1.5 s idle window so the user
+        // can extend a 1-tap set-the-1 into a 3+ tap constrained
+        // re-analysis without us committing too early. Locked-grid
+        // rejection (§3.5) and the upgrade precondition
+        // (§4.2 / gate 9) already passed above.
+        tapController.tap(playheadSecs: playhead)
+    }
 
     /// `true` once `library.openDefault()` has succeeded. Drives
     /// the browser's "Open library" affordance — until this flips,
@@ -480,6 +576,7 @@ final class WaveformAppModel: ObservableObject {
         self.engine = DubEngine()
         self.allowLoadIntoRunningDeckInPerformance =
             UserDefaults.standard.bool(forKey: Self.kAllowLoadIntoRunningDeck)
+        wireTapToGridControllers()
         applyAutoDetect()
         // Only enumerate input devices when we actually need them
         // (Timecode mode). Prep mode never touches the input HAL,
@@ -884,7 +981,8 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridCaptured = false
         starting.beatGridLoadSource = preloadedGrid?.source ?? "pending_auto"
         starting.manualGridEditCount = 0
-        starting.downbeatMarked = false
+        starting.tapGridCount = 0
+        tapToGrid(for: side).cancel()
         setState(starting, for: side)
 
         let deckIdx = side.ffiDeckIdx
@@ -944,15 +1042,33 @@ final class WaveformAppModel: ObservableObject {
                 next.trackTitle = info.title.isEmpty ? nil : info.title
                 next.trackArtist = info.artist.isEmpty ? nil : info.artist
             }
-            // M10.5v — BPM analysis is no longer awaited inline.
-            // The engine returns from `load_track` the instant the
-            // audio thread can play (decode + Arc<Track> install,
-            // ~50 ms total) and spawns peaks + `analyze_beat_grid`
-            // on a detached worker thread.  The deck-header BPM
-            // column is populated by `readDeckState` on the next
-            // 30 Hz poll tick(s) once the grid lands.
-            next.bpm = nil
-            next.bpmConfidence = 0
+            // PRD-BEATS §4.5 instant-display contract: whenever
+            // the library has ANY analyzed grid for this track
+            // (auto, imported, or user_tap), publish the library
+            // row's BPM the same render tick the load handshake
+            // resolves. There is no "wait for the engine to re-
+            // confirm" branch any more. The engine's later poll
+            // tick reports the same number (the engine's grid is
+            // built from the library row via `synthesise_beat_grid`
+            // for non-auto / locked rows; for auto / unlocked rows
+            // the engine re-runs analysis but the BPM should not
+            // change for a deterministic track + algorithm pair,
+            // and the previous "show — until re-analysis lands"
+            // branch was the source of the user's "BPM doesn't
+            // appear immediately" complaint).
+            //
+            // Library-row → deck-header parity is gate 14 in
+            // PRD-BEATS §7. The library row publisher and the
+            // engine poll publisher must agree the same render
+            // frame the load completes; this branch is the
+            // single source of truth at load time.
+            if let supplied = preloadedGrid {
+                next.bpm = supplied.bpm
+                next.bpmConfidence = 1.0
+            } else {
+                next.bpm = nil
+                next.bpmConfidence = 0
+            }
             setState(next, for: side)
             recomputeMaster()
             // M11d.2: record a play_history row when the source
@@ -1453,6 +1569,8 @@ final class WaveformAppModel: ObservableObject {
                let snap = selectedLibraryTrack, snap.id == trackId
             {
                 stamped.key = snap.key
+                stamped.gridLocked = snap.gridLocked
+                stamped.gridDriftQuality = snap.gridDriftQuality
             }
             setState(stamped, for: side)
 
@@ -1540,11 +1658,14 @@ final class WaveformAppModel: ObservableObject {
                     self.publishLibraryRowAnalysisUpdate(
                         trackId: trackId, outcome: outcome)
                 case .failure(let err):
-                    // Per-track failure is surfaced silently to
-                    // the error toast; the next Space-load
-                    // retries (the track stays unanalyzed in
-                    // analysis_cache because analyze_track only
-                    // stamps on success).
+                    // A fresh track shouldn't be locked, but a
+                    // racing manual lock toggle between the
+                    // `isTrackAnalyzed` check and the actual
+                    // analyze call could land us here. Silent
+                    // skip per PRD-BEATS §13 (no error toast).
+                    if case LibraryFfiError.GridLocked = err {
+                        return
+                    }
                     self.surfaceError(
                         "Analysis failed for track: \(err.localizedDescription)")
                 }
@@ -1552,14 +1673,60 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// M11d.7 — toggle grid lock from the library context menu.
+    ///
+    /// PRD-BEATS §3.5 + §7 gate 8 (defense in depth): when the
+    /// flipped track is currently loaded on either deck, mirror
+    /// the new lock state into the engine's per-deck `grid_locked`
+    /// so the engine's `install_beat_grid_from_taps` /
+    /// `relatch_beat_grid_at_downbeat` independently reject the
+    /// next call. Without this, a user could toggle the lock from
+    /// the library, then tap the BPM column before the next
+    /// `loadTrack` runs — the Swift gate would still see the new
+    /// lock (it reads `DeckState.gridLocked`, which we update
+    /// below), but the Rust engine wouldn't, and a raced tap
+    /// would slip past defense in depth.
+    func setGridLocked(trackId: String, locked: Bool) async {
+        guard libraryIsOpen else { return }
+        do {
+            try library.setGridLocked(trackId: trackId, locked: locked)
+            analysisGeneration &+= 1
+        } catch {
+            surfaceError("Grid lock failed: \(error.localizedDescription)")
+            return
+        }
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            guard deck.loadedLibraryTrackId == trackId else { continue }
+            deck.gridLocked = locked
+            setState(deck, for: side)
+            if isRunning {
+                _ = try? engine.setDeckGridLocked(
+                    deckIdx: side.ffiDeckIdx, locked: locked)
+            }
+        }
+    }
+
     /// M11c.1 — batch-analyze entry point. Drives the LibraryView
-    /// right-click context menu's "Analyze Selected" /
-    /// "Re-analyze Selected" actions. Iterates serially so each
-    /// analysis releases the library lock before the next acquires
-    /// it (other UI queries can interleave). Skips tracks already
-    /// analyzed unless `forceReanalyze` is `true`. Updates the
+    /// right-click context menu's single Analyze / Re-analyze
+    /// action (collapsed in round 3; see §4.4). Iterates serially
+    /// so each analysis releases the library lock before the next
+    /// acquires it (other UI queries can interleave). Updates the
     /// footer progress counters as it goes.
-    func analyzeTracks(_ trackIds: [String], forceReanalyze: Bool) async {
+    ///
+    /// PRD-BEATS §3.5 + §4.4: lock-is-absolute. Re-analyze is the
+    /// only entry point now (the `forceReanalyze` parameter was
+    /// removed when the Rust `analyze_track(force: bool)` signature
+    /// collapsed in round 3). The batch always runs analysis on
+    /// every selected track; the Rust side returns
+    /// `LibraryFfiError.GridLocked` for any locked track and we
+    /// surface that as a silent skip (per §13: no error toast).
+    /// The right-click menu greys out the menu item for locked
+    /// tracks so the user never reaches a state where they ask
+    /// for re-analyze on a locked grid and get a refusal — this
+    /// fallback exists only for batches where a track was locked
+    /// concurrently between menu and dispatch.
+    func analyzeTracks(_ trackIds: [String]) async {
         guard libraryIsOpen, !trackIds.isEmpty else { return }
         let library = self.library
         analysisBatchTotal = UInt32(trackIds.count)
@@ -1572,12 +1739,6 @@ final class WaveformAppModel: ObservableObject {
             if analyzingTrackIds.contains(trackId) {
                 analysisBatchCompleted &+= 1
                 continue
-            }
-            if !forceReanalyze {
-                if let analyzed = try? library.isTrackAnalyzed(trackId: trackId), analyzed {
-                    analysisBatchCompleted &+= 1
-                    continue
-                }
             }
             analyzingTrackIds.insert(trackId)
             analysisInFlightCount &+= 1
@@ -1593,24 +1754,13 @@ final class WaveformAppModel: ObservableObject {
             analyzingTrackIds.remove(trackId)
             if analysisInFlightCount > 0 { analysisInFlightCount -= 1 }
             analysisBatchCompleted &+= 1
-            // Bump the generation *per track* (not once at the
-            // end of the batch as the pre-fix code did) so the
-            // LibraryView's BPM / key badges land row by row as
-            // the batch runs. Users analyzing a 200 track folder
-            // need to see progress; a single end-of-batch refresh
-            // makes the table look frozen.
-            //
-            // Mirror `ensureTrackAnalyzed`'s pattern: only bump on
-            // success. A failed `analyze_track` writes nothing to
-            // the library (the Rust side stamps `analysis_cache`
-            // only on success), so a failure-triggered refresh
-            // would just repaint identical rows. On a 200-track
-            // batch where every entry fails, that's 200 wasted
-            // re-queries against the SQLite catalog.
             switch result {
             case .success(let outcome):
                 publishLibraryRowAnalysisUpdate(trackId: trackId, outcome: outcome)
             case .failure(let err):
+                if case LibraryFfiError.GridLocked = err {
+                    continue
+                }
                 surfaceError("Analysis failed for track: \(err.localizedDescription)")
             }
         }
@@ -2456,6 +2606,9 @@ final class WaveformAppModel: ObservableObject {
             return
         }
 
+        let postInstallGrid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
+        let installedBarPhase = postInstallGrid.barPhase
+
         if libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
             Task.detached(priority: .background) { [weak self] in
@@ -2464,7 +2617,8 @@ final class WaveformAppModel: ObservableObject {
                     try library.upsertUserTapBeatgrid(
                         trackId: trackId,
                         anchorSecs: anchor,
-                        bpm: newBpm)
+                        bpm: newBpm,
+                        barPhase: installedBarPhase)
                     persistError = nil
                 } catch {
                     persistError = error.localizedDescription
@@ -2562,59 +2716,159 @@ final class WaveformAppModel: ObservableObject {
             delta: deltaBpm)
     }
 
-    /// M11d.6 — mark beat 1 (downbeat) at the current playhead and
-    /// re-latch the full track grid from local onsets.
-    func markDownbeat(_ side: DeckSide) {
-        guard isRunning else { return }
+    /// M11d.7 — commit a tap-to-grid window (downbeat or tempo).
+    ///
+    /// PRD-BEATS §4.2 round 3 + gate 8: the Swift gate inside
+    /// `handleTapForGrid` already rejects taps on locked decks
+    /// before they reach the controller. This commit hook is a
+    /// defense-in-depth backstop for the case where the lock
+    /// flipped during an open session (so the buffered taps land
+    /// on a now-locked deck). In that case the engine returns
+    /// `EngineError.GridLocked`; we treat it as a silent no-op
+    /// per PRD-BEATS §13 (no error toast).
+    func commitTapGrid(side: DeckSide, playheadTimes: [Double]) {
+        guard isRunning, !playheadTimes.isEmpty else { return }
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
-        let playhead = engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs
-        deck.downbeatMarked = true
-
-        BeatgridCalibrationLog.logDownbeatMark(
-            side: "\(side)",
-            trackId: deck.loadedLibraryTrackId,
-            path: deck.sourceURL?.path,
-            title: deck.trackTitle ?? deck.displayName,
-            playheadSecs: playhead,
-            autoBpm: deck.autoGridBpm,
-            autoAnchorSecs: deck.autoGridAnchorSecs)
-
-        setState(deck, for: side)
+        let genre = selectedLibraryTrack?.genre
+        // PRD-BEATS §4.1: 1–2 tap "set the 1" re-anchors the grid
+        // at the snapped kick via `latch_beat_grid_at_downbeat`
+        // (Rust `set_bar_phase`). Trust the user's tap time
+        // verbatim — the ODF snap inside the latch absorbs small
+        // perceptual offset from the audio itself.
+        let downbeat = playheadTimes[0]
 
         do {
-            try engine.relatchBeatGridAtDownbeat(
-                deckIdx: side.ffiDeckIdx,
-                downbeatSecs: playhead)
+            if playheadTimes.count >= 3 {
+                try engine.installBeatGridFromTaps(
+                    deckIdx: side.ffiDeckIdx,
+                    tapTimes: playheadTimes,
+                    genre: genre)
+            } else {
+                try engine.setBarPhase(
+                    deckIdx: side.ffiDeckIdx,
+                    tapSecs: downbeat,
+                    genre: genre)
+            }
+        } catch EngineError.GridLocked {
+            return
         } catch let error as EngineError {
             surfaceError(describe(error))
             return
         } catch {
-            surfaceError("Downbeat relatch failed: \(error.localizedDescription)")
+            surfaceError("Tap-to-grid failed: \(error.localizedDescription)")
             return
         }
 
         deck = state(for: side)
         let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-        BeatgridCalibrationLog.logDownbeatRelatched(
-            side: "\(side)",
-            trackId: deck.loadedLibraryTrackId,
-            path: deck.sourceURL?.path,
-            title: deck.trackTitle ?? deck.displayName,
-            downbeatSecs: playhead,
-            resultBpm: grid.bpm,
-            resultAnchorSecs: grid.beats.first ?? playhead,
-            autoBpm: deck.autoGridBpm,
-            autoAnchorSecs: deck.autoGridAnchorSecs,
-            durationSecs: deck.durationSecs)
+        guard grid.confidence > 0, grid.bpm > 0 else { return }
 
-        persistNudgedGrid(
+        if playheadTimes.count >= 3 {
+            BeatgridCalibrationLog.logTapTempoRecalc(
+                side: "\(side)",
+                trackId: deck.loadedLibraryTrackId,
+                path: deck.sourceURL?.path,
+                title: deck.trackTitle ?? deck.displayName,
+                tapTimes: playheadTimes,
+                autoBpm: deck.autoGridBpm,
+                autoAnchorSecs: deck.autoGridAnchorSecs,
+                resultBpm: grid.bpm,
+                resultAnchorSecs: grid.beats.first ?? downbeat,
+                durationSecs: deck.durationSecs)
+        } else {
+            BeatgridCalibrationLog.logTapDownbeat(
+                side: "\(side)",
+                trackId: deck.loadedLibraryTrackId,
+                path: deck.sourceURL?.path,
+                title: deck.trackTitle ?? deck.displayName,
+                downbeatSecs: downbeat,
+                tapCount: playheadTimes.count,
+                autoBpm: deck.autoGridBpm,
+                autoAnchorSecs: deck.autoGridAnchorSecs,
+                resultBpm: grid.bpm,
+                resultAnchorSecs: grid.beats.first ?? downbeat)
+        }
+
+        persistTapGrid(
             side: side,
             deck: &deck,
-            action: "downbeat_relatch",
-            tier: .regular,
-            delta: 0)
+            grid: grid,
+            playheadTimes: playheadTimes)
+    }
+
+    private func persistTapGrid(
+        side: DeckSide,
+        deck: inout DeckState,
+        grid: BeatGrid,
+        playheadTimes: [Double]
+    ) {
+        guard let anchor = grid.beats.first else { return }
+        deck.manualGridEditCount += 1
+        deck.tapGridCount = 0
+        deck.bpm = grid.bpm
+        deck.bpmConfidence = Double(grid.confidence)
+        // Paused decks render on-demand (`WaveformView.continuously
+        // Rendering = false`), so `WaveformRenderer.refreshBeatGrid
+        // IfNeeded` only runs when `MTKView.setNeedsDisplay` fires.
+        // SwiftUI invokes that via `updateNSView` whenever
+        // `seekGeneration` or `peaksGeneration` change. Without
+        // bumping `seekGeneration` here the Rust engine's
+        // `bar_phase` rotation lands correctly but the user has
+        // to hit Play before the yellow downbeat marker moves —
+        // exactly the user-reported "i need to play the deck
+        // before the grid change shows" bug. Identical fix to the
+        // M11d.6 `persistNudgedGrid` defense; the playing-deck
+        // path is unaffected because CVDisplayLink redraws
+        // continuously regardless of this counter.
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
+
+        guard libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
+        let library = self.library
+        let quality = grid.quality
+        let barPhase = grid.barPhase
+        Task.detached(priority: .background) { [weak self] in
+            let persistError: String?
+            do {
+                try library.upsertUserTapBeatgrid(
+                    trackId: trackId,
+                    anchorSecs: anchor,
+                    bpm: grid.bpm,
+                    barPhase: barPhase)
+                if let quality {
+                    try library.applyGridQualityLock(
+                        trackId: trackId,
+                        quality: quality)
+                }
+                persistError = nil
+            } catch {
+                persistError = error.localizedDescription
+            }
+            await MainActor.run {
+                guard let self else { return }
+                if let persistError {
+                    self.surfaceError(
+                        "Saved grid on deck but library write failed: \(persistError)")
+                } else {
+                    self.analysisGeneration &+= 1
+                    if let q = quality {
+                        var d = self.state(for: side)
+                        d.gridDriftQuality = q.driftSlopeMsPerMin
+                        d.gridLocked = q.rmsMs < 8 && q.p95Ms < 25
+                            && q.maxAbsMs < 50 && q.keptFraction > 0.75
+                            && abs(q.driftSlopeMsPerMin) < 3
+                        self.setState(d, for: side)
+                    }
+                    self.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+                        trackId: trackId,
+                        bpm: grid.bpm,
+                        key: nil,
+                        isAnalyzed: true)
+                }
+            }
+        }
     }
 
     /// Write a finalized calibration record when unloading a track
@@ -2686,6 +2940,7 @@ final class WaveformAppModel: ObservableObject {
         // continuously via `CVDisplayLink`.
         deck.seekGeneration &+= 1
 
+        let nudgedBarPhase = grid.barPhase
         if libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
             Task.detached(priority: .background) { [weak self] in
@@ -2694,7 +2949,8 @@ final class WaveformAppModel: ObservableObject {
                     try library.upsertUserTapBeatgrid(
                         trackId: trackId,
                         anchorSecs: newAnchor,
-                        bpm: newBpm)
+                        bpm: newBpm,
+                        barPhase: nudgedBarPhase)
                     persistError = nil
                 } catch {
                     persistError = error.localizedDescription
@@ -2734,6 +2990,7 @@ final class WaveformAppModel: ObservableObject {
         case .EngineNotRunning:     return "Engine isn't running — Start it from Preferences (⌘,)."
         case .NoTrackLoaded:        return "No track loaded on that deck."
         case .InvalidBeatGridParams: return "Invalid beat grid — check BPM and anchor."
+        case .GridLocked:           return "Grid is locked — unlock from the library row to edit."
         }
     }
 }

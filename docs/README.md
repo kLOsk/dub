@@ -7,6 +7,10 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 
 - `PRD.md` is the product source of truth: scope, non-goals, milestone plan,
   acceptance criteria, and user-facing behavior.
+- `PRD-BEATS.md` is the sub-spec for tempo, beat grid, downbeat, tap-to-grid,
+  and the waveform overlay contract. Replaces PRD §8.3.1 and is binding for
+  any code under `crates/dub-bpm/`, the tap path in `crates/dub-ffi/`, and
+  the grid renderer in `apple/Dub/Performance/Waveform/`.
 - `LIBRARY-SCHEMA.md` is the public SQLite schema contract. Load it only for
   library, schema, migration, or FFI work.
 - `LICENSE-DEPENDENCIES.md` is the source of truth for dependency licenses and
@@ -24,6 +28,7 @@ when the Markdown diverges.
 | --- | --- |
 | `html/index.html` | Project landing + non-negotiables + doc routing card |
 | `html/architecture.html` | `ARCHITECTURE.md` (visual crate graph, RT-safety layers, messaging) |
+| `html/beats.html` | `PRD-BEATS.md` (SVG diagrams for grid anatomy, set-the-1, tap tempo, drift, industry comparison) |
 | `html/roadmap.html` | `PRD.md` §12 + `SHIPPED.md` TOC (milestone timeline) |
 | `html/schema.html` | `LIBRARY-SCHEMA.md` (interactive ER diagram + table reference) |
 | `html/backlog.html` | `UI-BACKLOG.md` (kanban with filter chips) |
@@ -38,7 +43,7 @@ when the Markdown diverges.
 | Library DB, migrations, FTS, analysis cache | `LIBRARY-SCHEMA.md` |
 | Serato/Traktor/rekordbox/iTunes import quirks | `LIBRARY-FORMATS.md` |
 | SwiftUI/AppKit UI polish backlog | `UI-BACKLOG.md` |
-| Beat-grid BPM octave / tap-to-grid work | `UI-BACKLOG.md` B-11, U-19; PRD §8.3.1 |
+| Beat-grid BPM octave / tap-to-grid / downbeat / waveform-overlay work | `PRD-BEATS.md` (source of truth); `UI-BACKLOG.md` B-11, U-19 |
 | License review, release acknowledgements | `LICENSE-DEPENDENCIES.md` |
 
 ## Context Budget Rules

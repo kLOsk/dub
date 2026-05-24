@@ -162,6 +162,20 @@ fn analyze_bpm_with_range_profile_and_odf(
     range: BpmRange,
     profile: OctaveProfile,
 ) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
+    let (estimate, odf, _) =
+        analyze_bpm_with_range_profile_and_odfs(samples, sample_rate, channels, range, profile)?;
+    Ok((estimate, odf))
+}
+
+/// Like [`analyze_bpm_with_range_profile_and_odf`] but also returns
+/// the kick-band ODF for M11d.7 downbeat detection.
+pub(crate) fn analyze_bpm_with_range_profile_and_odfs(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    range: BpmRange,
+    profile: OctaveProfile,
+) -> Result<(BpmEstimate, Vec<f32>, Vec<f32>), AnalysisError> {
     let (estimate, detector) = analyze_bpm_with_range_profile_into_detector(
         samples,
         sample_rate,
@@ -169,7 +183,8 @@ fn analyze_bpm_with_range_profile_and_odf(
         range,
         profile,
     )?;
-    Ok((estimate, detector.into_odf()))
+    let (odf, kick_odf) = detector.into_odfs();
+    Ok((estimate, odf, kick_odf))
 }
 
 fn analyze_bpm_with_range_profile_into_detector(

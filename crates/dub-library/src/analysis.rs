@@ -96,6 +96,29 @@ pub struct ActiveBeatgrid {
     pub anchor_secs: f64,
     /// Unix seconds (UTC) at which the row was upserted.
     pub captured_at: i64,
+    /// M11d.7: per-track lock from `tracks.grid_locked`.
+    pub grid_locked: bool,
+    /// M11d.7: drift slope (ms/min) from `tracks.grid_drift_quality`.
+    pub grid_drift_quality: Option<f32>,
+    /// PRD-BEATS §4.5 / C1 round 4 — absolute path to the
+    /// `.wf` waveform sidecar for this track's fingerprint, if the
+    /// last [`Self::analyze_track`] pass managed to render and
+    /// persist one. `None` when no sidecar has been written yet
+    /// (cold cache) or the sidecar row predates the C1 column.
+    /// The engine consults this path in
+    /// `background_analyze_and_install` and short-circuits the
+    /// ~100–300 ms `compute_offline_peaks` pass on a hit, which is
+    /// the "instant waveform after analyze" contract.
+    pub waveform_sidecar_path: Option<String>,
+    /// PRD-BEATS C2 (round 4) — explicit bar-phase scalar
+    /// persisted alongside `(bpm, anchor_secs)`. `bar_phase ∈
+    /// [0, beats_per_bar)` is the index `i` such that
+    /// `beats[i]`, `beats[i + beats_per_bar]`, … are downbeats.
+    /// All v1 rows store `0`; user set-the-1 edits via
+    /// [`crate::Library::upsert_user_tap_beatgrid`] +
+    /// `DubEngine::set_bar_phase` rotate this scalar without
+    /// touching `bpm` or `anchor_secs`.
+    pub bar_phase: u8,
 }
 
 /// Outcome of a single [`analyze_track`] call. Carries both the
@@ -206,6 +229,22 @@ impl Library {
     /// of the decode + BPM + key passes the user already paid for
     /// by loading the deck.
     pub fn analyze_track(&self, track_id: &str) -> Result<AnalysisOutcome> {
+        // PRD-BEATS §3.5 "lock is absolute": if the grid is locked
+        // we refuse the whole analysis pass rather than skipping
+        // just the beat-grid step (the previous `force` parameter
+        // dropped the lock and rebuilt the grid; round 3 removes
+        // that escape hatch). Locking is a user contract, not a
+        // performance gate, so we surface the refusal as
+        // `LibraryError::GridLocked` and let the Apple shell turn
+        // it into a no-op (the menu item that would call us is
+        // already greyed out when the grid is locked, so seeing
+        // this error in practice means a race or a tool calling
+        // us directly).
+        if self.is_grid_locked(track_id)? {
+            return Err(LibraryError::GridLocked {
+                track_id: track_id.to_string(),
+            });
+        }
         let (existing_fingerprint_id, file_path) = self.track_analysis_keys(track_id)?;
         let track =
             dub_io::Track::load_from_path(&file_path).map_err(|e| LibraryError::DecodeFailed {
@@ -265,7 +304,24 @@ impl Library {
             }
         };
 
-        // ---- Beat grid (M11c.1) ----------------------------------
+        // ---- Beat grid (M11c.1, contract M11d.7 round 3) --------
+        // PRD-BEATS §3.5 lock-is-absolute already gated us above:
+        // by the time we get here `grid_locked == false` and the
+        // user has explicitly asked for analysis. Any prior
+        // `user_tap` row is demoted unconditionally — the new
+        // auto run replaces it. This is the "re-analyze is a
+        // pure reset" contract from PRD-BEATS §4 (user actions
+        // table, "Re-analyze" row) and §4.6 idempotence: we never
+        // carry tap-derived BPM forward into the next auto pass.
+        let mut outcome = AnalysisOutcome::EMPTY;
+        let demoted = self.deactivate_user_tap_beatgrid(track_id)?;
+        if demoted > 0 {
+            eprintln!(
+                "dub-library: reanalyze demoted {demoted} active user_tap \
+                 row(s) on unlocked track {track_id} — auto grid will \
+                 claim is_active=1"
+            );
+        }
         let profile = self
             .track_id3_genre(track_id)?
             .as_deref()
@@ -283,17 +339,25 @@ impl Library {
             reason: format!("beat-grid analysis failed: {e}"),
         })?;
 
-        let mut outcome = AnalysisOutcome::EMPTY;
         if grid.confidence > 0.0 {
             let anchor_secs = grid.beats.first().copied().unwrap_or(0.0);
             let other_grid_active = self.has_non_auto_active_grid(track_id)?;
             let grid_auto_is_active = !other_grid_active;
-            self.upsert_auto_beatgrid(track_id, anchor_secs, grid.bpm, grid_auto_is_active)?;
+            self.upsert_auto_beatgrid(
+                track_id,
+                anchor_secs,
+                grid.bpm,
+                grid.bar_phase,
+                grid_auto_is_active,
+            )?;
             outcome.bpm = grid.bpm;
             outcome.anchor_secs = anchor_secs;
             outcome.bpm_confidence = grid.confidence;
             outcome.grid_auto_is_active = grid_auto_is_active;
             outcome.wrote_grid = true;
+            if let Some(quality) = grid.quality.as_ref() {
+                self.apply_grid_quality_lock(track_id, quality)?;
+            }
         }
 
         // ---- Key (M11c.2) ----------------------------------------
@@ -317,19 +381,83 @@ impl Library {
             outcome.wrote_key = true;
         }
 
+        // ---- Waveform sidecar (PRD-BEATS C1, round 4) ------------
+        // Pre-render the broadband / band / onset / filtered peak
+        // streams the engine will need when a deck loads this
+        // track, and persist them to
+        // `~/Library/Caches/Dub/waveforms/{fingerprint_id}.wf`.
+        // The engine's `background_analyze_and_install` consults
+        // the same path on every load and short-circuits the
+        // 100–300 ms `compute_offline_peaks` pass on hit, which is
+        // exactly the "instant waveform" contract from PRD-BEATS
+        // §4.5. Best-effort: any failure (cache dir unwritable,
+        // disk full, `OfflinePeaksError` on a zero-length track)
+        // is logged and analysis still returns success — BPM + key
+        // are the contract here; the sidecar is a perf cache.
+        let sidecar_path = self.write_waveform_sidecar(fingerprint_id, &track);
+
         // Stamp `analysis_cache` exactly once. `has_active_grid` and
         // `has_active_key` reflect whether the auto pass landed the
         // active row (so they can be `1` here but get flipped to `0`
         // later if an importer claims the active slot — that's
         // tracked separately by `stamp_analysis_cache_after_import`
-        // when those importers land in M11e).
+        // when those importers land in M11e). `sidecar_path` and
+        // `has_waveform` mirror the C1 sidecar write outcome above.
         self.stamp_analysis_cache(
             fingerprint_id,
             outcome.grid_auto_is_active,
             outcome.key_auto_is_active,
+            sidecar_path.as_deref(),
         )?;
 
         Ok(outcome)
+    }
+
+    /// Compute and persist the waveform sidecar for `fingerprint_id`
+    /// from a freshly-decoded `track`. Returns the absolute path on
+    /// success so the caller can stamp `analysis_cache`.
+    ///
+    /// **Best-effort.** All errors (peaks compute failure, missing
+    /// cache dir, disk full) are logged and the function returns
+    /// `None` — BPM + key analysis is the contract of
+    /// [`Self::analyze_track`]; the sidecar is a perf cache and a
+    /// missed write degrades to a slow first load, not a broken
+    /// one. The engine treats a missing sidecar as a cache miss
+    /// and recomputes on demand.
+    fn write_waveform_sidecar(&self, fingerprint_id: i64, track: &dub_io::Track) -> Option<String> {
+        let peaks = match dub_peaks::compute_offline_peaks(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "dub-library: skipping waveform sidecar for fingerprint \
+                     {fingerprint_id} (peaks compute failed: {e})"
+                );
+                return None;
+            }
+        };
+        let path = match self.waveforms_cache_dir() {
+            Ok(dir) => dir.join(format!("{fingerprint_id}.wf")),
+            Err(e) => {
+                eprintln!(
+                    "dub-library: skipping waveform sidecar for fingerprint \
+                     {fingerprint_id} (cache dir unavailable: {e})"
+                );
+                return None;
+            }
+        };
+        if let Err(e) = dub_peaks::write_sidecar(&path, &peaks) {
+            eprintln!(
+                "dub-library: failed to write waveform sidecar for fingerprint \
+                 {fingerprint_id} at {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+        path.to_str().map(str::to_string)
     }
 
     /// Fetch the active beat-grid row for `track_id`, if any.
@@ -367,16 +495,25 @@ impl Library {
     /// the canonical grid for a track without running analysis.
     pub fn active_beatgrid_for_track(&self, track_id: &str) -> Result<Option<ActiveBeatgrid>> {
         let row = self.connection().query_row(
-            "SELECT source, bpm, anchor_secs, captured_at \
-                 FROM track_beatgrids \
-                 WHERE track_id = ?1 AND is_active = 1",
+            "SELECT bg.source, bg.bpm, bg.anchor_secs, bg.captured_at, \
+                    COALESCE(t.grid_locked, 0), t.grid_drift_quality, \
+                    ac.waveform_sidecar_path, COALESCE(bg.bar_phase, 0) \
+             FROM track_beatgrids bg \
+             JOIN tracks t ON t.id = bg.track_id \
+             LEFT JOIN analysis_cache ac ON ac.fingerprint_id = t.fingerprint_id \
+             WHERE bg.track_id = ?1 AND bg.is_active = 1",
             params![track_id],
             |r| {
+                let phase: i64 = r.get(7)?;
                 Ok(ActiveBeatgrid {
                     source: r.get::<_, String>(0)?,
                     bpm: r.get::<_, f64>(1)?,
                     anchor_secs: r.get::<_, f64>(2)?,
                     captured_at: r.get::<_, i64>(3)?,
+                    grid_locked: r.get::<_, i64>(4)? != 0,
+                    grid_drift_quality: r.get(5)?,
+                    waveform_sidecar_path: r.get::<_, Option<String>>(6)?,
+                    bar_phase: u8::try_from(phase).unwrap_or(0),
                 })
             },
         );
@@ -414,6 +551,79 @@ impl Library {
             })
             .map_err(|e| LibraryError::sqlite("is_track_analyzed", e))?;
         Ok(analyzed.is_some())
+    }
+
+    /// M11d.7 — whether the track's beatgrid is frozen against
+    /// auto re-analysis.
+    pub fn is_grid_locked(&self, track_id: &str) -> Result<bool> {
+        let locked: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT grid_locked FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("is_grid_locked", e))?;
+        Ok(locked.is_some_and(|v| v != 0))
+    }
+
+    /// M11d.7 — user or auto-lock toggle.
+    pub fn set_grid_locked(&self, track_id: &str, locked: bool) -> Result<()> {
+        let n = self
+            .connection()
+            .execute(
+                "UPDATE tracks SET grid_locked = ?2, updated_at = strftime('%s','now') \
+                 WHERE id = ?1",
+                params![track_id, if locked { 1 } else { 0 }],
+            )
+            .map_err(|e| LibraryError::sqlite("set_grid_locked", e))?;
+        if n == 0 {
+            return Err(LibraryError::TrackNotFound {
+                track_id: track_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// M11d.7 — stored LSQ drift slope for the ⚠ indicator.
+    pub fn grid_drift_quality(&self, track_id: &str) -> Result<Option<f32>> {
+        self.connection()
+            .query_row(
+                "SELECT grid_drift_quality FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("grid_drift_quality", e))
+    }
+
+    /// M11d.7 — persist drift slope after analysis or relatch.
+    pub fn set_grid_drift_quality(&self, track_id: &str, drift: Option<f32>) -> Result<()> {
+        let n = self
+            .connection()
+            .execute(
+                "UPDATE tracks SET grid_drift_quality = ?2, updated_at = strftime('%s','now') \
+                 WHERE id = ?1",
+                params![track_id, drift],
+            )
+            .map_err(|e| LibraryError::sqlite("set_grid_drift_quality", e))?;
+        if n == 0 {
+            return Err(LibraryError::TrackNotFound {
+                track_id: track_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// M11d.7 — apply auto-lock thresholds from an LSQ fit.
+    pub fn apply_grid_quality_lock(
+        &self,
+        track_id: &str,
+        quality: &dub_bpm::GridQuality,
+    ) -> Result<()> {
+        self.set_grid_drift_quality(track_id, Some(quality.drift_slope_ms_per_min))?;
+        self.set_grid_locked(track_id, quality.auto_lock_safe())
     }
 
     /// Resolve the `(fingerprint_id, absolute_path)` pair we need
@@ -494,6 +704,34 @@ impl Library {
         Ok(n > 0)
     }
 
+    /// Demote any active `user_tap` beatgrid row for `track_id` to
+    /// inactive. Called at the start of every unlocked beat-grid
+    /// analysis pass (including force re-analyze after the lock is
+    /// dropped) so the freshly-computed auto row can claim the
+    /// single `is_active = 1` slot.
+    ///
+    /// **Why only `user_tap` and not all non-auto sources?** Imports
+    /// (Serato / Traktor / rekordbox / iTunes) are external
+    /// authorities the user pulled in deliberately, and PRD §8.3
+    /// ranks them above both `auto` and `user_tap`. An unlocked
+    /// re-analyse still honours an active import row via
+    /// `has_non_auto_active_grid` (auto lands with `is_active = 0`).
+    /// `user_tap` is Dub-authored and becomes stale the moment the
+    /// analyser re-runs on the same buffer.
+    ///
+    /// Returns the number of rows touched (0 if there was no
+    /// active user_tap to demote — useful for the debug log line
+    /// in `analyze_track`).
+    fn deactivate_user_tap_beatgrid(&self, track_id: &str) -> Result<usize> {
+        self.connection()
+            .execute(
+                "UPDATE track_beatgrids SET is_active = 0 \
+                 WHERE track_id = ?1 AND source = 'user_tap' AND is_active = 1",
+                params![track_id],
+            )
+            .map_err(|e| LibraryError::sqlite("deactivate_user_tap_beatgrid", e))
+    }
+
     /// Upsert the auto-source row in `track_beatgrids`. The
     /// `(track_id, source)` UNIQUE constraint makes this an
     /// idempotent refresh of the row's anchor / BPM / captured_at.
@@ -502,19 +740,27 @@ impl Library {
         track_id: &str,
         anchor_secs: f64,
         bpm: f64,
+        bar_phase: u8,
         is_active: bool,
     ) -> Result<()> {
         self.connection()
             .execute(
                 "INSERT INTO track_beatgrids \
-                 (track_id, source, anchor_secs, bpm, is_active, captured_at) \
-                 VALUES (?1, 'auto', ?2, ?3, ?4, strftime('%s','now')) \
+                 (track_id, source, anchor_secs, bpm, bar_phase, is_active, captured_at) \
+                 VALUES (?1, 'auto', ?2, ?3, ?4, ?5, strftime('%s','now')) \
                  ON CONFLICT(track_id, source) DO UPDATE SET \
                      anchor_secs = excluded.anchor_secs, \
                      bpm         = excluded.bpm, \
+                     bar_phase   = excluded.bar_phase, \
                      is_active   = excluded.is_active, \
                      captured_at = excluded.captured_at",
-                params![track_id, anchor_secs, bpm, if is_active { 1 } else { 0 }],
+                params![
+                    track_id,
+                    anchor_secs,
+                    bpm,
+                    i64::from(bar_phase),
+                    if is_active { 1 } else { 0 },
+                ],
             )
             .map_err(|e| LibraryError::sqlite("upsert_auto_beatgrid", e))?;
         Ok(())
@@ -528,6 +774,7 @@ impl Library {
         track_id: &str,
         anchor_secs: f64,
         bpm: f64,
+        bar_phase: u8,
     ) -> Result<()> {
         if !bpm.is_finite() || bpm <= 0.0 {
             return Err(LibraryError::DecodeFailed {
@@ -551,14 +798,15 @@ impl Library {
         .map_err(|e| LibraryError::sqlite("upsert_user_tap_beatgrid_deactivate", e))?;
         conn.execute(
             "INSERT INTO track_beatgrids \
-             (track_id, source, anchor_secs, bpm, is_active, captured_at) \
-             VALUES (?1, 'user_tap', ?2, ?3, 1, strftime('%s','now')) \
+             (track_id, source, anchor_secs, bpm, bar_phase, is_active, captured_at) \
+             VALUES (?1, 'user_tap', ?2, ?3, ?4, 1, strftime('%s','now')) \
              ON CONFLICT(track_id, source) DO UPDATE SET \
                  anchor_secs = excluded.anchor_secs, \
                  bpm         = excluded.bpm, \
+                 bar_phase   = excluded.bar_phase, \
                  is_active   = 1, \
                  captured_at = excluded.captured_at",
-            params![track_id, anchor_secs, bpm],
+            params![track_id, anchor_secs, bpm, i64::from(bar_phase)],
         )
         .map_err(|e| LibraryError::sqlite("upsert_user_tap_beatgrid", e))?;
         if let Ok((Some(fp_id), _path)) = self.track_analysis_keys(track_id) {
@@ -570,7 +818,7 @@ impl Library {
                 )
                 .map(|v| v != 0)
                 .unwrap_or(false);
-            self.stamp_analysis_cache(fp_id, true, has_active_key)?;
+            self.stamp_analysis_cache(fp_id, true, has_active_key, None)?;
         }
         Ok(())
     }
@@ -585,20 +833,38 @@ impl Library {
         fingerprint_id: i64,
         has_active_grid: bool,
         has_active_key: bool,
+        waveform_sidecar_path: Option<&str>,
     ) -> Result<()> {
+        let has_waveform = waveform_sidecar_path.is_some();
+        // PRD-BEATS C1: `waveform_sidecar_path` + `has_waveform` are
+        // updated atomically with the rest of the cache row. We
+        // preserve any previously-stamped path on a re-analyze pass
+        // that fails to refresh the sidecar (best-effort write
+        // dropping to `None` should not surprise a downstream
+        // reader by nulling out a valid prior path) by using
+        // `COALESCE(excluded.col, analysis_cache.col)` in the
+        // upsert.
         self.connection()
             .execute(
                 "INSERT INTO analysis_cache \
-                 (fingerprint_id, has_active_grid, has_active_key, analyzed_at) \
-                 VALUES (?1, ?2, ?3, strftime('%s','now')) \
+                 (fingerprint_id, has_active_grid, has_active_key, has_waveform, \
+                  waveform_sidecar_path, analyzed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now')) \
                  ON CONFLICT(fingerprint_id) DO UPDATE SET \
-                     has_active_grid = excluded.has_active_grid, \
-                     has_active_key  = excluded.has_active_key, \
-                     analyzed_at     = excluded.analyzed_at",
+                     has_active_grid       = excluded.has_active_grid, \
+                     has_active_key        = excluded.has_active_key, \
+                     has_waveform          = CASE \
+                         WHEN excluded.has_waveform = 1 THEN 1 \
+                         ELSE analysis_cache.has_waveform END, \
+                     waveform_sidecar_path = COALESCE(excluded.waveform_sidecar_path, \
+                                                     analysis_cache.waveform_sidecar_path), \
+                     analyzed_at           = excluded.analyzed_at",
                 params![
                     fingerprint_id,
                     if has_active_grid { 1 } else { 0 },
-                    if has_active_key { 1 } else { 0 }
+                    if has_active_key { 1 } else { 0 },
+                    if has_waveform { 1 } else { 0 },
+                    waveform_sidecar_path
                 ],
             )
             .map_err(|e| LibraryError::sqlite("stamp_analysis_cache", e))?;
@@ -944,6 +1210,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cache_active, 1);
+    }
+
+    /// PRD-BEATS C1 (round 4) — `analyze_track` must render the
+    /// waveform sidecar and stamp the path + `has_waveform = 1` so
+    /// the engine can short-circuit `compute_offline_peaks` on the
+    /// next deck load. End-to-end check: the sidecar file exists on
+    /// disk, the cache row points to it, and the surfaced
+    /// `ActiveBeatgrid` carries the same path.
+    #[test]
+    fn analyze_track_writes_waveform_sidecar_and_stamps_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("waveforms");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Canonicalise so `/var/folders/...` and `/private/var/folders/...`
+        // (the macOS symlink pair) match cleanly against the stored
+        // path the library writes (which is built from the override
+        // value, not from canonicalising the tempdir).
+        let cache_dir_canonical = cache_dir.canonicalize().unwrap_or(cache_dir.clone());
+        let lib = Library::open_in_memory()
+            .unwrap()
+            .with_waveforms_cache_dir(cache_dir.clone());
+        let (track_id, fp_id, _path) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        let outcome = lib.analyze_track(&track_id).unwrap();
+        assert!(outcome.wrote_grid, "click track must produce a grid");
+
+        // analysis_cache row: path populated, has_waveform flipped.
+        let (sidecar_path_db, has_waveform): (Option<String>, i64) = lib
+            .connection()
+            .query_row(
+                "SELECT waveform_sidecar_path, has_waveform \
+                 FROM analysis_cache WHERE fingerprint_id = ?1",
+                params![fp_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            has_waveform, 1,
+            "analyze_track must flip has_waveform after writing the sidecar"
+        );
+        let sidecar_path_db =
+            sidecar_path_db.expect("analyze_track must store the absolute sidecar path");
+        let stored_canonical = std::path::Path::new(&sidecar_path_db)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&sidecar_path_db));
+        assert!(
+            stored_canonical.starts_with(&cache_dir_canonical),
+            "stored sidecar path {} (canonical {}) must live inside the env-overridden cache dir {}",
+            sidecar_path_db,
+            stored_canonical.display(),
+            cache_dir_canonical.display()
+        );
+
+        // File actually exists on disk (the engine's read_sidecar
+        // will hit it on the next load).
+        let path_on_disk = std::path::Path::new(&sidecar_path_db);
+        assert!(
+            path_on_disk.exists(),
+            "expected sidecar file at {sidecar_path_db}"
+        );
+        let metadata = std::fs::metadata(path_on_disk).unwrap();
+        assert!(
+            metadata.len() > 64,
+            "sidecar must be larger than the header (got {} bytes)",
+            metadata.len()
+        );
+
+        // ActiveBeatgrid surfaces the same path so the engine can
+        // consult it without a second DB query.
+        let active = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        assert_eq!(
+            active.waveform_sidecar_path.as_deref(),
+            Some(sidecar_path_db.as_str()),
+            "active_beatgrid_for_track must surface the sidecar path"
+        );
+
+        // Round-trip: the file the library wrote must deserialise
+        // cleanly back into `OfflinePeaks` via the engine's reader.
+        let loaded = dub_peaks::read_sidecar(path_on_disk).unwrap();
+        let peaks = loaded.expect("sidecar round-trips through read_sidecar");
+        assert!(
+            !peaks.broadband.is_empty() && !peaks.bands.is_empty(),
+            "round-tripped sidecar must carry chunks"
+        );
+    }
+
+    /// PRD-BEATS C1: a re-analyze pass must overwrite the sidecar
+    /// (so the cached peaks track the latest analysis), keep the
+    /// path stable (the file lives at `{fingerprint_id}.wf`), and
+    /// leave `has_waveform = 1`. Mirror of
+    /// `analyze_track_is_idempotent_on_re_run` for the sidecar
+    /// state.
+    #[test]
+    fn re_analyze_overwrites_waveform_sidecar_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("waveforms");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let lib = Library::open_in_memory()
+            .unwrap()
+            .with_waveforms_cache_dir(cache_dir);
+        let (track_id, fp_id, _path) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        let first_path: String = lib
+            .connection()
+            .query_row(
+                "SELECT waveform_sidecar_path FROM analysis_cache WHERE fingerprint_id = ?1",
+                params![fp_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let first_mtime = std::fs::metadata(&first_path).unwrap().modified().unwrap();
+        // Sleep a hair so mtime can advance even on filesystems
+        // with second-resolution timestamps.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        lib.analyze_track(&track_id).unwrap();
+        let second_path: String = lib
+            .connection()
+            .query_row(
+                "SELECT waveform_sidecar_path FROM analysis_cache WHERE fingerprint_id = ?1",
+                params![fp_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_path, second_path,
+            "sidecar path is keyed by fingerprint id and must be stable across re-analyzes"
+        );
+        let second_mtime = std::fs::metadata(&second_path).unwrap().modified().unwrap();
+        assert!(
+            second_mtime >= first_mtime,
+            "re-analyze must refresh the sidecar (mtime moved backwards: \
+             first {first_mtime:?}, second {second_mtime:?})"
+        );
     }
 
     #[test]
@@ -1437,7 +1835,8 @@ mod tests {
         let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
         lib.analyze_track(&track_id).unwrap();
 
-        lib.upsert_user_tap_beatgrid(&track_id, 1.25, 65.0).unwrap();
+        lib.upsert_user_tap_beatgrid(&track_id, 1.25, 65.0, 0)
+            .unwrap();
 
         let row = lib
             .active_beatgrid_for_track(&track_id)
@@ -1457,6 +1856,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auto_active, 0, "auto row must be deactivated");
+    }
+
+    /// Re-analyze on an unlocked track with an active `user_tap`
+    /// row demotes that row and replaces it with a fresh auto
+    /// grid (PRD-BEATS §4 "Re-analyze" row: pure reset). The
+    /// previous round shipped this as the "non-force" path of a
+    /// `force: bool` parameter; round 3 removes `force` entirely
+    /// (lock is absolute) so this is now the *only* re-analyze
+    /// path on an unlocked track. Regression for the stale-tap
+    /// 133.017 / 133.000 mismatch the user reported on Oppidan.
+    #[test]
+    fn reanalyze_on_unlocked_track_demotes_active_user_tap_to_let_auto_win() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+
+        lib.analyze_track(&track_id).unwrap();
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 120.5, 0)
+            .unwrap();
+
+        let pre = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("user tap row must be active before reanalyze");
+        assert_eq!(pre.source, "user_tap");
+        assert!((pre.bpm - 120.5).abs() < 1e-9);
+
+        let outcome = lib.analyze_track(&track_id).unwrap();
+        assert!(outcome.wrote_grid);
+        assert!(
+            outcome.grid_auto_is_active,
+            "auto row must claim is_active = 1 after re-analyze"
+        );
+
+        let post = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("auto row must be active after re-analyze");
+        assert_eq!(post.source, "auto");
+
+        let tap_active: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT is_active FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'user_tap'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tap_active, 0, "stale user_tap row must be demoted");
+    }
+
+    /// PRD-BEATS C2 (round 4) — `bar_phase` is a first-class
+    /// column on `track_beatgrids` and `active_beatgrid_for_track`
+    /// surfaces it verbatim. The `user_tap` upsert path takes the
+    /// phase as a parameter (no inference from `anchor_secs`); the
+    /// schema default is `0` so legacy rows behave as before.
+    #[test]
+    fn upsert_user_tap_beatgrid_roundtrips_bar_phase() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+
+        lib.upsert_user_tap_beatgrid(&track_id, 1.25, 120.0, 2)
+            .unwrap();
+
+        let row = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("user tap row must be active");
+        assert_eq!(row.bar_phase, 2);
+
+        lib.upsert_user_tap_beatgrid(&track_id, 1.25, 120.0, 3)
+            .unwrap();
+        let row = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("user tap row must remain active after second upsert");
+        assert_eq!(row.bar_phase, 3);
+    }
+
+    /// PRD-BEATS §3.5 lock-is-absolute: analysing a locked track
+    /// returns `GridLocked` rather than silently skipping. The
+    /// previous behaviour (non-force on locked = no-op `Ok`) is
+    /// replaced with an explicit refusal so the Apple shell can
+    /// short-circuit cleanly. The locked grid stays untouched.
+    #[test]
+    fn analyze_track_on_locked_grid_returns_grid_locked_and_leaves_state() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+
+        lib.analyze_track(&track_id).unwrap();
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 120.5, 0)
+            .unwrap();
+        lib.set_grid_locked(&track_id, true).unwrap();
+
+        let err = lib.analyze_track(&track_id).err();
+        assert!(
+            matches!(err, Some(LibraryError::GridLocked { .. })),
+            "locked grid must refuse analysis with GridLocked; got {err:?}"
+        );
+
+        let post = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("tap row must still be active");
+        assert_eq!(post.source, "user_tap");
+        assert!((post.bpm - 120.5).abs() < 1e-9);
     }
 
     #[test]

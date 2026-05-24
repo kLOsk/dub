@@ -109,9 +109,21 @@ struct DeckHeaderState: Equatable {
     /// `false`.
     let useTimecodeToggle: Bool
 
-    /// M11d.6 — whether the user marked beat 1 at the playhead this
-    /// session. Drives button highlight in prep.
-    let downbeatMarked: Bool
+    /// M11d.7 — open tap-to-grid window count (0 = idle).
+    let tapGridCount: Int
+
+    /// PRD-BEATS §4.2 round 3 + gate 12 — rolling BPM preview
+    /// while a tap session is open. `nil` outside an active
+    /// session or while the session has fewer than 3 taps. When
+    /// non-nil, the BPM column renders this value in the
+    /// "tapping" treatment (italic + accent colour) instead of
+    /// the committed `bpm`, so the user can see the running
+    /// estimate converge tap by tap before commit.
+    let tapRollingBpm: Double?
+
+    /// M11d.7 — library grid lock + drift indicator plumbed at load.
+    let gridLocked: Bool
+    let gridDriftQuality: Float?
 
     enum Source: Equatable {
         case off
@@ -178,7 +190,8 @@ struct DeckHeaderState: Equatable {
         trackTitle: nil, trackArtist: nil, bpm: nil, key: nil,
         formatChip: nil, timeRow: nil, isMaster: false, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false,
-        downbeatMarked: false)
+        tapGridCount: 0, tapRollingBpm: nil,
+        gridLocked: false, gridDriftQuality: nil)
 }
 
 /// M10.6a transport callbacks the deck header invokes when the user
@@ -199,14 +212,8 @@ struct DeckHeaderCallbacks {
     /// `WaveformAppModel.panicToggle(side:)`.
     var onPanicToggle: () -> Void = {}
 
-    /// M11d.6 manual beat-grid phase nudge. `direction` is −1 (left)
-    /// or +1 (right). Modifiers pick the step tier at fire time.
-    var onNudgePhase: ((_ direction: Int, _ modifiers: NSEvent.ModifierFlags) -> Void)? = nil
-    /// M11d.6 manual BPM nudge. `direction` is −1 (slower) or +1
-    /// (faster).
-    var onNudgeBpm: ((_ direction: Int, _ modifiers: NSEvent.ModifierFlags) -> Void)? = nil
-    /// M11d.6 mark beat 1 at the current playhead and relatch grid.
-    var onMarkDownbeat: (() -> Void)? = nil
+    /// M11d.7 tap-to-grid on the BPM column.
+    var onTapBpm: (() -> Void)? = nil
 
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
@@ -384,79 +391,18 @@ struct DeckHeader: View {
         HStack(spacing: DubSpacing.lg) {
             if mirrored {
                 fxChip
-                gridNudgeCluster
                 Spacer(minLength: 0)
-                statColumn(label: "BPM", value: formattedBPM)
+                bpmStatColumn
                 statColumn(label: "KEY", value: formattedKey)
             } else {
-                statColumn(label: "BPM", value: formattedBPM)
+                bpmStatColumn
                 statColumn(label: "KEY", value: formattedKey)
-                gridNudgeCluster
                 Spacer(minLength: 0)
                 fxChip
             }
         }
         .frame(maxWidth: .infinity,
                alignment: mirrored ? .trailing : .leading)
-    }
-
-    /// M11d.6 manual beatgrid-nudge cluster. Click = regular step;
-    /// Shift+click = coarse; Shift+Option+click = fine. Hold to
-    /// repeat. Only renders when wired and a track is loaded.
-    @ViewBuilder
-    private var gridNudgeCluster: some View {
-        if state.bpm != nil,
-           let onPhase = callbacks.onNudgePhase,
-           let onBpm = callbacks.onNudgeBpm,
-           let onMarkDownbeat = callbacks.onMarkDownbeat
-        {
-            HStack(spacing: DubSpacing.xs) {
-                RepeatModifierButton(
-                    systemImage: "chevron.left",
-                    help: "Shift grid left (hold to repeat; Shift = coarse; Shift+Option = fine)"
-                ) { mods in
-                    onPhase(-1, mods)
-                }
-                RepeatModifierButton(
-                    systemImage: "chevron.right",
-                    help: "Shift grid right (hold to repeat; Shift = coarse; Shift+Option = fine)"
-                ) { mods in
-                    onPhase(1, mods)
-                }
-                downbeatMarkButton(
-                    marked: state.downbeatMarked,
-                    action: onMarkDownbeat)
-                RepeatModifierButton(
-                    systemImage: "minus",
-                    help: "Slow BPM (hold to repeat; Shift = coarse; Shift+Option = fine)"
-                ) { mods in
-                    onBpm(-1, mods)
-                }
-                RepeatModifierButton(
-                    systemImage: "plus",
-                    help: "Speed BPM (hold to repeat; Shift = coarse; Shift+Option = fine)"
-                ) { mods in
-                    onBpm(1, mods)
-                }
-            }
-        }
-    }
-
-    private func downbeatMarkButton(
-        marked: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Text("1")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(
-                    marked ? DubColor.surface0 : DubColor.textSecondary)
-                .frame(width: 22, height: 22)
-                .background(marked ? DubColor.deckTint(side) : DubColor.surface2)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
-        .buttonStyle(.plain)
-        .help("Mark downbeat at playhead — relatches the full grid from onsets")
     }
 
     /// Render the BPM column. The Stage-1 estimator delivers two
@@ -468,8 +414,19 @@ struct DeckHeader: View {
     /// every time. The dash falls out naturally when
     /// `state.bpm == nil`: no track / analysis bailed / zero
     /// confidence.
+    ///
+    /// PRD-BEATS §4.2 + gate 12: when a tap session is open and
+    /// has emitted a rolling preview, render that preview value
+    /// instead of the committed BPM so the user can see the
+    /// running estimate converge in real time.
     private var formattedBPM: String {
-        guard let bpm = state.bpm, bpm > 0 else { return "—" }
+        let value: Double?
+        if let preview = state.tapRollingBpm {
+            value = preview
+        } else {
+            value = state.bpm
+        }
+        guard let bpm = value, bpm > 0 else { return "—" }
         if prepMode {
             return String(format: "%.2f", bpm)
         }
@@ -719,6 +676,78 @@ struct DeckHeader: View {
     }
 
     @ViewBuilder
+    private var bpmStatColumn: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("BPM")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+            Button(action: { callbacks.onTapBpm?() }) {
+                HStack(spacing: 4) {
+                    Text(formattedBPM)
+                        .font(
+                            state.tapRollingBpm != nil
+                                ? DubFont.numericInline.italic()
+                                : DubFont.numericInline
+                        )
+                        .foregroundStyle(bpmDisplayColor)
+                    if state.tapGridCount > 0 {
+                        Text("(\(state.tapGridCount))")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.deckTint(side))
+                    }
+                    if state.gridLocked {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(DubColor.textSecondary)
+                    } else if let drift = state.gridDriftQuality,
+                              abs(drift) >= 3
+                    {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .underline(
+                    state.tapGridCount > 0,
+                    color: DubColor.deckTint(side).opacity(0.55))
+            }
+            .buttonStyle(.plain)
+            .disabled(callbacks.onTapBpm == nil || state.bpm == nil || state.gridLocked)
+            .help(bpmColumnHelpText)
+        }
+    }
+
+    /// PRD-BEATS §4.2 + gate 12: rolling preview takes the deck
+    /// tint colour so the user can see at a glance that the
+    /// displayed value is provisional. Locked grids render in the
+    /// secondary text colour since taps are disabled. Otherwise
+    /// the normal placeholder/primary split applies.
+    private var bpmDisplayColor: Color {
+        if state.tapRollingBpm != nil {
+            return DubColor.deckTint(side)
+        }
+        if state.gridLocked {
+            return DubColor.textSecondary
+        }
+        return state.bpm == nil ? DubColor.textPlaceholder : DubColor.textPrimary
+    }
+
+    /// Tooltip on the BPM column. Surfaces the dynamic-window
+    /// rule and the lock semantics so the user can discover
+    /// the contract without leaving the app. Adapts to the
+    /// current lock state so a locked-grid hover explains why
+    /// tap-tempo is greyed out.
+    private var bpmColumnHelpText: String {
+        if state.gridLocked {
+            return "Grid is locked. Unlock via the library row context menu before tapping."
+        }
+        return "Tap for downbeat (1–2 taps) or tempo recalc (3+ taps). "
+            + "Tap window adapts to the tempo (1.5 s minimum). "
+            + "Lock via library row context menu."
+    }
+
+    @ViewBuilder
     private func statColumn(label: String, value: String) -> some View {
         HStack(spacing: DubSpacing.sm) {
             Text(label)
@@ -911,7 +940,8 @@ extension DeckHeaderState {
                 isPlaying: false,
                 isPanicPlay: false,
                 useTimecodeToggle: false,
-                downbeatMarked: false)
+                tapGridCount: 0, tapRollingBpm: nil,
+                gridLocked: false, gridDriftQuality: nil)
         }
 
         if deckState.hasTrack {
@@ -957,7 +987,10 @@ extension DeckHeaderState {
                 // into the Play action in the model. See
                 // `useTimecodeToggle` doc comment for rationale.
                 useTimecodeToggle: false,
-                downbeatMarked: deckState.downbeatMarked)
+                tapGridCount: deckState.tapGridCount,
+                tapRollingBpm: deckState.tapRollingBpm,
+                gridLocked: deckState.gridLocked,
+                gridDriftQuality: deckState.gridDriftQuality)
         }
 
         if thruMode {
@@ -985,7 +1018,8 @@ extension DeckHeaderState {
                 isPlaying: false,
                 isPanicPlay: false,
                 useTimecodeToggle: false,
-                downbeatMarked: false)
+                tapGridCount: 0, tapRollingBpm: nil,
+                gridLocked: false, gridDriftQuality: nil)
         }
 
         return DeckHeaderState(
@@ -1001,7 +1035,8 @@ extension DeckHeaderState {
             isPlaying: false,
             isPanicPlay: false,
             useTimecodeToggle: false,
-            downbeatMarked: false)
+            tapGridCount: 0, tapRollingBpm: nil,
+            gridLocked: false, gridDriftQuality: nil)
     }
 }
 
@@ -1019,7 +1054,9 @@ extension DeckHeaderState {
         bpm: nil, key: nil,
         formatChip: nil, timeRow: nil,
         isMaster: true, isPlaying: false,
-        isPanicPlay: false, useTimecodeToggle: false, downbeatMarked: false))
+        isPanicPlay: false, useTimecodeToggle: false,
+        tapGridCount: 0, tapRollingBpm: nil,
+        gridLocked: false, gridDriftQuality: nil))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -1034,7 +1071,9 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly,
         isMaster: false, isPlaying: true,
-        isPanicPlay: false, useTimecodeToggle: true, downbeatMarked: true),
+        isPanicPlay: false, useTimecodeToggle: true,
+        tapGridCount: 2, tapRollingBpm: nil,
+        gridLocked: true, gridDriftQuality: nil),
         mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)
@@ -1050,7 +1089,9 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .elapsedAndRemaining,
         isMaster: true, isPlaying: true,
-        isPanicPlay: false, useTimecodeToggle: false, downbeatMarked: false))
+        isPanicPlay: false, useTimecodeToggle: false,
+        tapGridCount: 0, tapRollingBpm: nil,
+        gridLocked: false, gridDriftQuality: nil))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -1065,7 +1106,9 @@ extension DeckHeaderState {
         formatChip: "MP3 · 44.1 kHz · stereo",
         timeRow: .remainingOnly,
         isMaster: true, isPlaying: true,
-        isPanicPlay: true, useTimecodeToggle: true, downbeatMarked: false),
+        isPanicPlay: true, useTimecodeToggle: true,
+        tapGridCount: 0, tapRollingBpm: nil,
+        gridLocked: false, gridDriftQuality: 4.5),
         mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)

@@ -45,7 +45,7 @@ pub use dedupe::{
 pub use error::{LibraryError, Result};
 pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
 pub use importer::{import_folder, ImportError, ImportSummary};
-pub use paths::{default_library_db_path, default_waveforms_cache_dir};
+pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
 pub use schema::SCHEMA_VERSION;
 pub use version_tokens::{parse as parse_version_tokens, VersionToken};
 pub use volumes::{discover_for_path, DiscoveredVolume};

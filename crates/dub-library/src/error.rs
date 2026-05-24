@@ -136,6 +136,22 @@ pub enum LibraryError {
         /// analyser.
         reason: String,
     },
+
+    /// `analyze_track` (or any beatgrid-mutating call) refused to
+    /// proceed because the track's grid is locked
+    /// (`tracks.grid_locked = 1`). PRD-BEATS §3.5 ("lock is
+    /// absolute") forbids overwriting a locked grid — the lock is
+    /// the user's explicit commitment that "this grid is correct;
+    /// keep your algorithms away from it." Callers must explicitly
+    /// `set_grid_locked(track_id, false)` first (typically driven
+    /// by the right-click menu's "Unlock grid" item) and then
+    /// re-invoke. The Apple shell treats this as a no-op rather
+    /// than an error toast (per PRD-BEATS §13 deferred list).
+    #[error("track {track_id} has a locked beatgrid; unlock first")]
+    GridLocked {
+        /// The canonical UUID that was asked for re-analysis.
+        track_id: String,
+    },
 }
 
 impl LibraryError {

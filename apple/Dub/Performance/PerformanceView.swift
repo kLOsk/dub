@@ -152,18 +152,8 @@ struct PerformanceView: View {
             onPlay:    { model.play(side: side) },
             onPause:   { model.pause(side: side) },
             onPanicToggle: { model.panicToggle(side: side) },
-            onNudgePhase: { direction, modifiers in
-                let tier = BeatgridNudgeTier(modifiers: modifiers)
-                let delta = Double(direction) * tier.phaseStepSecs
-                model.nudgeBeatGridPhase(side, deltaSecs: delta, tier: tier)
-            },
-            onNudgeBpm: { direction, modifiers in
-                let tier = BeatgridNudgeTier(modifiers: modifiers)
-                let delta = Double(direction) * tier.bpmStep
-                model.nudgeBeatGridBpm(side, deltaBpm: delta, tier: tier)
-            },
-            onMarkDownbeat: {
-                model.markDownbeat(side)
+            onTapBpm: {
+                model.handleTapForGrid(side)
             })
     }
 

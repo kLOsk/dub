@@ -45,6 +45,9 @@ pub fn default_library_db_path() -> Result<PathBuf> {
 /// stores filenames relative to it in `analysis_cache.waveform_sidecar_path`.
 ///
 /// On macOS this resolves to `~/Library/Caches/Dub/waveforms/`.
+/// Tests redirect to a per-test tempdir via
+/// [`crate::Library::with_waveforms_cache_dir`] rather than a
+/// global env var — see PRD-BEATS C1 (round 4).
 pub fn default_waveforms_cache_dir() -> Result<PathBuf> {
     let base = dirs::cache_dir().ok_or_else(|| LibraryError::VolumeUuidUnavailable {
         path: PathBuf::from("<cache_dir>"),
@@ -53,6 +56,25 @@ pub fn default_waveforms_cache_dir() -> Result<PathBuf> {
     let dir = base.join(APP_SUPPORT_SUBDIR).join(WAVEFORMS_CACHE_SUBDIR);
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+/// Absolute path to the waveform sidecar file for a fingerprint id
+/// under the platform-default cache directory.
+///
+/// The filename is keyed by the integer primary key of
+/// `fingerprints` (rather than the hex of `chromaprint_blob`)
+/// because the id is short, collision-free, and already in hand at
+/// every call site. The dot-`wf` suffix matches PRD-BEATS §4.5
+/// (waveform sidecar contract) and the
+/// `analysis_cache.waveform_sidecar_path` column doc-comment.
+///
+/// Most callers should go through
+/// [`crate::Library::waveforms_cache_dir`] (which honours
+/// per-Library overrides); this free function is exported only
+/// for callers that need the on-disk default without an open
+/// `Library` handle.
+pub fn waveform_sidecar_path(fingerprint_id: i64) -> Result<PathBuf> {
+    Ok(default_waveforms_cache_dir()?.join(format!("{fingerprint_id}.wf")))
 }
 
 /// Ensures the given directory and its parents exist, surfacing any

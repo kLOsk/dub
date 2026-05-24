@@ -696,6 +696,7 @@ dependencies = [
  "dub-bpm",
  "dub-fingerprint",
  "dub-io",
+ "dub-peaks",
  "dub-spectral",
  "hound",
  "libc",
@@ -712,6 +713,7 @@ version = "0.0.1"
 dependencies = [
  "dub-spectral",
  "ringbuf",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
