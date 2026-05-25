@@ -159,6 +159,16 @@ SwiftUI views are tested via:
 - **Logic-layer tests** — view models / observable state are pure Swift code, fully unit-tested.
 - **No UI flow is untested** — accept lower coverage on raw view code, but the state machines that drive views are fully tested.
 
+**Phase-A status (current):** the snapshot-testing infrastructure
+does not exist yet. The recent UI-bug cluster (footer progress
+pill, multi-select context menu label, BPM color when locked,
+search-field focus dismiss, click-delay on row select) would all
+have been caught by a small suite around three views. Tracked
+in `docs/UI-BACKLOG.md` C-31 ("Swift-UI snapshot tests are PRD-
+mandated but don't exist yet") with concrete first-cut scope
+(LibraryView footer, library-row context menu, DeckHeader). The
+PRD policy stays in force; the backlog item carries the work.
+
 ### 2.2.5 Fuzzing parsers — special priority
 
 This is the highest-leverage investment for our use case. Imagine: DJ at a gig, imports a friend's library on a USB stick mid-set, file is subtly corrupted. **We must not crash.**

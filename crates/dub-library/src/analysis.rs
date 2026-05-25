@@ -322,11 +322,31 @@ impl Library {
                  claim is_active=1"
             );
         }
-        let profile = self
-            .track_id3_genre(track_id)?
-            .as_deref()
-            .map(dub_bpm::octave_profile_from_genre)
-            .unwrap_or(dub_bpm::OctaveProfile::Default);
+        // Genre is a pure octave-profile hint (M11c.3d). A failure
+        // to read it (missing `track_metadata_source` row, NULL
+        // column, or a SQLite error) must NOT abort analysis —
+        // the worst that happens with no genre is we fall back to
+        // `OctaveProfile::Default`, which is the profile used for
+        // every track that never had an ID3 tag to begin with.
+        // Pre-fix this branch could surface a `LibraryError::sqlite
+        // (analyze_lookup_genre, …)` for any weirdness in the
+        // metadata table and the user saw "Analysis failed for
+        // track: …" instead of a successful analysis (PRD-BEATS
+        // §4.4 contract: re-analyze is a pure reset, must succeed
+        // on any track that decodes).
+        let profile = match self.track_id3_genre(track_id) {
+            Ok(g) => g
+                .as_deref()
+                .map(dub_bpm::octave_profile_from_genre)
+                .unwrap_or(dub_bpm::OctaveProfile::Default),
+            Err(e) => {
+                eprintln!(
+                    "dub-library: genre lookup failed for {track_id} ({e}); \
+                     falling back to OctaveProfile::Default"
+                );
+                dub_bpm::OctaveProfile::Default
+            }
+        };
         let grid = dub_bpm::analyze_beat_grid_with_profile(
             track.samples(),
             track.sample_rate(),
@@ -356,7 +376,14 @@ impl Library {
             outcome.grid_auto_is_active = grid_auto_is_active;
             outcome.wrote_grid = true;
             if let Some(quality) = grid.quality.as_ref() {
-                self.apply_grid_quality_lock(track_id, quality)?;
+                // Auto-lock disabled (user feedback: silent
+                // freezes after an auto-pass were hostile — locks
+                // now happen only when the user explicitly toggles
+                // them via the BPM right-click menu or the library
+                // row context menu). Persist the drift slope so
+                // the "⚠" indicator still appears on suspect
+                // grids, but don't touch `grid_locked`.
+                self.set_grid_drift_quality(track_id, Some(quality.drift_slope_ms_per_min))?;
             }
         }
 
@@ -821,6 +848,130 @@ impl Library {
             self.stamp_analysis_cache(fp_id, true, has_active_key, None)?;
         }
         Ok(())
+    }
+
+    /// Octave-shift the currently active beatgrid (BPM × multiplier)
+    /// while keeping the visible downbeat anchored at the same
+    /// musical position. Writes the result as the sole active
+    /// `user_tap` row so the change persists across library reload
+    /// and so a subsequent re-analyse demotes it (PRD-BEATS §4
+    /// "Re-analyze" semantics).
+    ///
+    /// Used by the deck-header BPM context menu's "2×" and "½"
+    /// entries. The downbeat time is recovered from the active
+    /// row's `(anchor_secs, bar_phase, bpm)` and re-projected onto
+    /// the new period so the user sees twice as many (or half as
+    /// many) beat ticks landing on the same kick.
+    ///
+    /// Returns the new `ActiveBeatgrid` (always `Some` on success
+    /// because the upsert sets `is_active = 1`).
+    pub fn scale_active_beatgrid(
+        &self,
+        track_id: &str,
+        multiplier: f64,
+    ) -> Result<Option<ActiveBeatgrid>> {
+        if !multiplier.is_finite() || multiplier <= 0.0 {
+            return Err(LibraryError::DecodeFailed {
+                track_id: track_id.to_string(),
+                path: PathBuf::new(),
+                reason: format!("invalid bpm multiplier ({multiplier})"),
+            });
+        }
+        if self.is_grid_locked(track_id)? {
+            return Err(LibraryError::GridLocked {
+                track_id: track_id.to_string(),
+            });
+        }
+        let Some(active) = self.active_beatgrid_for_track(track_id)? else {
+            return Ok(None);
+        };
+        if !active.bpm.is_finite() || active.bpm <= 0.0 {
+            return Err(LibraryError::DecodeFailed {
+                track_id: track_id.to_string(),
+                path: PathBuf::new(),
+                reason: format!("active grid has non-positive bpm ({})", active.bpm),
+            });
+        }
+        let new_bpm = active.bpm * multiplier;
+        if !new_bpm.is_finite() || new_bpm <= 0.0 {
+            return Err(LibraryError::DecodeFailed {
+                track_id: track_id.to_string(),
+                path: PathBuf::new(),
+                reason: format!("scaled bpm not positive ({new_bpm})"),
+            });
+        }
+        let old_period = 60.0 / active.bpm;
+        let downbeat_secs = active.anchor_secs + f64::from(active.bar_phase) * old_period;
+        let new_period = 60.0 / new_bpm;
+        // Project the downbeat back into [0, new_period) for the
+        // anchor; pick `bar_phase` so that
+        // `new_anchor + bar_phase * new_period ≈ downbeat_secs`.
+        let new_anchor = downbeat_secs - (downbeat_secs / new_period).floor() * new_period;
+        let beats_per_bar: i64 = 4;
+        let beats_to_downbeat = ((downbeat_secs - new_anchor) / new_period).round() as i64;
+        let phase = beats_to_downbeat.rem_euclid(beats_per_bar);
+        let new_bar_phase = u8::try_from(phase).unwrap_or(0);
+        self.upsert_user_tap_beatgrid(track_id, new_anchor, new_bpm, new_bar_phase)?;
+        self.active_beatgrid_for_track(track_id)
+    }
+
+    /// Revert the currently active beatgrid to the original auto
+    /// analysis: demote any active `user_tap` row and reactivate
+    /// the `auto` row for this track. Backs the deck-header BPM
+    /// context menu's "Reset" entry.
+    ///
+    /// Returns `Ok(None)` when no `auto` row exists yet (the track
+    /// has never been analysed). The caller should surface a hint
+    /// asking the user to run analysis. The lock is honoured: a
+    /// locked grid refuses the reset and returns
+    /// [`LibraryError::GridLocked`].
+    pub fn reset_active_beatgrid_to_auto(&self, track_id: &str) -> Result<Option<ActiveBeatgrid>> {
+        if self.is_grid_locked(track_id)? {
+            return Err(LibraryError::GridLocked {
+                track_id: track_id.to_string(),
+            });
+        }
+        let conn = self.connection();
+        // Does an auto row exist? If not, there is nothing to
+        // revert to. Leave the user_tap row alone in that case so
+        // the deck doesn't end up gridless.
+        let auto_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'auto')",
+                params![track_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+            .map_err(|e| LibraryError::sqlite("reset_active_beatgrid_to_auto_check_auto", e))?;
+        if !auto_exists {
+            return Ok(None);
+        }
+        conn.execute(
+            "UPDATE track_beatgrids SET is_active = 0 \
+             WHERE track_id = ?1 AND source = 'user_tap'",
+            params![track_id],
+        )
+        .map_err(|e| LibraryError::sqlite("reset_active_beatgrid_to_auto_demote_tap", e))?;
+        conn.execute(
+            "UPDATE track_beatgrids SET is_active = 1 \
+             WHERE track_id = ?1 AND source = 'auto'",
+            params![track_id],
+        )
+        .map_err(|e| LibraryError::sqlite("reset_active_beatgrid_to_auto_promote_auto", e))?;
+        if let Ok((Some(fp_id), _path)) = self.track_analysis_keys(track_id) {
+            let has_active_key: bool = conn
+                .query_row(
+                    "SELECT COALESCE(has_active_key, 0) FROM analysis_cache \
+                     WHERE fingerprint_id = ?1",
+                    params![fp_id],
+                    |r| r.get::<_, i32>(0),
+                )
+                .map(|v| v != 0)
+                .unwrap_or(false);
+            self.stamp_analysis_cache(fp_id, true, has_active_key, None)?;
+        }
+        self.active_beatgrid_for_track(track_id)
     }
 
     /// Stamp `analysis_cache` for the track's fingerprint. Inserts
@@ -1990,6 +2141,248 @@ mod tests {
         assert_eq!(
             n, 1,
             "re-analyze should upsert the auto key row, not duplicate"
+        );
+    }
+
+    // ===== octave shift + reset (deck header BPM context menu) =====
+
+    /// Helper: `t_secs` must sit on a downbeat of the grid encoded
+    /// by `(anchor, bpm, bar_phase)` with `beats_per_bar = 4`.
+    /// Downbeats live at `anchor + (bar_phase + 4·k)·period` for
+    /// any integer k. We reverse the relation: compute how many
+    /// beats fit between `anchor` and `t_secs`, check it lands on
+    /// an integer beat, and check that integer is congruent to
+    /// `bar_phase` modulo 4.
+    fn assert_is_downbeat(t_secs: f64, anchor: f64, bpm: f64, bar_phase: u8) {
+        let period = 60.0 / bpm;
+        let n_beats = (t_secs - anchor) / period;
+        let n_round = n_beats.round();
+        assert!(
+            (n_beats - n_round).abs() < 1e-6,
+            "{t_secs} must sit on a beat of (anchor={anchor}, bpm={bpm}); \
+             n_beats={n_beats}"
+        );
+        let n_i = n_round as i64;
+        assert_eq!(
+            n_i.rem_euclid(4),
+            i64::from(bar_phase),
+            "{t_secs} must sit on a *downbeat* of (anchor={anchor}, bpm={bpm}, \
+             bar_phase={bar_phase}); n_beats={n_i}"
+        );
+    }
+
+    /// 2× preserves the *position* (in seconds) of every existing
+    /// downbeat — the new grid is denser, but every old downbeat is
+    /// still a downbeat in it. The post-wrap-back representation
+    /// `(anchor, bar_phase)` may differ from the pre-shift one
+    /// because `anchor` lives in `[0, period)` and the period
+    /// halves; what matters is the visible musical position.
+    #[test]
+    fn scale_active_beatgrid_doubles_bpm_and_preserves_downbeat_position() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        // anchor=0.5s, bpm=60 (period 1s), bar_phase=2
+        // → original downbeats at 2.5s, 6.5s, 10.5s, …
+        lib.upsert_user_tap_beatgrid(&track_id, 0.5, 60.0, 2)
+            .unwrap();
+        let pre = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        let pre_downbeat = pre.anchor_secs + f64::from(pre.bar_phase) * 60.0 / pre.bpm;
+
+        let post = lib
+            .scale_active_beatgrid(&track_id, 2.0)
+            .unwrap()
+            .expect("scale on a known-active grid must surface the new active row");
+
+        assert_eq!(
+            post.source, "user_tap",
+            "scaled grid must persist as user_tap"
+        );
+        assert!(
+            (post.bpm - 120.0).abs() < 1e-9,
+            "bpm must be doubled, got {}",
+            post.bpm
+        );
+        let new_period = 60.0 / post.bpm;
+        assert!(
+            post.anchor_secs >= 0.0 && post.anchor_secs < new_period,
+            "anchor must lie in [0, new_period); got anchor={} period={new_period}",
+            post.anchor_secs
+        );
+        assert!(post.bar_phase < 4, "bar_phase must stay < beats_per_bar");
+        // Every old downbeat must still be a downbeat in the new grid.
+        assert_is_downbeat(pre_downbeat, post.anchor_secs, post.bpm, post.bar_phase);
+        assert_is_downbeat(
+            pre_downbeat + 4.0,
+            post.anchor_secs,
+            post.bpm,
+            post.bar_phase,
+        );
+    }
+
+    /// ½ preserves the position of every *retained* downbeat (every
+    /// other one in the original grid). Same invariant as the 2×
+    /// case: the originally-pinned downbeat at `pre_downbeat` must
+    /// still be a downbeat in the half-density grid.
+    #[test]
+    fn scale_active_beatgrid_halves_bpm_and_preserves_downbeat_position() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        // anchor=0.25s, bpm=120 (period 0.5s), bar_phase=1
+        // → original downbeats at 0.75s, 2.75s, 4.75s, …
+        lib.upsert_user_tap_beatgrid(&track_id, 0.25, 120.0, 1)
+            .unwrap();
+        let pre = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        let pre_downbeat = pre.anchor_secs + f64::from(pre.bar_phase) * 60.0 / pre.bpm;
+
+        let post = lib.scale_active_beatgrid(&track_id, 0.5).unwrap().unwrap();
+        assert!(
+            (post.bpm - 60.0).abs() < 1e-9,
+            "bpm must be halved, got {}",
+            post.bpm
+        );
+        assert_is_downbeat(pre_downbeat, post.anchor_secs, post.bpm, post.bar_phase);
+        // After halving, the next downbeat is 4 new-beats = 4
+        // seconds further (new period = 1s). The original grid had
+        // a downbeat at pre_downbeat + 2s — but that one *is not*
+        // a downbeat in the half-density grid; only every other one
+        // is retained.
+        assert_is_downbeat(
+            pre_downbeat + 4.0,
+            post.anchor_secs,
+            post.bpm,
+            post.bar_phase,
+        );
+    }
+
+    #[test]
+    fn scale_active_beatgrid_rejects_invalid_multipliers() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = lib.scale_active_beatgrid(&track_id, bad).err();
+            assert!(
+                matches!(err, Some(LibraryError::DecodeFailed { .. })),
+                "multiplier {bad} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_active_beatgrid_refuses_to_touch_locked_grids() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        lib.set_grid_locked(&track_id, true).unwrap();
+
+        let err = lib.scale_active_beatgrid(&track_id, 2.0).err();
+        assert!(
+            matches!(err, Some(LibraryError::GridLocked { .. })),
+            "locked grid must refuse octave shift, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scale_active_beatgrid_returns_none_for_track_with_no_active_grid() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        // No analyze → no grid rows at all.
+        let res = lib.scale_active_beatgrid(&track_id, 2.0).unwrap();
+        assert!(res.is_none(), "no active grid → no-op Ok(None)");
+    }
+
+    #[test]
+    fn reset_active_beatgrid_demotes_user_tap_and_reactivates_auto() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        let auto = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        assert_eq!(auto.source, "auto");
+
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 99.0, 0)
+            .unwrap();
+        let tapped = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        assert_eq!(tapped.source, "user_tap");
+
+        let reset = lib
+            .reset_active_beatgrid_to_auto(&track_id)
+            .unwrap()
+            .expect("auto row must come back as the active grid");
+        assert_eq!(reset.source, "auto");
+        assert!(
+            (reset.bpm - auto.bpm).abs() < 1e-9,
+            "reset must restore the original auto bpm exactly"
+        );
+        assert!(
+            (reset.anchor_secs - auto.anchor_secs).abs() < 1e-9,
+            "reset must restore the original auto anchor exactly"
+        );
+        assert_eq!(reset.bar_phase, auto.bar_phase);
+
+        // user_tap row must remain in the table but with is_active=0
+        let tap_active: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT is_active FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'user_tap'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tap_active, 0, "user_tap row must be demoted, not deleted");
+    }
+
+    #[test]
+    fn reset_active_beatgrid_returns_none_when_no_auto_row_exists() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        // Never analyzed → no auto row. Write a user_tap row anyway
+        // to exercise the "no auto to fall back on" branch.
+        lib.upsert_user_tap_beatgrid(&track_id, 0.0, 120.0, 0)
+            .unwrap();
+
+        let res = lib.reset_active_beatgrid_to_auto(&track_id).unwrap();
+        assert!(
+            res.is_none(),
+            "no auto row → reset must report nothing to restore (caller asks user to analyze)"
+        );
+        // user_tap row must still be active so the deck doesn't go gridless.
+        let tap_active: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT is_active FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'user_tap'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tap_active, 1, "user_tap stays active when no auto exists");
+    }
+
+    #[test]
+    fn reset_active_beatgrid_refuses_to_touch_locked_grids() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 99.0, 0)
+            .unwrap();
+        lib.set_grid_locked(&track_id, true).unwrap();
+
+        let err = lib.reset_active_beatgrid_to_auto(&track_id).err();
+        assert!(
+            matches!(err, Some(LibraryError::GridLocked { .. })),
+            "locked grid must refuse reset, got {err:?}"
         );
     }
 }

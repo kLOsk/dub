@@ -215,6 +215,27 @@ struct DeckHeaderCallbacks {
     /// M11d.7 tap-to-grid on the BPM column.
     var onTapBpm: (() -> Void)? = nil
 
+    /// Deck-header BPM context menu — "2×" entry. Doubles the
+    /// active library beatgrid's BPM and re-installs it on the
+    /// engine while keeping the visible downbeat anchored.
+    var onDoubleBpm: (() -> Void)? = nil
+    /// Deck-header BPM context menu — "½" entry. Halves the BPM
+    /// with the same downbeat-preservation invariant as the "2×"
+    /// entry.
+    var onHalveBpm: (() -> Void)? = nil
+    /// Deck-header BPM context menu — "Reset" entry. Drops user-tap
+    /// edits and reverts to the original auto-analysis grid.
+    var onResetBpm: (() -> Void)? = nil
+    /// Deck-header BPM context menu — "Lock grid" / "Unlock grid"
+    /// entry. The auto-analyse pass no longer auto-locks (user
+    /// feedback: silent freezes after a tap are hostile), so this
+    /// is now the only place a user blesses or unblesses a grid
+    /// from the performance surface. Mirrors the library-row
+    /// context menu's Lock/Unlock entry — same FFI call under the
+    /// hood — but kept close to the BPM number where the
+    /// "good to go" decision actually happens.
+    var onToggleGridLocked: (() -> Void)? = nil
+
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
     static let noop = DeckHeaderCallbacks()
@@ -329,15 +350,19 @@ struct DeckHeader: View {
                 }
                 Spacer(minLength: 0)
                 titleArtistGroup
-                if state.isMaster {
+                if state.isMaster, !prepMode {
                     masterChip.layoutPriority(2)
                 }
-                sourcePill.layoutPriority(2)
+                if !prepMode || !shouldHideSourcePill {
+                    sourcePill.layoutPriority(2)
+                }
                 deckLabel.layoutPriority(2)
             } else {
                 deckLabel.layoutPriority(2)
-                sourcePill.layoutPriority(2)
-                if state.isMaster {
+                if !prepMode || !shouldHideSourcePill {
+                    sourcePill.layoutPriority(2)
+                }
+                if state.isMaster, !prepMode {
                     masterChip.layoutPriority(2)
                 }
                 titleArtistGroup
@@ -641,6 +666,16 @@ struct DeckHeader: View {
             )
     }
 
+    /// Prep mode hides the FILE / LOADING source pill and the
+    /// MASTER chip — single-deck rehearsal doesn't need load-
+    /// target or master-deck chrome at glance distance.
+    private var shouldHideSourcePill: Bool {
+        switch state.source {
+        case .file, .loading: return true
+        default: return false
+        }
+    }
+
     private var sourcePillLabel: String {
         switch state.source {
         case .off:      return "OFF"
@@ -716,19 +751,57 @@ struct DeckHeader: View {
             .disabled(callbacks.onTapBpm == nil || state.bpm == nil || state.gridLocked)
             .help(bpmColumnHelpText)
         }
+        // Attach the context menu at the HStack level (instead of
+        // on the inner Button) so it stays reachable when the
+        // button is disabled by `state.gridLocked` — that's the
+        // only path to "Unlock grid" from the performance surface.
+        .contextMenu { bpmContextMenu }
+    }
+
+    /// Deck-header BPM right-click menu (PRD-BEATS §4 octave
+    /// override + grid-lock toggle). The 2× / ½ / Reset entries
+    /// write a `user_tap` row through the library so the change
+    /// survives a reload and a future re-analyse can demote them;
+    /// they're hidden when the grid is locked. The Lock / Unlock
+    /// entry is ALWAYS shown — it's the only performance-surface
+    /// path to flip the lock now that auto-analyse no longer
+    /// auto-locks (user feedback: "for now disable auto grid lock
+    /// instead right clicking the bpm should also have the option
+    /// to lock a grid or to unlock it").
+    @ViewBuilder
+    private var bpmContextMenu: some View {
+        if !state.gridLocked, state.bpm != nil {
+            if let onDoubleBpm = callbacks.onDoubleBpm {
+                Button("2×", action: onDoubleBpm)
+            }
+            if let onHalveBpm = callbacks.onHalveBpm {
+                Button("½", action: onHalveBpm)
+            }
+            if callbacks.onDoubleBpm != nil || callbacks.onHalveBpm != nil {
+                Divider()
+            }
+            if let onResetBpm = callbacks.onResetBpm {
+                Button("Reset to auto", action: onResetBpm)
+                Divider()
+            }
+        }
+        if let onToggleGridLocked = callbacks.onToggleGridLocked {
+            Button(state.gridLocked ? "Unlock grid" : "Lock grid",
+                   action: onToggleGridLocked)
+        }
     }
 
     /// PRD-BEATS §4.2 + gate 12: rolling preview takes the deck
     /// tint colour so the user can see at a glance that the
-    /// displayed value is provisional. Locked grids render in the
-    /// secondary text colour since taps are disabled. Otherwise
-    /// the normal placeholder/primary split applies.
+    /// displayed value is provisional. Otherwise the normal
+    /// placeholder/primary split applies. Locked grids deliberately
+    /// keep the primary colour (user feedback: "if a grid is
+    /// locked the bpm shouldnt be dark. the dark lock is fine but
+    /// bpm should be the regular colour") — the lock icon next to
+    /// the number carries the lock-state signal on its own.
     private var bpmDisplayColor: Color {
         if state.tapRollingBpm != nil {
             return DubColor.deckTint(side)
-        }
-        if state.gridLocked {
-            return DubColor.textSecondary
         }
         return state.bpm == nil ? DubColor.textPlaceholder : DubColor.textPrimary
     }
@@ -740,11 +813,11 @@ struct DeckHeader: View {
     /// tap-tempo is greyed out.
     private var bpmColumnHelpText: String {
         if state.gridLocked {
-            return "Grid is locked. Unlock via the library row context menu before tapping."
+            return "Grid is locked. Right-click to unlock before tapping."
         }
         return "Tap for downbeat (1–2 taps) or tempo recalc (3+ taps). "
             + "Tap window adapts to the tempo (1.5 s minimum). "
-            + "Lock via library row context menu."
+            + "Right-click for 2× / ½ / Reset / Lock."
     }
 
     @ViewBuilder

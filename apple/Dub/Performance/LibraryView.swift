@@ -334,6 +334,13 @@ struct LibraryView: View {
     @State private var keyboardScrollTarget: LibraryTrack.ID?
     @State private var keyboardScrollDelta: Int = 0
 
+    /// Bumped when in-memory row fields change (analysis patch,
+    /// etc.) so the AppKit table body refreshes even though the
+    /// track-id ordering is unchanged.
+    @State private var tracksContentRevision: UInt64 = 0
+
+    @FocusState private var searchFocused: Bool
+
     /// M11d.4 — `true` while the Relocate sheet is presented.
     /// Bound to the missing-files footer button.
     @State private var showRelocateSheet: Bool = false
@@ -398,6 +405,12 @@ struct LibraryView: View {
         .onChange(of: model.libraryRowAnalysisUpdate) { update in
             guard let update else { return }
             applyAnalysisUpdate(update)
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            handleLibraryDrop(providers)
+        }
+        .background {
+            LibraryTextFocusDismissMonitor()
         }
         .sheet(isPresented: $showRelocateSheet) {
             RelocateSheet(model: model, isPresented: $showRelocateSheet)
@@ -499,6 +512,8 @@ struct LibraryView: View {
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
             if entry.isAvailable {
                 selectedSource = entry
             }
@@ -516,6 +531,11 @@ struct LibraryView: View {
             footer
         }
         .background(DubColor.surface0)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        }
     }
 
     private var toolbar: some View {
@@ -531,6 +551,7 @@ struct LibraryView: View {
                 TextField("Search artist, title, album, comment", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(DubFont.body)
+                    .focused($searchFocused)
                 if !searchText.isEmpty {
                     Button {
                         searchText = ""
@@ -612,13 +633,28 @@ struct LibraryView: View {
                 tableWidth: tableContentWidth,
                 columnOrderKey: visibleColumns.map(\.rawValue).joined(separator: ","),
                 headerStateKey: columnReorderHeaderStateKey,
+                tracksContentRevision: tracksContentRevision,
                 selectedTrackIds: selectedTrackIds,
                 header: AnyView(trackListHeader),
                 rows: AnyView(trackRowsStack),
-                scrollToTrackId: keyboardScrollTarget,
-                scrollDelta: keyboardScrollDelta,
                 trackIds: sortedTracks.map(\.id),
-                onScrollHandled: { keyboardScrollTarget = nil }
+                visibleTracks: sortedTracks,
+                menu: LibraryTableMenu(
+                    analysisBatchInProgress: model.analysisBatchTotal > 0,
+                    onAnalyzeRequested: { ids in
+                        Task { @MainActor in
+                            await model.analyzeTracks(ids)
+                        }
+                    },
+                    onSetGridLocked: { trackId, locked in
+                        Task { @MainActor in
+                            await model.setGridLocked(trackId: trackId, locked: locked)
+                        }
+                    }),
+                scroll: LibraryTableScroll(
+                    scrollToTrackId: keyboardScrollTarget,
+                    scrollDelta: keyboardScrollDelta,
+                    onScrollHandled: { keyboardScrollTarget = nil })
             )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -635,7 +671,15 @@ struct LibraryView: View {
             .allowsHitTesting(false)
         )
         .onChange(of: selectedTrackIds) { _ in
-            syncModelPrimarySelection()
+            // Defer the FFI path lookup so row highlight paints on
+            // the same frame as the click instead of waiting for
+            // `library.trackPath` on the main thread first.
+            Task { @MainActor in
+                syncModelPrimarySelection()
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            handleLibraryDrop(providers)
         }
     }
 
@@ -688,6 +732,10 @@ struct LibraryView: View {
         }
         .overlay(alignment: .bottom) {
             Rectangle().fill(DubColor.divider).frame(height: 1)
+        }
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
         }
         .onPreferenceChange(ColumnHeaderFramesKey.self) { columnHeaderFrames = $0 }
     }
@@ -1198,8 +1246,12 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func trackRow(for track: LibraryTrack) -> some View {
-        let isSelected = selectedTrackIds.contains(track.id)
         let dragURL = libraryDragURL(for: track)
+        // Selection highlight is painted by the AppKit
+        // `LibrarySelectionLayerView` beneath the row host so a
+        // click never has to round-trip through SwiftUI's view
+        // diff before the colour appears. See
+        // `LibraryTableScrollContainer` for the layer wiring.
         HStack(spacing: 0) {
             rowIndicators(for: track)
                 .frame(width: 36, alignment: .leading)
@@ -1211,16 +1263,19 @@ struct LibraryView: View {
             }
         }
         .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
-        .frame(width: tableContentWidth, alignment: .leading)
-        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .frame(
+            width: tableContentWidth,
+            height: LibraryRowLayout.estimatedHeight,
+            alignment: .leading)
         .contentShape(Rectangle())
         .if(dragURL != nil) { view in
             view.onDrag {
                 if !selectedTrackIds.contains(track.id) {
                     selectedTrackIds = [track.id]
                     selectionAnchorId = track.id
-                    syncModelPrimarySelection()
+                    Task { @MainActor in
+                        syncModelPrimarySelection()
+                    }
                 }
                 return NSItemProvider(object: dragURL! as NSURL)
             }
@@ -1228,57 +1283,23 @@ struct LibraryView: View {
         .onTapGesture(count: 1) {
             handleRowClick(track)
         }
-        .contextMenu {
-            let targets = analyzeTargets(for: track)
-            let count = targets.count
-            let label = analyzeMenuLabel(for: track, count: count)
-            Button(label) {
-                Task { @MainActor in
-                    await model.analyzeTracks(targets)
-                }
-            }
-            .disabled(model.analysisBatchTotal > 0 || track.gridLocked)
-            Divider()
-            if track.gridLocked {
-                Button("Unlock grid") {
-                    Task { @MainActor in
-                        await model.setGridLocked(trackId: track.id, locked: false)
-                    }
-                }
-            } else {
-                Button("Lock grid") {
-                    Task { @MainActor in
-                        await model.setGridLocked(trackId: track.id, locked: true)
-                    }
-                }
-            }
-        }
-    }
-
-    /// PRD-BEATS §4.4 single menu entry. Label resolves from the
-    /// right-clicked row's analysis state. Multi-selection uses
-    /// the right-clicked row's state for the verb (Analyze vs
-    /// Re-analyze) and appends the selection count. Locked tracks
-    /// keep the "Re-analyze" verb (the lock toggle below is what
-    /// the user reaches for) and rely on the `.disabled` modifier
-    /// to enforce "lock is absolute" at the UI layer; the Rust
-    /// FFI rejects any call that slips past anyway (gate 8).
-    private func analyzeMenuLabel(for track: LibraryTrack, count: Int) -> String {
-        let verb = track.isAnalyzed ? "Re-analyze" : "Analyze"
-        if count > 1 {
-            return "\(verb) Selected (\(count))"
-        }
-        return verb
-    }
-
-    private func analyzeTargets(for track: LibraryTrack) -> [String] {
-        if selectedTrackIds.contains(track.id), selectedTrackIds.count > 1 {
-            return Array(selectedTrackIds)
-        }
-        return [track.id]
+        // Right-click menu is built by AppKit in
+        // `LibraryDocumentWrapper.menu(for:)` instead of the
+        // SwiftUI `.contextMenu` modifier. SwiftUI's `.contextMenu`
+        // closure is empirically captured at the moment the row is
+        // first attached and is NOT re-evaluated when upstream
+        // `@State` (notably `selectedTrackIds`) changes, because
+        // the AppKit selection layer (see
+        // `LibraryTableScrollContainer.updateNSView`) deliberately
+        // skips reassigning `bodyHost.rootView` on selection-only
+        // changes for click latency. Building the menu in AppKit
+        // reads the live selection set at right-click time and so
+        // always reflects the actual multi-selection, including
+        // the "Re-analyze Selected (N)" label.
     }
 
     private func handleRowClick(_ track: LibraryTrack) {
+        searchFocused = false
         NSApp.keyWindow?.makeFirstResponder(nil)
         let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) {
@@ -1299,7 +1320,6 @@ struct LibraryView: View {
             selectedTrackIds = [track.id]
             selectionAnchorId = track.id
         }
-        syncModelPrimarySelection()
     }
 
     private func selectRange(from anchorId: String, to targetId: String) {
@@ -1331,6 +1351,61 @@ struct LibraryView: View {
             return
         }
         tracks[idx] = tracks[idx].patchedAfterAnalysis(update)
+        tracksContentRevision &+= 1
+    }
+
+    /// Finder drag-and-drop onto the library listing. Folders are
+    /// walked recursively; individual audio files import via the
+    /// same `import_folder` entry point (WalkDir yields one file).
+    ///
+    /// `provider.loadItem` callbacks fire on an arbitrary queue, so
+    /// the URL collector is serialised through a dedicated queue
+    /// before the main-actor import hop.
+    private func handleLibraryDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard model.libraryIsOpen, !model.libraryImportInProgress else { return false }
+        let collector = DispatchQueue(label: "com.dub.library-drop-collector")
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                let resolved: URL?
+                if let url = item as? URL {
+                    resolved = url
+                } else if let data = item as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil)
+                {
+                    resolved = url
+                } else {
+                    resolved = nil
+                }
+                guard let resolved else { return }
+                collector.sync { urls.append(resolved) }
+            }
+        }
+        group.notify(queue: .main) {
+            let collected: [URL] = collector.sync { urls }
+            let importable = collected.filter { url in
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                else { return false }
+                if isDir.boolValue { return true }
+                return Self.isSupportedAudioFile(url)
+            }
+            guard !importable.isEmpty else { return }
+            Task { @MainActor in
+                for url in importable {
+                    await model.importLibraryFolder(url)
+                }
+            }
+        }
+        return !providers.isEmpty
+    }
+
+    private static func isSupportedAudioFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["mp3", "wav", "flac", "aiff", "aif", "m4a", "aac", "alac", "ogg"].contains(ext)
     }
 
     /// PRD §8.5.3 leftmost-gutter indicators. Order, top to
@@ -1506,6 +1581,11 @@ struct LibraryView: View {
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.xs)
         .background(DubColor.surface1)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        }
     }
 
     private func missingFooterLine(_ n: UInt64) -> String {
@@ -1666,6 +1746,7 @@ struct LibraryView: View {
             }
             await MainActor.run {
                 self.tracks = rows
+                self.tracksContentRevision &+= 1
                 self.isLoading = false
                 if preserveSelection {
                     let visible = Set(rows.map(\.id))
@@ -1864,20 +1945,104 @@ private enum LibraryRowLayout {
     static let headerHeight: CGFloat = 22
 }
 
+/// Right-click-menu inputs for `LibraryTableScrollContainer`.
+/// Bundles the batch-in-progress predicate (used to grey out
+/// "Re-analyze" while another batch runs) and the two action
+/// callbacks. Grouped so the SwiftUI call site doesn't need to
+/// pass three loose params, and so the menu contract stays
+/// readable in one place.
+///
+/// The callbacks fire on the main thread from the AppKit
+/// NSMenu dispatch — callers MUST own their own
+/// `Task { @MainActor in … }` if they touch model state.
+struct LibraryTableMenu {
+    let analysisBatchInProgress: Bool
+    let onAnalyzeRequested: ([String]) -> Void
+    let onSetGridLocked: (String, Bool) -> Void
+}
+
+/// One-shot programmatic-scroll request for
+/// `LibraryTableScrollContainer`. The container scrolls the
+/// matching row into view on the next `updateNSView` cycle then
+/// invokes `onScrollHandled` so the parent can clear its
+/// `@State` binding (otherwise the next render would scroll
+/// again on every keystroke).
+struct LibraryTableScroll {
+    let scrollToTrackId: String?
+    let scrollDelta: Int
+    let onScrollHandled: () -> Void
+}
+
 /// Sticky header + vertically/horizontally scrollable rows. The body
 /// `NSScrollView` owns the horizontal scroller; the header clips and
 /// tracks the body's horizontal offset.
+///
+/// ## SwiftUI ↔ AppKit bridge contract
+///
+/// **Snapshot props** (read at `updateNSView` time, latest value
+/// wins, no re-read between updates):
+///
+/// * `tableWidth`, `columnOrderKey`, `headerStateKey` — geometry +
+///   header layout. A change forces the header to rebuild.
+/// * `tracksContentRevision` — bumped by the parent whenever
+///   in-memory row fields change (analysis patch, lock toggle).
+///   Used to force the body host to re-render without changing the
+///   row id list. Without this, AppKit caches the row view.
+/// * `header`, `rows` (both `AnyView`) — the SwiftUI sub-trees the
+///   AppKit hosts wrap. Re-built on every parent render.
+/// * `trackIds` — id-order array. Used by selection + scroll math.
+/// * `visibleTracks` — full row snapshots. Used by the menu builder
+///   for `gridLocked` / `isAnalyzed` per row.
+/// * `selectedTrackIds` — read by the AppKit selection highlight
+///   layer at `updateNSView` time AND by the menu builder at
+///   right-click time (live, not at SwiftUI build time — that was
+///   the multi-select-label staleness bug).
+/// * `menu: LibraryTableMenu` — bundles the menu's batch
+///   in-progress predicate and the two action callbacks. See the
+///   struct's own doc comment for the actor contract.
+/// * `scroll: LibraryTableScroll` — bundles the one-shot
+///   programmatic scroll request + handler. See the struct's own
+///   doc comment for the one-shot reset protocol.
+///
+/// **Lifecycle**: `Coordinator` owns the `NSScrollView`s, the
+/// document wrapper, the selection layer, and the menu-action
+/// anchor list. `dismantleNSView` calls `Coordinator.uninstall()`
+/// which drops the document wrapper's menu builder closure (so it
+/// can't fire on a torn-down coordinator) and clears the scroll
+/// view's document view references.
+///
+/// **Click semantics**: row selection paints via the AppKit
+/// `LibrarySelectionLayerView` (NOT a SwiftUI `.background`) so
+/// the highlight appears on the same frame the click lands. Hit
+/// testing on the layer returns `nil` so clicks pass through to
+/// the SwiftUI row underneath. The right-click NSMenu is owned by
+/// the `LibraryDocumentWrapper` and built fresh on every event
+/// via `Coordinator.buildMenu(for:rowHeight:)`.
 private struct LibraryTableScrollContainer: NSViewRepresentable {
     let tableWidth: CGFloat
     let columnOrderKey: String
     let headerStateKey: String
+    let tracksContentRevision: UInt64
     let selectedTrackIds: Set<String>
     let header: AnyView
     let rows: AnyView
-    let scrollToTrackId: String?
-    let scrollDelta: Int
     let trackIds: [String]
-    let onScrollHandled: () -> Void
+    /// Live snapshot of the rows currently visible to the user
+    /// (post-search, post-sort). Used by `LibraryDocumentWrapper`
+    /// to build the right-click menu for whichever row the user
+    /// clicks on. Kept separate from `trackIds` because the menu
+    /// needs `gridLocked` + `isAnalyzed` per track, not just the
+    /// identity.
+    let visibleTracks: [LibraryTrack]
+    /// Right-click menu wiring (analyse + lock toggle + batch
+    /// state). Grouped so the call site doesn't have to thread
+    /// three loose callbacks through every refactor and so the
+    /// menu contract has a single named home (see `LibraryTableMenu`).
+    let menu: LibraryTableMenu
+    /// Programmatic scroll request (keyboard arrow navigation).
+    /// Grouped so the one-shot "scroll to this id then clear me"
+    /// protocol stays explicit at the call site.
+    let scroll: LibraryTableScroll
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1902,16 +2067,48 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         bodyScroll.drawsBackground = false
         bodyScroll.translatesAutoresizingMaskIntoConstraints = false
 
+        // Selection highlights are painted by an AppKit layer that
+        // lives BELOW the SwiftUI body host inside the scroll view's
+        // document. Painting selection here (instead of as a SwiftUI
+        // `.background` per row) means selection changes never have
+        // to round-trip through SwiftUI's view diff — clicks paint on
+        // the same frame, Finder-style.
+        //
+        // Frame-based layout (not Auto Layout) deliberately mirrors
+        // the existing `updateWidths` / `updateBodyHeight` path. An
+        // earlier attempt at Auto Layout collapsed the host to 1 pt
+        // because the wrapper had no intrinsic width constraints.
+        let initialBounds = NSRect(x: 0, y: 0, width: max(tableWidth, 1), height: 1)
+        let documentWrapper = LibraryDocumentWrapper(frame: initialBounds)
+        documentWrapper.translatesAutoresizingMaskIntoConstraints = true
+        documentWrapper.autoresizesSubviews = true
+
+        let selectionLayer = LibrarySelectionLayerView(frame: documentWrapper.bounds)
+        selectionLayer.translatesAutoresizingMaskIntoConstraints = true
+        selectionLayer.autoresizingMask = [.width, .height]
+        selectionLayer.fillColor = NSColor(DubColor.surface2)
+        selectionLayer.rowHeight = LibraryRowLayout.estimatedHeight
+
         let bodyHost = NSHostingView(rootView: rows)
-        bodyHost.translatesAutoresizingMaskIntoConstraints = false
-        bodyScroll.documentView = bodyHost
+        bodyHost.translatesAutoresizingMaskIntoConstraints = true
+        bodyHost.autoresizingMask = [.width, .height]
+        bodyHost.frame = documentWrapper.bounds
+
+        // Order matters: selection layer first so it sits BELOW the
+        // SwiftUI host. The host's row backgrounds are clear, so the
+        // colored rects show through.
+        documentWrapper.addSubview(selectionLayer)
+        documentWrapper.addSubview(bodyHost)
+        bodyScroll.documentView = documentWrapper
 
         let widthConstraint = headerHost.widthAnchor.constraint(
             equalToConstant: max(tableWidth, 1))
+        let leadingConstraint = headerHost.leadingAnchor.constraint(
+            equalTo: headerWrapper.leadingAnchor)
 
         NSLayoutConstraint.activate([
             headerWrapper.heightAnchor.constraint(equalToConstant: LibraryRowLayout.headerHeight),
-            headerHost.leadingAnchor.constraint(equalTo: headerWrapper.leadingAnchor),
+            leadingConstraint,
             headerHost.topAnchor.constraint(equalTo: headerWrapper.topAnchor),
             headerHost.heightAnchor.constraint(equalToConstant: LibraryRowLayout.headerHeight),
             widthConstraint,
@@ -1928,15 +2125,28 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             bodyScroll: bodyScroll,
             headerHost: headerHost,
             bodyHost: bodyHost,
-            headerWidthConstraint: widthConstraint
+            documentWrapper: documentWrapper,
+            selectionLayer: selectionLayer,
+            headerWidthConstraint: widthConstraint,
+            headerLeadingConstraint: leadingConstraint
         )
         context.coordinator.recordSnapshot(
             tableWidth: tableWidth,
             columnOrderKey: columnOrderKey,
             headerStateKey: headerStateKey,
+            tracksContentRevision: tracksContentRevision,
             selectedTrackIds: selectedTrackIds,
             trackIds: trackIds)
+        context.coordinator.updateMenuState(
+            visibleTracks: visibleTracks,
+            selectedTrackIds: selectedTrackIds,
+            analysisBatchInProgress: menu.analysisBatchInProgress,
+            onAnalyzeRequested: menu.onAnalyzeRequested,
+            onSetGridLocked: menu.onSetGridLocked)
+        context.coordinator.attachMenuBuilder(rowHeight: LibraryRowLayout.estimatedHeight)
         context.coordinator.updateBodyHeight()
+        context.coordinator.updateSelectionHighlights(
+            selectedTrackIds: selectedTrackIds, trackIds: trackIds)
         return stack
     }
 
@@ -1946,11 +2156,17 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         let tracksChanged = coordinator.lastTrackIds != trackIds
         let columnsChanged = coordinator.lastColumnOrderKey != columnOrderKey
         let headerStateChanged = coordinator.lastHeaderStateKey != headerStateKey
+        let tracksContentChanged = coordinator.lastTracksContentRevision != tracksContentRevision
         let selectionChanged = coordinator.lastSelectedTrackIds != selectedTrackIds
+        // Selection deliberately NOT in `bodyPresentationChanged` —
+        // reassigning `bodyHost.rootView` triggers a full SwiftUI
+        // diff over every row (AnyView wraps defeat structural
+        // diffing). Selection paints via the AppKit layer instead,
+        // so clicks land on the next frame.
         let bodyPresentationChanged = tracksChanged
             || tableWidthChanged
             || columnsChanged
-            || selectionChanged
+            || tracksContentChanged
 
         if tableWidthChanged || tracksChanged || columnsChanged || headerStateChanged {
             coordinator.headerHost?.rootView = header
@@ -1963,20 +2179,39 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             if tracksChanged {
                 coordinator.updateBodyHeight()
             }
+        } else if tableWidthChanged {
+            coordinator.updateWidths(tableWidth)
+        }
+
+        if selectionChanged || tracksChanged {
+            coordinator.updateSelectionHighlights(
+                selectedTrackIds: selectedTrackIds, trackIds: trackIds)
         }
 
         coordinator.recordSnapshot(
             tableWidth: tableWidth,
             columnOrderKey: columnOrderKey,
             headerStateKey: headerStateKey,
+            tracksContentRevision: tracksContentRevision,
             selectedTrackIds: selectedTrackIds,
             trackIds: trackIds)
+        // The right-click menu reads from the Coordinator at
+        // `menu(for:)` time, so it ALWAYS sees the latest selection
+        // / lock state even though the SwiftUI rows themselves
+        // are not re-rendered on selection changes (intentional —
+        // the AppKit selection layer paints highlights instead).
+        coordinator.updateMenuState(
+            visibleTracks: visibleTracks,
+            selectedTrackIds: selectedTrackIds,
+            analysisBatchInProgress: menu.analysisBatchInProgress,
+            onAnalyzeRequested: menu.onAnalyzeRequested,
+            onSetGridLocked: menu.onSetGridLocked)
         coordinator.syncHeaderOffset()
 
-        if let id = scrollToTrackId {
-            coordinator.scrollToTrack(id: id, trackIds: trackIds, delta: scrollDelta)
+        if let id = scroll.scrollToTrackId {
+            coordinator.scrollToTrack(id: id, trackIds: trackIds, delta: scroll.scrollDelta)
             DispatchQueue.main.async {
-                onScrollHandled()
+                scroll.onScrollHandled()
             }
         }
     }
@@ -1989,24 +2224,46 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         weak var bodyScroll: NSScrollView?
         weak var headerHost: NSHostingView<AnyView>?
         weak var bodyHost: NSHostingView<AnyView>?
+        weak var documentWrapper: LibraryDocumentWrapper?
+        weak var selectionLayer: LibrarySelectionLayerView?
         weak var headerWidthConstraint: NSLayoutConstraint?
+        weak var headerLeadingConstraint: NSLayoutConstraint?
         private var boundsObserver: NSObjectProtocol?
         fileprivate var lastTableWidth: CGFloat = -1
         fileprivate var lastColumnOrderKey: String = ""
         fileprivate var lastHeaderStateKey: String = ""
+        fileprivate var lastTracksContentRevision: UInt64 = 0
         fileprivate var lastSelectedTrackIds: Set<String> = []
         fileprivate var lastTrackIds: [String] = []
+
+        /// Live state consulted by `LibraryDocumentWrapper.menu(for:)`
+        /// at right-click time. Refreshed on every `updateNSView`
+        /// pass so the menu always reflects the user's current
+        /// selection, not whatever state happened to be captured
+        /// when the row was first laid out.
+        fileprivate var visibleTracks: [LibraryTrack] = []
+        fileprivate var menuSelectedTrackIds: Set<String> = []
+        fileprivate var menuAnalysisBatchInProgress: Bool = false
+        fileprivate var onAnalyzeRequested: (([String]) -> Void)?
+        fileprivate var onSetGridLocked: ((String, Bool) -> Void)?
+        /// Anchors the closures the menu items invoke. NSMenuItem
+        /// holds only a weak target reference; without keeping the
+        /// targets alive on the Coordinator the actions would
+        /// segfault the moment the menu actually dispatches.
+        private var menuActionAnchors: [LibraryMenuActionTarget] = []
 
         func recordSnapshot(
             tableWidth: CGFloat,
             columnOrderKey: String,
             headerStateKey: String,
+            tracksContentRevision: UInt64,
             selectedTrackIds: Set<String>,
             trackIds: [String]
         ) {
             lastTableWidth = tableWidth
             lastColumnOrderKey = columnOrderKey
             lastHeaderStateKey = headerStateKey
+            lastTracksContentRevision = tracksContentRevision
             lastSelectedTrackIds = selectedTrackIds
             lastTrackIds = trackIds
         }
@@ -2015,12 +2272,18 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             bodyScroll: NSScrollView,
             headerHost: NSHostingView<AnyView>,
             bodyHost: NSHostingView<AnyView>,
-            headerWidthConstraint: NSLayoutConstraint
+            documentWrapper: LibraryDocumentWrapper,
+            selectionLayer: LibrarySelectionLayerView,
+            headerWidthConstraint: NSLayoutConstraint,
+            headerLeadingConstraint: NSLayoutConstraint
         ) {
             self.bodyScroll = bodyScroll
             self.headerHost = headerHost
             self.bodyHost = bodyHost
+            self.documentWrapper = documentWrapper
+            self.selectionLayer = selectionLayer
             self.headerWidthConstraint = headerWidthConstraint
+            self.headerLeadingConstraint = headerLeadingConstraint
             bodyScroll.contentView.postsBoundsChangedNotifications = true
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
@@ -2038,28 +2301,174 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         }
 
         func syncHeaderOffset() {
-            guard let bodyScroll, let headerHost else { return }
+            guard let bodyScroll else { return }
             let x = bodyScroll.contentView.bounds.origin.x
-            var frame = headerHost.frame
-            frame.origin.x = -x
-            headerHost.frame = frame
+            headerLeadingConstraint?.constant = -x
         }
 
         func updateWidths(_ tableWidth: CGFloat) {
-            guard let bodyHost else { return }
-            var frame = bodyHost.frame
+            guard let documentWrapper else { return }
+            var frame = documentWrapper.frame
             frame.size.width = max(tableWidth, 1)
-            bodyHost.frame = frame
+            documentWrapper.frame = frame
+            // bodyHost + selectionLayer follow via `autoresizingMask`.
         }
 
         func updateBodyHeight() {
-            guard let bodyHost, let bodyScroll else { return }
+            guard let bodyHost, let documentWrapper, let bodyScroll else { return }
             bodyHost.invalidateIntrinsicContentSize()
             let height = max(bodyHost.fittingSize.height, 1)
-            var frame = bodyHost.frame
+            var frame = documentWrapper.frame
             frame.size.height = height
-            bodyHost.frame = frame
-            bodyScroll.documentView = bodyHost
+            documentWrapper.frame = frame
+            // bodyScroll re-evaluates scrollable area off `documentView.frame`.
+            bodyScroll.documentView = documentWrapper
+        }
+
+        /// O(n) projection of the selected-id set onto sorted row
+        /// indices. Cheap — `selectionLayer.draw(_:)` only fills
+        /// the intersect of dirty rect × selected rectangles, so a
+        /// click invalidates one or two rows worth of pixels.
+        func updateSelectionHighlights(
+            selectedTrackIds: Set<String>,
+            trackIds: [String]
+        ) {
+            guard let selectionLayer else { return }
+            if selectedTrackIds.isEmpty {
+                selectionLayer.selectedRowIndices = IndexSet()
+                return
+            }
+            var indices = IndexSet()
+            for (i, id) in trackIds.enumerated() where selectedTrackIds.contains(id) {
+                indices.insert(i)
+            }
+            selectionLayer.selectedRowIndices = indices
+        }
+
+        /// Snapshot the menu-time inputs so the AppKit
+        /// `menu(for:)` override (which fires asynchronously
+        /// from the SwiftUI render pass) reads consistent state.
+        /// Called on every `updateNSView`.
+        func updateMenuState(
+            visibleTracks: [LibraryTrack],
+            selectedTrackIds: Set<String>,
+            analysisBatchInProgress: Bool,
+            onAnalyzeRequested: @escaping ([String]) -> Void,
+            onSetGridLocked: @escaping (String, Bool) -> Void
+        ) {
+            self.visibleTracks = visibleTracks
+            self.menuSelectedTrackIds = selectedTrackIds
+            self.menuAnalysisBatchInProgress = analysisBatchInProgress
+            self.onAnalyzeRequested = onAnalyzeRequested
+            self.onSetGridLocked = onSetGridLocked
+        }
+
+        /// Wire the document wrapper to ask us for an `NSMenu` on
+        /// every right-click. The closure captures the Coordinator
+        /// weakly so we don't leak it; it reads the live
+        /// `visibleTracks` + `menuSelectedTrackIds` set at click
+        /// time, which is the entire point — SwiftUI's
+        /// `.contextMenu` body is captured at row-attach time and
+        /// would have shown stale single-row state.
+        func attachMenuBuilder(rowHeight: CGFloat) {
+            documentWrapper?.menuBuilder = { [weak self] event in
+                self?.buildMenu(for: event, rowHeight: rowHeight)
+            }
+        }
+
+        /// Translate the right-click into a row index and build the
+        /// matching `NSMenu`. Returns `nil` (no menu) when the
+        /// click misses every row.
+        fileprivate func buildMenu(for event: NSEvent, rowHeight: CGFloat) -> NSMenu? {
+            guard let documentWrapper else { return nil }
+            let point = documentWrapper.convert(event.locationInWindow, from: nil)
+            let idx = Int(floor(point.y / rowHeight))
+            guard idx >= 0, idx < visibleTracks.count else { return nil }
+            let track = visibleTracks[idx]
+            return buildContextMenu(for: track)
+        }
+
+        /// Pure menu construction: no AppKit display side effects.
+        /// Split out so it can be unit-tested via the
+        /// `visibleTracks` / `menuSelectedTrackIds` inputs without
+        /// needing an `NSWindow` to host the popup.
+        private func buildContextMenu(for track: LibraryTrack) -> NSMenu {
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            let targets = analyzeTargets(rightClickedTrack: track)
+            let unlocked = targets.filter { !isLocked($0) }
+            let label = analyzeMenuLabel(
+                rightClickedTrack: track,
+                allCount: targets.count,
+                unlockedCount: unlocked.count)
+            let analyzeItem = NSMenuItem(title: label, action: nil, keyEquivalent: "")
+            if !menuAnalysisBatchInProgress, !unlocked.isEmpty,
+               let onAnalyze = onAnalyzeRequested
+            {
+                let target = LibraryMenuActionTarget { onAnalyze(unlocked) }
+                menuActionAnchors.append(target)
+                analyzeItem.target = target
+                analyzeItem.action = #selector(LibraryMenuActionTarget.dubMenuPerform(_:))
+                analyzeItem.isEnabled = true
+            } else {
+                analyzeItem.isEnabled = false
+            }
+            menu.addItem(analyzeItem)
+            menu.addItem(.separator())
+            let lockTitle = track.gridLocked ? "Unlock grid" : "Lock grid"
+            let lockItem = NSMenuItem(title: lockTitle, action: nil, keyEquivalent: "")
+            if let onSetGridLocked {
+                let target = LibraryMenuActionTarget {
+                    onSetGridLocked(track.id, !track.gridLocked)
+                }
+                menuActionAnchors.append(target)
+                lockItem.target = target
+                lockItem.action = #selector(LibraryMenuActionTarget.dubMenuPerform(_:))
+                lockItem.isEnabled = true
+            } else {
+                lockItem.isEnabled = false
+            }
+            menu.addItem(lockItem)
+            // Drop the previous run's anchors once a new menu is
+            // built — the anchors are only needed while the menu
+            // is visible, and AppKit keeps the in-flight menu
+            // retained via its own dispatcher. Without this the
+            // anchor list would grow unbounded over a long
+            // session.
+            menuActionAnchors = Array(menuActionAnchors.suffix(8))
+            return menu
+        }
+
+        /// Multi-selection acts on the full selection when the
+        /// right-clicked row IS part of it; otherwise the menu acts
+        /// only on the right-clicked row (Finder semantics).
+        private func analyzeTargets(rightClickedTrack track: LibraryTrack) -> [String] {
+            if menuSelectedTrackIds.contains(track.id), menuSelectedTrackIds.count > 1 {
+                return Array(menuSelectedTrackIds)
+            }
+            return [track.id]
+        }
+
+        private func isLocked(_ trackId: String) -> Bool {
+            visibleTracks.first(where: { $0.id == trackId })?.gridLocked ?? false
+        }
+
+        /// PRD-BEATS §4.4 label. Reflects mixed-lock selections as
+        /// "Re-analyze Selected (3 of 5)" so the user can see how
+        /// many rows the analyse pass will skip before clicking.
+        private func analyzeMenuLabel(
+            rightClickedTrack track: LibraryTrack,
+            allCount: Int,
+            unlockedCount: Int
+        ) -> String {
+            let verb = track.isAnalyzed ? "Re-analyze" : "Analyze"
+            if allCount > 1 {
+                if unlockedCount < allCount {
+                    return "\(verb) Selected (\(unlockedCount) of \(allCount))"
+                }
+                return "\(verb) Selected (\(allCount))"
+            }
+            return verb
         }
 
         func scrollToTrack(id: String, trackIds: [String], delta: Int) {
@@ -2083,6 +2492,233 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
     }
 }
 
+/// Container for the AppKit selection layer + the SwiftUI body
+/// host inside the library's scroll view. Flipped so row 0 sits
+/// at `y = 0` (top), matching `LibraryRowLayout.estimatedHeight`
+/// arithmetic used elsewhere in the coordinator.
+///
+/// Owns the right-click context menu. The actual menu construction
+/// lives in `LibraryTableScrollContainer.Coordinator` (so it can
+/// read the live selection + lock state); this view's only job is
+/// to receive the `menu(for:)` callback from AppKit and forward
+/// it. Building the menu in AppKit (instead of SwiftUI's
+/// `.contextMenu`) is what gives the "Re-analyze Selected (N)"
+/// label its always-fresh count: SwiftUI's modifier captures
+/// state when the row first attaches and is not re-evaluated by
+/// the AppKit selection-layer optimisation (see
+/// `LibraryTableScrollContainer.updateNSView`).
+private final class LibraryDocumentWrapper: NSView {
+    var menuBuilder: ((NSEvent) -> NSMenu?)?
+
+    override var isFlipped: Bool { true }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        if let menu = menuBuilder?(event) {
+            return menu
+        }
+        return super.menu(for: event)
+    }
+}
+
+/// Tiny `NSObject` wrapper so an `NSMenuItem` can fire a Swift
+/// closure. `NSMenuItem` only accepts an Objective-C-style
+/// (`target`, `action:`) pair; this class bridges that to a
+/// `() -> Void` closure. Lifetime is managed by the Coordinator
+/// (see `menuActionAnchors`) because `NSMenuItem.target` is weak.
+///
+/// IMPORTANT: the action method MUST NOT be named `perform(_:)`.
+/// Selector `perform:` collides with the long-deprecated
+/// `-[NSObject perform:]` method (an old alias for
+/// `performSelector:` that still lives in the Obj-C runtime).
+/// When AppKit dispatches the menu item action by selector
+/// `perform:`, the runtime resolves it against the base NSObject
+/// implementation instead of our override (the signatures differ
+/// enough that the override does not actually shadow it) and the
+/// closure silently never fires. The menu item visibly clicks,
+/// no exception is thrown, and "nothing happens" — a UI bug
+/// class that wasted multiple debugging rounds before the
+/// collision was identified. Using a project-scoped name like
+/// `dubMenuPerform:` sidesteps the collision entirely.
+private final class LibraryMenuActionTarget: NSObject {
+    private let work: () -> Void
+
+    init(_ work: @escaping () -> Void) {
+        self.work = work
+    }
+
+    @objc func dubMenuPerform(_ sender: Any?) {
+        work()
+    }
+}
+
+/// Paints library row-selection rectangles in AppKit so a click
+/// never has to wait for SwiftUI's view diff to repaint the row
+/// background. The layer is positioned below the SwiftUI body
+/// host inside `LibraryDocumentWrapper`; rows themselves draw a
+/// clear background so the fill shows through.
+///
+/// Rows are assumed uniform-height — same assumption the rest of
+/// the table makes (see `LibraryRowLayout.estimatedHeight` and
+/// the `scrollToTrack` arithmetic). If row heights diverge in the
+/// future, this view will need a row-frame oracle, but today it's
+/// strictly `y = i * rowHeight`.
+private final class LibrarySelectionLayerView: NSView {
+    var rowHeight: CGFloat = 28 {
+        didSet {
+            if rowHeight != oldValue { needsDisplay = true }
+        }
+    }
+
+    var fillColor: NSColor = .clear {
+        didSet { needsDisplay = true }
+    }
+
+    var selectedRowIndices: IndexSet = [] {
+        didSet {
+            guard selectedRowIndices != oldValue else { return }
+            invalidateRows(in: oldValue.union(selectedRowIndices))
+        }
+    }
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+    override var acceptsFirstResponder: Bool { false }
+
+    /// Crucial — this layer is decorative only. Returning `nil`
+    /// from `hitTest` lets every mouse event pass straight through
+    /// to the SwiftUI host above. Without this the selection
+    /// rects would swallow clicks and break tap-to-select.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !selectedRowIndices.isEmpty else { return }
+        fillColor.setFill()
+        for idx in selectedRowIndices {
+            let rowRect = NSRect(
+                x: 0, y: CGFloat(idx) * rowHeight,
+                width: bounds.width, height: rowHeight)
+            if rowRect.intersects(dirtyRect) {
+                rowRect.fill()
+            }
+        }
+    }
+
+    /// Invalidate only the strips that changed selection state.
+    /// Keeps the per-click repaint to two row-height bands instead
+    /// of the whole scrollable area (which on a long library is
+    /// many thousands of points tall).
+    private func invalidateRows(in indices: IndexSet) {
+        guard !indices.isEmpty else { return }
+        for idx in indices {
+            let rowRect = NSRect(
+                x: 0, y: CGFloat(idx) * rowHeight,
+                width: bounds.width, height: rowHeight)
+            setNeedsDisplay(rowRect)
+        }
+    }
+}
+
+/// Resigns library search focus on any click that lands outside
+/// an editable text field. SwiftUI `@FocusState` alone is
+/// unreliable with AppKit-hosted table rows.
+///
+/// ## SwiftUI ↔ AppKit bridge contract
+///
+/// **Snapshot props**: none. The bridge has no SwiftUI inputs; it
+/// exists purely as a parent-attached background that installs a
+/// global mouse-down monitor on `makeNSView`.
+///
+/// **Closure props**: none. Side-effect-only — the monitor calls
+/// `NSApp.keyWindow?.makeFirstResponder(nil)` directly.
+///
+/// **Lifecycle**: the local-monitor handle is owned by the
+/// `Coordinator`. `dismantleNSView` calls `uninstall()` which
+/// removes the monitor; without this the monitor outlives the
+/// SwiftUI view tree and fires against a stale window.
+///
+/// **Hit-test contract**: the hit-test for "is the click on an
+/// editable text view?" runs at the `contentView` of the key
+/// window using `event.locationInWindow` (NOT converted). Using
+/// converted coordinates produced false positives on the search
+/// field and broke the dismiss.
+private struct LibraryTextFocusDismissMonitor: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.install()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        private var monitor: Any?
+
+        func install() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+                guard Self.isEditableTextFirstResponder() else { return event }
+                guard !Self.eventTargetsEditableText(event) else { return event }
+                NSApp.keyWindow?.makeFirstResponder(nil)
+                return event
+            }
+        }
+
+        func uninstall() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            monitor = nil
+        }
+
+        private static func isEditableTextFirstResponder() -> Bool {
+            guard let responder = NSApp.keyWindow?.firstResponder else { return false }
+            if responder is NSTextView { return true }
+            if let field = responder as? NSTextField, field.isEditable {
+                return true
+            }
+            return false
+        }
+
+        private static func eventTargetsEditableText(_ event: NSEvent) -> Bool {
+            // `NSView.hitTest(_:)` expects the point in the
+            // receiver's superview coordinate space. Window
+            // coordinates ARE the contentView's effective parent
+            // space, so pass `locationInWindow` directly — do not
+            // convert into contentView-local coordinates first.
+            guard let window = event.window,
+                  let contentView = window.contentView
+            else { return false }
+            var candidate: NSView? = contentView.hitTest(event.locationInWindow)
+            while let view = candidate {
+                if view is NSTextView { return true }
+                if let field = view as? NSTextField, field.isEditable { return true }
+                candidate = view.superview
+            }
+            return false
+        }
+    }
+}
+
+/// Right-click context menu for a library row. PRD-BEATS §4.4
+/// "single Re-analyze entry" — collapses Analyze and Re-analyze
+/// into one verb that depends on the row's current state. Lives in
+/// its own `View` struct (rather than inline in
+/// `LibraryView.trackRow.contextMenu { ... }`) for one reason:
+/// SwiftUI's `.contextMenu` body closure does NOT reliably
+/// re-evaluate when the parent's `@State` changes. Empirically the
+/// closure runs once when the row is first attached and the
+/// captured selection then sticks across subsequent multi-selects.
+/// Threading the selection through an explicit child view forces
+/// SwiftUI's identity diffing to recreate the menu body whenever
+/// the inputs change, so the visible label "(N of M)" tracks the
+/// live selection rather than whatever was selected when the row
+/// first appeared.
 private struct DimUnanalyzed: ViewModifier {
     let track: LibraryTrack
     func body(content: Content) -> some View {
@@ -2144,6 +2780,41 @@ private extension LibraryTrack {
 // MARK: - Library arrow-key navigation
 
 /// Local ↑/↓ handler for the library list.
+///
+/// ## SwiftUI ↔ AppKit bridge contract
+///
+/// **Snapshot props** (read by the Coordinator at `updateNSView`):
+///
+/// * `trackIds: [String]` — current id-order array. The arrow-key
+///   handler uses this to translate "selection + delta" into "next
+///   track id". Stale `trackIds` means arrow keys jump to a
+///   wrong-but-old id; always pass the post-sort, post-filter list.
+///
+/// **Binding props** (two-way; the handler mutates them):
+///
+/// * `selectedTrackIds: Set<String>` — selection state. Mutated by
+///   arrow + shift-arrow.
+/// * `selectionAnchorId: String?` — shift-selection anchor.
+///   Mutated on plain arrow (anchor = new selection) and left
+///   alone on shift-arrow (anchor preserved).
+///
+/// **Closure props**:
+///
+/// * `onArrowNavigate(String, Int)?` — fires AFTER selection
+///   mutation, with the new selected id + direction (-1 / +1).
+///   Used by the parent to scroll the just-selected row into view
+///   and clear `keyboardScrollTarget` once handled.
+/// * `onSelectionChanged()` — fires AFTER every selection mutation
+///   so the model's primary-selection mirror stays in sync.
+///
+/// **Lifecycle**: the Coordinator installs an `NSEvent`
+/// local-monitor for `.keyDown`; `dismantleNSView` removes it.
+///
+/// **Hit-test contract**: parent uses `.allowsHitTesting(false)`
+/// on this view so mouse events fall through to the row tree
+/// beneath. The key-down monitor doesn't care — it fires on the
+/// first responder, which is the table region as long as no text
+/// field has focus (see `LibraryTextFocusDismissMonitor`).
 private struct LibraryArrowKeyView: NSViewRepresentable {
     @Binding var selectedTrackIds: Set<String>
     @Binding var selectionAnchorId: String?

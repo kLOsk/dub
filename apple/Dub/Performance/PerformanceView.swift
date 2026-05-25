@@ -154,6 +154,18 @@ struct PerformanceView: View {
             onPanicToggle: { model.panicToggle(side: side) },
             onTapBpm: {
                 model.handleTapForGrid(side)
+            },
+            onDoubleBpm: {
+                model.scaleLoadedDeckBpm(side: side, multiplier: 2.0)
+            },
+            onHalveBpm: {
+                model.scaleLoadedDeckBpm(side: side, multiplier: 0.5)
+            },
+            onResetBpm: {
+                model.resetLoadedDeckBeatGrid(side: side)
+            },
+            onToggleGridLocked: {
+                model.toggleLoadedDeckGridLocked(side: side)
             })
     }
 

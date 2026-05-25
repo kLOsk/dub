@@ -142,29 +142,20 @@ struct TrackOverviewView: View {
         // observes the per-second tick.
         TimelineView(.periodic(from: .now, by: 0.1)) { context in
             GeometryReader { geo in
-                Canvas { ctx, size in
-                    // **Critical** — referencing `context.date`
-                    // inside the Canvas closure is what forces
-                    // SwiftUI to re-invoke this draw block on every
-                    // TimelineView tick. Canvas's closure is
-                    // opaque to SwiftUI's diff machinery, so
-                    // without a per-tick captured dependency the
-                    // draw output is cached across body
-                    // re-evaluations and the playhead bracket
-                    // freezes at its first-frame position even
-                    // though the engine's playhead is advancing.
-                    // The read is otherwise unused — the engine
-                    // FFI is the real data source — but it pins
-                    // the Canvas to the animation schedule (same
-                    // idiom Apple's TimelineView + Canvas
-                    // examples document).
-                    _ = context.date
-                    drawBackground(ctx: ctx, size: size)
+                ZStack {
+                    Canvas { ctx, size in
+                        _ = context.date
+                        drawBackground(ctx: ctx, size: size)
+                        if let buckets, !buckets.isEmpty {
+                            drawBars(ctx: ctx, size: size, buckets: buckets)
+                            drawMinuteMarkers(ctx: ctx, size: size)
+                            drawPlayhead(ctx: ctx, size: size)
+                        } else {
+                            drawEmptyState(ctx: ctx, size: size)
+                        }
+                    }
                     if let buckets, !buckets.isEmpty {
-                        drawBars(ctx: ctx, size: size, buckets: buckets)
-                        drawPlayhead(ctx: ctx, size: size)
-                    } else {
-                        drawEmptyState(ctx: ctx, size: size)
+                        minuteMarkerLabels(in: geo.size)
                     }
                 }
                 .contentShape(Rectangle())
@@ -280,6 +271,133 @@ struct TrackOverviewView: View {
             ctx.fill(peakPath, with: .color(peakColor))
             ctx.fill(rmsPath, with: .color(rmsColor))
         }
+    }
+
+    /// Minute-boundary ticks along the time axis so the DJ can
+    /// read track length and current position at a glance.
+    private func drawMinuteMarkers(ctx: GraphicsContext, size: CGSize) {
+        guard let duration = overviewDurationSecs(), duration > 0 else { return }
+        let pad = OverviewLayout.endPadding
+        let tickColor = Color.white.opacity(0.28)
+        let majorTickColor = Color.white.opacity(0.42)
+        let intervalSecs = duration >= 120 ? 60.0 : 30.0
+        var marker = intervalSecs
+        while marker < duration {
+            let fraction = marker / duration
+            switch orientation {
+            case .vertical:
+                let axisStart = pad
+                let axisLength = max(0, size.height - 2 * pad)
+                let y = axisStart + axisLength * CGFloat(fraction)
+                let isMinute = intervalSecs >= 60
+                let tick = Path { path in
+                    path.move(to: CGPoint(x: 0, y: y))
+                    path.addLine(to: CGPoint(x: size.width, y: y))
+                }
+                ctx.stroke(
+                    tick,
+                    with: .color(isMinute ? majorTickColor : tickColor),
+                    lineWidth: isMinute ? 1.25 : 0.75)
+            case .horizontal:
+                let axisStart = pad
+                let axisLength = max(0, size.width - 2 * pad)
+                let x = axisStart + axisLength * CGFloat(fraction)
+                let isMinute = intervalSecs >= 60
+                let tick = Path { path in
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: size.height))
+                }
+                ctx.stroke(
+                    tick,
+                    with: .color(isMinute ? majorTickColor : tickColor),
+                    lineWidth: isMinute ? 1.25 : 0.75)
+            }
+            marker += intervalSecs
+        }
+    }
+
+    @ViewBuilder
+    private func minuteMarkerLabels(in size: CGSize) -> some View {
+        if let duration = overviewDurationSecs(), duration > 0 {
+            let intervalSecs = duration >= 120 ? 60.0 : 30.0
+            let labels = minuteLabelPoints(duration: duration, intervalSecs: intervalSecs)
+            ForEach(labels, id: \.self) { point in
+                switch orientation {
+                case .vertical:
+                    Text(point.label)
+                        .font(.system(size: 7, weight: .semibold, design: .rounded))
+                        .foregroundColor(Color.white.opacity(0.72))
+                        .position(x: size.width - 6, y: axisPosition(fraction: point.fraction, size: size) ?? 0)
+                case .horizontal:
+                    Text(point.label)
+                        .font(.system(size: 7, weight: .semibold, design: .rounded))
+                        .foregroundColor(Color.white.opacity(0.72))
+                        .position(x: axisPosition(fraction: point.fraction, size: size) ?? 0, y: 7)
+                }
+            }
+        }
+    }
+
+    private struct MinuteLabelPoint: Hashable {
+        let label: String
+        let fraction: Double
+    }
+
+    private func minuteLabelPoints(duration: Double, intervalSecs: Double) -> [MinuteLabelPoint] {
+        var points: [MinuteLabelPoint] = [MinuteLabelPoint(label: "0", fraction: 0)]
+        var marker = intervalSecs
+        while marker < duration {
+            points.append(
+                MinuteLabelPoint(
+                    label: Self.formatMarkerLabel(secs: marker, intervalSecs: intervalSecs),
+                    fraction: marker / duration))
+            marker += intervalSecs
+        }
+        return points
+    }
+
+    /// Sub-minute intervals get either `"Ns"` (under a minute) or
+    /// `"M:SS"` (past a minute) so adjacent labels never collapse
+    /// to the same string (e.g. 60s and 90s both being `"1m"`).
+    /// Minute intervals stay terse as `"Nm"`.
+    private static func formatMarkerLabel(secs: Double, intervalSecs: Double) -> String {
+        let total = Int(secs.rounded())
+        if intervalSecs >= 60 || total % 60 == 0 {
+            return "\(total / 60)m"
+        }
+        if total < 60 {
+            return "\(total)s"
+        }
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    private func axisPosition(fraction: Double, size: CGSize) -> CGFloat? {
+        let pad = OverviewLayout.endPadding
+        switch orientation {
+        case .vertical:
+            let axisLength = max(0, size.height - 2 * pad)
+            guard axisLength > 0 else { return nil }
+            return pad + axisLength * CGFloat(fraction)
+        case .horizontal:
+            let axisLength = max(0, size.width - 2 * pad)
+            guard axisLength > 0 else { return nil }
+            return pad + axisLength * CGFloat(fraction)
+        }
+    }
+
+    /// Track duration on the same peak-chunk grid as the bars and
+    /// playhead bracket.
+    private func overviewDurationSecs() -> Double? {
+        let pos = model.engine.position(deckIdx: deckIdx)
+        let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
+        let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
+        if peaksLen > 0, chunkDur > 0 {
+            return Double(peaksLen) * chunkDur
+        }
+        if pos.durationSecs > 0 {
+            return pos.durationSecs
+        }
+        return nil
     }
 
     private func drawPlayhead(ctx: GraphicsContext, size: CGSize) {

@@ -1509,6 +1509,16 @@ final class WaveformRenderer: NSObject {
         }
     }
 
+    /// Off-white used for beat ticks. Picked just below pure white
+    /// (≈ `surface ramp top + 4 %`) so the ticks read as bright
+    /// guides without competing with the playhead chevron's pure-
+    /// white callout. Crucially, the hue is luminance-distinct
+    /// from BOTH deck tints (orange and teal), so a tick remains
+    /// visible against a saturated waveform in either deck.
+    private static func beatTickRGBA(alpha: Float) -> SIMD4<Float> {
+        SIMD4(232.0 / 255.0, 232.0 / 255.0, 232.0 / 255.0, alpha)
+    }
+
     /// First beat index with `beats[i] >= time`. Beats are sorted
     /// ascending so we can skip the prefix outside the visible
     /// window in O(log n) instead of scanning from track start
@@ -1980,15 +1990,22 @@ final class WaveformRenderer: NSObject {
         case .horizontal:
             timeAxisPixels = max(1, Float(drawableSize.width))
         }
-        // PRD-BEATS §5.1 Serato-style rendering. Beat ticks now
-        // live in a narrow strip above the waveform; downbeats
-        // span the full cross axis with a thicker, brighter
-        // stroke so they read at glance distance. Pre-round-3
-        // both tick variants spanned the full cross axis with
-        // only thickness + alpha to differentiate them, which
-        // made downbeats hard to spot against a busy waveform.
-        let beatHalfNDC = 0.75 / timeAxisPixels
-        let barHalfNDC = 2.0 / timeAxisPixels
+        // PRD-BEATS §5.1 Serato-style rendering, round 4. The
+        // pre-round-3 design used deck-tinted ticks against a
+        // deck-tinted waveform — same hue, so the ticks vanished
+        // in busy passages. Round-3 widened them and bumped alpha;
+        // still invisible because LUMINANCE matched too.
+        //
+        // Round-4 fixes the actual problem: contrast. Beats are
+        // now bright WHITE (luminance-distinct from BOTH deck
+        // tints) and mirrored across the cross axis as TWO short
+        // strips — top headroom `[+beatTickInnerNDC, +1.0]` AND
+        // bottom headroom `[-1.0, -beatTickInnerNDC]`. A symmetric
+        // peak can no longer occlude both; the user always sees at
+        // least one tick edge. Downbeats stay deck-tinted at full
+        // height so deck identity remains glanceable.
+        let beatHalfNDC = 1.5 / timeAxisPixels
+        let barHalfNDC = 3.5 / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
         let startIdx = firstBeatIndex(atOrAfter: visibleStart)
@@ -2007,15 +2024,20 @@ final class WaveformRenderer: NSObject {
             let isDownbeat =
                 cachedBeatsPerBar > 0
                 && (idx % cachedBeatsPerBar == cachedBarPhase)
-            let half = isDownbeat ? barHalfNDC : beatHalfNDC
-            let alpha: Float = isDownbeat ? 1.0 : 0.85
-            let color = Self.deckTintRGBA(side: side, alpha: alpha)
-            appendBeatLineQuad(
-                vertices: &beatGridScratchVertices,
-                timeNDC: Float(timeNDC),
-                halfThickness: half,
-                color: color,
-                isDownbeat: isDownbeat)
+            if isDownbeat {
+                appendBeatLineQuad(
+                    vertices: &beatGridScratchVertices,
+                    timeNDC: Float(timeNDC),
+                    halfThickness: barHalfNDC,
+                    color: Self.deckTintRGBA(side: side, alpha: 1.0),
+                    isDownbeat: true)
+            } else {
+                appendMirroredBeatTick(
+                    vertices: &beatGridScratchVertices,
+                    timeNDC: Float(timeNDC),
+                    halfThickness: beatHalfNDC,
+                    color: Self.beatTickRGBA(alpha: 0.88))
+            }
         }
 
         logVisibleBeatAlignment(
@@ -2063,17 +2085,45 @@ final class WaveformRenderer: NSObject {
     }
 
     /// PRD-BEATS §5.1 Serato-style cross-axis ranges. A beat tick
-    /// is a short mark in the "headroom" outside the waveform; a
-    /// downbeat is a full-height line that cuts through the
-    /// waveform. The waveform shader uses cross-axis ∈ [-1, +1]
-    /// for amplitude, so beat ticks live in the top 12 % strip
-    /// (y/x ∈ [0.76, 1.0]) where the waveform's positive lobe
-    /// rarely reaches even on hot masters — keeps the ticks
-    /// readable without competing with the waveform's bright
-    /// envelope. Downbeats keep the full [-1, +1] span so the bar
-    /// boundary is unmistakable at a glance.
-    private static let beatTickInnerNDC: Float = 0.76
+    /// is a pair of short marks in the "headroom" at the top and
+    /// bottom edges of the cross axis (mirrored — see
+    /// `appendMirroredBeatTick`); a downbeat is a full-height
+    /// line that cuts through the waveform. The waveform shader
+    /// uses cross-axis ∈ [-1, +1] for amplitude, so each tick
+    /// strip lives in the outer ~19 % of the axis (|y/x| ∈
+    /// [0.62, 1.0]). Mirroring is what guarantees visibility
+    /// against busy waveforms: a hot peak can occlude one side,
+    /// never both. Downbeats keep the full [-1, +1] span so the
+    /// bar boundary is unmistakable at a glance.
+    private static let beatTickInnerNDC: Float = 0.62
     private static let beatTickOuterNDC: Float = 1.0
+
+    /// Emit a beat tick as TWO short strips: one in the top
+    /// headroom `[+beatTickInnerNDC, +beatTickOuterNDC]` and one
+    /// in the bottom headroom mirrored to negative cross-axis.
+    /// Even an asymmetric loud peak that fills one half of the
+    /// waveform still leaves the opposite tick fully visible.
+    private func appendMirroredBeatTick(
+        vertices: inout [BeatGridVertexLayout],
+        timeNDC: Float,
+        halfThickness: Float,
+        color: SIMD4<Float>
+    ) {
+        appendCrossAxisStrip(
+            vertices: &vertices,
+            timeNDC: timeNDC,
+            halfThickness: halfThickness,
+            color: color,
+            crossLow: Self.beatTickInnerNDC,
+            crossHigh: Self.beatTickOuterNDC)
+        appendCrossAxisStrip(
+            vertices: &vertices,
+            timeNDC: timeNDC,
+            halfThickness: halfThickness,
+            color: color,
+            crossLow: -Self.beatTickOuterNDC,
+            crossHigh: -Self.beatTickInnerNDC)
+    }
 
     /// Append one axis-aligned tick quad (two triangles, six
     /// vertices) at `timeNDC`. Downbeats span the full amplitude
@@ -2087,15 +2137,29 @@ final class WaveformRenderer: NSObject {
         color: SIMD4<Float>,
         isDownbeat: Bool
     ) {
-        let crossLow: Float
-        let crossHigh: Float
-        if isDownbeat {
-            crossLow = -1.0
-            crossHigh = 1.0
-        } else {
-            crossLow = Self.beatTickInnerNDC
-            crossHigh = Self.beatTickOuterNDC
-        }
+        let crossLow: Float = isDownbeat ? -1.0 : Self.beatTickInnerNDC
+        let crossHigh: Float = isDownbeat ? 1.0 : Self.beatTickOuterNDC
+        appendCrossAxisStrip(
+            vertices: &vertices,
+            timeNDC: timeNDC,
+            halfThickness: halfThickness,
+            color: color,
+            crossLow: crossLow,
+            crossHigh: crossHigh)
+    }
+
+    /// Emit a single axis-aligned strip quad spanning `[crossLow,
+    /// crossHigh]` on the cross axis and ±`halfThickness` around
+    /// `timeNDC` on the time axis. Vertex windings match the
+    /// existing beat-grid shader (no culling required).
+    private func appendCrossAxisStrip(
+        vertices: inout [BeatGridVertexLayout],
+        timeNDC: Float,
+        halfThickness: Float,
+        color: SIMD4<Float>,
+        crossLow: Float,
+        crossHigh: Float
+    ) {
         switch orientation {
         case .vertical:
             let y0 = timeNDC - halfThickness

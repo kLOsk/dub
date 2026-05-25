@@ -456,6 +456,48 @@ want a baseline so regressions are visible.
 
 ---
 
+### C-31. Swift-UI snapshot tests are PRD-mandated but don't exist yet
+
+PRD §2.2.4 says "every PR that changes a view must include
+updated snapshots" via `swift-snapshot-testing`. We have zero
+Swift snapshot tests. Every UI regression this round (footer
+progress pill missing on Re-analyze, multi-select context menu
+label stuck on a single track, BPM dimmed when locked, search
+field couldn't deselect, click delay on row select) would have
+been caught by a small snapshot suite around three views.
+
+Scope of the first cut:
+
+* `LibraryView` footer in three states (idle, batch in flight,
+  missing-files banner). Catches the C-1 / C-2 class of
+  flash-prone progress pills.
+* Library row context menu in single, multi-unlocked,
+  multi-mixed (some locked), and all-locked selections.
+  Catches the multi-select-label staleness class.
+* `DeckHeader` in idle, playing, locked-grid, and rolling-tap
+  preview states. Catches "BPM color wrong when locked" and
+  "tap rolling number missing" classes.
+
+Implementation notes:
+
+* Add `pointfreeco/swift-snapshot-testing` as a Swift-package
+  dependency on the test target only (not the app target).
+* Snapshots committed to `apple/DubTests/__Snapshots__/`.
+* Reviewer protocol: snapshot diff is part of PR review,
+  reviewer must click through each new image. CI runs the
+  tests but does NOT auto-accept changed snapshots; a changed
+  snapshot is a test failure until the developer re-records
+  with `record: true` and commits the new image.
+* Start with `assertSnapshot(matching: view, as: .image)` for
+  three sizes (compact / standard / wide) per view.
+
+Counts as the highest-leverage SwiftUI investment. The
+boundary contracts that the snapshot suite would test against
+are now documented inline at each `NSViewRepresentable` header
+(see commit landing alongside this entry).
+
+---
+
 ## Triage notes
 
 * Buckets are roughly ordered by priority within each section

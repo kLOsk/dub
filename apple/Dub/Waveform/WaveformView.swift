@@ -689,6 +689,49 @@ struct WaveformView: View {
 /// Bare `MTKView` host — the SwiftUI/AppKit bridge. Separated from
 /// `WaveformView` so the playhead overlay can live in pure SwiftUI
 /// without forcing the `NSViewRepresentable` to host both layers.
+///
+/// ## SwiftUI ↔ AppKit bridge contract
+///
+/// **Snapshot props** (read at `updateNSView` time, push state
+/// into the renderer / `MTKView`):
+///
+/// * `engine`, `deckIdx`, `side` — Rust-FFI handle and identity.
+///   Plumbed straight to the `WaveformRenderer` on init; not
+///   re-read post-make.
+/// * `palette`, `orientation` — visual style. Cheap to re-apply
+///   every update.
+/// * `continuouslyRendering: Bool` — flips the MTKView between
+///   `isPaused = false` (continuous CVDisplayLink driven draw, ~60
+///   Hz) and `isPaused = true` (on-demand). The renderer kicks a
+///   single `setNeedsDisplay` from `updateNSView` whenever a
+///   *Generation prop changes, so a paused deck still repaints on
+///   relevant state changes.
+/// * `seekGeneration: UInt64` — bumped by the model whenever the
+///   playhead jumps (seek, scratch end, set-the-1, library grid
+///   patch). Triggers an on-demand repaint.
+/// * `peaksGeneration: UInt64` — bumped when the per-deck peak
+///   buffer is rebuilt (track load, file replace). Triggers a
+///   peaks-texture re-upload + repaint.
+/// * `timeAxisZoom: Double` — horizontal zoom factor. Applied
+///   live; renderer interpolates between frames.
+/// * `renderSnapshot: WaveformRenderSnapshot?` — the B-24
+///   beat-grid overlay's shared draw-state pipe. `nil` disables
+///   the snapshot publish-path entirely (saves a few µs per frame
+///   when the overlay is gated off).
+///
+/// **Closure props**: none. The renderer pulls state from the
+/// engine via FFI on each draw; nothing flows out of the Metal
+/// view back to SwiftUI.
+///
+/// **Lifecycle**: `dismantleNSView` releases the renderer's
+/// Metal resources and stops the display link.
+///
+/// **Threading**: `updateNSView` runs on the main actor.
+/// `WaveformRenderer.draw` runs on Metal's render thread, reads
+/// engine state through the Rust FFI's lock-free path
+/// (`DubEngine.position` etc.) — never touches `@Published`
+/// model state, so the audio + render threads stay decoupled
+/// from the SwiftUI commit graph.
 private struct WaveformMetalView: NSViewRepresentable {
 
     let engine: DubEngine

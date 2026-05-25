@@ -140,7 +140,19 @@ uniffi::setup_scaffolding!();
 ///       `set_bar_phase` for the one-button
 ///       downbeat calibration path; beat grids are onset-latched
 ///       instead of uniform `anchor + i × period`.
-pub const FFI_VERSION: u32 = 19;
+///   20. Deck-header BPM context menu (PRD-BEATS §4 octave override) —
+///       [`DubLibrary::scale_active_beat_grid`] (2× / ½) and
+///       [`DubLibrary::reset_active_beat_grid_to_auto`] (revert
+///       user taps). Both honour the lock and surface the new
+///       active grid so the Apple shell can re-install it on the
+///       deck without a reload.
+///   21. [`DubLibrary::set_grid_drift_quality`] surfaces the
+///       drift-only update path so the user-tap commit pipeline
+///       can refresh the ⚠ indicator without invoking the
+///       auto-lock heuristic. PRD-BEATS §3.5 + user feedback:
+///       "i pressed the bpm to set the 1 and it initiated autlock"
+///       — auto-lock is reserved for the auto-analyse pass.
+pub const FFI_VERSION: u32 = 21;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1386,6 +1398,45 @@ impl DubEngine {
         // anchor" affordance. The user is asserting beats[0] is
         // the downbeat (bar position 1), so bar_phase is 0.
         let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs, 0);
+        if grid.confidence <= 0.0 || grid.beats.is_empty() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+            return Err(EngineError::NoTrackLoaded(deck_idx));
+        };
+        fp.beat_grid = grid;
+        drop(state);
+        self.bump_beat_grid_generation(idx);
+        Ok(())
+    }
+
+    /// Like [`Self::install_beat_grid`] but honours a persisted
+    /// `bar_phase` when reloading a library-sourced grid onto a
+    /// deck that is already playing the track.
+    pub fn install_beat_grid_with_phase(
+        &self,
+        deck_idx: u64,
+        bpm: f64,
+        anchor_secs: f64,
+        bar_phase: u32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        if !bpm.is_finite() || bpm <= 0.0 || !anchor_secs.is_finite() {
+            return Err(EngineError::InvalidBeatGridParams);
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
+        let duration_secs = track.samples().len() as f64
+            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let phase = u8::try_from(bar_phase).unwrap_or(0);
+        let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs, phase);
         if grid.confidence <= 0.0 || grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
@@ -2972,7 +3023,13 @@ mod tests {
         // M11c.3b 15→16 (install_beat_grid, beat_grid_generation,
         // upsert_user_tap_beatgrid).
         // M11d.5 round 5 16→17 (track_id_for_path reverse lookup).
-        assert_eq!(FFI_VERSION, 19);
+        // Deck-header BPM context menu 19→20
+        // (scale_active_beat_grid, reset_active_beat_grid_to_auto).
+        // User-tap commit no longer auto-locks 20→21
+        // (set_grid_drift_quality exposed so the user-tap path
+        // can update the drift indicator without invoking the
+        // auto-lock heuristic).
+        assert_eq!(FFI_VERSION, 21);
     }
 
     #[test]
@@ -3028,6 +3085,50 @@ mod tests {
         let engine = DubEngine::new();
         assert!(engine.track_info(0).is_none());
         assert!(engine.track_info(1).is_none());
+    }
+
+    #[test]
+    fn install_beat_grid_with_phase_on_stopped_engine_returns_not_running() {
+        let engine = DubEngine::new();
+        let err = engine
+            .install_beat_grid_with_phase(0, 120.0, 0.0, 0)
+            .unwrap_err();
+        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+    }
+
+    #[test]
+    fn install_beat_grid_with_phase_rejects_invalid_bpm() {
+        let engine = DubEngine::new();
+        // Invalid params surface before the running-state check —
+        // proves the validation matches `install_beat_grid`'s.
+        for bpm in [0.0, -120.0, f64::NAN, f64::INFINITY] {
+            let err = engine
+                .install_beat_grid_with_phase(0, bpm, 0.0, 0)
+                .unwrap_err();
+            assert!(
+                matches!(err, EngineError::InvalidBeatGridParams),
+                "bpm={bpm} → {err:?}"
+            );
+        }
+        let err = engine
+            .install_beat_grid_with_phase(0, 120.0, f64::NAN, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidBeatGridParams),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn install_beat_grid_with_phase_rejects_bad_deck_index() {
+        let engine = DubEngine::new();
+        let err = engine
+            .install_beat_grid_with_phase(99, 120.0, 0.0, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidDeckIndex(99)),
+            "got {err:?}"
+        );
     }
 
     // ===== M11d.5 round 4: library-sourced grid synthesis =====
@@ -4390,6 +4491,48 @@ impl DubLibrary {
         })
     }
 
+    /// Octave-shift the active beatgrid: multiply BPM by
+    /// `multiplier` (typically `2.0` or `0.5`), keeping the visible
+    /// downbeat anchored at the same musical position. Persists the
+    /// result as the sole active `user_tap` row.
+    ///
+    /// Backs the deck-header BPM right-click menu's "2×" and "½"
+    /// entries. Returns the new active grid, or `None` when the
+    /// track has no active grid yet (caller should analyze first).
+    ///
+    /// Refuses with [`LibraryFfiError::GridLocked`] when the track
+    /// is locked (PRD-BEATS §3.5 lock-is-absolute).
+    pub fn scale_active_beat_grid(
+        &self,
+        track_id: String,
+        multiplier: f64,
+    ) -> std::result::Result<Option<LibraryBeatGrid>, LibraryFfiError> {
+        self.with_library(|lib| {
+            Ok(lib
+                .scale_active_beatgrid(&track_id, multiplier)?
+                .map(LibraryBeatGrid::from))
+        })
+    }
+
+    /// Revert the active beatgrid to the original auto analysis:
+    /// demote any active `user_tap` row and reactivate the `auto`
+    /// row. Backs the deck-header BPM right-click menu's "Reset"
+    /// entry.
+    ///
+    /// Returns `Ok(None)` when no `auto` row exists yet (the track
+    /// has never been analyzed); the caller should hint the user
+    /// to analyze first. The lock is honoured.
+    pub fn reset_active_beat_grid_to_auto(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<LibraryBeatGrid>, LibraryFfiError> {
+        self.with_library(|lib| {
+            Ok(lib
+                .reset_active_beatgrid_to_auto(&track_id)?
+                .map(LibraryBeatGrid::from))
+        })
+    }
+
     /// M11d.7 — lock or unlock a track's beatgrid against auto
     /// re-analysis.
     pub fn set_grid_locked(
@@ -4437,6 +4580,25 @@ impl DubLibrary {
                 drift_slope_ms_per_min: quality.drift_slope_ms_per_min,
             };
             lib.apply_grid_quality_lock(&track_id, &core)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Update only the stored drift-slope indicator for `track_id`,
+    /// without touching `tracks.grid_locked`. Companion to
+    /// [`Self::apply_grid_quality_lock`] used by the user-tap path,
+    /// where the auto-lock heuristic must NOT fire (auto-lock is an
+    /// auto-analysis affordance — a user just told us where the
+    /// downbeat goes, and silently freezing their work the moment
+    /// they tap is the exact UX the user reported as a bug: "i
+    /// pressed the bpm to set the 1 and it initiated autlock").
+    pub fn set_grid_drift_quality(
+        &self,
+        track_id: String,
+        drift_slope_ms_per_min: Option<f32>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_grid_drift_quality(&track_id, drift_slope_ms_per_min)
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }
@@ -4526,6 +4688,104 @@ mod library_ffi_tests {
         lib.open_at(path.to_string_lossy().to_string()).unwrap();
         let res = lib.active_beat_grid("ffffffff-0000-0000-0000-000000000000".into());
         assert!(matches!(res, Ok(None)));
+    }
+
+    // === Deck-header BPM context menu smoke tests ============================
+
+    #[test]
+    fn scale_active_beat_grid_on_closed_library_returns_query_failed() {
+        let lib = DubLibrary::new();
+        let res = lib.scale_active_beat_grid("anything".into(), 2.0);
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn scale_active_beat_grid_for_unknown_track_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // Unknown track id: no active grid to scale → Ok(None).
+        let res = lib
+            .scale_active_beat_grid("ffffffff-0000-0000-0000-000000000000".into(), 2.0)
+            .unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn scale_active_beat_grid_rejects_invalid_multiplier_via_ffi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // The core layer wraps invalid multipliers in
+        // `LibraryError::DecodeFailed`, which the FFI flattens to
+        // `QueryFailed` rather than panicking.
+        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
+            let res =
+                lib.scale_active_beat_grid("ffffffff-0000-0000-0000-000000000000".into(), bad);
+            assert!(
+                matches!(res, Err(LibraryFfiError::QueryFailed(_))),
+                "multiplier {bad} must surface as QueryFailed across the FFI, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_active_beat_grid_on_closed_library_returns_query_failed() {
+        let lib = DubLibrary::new();
+        let res = lib.reset_active_beat_grid_to_auto("anything".into());
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn reset_active_beat_grid_for_unknown_track_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let res = lib
+            .reset_active_beat_grid_to_auto("ffffffff-0000-0000-0000-000000000000".into())
+            .unwrap();
+        assert!(res.is_none(), "no auto row → nothing to revert to");
+    }
+
+    // === set_grid_drift_quality (user-tap drift-only update) =================
+
+    #[test]
+    fn set_grid_drift_quality_on_closed_library_returns_query_failed() {
+        let lib = DubLibrary::new();
+        let res = lib.set_grid_drift_quality("anything".into(), Some(1.0));
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn set_grid_drift_quality_on_unknown_track_surfaces_query_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let res =
+            lib.set_grid_drift_quality("ffffffff-0000-0000-0000-000000000000".into(), Some(1.0));
+        // `set_grid_drift_quality` raises `TrackNotFound` when the
+        // UPDATE touches zero rows; the FFI flattens that into
+        // `QueryFailed` (no need for a typed variant — the call
+        // site is best-effort drift maintenance from the user-tap
+        // commit path).
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn set_grid_drift_quality_accepts_none_to_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        // Same TrackNotFound surface as above when no track is
+        // seeded — but the `None` payload must not panic the FFI
+        // (clearing the drift slope is a valid request).
+        let res = lib.set_grid_drift_quality("ffffffff-0000-0000-0000-000000000000".into(), None);
+        assert!(matches!(res, Err(LibraryFfiError::QueryFailed(_))));
     }
 
     // === M11d.4 missing-files smoke tests ====================================

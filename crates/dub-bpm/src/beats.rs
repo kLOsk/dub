@@ -331,45 +331,43 @@ pub fn latch_beat_grid_at_downbeat(
 
 /// Build a grid from user tap times (M11d.7 round 3 tap-to-grid).
 ///
-/// **The tap is a search hint, never the answer.** The user's
-/// taps tell the algorithm where to look (a ±15 % BPM neighborhood
-/// around the tap-interval median); the algorithm tells the user
-/// the precise answer (the strongest real autocorrelation peak in
-/// that neighborhood, snapped to integer if safe). A 2 s window
-/// of 3–8 taps cannot beat a full-track spectral-flux estimator on
-/// tempo precision — human reaction-time jitter (~25 ms 1σ) on
-/// each tap edge contaminates the tap-interval median, which is why
-/// PRD-BEATS §6.1 demands constrained re-analysis rather than
-/// tap-derived BPM substitution.
+/// **The taps ARE the BPM.** User feedback override of PRD-BEATS
+/// §6.1: the constrained-re-analysis pipeline was producing
+/// "wrong" BPMs on tracks where the auto-pass landed badly in a
+/// non-tapped neighborhood. Example the user surfaced: a 175 BPM
+/// DnB track that auto-resolved to ~135 BPM; tapping at 175 used
+/// to come back as ~160 because the ±15 % search window ([148,
+/// 201]) found a stronger ODF peak in that range than the truth
+/// at 175. The PRD argued the constrained autocorrelation beats
+/// human tap jitter on precision; the user prefers honesty: "show
+/// the bpm how the user taps it (building an average of the
+/// actual taps)". So the constrained re-analysis is gone — the
+/// tap-interval median IS the answer, no algorithmic second-guess
+/// on the BPM number.
 ///
 /// Pipeline:
 ///
-/// 1. **BPM seed** = weighted median of tap-to-tap intervals after
+/// 1. **BPM** = weighted median of tap-to-tap intervals after
 ///    dropping intervals that imply BPMs outside `[MIN_BPM,
 ///    MAX_BPM]` (an accidental double-tap inside one beat must not
-///    drag the median to 1200 BPM).
-/// 2. **Constrained re-analysis.** Build a `BpmRange` at
-///    `[seed × 0.85, seed × 1.15]` and run the full estimator
-///    inside it. The estimator returns the strongest real
-///    autocorrelation peak inside the window. ±15 % is comfortably
-///    wider than human tap noise (~5 BPM 1σ at 100 BPM) and well
-///    inside the half/double-time octaves (at ±50 % / +100 %), so
-///    octave-error correction lands in the right octave by
-///    construction. Replaces the old `reconcile_tap_bpm_with_hint`
-///    branch logic entirely.
-/// 3. **Integer-BPM snap if safe** (`snap_to_integer_bpm` —
-///    ±0.10 tolerance). Eliminates the 0.02-BPM jitter that the
-///    estimator otherwise leaves on integer dance tempos.
-/// 4. **Anchor** = first tap snapped to the nearest significant
+///    drag the median to 1200 BPM, a long pause to a "missed
+///    beat" interval must not drag it under MIN_BPM). Weighted
+///    median is still preferred over raw mean: it absorbs one
+///    outlier interval (a skipped beat) without dragging the
+///    result. Tap jitter on the resulting BPM is the user's
+///    explicit trade-off — see `tap_grid_returns_weighted_median_of_taps`.
+/// 2. **Anchor** = first tap snapped to the nearest significant
 ///    transient in the kick ODF (fallback broadband) inside a
 ///    window capped at `min(period/4, 70 ms)`. The
 ///    `odf_noise_floor` check keeps the snap from latching onto
 ///    sub-noise ODF wiggle when the first tap landed in dead
 ///    space — in that case we keep the raw tap (`unwrap_or`).
-/// 5. Confidence is fixed at `1.0` (the user supplied ground
-///    truth for tempo neighborhood and bar position);
-///    `GridQuality` is measured against the final grid for the
-///    drift indicator.
+/// 3. Confidence is fixed at `1.0` (the user supplied ground
+///    truth for tempo and bar position); `GridQuality` is still
+///    measured against the resulting grid for the drift
+///    indicator. The ODFs are computed only for the anchor snap
+///    and the drift measurement — the estimator's BPM result is
+///    deliberately discarded.
 ///
 /// **No `bpm_hint` parameter.** Idempotence by construction: the
 /// function takes only the new tap session's data, never prior
@@ -385,19 +383,23 @@ pub fn analyze_beat_grid_from_taps(
     if tap_times.len() < 3 {
         return Ok(BeatGrid::none());
     }
-    let Some(seed_bpm) = weighted_median_bpm_from_taps(tap_times) else {
+    let Some(bpm) = weighted_median_bpm_from_taps(tap_times) else {
         return Ok(BeatGrid::none());
     };
 
-    let lo = (seed_bpm * (1.0 - TAP_SEARCH_RADIUS_FRACTION)).max(MIN_BPM);
-    let hi = (seed_bpm * (1.0 + TAP_SEARCH_RADIUS_FRACTION)).min(MAX_BPM);
-    let range = BpmRange::new(lo, hi).unwrap_or(BpmRange::DEFAULT);
-    let (estimate, odf, kick_odf) =
-        analyze_bpm_with_range_profile_and_odfs(samples, sample_rate, channels, range, profile)?;
-    if estimate.confidence <= 0.0 || estimate.bpm <= 0.0 {
-        return Ok(BeatGrid::none());
-    }
-    let bpm_raw = estimate.bpm;
+    // ODFs are still required: the anchor snap reads kick + broadband
+    // ODF to find the nearest real transient to the first tap, and
+    // `measure_grid_quality` reads the broadband ODF to compute
+    // residuals for the drift indicator. The estimate BPM the
+    // function returns is deliberately discarded; the user's tap
+    // median is authoritative.
+    let (_estimate, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
+        samples,
+        sample_rate,
+        channels,
+        BpmRange::DEFAULT,
+        profile,
+    )?;
 
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
     let duration_secs =
@@ -406,11 +408,11 @@ pub fn analyze_beat_grid_from_taps(
         return Ok(BeatGrid::none());
     }
 
-    let period_raw = 60.0 / bpm_raw;
-    let snap_half = (period_raw * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
+    let period = 60.0 / bpm;
+    let snap_half = (period * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
     let kick_floor = odf_noise_floor(&kick_odf, SNAP_NOISE_FLOOR_FRAC);
     let broadband_floor = odf_noise_floor(&odf, SNAP_NOISE_FLOOR_FRAC);
-    let anchor_raw = snap_to_nearest_transient(
+    let anchor = snap_to_nearest_transient(
         &kick_odf,
         &odf,
         odf_sr,
@@ -421,28 +423,15 @@ pub fn analyze_beat_grid_from_taps(
     )
     .unwrap_or(tap_times[0]);
 
-    // Integer-BPM snap with anchor refit. Same contract as the
-    // auto path (`snap_bpm_to_integer_if_safe`): only snap when
-    // residuals don't get worse. This preserves the M11d.7a fix
-    // for the 133.02 / 87.95 / 174.04 grid-drift class on tracks
-    // where the constrained autocorrelation lands sub-BPM off.
-    let quality_raw = measure_grid_quality(&odf, odf_sr, bpm_raw, anchor_raw, duration_secs)
-        .unwrap_or(GridQuality::PERFECT);
-    let (bpm, anchor, quality) = snap_bpm_to_integer_if_safe(
-        &odf,
-        odf_sr,
-        bpm_raw,
-        anchor_raw,
-        duration_secs,
-        quality_raw,
-    );
+    let quality =
+        measure_grid_quality(&odf, odf_sr, bpm, anchor, duration_secs).unwrap_or(GridQuality {
+            rms_ms: 0.0,
+            p95_ms: 0.0,
+            max_abs_ms: 0.0,
+            kept_fraction: 0.0,
+            drift_slope_ms_per_min: 0.0,
+        });
 
-    // PRD-BEATS round 4 follow-up: emit beats spanning the FULL
-    // track. The user's first tap (snapped to the nearest
-    // transient) IS bar 1; `bar_phase` carries that information
-    // explicitly so pre-roll beats can render as regular ticks
-    // without confusing the downbeat. The previous behaviour
-    // dropped every beat before the anchor.
     let beats_per_bar: u8 = 4;
     let beats = uniform_beats(bpm, anchor, duration_secs);
     if beats.is_empty() {
@@ -502,21 +491,13 @@ fn snap_to_integer_bpm(bpm: f64, tolerance: f64) -> f64 {
     }
 }
 
-/// ±15 % search radius around the tap-interval median for
-/// constrained re-analysis (PRD-BEATS §6.1). Wider than human tap
-/// noise (~5 BPM 1σ at 100 BPM) so the true tempo lands inside
-/// even after reaction-time scatter, and tight enough to stay
-/// well inside the half/double-time octaves (50 % / 100 %) so the
-/// estimator can never silently snap up or down an octave from
-/// what the user intended. Replaces `TAP_BPM_HINT_TOLERANCE`
-/// (which gated the now-removed `reconcile_tap_bpm_with_hint`).
-const TAP_SEARCH_RADIUS_FRACTION: f64 = 0.15;
-
-// `reconcile_tap_bpm_with_hint` removed in M11d.7 round 3. The
-// constrained-re-analysis path inside `analyze_beat_grid_from_taps`
-// runs the full estimator at `tap_median ± 15 %` and uses the
-// returned `BpmEstimate.bpm` directly — there is no longer any
-// "previous BPM as hint" branch. See PRD-BEATS §6.1.
+// Constrained re-analysis at `tap_median ± 15 %` removed by user
+// feedback override of PRD-BEATS §6.1: the estimator was finding
+// stronger ODF peaks inside the search window that didn't match the
+// tap intent (e.g. 175 BPM DnB resolving to ~160 because the
+// strongest periodicity in [148, 201] BPM wasn't 175). The tap
+// median is now used directly as the BPM. See
+// `analyze_beat_grid_from_taps` doc comment.
 
 /// Emit strictly uniform beat timestamps for `(bpm, anchor, duration)`.
 #[must_use]
@@ -1575,14 +1556,35 @@ fn parabolic_peak_in_window(
 
 /// Window (in seconds) over which [`amplitude_peak_offset_secs`]
 /// searches forward from each ODF-aligned beat for the broadband
-/// amplitude peak. Sized for typical kick / snare attack ramps:
-/// the spectral-flux ODF peaks during the rising edge of the
-/// attack (since it tracks the *derivative* of band magnitudes),
-/// while the visible amplitude peak lands 5–25 ms later when the
-/// membrane / sample reaches max displacement. 30 ms covers
-/// almost every popular-music transient with a few ms of margin
-/// for parabolic refinement noise.
-const AMPLITUDE_PEAK_SHIFT_WINDOW_SECS: f64 = 0.030;
+/// amplitude peak. The spectral-flux ODF peaks during the rising
+/// edge of an attack (it tracks the *derivative* of band
+/// magnitudes), while the visible amplitude peak lands later
+/// when the membrane / sample reaches max displacement.
+///
+/// **Sized for slow-attack popular music transients.** Crisp
+/// synth kicks land their amp peak 5–25 ms after the ODF peak;
+/// the original M11d round-4 value of 30 ms covered them with
+/// margin. Sub-bass kicks (808s, dubstep, reggae / dub, slow
+/// hip-hop), heavily compressed material, and recorded acoustic
+/// drums push the amp peak 30–90 ms past the ODF rising edge —
+/// reggae / dub one-drops are the worst class because the
+/// sustained sub-fundamental keeps amplitude rising for nearly a
+/// full 1/16 note after the transient. At 30 ms the per-beat
+/// offset clipped at the window boundary on those tracks, so
+/// the median shift undershot the real offset and the grid line
+/// landed ~10–30 ms before the visible peak — exactly the
+/// "grid placed right before the peak" reported by users.
+/// Bumping to 60 ms (M11d round 5) caught most slow-attack
+/// genres but still clipped on dub one-drops; the user's
+/// "Bredren Evacuation" report ("set the 1 always puts the 1
+/// behind the actual peak of the kick") was 60 ms still
+/// undershooting a ~75 ms reggae kick. 90 ms covers the dub
+/// one-drop class without risking the next beat's transient on
+/// any realistic dance tempo (90 ms ≤ ~36 % of the period at
+/// 240 BPM, the upper edge of footwork; period / 2 at 240 BPM
+/// is 125 ms so we still leave a clean 35 ms margin between the
+/// window and the next beat).
+const AMPLITUDE_PEAK_SHIFT_WINDOW_SECS: f64 = 0.090;
 
 /// Fraction of beats (sorted by peak amplitude, loudest first)
 /// that contribute to the median amplitude-peak offset. 50 %
@@ -2096,12 +2098,12 @@ mod tests {
     /// within 0.1 BPM and the drift indicator must not trip.
     /// Pre-fix the pipeline ran `analyze_bpm_with_range_profile_*`
     /// over ±10 % followed by a full LSQ refit, which dragged the
-    /// answer to ~132.88 on real tracks.
-    ///
-    /// M11d.7a round 2: with the integer-BPM snap in place, the
-    /// resulting tempo must land **exactly** on the integer (no
-    /// more 133.02 drift). 0.001 tolerance leaves room for fp
-    /// noise from the weighted median.
+    /// Clean taps at exactly 133 BPM intervals must yield exactly
+    /// 133.0 BPM. With the post-PRD-§6.1-override pipeline the
+    /// tap-interval weighted median IS the BPM, so as long as the
+    /// intervals are exactly `60 / 133` seconds we get 133.0 back
+    /// out modulo fp noise (0.001 tolerance covers the weighted
+    /// median's fp work).
     #[test]
     fn tap_grid_respects_user_bpm_within_0_1() {
         let true_bpm = 133.0;
@@ -2117,7 +2119,7 @@ mod tests {
         assert!(grid.confidence > 0.0, "should accept user taps");
         assert!(
             (grid.bpm - true_bpm).abs() < 0.001,
-            "integer-BPM snap must land tap tempo exactly on 133.0; got {}",
+            "clean taps at 133 BPM intervals must yield exactly 133.0; got {}",
             grid.bpm
         );
         let q = grid.quality.expect("quality");
@@ -2291,9 +2293,12 @@ mod tests {
         // Downbeat must land at (or very near, allowing for the
         // amplitude-peak shift) the first audible click ~1.0 s.
         // Amplitude shift caps at AMPLITUDE_PEAK_SHIFT_WINDOW_SECS
-        // so 50 ms slack covers it generously.
+        // (90 ms after the reggae / dub one-drop widening) plus a
+        // few ms of parabolic-refinement noise → ~105 ms upper
+        // bound covers the worst-case forward shift without
+        // over-loosening the test.
         assert!(
-            (0.975..=1.05).contains(&downbeat),
+            (0.975..=1.105).contains(&downbeat),
             "auto downbeat must land on the first audible click; got {downbeat}"
         );
         // Grid must include pre-roll beats so the renderer can
@@ -2415,16 +2420,19 @@ mod tests {
         );
     }
 
-    /// Constrained re-analysis contract (PRD-BEATS §6.1): sloppy
-    /// taps at ~133 BPM with up to ±10 ms reaction-time jitter
-    /// must still resolve to exactly 133.0 because the estimator
-    /// runs the full autocorrelator over the tap-median ± 15 %
-    /// neighborhood and finds the strongest real periodicity in
-    /// that window (the tap median is just a search hint). This
-    /// is the replacement for the old "hint preserves auto BPM"
-    /// test that exercised the now-removed reconciliation branch.
+    /// User-feedback override of the old constrained-re-analysis
+    /// contract: tap-jittered ~133 BPM clicks no longer "lock back"
+    /// to exactly 133.0 via the estimator. The tap-interval
+    /// weighted median IS the BPM. The result must match the
+    /// weighted median computed directly from the tap series — no
+    /// ODF-based correction is allowed to override the taps.
+    /// Regression for: "i start tapping in the rhythm and instead
+    /// of immediately updating to 175 bpm it goes to 160
+    /// something" — the ODF estimator was picking spurious peaks
+    /// inside the ±15 % search window that didn't reflect the
+    /// user's tap intent.
     #[test]
-    fn tap_grid_constrained_search_locks_clean_integer_bpm_through_jitter() {
+    fn tap_grid_returns_weighted_median_of_taps() {
         let true_bpm = 133.0;
         let samples = click_track(true_bpm, 30.0, SR);
         let period = 60.0 / true_bpm;
@@ -2434,23 +2442,36 @@ mod tests {
             .enumerate()
             .map(|(i, &j)| 1.0 + i as f64 * period + j)
             .collect();
+        let expected_bpm = weighted_median_bpm_from_taps(&tap_times).expect("tap median");
         let grid =
             analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
                 .expect("tap analysis");
         assert!(
-            (grid.bpm - true_bpm).abs() < 1e-9,
-            "constrained re-analysis must lock 133.0 through tap jitter; got {}",
+            (grid.bpm - expected_bpm).abs() < 1e-9,
+            "tap grid BPM must equal the weighted median of tap intervals; got {} (expected {})",
+            grid.bpm,
+            expected_bpm
+        );
+        // And jitter must not flip us to the wrong octave: ±10 ms
+        // of human jitter cannot deviate the median far enough to
+        // cross a half/double-time boundary.
+        assert!(
+            grid.bpm > true_bpm * 0.5 && grid.bpm < true_bpm * 2.0,
+            "jittered tap median must stay in the right octave; got {}",
             grid.bpm
         );
     }
 
-    /// Octave-error correction (PRD-BEATS §6.1 row 3): the user
-    /// taps at the real ~109 BPM but the search radius starts
-    /// from the tap median, so the algorithm never even considers
-    /// 218 BPM. Constrained re-analysis fixes octave errors by
-    /// confining the search, not by post-hoc reconciliation.
+    /// Octave honesty: the user taps at the real ~109 BPM and the
+    /// grid lands at the tapped tempo. The previous test gated this
+    /// via constrained re-analysis ("search radius starts from the
+    /// tap median, so the algorithm never even considers 218 BPM");
+    /// after the user-feedback override of PRD-BEATS §6.1 the same
+    /// property holds trivially because the tap median IS the BPM.
+    /// Clean taps at 109 BPM produce exactly 109 BPM — no octave
+    /// folding, no ODF second-guess.
     #[test]
-    fn tap_grid_constrained_search_resolves_octave_at_tap_neighborhood() {
+    fn tap_grid_honors_user_tapped_octave() {
         let true_bpm = 109.0;
         let samples = click_track(true_bpm, 30.0, SR);
         let period = 60.0 / true_bpm;
@@ -2462,12 +2483,12 @@ mod tests {
                 .expect("tap analysis");
         assert!(
             (grid.bpm - true_bpm).abs() < 0.5,
-            "constrained search must land at user's tapped octave; got {}",
+            "tap-derived BPM must match user's tapped octave; got {}",
             grid.bpm
         );
         assert!(
             grid.bpm < 1.5 * true_bpm,
-            "constrained search must NOT silently double-time; got {}",
+            "tap-derived BPM must NOT silently double-time; got {}",
             grid.bpm
         );
     }

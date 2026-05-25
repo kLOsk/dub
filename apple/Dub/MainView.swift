@@ -825,6 +825,24 @@ final class WaveformAppModel: ObservableObject {
                 if grid.confidence > 0, grid.bpm > 0 {
                     next.bpm = grid.bpm
                     next.bpmConfidence = Double(grid.confidence)
+                    // Deck just resolved a BPM that the library row
+                    // had been waiting on. The lazy
+                    // `ensureTrackAnalyzed` triggered at load time
+                    // is what eventually writes that BPM into
+                    // `track_beatgrids`, but if `recordLoad`
+                    // happened to throw (legacy do/catch swallow)
+                    // OR the analyze finishes *after* the engine's
+                    // own analyzer, the library row would never get
+                    // a BPM until the user re-selected the track.
+                    // Calling `ensureTrackAnalyzed` here is
+                    // idempotent (the in-flight set + the
+                    // `is_track_analyzed` cache early-out makes
+                    // repeat calls free) and closes that gap so
+                    // the library catches up the same render tick
+                    // the deck header lights up.
+                    if let trackId = next.loadedLibraryTrackId {
+                        ensureTrackAnalyzed(trackId: trackId)
+                    }
                 }
             }
         } else {
@@ -1577,10 +1595,19 @@ final class WaveformAppModel: ObservableObject {
             let deck: UInt32 = (side == .a) ? 0 : 1
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             try library.recordLoad(trackId: trackId, deck: deck, timestampMs: nowMs)
-            ensureTrackAnalyzed(trackId: trackId)
         } catch {
             surfaceError("Failed to record play history: \(error.localizedDescription)")
         }
+        // PRD-BEATS §4.5: lazy analyse fires regardless of whether
+        // `recordLoad` succeeded. A transient `play_history` write
+        // failure (DB lock, FK in flight while the importer is
+        // still committing the row) must not swallow the library
+        // analysis the deck-load is asking for — without this
+        // separation, the deck would surface its engine-computed
+        // BPM in the header but the library row would never get
+        // updated because the `ensureTrackAnalyzed` call sits
+        // inside the same `do` block as the failing `try`.
+        ensureTrackAnalyzed(trackId: trackId)
     }
 
     /// Resolve a canonical library track id for a deck load URL.
@@ -1603,7 +1630,8 @@ final class WaveformAppModel: ObservableObject {
 
     private func publishLibraryRowAnalysisUpdate(
         trackId: String,
-        outcome: LibraryAnalysisOutcome
+        outcome: LibraryAnalysisOutcome,
+        refreshLoadedDecks: Bool = false
     ) {
         let bpm: Double? =
             (outcome.wroteGrid && outcome.gridAutoIsActive && outcome.bpm > 0)
@@ -1616,6 +1644,52 @@ final class WaveformAppModel: ObservableObject {
             key: key,
             isAnalyzed: true)
         analysisGeneration &+= 1
+        if refreshLoadedDecks {
+            refreshLoadedDecksAfterLibraryAnalysis(trackId: trackId, outcome: outcome)
+        }
+    }
+
+    /// When library analysis finishes for a track that is already
+    /// loaded on a deck, push the new grid into the engine and
+    /// refresh deck chrome without a reload. Only invoked from
+    /// explicit batch re-analyze — never from lazy deck-load
+    /// analysis, which would race set-the-1 and reset `bar_phase`.
+    private func refreshLoadedDecksAfterLibraryAnalysis(
+        trackId: String,
+        outcome: LibraryAnalysisOutcome
+    ) {
+        guard isRunning, libraryIsOpen else { return }
+        let activeGrid = try? library.activeBeatGrid(trackId: trackId)
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            guard deck.loadedLibraryTrackId == trackId, deck.hasTrack else { continue }
+            if outcome.wroteKey, outcome.keyAutoIsActive, !outcome.camelot.isEmpty {
+                deck.key = outcome.camelot
+            }
+            guard let grid = activeGrid, grid.bpm > 0 else {
+                setState(deck, for: side)
+                continue
+            }
+            guard !deck.gridLocked, !grid.gridLocked else {
+                setState(deck, for: side)
+                continue
+            }
+            do {
+                try engine.installBeatGridWithPhase(
+                    deckIdx: side.ffiDeckIdx,
+                    bpm: grid.bpm,
+                    anchorSecs: grid.anchorSecs,
+                    barPhase: grid.barPhase)
+            } catch {
+                setState(deck, for: side)
+                continue
+            }
+            deck.bpm = grid.bpm
+            deck.bpmConfidence = 1.0
+            deck.gridDriftQuality = grid.gridDriftQuality
+            deck.seekGeneration &+= 1
+            setState(deck, for: side)
+        }
     }
 
     /// M11c.1 — kick off lazy analysis for `trackId` if it has
@@ -1707,6 +1781,50 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Wrap a transient `@Published` "in-progress" flag so SwiftUI
+    /// is guaranteed at least one render tick where the flag is
+    /// observable before `work` runs (and one before the reset).
+    ///
+    /// Regression class this exists to prevent: a `set + work +
+    /// reset` sequence that runs entirely inside one main-actor
+    /// turn (no real suspension point in `work`, or a `work`
+    /// body that short-circuits) is published as a single batch
+    /// by `ObservableObject`. SwiftUI commits all three changes
+    /// into one render pass and the indicator never appears —
+    /// the user sees nothing happen even though the work
+    /// completed. The `analysisBatchTotal` footer-pill bug
+    /// (Re-analyze on a track with a lazy analysis in flight
+    /// silently skipped, the pill never showing) was an
+    /// instance of this; this helper standardises the
+    /// mitigation.
+    ///
+    /// Implementation: a one-frame sleep (≈ 16 ms at 60 Hz)
+    /// between `set()` and `work()` releases the main actor
+    /// long enough for SwiftUI's runloop pass to commit the
+    /// publish. `Task.yield()` alone is not sufficient because
+    /// SwiftUI's render queue is driven by the runloop, not the
+    /// cooperative task scheduler. The post-`work` reset goes
+    /// through `defer` so an exception in `work` still clears
+    /// the flag.
+    ///
+    /// Apply this anywhere you'd otherwise write
+    /// `flag = true; defer { flag = false }; work()` for
+    /// transient progress flags. Long-running work that itself
+    /// awaits a real I/O suspension point (e.g. `Task.detached`)
+    /// doesn't need it, but using the helper consistently keeps
+    /// the contract documented at the call site.
+    @MainActor
+    func withVisibleTransientFlag<T>(
+        set: @MainActor () -> Void,
+        reset: @MainActor () -> Void,
+        _ work: @MainActor () async throws -> T
+    ) async rethrows -> T {
+        set()
+        try? await Task.sleep(nanoseconds: 16_000_000)
+        defer { reset() }
+        return try await work()
+    }
+
     /// M11c.1 — batch-analyze entry point. Drives the LibraryView
     /// right-click context menu's single Analyze / Re-analyze
     /// action (collapsed in round 3; see §4.4). Iterates serially
@@ -1729,13 +1847,44 @@ final class WaveformAppModel: ObservableObject {
     func analyzeTracks(_ trackIds: [String]) async {
         guard libraryIsOpen, !trackIds.isEmpty else { return }
         let library = self.library
-        analysisBatchTotal = UInt32(trackIds.count)
-        analysisBatchCompleted = 0
-        defer {
-            self.analysisBatchTotal = 0
-            self.analysisBatchCompleted = 0
+        await withVisibleTransientFlag(
+            set: {
+                self.analysisBatchTotal = UInt32(trackIds.count)
+                self.analysisBatchCompleted = 0
+            },
+            reset: {
+                self.analysisBatchTotal = 0
+                self.analysisBatchCompleted = 0
+            }
+        ) {
+            await self.analyzeTracksBody(trackIds, library: library)
         }
+    }
+
+    private func analyzeTracksBody(_ trackIds: [String], library: DubLibrary) async {
         for trackId in trackIds {
+            // Coalesce with any concurrent lazy analysis (e.g. one
+            // kicked off by `recordLibraryLoadIfApplicable` or the
+            // `readDeckState` BPM-resolution catch-up). Before this
+            // wait the contains-check used to `continue` immediately
+            // after bumping `analysisBatchCompleted` — for a single
+            // track that path set `analysisBatchTotal = 1`, bumped
+            // completed to 1, and ran the `defer` reset all in one
+            // runloop turn, so SwiftUI never got a render tick where
+            // `analysisBatchTotal > 0` was true and the footer pill
+            // never appeared. Polling here yields between checks so
+            // the @Published assignment above gets a chance to
+            // propagate; once the lazy run clears the set we
+            // re-enter the analyze normally (PRD-BEATS §4.4 treats
+            // "Re-analyze" as idempotent — running the analyser
+            // again on a fresh result is cheap and matches what the
+            // user clicked for). The 10 s cap keeps us from
+            // hanging the batch on a wedged background task.
+            var waitTicks = 0
+            while analyzingTrackIds.contains(trackId), waitTicks < 200 {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                waitTicks &+= 1
+            }
             if analyzingTrackIds.contains(trackId) {
                 analysisBatchCompleted &+= 1
                 continue
@@ -1756,7 +1905,8 @@ final class WaveformAppModel: ObservableObject {
             analysisBatchCompleted &+= 1
             switch result {
             case .success(let outcome):
-                publishLibraryRowAnalysisUpdate(trackId: trackId, outcome: outcome)
+                publishLibraryRowAnalysisUpdate(
+                    trackId: trackId, outcome: outcome, refreshLoadedDecks: true)
             case .failure(let err):
                 if case LibraryFfiError.GridLocked = err {
                     continue
@@ -2046,13 +2196,12 @@ final class WaveformAppModel: ObservableObject {
         let side: DeckSide
         let priorIsPlaying: Bool
         let engagedPanic: Bool
-        /// Playhead position (seconds) captured at scratch begin.
-        /// Used on end to snap the engine to the gesture cursor
-        /// before restoring unity rate, so any rate-integration
-        /// drift doesn't carry into resumed playback.
-        let scratchStartElapsed: Double
         /// Most recent cursor offset (in audio seconds) reported
-        /// by the gesture overlay. Reset to 0 on begin.
+        /// by the gesture overlay. Reset to 0 on begin. Used by
+        /// the watchdog for stall detection, not by the end path —
+        /// scratch end leaves the engine at its naturally coasted
+        /// position rather than snapping back to a predicted
+        /// cursor offset (avoids the visible release-time jump).
         var lastEventOffsetSecs: Double = 0
         /// Wall-clock time of the most recent `scratchPointerOffset`
         /// call. Used both to compute `Δt` for the per-event rate
@@ -2069,13 +2218,11 @@ final class WaveformAppModel: ObservableObject {
             side: DeckSide,
             priorIsPlaying: Bool,
             engagedPanic: Bool,
-            scratchStartElapsed: Double,
             startedAt: Date
         ) {
             self.side = side
             self.priorIsPlaying = priorIsPlaying
             self.engagedPanic = engagedPanic
-            self.scratchStartElapsed = scratchStartElapsed
             self.lastEventAt = startedAt
         }
     }
@@ -2197,7 +2344,6 @@ final class WaveformAppModel: ObservableObject {
             side: side,
             priorIsPlaying: prior,
             engagedPanic: engagedPanic,
-            scratchStartElapsed: engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs,
             startedAt: Date())
         ensureScratchTimerRunning()
         // Publish last — flipping `scratchingDeck` enables the 60 Hz
@@ -2269,6 +2415,20 @@ final class WaveformAppModel: ObservableObject {
     /// pre-scratch play / pause state, and cancels Panic Play if
     /// we engaged it on `scratchBegin`. No-op on a side that
     /// isn't currently scratching.
+    ///
+    /// **Why no seek-back to the gesture cursor.** A pre-existing
+    /// "snap to `scratchStartElapsed + lastEventOffsetSecs`" step
+    /// produced a visible left-jump at release: during the
+    /// watchdog's stall-decay (`scratchRateStallDecay`, ~0.7 per
+    /// 16 ms tick) the engine plays out a brief platter-coast
+    /// past where the cursor last logically pointed. That coast
+    /// is what the user sees and hears, so the natural release
+    /// position is wherever the rate integration landed —
+    /// snapping back to the cursor's logical position warped the
+    /// playhead backward by exactly the coast displacement. The
+    /// drift from EMA lag itself is bounded by `τ × rate` (≈ 30 ms
+    /// at unity, imperceptible) so the legacy "drift-compensation"
+    /// rationale doesn't justify the visible glitch.
     func scratchEnd(side: DeckSide) {
         // Drop from the watchdog map before restoring transport.
         // `Timer.invalidate()` does not suppress a `scratchTick`
@@ -2285,9 +2445,7 @@ final class WaveformAppModel: ObservableObject {
         }
 
         let idx = side.ffiDeckIdx
-        let targetSecs = ended.scratchStartElapsed + ended.lastEventOffsetSecs
         do {
-            seekDeck(side: side, absoluteSecs: targetSecs)
             try engine.setDeckRate(deckIdx: idx, rate: 1.0)
         } catch let error as EngineError {
             surfaceError(describe(error))
@@ -2837,10 +2995,25 @@ final class WaveformAppModel: ObservableObject {
                     anchorSecs: anchor,
                     bpm: grid.bpm,
                     barPhase: barPhase)
+                // PRD-BEATS §3.5 + user-reported regression: user
+                // taps must NEVER auto-lock the grid. The auto-lock
+                // heuristic is meant for the initial auto-analyse
+                // pass — it freezes a tight-LSQ grid that the
+                // estimator is confident about. Applying that same
+                // heuristic to a user-supplied tap means the user
+                // taps once to set the 1, the LSQ refit produces
+                // tight residuals (because the grid spacing didn't
+                // change), `auto_lock_safe()` returns true, and
+                // the deck silently locks itself. The user then
+                // can't tap again to refine, can't 2x/½ from the
+                // header, can't reset to auto — the only way back
+                // is the library context menu. Refresh ONLY the
+                // drift indicator so the ⚠ marker stays accurate;
+                // the lock flag is left untouched.
                 if let quality {
-                    try library.applyGridQualityLock(
+                    try library.setGridDriftQuality(
                         trackId: trackId,
-                        quality: quality)
+                        driftSlopeMsPerMin: quality.driftSlopeMsPerMin)
                 }
                 persistError = nil
             } catch {
@@ -2856,9 +3029,11 @@ final class WaveformAppModel: ObservableObject {
                     if let q = quality {
                         var d = self.state(for: side)
                         d.gridDriftQuality = q.driftSlopeMsPerMin
-                        d.gridLocked = q.rmsMs < 8 && q.p95Ms < 25
-                            && q.maxAbsMs < 50 && q.keptFraction > 0.75
-                            && abs(q.driftSlopeMsPerMin) < 3
+                        // Deliberately do NOT touch `d.gridLocked`
+                        // here. See the equivalent comment on the
+                        // library-write branch above — the user
+                        // explicitly invoked a tap edit, so they
+                        // own the lock state.
                         self.setState(d, for: side)
                     }
                     self.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
@@ -2869,6 +3044,151 @@ final class WaveformAppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Octave-shift the active library beatgrid for the deck loaded
+    /// on `side`: multiply BPM by `multiplier` (2.0 for "2×", 0.5
+    /// for "½") and re-install the result on the engine while
+    /// keeping the visible downbeat anchored at the same musical
+    /// position. Backs the deck-header BPM right-click menu.
+    ///
+    /// Library-only operation: the user_tap row is the source of
+    /// truth, so the deck must have a `loadedLibraryTrackId`. If
+    /// the track has never been analysed (no active grid), surfaces
+    /// a hint asking the user to analyse first. Locked grids are
+    /// silently refused — the menu already disables itself in that
+    /// case, this guard is defense in depth.
+    ///
+    /// When the same track is loaded on the other deck we refresh
+    /// it too: the library row is shared, so both deck headers must
+    /// show the same BPM.
+    func scaleLoadedDeckBpm(side: DeckSide, multiplier: Double) {
+        guard isRunning, libraryIsOpen else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack, !deck.gridLocked else { return }
+        guard let trackId = deck.loadedLibraryTrackId else {
+            surfaceError("Scale BPM: track is not in the library.")
+            return
+        }
+        guard multiplier.isFinite, multiplier > 0 else { return }
+
+        let result: LibraryBeatGrid?
+        do {
+            result = try library.scaleActiveBeatGrid(
+                trackId: trackId,
+                multiplier: multiplier)
+        } catch {
+            surfaceError("Scale BPM failed: \(error.localizedDescription)")
+            return
+        }
+        guard let grid = result else {
+            surfaceError("Scale BPM: analyze the track first.")
+            return
+        }
+        installLibraryGridOnLoadedDecks(
+            trackId: trackId,
+            grid: grid,
+            bumpEditCount: true)
+    }
+
+    /// Drop any user-tap edits for the deck's loaded track and
+    /// re-install the original auto-analysis grid. Backs the
+    /// deck-header BPM right-click menu's "Reset" entry. Honours
+    /// the library lock and surfaces a hint when no auto row
+    /// exists yet (track has never been analysed).
+    /// Deck-header BPM right-click → "Lock grid" / "Unlock grid".
+    /// Mirrors the library row's lock toggle (`setGridLocked`) so
+    /// the user can flip the lock without leaving the performance
+    /// surface. Necessary because the auto-analyse pass no longer
+    /// auto-locks (user feedback: "for now disable auto grid
+    /// lock") — without this menu entry there's no performance-
+    /// time path to lock a freshly-tuned grid before a gig.
+    ///
+    /// Idempotent w.r.t. the lock flag itself: reads the current
+    /// state and writes its inverse. When the same track is
+    /// loaded on the other deck we mirror the new state there too
+    /// (same one-row-per-track invariant as `setGridLocked`).
+    func toggleLoadedDeckGridLocked(side: DeckSide) {
+        let deck = state(for: side)
+        guard deck.hasTrack, let trackId = deck.loadedLibraryTrackId else { return }
+        let newLocked = !deck.gridLocked
+        Task { @MainActor in
+            await self.setGridLocked(trackId: trackId, locked: newLocked)
+        }
+    }
+
+    func resetLoadedDeckBeatGrid(side: DeckSide) {
+        guard isRunning, libraryIsOpen else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack, !deck.gridLocked else { return }
+        guard let trackId = deck.loadedLibraryTrackId else {
+            surfaceError("Reset grid: track is not in the library.")
+            return
+        }
+
+        let result: LibraryBeatGrid?
+        do {
+            result = try library.resetActiveBeatGridToAuto(trackId: trackId)
+        } catch {
+            surfaceError("Reset grid failed: \(error.localizedDescription)")
+            return
+        }
+        guard let grid = result else {
+            surfaceError("Reset grid: no auto analysis exists yet. Analyze the track first.")
+            return
+        }
+        installLibraryGridOnLoadedDecks(
+            trackId: trackId,
+            grid: grid,
+            bumpEditCount: false)
+    }
+
+    /// Push the given library beatgrid onto every loaded deck whose
+    /// `loadedLibraryTrackId == trackId`. Mirrors the persist tail
+    /// used by `refreshLoadedDecksAfterLibraryAnalysis` so the
+    /// waveform redraws on the next vsync (paused decks) and the
+    /// deck-header BPM digit updates without a reload. Also
+    /// publishes a `LibraryRowAnalysisUpdate` so the LibraryView
+    /// row reflects the new BPM immediately.
+    private func installLibraryGridOnLoadedDecks(
+        trackId: String,
+        grid: LibraryBeatGrid,
+        bumpEditCount: Bool
+    ) {
+        guard grid.bpm > 0 else { return }
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            guard deck.loadedLibraryTrackId == trackId, deck.hasTrack else { continue }
+            do {
+                try engine.installBeatGridWithPhase(
+                    deckIdx: side.ffiDeckIdx,
+                    bpm: grid.bpm,
+                    anchorSecs: grid.anchorSecs,
+                    barPhase: grid.barPhase)
+            } catch {
+                continue
+            }
+            deck.bpm = grid.bpm
+            deck.bpmConfidence = 1.0
+            deck.gridDriftQuality = grid.gridDriftQuality
+            deck.gridLocked = grid.gridLocked
+            if bumpEditCount {
+                deck.manualGridEditCount &+= 1
+            }
+            // M11d.6 fix mirror: paused decks render on-demand,
+            // and the renderer only repaints when seekGeneration /
+            // peaksGeneration change. Bumping it here forces an
+            // immediate MTKView redraw so the new grid lines up on
+            // the same vsync.
+            deck.seekGeneration &+= 1
+            setState(deck, for: side)
+        }
+        libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+            trackId: trackId,
+            bpm: grid.bpm,
+            key: nil,
+            isAnalyzed: true)
+        analysisGeneration &+= 1
     }
 
     /// Write a finalized calibration record when unloading a track
@@ -3089,6 +3409,33 @@ struct MainView: View {
 /// local monitor intercepts every keyDown delivered to the
 /// application before any first responder gets it, which is the
 /// only way to make `Space` work the way `⌘,` does in macOS.
+///
+/// ## SwiftUI ↔ AppKit bridge contract
+///
+/// **Snapshot props**: `model: WaveformAppModel` — captured once
+/// at `makeNSView`; reads always go through this reference, so
+/// model identity must not change for the host's lifetime.
+///
+/// **Binding props**: `showingPreferences: Bool` — flipped by the
+/// `⌘,` handler. Bindings are captured by reference, so
+/// `updateNSView` is a deliberate no-op (the latest binding is
+/// always reachable through the captured `$showingPreferences`).
+///
+/// **Closure props**: callbacks are wired in `Coordinator.install`
+/// (`onSpace`, `onCmdComma`, `onTapGrid`). Each closure spawns
+/// `Task { @MainActor in … }` because the NSEvent monitor's
+/// handler block has no implicit actor isolation.
+///
+/// **Lifecycle**: the monitor handle lives on the Coordinator;
+/// `dismantleNSView` releases it via `NSEvent.removeMonitor`.
+/// Without this, the monitor outlives the SwiftUI view tree and
+/// fires against a torn-down model.
+///
+/// **Event filtering**: the handler returns `nil` (consume event)
+/// when it acts, the original event otherwise. Editable text
+/// fields keep their keyDown by detecting the first-responder
+/// kind before consuming Space (otherwise typing a space in the
+/// search field would load a track).
 private struct KeyEventMonitorHost: NSViewRepresentable {
     @Binding var showingPreferences: Bool
     let model: WaveformAppModel
