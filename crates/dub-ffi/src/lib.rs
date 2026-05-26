@@ -1451,16 +1451,21 @@ impl DubEngine {
 
     /// PRD-BEATS §4.1 — "set the 1" (1–2 taps in a session).
     ///
-    /// Re-anchors the uniform grid so the snapped kick at
-    /// `tap_secs` becomes bar position 1. BPM is preserved and
-    /// lightly refined; beat positions are rebuilt across the
-    /// full track via [`dub_bpm::latch_beat_grid_at_downbeat`]
-    /// (ODF transient snap + `uniform_beats`). This replaces
-    /// the round-4 pure `bar_phase` rotation, which could not
-    /// fix a misaligned auto grid: rotating phase only moves
-    /// which *existing* tick is yellow, so a tap on a kick
-    /// landed on the nearest grid line in dead air when the
-    /// auto anchor was offset.
+    /// Re-anchors the uniform grid so `tap_secs` becomes the
+    /// downbeat (bar position 1) **bit-exact**. PRD-BEATS Round 8:
+    /// the user owns the click coordinate; the engine does not
+    /// snap, shift, or refine the tap. BPM is preserved
+    /// bit-identical to the deck's current grid (Round 6 §6a);
+    /// beat positions are rebuilt across the full track via
+    /// [`dub_bpm::latch_beat_grid_at_downbeat`] (uniform spacing
+    /// from `tap_secs`). Replaces the Round 5–7 ODF-snap +
+    /// amp-peak-shift chain, which could move the rendered
+    /// downbeat tens of milliseconds away from where the user
+    /// pointed when those heuristics disagreed with the click
+    /// (Blaze Up Tha Dance regression). Also replaces the
+    /// round-4 pure `bar_phase` rotation, which could not fix a
+    /// misaligned auto grid (the tapped kick still landed on
+    /// whichever existing grid tick was nearest).
     ///
     /// # Errors
     ///

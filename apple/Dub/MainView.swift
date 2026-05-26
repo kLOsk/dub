@@ -2890,11 +2890,10 @@ final class WaveformAppModel: ObservableObject {
         guard deck.hasTrack else { return }
 
         let genre = selectedLibraryTrack?.genre
-        // PRD-BEATS §4.1: 1–2 tap "set the 1" re-anchors the grid
-        // at the snapped kick via `latch_beat_grid_at_downbeat`
-        // (Rust `set_bar_phase`). Trust the user's tap time
-        // verbatim — the ODF snap inside the latch absorbs small
-        // perceptual offset from the audio itself.
+        // PRD-BEATS §4.1, Round 8: 1–2 tap "set the 1" places
+        // the downbeat at `tap_secs` bit-exact. The engine does
+        // not snap, shift, or refine — the user owns the click
+        // coordinate, which is exactly what UI users expect.
         let downbeat = playheadTimes[0]
 
         do {
@@ -3091,11 +3090,6 @@ final class WaveformAppModel: ObservableObject {
             bumpEditCount: true)
     }
 
-    /// Drop any user-tap edits for the deck's loaded track and
-    /// re-install the original auto-analysis grid. Backs the
-    /// deck-header BPM right-click menu's "Reset" entry. Honours
-    /// the library lock and surfaces a hint when no auto row
-    /// exists yet (track has never been analysed).
     /// Deck-header BPM right-click → "Lock grid" / "Unlock grid".
     /// Mirrors the library row's lock toggle (`setGridLocked`) so
     /// the user can flip the lock without leaving the performance
@@ -3117,6 +3111,36 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Deck-header BPM context menu "Reset to auto" entry. Drops
+    /// the user's manual tap edits and reverts to the auto grid.
+    ///
+    /// Round 10 contract change: "Reset" now runs a FRESH analysis
+    /// (same code path as the library "Reanalyze" right-click
+    /// entry), not just a row-flip back to whatever auto grid the
+    /// DB happens to have cached. The previous implementation
+    /// (`reset_active_beatgrid_to_auto` in `dub-library`) demoted
+    /// the active `user_tap` row and re-activated the existing
+    /// `auto` row verbatim — but the existing `auto` row might
+    /// have been written months ago under a stale algorithm
+    /// version (e.g. Round 9's geometric-drift-aware integer-snap
+    /// which mis-snapped Chase & Status — Come Back to 175 BPM
+    /// before being reverted in Round 10). A user who hit Reset
+    /// after that revert would resurrect the stale 175 BPM,
+    /// directly contradicting what Round 10 fixed.
+    ///
+    /// User intent for "Reset" is "throw away my edits and give me
+    /// the current-algorithm baseline", which is exactly what
+    /// `analyzeTracks([trackId])` delivers. The Rust analyse path
+    /// demotes any active `user_tap` row unconditionally and
+    /// writes a fresh `auto` row, then `publishLibraryRow
+    /// AnalysisUpdate(refreshLoadedDecks: true)` installs it on
+    /// the deck without a reload. Same UX surface (footer pill,
+    /// row refresh, BPM digit updates immediately) and same
+    /// "lock is absolute" gate — the front-end early-out on
+    /// `deck.gridLocked` is kept so the operation feels instant
+    /// (the Rust side would also refuse with `GridLocked`, but
+    /// flashing an error toast for a state the menu already
+    /// communicates is hostile).
     func resetLoadedDeckBeatGrid(side: DeckSide) {
         guard isRunning, libraryIsOpen else { return }
         let deck = state(for: side)
@@ -3125,22 +3149,9 @@ final class WaveformAppModel: ObservableObject {
             surfaceError("Reset grid: track is not in the library.")
             return
         }
-
-        let result: LibraryBeatGrid?
-        do {
-            result = try library.resetActiveBeatGridToAuto(trackId: trackId)
-        } catch {
-            surfaceError("Reset grid failed: \(error.localizedDescription)")
-            return
+        Task { @MainActor in
+            await self.analyzeTracks([trackId])
         }
-        guard let grid = result else {
-            surfaceError("Reset grid: no auto analysis exists yet. Analyze the track first.")
-            return
-        }
-        installLibraryGridOnLoadedDecks(
-            trackId: trackId,
-            grid: grid,
-            bumpEditCount: false)
     }
 
     /// Push the given library beatgrid onto every loaded deck whose

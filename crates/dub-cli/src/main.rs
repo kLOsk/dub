@@ -30,6 +30,7 @@ mod calibrate;
 mod calibration;
 mod decode_timecode;
 mod device_profiles;
+mod diagnose;
 mod input_cmds;
 mod scope;
 mod thru;
@@ -45,6 +46,7 @@ fn main() -> ExitCode {
         "version" => version(),
         "play" => play(&args[2..]),
         "analyze" => analyze_cmd(&args[2..]),
+        "diagnose" => diagnose::run(&args[2..]),
         "decode-timecode" => decode_timecode_cmd(&args[2..]),
         "list-inputs" => input_cmds::list_inputs(),
         "levels" => input_cmds::levels(&args[2..]),
@@ -103,6 +105,7 @@ fn print_help() {
     eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
+    eprintln!("  diagnose <path-or-id>                    grid / waveform / BPM debugger");
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--window MS] [--head N]");

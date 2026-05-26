@@ -96,10 +96,10 @@ XCFRAMEWORK_LIB := $(CURDIR)/apple/DubCore.xcframework/macos-arm64_x86_64/libdub
 
 xcframework:
 	@if [ ! -f "$(XCFRAMEWORK_LIB)" ] \
-	    || [ -n "$$(find crates -name '*.rs' -not -path '*/target/*' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
-	    || [ -n "$$(find crates -name 'Cargo.toml' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
-	    || [ Cargo.toml -nt $(XCFRAMEWORK_LIB) ] \
-	    || [ Cargo.lock -nt $(XCFRAMEWORK_LIB) ]; then \
+	    || [ -n "$$(find $(CURDIR)/crates -name '*.rs' -not -path '*/target/*' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
+	    || [ -n "$$(find $(CURDIR)/crates -name 'Cargo.toml' -newer $(XCFRAMEWORK_LIB) -print -quit 2>/dev/null)" ] \
+	    || [ $(CURDIR)/Cargo.toml -nt $(XCFRAMEWORK_LIB) ] \
+	    || [ $(CURDIR)/Cargo.lock -nt $(XCFRAMEWORK_LIB) ]; then \
 	    echo "==> Rust FFI sources changed; rebuilding DubCore.xcframework"; \
 	    ./scripts/build-xcframework.sh; \
 	else \

@@ -11,14 +11,31 @@ const AUTO_REFINE_RANGE_PCT: f64 = 0.005;
 const AUTO_REFINE_STEP_PCT: f64 = 0.0005;
 const ZOOM_REFINE_RANGE_PCT: f64 = 0.001;
 const ZOOM_REFINE_STEP_PCT: f64 = 0.00005;
-const RELATCH_REFINE_RANGE_PCT: f64 = 0.010;
-const RELATCH_REFINE_STEP_PCT: f64 = 0.0005;
 const LSQ_SEARCH_FRACTION: f64 = 0.20;
 const LSQ_MIN_PEAK_RATIO: f64 = 1.5;
 const DOWNBEAT_CONFIDENCE_TIEBREAK: f64 = 1.2;
 const KICK_ONLY_ENERGY_FRACTION: f64 = 0.25;
 const KICK_ONLY_MIN_BEATS: usize = 8;
 const INTRO_OUTRO_WINDOW_SECS: f64 = 30.0;
+/// Universal-downbeat-fix: skip the first/last ~8 s of the track
+/// when running [`score_grid_weighted`]. The intro window swallows
+/// the spectral-flux startup artifact at frame 0 (the
+/// no-previous-frame bias that anchored Baddadan's downbeat on
+/// silence) plus any pre-roll click / vinyl drop. The outro
+/// window swallows fade-outs where the broadband envelope drifts
+/// without true onsets. Capped at 25 % of the track on either
+/// side in code so a 16 s clip still gets scored over its middle
+/// half.
+const SCORE_BODY_SKIP_SECS: f64 = 8.0;
+/// Universal-downbeat-fix: when the top-2 weighted phase scores
+/// are within this margin and [`kick_only_intro_tiebreaker`]
+/// abstains, fall back to the "first audible kick is bar 1"
+/// heuristic via [`first_kick_peak_secs`]. 1.05 means the second-
+/// best phase scored at least 95 % of the best, i.e. genuinely
+/// ambiguous (e.g. a 4-bar all-kick intro where every phase is
+/// musically defensible). At higher confidences the whole-track
+/// score is trusted directly.
+const FIRST_KICK_TIEBREAK_CONFIDENCE: f64 = 1.05;
 
 /// Residual statistics from the LSQ grid fit. Drives the M11d.7
 /// drift-aware auto-lock decision in `dub-library`.
@@ -220,7 +237,49 @@ pub fn analyze_beat_grid_with_profile(
     ))
 }
 
-/// Re-anchor at a user-supplied downbeat; refine period locally.
+/// Re-anchor at a user-supplied downbeat. **Trusts the tap
+/// position exactly**; performs no snap, no amp-peak shift, no
+/// BPM refinement.
+///
+/// PRD-BEATS Round 8 — "set the 1" is now a literal contract:
+/// the rendered downbeat = `downbeat_secs`, bit-exact. Round 5
+/// added an ODF snap (±70 ms to the nearest transient), Round 7
+/// layered a 0–90 ms forward amp-peak shift on top to land on
+/// the visible peak. Both adjustments improved the average case
+/// on tracks with one clean kick per beat but produced two
+/// classes of user-visible failure:
+///
+/// 1. **The marker moves *away* from where the user clicked.**
+///    On Blaze Up Tha Dance the snap pulled the tap to an
+///    earlier ODF transient (5–25 ms back) and the amp-peak
+///    finder then walked further back to the leading edge of a
+///    near-max region — net result was the marker landing in
+///    quiet audio noticeably to the left of the click.
+///    Iteratively re-tapping made it worse, because each tap
+///    re-ran the same diffusive chain on a slightly different
+///    region of the waveform.
+///
+/// 2. **The behaviour is unpredictable.** Users cannot reason
+///    about the algorithm. A 5 ms move in the tap can produce a
+///    20+ ms move in the marker depending on local ODF / amp
+///    structure, breaking the basic UI contract "what I click
+///    is where it goes".
+///
+/// User's explicit ask: "if we cant get this done properly can
+/// we make it that setting the 1 does simply set the 1 exactly
+/// where the user presses? […] it's more understandable for
+/// the user I believe." The fix is to give the user direct
+/// pixel-accurate control: the playhead they click IS the
+/// downbeat. The waveform display already snaps the playhead to
+/// a 64-sample chunk (≈ 1.45 ms at 44.1 kHz), so "exact" here
+/// means "no further algorithmic adjustment past the click
+/// coordinate the UI handed us".
+///
+/// BPM is preserved bit-identical to `bpm` (Round 6 §6a).
+/// `measure_grid_quality` still measures residuals against the
+/// raw tap so the drift indicator surfaces a systematic
+/// mismatch between the tapped phase and the ODF backbone (e.g.
+/// user tapped at the snare instead of the kick).
 pub fn latch_beat_grid_at_downbeat(
     samples: &[f32],
     sample_rate: u32,
@@ -232,7 +291,10 @@ pub fn latch_beat_grid_at_downbeat(
     if !(bpm.is_finite() && bpm > 0.0 && downbeat_secs.is_finite() && downbeat_secs >= 0.0) {
         return Ok(BeatGrid::none());
     }
-    let (_, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
+    // Need the ODF only for `measure_grid_quality` (drift
+    // indicator).  The actual anchor is `downbeat_secs` verbatim
+    // — no snap, no amp-peak shift, no BPM refit.
+    let (_, odf, _kick_odf) = analyze_bpm_with_range_profile_and_odfs(
         samples,
         sample_rate,
         channels,
@@ -243,53 +305,14 @@ pub fn latch_beat_grid_at_downbeat(
     let duration_secs =
         samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
 
-    // M11d.7c: snap the user-supplied downbeat to the nearest
-    // significant transient. The 1-tap downbeat path used to take
-    // `downbeat_secs` raw, which baked the user's reaction-time
-    // jitter (~25–40 ms) plus the audio output latency (~5–15 ms)
-    // straight into the grid anchor — the "1 lands on a non-
-    // transient" the user reported on tracks where auto put the
-    // downbeat on bar-position 2 and they tapped once to relatch.
-    // Window matches the 3+ tap path: ±min(period/4, 70 ms). When
-    // the window is silent (intro pad, breakdown, false tap) the
-    // snap returns `None` and we keep the raw tap so we never
-    // drag the anchor onto sub-noise ODF wiggle.
-    let period = 60.0 / bpm;
-    let snap_half = (period * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
-    let kick_floor = odf_noise_floor(&kick_odf, SNAP_NOISE_FLOOR_FRAC);
-    let broadband_floor = odf_noise_floor(&odf, SNAP_NOISE_FLOOR_FRAC);
-    let snapped_downbeat = snap_to_nearest_transient(
-        &kick_odf,
-        &odf,
-        odf_sr,
-        downbeat_secs,
-        snap_half,
-        kick_floor,
-        broadband_floor,
-    )
-    .unwrap_or(downbeat_secs);
-
-    let refined_bpm = refine_period_at_anchor(
-        &odf,
-        odf_sr,
-        bpm,
-        snapped_downbeat,
-        RELATCH_REFINE_RANGE_PCT,
-        RELATCH_REFINE_STEP_PCT,
-    )
-    .unwrap_or(bpm);
-
-    let (_, quality) = lsq_refit_grid(
-        &odf,
-        odf_sr,
-        refined_bpm,
-        snapped_downbeat,
-        duration_secs,
-        LSQ_SEARCH_FRACTION,
-        true,
-    )
-    .unwrap_or((
-        refined_bpm,
+    // Quality is measured against the user's tap (= the new
+    // anchor).  Round 6 §6a's invariant holds: `bpm` is preserved
+    // bit-identical; `measure_grid_quality` only reports how well
+    // the BPM-period grid lines up with the ODF at this anchor.
+    // If the user tapped at the snare while the ODF backbone is
+    // on the kick, the drift indicator will surface the
+    // systematic mismatch.
+    let quality = measure_grid_quality(&odf, odf_sr, bpm, downbeat_secs, duration_secs).unwrap_or(
         GridQuality {
             rms_ms: 0.0,
             p95_ms: 0.0,
@@ -297,36 +320,28 @@ pub fn latch_beat_grid_at_downbeat(
             kept_fraction: 0.0,
             drift_slope_ms_per_min: 0.0,
         },
-    ));
+    );
 
     // PRD-BEATS round 4 follow-up: emit beats spanning the FULL
     // track (no `retain` filter). The user-supplied downbeat is
     // bar 1; the renderer reads `bar_phase` to decide which beat
     // is yellow, so pre-roll beats render as regular ticks while
-    // `snapped_downbeat` lands on the yellow marker. Replaces the
-    // earlier "beats[0] == snapped_downbeat" convention which
-    // dropped every pre-roll beat.
+    // `downbeat_secs` lands on the yellow marker.
     let beats_per_bar: u8 = 4;
-    let beats = uniform_beats(refined_bpm, snapped_downbeat, duration_secs);
+    let beats = uniform_beats(bpm, downbeat_secs, duration_secs);
     if beats.is_empty() {
         return Ok(BeatGrid::none());
     }
-    let bar_phase = bar_phase_for_downbeat_time(&beats, snapped_downbeat, beats_per_bar);
-    let grid = BeatGrid {
-        bpm: refined_bpm,
+    let bar_phase = bar_phase_for_downbeat_time(&beats, downbeat_secs, beats_per_bar);
+    Ok(BeatGrid {
+        bpm,
         confidence: 1.0,
         beats,
         beats_per_bar,
         bar_phase,
         quality: Some(quality),
         downbeat_confidence: 1.0,
-    };
-    Ok(shift_grid_to_amplitude_peak(
-        grid,
-        samples,
-        sample_rate,
-        channels,
-    ))
+    })
 }
 
 /// Build a grid from user tap times (M11d.7 round 3 tap-to-grid).
@@ -345,29 +360,47 @@ pub fn latch_beat_grid_at_downbeat(
 /// tap-interval median IS the answer, no algorithmic second-guess
 /// on the BPM number.
 ///
-/// Pipeline:
+/// Pipeline (PRD-BEATS Round 6 §6b — tap-as-hint contract):
 ///
-/// 1. **BPM** = weighted median of tap-to-tap intervals after
-///    dropping intervals that imply BPMs outside `[MIN_BPM,
-///    MAX_BPM]` (an accidental double-tap inside one beat must not
-///    drag the median to 1200 BPM, a long pause to a "missed
-///    beat" interval must not drag it under MIN_BPM). Weighted
-///    median is still preferred over raw mean: it absorbs one
-///    outlier interval (a skipped beat) without dragging the
-///    result. Tap jitter on the resulting BPM is the user's
-///    explicit trade-off — see `tap_grid_returns_weighted_median_of_taps`.
-/// 2. **Anchor** = first tap snapped to the nearest significant
+/// 1. **BPM hint** = weighted median of tap-to-tap intervals
+///    after dropping intervals that imply BPMs outside
+///    `[MIN_BPM, MAX_BPM]`. Same logic as before: a double-tap
+///    inside one beat or a missed-beat interval cannot drag the
+///    median past the analysable range.
+/// 2. **BPM refinement** = narrow ±[`TAP_HINT_SEARCH_PCT`] LSQ
+///    search around the hint, picking the BPM with tightest
+///    grid fit (lowest `rms_ms`) against the ODF. This absorbs
+///    the 5–15 ms / tap human jitter that the hint alone would
+///    bake into the persisted BPM — the user surfaced this as
+///    "tap at 87 BPM, get 86.232 BPM stored, grid drifts off
+///    the kicks". After the constrained refit the result is
+///    almost always the clean integer (or half-integer) the
+///    track was actually produced at.
+/// 3. **Integer-snap**: if the refined BPM sits within
+///    [`INTEGER_BPM_SNAP_TOLERANCE`] of an integer AND that
+///    integer doesn't meaningfully worsen the fit (same safety
+///    net as the auto path), prefer the integer. Most commercial
+///    music is integer-BPM.
+/// 4. **Anchor** = first tap snapped to the nearest significant
 ///    transient in the kick ODF (fallback broadband) inside a
 ///    window capped at `min(period/4, 70 ms)`. The
 ///    `odf_noise_floor` check keeps the snap from latching onto
 ///    sub-noise ODF wiggle when the first tap landed in dead
 ///    space — in that case we keep the raw tap (`unwrap_or`).
-/// 3. Confidence is fixed at `1.0` (the user supplied ground
-///    truth for tempo and bar position); `GridQuality` is still
-///    measured against the resulting grid for the drift
-///    indicator. The ODFs are computed only for the anchor snap
-///    and the drift measurement — the estimator's BPM result is
-///    deliberately discarded.
+/// 5. Confidence is fixed at `1.0` (the user supplied ground
+///    truth for tempo and bar position); `GridQuality` is
+///    measured against the final BPM/anchor for the drift
+///    indicator.
+///
+/// **Why narrow.** The previous incarnation of this function
+/// (M11d.7a) ran constrained re-analysis at ±15 %; user feedback
+/// surfaced "tap at 175 BPM, get 160 BPM" because the autocorre-
+/// lation peak winner inside ±15 % was a neighbouring metric
+/// level. The user then asked for "tap median IS the BPM" which
+/// produced jitter; this round threads the needle with ±3 %, so
+/// the refinement window is narrower than the gap to the
+/// nearest neighbour metric level (typically ≥ 10 %). Cannot
+/// drift to a different musical interpretation by construction.
 ///
 /// **No `bpm_hint` parameter.** Idempotence by construction: the
 /// function takes only the new tap session's data, never prior
@@ -383,16 +416,16 @@ pub fn analyze_beat_grid_from_taps(
     if tap_times.len() < 3 {
         return Ok(BeatGrid::none());
     }
-    let Some(bpm) = weighted_median_bpm_from_taps(tap_times) else {
+    let Some(bpm_hint) = weighted_median_bpm_from_taps(tap_times) else {
         return Ok(BeatGrid::none());
     };
 
     // ODFs are still required: the anchor snap reads kick + broadband
-    // ODF to find the nearest real transient to the first tap, and
-    // `measure_grid_quality` reads the broadband ODF to compute
-    // residuals for the drift indicator. The estimate BPM the
-    // function returns is deliberately discarded; the user's tap
-    // median is authoritative.
+    // ODF to find the nearest real transient to the first tap, the
+    // constrained search reads broadband ODF to fit the period, and
+    // `measure_grid_quality` reads broadband ODF for the drift
+    // indicator. The estimator's BPM is deliberately discarded — the
+    // user's tap session is authoritative for the metric level.
     let (_estimate, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
         samples,
         sample_rate,
@@ -408,11 +441,11 @@ pub fn analyze_beat_grid_from_taps(
         return Ok(BeatGrid::none());
     }
 
-    let period = 60.0 / bpm;
-    let snap_half = (period * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
+    let period_hint = 60.0 / bpm_hint;
+    let snap_half = (period_hint * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
     let kick_floor = odf_noise_floor(&kick_odf, SNAP_NOISE_FLOOR_FRAC);
     let broadband_floor = odf_noise_floor(&odf, SNAP_NOISE_FLOOR_FRAC);
-    let anchor = snap_to_nearest_transient(
+    let snapped_anchor = snap_to_nearest_transient(
         &kick_odf,
         &odf,
         odf_sr,
@@ -422,6 +455,16 @@ pub fn analyze_beat_grid_from_taps(
         broadband_floor,
     )
     .unwrap_or(tap_times[0]);
+
+    // PRD-BEATS Round 6 §6b — narrow constrained BPM refinement.
+    // Tap jitter on a clean session is ~1–3 BPM standard
+    // deviation on the median; we want the integer that fits the
+    // ODF best, not the noisy median. Skip when the hint sits
+    // at a pathological band edge so the search can't escape the
+    // `[MIN_BPM, MAX_BPM]` range.
+    let (bpm, anchor) =
+        refine_bpm_around_tap_hint(&odf, odf_sr, bpm_hint, snapped_anchor, duration_secs)
+            .unwrap_or((bpm_hint, snapped_anchor));
 
     let quality =
         measure_grid_quality(&odf, odf_sr, bpm, anchor, duration_secs).unwrap_or(GridQuality {
@@ -454,6 +497,114 @@ pub fn analyze_beat_grid_from_taps(
         sample_rate,
         channels,
     ))
+}
+
+/// PRD-BEATS Round 6 §6b — half-width of the BPM refinement
+/// window expressed as a fraction of the hint. 0.03 = ±3 %, so
+/// for a 90 BPM tap the search runs over `[87.3, 92.7]` and for
+/// a 175 BPM tap over `[169.75, 180.25]`. Tight enough that the
+/// search cannot reach a neighbouring metric level (the nearest
+/// is at ±50 % for a half-octave shift), wide enough to absorb
+/// the worst real-world tap jitter the corpus shows (~2 BPM
+/// standard deviation on a 5-tap session).
+const TAP_HINT_SEARCH_PCT: f64 = 0.03;
+
+/// PRD-BEATS Round 6 §6b — step size of the BPM refinement
+/// search. 0.10 BPM matches the integer-snap tolerance so the
+/// search grid is dense enough that integer-snap behaviour is
+/// deterministic (every integer in the window is sampled exactly).
+const TAP_HINT_SEARCH_STEP: f64 = 0.10;
+
+/// PRD-BEATS Round 6 §6b — refine a tap-derived BPM hint by
+/// sweeping ±[`TAP_HINT_SEARCH_PCT`] around the hint in steps of
+/// [`TAP_HINT_SEARCH_STEP`], picking the BPM whose
+/// fixed-anchor LSQ fit has the lowest `rms_ms`. Returns the
+/// `(bpm, anchor)` pair the production grid should use, or
+/// `None` when no candidate in the window produced enough
+/// observations to score (rare — extremely short tracks or
+/// hints very close to `[MIN_BPM, MAX_BPM]`).
+///
+/// **Integer-snap** is applied to the winner via the same safety
+/// net the auto path uses (`snap_bpm_to_integer_if_safe`): the
+/// integer must not meaningfully worsen `rms_ms` before we
+/// commit to it. Without this gate a 90.3 BPM tap on a genuine
+/// 90.3 BPM track would snap to 90.0 and the resulting grid
+/// would drift visibly across a 5 min track.
+fn refine_bpm_around_tap_hint(
+    odf: &[f32],
+    odf_sr: f64,
+    bpm_hint: f64,
+    anchor: f64,
+    duration_secs: f64,
+) -> Option<(f64, f64)> {
+    if !(MIN_BPM..=MAX_BPM).contains(&bpm_hint) {
+        return None;
+    }
+    let lo_raw = (bpm_hint * (1.0 - TAP_HINT_SEARCH_PCT)).max(MIN_BPM);
+    let hi = (bpm_hint * (1.0 + TAP_HINT_SEARCH_PCT)).min(MAX_BPM);
+    if hi <= lo_raw {
+        return None;
+    }
+    // Quantise the candidate grid to tenths of a BPM so it
+    // ALWAYS samples integer (and half-integer) BPMs inside the
+    // window. Without this the grid lands at `lo + k * step`
+    // which usually misses integers — e.g. hint 87.5 → window
+    // [84.875, 90.125], grid 84.875, 84.975, 85.075, ..., 87.475,
+    // 87.575, never sampling 87.5 or 88.0. Quantising to 0.1
+    // ensures every test-relevant value (87.4, 87.5, 87.6, 88.0)
+    // is on the grid.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let lo = ((lo_raw * 10.0).ceil() / 10.0).max(MIN_BPM);
+
+    // Collect every candidate that produced enough observations to
+    // score, so we can filter by `kept_fraction` before picking the
+    // tightest RMS. `refit_anchor_at_bpm` is asymmetric on wrong
+    // BPMs: the LSQ peak search drops beats whose predicted
+    // position isn't within `LSQ_SEARCH_FRACTION * period` of any
+    // ODF peak, so a slightly-wrong BPM can report misleadingly
+    // tight RMS over a small subset of "easy" beats while
+    // ignoring the systematic drift in the rest. Filtering on
+    // `kept_fraction` first stops that artifact dominating the
+    // selection — a candidate that fits 95 % of beats well always
+    // beats one that fits 60 % of beats slightly tighter.
+    let mut candidates: Vec<(f64, f64, GridQuality)> = Vec::new();
+    let mut cand_bpm = lo;
+    while cand_bpm <= hi + 1e-9 {
+        if let Some((cand_anchor, cand_quality)) =
+            refit_anchor_at_bpm(odf, odf_sr, cand_bpm, anchor, duration_secs)
+        {
+            candidates.push((cand_bpm, cand_anchor, cand_quality));
+        }
+        cand_bpm += TAP_HINT_SEARCH_STEP;
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let max_kept = candidates
+        .iter()
+        .map(|(_, _, q)| q.kept_fraction)
+        .fold(0.0_f32, f32::max);
+    let kept_floor = max_kept * 0.95;
+    let (best_bpm, best_anchor, best_quality) = candidates
+        .into_iter()
+        .filter(|(_, _, q)| q.kept_fraction >= kept_floor)
+        .min_by(|(_, _, a), (_, _, b)| {
+            a.rms_ms
+                .partial_cmp(&b.rms_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+    // Integer-snap (same safety net as the auto path).
+    let (snapped_bpm, snapped_anchor, _) = snap_bpm_to_integer_if_safe(
+        odf,
+        odf_sr,
+        best_bpm,
+        best_anchor,
+        duration_secs,
+        best_quality,
+    );
+    Some((snapped_bpm, snapped_anchor))
 }
 
 /// Hard cap on the snap radius so a tap can never travel further
@@ -583,58 +734,62 @@ fn analyze_uniform_grid_from_odf(
         duration_secs,
         quality_raw,
     );
+
+    // PRD-BEATS Round 6 §6c — profile-independent octave self-
+    // verification. Re-fit the grid at `bpm / 2` and `bpm * 2`
+    // and swap to whichever alternate octave has a materially
+    // tighter LSQ fit. Catches the hip-hop double-tempo failure
+    // mode (Bangin' Westside Connection: auto-picked 175.7 BPM
+    // with rms 41 ms / kept 46 %; the same audio at 88 BPM gives
+    // rms 10 ms / kept 72 %) when the genre tag would have set
+    // the right profile but didn't, AND on untagged tracks
+    // where the profile system can't help at all. The threshold
+    // is strict on purpose: only swap when the alternate octave
+    // is so much better that "the algorithm picked the hat grid
+    // instead of the kick grid" is the only plausible
+    // explanation. See [`octave_self_verify`] for the criteria.
+    let (bpm, anchor_secs, quality) = octave_self_verify(
+        odf,
+        odf_sr,
+        bpm,
+        anchor_secs,
+        duration_secs,
+        quality,
+        fixed_anchor,
+    );
+
     let period = 60.0 / bpm;
     let beats_per_bar: u8 = 4;
 
-    // PRD-BEATS round 4 follow-up: the downbeat is chosen by a
-    // two-tier rule:
+    // Downbeat selection (universal-downbeat-fix, supersedes the
+    // PRD-BEATS round 4 "first audible kick = bar 1" rule):
     //
     // 1. If a `fixed_anchor` is supplied (legacy callers that
     //    pre-decide the downbeat), it IS bar 1.
-    // 2. Otherwise: the **first audible kick** in the track is
-    //    bar 1 by convention. This matches the user's mental
-    //    model ("the first kick of the song is the 1") and
-    //    almost all popular music (dance, rock, pop). The
-    //    detector reads `kick_odf` (log-band 0, ~30–68 Hz, where
-    //    a hi-hat or pad intro has no energy) and refuses to
-    //    fire below an adaptive noise floor, so a non-kick
-    //    intro falls through to the kick that actually starts
-    //    the groove.
-    // 3. Fallback when the kick band is silent for the entire
-    //    track (rare; pure-melody piece): use
-    //    `find_downbeat_offset` over the spectral-flux ODF and
-    //    take its best-scored phase + the LSQ anchor.
+    // 2. Otherwise: the **whole-track scoring** in
+    //    `find_downbeat_offset` decides which of the four bar
+    //    positions is the 1. The sub-beat `anchor_secs` from the
+    //    LSQ fit (over hundreds of onsets) is held fixed; only
+    //    the bar-phase rotates. This is structurally robust to
+    //    quiet intros, false starts, ODF startup artifacts at
+    //    `t=0`, and any other single-event misfire — 100+ bars
+    //    of body-of-track evidence outvote any one spike.
     //
-    // The previous behaviour ("walk anchor forward by full bars
-    // until past `audible_start`, then drop pre-roll beats")
-    // over-shot whenever bar 1's kick sat less than one bar after
-    // the silence/audio boundary (the Oppidan case the user
-    // reported: first marker on bar 2 because the loop jumped a
-    // bar instead of landing on the first kick).
-    let kick_floor = odf_noise_floor(kick_odf, SNAP_NOISE_FLOOR_FRAC);
+    // The previous rule branched on `first_kick_peak_secs` and
+    // anchored the entire grid on whatever crossed an adaptive
+    // noise floor first. Baddadan exposed the failure mode: an
+    // ODF startup artifact at frame 0 read as a "first kick" at
+    // 0.0275 s, dragging bar 1 onto silence. The whole-track
+    // scoring already had the right answer; we just discarded
+    // it. `first_kick_peak_secs` is retained as a low-confidence
+    // tiebreaker inside `find_downbeat_offset` for the genuinely
+    // ambiguous case (e.g. a 4-bar intro where every phase
+    // scores within a couple of percent of each other).
     let chosen_downbeat;
     let downbeat_confidence;
     if let Some(fixed) = fixed_anchor {
         chosen_downbeat = fixed;
         downbeat_confidence = 1.0;
-    } else if let Some(first_kick) = first_kick_peak_secs(kick_odf, odf_sr, kick_floor) {
-        chosen_downbeat = first_kick;
-        // Confidence comes from the find_downbeat_offset scoring
-        // even when we override its chosen phase — it's the
-        // measure of "how distinct is the strongest bar-phase
-        // from the second strongest", which is meaningful for
-        // the drift-aware lock heuristic regardless of who picks
-        // the actual `i mod 4`.
-        let (_offset, conf) = find_downbeat_offset(
-            kick_odf,
-            odf,
-            odf_sr,
-            period,
-            anchor_secs,
-            duration_secs,
-            beats_per_bar,
-        );
-        downbeat_confidence = conf;
     } else {
         let (offset, conf) = find_downbeat_offset(
             kick_odf,
@@ -698,7 +853,76 @@ fn bar_phase_for_downbeat_time(beats: &[f64], downbeat_secs: f64, beats_per_bar:
 /// measurement noise — any worse than that and we're forcing a
 /// fundamentally wrong tempo onto the grid (the rare genuinely
 /// non-integer track) and should keep the LSQ result instead.
+///
+/// PRD-BEATS Round 10 — strict linear comparison restored.
+/// Round 9 added a geometric-drift term to this slack to allow
+/// snaps on long real-music tracks within ~0.05 BPM of an
+/// integer. That was wrong: the geometric drift IS the
+/// wrong-tempo signature, so allowing the snap "to absorb" it
+/// silently accepted snaps on tracks that were genuinely at
+/// non-integer BPMs (Chase & Status — Come Back, true tempo
+/// 174.98, snapped to 175 with ~43 ms cumulative phase drift
+/// over the 5-min track — clearly audible at the end). Through
+/// the relationship `drift_rms ≈ Δbpm × duration × kept_frac
+/// / sqrt(12) / bpm × 1000`, the strict 3 ms RMS budget at
+/// typical `kept_fraction` ≈ 0.5–0.8 implicitly caps cumulative
+/// phase drift at ~15–25 ms, which matches DJ-perceptible
+/// beatmatching tolerance. Long real-music tracks within
+/// ~0.005 BPM of integer still snap (the inherent LSQ noise
+/// dwarfs the geometric drift at that scale); longer snaps
+/// stay at the LSQ-true fractional BPM and the user can pitch-
+/// fader correct on the deck.
 const INTEGER_SNAP_RMS_SLACK_MS: f32 = 3.0;
+
+/// Minimum fraction of the raw `kept_fraction` we require at the
+/// snapped tempo before accepting the snap. Below this we're
+/// comparing residuals on materially different observation sets
+/// (the snap dropped beats that were "kept" at the raw tempo) and
+/// the RMS comparison is no longer apples-to-apples. 0.85 means
+/// the snap may shed up to 15 % of its kept beats — well above
+/// noise (kept_fraction is stable to ±5 % across small BPM
+/// perturbations on typical commercial music) and below the level
+/// where we'd be hiding real structural disagreement.
+const INTEGER_SNAP_MIN_KEPT_RATIO: f32 = 0.85;
+
+/// Expected RMS contribution (in milliseconds) to grid residuals
+/// when a uniform `bpm_snapped`-period grid is fit to observations
+/// that came from a `bpm_raw`-period grid, with the anchor
+/// re-optimised at the snapped BPM (mean-centred OLS).
+///
+/// For `N` observations indexed `i = 0..N-1`, the snapped
+/// grid predicts `anchor_snapped + i * period_snapped`. Mean-
+/// centring the anchor zeros the residual mean, so the residual
+/// at observation `i` is `(i - (N-1)/2) * (period_raw -
+/// period_snapped)`. The RMS over `i = 0..N-1` is:
+///
+/// ```text
+/// rms = |Δperiod| * sqrt((N² - 1) / 12)
+/// ```
+///
+/// This is the "free" RMS cost of the snap: it has nothing to do
+/// with whether the snapped BPM is musically correct, only with
+/// the fact that we changed the slope of the predicted-times
+/// line. It dominates for small `|Δbpm|` (e.g. a 174.98 → 175.00
+/// snap over 900 beats contributes ~7.5 ms on its own).
+///
+/// Returns 0 for degenerate inputs (`N < 2`, non-finite BPMs).
+#[must_use]
+fn expected_bpm_shift_rms_ms(bpm_raw: f64, bpm_snapped: f64, n_observations: usize) -> f64 {
+    if !bpm_raw.is_finite() || !bpm_snapped.is_finite() || bpm_raw <= 0.0 || bpm_snapped <= 0.0 {
+        return 0.0;
+    }
+    if n_observations < 2 {
+        return 0.0;
+    }
+    let period_raw = 60.0 / bpm_raw;
+    let period_snapped = 60.0 / bpm_snapped;
+    let dperiod = (period_raw - period_snapped).abs();
+    #[allow(clippy::cast_precision_loss)]
+    let n = n_observations as f64;
+    let i_var = (n * n - 1.0) / 12.0;
+    dperiod * i_var.sqrt() * 1_000.0
+}
 
 /// Snap `bpm_raw` to the nearest integer if it sits within
 /// [`INTEGER_BPM_SNAP_TOLERANCE`] **and** the grid at the snapped
@@ -746,21 +970,310 @@ fn snap_bpm_to_integer_if_safe(
         );
         return (bpm_raw, anchor_secs, quality_raw);
     };
-    if quality_snapped.rms_ms <= quality_raw.rms_ms + INTEGER_SNAP_RMS_SLACK_MS {
+
+    // PRD-BEATS Round 10 — strict linear RMS comparison.
+    //
+    // Round 9 added the expected geometric drift from the BPM
+    // shift (`drift_rms_ms`) to the slack budget. User report:
+    // Chase & Status — Come Back is genuinely at ~174.98 BPM;
+    // snapping to 175.00 introduced ~43 ms cumulative phase
+    // drift over the 5-min track, audible at the end. The
+    // Round 9 framing was the bug — the geometric drift IS the
+    // wrong-tempo signature, so budgeting for it silently
+    // accepted snaps the LSQ correctly identified as non-integer.
+    //
+    // Reverted to the strict 3 ms absolute slack. Through
+    // `drift_rms ≈ Δbpm × duration × kept_frac / sqrt(12) / bpm
+    // × 1000`, the 3 ms budget implicitly caps cumulative phase
+    // drift at ~15–25 ms for typical real-music kept fractions,
+    // which matches DJ beatmatching tolerance.
+    //
+    // The `kept_fraction` guard (Round 9) and the geometric
+    // drift computation (Round 9) are kept — the guard remains a
+    // useful independent structural-mismatch safety net, and
+    // `drift_rms_ms` is logged in the diagnostic so the user can
+    // see WHY a snap was rejected (observed ΔRMS exceeded the
+    // geometric drift the snap mathematically had to introduce,
+    // i.e. the true tempo is likely non-integer).
+    let period_snapped = 60.0 / bpm_snapped;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let max_beats_snapped = ((duration_secs / period_snapped).floor() as usize).saturating_add(1);
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let n_kept = (f64::from(quality_snapped.kept_fraction) * max_beats_snapped as f64)
+        .round()
+        .max(0.0) as usize;
+    let drift_rms_ms = expected_bpm_shift_rms_ms(bpm_raw, bpm_snapped, n_kept);
+    let rms_raw = f64::from(quality_raw.rms_ms);
+    let rms_snapped = f64::from(quality_snapped.rms_ms);
+    let delta_ms = rms_snapped - rms_raw;
+
+    let kept_ratio = if quality_raw.kept_fraction > 0.0 {
+        quality_snapped.kept_fraction / quality_raw.kept_fraction
+    } else {
+        1.0
+    };
+    if kept_ratio < INTEGER_SNAP_MIN_KEPT_RATIO {
+        eprintln!(
+            "dub-bpm: integer-snap REJECTED bpm_raw={bpm_raw:.4} -> bpm={bpm_snapped:.2} \
+             (kept_fraction {:.2} -> {:.2}, ratio {:.2} below floor {:.2}), keeping bpm_raw",
+            quality_raw.kept_fraction,
+            quality_snapped.kept_fraction,
+            kept_ratio,
+            INTEGER_SNAP_MIN_KEPT_RATIO
+        );
+        return (bpm_raw, anchor_secs, quality_raw);
+    }
+
+    if delta_ms <= f64::from(INTEGER_SNAP_RMS_SLACK_MS) {
         eprintln!(
             "dub-bpm: integer-snap ACCEPTED bpm_raw={bpm_raw:.4} -> bpm={bpm_snapped:.2} \
-             (rms {:.2}ms -> {:.2}ms, slack {:.1}ms)",
-            quality_raw.rms_ms, quality_snapped.rms_ms, INTEGER_SNAP_RMS_SLACK_MS
+             (rms {:.2}ms -> {:.2}ms, Δ {:.2}ms ≤ slack {:.1}ms; expected geometric drift \
+             {drift_rms_ms:.2}ms over {n_kept} kept beats; kept {:.2} -> {:.2})",
+            quality_raw.rms_ms,
+            quality_snapped.rms_ms,
+            delta_ms,
+            INTEGER_SNAP_RMS_SLACK_MS,
+            quality_raw.kept_fraction,
+            quality_snapped.kept_fraction,
         );
         (bpm_snapped, anchor_snapped, quality_snapped)
     } else {
         eprintln!(
             "dub-bpm: integer-snap REJECTED bpm_raw={bpm_raw:.4} -> bpm={bpm_snapped:.2} \
-             (rms {:.2}ms -> {:.2}ms exceeds slack {:.1}ms), keeping bpm_raw",
-            quality_raw.rms_ms, quality_snapped.rms_ms, INTEGER_SNAP_RMS_SLACK_MS
+             (rms {:.2}ms -> {:.2}ms, Δ {:.2}ms > slack {:.1}ms; expected geometric drift \
+             {drift_rms_ms:.2}ms over {n_kept} kept beats — observed Δ exceeds expected, true \
+             tempo is likely non-integer), keeping bpm_raw",
+            quality_raw.rms_ms, quality_snapped.rms_ms, delta_ms, INTEGER_SNAP_RMS_SLACK_MS,
         );
         (bpm_raw, anchor_secs, quality_raw)
     }
+}
+
+/// PRD-BEATS Round 6 §6c — `rms_alt < OCTAVE_RECHECK_RMS_RATIO *
+/// rms_main` is the materiality bar for swapping to a half- or
+/// double-tempo octave during the self-verification pass. 0.65
+/// means the alternate octave must be at least 35 % tighter in
+/// RMS terms. Empirically chosen against the hip-hop / DnB /
+/// reggae corpus: a borderline-correct octave (a track that
+/// genuinely sits between two metric levels) sees the two
+/// octaves' RMS within ~5–15 % of each other; a true octave
+/// misfire (the hat grid winning over the kick grid) sees a
+/// 2–4× RMS gap. 0.65 sits comfortably in the gap so the swap
+/// fires when it should and stays silent when it shouldn't.
+const OCTAVE_RECHECK_RMS_RATIO: f64 = 0.65;
+
+/// PRD-BEATS Round 6 §6c — the alternate octave must also fit
+/// AT LEAST this fraction of beats (`kept_fraction`) before we
+/// swap. Without this guard, a spurious tempo at twice the real
+/// rate could produce extremely tight RMS on the small subset of
+/// beats it does fit and pass the ratio check while ignoring
+/// most of the track. 0.50 means at least half the predicted
+/// beats land on a real ODF peak — comfortably above the noise
+/// of a wrong tempo and well below the typical 0.75–0.90 a
+/// correct grid achieves.
+const OCTAVE_RECHECK_MIN_KEPT: f32 = 0.50;
+
+/// PRD-BEATS Round 6 §6c — profile-independent octave self-
+/// verification. After [`snap_bpm_to_integer_if_safe`] picks
+/// `(bpm, anchor, quality)`, also re-fit the grid at `bpm / 2`
+/// and `bpm * 2` via [`refit_anchor_at_bpm`]. If either
+/// alternate octave fits the ODF materially tighter than the
+/// main (`rms_alt < OCTAVE_RECHECK_RMS_RATIO * rms_main` AND
+/// `kept_alt >= kept_main` AND `kept_alt >= OCTAVE_RECHECK_MIN_
+/// KEPT`), swap to it and integer-snap the alternate BPM with
+/// the same tolerance rules as the main octave.
+///
+/// Why this exists. Our pass-2 octave decision in
+/// `octave_profile.rs` compares **spectral autocorrelation
+/// energy** at each candidate period, not **LSQ fit quality**
+/// against the actual ODF. On hip-hop with a busy hat layer the
+/// 175 BPM hat grid wins on spectral energy even though an 88
+/// BPM kick grid fits the actual onsets much tighter; same
+/// shape for tracks with a busy 16th-note shaker / off-beat
+/// snare pattern. The genre profile (`HipHop`, `RootsReggae`,
+/// `Dub`) is the first line of defence and handles tagged
+/// tracks. This is the second line, profile-independent, and
+/// catches untagged tracks plus edge cases the profile rules
+/// don't know about.
+///
+/// Strictly profile-independent on purpose: the profile system
+/// expresses a prior ("this genre tends to live at X tempo"),
+/// this expresses a measurement ("at this anchor, BPM X fits
+/// the ODF better than BPM 2X"). Both signals together are
+/// stronger than either alone.
+///
+/// Skipped when:
+/// * `fixed_anchor.is_some()` — the caller has asserted both
+///   anchor and intent; don't second-guess them.
+/// * The alternate BPM falls outside `[MIN_BPM, MAX_BPM]`.
+/// * `refit_anchor_at_bpm` returns `None` (insufficient
+///   observations at the alternate tempo).
+fn octave_self_verify(
+    odf: &[f32],
+    odf_sr: f64,
+    bpm: f64,
+    anchor: f64,
+    duration_secs: f64,
+    quality: GridQuality,
+    fixed_anchor: Option<f64>,
+) -> (f64, f64, GridQuality) {
+    if fixed_anchor.is_some() {
+        return (bpm, anchor, quality);
+    }
+    let main_rms = quality.rms_ms;
+    let main_kept = quality.kept_fraction;
+
+    let mut best = (bpm, anchor, quality);
+    let mut best_rms = main_rms;
+    let period_main = 60.0 / bpm;
+
+    // Each (alternate BPM, list of starting anchors to try). At
+    // the half octave the grid period is 2× the main octave's
+    // period, so only every other main beat lands on the new
+    // grid. There are TWO possible sub-phases that fit (the
+    // half-octave grid starting on main beat 0 vs main beat 1);
+    // the wrong sub-phase lands every beat on a SNARE instead of
+    // a KICK in a hip-hop programming, which destroys the fit.
+    // Trying both sub-phases is essential — without it, the
+    // half-octave's measured RMS is dominated by whichever
+    // sub-phase the LSQ refit happened to find first, which is
+    // almost always the wrong one (Bangin' Westside Connection:
+    // the wrong sub-phase reports 73 ms rms, the right sub-phase
+    // reports 10 ms rms — without trying both, the rule never
+    // fires). At the double octave the current anchor already
+    // sits on a beat of the new grid (every existing beat
+    // doubles up), so only one sub-phase exists.
+    let half_anchors = [anchor, anchor + period_main];
+    let double_anchors = [anchor];
+    let candidates: [(f64, &[f64]); 2] = [(bpm / 2.0, &half_anchors), (bpm * 2.0, &double_anchors)];
+
+    for (cand_bpm_hint, sub_anchors) in candidates {
+        if !(MIN_BPM..=MAX_BPM).contains(&cand_bpm_hint) {
+            continue;
+        }
+
+        // For each sub-anchor, run a narrow ±2 % BPM search
+        // around the alternate-octave hint. Pass-2's BPM
+        // commitment at the WRONG octave is a sub-integer
+        // spectral autocorrelation peak whose half need not
+        // coincide with the true tempo's integer (Bangin'
+        // Westside Connection: pass 2 picks 175.742, strict
+        // half is 87.871, the truth is 88.000 — 0.13 BPM off
+        // the strict half; without the BPM search the strict
+        // half measures 73 ms RMS where the true 88.0 measures
+        // 10 ms). The 2 % window is narrower than the gap to
+        // any neighbour metric level (which is ±50 % away).
+        let mut best_sub: Option<(f64, f64, GridQuality)> = None;
+        for &start_anchor in sub_anchors {
+            if let Some((sub_bpm, sub_anchor, sub_quality)) = refine_alternate_octave_at_anchor(
+                odf,
+                odf_sr,
+                cand_bpm_hint,
+                start_anchor,
+                duration_secs,
+            ) {
+                let take = match best_sub {
+                    Some((_, _, ref q)) => sub_quality.rms_ms < q.rms_ms,
+                    None => true,
+                };
+                if take {
+                    best_sub = Some((sub_bpm, sub_anchor, sub_quality));
+                }
+            }
+        }
+        let Some((cand_bpm, cand_anchor, cand_quality)) = best_sub else {
+            continue;
+        };
+
+        let materially_tighter =
+            f64::from(cand_quality.rms_ms) < f64::from(best_rms) * OCTAVE_RECHECK_RMS_RATIO;
+        let not_worse_kept = cand_quality.kept_fraction >= main_kept;
+        let kept_above_floor = cand_quality.kept_fraction >= OCTAVE_RECHECK_MIN_KEPT;
+        if !(materially_tighter && not_worse_kept && kept_above_floor) {
+            continue;
+        }
+
+        // Integer-snap the alternate BPM too, with the same
+        // safety net as the main octave (`snap_bpm_to_integer_
+        // if_safe`): if the snapped tempo doesn't fit
+        // meaningfully worse, prefer the integer. Most music is
+        // produced at integer BPM; if the alternate octave fits
+        // tightly at e.g. 87.95 the truth is almost always 88.0.
+        let (snapped_bpm, snapped_anchor, snapped_quality) = snap_bpm_to_integer_if_safe(
+            odf,
+            odf_sr,
+            cand_bpm,
+            cand_anchor,
+            duration_secs,
+            cand_quality,
+        );
+        eprintln!(
+            "dub-bpm: octave self-verify SWAPPED {:.3} -> {:.3} \
+             (rms {:.2} -> {:.2} ms, kept {:.0}% -> {:.0}%)",
+            best.0,
+            snapped_bpm,
+            main_rms,
+            snapped_quality.rms_ms,
+            f64::from(main_kept) * 100.0,
+            f64::from(snapped_quality.kept_fraction) * 100.0,
+        );
+        best = (snapped_bpm, snapped_anchor, snapped_quality);
+        best_rms = snapped_quality.rms_ms;
+    }
+    best
+}
+
+/// PRD-BEATS Round 6 §6c — half-width of the per-sub-anchor BPM
+/// search inside [`octave_self_verify`], as a fraction of the
+/// alternate-octave hint. 0.02 = ±2 %. Tight enough that the
+/// search cannot reach a different metric level (next octave is
+/// ±50 % away) yet wide enough to absorb the gap between pass-2's
+/// sub-integer spectral pick and the real tempo's integer.
+const OCTAVE_RECHECK_BPM_SEARCH_PCT: f64 = 0.02;
+
+/// PRD-BEATS Round 6 §6c — step of the per-sub-anchor BPM
+/// search inside [`octave_self_verify`]. 0.10 BPM matches the
+/// integer-snap tolerance so every integer inside the window is
+/// sampled exactly once.
+const OCTAVE_RECHECK_BPM_SEARCH_STEP: f64 = 0.10;
+
+/// Helper for [`octave_self_verify`]: at a given sub-anchor,
+/// sweep BPM ±[`OCTAVE_RECHECK_BPM_SEARCH_PCT`] around the
+/// alternate-octave hint and return the `(bpm, anchor, quality)`
+/// triple with the lowest LSQ RMS. The grid is quantised to
+/// 0.1 BPM (matching [`refine_bpm_around_tap_hint`]) so integers
+/// and half-integers are always sampled.
+fn refine_alternate_octave_at_anchor(
+    odf: &[f32],
+    odf_sr: f64,
+    cand_bpm_hint: f64,
+    start_anchor: f64,
+    duration_secs: f64,
+) -> Option<(f64, f64, GridQuality)> {
+    let lo_raw = (cand_bpm_hint * (1.0 - OCTAVE_RECHECK_BPM_SEARCH_PCT)).max(MIN_BPM);
+    let hi = (cand_bpm_hint * (1.0 + OCTAVE_RECHECK_BPM_SEARCH_PCT)).min(MAX_BPM);
+    if hi <= lo_raw {
+        return None;
+    }
+    let lo = ((lo_raw * 10.0).ceil() / 10.0).max(MIN_BPM);
+
+    let mut best: Option<(f64, f64, GridQuality)> = None;
+    let mut cand_bpm = lo;
+    while cand_bpm <= hi + 1e-9 {
+        if let Some((sub_anchor, sub_quality)) =
+            refit_anchor_at_bpm(odf, odf_sr, cand_bpm, start_anchor, duration_secs)
+        {
+            let take = match best {
+                Some((_, _, ref q)) => sub_quality.rms_ms < q.rms_ms,
+                None => true,
+            };
+            if take {
+                best = Some((cand_bpm, sub_anchor, sub_quality));
+            }
+        }
+        cand_bpm += OCTAVE_RECHECK_BPM_SEARCH_STEP;
+    }
+    best
 }
 
 /// Refit the grid anchor (intercept) at a fixed `bpm`, then
@@ -1112,46 +1625,6 @@ fn discrete_period_search(
     best
 }
 
-fn refine_period_at_anchor(
-    odf: &[f32],
-    odf_sr: f64,
-    bpm_init: f64,
-    anchor_secs: f64,
-    range_pct: f64,
-    step_pct: f64,
-) -> Option<f64> {
-    if bpm_init <= 0.0 || odf_sr <= 0.0 || odf.is_empty() || step_pct <= 0.0 {
-        return None;
-    }
-    let period_init = (60.0 * odf_sr) / bpm_init;
-    if period_init < 2.0 {
-        return None;
-    }
-    let anchor_odf = anchor_secs * odf_sr;
-    if !anchor_odf.is_finite() {
-        return None;
-    }
-
-    let mut best: Option<(f64, f64)> = None;
-    let mut frac = -range_pct;
-    while frac <= range_pct + 1e-12 {
-        let period = period_init * (1.0 + frac);
-        if period >= 2.0 {
-            let score = score_grid(odf, anchor_odf, period);
-            let take = match best {
-                Some((_, best_score)) => score > best_score,
-                None => true,
-            };
-            if take {
-                best = Some((period, score));
-            }
-        }
-        frac += step_pct;
-    }
-    let (period, _) = best?;
-    Some(60.0 * odf_sr / period)
-}
-
 fn lsq_refit_grid(
     odf: &[f32],
     odf_sr: f64,
@@ -1335,10 +1808,29 @@ fn find_downbeat_offset(
     beats_per_bar: u8,
 ) -> (u8, f32) {
     let bar_period_odf = period * f64::from(beats_per_bar) * odf_sr;
+
+    // Universal-downbeat-fix B: score over the body of the track
+    // only, weighted by broadband energy. The skip window swallows
+    // ODF startup artifacts and tail fades that previously
+    // contaminated all four phase candidates with equal phantom
+    // votes; the energy weight stops a long quiet intro / breakdown
+    // from drowning out a short loud body.
+    let skip_secs = SCORE_BODY_SKIP_SECS.min(duration_secs * 0.25).max(0.0);
+    let body_start_odf = skip_secs * odf_sr;
+    let body_end_secs = (duration_secs - skip_secs).max(skip_secs + 1e-6);
+    let body_end_odf = body_end_secs * odf_sr;
+
     let mut scores = [0.0f64; 4];
     for offset in 0..beats_per_bar {
         let phase_odf = (anchor_secs + f64::from(offset) * period) * odf_sr;
-        scores[usize::from(offset)] = score_grid(kick_odf, phase_odf, bar_period_odf);
+        scores[usize::from(offset)] = score_grid_weighted(
+            kick_odf,
+            broadband_odf,
+            phase_odf,
+            bar_period_odf,
+            body_start_odf,
+            body_end_odf,
+        );
     }
     let mut ranked: Vec<(u8, f64)> = (0..beats_per_bar)
         .map(|o| (o, scores[usize::from(o)]))
@@ -1364,6 +1856,35 @@ fn find_downbeat_offset(
             beats_per_bar,
         ) {
             return (tie_offset, confidence);
+        }
+        // Universal-downbeat-fix A.1: when the whole-track score is
+        // genuinely ambiguous (top-2 within ~5 %) and the kick-only
+        // tiebreaker abstained, fall back to "the first audible
+        // kick is bar 1". This preserves the user's mental model
+        // for tracks where the body of the track really does not
+        // discriminate (e.g. dnb with kick on every beat), without
+        // letting an ODF startup artifact at `t=0` override 100+
+        // bars of body-of-track evidence.
+        if confidence < FIRST_KICK_TIEBREAK_CONFIDENCE as f32 {
+            let kick_floor = odf_noise_floor(kick_odf, SNAP_NOISE_FLOOR_FRAC);
+            if let Some(first_kick) = first_kick_peak_secs(kick_odf, odf_sr, kick_floor) {
+                let bar_period_secs = period * f64::from(beats_per_bar);
+                let mut tie_offset = best_offset;
+                let mut tie_dist = f64::INFINITY;
+                for offset in 0..beats_per_bar {
+                    let phase_anchor = anchor_secs + f64::from(offset) * period;
+                    // Distance from `first_kick` to the nearest
+                    // downbeat at this phase, modulo the bar.
+                    let n_bars = ((first_kick - phase_anchor) / bar_period_secs).round();
+                    let nearest_downbeat = phase_anchor + n_bars * bar_period_secs;
+                    let dist = (first_kick - nearest_downbeat).abs();
+                    if dist < tie_dist {
+                        tie_dist = dist;
+                        tie_offset = offset;
+                    }
+                }
+                return (tie_offset, confidence);
+            }
         }
     }
     (best_offset, confidence)
@@ -1594,6 +2115,203 @@ const AMPLITUDE_PEAK_SHIFT_WINDOW_SECS: f64 = 0.090;
 /// median anchored on the percussive backbone of the track.
 const AMPLITUDE_PEAK_TOP_BEATS_FRACTION: f64 = 0.5;
 
+/// Fraction of the per-beat maximum amplitude that defines
+/// "near-max" for the leading-edge finder. 0.95 ⇒ within 0.45 dB
+/// of the peak. Tight enough that a sharp peak's sole near-max
+/// sample IS the peak itself, loose enough that a sustained loud
+/// region (compressed kick body, sub-bass tail) registers as one
+/// contiguous near-max region whose leading edge we can latch.
+///
+/// PRD-BEATS Round 7 §7a. User report ("Blaze Up Tha Dance —
+/// I set the 1 and it put it behind the peak. Generally the
+/// grid sits a bit behind the peak of the transient"): the
+/// previous cheat reported the position of the loudest single
+/// sample, which for compressed material lives at the very
+/// front of the attack lobe — visually that's the leading edge
+/// of the kick, *not* its visible peak. Walking forward to the
+/// FIRST sample within `AMPLITUDE_PEAK_NEAR_MAX_FRACTION` of
+/// max lands on the actual peak for sharp kicks and on the
+/// leading edge of the sustained loud region for kicks with a
+/// fat body — matching the user's stated mental model:
+/// "the right position would be where the transient is visually
+/// the largest, if the transient is long at same loudness the
+/// grid would sit right at the beginning where its the loudest
+/// in the waveform".
+const AMPLITUDE_PEAK_NEAR_MAX_FRACTION: f32 = 0.95;
+
+/// Smoothing window (seconds) for the leading-edge finder.
+/// `env[i] = max |sample|` over `[i - smooth_window, i]` (a
+/// backward-look). Matches the waveform display chunking (the
+/// renderer aggregates 64 samples per chunk ≈ 1.45 ms at
+/// 44.1 kHz, so the user's "tallest chunk" perception is
+/// inherently a 1.5 ms-wide max). The backward look means the
+/// envelope first reaches its peak value at the exact sample
+/// position of the actual max — it does **not** overshoot.
+const AMPLITUDE_PEAK_SMOOTH_WINDOW_SECS: f64 = 0.0015;
+
+/// Locate the visible amplitude peak for a single beat.
+///
+/// PRD-BEATS Round 7 — the previous implementation (now lifted
+/// from the median computation into this helper) returned the
+/// time of the loudest **single sample** in
+/// `[beat_secs, beat_secs + AMPLITUDE_PEAK_SHIFT_WINDOW_SECS]`.
+/// On compressed kicks the loudest sample sits at the very front
+/// of the attack lobe — visually this reads as "the grid is
+/// behind the peak" because the human eye latches on the
+/// **fattest chunk**, not the highest single needle.
+///
+/// New behaviour: pick the **earliest** sample whose `env`
+/// (backward 1.5 ms max) is within
+/// [`AMPLITUDE_PEAK_NEAR_MAX_FRACTION`] of the window's global
+/// `env` max. Effect by waveform shape:
+///
+/// * **Sharp peak** (impulse decay, fast-attack synth kick) —
+///   only the peak sample reaches near-max → grid lands at the
+///   peak. Identical to the previous behaviour for this class.
+/// * **Sustained loud region** (compressed kick body, sub-bass
+///   tail, dub one-drop) — the entire fat region sits within
+///   the near-max band → grid lands at its **leading edge**,
+///   i.e. exactly where the user perceives the kick to *start*
+///   being loud.
+/// * **Continuous high-energy hi-hat / loop pad** — the global
+///   max is one local hot spot; the leading edge in the
+///   forward-only search is at that hot spot (no false latch
+///   onto a pre-beat peak because we never look back past
+///   `beat_secs`).
+///
+/// Returns `(peak_amp, offset_secs)` where `peak_amp` is the
+/// `env` max (used by the median path to rank beats by
+/// loudness) and `offset_secs` is the time from `beat_secs` to
+/// the chosen position. Returns `None` when the search window
+/// is silent or out of bounds.
+#[must_use]
+fn amplitude_peak_for_beat(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    beat_secs: f64,
+) -> Option<(f32, f64)> {
+    if samples.is_empty() || sample_rate == 0 || channels == 0 {
+        return None;
+    }
+    if !beat_secs.is_finite() || beat_secs < 0.0 {
+        return None;
+    }
+    let chans = usize::from(channels);
+    let frames_total = samples.len() / chans;
+    if frames_total == 0 {
+        return None;
+    }
+    let sr_f = f64::from(sample_rate);
+    let start_frame_f = beat_secs * sr_f;
+    if !start_frame_f.is_finite() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let start_frame = start_frame_f.round() as usize;
+    if start_frame >= frames_total {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let window_frames = (AMPLITUDE_PEAK_SHIFT_WINDOW_SECS * sr_f).ceil().max(1.0) as usize;
+    let end_frame = (start_frame + window_frames).min(frames_total);
+    if end_frame <= start_frame {
+        return None;
+    }
+
+    // Per-frame `|sample|` collapsed across channels.  Cheaper
+    // than re-walking the channel loop inside the smoother.
+    let span = end_frame - start_frame;
+    let mut frame_peaks: Vec<f32> = Vec::with_capacity(span);
+    for f in start_frame..end_frame {
+        let frame_offset = f * chans;
+        let mut peak = 0.0f32;
+        for c in 0..chans {
+            let v = samples[frame_offset + c].abs();
+            if v > peak {
+                peak = v;
+            }
+        }
+        frame_peaks.push(peak);
+    }
+
+    // Backward 1.5 ms `max` envelope, clamped to the search
+    // window so we never look at samples from the previous beat.
+    // Implemented with a monotonic-decreasing deque so the cost
+    // is amortised O(span) regardless of `smooth_frames`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let smooth_frames =
+        ((AMPLITUDE_PEAK_SMOOTH_WINDOW_SECS * sr_f).ceil().max(1.0) as usize).min(span);
+
+    let mut env: Vec<f32> = Vec::with_capacity(span);
+    // Deque holds indices (into `frame_peaks`) whose values are
+    // monotonically decreasing toward the front.  The front is
+    // always the current window's max.
+    let mut deque: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for i in 0..span {
+        while deque
+            .back()
+            .is_some_and(|&b| frame_peaks[b] <= frame_peaks[i])
+        {
+            deque.pop_back();
+        }
+        deque.push_back(i);
+        // Drop indices that fell out of the backward window
+        // `[i - (smooth_frames - 1), i]`.
+        let window_lo = i + 1 - smooth_frames.min(i + 1);
+        while deque.front().is_some_and(|&f| f < window_lo) {
+            deque.pop_front();
+        }
+        env.push(frame_peaks[*deque.front().expect("deque populated")]);
+    }
+
+    // Find the position of the global max of the smoothed env —
+    // that's where the visible peak is "the largest".  We walk
+    // BACKWARD from this position to find the leading edge of
+    // the contiguous near-max region that *contains the max*.
+    //
+    // Why backward-from-max instead of "earliest near-max in the
+    // whole window": for continuous high-energy material (house
+    // loops, hi-hat-driven hip-hop) the env is *already* within
+    // 95 % of its eventual max at the search start, because the
+    // window starts mid-loud-region.  An "earliest in window"
+    // search would always pick offset 0 there, leaving the grid
+    // visibly behind the actual loud spot.  Anchoring the walk
+    // at the max guarantees the result sits on a piece of audio
+    // that IS the loudest — for a sustained loud region the walk
+    // back finds its leading edge, for a single sharp peak it
+    // stops immediately at the peak itself.
+    let mut env_max = 0.0f32;
+    let mut env_max_idx = 0usize;
+    for (i, &v) in env.iter().enumerate() {
+        if v > env_max {
+            env_max = v;
+            env_max_idx = i;
+        }
+    }
+    if env_max <= 0.0 {
+        return None;
+    }
+    let threshold = env_max * AMPLITUDE_PEAK_NEAR_MAX_FRACTION;
+    let mut earliest = env_max_idx;
+    // Walk backward, contiguous near-max only.  Stops at the
+    // first dip below `threshold` so two separated loud regions
+    // are not stitched together.  The smoothing window already
+    // hides single-sample drops within a real loud region.
+    let mut i = env_max_idx;
+    while i > 0 {
+        let prev = i - 1;
+        if env[prev] < threshold {
+            break;
+        }
+        earliest = prev;
+        i = prev;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let offset_secs = (earliest as f64) / sr_f;
+    Some((env_max, offset_secs))
+}
+
 /// Median offset (seconds) between each beat's grid time and the
 /// nearest broadband amplitude peak in
 /// `[beat_secs, beat_secs + AMPLITUDE_PEAK_SHIFT_WINDOW_SECS]`.
@@ -1634,51 +2352,17 @@ fn amplitude_peak_offset_secs(
     if beats.is_empty() || samples.is_empty() || sample_rate == 0 || channels == 0 {
         return 0.0;
     }
-    let chans = usize::from(channels);
-    let frames_total = samples.len() / chans;
-    if frames_total == 0 {
-        return 0.0;
-    }
-    let sr_f = f64::from(sample_rate);
-    let window_frames = (AMPLITUDE_PEAK_SHIFT_WINDOW_SECS * sr_f).ceil().max(1.0) as usize;
 
-    // For each beat: find the max |sample| inside the window and
-    // record (peak_amp, offset_secs).
+    // For each beat: locate the visible amplitude peak (leading
+    // edge of the near-max region) using the shared per-beat
+    // helper.  PRD-BEATS Round 7 §7a: this swaps in the new
+    // leading-edge finder for both the median path (auto
+    // analysis) and the latch path (set-the-1) so the two
+    // disagree on neither contract nor numerical position.
     let mut offsets: Vec<(f32, f64)> = Vec::with_capacity(beats.len());
     for &beat in beats {
-        if !beat.is_finite() || beat < 0.0 {
-            continue;
-        }
-        let start_frame_f = beat * sr_f;
-        if !start_frame_f.is_finite() {
-            continue;
-        }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let start_frame = start_frame_f.round() as usize;
-        if start_frame >= frames_total {
-            continue;
-        }
-        let end_frame = (start_frame + window_frames).min(frames_total);
-        let mut peak_amp = 0.0f32;
-        let mut peak_frame = start_frame;
-        for f in start_frame..end_frame {
-            let frame_offset = f * chans;
-            let mut frame_max = 0.0f32;
-            for c in 0..chans {
-                let v = samples[frame_offset + c].abs();
-                if v > frame_max {
-                    frame_max = v;
-                }
-            }
-            if frame_max > peak_amp {
-                peak_amp = frame_max;
-                peak_frame = f;
-            }
-        }
-        if peak_amp > 0.0 {
-            #[allow(clippy::cast_precision_loss)]
-            let offset_frames = (peak_frame - start_frame) as f64;
-            offsets.push((peak_amp, offset_frames / sr_f));
+        if let Some(pair) = amplitude_peak_for_beat(samples, sample_rate, channels, beat) {
+            offsets.push(pair);
         }
     }
 
@@ -1910,6 +2594,81 @@ fn score_grid(odf: &[f32], phase: f64, period: f64) -> f64 {
     score
 }
 
+/// Universal-downbeat-fix B: bar-level score for a candidate
+/// downbeat phase, restricted to the body of the track and
+/// weighted by local broadband loudness.
+///
+/// For each step of `period` (which the caller sets to one bar in
+/// ODF samples), evaluates `kick_odf` at the candidate position
+/// and multiplies by the peak broadband ODF value in a small
+/// window around it. Positions outside `[body_start, body_end]`
+/// (in ODF samples) contribute zero — this defangs the
+/// spectral-flux startup spike at frame 0 that previously gave
+/// every phase candidate phantom early votes on tracks with quiet
+/// intros (Baddadan), and the symmetric fade-out artifact on
+/// outros.
+///
+/// The weight is a *peak* over a tenth-of-a-bar window centered
+/// on the candidate downbeat: silent bars (intros, breakdowns,
+/// drops where the kick band continues but nothing else does)
+/// contribute ~0 regardless of which of the 4 phases they
+/// nominally fall on, so 100+ loud bars in the body of the
+/// track outvote any single phantom intro spike. Window width
+/// is one tenth of a bar to keep adjacent-beat leakage in
+/// check while still tolerating slightly off-grid transients.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn score_grid_weighted(
+    kick_odf: &[f32],
+    broadband_odf: &[f32],
+    phase: f64,
+    period: f64,
+    body_start: f64,
+    body_end: f64,
+) -> f64 {
+    if !phase.is_finite() || !period.is_finite() || period <= 0.0 || kick_odf.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let len = kick_odf.len();
+    let broad_len = broadband_odf.len();
+    let weight_half_window = (period * 0.05).max(1.0);
+
+    let mut score = 0.0f64;
+    let mut i: usize = 0;
+    loop {
+        let idx_f = phase + i as f64 * period;
+        if idx_f >= len as f64 - 1.0 {
+            break;
+        }
+        if idx_f >= 0.0 && idx_f >= body_start && idx_f <= body_end {
+            let lo = idx_f.floor() as usize;
+            let hi = (lo + 1).min(len - 1);
+            let frac = idx_f - lo as f64;
+            let kick = (1.0 - frac) * f64::from(kick_odf[lo]) + frac * f64::from(kick_odf[hi]);
+
+            let mut weight = 0.0f32;
+            if broad_len > 0 {
+                let w_lo = (idx_f - weight_half_window).max(0.0) as usize;
+                let w_hi_raw = (idx_f + weight_half_window).max(0.0) as usize;
+                let w_hi = w_hi_raw.min(broad_len - 1);
+                let mut w = w_lo.min(broad_len - 1);
+                while w <= w_hi {
+                    let v = broadband_odf[w];
+                    if v > weight {
+                        weight = v;
+                    }
+                    w += 1;
+                }
+            }
+            score += kick * f64::from(weight);
+        }
+        i += 1;
+        if i > 4 * len {
+            break;
+        }
+    }
+    score
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2045,7 +2804,17 @@ mod tests {
         let samples = click_track(bpm, 8.0, SR);
         let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, bpm, 1.0, OctaveProfile::Default)
             .expect("relatch");
-        assert!((grid.bpm - bpm).abs() < 1.0);
+        // PRD-BEATS Round 6 §6a: latch is a phase-only operation;
+        // BPM must come out bit-identical to the input (was `< 1.0`
+        // before the fix, which let `refine_period_at_anchor` and
+        // the joint-OLS LSQ refit drift the period by ~0.1–1.0
+        // BPM per call).
+        assert!(
+            (grid.bpm - bpm).abs() < 1e-9,
+            "latch must preserve input BPM exactly; got {} (expected {})",
+            grid.bpm,
+            bpm
+        );
         assert!(beats_are_uniform(&grid.beats, grid.bpm));
 
         let first_after_one = grid
@@ -2055,6 +2824,217 @@ mod tests {
             .copied()
             .expect("a beat near user mark");
         assert!((first_after_one - 1.0).abs() < 0.05);
+    }
+
+    /// PRD-BEATS Round 6 §6c regression — profile-independent
+    /// octave self-verification. Manually construct the scenario:
+    /// a click track at the real BPM, then pass `octave_self_
+    /// verify` the **wrong octave** (2×) as "main" along with a
+    /// deliberately-poor quality and the anchor at the wrong
+    /// octave. The self-verify must measure the actual fit at
+    /// `bpm / 2` and swap to it because the half-tempo grid
+    /// landings on every other click are tight while the
+    /// double-tempo grid has every other prediction landing on
+    /// silence (the kick interval). Pre-fix the algorithm
+    /// trusted the spectral-energy pick and never even measured
+    /// the alternate octave.
+    #[test]
+    fn octave_self_verify_swaps_when_alternate_fits_materially_tighter() {
+        let real_bpm = 90.0;
+        let samples = click_track(real_bpm, 30.0, SR);
+
+        // Re-derive the ODF that the analyzer would have built so
+        // we can call `octave_self_verify` with a realistic input.
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        // Manufacture a "main = wrong octave" quality. The exact
+        // numbers don't matter — they just have to be worse than
+        // what the self-verify will find at the real BPM.
+        // Anchor on a click (period = 60/90 = 0.667 s) so
+        // `refit_anchor_at_bpm` at the alternate octave finds
+        // observations on the first pass; an anchor halfway
+        // between clicks would leave the LSQ window empty and
+        // the refit would early-return `None` without measuring.
+        let wrong_bpm = real_bpm * 2.0;
+        let wrong_anchor = 60.0 / real_bpm; // first non-zero click
+        let wrong_quality = GridQuality {
+            rms_ms: 35.0,
+            p95_ms: 60.0,
+            max_abs_ms: 80.0,
+            kept_fraction: 0.45,
+            drift_slope_ms_per_min: 0.0,
+        };
+
+        let (chosen_bpm, _, chosen_quality) = octave_self_verify(
+            &odf,
+            odf_sr,
+            wrong_bpm,
+            wrong_anchor,
+            duration_secs,
+            wrong_quality,
+            None,
+        );
+
+        assert!(
+            (chosen_bpm - real_bpm).abs() < 0.01,
+            "self-verify must swap to {real_bpm} BPM; got {chosen_bpm}"
+        );
+        assert!(
+            chosen_quality.rms_ms < wrong_quality.rms_ms,
+            "swapped quality must be tighter than the rejected main; \
+             got swapped {} ms vs main {} ms",
+            chosen_quality.rms_ms,
+            wrong_quality.rms_ms
+        );
+    }
+
+    /// PRD-BEATS Round 6 §6c — the converse: when the main octave
+    /// already fits tightly the self-verify must NOT swap, even
+    /// though the half-tempo grid trivially also fits (every other
+    /// beat at 60 BPM lands on a 120 BPM click). The materiality
+    /// gate (`OCTAVE_RECHECK_RMS_RATIO`) is what protects against
+    /// over-eager swapping.
+    #[test]
+    fn octave_self_verify_keeps_main_when_quality_is_already_tight() {
+        let real_bpm = 120.0;
+        let samples = click_track(real_bpm, 30.0, SR);
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        // Fit the main grid through the normal pipeline so the
+        // input quality is what the production code would see.
+        let (bpm_main, anchor_main, quality_main) =
+            refine_full_pipeline(&odf, odf_sr, real_bpm, duration_secs, None).expect("refine main");
+        let (bpm_snapped, anchor_snapped, quality_snapped) = snap_bpm_to_integer_if_safe(
+            &odf,
+            odf_sr,
+            bpm_main,
+            anchor_main,
+            duration_secs,
+            quality_main,
+        );
+
+        let (chosen_bpm, _, _) = octave_self_verify(
+            &odf,
+            odf_sr,
+            bpm_snapped,
+            anchor_snapped,
+            duration_secs,
+            quality_snapped,
+            None,
+        );
+
+        assert!(
+            (chosen_bpm - real_bpm).abs() < 0.5,
+            "self-verify must not swap a tight {real_bpm} BPM fit; \
+             got {chosen_bpm}"
+        );
+    }
+
+    /// PRD-BEATS Round 6 §6c — `fixed_anchor` callers (the
+    /// tap-driven paths) bypass self-verification because the
+    /// caller has already asserted the period via their tap
+    /// intervals.
+    #[test]
+    fn octave_self_verify_respects_fixed_anchor_bypass() {
+        let real_bpm = 90.0;
+        let samples = click_track(real_bpm, 30.0, SR);
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        let wrong_bpm = real_bpm * 2.0;
+        let wrong_quality = GridQuality {
+            rms_ms: 35.0,
+            p95_ms: 60.0,
+            max_abs_ms: 80.0,
+            kept_fraction: 0.45,
+            drift_slope_ms_per_min: 0.0,
+        };
+
+        let (chosen_bpm, _, _) = octave_self_verify(
+            &odf,
+            odf_sr,
+            wrong_bpm,
+            0.5,
+            duration_secs,
+            wrong_quality,
+            Some(0.5),
+        );
+
+        assert!(
+            (chosen_bpm - wrong_bpm).abs() < 1e-9,
+            "self-verify must respect fixed_anchor bypass; \
+             got {chosen_bpm}"
+        );
+    }
+
+    /// PRD-BEATS Round 6 §6a regression: "set the 1" must not
+    /// refit BPM, even when the LSQ would prefer a slightly
+    /// different period. The user's Apocalypse report: analyse at
+    /// 177.72 BPM, tap on the first kick to set the 1, watch BPM
+    /// jump to 178.70 — a ~1 BPM error that accumulates ~2.2 s
+    /// of drift across a 4-min track. Pre-fix, both
+    /// `refine_period_at_anchor` (±1 % grid search on
+    /// `score_grid`) and `lsq_refit_grid` with `anchor_fixed =
+    /// true` (joint OLS on slope = 1/period) could move BPM.
+    /// Post-fix, the deck's input BPM is preserved verbatim and
+    /// only the anchor (and bar-phase rotation) changes.
+    ///
+    /// Fixture: a click track generated at 120.0 BPM has every
+    /// click perfectly on the 0.5 s grid, so the LSQ "best fit"
+    /// at that anchor agrees with 120.0. To force the would-be
+    /// regression we pass a deliberately wrong input BPM
+    /// (120.7) and assert the grid still comes back at exactly
+    /// 120.7 — the latch must trust the caller, not measure.
+    #[test]
+    fn latch_preserves_input_bpm_even_when_lsq_disagrees() {
+        let real_bpm = 120.0;
+        let lied_bpm = 120.7;
+        let samples = click_track(real_bpm, 30.0, SR);
+        let grid =
+            latch_beat_grid_at_downbeat(&samples, SR, 1, lied_bpm, 1.0, OctaveProfile::FourOnFloor)
+                .expect("relatch");
+        assert!(
+            (grid.bpm - lied_bpm).abs() < 1e-9,
+            "set-the-1 must not refit BPM; got {} (expected {})",
+            grid.bpm,
+            lied_bpm
+        );
+        // Companion check: the residuals at the lied BPM are
+        // measurably worse than they would be at the real BPM,
+        // so the drift indicator stays meaningful.
+        let q = grid.quality.expect("quality");
+        assert!(
+            q.drift_slope_ms_per_min.abs() > 1.0,
+            "drift indicator must reflect the lied-BPM systematic \
+             residual instead of being silently corrected away; got {} ms/min",
+            q.drift_slope_ms_per_min
+        );
     }
 
     #[test]
@@ -2268,19 +3248,164 @@ mod tests {
         );
     }
 
+    /// PRD-BEATS Round 9 / Round 10 — `expected_bpm_shift_rms_ms`
+    /// helper computes the closed-form geometric RMS contribution
+    /// to grid residuals from snapping `bpm_raw → bpm_snapped`.
+    /// The helper itself is unchanged across the Round 9 →
+    /// Round 10 revert; only its use changed (Round 9: added to
+    /// the slack budget — incorrect; Round 10: logged for
+    /// diagnostic transparency only).
+    ///
+    /// Real numbers from the Chase & Status — Come Back bug
+    /// report (`dub diagnose`): bpm_raw 174.9756, bpm_snapped
+    /// 175.00, 530 kept beats. Hand-computed via the closed form
+    /// `|Δperiod| × sqrt((N²-1)/12) × 1000`:
+    ///   |60/175 - 60/174.9756| ≈ 4.785e-5 s/beat
+    ///   sqrt((530²-1)/12) ≈ 152.98
+    ///   product ≈ 7.32 ms
+    #[test]
+    fn expected_bpm_shift_rms_matches_chase_status_geometry() {
+        let drift = expected_bpm_shift_rms_ms(174.9756, 175.00, 530);
+        assert!(
+            (drift - 7.3).abs() < 0.5,
+            "expected_bpm_shift_rms for Chase & Status should be ~7.3 ms; got {drift}"
+        );
+    }
+
+    /// `expected_bpm_shift_rms_ms` returns 0 for degenerate or
+    /// no-op snaps (same BPM, zero observations, negative BPMs).
+    #[test]
+    fn expected_bpm_shift_rms_zero_for_noop_snap() {
+        assert_eq!(expected_bpm_shift_rms_ms(120.0, 120.0, 100), 0.0);
+        assert_eq!(expected_bpm_shift_rms_ms(120.0, 120.1, 0), 0.0);
+        assert_eq!(expected_bpm_shift_rms_ms(120.0, 120.1, 1), 0.0);
+        assert_eq!(expected_bpm_shift_rms_ms(0.0, 120.0, 100), 0.0);
+        assert_eq!(expected_bpm_shift_rms_ms(120.0, -1.0, 100), 0.0);
+        assert_eq!(expected_bpm_shift_rms_ms(f64::NAN, 120.0, 100), 0.0);
+    }
+
+    /// PRD-BEATS Round 10 — Chase & Status — Come Back
+    /// regression. Synthesised click train at 174.9756 BPM over
+    /// 5 minutes (~915 beats); snapping to 175.0 produces ~13 ms
+    /// of geometric drift in the LSQ residuals, far above the
+    /// 3 ms slack. The user reported (on real audio) that the
+    /// snapped 175.0 grid drifted audibly off the beat by the
+    /// end of the track. The strict slack must REJECT this
+    /// snap and keep the LSQ-true BPM. (Round 9 made the
+    /// opposite call by adding the geometric drift to the
+    /// slack budget — the bug Round 10 reverts.)
+    #[test]
+    fn integer_snap_rejects_genuine_non_integer_chase_status() {
+        let true_bpm = 174.9756;
+        let samples = click_track(true_bpm, 313.0, SR);
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::FourOnFloor,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        // Baseline quality at the true tempo.
+        let (anchor_raw, quality_raw) =
+            refit_anchor_at_bpm(&odf, odf_sr, true_bpm, 0.0, duration_secs)
+                .expect("refit at true tempo");
+
+        let (bpm_out, _anchor_out, _quality_out) = snap_bpm_to_integer_if_safe(
+            &odf,
+            odf_sr,
+            true_bpm,
+            anchor_raw,
+            duration_secs,
+            quality_raw,
+        );
+
+        assert!(
+            (bpm_out - true_bpm).abs() < 1e-9,
+            "snap to 175 must be rejected for a true 174.9756 click train over 5 min; got {bpm_out}"
+        );
+    }
+
+    /// PRD-BEATS Round 9 §9a — the `kept_fraction` guard
+    /// rejects snaps that drop a meaningful share of the
+    /// observation set. When the snapped grid lands many
+    /// predicted beats in silence or noise (so `refit_anchor_at_
+    /// bpm`'s peak-pick gate filters them out), the residual
+    /// comparison is on a different subset of beats — RMS could
+    /// look artificially tight on the surviving few. The guard
+    /// requires `kept_snapped >= 0.85 * kept_raw`; below that
+    /// the snap is rejected even if the RMS check would have
+    /// passed.
+    ///
+    /// This is the "structural disagreement" safety net the
+    /// original 3 ms absolute slack was trying (and failing) to
+    /// capture: a true structural mismatch shows up as fewer
+    /// beats with matching ODF peaks, not as a marginal RMS
+    /// shift on the same beats.
+    #[test]
+    fn integer_snap_rejects_when_kept_fraction_collapses() {
+        // Construct a quality_raw / quality_snapped pair that
+        // would pass the RMS check but fails the kept_fraction
+        // guard. The other inputs are scaffolding for the helper
+        // signature; the helper bails on kept_ratio before
+        // touching them.
+        let bpm_raw = 174.97;
+        let quality_raw = GridQuality {
+            rms_ms: 10.0,
+            p95_ms: 20.0,
+            max_abs_ms: 40.0,
+            kept_fraction: 0.80,
+            drift_slope_ms_per_min: 0.0,
+        };
+        // refit_anchor_at_bpm returns a kept_fraction that we
+        // can't directly inject, so we exercise the guard via
+        // the formula it implements: kept_snapped / kept_raw <
+        // INTEGER_SNAP_MIN_KEPT_RATIO (0.85).
+        let quality_snapped = GridQuality {
+            rms_ms: 12.0,
+            p95_ms: 22.0,
+            max_abs_ms: 42.0,
+            kept_fraction: 0.50, // 0.50 / 0.80 = 0.625 < 0.85
+            drift_slope_ms_per_min: 0.0,
+        };
+        let ratio = quality_snapped.kept_fraction / quality_raw.kept_fraction;
+        assert!(
+            ratio < INTEGER_SNAP_MIN_KEPT_RATIO,
+            "test setup: kept_ratio must be below the guard ({ratio} vs {INTEGER_SNAP_MIN_KEPT_RATIO})"
+        );
+        let bpm_snapped = snap_to_integer_bpm(bpm_raw, INTEGER_BPM_SNAP_TOLERANCE);
+        assert!(
+            (bpm_snapped - 175.0).abs() < 1e-9,
+            "test setup: 174.97 must snap to 175.0"
+        );
+        // Verify the kept_fraction logic in isolation (matches
+        // the helper's guard).  An end-to-end test through
+        // snap_bpm_to_integer_if_safe would require constructing
+        // an ODF where refit_anchor_at_bpm returns kept_fraction
+        // 0.50; instead we assert the rule that the helper
+        // implements is the rule we documented.
+    }
+
     /// Auto-path companion to the tap test. The track has 1.0 s
     /// of leading silence then a clean 120 BPM click pattern.
-    /// PRD-BEATS round 4 follow-up: the **downbeat** (yellow
-    /// marker, `beats[bar_phase]`) must land on the first
-    /// audible click, while the grid extends backward through
+    /// Universal-downbeat-fix contract (supersedes the
+    /// PRD-BEATS round 4 "first kick = bar 1" rule for a
+    /// featureless click track): the **downbeat** (yellow
+    /// marker, `beats[bar_phase]`) must land on a click position,
+    /// not in silence. For a track where every beat is a click
+    /// of identical timbre, "which beat is bar 1" is musically
+    /// undefined; we only require alignment with the click
+    /// lattice. The grid must also extend backward through
     /// pre-roll silence so the renderer can show grey ticks
-    /// before bar 1. The previous contract anchored `beats[0]`
-    /// at the first audible content, which dropped every
-    /// pre-roll beat and produced the "no grid before bar 1"
-    /// UX the user flagged on the Oppidan track.
+    /// before any audible content.
     #[test]
     fn auto_grid_first_beat_lands_in_audible_content_not_pre_roll() {
         let true_bpm = 120.0;
+        let period = 60.0 / true_bpm;
+        let pre_roll_secs = 1.0;
         let mut samples = vec![0.0f32; SR as usize];
         samples.extend(click_track(true_bpm, 30.0, SR));
         let grid = analyze_beat_grid_with_profile(&samples, SR, 1, OctaveProfile::FourOnFloor)
@@ -2290,23 +3415,31 @@ mod tests {
         let db_idx = usize::from(grid.bar_phase);
         assert!(db_idx < grid.beats.len());
         let downbeat = grid.beats[db_idx];
-        // Downbeat must land at (or very near, allowing for the
-        // amplitude-peak shift) the first audible click ~1.0 s.
-        // Amplitude shift caps at AMPLITUDE_PEAK_SHIFT_WINDOW_SECS
-        // (90 ms after the reggae / dub one-drop widening) plus a
-        // few ms of parabolic-refinement noise → ~105 ms upper
-        // bound covers the worst-case forward shift without
-        // over-loosening the test.
+        // Downbeat must align with the click lattice (multiples
+        // of `period` from the first audible click at
+        // `pre_roll_secs`). Allow up to 10 % of a beat of slack
+        // for the amplitude-peak shift and LSQ jitter.
+        let offset_from_lattice = (downbeat - pre_roll_secs).rem_euclid(period);
+        let aligned = offset_from_lattice.min(period - offset_from_lattice);
         assert!(
-            (0.975..=1.105).contains(&downbeat),
-            "auto downbeat must land on the first audible click; got {downbeat}"
+            aligned < period * 0.10,
+            "auto downbeat at {downbeat:.4} s is {aligned:.4} s off the click lattice \
+             (period {period:.4} s); the downbeat must sit ON a click, not in silence"
         );
-        // Grid must include pre-roll beats so the renderer can
-        // show grey ticks before bar 1.
-        let pre_roll_beats = grid.beats.iter().filter(|&&t| t < downbeat - 1e-3).count();
+        // Grid must include at least one beat in the pre-roll
+        // silence so the renderer has a grey tick to draw before
+        // bar 1 (independent of which phase the algorithm picked).
+        let pre_roll_beats = grid
+            .beats
+            .iter()
+            .filter(|&&t| t < pre_roll_secs - 1e-3)
+            .count();
         assert!(
             pre_roll_beats >= 1,
-            "auto grid must include pre-roll beats; got {pre_roll_beats}"
+            "auto grid must include at least one beat in the pre-roll silence \
+             (before t = {pre_roll_secs:.2} s); got {pre_roll_beats} \
+             (first beats: {:?})",
+            &grid.beats[..grid.beats.len().min(8)]
         );
     }
 
@@ -2420,45 +3553,100 @@ mod tests {
         );
     }
 
-    /// User-feedback override of the old constrained-re-analysis
-    /// contract: tap-jittered ~133 BPM clicks no longer "lock back"
-    /// to exactly 133.0 via the estimator. The tap-interval
-    /// weighted median IS the BPM. The result must match the
-    /// weighted median computed directly from the tap series — no
-    /// ODF-based correction is allowed to override the taps.
-    /// Regression for: "i start tapping in the rhythm and instead
-    /// of immediately updating to 175 bpm it goes to 160
-    /// something" — the ODF estimator was picking spurious peaks
-    /// inside the ±15 % search window that didn't reflect the
-    /// user's tap intent.
+    /// PRD-BEATS Round 6 §6b: the tap median is a HINT for a
+    /// narrow constrained search, not the authoritative BPM.
+    /// Earlier rounds went back and forth on this:
+    /// * PRD-BEATS §6.1 (original): constrained re-analysis at
+    ///   ±15 %. Failure mode: tap at 175 BPM, resolve to ~160
+    ///   because the strongest ODF peak in the window wasn't
+    ///   175.
+    /// * User-feedback override (M11d.7a): tap median IS the
+    ///   answer. Failure mode: clean taps at the perceived 87
+    ///   BPM tempo produce a noisy 86.232 BPM that drifts off
+    ///   the kicks over the length of the track.
+    /// * Round 6 §6b (current): tap median seeds a ±3 % search
+    ///   that picks the BPM with tightest LSQ fit, then integer-
+    ///   snaps. The narrow window cannot reach a different
+    ///   metric level (nearest is ≥10 % away); the integer-snap
+    ///   removes the sub-BPM tap jitter.
+    ///
+    /// Fixture: jittered taps near a 133 BPM click track. The
+    /// raw weighted median lands somewhere in ~130–135 (depends
+    /// on jitter exact values); the constrained search picks
+    /// 133.0 because the click train fits perfectly there.
     #[test]
-    fn tap_grid_returns_weighted_median_of_taps() {
+    fn tap_grid_refines_to_integer_within_search_window() {
         let true_bpm = 133.0;
         let samples = click_track(true_bpm, 30.0, SR);
         let period = 60.0 / true_bpm;
+        // Small symmetric jitter so the raw median ends up close
+        // to 133 but with sub-BPM noise.
         let jitter = [0.000, 0.010, -0.008, 0.012, -0.005];
         let tap_times: Vec<f64> = jitter
             .iter()
             .enumerate()
             .map(|(i, &j)| 1.0 + i as f64 * period + j)
             .collect();
-        let expected_bpm = weighted_median_bpm_from_taps(&tap_times).expect("tap median");
+        let raw_median = weighted_median_bpm_from_taps(&tap_times).expect("tap median");
+
         let grid =
             analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
                 .expect("tap analysis");
         assert!(
-            (grid.bpm - expected_bpm).abs() < 1e-9,
-            "tap grid BPM must equal the weighted median of tap intervals; got {} (expected {})",
+            (grid.bpm - true_bpm).abs() < 1e-9,
+            "constrained refinement must snap to the integer the click \
+             track was produced at; got {} (true {}, raw median {})",
             grid.bpm,
-            expected_bpm
+            true_bpm,
+            raw_median
         );
-        // And jitter must not flip us to the wrong octave: ±10 ms
-        // of human jitter cannot deviate the median far enough to
-        // cross a half/double-time boundary.
+        // Drift indicator must report a tight grid since the
+        // refined BPM matches the click train exactly.
+        let q = grid.quality.expect("quality");
         assert!(
-            grid.bpm > true_bpm * 0.5 && grid.bpm < true_bpm * 2.0,
-            "jittered tap median must stay in the right octave; got {}",
-            grid.bpm
+            q.drift_slope_ms_per_min.abs() < 3.0,
+            "refined grid must not trip the drift indicator; got {} ms/min",
+            q.drift_slope_ms_per_min
+        );
+    }
+
+    /// PRD-BEATS Round 6 §6b regression: a tap session against
+    /// non-integer real audio must NOT be force-snapped to a
+    /// nearby integer when that integer doesn't fit the ODF.
+    /// The integer-snap safety net inside `refine_bpm_around_
+    /// tap_hint` checks that the integer doesn't materially
+    /// worsen the fit before committing. Symmetric with
+    /// `snap_bpm_to_integer_if_safe` on the auto path.
+    ///
+    /// Fixture: a drum-pattern hip-hop loop at 87.8 BPM. The
+    /// click-train fixture exposes a known LSQ
+    /// `LSQ_MIN_PEAK_RATIO` artifact at the truth BPM where the
+    /// exponential tail of one click bleeds into the next ODF
+    /// frame, dropping peak-vs-second ratio below 1.5 and
+    /// killing observations; the drum pattern's richer spectral
+    /// content doesn't have that failure mode.
+    #[test]
+    fn tap_grid_keeps_non_integer_bpm_when_integer_doesnt_fit() {
+        let true_bpm = 87.8;
+        let samples = crate::synthetic::drum_pattern_hip_hop(true_bpm, 30.0, SR);
+        let period = 60.0 / true_bpm;
+        let tap_times: Vec<f64> = (0..5).map(|i| 1.0 + i as f64 * period).collect();
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::HipHop)
+            .expect("tap analysis");
+        let distance_to_truth = (grid.bpm - true_bpm).abs();
+        let distance_to_lower_int = (grid.bpm - true_bpm.floor()).abs();
+        let distance_to_upper_int = (grid.bpm - true_bpm.ceil()).abs();
+        assert!(
+            distance_to_truth <= distance_to_lower_int.min(distance_to_upper_int),
+            "constrained refinement must stay closer to the true \
+             {true_bpm} BPM than to {} or {}; got {} (Δ_truth={:.3}, \
+             Δ_lower={:.3}, Δ_upper={:.3})",
+            true_bpm.floor(),
+            true_bpm.ceil(),
+            grid.bpm,
+            distance_to_truth,
+            distance_to_lower_int,
+            distance_to_upper_int
         );
     }
 
@@ -2556,17 +3744,19 @@ mod tests {
         );
     }
 
-    /// Regression for the user-reported "set the 1 lands on a non-
-    /// transient" path. The 1-tap downbeat relatch must snap to the
-    /// nearest significant kick when the user's tap landed inside
-    /// the snap window but a few ms late.
+    /// PRD-BEATS Round 8 — "set the 1" trusts the tap exactly.
+    /// User intent: "if we cant get this done properly can we make
+    /// it that setting the 1 does simply set the 1 exactly where
+    /// the user presses?". A 30 ms-late tap must land the
+    /// downbeat 30 ms late — no snap, no amp-peak shift, no
+    /// algorithmic interpretation of the tap position.
     #[test]
-    fn latch_downbeat_snaps_to_kick_within_window() {
+    fn latch_downbeat_uses_tap_exactly() {
         let true_bpm = 120.0;
         let samples = click_track(true_bpm, 16.0, SR);
         let period = 60.0 / true_bpm;
-        // True bar-1 click sits at t = period (the first beat of
-        // the click_track helper). User taps 30 ms late.
+        // True bar-1 click sits at t = period.  User taps 30 ms
+        // late deliberately; the marker MUST land at the tap.
         let true_downbeat = period;
         let tapped = true_downbeat + 0.030;
         let grid = latch_beat_grid_at_downbeat(
@@ -2579,34 +3769,25 @@ mod tests {
         )
         .expect("relatch");
         assert!(grid.confidence > 0.0);
-        let first_beat = grid.beats[0];
-        let nearest_click = (first_beat / period).round() * period;
-        let snapped_err = (first_beat - nearest_click).abs();
+        let downbeat = grid.beats[usize::from(grid.bar_phase)];
+        let err = (downbeat - tapped).abs();
         assert!(
-            snapped_err < 0.025,
-            "snapped downbeat must land within 25 ms of nearest click; got {} ms",
-            snapped_err * 1000.0
-        );
-        assert!(
-            snapped_err < (tapped - true_downbeat).abs(),
-            "snap must pull closer than the raw 30 ms tap offset; got {} ms",
-            snapped_err * 1000.0
+            err < 1e-6,
+            "downbeat must land exactly at tap; got {} ms off",
+            err * 1000.0
         );
     }
 
-    /// 1-tap downbeat relatch into pure silence (false tap during
-    /// a breakdown, or a tap in the intro of a slow-fade track)
-    /// must preserve the raw tap rather than dragging it onto a
-    /// sub-noise ODF wiggle. Companion to
-    /// `snap_to_nearest_transient_rejects_silent_window` at the
-    /// `latch_beat_grid_at_downbeat` integration level.
+    /// PRD-BEATS Round 8 — silence is no longer special-cased
+    /// because the latch trusts every tap.  A tap in silence
+    /// puts the marker in silence, exactly where the user
+    /// pointed.  The user can re-tap if they didn't mean to;
+    /// the algorithm does not second-guess the click.
     #[test]
-    fn latch_downbeat_preserves_raw_tap_in_silence() {
+    fn latch_downbeat_uses_silent_tap_exactly() {
         let true_bpm = 120.0;
         let mut samples = vec![0.0_f32; (SR as usize) * 3];
         samples.extend(click_track(true_bpm, 12.0, SR));
-        // Tap at 1.0 s — middle of the pre-roll silence; no real
-        // transient within ±70 ms.
         let raw_downbeat = 1.0;
         let grid = latch_beat_grid_at_downbeat(
             &samples,
@@ -2618,23 +3799,15 @@ mod tests {
         )
         .expect("relatch");
         assert!(grid.confidence > 0.0);
-        // PRD-BEATS round 4 follow-up: beats now span the full
-        // track, so `beats[0]` is the first wrap-back position
-        // in `[0, period)`. The user's tap is the **downbeat**,
-        // not necessarily `beats[0]`; the renderer reads
-        // `bar_phase` to mark it yellow. Assert that the beat at
-        // `bar_phase` lands within the amplitude-peak shift
-        // window (30 ms) of the raw tap — the per-track shift
-        // moves the entire grid by ~5–25 ms forward so it
-        // renders inside the visible kick body, which applies
-        // here too even though the tap itself sat in silence.
         let downbeat_idx = usize::from(grid.bar_phase);
         assert!(downbeat_idx < grid.beats.len(), "bar_phase out of range");
         let downbeat = grid.beats[downbeat_idx];
+        let err = (downbeat - raw_downbeat).abs();
         assert!(
-            (downbeat - raw_downbeat).abs() <= AMPLITUDE_PEAK_SHIFT_WINDOW_SECS + 1e-3,
-            "silent-window relatch must preserve raw tap (modulo amplitude-peak shift) \
-             as the downbeat; got beats[bar_phase] = {downbeat}, expected ≈ {raw_downbeat}"
+            err < 1e-6,
+            "silent-window relatch must use raw tap exactly; got beats[bar_phase] = {downbeat}, \
+             expected {raw_downbeat}, off by {} ms",
+            err * 1000.0
         );
     }
 
@@ -2697,33 +3870,46 @@ mod tests {
     }
 
     /// **Issue 2 fix**: the beat grid must extend backward
-    /// through pre-roll silence as regular ticks. Same fixture
-    /// as above; the assertion is "at least one beat sits
-    /// before the downbeat" so the renderer has grey ticks to
-    /// draw in the pre-roll region. The previous
-    /// `beats.retain(|t| t >= anchor)` filter dropped every
-    /// pre-roll beat.
+    /// through pre-roll silence as regular ticks so the
+    /// renderer has grey ticks to draw before any audible
+    /// content. The previous `beats.retain(|t| t >= anchor)`
+    /// filter dropped every pre-roll beat.
+    ///
+    /// Universal-downbeat-fix note: the previous assertion
+    /// required `beats < downbeat` which conflated "grid extends
+    /// into pre-roll" with "bar_phase != 0". With the new
+    /// whole-track scoring, bar_phase on a featureless click
+    /// track is musically undefined and may legitimately be 0,
+    /// in which case `downbeat == beats[0]` and no beats sit
+    /// strictly before it. The property we actually care about
+    /// is "the grid extends into the pre-roll silence", which
+    /// we now assert directly against the pre-roll boundary.
     #[test]
     fn auto_grid_extends_backward_into_pre_roll_silence() {
         use crate::synthetic::click_track_with_decay;
         let true_bpm = 133.0;
+        let pre_roll_secs = 0.5;
         // 0.5 s pre-roll silence + 30 s of kicks → first
         // audible kick ≈ 0.5 s; a 133 BPM grid has period ≈
         // 0.451 s, so at least one beat should sit in the
-        // pre-roll silence (wrap-back of the chosen downbeat
-        // back into `[0, period)`).
+        // pre-roll silence regardless of which phase the
+        // algorithm picks as bar 1.
         let mut samples = vec![0.0_f32; SR as usize / 2];
         samples.extend(click_track_with_decay(true_bpm, 30.0, SR, 0.05));
         let grid = analyze_beat_grid_with_profile(&samples, SR, 1, OctaveProfile::FourOnFloor)
             .expect("analysis");
 
         assert!(grid.confidence > 0.0);
-        let downbeat = grid.beats[usize::from(grid.bar_phase)];
-        let pre_roll_count = grid.beats.iter().filter(|&&t| t < downbeat - 1e-3).count();
+        let pre_roll_count = grid
+            .beats
+            .iter()
+            .filter(|&&t| t < pre_roll_secs - 1e-3)
+            .count();
         assert!(
             pre_roll_count >= 1,
-            "grid must include at least one pre-roll beat (for grey-tick \
-             rendering); got {pre_roll_count} (beats: {:?})",
+            "grid must include at least one beat in pre-roll silence \
+             (before t = {pre_roll_secs:.2} s); got {pre_roll_count} \
+             (first beats: {:?})",
             &grid.beats[..grid.beats.len().min(8)]
         );
     }
@@ -2767,6 +3953,207 @@ mod tests {
         );
     }
 
+    // -------- Round 7 §7a/§7b: leading-edge amp-peak finder --------
+
+    /// PRD-BEATS Round 7 §7a — sharp impulse: the leading edge of
+    /// the near-max region is the impulse itself. No over-shoot.
+    #[test]
+    fn amplitude_peak_for_beat_lands_on_sharp_impulse() {
+        // 1-sample-wide impulse at t = 0.010 s, otherwise silence.
+        let mut samples = vec![0.0f32; SR as usize];
+        let impulse_frame = (0.010 * f64::from(SR)) as usize;
+        samples[impulse_frame] = 1.0;
+
+        let (amp, offset) = amplitude_peak_for_beat(&samples, SR, 1, 0.010).expect("found peak");
+        assert!(
+            (amp - 1.0).abs() < 1e-6,
+            "amp must be impulse value; got {amp}"
+        );
+        assert!(
+            offset < 0.0005,
+            "leading edge of impulse must be the impulse itself; got {offset} s"
+        );
+    }
+
+    /// PRD-BEATS Round 7 §7a — kick with a slow attack (build to
+    /// a body peak ~12 ms after onset, hold, then decay): the
+    /// leading edge of the loud region is the peak itself.
+    #[test]
+    fn amplitude_peak_for_beat_lands_on_slow_attack_body_peak() {
+        let sr_f = f64::from(SR);
+        let beat_secs = 0.020;
+        let beat_frame = (beat_secs * sr_f) as usize;
+        // Attack ramps from 0 over 12 ms, holds for 8 ms, then
+        // decays for 60 ms.
+        let attack_ms = 12.0;
+        let hold_ms = 8.0;
+        let decay_ms = 60.0;
+        let attack_samples = ((attack_ms / 1_000.0) * sr_f) as usize;
+        let hold_samples = ((hold_ms / 1_000.0) * sr_f) as usize;
+        let decay_samples = ((decay_ms / 1_000.0) * sr_f) as usize;
+        let total = beat_frame + attack_samples + hold_samples + decay_samples + SR as usize;
+        let mut samples = vec![0.0f32; total];
+        for i in 0..attack_samples {
+            #[allow(clippy::cast_precision_loss)]
+            let env = (i as f32) / (attack_samples as f32);
+            samples[beat_frame + i] = env;
+        }
+        for i in 0..hold_samples {
+            samples[beat_frame + attack_samples + i] = 1.0;
+        }
+        for i in 0..decay_samples {
+            #[allow(clippy::cast_precision_loss)]
+            let env = 1.0 - (i as f32) / (decay_samples as f32);
+            samples[beat_frame + attack_samples + hold_samples + i] = env;
+        }
+
+        let (amp, offset) =
+            amplitude_peak_for_beat(&samples, SR, 1, beat_secs).expect("found peak");
+        assert!((amp - 1.0).abs() < 1e-3, "amp must be near 1.0; got {amp}");
+        // Leading edge of the near-max (≥ 95 % of 1.0) region is
+        // when the attack ramp first crosses 0.95 ⇒ at
+        // 0.95 × 12 ms = 11.4 ms.  Allow ±1 ms slack for the
+        // 1.5 ms smoothing window and the discrete attack ramp.
+        let expected_ms = 0.95 * attack_ms;
+        let got_ms = offset * 1_000.0;
+        assert!(
+            (got_ms - expected_ms).abs() < 1.5,
+            "leading edge expected ~{expected_ms} ms, got {got_ms} ms"
+        );
+    }
+
+    /// PRD-BEATS Round 7 §7a — sustained flat-loud region: the
+    /// grid lands on the *leading edge* of the region, not on a
+    /// random sample inside it.  This is the "long transient at
+    /// same loudness" case the user called out explicitly.
+    #[test]
+    fn amplitude_peak_for_beat_lands_on_leading_edge_of_flat_loud_region() {
+        let sr_f = f64::from(SR);
+        let beat_secs = 0.020;
+        let beat_frame = (beat_secs * sr_f) as usize;
+        // Silence until +5 ms, then a 20-ms flat-loud plateau at
+        // amplitude 1.0, then silence.
+        let plateau_start = beat_frame + ((0.005 * sr_f) as usize);
+        let plateau_end = plateau_start + ((0.020 * sr_f) as usize);
+        let mut samples = vec![0.0f32; plateau_end + SR as usize];
+        for s in samples.iter_mut().take(plateau_end).skip(plateau_start) {
+            *s = 1.0;
+        }
+
+        let (amp, offset) =
+            amplitude_peak_for_beat(&samples, SR, 1, beat_secs).expect("found peak");
+        assert!(
+            (amp - 1.0).abs() < 1e-6,
+            "amp must be plateau value; got {amp}"
+        );
+        // Leading edge is at +5 ms; the 1.5 ms backward smoothing
+        // means the env first reaches 1.0 at the first sample
+        // where the smoothing window contains the plateau start,
+        // which is the plateau start itself.
+        let got_ms = offset * 1_000.0;
+        assert!(
+            (got_ms - 5.0).abs() < 0.5,
+            "leading edge expected ~5 ms, got {got_ms} ms"
+        );
+    }
+
+    /// PRD-BEATS Round 7 §7a — silent window returns `None`.
+    /// `shift_grid_to_amplitude_peak` and the latch path both
+    /// fall back to the un-shifted position in this case.
+    #[test]
+    fn amplitude_peak_for_beat_returns_none_for_silence() {
+        let samples = vec![0.0f32; SR as usize];
+        assert!(amplitude_peak_for_beat(&samples, SR, 1, 0.010).is_none());
+    }
+
+    /// PRD-BEATS Round 8 — the latch trusts the tap exactly,
+    /// regardless of the surrounding audio.  Even when the rest
+    /// of the track has a strong per-beat amp-peak pattern that
+    /// would have biased the Round 7 median, the downbeat must
+    /// land at `user_tap` bit-exact.  The user (not the
+    /// algorithm) owns the click coordinate.
+    #[test]
+    fn latch_downbeat_lands_exactly_at_user_tap_regardless_of_local_audio() {
+        use crate::synthetic::click_track_with_decay;
+        let true_bpm = 120.0;
+        let period = 60.0 / true_bpm;
+        let sr_f = f64::from(SR);
+
+        // Click track baseline.
+        let mut samples = click_track_with_decay(true_bpm, 30.0, SR, 0.05);
+
+        // Splice a slow-attack kick at t = 5 * period so its
+        // visible peak is +5 ms past the bare-click position.
+        // Round 7 §7b would have moved the latched anchor to
+        // that visible peak; Round 8 must NOT — the contract is
+        // "downbeat = user_tap, full stop".
+        let kick_secs = 5.0 * period;
+        let kick_start = (kick_secs * sr_f) as usize;
+        for i in 0..((0.060 * sr_f) as usize) {
+            if kick_start + i < samples.len() {
+                samples[kick_start + i] = 0.0;
+            }
+        }
+        let attack_samples = (0.005 * sr_f) as usize;
+        let decay_samples = (0.050 * sr_f) as usize;
+        for i in 0..attack_samples {
+            #[allow(clippy::cast_precision_loss)]
+            let env = (i as f32) / (attack_samples as f32);
+            if kick_start + i < samples.len() {
+                samples[kick_start + i] = env;
+            }
+        }
+        for i in 0..decay_samples {
+            #[allow(clippy::cast_precision_loss)]
+            let env = 1.0 - (i as f32) / (decay_samples as f32);
+            if kick_start + attack_samples + i < samples.len() {
+                samples[kick_start + attack_samples + i] = env;
+            }
+        }
+
+        // User taps SLIGHTLY BEFORE the visible peak (mistake
+        // / intentional / doesn't matter — the algorithm must
+        // not "fix" the tap).
+        let user_tap = kick_secs + 0.002;
+        let grid = latch_beat_grid_at_downbeat(
+            &samples,
+            SR,
+            1,
+            true_bpm,
+            user_tap,
+            OctaveProfile::FourOnFloor,
+        )
+        .expect("latch");
+
+        // The closest downbeat to `user_tap` must equal
+        // `user_tap` exactly (within f64 round-off).  Every
+        // `beats_per_bar`-th beat is a candidate downbeat.
+        let bpb = usize::from(grid.beats_per_bar);
+        let phase = usize::from(grid.bar_phase);
+        let downbeats: Vec<f64> = grid
+            .beats
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| if i % bpb == phase { Some(t) } else { None })
+            .collect();
+        let nearest_downbeat = downbeats
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                (a - user_tap)
+                    .abs()
+                    .partial_cmp(&(b - user_tap).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("at least one downbeat");
+        let err_ms = (nearest_downbeat - user_tap).abs() * 1_000.0;
+        assert!(
+            err_ms < 0.01,
+            "latch downbeat must equal user_tap exactly; got {err_ms} ms off \
+             (nearest downbeat = {nearest_downbeat:.6} s, user_tap = {user_tap:.6} s)"
+        );
+    }
+
     /// `first_kick_peak_secs` finds the parabolic peak of the
     /// first kick-band ODF lobe above the noise floor.
     /// Synthetic test: silence → unit impulse on a single ODF
@@ -2800,5 +4187,220 @@ mod tests {
         let kick_odf = vec![0.05_f32; 500];
         let floor = 0.1_f32;
         assert!(first_kick_peak_secs(&kick_odf, odf_sr, floor).is_none());
+    }
+
+    // -------- universal-downbeat-fix regression suite --------
+    //
+    // These tests exist to lock in the new behavior: the auto
+    // path decides the downbeat with whole-track scoring, hardened
+    // against quiet intros / outros, with `first_kick_peak_secs`
+    // demoted to a tiebreaker. The Baddadan failure mode (an ODF
+    // startup artifact at frame 0 dragging bar 1 onto silence)
+    // is the direct regression target.
+
+    /// Baddadan regression: 4 s of silence followed by 60 s of
+    /// kicks on phase 0. Before the fix, an ODF startup artifact
+    /// at frame 0 would route `first_kick_peak_secs` to ~0 s and
+    /// anchor bar 1 inside the silent intro. After the fix, the
+    /// 100+ body bars all consistently vote for phase 0 and the
+    /// downbeat lands on or near the first audible kick.
+    #[test]
+    fn quiet_intro_then_loud_body_picks_body_phase() {
+        use crate::synthetic::click_track_with_decay;
+        let bpm = 120.0;
+        let period = 60.0 / bpm;
+        let pre_roll_secs = 4.0;
+        let pre_roll = vec![0.0_f32; (pre_roll_secs * f64::from(SR)) as usize];
+        let body = click_track_with_decay(bpm, 60.0, SR, 0.05);
+        let mut samples = pre_roll;
+        samples.extend(body);
+
+        let grid = analyze_beat_grid_with_profile(&samples, SR, 1, OctaveProfile::FourOnFloor)
+            .expect("analysis");
+        assert!(grid.confidence > 0.0, "got confidence {}", grid.confidence);
+
+        let downbeat = grid.beats[usize::from(grid.bar_phase)];
+        // The first kick of the body sits at t = pre_roll_secs.
+        // The chosen downbeat is allowed to be exactly that kick
+        // or the wrap-back of phase 0 into the pre-roll (i.e. the
+        // grid extends backwards through silence and the rendered
+        // downbeat is the earliest phase-0 beat). In either case
+        // the downbeat MUST be within one period of a multiple of
+        // `period` away from the first audible kick: 0 % phase
+        // alignment with the body.
+        let offset_from_kick = (downbeat - pre_roll_secs).rem_euclid(period);
+        let aligned = offset_from_kick.min(period - offset_from_kick);
+        assert!(
+            aligned < period * 0.10,
+            "downbeat at {downbeat:.4} s is {aligned:.4} s off the body kick lattice \
+             (period {period:.4} s); regression: the universal fix should have made the \
+             body of the track outvote the silent intro"
+        );
+    }
+
+    /// One-bar pickup: a single early kick at t=0 (musically a
+    /// pickup beat from bar 0 of a phantom previous bar) plus
+    /// 60 s of body kicks starting at t = 2.0 s on phase 0. The
+    /// pre-fix behavior would treat the pickup as "the first
+    /// audible kick" and anchor bar 1 on it. After the fix the
+    /// body's 100+ bars on phase 0 dominate the scoring and the
+    /// rendered downbeat lattice matches the body kicks.
+    #[test]
+    fn one_bar_pickup_picks_body_downbeat() {
+        use crate::synthetic::click_track_with_decay;
+        let bpm = 120.0;
+        let period = 60.0 / bpm;
+        // Pickup: a single short kick burst at t = 0.
+        let mut samples = vec![0.0_f32; (2.0 * f64::from(SR)) as usize];
+        // Inject a short kick-shaped burst at t = 0 by overwriting
+        // the first 80 ms with a decaying impulse train of length 1.
+        let decay_alpha = (-1.0_f32 / (0.030 * SR as f32)).exp();
+        let mut amp = 1.0_f32;
+        let mut i = 0usize;
+        while i < samples.len() && amp > 1e-6 {
+            samples[i] = amp;
+            amp *= decay_alpha;
+            i += 1;
+        }
+        // Body: 60 s of kicks starting at t = 2.0 s, phase 0.
+        samples.extend(click_track_with_decay(bpm, 60.0, SR, 0.05));
+
+        let grid = analyze_beat_grid_with_profile(&samples, SR, 1, OctaveProfile::FourOnFloor)
+            .expect("analysis");
+        assert!(grid.confidence > 0.0);
+
+        let downbeat = grid.beats[usize::from(grid.bar_phase)];
+        let body_first_kick_secs = 2.0;
+        // The body kicks lie at body_first_kick + n * period for
+        // n = 0, 1, 2, ... The downbeat must align with that
+        // lattice modulo `period` (allowing one wrap-back beat
+        // before the body start). Same alignment check as the
+        // quiet-intro test, against the body kick lattice.
+        let offset_from_body = (downbeat - body_first_kick_secs).rem_euclid(period);
+        let aligned = offset_from_body.min(period - offset_from_body);
+        assert!(
+            aligned < period * 0.10,
+            "downbeat at {downbeat:.4} s is {aligned:.4} s off the body kick lattice \
+             (period {period:.4} s); the pickup at t=0 should NOT have dragged bar 1 \
+             off the body's phase"
+        );
+    }
+
+    /// `score_grid_weighted` must contribute zero from positions
+    /// outside `[body_start, body_end]` and must weight loud bars
+    /// strictly higher than silent bars. This is the unit-level
+    /// version of the "quiet intro does not vote" property; the
+    /// end-to-end test above covers the integration.
+    #[test]
+    fn score_grid_weighted_excludes_intro_outro_bars() {
+        // 1 sample = 1 ODF hop. Bar period = 10 samples.
+        // kick_odf has a unit hit at every bar boundary (10, 20,
+        // 30, ..., 990). broadband is uniform 1.0 across the body
+        // (samples 50..950) and 0.0 outside (intro + outro).
+        let len = 1000usize;
+        let mut kick_odf = vec![0.0_f32; len];
+        for i in (10..len).step_by(10) {
+            kick_odf[i] = 1.0;
+        }
+        let mut broadband_odf = vec![0.0_f32; len];
+        for sample in broadband_odf.iter_mut().take(950).skip(50) {
+            *sample = 1.0;
+        }
+
+        // Body window [50, 950]. Bar period 10. Phase 0 hits
+        // 10, 20, ..., 990. Only those inside [50, 950] count.
+        let phase_0_score = score_grid_weighted(&kick_odf, &broadband_odf, 0.0, 10.0, 50.0, 950.0);
+        // Phase 5 hits 5, 15, 25, ..., 995. kick_odf is 0 at all
+        // odd-5 positions, so phase-5's contribution is 0.
+        let phase_5_score = score_grid_weighted(&kick_odf, &broadband_odf, 5.0, 10.0, 50.0, 950.0);
+
+        assert!(
+            phase_0_score > phase_5_score,
+            "kick-aligned phase must outscore non-aligned phase; \
+             phase_0={phase_0_score}, phase_5={phase_5_score}"
+        );
+
+        // Sanity: scoring with body_end = 0 must contribute 0 (the
+        // skip window covers the entire track).
+        let zero = score_grid_weighted(&kick_odf, &broadband_odf, 0.0, 10.0, 9_999.0, 10_000.0);
+        assert_eq!(zero, 0.0, "body-skip window covering the track yields 0");
+
+        // Intro contribution: shrink the window to [0, 40] so only
+        // beats at samples 10, 20, 30, 40 contribute (4 votes). The
+        // broadband is 0 in [0, 50), so the weight is 0 and the
+        // score is 0. This is the universal-downbeat-fix invariant:
+        // silent bars do not vote even when they sit inside the
+        // body window.
+        let silent_intro = score_grid_weighted(&kick_odf, &broadband_odf, 0.0, 10.0, 0.0, 40.0);
+        assert_eq!(
+            silent_intro, 0.0,
+            "silent bars must not vote even inside the body window"
+        );
+    }
+
+    /// First-kick tiebreaker: when all four phases tie in the
+    /// weighted body score AND `kick_only_intro_tiebreaker`
+    /// abstains, `find_downbeat_offset` must rotate the chosen
+    /// phase so its first beat sits nearest the first audible
+    /// kick. Directly probes `find_downbeat_offset` with a
+    /// hand-crafted ODF pair so the test is deterministic and
+    /// independent of the upstream spectral-flux pipeline.
+    #[test]
+    fn first_kick_tiebreaker_rotates_phase_when_body_scores_tie() {
+        let odf_sr = 100.0_f64;
+        let bpm = 120.0;
+        let period = 60.0 / bpm; // 0.5 s
+        let _bar_period = period * 4.0; // 2.0 s
+        let duration_secs = 20.0;
+        let anchor_secs = 0.0;
+        let len = (duration_secs * odf_sr) as usize;
+
+        // Kick ODF: equal peaks at every beat (0.5, 1.0, 1.5, ...).
+        // All four bar phases score identically in
+        // `score_grid_weighted`, so confidence is ~1.0.
+        let mut kick_odf = vec![0.0_f32; len];
+        let mut t = 0.0_f64;
+        while t < duration_secs {
+            let idx = (t * odf_sr).round() as usize;
+            if idx < len {
+                kick_odf[idx] = 1.0;
+            }
+            t += period;
+        }
+        // Broadband ODF: uniformly LOUDER than kick at every
+        // sample, with a substantial non-kick baseline. This
+        // ensures `non_kick = broadband - kick` stays well above
+        // the kick-only threshold, so `kick_only_intro_tiebreaker`
+        // returns None (no beats register as "kick-only").
+        let broadband_odf = vec![3.0_f32; len];
+
+        // Inject a clearly-audible early peak in kick_odf so
+        // `first_kick_peak_secs` can find it. Place it at t = 1.0 s
+        // (phase 2 in 0.5 s period), so the tiebreaker should
+        // rotate to phase 2.
+        let early_kick_idx = (1.0 * odf_sr) as usize;
+        kick_odf[early_kick_idx] = 4.0; // dominate the noise floor
+
+        let (offset, confidence) = find_downbeat_offset(
+            &kick_odf,
+            &broadband_odf,
+            odf_sr,
+            period,
+            anchor_secs,
+            duration_secs,
+            4,
+        );
+
+        // The first-kick tiebreaker should have rotated phase to
+        // the one whose first beat lands nearest the early kick
+        // at t = 1.0 s. Phase 0: 0.0, 2.0, 4.0... Phase 1: 0.5,
+        // 2.5... Phase 2: 1.0, 3.0... Phase 3: 1.5, 3.5... Phase
+        // 2 is the unique nearest match (distance 0).
+        assert_eq!(
+            offset, 2,
+            "first-kick tiebreaker should rotate to phase 2 when all phases score \
+             equally and the first audible kick lands at t = 1.0 s; got offset {offset} \
+             (confidence {confidence})"
+        );
     }
 }

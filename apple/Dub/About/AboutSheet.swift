@@ -33,8 +33,8 @@ struct AboutOverlay: View {
 
 struct AboutSheet: View {
 
-    private let githubURL = URL(string: "https://github.com/kLOsk/dub")!
-    private let docsURL = URL(string: "https://github.com/kLOsk/dub/blob/main/docs/PRD.md")!
+    private let githubURL = URL(string: "https://github.com/kLOsk/dub")
+    private let docsURL = URL(string: "https://github.com/kLOsk/dub/blob/main/docs/PRD.md")
 
     var body: some View {
         VStack(spacing: 0) {
@@ -79,8 +79,12 @@ struct AboutSheet: View {
             }
 
             HStack(spacing: DubSpacing.md) {
-                linkButton("GitHub repository", url: githubURL)
-                linkButton("Product spec", url: docsURL)
+                if let githubURL {
+                    linkButton("GitHub repository", url: githubURL)
+                }
+                if let docsURL {
+                    linkButton("Product spec", url: docsURL)
+                }
             }
         }
         .padding(DubSpacing.xl)

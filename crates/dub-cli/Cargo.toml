@@ -17,7 +17,9 @@ dub-ffi = { workspace = true }
 dub-io = { workspace = true }
 dub-audio = { workspace = true }
 dub-bpm = { workspace = true }
+dub-library = { workspace = true }
 dub-peaks = { workspace = true }
+rusqlite = { workspace = true }
 dub-timecode = { workspace = true }
 anyhow = { workspace = true }
 hound = { workspace = true }

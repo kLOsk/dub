@@ -93,8 +93,8 @@
 //! with "very low confidence detection".
 
 use crate::octave_profile::{
-    profile_doubletime_rejected, profile_skips_skank_pass, profile_subdivision_rejected,
-    OctaveProfile,
+    profile_doubletime_rejected, profile_halftime_rejected, profile_skips_skank_pass,
+    profile_subdivision_rejected, OctaveProfile,
 };
 use crate::{BpmEstimate, BpmRange};
 
@@ -896,6 +896,14 @@ pub(crate) fn estimate_tempo(
             if std::env::var("DUB_BPM_DEBUG").is_ok() {
                 eprintln!(
                     "  PASS2 lag={lo:3} bpm={candidate_bpm:6.2} raw={raw_score:.6} REJECTED (genre profile double-time)"
+                );
+            }
+            continue;
+        }
+        if profile_halftime_rejected(profile, candidate_bpm, raw_score, &qualified_pairs) {
+            if std::env::var("DUB_BPM_DEBUG").is_ok() {
+                eprintln!(
+                    "  PASS2 lag={lo:3} bpm={candidate_bpm:6.2} raw={raw_score:.6} REJECTED (genre profile half-time)"
                 );
             }
             continue;

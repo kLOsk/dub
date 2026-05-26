@@ -6,8 +6,8 @@
 > `crates/dub-bpm/`, `crates/dub-ffi/`, and `apple/Dub/Performance/`.
 > Visual companion: [`docs/html/beats.html`](html/beats.html).
 
-**Version:** 0.1 (working spec, M11d.7 round 3)
-**Date:** 2026-05-24
+**Version:** 1.3 (Round 10 — integer-snap slack revert + deck-header Reset → fresh reanalyze)
+**Date:** 2026-05-26
 **Status:** Replaces PRD §8.3.1. PRD §8.3, §8.3.3, §9 (waveform) refer
 back here for definitions and behaviour.
 
@@ -1020,6 +1020,17 @@ on the rising edge of the kick attack instead of inside the
 visible amplitude lobe. The same May 2026 cycle delivers three
 focused fixes in `crates/dub-bpm/src/beats.rs`:
 
+> **Superseded by the universal-downbeat-fix (round 5).** O1's
+> `first_kick_peak_secs`-as-primary rule was withdrawn after
+> Baddadan exposed the failure mode: an ODF startup artifact at
+> frame 0 reads as "the first kick" and anchors bar 1 inside the
+> silent intro, dragging the entire grid one full beat (or four)
+> off the body. Whole-track scoring decides phase now; the
+> first-kick rule is retained as a low-confidence tiebreaker
+> only. O2 (backward grid extension) and O3 (amplitude-peak
+> snap) are unchanged and still ship. See "Round 5 — universal
+> downbeat fix" below.
+
 | ID | Issue | Fix |
 |---|---|---|
 | O1 | **First downbeat lands on bar 2.** `analyze_uniform_grid_from_odf` used to "walk the LSQ anchor forward by full bars until it crossed `audible_start`", which overshoots by exactly one bar whenever bar 1's kick sits less than a full bar past the pre-roll silence. | New `first_kick_peak_secs(kick_odf, …)` finds the parabolically refined peak of the first kick-band ODF lobe above the adaptive noise floor; that time becomes the chosen downbeat. The previous walk-forward loop is gone. Falls back to `find_downbeat_offset` only when the kick band is silent for the entire track. |
@@ -1067,6 +1078,603 @@ the kick-snap helper comment block:
 `snap_tap_to_kick_respects_noise_floor_just_below`,
 `snap_tap_to_kick_respects_noise_floor_just_above`.
 
+### Round 5 — universal downbeat fix (Baddadan and the rest of the corpus)
+
+The next dogfooding session surfaced "Baddadan" (Chase & Status,
+DnB, 175 BPM): the auto grid placed bar 1 at 0.0275 s, in the
+silent pre-roll. The diagnose tool (`dub diagnose`) traced the
+failure to a structural property of the round-4 rule: the
+spectral-flux ODF has a startup artifact at frame 0 (no
+previous frame to differ against), which `first_kick_peak_secs`
+picked as "the first audible kick" above the adaptive noise
+floor. That single phantom dragged bar 1 onto silence even
+though hundreds of body kicks said phase 0 (or whichever) was
+correct. O1 was treating a global property (which of the four
+beats-per-bar is bar 1) as a function of a single early ODF
+sample.
+
+The fix demotes `first_kick_peak_secs` from primary to
+tiebreaker, routes phase decisions through whole-track scoring,
+and hardens that scoring against quiet intros / outros and
+silent breakdowns. The sub-beat `anchor_secs` from
+`refine_full_pipeline` (LSQ over hundreds of onsets) is
+untouched: only the bar-phase rotates. O2 (backward grid
+extension) and O3 (amplitude-peak snap) still ship as round-4
+delivered them.
+
+| ID | Issue | Fix |
+|---|---|---|
+| U1 | **Whole-track phase score discarded.** The round-4 O1 rule used `first_kick_peak_secs(kick_odf, …)` as the chosen downbeat and only borrowed `find_downbeat_offset`'s `confidence` value. Two failure modes followed: (a) ODF startup spike at `t=0` reads as the first kick and the entire grid drifts; (b) a one-bar pickup beat in the pre-roll dominates over 100+ body bars. | `analyze_uniform_grid_from_odf` always calls `find_downbeat_offset` now, computes `chosen_downbeat = anchor_secs + offset * period`, and ignores `first_kick_peak_secs` outright in the production path. The structural property "which beat is bar 1" is decided by the body of the track, not by a single ODF sample. The function and its tests stay for use inside the tiebreaker (U3). |
+| U2 | **Intro / outro contamination of the phase score.** `score_grid` summed `kick_odf[phase + n * bar_period]` over the whole track, so a phantom ODF spike at `t = 0` contributed to every one of the four phase candidates almost equally, and a long silent intro / breakdown leaked low-energy votes that diluted the body's signal. | New `score_grid_weighted(kick_odf, broadband_odf, phase, bar_period, body_start, body_end)`: skips beats outside `[body_start, body_end]` (default ±8 s, capped at 25 % of duration on each side so short clips still get scored over their middle half), and weights each kick value by the peak broadband ODF inside a tenth-of-a-bar window around the candidate downbeat. Silent bars contribute ~zero regardless of phase; loud body bars dominate naturally. The unweighted `score_grid` is retained for period refinement (`refine_full_pipeline`) and parabolic peak interpolation, which both want the simple shape. |
+| U3 | **Genuinely ambiguous body scores need a tiebreaker.** Click tracks, dnb fills, and other "every beat is identical" patterns produce all four phase scores within a few percent of each other. The existing `kick_only_intro_tiebreaker` only fires when `non_kick = broadband - kick` is meaningfully non-zero (it abstains on featureless click tracks). | New first-kick proximity tiebreaker inside `find_downbeat_offset`: when `confidence < FIRST_KICK_TIEBREAK_CONFIDENCE` (1.05, i.e. top-2 within 5 %) AND `kick_only_intro_tiebreaker` returned `None`, call `first_kick_peak_secs` and rotate to the phase whose first beat sits nearest the detected first kick (computed modulo bar period, so it works regardless of where in the track the kick lands). Preserves the user's mental model — "the first audible kick is the 1" — without letting it override 100+ bars of body evidence. |
+
+After the fix, Baddadan's auto downbeat moves from 0.0275 s to
+1.2482 s — inside one beat of the first audible kick, and
+within 6.5 ms of the anchor the user had previously stamped on
+the track via "set the 1". Bredren Evacuation, the other track
+the user complained about, gets downbeat 0.0729 s vs the user's
+locked anchor 0.0664 s (6.5 ms again — same alignment quality).
+
+The round-4 O1 helper rationale ("first audible kick is bar 1
+by convention") still drives the user's mental model and stays
+in the spec as a tiebreaker, but is no longer the structural
+load-bearer of phase decisions.
+
+Regression tests live in `crates/dub-bpm/src/beats.rs` under the
+"universal-downbeat-fix regression suite" comment block:
+`quiet_intro_then_loud_body_picks_body_phase` (Baddadan
+synthetic),
+`one_bar_pickup_picks_body_downbeat` (pickup-beat regression),
+`score_grid_weighted_excludes_intro_outro_bars` (unit test on the
+new weighted scorer),
+`first_kick_tiebreaker_rotates_phase_when_body_scores_tie`
+(direct unit test on the new U3 tiebreaker). Two existing
+"Oppidan triad" tests
+(`auto_grid_first_beat_lands_in_audible_content_not_pre_roll`,
+`auto_grid_extends_backward_into_pre_roll_silence`) were
+re-pointed at the underlying user-facing property they were
+guarding (downbeat on the click lattice; grid extends through
+pre-roll silence) since the previous "first kick = bar 1"
+assertion no longer matches the design.
+
+The `dub diagnose` subcommand (`crates/dub-cli/src/diagnose.rs`)
+is the go-to debugger for this class of issue: takes a path or
+track ID, prints the fresh BPM + bar_phase + fit quality, an
+independently computed broadband + low-band envelope with
+amplitude landmarks, a verdict line ("downbeat sits within
+±half a beat of the first audible transient"), and every
+`track_beatgrids` row from the live SQLite library so you can
+compare the algorithm's current choice against the user's
+historical tap corrections.
+
+### Round 6 — set-the-1 phase contract, tap-as-hint, octave self-verification
+
+The dogfooding session after Round 5 surfaced two new failure
+modes on different tracks:
+
+1. **Excel Apocalypse (Drum & Bass, 177.7 BPM)**: auto-analyse
+   gives a tight 177.7 BPM grid, but the visible 1 sits off
+   the kick. The user opens the deck, taps once on the first
+   kick to set the 1, the marker lands on the kick — and the
+   displayed BPM JUMPS from 177.72 to 178.70, dragging the
+   rest of the grid forward so every beat past the 1 sits ~1
+   ms further off the kick than it did before. By the end of
+   the track the grid has drifted ~2.2 s out of phase. The
+   user reported this as "setting the 1 makes the rest of the
+   grid worse".
+2. **Bangin' Westside Connection (Hip-Hop, ~88 BPM)**: auto-
+   analyse picks 175.7 BPM (the hi-hat / snare grid octave).
+   The user starts tapping at the perceived 88 BPM kick
+   tempo; the displayed BPM jumps to 86.232 BPM (the tap
+   median, jittered), and the grid lands on the kick — but
+   drifts visibly across the track because 86.232 isn't the
+   real tempo of the recording. The user reported this as
+   "tapping is an absolute mess; first analysed at twice the
+   speed, then turned into something completely uncorrelated
+   to the actual beat".
+
+The `dub diagnose` tool exposed the three structural causes
+that produced these two reports between them:
+
+| ID | Issue | Fix |
+|---|---|---|
+| **6a** | **`latch_beat_grid_at_downbeat` refits BPM.** The function called `refine_period_at_anchor` (±1 % spectral score search) followed by `lsq_refit_grid` with `anchor_fixed = true` (joint OLS on slope = 1/period). Both moved BPM despite the documented "set-the-1 is a phase assertion" contract. On Apocalypse the LSQ found a marginally tighter local fit at 178.70 and committed to it; net result was a phase-perfect "1" sitting on top of a BPM-wrong grid. | Both calls removed. `latch_beat_grid_at_downbeat` now keeps the deck's BPM bit-identical to its input; only the anchor moves. `measure_grid_quality` (hold-both-fixed) still measures residuals at the new anchor so the drift indicator stays meaningful for the user-supplied grid. Regression: `latch_preserves_input_bpm_even_when_lsq_disagrees` asserts that passing a deliberately-wrong 120.7 BPM with a click track at 120.0 produces grid.bpm == 120.7 exactly, AND that the drift indicator surfaces the systematic mismatch. |
+| **6b** | **Tap median taken verbatim.** The M11d.7a override of the original PRD-BEATS §6.1 contract had `analyze_beat_grid_from_taps` set `bpm = weighted_median_bpm_from_taps(taps)` and stop. Tap jitter (~5–15 ms / tap) baked directly into the persisted BPM as ~1–3 BPM noise; clean taps at the perceived 87 BPM tempo produced a noisy 86.232 BPM that drifted off the kicks. | Tap median is now a HINT for a narrow ±3 % LSQ search (`refine_bpm_around_tap_hint`). The search grid is quantised to 0.1 BPM so integers and half-integers are always sampled, and the winner is selected by `(kept_fraction >= 0.95 * max_kept, lowest rms_ms)` to defeat the `LSQ_MIN_PEAK_RATIO` artifact where slightly-wrong BPMs drop "hard" beats and report misleadingly tight RMS on the easy ones. Finally `snap_bpm_to_integer_if_safe` snaps to the nearest integer when it doesn't worsen the fit. Window (±3 %) is narrower than the ≥10 % gap to any neighbour metric level, so the search cannot drift to a different musical interpretation. Regressions: `tap_grid_refines_to_integer_within_search_window` (jittered taps at 133 BPM converge to exactly 133.0), `tap_grid_keeps_non_integer_bpm_when_integer_doesnt_fit` (drum pattern at 87.8 BPM stays at 87.8, not 88). |
+| **6c** | **Octave decision is spectral-only.** Pass 2 in `tempo.rs` picks between octave candidates based on harmonic-summed autocorrelation energy. On busy-hat genres (hip-hop, R&B) the 16th-note hat / shaker layer wins on spectral energy even when an 88 BPM kick grid fits the actual ODF onsets much tighter. The genre profile system is the first line of defence but only helps tagged tracks. | Profile-independent octave self-verification (`octave_self_verify`) runs unconditionally after `snap_bpm_to_integer_if_safe`. For each of `bpm / 2` and `bpm * 2`: try both possible sub-phases at the half octave (anchor and anchor + main-period — the wrong sub-phase lands every beat on a snare instead of a kick, destroying the fit), AND inside each sub-phase run a narrow ±2 % LSQ search to absorb the gap between pass-2's sub-integer spectral pick and the real tempo's integer (Bangin': pass 2 picks 175.742, strict half is 87.871, the truth is 88.000 — 0.13 BPM off the strict half; without the BPM search the half RMS measures 73 ms where the true 88.0 fits at 10 ms). Swaps to the alternate octave when `rms_alt < 0.65 * rms_main` AND `kept_alt >= kept_main` AND `kept_alt >= 0.5`. Strict thresholds on purpose — only swap when "the algorithm picked the hat grid instead of the kick grid" is the only plausible explanation. Skipped when `fixed_anchor.is_some()` (caller has asserted intent). Integer-snapped after swap. Regressions: `octave_self_verify_swaps_when_alternate_fits_materially_tighter` (90 BPM click, lied main = 180 BPM, swaps back to 90), `octave_self_verify_keeps_main_when_quality_is_already_tight` (tight 120 BPM main is not swapped to 60), `octave_self_verify_respects_fixed_anchor_bypass` (tap-driven caller is left untouched). Real-world: Bangin' Westside Connection (Hip-Hop, untagged Default profile) swaps from 175.742 → 88.000 BPM with rms improving from 41 ms to 10 ms. |
+| **6d** | **No `HipHop` octave profile.** `octave_profile_from_genre("Hip-Hop")` mapped to `Default`, so the profile system contributed nothing on hip-hop / rap / trap / R&B / boom-bap tags. Bangin' is tagged "Hip-Hop"; the spectral winner at 175.7 was kept because no genre rule fired. | New `OctaveProfile::HipHop` variant. Genre matcher covers `"Hip-Hop"`, `"Hip Hop"`, `"HipHop"`, `"Rap"`, `"Trap"`, `"R&B"`, `"R & B"`, `"RnB"`, `"Boom Bap"`, `"Boom-Bap"`, `"Boombap"`, and composite tags like `"Conscious Hip-Hop"`, `"West Coast Rap"`. Lower-octave bias via `profile_doubletime_rejected`: the upper octave (135–180 BPM) is rejected when paired with a credible 70–95 BPM peer (raw ≥ 70 % of upper). Less strict than the unconditional M11c.3e `hiphop_doubletime_rejected` (which requires ≥ 96 %) because tagged hip-hop has more evidence; the lower threshold catches the structural cases that the unconditional rule misses. Regressions: `genre_mapping_covers_hip_hop_family`, `hiphop_profile_rejects_bangin_shape`. |
+| **6e** | **No `DrumAndBass` octave profile.** DnB / jungle tagged tracks could half-time-flip to ~85 BPM when the snare backbeat produced a strong autocorrelation peak at the 2-beat period (the same K-S-backbeat half-time problem the rolling-DnB regression test documents). Nothing in the profile system prevented it for tagged DnB. | New `OctaveProfile::DrumAndBass` variant. Genre matcher covers `"Drum & Bass"`, `"Drum and Bass"`, `"Drum n Bass"`, `"Drum'n'Bass"`, `"drumandbass"`, `"DnB"`, `"D&B"`, `"Jungle"`, and composite tags like `"Liquid DnB"`. Inverse-of-hip-hop logic via new `profile_halftime_rejected`: the LOWER octave (70–95 BPM) is rejected when paired with a credible 135–180 BPM peer (raw ≥ 70 % of lower). DnB is matched BEFORE the hip-hop branch so composite tags like `"hip-hop jungle"` resolve to DnB tempo (the user's mix tempo for the fusion material). Regressions: `genre_mapping_covers_drum_and_bass_family`, `drumandbass_profile_rejects_inverted_halftime`. |
+
+Rationale for the layering. The three fixes work at different
+levels of authority:
+
+- **6d / 6e (profile rules)**: genre-tagged signal "this is
+  hip-hop, prefer the lower octave". Highest authority because
+  the user labelled the file.
+- **6c (self-verification)**: profile-independent measurement
+  "at this anchor, BPM X fits the ODF measurably tighter than
+  BPM 2X". Catches untagged tracks plus edge cases the profile
+  rules don't know about.
+- **6a / 6b (caller contracts)**: explicit user intent "this
+  is the 1" (6a) / "this is the tempo I'm tapping at" (6b).
+  Highest authority of all — the user is in front of the deck
+  watching the grid; we trust them.
+
+`octave_self_verify` deliberately skips when `fixed_anchor` is
+supplied so 6c can never overrule 6a / 6b.
+
+### Round 7 — amplitude-peak cheat: leading edge of the loud region
+
+After Round 6 the user reported one more class of "grid is in the
+wrong place" complaint, this time about the **visible** alignment
+between the grid line and the kick rather than the BPM or the bar
+phase:
+
+> "Can you check Blaze Up Tha Dance please. I set the 1 and it
+> put it behind the peak. Generally I feel the grid always sits
+> a bit behind the peak of the transient. I think we need to
+> adjust our cheat a bit to really sit at the peak of the
+> transient, otherwise users are confused."
+
+When asked to be precise about "the peak", the user clarified:
+
+> "The right position would be where the transient is visually
+> the largest. If the transient is long at same loudness, the
+> grid would sit right at the beginning where its the loudest in
+> the waveform."
+
+That clarification is doing real work. It splits the problem into
+two cases that the previous cheat collapsed into one:
+
+1. **Single sharp peak** (most kicks, most snares). The visibly
+   tallest point is a well-defined sample: `argmax |x|`. The
+   grid should sit on it.
+2. **Sustained loud region** (compressed kicks, sub-bass tails,
+   dub one-drops, continuous high-energy material like loop-
+   driven house). There is no single tallest point — a flat
+   plateau of near-max samples. The grid should sit at the
+   **leading edge** of that plateau, because that's where the
+   user's eye registers the kick "starting".
+
+The Round 4 `amplitude_peak_offset_secs` returned `argmax |x|`
+across the search window. On compressed material `argmax` lands
+at the very front of the attack lobe — the highest needle, not
+the fattest body. Visually that reads as "the grid sits behind
+the peak", matching the user's report. On continuous loop-driven
+audio `argmax` lands at whichever local hot spot happens to
+spike highest, with no guarantee that it represents the
+musically meaningful beat anchor.
+
+Two failures, two fixes (with the same helper underneath):
+
+| ID | Issue | Fix |
+|---|---|---|
+| **7a** | **Amplitude-peak finder returns a single sample.** `amplitude_peak_offset_secs` recorded `(peak_amp, offset_secs)` per beat using `argmax |sample|` in `[beat, beat + 90 ms]`, then took the median offset across the top 50 % loudest beats. On a kick with a sharp leading transient followed by a sustained body, `argmax` lands in the first 1–3 ms of the attack — visually that's the leading edge of the kick, NOT the body the user perceives as "the peak". On continuous loop material it picks an arbitrary peak inside a near-max region, varying beat-to-beat in ways the median diffuses. | New `amplitude_peak_for_beat` helper. Computes a backward 1.5 ms `max |sample|` envelope (matches the waveform display's 64-sample chunking ≈ 1.45 ms at 44.1 kHz, so "the user's tallest chunk" perception lines up with the algorithm's notion of "loud"). Finds the env's global max position, then walks backward from there as long as the env stays within 5 % (`AMPLITUDE_PEAK_NEAR_MAX_FRACTION = 0.95`) of that max. Returns the earliest sample of the contiguous near-max region containing the max. For a sharp peak this is the peak itself (the walk stops immediately on the attack slope). For a sustained loud region this is its leading edge. For continuous material it anchors on the actual loudest moment in the window rather than the first sample where env crosses some threshold. `amplitude_peak_offset_secs` (auto-path median) is rewritten as a thin wrapper that calls `amplitude_peak_for_beat` per beat and keeps the existing top-50 %-by-amplitude median. Regressions: `amplitude_peak_for_beat_lands_on_sharp_impulse`, `amplitude_peak_for_beat_lands_on_slow_attack_body_peak`, `amplitude_peak_for_beat_lands_on_leading_edge_of_flat_loud_region`, `amplitude_peak_for_beat_returns_none_for_silence`. |
+| **7b** | **"Set the 1" diffused the per-beat shift through the all-beat median.** `latch_beat_grid_at_downbeat` ended with `shift_grid_to_amplitude_peak`, which uses the all-beat median offset across the entire track. The user explicitly tapped on *this* visible peak; deferring to a track-wide median means the anchor sits at the typical attack-to-peak time, not at the visible peak of the specific kick the user pointed at. On Blaze Up Tha Dance the median undershot by ~5 ms — exactly the "grid behind the peak" report. The auto path's median is correct in spirit (no single beat is privileged in auto), but for set-the-1 the privileged beat IS the entire user intent. | `latch_beat_grid_at_downbeat` now calls `amplitude_peak_for_beat` for the **snapped tap alone** and anchors the grid at the result. No call to `shift_grid_to_amplitude_peak`. The visible downbeat lands at the leading edge of the near-max region containing the tap, every time, with no track-wide averaging in between. `measure_grid_quality` is still measured against the ODF-aligned `snapped_downbeat` (the spectral-flux ground truth for fit residuals — the visible shift moves only the rendered phase, not the algorithm's residual structure). Regression: `latch_anchor_lands_at_visible_peak_not_at_track_median` — a click track with a single slow-attack kick spliced in at bar 5; the rest of the track's beats have per-beat amp-peak offset ≈ 0 (clicks peak at the impulse), so the all-beat median is ≈ 0; the spliced kick's visible peak is at +5 ms past the click position; the test asserts the latched downbeat lands within ±2 ms of the +5 ms visible peak, which the old all-beat median could not satisfy. |
+
+Rationale for `AMPLITUDE_PEAK_NEAR_MAX_FRACTION = 0.95`. 0.95
+of max amplitude is within 0.45 dB of the peak — tight enough
+that a single sharp peak's sole near-max sample IS the peak
+itself, loose enough that a real sustained loud region with
+mild internal variation registers as one contiguous block whose
+leading edge we can latch. Lower values (e.g. 0.90 = within
+0.92 dB) start stitching together adjacent peaks that the user
+perceives as separate transients; higher values (e.g. 0.98 =
+within 0.18 dB) shrink the near-max region down to noise
+fluctuations on top of the actual peak.
+
+Rationale for `AMPLITUDE_PEAK_SMOOTH_WINDOW_SECS = 0.0015`.
+The waveform display aggregates 64 samples per chunk (≈ 1.45 ms
+at 44.1 kHz, ≈ 1.33 ms at 48 kHz). The user's "tallest chunk"
+perception is inherently a 1.5 ms-wide max. A backward envelope
+of the same window length matches what the user sees while
+keeping the leading-edge detection unbiased: backward-max env
+reaches its peak value at the **exact** position of the actual
+peak sample (it does not overshoot the way a forward or
+centered window would).
+
+Rationale for `walk-backward-from-max` (instead of "earliest
+near-max in the whole window"). Continuous high-energy material
+(Blaze Up Tha Dance is the dogfood track) has an env that's
+already within 95 % of its eventual max at the search start —
+"earliest in window" always returns offset 0 there, sitting the
+grid at the leading edge of the search window regardless of
+where the actual loud region is. Anchoring the walk at the
+global-max position guarantees the result sits on a sample that
+IS the loudest, and walking backward finds the leading edge of
+THAT loud region. Sharp peaks: walk stops on the attack slope
+within a sample or two. Sustained loud regions: walk continues
+to the leading edge of the plateau and stops when env dips below
+threshold. The contiguous-only walk also prevents two separate
+loud regions from being stitched together — if there is a real
+gap between regions (the smoothing window will not hide drops
+longer than 1.5 ms) the walk stops at the leading edge of the
+region containing the global max.
+
+Layering with previous rounds. 7a / 7b only change WHERE the
+grid renders (the rendered phase), not WHICH beats the algorithm
+selected (the LSQ residuals) or WHICH BPM the analyzer picked
+(Round 6's invariants). `measure_grid_quality` and
+`shift_grid_to_amplitude_peak`'s caller-side `bar_phase`
+recomputation are unchanged. The set-the-1 BPM-preservation
+invariant (Round 6 §6a) is preserved bit-identically: the new
+latch path still anchors a uniform `bpm`-period grid; only the
+anchor position changes.
+
+### Round 8 — "Set the 1" is literal: the tap IS the downbeat
+
+After Round 7 the user re-tested Blaze Up Tha Dance and reported
+the regression had not actually closed:
+
+> "Blaze Up Tha Dance doing the same error again. At first
+> analysis it's almost correct, just a small bit behind the
+> peak. Then I want to set the 1 a bit better and it moves
+> further back in a territory where there is no peak. If we
+> can't get this done properly can we make it that setting the
+> 1 does simply set the 1 exactly where the user presses? Like
+> with not changing the beat, it should not change the position
+> the user selected? This can be true for both paused tracks as
+> well as running. It's more understandable for the user I
+> believe."
+
+The user is reporting two failures of the post-Round 7 algorithm
+that they can no longer tolerate:
+
+1. **The marker moves *away* from where they clicked.** The
+   Round 5 ODF snap (`snap_to_nearest_transient`, ±70 ms window
+   to the strongest local ODF peak) followed by the Round 7
+   amp-peak shift (0–90 ms forward walk-back-from-max) is a
+   two-stage diffusive chain. When both stages agree with the
+   user the marker lands cleanly. When they disagree the
+   marker can land tens of milliseconds away from the click,
+   *in either direction*. On Blaze the snap pulled the tap
+   backward to an earlier ODF peak and the amp-peak walk-back
+   continued the move backward to a leading edge in quiet
+   audio. From the user's POV the marker moved "further back
+   in a territory where there is no peak".
+2. **The behaviour is unpredictable.** Even when the algorithm
+   gets the right answer most of the time, the user cannot
+   reason about WHEN it will move the tap and WHEN it will
+   trust it. A 5 ms move in the click can produce a 20+ ms
+   move in the marker depending on the local ODF / amp
+   structure. The basic UI contract "what I click is where
+   it goes" is broken.
+
+Both failures share a single root cause: **the algorithm was
+trying to be smarter than the user, and the user owns the
+click coordinate.** The waveform display already gives the user
+pixel-accurate control (the playhead snaps to a 64-sample chunk,
+≈ 1.45 ms at 44.1 kHz, ≈ 1.33 ms at 48 kHz — well below the
+~10 ms perceptual phase tolerance of human onset perception);
+adding heuristics on top of that just introduced failure modes
+the user can see but cannot predict or correct.
+
+Round 8 removes every algorithmic adjustment from
+`latch_beat_grid_at_downbeat`. The contract is now:
+
+> The rendered downbeat = `downbeat_secs`, bit-exact.
+
+| ID | Issue | Fix |
+|---|---|---|
+| **8a** | **The latch snaps + shifts the tap.** `latch_beat_grid_at_downbeat` ran a two-stage chain: (1) Round 5 `snap_to_nearest_transient` pulled the raw tap to the strongest ODF peak in ±70 ms (or kept the raw tap if the window was silent), then (2) Round 7 `amplitude_peak_for_beat` walked forward 0–90 ms from there to the leading edge of the near-max region. On well-behaved tracks both stages agreed with the user and the marker landed at the visible peak. On Blaze Up Tha Dance the snap pulled the tap backward to an earlier ODF transient and the amp-peak walk-back continued the move further back into quiet audio. Iterative re-tapping made the marker drift instead of converging — each tap re-ran the same diffusive chain on a slightly different region. | Both stages removed. `latch_beat_grid_at_downbeat` now uses `downbeat_secs` verbatim as the grid anchor. No snap, no amp-peak shift, no BPM refit. `measure_grid_quality` still measures residuals against the raw tap so the drift indicator surfaces a systematic phase / BPM mismatch (e.g. user tapped on a snare while the ODF backbone is on the kick, or the tapped tempo no longer fits the rest of the track). Round 6 §6a's BPM-preservation invariant is preserved — only the anchor changed. Regressions: `latch_downbeat_uses_tap_exactly` (30 ms-late tap lands 30 ms late), `latch_downbeat_uses_silent_tap_exactly` (tap in pre-roll silence stays in silence), `latch_downbeat_lands_exactly_at_user_tap_regardless_of_local_audio` (a slow-attack kick whose visible peak is +5 ms past the tap site does NOT pull the anchor toward the visible peak — the algorithm cannot second-guess the click any more). |
+
+Scope of the change. Round 8 applies ONLY to
+`latch_beat_grid_at_downbeat` (1–2 tap "set the 1" path,
+called by the FFI's `set_bar_phase`). Multi-tap BPM derivation
+(`analyze_beat_grid_from_taps`, 3+ taps) is unchanged — there
+the user is explicitly asking the engine to derive a tempo from
+their tapping rhythm, so the snap (which cleans up inter-tap
+jitter inside the LSQ search) still earns its keep. Auto-
+analysis (`analyze_beat_grid`) is also unchanged: it has no
+user-supplied anchor and Round 7's amp-peak median is still the
+right behaviour there.
+
+Layering with previous rounds. Round 8 supersedes Round 5's
+ODF snap and Round 7 §7b's per-beat amp-peak shift INSIDE
+`latch_beat_grid_at_downbeat`. It does NOT change `analyze_
+beat_grid` (auto path) or `analyze_beat_grid_from_taps` (3+ tap
+path). The Round 6 §6a invariant (BPM preserved bit-identical
+across the latch) is preserved bit-identically. Round 6 §6c
+(`octave_self_verify`) still skips when `fixed_anchor` is
+supplied, so the user's tapped anchor remains untouchable by
+the algorithm.
+
+Why this is the right answer, not a give-up. The user's
+mental model — "what I click is where it goes" — is the
+correct UI contract for a single, intentional, pixel-accurate
+gesture. Heuristics ("you meant the kick, here let me find it
+for you") earn their keep when the user is providing low-
+fidelity input (e.g. tapping along to a playing track at
+human reaction-time accuracy). For a paused deck with the
+playhead scrubbed to a specific waveform position, the user's
+input IS the high-fidelity ground truth; any algorithmic
+"help" is necessarily worse than what the user already
+provided. The auto-analysis path remains free to use every
+heuristic in the book because it has no user input to honour.
+
+### Round 9 — Integer-snap slack accounts for geometric drift
+
+After Round 8 the user reported a related but distinct case
+that the integer-snap safety net had been silently rejecting
+for months:
+
+> "Chase & Status — Come Back is getting analyzed at 174.98,
+> why? Didn't we say it should jump to 175 in such a case?"
+
+The diagnostic output for the track is the smoking gun:
+
+```text
+dub-bpm: integer-snap REJECTED bpm_raw=174.9756 -> bpm=175.00
+  (rms 12.16ms -> 18.43ms exceeds slack 3.0ms), keeping bpm_raw
+```
+
+The auto path measured 174.9756 BPM. That sits 0.0244 BPM
+inside the ±0.10 snap tolerance, so the integer-snap safety
+net (`snap_bpm_to_integer_if_safe`) attempted the snap to
+175.00. It re-fit the anchor at the snapped tempo and
+measured the residuals. The result: RMS went from 12.16 ms to
+18.43 ms — a 6.27 ms increase, which exceeded the historical
+`INTEGER_SNAP_RMS_SLACK_MS = 3.0` slack. So the helper kept
+the raw 174.98 BPM and rejected the snap.
+
+This is correct under the old rule, and wrong for the user.
+
+The mistake was treating the slack as a *pure* "structural
+fit" budget. Snapping `bpm_raw → bpm_snapped` mathematically
+shifts every predicted beat time after the anchor refit:
+
+```text
+residual_i = (i - mean(i)) * (period_raw - period_snapped)
+```
+
+For `N` observations indexed `0..N-1`, the RMS over a
+mean-centred OLS anchor refit is:
+
+```text
+rms_drift = |Δperiod| * sqrt((N² - 1) / 12) * 1000  [ms]
+```
+
+This is **purely geometric**: the snap *must* introduce this
+much additional RMS, regardless of whether the snapped BPM is
+musically correct, simply because we changed the slope of the
+predicted-times line. For the Chase & Status numbers (Δbpm
+0.0244, N ≈ 530 kept beats) the geometric drift alone is
+≈ 7.5 ms — already larger than the 3 ms absolute slack
+before any structural mismatch has been measured.
+
+The historical 3 ms slack was implicitly asking "is the snap
+free?". For tight click-track baselines (sub-millisecond RMS)
+3 ms is loose enough to absorb both geometric drift and
+measurement noise on small Δbpm. For long real-music tracks
+where the LSQ baseline is itself 8–15 ms RMS, the geometric
+drift dominates and the slack rejects every snap that isn't
+already on an integer to the third decimal. The bound is
+*scale-blind*: it ignores how many observations the fit covers
+and how far the snap has to move.
+
+| ID | Issue | Fix |
+|---|---|---|
+| **9a** | **`INTEGER_SNAP_RMS_SLACK_MS` ignored the geometric drift the snap mathematically introduces.** A 0.02 BPM snap over 500+ beats contributes ~7 ms RMS on its own; a 3 ms absolute slack rejects this every time even though the structural fit is unchanged. On Chase & Status — Come Back the raw LSQ resolved to 174.9756 BPM (12.16 ms RMS); snap to 175 gave 18.43 ms RMS. The 6.27 ms Δ was within the geometric drift (7.5 ms predicted), meaning the snap introduced no structural mismatch — but the absolute slack rejected it. Every DnB / techno / house production where the auto resolves within ~0.05 BPM of an integer over a 4+ minute track hit the same wall. | New `expected_bpm_shift_rms_ms` helper computes the geometric RMS contribution from `(bpm_raw, bpm_snapped, n_kept)`. `snap_bpm_to_integer_if_safe` now compares the observed ΔRMS against `INTEGER_SNAP_RMS_SLACK_MS + expected_drift`: the absolute floor still catches measurement noise on small snaps, and the drift term scales the slack with the snap's irreducible cost. Chase & Status: slack 10.1 ms (3 abs + 7.1 drift), observed Δ 6.27 ms, ACCEPT 175.00. Companion `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85` guard rejects the snap when `kept_fraction` drops by > 15 % (the structural-disagreement safety net the old absolute slack was *trying* to provide; this version measures it directly via the observation set rather than indirectly via RMS). The diagnostic eprintln logs the slack breakdown (abs + drift, kept ratio) so users can verify a snap decision from the CLI. Regressions: `expected_bpm_shift_rms_matches_chase_status_geometry` (the formula matches the real numbers from the bug report), `expected_bpm_shift_rms_zero_for_noop_snap` (degenerate inputs return 0), `integer_snap_accepts_near_integer_dnb_via_model_slack` (helper end-to-end on 174.98 → 175), `integer_snap_rejects_when_kept_fraction_collapses` (structural-mismatch safety net works via the kept_fraction guard, not RMS). |
+
+Rationale for the geometric model. The drift term isn't a
+heuristic; it's the closed-form RMS contribution of changing
+the slope of an OLS line with re-optimised intercept. For
+observations `t_i = i * period_raw + anchor_raw` and a snapped
+grid `predicted_i = i * period_snapped + anchor_snapped`:
+
+```text
+best anchor_snapped = mean(t_i) - period_snapped * mean(i)
+                    = anchor_raw + mean(i) * (period_raw - period_snapped)
+residual_i          = t_i - predicted_i
+                    = (i - mean(i)) * (period_raw - period_snapped)
+RMS(residual)       = |period_raw - period_snapped|
+                      * sqrt(variance(i - mean(i)))
+                    = |Δperiod| * sqrt((N² - 1) / 12)
+```
+
+This is exact for click-track-style input (no per-beat
+measurement noise). For real audio the inherent ODF noise
+adds in quadrature: `rms_snapped² ≈ rms_raw² + drift²`. Our
+slack comparison uses *linear* subtraction (`ΔRMS = rms_snapped
+- rms_raw`) rather than quadratic because:
+
+1. Real ODF noise is correlated across beats (peak-pick bias,
+   spectral-flux smoothing), so the quadratic-addition
+   assumption is loose anyway.
+2. Linear comparison is more permissive in exactly the right
+   regime: when the raw fit is already loose (10–15 ms RMS,
+   typical of real music), linear slack scales naturally with
+   the inherent uncertainty; quadratic would be overly
+   conservative and re-introduce the original rejection bug.
+
+Rationale for `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85`. When the
+snapped grid lines up with materially fewer real ODF peaks
+(`kept_fraction` drops), the residual comparison is no longer
+apples-to-apples — we'd be comparing a tight fit on N points
+against a tight fit on N/2 of them. 0.85 means the snap may
+shed up to 15 % of its kept beats, well above the ±5 % noise
+floor of `kept_fraction` for small BPM perturbations on
+typical commercial music and well below the level where
+"the structural fit broke" is hidden. This guard catches the
+genuine "snap target is at a completely different metric
+level" cases that geometric drift can't see.
+
+Bounded worst-case for a true non-integer track. The change
+makes the snap aggressive within ±0.10 BPM. In the rare case
+the underlying track is *genuinely* at, say, 174.92 BPM
+(vintage tape master, mid-2000s drum-machine drift, repitched
+audio), snapping to 175 introduces a cumulative phase error
+bounded by `0.08 / 175 * duration` ≈ 0.0457 % of the track
+length: ≈ 8 ms / minute, ≈ 32 ms over a 4 min mix slot. A DJ
+beatmatching by ear with a pitch fader corrects this
+automatically; the cleaner integer BPM is more useful for
+mental tempo book-keeping than the fractional truth. The
+drift indicator (now scaled by the snap distance, see
+`drift_slope_ms_per_min`) surfaces the residual systematic
+drift so the user can verify the snap was within bounds.
+
+Scope of the change. Round 9 modifies `snap_bpm_to_integer_
+if_safe`, the helper called from the auto path (`refine_full_
+pipeline`) and the tap path (`refine_bpm_around_tap_hint`)
+to absorb sub-BPM jitter at the analyzer output. It does not
+change `INTEGER_BPM_SNAP_TOLERANCE = 0.10` (the entry gate),
+the `octave_self_verify` invariants (Round 6 §6c), or any
+user-facing FFI surface. The tap path inherits the new slack
+because it calls the same helper.
+
+### Round 10 — Integer-snap slack revert (Round 9 was wrong)
+
+The day after Round 9 shipped the user re-tested Chase &
+Status — Come Back on real audio:
+
+> "ok come back tune was actually legit at 174.9~ now at 175
+> the drift is too big towards the end. shoudl we revert?"
+
+The user is right and Round 9 was wrong. Round 10 reverts the
+core slack change while keeping the diagnostic transparency
+and the `kept_fraction` guard improvements.
+
+What Round 9 got wrong (the framing error).
+
+Round 9 added the expected geometric drift `expected_bpm_
+shift_rms_ms` to the slack budget, on the reasoning that "the
+snap mathematically *has* to introduce this much RMS, so we
+shouldn't penalise the snap for it." That reasoning is
+exactly backwards.
+
+The geometric drift `|Δperiod| * sqrt((N²-1)/12) * 1000` is
+the **signature of the wrong tempo**, not a measurement
+artefact to be excluded. If you fit a 175.0 grid to audio
+that's genuinely at 174.98, the residuals show exactly this
+geometric drift because the grid and the audio diverge by a
+constant per-beat phase error. Round 9's slack effectively
+said: "any RMS increase explainable by 'we changed the BPM
+slope' is free", which silently accepted snaps on every track
+that the LSQ correctly identified as non-integer. The Round 9
+bound `cumulative_drift ≈ 32 ms / 4 min` for a true 174.92
+track was the size of the user's complaint — they DID notice
+it. 32 ms of cumulative phase error breaks beatmatching on
+the second half of a track.
+
+What Round 10 does.
+
+Reverts `snap_bpm_to_integer_if_safe` to the strict
+`Δ <= INTEGER_SNAP_RMS_SLACK_MS` (3 ms absolute) comparison
+that shipped through Round 8. The 3 ms strict bound is the
+right framing for almost-free reasons:
+
+```text
+drift_rms ≈ Δbpm * duration * kept_frac / sqrt(12) / bpm * 1000
+```
+
+Solving for the snap distance at which the geometric drift
+alone exhausts 3 ms of slack:
+
+```text
+Δbpm_critical ≈ 3 * sqrt(12) * bpm / (1000 * duration * kept_frac)
+```
+
+For a 5-min, 175 BPM track at `kept_frac = 0.55` (Chase &
+Status's regime): `Δbpm_critical ≈ 0.020 BPM`. Snaps within
+~0.005 BPM of the integer pass (the inherent LSQ noise
+dominates the geometric drift at that scale); snaps further
+than ~0.02 BPM are rejected (geometric drift alone breaches
+the slack). This implicitly caps cumulative phase drift at
+~15–25 ms over typical track lengths, which lines up with DJ
+beatmatching tolerance.
+
+| ID | Issue | Fix |
+|---|---|---|
+| **10a** | **Round 9's geometric-drift-aware slack silently accepted snaps on genuinely non-integer tracks.** Chase & Status — Come Back (true tempo ~174.98) was snapped to 175.00 with ~43 ms cumulative phase drift over the 5-min track, audible at the end. The Round 9 framing treated geometric drift as "irreducible cost" to be budgeted into the slack; in reality it's the wrong-tempo signature. | Reverted to the strict `delta_ms <= INTEGER_SNAP_RMS_SLACK_MS = 3.0` comparison from Round 8. Chase & Status: ΔRMS 6.27 ms > slack 3.0 ms → REJECT, keep 174.98 BPM. Brown Paper Bag (174.0057 → 174): ΔRMS 0.20 ms ≤ 3.0 ms → still ACCEPT. The 3 ms strict bound implicitly scales with track length (geometric drift dominates the comparison for distant snaps on long tracks) and is the right level for DJ beatmatching tolerance. |
+| **10b** | **Round 9's `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85` guard is still right and is kept.** A snap that sheds > 15 % of its kept observations breaks the apples-to-apples premise of the RMS comparison — this is an independent structural-mismatch safety net that operates on the observation set rather than residual magnitude. | Preserved verbatim. |
+| **10c** | **`expected_bpm_shift_rms_ms` helper is kept** but used for diagnostic logging only. Showing the expected geometric drift alongside the observed ΔRMS in the `dub-bpm: integer-snap ...` eprintln lets the user immediately see *why* a snap was rejected: "observed Δ exceeds expected, true tempo is likely non-integer." | The helper's math is unchanged (validated by `expected_bpm_shift_rms_matches_chase_status_geometry`); only the use site changed. |
+
+Regression test. `integer_snap_rejects_genuine_non_integer_
+chase_status` synthesises a click train at 174.9756 BPM over
+5 minutes and asserts the snap to 175.0 is rejected. This
+nails down the Round 10 contract: the strict slack must catch
+this geometry regardless of any future reorganisation of
+helper internals.
+
+Why not a fancier rule (quadratic comparison, cumulative
+drift cap, etc.)? A quadratic comparison (compute observed
+drift `= sqrt(rms_snapped² - rms_raw²)`, compare against
+expected geometric drift with absolute tolerance) is also
+principled and would also reject Chase & Status. A cumulative
+phase drift cap (`|Δbpm| * duration / bpm <= 20 ms`) maps the
+user's complaint directly to a single number. Both work. The
+strict 3 ms linear comparison is the simplest rule that
+matches user perception in the cases we have evidence for,
+and it's the same code path that shipped through Round 8 with
+no user complaints about over-eager snapping. Round 10 picks
+strict revert over new design because the user signal is
+"please undo this", and there's no evidence that any track
+in the user's library was being rejected under the strict
+slack that *should* have snapped.
+
+Scope of the change. Round 10 modifies
+`snap_bpm_to_integer_if_safe` only:
+
+- Reverts the RMS comparison from `delta_ms <= abs_slack +
+  drift_rms_ms` to `delta_ms <= INTEGER_SNAP_RMS_SLACK_MS`.
+- Updates the eprintln diagnostic to log `expected geometric
+  drift` separately from the slack so the user can read the
+  reason for any reject from the CLI.
+- Keeps `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85` and the
+  `kept_fraction` guard from Round 9.
+- Keeps `expected_bpm_shift_rms_ms` for diagnostic use.
+
+Round 10 does not modify `INTEGER_BPM_SNAP_TOLERANCE`, the
+`octave_self_verify` invariants, `latch_beat_grid_at_
+downbeat` (Round 8 bit-exact contract), the tap path
+(`refine_bpm_around_tap_hint`), or any FFI / Swift surface.
+
+### Round 10 follow-up — Deck-header "Reset to auto" = full reanalyze
+
+Immediately after the Round 10 slack revert the user asked:
+
+> "does bpm context reset do the same as reanalyze in browser
+> library? it should"
+
+It didn't. Two distinct code paths reached the same conceptual
+operation ("revert this track's grid to the algorithm's
+baseline") with materially different results:
+
+| Surface | Path | What it actually did |
+|---|---|---|
+| Library row right-click → "Re-analyze" | `analyzeTracks` → `library.analyzeTrack` (Rust) | Demoted any active `user_tap` row, ran a *fresh* analysis through the current `dub-bpm` algorithm, wrote a new `auto` row, refreshed loaded decks. |
+| Deck-header BPM right-click → "Reset to auto" | `resetLoadedDeckBeatGrid` → `library.resetActiveBeatGridToAuto` (Rust) | Demoted any active `user_tap` row, **re-activated the existing `auto` row verbatim** (whatever the DB had cached, possibly from an old algorithm version). |
+
+The two diverge precisely when the algorithm has changed
+since the track was last analyzed. After the Round 10 revert
+Chase & Status — Come Back had a stale 175.0 `auto` row in
+the DB from when the user re-ran analysis under Round 9.
+Hitting "Reset to auto" on the deck would resurrect that
+stale 175.0, directly contradicting the Round 10 fix the user
+just verified with Re-analyze. Same intent on the user side
+("give me the algorithm's current answer for this track"),
+two different outcomes depending on which menu they hit.
+
+| ID | Issue | Fix |
+|---|---|---|
+| **10d** | **Deck-header "Reset to auto" revived stale `auto` rows.** When the audio-analysis algorithm changes (Round 9 → Round 10 integer-snap revert, any future analyzer tuning) the DB-cached `auto` row no longer reflects the current algorithm. User-visible result: "Re-analyze" in the library gave the correct answer, "Reset" on the deck gave the old (wrong) answer for the same track. | `resetLoadedDeckBeatGrid` now delegates to `analyzeTracks([trackId])` instead of `library.resetActiveBeatGridToAuto`. Same Rust path the library context menu uses: demotes `user_tap`, runs fresh analysis, writes a new `auto` row, installs it on the loaded deck via `publishLibraryRowAnalysisUpdate(refreshLoadedDecks: true)`. Footer "Analyzing (n)" pill appears, library row refreshes, deck BPM updates without a reload. Front-end early-out on `deck.gridLocked` is kept so the operation feels instant (Rust would also refuse with `GridLocked`). Side effects: the "no auto exists yet" error path becomes unreachable (the new analyse path creates one); a track that was never analyzed now Just Works when the user hits Reset — useful UX improvement. The Rust `reset_active_beatgrid_to_auto` function is preserved with its tests for potential future "revert without re-analyzing" entry points; it is currently dead code from the Swift side. |
+
+Rationale for choosing "re-analyze" over "fast row-flip". A
+DB cache that diverges from the live algorithm produces
+violently surprising behaviour for the user when the
+algorithm is iterated (i.e. constantly, in this stage of the
+project). Surfacing the algorithm's current answer is the
+*meaning* of Reset; the row-flip was an optimisation that
+silently broke the meaning. The cost is one analyzer pass
+(~1–2 seconds for a typical track on modern hardware), which
+is acceptable for a deliberate user action, and the
+existing footer progress pill already communicates the wait.
+
+Scope of the change. Round 10 §10d modifies
+`MainView.resetLoadedDeckBeatGrid` only (Swift). No Rust
+changes, no FFI surface changes, no PRD-BEATS contract
+changes elsewhere. The Rust `reset_active_beatgrid_to_auto`
+function and its tests are preserved.
+
 ---
 
 ## 14. Document conventions
@@ -1093,3 +1701,10 @@ the kick-snap helper comment block:
 | 0.4 | 2026-05-26 | Round 4 follow-up: "Set the 1" UX triad fixed (paused-deck redraw via `seekGeneration` bump, paused-deck immediate commit, playing-deck reaction-time + output-latency bias). |
 | 0.5 | 2026-05-26 | "Set the 1" UX rework: withdrew the 80 ms reaction-time bias (DJs tap accurately, marker should land where the user clicks). Replaced `forceCommit` with `commitSingleTap` for paused decks so a stale playing-tap session can't leak into the paused commit. Added kick-snap inside `set_bar_phase` using the cached `FilePeaks.filtered` LF amplitude peaks so the marker latches onto the closest audible transient instead of a flat region between grid beats. |
 | 0.6 | 2026-05-26 | **Root-cause fix (Brown Paper Bag regression).** Round-4 C2 rewrote `set_bar_phase` as pure `bar_phase` rotation (nearest existing grid tick goes yellow). That cannot fix a misaligned auto grid: on Brown Paper Bag the auto anchor sits at 14 ms in silence while the first kick is at 112 ms; tapping the kick with pure rotation picks the grid line at 14 ms (97 ms left of the kick — exactly the screenshot). Restored `latch_beat_grid_at_downbeat` for 1–2 tap "set the 1" (ODF snap + full grid re-anchor at the kick, BPM preserved). Fixed `synthesise_beat_grid` library reload to use `uniform_beats` + downbeat reconstruction from `(beats[0], bar_phase)` so persisted user_tap rows round-trip the same beat positions as the in-memory relatch grid. Diagnostic: `crates/dub-bpm/tests/brown_paper_bag_set_the_one.rs`. |
+| 0.7 | 2026-05-26 | **Round 5 — universal downbeat fix (Baddadan).** Demoted `first_kick_peak_secs` from primary phase decider to low-confidence tiebreaker inside `find_downbeat_offset` (U1). Routed `find_downbeat_offset` through a new `score_grid_weighted` that skips intro/outro bars and weights each bar by broadband ODF energy (U2). Added a first-kick proximity tiebreaker that fires when top-2 phase scores are within 5 % AND the existing `kick_only_intro_tiebreaker` abstains (U3). Result: Baddadan's auto downbeat moves from 0.0275 s (ODF startup artifact, in the silent intro) to 1.2482 s (within 6.5 ms of the user's prior tap correction). The `dub diagnose` subcommand (lives in `crates/dub-cli/src/diagnose.rs`) is the go-to debugger for grid / waveform / BPM issues. Two pre-existing "Oppidan triad" tests re-pointed at the underlying user-facing property they were guarding; four new synthetic regression tests added. |
+| 1.3 | 2026-05-26 | **Round 10 follow-up — Deck-header "Reset to auto" = full reanalyze (§10d).** Deck-header BPM right-click → "Reset to auto" used to demote the active `user_tap` row and re-activate the existing DB-cached `auto` row verbatim, which silently resurrected stale grids whenever the analyzer changed between the original analysis and the Reset (e.g. Chase & Status — Come Back's stale 175.0 BPM `auto` row written under Round 9 surviving the Round 10 revert). User reported the mismatch immediately ("does bpm context reset do the same as reanalyze in browser library? it should"). `MainView.resetLoadedDeckBeatGrid` now delegates to `analyzeTracks([trackId])`, the same Rust path the library row's "Re-analyze" right-click uses: demotes `user_tap`, runs a fresh analysis through the current algorithm, writes a new `auto` row, refreshes the loaded deck without a reload. The Rust `reset_active_beatgrid_to_auto` function is preserved (tests still pass) but dead-from-Swift; kept for a potential future "revert without re-analyzing" entry point. |
+| 1.2 | 2026-05-26 | **Round 10 — Integer-snap slack revert (§10a–10c).** Round 9's geometric-drift-aware slack accepted snaps on genuinely non-integer tracks because it treated geometric drift as "irreducible cost" to budget for, when in reality it IS the wrong-tempo signature. Chase & Status — Come Back (true ~174.98 BPM) was snapped to 175.00 producing ~43 ms cumulative phase drift over the 5-min track, audible at the end. Reverted `snap_bpm_to_integer_if_safe` to the strict `delta_ms <= INTEGER_SNAP_RMS_SLACK_MS = 3.0` linear comparison from Round 8. Through the relationship `drift_rms ≈ Δbpm × duration × kept_frac / sqrt(12) / bpm × 1000`, the 3 ms strict bound implicitly caps cumulative phase drift at ~15–25 ms for typical real-music kept fractions, which matches DJ beatmatching tolerance. Brown Paper Bag (174.0057 → 174, Δ 0.20 ms) still snaps correctly. Kept Round 9's `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85` `kept_fraction` guard and `expected_bpm_shift_rms_ms` helper (the helper is now used for diagnostic logging only — the `dub-bpm: integer-snap REJECTED` line shows expected geometric drift alongside observed Δ so reject reasons are visible from `dub diagnose`). Removed Round 9's `integer_snap_accepts_near_integer_dnb_via_model_slack` test; added `integer_snap_rejects_genuine_non_integer_chase_status` regression. |
+| 1.1 | 2026-05-26 | **Round 9 — Integer-snap slack accounts for geometric drift.** (9a) `snap_bpm_to_integer_if_safe` was rejecting every snap on long real-music tracks within ~0.05 BPM of an integer because the absolute 3 ms RMS slack didn't budget for the geometric drift the snap mathematically introduces (`|Δperiod| * sqrt((N²-1)/12) * 1000` ms). Chase & Status — Come Back: bpm_raw 174.9756, snap to 175 introduces 7.5 ms geometric drift over 530 kept beats; observed ΔRMS 6.27 ms (less than the predicted drift, i.e. no structural disagreement); old slack 3 ms rejected. New helper `expected_bpm_shift_rms_ms(bpm_raw, bpm_snapped, n_observations)` returns the closed-form drift term; total slack is now `INTEGER_SNAP_RMS_SLACK_MS + expected_drift`, plus a new `INTEGER_SNAP_MIN_KEPT_RATIO = 0.85` guard that catches structural-mismatch cases (kept_fraction collapse) directly via the observation set rather than indirectly via RMS. Diagnostic eprintln now logs the slack breakdown (abs + drift over N kept beats, kept ratio). Bounded worst-case for a true non-integer track is ≈ 32 ms cumulative phase drift over a 4-min mix slot, well within DJ pitch-fader correction range. Scope: helper change only; entry tolerance (±0.10 BPM), `octave_self_verify`, and the FFI surface are unchanged. Regressions: `expected_bpm_shift_rms_matches_chase_status_geometry`, `expected_bpm_shift_rms_zero_for_noop_snap`, `integer_snap_accepts_near_integer_dnb_via_model_slack`, `integer_snap_rejects_when_kept_fraction_collapses`. |
+| 1.0 | 2026-05-26 | **Round 8 — "Set the 1" is literal: the tap IS the downbeat.** (8a) `latch_beat_grid_at_downbeat` no longer snaps to the nearest ODF transient (Round 5) and no longer applies the per-beat amp-peak shift (Round 7 §7b). The grid anchor = `downbeat_secs` bit-exact. Restores the basic UI contract "what I click is where it goes" after the post-Round 7 Blaze Up Tha Dance regression where iterative re-tapping drifted the marker backward into quiet audio instead of converging on the visible peak. BPM preservation (Round 6 §6a) is preserved bit-identically. Scope: ONLY `latch_beat_grid_at_downbeat` (1–2 tap "set the 1" path). Multi-tap BPM derivation and auto-analysis are unchanged. Regressions: `latch_downbeat_uses_tap_exactly`, `latch_downbeat_uses_silent_tap_exactly`, `latch_downbeat_lands_exactly_at_user_tap_regardless_of_local_audio`. Updated FFI doc on `set_bar_phase` and the Swift `commitTapGrid` call-site comment to reflect the new bit-exact contract. |
+| 0.9 | 2026-05-25 | **Round 7 — amplitude-peak cheat: leading edge of the loud region.** (7a) New `amplitude_peak_for_beat` helper replaces `argmax \|sample\|` with `argmax → walk-backward-from-max → leading edge of contiguous near-max region`, using a 1.5 ms backward `max` envelope. Sharp peaks land on the peak itself; sustained loud regions land on their leading edge (the user's explicit clarification of "where the transient is visually the largest, and if the transient is long at same loudness the grid would sit right at the beginning where its the loudest in the waveform"). Auto-path median (`amplitude_peak_offset_secs`) refactored to a thin wrapper around the helper. (7b) `latch_beat_grid_at_downbeat` no longer calls `shift_grid_to_amplitude_peak` — the per-beat amp-peak shift is now applied to the user's tapped beat alone, anchoring the visible downbeat exactly at the leading edge of the kick the user pointed at. Fixes Blaze Up Tha Dance's "set the 1 lands behind the peak" report. Regression suite: `amplitude_peak_for_beat_lands_on_sharp_impulse`, `amplitude_peak_for_beat_lands_on_slow_attack_body_peak`, `amplitude_peak_for_beat_lands_on_leading_edge_of_flat_loud_region`, `amplitude_peak_for_beat_returns_none_for_silence`, `latch_anchor_lands_at_visible_peak_not_at_track_median`. |
+| 0.8 | 2026-05-25 | **Round 6 — set-the-1 phase contract, tap-as-hint, octave self-verification.** (6a) `latch_beat_grid_at_downbeat` no longer refits BPM — `refine_period_at_anchor` and the BPM-refitting LSQ pass are gone, BPM is preserved bit-identical to the caller's input, only the anchor moves. Fixes Apocalypse's 177.72 → 178.70 jump after set-the-1. (6b) `analyze_beat_grid_from_taps` reinstates a constrained search: tap-interval weighted median seeds a ±3 % LSQ refinement quantised to 0.1 BPM, filtered by `kept_fraction`, then integer-snapped. Window is narrower than the gap to neighbour metric levels so the search cannot drift octaves. Supersedes the M11d.7a "tap median IS the BPM" override and the original PRD-BEATS §6.1 ±15 % search. Fixes Bangin's 86.232 BPM tap-jitter case. (6c) Profile-independent `octave_self_verify` runs after `snap_bpm_to_integer_if_safe`: re-fits at `bpm/2` and `bpm*2`, swaps to the alternate when `rms_alt < 0.65 * rms_main` AND `kept_alt >= kept_main` AND `kept_alt >= 0.5`. Catches untagged tracks the profile rules can't help. (6d) New `OctaveProfile::HipHop` for Hip-Hop / Rap / Trap / R&B / Boom-Bap tags, lower-octave bias via `profile_doubletime_rejected`. (6e) New `OctaveProfile::DrumAndBass` for DnB / Jungle tags, upper-octave preference via new `profile_halftime_rejected`. Profile rules + self-verify + caller contracts layer in increasing authority; `octave_self_verify` skips when `fixed_anchor` is supplied so 6c can never overrule 6a / 6b. |
