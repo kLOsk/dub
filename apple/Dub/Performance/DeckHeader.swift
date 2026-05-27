@@ -109,18 +109,6 @@ struct DeckHeaderState: Equatable {
     /// `false`.
     let useTimecodeToggle: Bool
 
-    /// M11d.7 — open tap-to-grid window count (0 = idle).
-    let tapGridCount: Int
-
-    /// PRD-BEATS §4.2 round 3 + gate 12 — rolling BPM preview
-    /// while a tap session is open. `nil` outside an active
-    /// session or while the session has fewer than 3 taps. When
-    /// non-nil, the BPM column renders this value in the
-    /// "tapping" treatment (italic + accent colour) instead of
-    /// the committed `bpm`, so the user can see the running
-    /// estimate converge tap by tap before commit.
-    let tapRollingBpm: Double?
-
     /// M11d.7 — library grid lock + drift indicator plumbed at load.
     let gridLocked: Bool
     let gridDriftQuality: Float?
@@ -190,7 +178,6 @@ struct DeckHeaderState: Equatable {
         trackTitle: nil, trackArtist: nil, bpm: nil, key: nil,
         formatChip: nil, timeRow: nil, isMaster: false, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false,
-        tapGridCount: 0, tapRollingBpm: nil,
         gridLocked: false, gridDriftQuality: nil)
 }
 
@@ -268,6 +255,16 @@ struct DeckHeader: View {
     var mirrored: Bool = false
     /// Prep mode shows BPM to two decimals; Performance mode one.
     var prepMode: Bool = false
+    /// Per-deck published surface for the open tap-tempo session.
+    /// Drives the parenthesised count chip and the italic
+    /// rolling-BPM preview in the BPM column. Deliberately
+    /// observed as a separate `ObservableObject` so a tap during
+    /// playback only invalidates this header's body — not the
+    /// entire `WaveformAppModel`'s view tree. See
+    /// `TapSessionViewModel` for the full rationale. Preview
+    /// callers default to a fresh empty session so SwiftUI
+    /// previews keep rendering without booting the app model.
+    @ObservedObject var tapSession: TapSessionViewModel = TapSessionViewModel()
     /// M11d.5 round 5 — engine reference + deck index for the
     /// self-driven time-row text. When supplied, the time row
     /// renders a `LiveDeckTimeText` subview that reads
@@ -446,7 +443,7 @@ struct DeckHeader: View {
     /// running estimate converge in real time.
     private var formattedBPM: String {
         let value: Double?
-        if let preview = state.tapRollingBpm {
+        if let preview = tapSession.rollingBpm {
             value = preview
         } else {
             value = state.bpm
@@ -721,13 +718,13 @@ struct DeckHeader: View {
                 HStack(spacing: 4) {
                     Text(formattedBPM)
                         .font(
-                            state.tapRollingBpm != nil
+                            tapSession.rollingBpm != nil
                                 ? DubFont.numericInline.italic()
                                 : DubFont.numericInline
                         )
                         .foregroundStyle(bpmDisplayColor)
-                    if state.tapGridCount > 0 {
-                        Text("(\(state.tapGridCount))")
+                    if tapSession.tapCount > 0 {
+                        Text("(\(tapSession.tapCount))")
                             .font(DubFont.micro)
                             .foregroundStyle(DubColor.deckTint(side))
                     }
@@ -744,7 +741,7 @@ struct DeckHeader: View {
                     }
                 }
                 .underline(
-                    state.tapGridCount > 0,
+                    tapSession.tapCount > 0,
                     color: DubColor.deckTint(side).opacity(0.55))
             }
             .buttonStyle(.plain)
@@ -800,7 +797,7 @@ struct DeckHeader: View {
     /// bpm should be the regular colour") — the lock icon next to
     /// the number carries the lock-state signal on its own.
     private var bpmDisplayColor: Color {
-        if state.tapRollingBpm != nil {
+        if tapSession.rollingBpm != nil {
             return DubColor.deckTint(side)
         }
         return state.bpm == nil ? DubColor.textPlaceholder : DubColor.textPrimary
@@ -942,7 +939,7 @@ struct LiveDeckTimeText: View {
         // M11d.5 round 3 user sign-off: "nothing is relevant sub
         // seconds" on the deck-header time display).
         TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            let pos = engine.position(deckIdx: deckIdx)
+            let pos = engine.positionSnapshot(deckIdx: deckIdx)
             Text(formattedText(for: pos))
         }
     }
@@ -1013,7 +1010,6 @@ extension DeckHeaderState {
                 isPlaying: false,
                 isPanicPlay: false,
                 useTimecodeToggle: false,
-                tapGridCount: 0, tapRollingBpm: nil,
                 gridLocked: false, gridDriftQuality: nil)
         }
 
@@ -1060,8 +1056,6 @@ extension DeckHeaderState {
                 // into the Play action in the model. See
                 // `useTimecodeToggle` doc comment for rationale.
                 useTimecodeToggle: false,
-                tapGridCount: deckState.tapGridCount,
-                tapRollingBpm: deckState.tapRollingBpm,
                 gridLocked: deckState.gridLocked,
                 gridDriftQuality: deckState.gridDriftQuality)
         }
@@ -1091,7 +1085,6 @@ extension DeckHeaderState {
                 isPlaying: false,
                 isPanicPlay: false,
                 useTimecodeToggle: false,
-                tapGridCount: 0, tapRollingBpm: nil,
                 gridLocked: false, gridDriftQuality: nil)
         }
 
@@ -1108,7 +1101,6 @@ extension DeckHeaderState {
             isPlaying: false,
             isPanicPlay: false,
             useTimecodeToggle: false,
-            tapGridCount: 0, tapRollingBpm: nil,
             gridLocked: false, gridDriftQuality: nil)
     }
 }
@@ -1128,7 +1120,6 @@ extension DeckHeaderState {
         formatChip: nil, timeRow: nil,
         isMaster: true, isPlaying: false,
         isPanicPlay: false, useTimecodeToggle: false,
-        tapGridCount: 0, tapRollingBpm: nil,
         gridLocked: false, gridDriftQuality: nil))
         .frame(width: 720)
         .background(DubColor.surface0)
@@ -1145,7 +1136,6 @@ extension DeckHeaderState {
         timeRow: .remainingOnly,
         isMaster: false, isPlaying: true,
         isPanicPlay: false, useTimecodeToggle: true,
-        tapGridCount: 2, tapRollingBpm: nil,
         gridLocked: true, gridDriftQuality: nil),
         mirrored: true)
         .frame(width: 720)
@@ -1163,7 +1153,6 @@ extension DeckHeaderState {
         timeRow: .elapsedAndRemaining,
         isMaster: true, isPlaying: true,
         isPanicPlay: false, useTimecodeToggle: false,
-        tapGridCount: 0, tapRollingBpm: nil,
         gridLocked: false, gridDriftQuality: nil))
         .frame(width: 720)
         .background(DubColor.surface0)
@@ -1180,7 +1169,6 @@ extension DeckHeaderState {
         timeRow: .remainingOnly,
         isMaster: true, isPlaying: true,
         isPanicPlay: true, useTimecodeToggle: true,
-        tapGridCount: 0, tapRollingBpm: nil,
         gridLocked: false, gridDriftQuality: 4.5),
         mirrored: true)
         .frame(width: 720)

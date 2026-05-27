@@ -115,6 +115,18 @@ final class BrowserMetadataCache: ObservableObject {
 struct FileBrowserView: View {
 
     @ObservedObject var model: WaveformAppModel
+    /// Library / analysis surface used for `libraryIsOpen` etc.
+    /// when this preview-only view is rendered alongside the
+    /// real LibraryView.
+    @ObservedObject var libraryModel: LibraryAppModel
+    /// M11d.6 round 2 — the selection URL was moved out of
+    /// `LibraryAppModel` into its own `ObservableObject` so a
+    /// library row click no longer invalidates `LibraryView`
+    /// (which doesn't read it from its body). `FileBrowserView`
+    /// is a preview-mode browser that still mutates the URL on
+    /// row tap, so it observes the new model directly to keep
+    /// its highlight live.
+    @ObservedObject var librarySelection: LibrarySelectionModel
 
     @State private var currentDirectory: URL = FileBrowserView.defaultDirectory()
     @State private var entries: [BrowserEntry] = []
@@ -215,7 +227,7 @@ struct FileBrowserView: View {
 
     @ViewBuilder
     private func row(for entry: BrowserEntry) -> some View {
-        let isSelected = model.browserSelection == entry.url
+        let isSelected = librarySelection.browserSelection == entry.url
         // M10.5b: do NOT wrap the row in a `Button`. `Button` claims
         // the primary press gesture before the drag recogniser can
         // install, which is why drag-out from this browser was
@@ -283,7 +295,7 @@ struct FileBrowserView: View {
             // (which would force SwiftUI to defer this handler).
             // Selection works on any row type; Space ignores
             // directories with a polite error.
-            model.browserSelection = entry.url
+            librarySelection.browserSelection = entry.url
 
             // Manual double-click detection: if the previous click
             // hit the same row inside the system double-click
@@ -444,6 +456,10 @@ private extension View {
 }
 
 #Preview {
-    FileBrowserView(model: WaveformAppModel())
-        .frame(width: 1440, height: 360)
+    FileBrowserView(
+        model: WaveformAppModel(),
+        libraryModel: LibraryAppModel(),
+        librarySelection: LibrarySelectionModel()
+    )
+    .frame(width: 1440, height: 360)
 }

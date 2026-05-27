@@ -11,8 +11,23 @@
 import Foundation
 
 /// One calibration event written as a single NDJSON line.
+///
+/// Writes are dispatched to a private serial background queue so the
+/// commit-time callers (`commitTapGrid`, `loadTrack`, etc.) on the
+/// main actor never block on disk I/O. PRD-BEATS §13 only requires
+/// the log exist; the order across events is preserved by the
+/// single-writer serial queue.
 enum BeatgridCalibrationLog {
     private static let fileName = "beatgrid-calibration.ndjson"
+
+    /// Serial writer queue. One file handle's worth of work at a
+    /// time; bounded by the queue's FIFO discipline. `.utility` QoS
+    /// keeps log writes off the responsive-UI / user-interactive
+    /// scheduling buckets so they never preempt audio-thread
+    /// supporting tasks or the Metal render thread.
+    private static let writerQueue = DispatchQueue(
+        label: "dub.beatgrid-calibration.writer",
+        qos: .utility)
 
     static var logURL: URL {
         let base = FileManager.default.urls(
@@ -277,6 +292,11 @@ enum BeatgridCalibrationLog {
     }
 
     private static func append(_ payload: [String: Any]) {
+        // Serialise the payload on the caller's thread (cheap; no
+        // file I/O) so the captured value is a plain `Data` and
+        // doesn't carry across the queue boundary as an
+        // `Any`-typed dictionary. The disk write itself is moved
+        // to the writer queue.
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload),
               let line = String(data: data, encoding: .utf8),
@@ -284,17 +304,19 @@ enum BeatgridCalibrationLog {
         else { return }
 
         let url = logURL
-        let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true)
+        writerQueue.async {
+            let dir = url.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
 
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: bytes)
-        } else {
-            try? bytes.write(to: url, options: .atomic)
+            if FileManager.default.fileExists(atPath: url.path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: bytes)
+            } else {
+                try? bytes.write(to: url, options: .atomic)
+            }
         }
     }
 }

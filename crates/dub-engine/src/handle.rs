@@ -251,6 +251,8 @@ impl EngineHandle {
             is_playing: shared.load_playing(),
             at_end: shared.load_at_end(),
             is_panic_play: shared.load_panic_play(),
+            duration_secs: shared.load_duration_secs(),
+            has_track: shared.load_has_track(),
         })
     }
 
@@ -781,6 +783,7 @@ impl Drop for EngineHandle {
 /// rendering. All fields are read with `Relaxed` ordering — consistent
 /// per-field but not consistent across fields. That's the right trade-off
 /// for a 60 Hz UI: tearing on transport changes is invisible.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeckSnapshot {
     /// Current playhead in track frames.
@@ -796,6 +799,15 @@ pub struct DeckSnapshot {
     /// clean `LiftIntent::Locked` (auto-resume) or the UI issues
     /// `cancel_panic_play`.
     pub is_panic_play: bool,
+    /// M11d.6 round 5. Loaded track's wall-clock duration. Zero
+    /// when no track is loaded. Published lock-free alongside
+    /// the position atomics so the off-main waveform renderer can
+    /// synthesise a full `PositionInfo` without consulting the
+    /// FFI engine mutex.
+    pub duration_secs: f64,
+    /// M11d.6 round 5. Mirrors `source.is_some()` from the audio
+    /// thread. Pairs with `duration_secs`.
+    pub has_track: bool,
 }
 
 /// Per-deck command builder. Returned by [`EngineHandle::deck`]; consumes
@@ -944,6 +956,8 @@ impl DeckCommand<'_> {
             is_playing: false,
             at_end: false,
             is_panic_play: false,
+            duration_secs: 0.0,
+            has_track: false,
         })
     }
 }

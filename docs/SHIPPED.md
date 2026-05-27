@@ -77,6 +77,7 @@
 - [M11c.2 — Key detection (Camelot canonical)](#m11c2)
 - [M11c.1 — Lazy auto-beatgrid + analysis lifecycle](#m11c1)
 - [M11d.6 — Full-screen on launch + windowed snap-back](#m11d6)
+- [M11d.6 round 5 — Waveform rendering off the main thread](#m11d6-round5)
 - [M11d.7 — Beatgrid precision, auto downbeat, tap-to-grid, drift lock](#m11d7)
 
 ---
@@ -3178,6 +3179,35 @@ First-cut testing surfaced the actual headline bug: full-screen "worked" (the wi
 Fix: set `hostingController.sizingOptions = []` and drop the `preferredContentSize` assignment. With no SwiftUI-driven intrinsic size, the standard edge-pinning constraints take over and the SwiftUI hierarchy fills whatever frame AppKit hands it — windowed at 1440x900 (still set by the window's `contentRect` + `setContentSize`, which are window-level concerns independent of the hosting controller), full-screen at every display the user can reach (Retina laptop, 5K Studio Display, 6K Pro Display XDR, ultrawide). The old `preferredContentSize` workaround for the "collapses to toolbar size" symptom is obsolete because `PerformanceView` and the M11d.5 deck-header layout both carry their own `frame(maxWidth: .infinity, maxHeight: .infinity)` and `frame(minWidth: 960, minHeight: 600)` floors, so SwiftUI no longer collapses without external prodding.
 
 Files: `apple/Dub/DubAppDelegate.swift`, `apple/Dub/MainWindowController.swift`.
+
+---
+
+<a id="m11d6-round5"></a>
+## M11d.6 round 5 — Waveform rendering off the main thread
+
+**Status:** shipped &nbsp;·&nbsp; **Parent:** M11d.6 Performance shell
+
+The Metal renderer no longer draws on the SwiftUI main runloop. Previous rounds had migrated the `CVDisplayLink` callback to a run-loop-integrated `CFRunLoopPerformBlock` and idempotently stamped the renderer's `MTKView` properties, but `MTKView` still hops every `draw(_:)` call back to the main thread. Any SwiftUI body re-evaluation, `NSHostingView` rebuild, or library FFI on main could still stall the next vsync. Round 5 cuts the cord.
+
+### Architecture
+
+`MTKView` is gone. A new `WaveformMetalHostView` subclasses `NSView` with a `CAMetalLayer` backing layer (`framebufferOnly = true`, `presentsWithTransaction = false`, `layerContentsRedrawPolicy = .never`). The host view owns drawable-size synchronisation and reports screen migration via an `onDisplayChange` closure that fires on `viewDidMoveToWindow` and on `NSWindow.didChangeScreenNotification`.
+
+A new `WaveformRenderThread` owns the per-deck `CVDisplayLink` plus a dedicated `userInteractive` serial `DispatchQueue` (`dub.waveform.render.<deckIdx>`). The display link's C callback dispatches a single `drawIfNeeded()` block onto the queue per vsync. `setContinuous(_:)` starts and stops the link without leaking the `Unmanaged` retain that balances the C-pointer capture; `requestOneShot()` posts a single draw for paused-deck generation bumps; `shutdown()` (called from `WaveformMetalView.dismantleNSView`) stops the link, flips a shutdown flag, and drains the queue with `sync { }` so no in-flight draw outlives the renderer.
+
+`WaveformRenderer` itself dropped `@MainActor` and became `final class WaveformRenderer: NSObject, @unchecked Sendable`. All SwiftUI-pushed appearance state (`palette`, `orientation`, `side`, `timeAxisZoom`, `beatGridEnabled`) lives behind an `OSAllocatedUnfairLock`-protected `RendererAppearance` snapshot. The draw entry reads one struct under the lock, then operates on stack-local values for the rest of the frame. The beat-grid array uses the same pattern (`BeatGridSnapshot`); the background fetch publishes directly into the lock-protected state without going through `MainActor.run`. MSAA is now renderer-managed instead of `MTKView`-managed — the renderer keeps a single multisample texture sized to the current drawable and rebuilds it on size change.
+
+The old main-thread peek into `NSApp.nextEvent` (`hasPendingPointerInput`) is gone — irrelevant once draws no longer run on main.
+
+### Lock-free playhead snapshot
+
+`DeckSharedState` gained two atomics (`duration_secs_bits`, `has_track`) that the audio thread publishes alongside `position_bits`. `DubEngine::position_snapshot(deckIdx:)` reads those atomics directly without taking `Mutex<EngineState>`, so the render thread never contends with `load_track`, library imports, or any other FFI work on the main thread. All chrome consumers (`pollDecks`, `TrackOverviewView`, `LiveDeckTimeText`, the renderer's per-frame read) now use `positionSnapshot(deckIdx:)`. The previous 50 ms cache (`LivePositionSnapshot`, `WaveformAppModel.cachedPosition`) is deleted — the FFI path is cheap enough that deduplicating no longer pays for itself.
+
+### What this fixes
+
+Library row clicks, sidebar source swaps, search-field typing, modal sheet presentations, and any other SwiftUI body re-eval cascade can keep running on the main thread without dropping a waveform vsync. The previous symptom — "tap a folder in the library, the waveform jumps" — is structurally impossible after this round, because the waveform's draw cadence is no longer tied to the main runloop at all. `FFI_VERSION` bumps to 22.
+
+**Files:** `crates/dub-engine/src/deck.rs`, `crates/dub-engine/src/handle.rs`, `crates/dub-engine/src/lib.rs`, `crates/dub-ffi/src/lib.rs`, `apple/Dub/Waveform/WaveformMetalHostView.swift`, `apple/Dub/Waveform/WaveformRenderThread.swift`, `apple/Dub/Waveform/WaveformRenderer.swift`, `apple/Dub/Waveform/WaveformView.swift`, `apple/Dub/Performance/PerformanceView.swift`, `apple/Dub/Performance/TrackOverviewView.swift`, `apple/Dub/Performance/DeckHeader.swift`, `apple/Dub/MainView.swift` (deletes the `cachedPosition` plumbing), `apple/Dub/Performance/LivePositionSnapshot.swift` (deleted).
 
 ---
 

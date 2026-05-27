@@ -185,19 +185,6 @@ struct DeckState: Equatable {
     /// Count of manual nudge actions this session (phase / BPM / tap).
     var manualGridEditCount: Int = 0
 
-    /// M11d.7 — open BPM tap window count for deck-header feedback.
-    var tapGridCount: Int = 0
-
-    /// PRD-BEATS §4.2 round 3 + gate 12 — rolling BPM preview while
-    /// a tap session is open. `nil` when no session is open, when
-    /// the session has fewer than 3 taps, or when the running
-    /// median tap interval implies a BPM outside `[40, 240]` (the
-    /// same bound the Rust tap-tempo path uses). Driven by the
-    /// `TapToGridController.onRollingBpmChanged` callback; cleared
-    /// on commit (the deck's authoritative BPM lands on the next
-    /// poll tick) and on session cancel.
-    var tapRollingBpm: Double? = nil
-
     /// M11d.7 — stamped from library row at load time.
     var gridLocked: Bool = false
     var gridDriftQuality: Float? = nil
@@ -292,9 +279,13 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: FS-browser selection (M10.5b)
 
-    /// File the user has highlighted in the FS browser. `Space`
-    /// loads this into the non-master, stopped deck (PRD §5.5).
-    @Published var browserSelection: URL? = nil
+    /// FS-browser selection now lives on `LibraryAppModel` so a
+    /// library / browser row click does not fire
+    /// `WaveformAppModel.objectWillChange` and therefore does not
+    /// cascade through `PerformanceView` / both waveform Metal
+    /// views / both `TrackOverviewView`s. See
+    /// `LibraryAppModel.browserSelection` for the full rationale.
+    /// Callers should read / write `librarySelection.browserSelection`.
 
     // MARK: Library (M11d)
 
@@ -309,40 +300,42 @@ final class WaveformAppModel: ObservableObject {
     private let tapToGridA = TapToGridController()
     private let tapToGridB = TapToGridController()
 
+    /// Per-deck published surfaces for the deck-header BPM column
+    /// tap-session indicators (`(N)` count chip + italic rolling
+    /// preview). Held as plain `let`s (not `@Published`) so a tap
+    /// only invalidates the `DeckHeader` that observes the matching
+    /// session — `PerformanceView`, `LibraryView`,
+    /// `FileBrowserView`, and both `TrackOverviewView`s stay inert.
+    /// See `TapSessionViewModel`'s doc for the rationale.
+    let tapSessionA = TapSessionViewModel()
+    let tapSessionB = TapSessionViewModel()
+
     private func tapToGrid(for side: DeckSide) -> TapToGridController {
         side == .a ? tapToGridA : tapToGridB
     }
 
+    func tapSession(for side: DeckSide) -> TapSessionViewModel {
+        side == .a ? tapSessionA : tapSessionB
+    }
+
     private func wireTapToGridControllers() {
         tapToGridA.onTapCountChanged = { [weak self] count in
-            guard let self else { return }
-            var deck = self.deckA
-            deck.tapGridCount = count
-            self.deckA = deck
+            self?.tapSessionA.tapCount = count
         }
         tapToGridA.onCommit = { [weak self] taps in
             self?.commitTapGrid(side: .a, playheadTimes: taps)
         }
         tapToGridA.onRollingBpmChanged = { [weak self] bpm in
-            guard let self else { return }
-            var deck = self.deckA
-            deck.tapRollingBpm = bpm
-            self.deckA = deck
+            self?.tapSessionA.rollingBpm = bpm
         }
         tapToGridB.onTapCountChanged = { [weak self] count in
-            guard let self else { return }
-            var deck = self.deckB
-            deck.tapGridCount = count
-            self.deckB = deck
+            self?.tapSessionB.tapCount = count
         }
         tapToGridB.onCommit = { [weak self] taps in
             self?.commitTapGrid(side: .b, playheadTimes: taps)
         }
         tapToGridB.onRollingBpmChanged = { [weak self] bpm in
-            guard let self else { return }
-            var deck = self.deckB
-            deck.tapRollingBpm = bpm
-            self.deckB = deck
+            self?.tapSessionB.rollingBpm = bpm
         }
     }
 
@@ -389,16 +382,25 @@ final class WaveformAppModel: ObservableObject {
         tapController.tap(playheadSecs: playhead)
     }
 
-    /// `true` once `library.openDefault()` has succeeded. Drives
-    /// the browser's "Open library" affordance — until this flips,
-    /// the LibraryView shows a one-shot "preparing library…"
-    /// placeholder rather than a blank list (which a DJ would read
-    /// as "Dub forgot everything").
-    @Published private(set) var libraryIsOpen: Bool = false
+    /// Library / analysis / relocate UI surface, owned as a
+    /// separate `ObservableObject` so library mutations don't
+    /// invalidate `PerformanceView`. Held as a plain `let` (not
+    /// `@Published`) — observers subscribe via
+    /// `model.libraryModel` directly. See `LibraryAppModel` for
+    /// the field-by-field rationale.
+    let libraryModel = LibraryAppModel()
 
-    /// Total canonical-track count, refreshed after every import.
-    /// Browser footer reads this directly.
-    @Published private(set) var libraryTrackCount: UInt64 = 0
+    /// M11d.6 round 2 — selection side-channel split out of
+    /// `LibraryAppModel`. Holds `browserSelection`,
+    /// `selectedLibraryTrackId`, `selectedLibraryTrack`. The
+    /// rationale lives in `LibrarySelectionModel`'s header
+    /// comment; tl;dr the three fields are **never read** from
+    /// `LibraryView`'s body, only written, so observing them
+    /// from there is a pure wasted-cascade cost on every row
+    /// click. The new model is observed only by call sites that
+    /// actually consume the selection (the deck load path,
+    /// the Space-loader, FileBrowserView in previews).
+    let librarySelection = LibrarySelectionModel()
 
     /// Unix-seconds boundary for the "Just Imported" smart crate
     /// per PRD §8.5.2. Captured at app launch so a DJ who plugs in
@@ -406,131 +408,11 @@ final class WaveformAppModel: ObservableObject {
     /// tracks they imported during this session.
     let appLaunchUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
 
-    /// Most recent import outcome, surfaced in the LibraryView
-    /// footer for ~5 s after an import-folder run completes.
-    /// `nil` while no import has run this session.
-    @Published var lastImportSummary: LibraryImportSummary? = nil
-
-    /// `true` while an import is in progress. Drives the
-    /// browser's progress indicator and disables the
-    /// "Import Folder…" button to prevent overlapping runs (the
-    /// importer is safe to run twice but the UX is confusing).
-    @Published private(set) var libraryImportInProgress: Bool = false
-
-    /// Canonical UUID of the LibraryView's currently selected
-    /// row, or `nil` when the current selection is a Finder drag.
-    /// Used by [`recordLibraryLoadIfApplicable`] to decide whether
-    /// a successful `loadTrack` deserves a `play_history` row.
-    /// Kept in lockstep with [`browserSelection`] inside
-    /// [`selectLibraryTrack`].
-    @Published var selectedLibraryTrackId: String? = nil
-
-    /// M11c.2 — full row snapshot for the currently-selected
-    /// library track. LibraryView writes this alongside
-    /// `selectedLibraryTrackId` so the load path can stamp the
-    /// track's key (and any future per-track-attribute) onto
-    /// `DeckState` without an extra FFI round-trip. `nil` when
-    /// no library row is selected (Finder-drag selection clears
-    /// it). The snapshot is intentionally untracked vs. live
-    /// library mutations: if the user analyzes the track *after*
-    /// selecting but *before* loading it, the cached key may lag
-    /// by one analysis cycle. The 30 Hz position poll's grid
-    /// refresh covers BPM staleness for the same window; key
-    /// staleness is a known minor cost of avoiding a per-load
-    /// FFI lookup.
-    @Published var selectedLibraryTrack: LibraryTrack? = nil
-
-    /// M11d.3 — per-volume reachability cache. The LibraryView
-    /// reads this to drive the missing-file indicator without a
-    /// `FileManager.fileExists` round-trip per visible row. Keys
-    /// are mount paths (e.g. `"/"`, `"/Volumes/Touring SSD"`);
-    /// values are `true` when the mount point is a directory
-    /// that currently exists, `false` when it does not. A track
-    /// is missing iff its primary volume's mount point is absent
-    /// from the cache (no recorded answer yet) or maps to
-    /// `false`. Recomputed on a coarse cadence in
-    /// `refreshVolumeReachability()` rather than per-keystroke
-    /// or per-frame.
-    @Published private(set) var volumeReachability: [String: Bool] = [:]
-
-    /// M11d.4 — count of canonical tracks whose every
-    /// `track_files` row has been flagged as missing by the
-    /// background scanner. Drives the LibraryView footer:
-    /// `247 tracks missing. Click to relocate.` Refreshed by
-    /// the scanner after each batch and after a Relocate run.
-    @Published private(set) var missingTrackCount: UInt64 = 0
-
-    /// M11c.1 — analysis-completion generation counter. Bumped
-    /// every time `ensureTrackAnalyzed` or `analyzeTracks` finishes
-    /// a *successful* per-track analysis, regardless of whether
-    /// the analyzer actually placed a grid or a key (silence and
-    /// non-musical input still flip `analysis_cache.analyzed_at`
-    /// and so still need a LibraryView refresh to un-dim the row).
-    /// Failed analyses **do not** bump the counter — `analyze_track`
-    /// writes nothing to the library on failure, so a failure-
-    /// triggered refresh would just repaint identical rows.
-    /// LibraryView observes this via `.onChange` and re-runs
-    /// `refreshTracks()` so the BPM badge / dim-state on the
-    /// affected rows lands without a per-row push channel. A single
-    /// counter is enough because the work happens on a background
-    /// actor; the LibraryView's debounced refresh path collapses
-    /// bursts.
-    @Published private(set) var analysisGeneration: UInt64 = 0
-
-    /// M11c.1 — immediate row patch for the LibraryView BPM / key /
-    /// dim-state columns. Emitted alongside `analysisGeneration`
-    /// so the browser can update the affected row before the async
-    /// listing refetch completes.
-    @Published private(set) var libraryRowAnalysisUpdate: LibraryRowAnalysisUpdate?
-
-    /// M11c.1 — count of analyses currently in flight, batch or
-    /// not. Drives the spinner-vs-quiescent decision on the
-    /// LibraryView footer ("any work happening at all?"). NOT
-    /// the right value for "N of M" progress — analyses inside
-    /// `analyzeTracks` run serially, so this counter is at most 1
-    /// for the duration of a batch even when 200 tracks are
-    /// queued. Use `analysisBatchCompleted` for the visible "N of
-    /// M" line.
-    @Published private(set) var analysisInFlightCount: UInt32 = 0
-
-    /// M11c.1 — number of tracks already processed in the current
-    /// batch (post-fix for the "Analyzing 5 of 5…" bug where the
-    /// view tried to derive `done` from `analysisInFlightCount`).
-    /// Incremented after each track in `analyzeTracks` finishes —
-    /// success or failure both count, because the user-visible
-    /// thing is "how much of the batch is left". Reset to 0 when
-    /// the batch starts; the deferred cleanup also zeroes it when
-    /// the batch ends.
-    @Published private(set) var analysisBatchCompleted: UInt32 = 0
-
-    /// M11c.1 — total tracks queued for the current batch-analyze
-    /// run. The view renders `"Analyzing \(analysisBatchCompleted
-    /// + 1) of \(analysisBatchTotal)…"` while the batch is live.
-    /// `0` when no batch is active (single-deck-load analyses
-    /// fire through `ensureTrackAnalyzed` and don't show a batch
-    /// progress line).
-    @Published private(set) var analysisBatchTotal: UInt32 = 0
-
     /// M11c.1 — set of track UUIDs currently in flight. Guards
     /// against double-analyzing the same track when the user
     /// rapid-fires Space + Right-click → Analyze, and is consulted
     /// before queueing each batch-analyze entry.
     private var analyzingTrackIds: Set<String> = []
-
-    /// M11d.4 — `true` while a Relocate run is in progress.
-    /// Drives the Relocate sheet's progress indicator and
-    /// disables the "Match Folder…" button.
-    @Published private(set) var relocateInProgress: Bool = false
-
-    /// M11d.4 — number of missing tracks that found a match on
-    /// the last Relocate run. Surfaced in the Relocate sheet
-    /// post-run.
-    @Published var lastRelocateMatches: UInt32 = 0
-
-    /// M11d.4 — number of missing tracks left unmatched after
-    /// the last Relocate run (i.e. the user must point Dub at a
-    /// different folder, or the file is truly gone).
-    @Published var lastRelocateUnmatched: UInt32 = 0
 
     // MARK: Private state
 
@@ -540,13 +422,26 @@ final class WaveformAppModel: ObservableObject {
     private var stickyMaster: DeckSide = .a
     private var lastPlayStart: [DeckSide: Date] = [:]
 
-    /// Polling timer for `engine.position(deck)`. ~30 Hz keeps the
-    /// track-time row smooth without hammering the FFI; the
-    /// audio-thread playhead is sampled by the timer-published
-    /// snapshot inside `RunningState`. Disabled when the engine
-    /// isn't running.
+    /// Polling timer for the deck-chrome `@Published` mirrors
+    /// (`hasTrack`, `isPlaying`, `durationSecs`, `peaksGeneration`,
+    /// `errorFlashUntil`, etc.). Runs at ~10 Hz — the deck-header
+    /// chrome doesn't need frame-accurate updates because the
+    /// **time row reads `engine.position(deckIdx:)` directly via
+    /// the `LiveDeckTimeText` `TimelineView` subtree** and the
+    /// Metal waveform refreshes off its own `CVDisplayLink` /
+    /// peak-generation observer. Pre-fix the timer ran at 30 Hz,
+    /// which meant `WaveformAppModel.deckA` / `.deckB` republished
+    /// 30× per second on top of any genuine state change. The
+    /// resulting SwiftUI invalidation cascade competed with the
+    /// 60 Hz Metal render thread for main-actor time and shaved a
+    /// visible margin off waveform smoothness during playback.
+    /// 10 Hz keeps the worst-case latency for chrome that **does**
+    /// react to polled values (PRD §6.1.2 Panic-Play pill, M11
+    /// peaks-generation swap, `errorFlashUntil` clear) ≤100 ms —
+    /// well inside human perception while cutting the cascade
+    /// frequency by 3×. Disabled when the engine isn't running.
     private var pollTimer: Timer?
-    private static let pollIntervalSecs: TimeInterval = 1.0 / 30.0
+    private static let pollIntervalSecs: TimeInterval = 1.0 / 10.0
 
     /// Throttles the lazy `engine.beatGrid` poll in `readDeckState`
     /// while BPM is still pending. The Metal renderer already
@@ -774,7 +669,10 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private func readDeckState(side: DeckSide, prev: DeckState) -> DeckState {
-        let pos = engine.position(deckIdx: side.ffiDeckIdx)
+        // M11d.6 round 5 — lock-free FFI snapshot. The position
+        // read no longer contends with library / load-track work
+        // because it bypasses the engine mutex entirely.
+        let pos = engine.positionSnapshot(deckIdx: side.ffiDeckIdx)
         let nowPlaying = pos.isPlaying
         if nowPlaying, !prev.isPlaying {
             lastPlayStart[side] = Date()
@@ -999,7 +897,6 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridCaptured = false
         starting.beatGridLoadSource = preloadedGrid?.source ?? "pending_auto"
         starting.manualGridEditCount = 0
-        starting.tapGridCount = 0
         tapToGrid(for: side).cancel()
         setState(starting, for: side)
 
@@ -1127,10 +1024,10 @@ final class WaveformAppModel: ObservableObject {
     /// call repeatedly; the FFI handle is idempotent on re-open.
     /// Called once from `MainView.onAppear`.
     func openLibraryIfNeeded() {
-        guard !libraryIsOpen else { return }
+        guard !libraryModel.libraryIsOpen else { return }
         do {
             try library.openDefault()
-            libraryIsOpen = true
+            libraryModel.libraryIsOpen = true
             refreshLibraryStats()
             refreshMissingTrackCount()
             startMissingFilesScanner()
@@ -1142,9 +1039,9 @@ final class WaveformAppModel: ObservableObject {
     /// Refresh `libraryTrackCount`. Cheap (`SELECT COUNT(*) FROM
     /// tracks`); called on app launch and after every import.
     func refreshLibraryStats() {
-        guard libraryIsOpen else { return }
+        guard libraryModel.libraryIsOpen else { return }
         if let count = try? library.trackCount() {
-            libraryTrackCount = count
+            libraryModel.libraryTrackCount = count
         }
     }
 
@@ -1168,7 +1065,7 @@ final class WaveformAppModel: ObservableObject {
                 mountPoints.insert(m)
             }
         }
-        var next = volumeReachability
+        var next = libraryModel.volumeReachability
         // Drop entries for mount points no longer in view so the
         // cache stays bounded.
         next = next.filter { mountPoints.contains($0.key) }
@@ -1177,8 +1074,8 @@ final class WaveformAppModel: ObservableObject {
             let exists = FileManager.default.fileExists(atPath: m, isDirectory: &isDir)
             next[m] = exists && isDir.boolValue
         }
-        if next != volumeReachability {
-            volumeReachability = next
+        if next != libraryModel.volumeReachability {
+            libraryModel.volumeReachability = next
         }
     }
 
@@ -1193,7 +1090,7 @@ final class WaveformAppModel: ObservableObject {
     /// false positive on the glyph is acceptable in that window).
     func isTrackReachable(_ track: LibraryTrack) -> Bool {
         guard let m = track.primaryVolumeMountPoint else { return false }
-        return volumeReachability[m] == true
+        return libraryModel.volumeReachability[m] == true
     }
 
     // MARK: - M11d.4 Missing-files scanner
@@ -1203,9 +1100,9 @@ final class WaveformAppModel: ObservableObject {
     /// app launch, after every import, and after each scanner
     /// batch + Relocate run.
     func refreshMissingTrackCount() {
-        guard libraryIsOpen else { return }
+        guard libraryModel.libraryIsOpen else { return }
         if let n = try? library.missingTrackCount() {
-            missingTrackCount = n
+            libraryModel.missingTrackCount = n
         }
     }
 
@@ -1223,7 +1120,7 @@ final class WaveformAppModel: ObservableObject {
     /// the main actor.
     @discardableResult
     func scanMissingFilesBatch(batchSize: UInt32 = 100) async -> UInt32 {
-        guard libraryIsOpen else { return 0 }
+        guard libraryModel.libraryIsOpen else { return 0 }
         let library = self.library
         let now = Int64(Date().timeIntervalSince1970)
         let processed: UInt32 = await Task.detached(priority: .utility) {
@@ -1316,18 +1213,18 @@ final class WaveformAppModel: ObservableObject {
     /// surface a "matched 42 of 247 missing tracks" line.
     @discardableResult
     func runRelocate(matchingFolder folder: URL) async -> (matched: UInt32, unmatched: UInt32) {
-        guard libraryIsOpen else { return (0, 0) }
-        if relocateInProgress { return (0, 0) }
-        relocateInProgress = true
-        defer { relocateInProgress = false }
+        guard libraryModel.libraryIsOpen else { return (0, 0) }
+        if libraryModel.relocateInProgress { return (0, 0) }
+        libraryModel.relocateInProgress = true
+        defer { libraryModel.relocateInProgress = false }
 
         let library = self.library
         let folderPath = folder.path
         let result: (UInt32, UInt32) = await Task.detached(priority: .userInitiated) {
             return Self.relocateImpl(library: library, folderPath: folderPath)
         }.value
-        lastRelocateMatches = result.0
-        lastRelocateUnmatched = result.1
+        libraryModel.lastRelocateMatches = result.0
+        libraryModel.lastRelocateUnmatched = result.1
         refreshMissingTrackCount()
         return result
     }
@@ -1391,15 +1288,15 @@ final class WaveformAppModel: ObservableObject {
     /// duplicating identity rows (proven by
     /// `re_import_is_idempotent` in `dub-library`).
     func importLibraryFolder(_ folder: URL) async {
-        guard libraryIsOpen else {
+        guard libraryModel.libraryIsOpen else {
             surfaceError("Library is not open yet.")
             return
         }
-        if libraryImportInProgress {
+        if libraryModel.libraryImportInProgress {
             surfaceError("An import is already running.")
             return
         }
-        libraryImportInProgress = true
+        libraryModel.libraryImportInProgress = true
         let library = self.library
         let path = folder.path
         let result: Result<LibraryImportSummary, Error> = await Task.detached(priority: .userInitiated) {
@@ -1410,10 +1307,10 @@ final class WaveformAppModel: ObservableObject {
                 return .failure(error)
             }
         }.value
-        libraryImportInProgress = false
+        libraryModel.libraryImportInProgress = false
         switch result {
         case .success(let summary):
-            lastImportSummary = summary
+            libraryModel.lastImportSummary = summary
             refreshLibraryStats()
             refreshMissingTrackCount()
             let changed = summary.added
@@ -1449,16 +1346,16 @@ final class WaveformAppModel: ObservableObject {
     /// memory. The id-only overload above is kept for callers
     /// that haven't yet been threaded with row snapshots.
     func selectLibraryTrack(_ trackId: String, snapshot: LibraryTrack?) {
-        guard libraryIsOpen else { return }
+        guard libraryModel.libraryIsOpen else { return }
         do {
             if let path = try library.trackPath(trackId: trackId) {
-                browserSelection = URL(fileURLWithPath: path)
-                selectedLibraryTrackId = trackId
-                selectedLibraryTrack = snapshot
+                librarySelection.browserSelection = URL(fileURLWithPath: path)
+                librarySelection.selectedLibraryTrackId = trackId
+                librarySelection.selectedLibraryTrack = snapshot
             } else {
-                browserSelection = nil
-                selectedLibraryTrackId = nil
-                selectedLibraryTrack = nil
+                librarySelection.browserSelection = nil
+                librarySelection.selectedLibraryTrackId = nil
+                librarySelection.selectedLibraryTrack = nil
                 surfaceError("Track is unreachable — the source volume may be unmounted.")
             }
         } catch {
@@ -1518,9 +1415,9 @@ final class WaveformAppModel: ObservableObject {
     /// safe to call on the main actor immediately before the
     /// detached `Task` that runs `loadTrack`.
     private func libraryGenreForPendingLoad(url: URL) -> String? {
-        guard libraryIsOpen,
-              let trackId = selectedLibraryTrackId,
-              let snap = selectedLibraryTrack,
+        guard libraryModel.libraryIsOpen,
+              let trackId = librarySelection.selectedLibraryTrackId,
+              let snap = librarySelection.selectedLibraryTrack,
               snap.id == trackId
         else { return nil }
         do {
@@ -1538,7 +1435,7 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private func libraryBeatGridForPendingLoad(url: URL) -> LibraryBeatGrid? {
-        guard libraryIsOpen, let trackId = selectedLibraryTrackId else {
+        guard libraryModel.libraryIsOpen, let trackId = librarySelection.selectedLibraryTrackId else {
             return nil
         }
         do {
@@ -1564,7 +1461,7 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
-        guard libraryIsOpen else {
+        guard libraryModel.libraryIsOpen else {
             var cleared = state(for: side)
             cleared.loadedLibraryTrackId = nil
             setState(cleared, for: side)
@@ -1583,8 +1480,8 @@ final class WaveformAppModel: ObservableObject {
             // path lookup for library drags that bypassed selection.
             var stamped = state(for: side)
             stamped.loadedLibraryTrackId = trackId
-            if selectedLibraryTrackId == trackId,
-               let snap = selectedLibraryTrack, snap.id == trackId
+            if librarySelection.selectedLibraryTrackId == trackId,
+               let snap = librarySelection.selectedLibraryTrack, snap.id == trackId
             {
                 stamped.key = snap.key
                 stamped.gridLocked = snap.gridLocked
@@ -1616,7 +1513,7 @@ final class WaveformAppModel: ObservableObject {
     /// `loadedLibraryTrackId` and fire lazy analysis.
     private func resolveLibraryTrackId(for url: URL) -> String? {
         let normalized = url.standardizedFileURL
-        if let selected = selectedLibraryTrackId,
+        if let selected = librarySelection.selectedLibraryTrackId,
            let path = try? library.trackPath(trackId: selected),
            URL(fileURLWithPath: path).standardizedFileURL == normalized
         {
@@ -1638,12 +1535,12 @@ final class WaveformAppModel: ObservableObject {
             ? outcome.bpm : nil
         let key: String? =
             (outcome.wroteKey && !outcome.camelot.isEmpty) ? outcome.camelot : nil
-        libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+        libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
             trackId: trackId,
             bpm: bpm,
             key: key,
             isAnalyzed: true)
-        analysisGeneration &+= 1
+        libraryModel.analysisGeneration &+= 1
         if refreshLoadedDecks {
             refreshLoadedDecksAfterLibraryAnalysis(trackId: trackId, outcome: outcome)
         }
@@ -1658,7 +1555,7 @@ final class WaveformAppModel: ObservableObject {
         trackId: String,
         outcome: LibraryAnalysisOutcome
     ) {
-        guard isRunning, libraryIsOpen else { return }
+        guard isRunning, libraryModel.libraryIsOpen else { return }
         let activeGrid = try? library.activeBeatGrid(trackId: trackId)
         for side in [DeckSide.a, DeckSide.b] {
             var deck = state(for: side)
@@ -1701,7 +1598,7 @@ final class WaveformAppModel: ObservableObject {
     /// `is_track_analyzed` predicate skips fast-path once the
     /// track has been processed once.
     func ensureTrackAnalyzed(trackId: String) {
-        guard libraryIsOpen else { return }
+        guard libraryModel.libraryIsOpen else { return }
         guard !analyzingTrackIds.contains(trackId) else { return }
         // Cheap synchronous check on the calling actor — if the
         // track is already analyzed, skip the background task
@@ -1711,9 +1608,15 @@ final class WaveformAppModel: ObservableObject {
             return
         }
         analyzingTrackIds.insert(trackId)
-        analysisInFlightCount &+= 1
+        libraryModel.analysisInFlightCount &+= 1
         let library = self.library
-        Task.detached(priority: .background) { [weak self] in
+        // Swift 6 strict-concurrency: capture `[weak self]` on the
+        // main-actor hop, not on the outer @Sendable Task body. The
+        // detached body only touches `library` (Sendable) and the
+        // `trackId` String; it doesn't need `self`. Reaching back
+        // to the actor-isolated instance across the actor boundary
+        // is done via the inner closure's own weak capture.
+        Task.detached(priority: .background) {
             let result: Result<LibraryAnalysisOutcome, Error>
             do {
                 let outcome = try library.analyzeTrack(trackId: trackId)
@@ -1721,11 +1624,11 @@ final class WaveformAppModel: ObservableObject {
             } catch {
                 result = .failure(error)
             }
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 self.analyzingTrackIds.remove(trackId)
-                if self.analysisInFlightCount > 0 {
-                    self.analysisInFlightCount -= 1
+                if self.libraryModel.analysisInFlightCount > 0 {
+                    self.libraryModel.analysisInFlightCount -= 1
                 }
                 switch result {
                 case .success(let outcome):
@@ -1761,10 +1664,10 @@ final class WaveformAppModel: ObservableObject {
     /// below), but the Rust engine wouldn't, and a raced tap
     /// would slip past defense in depth.
     func setGridLocked(trackId: String, locked: Bool) async {
-        guard libraryIsOpen else { return }
+        guard libraryModel.libraryIsOpen else { return }
         do {
             try library.setGridLocked(trackId: trackId, locked: locked)
-            analysisGeneration &+= 1
+            libraryModel.analysisGeneration &+= 1
         } catch {
             surfaceError("Grid lock failed: \(error.localizedDescription)")
             return
@@ -1845,16 +1748,16 @@ final class WaveformAppModel: ObservableObject {
     /// fallback exists only for batches where a track was locked
     /// concurrently between menu and dispatch.
     func analyzeTracks(_ trackIds: [String]) async {
-        guard libraryIsOpen, !trackIds.isEmpty else { return }
+        guard libraryModel.libraryIsOpen, !trackIds.isEmpty else { return }
         let library = self.library
         await withVisibleTransientFlag(
             set: {
-                self.analysisBatchTotal = UInt32(trackIds.count)
-                self.analysisBatchCompleted = 0
+                self.libraryModel.analysisBatchTotal = UInt32(trackIds.count)
+                self.libraryModel.analysisBatchCompleted = 0
             },
             reset: {
-                self.analysisBatchTotal = 0
-                self.analysisBatchCompleted = 0
+                self.libraryModel.analysisBatchTotal = 0
+                self.libraryModel.analysisBatchCompleted = 0
             }
         ) {
             await self.analyzeTracksBody(trackIds, library: library)
@@ -1886,11 +1789,11 @@ final class WaveformAppModel: ObservableObject {
                 waitTicks &+= 1
             }
             if analyzingTrackIds.contains(trackId) {
-                analysisBatchCompleted &+= 1
+                libraryModel.analysisBatchCompleted &+= 1
                 continue
             }
             analyzingTrackIds.insert(trackId)
-            analysisInFlightCount &+= 1
+            libraryModel.analysisInFlightCount &+= 1
             let result = await Task.detached(priority: .userInitiated) {
                 () -> Result<LibraryAnalysisOutcome, Error> in
                 do {
@@ -1901,8 +1804,8 @@ final class WaveformAppModel: ObservableObject {
                 }
             }.value
             analyzingTrackIds.remove(trackId)
-            if analysisInFlightCount > 0 { analysisInFlightCount -= 1 }
-            analysisBatchCompleted &+= 1
+            if libraryModel.analysisInFlightCount > 0 { libraryModel.analysisInFlightCount -= 1 }
+            libraryModel.analysisBatchCompleted &+= 1
             switch result {
             case .success(let outcome):
                 publishLibraryRowAnalysisUpdate(
@@ -1921,7 +1824,7 @@ final class WaveformAppModel: ObservableObject {
             surfaceError("Engine not running.")
             return
         }
-        guard let url = browserSelection else {
+        guard let url = librarySelection.browserSelection else {
             surfaceError("Select a file in the browser first.")
             return
         }
@@ -2767,9 +2670,15 @@ final class WaveformAppModel: ObservableObject {
         let postInstallGrid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
         let installedBarPhase = postInstallGrid.barPhase
 
-        if libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
+        if libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
-            Task.detached(priority: .background) { [weak self] in
+            // `[weak self]` lives on the main-actor closure, not on
+            // the outer @Sendable Task body. The detached body only
+            // touches Sendable locals (`library`, `trackId`,
+            // `anchor`, `newBpm`, `installedBarPhase`); reaching
+            // back to the actor-isolated instance happens inside
+            // `MainActor.run` where weak capture is safe.
+            Task.detached(priority: .background) {
                 let persistError: String?
                 do {
                     try library.upsertUserTapBeatgrid(
@@ -2781,14 +2690,14 @@ final class WaveformAppModel: ObservableObject {
                 } catch {
                     persistError = error.localizedDescription
                 }
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     guard let self else { return }
                     if let persistError {
                         self.surfaceError(
                             "Saved grid on deck but library write failed: \(persistError)")
                     } else {
-                        self.analysisGeneration &+= 1
-                        self.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+                        self.libraryModel.analysisGeneration &+= 1
+                        self.libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
                             trackId: trackId,
                             bpm: newBpm,
                             key: nil,
@@ -2889,7 +2798,7 @@ final class WaveformAppModel: ObservableObject {
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
-        let genre = selectedLibraryTrack?.genre
+        let genre = librarySelection.selectedLibraryTrack?.genre
         // PRD-BEATS §4.1, Round 8: 1–2 tap "set the 1" places
         // the downbeat at `tap_secs` bit-exact. The engine does
         // not snap, shift, or refine — the user owns the click
@@ -2963,7 +2872,6 @@ final class WaveformAppModel: ObservableObject {
     ) {
         guard let anchor = grid.beats.first else { return }
         deck.manualGridEditCount += 1
-        deck.tapGridCount = 0
         deck.bpm = grid.bpm
         deck.bpmConfidence = Double(grid.confidence)
         // Paused decks render on-demand (`WaveformView.continuously
@@ -2982,11 +2890,14 @@ final class WaveformAppModel: ObservableObject {
         deck.seekGeneration &+= 1
         setState(deck, for: side)
 
-        guard libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
+        guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
         let library = self.library
         let quality = grid.quality
         let barPhase = grid.barPhase
-        Task.detached(priority: .background) { [weak self] in
+        // `[weak self]` on the main-actor closure, not the outer
+        // detached body — see ensureTrackAnalyzed comment for the
+        // Swift-6 strict-concurrency rationale.
+        Task.detached(priority: .background) {
             let persistError: String?
             do {
                 try library.upsertUserTapBeatgrid(
@@ -3018,13 +2929,13 @@ final class WaveformAppModel: ObservableObject {
             } catch {
                 persistError = error.localizedDescription
             }
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 guard let self else { return }
                 if let persistError {
                     self.surfaceError(
                         "Saved grid on deck but library write failed: \(persistError)")
                 } else {
-                    self.analysisGeneration &+= 1
+                    self.libraryModel.analysisGeneration &+= 1
                     if let q = quality {
                         var d = self.state(for: side)
                         d.gridDriftQuality = q.driftSlopeMsPerMin
@@ -3035,7 +2946,7 @@ final class WaveformAppModel: ObservableObject {
                         // own the lock state.
                         self.setState(d, for: side)
                     }
-                    self.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+                    self.libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
                         trackId: trackId,
                         bpm: grid.bpm,
                         key: nil,
@@ -3062,7 +2973,7 @@ final class WaveformAppModel: ObservableObject {
     /// it too: the library row is shared, so both deck headers must
     /// show the same BPM.
     func scaleLoadedDeckBpm(side: DeckSide, multiplier: Double) {
-        guard isRunning, libraryIsOpen else { return }
+        guard isRunning, libraryModel.libraryIsOpen else { return }
         let deck = state(for: side)
         guard deck.hasTrack, !deck.gridLocked else { return }
         guard let trackId = deck.loadedLibraryTrackId else {
@@ -3142,7 +3053,7 @@ final class WaveformAppModel: ObservableObject {
     /// flashing an error toast for a state the menu already
     /// communicates is hostile).
     func resetLoadedDeckBeatGrid(side: DeckSide) {
-        guard isRunning, libraryIsOpen else { return }
+        guard isRunning, libraryModel.libraryIsOpen else { return }
         let deck = state(for: side)
         guard deck.hasTrack, !deck.gridLocked else { return }
         guard let trackId = deck.loadedLibraryTrackId else {
@@ -3194,12 +3105,12 @@ final class WaveformAppModel: ObservableObject {
             deck.seekGeneration &+= 1
             setState(deck, for: side)
         }
-        libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+        libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
             trackId: trackId,
             bpm: grid.bpm,
             key: nil,
             isAnalyzed: true)
-        analysisGeneration &+= 1
+        libraryModel.analysisGeneration &+= 1
     }
 
     /// Write a finalized calibration record when unloading a track
@@ -3272,9 +3183,12 @@ final class WaveformAppModel: ObservableObject {
         deck.seekGeneration &+= 1
 
         let nudgedBarPhase = grid.barPhase
-        if libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
+        if libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
-            Task.detached(priority: .background) { [weak self] in
+            // `[weak self]` on the main-actor closure, not the outer
+            // detached body — see ensureTrackAnalyzed comment for the
+            // Swift-6 strict-concurrency rationale.
+            Task.detached(priority: .background) {
                 let persistError: String?
                 do {
                     try library.upsertUserTapBeatgrid(
@@ -3286,14 +3200,14 @@ final class WaveformAppModel: ObservableObject {
                 } catch {
                     persistError = error.localizedDescription
                 }
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     guard let self else { return }
                     if let persistError {
                         self.surfaceError(
                             "Nudged grid on deck but library write failed: \(persistError)")
                     } else {
-                        self.analysisGeneration &+= 1
-                        self.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
+                        self.libraryModel.analysisGeneration &+= 1
+                        self.libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
                             trackId: trackId,
                             bpm: newBpm,
                             key: nil,

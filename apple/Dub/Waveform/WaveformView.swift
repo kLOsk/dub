@@ -2,15 +2,18 @@
 //  WaveformView.swift
 //  Dub
 //
-//  M10-B SwiftUI wrapper around an `MTKView` driven by
-//  `WaveformRenderer`. The view holds a single `DubEngine` reference
-//  (passed in by `MainView`) and polls it for new peaks each frame.
+//  M10-B SwiftUI wrapper around a `CAMetalLayer`-backed
+//  `WaveformMetalHostView` driven by a per-deck
+//  `WaveformRenderThread`. The view holds a single `DubEngine`
+//  reference (passed in by `MainView`) and pushes appearance + a
+//  one-shot redraw request whenever SwiftUI re-evaluates the body
+//  with a relevant prop change.
 //
-//  Threading: `MTKView` invokes its delegate on the main thread when
-//  configured with `isPaused = false` and `enableSetNeedsDisplay =
-//  false`, which is what we do here. The renderer is `@MainActor`
-//  isolated; SwiftUI lifecycle methods run on the main actor; no
-//  cross-thread hazards.
+//  Threading (M11d.6 round 5): the renderer now draws on a
+//  dedicated `userInteractive` serial queue driven by a
+//  `CVDisplayLink`. SwiftUI's `updateNSView` runs on the main actor
+//  and pushes appearance via the renderer's thread-safe setters.
+//  No main-thread work can stall the waveform pipeline.
 //
 
 import SwiftUI
@@ -171,11 +174,6 @@ struct WaveformView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                // When the overlay is disabled we pass `nil` so the
-                // renderer skips its snapshot write path entirely
-                // (cheap, but the goal is a clean A/B that proves
-                // nothing about the B-24 surface area can affect
-                // the Metal pipeline's smoothness).
                 WaveformMetalView(
                     engine: engine, deckIdx: deckIdx,
                     palette: palette, orientation: orientation,
@@ -183,8 +181,7 @@ struct WaveformView: View {
                     continuouslyRendering: continuouslyRendering,
                     seekGeneration: seekGeneration,
                     peaksGeneration: peaksGeneration,
-                    timeAxisZoom: timeAxisZoom,
-                    renderSnapshot: beatGridOverlayEnabled ? renderSnapshot : nil)
+                    timeAxisZoom: timeAxisZoom)
                 if let handler = scrubHandler {
                     scrubGestureOverlay(in: geo.size, handler: handler)
                 }
@@ -686,52 +683,69 @@ struct WaveformView: View {
     }
 }
 
-/// Bare `MTKView` host — the SwiftUI/AppKit bridge. Separated from
-/// `WaveformView` so the playhead overlay can live in pure SwiftUI
-/// without forcing the `NSViewRepresentable` to host both layers.
+/// SwiftUI bridge that hosts a `CAMetalLayer`-backed
+/// `WaveformMetalHostView` and a per-deck `WaveformRenderThread`.
+/// Separated from `WaveformView` so the playhead overlay can live
+/// in pure SwiftUI without forcing the `NSViewRepresentable` to
+/// host both layers.
 ///
 /// ## SwiftUI ↔ AppKit bridge contract
 ///
-/// **Snapshot props** (read at `updateNSView` time, push state
-/// into the renderer / `MTKView`):
+/// **Snapshot props** (read at `updateNSView` time, pushed into
+/// the renderer via thread-safe setters):
 ///
 /// * `engine`, `deckIdx`, `side` — Rust-FFI handle and identity.
 ///   Plumbed straight to the `WaveformRenderer` on init; not
 ///   re-read post-make.
-/// * `palette`, `orientation` — visual style. Cheap to re-apply
-///   every update.
-/// * `continuouslyRendering: Bool` — flips the MTKView between
-///   `isPaused = false` (continuous CVDisplayLink driven draw, ~60
-///   Hz) and `isPaused = true` (on-demand). The renderer kicks a
-///   single `setNeedsDisplay` from `updateNSView` whenever a
-///   *Generation prop changes, so a paused deck still repaints on
-///   relevant state changes.
+/// * `palette`, `orientation`, `timeAxisZoom` — visual style.
+///   Pushed via lock-protected `setPalette` / `setOrientation` /
+///   `setTimeAxisZoom`.
+/// * `continuouslyRendering: Bool` — flips the render thread
+///   between `CVDisplayLink`-driven continuous mode and idle.
+///   Generation-prop changes against a paused deck trigger a
+///   `requestOneShot()` instead.
 /// * `seekGeneration: UInt64` — bumped by the model whenever the
 ///   playhead jumps (seek, scratch end, set-the-1, library grid
 ///   patch). Triggers an on-demand repaint.
 /// * `peaksGeneration: UInt64` — bumped when the per-deck peak
 ///   buffer is rebuilt (track load, file replace). Triggers a
 ///   peaks-texture re-upload + repaint.
-/// * `timeAxisZoom: Double` — horizontal zoom factor. Applied
-///   live; renderer interpolates between frames.
-/// * `renderSnapshot: WaveformRenderSnapshot?` — the B-24
-///   beat-grid overlay's shared draw-state pipe. `nil` disables
-///   the snapshot publish-path entirely (saves a few µs per frame
-///   when the overlay is gated off).
 ///
-/// **Closure props**: none. The renderer pulls state from the
-/// engine via FFI on each draw; nothing flows out of the Metal
-/// view back to SwiftUI.
-///
-/// **Lifecycle**: `dismantleNSView` releases the renderer's
-/// Metal resources and stops the display link.
+/// **Lifecycle**: `dismantleNSView` calls
+/// `WaveformRenderThread.shutdown()` which stops the
+/// `CVDisplayLink`, drains the serial render queue, and releases
+/// the renderer's Metal resources.
 ///
 /// **Threading**: `updateNSView` runs on the main actor.
-/// `WaveformRenderer.draw` runs on Metal's render thread, reads
-/// engine state through the Rust FFI's lock-free path
-/// (`DubEngine.position` etc.) — never touches `@Published`
-/// model state, so the audio + render threads stay decoupled
-/// from the SwiftUI commit graph.
+/// `WaveformRenderer.drawIfPossible(...)` runs on a dedicated
+/// `userInteractive` serial queue driven by `CVDisplayLink` — no
+/// main-actor work can stall the waveform pipeline.
+///
+/// **Edge cases** (covered by the host view + render thread):
+///
+/// * **Display migration.** `WaveformMetalHostView` observes
+///   `NSWindow.didChangeScreenNotification` and fires
+///   `onDisplayChange`. The render thread retargets its
+///   `CVDisplayLink` via `setCurrentDisplay(_:)` so mixed-rate
+///   setups (e.g. 120 Hz internal + 60 Hz external) clock the
+///   waveform at the new display's refresh.
+/// * **Hidden / minimised window.** `CAMetalLayer.nextDrawable()`
+///   returns `nil`; the renderer drops the frame silently. No
+///   allocation, no crash.
+/// * **Live resize.** `WaveformMetalHostView.layout()` keeps
+///   `drawableSize` in sync with `bounds × backingScaleFactor`.
+///   The renderer rebuilds its MSAA texture from
+///   `currentDrawable.texture` whenever the dimensions change.
+/// * **Track unload during scratch.**
+///   `positionSnapshot(deckIdx:)` reports `has_track = false` as
+///   soon as the audio thread clears the source; the renderer's
+///   ring-buffer ingest path early-returns and no artifacts
+///   leak through.
+/// * **Deck swap between prep and timecode modes.**
+///   `dismantleNSView` calls `WaveformRenderThread.shutdown()`
+///   which stops the link, marks shutdown, and drains the queue.
+///   `WaveformRenderThread.deinit` is defensive but never blocks
+///   the deallocating thread.
 private struct WaveformMetalView: NSViewRepresentable {
 
     let engine: DubEngine
@@ -739,95 +753,96 @@ private struct WaveformMetalView: NSViewRepresentable {
     let palette: WaveformPalette
     let orientation: WaveformOrientation
     let side: DeckSide
-    /// When `false`, the MTKView stops its continuous draw loop
-    /// and only repaints on demand (see `updateNSView`).
+    /// When `false`, the render thread stops its `CVDisplayLink`
+    /// and only redraws on `requestOneShot()` calls.
     let continuouslyRendering: Bool
-    /// See `WaveformView.seekGeneration`.
     let seekGeneration: UInt64
-    /// See `WaveformView.peaksGeneration`.
     let peaksGeneration: UInt64
-    /// See `WaveformView.timeAxisZoom`.
     let timeAxisZoom: Double
-    /// Shared snapshot the renderer publishes draw state into for
-    /// the B-24 beat-grid overlay. See the `@StateObject` on
-    /// `WaveformView` for the lifecycle reasoning. `nil` when the
-    /// B-24 overlay is gated off via `beatGridOverlayEnabled` so
-    /// the renderer's snapshot write path is fully bypassed.
-    let renderSnapshot: WaveformRenderSnapshot?
 
     @MainActor
-    final class Coordinator: NSObject, MTKViewDelegate {
+    final class Coordinator: NSObject {
         var renderer: WaveformRenderer?
-        private weak var mtkView: MTKView?
-        private var cvDisplayLink: CVDisplayLink?
-        private var continuousRendering = false
+        var renderThread: WaveformRenderThread?
+        weak var hostView: WaveformMetalHostView?
 
-        func setContinuousRendering(_ active: Bool, on view: MTKView) {
-            guard active != continuousRendering else { return }
-            continuousRendering = active
-            mtkView = view
-            stopDisplayLink()
-            view.isPaused = true
-            view.enableSetNeedsDisplay = true
-            if active {
-                startDisplayLink()
-            } else {
-                view.setNeedsDisplay(view.bounds)
+        // Last-stamped prop snapshot for the idempotent
+        // `updateNSView` path. SwiftUI fires `updateNSView` on
+        // every body re-eval, which happens on every unrelated
+        // `@Published` write across the model. Compare-then-stamp
+        // turns the no-op cascade into actually-zero work.
+        private var lastPalette: WaveformPalette?
+        private var lastOrientation: WaveformOrientation?
+        private var lastSide: DeckSide?
+        private var lastTimeAxisZoom: Double?
+        private var lastSeekGeneration: UInt64?
+        private var lastPeaksGeneration: UInt64?
+        private var lastContinuous: Bool?
+
+        /// Push the new SwiftUI prop values into the renderer
+        /// through its thread-safe setters and report whether a
+        /// one-shot redraw is warranted (generation tick or a
+        /// visible prop change while paused). The render thread
+        /// snapshots `RendererAppearance` at the top of each
+        /// draw, so each setter only acquires a brief unfair lock
+        /// — they are cheap to call every body re-eval.
+        func stampRenderer(
+            palette: WaveformPalette,
+            orientation: WaveformOrientation,
+            side: DeckSide,
+            timeAxisZoom: Double,
+            seekGeneration: UInt64,
+            peaksGeneration: UInt64
+        ) -> Bool {
+            guard let renderer else {
+                lastPalette = palette
+                lastOrientation = orientation
+                lastSide = side
+                lastTimeAxisZoom = timeAxisZoom
+                lastSeekGeneration = seekGeneration
+                lastPeaksGeneration = peaksGeneration
+                return false
             }
-        }
 
-        private func requestDraw() {
-            guard let view = mtkView else { return }
-            view.setNeedsDisplay(view.bounds)
-        }
-
-        private func startDisplayLink() {
-            var link: CVDisplayLink?
-            guard CVDisplayLinkCreateWithActiveCGDisplays(&link) == kCVReturnSuccess,
-                  let link
-            else { return }
-            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-            CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, userInfo in
-                guard let userInfo else { return kCVReturnSuccess }
-                let coordinator = Unmanaged<Coordinator>.fromOpaque(userInfo)
-                    .takeUnretainedValue()
-                // Post directly onto the main run loop — avoids the
-                // `DispatchQueue.main.async` hop that jittered off vsync.
-                CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
-                    coordinator.requestDraw()
-                }
-                CFRunLoopWakeUp(CFRunLoopGetMain())
-                return kCVReturnSuccess
-            }, selfPtr)
-            CVDisplayLinkStart(link)
-            cvDisplayLink = link
-        }
-
-        private func stopDisplayLink() {
-            if let cvDisplayLink {
-                CVDisplayLinkStop(cvDisplayLink)
-                self.cvDisplayLink = nil
+            var rendererChanged = false
+            if lastPalette != palette {
+                renderer.setPalette(palette)
+                lastPalette = palette
+                rendererChanged = true
             }
+            if lastOrientation != orientation {
+                renderer.setOrientation(orientation)
+                lastOrientation = orientation
+                rendererChanged = true
+            }
+            if lastSide != side {
+                renderer.setSide(side)
+                lastSide = side
+                rendererChanged = true
+            }
+            if lastTimeAxisZoom != timeAxisZoom {
+                renderer.setTimeAxisZoom(timeAxisZoom)
+                lastTimeAxisZoom = timeAxisZoom
+                rendererChanged = true
+            }
+
+            var generationChanged = false
+            if lastSeekGeneration != seekGeneration {
+                lastSeekGeneration = seekGeneration
+                generationChanged = true
+            }
+            if lastPeaksGeneration != peaksGeneration {
+                lastPeaksGeneration = peaksGeneration
+                generationChanged = true
+            }
+
+            return rendererChanged || generationChanged
         }
 
-        deinit {
-            if let cvDisplayLink {
-                CVDisplayLinkStop(cvDisplayLink)
-            }
-        }
-
-        // MARK: MTKViewDelegate
-
-        nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-            MainActor.assumeIsolated {
-                renderer?.drawableSizeWillChange(size)
-            }
-        }
-
-        nonisolated func draw(in view: MTKView) {
-            MainActor.assumeIsolated {
-                renderer?.draw(in: view)
-            }
+        func applyContinuous(_ active: Bool) {
+            guard lastContinuous != active else { return }
+            lastContinuous = active
+            renderThread?.setContinuous(active)
         }
     }
 
@@ -835,79 +850,90 @@ private struct WaveformMetalView: NSViewRepresentable {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> MTKView {
-        let mtkView = MTKView()
-        mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.clearColor = MTLClearColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
-        mtkView.framebufferOnly = true
-        mtkView.isPaused = true
-        mtkView.enableSetNeedsDisplay = true
-        mtkView.preferredFramesPerSecond = 60
-        // 4× MSAA on the drawable. The waveform geometry is a stack
-        // of trapezoid slices with sub-pixel edge slopes at high
-        // zoom; without MSAA they stair-step into a visible
-        // "venetian blind" pattern. MTKView allocates the
-        // multisample texture itself when `sampleCount > 1` and the
-        // render pass descriptor it hands us already has the
-        // multisample → drawable resolve wired up.
-        mtkView.sampleCount = WaveformRenderer.sampleCount
+    func makeNSView(context: Context) -> WaveformMetalHostView {
+        let hostView = WaveformMetalHostView(frame: .zero)
+        context.coordinator.hostView = hostView
 
-        if let device = MTLCreateSystemDefaultDevice() {
-            mtkView.device = device
-            do {
-                let renderer = try WaveformRenderer(
-                    device: device, engine: engine, deckIdx: deckIdx)
-                renderer.palette = palette
-                renderer.orientation = orientation
-                renderer.side = side
-                renderer.beatGridEnabled = true
-                renderer.renderSnapshot = renderSnapshot
-                context.coordinator.renderer = renderer
-                mtkView.delegate = context.coordinator
-            } catch {
-                NSLog("WaveformView: renderer init failed: \(error.localizedDescription)")
-            }
-        } else {
+        guard let device = MTLCreateSystemDefaultDevice() else {
             NSLog("WaveformView: MTLCreateSystemDefaultDevice() returned nil")
+            return hostView
         }
-        DispatchQueue.main.async {
-            mtkView.setNeedsDisplay(mtkView.bounds)
+        hostView.metalLayer.device = device
+        // Drawable size is owned by the host view's `layout`
+        // hook; here we just make sure the layer has a sensible
+        // value before the first vsync (otherwise the first
+        // frame draws into a 1×1 drawable until layout fires).
+        let initialSize = hostView.currentDrawableSize
+        hostView.metalLayer.drawableSize = initialSize
+
+        let renderer: WaveformRenderer
+        do {
+            renderer = try WaveformRenderer(
+                device: device, engine: engine, deckIdx: deckIdx)
+        } catch {
+            NSLog("WaveformView: renderer init failed: \(error.localizedDescription)")
+            return hostView
         }
-        return mtkView
+        renderer.setPalette(palette)
+        renderer.setOrientation(orientation)
+        renderer.setSide(side)
+        renderer.setTimeAxisZoom(timeAxisZoom)
+        renderer.setBeatGridEnabled(true)
+        context.coordinator.renderer = renderer
+
+        let label = "dub.waveform.render.\(deckIdx)"
+        let renderThread = WaveformRenderThread(
+            metalLayer: hostView.metalLayer,
+            renderer: renderer,
+            label: label)
+        context.coordinator.renderThread = renderThread
+
+        // Wire host-view display migration straight into the
+        // render thread's CVDisplayLink. Fires on
+        // `viewDidMoveToWindow` and on
+        // `NSWindow.didChangeScreenNotification`.
+        hostView.onDisplayChange = { [weak renderThread] displayID in
+            renderThread?.setCurrentDisplay(displayID)
+        }
+
+        // Kick a single draw so the layer has content before the
+        // first vsync; if `continuouslyRendering` is true the
+        // immediate `setContinuous` call in `updateNSView`
+        // will keep the link running.
+        renderThread.requestOneShot()
+        return hostView
     }
 
-    func updateNSView(_ nsView: MTKView, context: Context) {
-        // Push the current palette + orientation into the renderer.
-        // Cheap — just property assignments; the next draw frame
-        // picks both up via the uniforms buffer. M10.5c-b
-        // orientation changes also implicitly remap which drawable
-        // dimension drives `chunksVisible` (see the orientation
-        // switch in `WaveformRenderer.draw`).
-        //
-        // `renderSnapshot` is also (re)assigned here — it's a
-        // reference type so the assignment is cheap; importantly,
-        // if SwiftUI ever rebuilds the parent view with a new
-        // `@StateObject` instance (unusual, but legal), the
-        // renderer picks up the new snapshot without needing a
-        // full `makeNSView` cycle.
-        context.coordinator.renderer?.palette = palette
-        context.coordinator.renderer?.orientation = orientation
-        context.coordinator.renderer?.side = side
-        context.coordinator.renderer?.timeAxisZoom = timeAxisZoom
-        context.coordinator.renderer?.renderSnapshot = renderSnapshot
+    func updateNSView(_ nsView: WaveformMetalHostView, context: Context) {
+        let rendererDirty = context.coordinator.stampRenderer(
+            palette: palette,
+            orientation: orientation,
+            side: side,
+            timeAxisZoom: timeAxisZoom,
+            seekGeneration: seekGeneration,
+            peaksGeneration: peaksGeneration)
 
-        // Demand-driven vsync via run-loop-integrated `CVDisplayLink`
-        // while playing/scratching (no `DispatchQueue.main.async` hop).
-        context.coordinator.setContinuousRendering(continuouslyRendering, on: nsView)
+        context.coordinator.applyContinuous(continuouslyRendering)
 
-        // Paused decks stop the display link; force a one-shot redraw
-        // whenever SwiftUI pushes new generation ticks (seek,
-        // offline peaks landing) so click-to-jump updates the visible
-        // playhead without requiring Play.
-        _ = seekGeneration
-        _ = peaksGeneration
-        if !continuouslyRendering {
-            nsView.setNeedsDisplay(nsView.bounds)
+        // Paused deck + generation / appearance bump ⇒ schedule a
+        // single repaint. The render thread queues it on its
+        // serial queue, so it lands after any in-flight draw
+        // without blocking the main thread.
+        if !continuouslyRendering && rendererDirty {
+            context.coordinator.renderThread?.requestOneShot()
         }
+    }
+
+    /// AppKit calls this when the SwiftUI subtree containing the
+    /// `WaveformMetalView` is removed (deck mode swap, window
+    /// close, model rebuild). Tearing down the render thread
+    /// here guarantees no `CVDisplayLink` keeps the renderer
+    /// alive past the SwiftUI lifetime.
+    static func dismantleNSView(_ nsView: WaveformMetalHostView, coordinator: Coordinator) {
+        coordinator.renderThread?.shutdown()
+        coordinator.renderThread = nil
+        coordinator.renderer = nil
+        coordinator.hostView = nil
+        nsView.onDisplayChange = nil
     }
 }

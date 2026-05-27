@@ -13,24 +13,31 @@
 //      and `bandChunks` (8 × f32 RMS per FFT hop) — written each
 //      frame from `DubEngine.peaksExtend` / `bandPeaksExtend`
 //
-//  Renders directly to the MTKView drawable in a single render pass.
-//  No HDR, no bloom, no tonemap, no onset confidence, no filtered-
-//  peaks gate: that was the M10.5h–p stack which made kicks read
-//  worse than Serato. The Rust DSP machinery for those features
-//  (onset detection in `dub-peaks`, LF/MF/HF filter in
-//  `dub-peaks::filtered`) is still alive for a future polish phase —
-//  this renderer simply doesn't bind it.
+//  Renders directly into a `CAMetalLayer`'s next drawable from a
+//  per-deck dedicated render thread (`WaveformRenderThread`). The
+//  renderer is `@unchecked Sendable`; all SwiftUI-pushed state
+//  (palette, orientation, side, time-axis zoom, beat-grid enable)
+//  lives behind an `OSAllocatedUnfairLock`-protected
+//  `RendererAppearance` snapshot that the draw entry point reads
+//  once per frame. The beat-grid array is similarly lock-protected
+//  so a background fetch can publish a new grid without the
+//  render thread ever taking the main actor.
 //
-//  Threading: all renderer work runs on the main thread. `MTKView`
-//  invokes `draw(in:)` on the main thread when `isPaused == false`
-//  and `enableSetNeedsDisplay == false` (our configuration in
-//  `WaveformView`).
+//  M11d.6 round 5 — pre-round-5 the renderer was `@MainActor`
+//  isolated and drew on the main thread via `MTKView`'s delegate
+//  callback. That made every SwiftUI body re-eval and every
+//  library FFI call on main a potential vsync drop. The new
+//  architecture moves the draw onto a dedicated `userInteractive`
+//  serial queue driven by `CVDisplayLink`, so the waveform stays
+//  smooth regardless of what the main thread is doing.
 //
 
 import AppKit
 import Foundation
 import Metal
 import MetalKit
+import os
+import QuartzCore
 import simd
 
 import DubCore
@@ -276,8 +283,46 @@ private struct BeatGridVertexLayout {
     var color: SIMD4<Float>
 }
 
-@MainActor
-final class WaveformRenderer: NSObject {
+/// Lock-protected snapshot of every SwiftUI-pushed renderer
+/// property (M11d.6 round 5). The main thread updates this via
+/// the per-field setters at `updateNSView` time; the render
+/// thread snapshots the whole struct once per draw with a single
+/// lock acquisition.
+struct RendererAppearance {
+    var palette: WaveformPalette = .serato
+    var orientation: WaveformOrientation = .vertical
+    var side: DeckSide = .a
+    var timeAxisZoom: Double = 1.0
+    var beatGridEnabled: Bool = true
+}
+
+/// Lock-protected beat-grid cache (M11d.6 round 5). The
+/// background `Task.detached` triggered by
+/// `refreshBeatGridIfNeeded` publishes its result here; the
+/// render thread reads it at the top of each draw. Removes the
+/// pre-round-5 `MainActor.run` commit hop, which contended with
+/// the main thread on every track-load / tap-to-grid commit.
+struct BeatGridSnapshot {
+    var beats: [Double] = []
+    var bpm: Double = 0
+    var beatsPerBar: Int = 4
+    /// PRD-BEATS C2 (round 4) — see
+    /// `WaveformRenderSnapshot.barPhase`.
+    var barPhase: Int = 0
+    var confidence: Float = 0
+    /// `peaksGeneration` value at the time `beats` was refreshed.
+    var peaksGeneration: UInt64 = 0
+    /// `beatGridGeneration` value at the time `beats` was
+    /// refreshed.
+    var beatGridGeneration: UInt64 = 0
+    /// `true` while a `Task.detached` fetch is in flight. The
+    /// render thread gates `refreshBeatGridIfNeeded` on this
+    /// flag, and the background task clears it on completion —
+    /// keeping the state machine entirely inside the lock.
+    var fetchInFlight: Bool = false
+}
+
+final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     // MARK: Configuration
 
@@ -481,55 +526,24 @@ final class WaveformRenderer: NSObject {
     /// authoritative source for `elapsed_secs → playhead_chunk`.
     private var peakChunkDurationSecs: Double = 0.0
 
-    /// Active palette. Single-valued in the post-strip-down baseline
-    /// but kept as a property so a future polish phase can add
-    /// branches without re-plumbing the view.
-    var palette: WaveformPalette = .serato
+    /// Lock-protected snapshot of every property SwiftUI pushes
+    /// in (palette, orientation, side, timeAxisZoom,
+    /// beatGridEnabled). Read once per draw on the render thread
+    /// via a single `withLock { $0 }` copy; written from the
+    /// main thread via the per-field setters below.
+    private let appearance = OSAllocatedUnfairLock(
+        initialState: RendererAppearance())
 
-    /// Orientation. `.vertical` is Performance mode (PRD §9.1);
-    /// `.horizontal` is Prep mode (M10.8).
-    var orientation: WaveformOrientation = .vertical
+    /// Lock-protected beat-grid cache. Background fetch
+    /// publishes here; the draw entry reads at the top of each
+    /// frame.
+    private let beatGridState = OSAllocatedUnfairLock(
+        initialState: BeatGridSnapshot())
 
-    /// Shared draw snapshot for legacy SwiftUI overlay consumers.
-    /// The Metal beat grid does not depend on this object.
-    var renderSnapshot: WaveformRenderSnapshot?
-
-    /// Which deck column this renderer belongs to. Drives beat-grid tint.
-    var side: DeckSide = .a
-
-    /// Time-axis zoom multiplier. `1.0` = performance default;
-    /// `prepModeTimeAxisZoom` (1.2) shows 20 % more audio in prep.
-    var timeAxisZoom: Double = 1.0
-
-    /// When `true`, beat ticks render in the Metal pass after waveform
-    /// geometry each frame.
-    var beatGridEnabled: Bool = true
-
-    /// Cached beat grid from the engine. Refreshed on peaks-generation
-    /// bumps and until `confidence > 0` latches.
-    private var cachedBeats: [Double] = []
-    private var cachedBpm: Double = 0
-    private var cachedBeatsPerBar: Int = 4
-    /// PRD-BEATS C2 (round 4) — see `WaveformRenderSnapshot.barPhase`.
-    private var cachedBarPhase: Int = 0
-    private var cachedBeatsConfidence: Float = 0
-    private var cachedBeatsGeneration: UInt64 = 0
-    private var cachedBeatGridGeneration: UInt64 = 0
-
-    /// Countdown between `engine.beatGrid` FFI calls while analysis
-    /// is still pending. Avoids cloning the beat `Vec` at 60 Hz.
+    /// Countdown between `engine.beatGrid` FFI calls while
+    /// analysis is still pending. Render-thread-only; no locking
+    /// needed.
     private var beatGridFetchCooldown: Int = 0
-
-    private var debugLastFrameLogUptime: TimeInterval = 0
-    private var debugLastVisibleBeatLogUptime: TimeInterval = 0
-    private var debugLastGridSummaryLogUptime: TimeInterval = 0
-    private var debugLastGridStabilityLogUptime: TimeInterval = 0
-    private var debugStableBeatIdx: Int?
-    private var debugStableBeatPixel: Double = 0
-    private var debugStableBeatPlayheadSecs: Double = 0
-    private var debugBeatPixelMaxError: Double = 0
-    private var debugBeatPixelLastError: Double = 0
-    private var debugBeatPixelErrorSamples: Int = 0
 
     /// Frames since the last peak-source swap. Beat-grid Metal
     /// work is skipped briefly so the first post-load scrubs aren't
@@ -540,10 +554,6 @@ final class WaveformRenderer: NSObject {
     /// crossed a chunk boundary since the last frame.
     private var lastBroadbandIngestPhChunk: UInt64 = UInt64.max
     private var lastBandIngestPhChunk: UInt64 = UInt64.max
-
-    /// Set when a draw is skipped because the GPU queue is full;
-    /// the completion handler schedules one catch-up repaint.
-    private var pendingRedraw = false
 
     // MARK: Init
 
@@ -667,6 +677,31 @@ final class WaveformRenderer: NSObject {
         super.init()
     }
 
+    // MARK: - Thread-safe appearance setters
+
+    /// All five setters take the appearance lock briefly. Called
+    /// from the main thread by `WaveformMetalView.updateNSView`'s
+    /// idempotent stamp helper, at most a few times per second.
+    func setPalette(_ value: WaveformPalette) {
+        appearance.withLock { $0.palette = value }
+    }
+
+    func setOrientation(_ value: WaveformOrientation) {
+        appearance.withLock { $0.orientation = value }
+    }
+
+    func setSide(_ value: DeckSide) {
+        appearance.withLock { $0.side = value }
+    }
+
+    func setTimeAxisZoom(_ value: Double) {
+        appearance.withLock { $0.timeAxisZoom = value }
+    }
+
+    func setBeatGridEnabled(_ value: Bool) {
+        appearance.withLock { $0.beatGridEnabled = value }
+    }
+
     /// Drop cached beat-grid state on source swap. GPU ring slots
     /// are overwritten on the next playhead-centred ingest — no
     /// full-buffer zero (that was ~16 MB on the main thread and
@@ -678,57 +713,92 @@ final class WaveformRenderer: NSObject {
         samplesPerPeakChunk = 64
         samplesPerBandChunk = 512
         peakChunkDurationSecs = 0.0
-        cachedBeats = []
-        cachedBpm = 0
-        cachedBeatsPerBar = 4
-        cachedBarPhase = 0
-        cachedBeatsConfidence = 0
-        cachedBeatsGeneration = 0
-        cachedBeatGridGeneration = 0
         beatGridFetchCooldown = 0
-        debugLastFrameLogUptime = 0
-        debugLastVisibleBeatLogUptime = 0
-        debugLastGridSummaryLogUptime = 0
-        debugLastGridStabilityLogUptime = 0
-        debugStableBeatIdx = nil
-        debugStableBeatPixel = 0
-        debugStableBeatPlayheadSecs = 0
-        debugBeatPixelMaxError = 0
-        debugBeatPixelLastError = 0
-        debugBeatPixelErrorSamples = 0
+        beatGridState.withLock { state in
+            // Don't touch `fetchInFlight`: a Task that's already
+            // in flight will commit on its own; clearing the flag
+            // here would let `refreshBeatGridIfNeeded` race a
+            // second fetch into the same cache fields.
+            state.beats = []
+            state.bpm = 0
+            state.beatsPerBar = 4
+            state.barPhase = 0
+            state.confidence = 0
+            state.peaksGeneration = 0
+            state.beatGridGeneration = 0
+        }
         framesSinceSourceSwap = 0
         lastBroadbandIngestPhChunk = UInt64.max
         lastBandIngestPhChunk = UInt64.max
-        pendingRedraw = false
     }
 
-    // MARK: MTKViewDelegate-style entry points
+    // MARK: - Off-main entry point (M11d.6 round 5)
 
-    func drawableSizeWillChange(_ size: CGSize) {
-        _ = size
-    }
+    /// Cached multisample resolve texture. `MTKView` allocated one
+    /// for us automatically; with `CAMetalLayer` we own this. The
+    /// texture is recreated whenever the drawable size or sample
+    /// count changes (in practice only on display migration or
+    /// live resize).
+    private var msaaTexture: MTLTexture?
+    private var msaaTextureSize: CGSize = .zero
 
-    /// Per-frame work. Polls the engine for new chunks, uploads
-    /// them into the rings, and records a single render pass to
-    /// the MTKView drawable.
-    func draw(in view: MTKView) {
-        // Yield to queued clicks before touching the GPU semaphore.
-        if Self.hasPendingPointerInput() {
+    /// One render pass. Pulls peaks from the engine, advances the
+    /// rings, and draws into the layer's next drawable. Called by
+    /// `WaveformRenderThread.drawIfNeeded()` from a dedicated
+    /// `userInteractive` queue — *not* the main thread.
+    ///
+    /// `nextDrawable()` can return `nil` (window hidden,
+    /// minimised, or off-screen). In that case the frame is
+    /// silently dropped; the next vsync tries again.
+    func drawIfPossible(into metalLayer: CAMetalLayer, drawableSize: CGSize) {
+        // Never block the render queue waiting for the GPU. When
+        // the GPU is busy, drop the frame; the next vsync covers
+        // for it. We don't need the elaborate
+        // `pendingRedraw` + completion-handler dance the old
+        // main-thread path used because the display link drives
+        // continuous redraws on its own schedule.
+        guard inflightSemaphore.wait(timeout: .now()) != .timedOut else {
             return
         }
-
-        // Never block the main thread waiting for a prior frame to
-        // retire. When the GPU is busy, mark one catch-up draw and
-        // return — the completion handler repaints so we don't drop
-        // every other vsync (visible stutter).
-        if inflightSemaphore.wait(timeout: .now()) == .timedOut {
-            pendingRedraw = true
-            return
-        }
-        pendingRedraw = false
         let releaseSemaphore: () -> Void = { [weak self] in
             self?.inflightSemaphore.signal()
         }
+        // `pendingRelease` is the one-way "we still own the
+        // semaphore" flag. `drawImpl` flips it to `false` once it
+        // hands ownership to the command buffer's completion
+        // handler. Any early return below this point releases the
+        // semaphore via the `defer`; the completion handler
+        // releases on the success path.
+        var pendingRelease = true
+        defer {
+            if pendingRelease {
+                releaseSemaphore()
+            }
+        }
+
+        let appearanceSnapshot = appearance.withLock { $0 }
+        let beatsSnapshot = beatGridState.withLock { $0 }
+        drawImpl(
+            metalLayer: metalLayer,
+            drawableSize: drawableSize,
+            appearance: appearanceSnapshot,
+            beats: beatsSnapshot,
+            releaseSemaphore: releaseSemaphore,
+            pendingRelease: &pendingRelease)
+    }
+
+    /// The actual draw body. Pulled out so `drawIfPossible` owns
+    /// the semaphore + lock-acquisition discipline cleanly and
+    /// this function can use `appearance` / `beats` as plain
+    /// locals throughout.
+    private func drawImpl(
+        metalLayer: CAMetalLayer,
+        drawableSize: CGSize,
+        appearance: RendererAppearance,
+        beats: BeatGridSnapshot,
+        releaseSemaphore: @escaping () -> Void,
+        pendingRelease: inout Bool
+    ) {
 
         // 0. Detect a PeakSource swap on this deck. When the engine
         //    swaps Thru → File (drag-and-drop load) or File → File
@@ -750,8 +820,9 @@ final class WaveformRenderer: NSObject {
 
         // Read playhead once up front — drives playhead-centred
         // peak ingest so a post-load / post-seek scrub doesn't wait
-        // for a whole-track GPU upload.
-        let pos = engine.position(deckIdx: deckIdx)
+        // for a whole-track GPU upload. Lock-free FFI: never
+        // contends with main-thread engine work.
+        let pos = engine.positionSnapshot(deckIdx: deckIdx)
         ingestNewChunks(playheadSecs: pos.playheadSecsUnclamped)
         ingestNewBandChunks(playheadSecs: pos.playheadSecsUnclamped)
 
@@ -763,9 +834,8 @@ final class WaveformRenderer: NSObject {
         // (top in vertical, left in horizontal) with a past region
         // covering 25 % of the axis and a future region the
         // remaining 75 %.
-        let drawableSize = view.drawableSize
         let timeAxisPixels: Int
-        switch orientation {
+        switch appearance.orientation {
         case .vertical:
             timeAxisPixels = max(1, Int(drawableSize.height))
         case .horizontal:
@@ -781,7 +851,7 @@ final class WaveformRenderer: NSObject {
         // the base `pixelsPerDrawnColumn` (= 2); prep mode divides
         // by `timeAxisZoom` (1.2) so ~20 % more audio is visible.
         let pixelsPerDrawnColumn =
-            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: timeAxisZoom)
+            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: appearance.timeAxisZoom)
         let drawnAbovePixels = max(
             0, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
         let drawnBelowPixels = max(
@@ -852,43 +922,22 @@ final class WaveformRenderer: NSObject {
             playheadChunkSigned = peaksLenGlobal == 0 ? 0 : Int64(peaksLenGlobal &- 1)
         }
 
-        // Publish this draw's playhead + cadence into the shared
-        // snapshot so the SwiftUI beat-grid overlay can render in
-        // lockstep with the Metal output.
-        //
-        // **Critical:** publish the **continuous, sample-accurate**
-        // `pos.playheadSecsUnclamped`, not the chunk-pair-snapped
-        // `playheadChunkSigned * peakChunkDurationSecs`. The Metal
-        // waveform's *visible* playhead is
-        // `snapped + epsChunks_subpixel_offset` (see
-        // `subChunkOffsetNDC` below) — the snapped chunk picks the
-        // data column and the eps shift slides the geometry
-        // continuously within the chunk-pair quantum. The overlay
-        // must match that combined position, not just the snap,
-        // otherwise the grid drifts versus the waveform by up to
-        // one logical pixel within each chunk-pair quantum and
-        // jumps forward in 1-px steps at the snap boundaries —
-        // exactly the "grid going left/right minimally" wobble
-        // the user reports during smooth waveform scroll. With
-        // the continuous value published, the overlay's
-        // `(beat - playhead) / secsPerLogicalPx` math lands on the
-        // same logical pixel as the renderer's `epsChunks` slide,
-        // and the two layers move byte-identically. The previous
-        // draft snapped the publication and then re-snapped on
-        // read, which double-locked the grid to the chunk-pair
-        // grid while the geometry was free to slide. See
-        // `WaveformRenderSnapshot` doc for the full sync story.
-        if let snapshot = renderSnapshot {
-            snapshot.lastDrawnPlayheadSecsUnclamped = pos.playheadSecsUnclamped
-            snapshot.peakDurSecs = peakChunkDurationSecs
-            snapshot.hasTrack = pos.hasTrack
-        }
-        if beatGridEnabled || renderSnapshot != nil {
+        // M11d.6 round 5: the renderer no longer publishes into
+        // `WaveformRenderSnapshot` from inside `draw`. The SwiftUI
+        // overlay that consumed those values has been gated off
+        // since round 4 (`beatGridOverlayEnabled = false` in
+        // `WaveformView`), and the off-main render thread cannot
+        // safely write to a `@MainActor`-isolated `ObservableObject`
+        // without a `DispatchQueue.main.async` hop that re-couples
+        // us to the main thread. If the overlay is ever
+        // re-enabled, the writer will be a throttled main-thread
+        // hop driven by a per-renderer atomic generation, not the
+        // hot draw path.
+        if appearance.beatGridEnabled {
             refreshBeatGridIfNeeded(
                 peaksGeneration: currentGeneration,
                 beatGridGeneration: beatGridGeneration,
-                hasTrack: pos.hasTrack,
-                mirrorIntoSnapshot: renderSnapshot)
+                hasTrack: pos.hasTrack)
         }
 
         // Legacy unsigned variant for code paths that only ever
@@ -968,11 +1017,26 @@ final class WaveformRenderer: NSObject {
         let rawAbove = drawnAbove * agg
         let hasContent = peaksLenGlobal > 0 && (drawnAbove + drawnBelow) > 0
 
-        guard let drawable = view.currentDrawable,
-              let passDescriptor = view.currentRenderPassDescriptor
-        else {
-            releaseSemaphore()
+        // Acquire next drawable + manually build the render-pass
+        // descriptor. `CAMetalLayer` (unlike `MTKView`) doesn't
+        // pre-build either, so we own the MSAA texture and the
+        // attachment configuration here.
+        guard let drawable = metalLayer.nextDrawable() else {
+            // Hidden / minimised window. Drop this frame.
             return
+        }
+        let msaaTex = ensureMSAATexture(matching: drawable.texture)
+        let passDescriptor = MTLRenderPassDescriptor()
+        passDescriptor.colorAttachments[0].clearColor =
+            MTLClearColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
+        passDescriptor.colorAttachments[0].loadAction = .clear
+        if let msaaTex {
+            passDescriptor.colorAttachments[0].texture = msaaTex
+            passDescriptor.colorAttachments[0].resolveTexture = drawable.texture
+            passDescriptor.colorAttachments[0].storeAction = .multisampleResolve
+        } else {
+            passDescriptor.colorAttachments[0].texture = drawable.texture
+            passDescriptor.colorAttachments[0].storeAction = .store
         }
 
         // Per-region chunk + band offsets. The shader's vertex
@@ -1096,40 +1160,6 @@ final class WaveformRenderer: NSObject {
         let pastSubChunkOffsetNDC = Float(epsChunks * 0.5 / pastChunksDenom)
         let futureSubChunkOffsetNDC = Float(epsChunks * 1.5 / futureChunksDenom)
 
-        let debugNow = ProcessInfo.processInfo.systemUptime
-        if debugNow - debugLastFrameLogUptime >= 1.0 {
-            debugLastFrameLogUptime = debugNow
-            // #region agent log
-            agentDebugLog(
-                hypothesisId: "H2,H3,H4",
-                location: "WaveformRenderer.swift:draw(in:)",
-                message: "beatgrid frame geometry",
-                data: [
-                    "deckIdx": Int(deckIdx),
-                    "orientation": orientation == .vertical ? "vertical" : "horizontal",
-                    "hasTrack": pos.hasTrack,
-                    "isPlaying": pos.isPlaying,
-                    "playheadSecsUnclamped": pos.playheadSecsUnclamped,
-                    "elapsedSecs": pos.elapsedSecs,
-                    "durationSecs": pos.durationSecs,
-                    "engineSampleRate": Int(engine.sampleRate()),
-                    "peakDurSecs": peakChunkDurationSecs,
-                    "peaksLen": Int(peaksLenGlobal),
-                    "samplesPerPeakChunk": Int(samplesPerPeakChunk),
-                    "timeAxisPixels": timeAxisPixels,
-                    "pixelsPerDrawnColumn": pixelsPerDrawnColumn,
-                    "drawnAbove": drawnAbove,
-                    "drawnBelow": drawnBelow,
-                    "continuousChunkF": continuousChunkF,
-                    "snappedChunkF": Double(playheadChunkSigned),
-                    "epsChunks": epsChunks,
-                    "pastSubChunkOffsetNDC": Double(pastSubChunkOffsetNDC),
-                    "futureSubChunkOffsetNDC": Double(futureSubChunkOffsetNDC),
-                    "zeroPadFits": zeroPadFits
-                ])
-            // #endregion
-        }
-
         // 3. Fill both region slots in the per-frame uniform buffer.
         //
         // Past draw sets `chunksAbovePlayhead = chunksAbove` (> 0).
@@ -1144,7 +1174,7 @@ final class WaveformRenderer: NSObject {
             bandChunkOffset: UInt32(pastFirstBandRingOffset),
             samplesPerBandChunk: samplesPerBandChunk,
             bandCapacity: UInt32(WaveformRenderer.bandChunkCapacity),
-            orientation: orientation.rawValue,
+            orientation: appearance.orientation.rawValue,
             chunksPerColumn: WaveformRenderer.chunksPerColumn,
             bandStartPhaseSamples: UInt32(pastBandPhase),
             subChunkOffsetNDC: pastSubChunkOffsetNDC)
@@ -1157,7 +1187,7 @@ final class WaveformRenderer: NSObject {
             bandChunkOffset: UInt32(futureFirstBandRingOffset),
             samplesPerBandChunk: samplesPerBandChunk,
             bandCapacity: UInt32(WaveformRenderer.bandChunkCapacity),
-            orientation: orientation.rawValue,
+            orientation: appearance.orientation.rawValue,
             chunksPerColumn: WaveformRenderer.chunksPerColumn,
             bandStartPhaseSamples: UInt32(futureBandPhase),
             subChunkOffsetNDC: futureSubChunkOffsetNDC)
@@ -1174,41 +1204,19 @@ final class WaveformRenderer: NSObject {
 
         // 4. Record one render pass.
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            releaseSemaphore()
             return
         }
         commandBuffer.label = "dub.waveform.commandBuffer"
-        commandBuffer.addCompletedHandler { [weak self, weak view] _ in
+        commandBuffer.addCompletedHandler { _ in
             releaseSemaphore()
-            guard let self else { return }
-            let needsCatchUp = self.pendingRedraw
-            self.pendingRedraw = false
-            guard needsCatchUp else { return }
-            // Don't schedule a catch-up repaint mid-scrub — let the
-            // gesture + scratch path own the main thread until release.
-            if NSEvent.pressedMouseButtons != 0 {
-                self.pendingRedraw = true
-                return
-            }
-            DispatchQueue.main.async {
-                view?.setNeedsDisplay(view?.bounds ?? .zero)
-            }
         }
-
-        // The MTKView's pass descriptor already has the correct
-        // colour attachment (the drawable with MSAA resolve when
-        // `view.sampleCount == 4`). Force `.clear` + dark deck
-        // background so a frame with no chunks still renders the
-        // base colour.
-        passDescriptor.colorAttachments[0].loadAction = .clear
-        passDescriptor.colorAttachments[0].storeAction =
-            (WaveformRenderer.sampleCount > 1) ? .multisampleResolve : .store
-        passDescriptor.colorAttachments[0].clearColor =
-            MTLClearColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
+        // Transfer ownership of the semaphore release to the
+        // completion handler. Subsequent early returns no longer
+        // need to call `releaseSemaphore()` from the `defer`.
+        pendingRelease = false
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor)
         else {
-            releaseSemaphore()
             return
         }
         encoder.label = "dub.waveform.pass"
@@ -1232,16 +1240,18 @@ final class WaveformRenderer: NSObject {
             }
         }
 
-        if beatGridEnabled,
+        if appearance.beatGridEnabled,
            framesSinceSourceSwap > 20,
-           cachedBeatsConfidence > 0,
-           !cachedBeats.isEmpty,
+           beats.confidence > 0,
+           !beats.beats.isEmpty,
            peakChunkDurationSecs > 0,
            pos.hasTrack
         {
             drawBeatGrid(
                 encoder: encoder,
                 drawableSize: drawableSize,
+                appearance: appearance,
+                beats: beats,
                 playheadSecs: pos.playheadSecsUnclamped,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
@@ -1256,6 +1266,44 @@ final class WaveformRenderer: NSObject {
         commandBuffer.commit()
 
         uniformIndex = (uniformIndex + 1) % WaveformRenderer.maxFramesInFlight
+    }
+
+    /// Lazily-allocate / re-allocate the multisample colour
+    /// attachment texture used as the renderer's MSAA target. The
+    /// resolved-to drawable is the layer's drawable, which is a
+    /// 1-sample texture — Metal does the MSAA resolve as part of
+    /// the `storeAction = .multisampleResolve` step.
+    ///
+    /// Returns `nil` when the device doesn't support the
+    /// configured sample count for the drawable's pixel format.
+    /// In that case `drawIfPossible` falls back to a 1-sample
+    /// render pass; the waveform geometry stair-steps slightly
+    /// but the deck remains functional.
+    private func ensureMSAATexture(matching drawableTexture: MTLTexture) -> MTLTexture? {
+        let sampleCount = WaveformRenderer.sampleCount
+        guard sampleCount > 1 else { return nil }
+        let size = CGSize(
+            width: drawableTexture.width, height: drawableTexture.height)
+        if let existing = msaaTexture,
+           msaaTextureSize == size,
+           existing.sampleCount == sampleCount,
+           existing.pixelFormat == drawableTexture.pixelFormat
+        {
+            return existing
+        }
+        let desc = MTLTextureDescriptor()
+        desc.textureType = .type2DMultisample
+        desc.pixelFormat = drawableTexture.pixelFormat
+        desc.width = drawableTexture.width
+        desc.height = drawableTexture.height
+        desc.sampleCount = sampleCount
+        desc.usage = [.renderTarget]
+        desc.storageMode = .private
+        let tex = device.makeTexture(descriptor: desc)
+        tex?.label = "dub.waveform.msaa"
+        msaaTexture = tex
+        msaaTextureSize = size
+        return tex
     }
 
     // MARK: Ingestion
@@ -1419,55 +1467,49 @@ final class WaveformRenderer: NSObject {
 
     // MARK: - Beat grid (B-24 Metal pass)
 
+    /// Off-main beat-grid refresh. Called from the render thread.
+    /// Reads / writes the lock-protected `beatGridState`; the
+    /// detached `Task` does the FFI `beatGrid(...)` clone outside
+    /// the lock and re-acquires it just to commit the result. The
+    /// previous design (round 4) committed on `MainActor.run`
+    /// which forced the render thread to wait on a main-thread
+    /// hop and pinned every track-load commit to the SwiftUI run
+    /// loop. After round 5 the commit happens on the detached
+    /// task's own thread, with no main-actor hop in sight.
     private func refreshBeatGridIfNeeded(
         peaksGeneration: UInt64,
         beatGridGeneration: UInt64,
-        hasTrack: Bool,
-        mirrorIntoSnapshot snapshot: WaveformRenderSnapshot?
+        hasTrack: Bool
     ) {
-        let needsRefresh =
-            cachedBeatsGeneration != peaksGeneration
-            || cachedBeatGridGeneration != beatGridGeneration
-            || (cachedBeatsConfidence == 0 && hasTrack)
-        guard needsRefresh else { return }
-        if cachedBeatsGeneration != peaksGeneration
-            || cachedBeatGridGeneration != beatGridGeneration
-        {
-            beatGridFetchCooldown = 0
-        } else if beatGridFetchCooldown > 0 {
-            beatGridFetchCooldown -= 1
-            return
+        let shouldFetch: Bool = beatGridState.withLock { state -> Bool in
+            let stale =
+                state.peaksGeneration != peaksGeneration
+                || state.beatGridGeneration != beatGridGeneration
+                || (state.confidence == 0 && hasTrack)
+            guard stale, !state.fetchInFlight else { return false }
+            state.fetchInFlight = true
+            return true
         }
-        beatGridFetchCooldown = 15
-        let grid = engine.beatGrid(deckIdx: deckIdx)
-        cachedBeats = grid.beats
-        cachedBpm = grid.bpm
-        cachedBeatsPerBar = max(1, Int(grid.beatsPerBar))
-        cachedBarPhase = min(
-            max(0, Int(grid.barPhase)),
-            max(0, cachedBeatsPerBar - 1))
-        cachedBeatsConfidence = grid.confidence
-        cachedBeatsGeneration = peaksGeneration
-        cachedBeatGridGeneration = beatGridGeneration
-        logBeatGridSummary(
-            gridBpm: grid.bpm,
-            beats: grid.beats,
-            beatsPerBar: Int(grid.beatsPerBar),
-            confidence: grid.confidence,
-            peaksGeneration: peaksGeneration,
-            beatGridGeneration: beatGridGeneration)
-        logWholeTrackBeatPeakAlignment(
-            gridBpm: grid.bpm,
-            beats: grid.beats,
-            confidence: grid.confidence,
-            peaksGeneration: peaksGeneration,
-            beatGridGeneration: beatGridGeneration)
-        if let snapshot {
-            snapshot.beats = cachedBeats
-            snapshot.beatsPerBar = cachedBeatsPerBar
-            snapshot.barPhase = cachedBarPhase
-            snapshot.beatsConfidence = cachedBeatsConfidence
-            snapshot.beatsGeneration = peaksGeneration
+        guard shouldFetch else { return }
+        let engineRef = engine
+        let deckIdxLocal = deckIdx
+        let observedPeaksGen = peaksGeneration
+        let observedBeatGridGen = beatGridGeneration
+        let stateRef = beatGridState
+        Task.detached(priority: .userInitiated) {
+            let grid = engineRef.beatGrid(deckIdx: deckIdxLocal)
+            stateRef.withLock { state in
+                state.fetchInFlight = false
+                state.beats = grid.beats
+                state.bpm = grid.bpm
+                state.beatsPerBar = max(1, Int(grid.beatsPerBar))
+                state.barPhase = min(
+                    max(0, Int(grid.barPhase)),
+                    max(0, state.beatsPerBar - 1))
+                state.confidence = grid.confidence
+                state.peaksGeneration = observedPeaksGen
+                state.beatGridGeneration = observedBeatGridGen
+            }
         }
     }
 
@@ -1524,12 +1566,12 @@ final class WaveformRenderer: NSObject {
     /// window in O(log n) instead of scanning from track start
     /// every frame (which was O(n) and caused occasional pause /
     /// click lag on longer tracks).
-    private func firstBeatIndex(atOrAfter time: Double) -> Int {
+    private static func firstBeatIndex(in beats: [Double], atOrAfter time: Double) -> Int {
         var lo = 0
-        var hi = cachedBeats.count
+        var hi = beats.count
         while lo < hi {
             let mid = (lo + hi) / 2
-            if cachedBeats[mid] < time {
+            if beats[mid] < time {
                 lo = mid + 1
             } else {
                 hi = mid
@@ -1538,431 +1580,11 @@ final class WaveformRenderer: NSObject {
         return lo
     }
 
-    private func logBeatGridSummary(
-        gridBpm: Double,
-        beats: [Double],
-        beatsPerBar: Int,
-        confidence: Float,
-        peaksGeneration: UInt64,
-        beatGridGeneration: UInt64
-    ) {
-        let now = ProcessInfo.processInfo.systemUptime
-        guard confidence > 0 || now - debugLastGridSummaryLogUptime >= 1.0 else { return }
-        debugLastGridSummaryLogUptime = now
-
-        let intervals = zip(beats.dropFirst(), beats).map { next, prev in next - prev }
-        func avg(_ values: ArraySlice<Double>) -> Double {
-            guard !values.isEmpty else { return 0 }
-            return values.reduce(0, +) / Double(values.count)
-        }
-        let firstIntervals = intervals.prefix(16)
-        let lastIntervals = intervals.suffix(16)
-        let firstAvg = avg(firstIntervals)
-        let lastAvg = avg(lastIntervals)
-        let bpmFirst = firstAvg > 0 ? 60.0 / firstAvg : 0
-        let bpmLast = lastAvg > 0 ? 60.0 / lastAvg : 0
-
-        // #region agent log
-        agentDebugLog(
-            hypothesisId: "H1,H3",
-            location: "WaveformRenderer.swift:refreshBeatGridIfNeeded",
-            message: "beatgrid estimator summary",
-            data: [
-                "deckIdx": Int(deckIdx),
-                "gridBpm": gridBpm,
-                "confidence": Double(confidence),
-                "beatsPerBar": beatsPerBar,
-                "beatCount": beats.count,
-                "firstBeats": Array(beats.prefix(8)),
-                "lastBeats": Array(beats.suffix(8)),
-                "firstIntervalAvgSecs": firstAvg,
-                "lastIntervalAvgSecs": lastAvg,
-                "firstIntervalBpm": bpmFirst,
-                "lastIntervalBpm": bpmLast,
-                "intervalBpmDelta": bpmLast - bpmFirst,
-                "peaksGeneration": Int(peaksGeneration),
-                "beatGridGeneration": Int(beatGridGeneration),
-                "peakDurSecs": peakChunkDurationSecs,
-                "peaksLen": Int(lastSeenPeaksLen)
-            ])
-        // #endregion
-    }
-
-    private func logWholeTrackBeatPeakAlignment(
-        gridBpm: Double,
-        beats: [Double],
-        confidence: Float,
-        peaksGeneration: UInt64,
-        beatGridGeneration: UInt64
-    ) {
-        guard confidence > 0,
-              gridBpm > 0,
-              peakChunkDurationSecs > 0,
-              !beats.isEmpty
-        else { return }
-
-        let peakData = engine.peaksExtend(deckIdx: deckIdx, startIdx: 0)
-        let stride = MemoryLayout<PeakChunkLayout>.stride
-        let chunkCount = peakData.count / stride
-        guard chunkCount > 0, peakData.count % stride == 0 else { return }
-
-        let period = 60.0 / gridBpm
-        let windowSecs = min(0.18, max(0.04, period * 0.25))
-        let radius = max(4, Int((windowSecs / peakChunkDurationSecs).rounded()))
-        var offsets: [Double] = []
-        var weighted: [(idx: Int, offset: Double, amp: Double)] = []
-        var boundaryHits = 0
-        var sampleRows: [[String: Any]] = []
-
-        peakData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress?.assumingMemoryBound(to: PeakChunkLayout.self)
-            else { return }
-
-            for (idx, beatSecs) in beats.enumerated() {
-                let centre = Int((beatSecs / peakChunkDurationSecs).rounded())
-                guard centre >= 0, centre < chunkCount else { continue }
-                let lo = max(0, centre - radius)
-                let hi = min(chunkCount - 1, centre + radius)
-                var bestAmp = -1.0
-                var bestChunk = centre
-                for c in lo...hi {
-                    let p = base[c]
-                    let amp = Double(max(abs(p.minSample), abs(p.maxSample)))
-                    if amp > bestAmp {
-                        bestAmp = amp
-                        bestChunk = c
-                    }
-                }
-                let offsetChunks = bestChunk - centre
-                if abs(offsetChunks) >= radius - 1 {
-                    boundaryHits += 1
-                }
-                let offsetSecs = Double(offsetChunks) * peakChunkDurationSecs
-                offsets.append(offsetSecs)
-                if bestAmp >= 0.05 && abs(offsetChunks) < radius - 1 {
-                    weighted.append((idx: idx, offset: offsetSecs, amp: bestAmp))
-                }
-                let includeSample =
-                    idx < 8
-                    || abs(idx - beats.count / 2) <= 4
-                    || idx >= max(0, beats.count - 8)
-                if includeSample {
-                    sampleRows.append([
-                        "idx": idx,
-                        "beatSecs": beatSecs,
-                        "offsetSecs": offsetSecs,
-                        "offsetChunks": offsetChunks,
-                        "bestAmp": bestAmp,
-                        "boundaryHit": abs(offsetChunks) >= radius - 1
-                    ])
-                }
-            }
-        }
-
-        func average(_ values: ArraySlice<Double>) -> Double {
-            guard !values.isEmpty else { return 0 }
-            return values.reduce(0, +) / Double(values.count)
-        }
-
-        let firstAvg = average(offsets.prefix(16))
-        let midStart = max(0, offsets.count / 2 - 8)
-        let midEnd = min(offsets.count, midStart + 16)
-        let midAvg = midStart < midEnd ? average(offsets[midStart..<midEnd]) : 0
-        let lastAvg = average(offsets.suffix(16))
-        let blockSize = 64
-        var blockSummaries: [[String: Any]] = []
-        if !weighted.isEmpty {
-            let blockCount = (beats.count + blockSize - 1) / blockSize
-            for block in 0..<blockCount {
-                let lo = block * blockSize
-                let hi = min(beats.count, lo + blockSize)
-                let rows = weighted.filter { $0.idx >= lo && $0.idx < hi }
-                guard !rows.isEmpty else { continue }
-                let sumW = rows.reduce(0.0) { $0 + $1.amp }
-                guard sumW > 0 else { continue }
-                let avgOffset = rows.reduce(0.0) { $0 + $1.offset * $1.amp } / sumW
-                let avgAmp = sumW / Double(rows.count)
-                blockSummaries.append([
-                    "startBeatIdx": lo,
-                    "endBeatIdx": hi - 1,
-                    "startSecs": beats[lo],
-                    "endSecs": beats[hi - 1],
-                    "avgOffsetSecs": avgOffset,
-                    "avgAmp": avgAmp,
-                    "usableCount": rows.count
-                ])
-            }
-        }
-
-        let slopeSecsPerBeat: Double = {
-            guard weighted.count >= 2 else { return 0 }
-            let sumW = weighted.reduce(0.0) { $0 + $1.amp }
-            guard sumW > 0 else { return 0 }
-            let meanX = weighted.reduce(0.0) { $0 + Double($1.idx) * $1.amp } / sumW
-            let meanY = weighted.reduce(0.0) { $0 + $1.offset * $1.amp } / sumW
-            let denom = weighted.reduce(0.0) {
-                let dx = Double($1.idx) - meanX
-                return $0 + $1.amp * dx * dx
-            }
-            guard denom > 0 else { return 0 }
-            return weighted.reduce(0.0) {
-                let dx = Double($1.idx) - meanX
-                return $0 + $1.amp * dx * ($1.offset - meanY)
-            } / denom
-        }()
-
-        // #region agent log
-        agentDebugLog(
-            hypothesisId: "H1,H2,H3",
-            location: "WaveformRenderer.swift:logWholeTrackBeatPeakAlignment",
-            message: "whole-track beat-to-peak alignment",
-            data: [
-                "deckIdx": Int(deckIdx),
-                "gridBpm": gridBpm,
-                "confidence": Double(confidence),
-                "beatCount": beats.count,
-                "chunkCount": chunkCount,
-                "peakDurSecs": peakChunkDurationSecs,
-                "windowSecs": windowSecs,
-                "radiusChunks": radius,
-                "boundaryHitFraction": offsets.isEmpty ? 0 : Double(boundaryHits) / Double(offsets.count),
-                "usableFitCount": weighted.count,
-                "first16AvgOffsetSecs": firstAvg,
-                "middle16AvgOffsetSecs": midAvg,
-                "last16AvgOffsetSecs": lastAvg,
-                "firstToLastAvgDeltaSecs": lastAvg - firstAvg,
-                "slopeSecsPerBeat": slopeSecsPerBeat,
-                "projectedDriftOverTrackSecs": slopeSecsPerBeat * Double(max(0, beats.count - 1)),
-                "blockSummaries": blockSummaries,
-                "sampleOffsets": sampleRows,
-                "peaksGeneration": Int(peaksGeneration),
-                "beatGridGeneration": Int(beatGridGeneration)
-            ])
-        // #endregion
-    }
-
-    private func peakWindowAround(globalChunk: Int64, radius: Int) -> [String: Any]? {
-        guard globalChunk >= 0,
-              globalChunk < Int64(lastSeenPeaksLen)
-        else { return nil }
-
-        let chunks = chunksBuffer.contents().assumingMemoryBound(to: PeakChunkLayout.self)
-        var centreAmp: Double = 0
-        var maxAmp: Double = -1
-        var maxOffset = 0
-        for offset in -radius...radius {
-            let g = globalChunk + Int64(offset)
-            guard g >= 0, g < Int64(lastSeenPeaksLen) else { continue }
-            let c = chunks[Int(g) & (WaveformRenderer.chunkCapacity - 1)]
-            let amp = Double(max(abs(c.minSample), abs(c.maxSample)))
-            if offset == 0 { centreAmp = amp }
-            if amp > maxAmp {
-                maxAmp = amp
-                maxOffset = offset
-            }
-        }
-
-        return [
-            "centreChunk": Int(globalChunk),
-            "centreAmp": centreAmp,
-            "maxAmp": maxAmp,
-            "maxOffsetChunks": maxOffset,
-            "maxOffsetSecs": Double(maxOffset) * peakChunkDurationSecs
-        ]
-    }
-
-    private func logVisibleBeatAlignment(
-        playheadSecs: Double,
-        snappedChunkF: Double,
-        drawnAbove: Int,
-        drawnBelow: Int,
-        pastSubChunkOffsetNDC: Float,
-        futureSubChunkOffsetNDC: Float,
-        drawableSize: CGSize
-    ) {
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now - debugLastVisibleBeatLogUptime >= 1.0 else { return }
-        debugLastVisibleBeatLogUptime = now
-        guard cachedBeatsConfidence > 0, !cachedBeats.isEmpty, peakChunkDurationSecs > 0 else {
-            return
-        }
-
-        let nextIdx = firstBeatIndex(atOrAfter: playheadSecs)
-        let candidates = [nextIdx - 1, nextIdx].filter {
-            $0 >= 0 && $0 < cachedBeats.count
-        }
-        guard let closestIdx = candidates.min(by: {
-            abs(cachedBeats[$0] - playheadSecs) < abs(cachedBeats[$1] - playheadSecs)
-        }) else { return }
-
-        let beatSecs = cachedBeats[closestIdx]
-        let timeNDC = Self.beatTimeNDC(
-            beatSecs: beatSecs,
-            peakDur: peakChunkDurationSecs,
-            snappedChunkF: snappedChunkF,
-            drawnAbove: drawnAbove,
-            drawnBelow: drawnBelow,
-            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
-        let timeAxisPixels: Double
-        switch orientation {
-        case .vertical:
-            timeAxisPixels = max(1, Double(drawableSize.height))
-        case .horizontal:
-            timeAxisPixels = max(1, Double(drawableSize.width))
-        }
-        let drawablePixel = (1.0 - timeNDC) * timeAxisPixels * 0.5
-        let beatPeriod = cachedBpm > 0 ? 60.0 / cachedBpm : 0
-        let beatChunk = Int64((beatSecs / peakChunkDurationSecs).rounded(.down))
-        var peakProbe = peakWindowAround(globalChunk: beatChunk, radius: 32) ?? [:]
-        peakProbe["radiusChunks"] = 32
-
-        // #region agent log
-        agentDebugLog(
-            hypothesisId: "H1,H2,H4",
-            location: "WaveformRenderer.swift:drawBeatGrid",
-            message: "nearest beat render alignment",
-            data: [
-                "deckIdx": Int(deckIdx),
-                "orientation": orientation == .vertical ? "vertical" : "horizontal",
-                "playheadSecs": playheadSecs,
-                "closestBeatIdx": closestIdx,
-                "closestBeatSecs": beatSecs,
-                "deltaBeatToPlayheadSecs": beatSecs - playheadSecs,
-                "deltaBeatPeriods": beatPeriod > 0 ? (beatSecs - playheadSecs) / beatPeriod : 0,
-                "timeNDC": timeNDC,
-                "drawablePixelFromLeadingEdge": drawablePixel,
-                "timeAxisPixels": timeAxisPixels,
-                "snappedChunkF": snappedChunkF,
-                "peakDurSecs": peakChunkDurationSecs,
-                "beatChunk": Int(beatChunk),
-                "localPeakProbe": peakProbe
-            ])
-        // #endregion
-    }
-
-    private func logBeatGridPixelStability(
-        playheadSecs: Double,
-        snappedChunkF: Double,
-        drawnAbove: Int,
-        drawnBelow: Int,
-        pastSubChunkOffsetNDC: Float,
-        futureSubChunkOffsetNDC: Float,
-        drawableSize: CGSize
-    ) {
-        guard cachedBeatsConfidence > 0, !cachedBeats.isEmpty, peakChunkDurationSecs > 0 else {
-            return
-        }
-
-        let nextIdx = firstBeatIndex(atOrAfter: playheadSecs)
-        let candidates = [nextIdx - 1, nextIdx].filter {
-            $0 >= 0 && $0 < cachedBeats.count
-        }
-        guard let closestIdx = candidates.min(by: {
-            abs(cachedBeats[$0] - playheadSecs) < abs(cachedBeats[$1] - playheadSecs)
-        }) else { return }
-
-        let beatSecs = cachedBeats[closestIdx]
-        let timeNDC = Self.beatTimeNDC(
-            beatSecs: beatSecs,
-            peakDur: peakChunkDurationSecs,
-            snappedChunkF: snappedChunkF,
-            drawnAbove: drawnAbove,
-            drawnBelow: drawnBelow,
-            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
-        let timeAxisPixels: Double
-        switch orientation {
-        case .vertical:
-            timeAxisPixels = max(1, Double(drawableSize.height))
-        case .horizontal:
-            timeAxisPixels = max(1, Double(drawableSize.width))
-        }
-        let pixel = (1.0 - timeNDC) * timeAxisPixels * 0.5
-
-        if debugStableBeatIdx == closestIdx {
-            let secondsPerPixel = peakChunkDurationSecs
-                * Double(WaveformRenderer.chunksPerColumn)
-                / Self.effectivePixelsPerDrawnColumn(timeAxisZoom: timeAxisZoom)
-            if secondsPerPixel > 0 {
-                let expectedPixel = debugStableBeatPixel
-                    - (playheadSecs - debugStableBeatPlayheadSecs) / secondsPerPixel
-                let error = pixel - expectedPixel
-                debugBeatPixelLastError = error
-                debugBeatPixelMaxError = max(debugBeatPixelMaxError, abs(error))
-                debugBeatPixelErrorSamples += 1
-            }
-        } else {
-            debugStableBeatIdx = closestIdx
-            debugBeatPixelMaxError = 0
-            debugBeatPixelLastError = 0
-            debugBeatPixelErrorSamples = 0
-        }
-        debugStableBeatPixel = pixel
-        debugStableBeatPlayheadSecs = playheadSecs
-
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now - debugLastGridStabilityLogUptime >= 1.0 else { return }
-        debugLastGridStabilityLogUptime = now
-
-        // #region agent log
-        agentDebugLog(
-            hypothesisId: "H4",
-            location: "WaveformRenderer.swift:logBeatGridPixelStability",
-            message: "beatgrid pixel stability",
-            data: [
-                "deckIdx": Int(deckIdx),
-                "orientation": orientation == .vertical ? "vertical" : "horizontal",
-                "trackedBeatIdx": closestIdx,
-                "trackedBeatSecs": beatSecs,
-                "playheadSecs": playheadSecs,
-                "pixelFromLeadingEdge": pixel,
-                "lastFrameErrorPixels": debugBeatPixelLastError,
-                "maxAbsErrorPixels": debugBeatPixelMaxError,
-                "samples": debugBeatPixelErrorSamples,
-                "timeAxisPixels": timeAxisPixels,
-                "snappedChunkF": snappedChunkF,
-                "peakDurSecs": peakChunkDurationSecs
-            ])
-        // #endregion
-    }
-
-    private func agentDebugLog(
-        hypothesisId: String,
-        location: String,
-        message: String,
-        data: [String: Any]
-    ) {
-        // #region agent log
-        let payload: [String: Any] = [
-            "sessionId": "c73978",
-            "runId": "beatgrid-pre-fix",
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": Int(Date().timeIntervalSince1970 * 1000)
-        ]
-        guard JSONSerialization.isValidJSONObject(payload),
-              let json = try? JSONSerialization.data(withJSONObject: payload),
-              let line = String(data: json, encoding: .utf8),
-              let bytes = (line + "\n").data(using: .utf8)
-        else { return }
-
-        let url = URL(fileURLWithPath: "/Users/klos/Development/dub/.cursor/debug-c73978.log")
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: bytes)
-        } else {
-            try? bytes.write(to: url, options: .atomic)
-        }
-        // #endregion
-    }
-
     private func drawBeatGrid(
         encoder: MTLRenderCommandEncoder,
         drawableSize: CGSize,
+        appearance: RendererAppearance,
+        beats: BeatGridSnapshot,
         playheadSecs: Double,
         snappedChunkF: Double,
         drawnAbove: Int,
@@ -1984,7 +1606,7 @@ final class WaveformRenderer: NSObject {
             Double(futureLastChunkSigned + Int64(chunksPerColumn)) * peakDur
 
         let timeAxisPixels: Float
-        switch orientation {
+        switch appearance.orientation {
         case .vertical:
             timeAxisPixels = max(1, Float(drawableSize.height))
         case .horizontal:
@@ -2008,10 +1630,10 @@ final class WaveformRenderer: NSObject {
         let barHalfNDC = 3.5 / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
-        let startIdx = firstBeatIndex(atOrAfter: visibleStart)
+        let startIdx = Self.firstBeatIndex(in: beats.beats, atOrAfter: visibleStart)
 
-        for idx in startIdx..<cachedBeats.count {
-            let beat = cachedBeats[idx]
+        for idx in startIdx..<beats.beats.count {
+            let beat = beats.beats[idx]
             if beat > visibleEnd { break }
             let timeNDC = Self.beatTimeNDC(
                 beatSecs: beat,
@@ -2022,40 +1644,25 @@ final class WaveformRenderer: NSObject {
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                 futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
             let isDownbeat =
-                cachedBeatsPerBar > 0
-                && (idx % cachedBeatsPerBar == cachedBarPhase)
+                beats.beatsPerBar > 0
+                && (idx % beats.beatsPerBar == beats.barPhase)
             if isDownbeat {
-                appendBeatLineQuad(
+                Self.appendBeatLineQuad(
                     vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
                     timeNDC: Float(timeNDC),
                     halfThickness: barHalfNDC,
-                    color: Self.deckTintRGBA(side: side, alpha: 1.0),
+                    color: Self.deckTintRGBA(side: appearance.side, alpha: 1.0),
                     isDownbeat: true)
             } else {
-                appendMirroredBeatTick(
+                Self.appendMirroredBeatTick(
                     vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
                     timeNDC: Float(timeNDC),
                     halfThickness: beatHalfNDC,
                     color: Self.beatTickRGBA(alpha: 0.88))
             }
         }
-
-        logVisibleBeatAlignment(
-            playheadSecs: playheadSecs,
-            snappedChunkF: snappedChunkF,
-            drawnAbove: drawnAbove,
-            drawnBelow: drawnBelow,
-            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
-            drawableSize: drawableSize)
-        logBeatGridPixelStability(
-            playheadSecs: playheadSecs,
-            snappedChunkF: snappedChunkF,
-            drawnAbove: drawnAbove,
-            drawnBelow: drawnBelow,
-            pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-            futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
-            drawableSize: drawableSize)
 
         guard !beatGridScratchVertices.isEmpty else { return }
 
@@ -2103,26 +1710,29 @@ final class WaveformRenderer: NSObject {
     /// in the bottom headroom mirrored to negative cross-axis.
     /// Even an asymmetric loud peak that fills one half of the
     /// waveform still leaves the opposite tick fully visible.
-    private func appendMirroredBeatTick(
+    private static func appendMirroredBeatTick(
         vertices: inout [BeatGridVertexLayout],
+        orientation: WaveformOrientation,
         timeNDC: Float,
         halfThickness: Float,
         color: SIMD4<Float>
     ) {
         appendCrossAxisStrip(
             vertices: &vertices,
+            orientation: orientation,
             timeNDC: timeNDC,
             halfThickness: halfThickness,
             color: color,
-            crossLow: Self.beatTickInnerNDC,
-            crossHigh: Self.beatTickOuterNDC)
+            crossLow: beatTickInnerNDC,
+            crossHigh: beatTickOuterNDC)
         appendCrossAxisStrip(
             vertices: &vertices,
+            orientation: orientation,
             timeNDC: timeNDC,
             halfThickness: halfThickness,
             color: color,
-            crossLow: -Self.beatTickOuterNDC,
-            crossHigh: -Self.beatTickInnerNDC)
+            crossLow: -beatTickOuterNDC,
+            crossHigh: -beatTickInnerNDC)
     }
 
     /// Append one axis-aligned tick quad (two triangles, six
@@ -2130,17 +1740,19 @@ final class WaveformRenderer: NSObject {
     /// axis; beat ticks span only the headroom strip
     /// (`beatTickInnerNDC ... beatTickOuterNDC`), keeping the
     /// waveform readable underneath.
-    private func appendBeatLineQuad(
+    private static func appendBeatLineQuad(
         vertices: inout [BeatGridVertexLayout],
+        orientation: WaveformOrientation,
         timeNDC: Float,
         halfThickness: Float,
         color: SIMD4<Float>,
         isDownbeat: Bool
     ) {
-        let crossLow: Float = isDownbeat ? -1.0 : Self.beatTickInnerNDC
-        let crossHigh: Float = isDownbeat ? 1.0 : Self.beatTickOuterNDC
+        let crossLow: Float = isDownbeat ? -1.0 : beatTickInnerNDC
+        let crossHigh: Float = isDownbeat ? 1.0 : beatTickOuterNDC
         appendCrossAxisStrip(
             vertices: &vertices,
+            orientation: orientation,
             timeNDC: timeNDC,
             halfThickness: halfThickness,
             color: color,
@@ -2152,8 +1764,9 @@ final class WaveformRenderer: NSObject {
     /// crossHigh]` on the cross axis and ±`halfThickness` around
     /// `timeNDC` on the time axis. Vertex windings match the
     /// existing beat-grid shader (no culling required).
-    private func appendCrossAxisStrip(
+    private static func appendCrossAxisStrip(
         vertices: inout [BeatGridVertexLayout],
+        orientation: WaveformOrientation,
         timeNDC: Float,
         halfThickness: Float,
         color: SIMD4<Float>,
@@ -2186,35 +1799,4 @@ final class WaveformRenderer: NSObject {
         }
     }
 
-    /// Peek the AppKit event queue without dequeuing. Returns
-    /// `true` when a mouse / scroll event is waiting — used to
-    /// bail out of `draw(in:)` so clicks reach gesture handlers
-    /// before the next Metal encode.
-    private static func hasPendingPointerInput() -> Bool {
-        // Always yield for press events so click-to-scrub reaches
-        // SwiftUI's `DragGesture` before Metal encodes.
-        let pressMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
-        let deadline = Date(timeIntervalSinceNow: 0)
-        for mode in [RunLoop.Mode.eventTracking, .default] {
-            if NSApp.nextEvent(matching: pressMask, until: deadline, inMode: mode, dequeue: false)
-                != nil
-            {
-                return true
-            }
-        }
-        // During playback we ignore `.leftMouseDragged` — micro-
-        // jitter was skipping steady-state frames and stuttering the
-        // scroll. While the button is held (active scrub) we yield
-        // again so `scratchPointerOffset` runs before `draw(in:)`.
-        guard NSEvent.pressedMouseButtons != 0 else { return false }
-        let dragMask: NSEvent.EventTypeMask = [.leftMouseDragged, .leftMouseUp]
-        for mode in [RunLoop.Mode.eventTracking, .default] {
-            if NSApp.nextEvent(matching: dragMask, until: deadline, inMode: mode, dequeue: false)
-                != nil
-            {
-                return true
-            }
-        }
-        return false
-    }
 }

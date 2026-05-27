@@ -112,6 +112,31 @@ struct TrackOverviewView: View {
     /// finger every frame via `dragPlayheadFraction`.
     @State private var lastOverviewSeekUptime: TimeInterval = 0
 
+    /// Last fraction we actually dispatched a `seekDeck(...)` for.
+    /// Used by the `onEnded` branch in `handleOverviewScrub` to
+    /// suppress a duplicate seek when the user clicked-and-released
+    /// without moving the mouse: the click already drove the
+    /// playhead to this fraction inside the `onChanged` branch, the
+    /// track has since been advancing under that anchor, and a
+    /// second seek to the same fraction would yank the playhead
+    /// *back* to the click point. That backward yank is the
+    /// user-visible "jump on mouse-up" reported against the M10.5t
+    /// overview gesture. `nil` whenever a gesture isn't in flight
+    /// or the track has changed under us (reset by `reloadIfStale`).
+    @State private var lastSeekedFraction: Double? = nil
+
+    /// Tolerance (in normalised axis fractions, 0.0–1.0) below
+    /// which a final-up fraction is considered "the same point" as
+    /// the last seek we dispatched. Sized so that a fingernail-
+    /// width nudge during click-and-release still suppresses the
+    /// duplicate seek, while any deliberate drag clears it on
+    /// the first `onChanged` past the threshold. Picked rather
+    /// than `== 0` because the AppKit drag pipeline can report a
+    /// `value.location` ~1 px off the click-down point even
+    /// without intentional motion (mouse hardware jitter), and
+    /// we don't want a sub-pixel drift to look like a drag.
+    private static let overviewSeekDedupTolerance: Double = 0.002
+
     private static let overviewSeekMinInterval: TimeInterval = 1.0 / 30.0
 
     private var deckState: DeckState {
@@ -140,7 +165,20 @@ struct TrackOverviewView: View {
         // self-driven timeline, only this Canvas closure re-runs
         // on the bracket cadence; nothing above the timeline ever
         // observes the per-second tick.
-        TimelineView(.periodic(from: .now, by: 0.1)) { context in
+        // 4 Hz overview tick. Pre-fix this was 10 Hz, which
+        // sounds reasonable for a position indicator but actually
+        // costs two SwiftUI body re-evals + two Canvas redraws per
+        // 100 ms (both decks share the runloop), and the visible
+        // playhead bracket moves at most a fraction of a pixel
+        // per tick on any realistic-length DJ track (e.g. a 4-min
+        // track at 60 fps overview width means ~0.15 px / tick at
+        // 10 Hz, 0.36 px / tick at 4 Hz — neither is humanly
+        // discernible from "smooth"). The Metal pipeline already
+        // drives the *zoomed* waveform's high-frequency playhead
+        // separately, so the overview only needs to feel
+        // "advancing" to the eye. 4 Hz saves runloop budget that
+        // was contending with the 60 Hz Metal draw callback.
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
             GeometryReader { geo in
                 ZStack {
                     Canvas { ctx, size in
@@ -388,7 +426,11 @@ struct TrackOverviewView: View {
     /// Track duration on the same peak-chunk grid as the bars and
     /// playhead bracket.
     private func overviewDurationSecs() -> Double? {
-        let pos = model.engine.position(deckIdx: deckIdx)
+        // M11d.6 round 5 — lock-free FFI snapshot. The renderer
+        // and the chrome consumers all read the same atomic
+        // `DeckSharedState` values, so there is no longer a need
+        // for the host model to deduplicate position calls.
+        let pos = model.engine.positionSnapshot(deckIdx: deckIdx)
         let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
         let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
         if peaksLen > 0, chunkDur > 0 {
@@ -498,7 +540,8 @@ struct TrackOverviewView: View {
         if let dragPlayheadFraction {
             return max(0, min(1, dragPlayheadFraction))
         }
-        let pos = model.engine.position(deckIdx: deckIdx)
+        // M11d.6 round 5 — lock-free FFI snapshot.
+        let pos = model.engine.positionSnapshot(deckIdx: deckIdx)
         let elapsed = pos.elapsedSecs
         let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
         let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
@@ -597,7 +640,17 @@ struct TrackOverviewView: View {
     /// During a drag the playhead bracket follows the finger
     /// immediately via `dragPlayheadFraction`; engine seeks are
     /// throttled to ~30 Hz so fast motion doesn't flood the FFI.
-    /// The final `onEnded` seek is always unthrottled.
+    /// The final `onEnded` seek is **gated** on the cursor having
+    /// actually moved past `overviewSeekDedupTolerance` since the
+    /// last dispatched seek. Pre-fix the `onEnded` branch always
+    /// re-issued the seek, which on a playing deck cancelled the
+    /// playback advancement the click had triggered: the user saw
+    /// the playhead snap forward on mouse-down (the seek), drift
+    /// forward while held (normal playback), then snap *back* to
+    /// the click point on mouse-up (the duplicate `onEnded`
+    /// seek). Skipping the no-op final seek removes that backward
+    /// yank while keeping a real drag's final-position seek
+    /// unthrottled.
     private func handleOverviewScrub(
         at point: CGPoint,
         in size: CGSize,
@@ -606,11 +659,28 @@ struct TrackOverviewView: View {
         guard let fraction = overviewFraction(at: point, in: size),
               let seekSecs = overviewSeekSecs(for: fraction)
         else {
-            if isFinal { dragPlayheadFraction = nil }
+            if isFinal {
+                dragPlayheadFraction = nil
+                lastSeekedFraction = nil
+            }
             return
         }
 
         dragPlayheadFraction = fraction
+
+        // Bug #1 — duplicate `onEnded` seek on a click-and-release
+        // without drag. If we already dispatched a seek to (within
+        // tolerance of) this fraction during the gesture, the
+        // final-up event should NOT re-issue it; doing so on a
+        // playing deck yanks the playhead back to the click point.
+        if isFinal,
+           let last = lastSeekedFraction,
+           abs(fraction - last) < Self.overviewSeekDedupTolerance
+        {
+            dragPlayheadFraction = nil
+            lastSeekedFraction = nil
+            return
+        }
 
         let now = ProcessInfo.processInfo.systemUptime
         let shouldSeek = isFinal
@@ -618,10 +688,12 @@ struct TrackOverviewView: View {
         guard shouldSeek else { return }
 
         lastOverviewSeekUptime = now
+        lastSeekedFraction = fraction
         model.seekDeck(side: side, absoluteSecs: seekSecs)
 
         if isFinal {
             dragPlayheadFraction = nil
+            lastSeekedFraction = nil
         }
     }
 
@@ -634,6 +706,13 @@ struct TrackOverviewView: View {
     /// debouncing.
     private func reloadIfStale() {
         let currentGen = model.engine.peaksGeneration(deckIdx: deckIdx)
+        // Bug #1 — any source swap clears the gesture-bookkeeping
+        // anchor so the next overview click starts with a clean
+        // "last dispatched seek" state. Without this, a click on
+        // deck A → load track → click overview at a fraction that
+        // happens to match the prior anchor would incorrectly
+        // suppress the seek as a duplicate.
+        lastSeekedFraction = nil
         // No track → drop any cached buckets so the empty-state
         // path renders. This also covers engine-stopped, where
         // `peaks_generation` returns 0 and `hasTrack` is false.

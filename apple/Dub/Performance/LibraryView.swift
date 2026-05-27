@@ -42,6 +42,7 @@
 //  modification.
 
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -52,7 +53,27 @@ import DubCore
 /// UniFFI's generated `LibraryTrack` already carries a `String id`
 /// field — Swift's `Identifiable` conformance is a one-liner. Used
 /// by SwiftUI `Table` to track row identity across sorts.
-extension LibraryTrack: Identifiable {}
+///
+/// `@retroactive` is the Swift 6 opt-in for declaring a
+/// conformance on a type from another module to a protocol from
+/// yet another module. The Apple shell intentionally owns this
+/// conformance rather than the `DubCore` (UniFFI-generated)
+/// module because:
+///
+/// 1. UniFFI's binding generator doesn't expose hooks to add
+///    Swift protocol conformances to its generated structs, so
+///    the conformance can't live next to the declaration without
+///    forking the generated source.
+/// 2. `Identifiable` is a SwiftUI-shaped affordance, not a core
+///    library invariant — keeping it in the UI module mirrors
+///    how the rest of `LibraryView`'s sort-key extensions sit.
+///
+/// If `dub-library`'s FFI ever ships its own `Identifiable`
+/// conformance we'll have a duplicate-conformance compile error
+/// that's straightforward to resolve by deleting this extension;
+/// `@retroactive` here is exactly the contract the Swift 6
+/// compiler asks us to make explicit.
+extension LibraryTrack: @retroactive Identifiable {}
 
 /// Computed accessors for client-side column sort.
 /// requires `Comparable` end values; raw `Optional<String>` is not
@@ -239,6 +260,24 @@ private enum LibrarySource: Hashable, Identifiable {
 struct LibraryView: View {
 
     @ObservedObject var model: WaveformAppModel
+    /// Library / analysis / relocate state — split out of
+    /// `WaveformAppModel` so library mutations don't invalidate
+    /// `PerformanceView`. The parent (PerformanceView) passes
+    /// the app model's `libraryModel` here. Every library-side
+    /// field LibraryView observes (`libraryIsOpen`,
+    /// `libraryTrackCount`, `lastImportSummary`,
+    /// `libraryImportInProgress`, `selectedLibraryTrackId`,
+    /// `selectedLibraryTrack`, `volumeReachability`,
+    /// `missingTrackCount`, `analysisGeneration`,
+    /// `libraryRowAnalysisUpdate`, `analysisInFlightCount`,
+    /// `analysisBatchCompleted`, `analysisBatchTotal`,
+    /// `relocateInProgress`, `lastRelocateMatches`,
+    /// `lastRelocateUnmatched`) is reached through this object.
+    /// LibraryView's body therefore only re-evaluates on library
+    /// activity; the `WaveformAppModel` observation above stays
+    /// because LibraryView also reads cross-cutting fields like
+    /// `engine`, `isRunning`, and `browserSelection` from there.
+    @ObservedObject var libraryModel: LibraryAppModel
 
     /// Currently selected source-tree node. Drives which query the
     /// track list runs against.
@@ -312,20 +351,29 @@ struct LibraryView: View {
         KeyPathComparator(\.titleSortKey, order: .forward),
     ]
 
-    /// Currently selected row ids (canonical UUIDs). Cmd+click toggles
-    /// membership; Shift+click selects a contiguous range in the
-    /// current sort order. The primary id drives Space-load.
-    @State private var selectedTrackIds: Set<String> = []
-
-    /// Anchor for Shift+click range selection in the current sort order.
-    @State private var selectionAnchorId: String? = nil
+    /// Selection state owned by the view, deliberately stored on
+    /// `@State` rather than `@StateObject` / `@ObservedObject`.
+    /// `@State` holds the class reference for the lifetime of the
+    /// view but does **not** subscribe to its
+    /// `objectWillChange` publisher, so mutating
+    /// `rowSelection.selectedTrackIds` or
+    /// `rowSelection.selectionAnchorId` no longer triggers a
+    /// `LibraryView.body` re-eval. See
+    /// `LibraryRowSelection`'s header for the full rationale —
+    /// this is the lever that takes the row-click main-thread
+    /// cost off the playing waveform. Subviews that need to
+    /// observe selection changes (e.g. the AppKit selection
+    /// layer) subscribe to `rowSelection` directly via Combine.
+    @State private var rowSelection = LibraryRowSelection()
 
     /// Primary selected row for Space-load + model sync.
     private var primarySelectedTrackId: String? {
-        if let anchor = selectionAnchorId, selectedTrackIds.contains(anchor) {
+        if let anchor = rowSelection.selectionAnchorId,
+           rowSelection.selectedTrackIds.contains(anchor)
+        {
             return anchor
         }
-        return selectedTrackIds.sorted().first
+        return rowSelection.selectedTrackIds.sorted().first
     }
 
     /// Drives a minimal keyboard scroll — set only by ↑/↓, never
@@ -381,10 +429,10 @@ struct LibraryView: View {
             }
             refreshTracks()
         }
-        .onChange(of: model.libraryIsOpen) { _ in
+        .onChange(of: libraryModel.libraryIsOpen) { _ in
             refreshTracks()
         }
-        .onChange(of: model.libraryTrackCount) { _ in
+        .onChange(of: libraryModel.libraryTrackCount) { _ in
             // Track count bumped → either an import just landed
             // or another window inserted rows. Refresh the visible
             // listing so the user sees the new rows immediately.
@@ -393,7 +441,7 @@ struct LibraryView: View {
         .onChange(of: searchText) { _ in
             refreshTracks()
         }
-        .onChange(of: model.analysisGeneration) { _ in
+        .onChange(of: libraryModel.analysisGeneration) { _ in
             // M11c.1 — a deck-load or batch analyze finished and
             // wrote at least one new grid. Re-fetch the current
             // listing so the BPM column lights up and the dim
@@ -402,10 +450,27 @@ struct LibraryView: View {
             // user shouldn't lose their Space-load target.
             refreshTracks(preserveSelection: true)
         }
-        .onChange(of: model.libraryRowAnalysisUpdate) { update in
+        .onChange(of: libraryModel.libraryRowAnalysisUpdate) { update in
             guard let update else { return }
             applyAnalysisUpdate(update)
         }
+        // M11d.6 round 3 — the previously-present
+        // `.onChange(of: sortOrder) { _ in recomputeSortedTracks() }`
+        // turned every sidebar swap into a **double** rootView
+        // swap. The first one fires when `.onChange(of:
+        // selectedSource)` flips `sortOrder` (resort the OLD
+        // tracks buffer); the second fires ~50 ms later when the
+        // FFI completes and `refreshTracks` lands the NEW rows.
+        // Both swaps go through `NSHostingView.rootView = rows`
+        // on a 5 000-row `LazyVStack`, which is the dominant
+        // main-thread block on a sidebar click. We now call
+        // `recomputeSortedTracks()` explicitly at every site
+        // that mutates `sortOrder` WITHOUT a paired
+        // `refreshTracks()` (the column-header sort toggles and
+        // the hide-column path); the sidebar-swap path skips
+        // the intermediate recompute and lets `refreshTracks`'s
+        // own MainActor block do the single combined swap when
+        // the new rows arrive.
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleLibraryDrop(providers)
         }
@@ -413,7 +478,9 @@ struct LibraryView: View {
             LibraryTextFocusDismissMonitor()
         }
         .sheet(isPresented: $showRelocateSheet) {
-            RelocateSheet(model: model, isPresented: $showRelocateSheet)
+            RelocateSheet(model: model,
+                          libraryModel: libraryModel,
+                          isPresented: $showRelocateSheet)
         }
     }
 
@@ -434,7 +501,7 @@ struct LibraryView: View {
                 .tracking(1.2)
                 .foregroundStyle(DubColor.textSecondary)
             Spacer(minLength: 0)
-            Text("\(model.libraryTrackCount)")
+            Text("\(libraryModel.libraryTrackCount)")
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textTertiary)
                 .help("Total tracks in library")
@@ -576,9 +643,9 @@ struct LibraryView: View {
                 Label("Import Folder…", systemImage: "tray.and.arrow.down")
             }
             .controlSize(.small)
-            .disabled(!model.libraryIsOpen || model.libraryImportInProgress)
+            .disabled(!libraryModel.libraryIsOpen || libraryModel.libraryImportInProgress)
             .help(
-                model.libraryImportInProgress
+                libraryModel.libraryImportInProgress
                     ? "An import is already running."
                     : "Add a folder of audio files to the library.")
         }
@@ -589,7 +656,7 @@ struct LibraryView: View {
 
     @ViewBuilder
     private var trackListContainer: some View {
-        if !model.libraryIsOpen {
+        if !libraryModel.libraryIsOpen {
             placeholderPane(
                 title: "Preparing library…",
                 subtitle: "The library will be ready in a moment.")
@@ -613,14 +680,31 @@ struct LibraryView: View {
     /// exceeds the page size). Client-side sort gives instant
     /// header-click feedback — the FFI is reserved for the
     /// initial fetch + page boundaries.
-    private var sortedTracks: [LibraryTrack] {
-        // Empty comparator → preserve the FFI's natural order
-        // (Recently Played / Just Imported). `sorted(using: [])`
-        // would still be a stable no-op but constructing the
-        // sorted copy is wasted work on every render.
-        guard !sortOrder.isEmpty else { return tracks }
-        return tracks.sorted(using: sortOrder)
-    }
+    ///
+    /// Memoised in `@State` and refreshed via
+    /// `recomputeSortedTracks(...)` whenever `tracks` or
+    /// `sortOrder` changes. Pre-memoisation this was a computed
+    /// property that re-sorted on every body re-eval — and was
+    /// read **three times** per body re-eval (`trackList`'s
+    /// `trackIds` / `visibleTracks` props plus `trackRowsStack`'s
+    /// `ForEach`). With 5 000 rows under a non-empty comparator
+    /// that's ~3–6 ms of pure CPU sort cost the LibraryView body
+    /// had to pay every time the user clicked a row (state
+    /// changes → SwiftUI body invalidation → triple-sort), which
+    /// stretched the main-runloop tick wide enough to make the
+    /// playing waveform skip a vsync.
+    @State private var sortedTracks: [LibraryTrack] = []
+
+    /// Memoised cache of `sortedTracks.map(\.id)`. Used by both
+    /// `LibraryTableScrollContainer.trackIds` (read twice per
+    /// body re-eval, once in `trackList` and once in
+    /// `selectionMonitor`) and `selectRange`. Refreshed alongside
+    /// `sortedTracks` in `recomputeSortedTracks()`. Same
+    /// motivation as `sortedTracks`'s memoisation — avoids a
+    /// 5 000-element `[String]` allocation per body re-eval that
+    /// was visible in the main-thread cost of every library
+    /// click.
+    @State private var sortedTrackIds: [String] = []
 
     /// Scrollable track list. Uses the same row pattern as
     /// `FileBrowserView` (full-row `onTapGesture` + AppKit
@@ -634,13 +718,13 @@ struct LibraryView: View {
                 columnOrderKey: visibleColumns.map(\.rawValue).joined(separator: ","),
                 headerStateKey: columnReorderHeaderStateKey,
                 tracksContentRevision: tracksContentRevision,
-                selectedTrackIds: selectedTrackIds,
+                rowSelection: rowSelection,
                 header: AnyView(trackListHeader),
                 rows: AnyView(trackRowsStack),
-                trackIds: sortedTracks.map(\.id),
+                trackIds: sortedTrackIds,
                 visibleTracks: sortedTracks,
                 menu: LibraryTableMenu(
-                    analysisBatchInProgress: model.analysisBatchTotal > 0,
+                    analysisBatchInProgress: libraryModel.analysisBatchTotal > 0,
                     onAnalyzeRequested: { ids in
                         Task { @MainActor in
                             await model.analyzeTracks(ids)
@@ -660,9 +744,8 @@ struct LibraryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
             LibraryArrowKeyView(
-                selectedTrackIds: $selectedTrackIds,
-                selectionAnchorId: $selectionAnchorId,
-                trackIds: sortedTracks.map(\.id),
+                rowSelection: rowSelection,
+                trackIds: sortedTrackIds,
                 onArrowNavigate: { trackId, delta in
                     keyboardScrollDelta = delta
                     keyboardScrollTarget = trackId
@@ -670,14 +753,17 @@ struct LibraryView: View {
                 onSelectionChanged: syncModelPrimarySelection)
             .allowsHitTesting(false)
         )
-        .onChange(of: selectedTrackIds) { _ in
-            // Defer the FFI path lookup so row highlight paints on
-            // the same frame as the click instead of waiting for
-            // `library.trackPath` on the main thread first.
-            Task { @MainActor in
-                syncModelPrimarySelection()
-            }
-        }
+        // M11d.6 round 4 — the previously-present
+        // `.onChange(of: selectedTrackIds)` handler was deleted
+        // alongside the migration of selection to
+        // `LibraryRowSelection`. With selection living on a
+        // non-observed class reference, `LibraryView.body` no
+        // longer re-evaluates on selection changes, so
+        // `.onChange` would never fire. `syncModelPrimarySelection()`
+        // is now called explicitly at every write site
+        // (`handleRowClick`, `selectRange`, `navigateToSibling`,
+        // `refreshTracks`, and the arrow-key Coordinator) so the
+        // model-side `librarySelection` stays in lock-step.
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleLibraryDrop(providers)
         }
@@ -861,6 +947,11 @@ struct LibraryView: View {
             if activeSortColumn == field {
                 activeSortColumn = nil
                 sortOrder = []
+                // Replaces the removed `.onChange(of: sortOrder)`
+                // handler — see the comment block at the
+                // `selectedSource` onChange for why we route the
+                // resort manually now.
+                recomputeSortedTracks()
             }
             persistColumnOrder(cols)
         }
@@ -1025,6 +1116,14 @@ struct LibraryView: View {
         if activeSortColumn != nil {
             syncSortOrderFromHeader()
         }
+        // M11d.6 round 3 — replaces the removed
+        // `.onChange(of: sortOrder)` handler. Refresh
+        // `sortedTracks` / `sortedTrackIds` exactly once on the
+        // tick the user clicked the header, instead of as a
+        // side effect of the SwiftUI observation chain (which
+        // also fired on sidebar swaps and caused the
+        // double rootView swap).
+        recomputeSortedTracks()
     }
 
     private func syncSortOrderFromHeader() {
@@ -1269,13 +1368,17 @@ struct LibraryView: View {
             alignment: .leading)
         .contentShape(Rectangle())
         .if(dragURL != nil) { view in
-            view.onDrag {
-                if !selectedTrackIds.contains(track.id) {
-                    selectedTrackIds = [track.id]
-                    selectionAnchorId = track.id
-                    Task { @MainActor in
-                        syncModelPrimarySelection()
-                    }
+            view.onDrag { [rowSelection] in
+                if !rowSelection.selectedTrackIds.contains(track.id) {
+                    rowSelection.selectedTrackIds = [track.id]
+                    rowSelection.selectionAnchorId = track.id
+                    // The previous `.onChange(of: selectedTrackIds)`
+                    // ran `syncModelPrimarySelection()` here, but
+                    // that handler is gone now that selection lives
+                    // on the non-observed `rowSelection`. The drag
+                    // path is rare enough that we just skip the
+                    // model sync on hand-off — the deck-load
+                    // pathway re-reads selection on its own.
                 }
                 return NSItemProvider(object: dragURL! as NSURL)
             }
@@ -1287,15 +1390,17 @@ struct LibraryView: View {
         // `LibraryDocumentWrapper.menu(for:)` instead of the
         // SwiftUI `.contextMenu` modifier. SwiftUI's `.contextMenu`
         // closure is empirically captured at the moment the row is
-        // first attached and is NOT re-evaluated when upstream
-        // `@State` (notably `selectedTrackIds`) changes, because
-        // the AppKit selection layer (see
-        // `LibraryTableScrollContainer.updateNSView`) deliberately
-        // skips reassigning `bodyHost.rootView` on selection-only
-        // changes for click latency. Building the menu in AppKit
-        // reads the live selection set at right-click time and so
-        // always reflects the actual multi-selection, including
-        // the "Re-analyze Selected (N)" label.
+        // first attached and is NOT re-evaluated when selection
+        // changes — and as of M11d.6 round 4 selection mutations
+        // don't even fire a `LibraryView.body` re-eval at all
+        // (selection lives on `rowSelection`, a `LibraryRowSelection`
+        // held on `@State` for ownership without observation).
+        // Building the menu in AppKit reads the live selection set
+        // on `rowSelection.selectedTrackIds` at right-click time
+        // (see `LibraryTableScrollContainer.Coordinator`'s
+        // computed `menuSelectedTrackIds` property), so the
+        // multi-select label is always accurate even though the
+        // SwiftUI render path is skipped.
     }
 
     private func handleRowClick(_ track: LibraryTrack) {
@@ -1303,36 +1408,47 @@ struct LibraryView: View {
         NSApp.keyWindow?.makeFirstResponder(nil)
         let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) {
-            if selectedTrackIds.contains(track.id) {
-                selectedTrackIds.remove(track.id)
-                if selectionAnchorId == track.id {
-                    selectionAnchorId = selectedTrackIds.sorted().first
+            if rowSelection.selectedTrackIds.contains(track.id) {
+                rowSelection.selectedTrackIds.remove(track.id)
+                if rowSelection.selectionAnchorId == track.id {
+                    rowSelection.selectionAnchorId =
+                        rowSelection.selectedTrackIds.sorted().first
                 }
             } else {
-                selectedTrackIds.insert(track.id)
-                selectionAnchorId = track.id
+                rowSelection.selectedTrackIds.insert(track.id)
+                rowSelection.selectionAnchorId = track.id
             }
         } else if flags.contains(.shift) {
-            let anchor = selectionAnchorId ?? primarySelectedTrackId ?? track.id
+            let anchor = rowSelection.selectionAnchorId
+                ?? primarySelectedTrackId
+                ?? track.id
             selectRange(from: anchor, to: track.id)
-            selectionAnchorId = track.id
+            rowSelection.selectionAnchorId = track.id
         } else {
-            selectedTrackIds = [track.id]
-            selectionAnchorId = track.id
+            rowSelection.selectedTrackIds = [track.id]
+            rowSelection.selectionAnchorId = track.id
         }
+        // Replaces the removed `.onChange(of: selectedTrackIds)`
+        // sink. `rowSelection` is owned via `@State` so
+        // `LibraryView.body` no longer re-evaluates on the click
+        // tick — and `.onChange` requires that body re-eval to
+        // fire. Calling `syncModelPrimarySelection()` here keeps
+        // the model-side `librarySelection` in lock-step with the
+        // visible selection without that body re-eval cost.
+        syncModelPrimarySelection()
     }
 
     private func selectRange(from anchorId: String, to targetId: String) {
-        let ids = sortedTracks.map(\.id)
+        let ids = sortedTrackIds
         guard let a = ids.firstIndex(of: anchorId),
               let b = ids.firstIndex(of: targetId)
         else {
-            selectedTrackIds = [targetId]
+            rowSelection.selectedTrackIds = [targetId]
             return
         }
         let lo = min(a, b)
         let hi = max(a, b)
-        selectedTrackIds = Set(ids[lo...hi])
+        rowSelection.selectedTrackIds = Set(ids[lo...hi])
     }
 
     private func syncModelPrimarySelection() {
@@ -1340,9 +1456,14 @@ struct LibraryView: View {
            let snapshot = tracks.first(where: { $0.id == trackId })
         {
             model.selectLibraryTrack(trackId, snapshot: snapshot)
-        } else if selectedTrackIds.isEmpty {
-            model.selectedLibraryTrackId = nil
-            model.selectedLibraryTrack = nil
+        } else if rowSelection.selectedTrackIds.isEmpty {
+            // Write through `librarySelection` (the new
+            // side-channel) instead of `libraryModel` — both
+            // fields no longer live on `LibraryAppModel`. See
+            // `LibrarySelectionModel`'s header for the cascade-
+            // cost rationale.
+            model.librarySelection.selectedLibraryTrackId = nil
+            model.librarySelection.selectedLibraryTrack = nil
         }
     }
 
@@ -1351,7 +1472,47 @@ struct LibraryView: View {
             return
         }
         tracks[idx] = tracks[idx].patchedAfterAnalysis(update)
+        recomputeSortedTracks()
         tracksContentRevision &+= 1
+    }
+
+    /// Refresh the memoised `sortedTracks` and `sortedTrackIds`
+    /// from the current `tracks` + `sortOrder`. Call sites:
+    ///
+    /// * `refreshTracks(...)` after the FFI listing returns a
+    ///   new `rows` buffer.
+    /// * `applyAnalysisUpdate(...)` after a per-row patch so the
+    ///   memoised array reflects the new field values (BPM, key,
+    ///   analyzed-flag, etc.) the next time the LazyVStack
+    ///   ForEach reads it.
+    /// * `toggleSort(...)` and the hide-column path inside
+    ///   `setColumnVisibility(...)` so a column-header click
+    ///   resort lands on the same tick the user clicked.
+    ///   M11d.6 round 3 deliberately dropped the
+    ///   `.onChange(of: sortOrder)` handler that used to live
+    ///   here — that handler caused a redundant rootView swap
+    ///   on every sidebar click (first against the stale
+    ///   tracks buffer, then again ~50 ms later against the
+    ///   real rows). Sidebar swaps now flip `sortOrder` and
+    ///   call `refreshTracks(...)`; the resort happens once,
+    ///   when `refreshTracks` lands the new rows.
+    /// * `.onAppear` so an early-render of the body sees a
+    ///   populated cache before the async first fetch lands.
+    ///
+    /// Calling this from inside a body re-eval is safe — the
+    /// `@State` writes coalesce into a single follow-up
+    /// invalidation that fires after the current re-eval
+    /// completes, which is the normal SwiftUI write-during-body
+    /// idiom. The cost is one sort + one map per real change,
+    /// down from three sorts + two maps per body re-eval pre-fix.
+    private func recomputeSortedTracks() {
+        let sorted = sortOrder.isEmpty
+            ? tracks
+            : tracks.sorted(using: sortOrder)
+        if sorted != sortedTracks {
+            sortedTracks = sorted
+            sortedTrackIds = sorted.map(\.id)
+        }
     }
 
     /// Finder drag-and-drop onto the library listing. Folders are
@@ -1362,7 +1523,7 @@ struct LibraryView: View {
     /// the URL collector is serialised through a dedicated queue
     /// before the main-actor import hop.
     private func handleLibraryDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard model.libraryIsOpen, !model.libraryImportInProgress else { return false }
+        guard libraryModel.libraryIsOpen, !libraryModel.libraryImportInProgress else { return false }
         let collector = DispatchQueue(label: "com.dub.library-drop-collector")
         var urls: [URL] = []
         let group = DispatchGroup()
@@ -1444,7 +1605,7 @@ struct LibraryView: View {
                 .buttonStyle(.plain)
                 .help("Potential duplicate — click to jump to sibling.")
             }
-            if model.libraryIsOpen && !model.isTrackReachable(track) {
+            if libraryModel.libraryIsOpen && !model.isTrackReachable(track) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.red.opacity(0.65))
@@ -1480,8 +1641,8 @@ struct LibraryView: View {
     private func navigateToSibling(_ trackId: String) {
         guard tracks.contains(where: { $0.id == trackId }) else { return }
         NSApp.keyWindow?.makeFirstResponder(nil)
-        selectedTrackIds = [trackId]
-        selectionAnchorId = trackId
+        rowSelection.selectedTrackIds = [trackId]
+        rowSelection.selectionAnchorId = trackId
         syncModelPrimarySelection()
     }
 
@@ -1533,11 +1694,11 @@ struct LibraryView: View {
 
     private var footer: some View {
         HStack(spacing: DubSpacing.md) {
-            if let summary = model.lastImportSummary {
+            if let summary = libraryModel.lastImportSummary {
                 Text(importSummaryLine(summary))
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
-            } else if model.libraryImportInProgress {
+            } else if libraryModel.libraryImportInProgress {
                 Text("Importing…")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textSecondary)
@@ -1547,24 +1708,24 @@ struct LibraryView: View {
             // `analysisInFlightCount` without setting
             // `analysisBatchTotal`, so they don't crowd the
             // footer with one-second blips).
-            if model.analysisBatchTotal > 0 {
+            if libraryModel.analysisBatchTotal > 0 {
                 HStack(spacing: 4) {
                     ProgressView()
                         .scaleEffect(0.5)
                         .frame(width: 12, height: 12)
                     Text(analyzeProgressLine(
-                        completed: model.analysisBatchCompleted,
-                        total: model.analysisBatchTotal))
+                        completed: libraryModel.analysisBatchCompleted,
+                        total: libraryModel.analysisBatchTotal))
                         .font(DubFont.micro)
                         .foregroundStyle(DubColor.textSecondary)
                 }
             }
-            if model.missingTrackCount > 0 {
+            if libraryModel.missingTrackCount > 0 {
                 Button(action: { showRelocateSheet = true }) {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red.opacity(0.85))
-                        Text(missingFooterLine(model.missingTrackCount))
+                        Text(missingFooterLine(libraryModel.missingTrackCount))
                             .underline()
                     }
                     .font(DubFont.micro)
@@ -1574,7 +1735,7 @@ struct LibraryView: View {
                 .help("Open the Relocate panel to point Dub at the directory that holds the missing files.")
             }
             Spacer(minLength: 0)
-            Text("\(tracks.count) shown · \(model.libraryTrackCount) total")
+            Text("\(tracks.count) shown · \(libraryModel.libraryTrackCount) total")
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textTertiary)
         }
@@ -1691,10 +1852,12 @@ struct LibraryView: View {
     // MARK: - Async refresh
 
     private func refreshTracks(preserveSelection: Bool = false) {
-        guard model.libraryIsOpen else {
+        guard libraryModel.libraryIsOpen else {
             tracks = []
-            selectedTrackIds = []
-            selectionAnchorId = nil
+            recomputeSortedTracks()
+            rowSelection.selectedTrackIds = []
+            rowSelection.selectionAnchorId = nil
+            syncModelPrimarySelection()
             return
         }
         // Switching source / search / library state invalidates the
@@ -1707,11 +1870,12 @@ struct LibraryView: View {
         // *should* persist; the rows haven't moved. The caller
         // opts into that via `preserveSelection: true`.
         if !preserveSelection {
-            selectedTrackIds = []
-            selectionAnchorId = nil
+            rowSelection.selectedTrackIds = []
+            rowSelection.selectionAnchorId = nil
+            syncModelPrimarySelection()
         }
-        let preservedSelection = selectedTrackIds
-        let preservedAnchor = selectionAnchorId
+        let preservedSelection = rowSelection.selectedTrackIds
+        let preservedAnchor = rowSelection.selectionAnchorId
         let source = selectedSource
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let limit = Self.listingLimit
@@ -1746,24 +1910,40 @@ struct LibraryView: View {
             }
             await MainActor.run {
                 self.tracks = rows
+                self.recomputeSortedTracks()
                 self.tracksContentRevision &+= 1
                 self.isLoading = false
                 if preserveSelection {
                     let visible = Set(rows.map(\.id))
-                    self.selectedTrackIds = preservedSelection.intersection(visible)
+                    self.rowSelection.selectedTrackIds =
+                        preservedSelection.intersection(visible)
                     if let anchor = preservedAnchor,
-                       self.selectedTrackIds.contains(anchor)
+                       self.rowSelection.selectedTrackIds.contains(anchor)
                     {
-                        self.selectionAnchorId = anchor
+                        self.rowSelection.selectionAnchorId = anchor
                     } else {
-                        self.selectionAnchorId = self.selectedTrackIds.sorted().first
+                        self.rowSelection.selectionAnchorId =
+                            self.rowSelection.selectedTrackIds.sorted().first
                     }
                     self.syncModelPrimarySelection()
                 }
-                // Recompute the per-volume reachability cache for
-                // the volumes referenced by the new track set. One
-                // syscall per unique mount point — cheap on a
-                // typical 3 to 5 volume DJ rig.
+            }
+            // Volume reachability has to run on the main thread
+            // (it mutates `libraryModel.volumeReachability`), but
+            // it's an O(rows) scan + per-mount-point `stat(2)`
+            // that has no business piggy-backing on the same
+            // runloop tick that ships the new rows into the
+            // table. Pre-fix it shared the `MainActor.run` block
+            // above, so the visible row body re-eval + AppKit
+            // selection-layer redraw + NSHostingView LazyVStack
+            // rebuild + `stat` syscalls all serialised onto the
+            // same vsync window — the largest single source of
+            // residual main-thread block on a sidebar swap. The
+            // reachability map drives the per-row missing-file
+            // glyph ONLY, so a one-runloop-tick delay is
+            // invisible to the user (the glyph just paints on
+            // the next CVDisplayLink frame instead of this one).
+            await MainActor.run {
                 self.model.refreshVolumeReachability(for: rows)
             }
         }
@@ -1993,10 +2173,16 @@ struct LibraryTableScroll {
 /// * `trackIds` — id-order array. Used by selection + scroll math.
 /// * `visibleTracks` — full row snapshots. Used by the menu builder
 ///   for `gridLocked` / `isAnalyzed` per row.
-/// * `selectedTrackIds` — read by the AppKit selection highlight
-///   layer at `updateNSView` time AND by the menu builder at
-///   right-click time (live, not at SwiftUI build time — that was
-///   the multi-select-label staleness bug).
+/// * `rowSelection: LibraryRowSelection` — the shared,
+///   non-observed selection store. The Coordinator subscribes to
+///   `rowSelection.$selectedTrackIds` via Combine so the AppKit
+///   selection layer repaints when the user clicks a row even
+///   though `LibraryView.body` no longer re-evaluates on
+///   selection changes (selection lives on a class reference,
+///   owned via `@State` for identity, deliberately not observed
+///   by SwiftUI). The right-click menu reads
+///   `rowSelection.selectedTrackIds` live so the
+///   multi-select label is always accurate at popup time.
 /// * `menu: LibraryTableMenu` — bundles the menu's batch
 ///   in-progress predicate and the two action callbacks. See the
 ///   struct's own doc comment for the actor contract.
@@ -2023,7 +2209,7 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
     let columnOrderKey: String
     let headerStateKey: String
     let tracksContentRevision: UInt64
-    let selectedTrackIds: Set<String>
+    let rowSelection: LibraryRowSelection
     let header: AnyView
     let rows: AnyView
     let trackIds: [String]
@@ -2128,36 +2314,37 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             documentWrapper: documentWrapper,
             selectionLayer: selectionLayer,
             headerWidthConstraint: widthConstraint,
-            headerLeadingConstraint: leadingConstraint
+            headerLeadingConstraint: leadingConstraint,
+            rowSelection: rowSelection
         )
         context.coordinator.recordSnapshot(
             tableWidth: tableWidth,
             columnOrderKey: columnOrderKey,
             headerStateKey: headerStateKey,
             tracksContentRevision: tracksContentRevision,
-            selectedTrackIds: selectedTrackIds,
+            selectedTrackIds: rowSelection.selectedTrackIds,
             trackIds: trackIds)
         context.coordinator.updateMenuState(
             visibleTracks: visibleTracks,
-            selectedTrackIds: selectedTrackIds,
             analysisBatchInProgress: menu.analysisBatchInProgress,
             onAnalyzeRequested: menu.onAnalyzeRequested,
             onSetGridLocked: menu.onSetGridLocked)
         context.coordinator.attachMenuBuilder(rowHeight: LibraryRowLayout.estimatedHeight)
         context.coordinator.updateBodyHeight()
         context.coordinator.updateSelectionHighlights(
-            selectedTrackIds: selectedTrackIds, trackIds: trackIds)
+            selectedTrackIds: rowSelection.selectedTrackIds, trackIds: trackIds)
         return stack
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
+        let liveSelection = rowSelection.selectedTrackIds
         let tableWidthChanged = coordinator.lastTableWidth != tableWidth
         let tracksChanged = coordinator.lastTrackIds != trackIds
         let columnsChanged = coordinator.lastColumnOrderKey != columnOrderKey
         let headerStateChanged = coordinator.lastHeaderStateKey != headerStateKey
         let tracksContentChanged = coordinator.lastTracksContentRevision != tracksContentRevision
-        let selectionChanged = coordinator.lastSelectedTrackIds != selectedTrackIds
+        let selectionChanged = coordinator.lastSelectedTrackIds != liveSelection
         // Selection deliberately NOT in `bodyPresentationChanged` —
         // reassigning `bodyHost.rootView` triggers a full SwiftUI
         // diff over every row (AnyView wraps defeat structural
@@ -2178,6 +2365,12 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             coordinator.updateWidths(tableWidth)
             if tracksChanged {
                 coordinator.updateBodyHeight()
+                // Cache must be in sync **before**
+                // `updateSelectionHighlights` below — otherwise
+                // the highlight code would resolve indices
+                // against the previous row set's lookup table
+                // and produce ghost highlights for missing IDs.
+                coordinator.rebuildTrackIdLookup(trackIds: trackIds)
             }
         } else if tableWidthChanged {
             coordinator.updateWidths(tableWidth)
@@ -2185,7 +2378,7 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
 
         if selectionChanged || tracksChanged {
             coordinator.updateSelectionHighlights(
-                selectedTrackIds: selectedTrackIds, trackIds: trackIds)
+                selectedTrackIds: liveSelection, trackIds: trackIds)
         }
 
         coordinator.recordSnapshot(
@@ -2193,7 +2386,7 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             columnOrderKey: columnOrderKey,
             headerStateKey: headerStateKey,
             tracksContentRevision: tracksContentRevision,
-            selectedTrackIds: selectedTrackIds,
+            selectedTrackIds: liveSelection,
             trackIds: trackIds)
         // The right-click menu reads from the Coordinator at
         // `menu(for:)` time, so it ALWAYS sees the latest selection
@@ -2202,7 +2395,6 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         // the AppKit selection layer paints highlights instead).
         coordinator.updateMenuState(
             visibleTracks: visibleTracks,
-            selectedTrackIds: selectedTrackIds,
             analysisBatchInProgress: menu.analysisBatchInProgress,
             onAnalyzeRequested: menu.onAnalyzeRequested,
             onSetGridLocked: menu.onSetGridLocked)
@@ -2220,6 +2412,7 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         coordinator.uninstall()
     }
 
+    @MainActor
     final class Coordinator {
         weak var bodyScroll: NSScrollView?
         weak var headerHost: NSHostingView<AnyView>?
@@ -2229,6 +2422,30 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         weak var headerWidthConstraint: NSLayoutConstraint?
         weak var headerLeadingConstraint: NSLayoutConstraint?
         private var boundsObserver: NSObjectProtocol?
+        /// The shared, non-observed `LibraryRowSelection` instance
+        /// the parent view also points at. Stored so the menu
+        /// builder can read live selection at right-click time and
+        /// so the Combine subscription below has a stable
+        /// reference to subscribe to.
+        fileprivate weak var rowSelection: LibraryRowSelection?
+        /// Subscription on `rowSelection.$selectedTrackIds`. Fires
+        /// the AppKit selection-layer refresh whenever
+        /// `handleRowClick`, arrow-key navigation, or any other
+        /// site writes to the selection — without re-evaluating
+        /// `LibraryView.body`. Held here so it lives as long as
+        /// the Coordinator.
+        private var selectionCancellable: AnyCancellable?
+        /// `trackId → row index` cache keyed off the current
+        /// `lastTrackIds` array. Refreshed in `recordSnapshot(...)`
+        /// whenever the visible track set changes (sidebar swap,
+        /// search, analysis-update row patch). Lets
+        /// `updateSelectionHighlights` resolve the IndexSet via
+        /// O(selected.count) Dictionary lookups instead of an
+        /// O(rows × selected.count) enumeration over the full
+        /// 5 000-row trackIds array — material at the millisecond
+        /// scale once selections grow beyond a single row via
+        /// Shift-click.
+        fileprivate var trackIdToIndex: [String: Int] = [:]
         fileprivate var lastTableWidth: CGFloat = -1
         fileprivate var lastColumnOrderKey: String = ""
         fileprivate var lastHeaderStateKey: String = ""
@@ -2242,7 +2459,16 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         /// selection, not whatever state happened to be captured
         /// when the row was first laid out.
         fileprivate var visibleTracks: [LibraryTrack] = []
-        fileprivate var menuSelectedTrackIds: Set<String> = []
+        /// Live selection at right-click time. Read through a
+        /// computed property so the menu builder always sees the
+        /// current state on `rowSelection`, even when the
+        /// SwiftUI render pass that triggered the right click
+        /// has not re-evaluated `LibraryView.body` (selection
+        /// changes no longer fire a body re-eval; see
+        /// `LibraryRowSelection`).
+        private var menuSelectedTrackIds: Set<String> {
+            rowSelection?.selectedTrackIds ?? []
+        }
         fileprivate var menuAnalysisBatchInProgress: Bool = false
         fileprivate var onAnalyzeRequested: (([String]) -> Void)?
         fileprivate var onSetGridLocked: ((String, Bool) -> Void)?
@@ -2268,6 +2494,26 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             lastTrackIds = trackIds
         }
 
+        /// Refresh the `trackIdToIndex` lookup. Called from
+        /// `LibraryTableScrollContainer.updateNSView` when
+        /// `tracksChanged` is true, **before**
+        /// `updateSelectionHighlights` reads the table — so the
+        /// O(selected.count) lookup path in the highlight code
+        /// always sees an in-sync cache.
+        ///
+        /// The Dictionary rebuild is O(N) on the 5 000-row buffer
+        /// but only fires on a real row-set change (sidebar swap,
+        /// search edit, refresh-tracks bump). Per-click selection
+        /// changes against the same row set reuse the cached
+        /// lookup without rebuilding.
+        func rebuildTrackIdLookup(trackIds: [String]) {
+            var lookup = [String: Int](minimumCapacity: trackIds.count)
+            for (i, id) in trackIds.enumerated() {
+                lookup[id] = i
+            }
+            trackIdToIndex = lookup
+        }
+
         func install(
             bodyScroll: NSScrollView,
             headerHost: NSHostingView<AnyView>,
@@ -2275,7 +2521,8 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             documentWrapper: LibraryDocumentWrapper,
             selectionLayer: LibrarySelectionLayerView,
             headerWidthConstraint: NSLayoutConstraint,
-            headerLeadingConstraint: NSLayoutConstraint
+            headerLeadingConstraint: NSLayoutConstraint,
+            rowSelection: LibraryRowSelection
         ) {
             self.bodyScroll = bodyScroll
             self.headerHost = headerHost
@@ -2284,20 +2531,52 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             self.selectionLayer = selectionLayer
             self.headerWidthConstraint = headerWidthConstraint
             self.headerLeadingConstraint = headerLeadingConstraint
+            self.rowSelection = rowSelection
             bodyScroll.contentView.postsBoundsChangedNotifications = true
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
                 object: bodyScroll.contentView,
                 queue: .main
             ) { [weak self] _ in
-                self?.syncHeaderOffset()
+                // `queue: .main` already delivers this on the main
+                // thread, but `NotificationCenter`'s closure type
+                // is not `@MainActor`-typed, so Swift 6 won't let
+                // us call a MainActor method without an explicit
+                // hop. `assumeIsolated` is the zero-cost
+                // dispatch-free hop documented for exactly this
+                // case.
+                MainActor.assumeIsolated {
+                    self?.syncHeaderOffset()
+                }
             }
+            // M11d.6 round 4 — selection is now mutated on
+            // `rowSelection`, a class that `LibraryView` owns via
+            // `@State` (so its body does NOT re-evaluate on
+            // selection changes). Without this subscription, the
+            // AppKit selection layer would never see a click
+            // because `updateNSView` wouldn't be invoked. We
+            // subscribe to `$selectedTrackIds` here (which fires
+            // synchronously on every assignment via Combine's
+            // `@Published`) and route the new value through
+            // `updateSelectionHighlights` so the layer redraws on
+            // the same tick the click landed on.
+            selectionCancellable = rowSelection.$selectedTrackIds
+                .dropFirst()
+                .sink { [weak self] newIds in
+                    guard let self else { return }
+                    self.lastSelectedTrackIds = newIds
+                    self.updateSelectionHighlights(
+                        selectedTrackIds: newIds,
+                        trackIds: self.lastTrackIds)
+                }
         }
 
         func uninstall() {
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
             }
+            selectionCancellable = nil
+            rowSelection = nil
         }
 
         func syncHeaderOffset() {
@@ -2338,9 +2617,26 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
                 selectionLayer.selectedRowIndices = IndexSet()
                 return
             }
+            // Resolve indices via `trackIdToIndex` so the cost is
+            // O(selectedTrackIds.count) instead of O(trackIds.count).
+            // Pre-fix this enumerated all 5 000 trackIds and
+            // ran a `Set.contains` per row on every selection
+            // change — including the ~10 Hz `pollDecks` cascade
+            // chain that can land while the user is mid-Shift-
+            // click range select. Falls back to the linear scan
+            // if the lookup table wasn't populated yet (e.g.
+            // first `updateNSView` before any `recordSnapshot`).
             var indices = IndexSet()
-            for (i, id) in trackIds.enumerated() where selectedTrackIds.contains(id) {
-                indices.insert(i)
+            if !trackIdToIndex.isEmpty {
+                for id in selectedTrackIds {
+                    if let i = trackIdToIndex[id] {
+                        indices.insert(i)
+                    }
+                }
+            } else {
+                for (i, id) in trackIds.enumerated() where selectedTrackIds.contains(id) {
+                    indices.insert(i)
+                }
             }
             selectionLayer.selectedRowIndices = indices
         }
@@ -2349,15 +2645,21 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         /// `menu(for:)` override (which fires asynchronously
         /// from the SwiftUI render pass) reads consistent state.
         /// Called on every `updateNSView`.
+        ///
+        /// Selection deliberately is *not* a parameter: the menu
+        /// builder reads `rowSelection.selectedTrackIds` live at
+        /// right-click time, which always reflects the latest
+        /// state regardless of whether `LibraryView` re-evaluated
+        /// recently. That's what makes the multi-select
+        /// "Re-analyze Selected (N)" label correct even when
+        /// selection is mutated without a SwiftUI body re-eval.
         func updateMenuState(
             visibleTracks: [LibraryTrack],
-            selectedTrackIds: Set<String>,
             analysisBatchInProgress: Bool,
             onAnalyzeRequested: @escaping ([String]) -> Void,
             onSetGridLocked: @escaping (String, Bool) -> Void
         ) {
             self.visibleTracks = visibleTracks
-            self.menuSelectedTrackIds = selectedTrackIds
             self.menuAnalysisBatchInProgress = analysisBatchInProgress
             self.onAnalyzeRequested = onAnalyzeRequested
             self.onSetGridLocked = onSetGridLocked
@@ -2790,13 +3092,17 @@ private extension LibraryTrack {
 ///   track id". Stale `trackIds` means arrow keys jump to a
 ///   wrong-but-old id; always pass the post-sort, post-filter list.
 ///
-/// **Binding props** (two-way; the handler mutates them):
+/// **Selection prop** (read + mutated by the arrow-key handler):
 ///
-/// * `selectedTrackIds: Set<String>` — selection state. Mutated by
-///   arrow + shift-arrow.
-/// * `selectionAnchorId: String?` — shift-selection anchor.
-///   Mutated on plain arrow (anchor = new selection) and left
-///   alone on shift-arrow (anchor preserved).
+/// * `rowSelection: LibraryRowSelection` — the shared, non-observed
+///   selection state. Mutating
+///   `rowSelection.selectedTrackIds` or
+///   `rowSelection.selectionAnchorId` here is what arrow-key
+///   navigation actually does. The Coordinator that
+///   `LibraryTableScrollContainer` owns subscribes to this same
+///   instance via Combine, so the AppKit selection layer
+///   repaints on the next vsync without `LibraryView` having to
+///   re-evaluate.
 ///
 /// **Closure props**:
 ///
@@ -2816,16 +3122,14 @@ private extension LibraryTrack {
 /// first responder, which is the table region as long as no text
 /// field has focus (see `LibraryTextFocusDismissMonitor`).
 private struct LibraryArrowKeyView: NSViewRepresentable {
-    @Binding var selectedTrackIds: Set<String>
-    @Binding var selectionAnchorId: String?
+    let rowSelection: LibraryRowSelection
     let trackIds: [String]
     var onArrowNavigate: ((String, Int) -> Void)?
     var onSelectionChanged: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
-            selectedTrackIds: $selectedTrackIds,
-            selectionAnchorId: $selectionAnchorId,
+            rowSelection: rowSelection,
             onArrowNavigate: onArrowNavigate,
             onSelectionChanged: onSelectionChanged)
     }
@@ -2848,21 +3152,18 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
 
     @MainActor
     final class Coordinator {
-        @Binding var selectedTrackIds: Set<String>
-        @Binding var selectionAnchorId: String?
+        let rowSelection: LibraryRowSelection
         var trackIds: [String] = []
         var onArrowNavigate: ((String, Int) -> Void)?
         var onSelectionChanged: () -> Void
         private var monitor: Any?
 
         init(
-            selectedTrackIds: Binding<Set<String>>,
-            selectionAnchorId: Binding<String?>,
+            rowSelection: LibraryRowSelection,
             onArrowNavigate: ((String, Int) -> Void)?,
             onSelectionChanged: @escaping () -> Void
         ) {
-            _selectedTrackIds = selectedTrackIds
-            _selectionAnchorId = selectionAnchorId
+            self.rowSelection = rowSelection
             self.onArrowNavigate = onArrowNavigate
             self.onSelectionChanged = onSelectionChanged
         }
@@ -2892,15 +3193,16 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
 
         private func moveSelection(by delta: Int) -> Bool {
             guard !trackIds.isEmpty else { return false }
-            let primary = selectionAnchorId ?? selectedTrackIds.sorted().first
+            let primary = rowSelection.selectionAnchorId
+                ?? rowSelection.selectedTrackIds.sorted().first
             let currentIdx: Int
             if let id = primary, let idx = trackIds.firstIndex(of: id) {
                 currentIdx = idx
             } else {
                 let firstId = trackIds[0]
                 NSApp.keyWindow?.makeFirstResponder(nil)
-                selectedTrackIds = [firstId]
-                selectionAnchorId = firstId
+                rowSelection.selectedTrackIds = [firstId]
+                rowSelection.selectionAnchorId = firstId
                 onSelectionChanged()
                 onArrowNavigate?(firstId, delta)
                 return true
@@ -2909,8 +3211,8 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
             guard next != currentIdx else { return false }
             let nextId = trackIds[next]
             NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedTrackIds = [nextId]
-            selectionAnchorId = nextId
+            rowSelection.selectedTrackIds = [nextId]
+            rowSelection.selectionAnchorId = nextId
             onSelectionChanged()
             onArrowNavigate?(nextId, delta)
             return true
@@ -2947,6 +3249,10 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
 /// previous path resurrects on its own.
 private struct RelocateSheet: View {
     @ObservedObject var model: WaveformAppModel
+    /// Library/analysis state passed through from the parent.
+    /// See `LibraryView.libraryModel`'s doc comment for the
+    /// performance rationale.
+    @ObservedObject var libraryModel: LibraryAppModel
     @Binding var isPresented: Bool
     @State private var lastRunSummary: (matched: UInt32, unmatched: UInt32)? = nil
 
@@ -2967,7 +3273,7 @@ private struct RelocateSheet: View {
                 summaryView(summary)
             }
 
-            if model.relocateInProgress {
+            if libraryModel.relocateInProgress {
                 HStack(spacing: DubSpacing.sm) {
                     ProgressView()
                         .controlSize(.small)
@@ -2985,7 +3291,7 @@ private struct RelocateSheet: View {
                     Text("Match Folder…")
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.relocateInProgress || model.missingTrackCount == 0)
+                .disabled(libraryModel.relocateInProgress || libraryModel.missingTrackCount == 0)
             }
         }
         .padding(DubSpacing.xl)
@@ -2994,10 +3300,10 @@ private struct RelocateSheet: View {
     }
 
     private var headline: String {
-        if model.missingTrackCount == 0 {
+        if libraryModel.missingTrackCount == 0 {
             return "All known files are reachable. Nothing to relocate right now."
         }
-        let n = model.missingTrackCount
+        let n = libraryModel.missingTrackCount
         let label = n == 1 ? "track is" : "tracks are"
         return "\(n) \(label) currently flagged as missing. Pick a folder Dub should search — files matching by fingerprint and duration will be reattached without disturbing the original library entries."
     }

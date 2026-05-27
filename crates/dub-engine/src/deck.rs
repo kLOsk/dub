@@ -25,7 +25,7 @@ use crate::realtime::RealtimeContext;
 /// [`crate::handle::DeckCommand`] proxy. Lock-free reads from the UI
 /// thread, lock-free writes from the audio thread.
 ///
-/// Four values are made visible across the boundary:
+/// Six values are made visible across the boundary:
 ///
 /// - **position (in track frames)** as `f64::to_bits` packed in an
 ///   `AtomicU64`. The audio thread updates this once per render block
@@ -43,23 +43,60 @@ use crate::realtime::RealtimeContext;
 ///   cancel. UI reads this to render the `TC · HOLD` source-pill
 ///   amber-dot state and to un-gate overview click-jump in
 ///   Timecode mode (M10.6c).
+/// - **duration in seconds** as `f64::to_bits` (M11d.6 round 5). The
+///   audio thread publishes this whenever a new source is set so
+///   the off-main waveform render thread can read playhead and
+///   duration from atomics without taking the FFI engine mutex.
+///   Zero when no track is loaded.
+/// - **has-track flag (M11d.6 round 5)**: matches `source.is_some()`
+///   from the audio thread's perspective. Paired with
+///   `duration_secs_bits` so a lock-free reader can detect an
+///   unloaded deck without consulting `file_tracks` under the
+///   `EngineState` mutex.
 #[derive(Debug)]
-pub(crate) struct DeckSharedState {
-    pub(crate) position_bits: AtomicU64,
-    pub(crate) is_playing: AtomicBool,
-    pub(crate) at_end: AtomicBool,
-    /// M10.6b. See struct docs.
-    pub(crate) is_panic_play: AtomicBool,
+pub struct DeckSharedState {
+    position_bits: AtomicU64,
+    is_playing: AtomicBool,
+    at_end: AtomicBool,
+    is_panic_play: AtomicBool,
+    duration_secs_bits: AtomicU64,
+    /// Published alongside [`Self::position_bits`] so a lock-free
+    /// snapshot reader can surface wall-clock seconds without
+    /// owning the track's sample-rate metadata.
+    position_secs_bits: AtomicU64,
+    has_track: AtomicBool,
 }
 
 impl DeckSharedState {
-    pub(crate) fn new() -> Self {
+    /// Construct a fresh shared-state slot. All fields default to
+    /// "no track" / "stopped". Cheap; intended to be called once
+    /// per deck per process.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             position_bits: AtomicU64::new(0.0f64.to_bits()),
             is_playing: AtomicBool::new(false),
             at_end: AtomicBool::new(false),
             is_panic_play: AtomicBool::new(false),
+            duration_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            has_track: AtomicBool::new(false),
         }
+    }
+
+    /// Reset all atomics to the "no track" / "stopped" baseline
+    /// (M11d.6 round 5). The FFI calls this when a Running →
+    /// Stopped transition lands so a UI that's still polling
+    /// `position_snapshot` after `stop_thru` sees a clean
+    /// "empty deck" state instead of the last in-flight playhead.
+    pub fn reset(&self) {
+        self.position_bits.store(0u64, Ordering::Relaxed);
+        self.position_secs_bits.store(0u64, Ordering::Relaxed);
+        self.duration_secs_bits.store(0u64, Ordering::Relaxed);
+        self.is_playing.store(false, Ordering::Relaxed);
+        self.at_end.store(false, Ordering::Relaxed);
+        self.is_panic_play.store(false, Ordering::Relaxed);
+        self.has_track.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn store_position(&self, frames: f64) {
@@ -67,7 +104,9 @@ impl DeckSharedState {
             .store(frames.to_bits(), Ordering::Relaxed);
     }
 
-    pub(crate) fn load_position(&self) -> f64 {
+    /// Read the current playhead in **track frames**.
+    #[must_use]
+    pub fn load_position(&self) -> f64 {
         f64::from_bits(self.position_bits.load(Ordering::Relaxed))
     }
 
@@ -75,7 +114,9 @@ impl DeckSharedState {
         self.is_playing.store(playing, Ordering::Relaxed);
     }
 
-    pub(crate) fn load_playing(&self) -> bool {
+    /// `true` while the deck is advancing its playhead.
+    #[must_use]
+    pub fn load_playing(&self) -> bool {
         self.is_playing.load(Ordering::Relaxed)
     }
 
@@ -83,7 +124,10 @@ impl DeckSharedState {
         self.at_end.store(at_end, Ordering::Relaxed);
     }
 
-    pub(crate) fn load_at_end(&self) -> bool {
+    /// `true` once the playhead has walked off the end of the
+    /// source.
+    #[must_use]
+    pub fn load_at_end(&self) -> bool {
         self.at_end.load(Ordering::Relaxed)
     }
 
@@ -91,8 +135,49 @@ impl DeckSharedState {
         self.is_panic_play.store(panic, Ordering::Relaxed);
     }
 
-    pub(crate) fn load_panic_play(&self) -> bool {
+    /// M10.6b. `true` while the deck is in Panic-Play state.
+    #[must_use]
+    pub fn load_panic_play(&self) -> bool {
         self.is_panic_play.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_duration_secs(&self, secs: f64) {
+        self.duration_secs_bits
+            .store(secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read the loaded track's wall-clock duration. Zero when no
+    /// track is loaded.
+    #[must_use]
+    pub fn load_duration_secs(&self) -> f64 {
+        f64::from_bits(self.duration_secs_bits.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn store_has_track(&self, has: bool) {
+        self.has_track.store(has, Ordering::Relaxed);
+    }
+
+    /// `true` while a File-mode track is loaded on the deck.
+    #[must_use]
+    pub fn load_has_track(&self) -> bool {
+        self.has_track.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_position_secs(&self, secs: f64) {
+        self.position_secs_bits
+            .store(secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read the current playhead in **wall-clock seconds**.
+    #[must_use]
+    pub fn load_position_secs(&self) -> f64 {
+        f64::from_bits(self.position_secs_bits.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for DeckSharedState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -181,21 +266,45 @@ impl Deck {
     /// the `Arc` is cheap.
     #[must_use]
     pub fn new(declick_envelope: Arc<DeclickEnvelope>) -> Self {
+        Self::with_shared(declick_envelope, Arc::new(DeckSharedState::new()))
+    }
+
+    /// Construct an empty deck that publishes its transport into
+    /// the caller-provided `shared` slot (M11d.6 round 5). Used by
+    /// the FFI so the same `Arc<DeckSharedState>` survives
+    /// `start_thru` / `stop_thru` cycles — a render thread that
+    /// captured the Arc once never has to swap it on engine
+    /// restart, and `DubEngine::position_snapshot` reads atomics
+    /// that exist for the lifetime of the process.
+    ///
+    /// The caller should pass a freshly [`DeckSharedState::reset`]-ed
+    /// slot when the engine is being (re)started; this constructor
+    /// does not touch the atomics.
+    #[must_use]
+    pub fn with_shared(
+        declick_envelope: Arc<DeclickEnvelope>,
+        shared: Arc<DeckSharedState>,
+    ) -> Self {
         Self {
             source: None,
             position: 0.0,
             rate: 1.0,
             gain: 1.0,
             playing: false,
-            shared: Arc::new(DeckSharedState::new()),
+            shared,
             declick_envelope,
             declick: DeclickState::Idle,
             pending_disposal: None,
         }
     }
 
-    /// Return a clone of the shared state Arc. Used by the engine handle
-    /// constructor to plumb the same atomic snapshot to both sides.
+    /// Return a clone of the shared state Arc.
+    ///
+    /// Production callers now pre-allocate the
+    /// `Arc<DeckSharedState>` and pass it to [`Self::with_shared`]
+    /// (M11d.6 round 5); this accessor stays in the API for tests
+    /// that need to poke the audio-thread atomics directly.
+    #[allow(dead_code)]
     pub(crate) fn shared(&self) -> Arc<DeckSharedState> {
         self.shared.clone()
     }
@@ -205,10 +314,18 @@ impl Deck {
     /// silence (or from whatever was previously playing).
     pub fn set_source(&mut self, track: Arc<Track>) {
         self.start_declick();
+        let duration_secs = Self::track_duration_secs(&track);
         self.source = Some(track);
         self.position = 0.0;
         self.shared.store_position(0.0);
+        self.shared.store_position_secs(0.0);
         self.shared.store_at_end(false);
+        // Publish duration + has_track before we return so a
+        // lock-free position_snapshot reader on another thread
+        // observes the new track at the same moment the audio
+        // thread does. Audio-thread safe: pure atomic stores.
+        self.shared.store_duration_secs(duration_secs);
+        self.shared.store_has_track(true);
     }
 
     /// Swap the deck's track for `track`. The previous source (if any)
@@ -220,10 +337,14 @@ impl Deck {
     /// Used by [`crate::Engine`] when applying [`crate::Command::DeckLoad`].
     pub fn swap_source(&mut self, track: Arc<Track>) {
         self.start_declick();
+        let duration_secs = Self::track_duration_secs(&track);
         self.source = Some(track);
         self.position = 0.0;
         self.shared.store_position(0.0);
+        self.shared.store_position_secs(0.0);
         self.shared.store_at_end(false);
+        self.shared.store_duration_secs(duration_secs);
+        self.shared.store_has_track(true);
     }
 
     /// Clear the loaded track. The deck fades to silence over the
@@ -233,7 +354,25 @@ impl Deck {
         self.source = None;
         self.position = 0.0;
         self.shared.store_position(0.0);
+        self.shared.store_position_secs(0.0);
         self.shared.store_at_end(false);
+        self.shared.store_duration_secs(0.0);
+        self.shared.store_has_track(false);
+    }
+
+    /// Compute wall-clock duration of a track in seconds. Pulled out
+    /// of [`Self::set_source`] / [`Self::swap_source`] so both paths
+    /// publish the same value, and so the conversion lives in one
+    /// place (frames as `u64` → `f64`, sample rate as `u32` → `f64`,
+    /// guarding against a zero sample rate).
+    #[allow(clippy::cast_precision_loss)]
+    fn track_duration_secs(track: &Track) -> f64 {
+        let sr = f64::from(track.sample_rate());
+        if sr > 0.0 {
+            track.frames() as f64 / sr
+        } else {
+            0.0
+        }
     }
 
     /// Begin a de-click ramp.
@@ -366,6 +505,23 @@ impl Deck {
         self.start_declick();
         self.position = position;
         self.shared.store_position(position);
+        // Mirror in seconds so the lock-free
+        // `position_snapshot` FFI surfaces a consistent playhead.
+        // Falls back to zero when no track is loaded (sample rate
+        // unknown) — same convention as
+        // [`Self::track_duration_secs`].
+        let secs = match self.source.as_ref() {
+            Some(track) => {
+                let sr = f64::from(track.sample_rate());
+                if sr > 0.0 {
+                    position / sr
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        self.shared.store_position_secs(secs);
         self.shared.store_at_end(false);
     }
 
@@ -600,6 +756,23 @@ impl Deck {
 
         self.position = pos;
         self.shared.store_position(pos);
+        // Publish playhead in seconds for the lock-free
+        // `position_snapshot` reader (M11d.6 round 5). One divide
+        // per render block; negligible cost. We use the *currently
+        // loaded* source's sample rate — the audio thread already
+        // owns this Arc for the duration of the block.
+        let secs = match self.source.as_ref() {
+            Some(track) => {
+                let sr = f64::from(track.sample_rate());
+                if sr > 0.0 {
+                    pos / sr
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        self.shared.store_position_secs(secs);
     }
 }
 
@@ -704,7 +877,13 @@ impl Deck {
 }
 
 #[cfg(test)]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -1177,6 +1356,142 @@ mod tests {
                 "tail-fade shouldn't fire on a 4-frame track; got {s}"
             );
         }
+    }
+
+    #[test]
+    fn shared_state_publishes_duration_and_has_track_on_load() {
+        let mut deck = test_deck();
+        let shared = deck.shared();
+        assert!(!shared.load_has_track(), "fresh deck must have no track");
+        assert_eq!(shared.load_duration_secs(), 0.0);
+        assert_eq!(shared.load_position_secs(), 0.0);
+
+        let n = 48_000;
+        let samples = vec![0.0_f32; n * 2];
+        let track = const_track(&samples, 2, 48_000);
+        deck.set_source(track);
+
+        assert!(shared.load_has_track(), "set_source must publish has_track");
+        let dur = shared.load_duration_secs();
+        assert!(
+            (dur - 1.0).abs() < 1e-9,
+            "duration_secs must reflect track length; got {dur}"
+        );
+        assert_eq!(shared.load_position_secs(), 0.0);
+
+        deck.clear_source();
+        assert!(
+            !shared.load_has_track(),
+            "clear_source must publish !has_track"
+        );
+        assert_eq!(shared.load_duration_secs(), 0.0);
+        assert_eq!(shared.load_position_secs(), 0.0);
+    }
+
+    #[test]
+    fn shared_state_position_secs_tracks_seek() {
+        let mut deck = test_deck();
+        let shared = deck.shared();
+        let samples = vec![0.0_f32; 96_000 * 2];
+        let track = const_track(&samples, 2, 48_000);
+        deck.set_source(track);
+
+        deck.set_position_frames(48_000.0);
+        let secs = shared.load_position_secs();
+        assert!(
+            (secs - 1.0).abs() < 1e-9,
+            "set_position_frames must publish position_secs; got {secs}"
+        );
+    }
+
+    #[test]
+    fn shared_state_reset_clears_all_fields() {
+        let mut deck = test_deck();
+        let shared = deck.shared();
+        let samples = vec![0.0_f32; 48_000 * 2];
+        let track = const_track(&samples, 2, 48_000);
+        deck.set_source(track);
+        deck.set_position_frames(24_000.0);
+        deck.set_playing(true);
+
+        assert!(shared.load_has_track());
+        assert!(shared.load_playing());
+
+        shared.reset();
+        assert!(!shared.load_has_track());
+        assert!(!shared.load_playing());
+        assert!(!shared.load_at_end());
+        assert!(!shared.load_panic_play());
+        assert_eq!(shared.load_position(), 0.0);
+        assert_eq!(shared.load_position_secs(), 0.0);
+        assert_eq!(shared.load_duration_secs(), 0.0);
+    }
+
+    /// Soak: every individual `load_*` accessor on
+    /// [`DeckSharedState`] must return a **non-torn** value
+    /// regardless of how aggressively the writer thread is
+    /// mutating the deck (M11d.6 round 5). That is, an `f64`
+    /// read from any of the `*_bits` atomics is always a single
+    /// previously-stored `f64::to_bits` — never a half-old /
+    /// half-new bit pattern that would yield `NaN`. The audio
+    /// thread updates these atomics roughly once per render
+    /// block; the off-main waveform renderer reads them at
+    /// vsync.
+    ///
+    /// Cross-field tearing (e.g. observing `has_track == true`
+    /// briefly paired with `duration_secs == 0.0` during the
+    /// sub-microsecond store window inside `set_source` /
+    /// `clear_source`) is **tolerated** and visually invisible:
+    /// the renderer skips drawing that frame's playhead and
+    /// recovers on the next vsync. This test therefore asserts
+    /// only the within-field invariant, which is what
+    /// `AtomicU64` provides.
+    #[test]
+    fn shared_state_concurrent_reads_are_within_field_coherent() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let mut deck = test_deck();
+        let shared: StdArc<DeckSharedState> = deck.shared();
+
+        let stop = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_shared = shared.clone();
+        let reader = thread::spawn(move || {
+            let mut observed = 0u64;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _has = reader_shared.load_has_track();
+                let dur = reader_shared.load_duration_secs();
+                let pos_secs = reader_shared.load_position_secs();
+                let pos_frames = reader_shared.load_position();
+                assert!(
+                    dur.is_finite() && dur >= 0.0,
+                    "duration_secs torn or negative: {dur}"
+                );
+                assert!(
+                    pos_secs.is_finite(),
+                    "position_secs torn (NaN/inf): {pos_secs}"
+                );
+                assert!(
+                    pos_frames.is_finite(),
+                    "position_frames torn (NaN/inf): {pos_frames}"
+                );
+                observed += 1;
+            }
+            observed
+        });
+
+        for cycle in 0..200 {
+            let n = 48_000 + (cycle as usize % 16) * 4_800;
+            let track = const_track(&vec![0.0_f32; n * 2], 2, 48_000);
+            deck.set_source(track);
+            deck.set_position_frames(((cycle as f64) * 1_000.0) % (n as f64));
+            std::thread::yield_now();
+            deck.clear_source();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let observed = reader.join().expect("reader thread");
+        assert!(observed > 0, "reader must have taken at least one sample");
     }
 
     proptest! {

@@ -40,7 +40,7 @@ use dub_bpm::{
     latch_beat_grid_at_downbeat, octave_profile_from_genre, uniform_beats,
     BeatGrid as CoreBeatGrid, GridQuality as CoreGridQuality, OctaveProfile,
 };
-use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
+use dub_engine::{DeckSharedState, Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
 };
@@ -152,7 +152,7 @@ uniffi::setup_scaffolding!();
 ///       auto-lock heuristic. PRD-BEATS §3.5 + user feedback:
 ///       "i pressed the bpm to set the 1 and it initiated autlock"
 ///       — auto-lock is reserved for the auto-analyse pass.
-pub const FFI_VERSION: u32 = 21;
+pub const FFI_VERSION: u32 = 22;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -301,6 +301,15 @@ pub struct DubEngine {
     /// `load_track`). Separate from `peak_generation_seq` so a
     /// grid correction does not wipe the waveform ring.
     beat_grid_generation_seq: Arc<[AtomicU64; 2]>,
+    /// Per-deck lock-free transport snapshot (M11d.6 round 5).
+    ///
+    /// Constructed once at [`Self::new`] and reused across every
+    /// `start_thru` / `stop_thru` cycle, so the same Arcs the
+    /// off-main waveform render thread captured at startup remain
+    /// valid for the lifetime of the process. The audio thread
+    /// writes through these atomics; [`Self::position_snapshot`]
+    /// reads them without ever touching `Mutex<EngineState>`.
+    deck_shared: Arc<[Arc<DeckSharedState>; 2]>,
 }
 
 /// Internal state machine for the engine.
@@ -626,6 +635,10 @@ impl DubEngine {
             state: Arc::new(Mutex::new(EngineState::Stopped)),
             peak_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
             beat_grid_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
+            deck_shared: Arc::new([
+                Arc::new(DeckSharedState::new()),
+                Arc::new(DeckSharedState::new()),
+            ]),
         })
     }
 
@@ -700,7 +713,7 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
-        let running = start_thru_inner(&device_name, &channels, None)?;
+        let running = start_thru_inner(&device_name, &channels, None, &self.deck_shared)?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
         Ok(())
@@ -747,7 +760,12 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(combined));
         }
 
-        let running = start_thru_inner(&device_name, &channels_a, Some(&channels_b))?;
+        let running = start_thru_inner(
+            &device_name,
+            &channels_a,
+            Some(&channels_b),
+            &self.deck_shared,
+        )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
         self.bump_peak_generation(1);
@@ -784,6 +802,13 @@ impl DubEngine {
         // shutdown sequence documented on `RunningState`.
         let prev = std::mem::replace(&mut *state, EngineState::Stopped);
         drop(prev);
+        // M11d.6 round 5. The audio thread has been torn down;
+        // the persistent `deck_shared` atomics will otherwise
+        // freeze on the last in-flight playhead. Reset them so a
+        // UI still polling `position_snapshot` sees an empty deck.
+        for slot in self.deck_shared.iter() {
+            slot.reset();
+        }
     }
 
     /// Alias of [`Self::stop_thru`] for parity with the M10.5
@@ -830,7 +855,7 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(vec![output_channels]));
         }
 
-        let running = start_engine_inner(output_channels)?;
+        let running = start_engine_inner(output_channels, &self.deck_shared)?;
         *state = EngineState::Running(Box::new(running));
         Ok(())
     }
@@ -1256,6 +1281,15 @@ impl DubEngine {
     ///
     /// Cheap: a few `Relaxed` atomic loads. Safe to call from a
     /// 30 Hz / 60 Hz UI loop without rate-limiting.
+    ///
+    /// **M11d.6 round 5**: this path still acquires the engine
+    /// `Mutex<EngineState>` because it consults
+    /// `running.file_tracks[idx]` for the loaded track's frames /
+    /// sample rate. Off-main hot-loop callers (e.g. the new
+    /// waveform render thread) should prefer
+    /// [`Self::position_snapshot`], which reads only the lock-free
+    /// `DeckSharedState` atomics and never contends with library
+    /// or load-track work on the main thread.
     #[must_use]
     pub fn position(&self, deck_idx: u64) -> PositionInfo {
         let idx = match deck_idx_to_usize(deck_idx) {
@@ -1301,6 +1335,71 @@ impl DubEngine {
             at_end: snap.at_end,
             has_track: true,
             is_panic_play: snap.is_panic_play,
+        }
+    }
+
+    /// Lock-free playhead snapshot for hot-path callers (M11d.6
+    /// round 5).
+    ///
+    /// Returns the same [`PositionInfo`] shape as [`Self::position`]
+    /// but reads **only** the atomic `DeckSharedState` fields. It
+    /// never acquires the engine mutex, so the caller cannot stall
+    /// behind `load_track`, library work, or any other FFI method
+    /// that holds `Mutex<EngineState>`. The downside: the
+    /// `duration_secs` is whatever the audio thread last published
+    /// (zero when no track is loaded). That matches the steady-state
+    /// `position(...)` reading, plus a sub-frame window during a
+    /// track swap where the duration may briefly read as the new
+    /// value while `position_frames` still reads as the old (or
+    /// vice versa). The waveform renderer tolerates that — it
+    /// gates real drawing behind `peaksGeneration` bumps, which
+    /// the FFI publishes through its own `Acquire`/`Release`
+    /// atomic — but a time-display consumer that needs strictly
+    /// consistent fields should keep using [`Self::position`].
+    ///
+    /// Intended consumers: the per-deck waveform render thread,
+    /// `TrackOverviewView`'s 4 Hz timeline, `LiveDeckTimeText`'s
+    /// 2 Hz timeline, and `pollDecks`'s 10 Hz transport mirror.
+    #[must_use]
+    pub fn position_snapshot(&self, deck_idx: u64) -> PositionInfo {
+        let idx = match deck_idx_to_usize(deck_idx) {
+            Ok(idx) => idx,
+            Err(_) => return PositionInfo::EMPTY,
+        };
+        let shared = match self.deck_shared.get(idx) {
+            Some(arc) => arc.as_ref(),
+            None => return PositionInfo::EMPTY,
+        };
+        let duration_secs = shared.load_duration_secs();
+        let is_playing = shared.load_playing();
+        let is_panic_play = shared.load_panic_play();
+        let at_end = shared.load_at_end();
+        let has_track = shared.load_has_track();
+        if !has_track {
+            return PositionInfo {
+                has_track: false,
+                is_playing,
+                is_panic_play,
+                ..PositionInfo::EMPTY
+            };
+        }
+        // The audio thread publishes the playhead in seconds
+        // alongside the canonical frame-domain `position_bits`
+        // (`Deck::store_position_secs`). That keeps the snapshot
+        // self-contained — readers do not need the track's sample
+        // rate to surface a wall-clock playhead.
+        let playhead_secs_unclamped = shared.load_position_secs();
+        let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
+        let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
+        PositionInfo {
+            elapsed_secs,
+            playhead_secs_unclamped,
+            remaining_secs,
+            duration_secs,
+            is_playing,
+            at_end,
+            has_track: true,
+            is_panic_play,
         }
     }
 
@@ -1656,9 +1755,6 @@ impl DubEngine {
     ///   grid has zero confidence (no BPM was detected) or
     ///   `delta_secs` isn't finite
     pub fn nudge_beat_grid_phase(&self, deck_idx: u64, delta_secs: f64) -> Result<(), EngineError> {
-        // #region agent log
-        agent_debug_log_nudge("phase", "entry", deck_idx, delta_secs, 0.0, 0.0, 0);
-        // #endregion
         let idx = deck_idx_to_usize(deck_idx)?;
         if !delta_secs.is_finite() {
             return Err(EngineError::InvalidBeatGridParams);
@@ -1673,25 +1769,11 @@ impl DubEngine {
         if fp.beat_grid.confidence <= 0.0 || fp.beat_grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
-        let current_anchor = fp.beat_grid.beats[0];
         for beat in &mut fp.beat_grid.beats {
             *beat += delta_secs;
         }
-        let new_first = fp.beat_grid.beats[0];
-        let beat_count = fp.beat_grid.beats.len();
         drop(state);
         self.bump_beat_grid_generation(idx);
-        // #region agent log
-        agent_debug_log_nudge(
-            "phase",
-            "applied",
-            deck_idx,
-            delta_secs,
-            current_anchor,
-            new_first,
-            beat_count,
-        );
-        // #endregion
         Ok(())
     }
 
@@ -1712,9 +1794,6 @@ impl DubEngine {
     /// [`EngineError::InvalidBeatGridParams`] when the resulting
     /// BPM would be non-positive or non-finite.
     pub fn nudge_beat_grid_bpm(&self, deck_idx: u64, delta_bpm: f64) -> Result<(), EngineError> {
-        // #region agent log
-        agent_debug_log_nudge("bpm", "entry", deck_idx, delta_bpm, 0.0, 0.0, 0);
-        // #endregion
         let idx = deck_idx_to_usize(deck_idx)?;
         if !delta_bpm.is_finite() {
             return Err(EngineError::InvalidBeatGridParams);
@@ -1749,16 +1828,9 @@ impl DubEngine {
         if grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
-        let new_first = grid.beats.first().copied().unwrap_or(0.0);
-        let beat_count = grid.beats.len();
         fp.beat_grid = grid;
         drop(state);
         self.bump_beat_grid_generation(idx);
-        // #region agent log
-        agent_debug_log_nudge(
-            "bpm", "applied", deck_idx, delta_bpm, anchor, new_first, beat_count,
-        );
-        // #endregion
         Ok(())
     }
 
@@ -2565,104 +2637,6 @@ fn background_analyze_and_install(
         a.fetch_add(1, Ordering::Release);
     }
     eprintln!("dub-ffi: beat-grid deck={idx} installed ({source_label}, {bpm_ms}ms DSP)");
-
-    // #region agent log
-    let snapshot = installed_grid_snapshot(&state, idx);
-    agent_log_beatgrid_install(idx, source_label, bpm_ms, &snapshot);
-    // #endregion
-}
-
-fn installed_grid_snapshot(
-    state: &Arc<Mutex<EngineState>>,
-    idx: usize,
-) -> (f64, f32, usize, Vec<f64>, Vec<f64>) {
-    let guard = lock_state(state);
-    let EngineState::Running(running) = &*guard else {
-        return (0.0, 0.0, 0, Vec::new(), Vec::new());
-    };
-    let Some(PeakSource::File(fp)) = running.peaks.get(idx).and_then(|p| p.as_ref()) else {
-        return (0.0, 0.0, 0, Vec::new(), Vec::new());
-    };
-    let beats = &fp.beat_grid.beats;
-    let head: Vec<f64> = beats.iter().take(8).copied().collect();
-    let tail: Vec<f64> = beats.iter().rev().take(8).rev().copied().collect();
-    (
-        fp.beat_grid.bpm,
-        fp.beat_grid.confidence,
-        beats.len(),
-        head,
-        tail,
-    )
-}
-
-// #region agent log
-/// NDJSON appender for the manual beat-grid nudge debug session.
-/// Best-effort: silent on any I/O failure.
-fn agent_debug_log_nudge(
-    kind: &str,
-    phase: &str,
-    deck_idx: u64,
-    delta: f64,
-    old_first_beat: f64,
-    new_first_beat: f64,
-    beat_count: usize,
-) {
-    use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/klos/Development/dub/.cursor/debug-c73978.log")
-    else {
-        return;
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = format!(
-        "{{\"sessionId\":\"c73978\",\"runId\":\"beatgrid-nudge\",\"hypothesisId\":\"paused-deck-no-redraw\",\"location\":\"dub-ffi/lib.rs:nudge_beat_grid_{kind}\",\"message\":\"nudge {phase}\",\"data\":{{\"deckIdx\":{deck_idx},\"delta\":{delta},\"oldFirstBeat\":{old_first_beat},\"newFirstBeat\":{new_first_beat},\"beatCount\":{beat_count}}},\"timestamp\":{ts}}}\n"
-    );
-    let _ = f.write_all(line.as_bytes());
-}
-// #endregion
-
-fn agent_log_beatgrid_install(
-    idx: usize,
-    source_label: &str,
-    bpm_ms: u128,
-    snapshot: &(f64, f32, usize, Vec<f64>, Vec<f64>),
-) {
-    use std::io::Write;
-    let path = "/Users/klos/Development/dub/.cursor/debug-c73978.log";
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let (bpm, confidence, beat_count, head, tail) = snapshot;
-    let fmt_arr = |xs: &[f64]| -> String {
-        let mut s = String::from("[");
-        for (i, v) in xs.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&format!("{v}"));
-        }
-        s.push(']');
-        s
-    };
-    let line = format!(
-        "{{\"sessionId\":\"c73978\",\"runId\":\"beatgrid-refine\",\"hypothesisId\":\"H1\",\"location\":\"dub-ffi/lib.rs:background_analyze_and_install\",\"message\":\"beat-grid installed\",\"data\":{{\"deckIdx\":{idx},\"sourceLabel\":\"{source_label}\",\"bpmAnalysisMs\":{bpm_ms},\"bpm\":{bpm},\"confidence\":{confidence},\"beatCount\":{beat_count},\"firstBeats\":{first},\"lastBeats\":{last}}},\"timestamp\":{timestamp_ms}}}\n",
-        first = fmt_arr(head),
-        last = fmt_arr(tail),
-    );
-    let _ = f.write_all(line.as_bytes());
 }
 
 /// Materialise a [`BeatGrid`] from the scalar `(bpm, anchor_secs)`
@@ -2778,6 +2752,7 @@ fn start_thru_inner(
     device_name: &str,
     channels_a: &[u32],
     channels_b: Option<&[u32]>,
+    deck_shared: &[Arc<DeckSharedState>; 2],
 ) -> Result<RunningState, EngineError> {
     // ----- 1. Build InputOptions ------------------------------------
     // Convert 1-based user-facing channel indices to 0-based
@@ -2829,7 +2804,14 @@ fn start_thru_inner(
     };
 
     // ----- 4. Build engine ------------------------------------------
-    let (engine, mut handle) = Engine::new_with_handle(input_sr_f32, ENGINE_BLOCK_FRAMES);
+    for slot in deck_shared.iter() {
+        slot.reset();
+    }
+    let (engine, mut handle) = Engine::new_with_handle_using_shared(
+        input_sr_f32,
+        ENGINE_BLOCK_FRAMES,
+        deck_shared.clone(),
+    );
 
     // ----- 5. Open output (internal-mixer routing for M10) ----------
     let output_opts = OutputOptions {
@@ -2893,7 +2875,10 @@ fn classify_audio_error(err: dub_audio::AudioError, device_name: &str) -> Engine
 
 /// Open an output AU only — no input, no Thru. Used by
 /// [`DubEngine::start_engine`] for the M10.5 File-mode-only path.
-fn start_engine_inner(output_channels: u32) -> Result<RunningState, EngineError> {
+fn start_engine_inner(
+    output_channels: u32,
+    deck_shared: &[Arc<DeckSharedState>; 2],
+) -> Result<RunningState, EngineError> {
     // We don't know the output device's SR ahead of time. The
     // existing `start_thru_inner` flow uses the *input* device's SR
     // as the engine SR; for output-only we follow the same
@@ -2906,7 +2891,14 @@ fn start_engine_inner(output_channels: u32) -> Result<RunningState, EngineError>
     // let `AudioOutput::start_with_options` align the device to it.
     // If the device refuses, we surface AudioStartFailed.
     const DEFAULT_OUTPUT_SR: f32 = 48_000.0;
-    let (engine, handle) = Engine::new_with_handle(DEFAULT_OUTPUT_SR, ENGINE_BLOCK_FRAMES);
+    for slot in deck_shared.iter() {
+        slot.reset();
+    }
+    let (engine, handle) = Engine::new_with_handle_using_shared(
+        DEFAULT_OUTPUT_SR,
+        ENGINE_BLOCK_FRAMES,
+        deck_shared.clone(),
+    );
 
     let output_opts = OutputOptions {
         channels: output_channels,
@@ -3034,7 +3026,9 @@ mod tests {
         // (set_grid_drift_quality exposed so the user-tap path
         // can update the drift indicator without invoking the
         // auto-lock heuristic).
-        assert_eq!(FFI_VERSION, 21);
+        // M11d.6 round 5 21→22 (position_snapshot — lock-free
+        // playhead read for the off-main waveform render thread).
+        assert_eq!(FFI_VERSION, 22);
     }
 
     #[test]
@@ -3083,6 +3077,35 @@ mod tests {
         assert_eq!(p.remaining_secs, 0.0);
         assert!(!p.is_playing);
         assert!(!p.has_track);
+    }
+
+    /// M11d.6 round 5. The lock-free path must surface the same
+    /// empty-deck shape as the mutex-protected path when no
+    /// session is running.
+    #[test]
+    fn position_snapshot_on_stopped_engine_returns_empty() {
+        let engine = DubEngine::new();
+        for deck in 0..2 {
+            let p = engine.position_snapshot(deck);
+            assert_eq!(p.elapsed_secs, 0.0);
+            assert_eq!(p.duration_secs, 0.0);
+            assert_eq!(p.remaining_secs, 0.0);
+            assert_eq!(p.playhead_secs_unclamped, 0.0);
+            assert!(!p.is_playing, "deck {deck}");
+            assert!(!p.has_track, "deck {deck}");
+            assert!(!p.at_end, "deck {deck}");
+            assert!(!p.is_panic_play, "deck {deck}");
+        }
+    }
+
+    /// M11d.6 round 5. Out-of-range indices must short-circuit
+    /// to the empty snapshot rather than panic.
+    #[test]
+    fn position_snapshot_out_of_range_returns_empty() {
+        let engine = DubEngine::new();
+        let p = engine.position_snapshot(99);
+        assert!(!p.has_track);
+        assert_eq!(p.duration_secs, 0.0);
     }
 
     #[test]

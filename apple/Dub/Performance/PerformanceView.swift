@@ -55,7 +55,7 @@ struct PerformanceView: View {
             Rectangle().fill(DubColor.divider).frame(height: 1)
             FXBarPlaceholder()
             Rectangle().fill(DubColor.divider).frame(height: 1)
-            LibraryView(model: model)
+            LibraryView(model: model, libraryModel: model.libraryModel)
         }
         .background(DubColor.surface0)
     }
@@ -77,6 +77,7 @@ struct PerformanceView: View {
                        callbacks: headerCallbacks(side: .a),
                        mirrored: false,
                        prepMode: true,
+                       tapSession: model.tapSession(for: .a),
                        liveEngine: model.engine,
                        liveDeckIdx: 0)
                 .background(DubColor.divider)
@@ -87,6 +88,7 @@ struct PerformanceView: View {
                            state: headerState(side: .a),
                            callbacks: headerCallbacks(side: .a),
                            mirrored: headerMirrored(side: .a),
+                           tapSession: model.tapSession(for: .a),
                            liveEngine: model.engine,
                            liveDeckIdx: 0)
                     .modifier(DeckDropTarget(model: model, side: .a))
@@ -94,6 +96,7 @@ struct PerformanceView: View {
                            state: headerState(side: .b),
                            callbacks: headerCallbacks(side: .b),
                            mirrored: headerMirrored(side: .b),
+                           tapSession: model.tapSession(for: .b),
                            liveEngine: model.engine,
                            liveDeckIdx: 1)
                     .modifier(DeckDropTarget(model: model, side: .b))

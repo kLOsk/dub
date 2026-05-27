@@ -33,7 +33,7 @@ pub mod thru;
 pub mod timecode;
 
 pub use command::Command;
-pub use deck::Deck;
+pub use deck::{Deck, DeckSharedState};
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
     ThruAttachWithPeaksError, ThruAttachWithTelemetryError, BPM_TEE_RING_CAPACITY_SECS,
@@ -260,11 +260,29 @@ impl Engine {
     /// shared state Arcs.
     #[must_use]
     pub fn new_with_handle(sample_rate: f32, block_size: usize) -> (Self, EngineHandle) {
-        let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
-        let decks: [Deck; DECK_COUNT] = std::array::from_fn(|_| Deck::new(envelope.clone()));
-        drop(envelope);
         let shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT] =
-            std::array::from_fn(|i| decks[i].shared());
+            std::array::from_fn(|_| std::sync::Arc::new(deck::DeckSharedState::new()));
+        Self::new_with_handle_using_shared(sample_rate, block_size, shared)
+    }
+
+    /// Same as [`Self::new_with_handle`] but the per-deck shared
+    /// atomic state is provided by the caller (M11d.6 round 5).
+    ///
+    /// The FFI uses this so the `Arc<DeckSharedState>` survives
+    /// `start_thru` / `stop_thru` cycles. The caller is expected
+    /// to call [`crate::DeckSharedState::reset`] on each slot
+    /// before passing it in, so the new engine starts from a
+    /// clean baseline.
+    #[must_use]
+    pub fn new_with_handle_using_shared(
+        sample_rate: f32,
+        block_size: usize,
+        shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT],
+    ) -> (Self, EngineHandle) {
+        let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
+        let decks: [Deck; DECK_COUNT] =
+            std::array::from_fn(|i| Deck::with_shared(envelope.clone(), shared[i].clone()));
+        drop(envelope);
         let (handle, side) = EngineHandle::new(shared, sample_rate);
         let engine = Self {
             sample_rate,

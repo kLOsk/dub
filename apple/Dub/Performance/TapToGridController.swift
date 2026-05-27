@@ -18,6 +18,53 @@
 
 import Foundation
 
+/// Per-deck published surface for an open tap session.
+///
+/// Owns the two pieces of UI state — current tap count and rolling
+/// BPM preview — that the deck-header BPM column needs to render
+/// while a tap-tempo session is in flight. **Deliberately split off
+/// from `DeckState`** so a tap during playback does not invalidate
+/// `WaveformAppModel.objectWillChange`. Pre-split, tapping the BPM
+/// column flipped `deck.tapGridCount` on a `@Published` `DeckState`
+/// inside `WaveformAppModel`, which re-evaluated every observer of
+/// the app model — `PerformanceView` (rebuilding both
+/// `TrackOverviewView`s, both `WaveformView`s, the FX bar, and the
+/// entire `LibraryView`) and `FileBrowserView`. The Metal renderer
+/// itself was unaffected, but the SwiftUI cascade competed with
+/// the render thread for main-actor time and stuttered the
+/// waveform on every tap. By moving the two fields to a dedicated
+/// per-deck `ObservableObject`, only the `DeckHeader` subscribed
+/// to that deck's session invalidates on tap.
+///
+/// Writes happen exclusively from the per-deck `TapToGridController`
+/// callbacks wired in `WaveformAppModel.wireTapToGridControllers()`.
+/// `WaveformAppModel` holds one instance per deck as a non-published
+/// `let` reference so model identity stays stable across the app
+/// lifetime (no SwiftUI re-subscription churn).
+@MainActor
+final class TapSessionViewModel: ObservableObject {
+    /// PRD-BEATS §4.2 — open tap-to-grid window count. `0` when no
+    /// session is in flight. Drives the parenthesised count next
+    /// to the BPM digit on the deck header.
+    @Published var tapCount: Int = 0
+
+    /// PRD-BEATS §4.2 round 3 + gate 12 — rolling BPM preview
+    /// while a tap session is open. `nil` outside an active
+    /// session or while the session has fewer than 3 taps. When
+    /// non-nil, the BPM column renders this value in the
+    /// "tapping" treatment (italic + accent colour) instead of
+    /// the committed BPM.
+    @Published var rollingBpm: Double? = nil
+
+    /// Drop both fields back to "no open session". Cheap and
+    /// idempotent; preferred entry point over zeroing the fields
+    /// individually so future additions stay in lockstep.
+    func reset() {
+        if tapCount != 0 { tapCount = 0 }
+        if rollingBpm != nil { rollingBpm = nil }
+    }
+}
+
 /// Per-deck tap buffer for beatgrid correction via the BPM column.
 @MainActor
 final class TapToGridController {
