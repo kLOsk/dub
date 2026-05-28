@@ -42,9 +42,113 @@ use objc2_core_audio_types::{AudioBufferList, AudioValueRange};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 
-use dub_engine::{Engine, RealtimeContext};
+use dub_engine::{DeckSharedState, Engine, RealtimeContext};
 
 use crate::{AudioError, DeviceInfo};
+
+// =============================================================
+// Coherent publish-clock for the engine.
+//
+// The CoreAudio render callback receives `mHostTime` (mach-
+// absolute ticks at which the buffer's first frame will leave
+// the DAC) on every invocation. The engine's publish-side
+// extrapolator (PRD §2.2.6) expects timestamps in its own
+// `host_time_ns` domain (`mach_continuous_time`-based on macOS,
+// identical to `mach_absolute_time` while awake). This helper
+// converts mach ticks → engine ns; the offset is captured once
+// at device open so the audio thread does the conversion in a
+// few wait-free ALU ops with no syscall and no allocation. See
+// the rationale on `dub_engine::Engine::set_block_output_host_ns`.
+// =============================================================
+
+#[repr(C)]
+#[derive(Default)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// Coerce the engine's `f32` sample rate into a positive Hz
+/// integer for the `engine_ns_per_block` arithmetic above.
+/// The engine constrains SR to standard audio rates
+/// (44.1k, 48k, 88.2k, 96k …) at construction time, so the
+/// cast can't truncate meaningful precision; the `max(1.0)`
+/// guards against accidental zero / NaN / negative inputs
+/// from a malformed `Engine`.
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn engine_sr_to_hz_u64(engine_sr: f32) -> u64 {
+    let clamped = engine_sr.max(1.0);
+    u64::from(clamped as u32)
+}
+
+#[derive(Clone, Copy)]
+struct MachToEngineMapping {
+    timebase_numer: u64,
+    timebase_denom: u64,
+    offset_ns: i64,
+}
+
+impl MachToEngineMapping {
+    /// Sample `mach_absolute_time` and the engine clock around
+    /// a tight bracket so the captured offset is accurate to
+    /// within the FFI call cost (~hundreds of ns). One-time
+    /// cost at device open; afterwards the conversion is pure
+    /// arithmetic.
+    fn capture() -> Self {
+        let mut info = MachTimebaseInfo::default();
+        // Documented as deterministic per OS install; the
+        // return code is `KERN_SUCCESS == 0` in practice.
+        let _ = unsafe { mach_timebase_info(&raw mut info) };
+        let timebase_numer = u64::from(info.numer.max(1));
+        let timebase_denom = u64::from(info.denom.max(1));
+
+        let before_ticks = unsafe { mach_absolute_time() };
+        let engine_ns = DeckSharedState::host_time_now_ns();
+        let after_ticks = unsafe { mach_absolute_time() };
+        let mid_ticks = before_ticks + (after_ticks - before_ticks) / 2;
+        let mid_ns = mid_ticks
+            .saturating_mul(timebase_numer)
+            .checked_div(timebase_denom)
+            .unwrap_or(0);
+        let offset_ns = i64::try_from(engine_ns)
+            .unwrap_or(i64::MAX)
+            .wrapping_sub(i64::try_from(mid_ns).unwrap_or(i64::MAX));
+
+        Self {
+            timebase_numer,
+            timebase_denom,
+            offset_ns,
+        }
+    }
+
+    /// Convert a mach-absolute tick value (e.g.
+    /// `AudioTimeStamp.mHostTime`) into the engine's
+    /// `host_time_ns` domain. Saturates non-negative.
+    #[inline]
+    fn engine_ns_from_mach_ticks(&self, ticks: u64) -> u64 {
+        let ns = ticks
+            .saturating_mul(self.timebase_numer)
+            .checked_div(self.timebase_denom)
+            .unwrap_or(0);
+        let signed = i64::try_from(ns)
+            .unwrap_or(i64::MAX)
+            .wrapping_add(self.offset_ns);
+        if signed > 0 {
+            #[allow(clippy::cast_sign_loss)]
+            {
+                signed as u64
+            }
+        } else {
+            0
+        }
+    }
+}
 
 /// Information about a device's allowed buffer-frame-size range.
 #[derive(Debug, Clone, Copy)]
@@ -245,9 +349,37 @@ impl AudioOutput {
         let mut engine = engine;
         let mut rt = RealtimeContext::new();
 
+        // Round 17 — capture the mach↔engine clock mapping
+        // BEFORE installing the callback so the very first
+        // render block already publishes a coherent
+        // `(position, output_host_ns)` pair. The engine SR
+        // matters here: the publish refers to the playhead
+        // **at end of block**, which is `num_frames /
+        // engine_sr` seconds after the buffer's first frame.
+        let mach_mapping = MachToEngineMapping::capture();
+        let engine_sr_hz = engine_sr_to_hz_u64(engine_sr);
+
         audio_unit.set_render_callback(
             move |args: render_callback::Args<data::Interleaved<f32>>| {
                 // RT thread. No allocation, no locks, no syscalls.
+                //
+                // Round 17 — pin the publish-host time for this
+                // block to the CoreAudio-reported output time so
+                // the FFI extrapolator can compute the playhead
+                // without inheriting render-thread CPU jitter.
+                // `mHostTime` is the mach-absolute tick at which
+                // the buffer's **first** frame plays; add the
+                // block duration to land on the last-frame
+                // moment that `publish_position_secs` will
+                // record. `set_block_output_host_ns` is a pair
+                // of relaxed atomic stores — RT-safe.
+                let buffer_start_engine_ns =
+                    mach_mapping.engine_ns_from_mach_ticks(args.time_stamp.mHostTime);
+                let block_duration_ns =
+                    (args.num_frames as u64).saturating_mul(1_000_000_000) / engine_sr_hz;
+                let buffer_end_engine_ns = buffer_start_engine_ns.saturating_add(block_duration_ns);
+                engine.set_block_output_host_ns(buffer_end_engine_ns);
+
                 // engine.render is verified alloc-free by tests; the
                 // AtomicU64::fetch_add is wait-free.
                 engine.render(&mut rt, args.data.buffer);
@@ -374,9 +506,21 @@ impl AudioOutput {
         // engine is moved in. (No `let routing = routing` shadow
         // needed — clippy flags the no-op rebind, and routing is
         // already an owned value from the function argument.)
+        //
+        // Round 17 — same coherent-publish-clock fix as the
+        // stereo path above; see the long comment there.
+        let mach_mapping = MachToEngineMapping::capture();
+        let engine_sr_hz = engine_sr_to_hz_u64(engine_sr);
         audio_unit.set_render_callback(
             move |args: render_callback::Args<data::Interleaved<f32>>| {
                 // RT thread. No allocation, no locks, no syscalls.
+                let buffer_start_engine_ns =
+                    mach_mapping.engine_ns_from_mach_ticks(args.time_stamp.mHostTime);
+                let block_duration_ns =
+                    (args.num_frames as u64).saturating_mul(1_000_000_000) / engine_sr_hz;
+                let buffer_end_engine_ns = buffer_start_engine_ns.saturating_add(block_duration_ns);
+                engine.set_block_output_host_ns(buffer_end_engine_ns);
+
                 // engine.render_routed is verified alloc-free by the
                 // M5.5.1 tests; AtomicU64::fetch_add is wait-free.
                 engine.render_routed(&mut rt, args.data.buffer, num_channels, &routing);

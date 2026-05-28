@@ -6,9 +6,13 @@
 //
 //  Owns the per-deck `CVDisplayLink` + a dedicated serial
 //  `DispatchQueue` (QoS `.userInteractive`). The display link's
-//  output callback dispatches a single `drawIfNeeded()` block onto
-//  the queue per vsync; the queue runs strictly serially, so a slow
-//  frame can never coalesce two draws nor preempt itself.
+//  output callback posts `drawIfNeeded()` to the queue per vsync,
+//  but only if no draw is currently pending or in flight
+//  (M11d.6 round 9 coalescing gate; see the `drawInFlight` field
+//  on `Flags`). The queue runs strictly serially, and a slow frame
+//  drops the next vsync rather than queueing a back-to-back paint
+//  behind itself — uniform frame cadence is what the eye reads as
+//  smooth motion, not 60 fps.
 //
 //  Lifecycle contract:
 //  - `init` creates an inactive thread. No display link is started
@@ -63,6 +67,15 @@ final class WaveformRenderThread: @unchecked Sendable {
     /// Phase 3 ships the lifecycle scaffolding and treats the
     /// renderer as an opaque "drawable into a layer" surface.
     private let renderer: WaveformRenderer
+    /// M11d.6 round 11 — converts the CVDisplayLink callback's
+    /// predicted vsync `CVTimeStamp.hostTime` (mach_absolute_time
+    /// ticks) into the engine's `host_time_ns` domain so the
+    /// renderer can pass it to
+    /// `DubEngine.positionSnapshotAtHostTime`. Owned by the
+    /// thread; lock-free, allocation-free reads on the render
+    /// queue. See `EngineHostTimeMapping` for the clock-domain
+    /// derivation.
+    private let hostTimeMapping: EngineHostTimeMapping
     /// Dedicated serial queue for all draws. QoS `.userInteractive`
     /// matches the audio thread's priority class without competing
     /// for the same scheduling slot — Metal's GPU command buffer
@@ -75,6 +88,19 @@ final class WaveformRenderThread: @unchecked Sendable {
         var isContinuous: Bool = false
         var oneShotRequested: Bool = false
         var shutdownRequested: Bool = false
+        /// True while a `drawIfNeeded` block has been posted to
+        /// `renderQueue` but hasn't started executing yet (or is
+        /// executing now). M11d.6 round 9 — used by the
+        /// CVDisplayLink callback to **coalesce** vsync ticks: if
+        /// a previous draw is still in flight, drop the new vsync
+        /// rather than queue another draw behind it. Without this,
+        /// a single slow frame produces a burst pair (the slow
+        /// draw finishes, the queued draw fires within ~1 ms, the
+        /// next real vsync fires ~16 ms later) that the eye reads
+        /// as 1-pixel grid jitter. Dropping a vsync gives one
+        /// long ~33 ms gap instead, which is invisible — uniform
+        /// motion is what matters, not 60 fps.
+        var drawInFlight: Bool = false
     }
     private let flagsLock = OSAllocatedUnfairLock(initialState: Flags())
 
@@ -95,9 +121,15 @@ final class WaveformRenderThread: @unchecked Sendable {
 
     // MARK: - Construction
 
-    init(metalLayer: CAMetalLayer, renderer: WaveformRenderer, label: String) {
+    init(
+        metalLayer: CAMetalLayer,
+        renderer: WaveformRenderer,
+        hostTimeMapping: EngineHostTimeMapping,
+        label: String
+    ) {
         self.metalLayer = metalLayer
         self.renderer = renderer
+        self.hostTimeMapping = hostTimeMapping
         self.renderQueue = DispatchQueue(
             label: label,
             qos: .userInteractive,
@@ -148,7 +180,20 @@ final class WaveformRenderThread: @unchecked Sendable {
 
         if needsStart {
             startDisplayLink()
-            scheduleOneShot()
+            // Cover the gap between "link started" and "first
+            // vsync fires" with a single warm-up draw, but go
+            // through the same coalescing path the
+            // `requestOneShot` API uses so an immediate first
+            // vsync can't pile up behind this block.
+            let shouldWarmUp: Bool = flagsLock.withLock { state in
+                if state.shutdownRequested { return false }
+                if state.drawInFlight { return false }
+                state.drawInFlight = true
+                return true
+            }
+            if shouldWarmUp {
+                scheduleOneShot()
+            }
         } else if needsStop {
             stopDisplayLink()
         }
@@ -163,6 +208,14 @@ final class WaveformRenderThread: @unchecked Sendable {
         let shouldSchedule: Bool = flagsLock.withLock { state in
             if state.shutdownRequested { return false }
             state.oneShotRequested = true
+            // M11d.6 round 9 — coalesce. If a CVDisplayLink draw
+            // is already in flight, set the flag and let the
+            // pending block pick it up; do not post a second
+            // block behind it. `drawIfNeeded` reads
+            // `oneShotRequested` under the same lock and clears
+            // it before running the actual paint.
+            if state.drawInFlight { return false }
+            state.drawInFlight = true
             return true
         }
         guard shouldSchedule else { return }
@@ -199,14 +252,39 @@ final class WaveformRenderThread: @unchecked Sendable {
 
     // MARK: - Internals
 
-    private func scheduleOneShot() {
+    /// `targetMachAbsoluteTicks` is the **target vsync host
+    /// time** (= the `CVTimeStamp.hostTime` we extrapolate the
+    /// playhead to and that we pin the drawable's present to);
+    /// `nil` for warm-up / one-shot paths that have no vsync to
+    /// target.
+    private func scheduleOneShot(targetMachAbsoluteTicks: UInt64? = nil) {
         renderQueue.async { [weak self] in
-            self?.drawIfNeeded()
+            self?.drawIfNeeded(targetMachAbsoluteTicks: targetMachAbsoluteTicks)
         }
     }
 
     /// Single-frame draw. Called from `renderQueue` only.
-    private func drawIfNeeded() {
+    ///
+    /// `targetMachAbsoluteTicks` is the **target vsync host
+    /// time** (= the `CVTimeStamp.hostTime` we extrapolate the
+    /// playhead to and that we pin the drawable's present to,
+    /// M11d.6 round 12). `nil` for warm-up / generation-bump
+    /// one-shots, in which case the renderer falls back to
+    /// "extrapolate-to-now" / "present-at-next-vsync".
+    /// Translated to the engine's `host_time_ns` domain and to
+    /// a `CFTimeInterval` for `present(atTime:)` via
+    /// `hostTimeMapping` before being handed to the renderer.
+    private func drawIfNeeded(targetMachAbsoluteTicks: UInt64? = nil) {
+        // M11d.6 round 9 — clear the coalescing flag at the END
+        // of this block, not the start. The whole point of the
+        // flag is to prevent a CVDisplayLink callback that fires
+        // *while a draw is still running* from queueing a second
+        // draw behind it; clearing at the start would let that
+        // second draw queue and produce the burst pair the round
+        // is trying to eliminate. `defer` runs even on early
+        // return so paused / shutdown paths still release the
+        // coalescing gate for the next vsync.
+        defer { flagsLock.withLock { $0.drawInFlight = false } }
         let (run, _) = flagsLock.withLock { state -> (Bool, Bool) in
             if state.shutdownRequested {
                 return (false, false)
@@ -216,11 +294,26 @@ final class WaveformRenderThread: @unchecked Sendable {
             return (state.isContinuous || oneShot, oneShot)
         }
         guard run else { return }
+        // Thread sanity signpost. Instruments → System Trace shows
+        // this event on the render queue's worker thread. If it
+        // ever lands on the main thread we have a regression.
+        os_signpost(.event, log: log, name: "drawIfNeeded.thread",
+                    "isMain=%d", Thread.isMainThread ? 1 : 0)
         let size = metalLayer.drawableSize
+        let targetEngineHostTimeNs: UInt64? = targetMachAbsoluteTicks.map {
+            hostTimeMapping.engineHostTimeNs(fromMachAbsoluteTicks: $0)
+        }
+        let targetPresentSeconds: CFTimeInterval? = targetMachAbsoluteTicks.map {
+            hostTimeMapping.cfTimeInterval(fromMachAbsoluteTicks: $0)
+        }
         // `nextDrawable()` can return `nil` when the window is
         // hidden, minimised, or off-screen. The render thread
         // simply drops the frame; no allocation, no crash.
-        renderer.drawIfPossible(into: metalLayer, drawableSize: size)
+        renderer.drawIfPossible(
+            into: metalLayer,
+            drawableSize: size,
+            targetEngineHostTimeNs: targetEngineHostTimeNs,
+            targetPresentSeconds: targetPresentSeconds)
     }
 
     // MARK: - CVDisplayLink lifecycle
@@ -238,15 +331,60 @@ final class WaveformRenderThread: @unchecked Sendable {
         let retain = Unmanaged.passRetained(self)
         let ptr = retain.toOpaque()
         let callback: CVDisplayLinkOutputCallback = {
-            _, _, _, _, _, userInfo in
+            _, _, inOutputTime, _, _, userInfo in
             guard let userInfo else { return kCVReturnSuccess }
             let me = Unmanaged<WaveformRenderThread>
                 .fromOpaque(userInfo).takeUnretainedValue()
+            // **M11d.6 round 11.** Capture the predicted vsync
+            // display time `inOutputTime.pointee.hostTime` (in
+            // mach_absolute_time ticks) and hand it to the
+            // render queue. The renderer will translate it into
+            // the engine's host_time_ns domain and pass it to
+            // `positionSnapshotAtHostTime`, so the playhead the
+            // shader sees is what the audio is playing *when
+            // this frame actually lights up the panel* — not
+            // what's playing when the renderer happens to run.
+            // CVDisplayLink schedules these on the panel's
+            // crystal-locked refresh interval, so consecutive
+            // frames are exactly `1/refreshRate` apart with no
+            // CPU-jitter contribution.
+            //
+            // **Round 12 lookahead reverted (round 13).**
+            // Targeting `inOutputTime + refreshTicks` (one
+            // vsync ahead) interacted catastrophically with the
+            // coalescing gate: whenever a CVDisplayLink callback
+            // got coalesced (`drawInFlight = true`), the next
+            // callback's `inOutputTime` had advanced by two
+            // refresh periods relative to the previous draw's
+            // snapshot, and the +1 lookahead amplified that
+            // into a `Δplayhead = 33 ms` "forward jump" inside a
+            // single 17 ms render interval. Net: doubled the
+            // visible jitter the lookahead was meant to fix.
+            // Going back to "target the upcoming vsync, accept
+            // the occasional missed render" — every coalesced
+            // callback now produces the *correct* Δplayhead of
+            // exactly one refresh period.
+            let targetTicks = inOutputTime.pointee.hostTime
+            // M11d.6 round 9 — coalesce vsyncs. The serial render
+            // queue plus a slow frame would otherwise let a second
+            // vsync's draw stack up behind a still-running first,
+            // producing a burst pair (1–5 ms apart) that reads as
+            // 1-pixel grid jitter when the surrounding frames are
+            // at the usual 16 ms cadence. We accept "drop a vsync"
+            // over "render twice almost-simultaneously" — uniform
+            // motion is the user-visible invariant, not 60 fps.
+            let shouldPost = me.flagsLock.withLock { state -> Bool in
+                if state.shutdownRequested { return false }
+                if state.drawInFlight { return false }
+                state.drawInFlight = true
+                return true
+            }
+            guard shouldPost else { return kCVReturnSuccess }
             // Post directly onto the render queue. No main-runloop
             // hop, no DispatchQueue.main work — this is the whole
             // point of the refactor.
             me.renderQueue.async {
-                me.drawIfNeeded()
+                me.drawIfNeeded(targetMachAbsoluteTicks: targetTicks)
             }
             return kCVReturnSuccess
         }

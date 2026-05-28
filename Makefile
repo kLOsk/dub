@@ -127,6 +127,65 @@ app: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 app-release:
 	$(MAKE) app APP_CONFIG=Release
 
+trace-grid:
+	@# Capture every os_signpost from the waveform renderer into a
+	@# plain-text file we can diff frame-to-frame to find the source
+	@# of intermittent grid steps.
+	@#
+	@# IMPORTANT: `log stream` does not stream signpost events on
+	@# macOS, so we use the marker-and-dump pattern: record a
+	@# timestamp, you reproduce the symptom, press Enter, and we
+	@# dump every signpost emitted between the marker and now.
+	@#
+	@# Usage:
+	@#   make trace-grid             # writes /tmp/dub-grid-trace.log
+	@#   make trace-grid OUT=foo.log
+	@#
+	@# Workflow:
+	@#   1. In one terminal: make run-app
+	@#   2. In another terminal: make trace-grid
+	@#   3. When prompted, reproduce the jitter in the running app.
+	@#   4. Press Enter in the trace-grid terminal.
+	@#   5. The file path is printed; share it for analysis.
+	@OUT_FILE="$(or $(OUT),/tmp/dub-grid-trace.log)"; \
+	MARK="$$(date '+%Y-%m-%d %H:%M:%S')"; \
+	echo "Marker: $$MARK"; \
+	echo "Reproduce the grid jitter in Dub now."; \
+	printf "Press Enter when you're done reproducing... "; \
+	read _; \
+	echo "Dumping signposts since $$MARK → $$OUT_FILE"; \
+	/usr/bin/log show \
+	    --predicate 'subsystem == "com.klos.dub.waveform"' \
+	    --info --debug --signpost --style compact \
+	    --start "$$MARK" \
+	    > "$$OUT_FILE"; \
+	LINES=$$(wc -l < "$$OUT_FILE"); \
+	echo "Wrote $$LINES lines to $$OUT_FILE"; \
+	if [ "$$LINES" -le 2 ]; then \
+	    echo "  WARNING: file looks empty. Did the waveform actually draw?"; \
+	    echo "  (Render thread only fires when a deck is loaded / visible.)"; \
+	fi
+
+trace-grid-last:
+	@# Variant for "I forgot to mark the start": dump the last N
+	@# minutes of waveform signposts. Useful when you've already
+	@# reproduced and just want everything in recent memory.
+	@#
+	@# Usage:
+	@#   make trace-grid-last                # last 5 minutes
+	@#   make trace-grid-last LAST=10m       # last 10 minutes
+	@#   make trace-grid-last OUT=foo.log
+	@OUT_FILE="$(or $(OUT),/tmp/dub-grid-trace.log)"; \
+	LAST_WINDOW="$(or $(LAST),5m)"; \
+	echo "Dumping last $$LAST_WINDOW of subsystem=com.klos.dub.waveform → $$OUT_FILE"; \
+	/usr/bin/log show \
+	    --predicate 'subsystem == "com.klos.dub.waveform"' \
+	    --info --debug --signpost --style compact \
+	    --last "$$LAST_WINDOW" \
+	    > "$$OUT_FILE"; \
+	LINES=$$(wc -l < "$$OUT_FILE"); \
+	echo "Wrote $$LINES lines to $$OUT_FILE"
+
 run-app: app
 	@# `open` only focuses an already-running instance — it will NOT
 	@# relaunch with the freshly-built binary / metallib. Send a

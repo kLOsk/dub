@@ -33,7 +33,7 @@ pub mod thru;
 pub mod timecode;
 
 pub use command::Command;
-pub use deck::{Deck, DeckSharedState};
+pub use deck::{Deck, DeckSharedState, PublishState};
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
     ThruAttachWithPeaksError, ThruAttachWithTelemetryError, BPM_TEE_RING_CAPACITY_SECS,
@@ -446,6 +446,37 @@ impl Engine {
     #[must_use]
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// Coherent publish clock. Audio host (CoreAudio on macOS)
+    /// calls this immediately before [`Self::render`] /
+    /// [`Self::render_routed`] with the engine-domain host time at
+    /// which the **last frame of the block about to be rendered**
+    /// will leave the DAC. Every deck's
+    /// [`crate::DeckSharedState::publish_position_secs`] then uses
+    /// this value as the `host_time_ns` paired with the post-
+    /// render playhead, instead of capturing `host_time_ns()` at
+    /// publish time and dragging the audio thread's CPU-scheduling
+    /// jitter into the snapshot read.
+    ///
+    /// On macOS, the caller is `dub-audio::macos`. It takes
+    /// `args.time_stamp.mHostTime` (mach-absolute ticks of the
+    /// buffer's first frame), converts ticks → ns via
+    /// `mach_timebase_info`, adds `num_frames / sample_rate` in
+    /// ns to land on the buffer's last frame, and passes the
+    /// result here. Engine-domain host time is
+    /// `mach_continuous_time` based (the same clock backing
+    /// `Instant::now`), which equals `mach_absolute_time`
+    /// numerically while the machine is awake.
+    ///
+    /// RT-safe: one relaxed atomic store per deck. Tests,
+    /// `dub-cli`, and the offline render harness do not need to
+    /// call this — the default `0` override makes publish fall
+    /// back to `host_time_ns()`.
+    pub fn set_block_output_host_ns(&self, ns: u64) {
+        for deck in &self.decks {
+            deck.set_publish_host_ns_override(ns);
+        }
     }
 
     /// Borrow a deck mutably. Caller is responsible for not invoking

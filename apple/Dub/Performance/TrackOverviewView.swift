@@ -154,71 +154,69 @@ struct TrackOverviewView: View {
         // bounds; reading them off the geo proxy is the
         // idiomatic workaround.
         //
-        // M11d.5 round 5: the Canvas is wrapped in a 10 Hz
-        // `TimelineView` and reads the playhead position from
-        // `engine.position(deckIdx:)` directly. Pre-fix the
-        // bracket advanced because `DeckState.elapsedSecs`
-        // republished every second, which invalidated the parent
-        // `PerformanceView` and triggered a full-tree body
-        // re-eval — that was the residual "subtle leftward jump
-        // every second" the user reported after round 3. With the
-        // self-driven timeline, only this Canvas closure re-runs
-        // on the bracket cadence; nothing above the timeline ever
-        // observes the per-second tick.
-        // 4 Hz overview tick. Pre-fix this was 10 Hz, which
-        // sounds reasonable for a position indicator but actually
-        // costs two SwiftUI body re-evals + two Canvas redraws per
-        // 100 ms (both decks share the runloop), and the visible
-        // playhead bracket moves at most a fraction of a pixel
-        // per tick on any realistic-length DJ track (e.g. a 4-min
-        // track at 60 fps overview width means ~0.15 px / tick at
-        // 10 Hz, 0.36 px / tick at 4 Hz — neither is humanly
-        // discernible from "smooth"). The Metal pipeline already
-        // drives the *zoomed* waveform's high-frequency playhead
-        // separately, so the overview only needs to feel
-        // "advancing" to the eye. 4 Hz saves runloop budget that
-        // was contending with the 60 Hz Metal draw callback.
-        TimelineView(.periodic(from: .now, by: 0.25)) { context in
-            GeometryReader { geo in
-                ZStack {
-                    Canvas { ctx, size in
-                        _ = context.date
-                        drawBackground(ctx: ctx, size: size)
-                        if let buckets, !buckets.isEmpty {
-                            drawBars(ctx: ctx, size: size, buckets: buckets)
-                            drawMinuteMarkers(ctx: ctx, size: size)
-                            drawPlayhead(ctx: ctx, size: size)
-                        } else {
-                            drawEmptyState(ctx: ctx, size: size)
-                        }
-                    }
+        // **M11d.6 round 13 — static / dynamic split.** The
+        // original implementation wrapped ONE Canvas inside the
+        // 4 Hz `TimelineView`, so every 250 ms the entire
+        // backing surface re-rasterised 480 peak bars + 480 RMS
+        // bars + minute markers + the playhead chevron. Trace
+        // measurements on a 2019 i9 MBP showed the resulting
+        // main-runloop spike contending with the off-main Metal
+        // render thread's `nextDrawable()` — exactly at the 4 Hz
+        // cadence — adding +12 ms to the waveform's draw budget
+        // on ~4 % of frames and producing the visible "1 px
+        // jump every quarter second" the user reported.
+        //
+        // Split the Canvas in two:
+        //   * `staticCanvas` (outside the `TimelineView`) draws
+        //     the bars + markers + background. SwiftUI invalidates
+        //     it only when `buckets` / `orientation` / colours
+        //     change, i.e. on track load. Steady-state cost: zero
+        //     per-tick CPU.
+        //   * The per-tick `TimelineView` Canvas redraws just the
+        //     ~6 shapes of `drawPlayhead`. ~120× cheaper than the
+        //     unsplit version.
+        //
+        // 4 Hz remains the right cadence (bracket motion is ≤ 0.4
+        // pixel / tick on a 4-min track, well below perceptual
+        // motion threshold), but the *cost per tick* now actually
+        // matches that budget.
+        GeometryReader { geo in
+            ZStack {
+                Canvas { ctx, size in
+                    drawBackground(ctx: ctx, size: size)
                     if let buckets, !buckets.isEmpty {
-                        minuteMarkerLabels(in: geo.size)
+                        drawBars(ctx: ctx, size: size, buckets: buckets)
+                        drawMinuteMarkers(ctx: ctx, size: size)
+                    } else {
+                        drawEmptyState(ctx: ctx, size: size)
                     }
                 }
-                .contentShape(Rectangle())
-                .gesture(
-                    // Traktor-style overview scrub: click or click-and-
-                    // drag to seek to absolute track positions. Unlike
-                    // the zoomed waveform's rate-driven vinyl scratch,
-                    // this is coarse position navigation — the deck
-                    // jumps to each point under the cursor. Transport
-                    // is left alone (paused stays paused; playing
-                    // keeps playing from each new position).
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            handleOverviewScrub(
-                                at: value.location,
-                                in: geo.size,
-                                isFinal: false)
+                if let buckets, !buckets.isEmpty {
+                    TimelineView(.periodic(from: .now, by: 0.25)) { context in
+                        Canvas { ctx, size in
+                            _ = context.date
+                            drawPlayhead(ctx: ctx, size: size)
                         }
-                        .onEnded { value in
-                            handleOverviewScrub(
-                                at: value.location,
-                                in: geo.size,
-                                isFinal: true)
-                        })
+                    }
+                    .allowsHitTesting(false)
+                    minuteMarkerLabels(in: geo.size)
+                }
             }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        handleOverviewScrub(
+                            at: value.location,
+                            in: geo.size,
+                            isFinal: false)
+                    }
+                    .onEnded { value in
+                        handleOverviewScrub(
+                            at: value.location,
+                            in: geo.size,
+                            isFinal: true)
+                    })
         }
         .modifier(OverviewSizing(orientation: orientation))
         .onAppear(perform: reloadIfStale)

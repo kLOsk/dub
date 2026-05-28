@@ -278,9 +278,21 @@ private struct BandPeakChunkLayout {
 }
 
 /// CPU-side mirror of `Shaders.metal`'s `BeatGridVertex`.
+/// Includes the analytic-AA fields (`signedTimeAxisDistNDC`,
+/// `visibleHalfNDC`); field order + types must match the Metal
+/// struct exactly — the buffer is `memcpy`'d straight into
+/// shared storage.
 private struct BeatGridVertexLayout {
     var position: SIMD2<Float>
     var color: SIMD4<Float>
+    /// Signed distance from the line's time-axis centre, in NDC.
+    /// Set by `appendCrossAxisStrip` to ±`quadHalfNDC` depending
+    /// on whether this vertex is on the leading or trailing edge.
+    var signedTimeAxisDistNDC: Float
+    /// Half the *visible* line width in NDC. Same for all 4
+    /// vertices of a quad. The fragment shader uses this with
+    /// `fwidth` to compute a 1-pixel anti-aliased fade.
+    var visibleHalfNDC: Float
 }
 
 /// Lock-protected snapshot of every SwiftUI-pushed renderer
@@ -458,8 +470,27 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     /// Dynamic upload buffer for beat-grid tick quads (6 vertices
     /// per tick × up to a few dozen visible ticks per frame).
-    private var beatGridVertexBuffer: MTLBuffer?
-    private var beatGridVertexCapacity: Int = 0
+    ///
+    /// **Triple-buffered against the in-flight semaphore.** With
+    /// `maxFramesInFlight = 3` the GPU can still be reading the
+    /// previous frame's grid vertices when the CPU writes the
+    /// current frame's vertices into the same memory. A single
+    /// shared `MTLBuffer` would let the GPU's read for frame N
+    /// land on memory the CPU has already advanced to frame N+1,
+    /// rendering the grid at one-frame-ahead positions for one
+    /// vsync and then snapping back — visible as a forward-
+    /// flash-then-snap-back jump on every grid line, every few
+    /// seconds, only during playback.
+    ///
+    /// Each frame writes to and binds
+    /// `beatGridVertexBuffers[uniformIndex]`; the semaphore
+    /// guarantees the GPU has finished with that slot before the
+    /// CPU touches it again. The waveform's uniform buffers and
+    /// the chunks/band rings are triple-buffered for the same
+    /// reason; the grid vertex buffer was the asymmetric one and
+    /// the source of the residual jitter.
+    private var beatGridVertexBuffers: [MTLBuffer?]
+    private var beatGridVertexCapacities: [Int]
 
     /// Reused each frame to avoid `[BeatGridVertexLayout]` heap
     /// churn on the main thread during playback.
@@ -476,14 +507,21 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private var uniformIndex: Int = 0
 
     /// Append-only ring buffer of `PeakChunk`s. Shared storage so
-    /// we memcpy directly from the FFI `Data` blob — zero-copy on
-    /// Apple Silicon.
-    private let chunksBuffer: MTLBuffer
+    /// we memcpy directly from the FFI `Data` blob.
+    ///
+    /// **Triple-buffered.** One buffer per `maxFramesInFlight`
+    /// slot, gated by the in-flight semaphore. Eliminates the
+    /// unified-memory CPU↔GPU contention that would otherwise
+    /// happen when the CPU's ingest write into the chunks ring
+    /// races the GPU reading the same slots for an earlier
+    /// in-flight frame.
+    private let chunksBuffers: [MTLBuffer]
 
     /// Append-only ring buffer of `BandPeakChunk`s. Parallel to
-    /// `chunksBuffer`; the vertex shader looks up the matching band
-    /// chunk for each broadband instance.
-    private let bandChunksBuffer: MTLBuffer
+    /// `chunksBuffers`; the vertex shader looks up the matching
+    /// band chunk for each broadband instance. Same triple-buffer
+    /// rationale.
+    private let bandChunksBuffers: [MTLBuffer]
 
     // MARK: Engine binding
 
@@ -551,9 +589,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private var framesSinceSourceSwap: Int = 0
 
     /// Skip redundant FFI + `memcpy` when the playhead hasn't
-    /// crossed a chunk boundary since the last frame.
-    private var lastBroadbandIngestPhChunk: UInt64 = UInt64.max
-    private var lastBandIngestPhChunk: UInt64 = UInt64.max
+    /// crossed a chunk boundary since the last ingest **into this
+    /// specific GPU buffer**. Per-buffer because the chunks/band
+    /// rings are triple-buffered; a freshness hit on buffer 0
+    /// says nothing about buffers 1 / 2.
+    private var lastBroadbandIngestPhChunkPerBuffer: [UInt64]
+    private var lastBandIngestPhChunkPerBuffer: [UInt64]
+    private var lastSeenPeaksLenPerBuffer: [UInt64]
+    private var lastSeenBandPeaksLenPerBuffer: [UInt64]
 
     // MARK: Init
 
@@ -632,31 +675,60 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             descriptor: beatGridDescriptor)
 
         let chunkBytes = WaveformRenderer.chunkCapacity * MemoryLayout<PeakChunkLayout>.stride
-        guard let chunks = device.makeBuffer(length: chunkBytes, options: .storageModeShared)
-        else {
-            throw NSError(
-                domain: "WaveformRenderer", code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "Chunks MTLBuffer allocation failed"])
+        var chunksList: [MTLBuffer] = []
+        chunksList.reserveCapacity(WaveformRenderer.maxFramesInFlight)
+        for idx in 0..<WaveformRenderer.maxFramesInFlight {
+            guard let buf = device.makeBuffer(
+                length: chunkBytes, options: .storageModeShared)
+            else {
+                throw NSError(
+                    domain: "WaveformRenderer", code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Chunks MTLBuffer allocation failed"
+                    ])
+            }
+            buf.label = "dub.waveform.chunks[\(idx)]"
+            buf.contents().initializeMemory(
+                as: UInt8.self, repeating: 0, count: chunkBytes)
+            chunksList.append(buf)
         }
-        chunks.label = "dub.waveform.chunks"
-        chunks.contents().initializeMemory(as: UInt8.self, repeating: 0, count: chunkBytes)
-        self.chunksBuffer = chunks
+        self.chunksBuffers = chunksList
 
         let bandChunkBytes =
             WaveformRenderer.bandChunkCapacity * MemoryLayout<BandPeakChunkLayout>.stride
-        guard let bandChunks = device.makeBuffer(
-            length: bandChunkBytes, options: .storageModeShared)
-        else {
-            throw NSError(
-                domain: "WaveformRenderer", code: 4,
-                userInfo: [
-                    NSLocalizedDescriptionKey: "Band chunks MTLBuffer allocation failed"
-                ])
+        var bandChunksList: [MTLBuffer] = []
+        bandChunksList.reserveCapacity(WaveformRenderer.maxFramesInFlight)
+        for idx in 0..<WaveformRenderer.maxFramesInFlight {
+            guard let buf = device.makeBuffer(
+                length: bandChunkBytes, options: .storageModeShared)
+            else {
+                throw NSError(
+                    domain: "WaveformRenderer", code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Band chunks MTLBuffer allocation failed"
+                    ])
+            }
+            buf.label = "dub.waveform.bandChunks[\(idx)]"
+            buf.contents().initializeMemory(
+                as: UInt8.self, repeating: 0, count: bandChunkBytes)
+            bandChunksList.append(buf)
         }
-        bandChunks.label = "dub.waveform.bandChunks"
-        bandChunks.contents().initializeMemory(
-            as: UInt8.self, repeating: 0, count: bandChunkBytes)
-        self.bandChunksBuffer = bandChunks
+        self.bandChunksBuffers = bandChunksList
+
+        self.lastBroadbandIngestPhChunkPerBuffer = Array(
+            repeating: UInt64.max, count: WaveformRenderer.maxFramesInFlight)
+        self.lastBandIngestPhChunkPerBuffer = Array(
+            repeating: UInt64.max, count: WaveformRenderer.maxFramesInFlight)
+        self.lastSeenPeaksLenPerBuffer = Array(
+            repeating: 0, count: WaveformRenderer.maxFramesInFlight)
+        self.lastSeenBandPeaksLenPerBuffer = Array(
+            repeating: 0, count: WaveformRenderer.maxFramesInFlight)
+        self.beatGridVertexBuffers = Array(
+            repeating: nil, count: WaveformRenderer.maxFramesInFlight)
+        self.beatGridVertexCapacities = Array(
+            repeating: 0, count: WaveformRenderer.maxFramesInFlight)
 
         let uniformStride = WaveformRenderer.uniformStridePerRegion
         let uniformBytesPerBuffer = uniformStride * 2
@@ -728,8 +800,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             state.beatGridGeneration = 0
         }
         framesSinceSourceSwap = 0
-        lastBroadbandIngestPhChunk = UInt64.max
-        lastBandIngestPhChunk = UInt64.max
+        for idx in 0..<WaveformRenderer.maxFramesInFlight {
+            lastBroadbandIngestPhChunkPerBuffer[idx] = UInt64.max
+            lastBandIngestPhChunkPerBuffer[idx] = UInt64.max
+            lastSeenPeaksLenPerBuffer[idx] = 0
+            lastSeenBandPeaksLenPerBuffer[idx] = 0
+        }
     }
 
     // MARK: - Off-main entry point (M11d.6 round 5)
@@ -742,6 +818,34 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private var msaaTexture: MTLTexture?
     private var msaaTextureSize: CGSize = .zero
 
+    // MARK: - Jitter trace (Instruments → Logging / signposts)
+    //
+    // Per-deck `OSLog` for the grid-jitter investigation. When no
+    // Instruments subscriber is active these calls compile to a
+    // single branch + `os_signpost_enabled` check; zero file I/O,
+    // zero allocation. Subsystem / category match the existing
+    // render-thread logger so a single Instruments filter captures
+    // both.
+    //
+    // Capture procedure:
+    //   1. Run Dub from Xcode (Debug build keeps signposts on by
+    //      default; Release builds also emit them — `os_signpost`
+    //      is not stripped).
+    //   2. In Instruments pick the "Logging" template (or
+    //      "System Trace"); set the subsystem filter to
+    //      "com.klos.dub.waveform".
+    //   3. Play a track long enough to reproduce the
+    //      intermittent grid step. Stop the recording.
+    //   4. Look at the "draw" interval markers on the timeline.
+    //      Each interval carries the metadata fields (playhead,
+    //      snap, eps, drawnAbove/Below, peakDur, drawableSize)
+    //      via an in-interval `os_signpost(.event, ..., "data=…")`
+    //      call. The frame where the grid stepped will be the
+    //      one whose drawn-column counts or peakDur changed, or
+    //      whose continuousChunkF / 2 just crossed an integer.
+    private let traceLog = OSLog(
+        subsystem: "com.klos.dub.waveform", category: "GridTrace")
+
     /// One render pass. Pulls peaks from the engine, advances the
     /// rings, and draws into the layer's next drawable. Called by
     /// `WaveformRenderThread.drawIfNeeded()` from a dedicated
@@ -750,7 +854,28 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// `nextDrawable()` can return `nil` (window hidden,
     /// minimised, or off-screen). In that case the frame is
     /// silently dropped; the next vsync tries again.
-    func drawIfPossible(into metalLayer: CAMetalLayer, drawableSize: CGSize) {
+    ///
+    /// `targetEngineHostTimeNs` is the upcoming-vsync display
+    /// time of this frame, expressed in the same engine-relative
+    /// nanosecond domain that
+    /// `DubEngine.positionSnapshotAtHostTime` consumes.
+    /// `WaveformRenderThread` computes it from
+    /// `CVTimeStamp.hostTime` via the per-renderer
+    /// `EngineHostTimeMapping`. Pass `nil` for non-vsync-driven
+    /// paths (one-shot warm-up draws, generation-bump repaints
+    /// of a paused deck); the renderer then falls back to
+    /// reading the playhead at "right now" inside the FFI.
+    ///
+    /// `targetPresentSeconds` was the same vsync in
+    /// `CACurrentMediaTime()` units; kept on the signature for
+    /// API stability but currently unused (see the present-at-
+    /// next-vsync note below the encoder).
+    func drawIfPossible(
+        into metalLayer: CAMetalLayer,
+        drawableSize: CGSize,
+        targetEngineHostTimeNs: UInt64? = nil,
+        targetPresentSeconds: CFTimeInterval? = nil
+    ) {
         // Never block the render queue waiting for the GPU. When
         // the GPU is busy, drop the frame; the next vsync covers
         // for it. We don't need the elaborate
@@ -783,6 +908,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             drawableSize: drawableSize,
             appearance: appearanceSnapshot,
             beats: beatsSnapshot,
+            targetEngineHostTimeNs: targetEngineHostTimeNs,
+            targetPresentSeconds: targetPresentSeconds,
             releaseSemaphore: releaseSemaphore,
             pendingRelease: &pendingRelease)
     }
@@ -796,9 +923,25 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         appearance: RendererAppearance,
         beats: BeatGridSnapshot,
+        targetEngineHostTimeNs: UInt64?,
+        targetPresentSeconds: CFTimeInterval?,
         releaseSemaphore: @escaping () -> Void,
         pendingRelease: inout Bool
     ) {
+        // One signpost interval per draw call. `traceID` is unique
+        // per call so concurrent recordings don't tangle when
+        // both decks render. Emitted on every frame; the
+        // sub-microsecond cost is paid only when an Instruments
+        // subscriber is attached.
+        let traceID = OSSignpostID(log: traceLog, object: self)
+        os_signpost(.begin, log: traceLog, name: "draw",
+                    signpostID: traceID,
+                    "deck=%llu w=%.0f h=%.0f",
+                    deckIdx, drawableSize.width, drawableSize.height)
+        defer {
+            os_signpost(.end, log: traceLog, name: "draw",
+                        signpostID: traceID)
+        }
 
         // 0. Detect a PeakSource swap on this deck. When the engine
         //    swaps Thru → File (drag-and-drop load) or File → File
@@ -822,9 +965,27 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // peak ingest so a post-load / post-seek scrub doesn't wait
         // for a whole-track GPU upload. Lock-free FFI: never
         // contends with main-thread engine work.
-        let pos = engine.positionSnapshot(deckIdx: deckIdx)
-        ingestNewChunks(playheadSecs: pos.playheadSecsUnclamped)
-        ingestNewBandChunks(playheadSecs: pos.playheadSecsUnclamped)
+        //
+        // When `targetEngineHostTimeNs` is supplied (= CVDisplay-
+        // Link-driven path), extrapolate the playhead to the
+        // upcoming vsync's display time rather than "right now".
+        // CVDisplayLink schedules vsyncs on the panel's crystal-
+        // locked refresh interval, so consecutive frames see
+        // Δnow_ns exactly equal to that interval with no CPU-
+        // scheduling jitter. The fallback "now" path keeps
+        // generation-bump repaints and one-shots working when
+        // there is no vsync to target.
+        let pos: PositionInfo
+        if let targetEngineHostTimeNs {
+            pos = engine.positionSnapshotAtHostTime(
+                deckIdx: deckIdx, hostTimeNs: targetEngineHostTimeNs)
+        } else {
+            pos = engine.positionSnapshot(deckIdx: deckIdx)
+        }
+        ingestNewChunks(
+            playheadSecs: pos.playheadSecsUnclamped, bufferIndex: uniformIndex)
+        ingestNewBandChunks(
+            playheadSecs: pos.playheadSecsUnclamped, bufferIndex: uniformIndex)
 
         // 2. Compute the visible window.
         //
@@ -922,17 +1083,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             playheadChunkSigned = peaksLenGlobal == 0 ? 0 : Int64(peaksLenGlobal &- 1)
         }
 
-        // M11d.6 round 5: the renderer no longer publishes into
-        // `WaveformRenderSnapshot` from inside `draw`. The SwiftUI
-        // overlay that consumed those values has been gated off
-        // since round 4 (`beatGridOverlayEnabled = false` in
-        // `WaveformView`), and the off-main render thread cannot
-        // safely write to a `@MainActor`-isolated `ObservableObject`
-        // without a `DispatchQueue.main.async` hop that re-couples
-        // us to the main thread. If the overlay is ever
-        // re-enabled, the writer will be a throttled main-thread
-        // hop driven by a per-renderer atomic generation, not the
-        // hot draw path.
+        // The off-main render thread cannot safely write to a
+        // `@MainActor`-isolated `ObservableObject` without a
+        // `DispatchQueue.main.async` hop that would re-couple us
+        // to the main thread, so the renderer does not publish
+        // into `WaveformRenderSnapshot` from inside `draw`. If
+        // the SwiftUI grid overlay is ever re-enabled, the writer
+        // will be a throttled main-thread hop driven by a
+        // per-renderer atomic generation, not the hot draw path.
         if appearance.beatGridEnabled {
             refreshBeatGridIfNeeded(
                 peaksGeneration: currentGeneration,
@@ -1160,6 +1318,36 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let pastSubChunkOffsetNDC = Float(epsChunks * 0.5 / pastChunksDenom)
         let futureSubChunkOffsetNDC = Float(epsChunks * 1.5 / futureChunksDenom)
 
+        // Per-frame trace event — every quantity the grid math
+        // depends on, in one record. Subscribe via Instruments
+        // (Logging template, subsystem `com.klos.dub.waveform`).
+        // Two consecutive frames whose `drawnAbove`/`drawnBelow`
+        // differ point at a layout-driven jitter; two whose
+        // `peakDur` differs point at a load-track / source-swap
+        // race; two whose `eps` jumps but `snap` did not point at
+        // audio-thread playhead non-monotonicity.
+        os_signpost(.event, log: traceLog, name: "grid",
+                    signpostID: traceID,
+                    """
+                    playhead=%.6f pubSecs=%.6f elapsedNs=%llu rate=%.4f \
+                    peakDur=%.6f contChunkF=%.4f \
+                    snap=%lld eps=%.4f ndcPast=%.6f ndcFuture=%.6f \
+                    drawnAbove=%d drawnBelow=%d peaksLen=%llu hasTrack=%d
+                    """,
+                    pos.playheadSecsUnclamped,
+                    pos.debugPublishSecs,
+                    pos.debugElapsedNs,
+                    pos.debugAdvanceRate,
+                    peakChunkDurationSecs,
+                    continuousChunkF,
+                    playheadChunkSigned,
+                    epsChunks,
+                    pastSubChunkOffsetNDC,
+                    futureSubChunkOffsetNDC,
+                    drawnAbove, drawnBelow,
+                    peaksLenGlobal,
+                    pos.hasTrack ? 1 : 0)
+
         // 3. Fill both region slots in the per-frame uniform buffer.
         //
         // Past draw sets `chunksAbovePlayhead = chunksAbove` (> 0).
@@ -1222,8 +1410,10 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         encoder.label = "dub.waveform.pass"
         encoder.setRenderPipelineState(waveformPipeline)
         if hasContent {
-            encoder.setVertexBuffer(chunksBuffer, offset: 0, index: 1)
-            encoder.setVertexBuffer(bandChunksBuffer, offset: 0, index: 2)
+            encoder.setVertexBuffer(
+                chunksBuffers[uniformIndex], offset: 0, index: 1)
+            encoder.setVertexBuffer(
+                bandChunksBuffers[uniformIndex], offset: 0, index: 2)
 
             if drawnAbove > 0 {
                 encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 0)
@@ -1252,16 +1442,26 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 appearance: appearance,
                 beats: beats,
-                playheadSecs: pos.playheadSecsUnclamped,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
                 drawnBelow: drawnBelow,
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
+                bufferIndex: uniformIndex)
         }
 
         encoder.endEncoding()
 
+        // Present at the next available vsync. We deliberately do
+        // not call `present(_:atTime: targetPresentSeconds)` —
+        // pinning the present time interacted badly with the
+        // CVDisplayLink coalescing gate (a coalesced callback
+        // advanced `inOutputTime` by two refresh periods, and
+        // the pinned present then opened a doubled Δplayhead gap
+        // inside a single render interval). Letting Metal choose
+        // the next vsync keeps Δplayhead per displayed frame
+        // equal to exactly one refresh period.
+        _ = targetPresentSeconds
         commandBuffer.present(drawable)
         commandBuffer.commit()
 
@@ -1310,7 +1510,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     /// Copy `[startIdx, startIdx + count)` broadband peak chunks
     /// from the engine into the GPU ring at `index % chunkCapacity`.
-    private func ingestBroadbandRange(startIdx: UInt64, count: UInt64) {
+    /// Writes to the triple-buffered slot the caller will bind to
+    /// the GPU this frame; the in-flight semaphore guarantees the
+    /// slot is not concurrently read.
+    private func ingestBroadbandRange(
+        startIdx: UInt64, count: UInt64, bufferIndex: Int
+    ) {
         guard count > 0 else { return }
         let data = engine.peaksExtend(deckIdx: deckIdx, startIdx: startIdx)
         if data.isEmpty { return }
@@ -1320,7 +1525,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         guard newChunkCount > 0, data.count % chunkStride == 0 else { return }
 
         let ringBytes = WaveformRenderer.chunkCapacity * chunkStride
-        let dstBase = chunksBuffer.contents()
+        let dstBase = chunksBuffers[bufferIndex].contents()
 
         data.withUnsafeBytes { (rawSrc: UnsafeRawBufferPointer) in
             guard let srcBase = rawSrc.baseAddress else { return }
@@ -1343,11 +1548,15 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     /// Pull a playhead-centred window of broadband peaks into the
     /// ring. Bounded to [`maxChunksIngestPerFrame`] so load / seek /
-    /// scrub stays responsive while the column scrolls.
-    private func ingestNewChunks(playheadSecs: Double) {
+    /// scrub stays responsive while the column scrolls. The dedupe
+    /// gate is per-buffer so the first frame on a freshly-rotated
+    /// triple-buffer slot always performs a real write instead of
+    /// binding zero-initialised memory.
+    private func ingestNewChunks(playheadSecs: Double, bufferIndex: Int) {
         let currentLen = engine.peaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenPeaksLen = 0
+            lastSeenPeaksLenPerBuffer[bufferIndex] = 0
             return
         }
         if lastSeenPeaksLen == 0 {
@@ -1364,20 +1573,25 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let half = budget / 2
         let start = phChunk > half ? phChunk - half : 0
         let end = min(currentLen, start + budget)
-        if phChunk == lastBroadbandIngestPhChunk,
-           lastSeenPeaksLen == currentLen,
+        if phChunk == lastBroadbandIngestPhChunkPerBuffer[bufferIndex],
+           lastSeenPeaksLenPerBuffer[bufferIndex] == currentLen,
            NSEvent.pressedMouseButtons == 0
         {
             return
         }
-        lastBroadbandIngestPhChunk = phChunk
-        ingestBroadbandRange(startIdx: start, count: end &- start)
+        lastBroadbandIngestPhChunkPerBuffer[bufferIndex] = phChunk
+        ingestBroadbandRange(
+            startIdx: start, count: end &- start, bufferIndex: bufferIndex)
         lastSeenPeaksLen = currentLen
+        lastSeenPeaksLenPerBuffer[bufferIndex] = currentLen
     }
 
     /// Copy `[startIdx, startIdx + count)` band peak chunks into
-    /// the GPU ring.
-    private func ingestBandRange(startIdx: UInt64, count: UInt64) {
+    /// the GPU ring at `bandChunksBuffers[bufferIndex]`. Triple-
+    /// buffered, same rationale as [`ingestBroadbandRange`].
+    private func ingestBandRange(
+        startIdx: UInt64, count: UInt64, bufferIndex: Int
+    ) {
         guard count > 0 else { return }
         let data = engine.bandPeaksExtend(deckIdx: deckIdx, startIdx: startIdx)
         if data.isEmpty { return }
@@ -1387,7 +1601,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         guard newChunkCount > 0, data.count % chunkStride == 0 else { return }
 
         let ringBytes = WaveformRenderer.bandChunkCapacity * chunkStride
-        let dstBase = bandChunksBuffer.contents()
+        let dstBase = bandChunksBuffers[bufferIndex].contents()
 
         data.withUnsafeBytes { (rawSrc: UnsafeRawBufferPointer) in
             guard let srcBase = rawSrc.baseAddress else { return }
@@ -1409,10 +1623,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     }
 
     /// Playhead-centred band peak ingest; mirrors [`ingestNewChunks`].
-    private func ingestNewBandChunks(playheadSecs: Double) {
+    /// Triple-buffered against `bandChunksBuffers[bufferIndex]`.
+    private func ingestNewBandChunks(playheadSecs: Double, bufferIndex: Int) {
         let currentLen = engine.bandPeaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenBandPeaksLen = 0
+            lastSeenBandPeaksLenPerBuffer[bufferIndex] = 0
             return
         }
 
@@ -1427,15 +1643,17 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let half = budget / 2
         let start = phChunk > half ? phChunk - half : 0
         let end = min(currentLen, start + budget)
-        if phChunk == lastBandIngestPhChunk,
-           lastSeenBandPeaksLen == currentLen,
+        if phChunk == lastBandIngestPhChunkPerBuffer[bufferIndex],
+           lastSeenBandPeaksLenPerBuffer[bufferIndex] == currentLen,
            NSEvent.pressedMouseButtons == 0
         {
             return
         }
-        lastBandIngestPhChunk = phChunk
-        ingestBandRange(startIdx: start, count: end &- start)
+        lastBandIngestPhChunkPerBuffer[bufferIndex] = phChunk
+        ingestBandRange(
+            startIdx: start, count: end &- start, bufferIndex: bufferIndex)
         lastSeenBandPeaksLen = currentLen
+        lastSeenBandPeaksLenPerBuffer[bufferIndex] = currentLen
     }
 
     /// Snapshot the engine's reported broadband + band chunk cadences
@@ -1585,12 +1803,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         appearance: RendererAppearance,
         beats: BeatGridSnapshot,
-        playheadSecs: Double,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
         pastSubChunkOffsetNDC: Float,
-        futureSubChunkOffsetNDC: Float
+        futureSubChunkOffsetNDC: Float,
+        bufferIndex: Int
     ) {
         let peakDur = peakChunkDurationSecs
         guard peakDur > 0, drawnAbove >= 2, drawnBelow >= 2 else { return }
@@ -1626,8 +1844,24 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // peak can no longer occlude both; the user always sees at
         // least one tick edge. Downbeats stay deck-tinted at full
         // height so deck identity remains glanceable.
-        let beatHalfNDC = 1.5 / timeAxisPixels
-        let barHalfNDC = 3.5 / timeAxisPixels
+        //
+        // **Analytic-AA line widths.** `visibleHalfPx` is the
+        // opaque-core half-width the fragment shader resolves to;
+        // `quadHalfPx = visibleHalfPx + 1` gives the smoothstep
+        // falloff (1 px each side, see
+        // `Shaders.metal :: beatGridFragment`) rasterised
+        // fragments to write into. Without the +1 px headroom the
+        // fade clips on the quad's hard edge and the line reads
+        // as 1 px integer-rounded jitter.
+        //
+        // Beat ticks: visible 1.5 px wide (= 0.75 logical on 2×
+        // Retina). Bars (downbeats): visible 3.5 px wide.
+        let beatVisibleHalfPx: Float = 0.75
+        let barVisibleHalfPx: Float = 1.75
+        let beatVisibleHalfNDC = beatVisibleHalfPx / timeAxisPixels
+        let barVisibleHalfNDC = barVisibleHalfPx / timeAxisPixels
+        let beatQuadHalfNDC = (beatVisibleHalfPx + 1.0) / timeAxisPixels
+        let barQuadHalfNDC = (barVisibleHalfPx + 1.0) / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
         let startIdx = Self.firstBeatIndex(in: beats.beats, atOrAfter: visibleStart)
@@ -1651,7 +1885,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     vertices: &beatGridScratchVertices,
                     orientation: appearance.orientation,
                     timeNDC: Float(timeNDC),
-                    halfThickness: barHalfNDC,
+                    quadHalfNDC: barQuadHalfNDC,
+                    visibleHalfNDC: barVisibleHalfNDC,
                     color: Self.deckTintRGBA(side: appearance.side, alpha: 1.0),
                     isDownbeat: true)
             } else {
@@ -1659,7 +1894,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     vertices: &beatGridScratchVertices,
                     orientation: appearance.orientation,
                     timeNDC: Float(timeNDC),
-                    halfThickness: beatHalfNDC,
+                    quadHalfNDC: beatQuadHalfNDC,
+                    visibleHalfNDC: beatVisibleHalfNDC,
                     color: Self.beatTickRGBA(alpha: 0.88))
             }
         }
@@ -1668,16 +1904,18 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
         let byteCount =
             beatGridScratchVertices.count * MemoryLayout<BeatGridVertexLayout>.stride
-        if beatGridVertexBuffer == nil
-            || beatGridVertexCapacity < beatGridScratchVertices.count
+        if beatGridVertexBuffers[bufferIndex] == nil
+            || beatGridVertexCapacities[bufferIndex] < beatGridScratchVertices.count
         {
             let newCap = max(beatGridScratchVertices.count, 256)
-            beatGridVertexBuffer = device.makeBuffer(
+            let buf = device.makeBuffer(
                 length: newCap * MemoryLayout<BeatGridVertexLayout>.stride,
                 options: .storageModeShared)
-            beatGridVertexCapacity = newCap
+            buf?.label = "dub.beatgrid.vertices[\(bufferIndex)]"
+            beatGridVertexBuffers[bufferIndex] = buf
+            beatGridVertexCapacities[bufferIndex] = newCap
         }
-        guard let buffer = beatGridVertexBuffer else { return }
+        guard let buffer = beatGridVertexBuffers[bufferIndex] else { return }
         beatGridScratchVertices.withUnsafeBytes { raw in
             guard let src = raw.baseAddress else { return }
             memcpy(buffer.contents(), src, byteCount)
@@ -1710,18 +1948,26 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// in the bottom headroom mirrored to negative cross-axis.
     /// Even an asymmetric loud peak that fills one half of the
     /// waveform still leaves the opposite tick fully visible.
+    ///
+    /// `quadHalfNDC` is the geometric width of the rasterised
+    /// quad on the time axis; `visibleHalfNDC` is the alpha-1
+    /// core width the shader resolves to. `quadHalfNDC >
+    /// visibleHalfNDC` so the shader has fade room on both
+    /// edges.
     private static func appendMirroredBeatTick(
         vertices: inout [BeatGridVertexLayout],
         orientation: WaveformOrientation,
         timeNDC: Float,
-        halfThickness: Float,
+        quadHalfNDC: Float,
+        visibleHalfNDC: Float,
         color: SIMD4<Float>
     ) {
         appendCrossAxisStrip(
             vertices: &vertices,
             orientation: orientation,
             timeNDC: timeNDC,
-            halfThickness: halfThickness,
+            quadHalfNDC: quadHalfNDC,
+            visibleHalfNDC: visibleHalfNDC,
             color: color,
             crossLow: beatTickInnerNDC,
             crossHigh: beatTickOuterNDC)
@@ -1729,7 +1975,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             vertices: &vertices,
             orientation: orientation,
             timeNDC: timeNDC,
-            halfThickness: halfThickness,
+            quadHalfNDC: quadHalfNDC,
+            visibleHalfNDC: visibleHalfNDC,
             color: color,
             crossLow: -beatTickOuterNDC,
             crossHigh: -beatTickInnerNDC)
@@ -1744,7 +1991,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         vertices: inout [BeatGridVertexLayout],
         orientation: WaveformOrientation,
         timeNDC: Float,
-        halfThickness: Float,
+        quadHalfNDC: Float,
+        visibleHalfNDC: Float,
         color: SIMD4<Float>,
         isDownbeat: Bool
     ) {
@@ -1754,48 +2002,78 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             vertices: &vertices,
             orientation: orientation,
             timeNDC: timeNDC,
-            halfThickness: halfThickness,
+            quadHalfNDC: quadHalfNDC,
+            visibleHalfNDC: visibleHalfNDC,
             color: color,
             crossLow: crossLow,
             crossHigh: crossHigh)
     }
 
     /// Emit a single axis-aligned strip quad spanning `[crossLow,
-    /// crossHigh]` on the cross axis and ±`halfThickness` around
+    /// crossHigh]` on the cross axis and ±`quadHalfNDC` around
     /// `timeNDC` on the time axis. Vertex windings match the
     /// existing beat-grid shader (no culling required).
+    ///
+    /// Each vertex carries `signedTimeAxisDistNDC` = its signed
+    /// offset from the line centre on the time axis. The fragment
+    /// shader (`Shaders.metal :: beatGridFragment`) reads this
+    /// linearly-interpolated value and computes pixel coverage
+    /// analytically, decoupling the rasterised quad's width
+    /// (`quadHalfNDC`) from the visible line width
+    /// (`visibleHalfNDC`).
     private static func appendCrossAxisStrip(
         vertices: inout [BeatGridVertexLayout],
         orientation: WaveformOrientation,
         timeNDC: Float,
-        halfThickness: Float,
+        quadHalfNDC: Float,
+        visibleHalfNDC: Float,
         color: SIMD4<Float>,
         crossLow: Float,
         crossHigh: Float
     ) {
+        let neg = -quadHalfNDC
+        let pos = +quadHalfNDC
         switch orientation {
         case .vertical:
-            let y0 = timeNDC - halfThickness
-            let y1 = timeNDC + halfThickness
+            let y0 = timeNDC - quadHalfNDC
+            let y1 = timeNDC + quadHalfNDC
             let x0 = crossLow
             let x1 = crossHigh
-            vertices.append(.init(position: SIMD2(x0, y0), color: color))
-            vertices.append(.init(position: SIMD2(x1, y0), color: color))
-            vertices.append(.init(position: SIMD2(x0, y1), color: color))
-            vertices.append(.init(position: SIMD2(x1, y0), color: color))
-            vertices.append(.init(position: SIMD2(x1, y1), color: color))
-            vertices.append(.init(position: SIMD2(x0, y1), color: color))
+            vertices.append(.init(position: SIMD2(x0, y0), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y0), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x0, y1), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y0), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y1), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x0, y1), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
         case .horizontal:
-            let x0 = -timeNDC - halfThickness
-            let x1 = -timeNDC + halfThickness
+            // Horizontal mode mirrors time across X via
+            // `xNDC = -timeNDC` (see the waveform vertex shader),
+            // so `x0` is the *positive* time-axis edge and `x1`
+            // is the *negative* edge. Set `signedTimeAxisDistNDC`
+            // accordingly so the AA falloff points in the right
+            // direction regardless of orientation.
+            let x0 = -timeNDC - quadHalfNDC
+            let x1 = -timeNDC + quadHalfNDC
             let y0 = crossLow
             let y1 = crossHigh
-            vertices.append(.init(position: SIMD2(x0, y0), color: color))
-            vertices.append(.init(position: SIMD2(x1, y0), color: color))
-            vertices.append(.init(position: SIMD2(x0, y1), color: color))
-            vertices.append(.init(position: SIMD2(x1, y0), color: color))
-            vertices.append(.init(position: SIMD2(x1, y1), color: color))
-            vertices.append(.init(position: SIMD2(x0, y1), color: color))
+            vertices.append(.init(position: SIMD2(x0, y0), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y0), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x0, y1), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y0), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x1, y1), color: color,
+                                  signedTimeAxisDistNDC: neg, visibleHalfNDC: visibleHalfNDC))
+            vertices.append(.init(position: SIMD2(x0, y1), color: color,
+                                  signedTimeAxisDistNDC: pos, visibleHalfNDC: visibleHalfNDC))
         }
     }
 

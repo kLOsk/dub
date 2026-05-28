@@ -881,10 +881,18 @@ private struct WaveformMetalView: NSViewRepresentable {
         renderer.setBeatGridEnabled(true)
         context.coordinator.renderer = renderer
 
+        // M11d.6 round 11 — capture the mach_absolute_time ↔
+        // engine-host-time-ns offset once per renderer so the
+        // CVDisplayLink callback can translate vsync display
+        // times into the FFI's host_time_ns domain. See
+        // `EngineHostTimeMapping` for the clock-domain rationale.
+        let hostTimeMapping = EngineHostTimeMapping(engine: engine)
+
         let label = "dub.waveform.render.\(deckIdx)"
         let renderThread = WaveformRenderThread(
             metalLayer: hostView.metalLayer,
             renderer: renderer,
+            hostTimeMapping: hostTimeMapping,
             label: label)
         context.coordinator.renderThread = renderThread
 

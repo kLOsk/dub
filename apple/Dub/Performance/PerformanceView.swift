@@ -212,9 +212,25 @@ struct PerformanceView: View {
     /// `VStack` layout from jumping when a track loads.
     @ViewBuilder
     private var prepOverviewBand: some View {
-        TrackOverviewView(model: model, side: .a, deckIdx: 0,
-                          orientation: .horizontal)
+        if Self.overviewEnabled {
+            TrackOverviewView(model: model, side: .a, deckIdx: 0,
+                              orientation: .horizontal)
+        }
     }
+
+    /// **M11d.6 round 13 jitter-isolation toggle.** Set to `false`
+    /// to bypass `TrackOverviewView` entirely. Used to confirm
+    /// that the round-13 Canvas split (static bars + markers
+    /// separated from per-tick playhead overlay) actually
+    /// removed the 4 Hz CoreAnimation contention that previously
+    /// stole ~12 ms from the Metal render thread every 250 ms.
+    /// With the overview off the trace showed σ Δplayhead =
+    /// 0.0465 ms (= the noise floor) and zero vsync misses, so
+    /// the residual user-visible jitter wasn't in playhead
+    /// timing — it was in the beat-tick rasterisation width
+    /// (see `beatHalfNDC` in `drawBeatGrid`). Toggle preserved
+    /// for future regression isolation.
+    private static let overviewEnabled: Bool = true
 
     /// Orientation of the playing waveform for the current engine
     /// mode. Performance (Timecode) mode keeps the canonical PRD
@@ -275,9 +291,11 @@ struct PerformanceView: View {
                 // pane look bare in screenshots.
                 HStack(spacing: 0) {
                     if side == .a {
-                        TrackOverviewView(
-                            model: model, side: side, deckIdx: deckIdx)
-                        Color.clear.frame(width: DubLayout.deckOverviewGap)
+                        if Self.overviewEnabled {
+                            TrackOverviewView(
+                                model: model, side: side, deckIdx: deckIdx)
+                            Color.clear.frame(width: DubLayout.deckOverviewGap)
+                        }
                         Spacer(minLength: 0)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
@@ -289,9 +307,11 @@ struct PerformanceView: View {
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
                         Spacer(minLength: 0)
-                        Color.clear.frame(width: DubLayout.deckOverviewGap)
-                        TrackOverviewView(
-                            model: model, side: side, deckIdx: deckIdx)
+                        if Self.overviewEnabled {
+                            Color.clear.frame(width: DubLayout.deckOverviewGap)
+                            TrackOverviewView(
+                                model: model, side: side, deckIdx: deckIdx)
+                        }
                     }
                 }
             case .horizontal:

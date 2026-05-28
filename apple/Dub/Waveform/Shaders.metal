@@ -477,14 +477,48 @@ fragment float4 waveformFragment(VertexOut in [[stage_in]]) {
 
 /// Per-vertex data for beat-grid tick quads. Positions are already
 /// in clip-space NDC; the vertex shader is a passthrough.
+///
+/// **M11d.6 round 15 — analytic anti-aliasing.** The original
+/// shader returned a flat colour and relied on the quad's
+/// geometric edges + MSAA 4× resolve to soften the line. That
+/// breaks down when the line is moving faster than its own
+/// width on a 60 Hz panel: each frame's "lit region" lands at a
+/// different *integer-rounded* pixel set, with a visible gap
+/// between consecutive frame positions that the eye reads as
+/// "1 px jumps left/right" (sub-logical-pixel lines) or "the
+/// grid line ghost-flashes" (super-logical-pixel lines).
+///
+/// The fix is to decouple the *visible* line width from the
+/// *rasterised quad* width. The quad is widened on the host
+/// side by 1 px in NDC so the shader has a fade region to
+/// work in. The host writes a signed time-axis offset to
+/// `signedTimeAxisDistNDC` on each vertex; that varies linearly
+/// across the quad along the time axis (constant in the cross
+/// axis). The fragment shader uses screen-space derivatives
+/// (`fwidth`) to convert NDC distance to *pixels*, and applies
+/// a `smoothstep` falloff that produces sub-pixel-perfect
+/// coverage at every fractional line position. Combined with
+/// MSAA 4×, the line's visible centre advances continuously
+/// regardless of integer pixel boundaries.
 struct BeatGridVertex {
     float2 position;
     float4 color;
+    /// Signed distance from the line's time-axis centre, in
+    /// NDC units. Varies linearly across the quad along the
+    /// time axis (constant in the cross axis). Reaches
+    /// ±`quadHalfNDC` at the quad's edges.
+    float signedTimeAxisDistNDC;
+    /// Half of the *visible* (post-AA) line width, in NDC. The
+    /// alpha falloff starts where `|dist| > visibleHalfNDC`.
+    /// Always ≤ `quadHalfNDC`.
+    float visibleHalfNDC;
 };
 
 struct BeatGridVertexOut {
     float4 position [[position]];
     float4 color;
+    float signedTimeAxisDistNDC;
+    float visibleHalfNDC;
 };
 
 vertex BeatGridVertexOut beatGridVertex(uint vid [[vertex_id]],
@@ -492,9 +526,27 @@ vertex BeatGridVertexOut beatGridVertex(uint vid [[vertex_id]],
     BeatGridVertexOut out;
     out.position = float4(verts[vid].position, 0.0, 1.0);
     out.color = verts[vid].color;
+    out.signedTimeAxisDistNDC = verts[vid].signedTimeAxisDistNDC;
+    out.visibleHalfNDC = verts[vid].visibleHalfNDC;
     return out;
 }
 
 fragment float4 beatGridFragment(BeatGridVertexOut in [[stage_in]]) {
-    return in.color;
+    // Analytical line-edge AA. `dist` is the absolute
+    // NDC-space distance from this fragment to the line's
+    // centre on the time axis. `fwidth` is the change in
+    // `signedTimeAxisDistNDC` between adjacent fragments —
+    // i.e. one pixel's worth of NDC distance — so the
+    // smoothstep transition spans exactly 1 pixel regardless
+    // of viewport size, orientation, or per-deck zoom level.
+    // The MSAA pass on top of this gives a further factor of
+    // 4 sub-pixel positions for the resolve, which lands the
+    // line centre at the precise fractional position requested
+    // by the host every frame.
+    float dist = abs(in.signedTimeAxisDistNDC);
+    float aa = fwidth(in.signedTimeAxisDistNDC);
+    float alpha = 1.0 - smoothstep(in.visibleHalfNDC - 0.5 * aa,
+                                    in.visibleHalfNDC + 0.5 * aa,
+                                    dist);
+    return float4(in.color.rgb, in.color.a * alpha);
 }

@@ -152,7 +152,59 @@ uniffi::setup_scaffolding!();
 ///       auto-lock heuristic. PRD-BEATS §3.5 + user feedback:
 ///       "i pressed the bpm to set the 1 and it initiated autlock"
 ///       — auto-lock is reserved for the auto-analyse pass.
-pub const FFI_VERSION: u32 = 22;
+///   23. **M11d.6 round 6** — [`DubEngine::position_snapshot`] now
+///       returns a render-time-extrapolated playhead. The audio
+///       thread publishes a seqlock-protected
+///       `(host_time, position_secs, rate)` triple every render
+///       block; the FFI extrapolates forward to the wall-clock
+///       moment of the snapshot call, eliminating the 30 Hz
+///       strobe pattern that emerged when a 60 Hz renderer
+///       sampled a ~100 Hz audio publisher. Pure read-side
+///       change: no new FFI surface, no Swift call-site
+///       changes, `PositionInfo` shape unchanged.
+///   24. **M11d.6 round 7 (diagnostic)** — `PositionInfo` grows
+///       three temporary `debug_*` fields exposing the raw
+///       publish triple (`position_secs`, `elapsed_ns`,
+///       `advance_rate`). The Apple grid trace surfaces them
+///       so we can distinguish a stale extrapolation source
+///       (audio thread mispublishing) from a render-side bug
+///       (Swift reading the wrong field). Will be removed once
+///       the residual playhead-rate-vs-wall-time mismatch is
+///       diagnosed.
+///   25. **M11d.6 round 8** — fix the audible 0.92× playback
+///       speed caused by a double sample-rate conversion in the
+///       FFI's `set_deck_rate` (track_sr / engine_sr was applied
+///       both there and in the deck's `new_increment` math). The
+///       FFI now passes the musical rate through unchanged.
+///   26. **M11d.6 round 10** — *reverted in round 11*. Round 10
+///       tried a synthesized audio clock (anchor + samples *
+///       1e9 / engine_sr). Symptom: 16.5 % of frames had
+///       `elapsedNs = 0` because the synth clock ran ahead of
+///       `Instant::now()` (the audio device clock buffers ~1
+///       block ahead of the wall-clock playback time; the synth
+///       didn't account for that), and the FFI's saturating
+///       subtraction `(now − pub_host_synth)` clamped to zero,
+///       freezing the visible playhead. The clamp-then-jump
+///       pattern was *worse* than the round-9 noise. Round 11
+///       reverts to the raw-`Instant::now()` publisher.
+///   27. **M11d.6 round 11** — new FFI entry point
+///       [`DubEngine::position_snapshot_at_host_time`] and the
+///       paired clock-anchor query
+///       [`DubEngine::current_host_time_ns`]. Lets the Apple
+///       `CVDisplayLink` callback pass the predicted vsync
+///       display time (`CVTimeStamp.hostTime`, after timebase
+///       conversion and a one-time clock-domain offset) as the
+///       playhead-extrapolation "now". The pre-round-11 path
+///       read `Instant::now()` inside the renderer's snapshot
+///       call, which on a 60 Hz screen runs anywhere inside
+///       the 16.67 ms vsync window with several-ms render-time
+///       jitter — that variance turned into the visible
+///       ~1-logical-pixel grid shimmer the user reported. With
+///       vsync-targeting, Δnow_ns between consecutive frames
+///       is exactly `1/refreshRate` (the panel's crystal-locked
+///       refresh interval), collapsing the visible motion's
+///       wall-time noise to zero.
+pub const FFI_VERSION: u32 = 27;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -620,6 +672,63 @@ impl DubEngine {
             if slot.is_some() {
                 self.bump_peak_generation(idx);
             }
+        }
+    }
+
+    /// Shared implementation between
+    /// [`Self::position_snapshot`] (which reads
+    /// `host_time_ns()` itself) and
+    /// [`Self::position_snapshot_at_host_time`] (which takes
+    /// it as a parameter). Lives in the non-`#[uniffi::export]`
+    /// impl block so it isn't accidentally exposed to Swift as
+    /// `positionSnapshotAtHostTimeInner` — the published FFI
+    /// surface is exactly the two snapshot entry points plus
+    /// `current_host_time_ns`, no more.
+    fn position_snapshot_at_host_time_inner(&self, deck_idx: u64, now_ns: u64) -> PositionInfo {
+        let idx = match deck_idx_to_usize(deck_idx) {
+            Ok(idx) => idx,
+            Err(_) => return PositionInfo::EMPTY,
+        };
+        let shared = match self.deck_shared.get(idx) {
+            Some(arc) => arc.as_ref(),
+            None => return PositionInfo::EMPTY,
+        };
+        let duration_secs = shared.load_duration_secs();
+        let is_playing = shared.load_playing();
+        let is_panic_play = shared.load_panic_play();
+        let at_end = shared.load_at_end();
+        let has_track = shared.load_has_track();
+        if !has_track {
+            return PositionInfo {
+                has_track: false,
+                is_playing,
+                is_panic_play,
+                ..PositionInfo::EMPTY
+            };
+        }
+        // Read the coherent `(host_time, secs, rate)` triple
+        // and extrapolate to the supplied wall-clock target.
+        // The audio thread pins `rate = 0` during pause /
+        // no-source / seek, so a paused deck's playhead is
+        // intrinsically stable here and we don't need an
+        // explicit branch for it.
+        let publish = shared.load_publish_state();
+        let playhead_secs_unclamped = publish.extrapolated_secs(now_ns);
+        let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
+        let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
+        let debug_elapsed_ns = now_ns.saturating_sub(publish.host_time_ns);
+        PositionInfo {
+            elapsed_secs,
+            playhead_secs_unclamped,
+            remaining_secs,
+            duration_secs,
+            is_playing,
+            at_end,
+            has_track: true,
+            is_panic_play,
+            debug_publish_secs: publish.position_secs,
+            debug_elapsed_ns,
+            debug_advance_rate: publish.rate,
         }
     }
 }
@@ -1118,13 +1227,16 @@ impl DubEngine {
     /// on prolonged near-zero rates so the user doesn't hear a DC
     /// thump).
     ///
-    /// **Sample-rate conversion is done here.** The user supplies a
-    /// rate in "audio seconds per real second" (= musical speed);
-    /// the engine internally drives source frames per output frame.
-    /// We multiply by `track_sr / engine_sr` so callers don't have
-    /// to know about engine SR. When no track is loaded we still
-    /// send the command — the engine treats it as a no-op so the UI
-    /// doesn't have to special-case empty decks.
+    /// **Sample-rate conversion is done inside the deck render
+    /// loop** (`new_increment = rate * track_sr / engine_sr`).
+    /// The FFI passes `rate` through unchanged — callers supply
+    /// musical units and the engine handles the SR ratio itself.
+    /// Pre-M11d.6-round-8 the FFI multiplied by `track_sr /
+    /// engine_sr` on this side as well, producing a
+    /// double-conversion that played a 44.1 kHz track on a 48 kHz
+    /// engine at 0.92× speed (≈1.5 semitones flat) once the Apple
+    /// shell started calling `setDeckRate(1.0)` on the prep-mode
+    /// play path; that pre-multiplication is gone now.
     ///
     /// **Timecode-mode interaction.** Without Panic Play the
     /// timecode driver overwrites the rate every block, so this
@@ -1147,27 +1259,24 @@ impl DubEngine {
             return Err(EngineError::EngineNotRunning);
         };
 
-        // SR conversion: convert musical rate (audio_secs / real_sec)
-        // into source frames per output frame. When the track SR
-        // isn't yet known we send the musical rate as-is; the deck's
-        // own resampler will handle the engine-side rate either way.
-        let engine_rate = match running.file_tracks[idx].as_ref() {
-            Some(track) => {
-                let track_sr = f64::from(track.sample_rate());
-                let engine_sr = f64::from(running.sample_rate);
-                if engine_sr > 0.0 {
-                    rate * track_sr / engine_sr
-                } else {
-                    rate
-                }
-            }
-            None => rate,
-        };
-
+        // **M11d.6 round 8.** `rate` here is the **musical** rate
+        // (audio-seconds-per-real-second; 1.0 = real-time at the
+        // track's natural pitch, 2.0 = double speed, -1.0 =
+        // reverse, etc.). That's also what `Deck::set_rate` takes
+        // — the deck's render loop applies the
+        // `track_sr / engine_sr` conversion internally inside
+        // `new_increment`. The pre-round-8 path multiplied by
+        // that ratio here as well, producing a double-conversion
+        // that played a 44.1 kHz track on a 48 kHz engine at
+        // 0.92× speed (≈1.5 semitones flat) once the Apple shell
+        // started calling `setDeckRate(1.0)` on the prep-mode
+        // play path. See `crates/dub-engine/src/deck.rs`
+        // `sample_rate_conversion_44k_to_48k` for the
+        // single-conversion guarantee.
         running
             .handle
             .deck(idx)
-            .set_rate(engine_rate)
+            .set_rate(rate)
             .map_err(map_command_error)
     }
 
@@ -1335,11 +1444,14 @@ impl DubEngine {
             at_end: snap.at_end,
             has_track: true,
             is_panic_play: snap.is_panic_play,
+            debug_publish_secs: playhead_secs_unclamped,
+            debug_elapsed_ns: 0,
+            debug_advance_rate: 0.0,
         }
     }
 
     /// Lock-free playhead snapshot for hot-path callers (M11d.6
-    /// round 5).
+    /// round 5; render-time extrapolation added in round 6).
     ///
     /// Returns the same [`PositionInfo`] shape as [`Self::position`]
     /// but reads **only** the atomic `DeckSharedState` fields. It
@@ -1357,50 +1469,96 @@ impl DubEngine {
     /// atomic — but a time-display consumer that needs strictly
     /// consistent fields should keep using [`Self::position`].
     ///
+    /// **M11d.6 round 6: render-time extrapolation.** The audio
+    /// thread publishes the playhead at its own block cadence
+    /// (≈100 Hz on a stock CoreAudio setup). The 60 Hz renderer
+    /// that samples the bare published value sees a 30 Hz
+    /// strobe — sometimes one publish lands per vsync, sometimes
+    /// two. To eliminate that, the audio thread tags every
+    /// publish with the host time it landed at, plus the rate
+    /// the playhead is advancing; this method reads the
+    /// `(host_time, secs, rate)` triple coherently via seqlock
+    /// and extrapolates the playhead forward to **now** using
+    /// `position_secs + (now - host_time) * rate`. Elapsed time
+    /// is clamped at 100 ms so a stalled audio thread freezes
+    /// the playhead instead of running it off. The resulting
+    /// `playhead_secs_unclamped` advances smoothly at vsync
+    /// resolution regardless of the audio-thread publish
+    /// cadence (PRD §2.2.6).
+    ///
     /// Intended consumers: the per-deck waveform render thread,
     /// `TrackOverviewView`'s 4 Hz timeline, `LiveDeckTimeText`'s
     /// 2 Hz timeline, and `pollDecks`'s 10 Hz transport mirror.
+    /// All four read the extrapolated value transparently —
+    /// no Swift-side changes are required.
     #[must_use]
     pub fn position_snapshot(&self, deck_idx: u64) -> PositionInfo {
-        let idx = match deck_idx_to_usize(deck_idx) {
-            Ok(idx) => idx,
-            Err(_) => return PositionInfo::EMPTY,
-        };
-        let shared = match self.deck_shared.get(idx) {
-            Some(arc) => arc.as_ref(),
-            None => return PositionInfo::EMPTY,
-        };
-        let duration_secs = shared.load_duration_secs();
-        let is_playing = shared.load_playing();
-        let is_panic_play = shared.load_panic_play();
-        let at_end = shared.load_at_end();
-        let has_track = shared.load_has_track();
-        if !has_track {
-            return PositionInfo {
-                has_track: false,
-                is_playing,
-                is_panic_play,
-                ..PositionInfo::EMPTY
-            };
-        }
-        // The audio thread publishes the playhead in seconds
-        // alongside the canonical frame-domain `position_bits`
-        // (`Deck::store_position_secs`). That keeps the snapshot
-        // self-contained — readers do not need the track's sample
-        // rate to surface a wall-clock playhead.
-        let playhead_secs_unclamped = shared.load_position_secs();
-        let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
-        let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
-        PositionInfo {
-            elapsed_secs,
-            playhead_secs_unclamped,
-            remaining_secs,
-            duration_secs,
-            is_playing,
-            at_end,
-            has_track: true,
-            is_panic_play,
-        }
+        self.position_snapshot_at_host_time_inner(deck_idx, DeckSharedState::host_time_now_ns())
+    }
+
+    /// **M11d.6 round 11** — vsync-targeted variant of
+    /// [`Self::position_snapshot`].
+    ///
+    /// Use this from a `CVDisplayLink`-driven render path: pass
+    /// in the predicted display time of the frame being
+    /// rendered (from `CVTimeStamp.hostTime`, after timebase
+    /// conversion to nanoseconds **and** the engine-relative
+    /// clock-domain offset from
+    /// [`Self::current_host_time_ns`]). The FFI then extrapolates
+    /// the playhead forward to that **future** wall-clock
+    /// moment rather than to "right now" — so the value
+    /// returned is "what the audio will be playing **when the
+    /// pixels actually hit the panel**", not "what the audio is
+    /// playing at the moment the renderer happens to run".
+    ///
+    /// Why this matters. The pre-round-11 path read the
+    /// playhead via `Instant::now()` inside `position_snapshot`.
+    /// On a 60 Hz vsync, the renderer can run anywhere in the
+    /// 16.67 ms vsync window — and the run-to-display latency
+    /// (= 1 vsync minus render time) varies frame to frame as
+    /// Metal command-buffer encoding takes 1–6 ms depending on
+    /// peaks-buffer hits, layout invalidations, etc. That
+    /// variance translated directly into the visible
+    /// "wall-time vs displayed-playhead" offset jittering,
+    /// which the user perceived as a ~1-logical-pixel grid
+    /// shimmer on retina (verified ~0.6 ms σ on Δplayhead in
+    /// the Δt = 17 ms grid-trace bucket on the user's 2019
+    /// Intel MBP). Targeting vsync collapses the variance:
+    /// CVDisplayLink schedules `hostTime` on the panel's
+    /// crystal-locked refresh interval, so consecutive frames
+    /// are spaced by exactly `1/refreshRate` regardless of
+    /// CPU jitter.
+    ///
+    /// Clamps the FFI extrapolation window to ±100 ms just
+    /// like [`Self::position_snapshot`]: if the supplied
+    /// `host_time_ns` is more than 100 ms ahead of the latest
+    /// publish, the playhead freezes at "publish + 100 ms" —
+    /// safe upper bound against a hung audio thread or a
+    /// pathologically-large render-ahead window.
+    #[must_use]
+    pub fn position_snapshot_at_host_time(&self, deck_idx: u64, host_time_ns: u64) -> PositionInfo {
+        self.position_snapshot_at_host_time_inner(deck_idx, host_time_ns)
+    }
+
+    /// **M11d.6 round 11** — current engine-relative host time
+    /// in nanoseconds.
+    ///
+    /// Used by the Apple shell once at engine init to anchor a
+    /// `mach_absolute_time → engine-relative-ns` offset. The
+    /// shell then converts each `CVTimeStamp.hostTime` (which
+    /// arrives in `mach_absolute_time` ticks) into the
+    /// engine-relative domain before passing to
+    /// [`Self::position_snapshot_at_host_time`]. The offset is
+    /// stable across an awake session (Rust's `Instant::now()`
+    /// resolves to `mach_continuous_time` and macOS's
+    /// `mach_absolute_time` agree modulo cumulative sleep time;
+    /// non-sleeping sessions see zero divergence). Sleep-aware
+    /// callers can recompute the offset on `NSApplication`
+    /// foreground notifications if they expect mid-set system
+    /// suspends.
+    #[must_use]
+    pub fn current_host_time_ns(&self) -> u64 {
+        DeckSharedState::host_time_now_ns()
     }
 
     /// Read metadata for the currently-loaded File-mode track on the
@@ -2199,6 +2357,24 @@ pub struct PositionInfo {
     /// (M10.6c) and to un-gate overview click-jump in two-deck
     /// Timecode mode.
     pub is_panic_play: bool,
+    /// **Debug-only (M11d.6 round 7)**: raw `position_secs` from
+    /// the seqlock publish triple, NOT extrapolated. Compare with
+    /// `playhead_secs_unclamped` to see how much the extrapolation
+    /// is adding. Will be removed once grid jitter is fully
+    /// understood.
+    pub debug_publish_secs: f64,
+    /// **Debug-only (M11d.6 round 7)**: nanoseconds elapsed
+    /// between the audio thread's last publish and the FFI's
+    /// `host_time_now_ns()` read used to extrapolate this
+    /// snapshot. A value of zero means the FFI saw a publish
+    /// landing exactly on the snapshot moment (extrapolation
+    /// contributed nothing).
+    pub debug_elapsed_ns: u64,
+    /// **Debug-only (M11d.6 round 7)**: the `advance_rate` that
+    /// the extrapolation multiplied `debug_elapsed_ns` by. For
+    /// 1.0× File-mode playback this MUST be 1.0; for paused or
+    /// no-source decks it is 0.0.
+    pub debug_advance_rate: f64,
 }
 
 impl PositionInfo {
@@ -2211,6 +2387,9 @@ impl PositionInfo {
         at_end: false,
         has_track: false,
         is_panic_play: false,
+        debug_publish_secs: 0.0,
+        debug_elapsed_ns: 0,
+        debug_advance_rate: 0.0,
     };
 }
 
@@ -3028,7 +3207,31 @@ mod tests {
         // auto-lock heuristic).
         // M11d.6 round 5 21→22 (position_snapshot — lock-free
         // playhead read for the off-main waveform render thread).
-        assert_eq!(FFI_VERSION, 22);
+        // M11d.6 round 6 22→23 (position_snapshot returns a
+        // render-time extrapolated playhead from a seqlock-protected
+        // (host_time, secs, rate) publish triple, eliminating the
+        // 30 Hz strobe that came from sampling a ~100 Hz audio
+        // publisher at 60 Hz vsync).
+        // M11d.6 round 7 23→24 (PositionInfo.debug_* diagnostic
+        // fields surfaced so the grid trace can correlate the
+        // extrapolated playhead with the raw publish triple
+        // while we hunt the residual Δph/Δt < 1.0 ratio).
+        // M11d.6 round 8 24→25: `set_deck_rate` no longer
+        // pre-multiplies its `rate` arg by `track_sr /
+        // engine_sr`. The deck's own render loop already
+        // converts musical rate into a per-output-sample
+        // track-frame step (`new_increment = rate * track_sr /
+        // engine_sr`), so the FFI's pre-multiplication was a
+        // double-conversion that played a 44.1 kHz track on a
+        // 48 kHz engine at 0.92× speed (≈1.5 semitones flat)
+        // once the Apple shell started calling
+        // `setDeckRate(1.0)` on the prep-mode play path. The
+        // matching round-7 publish formula in
+        // `Deck::update_publish_state` is reverted in the same
+        // commit. Public surface is unchanged: callers still
+        // pass musical rate (1.0 = real-time at the track's
+        // natural pitch).
+        assert_eq!(FFI_VERSION, 27);
     }
 
     #[test]

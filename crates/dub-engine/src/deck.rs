@@ -13,8 +13,9 @@
 //! resampling for ordinary playback (with key-lock disabled) lands later
 //! when we evaluate whether linear is audibly insufficient.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use dub_io::Track;
 
@@ -53,6 +54,17 @@ use crate::realtime::RealtimeContext;
 ///   `duration_secs_bits` so a lock-free reader can detect an
 ///   unloaded deck without consulting `file_tracks` under the
 ///   `EngineState` mutex.
+/// - **publish-time (M11d.6 round 6)**: the audio thread tags every
+///   `position_secs` publish with the wall-clock host time at which
+///   it was written, plus the rate at which the playhead is
+///   advancing (seconds-of-playhead per second-of-wall-clock).
+///   Stored together with `position_secs_bits` under a seqlock so
+///   the lock-free reader sees a coherent `(host_time, secs, rate)`
+///   triple. The FFI uses these to **extrapolate** the playhead
+///   forward to the moment of the read, eliminating the 30 Hz
+///   strobe that otherwise emerges when a ~100 Hz audio publisher
+///   is sampled by a 60 Hz renderer (PRD §2.2.6 audience-grade
+///   visual reliability).
 #[derive(Debug)]
 pub struct DeckSharedState {
     position_bits: AtomicU64,
@@ -60,11 +72,79 @@ pub struct DeckSharedState {
     at_end: AtomicBool,
     is_panic_play: AtomicBool,
     duration_secs_bits: AtomicU64,
+    /// Seqlock for `position_secs_bits` / `publish_host_ns` /
+    /// `rate_bits`. Even ⇒ stable; odd ⇒ writer is in the middle
+    /// of a publish. A single audio-thread writer per deck means
+    /// the writer can never deadlock against itself.
+    publish_seq: AtomicU64,
     /// Published alongside [`Self::position_bits`] so a lock-free
     /// snapshot reader can surface wall-clock seconds without
     /// owning the track's sample-rate metadata.
     position_secs_bits: AtomicU64,
+    /// Engine-relative host time (nanoseconds since
+    /// [`engine_host_origin`]) at which the audio thread last
+    /// wrote `position_secs_bits`.
+    publish_host_ns: AtomicU64,
+    /// Rate at which `position_secs` advances per wall-clock
+    /// second (f64 bits). `1.0` for ordinary forward playback,
+    /// negative for reverse, `0.0` for paused / no-source.
+    rate_bits: AtomicU64,
     has_track: AtomicBool,
+    /// Coherent publish clock. When non-zero,
+    /// [`Self::publish_position_secs`] uses this value as the
+    /// `host_time_ns` paired with the published `position_secs`,
+    /// instead of capturing `host_time_ns()` at the moment publish
+    /// runs.
+    ///
+    /// The audio thread computes `position_secs` for the playhead
+    /// at the **end of the block being rendered** — a value tied
+    /// to the audio hardware's output clock, not to the wall-clock
+    /// moment at which the publish runs. Publishing
+    /// `(position_at_end_of_block, host_time_ns_now)` would let
+    /// the renderer's `(vsync − now) × rate` extrapolation pick
+    /// up the audio thread's CPU-scheduling jitter as visible
+    /// sub-pixel grid-line wobble.
+    ///
+    /// `dub-audio` converts CoreAudio's hardware-locked
+    /// `inTimeStamp.mHostTime` to the engine's `host_time_ns`
+    /// domain, adds the block duration to get the output time of
+    /// the **last** frame (the one `position_secs` corresponds
+    /// to), and stores it here before calling `Engine::render`.
+    /// Result: the published `(position_secs, host_time_ns)` pair
+    /// is coherent to within audio-hardware-clock precision.
+    ///
+    /// Zero ⇒ no override; publish falls back to `host_time_ns()`
+    /// for tests and offline-render callers that don't wire the
+    /// CoreAudio timestamp through.
+    publish_host_ns_override: AtomicU64,
+}
+
+/// Process-local monotonic clock origin shared by the audio
+/// thread (writer) and the FFI snapshot reader. Lazily
+/// initialised on first access. We deliberately keep the "host
+/// time" private to dub-engine rather than exposing absolute
+/// `Instant`s across the FFI: callers see only `position_secs`
+/// already extrapolated to the moment of the read, so no clock
+/// semantics leak past the boundary.
+fn engine_host_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+/// Read the current engine-relative host time in nanoseconds.
+///
+/// On macOS this delegates to `mach_absolute_time` via
+/// `Instant::now`; on Linux to `clock_gettime(CLOCK_MONOTONIC)`.
+/// Both are vDSO-mapped on the platforms we care about, so the
+/// call is wait-free and RT-safe — no syscall, no allocation.
+#[inline]
+fn host_time_ns() -> u64 {
+    let origin = engine_host_origin();
+    let dt = origin.elapsed();
+    let nanos = u128::from(dt.as_secs())
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u128::from(dt.subsec_nanos()));
+    u64::try_from(nanos.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }
 
 impl DeckSharedState {
@@ -79,8 +159,12 @@ impl DeckSharedState {
             at_end: AtomicBool::new(false),
             is_panic_play: AtomicBool::new(false),
             duration_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            publish_seq: AtomicU64::new(0),
             position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            publish_host_ns: AtomicU64::new(0),
+            rate_bits: AtomicU64::new(0.0f64.to_bits()),
             has_track: AtomicBool::new(false),
+            publish_host_ns_override: AtomicU64::new(0),
         }
     }
 
@@ -91,12 +175,16 @@ impl DeckSharedState {
     /// "empty deck" state instead of the last in-flight playhead.
     pub fn reset(&self) {
         self.position_bits.store(0u64, Ordering::Relaxed);
-        self.position_secs_bits.store(0u64, Ordering::Relaxed);
         self.duration_secs_bits.store(0u64, Ordering::Relaxed);
         self.is_playing.store(false, Ordering::Relaxed);
         self.at_end.store(false, Ordering::Relaxed);
         self.is_panic_play.store(false, Ordering::Relaxed);
         self.has_track.store(false, Ordering::Relaxed);
+        // Bring the seqlock-protected publish triple back to a
+        // clean baseline (zero playhead, zero rate, host time at
+        // "now" so no extrapolation kicks in if the snapshot
+        // reader arrives before the next audio block).
+        self.publish_position_secs(0.0, 0.0);
     }
 
     pub(crate) fn store_position(&self, frames: f64) {
@@ -163,15 +251,167 @@ impl DeckSharedState {
         self.has_track.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn store_position_secs(&self, secs: f64) {
+    /// Override the host time used by the next
+    /// [`Self::publish_position_secs`] call. See the docstring on
+    /// `publish_host_ns_override` for the motivation.
+    /// `Engine::set_block_output_host_ns` calls this on every deck
+    /// immediately before draining the audio block. Set `0` to
+    /// disable.
+    pub fn set_publish_host_ns_override(&self, ns: u64) {
+        self.publish_host_ns_override.store(ns, Ordering::Release);
+    }
+
+    /// Publish the playhead (in wall-clock seconds) together with
+    /// the host time at which it was written and the rate at
+    /// which it is advancing.
+    ///
+    /// `rate` here is wall-time-rate: seconds of track time per
+    /// second of CPU wall time. For 1.0× File-mode playback this
+    /// is 1.0 regardless of any engine/track SR mismatch. Callers
+    /// must normalise out the SR ratio that [`Deck::set_rate`]
+    /// bakes into `self.rate` before passing the value in. Set to
+    /// 0.0 on pause / seek / no-source so the FFI extrapolator
+    /// freezes the playhead.
+    ///
+    /// Single audio-thread writer per deck, seqlock-protected so
+    /// a lock-free reader sees a coherent triple. RT-safe: vDSO
+    /// `Instant::now`, three relaxed stores, two fences, two
+    /// seqlock stores. No allocation, no syscall, no spin.
+    ///
+    /// When [`Self::publish_host_ns_override`] is non-zero the
+    /// publish uses that value as the `host_time_ns` paired with
+    /// `secs` instead of capturing `host_time_ns()` at publish
+    /// time, so the `(position, host_time)` pair is coherent
+    /// against the audio hardware clock rather than carrying
+    /// CPU-scheduling jitter from the render thread.
+    pub(crate) fn publish_position_secs(&self, secs: f64, rate: f64) {
+        let override_ns = self.publish_host_ns_override.load(Ordering::Acquire);
+        let host_ns = if override_ns != 0 {
+            override_ns
+        } else {
+            host_time_ns()
+        };
+        let seq = self.publish_seq.load(Ordering::Relaxed);
+        // Move the seq into the "odd" / writing state so a reader
+        // sandwiching its load between the two seq writes will
+        // detect the in-flight update and retry.
+        self.publish_seq
+            .store(seq.wrapping_add(1), Ordering::Release);
+        fence(Ordering::Release);
         self.position_secs_bits
             .store(secs.to_bits(), Ordering::Relaxed);
+        self.publish_host_ns.store(host_ns, Ordering::Relaxed);
+        self.rate_bits.store(rate.to_bits(), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.publish_seq
+            .store(seq.wrapping_add(2), Ordering::Release);
     }
 
     /// Read the current playhead in **wall-clock seconds**.
+    ///
+    /// This is the raw value last published by the audio thread,
+    /// **without extrapolation**. Use [`Self::load_publish_state`]
+    /// when you want a smooth render-time playhead (see PRD §2.2.6).
     #[must_use]
     pub fn load_position_secs(&self) -> f64 {
         f64::from_bits(self.position_secs_bits.load(Ordering::Relaxed))
+    }
+
+    /// **M11d.6 round 6.** Lock-free read of the coherent
+    /// `(host_time_ns, position_secs, rate)` triple. Returns the
+    /// values that were in-flight together for one audio render
+    /// block. The seqlock retries internally if a writer is
+    /// mid-publish; in practice this happens once per audio
+    /// block (~5–11 ms), so the reader spins at most once or
+    /// twice.
+    #[must_use]
+    pub fn load_publish_state(&self) -> PublishState {
+        loop {
+            let s1 = self.publish_seq.load(Ordering::Acquire);
+            // Writer is in the middle of a publish — back off and
+            // retry. The audio thread's publish window is
+            // <1 microsecond, so a `spin_loop` hint plus immediate
+            // retry is sufficient.
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            fence(Ordering::Acquire);
+            let position_secs = f64::from_bits(self.position_secs_bits.load(Ordering::Relaxed));
+            let host_time_ns = self.publish_host_ns.load(Ordering::Relaxed);
+            let rate = f64::from_bits(self.rate_bits.load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            let s2 = self.publish_seq.load(Ordering::Acquire);
+            if s1 == s2 {
+                return PublishState {
+                    position_secs,
+                    host_time_ns,
+                    rate,
+                };
+            }
+            // Torn read: writer landed a publish between s1 and
+            // s2. Loop. By construction this can only happen once
+            // per audio block per reader call.
+        }
+    }
+
+    /// Engine-relative host time **right now**, in nanoseconds.
+    ///
+    /// Same clock domain as [`PublishState::host_time_ns`], so the
+    /// FFI can compute `(now - publish_host_ns)` to get the
+    /// elapsed time since the audio thread last published. Wait-
+    /// free, RT-safe (vDSO / `mach_absolute_time` under the hood).
+    #[must_use]
+    pub fn host_time_now_ns() -> u64 {
+        host_time_ns()
+    }
+}
+
+/// Coherent publish-triple returned by
+/// [`DeckSharedState::load_publish_state`]. `position_secs` is the
+/// playhead as written by the audio thread at `host_time_ns`,
+/// advancing at `rate` seconds-of-playhead per second-of-wall-
+/// clock. A reader wanting a smooth render-time playhead computes
+/// `position_secs + (now - host_time_ns) * 1e-9 * rate`, clamped
+/// to a sane elapsed bound (see [`PublishState::extrapolated_secs`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PublishState {
+    /// Last-published playhead in wall-clock seconds (unclamped;
+    /// may be negative or beyond track end during scratching).
+    pub position_secs: f64,
+    /// Engine-relative host time when the audio thread wrote
+    /// `position_secs`. Use [`DeckSharedState::host_time_now_ns`]
+    /// for the matching "now" value.
+    pub host_time_ns: u64,
+    /// Seconds-of-playhead per second-of-wall-clock. `1.0` for
+    /// ordinary forward playback, negative for reverse, `0.0`
+    /// for paused or unloaded.
+    pub rate: f64,
+}
+
+impl PublishState {
+    /// Maximum wall-clock seconds the FFI will extrapolate forward
+    /// from a publish before clamping. A stalled audio thread
+    /// would otherwise let the renderer extrapolate into nonsense;
+    /// 100 ms is ~10 audio blocks worth of headroom, far longer
+    /// than any healthy publish interval, but short enough that
+    /// a real stall is visibly frozen instead of running away.
+    const MAX_EXTRAPOLATION_SECS: f64 = 0.100;
+
+    /// Extrapolate the publish forward to the moment of the call.
+    ///
+    /// `now_ns` should come from [`DeckSharedState::host_time_now_ns`]
+    /// so the clock domains match. Elapsed time is clamped to
+    /// `[0, 100 ms]` so a hung audio thread can't drive the
+    /// playhead off into the future.
+    #[must_use]
+    pub fn extrapolated_secs(&self, now_ns: u64) -> f64 {
+        let elapsed_ns = now_ns.saturating_sub(self.host_time_ns);
+        // `u64` → `f64` is lossy past 2^53 ns (~104 days). The
+        // clamp below makes that lossless in every realistic case.
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_secs = (elapsed_ns as f64 * 1e-9).clamp(0.0, Self::MAX_EXTRAPOLATION_SECS);
+        self.position_secs + elapsed_secs * self.rate
     }
 }
 
@@ -309,6 +549,17 @@ impl Deck {
         self.shared.clone()
     }
 
+    /// Audio-thread hook: pin the `host_time_ns` the next
+    /// [`DeckSharedState::publish_position_secs`] call will pair
+    /// with `position_secs`. Forwards to
+    /// [`DeckSharedState::set_publish_host_ns_override`]; lives on
+    /// `Deck` so [`crate::Engine::set_block_output_host_ns`] can
+    /// fan out across both decks without exposing `shared()` as
+    /// public. RT-safe (one relaxed store per deck per block).
+    pub fn set_publish_host_ns_override(&self, ns: u64) {
+        self.shared.set_publish_host_ns_override(ns);
+    }
+
     /// Load a track. Resets the playhead to position 0. Wraps the source
     /// change in a de-click ramp so a fresh load fades in smoothly from
     /// silence (or from whatever was previously playing).
@@ -318,7 +569,12 @@ impl Deck {
         self.source = Some(track);
         self.position = 0.0;
         self.shared.store_position(0.0);
-        self.shared.store_position_secs(0.0);
+        // Publish (secs=0, rate=0) so a snapshot reader landing
+        // between source-set and the first render block sees a
+        // pinned playhead instead of extrapolating off the prior
+        // track's rate. The audio thread will overwrite both with
+        // the real values on the next render block.
+        self.shared.publish_position_secs(0.0, 0.0);
         self.shared.store_at_end(false);
         // Publish duration + has_track before we return so a
         // lock-free position_snapshot reader on another thread
@@ -341,7 +597,7 @@ impl Deck {
         self.source = Some(track);
         self.position = 0.0;
         self.shared.store_position(0.0);
-        self.shared.store_position_secs(0.0);
+        self.shared.publish_position_secs(0.0, 0.0);
         self.shared.store_at_end(false);
         self.shared.store_duration_secs(duration_secs);
         self.shared.store_has_track(true);
@@ -354,7 +610,7 @@ impl Deck {
         self.source = None;
         self.position = 0.0;
         self.shared.store_position(0.0);
-        self.shared.store_position_secs(0.0);
+        self.shared.publish_position_secs(0.0, 0.0);
         self.shared.store_at_end(false);
         self.shared.store_duration_secs(0.0);
         self.shared.store_has_track(false);
@@ -473,21 +729,28 @@ impl Deck {
         self.source.as_ref()
     }
 
-    /// Current playback rate (track frames per output frame).
+    /// Current playback rate in **musical** units
+    /// (audio-seconds-per-real-second). `1.0` is realtime at the
+    /// track's natural pitch regardless of the engine vs source
+    /// sample rates; `2.0` is double speed, `-1.0` is reverse at
+    /// realtime, `0.0` is paused.
     #[must_use]
     pub fn rate(&self) -> f64 {
         self.rate
     }
 
-    /// Set the playback rate. `1.0` is realtime at the source SR; `2.0`
-    /// is double speed; `-1.0` is reverse at realtime; `0.0` is paused
-    /// (does not advance, but also does not stop the deck — the engine
-    /// will still mix in whatever's currently at the playhead position).
+    /// Set the playback rate in **musical** units (see
+    /// [`Deck::rate`]). `1.0` is realtime at the track's natural
+    /// pitch; the deck's render loop converts this into
+    /// per-output-sample track-frame increments internally
+    /// (`new_increment = rate * track_sr / engine_sr`), so callers
+    /// must **not** pre-multiply by the SR ratio. See the
+    /// `sample_rate_conversion_44k_to_48k` regression test for the
+    /// single-conversion guarantee.
     ///
-    /// **Note**: this is the raw rate. Higher-level callers should
-    /// pre-multiply by `track_sample_rate / engine_sample_rate` so an
-    /// 1.0 rate at a 44.1k track on a 48k engine actually plays at the
-    /// musical speed the user expects.
+    /// `0.0` parks the playhead but does not stop the deck — the
+    /// engine will still mix in whatever's currently at the
+    /// playhead position. `-1.0` plays in reverse at realtime.
     pub fn set_rate(&mut self, rate: f64) {
         self.rate = rate;
     }
@@ -521,7 +784,13 @@ impl Deck {
             }
             None => 0.0,
         };
-        self.shared.store_position_secs(secs);
+        // Publish (secs, rate=0) on the seek path: the audio
+        // thread is between blocks here, so the playhead is
+        // momentarily pinned. The next `render_into` will
+        // overwrite rate with the steady-state value. Pinning
+        // rate to 0 keeps the snapshot reader from extrapolating
+        // the seek target forward into the next block.
+        self.shared.publish_position_secs(secs, 0.0);
         self.shared.store_at_end(false);
     }
 
@@ -761,18 +1030,39 @@ impl Deck {
         // per render block; negligible cost. We use the *currently
         // loaded* source's sample rate — the audio thread already
         // owns this Arc for the duration of the block.
-        let secs = match self.source.as_ref() {
+        //
+        // **M11d.6 round 8.** `self.rate` is the **musical** rate
+        // (1.0 = real-time playback at the track's natural pitch).
+        // The deck's `new_increment = self.rate * (track_sr /
+        // engine_sr)` math turns it into the per-output-sample
+        // track-frame step, so over one engine sample:
+        //   Δsecs       = self.rate / engine_sr
+        //   Δwall       = 1 / engine_sr
+        //   Δsecs/Δwall = self.rate
+        // So the wall-time rate we want the FFI extrapolator to
+        // apply is just `self.rate` — no SR ratio cancellation.
+        // The round-7 formula multiplied by `engine_sr / track_sr`
+        // here, which would only have been correct if `self.rate`
+        // were in track-frames-per-output-frame; in practice it
+        // is musical, and the FFI's old pre-multiplication on the
+        // command side made `self.rate` 0.92 instead of 1.0 — so
+        // round-7's extra factor coincidentally produced
+        // pub_rate = 1.0 from a deck that was actually playing
+        // audio at 0.92×. Round 8 removes both wrongs.
+        let (secs, advance_rate) = match self.source.as_ref() {
             Some(track) => {
-                let sr = f64::from(track.sample_rate());
-                if sr > 0.0 {
-                    pos / sr
+                let track_sr = f64::from(track.sample_rate());
+                if track_sr > 0.0 {
+                    let secs = pos / track_sr;
+                    let pub_rate = if self.playing { self.rate } else { 0.0 };
+                    (secs, pub_rate)
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 }
             }
-            None => 0.0,
+            None => (0.0, 0.0),
         };
-        self.shared.store_position_secs(secs);
+        self.shared.publish_position_secs(secs, advance_rate);
     }
 }
 
@@ -1492,6 +1782,262 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let observed = reader.join().expect("reader thread");
         assert!(observed > 0, "reader must have taken at least one sample");
+    }
+
+    /// **M11d.6 round 6.** Verify that the seqlock-protected
+    /// `(host_time, position_secs, rate)` triple makes it
+    /// through `publish_position_secs` / `load_publish_state`
+    /// intact, and that `extrapolated_secs` advances the
+    /// playhead by the right amount.
+    #[test]
+    fn publish_state_round_trip_and_extrapolates_at_rate_one() {
+        let shared = DeckSharedState::new();
+        shared.publish_position_secs(10.0, 1.0);
+
+        let st = shared.load_publish_state();
+        assert!((st.position_secs - 10.0).abs() < f64::EPSILON);
+        assert!((st.rate - 1.0).abs() < f64::EPSILON);
+
+        // Extrapolate 5 ms into the future: at rate 1.0 the
+        // playhead should be 10.005.
+        let plus_5ms = st.host_time_ns + 5_000_000;
+        let extrap = st.extrapolated_secs(plus_5ms);
+        assert!(
+            (extrap - 10.005).abs() < 1e-9,
+            "expected 10.005 at +5ms@rate=1, got {extrap}"
+        );
+    }
+
+    /// A paused deck (`rate == 0.0`) must not extrapolate forward.
+    /// Without this invariant the renderer would smear the playhead
+    /// across the moment of pause.
+    #[test]
+    fn publish_state_rate_zero_pins_playhead() {
+        let shared = DeckSharedState::new();
+        shared.publish_position_secs(42.0, 0.0);
+        let st = shared.load_publish_state();
+        let plus_100ms = st.host_time_ns + 100_000_000;
+        let extrap = st.extrapolated_secs(plus_100ms);
+        assert!(
+            (extrap - 42.0).abs() < f64::EPSILON,
+            "rate 0 must pin the playhead, got drift to {extrap}"
+        );
+    }
+
+    /// Negative rate (scratch backwards) must extrapolate the
+    /// playhead in the opposite direction. PRD §4.4 — forward
+    /// and backward playback are byte-for-byte symmetric.
+    #[test]
+    fn publish_state_negative_rate_extrapolates_backwards() {
+        let shared = DeckSharedState::new();
+        shared.publish_position_secs(5.0, -2.0);
+        let st = shared.load_publish_state();
+        let plus_10ms = st.host_time_ns + 10_000_000;
+        let extrap = st.extrapolated_secs(plus_10ms);
+        // 5.0 + 0.010 * -2.0 = 4.98
+        assert!(
+            (extrap - 4.98).abs() < 1e-9,
+            "expected 4.98 at +10ms@rate=-2, got {extrap}"
+        );
+    }
+
+    /// **M11d.6 round 8 regression.** The audio thread's
+    /// publish-time `rate` must be the **musical** rate
+    /// (audio-seconds-per-real-second). Because `self.rate` is
+    /// already musical (see [`Deck::set_rate`]), the publisher
+    /// emits it directly — no SR-ratio multiplication on either
+    /// side. Verified by reading the published rate back through
+    /// the seqlock after one render block with a 44.1 kHz track
+    /// on a 48 kHz engine: a `set_rate(1.0)` call still yields
+    /// `pub_rate = 1.0`, not `0.9187` (the round-6 bug) and not
+    /// `1.0884` (the round-7 anti-pattern).
+    #[test]
+    fn render_publishes_one_x_rate_when_track_sr_differs_from_engine_sr() {
+        const ENGINE_SR: u32 = 48_000;
+        const TRACK_SR: u32 = 44_100;
+
+        let mut deck = test_deck();
+        let samples = vec![0.0f32; (TRACK_SR as usize) * 2];
+        deck.set_source(const_track(&samples, 2, TRACK_SR));
+        deck.set_playing(true);
+        deck.quiesce_declick_for_test();
+        deck.set_rate(1.0);
+
+        let shared = deck.shared();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256];
+        deck.render(&mut rt, &mut out, ENGINE_SR as f32);
+
+        let st = shared.load_publish_state();
+        assert!(
+            (st.rate - 1.0).abs() < 1e-9,
+            "expected musical publish rate 1.0 on SR-mismatch, got {} (round-6 bug would land 0.9187, \
+             round-7 anti-pattern would land 1.0884)",
+            st.rate,
+        );
+    }
+
+    /// Same SR for engine and track: publish rate is `self.rate`
+    /// directly — trivially.
+    #[test]
+    fn render_publishes_self_rate_when_engine_sr_matches_track_sr() {
+        const SR: u32 = 48_000;
+
+        let mut deck = test_deck();
+        let samples = vec![0.0f32; (SR as usize) * 2];
+        deck.set_source(const_track(&samples, 2, SR));
+        deck.set_playing(true);
+        deck.quiesce_declick_for_test();
+        deck.set_rate(1.0);
+
+        let shared = deck.shared();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256];
+        deck.render(&mut rt, &mut out, SR as f32);
+
+        let st = shared.load_publish_state();
+        assert!(
+            (st.rate - 1.0).abs() < 1e-9,
+            "expected publish rate 1.0, got {}",
+            st.rate
+        );
+    }
+
+    /// Half-speed scratch (0.5× musical) on an SR-mismatched
+    /// track: publish rate must be exactly 0.5 regardless of
+    /// engine vs source SR.
+    #[test]
+    fn render_publishes_half_rate_on_half_speed_scratch() {
+        const ENGINE_SR: u32 = 48_000;
+        const TRACK_SR: u32 = 44_100;
+
+        let mut deck = test_deck();
+        let samples = vec![0.0f32; (TRACK_SR as usize) * 2];
+        deck.set_source(const_track(&samples, 2, TRACK_SR));
+        deck.set_playing(true);
+        deck.quiesce_declick_for_test();
+        deck.set_rate(0.5);
+
+        let shared = deck.shared();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256];
+        deck.render(&mut rt, &mut out, ENGINE_SR as f32);
+
+        let st = shared.load_publish_state();
+        assert!(
+            (st.rate - 0.5).abs() < 1e-9,
+            "expected publish rate 0.5 (musical), got {}",
+            st.rate
+        );
+    }
+
+    /// A stalled audio thread (no publish for seconds) must not
+    /// let the renderer extrapolate the playhead off into the
+    /// future. The clamp at 100 ms gives a hard visible-freeze
+    /// rather than a runaway.
+    #[test]
+    fn publish_state_clamps_extrapolation_on_stall() {
+        let shared = DeckSharedState::new();
+        shared.publish_position_secs(1.0, 1.0);
+        let st = shared.load_publish_state();
+        let plus_60s = st.host_time_ns + 60_000_000_000;
+        let extrap = st.extrapolated_secs(plus_60s);
+        // 100 ms clamp at rate 1.0 → +0.1s → 1.1.
+        assert!(
+            (extrap - 1.1).abs() < 1e-9,
+            "expected clamp to 1.1 on a 60s stall, got {extrap}"
+        );
+    }
+
+    /// `now_ns < host_time_ns` would yield a negative elapsed,
+    /// which the clamp pins to zero (renderer must not see the
+    /// playhead move backwards in time on clock-skew jitter).
+    #[test]
+    fn publish_state_clamps_negative_elapsed() {
+        let shared = DeckSharedState::new();
+        shared.publish_position_secs(7.0, 1.0);
+        let st = shared.load_publish_state();
+        let earlier = st.host_time_ns.saturating_sub(1_000_000);
+        let extrap = st.extrapolated_secs(earlier);
+        assert!(
+            (extrap - 7.0).abs() < f64::EPSILON,
+            "negative elapsed must pin to publish-time playhead, got {extrap}"
+        );
+    }
+
+    /// Concurrent soak: writer publishes at a coarse cadence
+    /// (≈100 Hz, matching a real CoreAudio block on macOS),
+    /// reader spins reading the publish state at a much higher
+    /// rate (matching a 60 Hz renderer that calls
+    /// `position_snapshot` every vsync). The reader's
+    /// extrapolated playhead must be:
+    ///
+    /// 1. Always finite (no torn `f64::from_bits` reads).
+    /// 2. Monotonic non-decreasing as long as the writer's
+    ///    publish times are monotonic and rate ≥ 0.
+    ///
+    /// This is the regression guard for the 30 Hz strobe pattern
+    /// the unfix surfaces in production. A torn or non-monotonic
+    /// extrapolation would manifest there as the visible jitter.
+    #[test]
+    fn publish_state_extrapolation_is_monotonic_under_concurrent_writes() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc as StdArc;
+        use std::thread;
+        use std::time::Duration;
+
+        let shared = StdArc::new(DeckSharedState::new());
+        let stop = StdArc::new(AtomicBool::new(false));
+
+        let writer_shared = shared.clone();
+        let writer_stop = stop.clone();
+        let writer = thread::spawn(move || {
+            // Simulate the audio thread publishing the playhead
+            // every ~10 ms, advancing at rate = 1.0.
+            let start = Instant::now();
+            while !writer_stop.load(Ordering::Relaxed) {
+                let secs = start.elapsed().as_secs_f64();
+                writer_shared.publish_position_secs(secs, 1.0);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let reader_shared = shared.clone();
+        let reader_stop = stop.clone();
+        let reader = thread::spawn(move || {
+            // Mimic the 60 Hz render thread: read at ~16 ms.
+            let mut last_extrap = f64::NEG_INFINITY;
+            let mut samples = 0usize;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline && !reader_stop.load(Ordering::Relaxed) {
+                let st = reader_shared.load_publish_state();
+                let now = DeckSharedState::host_time_now_ns();
+                let extrap = st.extrapolated_secs(now);
+                assert!(extrap.is_finite(), "torn read: extrap = {extrap}");
+                // Allow a tiny tolerance for the writer racing
+                // ahead between two reader observations: the
+                // reader observed (host_time_N, secs_N), then
+                // the writer landed (host_time_{N+1}, secs_{N+1}).
+                // The new extrapolated playhead is from a fresher
+                // publish, so it can occasionally be slightly
+                // below the previous reader's clamped-by-stall
+                // extrapolation if the writer paused. A 1 ms
+                // window absorbs scheduler jitter.
+                assert!(
+                    extrap + 0.001 >= last_extrap,
+                    "non-monotonic extrap: {last_extrap} → {extrap}"
+                );
+                last_extrap = extrap;
+                samples += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            samples
+        });
+
+        let samples = reader.join().expect("reader joined");
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer joined");
+        assert!(samples > 20, "reader should have sampled many times");
     }
 
     proptest! {
