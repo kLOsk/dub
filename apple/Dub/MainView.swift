@@ -355,7 +355,21 @@ final class WaveformAppModel: ObservableObject {
         }
         let tapController = tapToGrid(for: side)
         let isPlaying = deck.isPlaying
-        let playhead = engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs
+        // Use the *extrapolated* playhead, not the raw audio-thread
+        // publish. The visible waveform / grid is rendered using
+        // `positionSnapshotAtHostTime(nextVsync)`, which extrapolates
+        // forward through the publish-to-vsync gap. The old
+        // `engine.position(...)` path returned `position_secs` from
+        // the end of the last audio block (~10–25 ms older than the
+        // displayed frame), so the captured `tap_secs` lived in a
+        // different clock domain than what the user sees on screen.
+        // `set_bar_phase` honours `tap_secs` bit-exact (PRD-BEATS §4.1
+        // Round 8 — "tap IS the downbeat"), so any input-side offset
+        // shows up directly as a visible "marker lands a bit before
+        // the transient I clicked" misalignment. `positionSnapshot()`
+        // extrapolates to wall-clock now, which is within ±8 ms of
+        // the last-displayed frame on a 60 Hz panel.
+        let playhead = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
         // Paused decks dispatch a single set-the-1 immediately
         // through a dedicated path that drops any stale buffered
         // session first. PRD-BEATS §4.2 + gate 9 already rejects
@@ -2022,14 +2036,19 @@ final class WaveformAppModel: ObservableObject {
     /// `DeckState` no longer carries the playhead (M11d.5 round 5
     /// removed `elapsedSecs` / `remainingSecs` to stop the
     /// per-second republish from invalidating the deck pane); the
-    /// jog seek queries `engine.position(deckIdx:)` here at the
-    /// moment of the gesture so it gets the freshest sub-sample-
-    /// accurate playhead available.
+    /// jog seek queries `engine.positionSnapshot(deckIdx:)` here at
+    /// the moment of the gesture so it gets the freshest playhead
+    /// available, extrapolated forward through the audio-publish-
+    /// to-now gap. Using the extrapolated snapshot rather than the
+    /// raw publish keeps the relative-seek target in the same
+    /// clock domain as the visible playhead the user is jogging
+    /// against; otherwise a "+1 s" jog from 60 fps eye perception
+    /// of "now" would land 10–25 ms shorter than the user intended.
     func scrub(side: DeckSide, relativeSecs: TimeInterval) {
         guard isRunning else { return }
         let deck = state(for: side)
         guard deck.hasTrack, deck.durationSecs > 0 else { return }
-        let pos = engine.position(deckIdx: side.ffiDeckIdx)
+        let pos = engine.positionSnapshot(deckIdx: side.ffiDeckIdx)
         let target = max(0, min(pos.durationSecs, pos.elapsedSecs + relativeSecs))
         seekDeck(side: side, absoluteSecs: target)
     }
@@ -2632,7 +2651,13 @@ final class WaveformAppModel: ObservableObject {
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
-        let pos = engine.position(deckIdx: side.ffiDeckIdx)
+        // Extrapolated playhead — same clock-domain rationale as
+        // `handleTapForGrid` (the deck-header BPM tap). The keyboard
+        // `G` shortcut puts the downbeat "where the playhead is
+        // right now"; the visible playhead lives in the vsync-
+        // extrapolated domain, so the captured anchor has to as
+        // well or the marker lands behind the visible position.
+        let pos = engine.positionSnapshot(deckIdx: side.ffiDeckIdx)
         let anchor = pos.elapsedSecs
 
         let currentBpm: Double
