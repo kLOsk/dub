@@ -4,6 +4,7 @@
 //! that places the most transients on grid lines, emit a strictly uniform
 //! grid `anchor + i × period`.
 
+use crate::octave_profile::{profile_blocks_double_octave_swap, profile_blocks_half_octave_swap};
 use crate::offline::analyze_bpm_with_range_profile_and_odfs;
 use crate::{AnalysisError, BpmRange, OctaveProfile, HOP_SIZE, MAX_BPM, MIN_BPM};
 
@@ -222,6 +223,7 @@ pub fn analyze_beat_grid_with_profile(
         estimate.bpm,
         estimate.confidence,
         None,
+        profile,
     )?;
     // PRD-BEATS round 4 follow-up — visual grid alignment. The
     // ODF-snapped grid sits at perceptual-onset time (the spectral
@@ -697,6 +699,7 @@ pub fn median_bpm_from_beats(beats: &[f64]) -> Option<f64> {
     Some(60.0 / median)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_uniform_grid_from_odf(
     odf: &[f32],
     kick_odf: &[f32],
@@ -705,6 +708,7 @@ fn analyze_uniform_grid_from_odf(
     bpm_init: f64,
     confidence: f32,
     fixed_anchor: Option<f64>,
+    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     let Some((bpm_raw, anchor_secs, quality_raw)) =
         refine_full_pipeline(odf, odf_sr, bpm_init, duration_secs, fixed_anchor)
@@ -756,6 +760,7 @@ fn analyze_uniform_grid_from_odf(
         duration_secs,
         quality,
         fixed_anchor,
+        profile,
     );
 
     let period = 60.0 / bpm;
@@ -1108,6 +1113,7 @@ const OCTAVE_RECHECK_MIN_KEPT: f32 = 0.50;
 /// * The alternate BPM falls outside `[MIN_BPM, MAX_BPM]`.
 /// * `refit_anchor_at_bpm` returns `None` (insufficient
 ///   observations at the alternate tempo).
+#[allow(clippy::too_many_arguments)]
 fn octave_self_verify(
     odf: &[f32],
     odf_sr: f64,
@@ -1116,6 +1122,7 @@ fn octave_self_verify(
     duration_secs: f64,
     quality: GridQuality,
     fixed_anchor: Option<f64>,
+    profile: OctaveProfile,
 ) -> (f64, f64, GridQuality) {
     if fixed_anchor.is_some() {
         return (bpm, anchor, quality);
@@ -1143,11 +1150,33 @@ fn octave_self_verify(
     // fires). At the double octave the current anchor already
     // sits on a beat of the new grid (every existing beat
     // doubles up), so only one sub-phase exists.
+    //
+    // PRD-BEATS round 6+ — direction-blocked octaves are also
+    // skipped here based on `profile`. Pass 2's profile-aware
+    // rules already committed to the genre's mix octave (e.g.
+    // FourOnFloor picking 133 over 66.5 via the perceptual prior
+    // + half-bar rejection); the self-verify must respect that
+    // decision. Profile-blind swap on Oppidan / Cutty Ranks
+    // (UKG 133 → 66.5) was the canonical regression.
     let half_anchors = [anchor, anchor + period_main];
     let double_anchors = [anchor];
-    let candidates: [(f64, &[f64]); 2] = [(bpm / 2.0, &half_anchors), (bpm * 2.0, &double_anchors)];
+    let candidates: [(f64, &[f64], bool); 2] = [
+        (
+            bpm / 2.0,
+            &half_anchors,
+            profile_blocks_half_octave_swap(profile),
+        ),
+        (
+            bpm * 2.0,
+            &double_anchors,
+            profile_blocks_double_octave_swap(profile),
+        ),
+    ];
 
-    for (cand_bpm_hint, sub_anchors) in candidates {
+    for (cand_bpm_hint, sub_anchors, blocked) in candidates {
+        if blocked {
+            continue;
+        }
         if !(MIN_BPM..=MAX_BPM).contains(&cand_bpm_hint) {
             continue;
         }
@@ -2882,6 +2911,7 @@ mod tests {
             duration_secs,
             wrong_quality,
             None,
+            OctaveProfile::Default,
         );
 
         assert!(
@@ -2939,6 +2969,7 @@ mod tests {
             duration_secs,
             quality_snapped,
             None,
+            OctaveProfile::Default,
         );
 
         assert!(
@@ -2984,6 +3015,7 @@ mod tests {
             duration_secs,
             wrong_quality,
             Some(0.5),
+            OctaveProfile::Default,
         );
 
         assert!(
@@ -2991,6 +3023,153 @@ mod tests {
             "self-verify must respect fixed_anchor bypass; \
              got {chosen_bpm}"
         );
+    }
+
+    /// Oppidan / Cutty Ranks regression — UK garage tagged
+    /// `FourOnFloor` must keep the upper octave even when the
+    /// half-tempo grid measures a tighter LSQ fit. Production-
+    /// sparse kick patterns (kick on 1+3, snare on 2+4, hat
+    /// fills) make the half-octave grid land on kicks only and
+    /// look misleadingly clean; the profile already said "mix
+    /// at the upper octave" via pass 2, and the self-verify
+    /// must respect that.
+    ///
+    /// Fixture: synthesise a perfectly clean click at the
+    /// upper octave so the main grid fits as tight as it can,
+    /// and pass a *worse* manufactured `GridQuality` for the
+    /// upper octave so the rule would unambiguously swap if it
+    /// were profile-blind. Default profile MUST swap (control);
+    /// FourOnFloor MUST NOT swap. Same shape covers Dancehall
+    /// and DrumAndBass via the parameterised loop.
+    #[test]
+    fn octave_self_verify_does_not_swap_down_for_upper_octave_profiles() {
+        let real_bpm = 133.0;
+        let samples = click_track(real_bpm, 30.0, SR);
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        // Anchor on a click so refit at the half octave finds
+        // observations; pass a deliberately-poor main quality so
+        // Default profile is forced to swap (control).
+        let upper_anchor = 60.0 / real_bpm;
+        let poor_main_quality = GridQuality {
+            rms_ms: 35.0,
+            p95_ms: 60.0,
+            max_abs_ms: 80.0,
+            kept_fraction: 0.45,
+            drift_slope_ms_per_min: 0.0,
+        };
+
+        let (control_bpm, _, _) = octave_self_verify(
+            &odf,
+            odf_sr,
+            real_bpm,
+            upper_anchor,
+            duration_secs,
+            poor_main_quality,
+            None,
+            OctaveProfile::Default,
+        );
+        assert!(
+            (control_bpm - real_bpm / 2.0).abs() < 0.5,
+            "Default profile MUST swap UKG-shaped 133 -> 66.5 (control); got {control_bpm}"
+        );
+
+        for profile in [
+            OctaveProfile::FourOnFloor,
+            OctaveProfile::DrumAndBass,
+            OctaveProfile::Dancehall,
+        ] {
+            let (kept_bpm, _, _) = octave_self_verify(
+                &odf,
+                odf_sr,
+                real_bpm,
+                upper_anchor,
+                duration_secs,
+                poor_main_quality,
+                None,
+                profile,
+            );
+            assert!(
+                (kept_bpm - real_bpm).abs() < 0.01,
+                "{profile:?} must refuse to swap 133 -> 66.5; got {kept_bpm}"
+            );
+        }
+    }
+
+    /// Symmetric to `does_not_swap_down`: profiles whose mix
+    /// tempo lives in the lower octave (RootsReggae, Dub,
+    /// HipHop) must refuse the BPM → BPM×2 swap even when the
+    /// upper-octave grid measures tighter. A 88 BPM hip-hop
+    /// track whose hi-hat layer doubles the autocorrelation at
+    /// 176 must stay at 88 once the profile has spoken.
+    #[test]
+    fn octave_self_verify_does_not_swap_up_for_lower_octave_profiles() {
+        let real_bpm = 88.0;
+        let samples = click_track(real_bpm * 2.0, 30.0, SR);
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            &samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        let duration_secs = samples.len() as f64 / f64::from(SR);
+
+        let lower_anchor = 60.0 / real_bpm;
+        let poor_main_quality = GridQuality {
+            rms_ms: 35.0,
+            p95_ms: 60.0,
+            max_abs_ms: 80.0,
+            kept_fraction: 0.45,
+            drift_slope_ms_per_min: 0.0,
+        };
+
+        let (control_bpm, _, _) = octave_self_verify(
+            &odf,
+            odf_sr,
+            real_bpm,
+            lower_anchor,
+            duration_secs,
+            poor_main_quality,
+            None,
+            OctaveProfile::Default,
+        );
+        assert!(
+            (control_bpm - real_bpm * 2.0).abs() < 0.5,
+            "Default profile MUST swap hip-hop-shaped 88 -> 176 (control); got {control_bpm}"
+        );
+
+        for profile in [
+            OctaveProfile::HipHop,
+            OctaveProfile::RootsReggae,
+            OctaveProfile::Dub,
+        ] {
+            let (kept_bpm, _, _) = octave_self_verify(
+                &odf,
+                odf_sr,
+                real_bpm,
+                lower_anchor,
+                duration_secs,
+                poor_main_quality,
+                None,
+                profile,
+            );
+            assert!(
+                (kept_bpm - real_bpm).abs() < 0.01,
+                "{profile:?} must refuse to swap 88 -> 176; got {kept_bpm}"
+            );
+        }
     }
 
     /// PRD-BEATS Round 6 §6a regression: "set the 1" must not

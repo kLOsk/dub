@@ -1395,73 +1395,85 @@ final class WaveformAppModel: ObservableObject {
     /// flashing the deck pane — a missed history row is a
     /// cosmetic glitch on the smart-crate, not a load failure
     /// the DJ needs to see.
-    /// M11d.5 round 4 — fetch the active row from
-    /// `track_beatgrids` for the track that's about to be loaded,
-    /// if any. Called from `loadTrack` to feed the new
-    /// `DubEngine.loadTrack(deckIdx:path:libraryBeatGrid:)` FFI so
-    /// the engine adopts the library's stored `(bpm, anchor_secs)`
-    /// instead of running `dub_bpm::analyze_beat_grid` from
-    /// scratch.
+    /// Fetch the genre string the engine should use when picking
+    /// its `OctaveProfile` for the (rare) case where the engine
+    /// still has to run a fresh analysis on this load — i.e. the
+    /// active library row is an `auto` row and not grid-locked.
+    /// Locked rows and imported (`user_tap`, `serato`, `traktor`,
+    /// `rekordbox`, `itunes`) rows bypass analysis entirely so
+    /// the genre is irrelevant; we still return it when we have
+    /// it so the worker thread has a hint if it ever falls
+    /// through to analysis as a backstop.
     ///
-    /// Returns `nil` in three legitimate cases, all of which fall
-    /// back to the engine's own analyser without any visible UX
-    /// change:
+    /// Resolution mirrors `resolveLibraryTrackId(for:)` so any
+    /// load source that lands a file already known to the library
+    /// (Finder drag, library drag, select+Space, Recently Played
+    /// pill) gets the genre it deserves. Pre-fix only the
+    /// select+Space path matched, because the genre lives on the
+    /// `selectedLibraryTrack` snapshot.
     ///
-    /// * **Library not open.** The Apple shell can run without an
-    ///   open library (early-launch state before the user has
-    ///   picked one); the engine path is independent.
-    /// * **No matching selection.** The current
-    ///   `selectedLibraryTrackId` doesn't resolve to `url`, which
-    ///   means the load came via Finder drag or a stale selection.
-    ///   The engine analyses the file and `ensureTrackAnalyzed`
-    ///   then writes the result back to `track_beatgrids` so the
-    ///   *next* load of the same file gets the fast path.
-    /// * **Track in library but unanalyzed (or silent).** The row
-    ///   exists in `tracks` but `track_beatgrids` has no
-    ///   `is_active = 1` row yet (or the analyser legitimately
-    ///   found no grid — silence, non-musical input). The engine
-    ///   runs analysis as before; same write-back as the previous
-    ///   case once `ensureTrackAnalyzed` lands.
+    /// Returns `nil` for: library closed, the file is not in the
+    /// library, the row has no genre tag, or we couldn't read it
+    /// off the selection snapshot. There is no FFI today that
+    /// fetches genre from a track row by id — adding one is the
+    /// next step if the auto-and-unlocked fallback path proves to
+    /// need it; the user-visible bug all of this guards (lock
+    /// being bypassed at load time) is fixed by
+    /// `libraryBeatGridForPendingLoad` below regardless.
+    private func libraryGenreForPendingLoad(url: URL) -> String? {
+        guard libraryModel.libraryIsOpen,
+              let trackId = resolveLibraryTrackId(for: url)
+        else { return nil }
+        if let snap = librarySelection.selectedLibraryTrack, snap.id == trackId {
+            return snap.genre
+        }
+        return nil
+    }
+
+    /// Fetch the active row from `track_beatgrids` for the track
+    /// that's about to be loaded, if any. Called from `loadTrack`
+    /// to feed the
+    /// `DubEngine.loadTrack(deckIdx:path:libraryBeatGrid:…)` FFI
+    /// so the engine adopts the library's stored
+    /// `(bpm, anchor_secs)` instead of running
+    /// `dub_bpm::analyze_beat_grid` from scratch — and, crucially,
+    /// so the engine honours the user's grid lock on every load
+    /// path, not just select+Space.
+    ///
+    /// **Grid-lock invariant.** Pre-fix this resolver short-
+    /// circuited to `nil` whenever the URL didn't match the
+    /// current browser selection (Finder drag, library drag from
+    /// a non-selected row, any path-shaped variation that defeats
+    /// `standardizedFileURL` equality). The engine then ran a
+    /// fresh analyser even on locked tracks, surfacing the
+    /// analysed BPM in the deck header and visually breaking the
+    /// lock contract. The Oppidan dogfood report — 133.0 locked
+    /// in the library, 88.67 in the header — was the canonical
+    /// case. Resolution now mirrors `resolveLibraryTrackId(for:)`:
+    /// the selection-match fast path falls back to
+    /// `library.trackIdForPath(path:)` so any load of a file the
+    /// library knows about picks up its active grid.
+    ///
+    /// Returns `nil` in two legitimate cases, both of which fall
+    /// back to the engine's own analyser:
+    ///
+    /// * **Library not open**, or **file unknown to the library**
+    ///   (Finder drag of a file that has never been imported).
+    /// * **Track in library but no active beat grid yet** (fresh
+    ///   import that lazy analysis hasn't reached, or silence
+    ///   that the analyser legitimately produced no grid for).
     ///
     /// The lookup is a single SELECT against the partial unique
     /// index on `track_beatgrids(track_id) WHERE is_active = 1`,
     /// well under a millisecond on any size of library, so it's
     /// safe to call on the main actor immediately before the
     /// detached `Task` that runs `loadTrack`.
-    private func libraryGenreForPendingLoad(url: URL) -> String? {
+    private func libraryBeatGridForPendingLoad(url: URL) -> LibraryBeatGrid? {
         guard libraryModel.libraryIsOpen,
-              let trackId = librarySelection.selectedLibraryTrackId,
-              let snap = librarySelection.selectedLibraryTrack,
-              snap.id == trackId
+              let trackId = resolveLibraryTrackId(for: url)
         else { return nil }
         do {
-            guard let resolved = try library.trackPath(trackId: trackId) else {
-                return nil
-            }
-            let resolvedUrl = URL(fileURLWithPath: resolved).standardizedFileURL
-            guard resolvedUrl == url.standardizedFileURL else {
-                return nil
-            }
-            return snap.genre
-        } catch {
-            return nil
-        }
-    }
-
-    private func libraryBeatGridForPendingLoad(url: URL) -> LibraryBeatGrid? {
-        guard libraryModel.libraryIsOpen, let trackId = librarySelection.selectedLibraryTrackId else {
-            return nil
-        }
-        do {
-            guard let resolved = try library.trackPath(trackId: trackId) else {
-                return nil
-            }
-            let resolvedUrl = URL(fileURLWithPath: resolved).standardizedFileURL
-            guard resolvedUrl == url.standardizedFileURL else {
-                return nil
-            }
-            let grid = try library.activeBeatGrid(trackId: trackId)
-            return grid
+            return try library.activeBeatGrid(trackId: trackId)
         } catch {
             // A failed read here is non-fatal: the engine will
             // analyse the file itself, and any database problem

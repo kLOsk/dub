@@ -290,32 +290,36 @@ mod tests {
         // Collect transitions for up to 5 s of wall time after the
         // last sample was pushed. The analysis thread needs at
         // least ~2 s to first lock (per the tracker tests).
+        //
+        // The acceptance criterion is *eventual* correctness — the
+        // stream lands within ±1 BPM of M7.5's offline answer. We
+        // therefore stop the moment we observe a correct lock and
+        // assert on whether one ever occurred, not on whatever event
+        // happens to be last when the wall-clock window closes.
+        // Asserting on the tail is racy: after the first lock the
+        // tracker keeps re-checking half/double octaves and can emit
+        // a transient `Tentative` (e.g. a momentary 64 BPM excursion);
+        // under CPU contention that excursion can be the last event
+        // seen before the deadline, failing a tail assertion even
+        // though the stream locked correctly seconds earlier.
         let mut transitions = Vec::new();
-        let _ = wait_until(Duration::from_secs(5), || {
+        let locked_correctly = wait_until(Duration::from_secs(5), || {
             while let Some(ev) = stream.try_recv() {
                 transitions.push(ev);
             }
-            matches!(
-                transitions.last(),
-                Some(TrackerEvent::StateChanged(TrackerState::Locked { .. }))
-            )
+            transitions.iter().any(|ev| {
+                matches!(
+                    ev,
+                    TrackerEvent::StateChanged(TrackerState::Locked { bpm })
+                        if (bpm - 128.0).abs() <= 1.0
+                )
+            })
         });
 
-        let last = transitions
-            .last()
-            .copied()
-            .unwrap_or_else(|| panic!("no transitions observed — analysis thread stuck?"));
-        match last {
-            TrackerEvent::StateChanged(TrackerState::Locked { bpm }) => {
-                assert!(
-                    (bpm - 128.0).abs() <= 1.0,
-                    "expected lock at 128±1, got {bpm} (transitions: {transitions:?})"
-                );
-            }
-            other => {
-                panic!("expected last transition Locked, got {other:?} (all: {transitions:?})")
-            }
-        }
+        assert!(
+            locked_correctly,
+            "expected a Locked event at 128±1 within 5 s, never saw one (transitions: {transitions:?})"
+        );
     }
 
     #[test]

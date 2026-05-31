@@ -2740,19 +2740,41 @@ fn background_analyze_and_install(
     // Two paths, selected by whether the load handshake supplied a
     // library-sourced grid:
     //
-    //   2a. Library-sourced (`library_grid = Some(_)` with
-    //       `source != "auto"`). The library row carries a trusted
-    //       `(bpm, anchor_secs)` (imported from Serato/Traktor/
-    //       rekordbox or hand-corrected by the user). We emit the
-    //       uniform 4/4 grid directly from those scalars — no
+    //   2a. Library-sourced (`library_grid = Some(_)`, any
+    //       `source`). The library row carries a trusted
+    //       `(bpm, anchor_secs, bar_phase)` triplet — produced
+    //       either by an explicit `analyze_track` pass (source =
+    //       `auto`), a user tap (`user_tap`), or a Serato /
+    //       Traktor / rekordbox / iTunes import. We emit the
+    //       uniform 4/4 grid from those scalars verbatim — no
     //       ODF, no analysis. Microseconds.
     //
-    //   2b. No library grid, or `source == "auto"` (re-analyse
-    //       with genre-aware octave profile). Runs
+    //       PRD-BEATS §3.4 "library is canonical": trusting the
+    //       library row unconditionally is the only way to keep
+    //       the deck-header BPM in sync with the library-row BPM
+    //       across loads. The prior implementation rejected
+    //       unlocked `auto` rows and re-ran
+    //       `analyze_beat_grid_with_profile`, which could produce
+    //       a different octave when the on-load genre context
+    //       differed from the analyse-time context (e.g. user
+    //       loaded from Finder with no library selection → engine
+    //       fell back to `OctaveProfile::Default` even though
+    //       `analyze_track` had used `FourOnFloor` to write the
+    //       stored auto row). The Oppidan / UK Garage regression:
+    //       library auto = 133 BPM, deck loaded as 88.67 BPM,
+    //       subsequent tap-to-grid persisted the 88.67 back over
+    //       the library. Re-analysis on every load is now opt-in
+    //       via the explicit library `Reanalyze` action; fresh
+    //       loads short-circuit to a synthesised grid.
+    //
+    //   2b. No library grid (`library_grid = None`, i.e. track is
+    //       not in the catalog). Runs
     //       `analyze_beat_grid_with_profile`: spectral-flux ODF +
     //       autocorrelation + Traktor-style period + phase
     //       refinement → uniform 4/4 grid. ~100–400 ms depending
-    //       on track length.
+    //       on track length. This path serves transient loads
+    //       (drag from Finder without a library import) where we
+    //       have no persisted ground truth to lean on.
     //
     // Either way, the result is installed in place into the
     // `FilePeaks.beat_grid` slot. No `peak_generation_seq` bump:
@@ -2760,9 +2782,7 @@ fn background_analyze_and_install(
     // line overlay, and the renderer is already polling the grid
     // each frame.
     let (grid, bpm_ms, source_label): (BeatGrid, u128, &'static str) = if let Some(supplied) =
-        library_grid
-            .as_ref()
-            .filter(|grid| grid.source != "auto" || grid.grid_locked)
+        library_grid.as_ref()
     {
         let duration_secs = track.samples().len() as f64
             / (f64::from(track.sample_rate()) * f64::from(track.channels()));
@@ -2789,15 +2809,7 @@ fn background_analyze_and_install(
                 BeatGrid::empty()
             }
         };
-        let source_label = if library_grid
-            .as_ref()
-            .is_some_and(|grid| grid.source == "auto")
-        {
-            "library-auto-reanalyzed"
-        } else {
-            "analyzed"
-        };
-        (grid, bpm_ms, source_label)
+        (grid, bpm_ms, "analyzed")
     };
 
     {

@@ -3,6 +3,34 @@
 //! Offline library analysis can pass an [`OctaveProfile`] derived from
 //! ID3 genre tags. Thru-mode streaming keeps [`OctaveProfile::Default`]
 //! because live wax has no tag until fingerprint match (v1.1).
+//!
+//! ## Scope of the genre matcher
+//!
+//! The matcher prioritises the urban-scratch DJ niche the product
+//! targets (PRD §1): hip-hop, reggae / dub family, dancehall, UK
+//! garage, jungle / DnB, dubstep, plus their substyles. Genres
+//! outside that niche fall to [`OctaveProfile::Default`] and rely
+//! on the M11c.3a perceptual prior — they still analyse, just
+//! without a tempo-band hint. Tags accepted today:
+//!
+//! * **HipHop** — `hip-hop`, `hip hop`, `hiphop`, `rap`, `trap`,
+//!   `r&b`, `r & b`, `rnb`, `boom bap` / `boom-bap` / `boombap`,
+//!   `drill` (UK / Brooklyn / Chicago, kick perceived at ~70 BPM),
+//!   `lo-fi` / `lofi` / `lo fi` (chill hop), `reggaeton`
+//!   (dembow, 90–100 BPM — explicit override of the `reggae`
+//!   substring trap).
+//! * **FourOnFloor** — `house`, `garage`, `ukg`, `4x4` / `4×4`,
+//!   `2-step` / `2step` / `two-step`, `bassline`, `grime` (140 BPM
+//!   mix tempo, sparse kick), `jersey club`, `baltimore club`,
+//!   `techno`, `trance`, `electro`, `club`.
+//! * **DrumAndBass** — `drum & bass` / `drum and bass` /
+//!   `drum n bass` / `drum'n'bass` / `drumandbass`, `dnb`, `d&b`,
+//!   `jungle`, `neurofunk`, `breakcore`, `liquid funk`, `footwork`,
+//!   `juke`, `uk hardcore`, `happy hardcore`.
+//! * **Dancehall** — `dancehall`, `ragga`, `bashment`.
+//! * **Dub** — `dub` (but not `dubstep` greediness), `dubstep`.
+//! * **RootsReggae** — `reggae` (after reggaeton override),
+//!   `rocksteady`, `roots`, `lovers`, `stepper(s)`, `ska`.
 
 /// How pass 2 resolves octave / subdivision ambiguity when metadata
 /// supplies genre context. [`Default`] is the mixable-band prior from
@@ -44,14 +72,35 @@ pub enum OctaveProfile {
 /// Map a container genre string to an [`OctaveProfile`].
 ///
 /// Matching is case-insensitive and substring-based so tags like
-/// `"Reggae / Dub"` or `"UK Garage"` resolve sensibly.
+/// `"Reggae / Dub"` or `"UK Garage 4x4"` resolve sensibly.
+///
+/// **Ordering is load-bearing.** The chain is `reggaeton →
+/// dancehall → dub → reggae → four-on-floor (incl. UKG / grime)
+/// → drum & bass → hip-hop → default`. Two cases force an explicit
+/// override of substring greediness:
+///
+/// * `"Reggaeton"` contains `"reggae"` but is a 90–100 BPM dembow
+///   genre that mixes at the kick (HipHop band), not the half-
+///   time one-drop. Without the up-front check, every reggaeton
+///   tag misroutes to [`OctaveProfile::RootsReggae`] and the
+///   half-time bias actively flips the perceived ~95 BPM into
+///   ~48.
+/// * `"Lo-Fi House"` and `"4x4 House"` contain `"house"` and must
+///   stay in the four-on-floor arm. Ordering is fine here because
+///   the four-on-floor arm runs before the hip-hop arm (`"lo-fi"`
+///   lives), so the house tag wins by position.
 #[must_use]
 pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
     let g = genre.trim().to_ascii_lowercase();
     if g.is_empty() {
         return OctaveProfile::Default;
     }
-    if g.contains("dancehall") || g.contains("ragga") {
+    // Reggaeton MUST win before the reggae arm. Substring trap:
+    // `"reggaeton".contains("reggae") == true`. See header comment.
+    if g.contains("reggaeton") {
+        return OctaveProfile::HipHop;
+    }
+    if g.contains("dancehall") || g.contains("ragga") || g.contains("bashment") {
         return OctaveProfile::Dancehall;
     }
     if g.contains("dub") && !g.contains("dubstep") {
@@ -64,12 +113,40 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
         || g.contains("rocksteady")
         || g.contains("roots")
         || g.contains("lovers")
+        || g.contains("stepper")
         || g.contains("ska")
     {
         return OctaveProfile::RootsReggae;
     }
+    // UK garage family lives here. The 4/4 kick + 130–135 BPM mix
+    // tempo of UKG, 4x4 garage, speed garage, 2-step (kick on 1+3
+    // perceptually still mixed at 130), and bassline all sit
+    // squarely inside the FourOnFloor band (115–145 BPM) and benefit
+    // from `four_on_floor_halfbar_rejected` killing the ~87 BPM
+    // half-time twin. `"speed garage"` already passes via `"garage"`;
+    // explicit entries for `"ukg"`, `"4x4"`, `"4×4"`, `"2-step"`,
+    // `"bassline"` close the gaps where the bare token is what
+    // ships in id3.
+    //
+    // Grime: 140 BPM mix tempo, sparse kick on 1+3, snare on 2+4,
+    // bass synth at 140. UK grime DJs mix at 140, not 70. Mapping
+    // to FourOnFloor keeps the 140 octave intact (the HipHop
+    // profile would actively reject 140 in favour of a 70 BPM
+    // sibling, which is the wrong call for grime).
     if g.contains("house")
         || g.contains("garage")
+        || g.contains("ukg")
+        || g.contains("4x4")
+        || g.contains("4×4")
+        || g.contains("2-step")
+        || g.contains("2step")
+        || g.contains("2 step")
+        || g.contains("two-step")
+        || g.contains("two step")
+        || g.contains("bassline")
+        || g.contains("grime")
+        || g.contains("jersey club")
+        || g.contains("baltimore club")
         || g.contains("techno")
         || g.contains("trance")
         || g.contains("electro")
@@ -84,6 +161,15 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
     // composite tag, and the user's mix tempo for those is the
     // DnB tempo, not the hip-hop tempo. `"jungle"` is its own
     // umbrella term for the early-90s DnB lineage.
+    //
+    // Extended for the urban-niche DnB family: neurofunk (170–180),
+    // breakcore (170–220), liquid funk (170–175), footwork / juke
+    // (Chicago, 150–160), and the hardcore-rave variants UK
+    // hardcore + happy hardcore (165–180). Bare `"hardcore"` is
+    // NOT matched: it's overloaded by hardcore punk, hardcore rap,
+    // hardcore techno, gabber-style hardcore, etc. — the explicit
+    // `"uk hardcore"` / `"happy hardcore"` tokens are the only
+    // ones whose tempo band is unambiguous.
     if g.contains("drum & bass")
         || g.contains("drum and bass")
         || g.contains("drum n bass")
@@ -92,6 +178,13 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
         || g.contains("dnb")
         || g.contains("d&b")
         || g.contains("jungle")
+        || g.contains("neurofunk")
+        || g.contains("breakcore")
+        || g.contains("liquid funk")
+        || g.contains("footwork")
+        || g.contains("juke")
+        || g.contains("uk hardcore")
+        || g.contains("happy hardcore")
     {
         return OctaveProfile::DrumAndBass;
     }
@@ -100,6 +193,18 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
     // niche reggae-trap fusion; the mix tempo of the fusion
     // material is overwhelmingly in the 75–105 hip-hop band,
     // not the 65–95 roots band, so HipHop is the right call.
+    //
+    // Urban subgenre additions:
+    // * `"drill"` (UK drill, Brooklyn drill, Chicago drill) —
+    //   kick on the 1 at ~70 BPM, snares at ~140; DJs mix at
+    //   ~70 so the HipHop sibling rule (kill 135–180 when paired
+    //   with a 60–100 sibling) is exactly what we want.
+    // * `"lo-fi"` / `"lofi"` (lo-fi hip-hop, chill hop, study
+    //   beats) — 60–90 BPM kick-driven instrumentals. Note that
+    //   `"Lo-fi House"` resolves to FourOnFloor above by chain
+    //   ordering: the FourOnFloor arm runs first and `"house"`
+    //   wins. So `"lo-fi"` only lands here when no house token
+    //   accompanies it.
     if g.contains("hip-hop")
         || g.contains("hip hop")
         || g.contains("hiphop")
@@ -111,6 +216,10 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
         || g.contains("boom bap")
         || g.contains("boom-bap")
         || g.contains("boombap")
+        || g.contains("drill")
+        || g.contains("lo-fi")
+        || g.contains("lofi")
+        || g.contains("lo fi")
     {
         return OctaveProfile::HipHop;
     }
@@ -118,15 +227,26 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
 }
 
 /// Parse a manifest profile label (`roots`, `dub`, `house`, …).
+///
+/// Used by `dub diagnose --profile <label>` and the test corpus
+/// manifest. Mirrors the genre-tag matcher's family groupings,
+/// but accepts canonical short tokens rather than substring
+/// fragments so the CLI surface stays unambiguous.
 #[must_use]
 pub fn octave_profile_from_label(label: &str) -> OctaveProfile {
     match label.trim().to_ascii_lowercase().as_str() {
-        "roots" | "roots_reggae" | "reggae" => OctaveProfile::RootsReggae,
-        "dub" => OctaveProfile::Dub,
-        "dancehall" | "ragga" => OctaveProfile::Dancehall,
-        "house" | "four_on_floor" | "garage" | "techno" => OctaveProfile::FourOnFloor,
-        "hip_hop" | "hiphop" | "hip-hop" | "rap" | "trap" | "rnb" => OctaveProfile::HipHop,
-        "dnb" | "drum_and_bass" | "drum-and-bass" | "drumandbass" | "jungle" => {
+        "roots" | "roots_reggae" | "reggae" | "rocksteady" | "ska" | "steppers" => {
+            OctaveProfile::RootsReggae
+        }
+        "dub" | "dubstep" => OctaveProfile::Dub,
+        "dancehall" | "ragga" | "bashment" => OctaveProfile::Dancehall,
+        "house" | "four_on_floor" | "four-on-floor" | "garage" | "ukg" | "uk_garage"
+        | "uk-garage" | "4x4" | "2-step" | "2step" | "two_step" | "bassline" | "grime"
+        | "techno" | "trance" | "electro" => OctaveProfile::FourOnFloor,
+        "hip_hop" | "hiphop" | "hip-hop" | "rap" | "trap" | "rnb" | "drill" | "lofi" | "lo-fi"
+        | "lo_fi" | "reggaeton" => OctaveProfile::HipHop,
+        "dnb" | "drum_and_bass" | "drum-and-bass" | "drumandbass" | "jungle" | "neurofunk"
+        | "breakcore" | "liquid_funk" | "footwork" | "juke" | "uk_hardcore" | "happy_hardcore" => {
             OctaveProfile::DrumAndBass
         }
         _ => OctaveProfile::Default,
@@ -137,6 +257,58 @@ pub fn octave_profile_from_label(label: &str) -> OctaveProfile {
 #[must_use]
 pub fn profile_skips_skank_pass(profile: OctaveProfile) -> bool {
     matches!(profile, OctaveProfile::FourOnFloor)
+}
+
+/// Returns `true` when the profile forbids the post-pass-2
+/// `octave_self_verify` from swapping the chosen BPM down to its
+/// half (BPM → BPM/2).
+///
+/// Genres whose mix tempo lives in the **upper** octave (4/4 kick
+/// or kick-roll grid) suffer a structural LSQ trap at the half
+/// octave: when the production has sparse kick patterns (UK
+/// garage 2-step, broken-beat house, DnB kick rolls), the predicted
+/// beat positions at the true tempo land in dead air half the time,
+/// while the half-tempo grid only predicts every-other-beat and
+/// happens to align with the kicks that *do* land. RMS at the half
+/// octave reads dramatically tighter even though the half octave is
+/// musically wrong — Oppidan & Cutty Ranks "Armed & Dangerous" was
+/// the canonical case: true 133 BPM UKG with rms 31.5 ms at 133,
+/// rms 5.8 ms at 66.5; profile-blind self-verify swapped to 66.5
+/// and surfaced it in the deck header.
+///
+/// The profile-driven block is the right layer to fix this: the
+/// genre tag already says "the kick / mix tempo is in the upper
+/// octave, don't second-guess pass 2's pick". Pass 2 itself
+/// already prefers the upper octave for these profiles via the
+/// perceptual prior + `four_on_floor_halfbar_rejected` /
+/// `profile_halftime_rejected` (DnB) / Dancehall's
+/// continue-don't-reject behaviour; the self-verify must respect
+/// that decision instead of undoing it.
+#[must_use]
+pub fn profile_blocks_half_octave_swap(profile: OctaveProfile) -> bool {
+    matches!(
+        profile,
+        OctaveProfile::FourOnFloor | OctaveProfile::DrumAndBass | OctaveProfile::Dancehall
+    )
+}
+
+/// Returns `true` when the profile forbids the post-pass-2
+/// `octave_self_verify` from swapping the chosen BPM up to its
+/// double (BPM → BPM×2).
+///
+/// Mirror of [`profile_blocks_half_octave_swap`]. Genres whose mix
+/// tempo lives in the **lower** octave (one-drop, dub, hip-hop kick
+/// on 1+3) suffer the inverse LSQ trap: when the production has a
+/// dense hi-hat or shaker layer, the upper-octave grid finds
+/// tighter onset alignment to the hat / shaker pulses than the
+/// kick-aligned lower octave does. The profile already encodes
+/// "mix at the lower octave"; the self-verify must respect that.
+#[must_use]
+pub fn profile_blocks_double_octave_swap(profile: OctaveProfile) -> bool {
+    matches!(
+        profile,
+        OctaveProfile::RootsReggae | OctaveProfile::Dub | OctaveProfile::HipHop
+    )
 }
 
 /// Upper BPM band for profile-driven double-time rejection.
@@ -442,10 +614,10 @@ mod tests {
         }
     }
 
-    /// PRD-BEATS Round 6 §6e: every common DnB / jungle tag must
-    /// map to the `DrumAndBass` profile so an inverted K-S half-
-    /// time peak at ~85 BPM cannot beat the true ~170 BPM tempo
-    /// when the track is tagged.
+    /// PRD-BEATS Round 6 §6e + niche-genres pass: every common
+    /// DnB / jungle / fast-urban tag must map to the `DrumAndBass`
+    /// profile so an inverted K-S half-time peak at ~85 BPM cannot
+    /// beat the true ~170 BPM tempo when the track is tagged.
     #[test]
     fn genre_mapping_covers_drum_and_bass_family() {
         for tag in [
@@ -458,26 +630,157 @@ mod tests {
             "drumandbass",
             "Jungle",
             "Liquid DnB",
+            "Liquid Funk",
             "Neurofunk",
+            "Breakcore",
+            "Footwork",
+            "Juke",
+            "UK Hardcore",
+            "Happy Hardcore",
         ] {
-            // "Liquid DnB" / "Neurofunk" should pass the dnb/jungle
-            // matcher because they contain `dnb` / `jungle`. The
-            // `Neurofunk` tag does NOT — it goes to Default. Spot-
-            // check the ones that match.
-            let mapped = octave_profile_from_genre(tag);
-            if tag == "Neurofunk" {
-                // Not in our matcher; intentionally caught by
-                // default. If the project wants neurofunk → DnB in
-                // future, extend the match arm.
-                assert_eq!(mapped, OctaveProfile::Default, "tag {tag:?}");
-            } else {
-                assert_eq!(
-                    mapped,
-                    OctaveProfile::DrumAndBass,
-                    "tag {tag:?} should map to DrumAndBass"
-                );
-            }
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::DrumAndBass,
+                "tag {tag:?} should map to DrumAndBass"
+            );
         }
+    }
+
+    /// Niche-genres pass: UK garage family + grime. Every tag
+    /// that the urban-scratch DJ niche uses to mean "130–140 BPM
+    /// 4/4 (or 4/4-perceptible) kick" must land on
+    /// `FourOnFloor` so the half-bar and shuffle-high
+    /// rejections fire. `"speed garage"` and `"uk garage"` ride
+    /// the existing `"garage"` substring; the explicit tokens
+    /// here pin the bare shorthand IDs that ship in id3.
+    #[test]
+    fn genre_mapping_covers_uk_garage_family() {
+        for tag in [
+            "UKG",
+            "UK Garage",
+            "Speed Garage",
+            "4x4",
+            "4x4 Garage",
+            "4×4",
+            "2-Step",
+            "2 Step",
+            "2step",
+            "Two-Step",
+            "Two Step",
+            "Bassline",
+            "Grime",
+            "Jersey Club",
+            "Baltimore Club",
+        ] {
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::FourOnFloor,
+                "tag {tag:?} should map to FourOnFloor"
+            );
+        }
+    }
+
+    /// Niche-genres pass: hip-hop subgenres added in the same
+    /// cycle as UKG. Drill (kick at 70), lo-fi (60–90 chill hop),
+    /// and reggaeton (90–100 dembow) all sit in or near the
+    /// HipHop 75–105 mix-tempo band and want the 2:1 upper-octave
+    /// rejection rule that profile carries.
+    #[test]
+    fn genre_mapping_covers_hip_hop_subgenres() {
+        for tag in [
+            "Drill",
+            "UK Drill",
+            "Brooklyn Drill",
+            "Chicago Drill",
+            "Lo-Fi",
+            "Lo-Fi Hip Hop",
+            "Lofi",
+            "LoFi",
+            "Lo Fi",
+            "Reggaeton",
+            "Latin Reggaeton",
+        ] {
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::HipHop,
+                "tag {tag:?} should map to HipHop"
+            );
+        }
+    }
+
+    /// Regression for the substring trap that motivated the
+    /// reggaeton up-front check: `"Reggaeton".contains("reggae")
+    /// == true`, so without the override the reggae arm would
+    /// claim it and the RootsReggae half-time bias would actively
+    /// degrade analysis of a 90–100 BPM dembow track.
+    #[test]
+    fn reggaeton_does_not_leak_into_roots_reggae() {
+        assert_eq!(
+            octave_profile_from_genre("Reggaeton"),
+            OctaveProfile::HipHop
+        );
+        assert_eq!(
+            octave_profile_from_genre("Reggaeton / Trap"),
+            OctaveProfile::HipHop
+        );
+        // The reggae arm still claims plain reggae tags — the
+        // override is strictly scoped to the `"reggaeton"`
+        // substring.
+        assert_eq!(
+            octave_profile_from_genre("Reggae"),
+            OctaveProfile::RootsReggae
+        );
+        assert_eq!(
+            octave_profile_from_genre("Roots Reggae"),
+            OctaveProfile::RootsReggae
+        );
+    }
+
+    /// Lo-fi house must stay in FourOnFloor — the `"house"`
+    /// substring wins by chain order over the new `"lo-fi"`
+    /// addition in the HipHop arm. Pure `"lo-fi"` (no house
+    /// modifier) must reach the HipHop arm.
+    #[test]
+    fn lo_fi_house_stays_in_four_on_floor() {
+        assert_eq!(
+            octave_profile_from_genre("Lo-Fi House"),
+            OctaveProfile::FourOnFloor
+        );
+        assert_eq!(
+            octave_profile_from_genre("Lofi House"),
+            OctaveProfile::FourOnFloor
+        );
+        assert_eq!(octave_profile_from_genre("Lo-Fi"), OctaveProfile::HipHop);
+    }
+
+    /// Bashment is Jamaican slang for dancehall; it must land in
+    /// the same profile as `"Dancehall"` so the 130–145 BPM mix
+    /// tempo survives octave disambiguation.
+    #[test]
+    fn bashment_maps_to_dancehall() {
+        assert_eq!(
+            octave_profile_from_genre("Bashment"),
+            OctaveProfile::Dancehall
+        );
+        assert_eq!(
+            octave_profile_from_genre("Dancehall / Bashment"),
+            OctaveProfile::Dancehall
+        );
+    }
+
+    /// Roots-reggae subgenre extensions: steppers (75–85 BPM
+    /// roots, deliberate steady kick on every beat) joins the
+    /// existing one-drop / rocksteady / lovers / ska family.
+    #[test]
+    fn steppers_maps_to_roots_reggae() {
+        assert_eq!(
+            octave_profile_from_genre("Steppers"),
+            OctaveProfile::RootsReggae
+        );
+        assert_eq!(
+            octave_profile_from_genre("Roots Steppers"),
+            OctaveProfile::RootsReggae
+        );
     }
 
     /// PRD-BEATS Round 6 §6d: hip-hop profile rejects the upper

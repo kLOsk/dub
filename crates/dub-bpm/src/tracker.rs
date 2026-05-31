@@ -477,4 +477,65 @@ mod tests {
             TrackerState::Searching => panic!("should not still be Searching after 8 s"),
         }
     }
+
+    #[test]
+    fn locked_click_track_settles_and_holds() {
+        // Settle-and-hold: once the tracker locks onto a steady,
+        // unchanging click track it must *keep* that lock for the
+        // remainder of the signal — never dropping back to Searching
+        // and never flipping to a half/double-octave tempo.
+        //
+        // This is the deterministic companion to the streaming
+        // `click_track_streams_to_lock` test. That test proves we
+        // *reach* a correct lock; this one proves we *hold* it. It is
+        // driven synchronously through `BpmTracker::process` — no
+        // spawned thread, no wall clock — so the trajectory is bit-for-
+        // bit identical on every run regardless of host load. (The
+        // transient half-octave excursions occasionally seen on the
+        // streaming path come from variable-size analysis-thread drains
+        // under CPU contention, not from the tracker logic this test
+        // exercises directly.)
+        let sr = 48_000u32;
+        let audio = synthetic::click_track(128.0, 20.0, sr);
+        let mut t = BpmTracker::new(cfg_mono(sr)).unwrap();
+
+        let mut first_lock_block: Option<usize> = None;
+        let mut held_blocks = 0usize;
+        for (blk, chunk) in audio.chunks(2048).enumerate() {
+            t.process(chunk);
+            match (t.state(), first_lock_block) {
+                (TrackerState::Locked { bpm }, _) => {
+                    assert!(
+                        (bpm - 128.0).abs() <= 1.0,
+                        "locked at the wrong octave: {bpm} BPM at block {blk} \
+                         (expected 128±1) — settle-and-hold violated"
+                    );
+                    first_lock_block.get_or_insert(blk);
+                    held_blocks += 1;
+                }
+                // Any non-Locked state *after* the first lock means the
+                // tracker gave up a lock it had already committed to.
+                (other, Some(lock_blk)) => {
+                    panic!(
+                        "tracker left Locked after settling: saw {other:?} at \
+                         block {blk}, having first locked at block {lock_blk} \
+                         and held for {held_blocks} blocks"
+                    );
+                }
+                (_, None) => {}
+            }
+        }
+
+        let lock_blk = first_lock_block
+            .expect("tracker never locked on 20 s of clean 128 BPM clicks");
+        // Guard against a degenerate "locked only on the final block"
+        // pass: the hold must be sustained, not a last-moment fluke.
+        // 20 s / ~43 ms per 2048-sample block ≈ 469 blocks; locking by
+        // ~4 s leaves well over 300 held blocks.
+        assert!(
+            held_blocks > 100,
+            "lock was not sustained: first locked at block {lock_blk}, \
+             held only {held_blocks} blocks"
+        );
+    }
 }
