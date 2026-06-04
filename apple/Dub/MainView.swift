@@ -1609,18 +1609,25 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    /// `true` when the supplied track resolves to a path on a
-    /// currently-reachable volume per the cached reachability
-    /// map. Used by the LibraryView to render the missing-file
-    /// glyph. Conservative — returns `false` for any track
-    /// without a primary mount point on record, or whose mount
-    /// point hasn't been probed yet (the LibraryView calls
-    /// `refreshVolumeReachability` *before* rendering the first
-    /// frame, so "not yet probed" is a transient state and a
-    /// false positive on the glyph is acceptable in that window).
+    /// `true` unless we have positive evidence the track's volume is
+    /// unreachable. Used by the LibraryView to render the missing-file
+    /// glyph.
+    ///
+    /// Optimistic by design: the reachability cache is populated one
+    /// runloop tick *after* rows first render (see
+    /// `refreshVolumeReachability`'s call site), so a pessimistic
+    /// "unknown → unreachable" default flashes the red ⚠ on every row
+    /// in that window — and any path that leaves the cache unpopulated
+    /// for a mount point pins the false positive permanently (the bug
+    /// this fixes: a healthy internal-volume library showing ⚠ on
+    /// every track). We only cry wolf when a probe *positively*
+    /// returned `false` for the mount point. A track with no volume on
+    /// record is handled by the load path, not this glyph.
     func isTrackReachable(_ track: LibraryTrack) -> Bool {
-        guard let m = track.primaryVolumeMountPoint else { return false }
-        return libraryModel.volumeReachability[m] == true
+        guard let m = track.primaryVolumeMountPoint, !m.isEmpty else { return true }
+        // `nil` (not yet probed) and `true` both read as reachable;
+        // only an explicit `false` flags the track.
+        return libraryModel.volumeReachability[m] != false
     }
 
     // MARK: - M11d.4 Missing-files scanner
@@ -2387,7 +2394,17 @@ final class WaveformAppModel: ObservableObject {
             flashLoadError(side: candidate)
             return
         }
-        _ = await loadTrack(side: candidate, url: url)
+        let didLoad = await loadTrack(side: candidate, url: url)
+        // Prep-mode Space-load mirrors the drag-to-play idiom
+        // (`DeckDropTarget`): auto-start the deck so Space behaves like
+        // a drag-and-drop. Performance mode never auto-plays — playback
+        // is driven by the control vinyl or an explicit Play press;
+        // auto-playing there would engage user-initiated Panic-Play and
+        // ignore the timecode (the "load auto-starts internal play and
+        // the record does nothing" bug).
+        if didLoad, engineMode == .prep {
+            play(side: candidate)
+        }
     }
 
     /// `true` when a load is allowed to land on a deck that is
@@ -3802,7 +3819,13 @@ struct MainView: View {
     @StateObject private var model = WaveformAppModel()
     @State private var showingPreferences: Bool = false
     @State private var showingAbout: Bool = false
+    @State private var showingOnboarding: Bool = false
     @State private var showLaunchSplash: Bool = true
+
+    /// U-23 — once the user finishes or skips the first-run guide we
+    /// never show it unbidden again. Persisted so it survives relaunch;
+    /// re-openable from Preferences via `.dubShowOnboarding`.
+    @AppStorage("dub.hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
     var body: some View {
         ZStack {
@@ -3827,6 +3850,12 @@ struct MainView: View {
             .sheet(isPresented: $showingPreferences) {
                 PreferencesSheet(model: model)
             }
+            .sheet(isPresented: $showingOnboarding) {
+                OnboardingSheet(model: model) {
+                    hasCompletedOnboarding = true
+                    showingOnboarding = false
+                }
+            }
             .background(
                 KeyEventMonitorHost(
                     showingPreferences: $showingPreferences,
@@ -3837,6 +3866,13 @@ struct MainView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .dubShowPreferences)) { _ in
                 showingPreferences = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .dubShowOnboarding)) { _ in
+                // Re-opened from Preferences. Close that sheet first so
+                // we don't try to present two sheets at once, then bring
+                // up onboarding on the next runloop tick.
+                showingPreferences = false
+                DispatchQueue.main.async { showingOnboarding = true }
             }
             .task {
                 await runColdBoot()
@@ -3876,6 +3912,12 @@ struct MainView: View {
 
         withAnimation(.easeOut(duration: 0.35)) {
             showLaunchSplash = false
+        }
+
+        // U-23 — first launch (or a reset flag): greet the user with
+        // the onboarding guide once the splash has cleared.
+        if !hasCompletedOnboarding {
+            showingOnboarding = true
         }
     }
 }

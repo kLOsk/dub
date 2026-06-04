@@ -20,185 +20,7 @@ re-discovering the issue.
 
 ---
 
-## 1. Real bugs (correctness or visible user pain)
-
-### ~~B-26. Waveform scrub lag and playback stutter~~ — fixed (M11d.5 follow-up)
-
-Closed after dogfood validation (2026-05-20). Playing-deck scrub is responsive
-again; idle playback scroll is smooth. Landed in `01291cd` via demand-driven
-Metal rendering (`CVDisplayLink` on the main run loop), input yield during
-press/drag, redundant peak-ingest skip when the playhead is stable, and GPU
-catch-up when frames are deferred. No further action unless regression.
-
----
-
-### ~~B-11. Auto BPM locks at 2× tempo on real hip-hop / rap~~ — largely addressed; residual cases handled by tap-to-grid
-
-Closed as a blocking item. The octave decision was hardened across
-M11c.3a–f (perceptual tempo prior, reggae skank double-time rejection,
-genre-aware `OctaveProfile`, hip-hop double-time rejection, FourOnFloor /
-Dub mid-band fix) and the M11d.7 / PRD-BEATS rounds 5–10 (universal
-downbeat, `OctaveProfile::HipHop` lower-octave bias,
-`OctaveProfile::DrumAndBass` upper-octave preference, integer-snap safety
-net). The real-music regression corpus this item asked for now exists at
-`crates/dub-bpm/tests/fixtures/*.tsv` (94 tracks, gated by
-`real_music_corpus`); Classic sits at 11/94 failures concentrated in DnB
-half-time / triplet false peaks and intrinsically ambiguous edges.
-
-Why this is not "fixed to zero": `BPM-DETECTOR-V2-INVESTIGATION.md`
-measured a from-scratch non-ML structural detector and found it cannot
-beat the tuned Classic logic (overlapping decision classes have no global
-threshold). The remaining ambiguous tracks are the user's call —
-**tap-to-grid (U-19, shipped) is the per-track override** and the
-`BpmRange` escape hatch constrains the search. Further automatic gains are
-gated on a learned beat tracker (see the investigation doc); do not re-open
-this as a heuristic-tuning task.
-
-**Location:** `crates/dub-bpm/src/tempo.rs`, `crates/dub-bpm/src/octave_profile.rs`, `crates/dub-library/src/analysis.rs`.
-
----
-
-### B-7. `scanMissingFilesBatch` has identical `if/else` branches
-
-`MainView.swift` ~L957–985 — the loop that reconciles the
-`track_files` rows against on-disk presence has:
-
-```
-if isMissing != r.wasMissing {
-    try library.markFileState(fileId:, isMissing:, timestampUnixSecs:)
-} else {
-    try library.markFileState(fileId:, isMissing:, timestampUnixSecs:) // identical args
-}
-```
-
-Intent was almost certainly:
-
-* When the missing-state flipped → write the new state.
-* When it did *not* flip → bump `last_seen_at` only (a separate
-  FFI, or a `markFileStateTouched(fileId:)` variant).
-
-As-is, every row in the batch writes the same row to SQLite twice
-the database hits would otherwise be on first-import days. The
-behaviour is correct (we re-mark the same state), just wasteful.
-
-**Fix**: either collapse the branches (write once, since both do
-the same thing) or split the FFI so the unchanged path is a cheap
-`UPDATE … SET last_seen_at = ?` without re-evaluating `is_missing`.
-
----
-
-### B-8. `libraryTrackCount` refresh clobbers the user's selection
-
-`LibraryView.swift` — `refreshTracks()` (called from the
-`onChange(of: model.libraryTrackCount)`) defaults to
-`preserveSelection: false`. The intended trigger is "another window
-just imported tracks, refresh the listing" — but it also fires
-during the user's own session if track-count bumps for any reason,
-losing whatever row they had highlighted.
-
-**Fix**: pass `preserveSelection: true` from this `onChange` so
-the row the user is *looking at* survives the refresh. The
-preserve path already exists; only the call site is wrong.
-
----
-
-### B-9. Search field has no debounce
-
-`LibraryView.swift` — the `onChange(of: searchText)` handler
-re-queries the FTS5 index synchronously on every keystroke. On a
-100 k row library this is fast enough today, but the keystroke
-that fires the FTS query *also* causes a full list refresh and
-layout. On a 500 ms-long word the user types six FTS queries plus
-six list rebuilds; we want one query plus one rebuild, ~250 ms
-after the last keystroke.
-
-**Fix**: wrap the `onChange` in a SwiftUI `.task(id: searchText)`
-that sleeps 250 ms before firing `refreshTracks()`. Cancel-on-
-new-input is automatic with that pattern (the previous task is
-torn down when `id` changes).
-
----
-
-### ~~B-10. Key column tap-to-toggle fires on every cell tap~~ — stale after browser column reset
-
-The current performance browser no longer renders the Key column
-by default (Artist / Title / BPM / Comment only), and the SwiftUI
-`Table` selection model has been replaced by a custom
-`ScrollView + LazyVStack` row model. If the Key column comes back
-through customizable columns, re-open this as a header-toggle
-affordance rather than a row-cell gesture.
-
-Original fix still stands: the notation toggle belongs in the
-column header, not on individual row cells.
-
----
-
-### ~~B-25. BPM-grid polling on the deck never latches~~ — fixed (M11d.5 round 4)
-
-Closed by the library-sourced beat-grid work documented in
-`docs/SHIPPED.md` under "Follow-up — Library-sourced beat grid
-is the single source of truth (M11d.5 round 4)". The deck-load
-handshake now delivers the final grid before the first Metal
-frame after load (when the library has an active row) or runs
-the deterministic engine analyser which returns
-`confidence = 0` for silence (when it doesn't). Either way the
-renderer's `confidence > 0` latch fires on the first poll and
-the perpetual-FFI failure mode is gone. The fix landed at the
-*source* of the per-frame poll (the load handshake) rather than
-the symptom (a per-deck "analysis finished" flag), which also
-removed the ±0.02 BPM cross-deck drift and the redundant
-~100–400 ms BPM analysis on every load.
-
----
-
 ## 2. UX polish (works, but feels rough)
-
-### ~~U-18. Beat-grid overlay lines jitter slightly during playback~~ — fixed (waveform + grid jitter killed end to end)
-
-Closed. The grid + envelope now share one playhead source extrapolated
-from the audio clock (`EngineHostTimeMapping` / `PlayheadMarker`), and the
-renderer draws off the main thread (`WaveformRenderThread`). The wobble is
-gone in dogfooding. The `os_signpost` capture runbook in
-`WAVEFORM-JITTER-CAPTURE.md` remains wired (`make trace-grid`) for the next
-regression. Re-open only with a captured trace showing a bad frame.
-
----
-
-### ~~U-19. Tap-to-grid not implemented (PRD §8.3.1)~~ — shipped (M11c.3b / M11d.7 / PRD-BEATS)
-
-Closed. Tap-to-grid is the deck-header BPM affordance: 1–2 taps within 2 s
-relatch the downbeat at the first tap (a pure `bar_phase` rotation, BPM
-bit-identical); 3+ taps recompute tempo via `analyze_beat_grid_from_taps`
-(tap median seeds the BPM range, ODF refines). Persists `user_tap` rows and
-installs the grid in-place on the loaded deck without a full reanalysis. The
-binding spec is `PRD-BEATS.md` (it supersedes PRD §8.3.1). This is the
-per-track override for the residual B-11 cases.
-
----
-
-### U-12. Dev-facing placeholder text leaks into Casual-Play
-
-`Placeholders.swift` — strings like "Phase-Drift Trail lands at
-M10.7" and "Filter ladder ships with M14" appear verbatim in the
-UI. These are meaningful to us but confusing to a DJ who just
-opened the app.
-
-**Fix**: replace with user-facing copy that names the *feature*
-rather than the *milestone* ("Phase drift visualisation coming
-soon"), or hide the placeholder entirely in Casual-Play builds
-behind a debug flag.
-
----
-
-### ~~U-13. LibraryView duplicates info that's already in the header~~ — stale after list rewrite
-
-The current browser keeps the right-pane count in the footer. The
-sidebar still shows the library total beside "All Tracks", which
-is a different navigation cue and not this duplicate-header bug.
-
-No action unless the right-pane header count is reintroduced.
-
----
 
 ### U-14. No feedback while a single-deck-load analysis is running
 
@@ -232,18 +54,6 @@ modal errors go to the banner.
 
 ---
 
-### U-16. `navigateToSibling` fails silently
-
-The arrow-key sibling navigation in LibraryView is a no-op when
-there's no next sibling (top/bottom of the listing). No glyph
-flash, no system beep. Users press Down repeatedly at the end of
-the list and nothing tells them they're at the end.
-
-**Fix**: `NSSound.beep()` on hard-stop, matching the rest of macOS
-arrow-key navigation in tables.
-
----
-
 ### U-17. The notation-toggle affordance is invisible
 
 The Key column is currently not part of the default performance
@@ -274,32 +84,6 @@ listing anyway.
 
 ---
 
-### U-19. Idle-pane hint text gets truncated
-
-`Placeholders.idleHint` renders a multi-line cue inside the
-deckPane's `GeometryReader`. When the window is narrower than
-~840 px, the second line truncates mid-word ("…drop a track to
-load i").
-
-**Fix**: replace the explicit `.lineLimit(2)` with
-`.lineLimit(nil)` + `.minimumScaleFactor(0.8)`. The hint is allowed
-to wrap to three lines on narrow windows; better truncated text
-ruins the cue.
-
----
-
-### U-20. PerformanceView idle pane shows redundant copy
-
-Both decks render the same idle hint ("Drop a track here · Space
-to load the browser selection · ⌘O to open the library") when no
-track is loaded. On a two-deck layout this reads twice.
-
-**Fix**: render the hint only on the left (or master) deck. The
-right deck idle pane stays blank — the divider already implies
-symmetry.
-
----
-
 ### U-21. StatusStrip mixes engine + library state
 
 The status strip currently shows engine-running, master-deck, and
@@ -314,68 +98,7 @@ state only.
 
 ---
 
-### U-22. Tooltip text is dev-leaky
-
-Several tooltips embed milestone names ("M11c.2 Camelot key
-detection") that are meaningless to a DJ. Tooltips should describe
-the *feature*, not the *milestone*.
-
-**Fix**: sweep `.help("M…")` strings and rewrite them in user
-language.
-
----
-
-### U-23. Onboarding doesn't exist
-
-The first-run experience is "you open the app, see an empty
-library, and figure it out". For a DJ tool with a strict hardware
-prerequisite (≥4 in / 4 out interface) this is hostile.
-
-**Fix**: first-run sheet that walks the user through device
-selection, channel routing, and "drop a folder here to import".
-Skippable. Lives behind the Preferences sheet so power users can
-re-open it.
-
----
-
 ## 3. Code health (no visible symptom yet, but architectural debt)
-
-### ~~C-24. `FileBrowserView.swift` is dead code~~ — deleted
-
-Deleted. The M10.5b file-browser sidebar had no call sites after
-the M11d library superseded it (only its own `#Preview` and stale
-doc-comment references in other files, which were rewritten). The
-XcodeGen `sources: - path: Dub` directory glob drops it on the next
-`bootstrap.sh`; no filelist edit was needed.
-
----
-
-### ~~C-25. `LibraryPlaceholder` is dead code~~ — deleted
-
-Deleted from `Placeholders.swift` (struct + its `#Preview` + header
-comment). `FXBarPlaceholder` stays — it still marks the unshipped
-M15/M16/M17 FX slots. `DubLayout.libraryMinHeight` is retained
-because `LibraryView` still uses it.
-
----
-
-### ~~C-26. BPM lookup differs between DeckHeader and LibraryView~~ — fixed (M11d.5 round 4)
-
-Closed by the library-sourced beat-grid work documented in
-`docs/SHIPPED.md` under "Follow-up — Library-sourced beat grid
-is the single source of truth (M11d.5 round 4)". The fix lands
-exactly as the backlog item suggested: the engine now adopts the
-library's `track_beatgrids(is_active = 1)` row via a new optional
-`LibraryBeatGrid` parameter on `DubEngine.loadTrack`, instead of
-re-running `dub_bpm::analyze_beat_grid` from scratch. Both the
-DeckHeader and the LibraryView now read the same SQLite row by
-construction; the ±0.02 BPM drift is impossible to reproduce. The
-side-benefit also materialised — the ~100–400 ms per-load
-estimator pass is cut to a few microseconds for any track the
-library has already seen (the first-ever load still pays the
-analysis cost; see the deferral note in the SHIPPED entry).
-
----
 
 ### C-27. `selectLibraryTrack` calls `trackPath` twice
 
@@ -414,17 +137,6 @@ post-fix). The right value for batch progress is now
 counter would be clearer as `analysisInFlight: Bool` (we never
 actually use the count > 1 case, since analyses are serial).
 Trivial follow-up; can land with the next library-related PR.
-
----
-
-### ~~C-29. `Table` selection model double-fires on programmatic set~~ — obsolete after Table removal
-
-The current browser no longer uses SwiftUI `Table` selection.
-Selection is owned by the row model and `LibraryArrowKeyView`, so
-this exact double-fire path is gone.
-
-Re-open only if a future NSTableView/SwiftUI Table paging rewrite
-reintroduces a binding echo.
 
 ---
 
@@ -595,13 +307,46 @@ render-path code must stay allocation/lock/syscall free
 
 ---
 
+---
+
+## Closed (archive)
+
+_One line each; full write-ups are in git history. Kept so a reopened symptom is easy to cross-reference._
+
+- B-26. Waveform scrub lag and playback stutter — fixed (M11d.5 follow-up)
+- B-11. Auto BPM locks at 2× tempo on real hip-hop / rap — largely addressed; residual cases handled by tap-to-grid
+- B-7. `scanMissingFilesBatch` has identical `if/else` branches — already fixed (M11d.8)
+- B-8. `libraryTrackCount` refresh clobbers the user's selection — fixed (M11d.8)
+- B-9. Search field has no debounce — fixed (M11d.8)
+- B-10. Key column tap-to-toggle fires on every cell tap — stale after browser column reset
+- B-25. BPM-grid polling on the deck never latches — fixed (M11d.5 round 4)
+- U-18. Beat-grid overlay lines jitter slightly during playback — fixed (waveform + grid jitter killed end to end)
+- U-19. Tap-to-grid not implemented (PRD §8.3.1) — shipped (M11c.3b / M11d.7 / PRD-BEATS)
+- U-12. Dev-facing placeholder text leaks into Casual-Play — fixed (M11d.8)
+- U-13. LibraryView duplicates info that's already in the header — stale after list rewrite
+- U-16. arrow-key navigation fails silently at list edges — fixed (M11d.8)
+- U-19. Idle-pane hint text gets truncated — fixed (M11d.8)
+- U-20. PerformanceView idle pane shows redundant copy — fixed (M11d.8)
+- U-22. Tooltip text is dev-leaky — fixed (M11d.8)
+- U-23. Onboarding doesn't exist — fixed (M11d.8)
+- C-24. `FileBrowserView.swift` is dead code — deleted
+- C-25. `LibraryPlaceholder` is dead code — deleted
+- C-26. BPM lookup differs between DeckHeader and LibraryView — fixed (M11d.5 round 4)
+- C-29. `Table` selection model double-fires on programmatic set — obsolete after Table removal
+
 ## Triage notes
 
 * Buckets are roughly ordered by priority within each section
   (top of list → fix first).
-* Items B-7 through B-9 should land before major new library UI
-  features, since they affect existing functionality. B-10, B-25,
-  and B-26 are retained only as closed context.
+* Items B-7 through B-9 are now closed (M11d.8) — they were the
+  gate before major new library UI features. B-7 was already fixed
+  before the pass; B-8 (selection preserve) and B-9 (search debounce)
+  landed in the pass. B-10, B-25, and B-26 are retained only as
+  closed context.
+* M11d.8 "Polish & First-Run" also closed U-12, U-16, U-19, U-20,
+  U-22 (UX truthfulness sweep) and U-23 (first-run onboarding).
+  Remaining open UX items (U-14, U-15, U-17, U-18, U-21) are
+  non-blocking and can ride along with the next library PR.
 * The beat-grid cluster (B-11 octave, U-18 grid jitter, U-19
   tap-to-grid) has shipped / closed. Further automatic octave gains
   are gated on a learned beat tracker — see

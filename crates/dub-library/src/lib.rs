@@ -3,7 +3,7 @@
 //! Owns a SQLite database describing the user's tracks. Imports from
 //! Serato, Traktor (NML), rekordbox (DB6 + XML), iTunes XML, and Lexicon
 //! (via its rekordbox/Serato exports). See PRD §8 and the normative
-//! schema reference at `docs/LIBRARY-SCHEMA.md`.
+//! schema reference at `docs/spec/LIBRARY-SCHEMA.md`.
 //!
 //! M11a (this commit) ships:
 //!

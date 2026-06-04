@@ -73,7 +73,7 @@ libc = "0.2"
 # library-internal dedupe via similarity — we do not ship AcoustID
 # lookup, so cross-implementation bit-identity is not a requirement.
 # The Chromaprint algorithm (algorithm 2, 11025 Hz mono, 4096-frame
-# FFT) is documented in `docs/LIBRARY-SCHEMA.md` so the schema is
+# FFT) is documented in `docs/spec/LIBRARY-SCHEMA.md` so the schema is
 # implementation-portable: a third party reading `library.sqlite`
 # can re-derive Dub's fingerprints with any algorithm-2-faithful
 # implementation.

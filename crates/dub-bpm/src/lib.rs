@@ -29,7 +29,7 @@
 //!
 //! Aubio (or any future backend) can replace the internals later without
 //! changing this public surface — that's the whole point of the M7.5/M8
-//! split documented in `docs/PRD.md` §12.
+//! split documented in `docs/spec/PRD.md` §12.
 //!
 //! ## Channel handling
 //!

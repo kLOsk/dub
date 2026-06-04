@@ -471,7 +471,7 @@ fn build_fts_query(query: &str) -> String {
 
 /// A handle to an open Dub library database. Owns one SQLite
 /// connection in WAL mode with PRAGMAs applied per
-/// `docs/LIBRARY-SCHEMA.md`.
+/// `docs/spec/LIBRARY-SCHEMA.md`.
 pub struct Library {
     conn: Connection,
     db_path: PathBuf,

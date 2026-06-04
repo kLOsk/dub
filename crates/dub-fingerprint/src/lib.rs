@@ -17,7 +17,7 @@
 //! Dub library, not AcoustID database lookup, so cross-
 //! implementation bit-identity is not a requirement.
 //!
-//! The algorithm itself is unchanged. `docs/LIBRARY-SCHEMA.md`
+//! The algorithm itself is unchanged. `docs/spec/LIBRARY-SCHEMA.md`
 //! documents the Chromaprint parameters Dub uses (algorithm 2,
 //! 11025 Hz mono, 4096-frame FFT, full-track window, raw
 //! `uint32_t[]` storage) so a third party can re-derive Dub's
@@ -86,7 +86,7 @@ pub type Result<T> = std::result::Result<T, FingerprintError>;
 /// Serialisation: [`Fingerprint::to_blob`] / [`Fingerprint::from_blob`]
 /// round-trip the items as little-endian `u32`s, matching the
 /// `fingerprints.chromaprint_blob` column documented in
-/// `docs/LIBRARY-SCHEMA.md`.
+/// `docs/spec/LIBRARY-SCHEMA.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
     items: Vec<u32>,

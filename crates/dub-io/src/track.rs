@@ -83,7 +83,7 @@ pub struct Track {
 ///
 /// Field-naming follows the [`StandardTagKey`] enum and maps onto the
 /// columns in the `track_metadata_source` table documented in
-/// `docs/LIBRARY-SCHEMA.md`. The dub-library M11c importer is the
+/// `docs/spec/LIBRARY-SCHEMA.md`. The dub-library M11c importer is the
 /// primary consumer of the extended fields.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackMetadata {
@@ -481,7 +481,7 @@ impl Track {
     /// `gain_db` in addition to the title / artist / album surfaced
     /// by the dedicated accessors). Used by the M11c library
     /// importer to populate the `track_metadata_source(source='id3')`
-    /// row per `docs/LIBRARY-SCHEMA.md`.
+    /// row per `docs/spec/LIBRARY-SCHEMA.md`.
     #[must_use]
     pub fn extended_metadata(&self) -> &TrackMetadata {
         &self.metadata

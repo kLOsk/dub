@@ -156,6 +156,16 @@ struct PreferencesSheet: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 0)
+            // U-23 — let users re-open the first-run guide. Dismiss
+            // this sheet first; MainView brings onboarding up on the
+            // next tick (two sheets can't present at once).
+            Button("Show Welcome Guide") {
+                dismiss()
+                NotificationCenter.default.post(name: .dubShowOnboarding, object: nil)
+            }
+            .buttonStyle(.plain)
+            .font(DubFont.body)
+            .foregroundStyle(DubColor.textSecondary)
             // Single Close button bound only to `.cancelAction` (Esc).
             // Everything in this sheet either auto-applies or is
             // read-only, so there is nothing to manually commit.

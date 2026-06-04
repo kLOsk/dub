@@ -45,7 +45,7 @@ pub enum LibraryError {
 
     /// The database on disk is at a `schema_version` strictly greater
     /// than what this binary knows how to write. v1.0 ships a
-    /// strict-write guard per `docs/LIBRARY-SCHEMA.md` — see the
+    /// strict-write guard per `docs/spec/LIBRARY-SCHEMA.md` — see the
     /// "What v1.0 does not commit to" section. The caller may
     /// degrade to read-only or refuse to operate.
     #[error(

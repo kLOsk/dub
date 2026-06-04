@@ -79,9 +79,9 @@ require_match "index.html crate count (architecture card)" \
 
 # LIBRARY-SCHEMA.md states the current version in prose + version history.
 require_match "LIBRARY-SCHEMA.md current-version prose" \
-    docs/LIBRARY-SCHEMA.md -F "current applied version is **${SCHEMA_VERSION}**"
+    docs/spec/LIBRARY-SCHEMA.md -F "current applied version is **${SCHEMA_VERSION}**"
 require_match "LIBRARY-SCHEMA.md version-history row" \
-    docs/LIBRARY-SCHEMA.md -E "^\| ${SCHEMA_VERSION} +\|"
+    docs/spec/LIBRARY-SCHEMA.md -E "^\| ${SCHEMA_VERSION} +\|"
 
 echo ""
 if [ "$FAILURES" -ne 0 ]; then

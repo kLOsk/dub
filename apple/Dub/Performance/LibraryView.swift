@@ -493,9 +493,22 @@ struct LibraryView: View {
             // Track count bumped → either an import just landed
             // or another window inserted rows. Refresh the visible
             // listing so the user sees the new rows immediately.
-            refreshTracks()
+            // B-8 — preserve the user's highlighted row: the bump
+            // can fire mid-session (background insert, another
+            // window) and must not yank the selection the user is
+            // about to Space-load. The rows the user sees haven't
+            // moved; new rows just append.
+            refreshTracks(preserveSelection: true)
         }
-        .onChange(of: searchText) { _ in
+        .task(id: searchText) {
+            // B-9 — debounce FTS5 queries: wait 250 ms after the
+            // last keystroke before re-querying, so a fast-typed
+            // word fires one query + one list rebuild instead of
+            // one per character. Changing `searchText` cancels the
+            // in-flight task automatically, so only the final
+            // keystroke survives the sleep.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
             refreshTracks()
         }
         .onChange(of: libraryModel.analysisGeneration) { _ in
@@ -744,7 +757,7 @@ struct LibraryView: View {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(DubColor.textPlaceholder)
-                    .help("Coming in a later milestone (M11e / v1.1).")
+                    .help("Coming soon.")
             }
         }
         .padding(.horizontal, DubSpacing.lg)
@@ -3994,7 +4007,14 @@ private struct LibraryArrowKeyView: NSViewRepresentable {
                 return true
             }
             let next = max(0, min(trackIds.count - 1, currentIdx + delta))
-            guard next != currentIdx else { return false }
+            guard next != currentIdx else {
+                // U-16 — hard stop at the top/bottom of the listing.
+                // Match the rest of macOS arrow-key table navigation
+                // and beep so the user knows the press registered but
+                // there's nowhere further to go.
+                NSSound.beep()
+                return false
+            }
             let nextId = trackIds[next]
             NSApp.keyWindow?.makeFirstResponder(nil)
             rowSelection.selectedTrackIds = [nextId]

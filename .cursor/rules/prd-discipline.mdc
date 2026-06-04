@@ -5,7 +5,7 @@ alwaysApply: true
 
 # PRD discipline
 
-`docs/PRD.md` is the source of truth. When making changes, observe these rules:
+`docs/spec/PRD.md` is the source of truth. When making changes, observe these rules:
 
 ## Non-negotiable design principles (PRD §1, §2.1, §2.2)
 

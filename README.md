@@ -32,7 +32,7 @@ This is **pre-alpha software**. There is no release. There is `main`.
   [`assert_no_alloc`](https://crates.io/crates/assert_no_alloc) before any merge.
 - **Clean-room timecode.** [`dub-timecode`](crates/dub-timecode) decodes Serato
   CV02 in relative mode — analytic-signal demod, signed rate, confidence
-  estimate, all alloc-free. ([Architecture notes.](docs/ARCHITECTURE.md))
+  estimate, all alloc-free. ([Architecture notes.](docs/spec/ARCHITECTURE.md))
 - **Lift policy hardened on real hardware.** The `LiftPolicy` state machine
   combines a three-layer defense — RMS amplitude gate, two-edge confidence
   hysteresis, sticky-block window — driven by SL3 + Serato CV02 testing.
@@ -111,28 +111,28 @@ open apple/build/Build/Products/Debug/Dub.app
 
 ## Milestone progress
 
-Roadmap and forward-looking milestones live in [`docs/PRD.md` §12](docs/PRD.md#12-milestones);
+Roadmap and forward-looking milestones live in [`docs/spec/PRD.md` §12](docs/spec/PRD.md#12-milestones);
 detailed design history for everything shipped lives in
-[`docs/SHIPPED.md`](docs/SHIPPED.md) (load it by anchor, not whole-file). Beat-grid
-history specifically lives in [`docs/PRD-BEATS.md`](docs/PRD-BEATS.md), the binding
+[`docs/history/SHIPPED.md`](docs/history/SHIPPED.md) (load it by anchor, not whole-file). Beat-grid
+history specifically lives in [`docs/spec/PRD-BEATS.md`](docs/spec/PRD-BEATS.md), the binding
 sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 
 | Range | Status | Scope | History |
 |---|---|---|---|
-| **M0 → M4** | ✅ shipped | Scaffold, CI, RT-safety harness + soak/fuzz, first sound, lock-free transport command channel, format coverage (mp3 / flac / m4a / aiff / aac / alac) + hot `Arc<Track>` loading, de-click envelope, `dub analyze` offline click detector, two decks + debug mixer. | [`SHIPPED.md#m0`](docs/SHIPPED.md#m0) |
-| **M5.1 → M5.6** | ✅ shipped | Clean-room Serato CV02 decoder → live timecode-to-deck with 3-layer `LiftPolicy` (the point Dub becomes a DJ app) → `dub scope` + `dub calibrate` → fast single-phase per-deck calibration → late-binding DJ takeover → external-mixer 4-channel routing → two-deck timecode. | [`SHIPPED.md#m51`](docs/SHIPPED.md#m51) |
-| **M6 + M7** | ✅ shipped | Traktor MK1 (2 kHz) + MK2 (2.5 kHz) through the same format-agnostic decoder; **Thru Mode** — per-deck always-on software passthrough at constant ~2.7 ms one-way latency, FX-ready, with the `dub thru` CLI. | [`SHIPPED.md#m6`](docs/SHIPPED.md#m6) |
-| **M7.5 → M8.1** | ✅ shipped | Pure-Rust BPM engine (`dub-bpm`: spectral-flux + harmonic-summed autocorrelation; aubio parked); auto-BPM streaming driver on Thru (`BpmStream`, alloc-free mono tee); log-band ODF + windowed-energy octave fix + `BpmRange` escape hatch. | [`SHIPPED.md#m75`](docs/SHIPPED.md#m75) |
-| **M9 → M10.8** | ✅ shipped | Live waveform capture (`dub-peaks`); `dub-spectral` extraction + 8-band peak capture; Apple shell (M0.5); `DubEngine` UniFFI surface; Metal multi-colour waveform; palette presets + honest silence/clipping; Performance/Prep shell; mouse transport + Panic Play; Phase-Drift Trail; Serato-parity waveform baseline freeze (§9.6.0 guardrail). | [`SHIPPED.md#m9`](docs/SHIPPED.md#m9) |
-| **M11a → M11d.4** | ✅ shipped | SQLite library (path-by-volume-UUID); pure-Rust Chromaprint dedupe; filesystem importer + filename parser; library browser shell, Recently Played, sortable columns, per-row indicators; background missing-files scanner + Relocate panel. | [`SHIPPED.md#m11a`](docs/SHIPPED.md#m11a) |
-| **M11c.1 → M11c.4** | ✅ shipped | Lazy auto-beatgrid + analysis lifecycle; Camelot key detection (`track_keys`, schema v3); BPM octave fixes (perceptual prior, reggae/hip-hop double-time rejection, genre-aware `OctaveProfile`, FourOnFloor); tap-to-grid manual override; lazy fingerprint. | [`SHIPPED.md#m11c1`](docs/SHIPPED.md#m11c1) |
-| **M11d.5 → M11d.7** | ✅ shipped | Dogfooding bug-fix rounds (Performance-mode play, library-sourced beat grid as single source of truth); full-screen launch; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md#m11d5`](docs/SHIPPED.md#m11d5) |
-| **PRD-BEATS hardening** | ✅ shipped | Uniform Traktor-style beat grid + M11d.6 calibration; tap-to-grid, explicit `bar_phase` (schema v5), relatch "set the 1"; beat-grid robustness rounds 5–10 (universal downbeat, set-the-1 contract, `OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose` CLI; waveform + beat-grid jitter killed end to end. | [`PRD-BEATS.md`](docs/PRD-BEATS.md) |
-| **Manual crates** | ✅ shipped | User-created Dub crates (PRD §8.5.1): create, inline-rename, delete, drag tracks in, remove, and reorder (drag-to-reorder + context-menu move). A `#` manual-order column drives the order; reorder is enabled only in manual order, and clicking any other column header sorts the crate as a read-only view. SQLite `crates` / `crate_tracks` CRUD + ordering, FFI surface (FFI **29**), editable "Dub Crates" sidebar section. | [`PRD.md §8.5.1`](docs/PRD.md#851-source-tree) |
-| **next** | ◻ planned | Played From / Played Into, Serato importer, customizable browser columns, nested crates. See PRD §12.1. | [`PRD.md §12.1`](docs/PRD.md#12-milestones) |
+| **M0 → M4** | ✅ shipped | Scaffold, CI, RT-safety harness + soak/fuzz, first sound, lock-free transport command channel, format coverage (mp3 / flac / m4a / aiff / aac / alac) + hot `Arc<Track>` loading, de-click envelope, `dub analyze` offline click detector, two decks + debug mixer. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M5.1 → M5.6** | ✅ shipped | Clean-room Serato CV02 decoder → live timecode-to-deck with 3-layer `LiftPolicy` (the point Dub becomes a DJ app) → `dub scope` + `dub calibrate` → fast single-phase per-deck calibration → late-binding DJ takeover → external-mixer 4-channel routing → two-deck timecode. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M6 + M7** | ✅ shipped | Traktor MK1 (2 kHz) + MK2 (2.5 kHz) through the same format-agnostic decoder; **Thru Mode** — per-deck always-on software passthrough at constant ~2.7 ms one-way latency, FX-ready, with the `dub thru` CLI. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M7.5 → M8.1** | ✅ shipped | Pure-Rust BPM engine (`dub-bpm`: spectral-flux + harmonic-summed autocorrelation; aubio parked); auto-BPM streaming driver on Thru (`BpmStream`, alloc-free mono tee); log-band ODF + windowed-energy octave fix + `BpmRange` escape hatch. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M9 → M10.8** | ✅ shipped | Live waveform capture (`dub-peaks`); `dub-spectral` extraction + 8-band peak capture; Apple shell (M0.5); `DubEngine` UniFFI surface; Metal multi-colour waveform; palette presets + honest silence/clipping; Performance/Prep shell; mouse transport + Panic Play; Phase-Drift Trail; Serato-parity waveform baseline freeze (§9.6.0 guardrail). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M11a → M11d.4** | ✅ shipped | SQLite library (path-by-volume-UUID); pure-Rust Chromaprint dedupe; filesystem importer + filename parser; library browser shell, Recently Played, sortable columns, per-row indicators; background missing-files scanner + Relocate panel. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M11c.1 → M11c.4** | ✅ shipped | Lazy auto-beatgrid + analysis lifecycle; Camelot key detection (`track_keys`, schema v3); BPM octave fixes (perceptual prior, reggae/hip-hop double-time rejection, genre-aware `OctaveProfile`, FourOnFloor); tap-to-grid manual override; lazy fingerprint. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M11d.5 → M11d.7** | ✅ shipped | Dogfooding bug-fix rounds (Performance-mode play, library-sourced beat grid as single source of truth); full-screen launch; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **PRD-BEATS hardening** | ✅ shipped | Uniform Traktor-style beat grid + M11d.6 calibration; tap-to-grid, explicit `bar_phase` (schema v5), relatch "set the 1"; beat-grid robustness rounds 5–10 (universal downbeat, set-the-1 contract, `OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose` CLI; waveform + beat-grid jitter killed end to end. | [`PRD-BEATS.md`](docs/spec/PRD-BEATS.md) |
+| **Manual crates** | ✅ shipped | User-created Dub crates (PRD §8.5.1): create, inline-rename, delete, drag tracks in, remove, and reorder (drag-to-reorder + context-menu move). A `#` manual-order column drives the order; reorder is enabled only in manual order, and clicking any other column header sorts the crate as a read-only view. SQLite `crates` / `crate_tracks` CRUD + ordering, FFI surface (FFI **29**), editable "Dub Crates" sidebar section. | [`PRD.md §8.5.1`](docs/spec/PRD.md#851-source-tree) |
+| **next** | ◻ planned | Played From / Played Into, Serato importer, customizable browser columns, nested crates. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **29** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **32** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 
@@ -178,7 +178,7 @@ dub/                                 repo root (workspace)
 
 ## Engineering tenets
 
-These are anchored in [`docs/PRD.md` §2.2](docs/PRD.md) and enforced both
+These are anchored in [`docs/spec/PRD.md` §2.2](docs/spec/PRD.md) and enforced both
 socially and in CI:
 
 1. **No allocations on the audio thread.** Static buffers, lock-free SPSC
@@ -236,8 +236,8 @@ made by anyone in the community come back to the community.
 
 This is currently a single-developer project. Contributions are welcome but
 expect reviews to be opinionated about reliability and the No-Mouse-DJ-Ever
-philosophy. Read [`docs/PRD.md`](docs/PRD.md) first; for engineering background,
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+philosophy. Read [`docs/spec/PRD.md`](docs/spec/PRD.md) first; for engineering background,
+[`docs/spec/ARCHITECTURE.md`](docs/spec/ARCHITECTURE.md).
 
 Bugs and feature requests: open an issue. Patches: open a PR against `main`.
 CI must be green; new audio-path code requires `assert_no_alloc` coverage and

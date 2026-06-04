@@ -20,10 +20,10 @@
     <span class="dub-nav__sep"></span>
     <div class="dub-nav__links">
         <a href="index.html">Overview</a>
-        <a href="architecture.html">Architecture</a>
-        <a href="beats.html">Beat grid</a>
+        <a href="../spec/ARCHITECTURE.md">Architecture</a>
+        <a href="../spec/PRD-BEATS.md">Beat grid</a>
         <a href="roadmap.html">Roadmap</a>
-        <a href="schema.html">Library schema</a>
+        <a href="../spec/LIBRARY-SCHEMA.md">Library schema</a>
         <a href="backlog.html">UI backlog</a>
     </div>
     <span class="dub-nav__source">file://docs/html</span>
@@ -130,11 +130,11 @@
     <div class="dub-grid">
 
         <div class="dub-card">
-            <h3><a href="architecture.html">Architecture</a></h3>
+            <h3><a href="../spec/ARCHITECTURE.md">Architecture</a></h3>
             <p style="color: var(--dub-text-muted);">
                 Crate dependency graph, audio thread isolation, RT-safety
                 layers, UI ↔ Engine messaging shape. Visual companion to
-                <code><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a></code>.
+                <code><a href="../spec/ARCHITECTURE.md">ARCHITECTURE.md</a></code>.
             </p>
             <div style="margin-top: var(--sp-md);">
                 <span class="pill">15 crates</span>
@@ -146,9 +146,9 @@
             <h3><a href="roadmap.html">Roadmap</a></h3>
             <p style="color: var(--dub-text-muted);">
                 Milestone timeline from M0 through v1.0 and v1.1. Shipped
-                milestones link into <code><a href="../SHIPPED.md">SHIPPED.md</a></code>
+                milestones link into <code><a href="../history/SHIPPED.md">SHIPPED.md</a></code>
                 anchors; planned milestones link into
-                <code><a href="../PRD.md">PRD.md</a></code> §12.
+                <code><a href="../spec/PRD.md">PRD.md</a></code> §12.
             </p>
             <div style="margin-top: var(--sp-md);">
                 <span class="pill pill--shipped">M0 → M11d.7 shipped</span>
@@ -157,11 +157,11 @@
         </div>
 
         <div class="dub-card">
-            <h3><a href="schema.html">Library schema</a></h3>
+            <h3><a href="../spec/LIBRARY-SCHEMA.md">Library schema</a></h3>
             <p style="color: var(--dub-text-muted);">
                 Interactive ER diagram of the SQLite library, table by table.
                 Companion to
-                <code><a href="../LIBRARY-SCHEMA.md">LIBRARY-SCHEMA.md</a></code>;
+                <code><a href="../spec/LIBRARY-SCHEMA.md">LIBRARY-SCHEMA.md</a></code>;
                 the schema is part of Dub's public API per PRD §8.7.
             </p>
             <div style="margin-top: var(--sp-md);">
@@ -204,37 +204,37 @@
         </thead>
         <tbody>
             <tr>
-                <td><a href="../PRD.md"><code>PRD.md</code></a></td>
+                <td><a href="../spec/PRD.md"><code>PRD.md</code></a></td>
                 <td>Product source of truth: scope, non-goals, milestone plan, acceptance criteria.</td>
                 <td>Load by anchored section, not whole file.</td>
             </tr>
             <tr>
-                <td><a href="../PRD-BEATS.md"><code>PRD-BEATS.md</code></a></td>
+                <td><a href="../spec/PRD-BEATS.md"><code>PRD-BEATS.md</code></a></td>
                 <td>Binding sub-spec for tempo, beat grid, downbeat, tap-to-grid, waveform overlay. Supersedes PRD §8.3.1.</td>
                 <td>Load for any beat-grid / BPM / tap work.</td>
             </tr>
             <tr>
-                <td><a href="../ARCHITECTURE.md"><code>ARCHITECTURE.md</code></a></td>
+                <td><a href="../spec/ARCHITECTURE.md"><code>ARCHITECTURE.md</code></a></td>
                 <td>How the crates fit together; threading and FFI shape.</td>
                 <td>Read overview, then jump to the relevant section.</td>
             </tr>
             <tr>
-                <td><a href="../SHIPPED.md"><code>SHIPPED.md</code></a></td>
+                <td><a href="../history/SHIPPED.md"><code>SHIPPED.md</code></a></td>
                 <td>Per-milestone shipped history and design rationale.</td>
                 <td>Anchor-only. Never load whole file.</td>
             </tr>
             <tr>
-                <td><a href="../LIBRARY-SCHEMA.md"><code>LIBRARY-SCHEMA.md</code></a></td>
+                <td><a href="../spec/LIBRARY-SCHEMA.md"><code>LIBRARY-SCHEMA.md</code></a></td>
                 <td>Public SQLite schema contract.</td>
                 <td>Load for library / migration / FFI work only.</td>
             </tr>
             <tr>
-                <td><a href="../LIBRARY-FORMATS.md"><code>LIBRARY-FORMATS.md</code></a></td>
+                <td><a href="../spec/LIBRARY-FORMATS.md"><code>LIBRARY-FORMATS.md</code></a></td>
                 <td>Serato / Traktor / rekordbox / iTunes / Lexicon format quirks.</td>
                 <td>Load only for importer / format work.</td>
             </tr>
             <tr>
-                <td><a href="../LICENSE-DEPENDENCIES.md"><code>LICENSE-DEPENDENCIES.md</code></a></td>
+                <td><a href="../spec/LICENSE-DEPENDENCIES.md"><code>LICENSE-DEPENDENCIES.md</code></a></td>
                 <td>Dependency license posture and binary attribution.</td>
                 <td>Load for license review / release work.</td>
             </tr>

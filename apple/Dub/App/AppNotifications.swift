@@ -11,4 +11,7 @@ import Foundation
 extension Notification.Name {
     static let dubShowAbout = Notification.Name("com.klos.dub.showAbout")
     static let dubShowPreferences = Notification.Name("com.klos.dub.showPreferences")
+    /// Re-open the first-run onboarding flow (U-23). Posted by the
+    /// "Show welcome guide" button in Preferences; observed by MainView.
+    static let dubShowOnboarding = Notification.Name("com.klos.dub.showOnboarding")
 }

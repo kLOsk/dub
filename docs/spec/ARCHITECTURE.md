@@ -1106,8 +1106,8 @@ high-frequency bin count dominated the flux. The M8.1 rewrite
 local-energy removes the parabolic-vertex shoulder-asymmetry
 bias) resolves the user's stated genre mix (reggae 65, hip-hop
 90/100, rolling dnb 174) at the correct octave out of the box.
-See [`docs/SHIPPED.md#m75`](SHIPPED.md#m75) for the M7.5 baseline
-walkthrough and [`docs/SHIPPED.md#m81`](SHIPPED.md#m81) for the
+See [`docs/SHIPPED.md`](../history/SHIPPED.md) for the M7.5 baseline
+walkthrough and [`docs/SHIPPED.md`](../history/SHIPPED.md) for the
 M8.1 multi-band + windowed-energy derivation, including the
 "why not biased ACF" and "why not wider tie tolerance"
 trade-offs that landed on the chosen design.
@@ -1116,7 +1116,7 @@ trade-offs that landed on the chosen design.
 principle resolve genres whose autocorrelation legitimately peaks
 at a different octave than the convention (dubstep at 140 / 70,
 K-S-backbeat dnb at 174 / 87) without a tempo or genre prior. The
-[`BpmRange`](../crates/dub-bpm/src/lib.rs) value type +
+[`BpmRange`](../../crates/dub-bpm/src/lib.rs) value type +
 `analyze_bpm_with_range(samples, sr, channels, range)` (offline)
 + `TrackerConfig::bpm_range` (streaming) + `dub thru --bpm-range
 MIN,MAX` (CLI) plumb a user-chosen `[min, max]` BPM window
@@ -1684,12 +1684,12 @@ covers everything we need through M4.
   is cache-line traffic vs. update granularity. **Decision: M4.**
 - ~~UniFFI vs `swift-bridge` for the FFI surface — UniFFI is more polished,
   `swift-bridge` allows tighter integration. **Decision: M0.5.**~~ Resolved
-  in M0.5 — UniFFI 0.28 proc-macros. See [`docs/SHIPPED.md#m05`](SHIPPED.md#m05).
+  in M0.5 — UniFFI 0.28 proc-macros. See [`docs/SHIPPED.md`](../history/SHIPPED.md).
 
 ## See also
 
 - [`docs/PRD.md`](PRD.md) — product spec (source of truth)
-- [`docs/README.md`](README.md) — routing guide for context-efficient doc loading
-- [`docs/SHIPPED.md`](SHIPPED.md) — shipped design history; load by anchor for rationale / archaeology
+- [`docs/README.md`](../README.md) — routing guide for context-efficient doc loading
+- [`docs/SHIPPED.md`](../history/SHIPPED.md) — shipped design history; load by anchor for rationale / archaeology
 - [`docs/LIBRARY-SCHEMA.md`](LIBRARY-SCHEMA.md) — public SQLite schema contract
 - [`docs/LIBRARY-FORMATS.md`](LIBRARY-FORMATS.md) — Serato / Traktor / rekordbox / iTunes / Lexicon parsing notes

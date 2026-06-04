@@ -91,7 +91,7 @@ their own milestone in v1.1 (PRD §12.2, M23).
 
 ## See also
 
-- `docs/PRD.md` §10.1 — Workspace layout
-- `docs/PRD.md` §10.3 — Apple frontend stack
+- `docs/spec/PRD.md` §10.1 — Workspace layout
+- `docs/spec/PRD.md` §10.3 — Apple frontend stack
 - `.cursor/rules/swift.mdc` — Swift conventions
 - `.cursor/rules/ffi.mdc` — Rust ↔ Swift contract

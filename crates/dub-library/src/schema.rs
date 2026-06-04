@@ -1,7 +1,7 @@
 //! Schema definition + migration runner for the Dub library DB.
 //!
 //! The schema is the public API surface per PRD §8.7 and is
-//! normatively documented in `docs/LIBRARY-SCHEMA.md`. The SQL strings
+//! normatively documented in `docs/spec/LIBRARY-SCHEMA.md`. The SQL strings
 //! in this file must stay byte-for-byte identical with the doc's
 //! `CREATE TABLE` blocks; the doc is the spec, this file is the
 //! implementation.
@@ -38,7 +38,7 @@ use crate::error::{LibraryError, Result};
 
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
-/// `docs/LIBRARY-SCHEMA.md`.
+/// `docs/spec/LIBRARY-SCHEMA.md`.
 pub const SCHEMA_VERSION: u32 = 5;
 
 /// One migration step. Applied inside a single SQLite transaction;
@@ -81,7 +81,7 @@ static MIGRATIONS: &[Migration] = &[
 /// The runner:
 ///
 /// 1. Sets the connection-level PRAGMAs (`journal_mode=WAL`,
-///    `foreign_keys=ON`, etc.) per `docs/LIBRARY-SCHEMA.md`.
+///    `foreign_keys=ON`, etc.) per `docs/spec/LIBRARY-SCHEMA.md`.
 /// 2. Creates `schema_version` if missing; reads the current version.
 /// 3. Refuses with `LibraryError::SchemaTooNew` if the on-disk
 ///    version exceeds [`SCHEMA_VERSION`].
@@ -112,7 +112,7 @@ pub fn open_and_migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Connection-level PRAGMAs documented in `docs/LIBRARY-SCHEMA.md`
+/// Connection-level PRAGMAs documented in `docs/spec/LIBRARY-SCHEMA.md`
 /// under "PRAGMAs". Applied on every open (PRAGMAs that are
 /// per-connection rather than per-database, like `foreign_keys`,
 /// must be set each time).
@@ -197,7 +197,7 @@ fn apply_migration(tx: &Transaction<'_>, migration: &Migration) -> Result<()> {
     Ok(())
 }
 
-/// v1 schema. The canonical reference is `docs/LIBRARY-SCHEMA.md`;
+/// v1 schema. The canonical reference is `docs/spec/LIBRARY-SCHEMA.md`;
 /// changes here must be reflected there in lockstep. Every statement
 /// uses `IF NOT EXISTS` so re-running this script on an already-
 /// migrated DB is a no-op (matters because the migration runner
@@ -205,7 +205,7 @@ fn apply_migration(tx: &Transaction<'_>, migration: &Migration) -> Result<()> {
 /// commits then a later step fails, the next open re-attempts and
 /// must not double-create).
 const V1_SCHEMA: &str = r#"
--- See docs/LIBRARY-SCHEMA.md for the normative reference.
+-- See docs/spec/LIBRARY-SCHEMA.md for the normative reference.
 
 CREATE TABLE IF NOT EXISTS fingerprints (
     id                INTEGER PRIMARY KEY,
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn migration_creates_every_documented_table() {
-        // Spot-check every table from docs/LIBRARY-SCHEMA.md is
+        // Spot-check every table from docs/spec/LIBRARY-SCHEMA.md is
         // present after migration. Catches a typo in V1_SCHEMA at
         // build time rather than at "first import" time.
         let conn = fresh_db();

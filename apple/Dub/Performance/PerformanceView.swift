@@ -474,11 +474,20 @@ struct PerformanceView: View {
                         .font(DubFont.caps)
                         .tracking(0.6)
                         .foregroundStyle(DubColor.textSecondary)
-                    Text(idleHint(side: side))
-                        .font(DubFont.body)
-                        .foregroundStyle(DubColor.textPlaceholder)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, DubSpacing.lg)
+                    let hint = idleHint(side: side)
+                    if !hint.isEmpty {
+                        Text(hint)
+                            .font(DubFont.body)
+                            .foregroundStyle(DubColor.textPlaceholder)
+                            .multilineTextAlignment(.center)
+                            // U-19 — let the cue wrap and scale down on
+                            // narrow windows (≲840 px) instead of
+                            // truncating mid-word.
+                            .lineLimit(nil)
+                            .minimumScaleFactor(0.8)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, DubSpacing.lg)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
@@ -513,7 +522,12 @@ struct PerformanceView: View {
             return "Drag an audio file here, or press Space to load the browser selection."
         case .b:
             if !model.isRunning {
-                return "Open Preferences (⌘,) to start the engine."
+                // U-20 — deck A already carries the engine-stopped
+                // "Open Preferences" nudge (or the real start error).
+                // Repeating it on deck B is the one genuinely
+                // duplicated cue across the two panes, so deck B stays
+                // quiet here; its caption ("ENGINE STOPPED") is enough.
+                return ""
             }
             switch model.engineMode {
             case .timecode:

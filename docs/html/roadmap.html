@@ -167,10 +167,10 @@
     <span class="dub-nav__sep"></span>
     <div class="dub-nav__links">
         <a href="index.html">Overview</a>
-        <a href="architecture.html">Architecture</a>
-        <a href="beats.html">Beat grid</a>
+        <a href="../spec/ARCHITECTURE.md">Architecture</a>
+        <a href="../spec/PRD-BEATS.md">Beat grid</a>
         <a href="roadmap.html">Roadmap</a>
-        <a href="schema.html">Library schema</a>
+        <a href="../spec/LIBRARY-SCHEMA.md">Library schema</a>
         <a href="backlog.html">UI backlog</a>
     </div>
     <span class="dub-nav__source">source: PRD.md §12 · SHIPPED.md</span>
@@ -240,7 +240,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Workspace bootstrap with the test taxonomy, RT-safety enforcement, CI pipeline, branch protection, and the Makefile that the rest of the project runs against.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m0">SHIPPED.md#m0</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M1 first sound playback">
@@ -250,7 +250,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">CoreAudio HAL output. First test tone through the engine.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m1">SHIPPED.md#m1</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M2 transport command channel ringbuf">
@@ -260,7 +260,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">SPSC ringbuf for UI → Engine commands. RT-safe drain inside the render block. Verified by rt-audit under <code>assert_no_alloc</code>.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m2">SHIPPED.md#m2</a> · <a href="../SHIPPED.md#m21">M2.1 · RT discipline + soak harness</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a> · <a href="../history/SHIPPED.md">M2.1 · RT discipline + soak harness</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M3 format coverage track loading symphonia">
@@ -270,7 +270,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Symphonia decoders (WAV, MP3, FLAC, AIFF, AAC, ALAC, MP4). Hot-load via Arc&lt;Track&gt; swap on the engine. M3.5 adds de-click envelope, tail-fade, and the offline analyzer.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m3">SHIPPED.md#m3</a> · <a href="../SHIPPED.md#m35">M3.5</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a> · <a href="../history/SHIPPED.md">M3.5</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M4 two decks debug mixer">
@@ -280,7 +280,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Two independent decks running in parallel. Debug mixer for development. The user-facing mix happens on their external hardware mixer.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m4">SHIPPED.md#m4</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M5 timecode decoder serato cv02 clean-room">
@@ -291,12 +291,12 @@
             </div>
             <div class="ms__body">Clean-room Serato CV02 decoder; audio input plumbing; live timecode to deck; calibration + scope; per-deck calibration with always-fresh handshake; two-deck timecode. The first scratch.</div>
             <div class="ms__meta">
-                <a href="../SHIPPED.md#m51">M5.1</a> ·
-                <a href="../SHIPPED.md#m52">M5.2</a> ·
-                <a href="../SHIPPED.md#m53">M5.3</a> ·
-                <a href="../SHIPPED.md#m54">M5.4</a> ·
-                <a href="../SHIPPED.md#m55">M5.5</a> ·
-                <a href="../SHIPPED.md#m56">M5.6</a>
+                <a href="../history/SHIPPED.md">M5.1</a> ·
+                <a href="../history/SHIPPED.md">M5.2</a> ·
+                <a href="../history/SHIPPED.md">M5.3</a> ·
+                <a href="../history/SHIPPED.md">M5.4</a> ·
+                <a href="../history/SHIPPED.md">M5.5</a> ·
+                <a href="../history/SHIPPED.md">M5.6</a>
             </div>
         </div>
 
@@ -307,7 +307,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Traktor MK1 and MK2 decoders alongside the Serato CV02 one. Both formats decode in the same pipeline; selection is per-deck.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m6">SHIPPED.md#m6</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M7 thru mode real records routing">
@@ -317,7 +317,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Real records route through the engine at ~2.7 ms one-way latency. FX-capable. Auto source detection lives in <code>dub-thru</code> (still placeholder for the classifier, the passthrough itself is in dub-engine).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m7">SHIPPED.md#m7</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M75 BPM engine offline analysis pure-Rust">
@@ -327,7 +327,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Pure-Rust spectral-flux + harmonic-summed autocorrelation. Replaces the originally-planned aubio dependency; the LGPL FFI is parked as a future opt-in feature backend.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m75">SHIPPED.md#m75</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M8 auto BPM thru streaming">
@@ -337,7 +337,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">BpmStream per Thru deck. M8.1 lands log-band ODF + windowed-energy picker so reggae 65, hip-hop 90/100, and rolling dnb 174 lock at the correct octave without genre hints.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m8">M8</a> · <a href="../SHIPPED.md#m81">M8.1</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M8</a> · <a href="../history/SHIPPED.md">M8.1</a></div>
         </div>
 
         <!-- =========================================================
@@ -352,7 +352,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Thru waveform capture at 60 fps. M9.5 extracts <code>dub-spectral</code> with 8-band peak capture via realfft, replacing the original rustfft dependency.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m9">M9</a> · <a href="../SHIPPED.md#m95">M9.5</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M9</a> · <a href="../history/SHIPPED.md">M9.5</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M0.5 apple shell smoke screen">
@@ -362,7 +362,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">SwiftUI / AppKit project, UniFFI integration, signing scaffolding, smoke screen that boots the engine and prints "engine OK". The shell that all later UI work lives in.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m05">SHIPPED.md#m05</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10A M10B dub-ffi metal renderer waveform">
@@ -372,7 +372,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">The DubEngine FFI object. Metal renderer that pulls peaks from the engine and draws the first live broadband waveform on the Apple shell.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m10a">M10-A</a> · <a href="../SHIPPED.md#m10b">M10-B</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M10-A</a> · <a href="../history/SHIPPED.md">M10-B</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10.1 M10.2 shader fragment color polish">
@@ -382,7 +382,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Multi-colour shader · deck B mirror · palette presets · honest silence and clipping. M10.2 remainder was superseded by the M10.5h–p shader ladder, then rolled back in M10.8.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m101">M10.1</a> · <a href="../SHIPPED.md#m102">M10.2</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M10.1</a> · <a href="../history/SHIPPED.md">M10.2</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10.3 M10.4 performance shell vertical waveform">
@@ -392,7 +392,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">The performance-mode chrome and the symmetric two-deck layout that's the default surface today.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m103">M10.3</a> · <a href="../SHIPPED.md#m104">M10.4</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M10.3</a> · <a href="../history/SHIPPED.md">M10.4</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10.5 file playback dev loop background load">
@@ -403,11 +403,11 @@
             </div>
             <div class="ms__body">File-playback dev loop (a, b), Track Overview waveform + horizontal shader (c), background load with off-thread decode (d), waveform polish (e–g), shader exploration ladder rolled back at M10.8, playhead-vs-audio drift fix (n) that survived the rollback, and the load-never-blocks-playback rework + O(N²) BPM bug fix (v).</div>
             <div class="ms__meta">
-                <a href="../SHIPPED.md#m105">M10.5</a> ·
-                <a href="../SHIPPED.md#m105c">M10.5c</a> ·
-                <a href="../SHIPPED.md#m105d">M10.5d</a> ·
-                <a href="../SHIPPED.md#m105hp">M10.5h–p</a> ·
-                <a href="../SHIPPED.md#m105v">M10.5v</a>
+                <a href="../history/SHIPPED.md">M10.5</a> ·
+                <a href="../history/SHIPPED.md">M10.5c</a> ·
+                <a href="../history/SHIPPED.md">M10.5d</a> ·
+                <a href="../history/SHIPPED.md">M10.5h–p</a> ·
+                <a href="../history/SHIPPED.md">M10.5v</a>
             </div>
         </div>
 
@@ -418,7 +418,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Mouse transport (allowed; not a performance gesture). Panic Play keystroke transitions the deck from timecode-driven to last-known-velocity for needle-dirt recovery.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m106">SHIPPED.md#m106</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10.7 phase drift trail">
@@ -428,7 +428,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Centre-gutter visualisation that slopes when tempos differ and centres when in phase. Updates at 30 Hz with ≤ 1 frame of stutter at 60 fps UI.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m107">SHIPPED.md#m107</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M10.8 track preparation mode shell waveform baseline freeze">
@@ -438,7 +438,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Prep mode auto-boots when no multi-channel interface is connected. The waveform shader baseline is frozen here; future shader work must benchmark against this baseline (§9.6.0 guardrail).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m108">SHIPPED.md#m108</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <!-- =========================================================
@@ -453,7 +453,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">SQLite library at <code>~/Library/Application Support/Dub/library.sqlite</code>. Path-by-volume-UUID design so drive moves, rename, and re-encodes don't break track identity. Schema v1.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11a">SHIPPED.md#m11a</a> · <a href="schema.html">schema view</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a> · <a href="../spec/LIBRARY-SCHEMA.md">schema view</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11b chromaprint fingerprint dedupe canonical">
@@ -463,7 +463,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Pure-Rust Chromaprint via <code>rusty-chromaprint</code> (not the LGPL C library). Canonical fingerprint per recording, not per file. Version-aware dedupe so "clean" and "dirty" cuts don't collapse onto each other.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11b">SHIPPED.md#m11b</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11c filesystem importer filename parser">
@@ -473,7 +473,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Recursive folder import via walkdir with stable depth-first order. Filename parser that strips version tokens (clean / dirty / instrumental / acapella / radio / edit / extended / remix / etc.) into <code>track_metadata_source.version_token</code>.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11c">SHIPPED.md#m11c</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.1 library browser shell">
@@ -483,7 +483,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">The first functional library browser pane. Functional replacement for the M10.5b file-browser sidebar; that sidebar (<code>FileBrowserView</code>) survives as dead code today (C-24 backlog).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d1">SHIPPED.md#m11d1</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.2 recently played wiring sortable columns">
@@ -493,7 +493,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Recently Played smart crate wired up to <code>play_history</code>. Sortable browser columns. Sort semantics drift between FFI and client sort tracked as U-18 in the backlog.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d2">SHIPPED.md#m11d2</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.3 per-row indicators loaded deck library">
@@ -503,7 +503,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Leftmost-column glyph in the LibraryView indicates the loaded-now A / B track. Prevents the "I just loaded the track that's already playing" mistake and visually confirms Instant Doubles.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d3">SHIPPED.md#m11d3</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.4 missing files scanner relocate panel">
@@ -513,7 +513,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Schema v2 adds <code>track_files.is_missing</code> + <code>last_checked_at</code> + two indexes. Background scanner runs at 30 s tick (5 min nap when idle) to avoid SSD wear. Relocate panel adds a fresh <code>track_files</code> row at the new path without deleting the original.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d4">SHIPPED.md#m11d4</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.5 dogfooding performance mode play deck B phantom beatgrid">
@@ -523,7 +523,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Multiple dogfooding rounds. Performance-mode play fix, library-sourced beat grid as the single source of truth (closes B-25, C-26), beat-grid overlay smoothness, deck-header layout (closes B-26). Header height changes during M11d.5 round 5 are visible in the design tokens.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d5">SHIPPED.md#m11d5</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11c.1 lazy auto beatgrid analysis lifecycle">
@@ -533,7 +533,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Auto-analyzes tracks on first interaction. Background batch path for "Analyze N selected" with quiet footer progress.</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11c1">SHIPPED.md#m11c1</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11c.2 key detection camelot canonical">
@@ -543,7 +543,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Krumhansl-Kessler-based key detection. <code>track_keys</code> table at schema v3 with verbatim source preservation for round-trip discipline. Relative-major-aware cross-validation (<code>8B</code> vs <code>5A</code> is a real disagreement; <code>8B</code> vs <code>8A</code> isn't).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11c2">SHIPPED.md#m11c2</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11c.3 BPM octave fix perceptual prior reggae hip hop fouronfloor tap to grid">
@@ -553,7 +553,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Perceptual tempo prior, reggae skank + hip-hop double-time rejection, genre-aware <code>OctaveProfile</code>, FourOnFloor / Dub mid-band fix. Tap-to-grid manual override. Lazy fingerprint (deferred from import to first deck-load). Closes backlog B-11 (octave) and U-19 (tap-to-grid).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11c3a">M11c.3a</a> · <a href="../SHIPPED.md#m11c3b">M11c.3b</a> · <a href="../SHIPPED.md#m11c4">M11c.4</a> · <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">detector investigation</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M11c.3a</a> · <a href="../history/SHIPPED.md">M11c.3b</a> · <a href="../history/SHIPPED.md">M11c.4</a> · <a href="../investigations/BPM-DETECTOR-V2-INVESTIGATION.md">detector investigation</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11d.6 M11d.7 full screen launch off main thread waveform beatgrid precision auto downbeat drift lock">
@@ -563,7 +563,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Full-screen on launch with windowed snap-back; waveform rendering moved off the main thread (dedicated <code>CVDisplayLink</code> render thread); seven-stage auto beat-grid pipeline with auto downbeat, <code>GridQuality</code> auto-lock, and per-track grid lock (schema v4 <code>grid_locked</code>).</div>
-            <div class="ms__meta"><a href="../SHIPPED.md#m11d6">M11d.6</a> · <a href="../SHIPPED.md#m11d7">M11d.7</a></div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">M11d.6</a> · <a href="../history/SHIPPED.md">M11d.7</a></div>
         </div>
 
         <div class="ms" data-tags="shipped" data-filter-text="PRD-BEATS hardening uniform traktor beatgrid bar phase set the 1 robustness rounds diagnose jitter">
@@ -573,7 +573,7 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body">Uniform Traktor-style grid + calibration; explicit <code>bar_phase</code> (schema v5) so "set the 1" is a pure rotation; relatch from taps; robustness rounds 5–10 (universal downbeat, <code>OctaveProfile::HipHop</code> / <code>DrumAndBass</code>, integer-snap safety net) + <code>dub diagnose</code> CLI; waveform + beat-grid jitter killed end to end.</div>
-            <div class="ms__meta"><a href="../PRD-BEATS.md">PRD-BEATS.md</a> · <a href="beats.html">beat grid view</a></div>
+            <div class="ms__meta"><a href="../spec/PRD-BEATS.md">PRD-BEATS.md</a> · <a href="../spec/PRD-BEATS.md">beat grid view</a></div>
         </div>
 
         <!-- =========================================================
@@ -588,7 +588,17 @@
                 <span class="pill pill--shipped">Shipped</span>
             </div>
             <div class="ms__body"><strong>Shipped:</strong> User-created Dub crates backed by the <code>crates</code> + <code>crate_tracks</code> tables — create, inline-rename, delete (cascade), drag tracks in, remove, and reorder (drag-to-reorder with an insertion line + context-menu move). A <code>#</code> manual-order column carries the order: it is the crate's default sort and the only state in which reordering is enabled, so clicking any other header sorts the crate as a read-only view and the <code>#</code> header returns to manual order (the row model carries <code>crate_ordinal</code> so manual order can compose into future multi-column sorting). Editable "Dub Crates" sidebar section; FFI <code>FFI_VERSION 29</code>. Nested crates deferred to a follow-up.</div>
-            <div class="ms__meta"><a href="../PRD.md#851-source-tree">PRD.md §8.5.1</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#851-source-tree">PRD.md §8.5.1</a></div>
+        </div>
+
+        <div class="ms" data-tags="shipped" data-filter-text="M11d.8 polish first-run onboarding search debounce reachability prep autoplay">
+            <div class="ms__head">
+                <span class="ms__id">M11d.8</span>
+                <span class="ms__name">Polish &amp; First-Run</span>
+                <span class="pill pill--shipped">Shipped</span>
+            </div>
+            <div class="ms__body"><strong>Shipped:</strong> Stability + first-run pass — search debounce + selection-preserve, a sweep of dev-facing milestone text out of the UI, edge-of-list beep, idle-hint layout, and a skippable first-run onboarding sheet (re-openable from Preferences). Dogfood fixes: the library reachability ⚠ false-positive on healthy volumes, and Prep-mode Space-load now auto-plays like drag-and-drop (Performance mode still never auto-plays). Closed UI-backlog B-8/B-9 + U-12/16/19/20/22/23.</div>
+            <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a> · <a href="../UI-BACKLOG.md">UI-BACKLOG.md</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11d-history played from into deck header session">
@@ -598,7 +608,7 @@
                 <span class="pill pill--inprog">Next up · 1–2 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Deck header and session history surface useful transitions from <code>play_history.from_track_id</code> / <code>to_track_id</code>.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11e serato importer DB crates GEOB">
@@ -608,7 +618,7 @@
                 <span class="pill pill--planned">Planned · 4–5 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Read Serato DB / crates / GEOB tags. Populate source metadata, beatgrids, keys, imported crates, cues, and loops.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a> · <a href="../LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a> · <a href="../spec/LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11d-columns customizable browser columns">
@@ -618,7 +628,7 @@
                 <span class="pill pill--planned">Planned · 3–4 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> User can choose visible columns, inspect source-specific metadata, and see analysis vs source disagreements without paying query cost for disabled columns.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11f export rekordbox xml m3u m3u8">
@@ -628,7 +638,7 @@
                 <span class="pill pill--planned">Planned · 3 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M12 rekordbox traktor itunes lexicon importers">
@@ -638,7 +648,7 @@
                 <span class="pill pill--planned">Planned · ~5.5 days total</span>
             </div>
             <div class="ms__body"><strong>Demos:</strong> User-exported rekordbox XML (DB6 deferred to v1.1); Traktor <code>collection.nml</code>; iTunes <code>Library.xml</code>; Lexicon export-path documented (no code).</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a> · <a href="../LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a> · <a href="../spec/LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M13 looping manual auto halve double">
@@ -648,7 +658,7 @@
                 <span class="pill pill--planned">Planned · 4–6 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Manual and auto-loop, halve / double, behave correctly under timecode.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M14 key lock auto bypass rubber band stretch">
@@ -658,7 +668,7 @@
                 <span class="pill pill--planned">Planned · 1 week</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Rubber Band integrated per deck with scratch-aware auto-bypass per PRD §6.1.1. Activates the GPL-3.0 license posture for the dep graph (placeholder crate <code>dub-stretch</code> exists today).</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M15 M16 smart fx echo out dub siren synth delay reverb">
@@ -668,7 +678,7 @@
                 <span class="pill pill--planned">Planned · ~8 days total</span>
             </div>
             <div class="ms__body"><strong>Demos:</strong> Tap-and-hold echo-out works on both decks including Thru decks (M15). Dub siren synth + delay + reverb is keyboard-controllable (M16).</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M17 sampler quick scratch instant doubles">
@@ -678,7 +688,7 @@
                 <span class="pill pill--planned">Planned · 4–6 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> All three trigger systems work per PRD §7. Sampler is 4 slots; expansion to Serato-parity 6 deferred to v1.x if real use demands it.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M18 polish alpha calibration preferences dark mode rig checklist">
@@ -688,7 +698,7 @@
                 <span class="pill pill--planned">Planned · 2–3 weeks</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Calibration UX, preferences, key remapping, dark-mode polish, manual rig checklist (§2.2.10) ready for 3–5 trusted DJs. Marks the transition Phase A → Phase B.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M19 beta github releases feature freeze hotfix">
@@ -698,7 +708,7 @@
                 <span class="pill pill--planned">Planned · 2–4 weeks, gig-gated</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Public opt-in beta on GitHub Releases. Feature-frozen for v1.0 with hotfix discipline active. Phase B → Phase C bridge.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M20 v1 stable release SLO DMG">
@@ -708,7 +718,7 @@
                 <span class="pill pill--planned">Planned · 3–5 days once SLOs pass</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> §2.2.6 SLOs met. DMG published. README / docs / demo ready. Ships unsigned-with-instructions; code signing + notarization deferred to v1.1 (M23).</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a> · <a href="../PRD.md#14-acceptance-criteria-for-v10">PRD.md §14</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a> · <a href="../spec/PRD.md#14-acceptance-criteria-for-v10">PRD.md §14</a></div>
         </div>
 
         <!-- =========================================================
@@ -723,7 +733,7 @@
                 <span class="pill">v1.1</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Chromaprint integrated. First play of a real record captures fingerprint; second play recognizes within 5–10 s and loads saved waveform.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 
         <div class="ms" data-tags="v11" data-filter-text="M22 persistent waveform learning thru library">
@@ -733,7 +743,7 @@
                 <span class="pill">v1.1</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Captured Thru waveforms persist to library DB; rendered immediately on recognized records.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 
         <div class="ms" data-tags="v11" data-filter-text="M23 code signing notarization apple developer id auto update">
@@ -743,7 +753,7 @@
                 <span class="pill">v1.1</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Apple Developer ID acquired. Notarized DMG. Auto-update mechanism in place.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 
         <div class="ms" data-tags="v11" data-filter-text="M24 beatgrid editor full grid downbeat nudge halve double taps">
@@ -753,7 +763,7 @@
                 <span class="pill">v1.1</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Full grid editing UX (drag downbeat, nudge BPM, halve / double, taps). The v1 tap-to-grid path already shipped (M11c.3b / M11d.7); the full editor is the v1.1 expansion.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 
         <div class="ms" data-tags="v11" data-filter-text="M25 opt-in crash reporting sentry telemetry">
@@ -763,7 +773,7 @@
                 <span class="pill">v1.1</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Sentry (or similar) integration with explicit user toggle, file-path redaction per PRD §2.2.7.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 
     </div>
@@ -810,9 +820,9 @@
 
 <div class="dub-source-row">
     <span>Generated from</span>
-    <a href="../PRD.md">docs/PRD.md</a> §12 + §15
+    <a href="../spec/PRD.md">docs/PRD.md</a> §12 + §15
     <span>·</span>
-    <a href="../SHIPPED.md">docs/SHIPPED.md</a> table of contents
+    <a href="../history/SHIPPED.md">docs/SHIPPED.md</a> table of contents
 </div>
 
 </main>

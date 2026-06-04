@@ -34,7 +34,7 @@ struct AboutOverlay: View {
 struct AboutSheet: View {
 
     private let githubURL = URL(string: "https://github.com/kLOsk/dub")
-    private let docsURL = URL(string: "https://github.com/kLOsk/dub/blob/main/docs/PRD.md")
+    private let docsURL = URL(string: "https://github.com/kLOsk/dub/blob/main/docs/spec/PRD.md")
 
     var body: some View {
         VStack(spacing: 0) {

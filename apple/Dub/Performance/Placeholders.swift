@@ -10,10 +10,11 @@
 //                            Scratch).
 //
 //  Each placeholder is a visible-but-honest dim block with a tiny
-//  caption naming the milestone that owes it real content. The
-//  goal is to make "M15 hasn't shipped yet" obvious to anyone
-//  looking at the running app, and to make the layout sizes wrong
-//  *now* if they would be wrong later.
+//  "Coming soon" caption. The goal is to make the unshipped slots
+//  obvious to anyone looking at the running app (in DJ language, not
+//  our milestone codes — see U-12 / U-22), and to make the layout
+//  sizes wrong *now* if they would be wrong later. The milestone
+//  that owes each slot is noted in code comments only.
 //
 
 import SwiftUI
@@ -35,8 +36,8 @@ struct FXBarPlaceholder: View {
     @ViewBuilder
     private func deckColumn(_ side: DeckSide) -> some View {
         HStack(spacing: DubSpacing.md) {
-            modulePlaceholder("ECHO-OUT", milestone: "M15")
-            modulePlaceholder("DUB SIREN", milestone: "M16")
+            modulePlaceholder("ECHO-OUT")   // M15
+            modulePlaceholder("DUB SIREN")  // M16
             scratchPlaceholder(side: side)
             samplerPlaceholder(side: side)
             Spacer(minLength: 0)
@@ -46,14 +47,18 @@ struct FXBarPlaceholder: View {
         .background(DubColor.surface2)
     }
 
+    /// User-facing caption for an unshipped slot. Deliberately names
+    /// the state in DJ language, never our milestone codes (U-12).
+    private static let comingSoonCaption = "Coming soon"
+
     @ViewBuilder
-    private func modulePlaceholder(_ label: String, milestone: String) -> some View {
+    private func modulePlaceholder(_ label: String) -> some View {
         VStack(alignment: .leading, spacing: DubSpacing.xs) {
             Text(label)
                 .font(DubFont.caps)
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
-            Text(milestone)
+            Text(Self.comingSoonCaption)
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textPlaceholder)
         }
@@ -70,24 +75,24 @@ struct FXBarPlaceholder: View {
         // PRD §7 Quick Scratch keymap intent — final binding lives
         // with M17).
         let keys = (side == .a) ? ["Q", "W"] : ["E", "R"]
-        keyCapGroup(label: "SCRATCH", keys: keys, milestone: "M17")
+        keyCapGroup(label: "SCRATCH", keys: keys)   // M17
     }
 
     @ViewBuilder
     private func samplerPlaceholder(side: DeckSide) -> some View {
         let keys = (side == .a) ? ["A", "S"] : ["D", "F"]
-        keyCapGroup(label: "SAMPLER", keys: keys, milestone: "M17")
+        keyCapGroup(label: "SAMPLER", keys: keys)   // M17
     }
 
     @ViewBuilder
-    private func keyCapGroup(label: String, keys: [String], milestone: String) -> some View {
+    private func keyCapGroup(label: String, keys: [String]) -> some View {
         VStack(alignment: .leading, spacing: DubSpacing.xs) {
             HStack(spacing: DubSpacing.xs) {
                 Text(label)
                     .font(DubFont.caps)
                     .tracking(0.8)
                     .foregroundStyle(DubColor.textSecondary)
-                Text(milestone)
+                Text(Self.comingSoonCaption)
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textPlaceholder)
             }

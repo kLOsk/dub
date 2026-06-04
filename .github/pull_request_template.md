@@ -1,4 +1,4 @@
-<!-- Thanks for contributing! See AGENTS.md and docs/PRD.md for context. -->
+<!-- Thanks for contributing! See AGENTS.md and docs/spec/PRD.md for context. -->
 
 ## Summary
 
@@ -22,7 +22,7 @@
 
 ## PRD impact
 
-<!-- Does this change anything in the PRD? Update docs/PRD.md if so. -->
+<!-- Does this change anything in the PRD? Update docs/spec/PRD.md if so. -->
 
 ## Out-of-scope check
 

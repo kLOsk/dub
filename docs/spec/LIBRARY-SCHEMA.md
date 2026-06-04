@@ -810,4 +810,4 @@ LIMIT 10;
 * [docs/LIBRARY-FORMATS.md](LIBRARY-FORMATS.md) — source-format notes
   for the M11e Serato importer and M12 Traktor / rekordbox / iTunes
   importers
-* [docs/SHIPPED.md](SHIPPED.md) — milestone history
+* [docs/SHIPPED.md](../history/SHIPPED.md) — milestone history

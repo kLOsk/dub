@@ -23,7 +23,7 @@
 //!    `λ = ` [`LAMBDA`]. Klapuri 2006-style μ-law-ish compression — linear
 //!    near silence (so spectral-leakage noise stays quiet) and logarithmic
 //!    at audible levels (so loud bins don't dominate). See
-//!    [`docs/SHIPPED.md#m81`](../../docs/SHIPPED.md#m81) for the
+//!    [`docs/history/SHIPPED.md#m81`](../../docs/history/SHIPPED.md#m81) for the
 //!    derivation of `λ = 1000`.
 //! 2. The log-spaced frequency-band layout for this sample rate.
 //!    [`NUM_BANDS`] = 8 bands from [`BAND_MIN_HZ`] to [`BAND_MAX_HZ`].

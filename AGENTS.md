@@ -1,7 +1,7 @@
 # AGENTS.md — project context for AI assistants
 
 > **Always-loaded context for any AI agent working in this repo.**
-> Source of truth for product spec: `docs/PRD.md`. Read it first if uncertain.
+> Source of truth for product spec: `docs/spec/PRD.md`. Read it first if uncertain.
 
 ---
 
@@ -62,10 +62,13 @@ crates/
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).
-docs/                PRD.md (forward-looking spec),
-                     SHIPPED.md (M0 → M7 design history),
-                     ARCHITECTURE.md (how the crates fit together),
-                     LIBRARY-FORMATS.md (Serato/Traktor/… format notes).
+docs/                README.md (routing guide — which doc to load for a task) + UI-BACKLOG.md.
+  spec/              PRD.md (forward-looking spec), PRD-BEATS.md, ARCHITECTURE.md,
+                     LIBRARY-SCHEMA.md, LIBRARY-FORMATS.md, LICENSE-DEPENDENCIES.md.
+  history/           SHIPPED.md (one-line-per-milestone index; detail in git) +
+                     LESSONS.md (pitfalls + load-bearing decisions — read before touching a subsystem).
+  investigations/    BPM-DETECTOR-V2 + WAVEFORM-JITTER runbooks.
+  html/              status dashboard (index / roadmap / backlog).
 scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
 .claude/             Claude Code settings + hooks (mirrors .cursor/; see CLAUDE.md).

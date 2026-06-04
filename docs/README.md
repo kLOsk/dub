@@ -3,7 +3,27 @@
 Use this file to choose the smallest useful doc set for a task. The goal is to
 avoid loading the whole `docs/` folder when one anchored section is enough.
 
-## Source Of Truth
+## Folder layout
+
+```
+docs/
+  README.md            this routing guide
+  UI-BACKLOG.md        open UI/UX work (+ a closed archive)
+  spec/                binding spec + reference (source of truth)
+    PRD.md  PRD-BEATS.md  ARCHITECTURE.md
+    LIBRARY-SCHEMA.md  LIBRARY-FORMATS.md  LICENSE-DEPENDENCIES.md
+  history/             durable, backward-looking
+    SHIPPED.md         one-line-per-milestone index (detail in git)
+    LESSONS.md         pitfalls + load-bearing decisions
+  investigations/      research / runbooks
+    BPM-DETECTOR-V2-INVESTIGATION.md  WAVEFORM-JITTER-CAPTURE.md
+  html/                read-only status dashboard (index / roadmap / backlog)
+```
+
+Doc names below are unique, so they're referenced by bare name; the folder map
+above says where each lives.
+
+## Source of truth — `spec/`
 
 - `PRD.md` is the product source of truth: scope, non-goals, milestone plan,
   acceptance criteria, and user-facing behavior.
@@ -17,7 +37,18 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 - `LICENSE-DEPENDENCIES.md` is the source of truth for dependency licenses and
   binary attribution.
 
-## Investigation notes and runbooks (durable, not source of truth)
+## Lessons and history — `history/`
+
+- `LESSONS.md` is the distilled "don't repeat these mistakes" file: the
+  hard-won pitfalls and load-bearing decisions (RT-safety, timecode lift,
+  BPM octave ceiling, waveform sample-rate drift, FFI versioning, library
+  reachability, …). **Read the relevant section before touching a subsystem.**
+- `SHIPPED.md` is now a one-line-per-milestone **index** of what has shipped,
+  in build order. The detailed per-milestone write-ups moved to git history —
+  `git log` the crate, or read the landing commit, when you need the full
+  archaeology. Durable rationale was lifted into `LESSONS.md`.
+
+## Investigation notes and runbooks — `investigations/`
 
 - `BPM-DETECTOR-V2-INVESTIGATION.md` records why a classical (non-ML) detector
   does not beat the tuned Classic `dub-bpm` octave logic, and the learned
@@ -28,21 +59,18 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
   investigated jitter was fixed end to end; this remains the procedure if it
   recurs (the probes and `make trace-grid` targets are still wired).
 
-## Human-facing HTML views (read-only, optional)
+## Human-facing HTML dashboard (read-only, optional)
 
-`docs/html/` holds an HTML dashboard generated from the Markdown sources for
-human reading and sharing. Open `docs/html/index.html` in a browser. **These
-are not the source of truth and AI agents should not load them**: agents read
-the Markdown directly (cheaper, anchorable, single source). Refresh manually
-when the Markdown diverges.
+`docs/html/` is a **status dashboard only** — three hand-kept pages, openable
+from `file://` with no build step. It is deliberately *not* a mirror of the
+reference docs (the old `architecture.html` / `schema.html` / `beats.html`
+duplicated Markdown and rotted, so they were deleted). **AI agents should not
+load these** — read the Markdown directly. See `html/README.md` for the rule.
 
-| View | Backs the Markdown |
+| Page | Mirrors |
 | --- | --- |
-| `html/index.html` | Project landing + non-negotiables + doc routing card |
-| `html/architecture.html` | `ARCHITECTURE.md` (visual crate graph, RT-safety layers, messaging) |
-| `html/beats.html` | `PRD-BEATS.md` (SVG diagrams for grid anatomy, set-the-1, tap tempo, drift, industry comparison) |
-| `html/roadmap.html` | `PRD.md` §12 + `SHIPPED.md` TOC (milestone timeline) |
-| `html/schema.html` | `LIBRARY-SCHEMA.md` (interactive ER diagram + table reference) |
+| `html/index.html` | Project landing + non-negotiables + doc routing |
+| `html/roadmap.html` | `PRD.md` §12 + `SHIPPED.md` (milestone timeline, filter chips) |
 | `html/backlog.html` | `UI-BACKLOG.md` (kanban with filter chips) |
 
 ## Load By Task
@@ -50,7 +78,8 @@ when the Markdown diverges.
 | Task | Read |
 | --- | --- |
 | Product scope, out-of-scope, milestone planning | Relevant `PRD.md` section |
-| Why a past implementation looks this way | Anchored section in `SHIPPED.md` |
+| Pitfalls before touching a subsystem | Relevant `LESSONS.md` section |
+| Why a past implementation looks this way | `LESSONS.md`, then `git log` the crate (`SHIPPED.md` indexes the milestone) |
 | Crate/threading/FFI structure | `ARCHITECTURE.md` overview, then relevant section |
 | Library DB, migrations, FTS, analysis cache | `LIBRARY-SCHEMA.md` |
 | Serato/Traktor/rekordbox/iTunes import quirks | `LIBRARY-FORMATS.md` |
@@ -60,21 +89,20 @@ when the Markdown diverges.
 
 ## Context Budget Rules
 
-- Do not read all of `SHIPPED.md` by default. It is historical archaeology;
-  load an anchor from a PRD or code reference.
+- `SHIPPED.md` is now a short index — fine to skim, but it has no detail; for
+  "why did this land this way?" read the matching `LESSONS.md` section, then
+  `git log` the crate.
 - Do not read all of `PRD.md` for implementation work. Start with the relevant
   section, then follow links.
 - Prefer code plus `ARCHITECTURE.md` for "how does this work today?" questions.
-  Use `SHIPPED.md` only when the task asks "why did this land this way?"
 - Keep backlog files task-specific. `UI-BACKLOG.md` should not be loaded for
   engine, DSP, library schema, or license work.
 
 ## Maintenance
 
 When adding a new doc, update this routing guide in the same change. When a
-backlog item ships, either remove it or mark it fixed with the shipped anchor.
-When the Markdown source of an HTML view in `docs/html/` changes in a way that
-materially alters the view (new milestone, new schema table, retired backlog
-item, new architecture diagram), refresh the corresponding HTML by re-reading
-the source and updating the static page. HTML refresh is manual; the Markdown
-remains canonical.
+backlog item ships, move it to the `UI-BACKLOG.md` "Closed (archive)" list and,
+if it carries a durable lesson, add that to `LESSONS.md`. When a milestone
+ships, add its one-liner to `SHIPPED.md` and reflect the headline in
+`html/roadmap.html`. Keep `docs/html/` to the three status pages — reference
+material belongs in Markdown, never a new HTML page (see `html/README.md`).

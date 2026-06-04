@@ -162,10 +162,10 @@
     <span class="dub-nav__sep"></span>
     <div class="dub-nav__links">
         <a href="index.html">Overview</a>
-        <a href="architecture.html">Architecture</a>
-        <a href="beats.html">Beat grid</a>
+        <a href="../spec/ARCHITECTURE.md">Architecture</a>
+        <a href="../spec/PRD-BEATS.md">Beat grid</a>
         <a href="roadmap.html">Roadmap</a>
-        <a href="schema.html">Library schema</a>
+        <a href="../spec/LIBRARY-SCHEMA.md">Library schema</a>
         <a href="backlog.html">UI backlog</a>
     </div>
     <span class="dub-nav__source">source: UI-BACKLOG.md · triaged 2026-05-17</span>
@@ -406,7 +406,7 @@
         <ul style="color: var(--dub-text-muted); padding-left: 1.2em;">
             <li>Buckets are roughly ordered by priority within each section (top of list → fix first).</li>
             <li><strong>B-7 → B-9</strong> should land before major new library UI features, since they affect existing functionality.</li>
-            <li>The beat-grid cluster (<strong>B-11 octave</strong>, <strong>U-18 grid jitter</strong>, <strong>U-19 tap-to-grid</strong>) has shipped / closed. Further automatic octave gains are gated on a learned beat tracker — see <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>, not a heuristic-tuning task.</li>
+            <li>The beat-grid cluster (<strong>B-11 octave</strong>, <strong>U-18 grid jitter</strong>, <strong>U-19 tap-to-grid</strong>) has shipped / closed. Further automatic octave gains are gated on a learned beat tracker — see <a href="../investigations/BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>, not a heuristic-tuning task.</li>
             <li><strong>C-24 / C-25</strong> (<code>FileBrowserView</code> + <code>LibraryPlaceholder</code> dead code) are deleted.</li>
             <li>The UX bucket can land alongside <strong>M11e (Library polish)</strong> — most items are surface-level copy or layout tweaks.</li>
             <li>Code-health items are not blocking but should be ticked off as PRs touch the affected files.</li>
@@ -439,15 +439,15 @@
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-11</span> · Auto BPM locks at 2× · <span class="pill pill--shipped">addressed M11c.3 + PRD-BEATS</span></h3>
-                    <p style="color: var(--dub-text-muted); font-size: 13px;">Octave hardened across M11c.3a–f (perceptual prior, reggae / hip-hop double-time rejection, genre-aware <code>OctaveProfile</code>) and PRD-BEATS rounds 5–10 (<code>OctaveProfile::HipHop</code> / <code>DrumAndBass</code>, integer-snap safety net). Real-music corpus now at <code>dub-bpm/tests/fixtures/*.tsv</code> (Classic = 11/94). Residual ambiguous tracks are handled by tap-to-grid; further automatic gains are gated on a learned beat tracker — see <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>.</p>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Octave hardened across M11c.3a–f (perceptual prior, reggae / hip-hop double-time rejection, genre-aware <code>OctaveProfile</code>) and PRD-BEATS rounds 5–10 (<code>OctaveProfile::HipHop</code> / <code>DrumAndBass</code>, integer-snap safety net). Real-music corpus now at <code>dub-bpm/tests/fixtures/*.tsv</code> (Classic = 11/94). Residual ambiguous tracks are handled by tap-to-grid; further automatic gains are gated on a learned beat tracker — see <a href="../investigations/BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>.</p>
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">U-19</span> · Tap-to-grid · <span class="pill pill--shipped">shipped M11c.3b / M11d.7</span></h3>
-                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deck-header BPM affordance: 1–2 taps relatch the downbeat (pure <code>bar_phase</code> rotation, BPM bit-identical); 3+ taps recompute tempo via <code>analyze_beat_grid_from_taps</code>. Persists <code>user_tap</code> rows and installs the grid in-place without full reanalysis. Binding spec is <a href="../PRD-BEATS.md">PRD-BEATS.md</a>.</p>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deck-header BPM affordance: 1–2 taps relatch the downbeat (pure <code>bar_phase</code> rotation, BPM bit-identical); 3+ taps recompute tempo via <code>analyze_beat_grid_from_taps</code>. Persists <code>user_tap</code> rows and installs the grid in-place without full reanalysis. Binding spec is <a href="../spec/PRD-BEATS.md">PRD-BEATS.md</a>.</p>
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">U-18</span> · Beat-grid overlay jitter · <span class="pill pill--shipped">fixed (jitter killed end to end)</span></h3>
-                    <p style="color: var(--dub-text-muted); font-size: 13px;">Grid + envelope now share one audio-clock-extrapolated playhead (<code>EngineHostTimeMapping</code> / <code>PlayheadMarker</code>) and render off the main thread (<code>WaveformRenderThread</code>). The <code>os_signpost</code> runbook in <a href="../WAVEFORM-JITTER-CAPTURE.md">WAVEFORM-JITTER-CAPTURE.md</a> stays wired for the next regression.</p>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Grid + envelope now share one audio-clock-extrapolated playhead (<code>EngineHostTimeMapping</code> / <code>PlayheadMarker</code>) and render off the main thread (<code>WaveformRenderThread</code>). The <code>os_signpost</code> runbook in <a href="../investigations/WAVEFORM-JITTER-CAPTURE.md">WAVEFORM-JITTER-CAPTURE.md</a> stays wired for the next regression.</p>
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-26</span> · Waveform scrub lag · <span class="pill pill--shipped">closed M11d.5</span></h3>
