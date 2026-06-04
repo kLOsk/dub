@@ -53,10 +53,8 @@ final class LibrarySelectionModel: ObservableObject {
     /// Previously lived on `LibraryAppModel`; moved here so a
     /// row click doesn't invalidate `LibraryView` a second time
     /// after the local `selectedTrackIds` `@State` write already
-    /// scheduled a body re-eval. `FileBrowserView` observes the
-    /// new model directly through `@ObservedObject var
-    /// librarySelection` and so still sees `browserSelection`
-    /// changes live for preview builds.
+    /// scheduled a body re-eval. Consumers observe this model
+    /// directly through `@ObservedObject var librarySelection`.
     @Published var browserSelection: URL? = nil
 
     /// Canonical UUID of the LibraryView's currently selected

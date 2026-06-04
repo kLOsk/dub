@@ -40,7 +40,10 @@ use dub_bpm::{
     latch_beat_grid_at_downbeat, octave_profile_from_genre, uniform_beats,
     BeatGrid as CoreBeatGrid, GridQuality as CoreGridQuality, OctaveProfile,
 };
-use dub_engine::{DeckSharedState, Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
+use dub_engine::{
+    DeckSharedState, Engine, EngineHandle, ThruInputConfig, TimecodeInputConfig,
+    INTERNAL_MIXER_ROUTING,
+};
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
 };
@@ -204,7 +207,57 @@ uniffi::setup_scaffolding!();
 ///       is exactly `1/refreshRate` (the panel's crystal-locked
 ///       refresh interval), collapsing the visible motion's
 ///       wall-time noise to zero.
-pub const FFI_VERSION: u32 = 27;
+///   28. **M11d-next — Dub crates (user playlists)** — new
+///       [`LibraryCrate`] record plus the [`DubLibrary`] crate
+///       surface: `list_crates`, `create_crate`, `rename_crate`,
+///       `delete_crate`, `add_track_to_crate`,
+///       `remove_track_from_crate`, `set_crate_track_order`, and
+///       `crate_tracks`. Two new [`LibraryFfiError`] variants
+///       (`CrateNameConflict`, `NotFound`) let the Apple shell
+///       distinguish a sibling-name clash and a raced-delete from
+///       a generic query failure. Backs the editable "Dub Crates"
+///       sidebar section (PRD §8.5.1).
+///   29. **M11d-next — crate manual-order rank on the row** —
+///       [`LibraryTrack`] grows `crate_ordinal: Option<u32>`. It is
+///       `None` for every listing except [`DubLibrary::crate_tracks`],
+///       which stamps each row's dense 0-based position in the
+///       ordinal-sorted member slice. The Apple shell renders it as
+///       the browser's `#` column and uses it as the manual-order
+///       sort key, which also gates whether drag-to-reorder is
+///       enabled (only in manual order). No new methods — the
+///       reorder write still goes through `set_crate_track_order`.
+///   30. Device classifier + per-device output selection. The FFI
+///       surface gains [`DubEngine::list_audio_devices`] returning
+///       a vector of [`AudioDeviceInfo`] (uid + name +
+///       manufacturer + channel counts + category enum) so the
+///       Apple shell can populate Performance / Prep mode pickers
+///       without seeing the built-in mic, iPhone Continuity mic,
+///       Camo / Teams virtual devices, or any other non-DJ
+///       hardware. The existing `start_thru` / `start_thru_two_deck`
+///       / `start_engine` methods grow an optional
+///       `output_device_uid` parameter so the Apple shell can pin
+///       master output to a specific interface UID (SL3 in
+///       Performance, built-in speakers in Prep) — previously
+///       output always followed the macOS default. UID-based
+///       selection survives reconnects; name-based fallback is
+///       built into the dub-audio layer for legacy drivers whose
+///       UIDs aren't stable.
+///   31. **Opinionated auto-mode + TCC-safe enumeration.** Adds
+///       [`DubEngine::list_output_devices`] (input-scope-free device
+///       enumeration safe to call in Prep mode and from the
+///       hot-plug listener without waking the mic-permission prompt)
+///       and [`DubEngine::performance_routing_for`] returning a
+///       [`PerformanceRouting`] (per-deck input pairs + output
+///       routing resolved from `devices.toml`) so the Apple shell
+///       auto-configures deck channels from the registry instead of
+///       hardcoding them. `start_thru_two_deck` now routes each deck
+///       to its own physical output pair on the interface (per the
+///       registry) instead of summing both decks to a 2-channel
+///       internal mix — honouring the "external mixer is the
+///       product" non-negotiable. The detection probe
+///       (`has_external_audio_interface`) is now strictly
+///       output-scope-only.
+pub const FFI_VERSION: u32 = 32;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -751,9 +804,15 @@ impl DubEngine {
         })
     }
 
-    /// Enumerate CoreAudio input devices. Returns just their names;
-    /// the Swift picker passes one of these strings back to
-    /// [`start_thru`].
+    /// Enumerate CoreAudio input devices by name (legacy M10.5b API).
+    ///
+    /// Backed by the *classifier-filtered* device list, so the result
+    /// only contains DJ-grade interfaces — the built-in mic, iPhone
+    /// Continuity mic, virtual devices (Camo, Teams, Loopback), and
+    /// every Bluetooth / HDMI / AirPlay device are hidden. Callers
+    /// who want richer information (UID, channel counts,
+    /// manufacturer, category) should switch to
+    /// [`Self::list_audio_devices`] instead.
     ///
     /// Off-RT; safe to call at any time. Returns an empty list if
     /// CoreAudio enumeration fails for any reason (logged via
@@ -762,13 +821,87 @@ impl DubEngine {
     /// branch on a near-impossible failure).
     #[must_use]
     pub fn list_input_devices(&self) -> Vec<String> {
-        match dub_audio::list_input_devices() {
-            Ok(devs) => devs.into_iter().map(|d| d.name).collect(),
+        self.list_audio_devices()
+            .into_iter()
+            .filter(|d| d.category == AudioDeviceCategory::PerformanceInterface)
+            .map(|d| d.name)
+            .collect()
+    }
+
+    /// Enumerate every classified audio device the user could pick
+    /// from.
+    ///
+    /// Hard-filtered: includes only DJ-grade Performance interfaces
+    /// (`AudioDeviceCategory::PerformanceInterface`) and the built-in
+    /// speakers (`AudioDeviceCategory::BuiltInOutput`). Everything
+    /// else (built-in mic, iPhone Continuity mic, Camo / Teams /
+    /// Loopback virtuals, Bluetooth, HDMI, AirPlay, aggregates) is
+    /// dropped at the `dub_audio::classify` boundary so the Apple
+    /// shell never has to filter the list itself.
+    ///
+    /// The Swift shell should:
+    ///
+    /// * In Performance mode, present devices where
+    ///   `category == .performanceInterface` for both input and
+    ///   output selection.
+    /// * In Prep mode, present devices where
+    ///   `category == .builtInOutput` *and* every Performance
+    ///   interface (the DJ might be wearing headphones plugged into
+    ///   the SL3 while auditioning).
+    ///
+    /// Off-RT; returns an empty list on HAL enumeration failure
+    /// (logged via `eprintln!`).
+    #[must_use]
+    pub fn list_audio_devices(&self) -> Vec<AudioDeviceInfo> {
+        match dub_audio::list_audio_devices() {
+            Ok(devs) => devs.into_iter().map(AudioDeviceInfo::from_audio).collect(),
             Err(e) => {
-                eprintln!("dub-ffi: list_input_devices failed: {e}");
+                eprintln!("dub-ffi: list_audio_devices failed: {e}");
                 Vec::new()
             }
         }
+    }
+
+    /// Enumerate classified devices **without reading any input-scope
+    /// HAL property**, so the Apple shell can call it in Prep mode and
+    /// from its device-hot-plug listener without ever tripping the
+    /// macOS microphone-permission prompt.
+    ///
+    /// Returns the built-in output plus every DJ-grade Performance
+    /// interface (so the Prep-mode output picker can offer the SL3's
+    /// headphone-out as well as the laptop speakers). Each entry
+    /// reports `input_channels = 0` because this path deliberately
+    /// never probes input width — Performance-mode input layout comes
+    /// from [`Self::performance_routing_for`] instead.
+    ///
+    /// Off-RT; returns an empty list on HAL enumeration failure
+    /// (logged via `eprintln!`).
+    #[must_use]
+    pub fn list_output_devices(&self) -> Vec<AudioDeviceInfo> {
+        match dub_audio::list_output_devices() {
+            Ok(devs) => devs.into_iter().map(AudioDeviceInfo::from_audio).collect(),
+            Err(e) => {
+                eprintln!("dub-ffi: list_output_devices failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Resolve the per-deck Performance-mode routing for a device by
+    /// name, from the embedded `devices.toml` registry.
+    ///
+    /// A registry-matched interface (e.g. the SL3) yields its full
+    /// two-deck input + output channel map; any other device gets the
+    /// conservative heuristic default (single deck on input ch 1+2,
+    /// summed stereo output). The Apple shell uses this to auto-fill
+    /// deck channels so the user never types a channel number.
+    ///
+    /// Pure registry lookup; touches no HAL and is always safe to call.
+    #[must_use]
+    pub fn performance_routing_for(&self, device_name: String) -> PerformanceRouting {
+        PerformanceRouting::from_audio(
+            dub_audio::DeviceRegistry::embedded().performance_routing(&device_name),
+        )
     }
 
     /// Return `true` iff at least one external audio interface
@@ -801,6 +934,14 @@ impl DubEngine {
     /// `channels` is a pair of 1-based CoreAudio input-channel
     /// indices (e.g. `[3, 4]` for the canonical SL3 timecode pair).
     ///
+    /// `output_device_uid` (optional) pins the master output to a
+    /// specific device by its stable `kAudioDevicePropertyDeviceUID`
+    /// string. Pass `None` (or empty string) to use the system
+    /// default output. Performance-mode callers should normally pass
+    /// the SL3 / DJ-interface UID here so deck audio leaves through
+    /// the right interface even when the user's macOS default is set
+    /// to MacBook Speakers.
+    ///
     /// # Errors
     ///
     /// * [`EngineError::AlreadyRunning`] if the engine is already in
@@ -811,8 +952,14 @@ impl DubEngine {
     /// * [`EngineError::DeviceNotFound`] if no input device matches
     ///   `device_name`.
     /// * [`EngineError::AudioStartFailed`] for any other CoreAudio
-    ///   open / attach failure.
-    pub fn start_thru(&self, device_name: String, channels: Vec<u32>) -> Result<(), EngineError> {
+    ///   open / attach failure (including an unresolvable
+    ///   `output_device_uid`).
+    pub fn start_thru(
+        &self,
+        device_name: String,
+        channels: Vec<u32>,
+        output_device_uid: Option<String>,
+    ) -> Result<(), EngineError> {
         let mut state = lock_state(&self.state);
         if matches!(*state, EngineState::Running(_)) {
             return Err(EngineError::AlreadyRunning);
@@ -822,7 +969,14 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
-        let running = start_thru_inner(&device_name, &channels, None, &self.deck_shared)?;
+        let running = start_thru_inner(
+            &device_name,
+            &channels,
+            None,
+            output_device_uid.as_deref(),
+            &self.deck_shared,
+            PerfSource::Thru,
+        )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
         Ok(())
@@ -840,9 +994,12 @@ impl DubEngine {
     /// `channels_a = [3, 4]`, `channels_b = [5, 6]` for the canonical
     /// SL3 two-deck layout). Channels must not overlap.
     ///
+    /// `output_device_uid` has the same semantics as on
+    /// [`Self::start_thru`].
+    ///
     /// # Errors
     ///
-    /// Same as [`start_thru`] for the deck A pair, plus:
+    /// Same as [`Self::start_thru`] for the deck A pair, plus:
     /// * [`EngineError::InvalidChannels`] if `channels_b.len() != 2`,
     ///   any index is `0`, or the A/B pairs share a channel.
     pub fn start_thru_two_deck(
@@ -850,6 +1007,7 @@ impl DubEngine {
         device_name: String,
         channels_a: Vec<u32>,
         channels_b: Vec<u32>,
+        output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
         let mut state = lock_state(&self.state);
         if matches!(*state, EngineState::Running(_)) {
@@ -873,7 +1031,111 @@ impl DubEngine {
             &device_name,
             &channels_a,
             Some(&channels_b),
+            output_device_uid.as_deref(),
             &self.deck_shared,
+            PerfSource::Thru,
+        )?;
+        *state = EngineState::Running(Box::new(running));
+        self.bump_peak_generation(0);
+        self.bump_peak_generation(1);
+        Ok(())
+    }
+
+    /// Begin a **single-deck Performance (timecode) session**: open
+    /// the input device on the deck A pair and attach a Serato CV02
+    /// [`dub_engine::TimecodeInput`] on deck 0 so control vinyl
+    /// drives the loaded file (PRD §5.1). Output routing follows the
+    /// same registry-resolved per-deck map as Thru.
+    ///
+    /// This is the timecode counterpart to [`Self::start_thru`]: same
+    /// input-demux + output-routing, but the deck plays a loaded
+    /// track under timecode control instead of passing the live
+    /// input through. Load a track with [`Self::load_track`], then
+    /// spin the control record; the deck engages on a clean carrier
+    /// lock and follows the platter's rate and direction.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::start_thru`].
+    pub fn start_performance(
+        &self,
+        device_name: String,
+        channels: Vec<u32>,
+        output_device_uid: Option<String>,
+    ) -> Result<(), EngineError> {
+        let mut state = lock_state(&self.state);
+        if matches!(*state, EngineState::Running(_)) {
+            return Err(EngineError::AlreadyRunning);
+        }
+
+        if channels.len() != 2 || channels.contains(&0) {
+            return Err(EngineError::InvalidChannels(channels));
+        }
+
+        let running = start_thru_inner(
+            &device_name,
+            &channels,
+            None,
+            output_device_uid.as_deref(),
+            &self.deck_shared,
+            PerfSource::Timecode,
+        )?;
+        *state = EngineState::Running(Box::new(running));
+        self.bump_peak_generation(0);
+        Ok(())
+    }
+
+    /// Begin a **two-deck Performance (timecode) session**: open the
+    /// input device on the combined 4-channel set (deck A pair + deck
+    /// B pair), demux into two stereo SPSC rings, and attach a Serato
+    /// CV02 [`dub_engine::TimecodeInput`] on both decks so each
+    /// control record drives its loaded file (PRD §5.1).
+    ///
+    /// This is the timecode counterpart to
+    /// [`Self::start_thru_two_deck`]: identical input-demux and
+    /// per-deck output routing (each deck to its own physical output
+    /// pair — the external mixer is the product, PRD §2.1), but the
+    /// decks play loaded tracks under timecode control rather than
+    /// passing the live input through.
+    ///
+    /// `channels_a` / `channels_b` are 1-based pairs (e.g. the
+    /// canonical SL3 layout `channels_a = [1, 2]`, `channels_b =
+    /// [3, 4]`); they must not overlap.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::start_thru_two_deck`].
+    pub fn start_performance_two_deck(
+        &self,
+        device_name: String,
+        channels_a: Vec<u32>,
+        channels_b: Vec<u32>,
+        output_device_uid: Option<String>,
+    ) -> Result<(), EngineError> {
+        let mut state = lock_state(&self.state);
+        if matches!(*state, EngineState::Running(_)) {
+            return Err(EngineError::AlreadyRunning);
+        }
+
+        if channels_a.len() != 2 || channels_a.contains(&0) {
+            return Err(EngineError::InvalidChannels(channels_a));
+        }
+        if channels_b.len() != 2 || channels_b.contains(&0) {
+            return Err(EngineError::InvalidChannels(channels_b));
+        }
+        if channels_a.iter().any(|c| channels_b.contains(c)) {
+            let mut combined = channels_a;
+            combined.extend(channels_b);
+            return Err(EngineError::InvalidChannels(combined));
+        }
+
+        let running = start_thru_inner(
+            &device_name,
+            &channels_a,
+            Some(&channels_b),
+            output_device_uid.as_deref(),
+            &self.deck_shared,
+            PerfSource::Timecode,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -941,8 +1203,14 @@ impl DubEngine {
     /// headphones); pass `4` to mirror the canonical SL3 layout
     /// (deck A → ch 1+2, deck B → ch 3+4) so a follow-up
     /// `start_thru_two_deck` call from the same UI gives consistent
-    /// physical routing. Output device is the system default; choose
-    /// via Audio MIDI Setup (PRD §10).
+    /// physical routing.
+    ///
+    /// `output_device_uid` (optional) pins the output to a specific
+    /// device by its stable `kAudioDevicePropertyDeviceUID`. Prep
+    /// Mode callers should normally pass the built-in speakers UID
+    /// here so playback drives the laptop speakers regardless of the
+    /// user's current macOS default. Pass `None` to fall back to the
+    /// macOS default output.
     ///
     /// After success, the deck count is `dub_engine::DECK_COUNT` (= 2);
     /// each deck starts empty (no peaks, no track). Call
@@ -955,7 +1223,11 @@ impl DubEngine {
     /// * [`EngineError::InvalidChannels`] if `output_channels < 2`.
     /// * [`EngineError::AudioStartFailed`] for any CoreAudio
     ///   open/start failure.
-    pub fn start_engine(&self, output_channels: u32) -> Result<(), EngineError> {
+    pub fn start_engine(
+        &self,
+        output_channels: u32,
+        output_device_uid: Option<String>,
+    ) -> Result<(), EngineError> {
         let mut state = lock_state(&self.state);
         if matches!(*state, EngineState::Running(_)) {
             return Err(EngineError::AlreadyRunning);
@@ -964,7 +1236,11 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(vec![output_channels]));
         }
 
-        let running = start_engine_inner(output_channels, &self.deck_shared)?;
+        let running = start_engine_inner(
+            output_channels,
+            output_device_uid.as_deref(),
+            &self.deck_shared,
+        )?;
         *state = EngineState::Running(Box::new(running));
         Ok(())
     }
@@ -2519,6 +2795,121 @@ pub struct TrackInfo {
     pub bpm: Option<f64>,
 }
 
+/// Audio device categorisation surfaced to the Apple shell.
+///
+/// Mirrors [`dub_audio::DeviceCategory`] across the FFI. The Swift
+/// picker uses this to populate two separate menus (input devices in
+/// Performance mode, output devices in Prep mode) and to hide every
+/// non-DJ device (built-in mic, virtual interfaces, Continuity mic,
+/// etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AudioDeviceCategory {
+    /// DJ-grade audio interface — capable of timecode input AND
+    /// master output. Performance mode runs against this category.
+    PerformanceInterface,
+
+    /// Built-in speakers / headphone jack. Used by Prep Mode output;
+    /// the built-in mic is deliberately excluded.
+    BuiltInOutput,
+}
+
+impl AudioDeviceCategory {
+    fn from_audio(c: dub_audio::DeviceCategory) -> Self {
+        match c {
+            dub_audio::DeviceCategory::PerformanceInterface => Self::PerformanceInterface,
+            dub_audio::DeviceCategory::BuiltInOutput => Self::BuiltInOutput,
+        }
+    }
+}
+
+/// One audio device the classifier surfaces to the UI.
+///
+/// Stable across reconnects via [`AudioDeviceInfo::uid`], so the Swift
+/// shell should persist that as the user's saved-device key rather
+/// than the human-readable name (two SL3s in the same room share a
+/// name but never a UID).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AudioDeviceInfo {
+    /// CoreAudio device UID — stable, unique, persistable. Empty
+    /// string only on the rare drivers that refuse to publish a UID
+    /// (callers should fall back to name in that case).
+    pub uid: String,
+    /// Human-readable device name (e.g. `"SL 3"`,
+    /// `"MacBook Pro Speakers"`). Used as the display label in the
+    /// Preferences picker.
+    pub name: String,
+    /// Manufacturer string (e.g. `"Rane"`, `"Apple Inc."`). Empty
+    /// string when the driver doesn't publish one.
+    pub manufacturer: String,
+    /// Physical input channel count. 0 for pure-output devices like
+    /// the built-in speakers.
+    pub input_channels: u32,
+    /// Physical output channel count.
+    pub output_channels: u32,
+    /// Which Dub-relevant category this device falls in. The Swift
+    /// picker filters by this to populate the input vs output menus.
+    pub category: AudioDeviceCategory,
+}
+
+impl AudioDeviceInfo {
+    fn from_audio(d: dub_audio::AudioDevice) -> Self {
+        Self {
+            uid: d.uid,
+            name: d.name,
+            manufacturer: d.manufacturer.unwrap_or_default(),
+            input_channels: d.input_channels,
+            output_channels: d.output_channels,
+            category: AudioDeviceCategory::from_audio(d.category),
+        }
+    }
+}
+
+/// Per-deck Performance-mode routing resolved from the device registry
+/// (`devices.toml`), surfaced to the Apple shell so it never has to
+/// hardcode a device's channel map.
+///
+/// The shell calls [`DubEngine::performance_routing_for`] with the
+/// chosen interface's name and feeds the resulting `deck_a_input` /
+/// `deck_b_input` pairs straight into [`DubEngine::start_thru`] (when
+/// [`Self::two_deck`] is `false`) or
+/// [`DubEngine::start_thru_two_deck`] (when `true`). The output fields
+/// are informational for the shell; the engine resolves output routing
+/// itself from the same registry inside `start_thru_two_deck`.
+///
+/// All channel numbers are 1-based, matching the rest of the FFI.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PerformanceRouting {
+    /// Deck A timecode input pair, 1-based (e.g. `[3, 4]` for the SL3).
+    pub deck_a_input: Vec<u32>,
+    /// Deck B timecode input pair, 1-based (e.g. `[5, 6]`). Only
+    /// meaningful when [`Self::two_deck`] is `true`.
+    pub deck_b_input: Vec<u32>,
+    /// Physical output channels the master AU opens with (6 for the
+    /// SL3; 2 for the heuristic fallback).
+    pub output_channels: u32,
+    /// 1-based first output channel for deck A's master pair.
+    pub deck_a_output_first: u32,
+    /// 1-based first output channel for deck B's master pair.
+    pub deck_b_output_first: u32,
+    /// `true` for a known two-deck interface; `false` for a
+    /// heuristic-only match (single deck on input ch 1+2, summed
+    /// stereo output).
+    pub two_deck: bool,
+}
+
+impl PerformanceRouting {
+    fn from_audio(r: dub_audio::PerformanceRouting) -> Self {
+        Self {
+            deck_a_input: vec![r.deck_a_input_first, r.deck_a_input_first + 1],
+            deck_b_input: vec![r.deck_b_input_first, r.deck_b_input_first + 1],
+            output_channels: r.output_channels,
+            deck_a_output_first: r.deck_a_output_first,
+            deck_b_output_first: r.deck_b_output_first,
+            two_deck: r.two_deck,
+        }
+    }
+}
+
 /// Stateless tag snapshot for a file on disk (M10.5r).
 ///
 /// Returned by [`read_track_metadata`]. Lets the Apple shell's
@@ -2932,9 +3323,29 @@ fn usize_from_u64(v: u64) -> usize {
     usize::try_from(v).unwrap_or(usize::MAX)
 }
 
-/// Open the input device, build the engine, and attach a Thru
-/// source on deck 0 with peaks + band capture. Returns the full
-/// [`RunningState`] on success.
+/// Which engine source each performance deck is driven by, chosen at
+/// session start.
+///
+/// Both modes share the input-demux + output-routing scaffolding in
+/// [`start_thru_inner`]; only the per-deck attach differs:
+///
+/// - [`PerfSource::Thru`] — attach a [`dub_engine::ThruSource`] +
+///   live `PeakStream` per deck (real record on the platter; the
+///   waveform follows the live input).
+/// - [`PerfSource::Timecode`] — attach a [`dub_engine::TimecodeInput`]
+///   (Serato CV02) per deck so control vinyl drives the loaded file
+///   through the existing `drive_timecode_inputs` path. No live
+///   peaks are attached; the waveform follows the loaded track's
+///   file peaks (set by [`DubEngine::load_track`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PerfSource {
+    Thru,
+    Timecode,
+}
+
+/// Open the input device, build the engine, and attach the chosen
+/// per-deck source (Thru passthrough, or timecode-driven file
+/// playback). Returns the full [`RunningState`] on success.
 ///
 /// Pulled out of `start_thru` so the `Mutex` guard stays narrow:
 /// this function never touches `self.state`, only the audio
@@ -2943,7 +3354,9 @@ fn start_thru_inner(
     device_name: &str,
     channels_a: &[u32],
     channels_b: Option<&[u32]>,
+    output_device_uid: Option<&str>,
     deck_shared: &[Arc<DeckSharedState>; 2],
+    source_mode: PerfSource,
 ) -> Result<RunningState, EngineError> {
     // ----- 1. Build InputOptions ------------------------------------
     // Convert 1-based user-facing channel indices to 0-based
@@ -3004,39 +3417,97 @@ fn start_thru_inner(
         deck_shared.clone(),
     );
 
-    // ----- 5. Open output (internal-mixer routing for M10) ----------
+    // ----- 5. Open output -------------------------------------------
+    // Two-deck Performance mode routes each deck to its OWN physical
+    // output pair on the interface — PRD non-negotiable §2.1: the
+    // external mixer is the product, decks are never summed in
+    // software. We resolve the per-deck output map from the registry
+    // by the input device name (the interface). Single-deck Thru and
+    // unknown / heuristic-only devices fall back to the 2-channel
+    // internal-mixer sum so the dev rig (built-in output) still works.
+    let routing_info = dub_audio::DeviceRegistry::embedded().performance_routing(device_name);
+    let (output_channels, output_routing): (u32, dub_engine::OutputRouting) =
+        if channels_b.is_some() && routing_info.two_deck && routing_info.output_channels >= 4 {
+            (
+                routing_info.output_channels,
+                [
+                    Some(routing_info.deck_a_output_first.saturating_sub(1)),
+                    Some(routing_info.deck_b_output_first.saturating_sub(1)),
+                ],
+            )
+        } else {
+            (2, INTERNAL_MIXER_ROUTING)
+        };
     let output_opts = OutputOptions {
-        channels: 2,
+        channels: output_channels,
+        device_uid: output_device_uid
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         ..OutputOptions::default()
     };
-    let output = AudioOutput::start_with_options(engine, &output_opts, INTERNAL_MIXER_ROUTING)
+    let output = AudioOutput::start_with_options(engine, &output_opts, output_routing)
         .map_err(|e| EngineError::AudioStartFailed(format!("starting output: {e}")))?;
 
-    // ----- 6. Attach Thru source(s) + peaks on each deck -----------
-    let thru_cfg = ThruInputConfig {
-        max_block_frames: THRU_MAX_BLOCK_FRAMES,
-        input_sample_rate: input_sr_f32,
-    };
+    // ----- 6. Attach the chosen per-deck source --------------------
+    // Thru: passthrough + live peaks per deck (waveform follows the
+    // live input). Timecode: a Serato CV02 decoder per deck drives
+    // the loaded file via `drive_timecode_inputs`; no live peaks are
+    // attached because the waveform follows the loaded track's file
+    // peaks (installed by `load_track`).
     let mut peaks: [Option<PeakSource>; 2] = [None, None];
 
-    let peaks_cfg_a = PeakStreamConfig::at(input_sr);
-    let peaks_stream_a = handle
-        .attach_thru_source_with_peaks_tracking(0, consumer_a, thru_cfg, peaks_cfg_a)
-        .map_err(|e| EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}")))?;
-    peaks[0] = Some(PeakSource::Live {
-        stream: peaks_stream_a,
-        sample_rate: input_sr,
-    });
+    match source_mode {
+        PerfSource::Thru => {
+            let thru_cfg = ThruInputConfig {
+                max_block_frames: THRU_MAX_BLOCK_FRAMES,
+                input_sample_rate: input_sr_f32,
+            };
+            let peaks_cfg_a = PeakStreamConfig::at(input_sr);
+            let peaks_stream_a = handle
+                .attach_thru_source_with_peaks_tracking(0, consumer_a, thru_cfg, peaks_cfg_a)
+                .map_err(|e| {
+                    EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}"))
+                })?;
+            peaks[0] = Some(PeakSource::Live {
+                stream: peaks_stream_a,
+                sample_rate: input_sr,
+            });
 
-    if let Some(consumer_b) = consumer_b {
-        let peaks_cfg_b = PeakStreamConfig::at(input_sr);
-        let peaks_stream_b = handle
-            .attach_thru_source_with_peaks_tracking(1, consumer_b, thru_cfg, peaks_cfg_b)
-            .map_err(|e| EngineError::AudioStartFailed(format!("attaching thru on deck 1: {e}")))?;
-        peaks[1] = Some(PeakSource::Live {
-            stream: peaks_stream_b,
-            sample_rate: input_sr,
-        });
+            if let Some(consumer_b) = consumer_b {
+                let peaks_cfg_b = PeakStreamConfig::at(input_sr);
+                let peaks_stream_b = handle
+                    .attach_thru_source_with_peaks_tracking(1, consumer_b, thru_cfg, peaks_cfg_b)
+                    .map_err(|e| {
+                        EngineError::AudioStartFailed(format!("attaching thru on deck 1: {e}"))
+                    })?;
+                peaks[1] = Some(PeakSource::Live {
+                    stream: peaks_stream_b,
+                    sample_rate: input_sr,
+                });
+            }
+        }
+        PerfSource::Timecode => {
+            // Serato CV02, no-calibration defaults. Input SR and block
+            // bound come from the live device; thresholds use the
+            // empirically-tuned `TimecodeInputConfig::default()` values.
+            let tc_cfg = TimecodeInputConfig {
+                input_sample_rate: input_sr_f32,
+                max_block_frames: THRU_MAX_BLOCK_FRAMES,
+                ..TimecodeInputConfig::default()
+            };
+            handle
+                .attach_timecode_input(0, consumer_a, tc_cfg)
+                .map_err(|e| {
+                    EngineError::AudioStartFailed(format!("attaching timecode on deck 0: {e}"))
+                })?;
+            if let Some(consumer_b) = consumer_b {
+                handle
+                    .attach_timecode_input(1, consumer_b, tc_cfg)
+                    .map_err(|e| {
+                        EngineError::AudioStartFailed(format!("attaching timecode on deck 1: {e}"))
+                    })?;
+            }
+        }
     }
 
     Ok(RunningState {
@@ -3068,6 +3539,7 @@ fn classify_audio_error(err: dub_audio::AudioError, device_name: &str) -> Engine
 /// [`DubEngine::start_engine`] for the M10.5 File-mode-only path.
 fn start_engine_inner(
     output_channels: u32,
+    output_device_uid: Option<&str>,
     deck_shared: &[Arc<DeckSharedState>; 2],
 ) -> Result<RunningState, EngineError> {
     // We don't know the output device's SR ahead of time. The
@@ -3093,6 +3565,9 @@ fn start_engine_inner(
 
     let output_opts = OutputOptions {
         channels: output_channels,
+        device_uid: output_device_uid
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         ..OutputOptions::default()
     };
     let output = AudioOutput::start_with_options(engine, &output_opts, INTERNAL_MIXER_ROUTING)
@@ -3243,7 +3718,30 @@ mod tests {
         // commit. Public surface is unchanged: callers still
         // pass musical rate (1.0 = real-time at the track's
         // natural pitch).
-        assert_eq!(FFI_VERSION, 27);
+        // M11d-next 27→28: Dub-crates FFI surface (LibraryCrate +
+        // list/create/rename/delete/add/remove/reorder/crate_tracks
+        // on DubLibrary, plus CrateNameConflict / NotFound error
+        // variants). Backs the editable "Dub Crates" sidebar section.
+        // M11d-next 28→29: LibraryTrack.crate_ordinal — dense 0-based
+        // manual rank stamped by crate_tracks; powers the `#` column,
+        // the manual-order sort key, and the drag-reorder enable gate.
+        // 29→30: device classifier + per-device output selection. New
+        // `list_audio_devices` method returning categorized
+        // `AudioDeviceInfo`, plus an `output_device_uid` parameter
+        // threaded through `start_thru` / `start_thru_two_deck` /
+        // `start_engine` so the Apple shell pins master output by
+        // stable UID instead of relying on the macOS default-output.
+        // 30→31: opinionated auto-mode. Added `list_output_devices`
+        // (TCC-safe enumeration) and `performance_routing_for`
+        // (registry-driven per-deck routing); two-deck Thru now routes
+        // each deck to its own physical output pair instead of an
+        // internal-mixer sum.
+        // 31→32: timecode-controlled playback (PRD §5.1). Added
+        // `start_performance` / `start_performance_two_deck` — same
+        // input-demux + output-routing as Thru, but each deck plays a
+        // loaded file driven by a Serato CV02 `TimecodeInput` instead
+        // of passing the live input through.
+        assert_eq!(FFI_VERSION, 32);
     }
 
     #[test]
@@ -3449,9 +3947,9 @@ mod tests {
     #[test]
     fn start_engine_rejects_zero_one_output_channels() {
         let engine = DubEngine::new();
-        let err = engine.start_engine(0).unwrap_err();
+        let err = engine.start_engine(0, None).unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
-        let err = engine.start_engine(1).unwrap_err();
+        let err = engine.start_engine(1, None).unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
     }
 
@@ -3574,24 +4072,44 @@ mod tests {
         let engine = DubEngine::new();
         // Wrong arity on deck A.
         let err = engine
-            .start_thru_two_deck("MacBook Pro Microphone".to_string(), vec![], vec![3, 4])
+            .start_thru_two_deck(
+                "MacBook Pro Microphone".to_string(),
+                vec![],
+                vec![3, 4],
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
         // Wrong arity on deck B.
         let err = engine
-            .start_thru_two_deck("MacBook Pro Microphone".to_string(), vec![1, 2], vec![3])
+            .start_thru_two_deck(
+                "MacBook Pro Microphone".to_string(),
+                vec![1, 2],
+                vec![3],
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
         // Zero index rejected (1-based).
         let err = engine
-            .start_thru_two_deck("MacBook Pro Microphone".to_string(), vec![1, 2], vec![0, 3])
+            .start_thru_two_deck(
+                "MacBook Pro Microphone".to_string(),
+                vec![1, 2],
+                vec![0, 3],
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
         // Overlap between A and B is rejected — picking the same
         // physical channel for both decks would silently route the
         // wrong audio.
         let err = engine
-            .start_thru_two_deck("MacBook Pro Microphone".to_string(), vec![1, 2], vec![2, 3])
+            .start_thru_two_deck(
+                "MacBook Pro Microphone".to_string(),
+                vec![1, 2],
+                vec![2, 3],
+                None,
+            )
             .unwrap_err();
         match err {
             EngineError::InvalidChannels(combined) => {
@@ -3607,17 +4125,17 @@ mod tests {
 
         // Empty / wrong arity.
         let err = engine
-            .start_thru("MacBook Pro Microphone".to_string(), vec![])
+            .start_thru("MacBook Pro Microphone".to_string(), vec![], None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
         let err = engine
-            .start_thru("MacBook Pro Microphone".to_string(), vec![1, 2, 3])
+            .start_thru("MacBook Pro Microphone".to_string(), vec![1, 2, 3], None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
 
         // Zero is rejected (we use 1-based indices).
         let err = engine
-            .start_thru("MacBook Pro Microphone".to_string(), vec![0, 1])
+            .start_thru("MacBook Pro Microphone".to_string(), vec![0, 1], None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
     }
@@ -3741,12 +4259,31 @@ pub enum LibraryFfiError {
     /// log-trace.
     #[error("track {0} grid is locked; unlock first")]
     GridLocked(String),
+    /// A Dub-crate create / rename hit the sibling-name uniqueness
+    /// rule (PRD §8.5.1). The Apple shell surfaces this inline next
+    /// to the rename field ("a crate with that name already exists")
+    /// rather than as a generic query-failed toast. Carries the
+    /// conflicting name for the message.
+    #[error("a crate named {0:?} already exists here")]
+    CrateNameConflict(String),
+    /// A Dub-crate operation referenced a crate (or track) id that no
+    /// longer exists — typically the UI raced a delete. The shell
+    /// treats this as a benign refresh trigger rather than an error.
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl From<dub_library::LibraryError> for LibraryFfiError {
     fn from(e: dub_library::LibraryError) -> Self {
         match e {
             dub_library::LibraryError::GridLocked { track_id } => Self::GridLocked(track_id),
+            dub_library::LibraryError::CrateNameConflict { name } => Self::CrateNameConflict(name),
+            dub_library::LibraryError::CrateNotFound { crate_id } => {
+                Self::NotFound(format!("crate {crate_id}"))
+            }
+            dub_library::LibraryError::TrackNotFound { track_id } => {
+                Self::NotFound(format!("track {track_id}"))
+            }
             other => Self::QueryFailed(other.to_string()),
         }
     }
@@ -3845,6 +4382,17 @@ pub struct LibraryTrack {
     pub grid_locked: bool,
     /// M11d.7: LSQ drift slope when unlocked (ms/min).
     pub grid_drift_quality: Option<f32>,
+    /// M11d-next: 0-based manual rank of this row inside the crate
+    /// it was listed from. `None` for every listing that is not a
+    /// manual crate (`all_tracks`, search, smart sections), because
+    /// "position in the crate" is undefined there. Populated by
+    /// [`DubLibrary::crate_tracks`] from the row's ordinal position
+    /// in the returned (ordinal-ordered) slice, so it is a dense
+    /// `0..n` rank regardless of any gaps left in `crate_tracks.ordinal`
+    /// by prior removals. The Apple shell surfaces this as the
+    /// browser's `#` column and uses it as the manual-order sort key
+    /// (which doubles as the drag-reorder enable gate).
+    pub crate_ordinal: Option<u32>,
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -4051,6 +4599,37 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             track_number: r.track_number,
             grid_locked: r.grid_locked,
             grid_drift_quality: r.grid_drift_quality,
+            // Only `crate_tracks` knows a row's manual rank; every
+            // other listing leaves this `None` and the Apple shell
+            // hides the `#` column accordingly.
+            crate_ordinal: None,
+        }
+    }
+}
+
+/// One Dub-crate node for the M11d-next "Dub Crates" sidebar
+/// section (PRD §8.5.1). Mirrors [`dub_library::CrateRow`]. The
+/// `parent_id` is `None` for a top-level crate; the Swift side
+/// rebuilds the tree from the flat list.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryCrate {
+    /// Stable crate id; round-trips back into the mutators.
+    pub id: i64,
+    /// User-facing name, unique among siblings.
+    pub name: String,
+    /// Parent crate id, or `None` for a top-level crate.
+    pub parent_id: Option<i64>,
+    /// Number of tracks directly in this crate.
+    pub track_count: u64,
+}
+
+impl From<dub_library::CrateRow> for LibraryCrate {
+    fn from(c: dub_library::CrateRow) -> Self {
+        Self {
+            id: c.id,
+            name: c.name,
+            parent_id: c.parent_id,
+            track_count: c.track_count,
         }
     }
 }
@@ -4362,6 +4941,111 @@ impl DubLibrary {
         path: String,
     ) -> std::result::Result<Option<String>, LibraryFfiError> {
         self.with_library(|lib| Ok(lib.track_id_for_absolute_path(std::path::Path::new(&path))?))
+    }
+
+    // === M11d-next — Dub crates (user playlists) ==========================
+    //
+    // User-created, editable, nestable crates per PRD §8.5.1, backed by
+    // the `crates` / `crate_tracks` tables. The Apple shell loads the
+    // flat list on open (and after every mutation), rebuilds the tree
+    // from `parent_id`, and drives create / rename / delete / add /
+    // remove / reorder from the sidebar + track-list context menus.
+
+    /// List every Dub crate with its direct-member track count, for
+    /// the sidebar's "Dub Crates" section. Ordered case-insensitively
+    /// by name.
+    pub fn list_crates(&self) -> std::result::Result<Vec<LibraryCrate>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_crates()?;
+            Ok(rows.into_iter().map(LibraryCrate::from).collect())
+        })
+    }
+
+    /// Create a Dub crate and return its new id. `parent_id` nests it
+    /// under another crate (pass `None` for top-level). Errors with
+    /// [`LibraryFfiError::CrateNameConflict`] on a sibling-name clash.
+    pub fn create_crate(
+        &self,
+        name: String,
+        parent_id: Option<i64>,
+    ) -> std::result::Result<i64, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.create_crate(&name, parent_id)?))
+    }
+
+    /// Rename a Dub crate. Errors with [`LibraryFfiError::NotFound`]
+    /// for an unknown id and [`LibraryFfiError::CrateNameConflict`]
+    /// on a sibling-name clash.
+    pub fn rename_crate(
+        &self,
+        crate_id: i64,
+        new_name: String,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.rename_crate(crate_id, &new_name)?))
+    }
+
+    /// Delete a Dub crate. Member rows and child crates cascade. Errors
+    /// with [`LibraryFfiError::NotFound`] for an unknown id.
+    pub fn delete_crate(&self, crate_id: i64) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.delete_crate(crate_id)?))
+    }
+
+    /// Append a track to a crate. Idempotent — returns `true` on a
+    /// fresh insert, `false` when the track was already a member.
+    pub fn add_track_to_crate(
+        &self,
+        crate_id: i64,
+        track_id: String,
+    ) -> std::result::Result<bool, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.add_track_to_crate(crate_id, &track_id)?))
+    }
+
+    /// Remove a track from a crate. Idempotent (no error if absent).
+    pub fn remove_track_from_crate(
+        &self,
+        crate_id: i64,
+        track_id: String,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.remove_track_from_crate(crate_id, &track_id)?))
+    }
+
+    /// Rewrite a crate's member ordering to match `ordered_track_ids`
+    /// (0-based, in the given order). The Apple shell sends the full
+    /// member list after a drag-reorder.
+    pub fn set_crate_track_order(
+        &self,
+        crate_id: i64,
+        ordered_track_ids: Vec<String>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            let refs: Vec<&str> = ordered_track_ids.iter().map(String::as_str).collect();
+            Ok(lib.set_crate_track_order(crate_id, &refs)?)
+        })
+    }
+
+    /// List a crate's member tracks in ordinal order, in the same
+    /// [`LibraryTrack`] shape the rest of the browser uses.
+    pub fn crate_tracks(
+        &self,
+        crate_id: i64,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_crate_tracks(crate_id)?;
+            // `list_crate_tracks` returns members already sorted by
+            // `crate_tracks.ordinal`, so the enumerate index is the
+            // dense 0-based manual rank even when removals have left
+            // gaps in the stored ordinals. Stamping it here keeps the
+            // rank on the row so the Swift `#` column / manual-order
+            // sort key never needs a second FFI round-trip.
+            Ok(rows
+                .into_iter()
+                .enumerate()
+                .map(|(rank, row)| {
+                    let mut track = LibraryTrack::from(row);
+                    track.crate_ordinal = Some(rank as u32);
+                    track
+                })
+                .collect())
+        })
     }
 
     // === M11d.4 — missing-files scanner + Relocate ========================
@@ -5084,5 +5768,156 @@ mod library_ffi_tests {
             .try_relocate_candidate(stub.to_string_lossy().to_string(), 10)
             .unwrap();
         assert!(r.is_none());
+    }
+
+    // === M11d-next Dub-crate FFI smoke tests =================================
+
+    #[test]
+    fn crate_ops_on_closed_library_return_query_failed() {
+        let lib = DubLibrary::new();
+        assert!(matches!(
+            lib.list_crates(),
+            Err(LibraryFfiError::QueryFailed(_))
+        ));
+        assert!(matches!(
+            lib.create_crate("X".into(), None),
+            Err(LibraryFfiError::QueryFailed(_))
+        ));
+    }
+
+    #[test]
+    fn create_list_rename_delete_round_trip_via_ffi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+
+        let id = lib.create_crate("Reggae 45s".into(), None).unwrap();
+        let crates = lib.list_crates().unwrap();
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].id, id);
+        assert_eq!(crates[0].name, "Reggae 45s");
+        assert_eq!(crates[0].track_count, 0);
+
+        lib.rename_crate(id, "Reggae Dubplates".into()).unwrap();
+        assert_eq!(lib.list_crates().unwrap()[0].name, "Reggae Dubplates");
+
+        lib.delete_crate(id).unwrap();
+        assert!(lib.list_crates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_top_level_name_surfaces_crate_name_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        lib.create_crate("Bag".into(), None).unwrap();
+        let err = lib.create_crate("Bag".into(), None);
+        assert!(matches!(err, Err(LibraryFfiError::CrateNameConflict(_))));
+    }
+
+    #[test]
+    fn rename_and_delete_of_unknown_crate_surface_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert!(matches!(
+            lib.rename_crate(123, "Whatever".into()),
+            Err(LibraryFfiError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.delete_crate(123),
+            Err(LibraryFfiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn add_track_to_unknown_crate_surfaces_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let err = lib.add_track_to_crate(999, "ffffffff-0000-0000-0000-000000000000".into());
+        assert!(matches!(err, Err(LibraryFfiError::NotFound(_))));
+    }
+
+    #[test]
+    fn crate_tracks_is_empty_for_fresh_crate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let id = lib.create_crate("Empty".into(), None).unwrap();
+        assert!(lib.crate_tracks(id).unwrap().is_empty());
+        // Reordering an empty crate is a harmless no-op.
+        lib.set_crate_track_order(id, vec![]).unwrap();
+    }
+
+    #[test]
+    fn crate_tracks_stamp_dense_manual_rank_and_other_listings_leave_it_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+
+        // Seed three bare tracks through the dub-library API on a
+        // scoped connection, then drop it so the FFI's own handle
+        // opens the same on-disk file cleanly.
+        let ids: Vec<String> = vec![
+            "aaaaaaaa-0000-0000-0000-000000000001".into(),
+            "aaaaaaaa-0000-0000-0000-000000000002".into(),
+            "aaaaaaaa-0000-0000-0000-000000000003".into(),
+        ];
+        {
+            let seed = dub_library::Library::open_at(&path).unwrap();
+            for id in &ids {
+                seed.insert_track(id, None, Some(10_000), None).unwrap();
+            }
+        }
+
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let crate_id = lib.create_crate("Set".into(), None).unwrap();
+        for id in &ids {
+            lib.add_track_to_crate(crate_id, id.clone()).unwrap();
+        }
+
+        // Insertion order → dense 0..n ranks.
+        let listed = lib.crate_tracks(crate_id).unwrap();
+        assert_eq!(
+            listed.iter().map(|t| t.crate_ordinal).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(listed.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), ids);
+
+        // Reorder (reverse) → ranks stay dense 0..n in the new order.
+        let reversed: Vec<String> = ids.iter().rev().cloned().collect();
+        lib.set_crate_track_order(crate_id, reversed.clone())
+            .unwrap();
+        let after = lib.crate_tracks(crate_id).unwrap();
+        assert_eq!(
+            after.iter().map(|t| t.crate_ordinal).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(
+            after.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            reversed
+        );
+
+        // Removing the new first member leaves the survivors dense
+        // (0,1) even though their stored ordinals now have a gap.
+        lib.remove_track_from_crate(crate_id, reversed[0].clone())
+            .unwrap();
+        let trimmed = lib.crate_tracks(crate_id).unwrap();
+        assert_eq!(
+            trimmed.iter().map(|t| t.crate_ordinal).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+
+        // The flat library listing is not a crate, so every row's
+        // manual rank is `None`.
+        let flat = lib.list_tracks(100, 0).unwrap();
+        assert_eq!(flat.len(), 3);
+        assert!(flat.iter().all(|t| t.crate_ordinal.is_none()));
     }
 }

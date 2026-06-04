@@ -48,7 +48,8 @@ fn main() -> ExitCode {
         "analyze" => analyze_cmd(&args[2..]),
         "diagnose" => diagnose::run(&args[2..]),
         "decode-timecode" => decode_timecode_cmd(&args[2..]),
-        "list-inputs" => input_cmds::list_inputs(),
+        "list-inputs" => input_cmds::list_inputs_with_args(&args[2..]),
+        "list-outputs" => input_cmds::list_outputs(),
         "levels" => input_cmds::levels(&args[2..]),
         "capture" => input_cmds::capture(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
@@ -84,7 +85,10 @@ fn print_help() {
     eprintln!("  rt-audit          stress the render path under assert_no_alloc");
     eprintln!("  version           print versions");
     eprintln!("  measure-latency   query the default output device for SR + buffer + latency");
-    eprintln!("  list-inputs       enumerate audio input devices (M5.2)");
+    eprintln!("  list-inputs       enumerate DJ audio interfaces (classified).");
+    eprintln!("                    pass --all to dump every HAL input device.");
+    eprintln!("  list-outputs      enumerate classified output devices");
+    eprintln!("                    (DJ interfaces + built-in speakers).");
     eprintln!("  levels            [--device NAME] [--channels N] [--buffer-size F]");
     eprintln!("                    [--input-channels N,M] [--sr SR] [--duration SECS]");
     eprintln!("                                                  live RMS meters per ch");

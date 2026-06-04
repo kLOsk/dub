@@ -12,6 +12,13 @@ dub-engine = { workspace = true }
 ringbuf = { workspace = true }
 thiserror = { workspace = true }
 
+# Device-registry parsing (see `devices.toml`). The registry is read once at
+# process start and lives in an `OnceLock`; nothing on the audio thread
+# touches `serde` or `toml`. Versions match what's already in the workspace
+# lock to avoid pulling in a second copy of either crate.
+serde = { version = "1", features = ["derive"] }
+toml = "0.5"
+
 # CoreAudio is target-gated: the rest of the workspace builds fine on Linux
 # even though Dub itself is macOS-first. Once we add Windows ASIO this gets a
 # corresponding `cfg(target_os = "windows")` block.
@@ -20,3 +27,7 @@ coreaudio-rs = { workspace = true }
 objc2-core-audio = { workspace = true }
 objc2-core-audio-types = { workspace = true }
 objc2-audio-toolbox = { workspace = true }
+# CoreFoundation strings for the M5.7 device-UID / manufacturer queries.
+# Version mirrors what coreaudio-rs 0.14.2 already pulls in transitively, so
+# we don't duplicate the crate in the lock.
+objc2-core-foundation = "0.3"

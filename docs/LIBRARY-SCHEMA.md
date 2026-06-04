@@ -32,18 +32,21 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; **version 2** ships with M11d.4 and
-adds the missing-files columns + indexes on `track_files` documented
-inline in the [`track_files`](#track_files--files-on-disk) section.
-Any change to the table set, column set, indexes, FTS5 definition,
-or trigger logic requires a version bump and a migration step.
+v1.0 baseline is **version 1**; the current applied version is **5**.
+Each bump is additive (new tables / columns with safe defaults / indexes),
+so a third-party reader that ignores the new columns keeps working. Any
+change to the table set, column set, indexes, FTS5 definition, or trigger
+logic requires a version bump and a migration step.
 
 ### Version history
 
 | Version | Milestone | Change |
 | --- | --- | --- |
 | 1       | M11a   | Initial schema. |
-| 2       | M11d.4 | `track_files.is_missing INTEGER NOT NULL DEFAULT 0` + `track_files.last_checked_at INTEGER` + partial index `idx_track_files_missing` + index `idx_track_files_last_checked`. Backs PRD §8.5.5 missing-files scanner + Relocate panel. Additive only — third-party readers that ignore the new columns keep working. |
+| 2       | M11d.4 | `track_files.is_missing INTEGER NOT NULL DEFAULT 0` + `track_files.last_checked_at INTEGER` + partial index `idx_track_files_missing` + index `idx_track_files_last_checked`. Backs PRD §8.5.5 missing-files scanner + Relocate panel. Additive only. |
+| 3       | M11c.2 | `track_keys` table (one musical key per source per track) + `idx_one_active_key_per_track` partial unique index + `idx_track_keys_track_id`. `analysis_cache.has_active_key INTEGER NOT NULL DEFAULT 0`. Backs Camelot key detection. |
+| 4       | M11d.7 | `tracks.grid_locked INTEGER NOT NULL DEFAULT 0` + `tracks.grid_drift_quality REAL`. Per-track beat-grid lock (locked tracks skip auto re-analysis on reload) + drift-quality indicator. |
+| 5       | PRD-BEATS C2 (round 4) | `track_beatgrids.bar_phase INTEGER NOT NULL DEFAULT 0 CHECK (0 ≤ bar_phase < 16)`. Makes the downbeat phase a first-class scalar so "set the 1" is a pure rotation (BPM + anchor unchanged) instead of a grid rebuild. |
 
 ### Backward compatibility contract
 
@@ -171,6 +174,13 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- merge target is the survivor; the merged-from row is kept
     -- as a tombstone so re-import doesn't resurrect it.
     explicit_merge_target_id    TEXT    REFERENCES tracks(id) ON DELETE SET NULL,
+    -- Beat-grid lock (schema v4, M11d.7). When 1, the loaded deck
+    -- adopts the active grid as-is and skips auto re-analysis on
+    -- reload. `grid_drift_quality` is the analyzer's drift slope
+    -- (ms/min) over the kept beats; a ⚠ shows on BPM when the grid
+    -- drifts >= 3 ms/min and is unlocked.
+    grid_locked                 INTEGER NOT NULL DEFAULT 0 CHECK (grid_locked IN (0, 1)),
+    grid_drift_quality          REAL,
     created_at                  INTEGER NOT NULL,
     updated_at                  INTEGER NOT NULL
 );
@@ -353,6 +363,11 @@ CREATE TABLE IF NOT EXISTS track_beatgrids (
     -- Downbeat anchor in seconds from track start.
     anchor_secs   REAL    NOT NULL,
     bpm           REAL    NOT NULL,
+    -- Downbeat phase (schema v5, PRD-BEATS C2). `bar_phase ∈ [0,
+    -- beats_per_bar)` is the index i such that beats[i], beats[i +
+    -- beats_per_bar], … are the downbeats (bar position 1). Lets
+    -- "set the 1" rotate the grid without touching bpm/anchor.
+    bar_phase     INTEGER NOT NULL DEFAULT 0 CHECK (bar_phase >= 0 AND bar_phase < 16),
     -- Exactly one grid per track is_active at a time. Enforced
     -- by the partial unique index below.
     is_active     INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),

@@ -33,6 +33,19 @@ settings:
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
+  # `settingPresets: none` strips Xcode's auto-derived per-configuration
+  # defaults, including `SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG` and
+  # the `-Onone` debug optimization level. Re-add them by hand so `#if
+  # DEBUG` actually compiles (the Preferences dev mode switch lives behind
+  # it) and Debug builds aren't silently optimized.
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+      GCC_OPTIMIZATION_LEVEL: "0"
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      GCC_OPTIMIZATION_LEVEL: "s"
 
 # Single target: the Dub.app shell. It links DubCore.xcframework (built by
 # scripts/build-xcframework.sh) and pulls in the generated Swift bindings

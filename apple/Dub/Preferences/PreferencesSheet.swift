@@ -2,15 +2,20 @@
 //  PreferencesSheet.swift
 //  Dub
 //
-//  M10.3 Preferences sheet. Houses the dev toolbar — input device
-//  picker, deck A/B channel fields — *off* the performance surface
-//  so the performance view stays clean.
+//  Preferences sheet. Dub is opinionated about audio (PRD §3): the
+//  engine mode is derived from the hardware, not chosen by the user.
+//  Plug in a DJ interface and the app runs Performance mode with the
+//  deck channels pulled from `devices.toml`; with no interface it runs
+//  Track Preparation on the built-in output; hot-plugging switches
+//  live. There is therefore NO Prep/Performance switch, no input
+//  picker, and no channel fields in a shipping build — the sheet only
+//  shows a read-only status line plus the track-loading safety toggle.
 //
-//  Opened via `⌘,` or the status-strip gear icon. M10.5b removed
-//  the Start / Stop / Apply buttons: every config change auto-
-//  applies via `model.applyConfig()` and the footer carries a
-//  single Close button. Channel fields commit on Enter / focus-
-//  blur so we don't restart the engine on every keystroke.
+//  A DEV-only block (compiled in `#if DEBUG` only) adds a manual mode
+//  override and device/channel overrides so the performance UI can be
+//  exercised on a Mac with no DJ interface. None of it ships.
+//
+//  Opened via `⌘,` or the status-strip gear icon. Esc / Close dismiss.
 //
 
 import SwiftUI
@@ -25,13 +30,10 @@ struct PreferencesSheet: View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             header
             Divider()
-            modeSection
-            if model.engineMode == .timecode {
-                deviceSection
-                channelsSection
-            } else {
-                prepModeNote
-            }
+            statusSection
+            #if DEBUG
+            devSection
+            #endif
             loadBehaviourSection
             Spacer(minLength: 0)
             Divider()
@@ -42,12 +44,76 @@ struct PreferencesSheet: View {
         .background(DubColor.surface0)
     }
 
+    // MARK: - Status (read-only)
+
+    /// Read-only summary of what the engine auto-selected. There is no
+    /// control here on purpose: the hardware decides the mode and the
+    /// registry decides the channels.
+    private var statusSection: some View {
+        section(title: "AUDIO") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                statusRow(label: "Mode", value: model.engineMode.displayName)
+                statusRow(label: "Device", value: currentDeviceLabel)
+                if model.engineMode == .timecode {
+                    statusRow(label: "Decks", value: currentChannelLabel)
+                }
+                Text("Dub configures audio automatically: connect a DJ interface to enter Performance mode (deck channels come from devices.toml); with none connected it runs Track Preparation through the built-in output. Add an interface to devices.toml to support new hardware.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, DubSpacing.xs)
+            }
+        }
+    }
+
+    private func statusRow(label: String, value: String) -> some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text(label)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+                .frame(width: 64, alignment: .leading)
+            Text(value)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Human-readable label for the device currently in play.
+    private var currentDeviceLabel: String {
+        switch model.engineMode {
+        case .timecode:
+            return model.selectedInputDevice?.name
+                ?? model.performanceDevices.first?.name
+                ?? "No interface connected"
+        case .prep:
+            if let uid = model.selectedOutputUID,
+               let dev = model.outputDevices.first(where: { $0.uid == uid }) {
+                return dev.name
+            }
+            return "Built-in output (system default)"
+        }
+    }
+
+    /// Registry-resolved deck channels for the active interface, shown
+    /// read-only so the user can see what Dub picked.
+    private var currentChannelLabel: String {
+        guard let device = model.selectedInputDevice ?? model.performanceDevices.first
+        else { return "—" }
+        let r = model.engine.performanceRoutingFor(deviceName: device.name)
+        let a = r.deckAInput.map(String.init).joined(separator: "+")
+        guard r.twoDeck else { return "A \(a) (single deck)" }
+        let b = r.deckBInput.map(String.init).joined(separator: "+")
+        return "A \(a) · B \(b)"
+    }
+
+    // MARK: - Track loading safety
+
     /// Load-into-playing-deck guard toggle (M10.5r). PRD §5.5 + §6.4
     /// default the engine to refusing a load on a running deck; this
     /// toggle lets the user opt out of the safety rule in
-    /// Performance mode. The note explicitly calls out that Prep
-    /// mode is unaffected — Prep is a single-deck rehearsal shell
-    /// where the rule never applied.
+    /// Performance mode. Prep mode is unaffected — it's a single-deck
+    /// rehearsal shell where the rule never applied.
     private var loadBehaviourSection: some View {
         section(title: "TRACK LOADING") {
             VStack(alignment: .leading, spacing: DubSpacing.xs) {
@@ -65,34 +131,7 @@ struct PreferencesSheet: View {
         }
     }
 
-    private var modeSection: some View {
-        section(title: "ENGINE MODE") {
-            VStack(alignment: .leading, spacing: DubSpacing.xs) {
-                Picker("", selection: $model.engineMode) {
-                    ForEach(EngineMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                Text(model.engineMode == .timecode
-                    ? "Two-deck timecode capture via a multi-channel audio interface."
-                    : "Output-only file playback — no input device needed.")
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-            }
-        }
-    }
-
-    private var prepModeNote: some View {
-        section(title: "INPUT DEVICE") {
-            Text("Prep mode bypasses input capture. Configure your default output device in macOS Audio MIDI Setup.")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textTertiary)
-        }
-    }
-
-    // MARK: - Sections
+    // MARK: - Header / footer
 
     private var header: some View {
         HStack {
@@ -100,52 +139,11 @@ struct PreferencesSheet: View {
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(DubColor.textPrimary)
             Spacer()
-            Text("M10.3 dev surface — final preferences UX in M18")
+            #if DEBUG
+            Text("DEBUG build — dev overrides shown")
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textPlaceholder)
-        }
-    }
-
-    private var deviceSection: some View {
-        section(title: "INPUT DEVICE") {
-            HStack(spacing: DubSpacing.sm) {
-                Picker("", selection: pickerBinding) {
-                    if model.availableDevices.isEmpty {
-                        Text("No input devices found").tag(Optional<String>.none)
-                    } else {
-                        ForEach(model.availableDevices, id: \.self) { d in
-                            Text(d).tag(Optional<String>.some(d))
-                        }
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-
-                Button {
-                    model.refreshDevices()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Re-scan input devices")
-            }
-        }
-    }
-
-    private var channelsSection: some View {
-        section(title: "CHANNEL PAIRS (1-BASED)") {
-            VStack(alignment: .leading, spacing: DubSpacing.sm) {
-                channelField(
-                    label: "Deck A",
-                    text: $model.channelsAText,
-                    hint: "1,2")
-                channelField(
-                    label: "Deck B",
-                    text: $model.channelsBText,
-                    hint: "leave empty for single-deck")
-                Text("E.g. SL3: A = 3,4 · B = 5,6.")
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-            }
+            #endif
         }
     }
 
@@ -158,18 +156,9 @@ struct PreferencesSheet: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 0)
-            // M10.5b: single Close button. Every config change in
-            // this sheet (mode picker, device picker, channel fields)
-            // auto-applies via `model.applyConfig()`, so there's
-            // never anything for the user to manually commit. The
-            // button binds *only* to `.cancelAction` (Esc) — having
-            // both `.cancelAction` *and* `.defaultAction` (Enter)
-            // on the same button is a SwiftUI footgun: only the
-            // last-applied shortcut wins reliably, leaving Esc
-            // dead and Enter behaving weirdly on macOS 14 with
-            // text fields focused. Esc-to-dismiss matches every
-            // other macOS modal; Enter is the wrong key for a
-            // sheet that has nothing to commit anyway.
+            // Single Close button bound only to `.cancelAction` (Esc).
+            // Everything in this sheet either auto-applies or is
+            // read-only, so there is nothing to manually commit.
             Button("Close") { dismiss() }
                 .keyboardShortcut(.cancelAction)
         }
@@ -191,35 +180,98 @@ struct PreferencesSheet: View {
         }
     }
 
-    @ViewBuilder
-    private func channelField(
-        label: String, text: Binding<String>, hint: String
-    ) -> some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text(label)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .frame(width: 64, alignment: .leading)
-            TextField(hint, text: text)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 240)
-                // Channel fields commit on Enter / focus-blur. Doing
-                // it onChange would attempt a restart on every
-                // keystroke ("1" → "1," → "1,2" each spawning a
-                // startThru call, which is racy and noisy with
-                // CoreAudio).
-                .onSubmit {
-                    model.applyConfig()
+    #if DEBUG
+    // MARK: - DEV overrides (never compiled into Release)
+
+    /// Developer-only controls. Dub can't exercise Performance mode on
+    /// built-in audio, so this block lets a developer force the mode
+    /// and pin devices to drive the performance UI without a real DVS
+    /// interface. Compiled out of shipping builds entirely.
+    private var devSection: some View {
+        section(title: "DEVELOPER") {
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                Picker("Mode override", selection: devModeBinding) {
+                    Text("Auto (hardware)").tag(EngineMode?.none)
+                    Text("Force Track Preparation").tag(EngineMode?.some(.prep))
+                    Text("Force Performance").tag(EngineMode?.some(.timecode))
                 }
+                .pickerStyle(.menu)
+
+                Picker("Performance source", selection: devSourceBinding) {
+                    ForEach(PerformanceSource.allCases) { src in
+                        Text(src.displayName).tag(src)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(model.engineMode != .timecode)
+
+                HStack(spacing: DubSpacing.sm) {
+                    Picker("Input", selection: devInputBinding) {
+                        if model.performanceDevices.isEmpty {
+                            Text("No DJ interfaces found").tag(Optional<String>.none)
+                        } else {
+                            ForEach(model.performanceDevices, id: \.uid) { d in
+                                Text(d.name).tag(Optional<String>.some(d.uid))
+                            }
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Button {
+                        model.refreshDevices()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .help("Re-scan devices")
+                }
+
+                Picker("Output (Prep only)", selection: devOutputBinding) {
+                    Text("Auto (interface / built-in)").tag(Optional<String>.none)
+                    ForEach(model.outputDevices, id: \.uid) { d in
+                        Text(d.name).tag(Optional<String>.some(d.uid))
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(model.engineMode == .timecode)
+
+                Text("Dev-only: forces the mode and pins devices so the performance UI can be exercised without a real DJ interface. Performance source picks how the decks are driven — Timecode (control vinyl → loaded file, the product behaviour) or Thru (real-record live passthrough). The output picker applies to Track Preparation only — in Performance mode the master always returns through the interface itself (deck A → 3+4, deck B → 5+6). None of this ships in Release; production mode is hardware-derived only.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
-    private var pickerBinding: Binding<String?> {
+    private var devModeBinding: Binding<EngineMode?> {
         Binding(
-            get: { model.selectedDevice },
-            set: { model.selectedDevice = $0 }
+            get: { model.devForcedMode },
+            set: { model.devForcedMode = $0 }  // didSet re-detects + restarts
         )
     }
+
+    private var devSourceBinding: Binding<PerformanceSource> {
+        Binding(
+            get: { model.devForcedSource },
+            set: { model.devForcedSource = $0 }  // didSet restarts in timecode mode
+        )
+    }
+
+    private var devInputBinding: Binding<String?> {
+        Binding(
+            get: { model.selectedInputUID },
+            set: {
+                model.selectedInputUID = $0
+                model.applyConfig()
+            }
+        )
+    }
+
+    private var devOutputBinding: Binding<String?> {
+        Binding(
+            get: { model.selectedOutputUID },
+            set: { model.selectedOutputUID = $0 }  // onChange in MainView applies
+        )
+    }
+    #endif
 }
 
 #Preview {

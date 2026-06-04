@@ -152,9 +152,9 @@ pub fn resolve_output_routing(
             anyhow!(
                 "--device-profile {pattern:?} not found in known-device table; \
                  known patterns: {}",
-                device_profiles::KNOWN_DEVICES
+                device_profiles::known_devices()
                     .iter()
-                    .map(|d| d.name_pattern)
+                    .map(|d| d.name_pattern.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -180,8 +180,12 @@ pub fn resolve_output_routing(
         });
     };
 
+    // `KnownInterface` stores 1-based channels (matching back-panel
+    // labels in `devices.toml`); convert at the engine boundary.
+    let deck_a_zero = profile.deck_a_zero_based();
+    let deck_b_zero = profile.deck_b_zero_based();
     let channels = args.output_channels.unwrap_or(profile.output_channels);
-    if profile.deck_a_first_channel + 2 > channels || profile.deck_b_first_channel + 2 > channels {
+    if deck_a_zero + 2 > channels || deck_b_zero + 2 > channels {
         return Err(anyhow!(
             "device profile '{}' wants {} channels but --output-channels {} is too small",
             profile.display_name,
@@ -196,18 +200,15 @@ pub fn resolve_output_routing(
     };
     Ok(ResolvedOutputRouting {
         channels,
-        routing: [
-            Some(profile.deck_a_first_channel),
-            Some(profile.deck_b_first_channel),
-        ],
+        routing: [Some(deck_a_zero), Some(deck_b_zero)],
         summary: format!(
             "output routing: {} ({} ch, deck A → ch {}+{}, deck B → ch {}+{}){}",
             profile.display_name,
             channels,
+            profile.deck_a_first_channel,
             profile.deck_a_first_channel + 1,
-            profile.deck_a_first_channel + 2,
+            profile.deck_b_first_channel,
             profile.deck_b_first_channel + 1,
-            profile.deck_b_first_channel + 2,
             verified_note,
         ),
     })

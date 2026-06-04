@@ -1,0 +1,84 @@
+# Dub device registry.
+#
+# This file is embedded into the binary at compile time via `include_str!`
+# and parsed once at startup by `dub_audio::devices::DeviceRegistry::embedded`.
+# It serves two purposes:
+#
+#   1. Allowlist: force-classify a device as a DJ-grade `PerformanceInterface`
+#      even when the heuristic (external transport + >=4 outputs) does not
+#      match it. Useful for unusual interfaces (e.g. a small 2x2 DVS box the
+#      heuristic would otherwise reject).
+#
+#   2. Per-deck routing: for each known interface, pin the AU open width
+#      (`output_channels`) and the 1-based first OUTPUT channel for deck A
+#      and deck B's stereo pairs. The Apple shell (Performance auto-mode),
+#      the CLI's `--device-profile`, and `dub-engine::OutputRouting` consume
+#      these. The deck INPUT (timecode) pairs default to the same channel
+#      numbers as the outputs; override them only when an interface's input
+#      layout differs, via the optional `deck_a_input_first_channel` /
+#      `deck_b_input_first_channel` fields (also 1-based).
+#
+#   3. Denylist: force-exclude a device the heuristic would wrongly accept
+#      (rare, but useful for studio interfaces that happen to be 4x4 USB
+#      but are not DVS-suitable).
+#
+# Adding a device:
+#
+#   1. Plug it into a Mac and run `dub list-inputs` / `dub list-outputs`
+#      (M5.5.2). Copy the CoreAudio name exactly. Use a substring that is
+#      unique in the set of devices a user is likely to have.
+#   2. Look up the per-deck channel mapping in the device's manual or
+#      driver-panel docs (Native Instruments and Serato both publish this).
+#   3. Add an `[[interface]]` block here.
+#   4. Add a unit test in `crates/dub-audio/src/devices.rs` asserting the
+#      registry's `match_interface` finds the new entry. Mark `verified =
+#      false` if the routing has not been validated on real hardware yet
+#      so the CLI surfaces a "double-check this" warning.
+#
+# Channels in this file are **1-based** for user ergonomics (matches the
+# CLI's `--deck-a-out-ch` flags and the labels on every interface's back
+# panel). The classifier converts to 0-based at the API boundary.
+
+# -- Verified interfaces ------------------------------------------------
+
+# Serato SL3 (Rane) — the M5.x reference device. Inputs and outputs are
+# both 6 channels. Aux is ch 1+2, deck A on ch 3+4, deck B on ch 5+6.
+# The wiring is internal to the box: ch 3+4 of the SL3 outputs physically
+# connect to the "Deck A -> Mixer" RCAs on the back. Input pairs sit on
+# the same channel numbers as the outputs (3+4 / 5+6), so no explicit
+# `deck_*_input_first_channel` override is needed here.
+[[interface]]
+name_pattern = "SL 3"
+display_name = "Serato SL 3"
+manufacturer = "Rane"
+output_channels = 6
+deck_a_first_channel = 3
+deck_b_first_channel = 5
+verified = true
+
+# -- Unverified interfaces ---------------------------------------------
+#
+# These are driver-panel guesses we apply but cannot yet validate end-to-end
+# against real hardware. The CLI marks them as unverified so the user
+# double-checks the routing on the first session.
+
+# Traktor Audio 6 (Native Instruments). Deck A on ch 1+2, deck B on ch 3+4.
+[[interface]]
+name_pattern = "Audio 6"
+display_name = "Traktor Audio 6"
+manufacturer = "Native Instruments"
+output_channels = 6
+deck_a_first_channel = 1
+deck_b_first_channel = 3
+verified = false
+
+# -- Denylist ----------------------------------------------------------
+#
+# Add `[[denylist]]` blocks here to force-exclude a device that the
+# heuristic would wrongly accept (rare). Use the same substring-pattern
+# style as `[[interface]]`.
+#
+# (Empty by default. Uncomment and edit if needed.)
+#
+# [[denylist]]
+# name_pattern = "Some 4x4 Studio Interface"

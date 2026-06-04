@@ -32,18 +32,26 @@ use objc2_audio_toolbox::{
 };
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
-    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
+    kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyTranslateUIDToDevice,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
-    kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-    AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
+    kAudioObjectPropertyManufacturer, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioValueRange};
+use objc2_core_foundation::{CFRetained, CFString};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 
 use dub_engine::{DeckSharedState, Engine, RealtimeContext};
 
+#[cfg(test)]
+use crate::devices::DeviceCategory;
+use crate::devices::{
+    classify, is_performance_interface, AudioDevice, DeviceRegistry, TransportKind,
+};
 use crate::{AudioError, DeviceInfo};
 
 // =============================================================
@@ -222,13 +230,16 @@ pub struct AudioOutput {
 ///
 /// Mirrors [`InputOptions`]: the M5.2 input-side struct. Defaults are
 /// chosen so that `start_with_options` with `OutputOptions::default()`
-/// behaves like `start`: stereo, default device, device's current SR
-/// and buffer size.
+/// behaves like `start`: stereo, the macOS default output device,
+/// device's current SR and buffer size.
 ///
-/// In v1 the *device* itself is always the system default output —
-/// there's no `device_name` here yet. Users target a specific
-/// interface via macOS Audio MIDI Setup → "Use this device for
-/// sound output". Per-device selection lands later.
+/// **Per-device output selection (added with the device classifier).**
+/// Setting [`OutputOptions::device_uid`] opens that specific device
+/// instead of the macOS default output, so the app can drive the
+/// SL3 (or any DJ interface) for Performance mode and the built-in
+/// speakers for Prep mode without asking the user to flip the
+/// default in Audio MIDI Setup. `None` keeps the historical
+/// default-output behaviour.
 #[derive(Debug, Clone)]
 pub struct OutputOptions {
     /// Number of physical output channels to open the AU with. 2 for
@@ -250,6 +261,20 @@ pub struct OutputOptions {
     /// for SL3 / Audio 6 since those devices already expose their
     /// physical channels in order.
     pub channel_map: Option<Vec<i32>>,
+    /// Open this specific output device instead of the macOS default.
+    /// The string is a CoreAudio device UID
+    /// (`kAudioDevicePropertyDeviceUID`) — stable across reconnects,
+    /// preferred over name because two SL3s share a name but never
+    /// a UID. `None` keeps the legacy "system default output"
+    /// behaviour. Falls back to substring name match if UID
+    /// translation fails (older drivers occasionally lose UID
+    /// stability across reboots).
+    pub device_uid: Option<String>,
+    /// Fallback when `device_uid` is `None` or UID translation
+    /// returns no device: open the first output-capable device whose
+    /// name contains this substring (case-insensitive). `None` falls
+    /// back to the macOS default-output AudioUnit.
+    pub device_name: Option<String>,
 }
 
 impl Default for OutputOptions {
@@ -259,6 +284,8 @@ impl Default for OutputOptions {
             buffer_frames: None,
             sample_rate: None,
             channel_map: None,
+            device_uid: None,
+            device_name: None,
         }
     }
 }
@@ -425,8 +452,14 @@ impl AudioOutput {
         opts: &OutputOptions,
         routing: dub_engine::OutputRouting,
     ) -> Result<Self, AudioError> {
-        let mut audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
-        let device_id = device_id_from_audio_unit(&audio_unit)?;
+        // Per-device output selection (M5.7). Prefer UID — stable across
+        // reconnects and unique across same-model duplicates. Fall back
+        // to a name substring match for older drivers whose UIDs aren't
+        // stable, then to the macOS default output AU if nothing was
+        // requested. Each branch yields a `(AudioUnit, AudioObjectID)`
+        // pair so the rest of the function is independent of the
+        // resolution path.
+        let (mut audio_unit, device_id, needs_init) = open_output_audio_unit(opts)?;
         let device_name = get_device_name(device_id).unwrap_or_default();
         let engine_sr = engine.sample_rate();
 
@@ -488,6 +521,20 @@ impl AudioOutput {
                 )));
             }
             set_output_channel_map(&audio_unit, map)?;
+        }
+
+        // HAL units opened for a *specific* device (the `device_uid` /
+        // `device_name` Performance path) come back uninitialized so the
+        // stream format / channel map above can be set first. They must
+        // be initialized before `start()`, exactly like the input path —
+        // otherwise `AudioOutputUnitStart` returns
+        // `kAudioUnitErr_Uninitialized`. The `IOType::DefaultOutput`
+        // branch is already initialized by `AudioUnit::new`, so skip it
+        // there (re-initializing a live default-output unit is needless).
+        if needs_init {
+            audio_unit
+                .initialize()
+                .map_err(|e| AudioError::Device(format!("audio_unit.initialize(output): {e}")))?;
         }
 
         if let Some(frames) = opts.buffer_frames {
@@ -636,6 +683,212 @@ fn device_id_from_audio_unit(au: &AudioUnit) -> Result<AudioObjectID, AudioError
         Element::Output,
     )?;
     Ok(device_id)
+}
+
+/// Build the output AudioUnit and resolve its bound device-id, honoring
+/// [`OutputOptions::device_uid`] and [`OutputOptions::device_name`].
+///
+/// Resolution order:
+/// 1. `device_uid` -> `kAudioHardwarePropertyTranslateUIDToDevice`.
+/// 2. `device_name` -> case-insensitive substring across all global
+///    AudioObjectIDs that have at least one output stream.
+/// 3. Macos default output AudioUnit (`IOType::DefaultOutput`).
+///
+/// When (1) or (2) yields a device, we build a HAL AudioUnit bound to
+/// that specific device via `audio_unit_from_device_id_uninitialized`
+/// (the same helper the input path uses). The `false` second arg picks
+/// "output element" — mirror of the input-only path's `true`.
+///
+/// The returned `bool` is `needs_init`: `true` when the unit came from
+/// `audio_unit_from_device_id_uninitialized` (branches 1 and 2) and the
+/// caller must call `AudioUnitInitialize` before `start()`; `false` for
+/// the `IOType::DefaultOutput` branch (3), where `AudioUnit::new`
+/// already initialized the unit. Forgetting this is exactly the
+/// `kAudioUnitErr_Uninitialized` start failure that surfaced when
+/// Performance mode opened a specific output device by UID at
+/// multi-channel for the first time.
+fn open_output_audio_unit(
+    opts: &OutputOptions,
+) -> Result<(AudioUnit, AudioObjectID, bool), AudioError> {
+    if let Some(uid) = opts.device_uid.as_deref() {
+        if let Some(id) = lookup_device_id_by_uid(uid) {
+            if get_audio_device_supports_scope(id, Scope::Output).unwrap_or(false) {
+                let au = audio_unit_from_device_id_uninitialized(id, false).map_err(|e| {
+                    AudioError::Device(format!("audio_unit_from_device_id(output uid={uid}): {e}"))
+                })?;
+                return Ok((au, id, true));
+            }
+            return Err(AudioError::Device(format!(
+                "output device uid='{uid}' has no output stream"
+            )));
+        }
+        eprintln!(
+            "dub-audio: device_uid='{uid}' not resolvable; falling back to device_name / default"
+        );
+    }
+    if let Some(name) = opts.device_name.as_deref() {
+        if let Some(id) = lookup_output_device_id_by_name(name) {
+            let au = audio_unit_from_device_id_uninitialized(id, false).map_err(|e| {
+                AudioError::Device(format!(
+                    "audio_unit_from_device_id(output name={name}): {e}"
+                ))
+            })?;
+            return Ok((au, id, true));
+        }
+        return Err(AudioError::Device(format!(
+            "no output device matching name '{name}'"
+        )));
+    }
+    let au = AudioUnit::new(IOType::DefaultOutput)?;
+    let id = device_id_from_audio_unit(&au)?;
+    Ok((au, id, false))
+}
+
+/// Look up the `AudioObjectID` for a given device UID string via
+/// `kAudioHardwarePropertyTranslateUIDToDevice`. Returns `None` if the
+/// UID is empty, malformed, or no longer maps to a live device (e.g.
+/// the user yanked the cable after the UID was cached).
+fn lookup_device_id_by_uid(uid: &str) -> Option<AudioObjectID> {
+    if uid.is_empty() {
+        return None;
+    }
+    let cf_uid = CFString::from_str(uid);
+    // The HAL qualifier slot wants a `CFStringRef` value, which is a
+    // pointer to a CFString object. We hold the +1 retain in `cf_uid`
+    // for the duration of this call; `cf_uid_ref` is a non-owning
+    // raw pointer that gets boxed as the qualifier's value.
+    let cf_uid_ref: *const CFString = &raw const *cf_uid;
+    let mut device_id: AudioObjectID = 0;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut size: u32 = mem::size_of::<AudioObjectID>() as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    let qualifier_size: u32 = mem::size_of::<*const CFString>() as u32;
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let system_object = kAudioObjectSystemObject as AudioObjectID;
+    let qualifier_ptr: *const c_void = std::ptr::from_ref(&cf_uid_ref).cast();
+    // SAFETY:
+    // - `address` is a live stack value held for the call.
+    // - `cf_uid_ref` points at the CFString we just retained for the
+    //   duration of this function (CFRetained holds the reference;
+    //   `cf_uid` outlives this unsafe block).
+    // - `qualifier_ptr` points at `cf_uid_ref`, a stack slot whose
+    //   content is a single `CFStringRef`-sized pointer — what this
+    //   selector expects as its qualifier value.
+    // - `device_id` is u32-sized, matching the property's return shape.
+    // - Status 0 with device_id == 0 means `kAudioObjectUnknown`; we
+    //   surface that as `None` so callers fall through to the name /
+    //   default-output path.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            system_object,
+            NonNull::from(&address),
+            qualifier_size,
+            qualifier_ptr,
+            NonNull::from(&mut size),
+            NonNull::from(&mut device_id).cast::<c_void>(),
+        )
+    };
+    if status != 0 || device_id == 0 {
+        return None;
+    }
+    Some(device_id)
+}
+
+/// Case-insensitive substring lookup for an output-capable device by
+/// name. Mirror of [`resolve_input_device`] minus the default-input
+/// fallback (callers that didn't supply `device_name` fall through to
+/// `IOType::DefaultOutput` in [`open_output_audio_unit`]).
+fn lookup_output_device_id_by_name(query: &str) -> Option<AudioObjectID> {
+    if let Some(id) = get_device_id_from_name(query, false) {
+        if get_audio_device_supports_scope(id, Scope::Output).unwrap_or(false) {
+            return Some(id);
+        }
+    }
+    let needle = query.to_lowercase();
+    let ids = get_audio_device_ids_for_scope(Scope::Global).ok()?;
+    for id in ids {
+        if !get_audio_device_supports_scope(id, Scope::Output).unwrap_or(false) {
+            continue;
+        }
+        if let Ok(name) = get_device_name(id) {
+            if name.to_lowercase().contains(&needle) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Read a CFString device property (UID, manufacturer, etc.) and decode
+/// it to a Rust `String`. Returns `None` on any HAL error, including
+/// "this device has no such property" (which is what drivers do when
+/// the field is unsupported rather than e.g. an empty string).
+fn get_string_property(device: AudioObjectID, selector: u32) -> Option<String> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut cf_ptr: *const CFString = ptr::null();
+    #[allow(clippy::cast_possible_truncation)]
+    let mut size: u32 = mem::size_of::<*const CFString>() as u32;
+    // SAFETY: address + size + cf_ptr all live on the local stack for
+    // the call. The kernel writes a single CFStringRef pointer to
+    // `cf_ptr` on success. We retain it as a CFRetained below so we
+    // can decode it without leaking; CFRetained's drop releases the
+    // CoreFoundation reference.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut cf_ptr).cast::<c_void>(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let nn = NonNull::new(cf_ptr.cast_mut())?;
+    // SAFETY: the HAL gives us a +1 retain on the CFString; CFRetained
+    // takes ownership of that retain count.
+    let s = unsafe { CFRetained::from_raw(nn) };
+    Some(s.to_string())
+}
+
+/// Resolve a CoreAudio transport-type integer to the three-bucket
+/// [`TransportKind`] the classifier reasons about.
+///
+/// "External" is defined as `transport ∈ {USB, Thunderbolt, FireWire,
+/// PCI, AVB}` — the bus types every DVS interface we have ever seen
+/// uses. "BuiltIn" is exactly the laptop's onboard mic / speakers.
+/// Everything else (Aggregate, Virtual, Unknown, Bluetooth, HDMI,
+/// AirPlay, Continuity) is classified as `Other` and falls through
+/// the classifier's filter.
+fn transport_kind_of(transport: u32) -> TransportKind {
+    use objc2_core_audio::{
+        kAudioDeviceTransportTypeAVB, kAudioDeviceTransportTypeBuiltIn,
+        kAudioDeviceTransportTypeFireWire, kAudioDeviceTransportTypePCI,
+        kAudioDeviceTransportTypeThunderbolt, kAudioDeviceTransportTypeUSB,
+    };
+    if transport == kAudioDeviceTransportTypeUSB
+        || transport == kAudioDeviceTransportTypeThunderbolt
+        || transport == kAudioDeviceTransportTypeFireWire
+        || transport == kAudioDeviceTransportTypePCI
+        || transport == kAudioDeviceTransportTypeAVB
+    {
+        TransportKind::External
+    } else if transport == kAudioDeviceTransportTypeBuiltIn {
+        TransportKind::BuiltIn
+    } else {
+        TransportKind::Other
+    }
 }
 
 fn buffer_frame_size_address() -> AudioObjectPropertyAddress {
@@ -876,34 +1129,37 @@ pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
     Ok(out)
 }
 
-/// Return `true` iff at least one **external** audio interface with
-/// input streams is currently attached to the system. Used by the
-/// Apple shell's auto-detect (PRD §3.1) to decide whether to boot
-/// into Performance / Timecode mode (external interface present)
-/// or Track Preparation / output-only mode (no external interface).
+/// Return `true` iff at least one **DJ-grade audio interface** is
+/// currently attached to the system. Used by the Apple shell's auto-
+/// detect (PRD §3.1) to decide whether to boot into Performance /
+/// Timecode mode (DJ interface present) or Track Preparation /
+/// output-only mode (none present).
 ///
 /// **The whole point of this helper is to keep the app off the
-/// microphone-permission path when no external interface is
-/// plugged in.** macOS Sonoma / Sequoia will surface the mic-
-/// permission prompt at the first input-related interaction with
-/// the audio HAL when the app declares `NSMicrophoneUsageDescription`;
-/// enumerating input devices via [`list_input_devices`] (which
-/// reads device names, channel counts, etc. on every input-capable
-/// device — including the built-in mic) is exactly such an
-/// interaction. This probe queries only device-level *transport-
-/// type* metadata + input-scope availability, both of which are
-/// permission-safe, so the prompt only fires later when we
-/// actually open an input AudioUnit on an external interface.
+/// microphone-permission path when no DJ interface is plugged in.**
+/// macOS Sonoma / Sequoia surfaces the mic-permission prompt at the
+/// first input-related interaction with the audio HAL when the app
+/// declares `NSMicrophoneUsageDescription`. Reading a device's
+/// *input*-scope `kAudioDevicePropertyStreamConfiguration` is exactly
+/// such an interaction. This probe therefore reads **only** transport
+/// type, OUTPUT-scope channel counts, and (for external devices) the
+/// device name — never any input-scope property — so it stays strictly
+/// off the TCC path. The mic prompt fires only later, when Performance
+/// mode actually opens an input AudioUnit on a real DJ rig (the
+/// Serato-style behaviour we want).
 ///
-/// "External" is defined as transport type ∈ {USB, Thunderbolt,
-/// FireWire, PCI, AVB} — the bus types Serato SL3 / NI Audio 6 /
-/// Pioneer DJM-S DVS interfaces actually use. Bluetooth, HDMI,
-/// AirPlay, and Continuity Capture are explicitly *not* external
-/// for this purpose: they're not DVS interfaces and treating them
-/// as such would still pull the user onto the mic-permission path
-/// with no benefit. Aggregate / Virtual / Unknown transport types
-/// are skipped for the same reason — they're never used as DVS
-/// inputs.
+/// "DJ-grade" is defined as **external transport ∈ {USB, Thunderbolt,
+/// FireWire, PCI, AVB} AND >= 4 output channels**, OR an entry in the
+/// `[[interface]]` allowlist of `devices.toml`. The output-count gate
+/// isolates DJ interfaces from USB headsets / podcast mics / stereo
+/// DACs just as cleanly as the old 4-in/4-out rule, without the
+/// input-scope read. See [`crate::devices`] for the full classifier.
+///
+/// Because we read names only on external-transport devices, the
+/// built-in mic and every virtual / Bluetooth / HDMI device is skipped
+/// before any name read — and the registry allowlist is now honoured
+/// here too (an allowlisted external interface auto-detects into
+/// Performance mode).
 ///
 /// Returns `false` on any HAL enumeration error (logged via
 /// `eprintln!`); the conservative fallback is "no external
@@ -918,37 +1174,141 @@ pub fn has_external_audio_interface() -> bool {
             return false;
         }
     };
+    let registry = DeviceRegistry::embedded();
     for id in ids {
-        if !get_audio_device_supports_scope(id, Scope::Input).unwrap_or(false) {
-            continue;
-        }
+        // Transport type is a device-level property, TCC-safe. Read it
+        // first and skip everything that isn't on an external bus so we
+        // never touch the name / channel-count of the built-in mic.
         let Ok(transport) = get_device_transport_type(id) else {
             continue;
         };
-        if is_external_transport(transport) {
+        if transport_kind_of(transport) != TransportKind::External {
+            continue;
+        }
+        // OUTPUT-scope channel count + device name are both TCC-safe
+        // (output-scope reads never wake the mic permission). The
+        // classifier accepts on `external + out>=4` OR registry match.
+        let out_ch = device_channel_count(id, kAudioObjectPropertyScopeOutput).unwrap_or(0);
+        let name = get_device_name(id).unwrap_or_default();
+        if is_performance_interface(&name, TransportKind::External, out_ch, registry) {
             return true;
         }
     }
     false
 }
 
-/// Returns `true` for transport-type constants that identify an
-/// external DJ-grade audio interface bus. See
-/// [`has_external_audio_interface`] for rationale.
-fn is_external_transport(transport: u32) -> bool {
-    use objc2_core_audio::{
-        kAudioDeviceTransportTypeAVB, kAudioDeviceTransportTypeFireWire,
-        kAudioDeviceTransportTypePCI, kAudioDeviceTransportTypeThunderbolt,
-        kAudioDeviceTransportTypeUSB,
-    };
-    matches!(
-        transport,
-        t if t == kAudioDeviceTransportTypeUSB
-            || t == kAudioDeviceTransportTypeThunderbolt
-            || t == kAudioDeviceTransportTypeFireWire
-            || t == kAudioDeviceTransportTypePCI
-            || t == kAudioDeviceTransportTypeAVB
-    )
+/// Enumerate every CoreAudio device that classifies into one of the
+/// two categories Dub cares about (PRD §3): a Performance interface
+/// or the built-in output.
+///
+/// Hard-filtered. Devices that fail the classifier (built-in mic,
+/// iPhone Continuity mic, Camo / Teams / Loopback virtual devices,
+/// Bluetooth headphones, aggregates, etc.) are dropped entirely.
+/// Anything in `devices.toml`'s `[[denylist]]` is also dropped even
+/// when the heuristic would otherwise accept it.
+///
+/// This is the unified source the CLI's `list-inputs` / `list-outputs`,
+/// the FFI's `list_audio_devices`, and the Swift picker should consume.
+/// The legacy [`list_input_devices`] still exists for backward
+/// compatibility with the M5.2 input-only callers but is otherwise
+/// superseded by this function.
+///
+/// # Errors
+/// Returns [`AudioError::Device`] only when CoreAudio enumeration
+/// itself fails. Per-device property errors are silently skipped so a
+/// single misbehaving driver does not blank the whole list.
+pub fn list_audio_devices() -> Result<Vec<AudioDevice>, AudioError> {
+    let ids = get_audio_device_ids_for_scope(Scope::Global)
+        .map_err(|e| AudioError::Device(format!("enumerating audio devices: {e}")))?;
+    let registry = DeviceRegistry::embedded();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Ok(name) = get_device_name(id) else {
+            continue;
+        };
+        let Ok(transport) = get_device_transport_type(id) else {
+            continue;
+        };
+        let kind = transport_kind_of(transport);
+        let in_ch = device_channel_count(id, kAudioObjectPropertyScopeInput).unwrap_or(0);
+        let out_ch = device_channel_count(id, kAudioObjectPropertyScopeOutput).unwrap_or(0);
+        let Some(category) = classify(&name, kind, out_ch, registry) else {
+            continue;
+        };
+        let uid = get_string_property(id, kAudioDevicePropertyDeviceUID).unwrap_or_default();
+        let manufacturer = get_string_property(id, kAudioObjectPropertyManufacturer)
+            .filter(|s| !s.is_empty() && s != "Unknown Manufacturer");
+        out.push(AudioDevice {
+            uid,
+            name,
+            manufacturer,
+            input_channels: in_ch,
+            output_channels: out_ch,
+            category,
+        });
+    }
+    Ok(out)
+}
+
+/// Enumerate classified devices **without ever reading input-scope
+/// HAL properties**, so it is safe to call in Prep mode and from the
+/// device-hot-plug listener without waking the microphone-permission
+/// (TCC) prompt.
+///
+/// This is the Prep-mode and auto-detect sibling of [`list_audio_devices`].
+/// It probes transport type, OUTPUT-scope channel count, device name,
+/// UID, and manufacturer — none of which touch the mic-permission path
+/// — and classifies on `(name, transport, output_channels)`. Devices
+/// with zero output channels (the built-in mic, the iPhone Continuity
+/// mic, pure-input aggregates) are skipped before their name is even
+/// read, so the built-in mic never enters the probe.
+///
+/// The returned [`AudioDevice`] values always report `input_channels =
+/// 0`: this function deliberately does not know a device's input
+/// width. Performance-mode callers that need the real input layout use
+/// the registry routing ([`DeviceRegistry::performance_routing`]) or
+/// the full [`list_audio_devices`] (acceptable there because Performance
+/// mode has already requested mic permission).
+///
+/// # Errors
+/// Returns [`AudioError::Device`] only when CoreAudio enumeration
+/// itself fails. Per-device property errors are silently skipped.
+pub fn list_output_devices() -> Result<Vec<AudioDevice>, AudioError> {
+    let ids = get_audio_device_ids_for_scope(Scope::Global)
+        .map_err(|e| AudioError::Device(format!("enumerating audio devices: {e}")))?;
+    let registry = DeviceRegistry::embedded();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Ok(transport) = get_device_transport_type(id) else {
+            continue;
+        };
+        let kind = transport_kind_of(transport);
+        // OUTPUT-scope read only. A 0-output device cannot be an output
+        // target nor a DJ interface, and skipping it here means we
+        // never read the built-in mic's name.
+        let out_ch = device_channel_count(id, kAudioObjectPropertyScopeOutput).unwrap_or(0);
+        if out_ch == 0 {
+            continue;
+        }
+        let Ok(name) = get_device_name(id) else {
+            continue;
+        };
+        let Some(category) = classify(&name, kind, out_ch, registry) else {
+            continue;
+        };
+        let uid = get_string_property(id, kAudioDevicePropertyDeviceUID).unwrap_or_default();
+        let manufacturer = get_string_property(id, kAudioObjectPropertyManufacturer)
+            .filter(|s| !s.is_empty() && s != "Unknown Manufacturer");
+        out.push(AudioDevice {
+            uid,
+            name,
+            manufacturer,
+            input_channels: 0,
+            output_channels: out_ch,
+            category,
+        });
+    }
+    Ok(out)
 }
 
 /// Query the system's current default *input* device (System Settings
@@ -1664,8 +2024,122 @@ fn device_channel_count(device: AudioObjectID, scope: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_core_audio::{
+        kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAirPlay,
+        kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBuiltIn,
+        kAudioDeviceTransportTypeFireWire, kAudioDeviceTransportTypeHDMI,
+        kAudioDeviceTransportTypePCI, kAudioDeviceTransportTypeThunderbolt,
+        kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeUnknown,
+        kAudioDeviceTransportTypeVirtual,
+    };
     use ringbuf::traits::{Consumer, Split};
     use ringbuf::HeapRb;
+
+    /// USB / Thunderbolt / FireWire / PCI / AVB all map to `External`.
+    /// AVB has a separate constant we don't import to keep the test
+    /// list compact; the other four cover every DVS-interface bus in
+    /// real use.
+    #[test]
+    fn transport_kind_of_external_buses() {
+        for t in [
+            kAudioDeviceTransportTypeUSB,
+            kAudioDeviceTransportTypeThunderbolt,
+            kAudioDeviceTransportTypeFireWire,
+            kAudioDeviceTransportTypePCI,
+        ] {
+            assert_eq!(
+                transport_kind_of(t),
+                TransportKind::External,
+                "transport 0x{t:08x} should be External"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_kind_of_built_in() {
+        assert_eq!(
+            transport_kind_of(kAudioDeviceTransportTypeBuiltIn),
+            TransportKind::BuiltIn
+        );
+    }
+
+    #[test]
+    fn transport_kind_of_other_buckets() {
+        // Bluetooth, HDMI, AirPlay, Aggregate, Virtual, Unknown all
+        // collapse to `Other`. The classifier drops these regardless
+        // of channel count.
+        for t in [
+            kAudioDeviceTransportTypeBluetooth,
+            kAudioDeviceTransportTypeHDMI,
+            kAudioDeviceTransportTypeAirPlay,
+            kAudioDeviceTransportTypeAggregate,
+            kAudioDeviceTransportTypeVirtual,
+            kAudioDeviceTransportTypeUnknown,
+        ] {
+            assert_eq!(
+                transport_kind_of(t),
+                TransportKind::Other,
+                "transport 0x{t:08x} should be Other"
+            );
+        }
+    }
+
+    /// Mirrors the unit-fixture in `devices.rs` for the user's machine
+    /// at plan time, but goes through `transport_kind_of()` -> classify
+    /// to confirm the macOS-side mapping aligns with the classifier's
+    /// expectations end-to-end. Pure logic — no HAL call needed.
+    #[test]
+    fn user_machine_fixture_passes_through_macos_transport_mapping() {
+        let r = DeviceRegistry::embedded();
+        let cases: &[(&str, u32, u32, u32, Option<DeviceCategory>)] = &[
+            (
+                "iPhone 16 Pro Microphone",
+                kAudioDeviceTransportTypeUnknown,
+                1,
+                0,
+                None,
+            ),
+            (
+                "MacBook Pro Microphone",
+                kAudioDeviceTransportTypeBuiltIn,
+                1,
+                0,
+                None,
+            ),
+            (
+                "MacBook Pro Speakers",
+                kAudioDeviceTransportTypeBuiltIn,
+                0,
+                2,
+                Some(DeviceCategory::BuiltInOutput),
+            ),
+            (
+                "Camo Microphone",
+                kAudioDeviceTransportTypeVirtual,
+                2,
+                2,
+                None,
+            ),
+            (
+                "Microsoft Teams Audio",
+                kAudioDeviceTransportTypeVirtual,
+                1,
+                1,
+                None,
+            ),
+            (
+                "SL 3",
+                kAudioDeviceTransportTypeUSB,
+                6,
+                6,
+                Some(DeviceCategory::PerformanceInterface),
+            ),
+        ];
+        for (name, transport, _in_ch, out_ch, want) in cases.iter().copied() {
+            let kind = transport_kind_of(transport);
+            assert_eq!(classify(name, kind, out_ch, r), want, "{name}");
+        }
+    }
 
     /// Build N HeapProds + HeapCons of the given capacity for the
     /// pure-logic demux tests. Mirrors what `start_with_options`

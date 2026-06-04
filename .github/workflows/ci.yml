@@ -58,3 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rt-audit (debug)
         run: cargo run -p rt-audit
+
+  docs-check:
+    name: Docs in sync with code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-docs
+        run: ./scripts/check-docs.sh

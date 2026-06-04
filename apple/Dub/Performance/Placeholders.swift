@@ -8,7 +8,6 @@
 //  * `FXBarPlaceholder`   — split per-deck, lit by M15 (Echo-Out) /
 //                            M16 (Dub Siren) / M17 (Sampler + Quick
 //                            Scratch).
-//  * `LibraryPlaceholder` — lit by M11 (Serato import).
 //
 //  Each placeholder is a visible-but-honest dim block with a tiny
 //  caption naming the milestone that owes it real content. The
@@ -111,32 +110,7 @@ struct FXBarPlaceholder: View {
     }
 }
 
-/// Library / browser placeholder. Single block with a centred
-/// caption.
-struct LibraryPlaceholder: View {
-    var body: some View {
-        ZStack {
-            DubColor.surface1
-            VStack(spacing: DubSpacing.sm) {
-                Text("LIBRARY")
-                    .font(DubFont.caps)
-                    .tracking(1.2)
-                    .foregroundStyle(DubColor.textSecondary)
-                Text("Lit by M11 — Serato library import")
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textPlaceholder)
-            }
-        }
-        .frame(minHeight: DubLayout.libraryMinHeight)
-    }
-}
-
 #Preview("FX bar") {
     FXBarPlaceholder()
         .frame(width: 1440)
-}
-
-#Preview("Library") {
-    LibraryPlaceholder()
-        .frame(width: 1440, height: 240)
 }

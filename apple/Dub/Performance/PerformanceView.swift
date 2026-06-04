@@ -502,6 +502,12 @@ struct PerformanceView: View {
         switch side {
         case .a:
             if !model.isRunning {
+                // Surface the real reason the engine is stopped (a
+                // start failure / mic denial) so the user sees the
+                // actual error instead of a generic "configure" nudge.
+                if let err = model.lastError {
+                    return err
+                }
                 return "Open Preferences (⌘,) to pick an input device and start."
             }
             return "Drag an audio file here, or press Space to load the browser selection."
@@ -524,10 +530,12 @@ struct PerformanceView: View {
 /// onto any part of the deck lands the load. Pre-fix the drop
 /// modifier was scoped to the 80 px waveform strip only, which
 /// the user reported as "I keep missing the strip; the header
-/// should also accept drops". Behaviour matches the prior path:
-/// macOS 13+ Transferable API, auto-play on a successful load
-/// (matches the drag-to-play idiom from M10.5d), and a `true`
-/// return value so SwiftUI knows the drop was consumed.
+/// should also accept drops". Behaviour: macOS 13+ Transferable
+/// API, auto-play on a successful load **in Prep mode only**
+/// (the drag-to-play idiom from M10.5d), and a `true` return
+/// value so SwiftUI knows the drop was consumed. In Performance
+/// mode the drop loads but does not start the deck — playback is
+/// driven by the control vinyl (or an explicit Play press).
 private struct DeckDropTarget: ViewModifier {
     let model: WaveformAppModel
     let side: DeckSide
@@ -537,7 +545,18 @@ private struct DeckDropTarget: ViewModifier {
             guard let url = urls.first else { return false }
             Task { @MainActor in
                 if await model.loadTrack(side: side, url: url) {
-                    model.play(side: side)
+                    // Drag-to-play idiom (M10.5d) applies in Prep mode
+                    // only. In Performance mode the loaded track must
+                    // wait for the control vinyl (or an explicit Play
+                    // press). Auto-playing here calls `play(side:)`,
+                    // which in Timecode mode engages *user-initiated*
+                    // Panic-Play — internal playback that ignores
+                    // timecode until the deck is paused. That was the
+                    // "load auto-starts internal play and the record
+                    // does nothing" bug.
+                    if model.engineMode == .prep {
+                        model.play(side: side)
+                    }
                 }
             }
             return true

@@ -1410,12 +1410,14 @@ observably do at the end.
 | **M11c.3b** | Tap-to-grid (`G` / `Shift+G` / `Option+G`) + in-place deck grid install. | [`SHIPPED.md`](SHIPPED.md#m11c3b) |
 | **M11c.4** | Lazy fingerprint (deferred from import to first deck-load). | [`SHIPPED.md`](SHIPPED.md#m11c4) |
 | **M11d dogfooding rounds** | Performance-mode play fixes, library-sourced beat grids, waveform/beat-grid smoothness, library UI reliability. | [`SHIPPED.md`](SHIPPED.md#m11d5) |
+| **M11d.6 → M11d.7** | Full-screen launch + windowed snap-back; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md`](SHIPPED.md#m11d7) |
+| **PRD-BEATS hardening** | Uniform Traktor-style grid + calibration; tap-to-grid + explicit `bar_phase` (schema v5) + relatch "set the 1"; robustness rounds 5–10 (`OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose`; waveform/beat-grid jitter killed end to end. | [`PRD-BEATS.md`](PRD-BEATS.md) |
+| **M11d-next** | Manual crates (playlists, §8.5.1): create / inline-rename / delete (cascade) / drag-add / remove / drag-to-reorder + context-menu reorder; `crates` + `crate_tracks` CRUD + ordering, FFI 29, editable "Dub Crates" sidebar. A `#` manual-order column (`crate_ordinal` on the row) is the crate's default sort and the only state where reorder is enabled; other column sorts render a read-only view, leaving manual order composable into future multi-column sorting. Nested crates deferred. | §8.5.1 |
 
 ### 12.1 Planned path to v1.0
 
 | # | Name | Demo criterion | Estimate |
 | --- | --- | --- | --- |
-| **M11d-next** | **Manual crates (playlists)** | User can create, name, drag-add, reorder, and delete Dub-native crates backed by the existing `crates` + `crate_tracks` tables. | 2–3 days |
 | **M11d-history** | **Played From / Played Into** | Deck header and session history surface useful transitions from `play_history.from_track_id` / `to_track_id`. | 1–2 days |
 | **M11e** | **Serato importer** | Read Serato DB/crates/GEOB tags, populate source metadata, beatgrids, keys, imported crates, cues, and loops. | 4–5 days |
 | **M11d-columns** | **Customizable browser columns + per-source disagreement view** | User can choose visible columns, inspect source-specific metadata, and see analysis/source disagreements without paying query cost for disabled columns. | 3–4 days |

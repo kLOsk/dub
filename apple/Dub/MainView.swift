@@ -18,7 +18,9 @@
 //
 
 import AppKit
+import AVFoundation
 import Combine
+import CoreAudio
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -41,6 +43,27 @@ enum EngineMode: String, CaseIterable, Identifiable {
         switch self {
         case .timecode: return "Performance (Timecode)"
         case .prep:     return "Track Preparation"
+        }
+    }
+}
+
+/// Which engine source drives the decks while in Performance mode.
+///
+/// The shipping product runs `.timecode` (control vinyl drives the
+/// loaded file, PRD §5.1). `.thru` (real-record live passthrough,
+/// PRD §5.1.1) is currently selectable only via the DEBUG dev
+/// override; per-deck automatic detection that chooses between the
+/// two will land in a later milestone.
+enum PerformanceSource: String, CaseIterable, Identifiable {
+    case timecode = "timecode"
+    case thru = "thru"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .timecode: return "Timecode (control vinyl → file)"
+        case .thru:     return "Thru (real record passthrough)"
         }
     }
 }
@@ -220,17 +243,118 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: Lifecycle config (driven by Preferences)
 
-    @Published var availableDevices: [String] = []
-    @Published var selectedDevice: String? = nil
+    /// Hard-filtered list of DJ-grade input interfaces (the
+    /// `AudioDeviceCategory.performanceInterface` subset returned by
+    /// `engine.listAudioDevices()`). Drives the Performance-mode
+    /// input device picker. The built-in mic, iPhone Continuity
+    /// mic, Camo / Teams / Loopback virtuals, AirPods, etc. are all
+    /// dropped at the classifier boundary — they never appear here.
+    @Published var performanceDevices: [AudioDeviceInfo] = []
+
+    /// Hard-filtered list of output-capable devices the user can
+    /// pick in Prep mode (the built-in speakers, plus every
+    /// Performance interface — DJs sometimes audition through
+    /// headphones plugged into the SL3 instead of the laptop
+    /// speakers). Drives the Prep-mode output picker.
+    @Published var outputDevices: [AudioDeviceInfo] = []
+
+    /// Stable `kAudioDevicePropertyDeviceUID` of the input device.
+    /// We persist by UID, not name, because two SL3s in the same
+    /// venue share a name but never a UID. Persisted in
+    /// `UserDefaults` under `dub.selectedInputDeviceUID`.
+    @Published var selectedInputUID: String? = nil {
+        didSet { Self.persistUID(selectedInputUID, key: Self.kSelectedInputUID) }
+    }
+
+    /// Stable UID of the output device (M5.7). `nil` keeps the macOS
+    /// system default; otherwise we drive that specific device.
+    /// Persisted under `dub.selectedOutputDeviceUID`.
+    @Published var selectedOutputUID: String? = nil {
+        didSet { Self.persistUID(selectedOutputUID, key: Self.kSelectedOutputUID) }
+    }
+
+    private static let kSelectedInputUID = "dub.selectedInputDeviceUID"
+    private static let kSelectedOutputUID = "dub.selectedOutputDeviceUID"
+
+    private static func persistUID(_ uid: String?, key: String) {
+        if let uid, !uid.isEmpty {
+            UserDefaults.standard.set(uid, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    /// Display name of the currently selected input device, derived
+    /// from `selectedInputUID` against the classified list. Used by
+    /// the picker label and the `startThru` call (the FFI still
+    /// takes a substring name to resolve the input device; per-UID
+    /// input selection is a future polish).
+    var selectedInputDevice: AudioDeviceInfo? {
+        guard let uid = selectedInputUID else { return nil }
+        return performanceDevices.first(where: { $0.uid == uid })
+    }
+
+    /// Display name of the currently selected output device. Used by
+    /// the Preferences picker label and by `startThru` / `startEngine`
+    /// to pass the UID across the FFI.
+    var selectedOutputDevice: AudioDeviceInfo? {
+        guard let uid = selectedOutputUID else { return nil }
+        return outputDevices.first(where: { $0.uid == uid })
+    }
+
     @Published var channelsAText: String = "1,2"
     /// Empty = single-deck mode (only in `.timecode`); always
     /// ignored in `.prep` (deck B stays off).
     @Published var channelsBText: String = ""
     @Published var palette: WaveformPalette = .serato
 
-    /// Engine mode the next Start call will use. Auto-default
-    /// computed at launch; user can override in Preferences.
+    /// Engine mode the next Start call will use. **Derived state**:
+    /// set only by `applyAutoDetect()` (launch + hot-plug) and, in
+    /// DEBUG builds, by the dev override below. There is no
+    /// user-facing mode switch in a shipping build — the hardware
+    /// decides (PRD §3).
     @Published var engineMode: EngineMode = .timecode
+
+    #if DEBUG
+    /// DEV-only manual mode override. `nil` means "follow hardware
+    /// auto-detect"; a non-nil value pins the mode so the performance
+    /// UI can be exercised on a Mac with no DJ interface (you can't
+    /// test Performance against built-in audio). Never compiled into a
+    /// Release build, so shipping users can't desync mode from
+    /// hardware. Setting it re-runs detection + restarts the engine.
+    @Published var devForcedMode: EngineMode? = nil {
+        didSet {
+            guard devForcedMode != oldValue else { return }
+            applyAutoDetect()
+            applyConfig()
+        }
+    }
+
+    /// DEV-only Performance source override. Performance mode's product
+    /// behaviour is **timecode** — control vinyl drives the loaded
+    /// file (PRD §5.1). Until per-deck automatic source detection
+    /// (PRD §5.1.1) lands, this toggle lets a developer force the
+    /// **Thru** passthrough path instead, to exercise the real-record
+    /// live-input rendering against an interface. Never compiled into
+    /// Release. Changing it while running restarts the engine.
+    @Published var devForcedSource: PerformanceSource = .timecode {
+        didSet {
+            guard devForcedSource != oldValue else { return }
+            if engineMode == .timecode { applyConfig() }
+        }
+    }
+    #endif
+
+    /// CoreAudio device-list change listener block. Retained so we can
+    /// remove it in `deinit`. `nil` until `installDeviceChangeListener()`
+    /// runs.
+    private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// Serial token to debounce bursts of `kAudioHardwarePropertyDevices`
+    /// notifications (a single plug event often fires several). Bumped on
+    /// every callback; the trailing work only runs if its captured token
+    /// still matches.
+    private var deviceChangeToken: Int = 0
 
     /// Allow loading a track onto a *playing* deck while in
     /// Performance / Timecode mode. The PRD's default policy (§5.5,
@@ -304,8 +428,8 @@ final class WaveformAppModel: ObservableObject {
     /// tap-session indicators (`(N)` count chip + italic rolling
     /// preview). Held as plain `let`s (not `@Published`) so a tap
     /// only invalidates the `DeckHeader` that observes the matching
-    /// session — `PerformanceView`, `LibraryView`,
-    /// `FileBrowserView`, and both `TrackOverviewView`s stay inert.
+    /// session — `PerformanceView`, `LibraryView`, and both
+    /// `TrackOverviewView`s stay inert.
     /// See `TapSessionViewModel`'s doc for the rationale.
     let tapSessionA = TapSessionViewModel()
     let tapSessionB = TapSessionViewModel()
@@ -412,8 +536,8 @@ final class WaveformAppModel: ObservableObject {
     /// `LibraryView`'s body, only written, so observing them
     /// from there is a pure wasted-cascade cost on every row
     /// click. The new model is observed only by call sites that
-    /// actually consume the selection (the deck load path,
-    /// the Space-loader, FileBrowserView in previews).
+    /// actually consume the selection (the deck load path and
+    /// the Space-loader).
     let librarySelection = LibrarySelectionModel()
 
     /// Unix-seconds boundary for the "Just Imported" smart crate
@@ -485,50 +609,119 @@ final class WaveformAppModel: ObservableObject {
         self.engine = DubEngine()
         self.allowLoadIntoRunningDeckInPerformance =
             UserDefaults.standard.bool(forKey: Self.kAllowLoadIntoRunningDeck)
+        // Rehydrate persisted device UIDs from UserDefaults. The
+        // `didSet` writes back to disk on every change, so this is
+        // the only place the cold-boot value enters the model. We
+        // intentionally bypass the `didSet` via setting the backing
+        // store directly... wait, Swift's @Published doesn't expose
+        // a backing store; the didSet fires here too. That's fine
+        // because it just re-writes the same value to UserDefaults
+        // on first launch.
+        let storedInputUID = UserDefaults.standard.string(forKey: Self.kSelectedInputUID)
+        let storedOutputUID = UserDefaults.standard.string(forKey: Self.kSelectedOutputUID)
+        self.selectedInputUID = storedInputUID
+        self.selectedOutputUID = storedOutputUID
         wireTapToGridControllers()
         applyAutoDetect()
-        // Only enumerate input devices when we actually need them
-        // (Timecode mode). Prep mode never touches the input HAL,
-        // which is the whole point of the auto-detect — the user
-        // never sees a microphone-permission prompt on a Mac with
-        // no external interface plugged in.
-        if engineMode == .timecode {
-            refreshDevices()
-        }
+        // `refreshDevices()` is now TCC-safe in every mode (it goes
+        // through `listOutputDevices()`, which never reads an
+        // input-scope HAL property), so we can populate the lists
+        // unconditionally at launch without risking the
+        // microphone-permission prompt. The prompt only fires later,
+        // when Performance mode actually opens input capture.
+        refreshDevices()
+        installDeviceChangeListener()
     }
 
     deinit {
+        // Inline the listener removal: `deinit` is nonisolated, so we
+        // can't call the @MainActor `removeDeviceChangeListener()` here.
+        // The CoreAudio free function itself is not actor-isolated, and
+        // reading a stored property in deinit is allowed.
+        if let block = deviceListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                DispatchQueue.main,
+                block)
+        }
         libraryScannerTask?.cancel()
         engine.stopEngine()
     }
 
     // MARK: Device list + auto-detect
 
+    /// Re-probe the device lists. **TCC-safe at all times.**
+    ///
+    /// Backed by `engine.listOutputDevices()`, which reads only
+    /// transport type + OUTPUT-scope channel counts + names — never an
+    /// input-scope HAL property — so calling it on launch, in Prep
+    /// mode, and from the hot-plug listener never wakes the macOS
+    /// microphone-permission prompt. The Performance-mode input
+    /// channel layout does not come from here; it comes from the
+    /// registry via `engine.performanceRoutingFor(_:)`.
     func refreshDevices() {
-        availableDevices = engine.listInputDevices()
-        if selectedDevice == nil, let first = availableDevices.first {
-            selectedDevice = first
+        let all = engine.listOutputDevices()
+        performanceDevices = all.filter { $0.category == .performanceInterface }
+        // Output picker pool (DEV builds only): built-in speakers +
+        // every Performance interface. A DJ might listen through the
+        // SL3's headphone out while auditioning.
+        outputDevices = all.filter { $0.outputChannels >= 2 }
+        // Reconcile persisted UIDs against the freshly probed list. If
+        // a device is gone (cable unplugged between sessions) clear the
+        // selection so we don't drive a dead UID.
+        if let uid = selectedInputUID,
+           !performanceDevices.contains(where: { $0.uid == uid }) {
+            selectedInputUID = nil
+        }
+        if let uid = selectedOutputUID,
+           !outputDevices.contains(where: { $0.uid == uid }) {
+            selectedOutputUID = nil
+        }
+        // Opinionated default: the first classified Performance
+        // interface wins (two SL3s plugged in => take the first, per
+        // the product spec). Performance mode without an input device
+        // is unusable, so always default-select one when present.
+        if selectedInputUID == nil {
+            selectedInputUID = performanceDevices.first?.uid
         }
     }
 
-    /// Pick a default `engineMode` based on what's plugged in.
+    /// Backwards-compatible alias. Both lists are now refreshed from
+    /// the single TCC-safe `listOutputDevices()` probe, so the Prep
+    /// entry path and the Performance entry path share one method.
+    func refreshOutputDevices() {
+        refreshDevices()
+    }
+
+    /// Derive `engineMode` from what's plugged in. **This is the only
+    /// thing that picks the mode in a shipping build** — there is no
+    /// user-facing Prep/Performance switch (PRD §3: the hardware
+    /// decides). A DEV-only override exists behind `#if DEBUG` for UI
+    /// work, since Performance mode can't be exercised on built-in
+    /// audio.
     ///
     /// **Permission-safe.** Uses [`DubEngine.hasExternalAudioInterface`]
-    /// which queries CoreAudio transport-type metadata only — no
-    /// AudioUnit instantiation, no device-name reads on input-
-    /// capable devices, nothing that would tickle macOS's
-    /// microphone-permission TCC layer. PRD §3.1: external
-    /// interface present → Performance / Timecode; none present →
-    /// Track Preparation / output-only (no input touched at all).
-    ///
-    /// "External" here is defined by transport type — USB,
-    /// Thunderbolt, FireWire, PCI, AVB — i.e. the bus types DVS
-    /// interfaces actually use. The previous heuristic (string-
-    /// match device names against built-in-mic patterns) called
-    /// `listInputDevices` which itself triggered the TCC prompt on
-    /// macOS 14+; that was the regression the user reported in
-    /// M10.5b shakedown.
+    /// which now queries transport type + OUTPUT-scope channel counts
+    /// only — no input-scope HAL property, no AudioUnit instantiation,
+    /// nothing that wakes macOS's microphone-permission (TCC) layer.
+    /// External DJ interface present → Performance / Timecode; none
+    /// present → Track Preparation / output-only (input never touched).
     private func applyAutoDetect() {
+        // In DEBUG builds, a manual override (set via the dev toggle in
+        // Preferences) pins the mode so the performance UI can be
+        // exercised without a real interface. When the override is
+        // nil, fall through to hardware auto-detect.
+        #if DEBUG
+        if let forced = devForcedMode {
+            engineMode = forced
+            return
+        }
+        #endif
         engineMode = engine.hasExternalAudioInterface() ? .timecode : .prep
     }
 
@@ -545,16 +738,9 @@ final class WaveformAppModel: ObservableObject {
     /// `start()` directly anymore — `applyConfig` is the only
     /// caller that knows whether a restart-vs-fresh-start is needed.
     func applyConfig() {
-        // Just-in-time device enumeration. The auto-detect at init
-        // *intentionally* skipped `refreshDevices()` when Prep mode
-        // was picked, so the user never saw the mic-permission prompt
-        // on a Mac with no external interface. The moment the user
-        // (or some onChange handler) selects Timecode mode, we need
-        // a device list — call `refreshDevices()` here so the
-        // Preferences picker has something to show. This is the
-        // explicit-user-action point where macOS's TCC prompt may
-        // fire, and that's the right time for it.
-        if engineMode == .timecode && availableDevices.isEmpty {
+        // `refreshDevices()` is TCC-safe in every mode now, so we can
+        // always keep the lists current before (re)starting.
+        if performanceDevices.isEmpty && outputDevices.isEmpty {
             refreshDevices()
         }
         let wasRunning = isRunning
@@ -566,11 +752,14 @@ final class WaveformAppModel: ObservableObject {
 
     func start() {
         surfaceError(nil)
+        // Each path manages its own `startPolling()`: Prep starts
+        // synchronously, while Timecode defers behind the async
+        // microphone-permission request and starts polling from its
+        // completion handler.
         switch engineMode {
         case .timecode: startTimecode()
         case .prep:     startPrep()
         }
-        if isRunning { startPolling() }
     }
 
     func stop() {
@@ -585,37 +774,217 @@ final class WaveformAppModel: ObservableObject {
         lastPlayStart.removeAll()
     }
 
-    private func startTimecode() {
-        guard let device = selectedDevice, !device.isEmpty else {
-            surfaceError("Pick an input device first.")
-            return
-        }
-        let channelsA: [UInt32]
-        switch parseChannels(channelsAText, side: "A") {
-        case .success(let cs): channelsA = cs
-        case .failure(let msg):
-            surfaceError(msg)
-            return
-        }
-        let trimmedB = channelsBText.trimmingCharacters(in: .whitespaces)
-        do {
-            if trimmedB.isEmpty {
-                try engine.startThru(deviceName: device, channels: channelsA)
-                twoDeckMode = false
-            } else {
-                let channelsB: [UInt32]
-                switch parseChannels(trimmedB, side: "B") {
-                case .success(let cs): channelsB = cs
-                case .failure(let msg):
-                    surfaceError(msg)
-                    return
-                }
-                try engine.startThruTwoDeck(
-                    deviceName: device, channelsA: channelsA, channelsB: channelsB)
-                twoDeckMode = true
+    // MARK: Microphone permission (Serato-style)
+
+    /// Request microphone access exactly the way Serato does: only at
+    /// the moment Performance capture is about to open, never on launch
+    /// in Prep mode. Delivers the decision on the main queue.
+    ///
+    /// - `.authorized` → starts immediately.
+    /// - `.notDetermined` → triggers the one-time system prompt and
+    ///   reports the user's choice.
+    /// - `.denied` / `.restricted` → reports `false`; the caller
+    ///   surfaces an error pointing at System Settings.
+    ///
+    /// Prep mode never calls this, so a Mac with no DJ interface never
+    /// sees the prompt.
+    private func ensureInputPermission(_ completion: @escaping @MainActor (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            // Already on the main actor (this method is @MainActor).
+            completion(true)
+        case .notDetermined:
+            // The system prompt's completion fires on an arbitrary
+            // queue; hop back onto the main actor to touch the model.
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                Task { @MainActor in completion(granted) }
             }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
+    // MARK: Device hot-plug (auto mode switching)
+
+    /// Install a CoreAudio listener on the system device list so the
+    /// app reacts live to plugging / unplugging a DJ interface (PRD
+    /// §3.1): connect one in Prep mode and we switch to Performance and
+    /// move audio to it; unplug it in Performance mode and we fall back
+    /// to Prep on the built-in output.
+    ///
+    /// The callback only reads `hasExternalAudioInterface()` (TCC-safe)
+    /// so a device-list change never wakes the mic prompt by itself —
+    /// the prompt fires only if the resulting mode switch into
+    /// Performance opens capture.
+    private func installDeviceChangeListener() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // The HAL calls this (on the main queue, passed below) often
+            // several times per physical plug event. Hop onto the main
+            // actor and debounce so we restart the engine at most once.
+            Task { @MainActor in
+                self?.scheduleDeviceChangeReevaluation()
+            }
+        }
+        self.deviceListenerBlock = block
+
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block)
+        if status != noErr {
+            // Non-fatal: the app still works, it just won't auto-switch
+            // on hot-plug until the next manual config change.
+            self.deviceListenerBlock = nil
+        }
+    }
+
+    private func removeDeviceChangeListener() {
+        guard let block = deviceListenerBlock else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block)
+        deviceListenerBlock = nil
+    }
+
+    /// Debounce a burst of device-change notifications, then re-evaluate
+    /// the desired mode and restart only if it actually changed.
+    private func scheduleDeviceChangeReevaluation() {
+        deviceChangeToken &+= 1
+        let token = deviceChangeToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            Task { @MainActor in
+                guard let self, token == self.deviceChangeToken else { return }
+                self.reevaluateModeForDeviceChange()
+            }
+        }
+    }
+
+    private func reevaluateModeForDeviceChange() {
+        // Always re-probe the (TCC-safe) device lists so the picker and
+        // first-interface default reflect what's now attached.
+        refreshDevices()
+
+        // In DEBUG, a forced mode pins us regardless of hardware — the
+        // whole point of the dev override. Still refresh lists above so
+        // a real interface plugged in during UI work shows up.
+        #if DEBUG
+        if devForcedMode != nil { return }
+        #endif
+
+        let desired: EngineMode = engine.hasExternalAudioInterface() ? .timecode : .prep
+        guard desired != engineMode else { return }
+        engineMode = desired
+        applyConfig()
+    }
+
+    private func startTimecode() {
+        // Opinionated input selection: the first classified Performance
+        // interface (two SL3s => first one). No manual picker drives
+        // this in a shipping build.
+        guard let inputDevice = selectedInputDevice ?? performanceDevices.first else {
+            // No DJ interface present. In a shipping build this only
+            // happens if the interface was yanked between detection and
+            // start (the hot-plug listener will flip us back to Prep
+            // momentarily). In DEBUG with a forced Performance mode it
+            // means "show the performance UI without real capture".
+            surfaceError("No DJ interface detected — connect one to enter Performance mode.")
+            return
+        }
+        // Serato-style permission: request microphone access right
+        // before opening capture. Granted/already-authorized starts
+        // immediately; not-determined shows the one-time system prompt
+        // and starts on grant; denied surfaces an error and leaves the
+        // engine stopped (the user must enable it in System Settings).
+        ensureInputPermission { [weak self] granted in
+            guard let self else { return }
+            guard granted else {
+                self.surfaceError(
+                    "Microphone access is required for timecode capture. "
+                        + "Enable Dub under System Settings > Privacy & Security > Microphone.")
+                return
+            }
+            self.openTimecodeCapture(on: inputDevice)
+        }
+    }
+
+    /// Open the actual input + output AudioUnits for Performance mode.
+    /// Channels and per-deck routing come entirely from the registry
+    /// (`engine.performanceRoutingFor`), so the user never types a
+    /// channel number; the SL3 maps to deck A on 3+4 / deck B on 5+6
+    /// automatically.
+    ///
+    /// Master output ALWAYS goes back through the interface itself —
+    /// the external mixer is wired to its physical outputs, and the
+    /// per-deck routing only makes sense on the multi-out interface.
+    /// We deliberately ignore `selectedOutputUID` here: it is a
+    /// Prep-mode / dev concept that gets persisted, and a stale value
+    /// (e.g. the 2-channel built-in speakers, which can't even hold
+    /// the 6-channel deck routing) must never silently redirect deck
+    /// audio off the interface.
+    private func openTimecodeCapture(on inputDevice: AudioDeviceInfo) {
+        let routing = engine.performanceRoutingFor(deviceName: inputDevice.name)
+        let outputUID: String? = inputDevice.uid
+        // Product behaviour is timecode (control vinyl drives the loaded
+        // file). In DEBUG a dev override can force the Thru passthrough
+        // path instead, to exercise live-input rendering on the
+        // interface; release builds always run timecode.
+        var useThru = false
+        #if DEBUG
+        useThru = (devForcedSource == .thru)
+        #endif
+        do {
+            if routing.twoDeck {
+                if useThru {
+                    try engine.startThruTwoDeck(
+                        deviceName: inputDevice.name,
+                        channelsA: routing.deckAInput,
+                        channelsB: routing.deckBInput,
+                        outputDeviceUid: outputUID)
+                } else {
+                    try engine.startPerformanceTwoDeck(
+                        deviceName: inputDevice.name,
+                        channelsA: routing.deckAInput,
+                        channelsB: routing.deckBInput,
+                        outputDeviceUid: outputUID)
+                }
+                twoDeckMode = true
+            } else {
+                if useThru {
+                    try engine.startThru(
+                        deviceName: inputDevice.name,
+                        channels: routing.deckAInput,
+                        outputDeviceUid: outputUID)
+                } else {
+                    try engine.startPerformance(
+                        deviceName: inputDevice.name,
+                        channels: routing.deckAInput,
+                        outputDeviceUid: outputUID)
+                }
+                twoDeckMode = false
+            }
+            // Mirror the resolved channels into the text fields so the
+            // DEV Preferences surface shows what the registry picked.
+            channelsAText = routing.deckAInput.map(String.init).joined(separator: ",")
+            channelsBText = routing.twoDeck
+                ? routing.deckBInput.map(String.init).joined(separator: ",")
+                : ""
             isRunning = true
             masterDeck = stickyMaster
+            if isRunning { startPolling() }
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -625,10 +994,19 @@ final class WaveformAppModel: ObservableObject {
 
     private func startPrep() {
         do {
-            try engine.startEngine(outputChannels: 2)
+            // Prep mode: pin the output device by UID when the user
+            // picked one in Preferences; otherwise fall through to
+            // the macOS default output (matching the pre-classifier
+            // behaviour). The default-output fallback also handles
+            // the "no built-in speakers found" edge case (e.g. on a
+            // Mac mini wired to HDMI only).
+            try engine.startEngine(
+                outputChannels: 2,
+                outputDeviceUid: selectedOutputUID)
             isRunning = true
             twoDeckMode = false
             masterDeck = stickyMaster
+            if isRunning { startPolling() }
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -1043,6 +1421,7 @@ final class WaveformAppModel: ObservableObject {
             try library.openDefault()
             libraryModel.libraryIsOpen = true
             refreshLibraryStats()
+            reloadCrates()
             refreshMissingTrackCount()
             startMissingFilesScanner()
         } catch {
@@ -1056,6 +1435,143 @@ final class WaveformAppModel: ObservableObject {
         guard libraryModel.libraryIsOpen else { return }
         if let count = try? library.trackCount() {
             libraryModel.libraryTrackCount = count
+        }
+    }
+
+    // MARK: - Dub crates (M11d-next, PRD §8.5.1)
+
+    /// Re-read the flat crate list into `libraryModel.crates`. Cheap
+    /// (`crates` LEFT JOIN `crate_tracks`, GROUP BY); called on
+    /// library open and after every crate mutation so the sidebar
+    /// names + track counts stay live. Synchronous read on the main
+    /// actor — the crate table is tiny (a working DJ has tens of
+    /// crates, not thousands), so the SQLite round-trip is sub-
+    /// millisecond and not worth a detached hop.
+    func reloadCrates() {
+        guard libraryModel.libraryIsOpen else {
+            libraryModel.crates = []
+            return
+        }
+        do {
+            libraryModel.crates = try library.listCrates()
+        } catch {
+            surfaceError("Couldn't load crates: \(error.localizedDescription)")
+        }
+    }
+
+    /// Create a new top-level Dub crate, refresh the list, and
+    /// return its id (so the caller can drop the user straight into
+    /// inline-rename). Surfaces a name-conflict inline rather than
+    /// as a toast. Returns `nil` on failure.
+    @discardableResult
+    func createCrate(named name: String) -> Int64? {
+        guard libraryModel.libraryIsOpen else { return nil }
+        do {
+            let id = try library.createCrate(name: name, parentId: nil)
+            reloadCrates()
+            return id
+        } catch {
+            surfaceError("Couldn't create crate: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Rename a crate. No-ops cleanly when the new name is unchanged
+    /// or empty (the caller already trimmed). Reloads on success.
+    func renameCrate(_ crateId: Int64, to newName: String) {
+        guard libraryModel.libraryIsOpen else { return }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try library.renameCrate(crateId: crateId, newName: trimmed)
+            reloadCrates()
+        } catch {
+            surfaceError("Couldn't rename crate: \(error.localizedDescription)")
+            reloadCrates()
+        }
+    }
+
+    /// Delete a crate (members + child crates cascade in SQLite).
+    func deleteCrate(_ crateId: Int64) {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.deleteCrate(crateId: crateId)
+            reloadCrates()
+            libraryModel.crateContentGeneration &+= 1
+        } catch {
+            surfaceError("Couldn't delete crate: \(error.localizedDescription)")
+            reloadCrates()
+        }
+    }
+
+    /// Add tracks to a crate by canonical id, appending in order.
+    /// Returns how many were freshly added (re-adds count as 0).
+    /// Reloads counts + bumps the content generation so a currently-
+    /// open crate refreshes.
+    @discardableResult
+    func addTracksToCrate(_ crateId: Int64, trackIds: [String]) -> Int {
+        guard libraryModel.libraryIsOpen, !trackIds.isEmpty else { return 0 }
+        var added = 0
+        do {
+            for id in trackIds {
+                if try library.addTrackToCrate(crateId: crateId, trackId: id) {
+                    added += 1
+                }
+            }
+            reloadCrates()
+            libraryModel.crateContentGeneration &+= 1
+        } catch {
+            surfaceError("Couldn't add to crate: \(error.localizedDescription)")
+            reloadCrates()
+        }
+        return added
+    }
+
+    /// Resolve dropped file URLs to canonical track ids (only files
+    /// already in the library map; Finder-drag of an un-imported
+    /// file resolves to `nil` and is skipped) and add them to the
+    /// crate. The on-screen track rows drag a file URL (see
+    /// `LibraryView.libraryDragURL`), so this is the same payload
+    /// the deck-load drop path consumes.
+    func addDroppedURLsToCrate(_ crateId: Int64, urls: [URL]) {
+        guard libraryModel.libraryIsOpen, !urls.isEmpty else { return }
+        var ids: [String] = []
+        for url in urls {
+            // `try?` flattens the throwing `String?` return into a
+            // single optional, so one `if let` unwraps both layers.
+            if let id = try? library.trackIdForPath(path: url.path) {
+                ids.append(id)
+            }
+        }
+        addTracksToCrate(crateId, trackIds: ids)
+    }
+
+    /// Remove a track from a crate.
+    func removeTrackFromCrate(_ crateId: Int64, trackId: String) {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.removeTrackFromCrate(crateId: crateId, trackId: trackId)
+            reloadCrates()
+            libraryModel.crateContentGeneration &+= 1
+        } catch {
+            surfaceError("Couldn't remove from crate: \(error.localizedDescription)")
+            reloadCrates()
+        }
+    }
+
+    /// Persist a crate's member ordering. The caller (LibraryView)
+    /// computes the new full order locally for instant feedback and
+    /// hands it here to write through; we bump the content
+    /// generation so the visible list re-fetches the canonical order.
+    func setCrateOrder(_ crateId: Int64, orderedTrackIds: [String]) {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setCrateTrackOrder(
+                crateId: crateId, orderedTrackIds: orderedTrackIds)
+            libraryModel.crateContentGeneration &+= 1
+        } catch {
+            surfaceError("Couldn't reorder crate: \(error.localizedDescription)")
+            libraryModel.crateContentGeneration &+= 1
         }
     }
 
@@ -3263,11 +3779,11 @@ final class WaveformAppModel: ObservableObject {
         switch error {
         case .DeviceNotFound:       return "Device not found."
         case .InvalidChannels:      return "Invalid / overlapping channels — use two 1-based numbers per deck."
-        case .AudioStartFailed:     return "Audio start failed."
+        case let .AudioStartFailed(message): return "Audio start failed: \(message)"
         case .AlreadyRunning:       return "Engine already running."
         case .NotRunning:           return "Engine not running."
         case .InvalidDeckIndex:     return "Invalid deck index."
-        case .TrackDecodeFailed:    return "Couldn't decode that track."
+        case let .TrackDecodeFailed(message): return "Couldn't decode that track: \(message)"
         case .CommandChannelFull:   return "Audio thread is overloaded — try again."
         case .EngineNotRunning:     return "Engine isn't running — Start it from Preferences (⌘,)."
         case .NoTrackLoaded:        return "No track loaded on that deck."
@@ -3325,15 +3841,18 @@ struct MainView: View {
             .task {
                 await runColdBoot()
             }
-            // M10.5b "no Apply button" UX: every Preferences-driven
-            // config change auto-applies. `applyConfig()` starts the
-            // engine when stopped and restarts it when running, so
-            // the user only ever needs to *change* a setting; the
-            // engine catches up on its own.
-            .onChange(of: model.engineMode) { _ in
-                model.applyConfig()
-            }
-            .onChange(of: model.selectedDevice) { _ in
+            // Mode is derived state now (hardware auto-detect +
+            // hot-plug listener, plus the DEBUG dev override), so there
+            // is no `onChange(of: engineMode)` auto-apply — every mode
+            // transition already calls `applyConfig()` itself, and an
+            // extra reactive call would double-restart the engine.
+            //
+            // `selectedOutputUID` stays reactive: in DEBUG the output
+            // override picker writes it and we want the engine to
+            // follow. It never changes on its own in a shipping build
+            // (output is auto: the interface in Performance, built-in
+            // in Prep), so this is inert there.
+            .onChange(of: model.selectedOutputUID) { _ in
                 model.applyConfig()
             }
     }
@@ -3366,7 +3885,7 @@ struct MainView: View {
 /// Hidden NSView host that installs an `NSEvent.addLocalMonitorForEvents`
 /// handler at view-mount. Keyboard shortcuts placed on SwiftUI
 /// `Button`s with `.opacity(0)` are unreliable — when a child view
-/// (the FileBrowserView's scroll-view, a TextField, etc.) holds
+/// (the library list's scroll-view, a TextField, etc.) holds
 /// keyboard focus, the synthetic Button doesn't fire. NSEvent's
 /// local monitor intercepts every keyDown delivered to the
 /// application before any first responder gets it, which is the

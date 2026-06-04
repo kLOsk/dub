@@ -10,11 +10,23 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 - `PRD-BEATS.md` is the sub-spec for tempo, beat grid, downbeat, tap-to-grid,
   and the waveform overlay contract. Replaces PRD §8.3.1 and is binding for
   any code under `crates/dub-bpm/`, the tap path in `crates/dub-ffi/`, and
-  the grid renderer in `apple/Dub/Performance/Waveform/`.
+  the grid renderer in `apple/Dub/Waveform/`. Round-by-round beat-grid
+  hardening history lives here, not in `SHIPPED.md`.
 - `LIBRARY-SCHEMA.md` is the public SQLite schema contract. Load it only for
   library, schema, migration, or FFI work.
 - `LICENSE-DEPENDENCIES.md` is the source of truth for dependency licenses and
   binary attribution.
+
+## Investigation notes and runbooks (durable, not source of truth)
+
+- `BPM-DETECTOR-V2-INVESTIGATION.md` records why a classical (non-ML) detector
+  does not beat the tuned Classic `dub-bpm` octave logic, and the learned
+  beat-tracker plan that can. Load before any "replace the BPM detector" work;
+  the experimental code it describes was measured and removed.
+- `WAVEFORM-JITTER-CAPTURE.md` is the `os_signpost` capture runbook for
+  diagnosing waveform / beat-grid jitter regressions. The originally
+  investigated jitter was fixed end to end; this remains the procedure if it
+  recurs (the probes and `make trace-grid` targets are still wired).
 
 ## Human-facing HTML views (read-only, optional)
 
@@ -43,7 +55,7 @@ when the Markdown diverges.
 | Library DB, migrations, FTS, analysis cache | `LIBRARY-SCHEMA.md` |
 | Serato/Traktor/rekordbox/iTunes import quirks | `LIBRARY-FORMATS.md` |
 | SwiftUI/AppKit UI polish backlog | `UI-BACKLOG.md` |
-| Beat-grid BPM octave / tap-to-grid / downbeat / waveform-overlay work | `PRD-BEATS.md` (source of truth); `UI-BACKLOG.md` B-11, U-19 |
+| Beat-grid BPM octave / tap-to-grid / downbeat / waveform-overlay work | `PRD-BEATS.md` (source of truth); `BPM-DETECTOR-V2-INVESTIGATION.md` before any detector replacement |
 | License review, release acknowledgements | `LICENSE-DEPENDENCIES.md` |
 
 ## Context Budget Rules

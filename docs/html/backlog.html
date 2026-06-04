@@ -203,22 +203,6 @@
                 <span class="column__count">correctness or visible user pain</span>
             </div>
 
-            <article class="card card--bug" data-tags="bug" data-filter-text="B-11 BPM octave 2x hip-hop rap audible tempo half-time">
-                <div class="card__head"><span class="card__id">B-11</span><span class="pill pill--blocked">Blocks tap-to-grid</span></div>
-                <div class="card__title">Auto BPM locks at 2× tempo on real hip-hop / rap</div>
-                <div class="card__body">
-                    <strong>Symptom:</strong> Library analysis and deck header report ~190 BPM on tracks audibly around 90–100 (kick/snare half-time feel). Synthetic <code>genre_octave</code> fixtures pass; real mastered rap with bright hi-hats still loses the octave.<br><br>
-                    <strong>Likely cause:</strong> <code>estimate_tempo</code> prefers the faster tempo on a 1 % harmonic-mean tie (<code>SCORE_TIE_REL_TOL</code>).<br><br>
-                    <strong>Fix direction:</strong> add a real-music regression corpus next to the synthetic suite, slow-side tie-break for urban genres or a low-band-weighted tie-break pass, and an optional post-analysis octave sanity check against ID3 / filename BPM within ±20 %.
-                </div>
-                <div class="card__meta">
-                    <span>engine</span>
-                    <span>dub-bpm/tempo.rs</span>
-                    <span>dub-library/analysis.rs</span>
-                    <a href="../UI-BACKLOG.md">→ MD source</a>
-                </div>
-            </article>
-
             <article class="card card--bug" data-tags="bug" data-filter-text="B-7 scanMissingFilesBatch identical if else branches">
                 <div class="card__head"><span class="card__id">B-7</span><span class="pill">low impact · wasteful</span></div>
                 <div class="card__title"><code>scanMissingFilesBatch</code> has identical if / else branches</div>
@@ -259,28 +243,6 @@
                 <span class="column__name">2 · UX polish</span>
                 <span class="column__count">works, but feels rough</span>
             </div>
-
-            <article class="card card--polish" data-tags="polish" data-filter-text="U-19 tap to grid keyboard G PRD 8.3.1 downbeat anchor">
-                <div class="card__head"><span class="card__id">U-19</span><span class="pill pill--blocked">Blocked on B-11</span></div>
-                <div class="card__title">Tap-to-grid not implemented (PRD §8.3.1)</div>
-                <div class="card__body">
-                    Schema supports <code>source = 'user_tap'</code>; UI affordance and <code>dub-bpm</code> refit hook are both missing. Multi-tap path for sparse tracks is part of the spec.<br><br>
-                    <strong>Flow:</strong> keyboard handler → record tap → snap to nearest transient (±200 ms) → search ±20 BPM around imported/active → write <code>track_beatgrids(source='user_tap')</code> → reload deck grid without full reanalysis.<br><br>
-                    <strong>Blocked:</strong> B-11 first (a wrong auto BPM makes taps harder to trust).
-                </div>
-                <div class="card__meta"><span>swift + rust</span><a href="roadmap.html">→ M11c.3</a></div>
-            </article>
-
-            <article class="card card--polish" data-tags="polish" data-filter-text="U-18 beatgrid overlay lines jitter playback waveform metal">
-                <div class="card__head"><span class="card__id">U-18</span></div>
-                <div class="card__title">Beat-grid overlay lines jitter sub-pixel during playback</div>
-                <div class="card__body">
-                    Grid lines wobble sub-pixel against the scrolling envelope when the deck is playing. Beats are readable.<br><br>
-                    <strong>Likely cause:</strong> residual mismatch between the Metal playhead extrapolation and the SwiftUI Canvas grid draw cadence, or fractional-chunk NDC rounding at the playhead boundary (see M11d.5 round-5 follow-ups).<br><br>
-                    <strong>Fix:</strong> consider drawing grid lines in Metal alongside the envelope so both layers share one sub-chunk offset.
-                </div>
-                <div class="card__meta"><span>swift</span><span>WaveformView · WaveformRenderer</span></div>
-            </article>
 
             <article class="card card--polish" data-tags="polish" data-filter-text="U-12 dev placeholder casual play strings M10.7 M14">
                 <div class="card__head"><span class="card__id">U-12</span></div>
@@ -400,26 +362,6 @@
                 <span class="column__count">no symptom yet · architectural debt</span>
             </div>
 
-            <article class="card card--health" data-tags="health" data-filter-text="C-24 FileBrowserView dead code M10.5b M11d superseded">
-                <div class="card__head"><span class="card__id">C-24</span></div>
-                <div class="card__title"><code>FileBrowserView.swift</code> is dead code</div>
-                <div class="card__body">
-                    The M10.5b file-browser sidebar was superseded by the M11d library. The file remains in the target with no call sites.<br><br>
-                    <strong>Fix:</strong> delete the file; verify no references in the Xcode project's filelist.
-                </div>
-                <div class="card__meta"><span>swift</span><span>FileBrowserView.swift</span></div>
-            </article>
-
-            <article class="card card--health" data-tags="health" data-filter-text="C-25 LibraryPlaceholder dead code M11d.2">
-                <div class="card__head"><span class="card__id">C-25</span></div>
-                <div class="card__title"><code>LibraryPlaceholder</code> is dead code</div>
-                <div class="card__body">
-                    Pre-M11d.2 empty-state placeholder; the new LibraryView's empty states cover all paths.<br><br>
-                    <strong>Fix:</strong> delete.
-                </div>
-                <div class="card__meta"><span>swift</span></div>
-            </article>
-
             <article class="card card--health" data-tags="health" data-filter-text="C-27 selectLibraryTrack trackPath called twice FFI">
                 <div class="card__head"><span class="card__id">C-27</span></div>
                 <div class="card__title"><code>selectLibraryTrack</code> calls <code>trackPath</code> twice</div>
@@ -464,7 +406,8 @@
         <ul style="color: var(--dub-text-muted); padding-left: 1.2em;">
             <li>Buckets are roughly ordered by priority within each section (top of list → fix first).</li>
             <li><strong>B-7 → B-9</strong> should land before major new library UI features, since they affect existing functionality.</li>
-            <li><strong>B-11 (BPM octave)</strong> and <strong>U-19 (tap-to-grid)</strong> are the next beat-grid cluster; <strong>U-18 (grid-line jitter)</strong> follows once the grid source of truth stabilises.</li>
+            <li>The beat-grid cluster (<strong>B-11 octave</strong>, <strong>U-18 grid jitter</strong>, <strong>U-19 tap-to-grid</strong>) has shipped / closed. Further automatic octave gains are gated on a learned beat tracker — see <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>, not a heuristic-tuning task.</li>
+            <li><strong>C-24 / C-25</strong> (<code>FileBrowserView</code> + <code>LibraryPlaceholder</code> dead code) are deleted.</li>
             <li>The UX bucket can land alongside <strong>M11e (Library polish)</strong> — most items are surface-level copy or layout tweaks.</li>
             <li>Code-health items are not blocking but should be ticked off as PRs touch the affected files.</li>
             <li><strong>Hygiene note:</strong> <code>UI-BACKLOG.md</code> has two cards each at <code>U-18</code> and <code>U-19</code> (beat-grid jitter / sort semantics, and tap-to-grid / idle-hint truncation). Preserved as written here; worth a one-line renumber when the next backlog pass lands.</li>
@@ -483,9 +426,29 @@
         through; this view collapses them out of the way.
     </p>
     <details class="dub-details">
-        <summary><strong>Show closed / stale items (6)</strong></summary>
+        <summary><strong>Show closed / stale items (11)</strong></summary>
         <div>
             <div class="dub-grid dub-grid--2">
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">C-24</span> · <code>FileBrowserView.swift</code> dead code · <span class="pill pill--shipped">deleted</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deleted. No call sites after the M11d library superseded it (only its own <code>#Preview</code> + stale doc-comment references, which were rewritten). The XcodeGen <code>sources: - path: Dub</code> directory glob drops it on the next bootstrap.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">C-25</span> · <code>LibraryPlaceholder</code> dead code · <span class="pill pill--shipped">deleted</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deleted from <code>Placeholders.swift</code> (struct + <code>#Preview</code> + header comment). <code>FXBarPlaceholder</code> stays — it still marks the unshipped M15/M16/M17 FX slots.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-11</span> · Auto BPM locks at 2× · <span class="pill pill--shipped">addressed M11c.3 + PRD-BEATS</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Octave hardened across M11c.3a–f (perceptual prior, reggae / hip-hop double-time rejection, genre-aware <code>OctaveProfile</code>) and PRD-BEATS rounds 5–10 (<code>OctaveProfile::HipHop</code> / <code>DrumAndBass</code>, integer-snap safety net). Real-music corpus now at <code>dub-bpm/tests/fixtures/*.tsv</code> (Classic = 11/94). Residual ambiguous tracks are handled by tap-to-grid; further automatic gains are gated on a learned beat tracker — see <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">U-19</span> · Tap-to-grid · <span class="pill pill--shipped">shipped M11c.3b / M11d.7</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deck-header BPM affordance: 1–2 taps relatch the downbeat (pure <code>bar_phase</code> rotation, BPM bit-identical); 3+ taps recompute tempo via <code>analyze_beat_grid_from_taps</code>. Persists <code>user_tap</code> rows and installs the grid in-place without full reanalysis. Binding spec is <a href="../PRD-BEATS.md">PRD-BEATS.md</a>.</p>
+                </div>
+                <div class="dub-card">
+                    <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">U-18</span> · Beat-grid overlay jitter · <span class="pill pill--shipped">fixed (jitter killed end to end)</span></h3>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Grid + envelope now share one audio-clock-extrapolated playhead (<code>EngineHostTimeMapping</code> / <code>PlayheadMarker</code>) and render off the main thread (<code>WaveformRenderThread</code>). The <code>os_signpost</code> runbook in <a href="../WAVEFORM-JITTER-CAPTURE.md">WAVEFORM-JITTER-CAPTURE.md</a> stays wired for the next regression.</p>
+                </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-26</span> · Waveform scrub lag · <span class="pill pill--shipped">closed M11d.5</span></h3>
                     <p style="color: var(--dub-text-muted); font-size: 13px;">Demand-driven Metal rendering (CVDisplayLink on the main run loop), input yield during press/drag, redundant peak-ingest skip when the playhead is stable, GPU catch-up when frames are deferred. Landed in 01291cd.</p>

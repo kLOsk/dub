@@ -159,4 +159,19 @@ final class LibraryAppModel: ObservableObject {
     /// the last Relocate run (i.e. the user must point Dub at a
     /// different folder, or the file is truly gone).
     @Published var lastRelocateUnmatched: UInt32 = 0
+
+    /// M11d-next — user-created Dub crates (PRD §8.5.1), flat list
+    /// ordered case-insensitively by name (the FFI sorts). Drives
+    /// the sidebar's "Dub Crates" section. Refreshed on library
+    /// open and after every crate mutation (create / rename /
+    /// delete / add / remove / reorder) by `reloadCrates()`.
+    @Published var crates: [LibraryCrate] = []
+
+    /// M11d-next — bumped whenever a crate's *membership or order*
+    /// changes (add / remove / reorder). LibraryView observes this
+    /// via `.onChange` and re-runs `refreshTracks()` so a crate
+    /// that's currently selected reflects the edit immediately,
+    /// without a per-crate push channel. The crate *list* itself
+    /// (names / counts) is observed directly through `crates`.
+    @Published var crateContentGeneration: UInt64 = 0
 }

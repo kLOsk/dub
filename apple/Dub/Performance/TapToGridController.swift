@@ -28,8 +28,8 @@ import Foundation
 /// column flipped `deck.tapGridCount` on a `@Published` `DeckState`
 /// inside `WaveformAppModel`, which re-evaluated every observer of
 /// the app model — `PerformanceView` (rebuilding both
-/// `TrackOverviewView`s, both `WaveformView`s, the FX bar, and the
-/// entire `LibraryView`) and `FileBrowserView`. The Metal renderer
+    /// `TrackOverviewView`s, both `WaveformView`s, the FX bar, and the
+    /// entire `LibraryView`). The Metal renderer
 /// itself was unaffected, but the SwiftUI cascade competed with
 /// the render thread for main-actor time and stuttered the
 /// waveform on every tap. By moving the two fields to a dedicated

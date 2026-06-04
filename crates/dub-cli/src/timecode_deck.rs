@@ -520,8 +520,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let output_opts = dub_audio::OutputOptions {
         channels: routing.channels,
         buffer_frames: opts.output_buffer_size,
-        sample_rate: None,
-        channel_map: None,
+        ..dub_audio::OutputOptions::default()
     };
     let output = dub_audio::AudioOutput::start_with_options(engine, &output_opts, routing.routing)
         .context("starting CoreAudio output for timecode-deck")?;

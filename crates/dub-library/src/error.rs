@@ -152,6 +152,25 @@ pub enum LibraryError {
         /// The canonical UUID that was asked for re-analysis.
         track_id: String,
     },
+
+    /// A Dub-crate operation (rename / delete / add-track) named a
+    /// `crates.id` that is not present. Indicates a stale id on the
+    /// caller side (the UI raced a delete) rather than a library bug.
+    #[error("no crate with id {crate_id} found")]
+    CrateNotFound {
+        /// The crate id the caller asked for.
+        crate_id: i64,
+    },
+
+    /// `create_crate` / `rename_crate` hit the `UNIQUE (parent_crate_id,
+    /// name)` constraint: a sibling crate already carries that name.
+    /// The Apple shell surfaces this as "a crate with that name already
+    /// exists here" rather than a raw SQLite constraint string.
+    #[error("a crate named {name:?} already exists under the same parent")]
+    CrateNameConflict {
+        /// The conflicting name the caller tried to use.
+        name: String,
+    },
 }
 
 impl LibraryError {

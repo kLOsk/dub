@@ -37,7 +37,9 @@ mod version_tokens;
 mod volumes;
 
 pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
-pub use db::{FileScanRow, Library, MissingTrack, StoredFingerprint, TrackRow, TrackSortKey};
+pub use db::{
+    CrateRow, FileScanRow, Library, MissingTrack, StoredFingerprint, TrackRow, TrackSortKey,
+};
 pub use dedupe::{
     decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,
     SIMILARITY_THRESHOLD,

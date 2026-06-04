@@ -46,6 +46,8 @@ fuzz/artifacts/
 *.log
 crashes/
 .cursor/settings.json
+# Claude Code: share settings.json + hooks/, keep per-user overrides local
+.claude/settings.local.json
 
 # Env / secrets
 .env

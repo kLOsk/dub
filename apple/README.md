@@ -3,14 +3,16 @@
 This directory hosts the AppKit/SwiftUI shell that consumes the Rust core
 through UniFFI.
 
-## Status: M11d — library browser + branding
+## Status: Performance + Prep shell, library browser, beat grid
 
 The app opens a performance window with two deck columns, a library browser,
-Metal waveforms, and a status strip. On cold boot a brief launch splash fades
-out once the engine and library are ready. Click **DUB** in the top-left status
-strip, or choose **Dub → About Dub**, for the About sheet (splash artwork,
-version info, links to the repo and PRD). App icon and splash live in
-`Dub/Assets.xcassets/`.
+Metal waveforms with a beat-grid overlay, tap-to-grid editing from the deck
+header, and a status strip. When no multi-channel interface is connected it
+boots the Track Preparation Mode shell instead (file playback at horizontal
+waveform resolution). On cold boot a brief launch splash fades out once the
+engine and library are ready. Click **DUB** in the top-left status strip, or
+choose **Dub → About Dub**, for the About sheet (splash artwork, version info,
+links to the repo and PRD). App icon and splash live in `Dub/Assets.xcassets/`.
 
 ## One-shot bootstrap
 
@@ -40,15 +42,22 @@ apple/
 ├── Dub/
 │   ├── DubAppDelegate.swift       AppKit @main lifecycle
 │   ├── MainWindowController.swift NSWindow holding an NSHostingController(MainView)
-│   ├── MainView.swift             SwiftUI shell + WaveformAppModel
-│   ├── About/AboutSheet.swift     About sheet (status-strip wordmark + menu)
-│   ├── About/LaunchSplashOverlay.swift  Cold-boot splash
-│   ├── App/AppNotifications.swift Menu-bar → SwiftUI notification bridge
-│   ├── Assets.xcassets/           AppIcon + AboutSplash image sets
+│   ├── MainView.swift             SwiftUI shell + app model (engine, library, decks)
+│   ├── Performance/               two-deck surface: PerformanceView, DeckHeader,
+│   │                              LibraryView, TapToGridController,
+│   │                              TrackOverviewView, StatusStrip, BeatgridCalibrationLog
 │   ├── Waveform/
 │   │   ├── Shaders.metal          Vertex (instanced quads) + fragment shaders
-│   │   ├── WaveformRenderer.swift @MainActor Metal renderer (chunks ring, triple-buffered uniforms)
-│   │   └── WaveformView.swift     NSViewRepresentable wrapping MTKView
+│   │   ├── WaveformRenderer.swift Metal renderer (chunks ring, triple-buffered uniforms, beat grid)
+│   │   ├── WaveformRenderThread.swift  Dedicated off-main render thread (CVDisplayLink-driven)
+│   │   ├── WaveformMetalHostView.swift / WaveformView.swift  NSViewRepresentable wrapping MTKView
+│   │   ├── PlayheadMarker.swift   Shared playhead source for envelope + grid
+│   │   └── EngineHostTimeMapping.swift  Audio-clock → host-time extrapolation
+│   ├── Preferences/PreferencesSheet.swift   Device / channel / key-remap settings
+│   ├── DesignSystem/Tokens.swift  Spacing / colour / type tokens
+│   ├── About/                     AboutSheet + LaunchSplashOverlay
+│   ├── App/AppNotifications.swift Menu-bar → SwiftUI notification bridge
+│   ├── Assets.xcassets/           AppIcon + AboutSplash image sets
 │   ├── Info.plist                 Placeholder — keys overridden by XcodeGen
 │   └── Dub.entitlements           Sandbox off (local-only signing)
 └── DubShared/
@@ -64,20 +73,21 @@ apple/
   through `NSViewRepresentable`, plus future `NSEvent` hooks that
   SwiftUI either doesn't expose or re-exposes through awkward bridges.
   AppKit gives us the lowest-overhead path.
-- **SwiftUI owns non-realtime sub-views.** `MainView`, the upcoming
-  M10.2 palette picker, and future library / settings sheets are pure
-  forms; SwiftUI's declarative model is faster to iterate on than
-  AppKit's view-by-view layout.
+- **SwiftUI owns non-realtime sub-views.** `MainView`, the library
+  browser, the deck header, the palette picker, and Preferences /
+  About sheets are pure forms; SwiftUI's declarative model is faster
+  to iterate on than AppKit's view-by-view layout.
 - **The waveform itself is `MTKView` (Metal) wrapped in
-  `NSViewRepresentable`.** The renderer polls `DubEngine.peaksLen` +
-  `peaksExtend` each frame; no callback path from the audio thread
-  ever reaches Swift.
+  `NSViewRepresentable`.** A dedicated render thread (driven by
+  `CVDisplayLink`, not the main run loop) polls `DubEngine.peaksLen` +
+  `peaksExtend` each frame and draws off the main thread; no callback
+  path from the audio thread ever reaches Swift.
 
 ## Signing
 
-M0.5 ships with **"Sign to Run Locally"** only. No Apple Developer
-account, no notarisation. Distribution signing lands as its own
-milestone after M10.2.
+The app uses **"Sign to Run Locally"** only. No Apple Developer
+account, no notarisation. Distribution signing + notarisation land as
+their own milestone in v1.1 (PRD §12.2, M23).
 
 ## See also
 

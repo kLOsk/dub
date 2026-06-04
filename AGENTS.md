@@ -68,6 +68,7 @@ docs/                PRD.md (forward-looking spec),
                      LIBRARY-FORMATS.md (Serato/Traktor/… format notes).
 scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
+.claude/             Claude Code settings + hooks (mirrors .cursor/; see CLAUDE.md).
 .github/workflows/   CI pipeline.
 ```
 

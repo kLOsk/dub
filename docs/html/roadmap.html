@@ -444,7 +444,7 @@
         <!-- =========================================================
              Cluster 3 · Library
              ========================================================= -->
-        <div class="cluster-head">Cluster 3 · Library + browser (M11a → M11d.5)</div>
+        <div class="cluster-head">Cluster 3 · Library + browser + beat grid (M11a → M11d.7)</div>
 
         <div class="ms" data-tags="shipped" data-filter-text="M11a library schema path volume uuid sqlite">
             <div class="ms__head">
@@ -546,36 +546,56 @@
             <div class="ms__meta"><a href="../SHIPPED.md#m11c2">SHIPPED.md#m11c2</a></div>
         </div>
 
+        <div class="ms" data-tags="shipped" data-filter-text="M11c.3 BPM octave fix perceptual prior reggae hip hop fouronfloor tap to grid">
+            <div class="ms__head">
+                <span class="ms__id">M11c.3a–f · M11c.4</span>
+                <span class="ms__name">BPM octave hardening + tap-to-grid + lazy fingerprint</span>
+                <span class="pill pill--shipped">Shipped</span>
+            </div>
+            <div class="ms__body">Perceptual tempo prior, reggae skank + hip-hop double-time rejection, genre-aware <code>OctaveProfile</code>, FourOnFloor / Dub mid-band fix. Tap-to-grid manual override. Lazy fingerprint (deferred from import to first deck-load). Closes backlog B-11 (octave) and U-19 (tap-to-grid).</div>
+            <div class="ms__meta"><a href="../SHIPPED.md#m11c3a">M11c.3a</a> · <a href="../SHIPPED.md#m11c3b">M11c.3b</a> · <a href="../SHIPPED.md#m11c4">M11c.4</a> · <a href="../BPM-DETECTOR-V2-INVESTIGATION.md">detector investigation</a></div>
+        </div>
+
+        <div class="ms" data-tags="shipped" data-filter-text="M11d.6 M11d.7 full screen launch off main thread waveform beatgrid precision auto downbeat drift lock">
+            <div class="ms__head">
+                <span class="ms__id">M11d.6 · M11d.7</span>
+                <span class="ms__name">Full-screen launch · off-main-thread waveform · beat-grid precision + drift lock</span>
+                <span class="pill pill--shipped">Shipped</span>
+            </div>
+            <div class="ms__body">Full-screen on launch with windowed snap-back; waveform rendering moved off the main thread (dedicated <code>CVDisplayLink</code> render thread); seven-stage auto beat-grid pipeline with auto downbeat, <code>GridQuality</code> auto-lock, and per-track grid lock (schema v4 <code>grid_locked</code>).</div>
+            <div class="ms__meta"><a href="../SHIPPED.md#m11d6">M11d.6</a> · <a href="../SHIPPED.md#m11d7">M11d.7</a></div>
+        </div>
+
+        <div class="ms" data-tags="shipped" data-filter-text="PRD-BEATS hardening uniform traktor beatgrid bar phase set the 1 robustness rounds diagnose jitter">
+            <div class="ms__head">
+                <span class="ms__id">PRD-BEATS</span>
+                <span class="ms__name">Beat-grid hardening · bar_phase · set-the-1 · robustness rounds · jitter kill</span>
+                <span class="pill pill--shipped">Shipped</span>
+            </div>
+            <div class="ms__body">Uniform Traktor-style grid + calibration; explicit <code>bar_phase</code> (schema v5) so "set the 1" is a pure rotation; relatch from taps; robustness rounds 5–10 (universal downbeat, <code>OctaveProfile::HipHop</code> / <code>DrumAndBass</code>, integer-snap safety net) + <code>dub diagnose</code> CLI; waveform + beat-grid jitter killed end to end.</div>
+            <div class="ms__meta"><a href="../PRD-BEATS.md">PRD-BEATS.md</a> · <a href="beats.html">beat grid view</a></div>
+        </div>
+
         <!-- =========================================================
              Cluster 4 · Planned v1.0
              ========================================================= -->
         <div class="cluster-head">Cluster 4 · Planned · path to v1.0</div>
 
-        <div class="ms" data-tags="inprog" data-filter-text="M11c.3 BPM octave fix tap to grid hip hop rap">
-            <div class="ms__head">
-                <span class="ms__id">M11c.3</span>
-                <span class="ms__name">BPM octave fix + tap-to-grid</span>
-                <span class="pill pill--inprog">Next up · 3–4 days</span>
-            </div>
-            <div class="ms__body"><strong>Demo:</strong> Real hip-hop / rap catalogs analyze at the audible tempo (not 2×). User can tap <kbd>G</kbd> to set downbeat and re-fit the grid per PRD §8.3.1. Resolves backlog items B-11 and U-19.</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a> · <a href="backlog.html">backlog B-11 · U-19</a></div>
-        </div>
-
-        <div class="ms" data-tags="planned" data-filter-text="M11d-next manual crates playlists">
+        <div class="ms" data-tags="shipped" data-filter-text="M11d-next manual crates playlists dub crates">
             <div class="ms__head">
                 <span class="ms__id">M11d-next</span>
                 <span class="ms__name">Manual crates (playlists)</span>
-                <span class="pill pill--planned">Planned · 2–3 days</span>
+                <span class="pill pill--shipped">Shipped</span>
             </div>
-            <div class="ms__body"><strong>Demo:</strong> User can create, name, drag-add, reorder, and delete Dub-native crates backed by the existing <code>crates</code> + <code>crate_tracks</code> tables (already in schema v1).</div>
-            <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__body"><strong>Shipped:</strong> User-created Dub crates backed by the <code>crates</code> + <code>crate_tracks</code> tables — create, inline-rename, delete (cascade), drag tracks in, remove, and reorder (drag-to-reorder with an insertion line + context-menu move). A <code>#</code> manual-order column carries the order: it is the crate's default sort and the only state in which reordering is enabled, so clicking any other header sorts the crate as a read-only view and the <code>#</code> header returns to manual order (the row model carries <code>crate_ordinal</code> so manual order can compose into future multi-column sorting). Editable "Dub Crates" sidebar section; FFI <code>FFI_VERSION 29</code>. Nested crates deferred to a follow-up.</div>
+            <div class="ms__meta"><a href="../PRD.md#851-source-tree">PRD.md §8.5.1</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11d-history played from into deck header session">
             <div class="ms__head">
                 <span class="ms__id">M11d-history</span>
                 <span class="ms__name">Played From / Played Into</span>
-                <span class="pill pill--planned">Planned · 1–2 days</span>
+                <span class="pill pill--inprog">Next up · 1–2 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Deck header and session history surface useful transitions from <code>play_history.from_track_id</code> / <code>to_track_id</code>.</div>
             <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12</a></div>
@@ -732,7 +752,7 @@
                 <span class="ms__name">Beatgrid editor</span>
                 <span class="pill">v1.1</span>
             </div>
-            <div class="ms__body"><strong>Demo:</strong> Full grid editing UX (drag downbeat, nudge BPM, halve / double, taps). The v1 tap-to-grid path lands at M11c.3; the full editor is the v1.1 expansion.</div>
+            <div class="ms__body"><strong>Demo:</strong> Full grid editing UX (drag downbeat, nudge BPM, halve / double, taps). The v1 tap-to-grid path already shipped (M11c.3b / M11d.7); the full editor is the v1.1 expansion.</div>
             <div class="ms__meta"><a href="../PRD.md#12-milestones">PRD.md §12.2</a></div>
         </div>
 

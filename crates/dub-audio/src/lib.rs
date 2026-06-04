@@ -28,16 +28,22 @@
 // for English prose — we'd backtick-pollute every doc comment.
 #![allow(clippy::doc_markdown)]
 
+mod devices;
 mod error;
 #[cfg(target_os = "macos")]
 mod macos;
 
+pub use devices::{
+    classify, is_performance_interface, AudioDevice, DenyEntry, DeviceCategory, DeviceRegistry,
+    KnownInterface, PerformanceRouting, TransportKind,
+};
 pub use error::AudioError;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    has_external_audio_interface, list_input_devices, query_default_input, query_default_output,
-    AudioInput, AudioOutput, BufferFrameRange, InputDeviceInfo, InputOptions, OutputOptions,
+    has_external_audio_interface, list_audio_devices, list_input_devices, list_output_devices,
+    query_default_input, query_default_output, AudioInput, AudioOutput, BufferFrameRange,
+    InputDeviceInfo, InputOptions, OutputOptions,
 };
 
 /// Library version reported by the crate.

@@ -594,8 +594,11 @@ dependencies = [
  "objc2-audio-toolbox",
  "objc2-core-audio",
  "objc2-core-audio-types",
+ "objc2-core-foundation",
  "ringbuf",
+ "serde",
  "thiserror 1.0.69",
+ "toml",
 ]
 
 [[package]]
@@ -1399,7 +1402,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.11.1",
+ "block2",
  "dispatch2",
+ "libc",
  "objc2",
 ]
 

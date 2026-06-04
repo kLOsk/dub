@@ -44,6 +44,22 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
     })
 }
 
+/// Map a `crates` write error to a typed [`LibraryError`]. A
+/// `UNIQUE (parent_crate_id, name)` violation becomes
+/// [`LibraryError::CrateNameConflict`] so the UI can show a friendly
+/// message; everything else passes through as a generic `Sqlite`
+/// error tagged with `context`.
+fn map_crate_constraint(e: rusqlite::Error, name: &str, context: &'static str) -> LibraryError {
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        if err.code == rusqlite::ErrorCode::ConstraintViolation {
+            return LibraryError::CrateNameConflict {
+                name: name.to_string(),
+            };
+        }
+    }
+    LibraryError::sqlite(context, e)
+}
+
 /// One row returned by [`Library::list_files_for_scan`] for the
 /// M11d.4 background missing-files scanner. The scanner reads the
 /// rows, calls `access()` per absolute path, and feeds the result
@@ -498,6 +514,26 @@ pub struct StoredFingerprint {
     /// pass dedupe filter (different sizes → almost certainly
     /// different recordings, and we can skip the Hamming compare).
     pub file_size: Option<u64>,
+}
+
+/// One Dub-crate node for the M11d-next "Dub Crates" source-tree
+/// section (PRD §8.5.1). User-created, editable, nestable, and
+/// persisted in the `crates` / `crate_tracks` tables. `track_count`
+/// is the number of direct members (it does **not** roll up child
+/// crates — the sidebar shows the count of tracks the user dragged
+/// onto this node specifically).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateRow {
+    /// `crates.id` primary key.
+    pub id: i64,
+    /// User-facing crate name. Unique among siblings sharing the
+    /// same `parent_id`.
+    pub name: String,
+    /// Parent crate id for nesting, or `None` for a top-level crate.
+    pub parent_id: Option<i64>,
+    /// Number of tracks directly in this crate (not counting
+    /// descendants).
+    pub track_count: u64,
 }
 
 impl Library {
@@ -1278,6 +1314,306 @@ impl Library {
             )
             .map_err(|e| LibraryError::sqlite("query_just_imported", e))?;
         collect_track_rows(rows, "just_imported")
+    }
+
+    // === Dub crates (M11d-next) ==========================================
+    //
+    // User-created, editable, nestable crates backed by `crates` /
+    // `crate_tracks` (PRD §8.5.1). The split between these (owned,
+    // editable) and the read-only `imported_crates` mirror is
+    // non-negotiable — see the PRD section. Every mutator bumps
+    // `crates.updated_at` so a future "sort by recently-edited"
+    // sidebar order has the data it needs. Ordinals are dense
+    // (0..n) and rewritten wholesale on reorder; `add_track_to_crate`
+    // appends at `MAX(ordinal) + 1`.
+
+    /// List every Dub crate with its direct-member track count, for
+    /// the sidebar's "Dub Crates" section. Ordered case-insensitively
+    /// by name so the tree is stable across re-opens. Returns the
+    /// flat set; the caller reconstructs nesting from `parent_id`.
+    pub fn list_crates(&self) -> Result<Vec<CrateRow>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT c.id, c.name, c.parent_crate_id, \
+                        COUNT(ct.track_id) AS track_count \
+                 FROM crates c \
+                 LEFT JOIN crate_tracks ct ON ct.crate_id = c.id \
+                 GROUP BY c.id \
+                 ORDER BY c.name COLLATE NOCASE ASC",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_list_crates", e))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CrateRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    parent_id: r.get(2)?,
+                    track_count: r.get::<_, i64>(3)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("query_list_crates", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| LibraryError::sqlite("collect_list_crates", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Create a Dub crate and return its new id. `parent_id` nests it
+    /// under another crate (or `None` for a top-level crate). The
+    /// `UNIQUE (parent_crate_id, name)` constraint maps to
+    /// [`LibraryError::CrateNameConflict`] so the UI can show a
+    /// friendly "name already exists" message instead of a raw
+    /// SQLite string.
+    pub fn create_crate(&self, name: &str, parent_id: Option<i64>) -> Result<i64> {
+        // SQLite's `UNIQUE (parent_crate_id, name)` does NOT fire for
+        // top-level crates: two rows with `parent_crate_id IS NULL`
+        // and the same name are "distinct" because NULL != NULL in SQL
+        // uniqueness. So we pre-check siblings explicitly (the `IS`
+        // operator compares NULLs as equal); the table constraint stays
+        // as a backstop for non-NULL parents.
+        if self.crate_name_taken(name, parent_id, None)? {
+            return Err(LibraryError::CrateNameConflict {
+                name: name.to_string(),
+            });
+        }
+        self.conn
+            .execute(
+                "INSERT INTO crates (name, parent_crate_id, created_at, updated_at) \
+                 VALUES (?1, ?2, strftime('%s','now'), strftime('%s','now'))",
+                params![name, parent_id],
+            )
+            .map_err(|e| map_crate_constraint(e, name, "create_crate"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Rename a Dub crate. Errors with [`LibraryError::CrateNotFound`]
+    /// when no crate carries the id, and
+    /// [`LibraryError::CrateNameConflict`] on a sibling-name clash.
+    pub fn rename_crate(&self, crate_id: i64, new_name: &str) -> Result<()> {
+        // Resolve the crate's parent so we can scope the sibling-name
+        // pre-check (see `create_crate` for why the table UNIQUE alone
+        // isn't enough for top-level crates). `None` parent on a missing
+        // id is caught by the row-count check below.
+        let parent_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT parent_crate_id FROM crates WHERE id = ?1",
+                params![crate_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("rename_crate_lookup_parent", e))?
+            .ok_or(LibraryError::CrateNotFound { crate_id })?;
+        if self.crate_name_taken(new_name, parent_id, Some(crate_id))? {
+            return Err(LibraryError::CrateNameConflict {
+                name: new_name.to_string(),
+            });
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE crates SET name = ?1, updated_at = strftime('%s','now') \
+                 WHERE id = ?2",
+                params![new_name, crate_id],
+            )
+            .map_err(|e| map_crate_constraint(e, new_name, "rename_crate"))?;
+        if changed == 0 {
+            return Err(LibraryError::CrateNotFound { crate_id });
+        }
+        Ok(())
+    }
+
+    /// `true` when a sibling crate (same `parent_id`, NULLs compared
+    /// equal via SQL `IS`) already carries `name`, optionally excluding
+    /// a crate id (used by rename so a no-op rename onto the same name
+    /// doesn't self-conflict).
+    fn crate_name_taken(
+        &self,
+        name: &str,
+        parent_id: Option<i64>,
+        exclude_id: Option<i64>,
+    ) -> Result<bool> {
+        let taken: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM crates \
+                    WHERE name = ?1 \
+                      AND parent_crate_id IS ?2 \
+                      AND (?3 IS NULL OR id != ?3)\
+                 )",
+                params![name, parent_id, exclude_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("crate_name_taken", e))?;
+        Ok(taken)
+    }
+
+    /// Delete a Dub crate. `crate_tracks` rows and any child crates
+    /// cascade via the schema's `ON DELETE CASCADE`. Errors with
+    /// [`LibraryError::CrateNotFound`] when the id is unknown so the
+    /// UI can distinguish a no-op from a real delete.
+    pub fn delete_crate(&self, crate_id: i64) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM crates WHERE id = ?1", params![crate_id])
+            .map_err(|e| LibraryError::sqlite("delete_crate", e))?;
+        if changed == 0 {
+            return Err(LibraryError::CrateNotFound { crate_id });
+        }
+        Ok(())
+    }
+
+    /// Append a track to a crate at the next ordinal. Idempotent:
+    /// re-adding a track already in the crate is a no-op and returns
+    /// `Ok(false)`; a fresh insert returns `Ok(true)`. Validates that
+    /// both the crate and the track exist first so the caller gets a
+    /// typed [`LibraryError::CrateNotFound`] / [`LibraryError::TrackNotFound`]
+    /// instead of a raw foreign-key failure.
+    pub fn add_track_to_crate(&self, crate_id: i64, track_id: &str) -> Result<bool> {
+        self.ensure_crate_exists(crate_id)?;
+        self.ensure_track_exists(track_id)?;
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO crate_tracks (crate_id, track_id, ordinal, added_at) \
+                 VALUES (\
+                    ?1, ?2, \
+                    (SELECT COALESCE(MAX(ordinal), -1) + 1 \
+                       FROM crate_tracks WHERE crate_id = ?1), \
+                    strftime('%s','now')\
+                 )",
+                params![crate_id, track_id],
+            )
+            .map_err(|e| LibraryError::sqlite("add_track_to_crate", e))?;
+        if inserted > 0 {
+            self.touch_crate(crate_id)?;
+        }
+        Ok(inserted > 0)
+    }
+
+    /// Remove a track from a crate. Idempotent — removing a track that
+    /// isn't a member is a successful no-op. Leaves a gap in the
+    /// ordinal sequence; ordinals are only used for relative ordering,
+    /// not as dense keys, and the next reorder rewrites them anyway.
+    pub fn remove_track_from_crate(&self, crate_id: i64, track_id: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM crate_tracks WHERE crate_id = ?1 AND track_id = ?2",
+                params![crate_id, track_id],
+            )
+            .map_err(|e| LibraryError::sqlite("remove_track_from_crate", e))?;
+        if changed > 0 {
+            self.touch_crate(crate_id)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the member ordering of a crate to match `ordered_track_ids`
+    /// (0-based, in the given order). Ids not currently in the crate are
+    /// ignored; members absent from the list keep their old ordinal and
+    /// therefore sort after the reordered block (the UI always sends the
+    /// full member list, so this is a defensive corner). Runs in a single
+    /// transaction so a mid-write failure can't leave a half-reordered
+    /// crate.
+    pub fn set_crate_track_order(&self, crate_id: i64, ordered_track_ids: &[&str]) -> Result<()> {
+        self.ensure_crate_exists(crate_id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| LibraryError::sqlite("begin_set_crate_track_order", e))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "UPDATE crate_tracks SET ordinal = ?1 \
+                     WHERE crate_id = ?2 AND track_id = ?3",
+                )
+                .map_err(|e| LibraryError::sqlite("prepare_set_crate_track_order", e))?;
+            for (ordinal, track_id) in ordered_track_ids.iter().enumerate() {
+                stmt.execute(params![ordinal as i64, crate_id, track_id])
+                    .map_err(|e| LibraryError::sqlite("set_crate_track_order", e))?;
+            }
+        }
+        tx.execute(
+            "UPDATE crates SET updated_at = strftime('%s','now') WHERE id = ?1",
+            params![crate_id],
+        )
+        .map_err(|e| LibraryError::sqlite("touch_set_crate_track_order", e))?;
+        tx.commit()
+            .map_err(|e| LibraryError::sqlite("commit_set_crate_track_order", e))?;
+        Ok(())
+    }
+
+    /// List a crate's member tracks in ordinal order, assembled into
+    /// the same [`TrackRow`] shape the browser uses everywhere else.
+    /// Empty for an empty (or unknown) crate.
+    pub fn list_crate_tracks(&self, crate_id: i64) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             JOIN crate_tracks ct ON ct.track_id = t.id \
+             WHERE ct.crate_id = ?1 \
+             ORDER BY ct.ordinal ASC"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_list_crate_tracks", e))?;
+        let rows = stmt
+            .query_map(params![crate_id], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("query_list_crate_tracks", e))?;
+        collect_track_rows(rows, "list_crate_tracks")
+    }
+
+    /// Bump a crate's `updated_at`. Called after every membership
+    /// mutation. Silently does nothing for an unknown id (the
+    /// mutators that call this have already validated the crate).
+    fn touch_crate(&self, crate_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE crates SET updated_at = strftime('%s','now') WHERE id = ?1",
+                params![crate_id],
+            )
+            .map_err(|e| LibraryError::sqlite("touch_crate", e))?;
+        Ok(())
+    }
+
+    /// Return [`LibraryError::CrateNotFound`] unless the crate exists.
+    fn ensure_crate_exists(&self, crate_id: i64) -> Result<()> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM crates WHERE id = ?1)",
+                params![crate_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("ensure_crate_exists", e))?;
+        if exists {
+            Ok(())
+        } else {
+            Err(LibraryError::CrateNotFound { crate_id })
+        }
+    }
+
+    /// Return [`LibraryError::TrackNotFound`] unless the track exists.
+    fn ensure_track_exists(&self, track_id: &str) -> Result<()> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tracks WHERE id = ?1)",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("ensure_track_exists", e))?;
+        if exists {
+            Ok(())
+        } else {
+            Err(LibraryError::TrackNotFound {
+                track_id: track_id.to_string(),
+            })
+        }
     }
 
     /// Resolve a canonical `track_id` to one of its on-disk paths.
@@ -2249,5 +2585,176 @@ mod tests {
             .resolve_track_path("00000000-0000-0000-0000-000000000000")
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    // === Dub crates (M11d-next) ==========================================
+
+    #[test]
+    fn create_crate_returns_id_and_lists_with_zero_tracks() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = lib.create_crate("Reggae 45s", None).unwrap();
+        assert!(id > 0);
+        let crates = lib.list_crates().unwrap();
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].id, id);
+        assert_eq!(crates[0].name, "Reggae 45s");
+        assert_eq!(crates[0].parent_id, None);
+        assert_eq!(crates[0].track_count, 0);
+    }
+
+    #[test]
+    fn create_crate_rejects_duplicate_sibling_name() {
+        let lib = Library::open_in_memory().unwrap();
+        lib.create_crate("Dubplates", None).unwrap();
+        let err = lib.create_crate("Dubplates", None).unwrap_err();
+        assert!(
+            matches!(err, LibraryError::CrateNameConflict { ref name } if name == "Dubplates"),
+            "expected CrateNameConflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nested_crate_can_reuse_sibling_name_under_different_parent() {
+        let lib = Library::open_in_memory().unwrap();
+        let parent_a = lib.create_crate("Sets", None).unwrap();
+        let parent_b = lib.create_crate("Archive", None).unwrap();
+        // "Friday" under two different parents is allowed; the UNIQUE
+        // constraint is scoped to (parent_crate_id, name).
+        lib.create_crate("Friday", Some(parent_a)).unwrap();
+        lib.create_crate("Friday", Some(parent_b)).unwrap();
+        let crates = lib.list_crates().unwrap();
+        assert_eq!(crates.len(), 4);
+    }
+
+    #[test]
+    fn rename_crate_changes_name_and_flags_conflicts() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = lib.create_crate("Workhouse", None).unwrap();
+        lib.create_crate("Taken", None).unwrap();
+        lib.rename_crate(id, "Workshop").unwrap();
+        assert_eq!(lib.list_crates().unwrap()[0].name, "Taken");
+        // Renaming onto a sibling's name conflicts.
+        let conflict = lib.rename_crate(id, "Taken").unwrap_err();
+        assert!(matches!(conflict, LibraryError::CrateNameConflict { .. }));
+        // Renaming a non-existent crate is CrateNotFound.
+        let missing = lib.rename_crate(9999, "Whatever").unwrap_err();
+        assert!(matches!(
+            missing,
+            LibraryError::CrateNotFound { crate_id: 9999 }
+        ));
+    }
+
+    #[test]
+    fn delete_crate_cascades_membership_and_children() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B"]);
+        let parent = lib.create_crate("Parent", None).unwrap();
+        let child = lib.create_crate("Child", Some(parent)).unwrap();
+        lib.add_track_to_crate(parent, &ids[0]).unwrap();
+        lib.add_track_to_crate(child, &ids[1]).unwrap();
+        lib.delete_crate(parent).unwrap();
+        // Parent + cascaded child are both gone.
+        assert!(lib.list_crates().unwrap().is_empty());
+        // crate_tracks rows for both crates cascaded away; the tracks
+        // themselves survive.
+        assert_eq!(lib.track_count().unwrap(), 2);
+        // Deleting a missing crate is CrateNotFound.
+        let missing = lib.delete_crate(parent).unwrap_err();
+        assert!(matches!(missing, LibraryError::CrateNotFound { .. }));
+    }
+
+    #[test]
+    fn add_track_is_idempotent_and_counts_members() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["One", "Two"]);
+        let id = lib.create_crate("Bag", None).unwrap();
+        assert!(lib.add_track_to_crate(id, &ids[0]).unwrap());
+        // Re-adding the same track is a no-op.
+        assert!(!lib.add_track_to_crate(id, &ids[0]).unwrap());
+        assert!(lib.add_track_to_crate(id, &ids[1]).unwrap());
+        assert_eq!(lib.list_crates().unwrap()[0].track_count, 2);
+    }
+
+    #[test]
+    fn add_track_validates_crate_and_track_existence() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Real"]);
+        let id = lib.create_crate("Bag", None).unwrap();
+        // Unknown crate.
+        let no_crate = lib.add_track_to_crate(4242, &ids[0]).unwrap_err();
+        assert!(matches!(
+            no_crate,
+            LibraryError::CrateNotFound { crate_id: 4242 }
+        ));
+        // Unknown track.
+        let no_track = lib
+            .add_track_to_crate(id, "00000000-0000-0000-0000-000000000000")
+            .unwrap_err();
+        assert!(matches!(no_track, LibraryError::TrackNotFound { .. }));
+    }
+
+    #[test]
+    fn list_crate_tracks_returns_members_in_insertion_order() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["First", "Second", "Third"]);
+        let id = lib.create_crate("Order", None).unwrap();
+        lib.add_track_to_crate(id, &ids[0]).unwrap();
+        lib.add_track_to_crate(id, &ids[1]).unwrap();
+        lib.add_track_to_crate(id, &ids[2]).unwrap();
+        let rows = lib.list_crate_tracks(id).unwrap();
+        let got: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(got, vec![&ids[0], &ids[1], &ids[2]]);
+    }
+
+    #[test]
+    fn remove_track_is_idempotent() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["X"]);
+        let id = lib.create_crate("C", None).unwrap();
+        lib.add_track_to_crate(id, &ids[0]).unwrap();
+        lib.remove_track_from_crate(id, &ids[0]).unwrap();
+        assert!(lib.list_crate_tracks(id).unwrap().is_empty());
+        // Removing again is a successful no-op.
+        lib.remove_track_from_crate(id, &ids[0]).unwrap();
+    }
+
+    #[test]
+    fn set_crate_track_order_rewrites_ordinals() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B", "C"]);
+        let id = lib.create_crate("Reorder", None).unwrap();
+        for t in &ids {
+            lib.add_track_to_crate(id, t).unwrap();
+        }
+        // Reverse the order.
+        let reversed: Vec<&str> = vec![ids[2].as_str(), ids[1].as_str(), ids[0].as_str()];
+        lib.set_crate_track_order(id, &reversed).unwrap();
+        let got: Vec<String> = lib
+            .list_crate_tracks(id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(got, vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+    }
+
+    #[test]
+    fn add_track_appends_after_reorder() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B", "C"]);
+        let id = lib.create_crate("Append", None).unwrap();
+        lib.add_track_to_crate(id, &ids[0]).unwrap();
+        lib.add_track_to_crate(id, &ids[1]).unwrap();
+        // Reorder so B is first, then add C — C should land last.
+        lib.set_crate_track_order(id, &[ids[1].as_str(), ids[0].as_str()])
+            .unwrap();
+        lib.add_track_to_crate(id, &ids[2]).unwrap();
+        let got: Vec<String> = lib
+            .list_crate_tracks(id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(got, vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]);
     }
 }

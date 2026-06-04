@@ -2,8 +2,8 @@
 //  LibraryView.swift
 //  Dub
 //
-//  M11d.1 — Library browser shell. Replaces the M10.5b
-//  `FileBrowserView` in the LIBRARY region of the Performance View.
+//  M11d.1 — Library browser shell. Replaces the M10.5b file-mode
+//  browser in the LIBRARY region of the Performance View.
 //  Backed by the M11a–c SQLite catalog through `DubLibrary`
 //  (`crates/dub-ffi`).
 //
@@ -105,6 +105,13 @@ extension LibraryTrack {
     var versionTokensSortKey: String { versionTokens ?? "" }
     var composerSortKey: String { composer ?? "" }
     var trackNumberSortKey: Int32 { trackNumber ?? Int32.max }
+    /// Manual-order rank inside the crate this row was listed from.
+    /// `crateOrdinal` is `nil` for every non-crate listing; folding
+    /// those to `UInt32.max` keeps the comparator total even though
+    /// the `#` column is never rendered outside a crate view. Sorting
+    /// ascending on this key reproduces the FFI's ordinal order — the
+    /// canonical manual order.
+    var crateOrderSortKey: UInt32 { crateOrdinal ?? UInt32.max }
 }
 
 // MARK: - Configurable library columns (PRD §8.5.3.1 lite)
@@ -113,6 +120,13 @@ extension LibraryTrack {
 /// and title are always shown; the trailing set is user-configurable
 /// via header right-click and persisted in `@AppStorage`.
 private enum LibraryColumnField: String, CaseIterable, Identifiable {
+    /// Manual-order rank column (`#`). Injected as a fixed leading
+    /// column only while a Dub crate is selected; never part of the
+    /// user-configurable / persisted column set, so it stays out of
+    /// `fixedPrefix`, `defaultTrailing`, and `configurable`. Sorting
+    /// it ascending *is* the crate's manual order, and that state is
+    /// what gates drag-to-reorder (`isCrateManualOrder`).
+    case crateOrder
     case artist
     case title
     case duration
@@ -147,7 +161,7 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
 
     var pickerCategory: String {
         switch self {
-        case .artist, .title, .source, .versionTokens:
+        case .artist, .title, .source, .versionTokens, .crateOrder:
             return "Library"
         case .album, .genre, .year, .comment, .composer, .trackNumber:
             return "ID3 metadata"
@@ -158,6 +172,7 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
 
     var headerLabel: String {
         switch self {
+        case .crateOrder: return "#"
         case .artist: return "Artist"
         case .title: return "Title"
         case .duration: return "Length"
@@ -183,7 +198,11 @@ private enum LibrarySource: Hashable, Identifiable {
     case allTracks
     case recentlyPlayed
     case justImported
-    case dubCratesPlaceholder
+    /// A user-created Dub crate (M11d-next, PRD §8.5.1). Carries the
+    /// crate id only; the display name + track count are looked up
+    /// live from `libraryModel.crates` so a rename doesn't strand a
+    /// stale label in the selection state.
+    case dubCrate(id: Int64)
     case importedSourcesPlaceholder
     case realRecordsPlaceholder
 
@@ -194,7 +213,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .allTracks:                   return "All Tracks"
         case .recentlyPlayed:              return "Recently Played"
         case .justImported:                return "Just Imported"
-        case .dubCratesPlaceholder:        return "Dub Crates"
+        case .dubCrate:                    return "Crate"
         case .importedSourcesPlaceholder:  return "Imported Sources"
         case .realRecordsPlaceholder:      return "Real Records"
         }
@@ -205,17 +224,24 @@ private enum LibrarySource: Hashable, Identifiable {
         case .allTracks:                   return "music.note.list"
         case .recentlyPlayed:              return "clock.arrow.circlepath"
         case .justImported:                return "tray.and.arrow.down"
-        case .dubCratesPlaceholder:        return "folder"
+        case .dubCrate:                    return "square.stack.fill"
         case .importedSourcesPlaceholder:  return "lock.square"
         case .realRecordsPlaceholder:      return "opticaldisc"
         }
+    }
+
+    /// The backing crate id when this source is a Dub crate.
+    var crateId: Int64? {
+        if case let .dubCrate(id) = self { return id }
+        return nil
     }
 
     /// `false` for the v1.0 placeholders that render disabled.
     var isAvailable: Bool {
         switch self {
         case .allTracks, .recentlyPlayed, .justImported: return true
-        default: return false
+        case .dubCrate:                                  return true
+        default:                                         return false
         }
     }
 
@@ -231,7 +257,11 @@ private enum LibrarySource: Hashable, Identifiable {
     /// the default title sort still applies there.
     var preservesNaturalOrder: Bool {
         switch self {
-        case .recentlyPlayed, .justImported: return true
+        // A Dub crate's ordinal order is user-defined (it's a
+        // playlist); the default title sort would clobber the order
+        // the user just dragged into place, exactly like the smart
+        // crates' recency order.
+        case .recentlyPlayed, .justImported, .dubCrate: return true
         default: return false
         }
     }
@@ -243,7 +273,7 @@ private enum LibrarySource: Hashable, Identifiable {
             return "Library"
         case .recentlyPlayed, .justImported:
             return "Smart Crates"
-        case .dubCratesPlaceholder:
+        case .dubCrate:
             return "Dub Crates"
         case .importedSourcesPlaceholder:
             return "Imported Sources"
@@ -282,6 +312,26 @@ struct LibraryView: View {
     /// Currently selected source-tree node. Drives which query the
     /// track list runs against.
     @State private var selectedSource: LibrarySource = .allTracks
+
+    /// M11d-next — id of the crate currently in inline-rename mode
+    /// (its sidebar row shows a `TextField` instead of a label), or
+    /// `nil` when no crate is being renamed. Set when the user picks
+    /// "Rename" from a crate's context menu or right after creating
+    /// a crate.
+    @State private var renamingCrateId: Int64?
+
+    /// Working text for the in-progress inline rename. Committed on
+    /// submit / focus-loss, discarded on Escape.
+    @State private var crateRenameText: String = ""
+
+    /// Focus binding for the inline-rename text field so a fresh
+    /// create / rename drops the caret straight into the field.
+    @FocusState private var crateRenameFocused: Bool
+
+    /// M11d-next — crate id currently under a drag (drop-to-add
+    /// highlight), or `nil`. Drives the sidebar row's accent ring.
+    @State private var crateDropTargetId: Int64?
+
 
     /// Notation mode for the Key column (M11c.2, PRD §8.3.2).
     /// Camelot is canonical; musical notation is opt-in via a
@@ -411,21 +461,28 @@ struct LibraryView: View {
             refreshTracks()
         }
         .onChange(of: selectedSource) { newSource in
-            // Smart crates with a meaningful natural order
-            // (Recently Played, Just Imported) start out
-            // *unsorted* so the FFI's recency order survives.
-            // `allTracks` falls back to title-ascending as
-            // before. The user can still click a column header
-            // afterwards to override either default — that's
-            // what the comparator binding is for.
-            sortOrder = newSource.preservesNaturalOrder
-                ? []
-                : [KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward)]
-            if newSource.preservesNaturalOrder {
+            // Pick the default sort for the new source. The user can
+            // still click any column header afterwards to override it.
+            if newSource.crateId != nil {
+                // A crate opens in its manual order: sort by the `#`
+                // column ascending. This is the only sort state that
+                // enables drag-to-reorder; the user can click any
+                // other header to view the crate sorted (drag then
+                // disables) and click `#` to come back.
+                activeSortColumn = .crateOrder
+                sortAscending = true
+                sortOrder = [KeyPathComparator(\LibraryTrack.crateOrderSortKey, order: .forward)]
+            } else if newSource.preservesNaturalOrder {
+                // Smart crates with a meaningful natural order
+                // (Recently Played, Just Imported) start out
+                // *unsorted* so the FFI's recency order survives.
                 activeSortColumn = nil
+                sortOrder = []
             } else {
+                // `allTracks` falls back to title-ascending.
                 activeSortColumn = .title
                 sortAscending = true
+                sortOrder = [KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward)]
             }
             refreshTracks()
         }
@@ -453,6 +510,13 @@ struct LibraryView: View {
         .onChange(of: libraryModel.libraryRowAnalysisUpdate) { update in
             guard let update else { return }
             applyAnalysisUpdate(update)
+        }
+        .onChange(of: libraryModel.crateContentGeneration) { _ in
+            // A crate's membership / order changed (add / remove /
+            // reorder / delete). Only the currently-open crate view
+            // needs to re-fetch; other sources are unaffected.
+            guard selectedSource.crateId != nil else { return }
+            refreshTracks(preserveSelection: true)
         }
         // M11d.6 round 3 — the previously-present
         // `.onChange(of: sortOrder) { _ in recomputeSortedTracks() }`
@@ -520,9 +584,7 @@ struct LibraryView: View {
                 section(
                     heading: "Smart Crates",
                     entries: [.recentlyPlayed, .justImported])
-                section(
-                    heading: "Dub Crates",
-                    entries: [.dubCratesPlaceholder])
+                dubCratesSection
                 section(
                     heading: "Imported Sources",
                     entries: [.importedSourcesPlaceholder])
@@ -546,6 +608,118 @@ struct LibraryView: View {
         ForEach(entries) { entry in
             sidebarRow(entry)
         }
+    }
+
+    // MARK: - Dub Crates section (M11d-next, PRD §8.5.1)
+
+    /// The editable "Dub Crates" section: a header carrying a `+`
+    /// create affordance, then one row per crate (dynamic from
+    /// `libraryModel.crates`). Each row is a drop target for tracks,
+    /// supports inline rename, and carries a Rename / Delete context
+    /// menu. Empty-state shows a faint hint so the section never
+    /// reads as broken when the user has no crates yet.
+    @ViewBuilder
+    private var dubCratesSection: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("DUB CRATES")
+                .font(DubFont.caps)
+                .tracking(1.0)
+                .foregroundStyle(DubColor.textTertiary)
+            Spacer(minLength: 0)
+            Button {
+                createCrateAndRename()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!libraryModel.libraryIsOpen)
+            .help("New crate")
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.top, DubSpacing.sm)
+        .padding(.bottom, 2)
+
+        if libraryModel.crates.isEmpty {
+            Text("No crates yet — drag tracks here.")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textPlaceholder)
+                .padding(.horizontal, DubSpacing.lg)
+                .padding(.vertical, DubSpacing.xs)
+        } else {
+            ForEach(libraryModel.crates, id: \.id) { crate in
+                crateRow(crate)
+            }
+        }
+    }
+
+    private func crateRow(_ crate: LibraryCrate) -> some View {
+        let source = LibrarySource.dubCrate(id: crate.id)
+        let isSelected = selectedSource == source
+        let isDropTarget = crateDropTargetId == crate.id
+        let isRenaming = renamingCrateId == crate.id
+        return HStack(spacing: DubSpacing.sm) {
+            Image(systemName: source.systemImage)
+                .frame(width: 16)
+                .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
+            if isRenaming {
+                TextField("Crate name", text: $crateRenameText)
+                    .textFieldStyle(.plain)
+                    .font(DubFont.body)
+                    .focused($crateRenameFocused)
+                    .onSubmit { commitCrateRename(crate.id) }
+                    .onExitCommand { cancelCrateRename() }
+                    .onChange(of: crateRenameFocused) { focused in
+                        if !focused && renamingCrateId == crate.id {
+                            commitCrateRename(crate.id)
+                        }
+                    }
+            } else {
+                Text(crate.name)
+                    .font(DubFont.body)
+                    .foregroundStyle(DubColor.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+                Text("\(crate.trackCount)")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .monospacedDigit()
+            }
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(DubColor.deckATint, lineWidth: 1.5)
+                    .padding(.horizontal, DubSpacing.sm)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !isRenaming else { return }
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            selectedSource = source
+        }
+        .onDrop(of: [.fileURL], isTargeted: dropTargetBinding(for: crate.id)) { providers in
+            handleCrateDrop(providers, crateId: crate.id)
+        }
+        .contextMenu {
+            Button("Rename") { beginCrateRename(crate) }
+            Button("Delete", role: .destructive) { confirmDeleteCrate(crate) }
+        }
+    }
+
+    private func dropTargetBinding(for crateId: Int64) -> Binding<Bool> {
+        Binding(
+            get: { crateDropTargetId == crateId },
+            set: { active in crateDropTargetId = active ? crateId : nil }
+        )
     }
 
     private func sidebarRow(_ entry: LibrarySource) -> some View {
@@ -706,16 +880,15 @@ struct LibraryView: View {
     /// click.
     @State private var sortedTrackIds: [String] = []
 
-    /// Scrollable track list. Uses the same row pattern as
-    /// `FileBrowserView` (full-row `onTapGesture` + AppKit
-    /// `onDrag`) because SwiftUI `Table` was dropping ~4/5
+    /// Scrollable track list. Uses a full-row `onTapGesture` +
+    /// AppKit `onDrag` row pattern because SwiftUI `Table` was dropping ~4/5
     /// clicks and turning drags outside the Title column into
     /// arrow-key-style selection changes.
     private var trackList: some View {
         VStack(spacing: 0) {
             LibraryTableScrollContainer(
                 tableWidth: tableContentWidth,
-                columnOrderKey: visibleColumns.map(\.rawValue).joined(separator: ","),
+                columnOrderKey: displayedColumns.map(\.rawValue).joined(separator: ","),
                 headerStateKey: columnReorderHeaderStateKey,
                 tracksContentRevision: tracksContentRevision,
                 rowSelection: rowSelection,
@@ -734,11 +907,35 @@ struct LibraryView: View {
                         Task { @MainActor in
                             await model.setGridLocked(trackId: trackId, locked: locked)
                         }
-                    }),
+                    },
+                    crateId: selectedSource.crateId,
+                    onCrateRemove: { ids in
+                        guard let crateId = selectedSource.crateId else { return }
+                        for id in ids {
+                            model.removeTrackFromCrate(crateId, trackId: id)
+                        }
+                    },
+                    // Move… is offered only in manual order, mirroring
+                    // the drag-reorder gate. With a foreign column sort
+                    // active, "Move Up" against the sorted view wouldn't
+                    // map to a persistent manual position, so the items
+                    // are withheld (Remove from Crate stays available).
+                    onCrateMove: isCrateManualOrder
+                        ? { trackId, move in
+                            guard let crateId = selectedSource.crateId else { return }
+                            let reordered = reorderedCrateIds(
+                                moving: trackId, move: move, current: sortedTrackIds)
+                            model.setCrateOrder(crateId, orderedTrackIds: reordered)
+                        }
+                        : nil),
                 scroll: LibraryTableScroll(
                     scrollToTrackId: keyboardScrollTarget,
                     scrollDelta: keyboardScrollDelta,
-                    onScrollHandled: { keyboardScrollTarget = nil })
+                    onScrollHandled: { keyboardScrollTarget = nil }),
+                crateReorderEnabled: isCrateManualOrder,
+                onCrateReorder: { ids, slot in
+                    performCrateReorder(draggedIds: ids, toSlot: slot)
+                }
             )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -793,7 +990,7 @@ struct LibraryView: View {
     /// Gutter + columns + horizontal padding. Header and rows share
     /// this width, including the in-progress resize preview.
     private var tableContentWidth: CGFloat {
-        let columnSum = visibleColumns.map { columnWidth($0) }.reduce(0, +)
+        let columnSum = displayedColumns.map { columnWidth($0) }.reduce(0, +)
         return 36 + columnSum + DubSpacing.lg * 2
     }
 
@@ -803,7 +1000,7 @@ struct LibraryView: View {
                 .overlay(alignment: .trailing) {
                     columnHeaderDivider
                 }
-            ForEach(visibleColumns) { field in
+            ForEach(displayedColumns) { field in
                 resizableColumnHeader(for: field)
             }
         }
@@ -924,6 +1121,32 @@ struct LibraryView: View {
         return parsed
     }
 
+    /// `true` while a manual Dub crate is the selected source.
+    private var isCrateView: Bool { selectedSource.crateId != nil }
+
+    /// Columns actually rendered. A crate view pins the `#`
+    /// (manual-order) column ahead of the user-configurable set;
+    /// every other source renders `visibleColumns` unchanged. Kept
+    /// separate from `visibleColumns` so the `#` column never leaks
+    /// into the persisted column order / picker / header-reorder
+    /// machinery.
+    private var displayedColumns: [LibraryColumnField] {
+        isCrateView ? [.crateOrder] + visibleColumns : visibleColumns
+    }
+
+    /// `true` when the open crate is showing its manual order — i.e.
+    /// no foreign column sort is active. Manual order is the only
+    /// state where drag-to-reorder has a persistent meaning, so this
+    /// gates both the reorder drag payload and the drop targets.
+    /// Both the explicit `#`-ascending sort and the unsorted FFI
+    /// order (`activeSortColumn == nil`) count as manual order; they
+    /// render identically because `crateOrdinal` is dense `0..n`.
+    private var isCrateManualOrder: Bool {
+        guard isCrateView else { return false }
+        if activeSortColumn == nil { return true }
+        return activeSortColumn == .crateOrder && sortAscending
+    }
+
     private func persistColumnOrder(_ columns: [LibraryColumnField]) {
         var cols = columns
         for fixed in LibraryColumnField.fixedPrefix where !cols.contains(fixed) {
@@ -968,6 +1191,9 @@ struct LibraryView: View {
         DragGesture(minimumDistance: 8, coordinateSpace: .global)
             .onChanged { value in
                 guard columnResizeDragOrigin == nil else { return }
+                // The `#` column is pinned; it can't be a reorder
+                // source (and it's not in the persisted order anyway).
+                guard field != .crateOrder else { return }
                 if columnReorderDrag == nil {
                     columnReorderDrag = field
                     columnReorderPendingOrder = visibleColumns
@@ -1133,6 +1359,8 @@ struct LibraryView: View {
         }
         let order: SortOrder = sortAscending ? .forward : .reverse
         switch column {
+        case .crateOrder:
+            sortOrder = [KeyPathComparator(\.crateOrderSortKey, order: order)]
         case .artist:
             sortOrder = [KeyPathComparator(\.artistSortKey, order: order)]
         case .title:
@@ -1164,6 +1392,7 @@ struct LibraryView: View {
 
     private func defaultColumnWidth(_ field: LibraryColumnField) -> CGFloat {
         switch field {
+        case .crateOrder: return 40
         case .artist: return 120
         case .title: return 180
         case .duration: return 52
@@ -1253,6 +1482,12 @@ struct LibraryView: View {
     @ViewBuilder
     private func columnCell(for field: LibraryColumnField, track: LibraryTrack) -> some View {
         switch field {
+        case .crateOrder:
+            Text(track.crateOrdinal.map { String($0 + 1) } ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textTertiary)
+                .monospacedDigit()
+                .frame(maxWidth: .infinity, alignment: .trailing)
         case .artist:
             Text(track.artist ?? "—")
                 .font(DubFont.body)
@@ -1354,7 +1589,7 @@ struct LibraryView: View {
         HStack(spacing: 0) {
             rowIndicators(for: track)
                 .frame(width: 36, alignment: .leading)
-            ForEach(visibleColumns) { field in
+            ForEach(displayedColumns) { field in
                 columnCell(for: field, track: track)
                     .padding(.leading, LibraryColumnLayout.columnLeadingInset)
                     .modifier(DimUnanalyzed(track: track))
@@ -1380,9 +1615,18 @@ struct LibraryView: View {
                     // model sync on hand-off — the deck-load
                     // pathway re-reads selection on its own.
                 }
-                return NSItemProvider(object: dragURL! as NSURL)
+                return makeRowDragProvider(for: track, dragURL: dragURL!)
             }
         }
+        // The reorder DROP target + the insertion line are handled in
+        // AppKit on `LibraryDocumentWrapper`, not here. A per-row
+        // SwiftUI `.onDrop` cannot paint live feedback in this table:
+        // the rows are hosted in an `NSHostingView` whose `rootView`
+        // is only re-assigned on a track/column/width change (the
+        // perf optimization that keeps sidebar swaps cheap), so any
+        // `@State` the drop delegate flips never repaints mid-drag.
+        // Doing it in AppKit (like the selection layer) gives a live
+        // insertion line and reliable end-of-list handling.
         .onTapGesture(count: 1) {
             handleRowClick(track)
         }
@@ -1401,6 +1645,110 @@ struct LibraryView: View {
         // computed `menuSelectedTrackIds` property), so the
         // multi-select label is always accurate even though the
         // SwiftUI render path is skipped.
+    }
+
+    /// In-process drag type carrying the crate-reorder payload. Kept
+    /// distinct from `public.file-url` (the deck/sidebar drop) so the
+    /// in-list reorder drop targets only ever react to a row drag
+    /// that originated inside the open crate, never to a Finder file
+    /// drag. The payload is a newline-joined list whose first line is
+    /// the `DUBCRATE` sentinel followed by the dragged track ids in
+    /// visual order. A custom reverse-DNS identifier is fine for an
+    /// in-process drag without a UTI declaration in Info.plist.
+    fileprivate static let crateReorderType =
+        UTType(exportedAs: "com.dub.crate-track-order")
+
+    /// Builds the drag item provider for a track row. It always vends
+    /// the file URL (deck-load + add-to-crate drops), and, while the
+    /// open crate is in manual order, *also* vends the reorder payload
+    /// so the same drag can either load a deck or reorder in place
+    /// depending on where it lands.
+    private func makeRowDragProvider(for track: LibraryTrack, dragURL: URL) -> NSItemProvider {
+        let provider = NSItemProvider(object: dragURL as NSURL)
+        guard isCrateManualOrder else { return provider }
+        let ids = orderedSelectedIds(includingPrimary: track.id)
+        let payload = (["DUBCRATE"] + ids).joined(separator: "\n")
+        provider.registerDataRepresentation(
+            forTypeIdentifier: Self.crateReorderType.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(Data(payload.utf8), nil)
+            return nil
+        }
+        return provider
+    }
+
+    /// The dragged track ids in current visual order. A multi-row
+    /// selection moves as a contiguous block; a drag on an unselected
+    /// row (or a single selection) carries just that row.
+    private func orderedSelectedIds(includingPrimary primary: String) -> [String] {
+        let selected = rowSelection.selectedTrackIds
+        if selected.contains(primary), selected.count > 1 {
+            return sortedTrackIds.filter { selected.contains($0) }
+        }
+        return [primary]
+    }
+
+    /// Commits a drag-reorder to a 0-based insertion slot in `0…count`
+    /// (the value the AppKit document wrapper computes from the drop's
+    /// y-position; `count` means "after the last row"). Removes the
+    /// dragged block from the current manual order and reinserts it at
+    /// the slot, anchored to the first non-dragged row at or after it
+    /// so dropping into the middle of a multi-selection still lands
+    /// predictably. The `crateContentGeneration` bump that
+    /// `setCrateOrder` triggers re-fetches the crate so the `#` ranks
+    /// resettle to a dense `0..n`.
+    private func performCrateReorder(draggedIds: [String], toSlot slot: Int) {
+        guard let crateId = selectedSource.crateId else { return }
+        let draggedSet = Set(draggedIds)
+        guard !draggedSet.isEmpty else { return }
+        let current = sortedTrackIds
+
+        // The row that currently occupies `slot` (skipping any dragged
+        // rows) becomes the insertion anchor; nil means append.
+        var anchorId: String?
+        var probe = max(0, min(slot, current.count))
+        while probe < current.count {
+            if !draggedSet.contains(current[probe]) {
+                anchorId = current[probe]
+                break
+            }
+            probe += 1
+        }
+
+        var order = current
+        order.removeAll { draggedSet.contains($0) }
+        let insertAt: Int
+        if let anchorId, let idx = order.firstIndex(of: anchorId) {
+            insertAt = idx
+        } else {
+            insertAt = order.count
+        }
+        order.insert(contentsOf: draggedIds, at: insertAt)
+        guard order != current else { return }
+        model.setCrateOrder(crateId, orderedTrackIds: order)
+    }
+
+    /// Decode a `DUBCRATE`-tagged reorder payload off an item
+    /// provider and hand the dragged track ids back on the main
+    /// actor. Item-provider loads complete on an arbitrary queue, so
+    /// the completion hops to the main thread before mutating order.
+    private func loadCrateReorderPayload(
+        from provider: NSItemProvider,
+        then apply: @escaping ([String]) -> Void
+    ) {
+        provider.loadDataRepresentation(
+            forTypeIdentifier: Self.crateReorderType.identifier
+        ) { data, _ in
+            guard let data,
+                  let text = String(data: data, encoding: .utf8)
+            else { return }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard lines.first == "DUBCRATE" else { return }
+            let ids = Array(lines.dropFirst()).filter { !$0.isEmpty }
+            guard !ids.isEmpty else { return }
+            DispatchQueue.main.async { apply(ids) }
+        }
     }
 
     private func handleRowClick(_ track: LibraryTrack) {
@@ -1523,6 +1871,23 @@ struct LibraryView: View {
     /// the URL collector is serialised through a dedicated queue
     /// before the main-actor import hop.
     private func handleLibraryDrop(_ providers: [NSItemProvider]) -> Bool {
+        // A crate-reorder drag that lands in the list's empty area
+        // (below the last row, or anywhere not over a specific row)
+        // means "move to the end". The dragged provider also carries
+        // a file URL, so without this guard the drop would fall
+        // through to the importer and re-import the track's own file.
+        // Detecting the reorder payload here is what makes the
+        // end-of-playlist drop work.
+        if isCrateManualOrder,
+           let reorderProvider = providers.first(where: {
+               $0.hasItemConformingToTypeIdentifier(Self.crateReorderType.identifier)
+           })
+        {
+            loadCrateReorderPayload(from: reorderProvider) { ids in
+                performCrateReorder(draggedIds: ids, toSlot: sortedTrackIds.count)
+            }
+            return true
+        }
         guard libraryModel.libraryIsOpen, !libraryModel.libraryImportInProgress else { return false }
         let collector = DispatchQueue(label: "com.dub.library-drop-collector")
         var urls: [URL] = []
@@ -1567,6 +1932,137 @@ struct LibraryView: View {
     private static func isSupportedAudioFile(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ["mp3", "wav", "flac", "aiff", "aif", "m4a", "aac", "alac", "ogg"].contains(ext)
+    }
+
+    // MARK: - Dub crate actions (M11d-next)
+
+    /// Create a crate with a unique default name, then drop the user
+    /// straight into inline-rename so the common "create + name it"
+    /// flow is one gesture. The default-name uniqueness avoids a
+    /// name-conflict error when the user spams the `+` button.
+    private func createCrateAndRename() {
+        let name = uniqueDefaultCrateName()
+        guard let id = model.createCrate(named: name) else { return }
+        beginInlineRename(crateId: id, seed: name)
+    }
+
+    /// "New Crate", then "New Crate 2", "New Crate 3", … skipping any
+    /// already taken among the current top-level crates.
+    private func uniqueDefaultCrateName() -> String {
+        let existing = Set(libraryModel.crates.map(\.name))
+        let base = "New Crate"
+        if !existing.contains(base) { return base }
+        var n = 2
+        while existing.contains("\(base) \(n)") { n += 1 }
+        return "\(base) \(n)"
+    }
+
+    private func beginCrateRename(_ crate: LibraryCrate) {
+        beginInlineRename(crateId: crate.id, seed: crate.name)
+    }
+
+    private func beginInlineRename(crateId: Int64, seed: String) {
+        crateRenameText = seed
+        renamingCrateId = crateId
+        // Defer focus to the next runloop tick so the TextField has
+        // actually been installed by the time we request first
+        // responder (SwiftUI attaches it on the same body pass that
+        // flips `renamingCrateId`).
+        DispatchQueue.main.async { crateRenameFocused = true }
+    }
+
+    private func commitCrateRename(_ crateId: Int64) {
+        guard renamingCrateId == crateId else { return }
+        let newName = crateRenameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        renamingCrateId = nil
+        crateRenameFocused = false
+        guard !newName.isEmpty else { return }
+        // Skip the FFI write when nothing changed (a plain focus-loss
+        // on an untouched field).
+        if libraryModel.crates.first(where: { $0.id == crateId })?.name == newName { return }
+        model.renameCrate(crateId, to: newName)
+    }
+
+    private func cancelCrateRename() {
+        renamingCrateId = nil
+        crateRenameFocused = false
+    }
+
+    /// Compute the full member-id order after moving `trackId` per
+    /// `move` within `current` (the visible crate order). Returns
+    /// `current` unchanged when the move is a no-op (already at the
+    /// edge, or the id isn't present). The result is handed straight
+    /// to `setCrateTrackOrder`, which rewrites ordinals 0..n.
+    private func reorderedCrateIds(
+        moving trackId: String, move: CrateMove, current: [String]
+    ) -> [String] {
+        guard let from = current.firstIndex(of: trackId) else { return current }
+        var ids = current
+        ids.remove(at: from)
+        let to: Int
+        switch move {
+        case .up:     to = max(0, from - 1)
+        case .down:   to = min(ids.count, from + 1)
+        case .top:    to = 0
+        case .bottom: to = ids.count
+        }
+        ids.insert(trackId, at: to)
+        return ids
+    }
+
+    /// Confirm-then-delete a crate. Deleting cascades the crate's
+    /// membership (and any child crates) so a misclick is worth one
+    /// modal. The tracks themselves are never touched.
+    private func confirmDeleteCrate(_ crate: LibraryCrate) {
+        let alert = NSAlert()
+        alert.messageText = "Delete the crate \"\(crate.name)\"?"
+        alert.informativeText =
+            "This removes the crate and its track list. The tracks themselves stay in your library."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let wasSelected = selectedSource.crateId == crate.id
+        model.deleteCrate(crate.id)
+        if wasSelected {
+            selectedSource = .allTracks
+        }
+    }
+
+    /// Drop handler for a crate sidebar row. Collects the dragged
+    /// file URLs (same payload the track rows produce for deck
+    /// loads) and adds the matching library tracks to the crate.
+    private func handleCrateDrop(_ providers: [NSItemProvider], crateId: Int64) -> Bool {
+        guard libraryModel.libraryIsOpen else { return false }
+        let collector = DispatchQueue(label: "com.dub.crate-drop-collector")
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                let resolved: URL?
+                if let url = item as? URL {
+                    resolved = url
+                } else if let data = item as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil)
+                {
+                    resolved = url
+                } else {
+                    resolved = nil
+                }
+                guard let resolved else { return }
+                collector.sync { urls.append(resolved) }
+            }
+        }
+        group.notify(queue: .main) {
+            let collected: [URL] = collector.sync { urls }
+            guard !collected.isEmpty else { return }
+            Task { @MainActor in
+                model.addDroppedURLsToCrate(crateId, urls: collected)
+            }
+        }
+        return !providers.isEmpty
     }
 
     /// PRD §8.5.3 leftmost-gutter indicators. Order, top to
@@ -1781,6 +2277,8 @@ struct LibraryView: View {
             return "No play history yet."
         case .justImported:
             return "No imports this session."
+        case .dubCrate:
+            return "This crate is empty."
         default:
             return "Not available in this build."
         }
@@ -1797,6 +2295,8 @@ struct LibraryView: View {
             return "Tracks you load on a deck show up here."
         case .justImported:
             return "Tracks imported this session show up here."
+        case .dubCrate:
+            return "Drag tracks onto the crate in the sidebar to add them."
         default:
             return nil
         }
@@ -1897,6 +2397,8 @@ struct LibraryView: View {
                     case .justImported:
                         rows = try library.justImported(
                             sinceUnixSecs: since, limit: limit)
+                    case .dubCrate(let crateId):
+                        rows = try library.crateTracks(crateId: crateId)
                     default:
                         rows = []
                     }
@@ -2139,6 +2641,25 @@ struct LibraryTableMenu {
     let analysisBatchInProgress: Bool
     let onAnalyzeRequested: ([String]) -> Void
     let onSetGridLocked: (String, Bool) -> Void
+    /// Non-nil when the visible listing is a Dub crate, enabling the
+    /// crate-specific "Remove from Crate" / "Move…" menu items
+    /// (M11d-next). `nil` for All Tracks / smart crates / search.
+    var crateId: Int64? = nil
+    /// Remove the given track ids from the open crate. Selection-aware
+    /// (matches the analyze target set). No-op when `crateId == nil`.
+    var onCrateRemove: (([String]) -> Void)? = nil
+    /// Reorder the right-clicked track within the open crate.
+    var onCrateMove: ((String, CrateMove) -> Void)? = nil
+}
+
+/// Where a "Move…" crate context-menu item places the track within
+/// its crate (M11d-next reorder without a drag, friendlier to verify
+/// than a drag-and-drop reorder in the bespoke AppKit table).
+enum CrateMove {
+    case up
+    case down
+    case top
+    case bottom
 }
 
 /// One-shot programmatic-scroll request for
@@ -2229,6 +2750,12 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
     /// Grouped so the one-shot "scroll to this id then clear me"
     /// protocol stays explicit at the call site.
     let scroll: LibraryTableScroll
+    /// `true` while the visible crate is in manual order, enabling the
+    /// AppKit drag-to-reorder drop target + insertion line.
+    let crateReorderEnabled: Bool
+    /// Commit handler for a reorder drop: `(draggedIds, insertionSlot)`
+    /// where `insertionSlot` is 0-based in `0…count`.
+    let onCrateReorder: (([String], Int) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -2277,7 +2804,14 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
 
         let bodyHost = NSHostingView(rootView: rows)
         bodyHost.translatesAutoresizingMaskIntoConstraints = true
-        bodyHost.autoresizingMask = [.width, .height]
+        // Width follows the wrapper, but height is pinned to the
+        // content (set in `updateBodyHeight`). The wrapper itself is
+        // grown to fill the viewport so its empty bottom area is a
+        // valid reorder drop target (see `updateBodyHeight`); letting
+        // the host stretch with it would make SwiftUI re-center the
+        // rows in the taller frame and desync them from the AppKit
+        // selection layer.
+        bodyHost.autoresizingMask = [.width]
         bodyHost.frame = documentWrapper.bounds
 
         // Order matters: selection layer first so it sits BELOW the
@@ -2326,13 +2860,16 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             trackIds: trackIds)
         context.coordinator.updateMenuState(
             visibleTracks: visibleTracks,
-            analysisBatchInProgress: menu.analysisBatchInProgress,
-            onAnalyzeRequested: menu.onAnalyzeRequested,
-            onSetGridLocked: menu.onSetGridLocked)
+            menu: menu)
         context.coordinator.attachMenuBuilder(rowHeight: LibraryRowLayout.estimatedHeight)
         context.coordinator.updateBodyHeight()
         context.coordinator.updateSelectionHighlights(
             selectedTrackIds: rowSelection.selectedTrackIds, trackIds: trackIds)
+        context.coordinator.updateReorder(
+            enabled: crateReorderEnabled,
+            rowHeight: LibraryRowLayout.estimatedHeight,
+            trackCount: trackIds.count,
+            onReorder: onCrateReorder)
         return stack
     }
 
@@ -2395,9 +2932,12 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         // the AppKit selection layer paints highlights instead).
         coordinator.updateMenuState(
             visibleTracks: visibleTracks,
-            analysisBatchInProgress: menu.analysisBatchInProgress,
-            onAnalyzeRequested: menu.onAnalyzeRequested,
-            onSetGridLocked: menu.onSetGridLocked)
+            menu: menu)
+        coordinator.updateReorder(
+            enabled: crateReorderEnabled,
+            rowHeight: LibraryRowLayout.estimatedHeight,
+            trackCount: trackIds.count,
+            onReorder: onCrateReorder)
         coordinator.syncHeaderOffset()
 
         if let id = scroll.scrollToTrackId {
@@ -2472,6 +3012,12 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         fileprivate var menuAnalysisBatchInProgress: Bool = false
         fileprivate var onAnalyzeRequested: (([String]) -> Void)?
         fileprivate var onSetGridLocked: ((String, Bool) -> Void)?
+        /// Crate context (M11d-next): non-nil id + callbacks when the
+        /// visible listing is a Dub crate, so the right-click menu
+        /// can offer "Remove from Crate" + "Move…".
+        fileprivate var menuCrateId: Int64?
+        fileprivate var onCrateRemove: (([String]) -> Void)?
+        fileprivate var onCrateMove: ((String, CrateMove) -> Void)?
         /// Anchors the closures the menu items invoke. NSMenuItem
         /// holds only a weak target reference; without keeping the
         /// targets alive on the Coordinator the actions would
@@ -2547,6 +3093,11 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
                 // case.
                 MainActor.assumeIsolated {
                     self?.syncHeaderOffset()
+                    // Fires on scroll AND on viewport resize. The
+                    // helper guards on a changed clip height, so the
+                    // common scroll case is a no-op and only an actual
+                    // resize re-fills the wrapper's drop-target area.
+                    self?.syncWrapperFillHeight()
                 }
             }
             // M11d.6 round 4 — selection is now mutated on
@@ -2593,15 +3144,55 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             // bodyHost + selectionLayer follow via `autoresizingMask`.
         }
 
+        /// Last measured SwiftUI content height (sum of row heights).
+        /// Cached so the cheap viewport-resize path can re-grow the
+        /// wrapper without re-running the (relatively pricey)
+        /// `fittingSize` measurement on every scroll/resize tick.
+        private var lastContentHeight: CGFloat = 1
+        /// Last clip-view height the wrapper was filled against, so
+        /// `syncHeaderOffset`'s bounds observer can tell a viewport
+        /// resize apart from a plain scroll and skip redundant work.
+        fileprivate var lastViewportHeight: CGFloat = -1
+
         func updateBodyHeight() {
             guard let bodyHost, let documentWrapper, let bodyScroll else { return }
             bodyHost.invalidateIntrinsicContentSize()
-            let height = max(bodyHost.fittingSize.height, 1)
+            let contentHeight = max(bodyHost.fittingSize.height, 1)
+            lastContentHeight = contentHeight
+
+            // The hosting view (the rows) is pinned to the content
+            // height and top-aligned. The wrapper, however, is grown
+            // to at least the viewport height so its empty area below
+            // the last row is still part of the AppKit reorder drop
+            // target — dragging into the black space past the end now
+            // resolves to the "append" slot with a live insertion
+            // line, instead of falling through to the file-import path.
+            var bodyFrame = bodyHost.frame
+            bodyFrame.size.height = contentHeight
+            bodyHost.frame = bodyFrame
+
+            let viewportHeight = bodyScroll.contentView.bounds.height
+            lastViewportHeight = viewportHeight
             var frame = documentWrapper.frame
-            frame.size.height = height
+            frame.size.height = max(contentHeight, viewportHeight)
             documentWrapper.frame = frame
             // bodyScroll re-evaluates scrollable area off `documentView.frame`.
             bodyScroll.documentView = documentWrapper
+        }
+
+        /// Cheap viewport-resize handler: re-fills the wrapper to the
+        /// new clip height using the cached content height, without a
+        /// `fittingSize` re-measure. The hosting view stays at the
+        /// content height (rows top-aligned); only the wrapper's
+        /// drop-target area grows or shrinks.
+        func syncWrapperFillHeight() {
+            guard let documentWrapper, let bodyScroll else { return }
+            let viewportHeight = bodyScroll.contentView.bounds.height
+            guard viewportHeight != lastViewportHeight else { return }
+            lastViewportHeight = viewportHeight
+            var frame = documentWrapper.frame
+            frame.size.height = max(lastContentHeight, viewportHeight)
+            documentWrapper.frame = frame
         }
 
         /// O(n) projection of the selected-id set onto sorted row
@@ -2655,14 +3246,32 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         /// selection is mutated without a SwiftUI body re-eval.
         func updateMenuState(
             visibleTracks: [LibraryTrack],
-            analysisBatchInProgress: Bool,
-            onAnalyzeRequested: @escaping ([String]) -> Void,
-            onSetGridLocked: @escaping (String, Bool) -> Void
+            menu: LibraryTableMenu
         ) {
             self.visibleTracks = visibleTracks
-            self.menuAnalysisBatchInProgress = analysisBatchInProgress
-            self.onAnalyzeRequested = onAnalyzeRequested
-            self.onSetGridLocked = onSetGridLocked
+            self.menuAnalysisBatchInProgress = menu.analysisBatchInProgress
+            self.onAnalyzeRequested = menu.onAnalyzeRequested
+            self.onSetGridLocked = menu.onSetGridLocked
+            self.menuCrateId = menu.crateId
+            self.onCrateRemove = menu.onCrateRemove
+            self.onCrateMove = menu.onCrateMove
+        }
+
+        /// Push the crate drag-reorder config onto the document
+        /// wrapper. The wrapper is the AppKit drop target + paints the
+        /// insertion line; this keeps its row-height / member-count /
+        /// enable flag in sync as the visible listing changes.
+        func updateReorder(
+            enabled: Bool,
+            rowHeight: CGFloat,
+            trackCount: Int,
+            onReorder: (([String], Int) -> Void)?
+        ) {
+            guard let wrapper = documentWrapper else { return }
+            wrapper.reorderRowHeight = rowHeight
+            wrapper.reorderTrackCount = trackCount
+            wrapper.onReorderDrop = onReorder
+            wrapper.reorderEnabled = enabled
         }
 
         /// Wire the document wrapper to ask us for an `NSMenu` on
@@ -2731,14 +3340,72 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
                 lockItem.isEnabled = false
             }
             menu.addItem(lockItem)
+
+            // M11d-next — crate-specific items, only when the visible
+            // listing is a Dub crate. "Remove from Crate" is
+            // selection-aware (matches the analyze target set); the
+            // "Move…" items act on the single right-clicked row and
+            // grey out at the edges.
+            if menuCrateId != nil {
+                menu.addItem(.separator())
+                appendCrateItems(to: menu, rightClickedTrack: track)
+            }
+
             // Drop the previous run's anchors once a new menu is
             // built — the anchors are only needed while the menu
             // is visible, and AppKit keeps the in-flight menu
             // retained via its own dispatcher. Without this the
             // anchor list would grow unbounded over a long
             // session.
-            menuActionAnchors = Array(menuActionAnchors.suffix(8))
+            menuActionAnchors = Array(menuActionAnchors.suffix(16))
             return menu
+        }
+
+        /// Build the "Remove from Crate" + "Move…" block. Split out
+        /// of `buildContextMenu` to keep that method readable. Move
+        /// items are disabled at the list edges (can't move the top
+        /// row up, etc.) using the right-clicked row's index in the
+        /// visible (ordinal) order.
+        private func appendCrateItems(to menu: NSMenu, rightClickedTrack track: LibraryTrack) {
+            let removeTargets = analyzeTargets(rightClickedTrack: track)
+            let removeTitle = removeTargets.count > 1
+                ? "Remove from Crate (\(removeTargets.count))"
+                : "Remove from Crate"
+            let removeItem = NSMenuItem(title: removeTitle, action: nil, keyEquivalent: "")
+            if let onCrateRemove {
+                let target = LibraryMenuActionTarget { onCrateRemove(removeTargets) }
+                menuActionAnchors.append(target)
+                removeItem.target = target
+                removeItem.action = #selector(LibraryMenuActionTarget.dubMenuPerform(_:))
+                removeItem.isEnabled = true
+            } else {
+                removeItem.isEnabled = false
+            }
+            menu.addItem(removeItem)
+
+            guard let onCrateMove else { return }
+            let index = visibleTracks.firstIndex(where: { $0.id == track.id })
+            let count = visibleTracks.count
+            menu.addItem(.separator())
+            let moves: [(String, CrateMove, Bool)] = [
+                ("Move Up", .up, (index ?? 0) > 0),
+                ("Move Down", .down, (index ?? count) < count - 1),
+                ("Move to Top", .top, (index ?? 0) > 0),
+                ("Move to Bottom", .bottom, (index ?? count) < count - 1),
+            ]
+            for (title, move, enabled) in moves {
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                if enabled {
+                    let target = LibraryMenuActionTarget { onCrateMove(track.id, move) }
+                    menuActionAnchors.append(target)
+                    item.target = target
+                    item.action = #selector(LibraryMenuActionTarget.dubMenuPerform(_:))
+                    item.isEnabled = true
+                } else {
+                    item.isEnabled = false
+                }
+                menu.addItem(item)
+            }
         }
 
         /// Multi-selection acts on the full selection when the
@@ -2812,6 +3479,49 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
 private final class LibraryDocumentWrapper: NSView {
     var menuBuilder: ((NSEvent) -> NSMenu?)?
 
+    // MARK: - Crate drag-reorder (AppKit drop target + insertion line)
+    //
+    // The reorder DROP is handled here, not in a per-row SwiftUI
+    // `.onDrop`, because the rows live in an `NSHostingView` whose
+    // `rootView` is only re-assigned on a track/column/width change
+    // (the perf optimization in `LibraryTableScrollContainer`). A
+    // SwiftUI drop delegate flipping `@State` would never repaint the
+    // insertion line mid-drag. Painting in AppKit — like the selection
+    // layer below — gives live feedback and reliable end-of-list drops.
+    //
+    // The drag SOURCE stays in SwiftUI (`makeRowDragProvider`); it puts
+    // a `DUBCRATE`-tagged payload on the drag pasteboard under the
+    // private reorder UTI. This wrapper registers for exactly that
+    // type, so Finder file drags (file-URL only) fall through to the
+    // library importer and deck-load drags hit the deck's own
+    // `dropDestination(for: URL.self)`.
+
+    /// Enabled only while the visible crate is in manual order.
+    var reorderEnabled = false {
+        didSet {
+            if reorderEnabled != oldValue { refreshReorderRegistration() }
+        }
+    }
+    var reorderRowHeight: CGFloat = 28
+    /// Member count of the visible crate; clamps the insertion slot.
+    var reorderTrackCount = 0
+    /// Called on a committed drop with the dragged ids and the 0-based
+    /// insertion slot in `0…count`. The SwiftUI side performs the
+    /// `setCrateOrder` write.
+    var onReorderDrop: (([String], Int) -> Void)?
+
+    static let reorderPasteboardType =
+        NSPasteboard.PasteboardType("com.dub.crate-track-order")
+
+    private lazy var insertionLine: NSView = {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor(DubColor.deckATint).cgColor
+        view.layer?.cornerRadius = 1
+        view.isHidden = true
+        return view
+    }()
+
     override var isFlipped: Bool { true }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -2819,6 +3529,81 @@ private final class LibraryDocumentWrapper: NSView {
             return menu
         }
         return super.menu(for: event)
+    }
+
+    func refreshReorderRegistration() {
+        if reorderEnabled {
+            registerForDraggedTypes([Self.reorderPasteboardType])
+        } else {
+            unregisterDraggedTypes()
+            hideInsertionLine()
+        }
+    }
+
+    private func hasReorderPayload(_ sender: NSDraggingInfo) -> Bool {
+        sender.draggingPasteboard.types?.contains(Self.reorderPasteboardType) ?? false
+    }
+
+    /// 0-based insertion slot from the drop's y-position. Top half of a
+    /// row inserts before it, bottom half after, so the slot ranges
+    /// `0…count` and the list's end is always reachable.
+    private func slot(for sender: NSDraggingInfo) -> Int {
+        guard reorderRowHeight > 0 else { return 0 }
+        let point = convert(sender.draggingLocation, from: nil)
+        let raw = Int(((point.y + reorderRowHeight / 2) / reorderRowHeight).rounded(.down))
+        return max(0, min(reorderTrackCount, raw))
+    }
+
+    private func showInsertionLine(at slot: Int) {
+        if insertionLine.superview !== self {
+            addSubview(insertionLine, positioned: .above, relativeTo: nil)
+        }
+        let y = CGFloat(slot) * reorderRowHeight
+        insertionLine.frame = NSRect(x: 0, y: max(0, y - 1), width: bounds.width, height: 2)
+        insertionLine.isHidden = false
+    }
+
+    private func hideInsertionLine() {
+        insertionLine.isHidden = true
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard reorderEnabled, hasReorderPayload(sender) else { return [] }
+        showInsertionLine(at: slot(for: sender))
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard reorderEnabled, hasReorderPayload(sender) else { return [] }
+        showInsertionLine(at: slot(for: sender))
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        hideInsertionLine()
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        hideInsertionLine()
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        reorderEnabled && hasReorderPayload(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer { hideInsertionLine() }
+        guard reorderEnabled, hasReorderPayload(sender) else { return false }
+        let targetSlot = slot(for: sender)
+        guard let data = sender.draggingPasteboard.data(forType: Self.reorderPasteboardType),
+              let text = String(data: data, encoding: .utf8)
+        else { return false }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard lines.first == "DUBCRATE" else { return false }
+        let ids = Array(lines.dropFirst()).filter { !$0.isEmpty }
+        guard !ids.isEmpty else { return false }
+        onReorderDrop?(ids, targetSlot)
+        return true
     }
 }
 
@@ -3075,7 +3860,8 @@ private extension LibraryTrack {
             composer: composer,
             trackNumber: trackNumber,
             gridLocked: gridLocked,
-            gridDriftQuality: gridDriftQuality)
+            gridDriftQuality: gridDriftQuality,
+            crateOrdinal: crateOrdinal)
     }
 }
 

@@ -32,28 +32,29 @@ catch-up when frames are deferred. No further action unless regression.
 
 ---
 
-### B-11. Auto BPM locks at 2× tempo on real hip-hop / rap
+### ~~B-11. Auto BPM locks at 2× tempo on real hip-hop / rap~~ — largely addressed; residual cases handled by tap-to-grid
 
-**Symptom:** Library analysis and deck header report ~190 BPM on tracks that
-audibly sit around 90–100 BPM (classic kick/snare half-time feel). Synthetic
-fixtures in `crates/dub-bpm/tests/genre_octave.rs` pass; real mastered rap
-with bright hi-hats / percussion still loses the octave to the faster
-candidate.
+Closed as a blocking item. The octave decision was hardened across
+M11c.3a–f (perceptual tempo prior, reggae skank double-time rejection,
+genre-aware `OctaveProfile`, hip-hop double-time rejection, FourOnFloor /
+Dub mid-band fix) and the M11d.7 / PRD-BEATS rounds 5–10 (universal
+downbeat, `OctaveProfile::HipHop` lower-octave bias,
+`OctaveProfile::DrumAndBass` upper-octave preference, integer-snap safety
+net). The real-music regression corpus this item asked for now exists at
+`crates/dub-bpm/tests/fixtures/*.tsv` (94 tracks, gated by
+`real_music_corpus`); Classic sits at 11/94 failures concentrated in DnB
+half-time / triplet false peaks and intrinsically ambiguous edges.
 
-**Likely cause:** `dub-bpm::tempo::estimate_tempo` prefers the *faster* tempo
-when harmonic-mean scores tie within 1 % (`SCORE_TIE_REL_TOL`). Real tracks
-with strong off-beat high-band content can still score the 2× period as high
-as the kick period despite M8.1's log-band ODF.
+Why this is not "fixed to zero": `BPM-DETECTOR-V2-INVESTIGATION.md`
+measured a from-scratch non-ML structural detector and found it cannot
+beat the tuned Classic logic (overlapping decision classes have no global
+threshold). The remaining ambiguous tracks are the user's call —
+**tap-to-grid (U-19, shipped) is the per-track override** and the
+`BpmRange` escape hatch constrains the search. Further automatic gains are
+gated on a learned beat tracker (see the investigation doc); do not re-open
+this as a heuristic-tuning task.
 
-**Fix direction (engine):**
-* Add a real-music regression corpus (3–5 known-BPM rap cuts) beside the
-  synthetic `genre_octave` suite.
-* Revisit tie-break: prefer slower tempo when scores agree within tolerance
-  for urban genres, or add a low-band-weighted tie-break pass.
-* Optional: post-analysis octave sanity check against ID3 / filename BPM when
-  within ±20 % (PRD §8.3.1 tap-to-grid step 3 already assumes this window).
-
-**Location:** `crates/dub-bpm/src/tempo.rs`, `crates/dub-library/src/analysis.rs`.
+**Location:** `crates/dub-bpm/src/tempo.rs`, `crates/dub-bpm/src/octave_profile.rs`, `crates/dub-library/src/analysis.rs`.
 
 ---
 
@@ -152,37 +153,26 @@ removed the ±0.02 BPM cross-deck drift and the redundant
 
 ## 2. UX polish (works, but feels rough)
 
-### U-18. Beat-grid overlay lines jitter slightly during playback
+### ~~U-18. Beat-grid overlay lines jitter slightly during playback~~ — fixed (waveform + grid jitter killed end to end)
 
-**Symptom:** Grid lines on the zoomed waveform wobble sub-pixel against the
-scrolling envelope when the deck is playing. Not blocking; beats are readable.
-
-**Likely cause:** Residual mismatch between Metal playhead extrapolation and
-SwiftUI Canvas grid draw cadence, or fractional-chunk NDC rounding at the
-playhead boundary (see M11d.5 round-5 follow-ups in `SHIPPED.md`).
-
-**Fix:** Revisit `WaveformRenderer.drawBeatGrid` / `WaveformView.drawBeatGrid`
-shared playhead source; consider drawing grid lines in Metal alongside the
-envelope so both layers share one sub-chunk offset.
-
-**Deferred:** polish pass after tap-to-grid and BPM octave work land.
+Closed. The grid + envelope now share one playhead source extrapolated
+from the audio clock (`EngineHostTimeMapping` / `PlayheadMarker`), and the
+renderer draws off the main thread (`WaveformRenderThread`). The wobble is
+gone in dogfooding. The `os_signpost` capture runbook in
+`WAVEFORM-JITTER-CAPTURE.md` remains wired (`make trace-grid`) for the next
+regression. Re-open only with a captured trace showing a bad frame.
 
 ---
 
-### U-19. Tap-to-grid not implemented (PRD §8.3.1)
+### ~~U-19. Tap-to-grid not implemented (PRD §8.3.1)~~ — shipped (M11c.3b / M11d.7 / PRD-BEATS)
 
-**Symptom:** No `G`-key (or equivalent) affordance to set downbeat anchor and
-re-fit BPM from user taps. Schema supports `source = 'user_tap'`; UI and
-`dub-bpm` refit hook are missing.
-
-**Intended remediation:** Keyboard handler in Performance/Prep mode → record
-tap timestamp → snap to nearest transient (±200 ms) → search ±20 BPM around
-active/imported BPM → write `track_beatgrids(source='user_tap')` → reload deck
-grid without full reanalysis. Multi-tap path for sparse tracks per PRD.
-
-**Blocked on:** B-11 fix is high leverage first (wrong auto BPM makes taps
-harder to trust); tap-to-grid then becomes the user escape hatch for the
-remaining edge cases.
+Closed. Tap-to-grid is the deck-header BPM affordance: 1–2 taps within 2 s
+relatch the downbeat at the first tap (a pure `bar_phase` rotation, BPM
+bit-identical); 3+ taps recompute tempo via `analyze_beat_grid_from_taps`
+(tap median seeds the BPM range, ODF refines). Persists `user_tap` rows and
+installs the grid in-place on the loaded deck without a full reanalysis. The
+binding spec is `PRD-BEATS.md` (it supersedes PRD §8.3.1). This is the
+per-track override for the residual B-11 cases.
 
 ---
 
@@ -350,24 +340,22 @@ re-open it.
 
 ## 3. Code health (no visible symptom yet, but architectural debt)
 
-### C-24. `FileBrowserView.swift` is dead code
+### ~~C-24. `FileBrowserView.swift` is dead code~~ — deleted
 
-The M10.5b file-browser sidebar was superseded by the M11d
-library. The file remains in the target with no call sites.
-Removing it would drop a few hundred lines of code and prevent
-future contributors from extending the wrong UI surface.
-
-**Fix**: delete the file; verify no references in the Xcode
-project's filelist.
+Deleted. The M10.5b file-browser sidebar had no call sites after
+the M11d library superseded it (only its own `#Preview` and stale
+doc-comment references in other files, which were rewritten). The
+XcodeGen `sources: - path: Dub` directory glob drops it on the next
+`bootstrap.sh`; no filelist edit was needed.
 
 ---
 
-### C-25. `LibraryPlaceholder` is dead code
+### ~~C-25. `LibraryPlaceholder` is dead code~~ — deleted
 
-Same story for the empty-state placeholder we used pre-M11d.2;
-the new LibraryView's empty states cover all paths.
-
-**Fix**: delete.
+Deleted from `Placeholders.swift` (struct + its `#Preview` + header
+comment). `FXBarPlaceholder` stays — it still marks the unshipped
+M15/M16/M17 FX slots. `DubLayout.libraryMinHeight` is retained
+because `LibraryView` still uses it.
 
 ---
 
@@ -498,6 +486,115 @@ are now documented inline at each `NSViewRepresentable` header
 
 ---
 
+## 4. Performance / timecode mode (deferred)
+
+_Added 2026-06-04 after dogfooding the timecode playback wiring on the
+SL3. The load/lift/hand-back behaviour shipped (see notes below); these
+are the follow-ups that were explicitly deferred so we don't lose them._
+
+What shipped in this round (for context, not action):
+
+* Loading a track in Performance mode no longer auto-plays. The
+  drag-to-play idiom is now Prep-only (`apple/Dub/Performance/PerformanceView.swift`,
+  `DeckDropTarget`).
+* A needle lift pauses the deck and holds position instead of
+  auto-engaging internal play. The PRD §5.4.2 "Repeat" auto-Panic-on-
+  dropout was removed (`crates/dub-engine/src/lib.rs`,
+  `drive_timecode_inputs` `DropoutHoldRate` arm).
+* Internal (Panic) Play hands control back to timecode once the
+  carrier is solidly re-locked for a short debounce window
+  (`PANIC_RELOCK_BLOCKS_TO_HANDBACK`), so dropping the control record
+  back on resumes timecode control.
+
+### P-32. End-zone auto-internal needs absolute-position decoding (M6)
+
+The intended behaviour is: when the timecode runs into the control
+record's end zone (the lead-out / indefinite loop area), the deck
+auto-switches to internal play so the track keeps going; the operator
+can then lift and reposition the needle to re-enter timecode. We cannot
+do this today because the engine cannot tell the lead-out apart from a
+normal needle lift: both look like the carrier going away. The decoder
+only integrates *relative* position from carrier phase
+(`crates/dub-timecode/src/decoder.rs`, `position_secs`); it does not
+read the absolute-position bitstream that rides on the control tone.
+
+**Fix**: implement M6 absolute-position decoding in `dub-timecode` so
+the deck knows when the needle is in the lead-out region, then
+auto-engage internal play only there (replacing the current "a dropout
+always pauses" behaviour at the end zone). Until then a dropout pauses
+and the operator presses internal Play to continue past the end zone.
+
+**Location**: `crates/dub-timecode/src/decoder.rs`,
+`crates/dub-engine/src/lib.rs` (`drive_timecode_inputs`).
+
+---
+
+### P-33. Cannot switch to internal play while timecode is actively running
+
+While the control vinyl is driving the deck, the deck Play button does
+not let the operator switch to internal play. Today they have to lift
+the needle first (which now pauses the deck), then press Play. The
+intended flow: while timecode plays, pressing Play switches to internal
+playback at the current rate; the deck then keeps playing internally
+even when the needle goes back down.
+
+Open product decision (undecided, deferred deliberately): once the
+operator is in internal play and drops the needle back on, should the
+deck (a) stay internal until they explicitly re-engage timecode, or
+(b) auto-return to timecode control as soon as a clean carrier is
+present. Option (b) is what the engine hand-back already does today;
+option (a) needs an explicit "internal latch" that the carrier cannot
+override. Decide this together with the pill/UX work in P-34.
+
+**Location**: `apple/Dub/Performance/DeckHeader.swift` (Play button
+enablement/labeling in timecode mode), `apple/Dub/MainView.swift`
+(`play(side:)` timecode branch), `crates/dub-engine/src/lib.rs`
+(panic hand-back debounce).
+
+---
+
+### P-34. Performance source pill is not self-explanatory
+
+The deck-header source pill currently reads "FILE", and the dropout
+state surfaces as "TC HOLD"; neither communicates the actual deck state
+to a DJ (timecode-driven vs internal play vs paused vs thru). This is
+the UI half of P-33: the operator needs to see at a glance whether the
+deck is following the platter, running internally, or paused, plus the
+green/amber/red timecode tracking dot from PRD §5.4.
+
+**Fix**: redesign the source pill + tracking dot to show Timecode /
+Internal / Paused (and Thru once P-35 lands), driven by truthful engine
+state. Pairs with the Phase 4 UI-truthfulness work in P-35.
+
+**Location**: `apple/Dub/Performance/DeckHeader.swift`.
+
+---
+
+### P-35. Automatic per-deck source detection (Thru ↔ Timecode)
+
+PRD §5.1.1 calls for each deck to auto-detect whether the input is
+control vinyl (drive a loaded file) or a real record (Thru passthrough)
+and switch transparently. The timecode-playback wiring shipped via the
+engine's existing tested path; the auto-detection half (Phases 2 to 5
+of the `timecode_playback_+_auto_source_detect` plan) was deferred to
+avoid rewriting the audio thread's render path without hardware
+validation.
+
+**Fix**: the deferred plan phases — a per-deck `SourceMux` (single input
+read per block, atomic mode flip), an off-RT `SourceDetector`
+(silence / Goertzel spectral / Serato-lock state machine publishing
+`desired_mode` + confidence), a 5 ms equal-power crossfade with
+stickiness + freeze-during-scratch, FFI `deck_source_mode` /
+`timecode_signal`, and the waveform-source-follows-mode UI. All
+render-path code must stay allocation/lock/syscall free
+(`assert_no_alloc` + `make rt-audit`).
+
+**Location**: `crates/dub-engine/src/{thru,timecode}.rs`,
+`crates/dub-engine/src/lib.rs`, `crates/dub-thru/src/lib.rs`,
+`crates/dub-ffi/src/lib.rs`, `apple/Dub/Performance/`.
+
+---
+
 ## Triage notes
 
 * Buckets are roughly ordered by priority within each section
@@ -505,10 +602,18 @@ are now documented inline at each `NSViewRepresentable` header
 * Items B-7 through B-9 should land before major new library UI
   features, since they affect existing functionality. B-10, B-25,
   and B-26 are retained only as closed context.
-* B-11 (BPM octave) and U-19 (tap-to-grid) are the next beat-grid
-  cluster; U-18 (grid-line jitter) can follow once the grid source
-  of truth stabilises.
+* The beat-grid cluster (B-11 octave, U-18 grid jitter, U-19
+  tap-to-grid) has shipped / closed. Further automatic octave gains
+  are gated on a learned beat tracker — see
+  `BPM-DETECTOR-V2-INVESTIGATION.md`, not a heuristic-tuning task here.
+* C-24 / C-25 (`FileBrowserView` + `LibraryPlaceholder` dead code) are
+  deleted. The remaining open code-health items (C-27, C-28, C-30, C-31)
+  are non-blocking and should ride along with the next library PR.
 * The UX bucket can land alongside M11e (Library polish) — most
   items are surface-level copy or layout tweaks.
 * Code-health items are not blocking but should be ticked off
   during routine refactors rather than left to accrete.
+* Section 4 (P-32 to P-35) tracks the Performance / timecode follow-ups
+  deferred after the 2026-06-04 SL3 dogfood. P-32 (end-zone) is gated on
+  M6 absolute-position decoding; P-33 + P-34 are a paired product/UX
+  decision; P-35 is the deferred auto-source-detection plan phases.

@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci app app-release run-app open-app xcframework
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci docs-check app app-release run-app open-app xcframework
 
 help:
 	@echo "Dub — common targets"
@@ -21,6 +21,7 @@ help:
 	@echo "  make fuzz-quick    run fuzz targets for 60s each (placeholder)"
 	@echo "  make soak          1-hour offline render soak (placeholder)"
 	@echo "  make ci            run the full CI pipeline locally"
+	@echo "  make docs-check    fail if README / docs/html drift from code constants"
 	@echo "  make clean         cargo clean"
 	@echo ""
 	@echo "Apple shell"
@@ -64,7 +65,10 @@ fuzz-quick:
 soak:
 	@echo "[placeholder] soak harness lands in M2. See PRD §2.2.0 phase B."
 
-ci: fmt-check clippy test
+docs-check:
+	./scripts/check-docs.sh
+
+ci: docs-check fmt-check clippy test
 	@echo "Local CI pipeline complete."
 
 clean:

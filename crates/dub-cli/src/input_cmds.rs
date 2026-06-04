@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use dub_audio::{AudioInput, InputDeviceInfo, InputOptions};
+use dub_audio::{AudioInput, DeviceCategory, InputDeviceInfo, InputOptions};
 
 /// Default capture/levels duration in seconds when `--duration` is
 /// omitted. 5 seconds is enough to confirm signal flow without
@@ -156,34 +156,104 @@ pub fn parse_input_args(args: &[String]) -> Result<(InputArgs, Vec<String>)> {
     Ok((input, leftover))
 }
 
-/// `dub list-inputs` — enumerate HAL input devices.
+/// `dub list-inputs` — enumerate audio input devices.
+///
+/// Since the device classifier landed, this surfaces ONLY devices
+/// that map to one of the two Dub-relevant categories
+/// (`PerformanceInterface` for DJ rigs, `BuiltInOutput` is irrelevant
+/// here — the built-in mic is never useful for DVS). To inspect every
+/// raw HAL input device pass `--all`.
 ///
 /// # Errors
 /// HAL enumeration failures.
-pub fn list_inputs() -> Result<()> {
-    let devices = dub_audio::list_input_devices().context("enumerating input devices")?;
-    if devices.is_empty() {
-        println!("(no input devices found)");
+pub fn list_inputs_with_args(args: &[String]) -> Result<()> {
+    let show_all = args.iter().any(|a| a == "--all");
+    if show_all {
+        // Pre-classifier path — the raw HAL list, including the
+        // built-in mic, iPhone Continuity mic, virtual devices, etc.
+        // Mostly a debugging tool; not what the app's UI consumes.
+        let devices = dub_audio::list_input_devices().context("enumerating input devices")?;
+        if devices.is_empty() {
+            println!("(no input devices found)");
+            return Ok(());
+        }
+        let default_name = dub_audio::query_default_input().ok().map(|d| d.name);
+        println!("all HAL input devices ({}):", devices.len());
+        for d in &devices {
+            let star = if Some(&d.name) == default_name.as_ref() {
+                " [default]"
+            } else {
+                ""
+            };
+            let InputDeviceInfo {
+                name,
+                sample_rate,
+                channels,
+                buffer_frames,
+                buffer_frame_range,
+            } = d;
+            println!(
+                "  {name}{star}\n    sr={sample_rate} Hz  channels={channels}  buffer={buffer_frames} frames (range {}-{})",
+                buffer_frame_range.min, buffer_frame_range.max
+            );
+        }
         return Ok(());
     }
-    let default_name = dub_audio::query_default_input().ok().map(|d| d.name);
-    println!("input devices ({}):", devices.len());
-    for d in &devices {
+    let devices = dub_audio::list_audio_devices().context("enumerating audio devices")?;
+    let perf: Vec<_> = devices
+        .iter()
+        .filter(|d| d.category == DeviceCategory::PerformanceInterface)
+        .collect();
+    if perf.is_empty() {
+        println!("(no DJ-grade audio interfaces detected)");
+        println!("  tip: pass `--all` to dump every HAL input device the OS reports.");
+        return Ok(());
+    }
+    println!("DJ audio interfaces ({}):", perf.len());
+    for d in &perf {
+        let manuf = d.manufacturer.as_deref().unwrap_or("?");
+        println!(
+            "  {} ({})\n    uid={}\n    {} in / {} out",
+            d.name, manuf, d.uid, d.input_channels, d.output_channels
+        );
+    }
+    Ok(())
+}
+
+/// `dub list-outputs` — enumerate classified output devices.
+///
+/// Shows both Performance-interface outputs (e.g. SL3 master out)
+/// and the built-in speakers. Used for the same purpose as
+/// `list-inputs` but on the master-output side, and to populate the
+/// Prep-mode device picker in the FFI / Swift shell.
+///
+/// # Errors
+/// HAL enumeration failures.
+pub fn list_outputs() -> Result<()> {
+    let devices = dub_audio::list_audio_devices().context("enumerating audio devices")?;
+    let outs: Vec<_> = devices.iter().filter(|d| d.output_channels >= 2).collect();
+    if outs.is_empty() {
+        println!("(no output devices found)");
+        return Ok(());
+    }
+    let default_name = dub_audio::query_default_output()
+        .ok()
+        .map(|d| d.device_name);
+    println!("output devices ({}):", outs.len());
+    for d in &outs {
         let star = if Some(&d.name) == default_name.as_ref() {
-            " [default]"
+            " [system default]"
         } else {
             ""
         };
-        let InputDeviceInfo {
-            name,
-            sample_rate,
-            channels,
-            buffer_frames,
-            buffer_frame_range,
-        } = d;
+        let category = match d.category {
+            DeviceCategory::PerformanceInterface => "[performance]",
+            DeviceCategory::BuiltInOutput => "[built-in]",
+        };
+        let manuf = d.manufacturer.as_deref().unwrap_or("?");
         println!(
-            "  {name}{star}\n    sr={sample_rate} Hz  channels={channels}  buffer={buffer_frames} frames (range {}-{})",
-            buffer_frame_range.min, buffer_frame_range.max
+            "  {} {category}{star} ({})\n    uid={}\n    {} in / {} out",
+            d.name, manuf, d.uid, d.input_channels, d.output_channels
         );
     }
     Ok(())
