@@ -131,19 +131,19 @@ struct PerformanceView: View {
             deckState: deck,
             engineRunning: model.isRunning,
             deckEnabled: enabled,
-            thruMode: model.engineMode == .timecode,
+            thruMode: model.engineMode == .timecode && !model.isInternalMixer,
             isMaster: model.masterDeck == side,
-            prepMode: model.engineMode == .prep)
+            prepMode: model.engineMode == .prep || model.isInternalMixer)
     }
 
-    /// Should this deck's header render horizontally mirrored?
-    /// Two-deck Performance / Timecode mode mirrors deck B so its
-    /// identity cluster ends up on the window's right edge instead
-    /// of pinned against the divider. Prep mode is single-deck and
-    /// never mirrors. See `DeckHeader.mirrored` for the rationale.
-    private func headerMirrored(side: DeckSide) -> Bool {
-        guard model.engineMode == .timecode else { return false }
-        return side == .b
+    /// Deck headers are **never** mirrored. Real turntables aren't
+    /// mirror images of each other, so neither are Dub's decks: both
+    /// headers read identically left-to-right, so your eye always
+    /// finds PITCH / BPM / KEY in the same place regardless of which
+    /// deck you're looking at. (Pre-redesign, deck B was mirrored,
+    /// which forced a left/right re-parse on every glance.)
+    private func headerMirrored(side _: DeckSide) -> Bool {
+        false
     }
 
     /// M10.6a Casual-Play transport callbacks for the deck header.
@@ -169,7 +169,11 @@ struct PerformanceView: View {
             },
             onToggleGridLocked: {
                 model.toggleLoadedDeckGridLocked(side: side)
-            })
+            },
+            onSetInternal: { model.setDeckInternal(side: side) },
+            onSetTimecode: { model.setDeckTimecode(side: side) },
+            onSetThru: { model.setDeckThru(side: side) },
+            onRecalibrate: { model.recalibrateDeck(side: side) })
     }
 
     // MARK: - Waveform region
@@ -198,6 +202,13 @@ struct PerformanceView: View {
         } else {
             HStack(spacing: 1) {
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
+                // Centre gutter: the beatmatch visualizations (three
+                // vertical candidates side by side — pendulum / tug bars
+                // / beat ladder — each mapping left = deck A, right =
+                // deck B to pick the winner). Grid-based; no engine FFI.
+                BeatmatchStackView(model: model)
+                    .frame(width: DubLayout.beatmatchGutterWidth)
+                    .frame(maxHeight: .infinity)
                 deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
             }
             .frame(minHeight: DubLayout.waveformMinHeight)
@@ -246,7 +257,7 @@ struct PerformanceView: View {
     /// Prep mode the strip is horizontal and uses
     /// `DubLayout.waveformPrepHeight` instead.
     private var waveformColumnWidth: CGFloat {
-        DubLayout.deckColumnWidth
+        DubLayout.performanceWaveformWidth
     }
 
     /// One deck's pane — Metal waveform when the deck has any
@@ -289,29 +300,40 @@ struct PerformanceView: View {
                 // `deckState.hasTrack`, which left the strip
                 // invisible at cold launch and made the deck
                 // pane look bare in screenshots.
+                // Redesign: a single outer `Spacer` pulls each deck's
+                // waveform toward the **centre** so the two decks form
+                // one tight cluster with the phase clock between them
+                // (where the eyes converge during a mix), and the
+                // overview sits on the deck's outer edge. Pre-redesign
+                // two Spacers centred each waveform in its own half,
+                // leaving the two strips marooned far apart in dead
+                // space.
+                // Scratch-Live-style deck pane. Inner→outer:
+                //   waveform (hugs the centre phase clock) · overview ·
+                //   performance pads (fill the outer space).
+                // Deck A is the window-left half (pads on the left),
+                // deck B the right (pads on the right).
                 HStack(spacing: 0) {
                     if side == .a {
+                        PerformancePadsView(side: side)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
                             Color.clear.frame(width: DubLayout.deckOverviewGap)
                         }
-                        Spacer(minLength: 0)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
-                        Spacer(minLength: 0)
                     } else {
-                        Spacer(minLength: 0)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
-                        Spacer(minLength: 0)
                         if Self.overviewEnabled {
                             Color.clear.frame(width: DubLayout.deckOverviewGap)
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
                         }
+                        PerformancePadsView(side: side)
                     }
                 }
             case .horizontal:
@@ -362,6 +384,11 @@ struct PerformanceView: View {
         }
         switch orientation {
         case .vertical:
+            // Fixed, moderate width (Scratch-Live-style): the overview
+            // hugs the waveform's outer edge and the remaining outer
+            // space holds the performance pads. Full-bleed was wrong —
+            // a vertical scratch waveform wants time-history, not a
+            // metre of horizontal peak detail.
             content
                 .frame(width: waveformColumnWidth)
                 .frame(maxHeight: .infinity)

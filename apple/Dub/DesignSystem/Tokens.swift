@@ -251,6 +251,24 @@ enum DubLayout {
     /// time, RPM, key-lock, beatgrid offset).
     static let deckColumnWidth: CGFloat = 80
 
+    /// Width of each deck's playing waveform in the redesigned
+    /// Performance surface. Wider than the original Serato-slim
+    /// `deckColumnWidth` (80) so the two waveforms read as prominent
+    /// "records" pulled into a centred cluster, while still favouring
+    /// vertical time-history over horizontal peak-detail. The phase
+    /// clock sits between the two, overviews on the outer edges.
+    static let performanceWaveformWidth: CGFloat = 200
+
+    /// The centre-gutter beatmatch phase clock (PhaseClockView). The
+    /// ring diameter and the gutter column it lives in.
+    static let phaseClockDiameter: CGFloat = 132
+    static let phaseClockWidth: CGFloat = 160
+
+    /// Centre gutter holding the beatmatch visualizations (the A/B/C
+    /// trial stack). Wider than the old clock gutter so the three are
+    /// legible side by side.
+    static let beatmatchGutterWidth: CGFloat = 260
+
     /// Height of the horizontal playing-waveform strip in Prep
     /// mode. ≈ half the vertical-mode `waveformMinHeight`, sized
     /// so the strip is tall enough to read transient envelopes

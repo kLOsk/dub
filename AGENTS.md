@@ -26,8 +26,10 @@ we are **not** building a controller-only DJ app (no Serato/rekordbox territory)
    and the turntable are allowed during a set.
 2. **External mixer is the product.** No software mixer in v1/v2. We require a
    ≥4-in/4-out audio interface; the user's external mixer does the mixing.
-3. **Real records are first-class citizens.** Thru mode auto-detects when a real
-   record is on the deck and switches transparently. FX work on real records.
+3. **Real records are first-class citizens.** Thru mode passes a live record
+   straight through; the DJ selects it explicitly via the per-deck
+   INT · TC · THRU switch (auto-detection deferred — PRD §5.1.1). FX work on
+   real records.
 4. **Reliability over features.** A crash on stage ends a DJ's career night.
    We accept ~20–30 % slower velocity to never ship a show-stopper.
 5. **Forward and backward playback are byte-for-byte symmetric.** Manual rewinds

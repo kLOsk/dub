@@ -423,6 +423,24 @@ impl Library {
         // are the contract here; the sidecar is a perf cache.
         let sidecar_path = self.write_waveform_sidecar(fingerprint_id, &track);
 
+        // ---- Loudness / auto-gain (store-only) -------------------
+        // Measure integrated LUFS (BS.1770-4) + sample peak in this
+        // same decode pass and persist them to `analysis_cache`. The
+        // value is **store-only**: it is consumed the *next* time the
+        // track is loaded (`dub-ffi::load_track` reads it back via
+        // [`Self::track_normalization_gain`] and applies the derived
+        // gain once at load time). It is deliberately never pushed to
+        // a deck that is already playing this track — retroactively
+        // jumping the level of a tune live in front of an audience is
+        // unacceptable, so a track analysed while it plays is
+        // normalized only on its subsequent loads.
+        let loudness = dub_dsp::measure_integrated_loudness(
+            track.samples(),
+            track.sample_rate(),
+            u16::from(track.channels()),
+        );
+        self.stamp_loudness(fingerprint_id, loudness.lufs_i, loudness.sample_peak_dbfs)?;
+
         // Stamp `analysis_cache` exactly once. `has_active_grid` and
         // `has_active_key` reflect whether the auto pass landed the
         // active row (so they can be `1` here but get flipped to `0`
@@ -1022,6 +1040,109 @@ impl Library {
         Ok(())
     }
 
+    /// Persist the loudness measurement for a fingerprint into
+    /// `analysis_cache` (`lufs_i`, `true_peak_dbtp`, `has_lufs`).
+    ///
+    /// Kept **separate** from [`Self::stamp_analysis_cache`] on
+    /// purpose: the grid/key/waveform stamp runs from tap-edit and
+    /// reset paths that have no loudness to offer, and folding the
+    /// loudness columns into that upsert's `SET` list would null them
+    /// out on every such edit. This method touches only the three
+    /// loudness columns, leaving the grid/key/waveform state intact,
+    /// and is called from exactly one place — [`Self::analyze_track`],
+    /// once per analysis pass.
+    ///
+    /// `lufs_i = None` (silence / too-short input) is recorded with
+    /// `has_lufs = 0` so the load path falls back to unity gain. The
+    /// sample peak is always stored (it is meaningful even for the
+    /// no-LUFS case and bounds any future gain).
+    fn stamp_loudness(
+        &self,
+        fingerprint_id: i64,
+        lufs_i: Option<f64>,
+        sample_peak_dbfs: f64,
+    ) -> Result<()> {
+        let has_lufs = i64::from(lufs_i.is_some());
+        self.connection()
+            .execute(
+                "INSERT INTO analysis_cache \
+                 (fingerprint_id, lufs_i, true_peak_dbtp, has_lufs, analyzed_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now')) \
+                 ON CONFLICT(fingerprint_id) DO UPDATE SET \
+                     lufs_i         = excluded.lufs_i, \
+                     true_peak_dbtp = excluded.true_peak_dbtp, \
+                     has_lufs       = excluded.has_lufs",
+                params![fingerprint_id, lufs_i, sample_peak_dbfs, has_lufs],
+            )
+            .map_err(|e| LibraryError::sqlite("stamp_loudness", e))?;
+        Ok(())
+    }
+
+    /// Linear deck gain that normalizes `track_id` toward the default
+    /// loudness target, or `None` when no loudness has been measured
+    /// for the track yet.
+    ///
+    /// This is the **read side of auto-gain**. The Apple shell calls
+    /// it (via the `DubLibrary::track_normalization_gain` FFI shim)
+    /// immediately before `DubEngine::load_track` and hands the result
+    /// to the engine, which applies it to the deck once at load and
+    /// holds it for the life of that load. `None` is returned when:
+    ///
+    /// * the track is unknown / has no fingerprint, or
+    /// * `analysis_cache` has no row for it, or
+    /// * `has_lufs = 0` (analysed but silent / too short).
+    ///
+    /// In every `None` case the caller applies unity gain — including
+    /// the "freshly imported, never analysed" track, which therefore
+    /// plays at unity the first time and is normalized on subsequent
+    /// loads once background analysis has stored its LUFS.
+    ///
+    /// The gain is derived from the stored integrated LUFS and sample
+    /// peak via `dub_dsp::normalization_gain_db` against
+    /// [`dub_dsp::DEFAULT_TARGET_LUFS`] and [`dub_dsp::CEILING_DBFS`],
+    /// so it is bounded and clip-safe.
+    pub fn track_normalization_gain(&self, track_id: &str) -> Result<Option<f32>> {
+        let fingerprint_id: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT fingerprint_id FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("track_normalization_gain_lookup_fp", e))?
+            .flatten();
+        let Some(fingerprint_id) = fingerprint_id else {
+            return Ok(None);
+        };
+        let row: Option<(Option<f64>, Option<f64>, i64)> = self
+            .connection()
+            .query_row(
+                "SELECT lufs_i, true_peak_dbtp, COALESCE(has_lufs, 0) \
+                 FROM analysis_cache WHERE fingerprint_id = ?1",
+                params![fingerprint_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("track_normalization_gain_lookup_cache", e))?;
+        let Some((Some(lufs), peak, has_lufs)) = row else {
+            return Ok(None);
+        };
+        if has_lufs == 0 {
+            return Ok(None);
+        }
+        // A missing peak (legacy row) is treated as 0 dBFS, the most
+        // conservative assumption for the clip ceiling.
+        let peak = peak.unwrap_or(0.0);
+        let gain_db = dub_dsp::normalization_gain_db(
+            lufs,
+            peak,
+            dub_dsp::DEFAULT_TARGET_LUFS,
+            dub_dsp::CEILING_DBFS,
+        );
+        Ok(Some(dub_dsp::db_to_linear(gain_db)))
+    }
+
     /// Upsert the auto-source row in `track_keys`. Mirrors
     /// [`Self::upsert_auto_beatgrid`] for the M11c.2 key
     /// pipeline. `original_notation` is stored equal to the
@@ -1293,6 +1414,63 @@ mod tests {
             fp_rows, 1,
             "second analyze must reuse the existing fingerprint id"
         );
+    }
+
+    #[test]
+    fn loudness_round_trips_through_analyze_to_normalization_gain() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _fp_id, _path) = seed_track_with_file(&lib, &tmp, 120.0, 12.0);
+
+        // Pre-analysis: no stored loudness → unity-fallback (None).
+        assert!(
+            lib.track_normalization_gain(&track_id).unwrap().is_none(),
+            "an unanalyzed track must yield no auto-gain (caller uses unity)"
+        );
+
+        lib.analyze_track(&track_id).unwrap();
+
+        // analysis_cache now carries a finite LUFS + sample peak.
+        let (lufs, peak, has): (Option<f64>, Option<f64>, i64) = lib
+            .connection()
+            .query_row(
+                "SELECT ac.lufs_i, ac.true_peak_dbtp, ac.has_lufs \
+                 FROM tracks t JOIN analysis_cache ac \
+                   ON ac.fingerprint_id = t.fingerprint_id \
+                 WHERE t.id = ?1",
+                params![track_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(has, 1, "click track must measure a loudness");
+        assert!(lufs.is_some_and(f64::is_finite));
+        assert!(peak.is_some_and(f64::is_finite));
+
+        // The derived gain is finite, positive, and clip-safe: the
+        // resulting sample peak stays at or under the ceiling.
+        let gain = lib
+            .track_normalization_gain(&track_id)
+            .unwrap()
+            .expect("analyzed track must yield an auto-gain");
+        assert!(
+            gain.is_finite() && gain > 0.0,
+            "gain must be a real multiplier: {gain}"
+        );
+        let peak_after_db = 20.0 * f64::from(gain).log10() + peak.unwrap();
+        assert!(
+            peak_after_db <= dub_dsp::CEILING_DBFS + 1e-6,
+            "normalized peak {peak_after_db} dBFS must respect the {} dBFS ceiling",
+            dub_dsp::CEILING_DBFS
+        );
+    }
+
+    #[test]
+    fn normalization_gain_is_none_for_unknown_track() {
+        let lib = Library::open_in_memory().unwrap();
+        assert!(lib
+            .track_normalization_gain("00000000-0000-0000-0000-000000000000")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

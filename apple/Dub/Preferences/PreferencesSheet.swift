@@ -30,12 +30,21 @@ struct PreferencesSheet: View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             header
             Divider()
-            statusSection
-            #if DEBUG
-            devSection
-            #endif
-            loadBehaviourSection
-            Spacer(minLength: 0)
+            // Sections scroll so a tall DEBUG build (dev overrides +
+            // every section) can never push the footer — and its
+            // Signal Quality / Close buttons — off the bottom of a
+            // fixed-height sheet.
+            ScrollView {
+                VStack(alignment: .leading, spacing: DubSpacing.lg) {
+                    statusSection
+                    #if DEBUG
+                    devSection
+                    #endif
+                    loadBehaviourSection
+                    loudnessSection
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Divider()
             footer
         }
@@ -131,6 +140,30 @@ struct PreferencesSheet: View {
         }
     }
 
+    // MARK: - Loudness auto-gain
+
+    /// Loudness normalization toggle (PRD §8.4). Default on: a track
+    /// with a cached LUFS-I measurement loads with a gain that lines
+    /// levels up deck-to-deck so the DJ isn't chasing the trim on every
+    /// load. Turning it off loads at unity and hands level control back
+    /// to the hardware mixer; measurement is unaffected either way.
+    private var loudnessSection: some View {
+        section(title: "LOUDNESS") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Toggle(isOn: $model.loudnessAutoGainEnabled) {
+                    Text("Auto-match loudness on load")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("When on, a track with a measured loudness (LUFS-I) loads at a gain that matches it to the reference level, so decks sit at consistent loudness without riding the trim. When off, tracks load untouched and you set level at the mixer. Loudness is always measured and shown regardless of this setting.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     // MARK: - Header / footer
 
     private var header: some View {
@@ -159,6 +192,13 @@ struct PreferencesSheet: View {
             // U-23 — let users re-open the first-run guide. Dismiss
             // this sheet first; MainView brings onboarding up on the
             // next tick (two sheets can't present at once).
+            Button("Signal Quality…") {
+                dismiss()
+                NotificationCenter.default.post(name: .dubShowSignalQuality, object: nil)
+            }
+            .buttonStyle(.plain)
+            .font(DubFont.body)
+            .foregroundStyle(DubColor.textSecondary)
             Button("Show Welcome Guide") {
                 dismiss()
                 NotificationCenter.default.post(name: .dubShowOnboarding, object: nil)
@@ -234,16 +274,16 @@ struct PreferencesSheet: View {
                     .help("Re-scan devices")
                 }
 
-                Picker("Output (Prep only)", selection: devOutputBinding) {
+                Picker("Output (Prep / Internal)", selection: devOutputBinding) {
                     Text("Auto (interface / built-in)").tag(Optional<String>.none)
                     ForEach(model.outputDevices, id: \.uid) { d in
                         Text(d.name).tag(Optional<String>.some(d.uid))
                     }
                 }
                 .pickerStyle(.menu)
-                .disabled(model.engineMode == .timecode)
+                .disabled(model.engineMode == .timecode && !model.isInternalMixer)
 
-                Text("Dev-only: forces the mode and pins devices so the performance UI can be exercised without a real DJ interface. Performance source picks how the decks are driven — Timecode (control vinyl → loaded file, the product behaviour) or Thru (real-record live passthrough). The output picker applies to Track Preparation only — in Performance mode the master always returns through the interface itself (deck A → 3+4, deck B → 5+6). None of this ships in Release; production mode is hardware-derived only.")
+                Text("Dev-only: forces the mode and pins devices so the performance UI can be exercised without a real DJ interface. Performance source picks how the decks are driven — Timecode (control vinyl → loaded file, the product behaviour), Thru (real-record live passthrough), or Internal (both decks summed to the built-in soundcard, no input, each playing its file on its own clock — the no-hardware dogfood path). The output picker applies to Track Preparation and Internal; in Timecode / Thru the master always returns through the interface itself (deck A → 3+4, deck B → 5+6). None of this ships in Release; production mode is hardware-derived only.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

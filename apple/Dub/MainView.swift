@@ -21,10 +21,23 @@ import AppKit
 import AVFoundation
 import Combine
 import CoreAudio
+import os
 import SwiftUI
 import UniformTypeIdentifiers
 
 import DubCore
+
+/// App-wide logger. Errors persist in the unified log (Console.app, or
+/// `log stream --predicate 'subsystem == "com.dub.app"'` from a terminal),
+/// so a failure that only flashed a transient toast is still recoverable
+/// after the toast clears.
+let dubLog = Logger(subsystem: "com.dub.app", category: "engine")
+
+/// Timecode signal / calibration diagnostics (lock state, confidence,
+/// amplitude, pitch, the computed whitening matrix). Separate category so
+/// it can be filtered: `log stream --predicate 'subsystem ==
+/// "com.dub.app"' --info`.
+let dubTimecodeLog = Logger(subsystem: "com.dub.app", category: "timecode")
 
 /// Mode the engine is currently running in. Drives whether the
 /// canonical two-deck performance surface (`.timecode`) or the
@@ -57,13 +70,20 @@ enum EngineMode: String, CaseIterable, Identifiable {
 enum PerformanceSource: String, CaseIterable, Identifiable {
     case timecode = "timecode"
     case thru = "thru"
+    /// DEV-only: two decks summed to the built-in soundcard, no input,
+    /// no timecode — each deck plays its loaded file on its own clock.
+    /// Lets the two-deck Performance surface be dogfooded without a DJ
+    /// interface. Selectable only from the DEBUG dev override; never
+    /// reached in a Release build (the dev picker is compiled out).
+    case internalMixer = "internalMixer"
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .timecode: return "Timecode (control vinyl → file)"
-        case .thru:     return "Thru (real record passthrough)"
+        case .timecode:      return "Timecode (control vinyl → file)"
+        case .thru:          return "Thru (real record passthrough)"
+        case .internalMixer: return "Internal (built-in output, no timecode)"
         }
     }
 }
@@ -149,6 +169,41 @@ struct DeckState: Equatable {
     /// another FFI poll.
     var bpmConfidence: Double = 0
 
+    /// Deck pitch as a signed percentage `(rate − 1) × 100`, from
+    /// `engine.deckTelemetry`. `nil` when the deck isn't actively
+    /// driven (paused / lifted / no source) so the header shows `—`.
+    /// For File playback this is `+0.0 %`; for timecode it tracks the
+    /// platter speed.
+    var pitchPercent: Double? = nil
+
+    /// Timecode lock state from `engine.deckTelemetry`: 0 none ·
+    /// 1 clean · 2 degraded (sticky window) · 3 disengaged (lifted /
+    /// scratching / dropout). Drives the deck-header tracking dot.
+    var timecodeLockState: UInt8 = 0
+
+    /// Source-control state from `engine.deckTelemetry`, for the row-3
+    /// Internal/Timecode switch. `hasTimecodeInput` gates whether the
+    /// switch is shown at all.
+    var hasTimecodeInput: Bool = false
+    var controlMode: UInt8 = 0   // 0 internal, 1 timecode
+    var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
+    var calibrated: Bool = false
+    var calibrating: Bool = false
+    /// Whether the user pinned the control mode via the row-3 switch
+    /// (auto source-detection suppressed). Drives the "· PINNED" badge.
+    var controlOverridden: Bool = false
+
+    /// Wall-clock time (seconds) of the first downbeat in the loaded
+    /// track's beat grid, captured alongside `bpm`. With `bpm` +
+    /// `gridBeatsPerBar` this lets the phase clock compute the live
+    /// bar-phase angle: `((playhead − anchor) / barDuration) mod 1`.
+    /// `nil` until a grid lands (or for gridless / Thru decks).
+    var gridAnchorSecs: Double? = nil
+
+    /// Beats per bar from the loaded grid (4 for 4/4). Used with
+    /// `bpm` to derive the bar duration for the phase clock.
+    var gridBeatsPerBar: Int = 4
+
     /// When set in the future, the deck pane renders a red overlay
     /// with a "deck is playing — lift the needle" message until
     /// this timestamp elapses. Used to surface a load failure
@@ -230,6 +285,31 @@ struct DeckState: Equatable {
     /// `true` when the deck has a track but isn't currently
     /// playing — a valid target for `Space` load (PRD §6.4 + §5.5).
     var isStopped: Bool { !isPlaying }
+
+    /// Clear the loaded-track identity (title, grid, library linkage,
+    /// …) while leaving live telemetry/source-control fields to be
+    /// refreshed by the next poll. Used when a deck is unloaded — e.g.
+    /// switching to Thru, where the live record replaces the file.
+    mutating func clearLoadedTrack() {
+        hasTrack = false
+        displayName = nil
+        trackTitle = nil
+        trackArtist = nil
+        bpm = nil
+        bpmConfidence = 0
+        key = nil
+        sourceURL = nil
+        loadedLibraryTrackId = nil
+        gridAnchorSecs = nil
+        autoGridBpm = nil
+        autoGridAnchorSecs = nil
+        autoGridCaptured = false
+        beatGridLoadSource = nil
+        manualGridEditCount = 0
+        gridLocked = false
+        gridDriftQuality = nil
+        isLoading = false
+    }
 }
 
 /// View-model owning the shared `DubEngine` for the lifetime of the
@@ -345,6 +425,22 @@ final class WaveformAppModel: ObservableObject {
     }
     #endif
 
+    /// DEV-only two-deck internal-mixer playback on the built-in
+    /// soundcard: forced Performance mode + the `.internalMixer`
+    /// source. Both decks sum to the local stereo output
+    /// (`INTERNAL_MIXER_ROUTING`) and play on their own clock — no
+    /// interface, no input, no timecode. The flag reuses the
+    /// two-deck `.timecode` performance layout but routes transport
+    /// and loading down the own-clock (Prep-like) paths. Always
+    /// `false` in Release, where the dev override doesn't exist.
+    var isInternalMixer: Bool {
+        #if DEBUG
+        return engineMode == .timecode && devForcedSource == .internalMixer
+        #else
+        return false
+        #endif
+    }
+
     /// CoreAudio device-list change listener block. Retained so we can
     /// remove it in `deinit`. `nil` until `installDeviceChangeListener()`
     /// runs.
@@ -380,6 +476,28 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private static let kAllowLoadIntoRunningDeck = "dub.allowLoadIntoRunningDeckInPerformance"
+
+    /// Loudness auto-gain toggle (PRD §8.4). When on (the default), a
+    /// track that has a cached LUFS-I measurement is loaded with a
+    /// normalization gain so deck-to-deck levels sit consistently near
+    /// the target without the DJ chasing the trim on every load. When
+    /// off, tracks load at unity gain and the DJ rides their hardware
+    /// trim manually. The toggle gates *application* only — LUFS is
+    /// still measured, cached, and shown in the browser either way, so
+    /// turning it off never costs the metering.
+    ///
+    /// Persisted in `UserDefaults` under `dub.loudnessAutoGainEnabled`.
+    /// The setting applies on the next load; the gain a deck is already
+    /// holding is not retroactively changed.
+    @Published var loudnessAutoGainEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                loudnessAutoGainEnabled,
+                forKey: Self.kLoudnessAutoGain)
+        }
+    }
+
+    private static let kLoudnessAutoGain = "dub.loudnessAutoGainEnabled"
 
     // MARK: Live engine state
 
@@ -609,6 +727,11 @@ final class WaveformAppModel: ObservableObject {
         self.engine = DubEngine()
         self.allowLoadIntoRunningDeckInPerformance =
             UserDefaults.standard.bool(forKey: Self.kAllowLoadIntoRunningDeck)
+        // Default ON: `bool(forKey:)` can't distinguish "unset" from
+        // "false", so read the raw object and fall back to `true` when
+        // the key has never been written.
+        self.loudnessAutoGainEnabled =
+            UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
         // the only place the cold-boot value enters the model. We
@@ -892,6 +1015,13 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private func startTimecode() {
+        // DEV internal-mixer: forced Performance with no interface and
+        // the `.internalMixer` source. Skip input + mic permission
+        // entirely and run both decks summed to the built-in output.
+        if isInternalMixer {
+            startInternalMixer()
+            return
+        }
         // Opinionated input selection: the first classified Performance
         // interface (two SL3s => first one). No manual picker drives
         // this in a shipping build.
@@ -1014,6 +1144,32 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// DEV-only two-deck internal mixer (see `isInternalMixer`). Starts
+    /// the engine output-only on the built-in soundcard — the same path
+    /// Prep uses, which already builds both decks and routes them summed
+    /// into the built-in stereo pair via `INTERNAL_MIXER_ROUTING` — but
+    /// presents the two-deck Performance surface (`twoDeckMode = true`).
+    /// No interface, no input, no mic prompt. Both decks play on their
+    /// own clock; transport + loading follow the Prep-like own-clock
+    /// paths gated on `isInternalMixer`.
+    private func startInternalMixer() {
+        do {
+            try engine.startEngine(
+                outputChannels: 2,
+                outputDeviceUid: selectedOutputUID)
+            isRunning = true
+            twoDeckMode = true
+            channelsAText = "built-in"
+            channelsBText = "built-in"
+            masterDeck = stickyMaster
+            if isRunning { startPolling() }
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Unexpected error: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: Polling
 
     private func startPolling() {
@@ -1058,6 +1214,55 @@ final class WaveformAppModel: ObservableObject {
         if newA != deckA { deckA = newA }
         if newB != deckB { deckB = newB }
         recomputeMaster()
+        logSignalDiagnostics()
+    }
+
+    /// Per-deck timecode diagnostics → the unified log (subsystem
+    /// `com.dub.app`, category `timecode`). Logs on every lock-state or
+    /// calibration change, plus a ~1 Hz heartbeat, so the signal /
+    /// calibration behaviour is fully recoverable after the fact.
+    ///
+    /// Read it with (note `/usr/bin/log` — zsh's `log` builtin shadows it):
+    /// `/usr/bin/log show --predicate 'subsystem == "com.dub.app"' --last 30m`
+    private var diagTick = 0
+    private var lastDiag: [(lock: UInt8, calSeq: UInt32, absLocked: Bool)] =
+        [(255, .max, false), (255, .max, false)]
+    private func logSignalDiagnostics() {
+        diagTick &+= 1
+        let heartbeat = diagTick % 30 == 0   // ~1 s at 30 Hz
+        for idx in 0..<2 {
+            let t = engine.deckTelemetry(deckIdx: UInt64(idx))
+            guard t.hasTimecodeInput else { continue }
+            let changed = t.lockState != lastDiag[idx].lock
+                || t.calibrationSeq != lastDiag[idx].calSeq
+                || t.absLocked != lastDiag[idx].absLocked
+            guard changed || heartbeat else { continue }
+
+            let lock = ["none", "LOCK", "degraded", "no-lock"][Int(min(t.lockState, 3))]
+            // M6 absolute bitstream lock: while ABS the pitch is bit-exact
+            // and the playhead is drift-free; "rel" means the carrier-phase
+            // relative path is driving (acquisition / degraded signal).
+            let abs = t.absLocked
+                ? String(format: "ABS@%.2fs", t.absPositionSecs)
+                : "rel"
+            let w = t.whitening
+            let wStr = w.count == 4
+                ? String(format: "[% .3f % .3f / % .3f % .3f]", w[0], w[1], w[2], w[3])
+                : "\(w)"
+            // .log (default level), not .info — info isn't persisted, so
+            // post-hoc `log show` during on-rig debugging came back empty.
+            dubTimecodeLog.log("""
+                deck \(idx == 0 ? "A" : "B", privacy: .public): \
+                \(lock, privacy: .public) conf=\(t.carrierConfidence, format: .fixed(precision: 3), privacy: .public) \
+                amp=\(t.carrierAmplitude, format: .fixed(precision: 3), privacy: .public) \
+                pitch=\(t.pitchPercent, format: .fixed(precision: 2), privacy: .public)% \
+                abs=\(abs, privacy: .public) \
+                cls=\(t.sourceClass, privacy: .public) \
+                calibrated=\(t.calibrated, privacy: .public) calibrating=\(t.calibrating, privacy: .public) \
+                cal#\(t.calibrationSeq, privacy: .public) whitening=\(wStr, privacy: .public)
+                """)
+            lastDiag[idx] = (t.lockState, t.calibrationSeq, t.absLocked)
+        }
     }
 
     private func readDeckState(side: DeckSide, prev: DeckState) -> DeckState {
@@ -1089,6 +1294,24 @@ final class WaveformAppModel: ObservableObject {
         // `TimelineView` wrapping `TrackOverviewView`'s Canvas for
         // the new consumer-side wiring.
         next.isPanicPlay = pos.isPanicPlay
+        // M-perf-ui — pitch + timecode lock state for the deck header
+        // (tracking dot + PITCH readout). Lock-free, same hot path as
+        // the position snapshot. Pitch is only meaningful while the
+        // deck is actually being driven; gate on `isPlaying` so a
+        // paused / lifted deck (which publishes rate 0 ⇒ −100 %) shows
+        // an em-dash instead of a bogus pitch.
+        // Pitch is already heavily smoothed in the engine (per audio
+        // block, before the UI samples it), so no extra UI filtering —
+        // just gate it on playback so a paused deck reads "—".
+        let tele = engine.deckTelemetry(deckIdx: side.ffiDeckIdx)
+        next.pitchPercent = nowPlaying ? tele.pitchPercent : nil
+        next.timecodeLockState = tele.lockState
+        next.hasTimecodeInput = tele.hasTimecodeInput
+        next.controlMode = tele.controlMode
+        next.sourceClass = tele.sourceClass
+        next.calibrated = tele.calibrated
+        next.calibrating = tele.calibrating
+        next.controlOverridden = tele.controlOverridden
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -1105,7 +1328,7 @@ final class WaveformAppModel: ObservableObject {
         // no detectable BPM (silence / too-short / non-musical)
         // keep polling — the cost is one FFI call returning an
         // empty `BeatGrid` per tick (~µs), well below the budget.
-        if next.hasTrack, next.bpm == nil {
+        if next.hasTrack, next.bpm == nil || next.gridAnchorSecs == nil {
             let tick = (bpmPollTick[side] ?? 0) &+ 1
             bpmPollTick[side] = tick
             // ~1 Hz is enough for the deck-header BPM chip to light
@@ -1115,6 +1338,17 @@ final class WaveformAppModel: ObservableObject {
                 if grid.confidence > 0, grid.bpm > 0 {
                     next.bpm = grid.bpm
                     next.bpmConfidence = Double(grid.confidence)
+                    // Capture the phase-clock anchor: the first
+                    // downbeat (bar position 0). `barPhase` is the
+                    // bar position of `beats[0]`, so the first
+                    // downbeat sits at index `(beatsPerBar − barPhase)
+                    // mod beatsPerBar`.
+                    let bpb = max(1, Int(grid.beatsPerBar))
+                    next.gridBeatsPerBar = bpb
+                    let firstDownbeat = (bpb - Int(grid.barPhase) % bpb) % bpb
+                    next.gridAnchorSecs = grid.beats.indices.contains(firstDownbeat)
+                        ? grid.beats[firstDownbeat]
+                        : grid.beats.first
                     // Deck just resolved a BPM that the library row
                     // had been waiting on. The lazy
                     // `ensureTrackAnalyzed` triggered at load time
@@ -1322,13 +1556,20 @@ final class WaveformAppModel: ObservableObject {
         // the engine's existing `analyze_beat_grid` path with no
         // behaviour change.
         let genreForLoad = libraryGenreForPendingLoad(url: url)
+        // Auto-gain (M16): resolve the track's stored loudness gain
+        // before the load so the engine applies it atomically with the
+        // swap. `nil` for unanalyzed tracks / Finder drags → the engine
+        // loads at unity. Resolved here, on the main actor, off the
+        // same single-SELECT path as the beat grid; never re-read after.
+        let autoGainForLoad = autoGainForPendingLoad(url: url)
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
                 try engineRef.loadTrack(
                     deckIdx: deckIdx,
                     path: url.path,
                     libraryBeatGrid: preloadedGrid,
-                    genre: genreForLoad
+                    genre: genreForLoad,
+                    autoGain: autoGainForLoad
                 )
                 return .success(())
             } catch {
@@ -2009,6 +2250,40 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Resolve the stored auto-gain (loudness-normalization) linear
+    /// multiplier for the track about to be loaded, if the library has
+    /// measured its loudness. Fed to
+    /// `DubEngine.loadTrack(…, autoGain:)` so the engine applies it
+    /// once, atomically with the deck swap (M16).
+    ///
+    /// Returns `nil` — and the engine then loads at unity — in every
+    /// case the gain shouldn't apply:
+    ///
+    /// * library not open, or the file is unknown to the library
+    ///   (a Finder drag of a never-imported track), or
+    /// * the track has been imported but not yet analysed, or was
+    ///   analysed as silent / too short (no `lufs_i`).
+    ///
+    /// The "imported but not yet analysed" case is exactly the
+    /// store-only contract: a fresh track plays at unity now, the
+    /// background `analyzeTrack` writes its LUFS, and the *next* load
+    /// picks the value up here. Mirrors `libraryBeatGridForPendingLoad`
+    /// — same sub-millisecond indexed lookup, safe on the main actor
+    /// right before the detached load task — and is equally non-fatal
+    /// on error.
+    private func autoGainForPendingLoad(url: URL) -> Float? {
+        guard loudnessAutoGainEnabled else { return nil }
+        guard libraryModel.libraryIsOpen,
+              let trackId = resolveLibraryTrackId(for: url)
+        else { return nil }
+        do {
+            return try library.trackNormalizationGain(trackId: trackId)
+        } catch {
+            print("dub: autoGainForPendingLoad failed for \(trackId): \(error)")
+            return nil
+        }
+    }
+
     private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
         guard libraryModel.libraryIsOpen else {
             var cleared = state(for: side)
@@ -2402,7 +2677,7 @@ final class WaveformAppModel: ObservableObject {
         // auto-playing there would engage user-initiated Panic-Play and
         // ignore the timecode (the "load auto-starts internal play and
         // the record does nothing" bug).
-        if didLoad, engineMode == .prep {
+        if didLoad, engineMode == .prep || isInternalMixer {
             play(side: candidate)
         }
     }
@@ -2426,6 +2701,9 @@ final class WaveformAppModel: ObservableObject {
     ///   opt-out for users who consciously want to relax even this
     ///   case (rehearsing transitions, etc.).
     private func canLoadIntoPlayingDeck() -> Bool {
+        // Internal-mixer is a dev sandbox with no audience cue to
+        // protect; treat it like Prep and always allow the swap.
+        if isInternalMixer { return true }
         switch engineMode {
         case .prep:
             return true
@@ -2468,14 +2746,16 @@ final class WaveformAppModel: ObservableObject {
         let deck = state(for: side)
         guard deck.hasTrack else { return }
         do {
-            switch engineMode {
-            case .prep:
+            // Internal-mixer decks have no timecode carrier, so they
+            // drive their own clock exactly like Prep (rate 1.0 + play)
+            // rather than engaging Panic Play.
+            if engineMode == .prep || isInternalMixer {
                 try engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0)
                 try engine.play(deckIdx: side.ffiDeckIdx)
                 var s = state(for: side)
                 s.isPlaying = true
                 setState(s, for: side)
-            case .timecode:
+            } else {
                 try engine.panicPlay(deckIdx: side.ffiDeckIdx)
                 var s = state(for: side)
                 s.isPlaying = true
@@ -2545,15 +2825,16 @@ final class WaveformAppModel: ObservableObject {
         guard deck.hasTrack else { return }
         do {
             try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: 0)
-            switch engineMode {
-            case .prep:
+            // Internal-mixer mirrors Prep's own-clock restart (no
+            // timecode carrier to defer to).
+            if engineMode == .prep || isInternalMixer {
                 try engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0)
                 try engine.play(deckIdx: side.ffiDeckIdx)
                 var s = state(for: side)
                 s.atEnd = false
                 s.isPlaying = true
                 setState(s, for: side)
-            case .timecode:
+            } else {
                 try engine.panicPlay(deckIdx: side.ffiDeckIdx)
                 var s = state(for: side)
                 s.atEnd = false
@@ -3109,6 +3390,36 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    // MARK: Source control (Internal / Timecode + calibration)
+
+    /// Select Internal playback for a deck (the deck-header switch).
+    /// Coming from Timecode this keeps the platter's last pitch; coming
+    /// from Thru it lands at unity, paused.
+    func setDeckInternal(side: DeckSide) {
+        try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .internalPlay)
+    }
+
+    /// Select Timecode control for a deck (the deck-header switch).
+    func setDeckTimecode(side: DeckSide) {
+        try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .timecode)
+    }
+
+    /// Select Thru — pass the live record straight through (the
+    /// deck-header switch). The live record becomes the source, so the
+    /// loaded file is unloaded (engine + FFI peaks); clear the model's
+    /// cached track identity to match so no ghost title/waveform lingers.
+    func setDeckThru(side: DeckSide) {
+        try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .thru)
+        var s = state(for: side)
+        s.clearLoadedTrack()
+        setState(s, for: side)
+    }
+
+    /// Manually (re)calibrate a deck's timecode needle (the ↻ button).
+    func recalibrateDeck(side: DeckSide) {
+        try? engine.calibrateDeck(deckIdx: side.ffiDeckIdx)
+    }
+
     // MARK: Helpers
 
     /// Single sink for surfaceable user-facing errors. Updates
@@ -3119,7 +3430,11 @@ final class WaveformAppModel: ObservableObject {
         lastErrorClearTask?.cancel()
         lastErrorClearTask = nil
         lastError = message
-        guard message != nil else { return }
+        guard let message else { return }
+        // Persist it: the toast auto-clears after a few seconds, but the
+        // unified log keeps the full text so an audio-start failure (etc.)
+        // is recoverable after the fact.
+        dubLog.error("\(message, privacy: .public)")
         let task = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.errorVisibilitySecs)
             guard let self else { return }
@@ -3820,6 +4135,7 @@ struct MainView: View {
     @State private var showingPreferences: Bool = false
     @State private var showingAbout: Bool = false
     @State private var showingOnboarding: Bool = false
+    @State private var showingSignalQuality: Bool = false
     @State private var showLaunchSplash: Bool = true
 
     /// U-23 — once the user finishes or skips the first-run guide we
@@ -3856,6 +4172,9 @@ struct MainView: View {
                     showingOnboarding = false
                 }
             }
+            .sheet(isPresented: $showingSignalQuality) {
+                SignalQualityView(model: model)
+            }
             .background(
                 KeyEventMonitorHost(
                     showingPreferences: $showingPreferences,
@@ -3873,6 +4192,10 @@ struct MainView: View {
                 // up onboarding on the next runloop tick.
                 showingPreferences = false
                 DispatchQueue.main.async { showingOnboarding = true }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .dubShowSignalQuality)) { _ in
+                showingPreferences = false
+                DispatchQueue.main.async { showingSignalQuality = true }
             }
             .task {
                 await runColdBoot()

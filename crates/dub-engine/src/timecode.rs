@@ -53,7 +53,7 @@
 use ringbuf::traits::{Consumer, Observer};
 use ringbuf::HeapCons;
 
-use dub_timecode::{DecodeOutput, Decoder, Format};
+use dub_timecode::{whitening_from_covariance, DecodeOutput, Decoder, Format, RateSmoother};
 
 // -------------------------------------------------------------------
 // Re-exports from this module's public API:
@@ -274,7 +274,29 @@ pub struct LiftPolicy {
     /// below threshold (single-block dropouts shouldn't freeze a
     /// scratch).
     last_locked_rate: f64,
+
+    /// Absolute groove position (input frames at unity) of the previous
+    /// fully-locked block, when the LFSR tracker was locked on it.
+    /// `Some` only while consecutive engaged blocks carry a confident
+    /// absolute fix — the *delta* between two such fixes is the exact,
+    /// drift-free playhead advance (M6). Reset to `None` on every other
+    /// branch so a lift/dropout/lukewarm gap forces a re-anchor: the
+    /// first absolute fix after a gap establishes a new reference and
+    /// never jumps the deck (relative-only behavior, PRD §5.1).
+    prev_abs_position: Option<f64>,
 }
+
+/// Minimum [`DecodeOutput::abs_confidence`] for an absolute fix to
+/// participate in delta-advance. Below this the block degrades to the
+/// plain relative `Locked` path.
+const ABS_CONFIDENCE_THRESHOLD: f32 = 0.8;
+
+/// Belt-and-braces bound on a single block's absolute advance, in
+/// input frames. The decoder re-anchors (never jumps) after any gap,
+/// so a delta this large can only be a tracker malfunction — a real
+/// block at 48 kHz is ≤ ~16k frames even at extreme scratch speeds.
+/// Exceeding it re-anchors instead of slewing the playhead.
+const MAX_ABS_BLOCK_ADVANCE_FRAMES: f64 = 131_072.0;
 
 impl LiftPolicy {
     /// Build a policy from the same threshold fields as a
@@ -290,6 +312,7 @@ impl LiftPolicy {
             engaged: false,
             consecutive_below: 0,
             last_locked_rate: 0.0,
+            prev_abs_position: None,
         }
     }
 
@@ -337,6 +360,7 @@ impl LiftPolicy {
     pub fn force_disengaged(&mut self) {
         self.engaged = false;
         self.consecutive_below = 0;
+        self.prev_abs_position = None;
     }
 
     /// Advance the state machine by one decoder block.
@@ -369,7 +393,7 @@ impl LiftPolicy {
             if carrier_alive && out.confidence >= self.engage_threshold {
                 self.consecutive_below = 0;
                 self.last_locked_rate = out.rate;
-                LiftIntent::Locked { rate: out.rate }
+                self.locked_with_absolute(out)
             } else if carrier_alive && out.confidence >= self.disengage_threshold {
                 // Lukewarm scratch transient — hold the last good
                 // rate (don't trust the noisy current-block estimate)
@@ -380,6 +404,7 @@ impl LiftPolicy {
                 // carrier is alive, so handling-noise during lift no
                 // longer counts as "scratch transient".
                 self.consecutive_below = 0;
+                self.prev_abs_position = None;
                 LiftIntent::Locked {
                     rate: self.last_locked_rate,
                 }
@@ -389,6 +414,7 @@ impl LiftPolicy {
                 // mid-scratch), or amplitude collapsed (carrier dead
                 // — e.g. stylus lift). Either way, count toward the
                 // sticky disengage window.
+                self.prev_abs_position = None;
                 self.consecutive_below = self.consecutive_below.saturating_add(1);
                 if self.consecutive_below >= self.sticky_blocks_to_disengage {
                     self.engaged = false;
@@ -408,13 +434,57 @@ impl LiftPolicy {
             self.engaged = true;
             self.consecutive_below = 0;
             self.last_locked_rate = out.rate;
-            LiftIntent::Locked { rate: out.rate }
+            self.locked_with_absolute(out)
         } else {
             // Disengaged and not confident *and* alive enough to
             // re-engage. Amplitude check matters here too: a quiet
             // burst of structured noise must not re-engage.
+            self.prev_abs_position = None;
             LiftIntent::DropoutHoldRate {
                 rate: self.last_locked_rate,
+            }
+        }
+    }
+
+    /// Fully-locked block: upgrade to [`LiftIntent::LockedAbsolute`]
+    /// when this block *and* the previous one both carried a confident
+    /// absolute LFSR fix — the delta between the two fixes is the
+    /// exact playhead advance, immune to carrier-phase rate bias (M6).
+    ///
+    /// Anything that breaks the consecutive-fix chain (first lock,
+    /// re-lock after a lift, tracker unlocked, low `abs_confidence`,
+    /// or an implausibly large delta) anchors the reference and emits
+    /// the plain relative `Locked` — the deck keeps integrating its
+    /// rate and never jumps to the groove position (PRD §5.1:
+    /// relative-only, no needle-drop).
+    fn locked_with_absolute(&mut self, out: DecodeOutput) -> LiftIntent {
+        let abs = (out.abs_confidence >= ABS_CONFIDENCE_THRESHOLD)
+            .then_some(out.abs_position_frames)
+            .flatten();
+        match (self.prev_abs_position, abs) {
+            (Some(prev), Some(p)) => {
+                self.prev_abs_position = Some(p);
+                let advance_frames = p - prev;
+                if advance_frames.abs() > MAX_ABS_BLOCK_ADVANCE_FRAMES {
+                    // Tracker glitch — re-anchor, never slew the deck
+                    // across a huge jump.
+                    LiftIntent::Locked { rate: out.rate }
+                } else {
+                    LiftIntent::LockedAbsolute {
+                        rate: out.rate,
+                        advance_frames,
+                    }
+                }
+            }
+            (None, Some(p)) => {
+                // First confident fix after a gap: anchor only. The
+                // *next* block can emit a delta.
+                self.prev_abs_position = Some(p);
+                LiftIntent::Locked { rate: out.rate }
+            }
+            (_, None) => {
+                self.prev_abs_position = None;
+                LiftIntent::Locked { rate: out.rate }
             }
         }
     }
@@ -434,6 +504,15 @@ pub struct TimecodeInput {
     /// `max_block_frames * 2` (interleaved stereo) at attach time.
     scratch: Vec<f32>,
 
+    /// Number of interleaved samples actually popped into `scratch` by
+    /// the most recent [`Self::drive`] call (always even — whole stereo
+    /// frames). Read by [`Self::render_passthrough_into`] so Thru mode
+    /// can pass the live record straight to the output using the *same*
+    /// samples the decoder just consumed — one input consumer, no second
+    /// ring. Reset to `0` on a block with no new input so a stale block
+    /// is never re-emitted (which would buzz).
+    last_popped: usize,
+
     /// Latest decoded block result. Cached so the engine can surface
     /// `(rate, position, confidence)` to the UI without reaching into
     /// the decoder.
@@ -443,6 +522,44 @@ pub struct TimecodeInput {
     /// countdown + amplitude-gated hysteresis. See [`LiftPolicy`]
     /// for the algorithm.
     policy: LiftPolicy,
+
+    /// In-progress channel-whitening calibration (running covariance of
+    /// the raw input). `None` when not calibrating. Accumulated on the
+    /// audio thread; installs on the decoder when the window completes.
+    cal: Option<CalCapture>,
+
+    /// Whether a whitening calibration has been installed since attach.
+    calibrated: bool,
+
+    /// The most recently installed whitening matrix (identity until the
+    /// first calibration completes) and a counter that bumps each time a
+    /// new calibration installs. Diagnostic-only: published to the deck
+    /// shared state so the signal-quality log can show what the
+    /// calibration actually computed (catching a degenerate / identity
+    /// result that would leave the cartridge ellipse uncorrected).
+    installed_whitening: [[f64; 2]; 2],
+    calibration_seq: u32,
+
+    /// Outlier-rejecting + adaptive smoother for the decoded rate. Sits
+    /// on the rate the moment it leaves the decoder, so both the audible
+    /// playback rate (via the lift policy) and the pitch readout are
+    /// de-spiked. See [`RateSmoother`].
+    rate_smoother: RateSmoother,
+}
+
+/// Running covariance of the raw `(ch1, ch0)` input during a
+/// calibration capture. All-arithmetic, `Copy`, RT-safe to accumulate.
+#[derive(Debug, Clone, Copy)]
+struct CalCapture {
+    saa: f64,
+    sbb: f64,
+    sab: f64,
+    /// Channel means (`Σre`, `Σim`) for DC removal — see
+    /// [`dub_timecode::whitening_from_covariance`].
+    sre: f64,
+    sim: f64,
+    frames: usize,
+    target: usize,
 }
 
 impl TimecodeInput {
@@ -451,14 +568,61 @@ impl TimecodeInput {
     #[must_use]
     pub fn new(rx: HeapCons<f32>, config: TimecodeInputConfig) -> Self {
         let scratch = vec![0.0_f32; config.max_block_frames.saturating_mul(2).max(2)];
-        let decoder = Decoder::new(config.format, config.input_sample_rate);
+        // `with_absolute` builds the LFSR position LUT here, off-RT, at
+        // attach time; formats without a known bitstream (Traktor MK2)
+        // silently stay relative-only. The audio thread sees only the
+        // pre-built table (M6).
+        let decoder = Decoder::with_absolute(config.format, config.input_sample_rate);
         Self {
             rx,
             decoder,
             scratch,
+            last_popped: 0,
             last_output: None,
             policy: LiftPolicy::new(&config),
+            cal: None,
+            calibrated: false,
+            installed_whitening: dub_timecode::IDENTITY_WHITENING,
+            calibration_seq: 0,
+            rate_smoother: RateSmoother::new(),
         }
+    }
+
+    /// Begin a channel-whitening calibration: clear any existing
+    /// correction (so we measure the raw cartridge ellipse) and capture
+    /// `target_frames` of input covariance, after which the whitening
+    /// installs automatically. RT-safe — a few field writes.
+    pub(crate) fn begin_calibration(&mut self, target_frames: usize) {
+        self.decoder.clear_whitening();
+        self.cal = Some(CalCapture {
+            saa: 0.0,
+            sbb: 0.0,
+            sab: 0.0,
+            sre: 0.0,
+            sim: 0.0,
+            frames: 0,
+            target: target_frames.max(1),
+        });
+        self.calibrated = false;
+    }
+
+    /// Whether a calibration capture is currently in progress.
+    #[must_use]
+    pub fn is_calibrating(&self) -> bool {
+        self.cal.is_some()
+    }
+
+    /// Whether a whitening calibration has been installed since attach.
+    #[must_use]
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    /// The currently installed whitening matrix (identity until the first
+    /// calibration completes) and the calibration counter. Diagnostic.
+    #[must_use]
+    pub(crate) fn installed_whitening(&self) -> ([[f64; 2]; 2], u32) {
+        (self.installed_whitening, self.calibration_seq)
     }
 
     /// Number of input samples currently buffered between the IOProc
@@ -521,16 +685,90 @@ impl TimecodeInput {
         // would walk the L/R alignment by one sample forever.
         let popped_even = popped & !1;
         if popped_even == 0 {
+            // No fresh input this block. Clear the passthrough window so
+            // Thru mode renders silence rather than re-emitting the prior
+            // block's samples.
+            self.last_popped = 0;
             return None;
         }
+        self.last_popped = popped_even;
         // Push the dangling odd sample (if any) back into the ring is
         // not possible with HeapCons — but pop_slice doesn't take half
         // a frame anyway: the IOProc only ever pushes whole frames
         // (channels × N). So `popped` is even in practice; the masking
         // is defensive belt-and-braces.
-        let out = self.decoder.process(&self.scratch[..popped_even]);
+        let mut out = self.decoder.process(&self.scratch[..popped_even]);
+        // De-spike + adaptively smooth the rate the instant it leaves
+        // the decoder, so the same clean value feeds both the lift
+        // policy (audible playback rate) and `last_output` (pitch /
+        // live-BPM readout). Position is left as decoded — only the
+        // velocity estimate is filtered.
+        out.rate = self.rate_smoother.smooth(out.rate, out.confidence);
         self.last_output = Some(out);
+        self.accumulate_calibration(popped_even);
         Some(self.policy.step(out))
+    }
+
+    /// Render the live input as a Thru passthrough into `out` (PRD
+    /// §5.1.1 Thru mode). Copies the raw stereo frames that the most
+    /// recent [`Self::drive`] popped — the real record's audio — into
+    /// the deck's routed output pair, additively, at `gain`. `out` is
+    /// interleaved `num_channels`-wide; the deck's stereo pair lands at
+    /// channels `first, first + 1`.
+    ///
+    /// Reuses the decoder's already-drained samples instead of a second
+    /// input consumer: in Performance mode the engine runs at the
+    /// input's sample rate, so the passthrough is a 1:1 copy with no
+    /// resampling. Frames the decoder didn't have this block render as
+    /// silence (the output was pre-zeroed), matching the underrun
+    /// behaviour of the dedicated [`crate::thru::ThruSource`] path.
+    ///
+    /// **RT-safety**: no allocation, no locks — a bounded additive copy.
+    pub(crate) fn render_passthrough_into(
+        &self,
+        out: &mut [f32],
+        gain: f32,
+        num_channels: usize,
+        first: usize,
+    ) {
+        let frames = out.len() / num_channels;
+        let avail_frames = self.last_popped / 2;
+        let n = frames.min(avail_frames);
+        for i in 0..n {
+            let base = i * num_channels + first;
+            out[base] += self.scratch[2 * i] * gain;
+            out[base + 1] += self.scratch[2 * i + 1] * gain;
+        }
+    }
+
+    /// Fold this block's raw `(ch1, ch0)` covariance into an in-flight
+    /// calibration, and install the computed whitening once the capture
+    /// window completes. No-op when not calibrating. RT-safe.
+    fn accumulate_calibration(&mut self, popped_even: usize) {
+        if let Some(cal) = self.cal.as_mut() {
+            for frame in self.scratch[..popped_even].chunks_exact(2) {
+                let re = f64::from(frame[1]);
+                let im = f64::from(frame[0]);
+                cal.saa += re * re;
+                cal.sbb += im * im;
+                cal.sab += re * im;
+                cal.sre += re;
+                cal.sim += im;
+            }
+            cal.frames += popped_even / 2;
+        }
+        if let Some(cal) = self.cal {
+            if cal.frames >= cal.target {
+                let w = whitening_from_covariance(
+                    cal.saa, cal.sbb, cal.sab, cal.sre, cal.sim, cal.frames,
+                );
+                self.decoder.set_whitening(w);
+                self.installed_whitening = w;
+                self.calibration_seq = self.calibration_seq.wrapping_add(1);
+                self.cal = None;
+                self.calibrated = true;
+            }
+        }
     }
 }
 
@@ -552,6 +790,21 @@ pub enum LiftIntent {
         /// estimates); inside the engage band it's the current
         /// block's decoded rate.
         rate: f64,
+    },
+    /// Fully locked *and* the absolute LFSR tracker delivered
+    /// confident position fixes on both this block and the previous
+    /// one (M6). `advance_frames` is the exact groove distance the
+    /// record travelled between the two fixes — drift-free and immune
+    /// to carrier-phase rate bias. The engine advances the deck's
+    /// playhead by exactly this amount (converted to track frames)
+    /// and uses `rate` only for the intra-block resampling slope.
+    LockedAbsolute {
+        /// Playback rate for the deck this block (same semantics as
+        /// [`LiftIntent::Locked::rate`]).
+        rate: f64,
+        /// Exact playhead advance since the previous block, in *input*
+        /// frames at unity speed. Negative for reverse motion.
+        advance_frames: f64,
     },
     /// Confidence dropped — the deck is paused; rate is held in case
     /// confidence comes back this very next block (chatter immunity).
@@ -631,6 +884,22 @@ mod policy_tests {
             position_secs: 0.0,
             amplitude,
             confidence,
+            abs_position_frames: None,
+            abs_confidence: 0.0,
+        }
+    }
+
+    /// A fully-locked block carrying a confident absolute LFSR fix at
+    /// `abs_frames` (input frames at unity). Confidence 0.95 / amp 0.5
+    /// — comfortably in the engage band.
+    fn out_with_abs(rate: f64, abs_frames: f64) -> DecodeOutput {
+        DecodeOutput {
+            rate,
+            position_secs: 0.0,
+            amplitude: 0.5,
+            confidence: 0.95,
+            abs_position_frames: Some(abs_frames),
+            abs_confidence: 1.0,
         }
     }
 
@@ -656,6 +925,7 @@ mod policy_tests {
             match p.step(out(0.0, 0.0)) {
                 LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
                 LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
+                LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
             }
         }
     }
@@ -694,6 +964,7 @@ mod policy_tests {
         match p.step(out(0.5, 0.6)) {
             LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
             LiftIntent::DropoutHoldRate { .. } => panic!("disengaged in lukewarm band"),
+            LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
         }
         // Now we have a fresh sticky window; need 4 more sub-disengage
         // blocks to actually disengage.
@@ -773,6 +1044,7 @@ mod policy_tests {
             match p.step(out_with_amp(0.0, 0.7, 0.001)) {
                 LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
                 LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
+                LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
             }
         }
         // 4th quiet block: actually disengage.
@@ -930,5 +1202,153 @@ mod policy_tests {
         let i = p.step(out(1.0, 0.9));
         assert!(matches!(i, LiftIntent::Locked { rate } if (rate - 1.0).abs() < 1e-9));
         assert!(p.is_engaged());
+    }
+
+    // M6 — absolute-position delta advance.
+
+    #[test]
+    fn first_absolute_fix_anchors_without_advancing() {
+        // The first confident fix (here: also the engaging block) must
+        // emit plain Locked — anchoring the reference, never jumping
+        // the deck to the groove position (relative-only, PRD §5.1).
+        let mut p = make(0.8, 0.5, 4);
+        let i = p.step(out_with_abs(1.0, 100_000.0));
+        assert!(
+            matches!(i, LiftIntent::Locked { rate } if (rate - 1.0).abs() < 1e-9),
+            "first abs fix must anchor, not advance; got {i:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_absolute_fixes_emit_exact_deltas() {
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_abs(1.0, 100_000.0)); // anchor
+        let i = p.step(out_with_abs(1.0, 100_512.0));
+        match i {
+            LiftIntent::LockedAbsolute {
+                rate,
+                advance_frames,
+            } => {
+                assert!((rate - 1.0).abs() < 1e-9);
+                assert!((advance_frames - 512.0).abs() < 1e-9);
+            }
+            other => panic!("expected LockedAbsolute, got {other:?}"),
+        }
+        // Reverse motion: negative delta.
+        let i = p.step(out_with_abs(-1.0, 100_000.0));
+        assert!(matches!(
+            i,
+            LiftIntent::LockedAbsolute { advance_frames, .. }
+                if (advance_frames + 512.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn gap_in_absolute_lock_re_anchors_instead_of_jumping() {
+        // Lift + re-drop at a *different* groove position: the blocks
+        // between abs fixes (lift) clear the reference, so the first
+        // fix after the gap must anchor (plain Locked), and only the
+        // block after that resumes deltas — measured from the *new*
+        // position. The 400k-frame jump must never reach the deck.
+        let mut p = make(0.8, 0.5, 2);
+        p.step(out_with_abs(1.0, 100_000.0));
+        p.step(out_with_abs(1.0, 100_512.0)); // delta path active
+                                              // Lift: two dead blocks → disengaged.
+        p.step(out_with_amp(0.0, 0.0, 0.0));
+        p.step(out_with_amp(0.0, 0.0, 0.0));
+        // Re-drop far away.
+        let i = p.step(out_with_abs(1.0, 500_000.0));
+        assert!(
+            matches!(i, LiftIntent::Locked { .. }),
+            "re-drop must re-anchor, not jump; got {i:?}"
+        );
+        let i = p.step(out_with_abs(1.0, 500_512.0));
+        assert!(matches!(
+            i,
+            LiftIntent::LockedAbsolute { advance_frames, .. }
+                if (advance_frames - 512.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn lukewarm_block_breaks_the_absolute_chain() {
+        // A lukewarm block mid-scratch loses the consecutive-fix
+        // property (rate is held, not measured) — the next confident
+        // fix must re-anchor rather than emit a delta spanning the
+        // lukewarm gap with a stale rate attached.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_abs(1.0, 100_000.0));
+        p.step(out_with_abs(1.0, 100_512.0));
+        p.step(out(0.9, 0.6)); // lukewarm
+        let i = p.step(out_with_abs(1.0, 101_536.0));
+        assert!(
+            matches!(i, LiftIntent::Locked { .. }),
+            "post-lukewarm fix must re-anchor; got {i:?}"
+        );
+    }
+
+    #[test]
+    fn low_abs_confidence_degrades_to_relative() {
+        // abs fix present but below ABS_CONFIDENCE_THRESHOLD → plain
+        // relative Locked, and the chain is broken.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_abs(1.0, 100_000.0));
+        let mut weak = out_with_abs(1.0, 100_512.0);
+        weak.abs_confidence = 0.5;
+        let i = p.step(weak);
+        assert!(matches!(i, LiftIntent::Locked { .. }));
+        // Chain broken: next strong fix anchors again.
+        let i = p.step(out_with_abs(1.0, 101_024.0));
+        assert!(matches!(i, LiftIntent::Locked { .. }));
+        // ...and the one after that resumes deltas.
+        let i = p.step(out_with_abs(1.0, 101_536.0));
+        assert!(matches!(
+            i,
+            LiftIntent::LockedAbsolute { advance_frames, .. }
+                if (advance_frames - 512.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn implausible_delta_re_anchors() {
+        // Belt-and-braces: a single-block delta beyond the bound is a
+        // tracker malfunction — re-anchor at the new fix, emit plain
+        // Locked, never slew the playhead across it.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_abs(1.0, 100_000.0));
+        let i = p.step(out_with_abs(
+            1.0,
+            100_000.0 + MAX_ABS_BLOCK_ADVANCE_FRAMES * 2.0,
+        ));
+        assert!(
+            matches!(i, LiftIntent::Locked { .. }),
+            "implausible delta must re-anchor; got {i:?}"
+        );
+        // The new fix is the anchor: a sane next delta resumes.
+        let i = p.step(out_with_abs(
+            1.0,
+            100_000.0 + MAX_ABS_BLOCK_ADVANCE_FRAMES * 2.0 + 512.0,
+        ));
+        assert!(matches!(
+            i,
+            LiftIntent::LockedAbsolute { advance_frames, .. }
+                if (advance_frames - 512.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn force_disengaged_clears_absolute_anchor() {
+        // Panic-Play must also reset the abs reference: the re-lock
+        // after panic is a *fresh* engagement and its first fix must
+        // anchor, not emit a delta spanning the panic hold.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_abs(1.0, 100_000.0));
+        p.step(out_with_abs(1.0, 100_512.0));
+        p.force_disengaged();
+        let i = p.step(out_with_abs(1.0, 200_000.0));
+        assert!(
+            matches!(i, LiftIntent::Locked { .. }),
+            "first fix after force_disengaged must anchor; got {i:?}"
+        );
     }
 }

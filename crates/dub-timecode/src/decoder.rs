@@ -30,12 +30,18 @@
 //! nominal carrier frequency. We accumulate it in seconds-of-record
 //! at unity speed so the engine can map deck position 1:1 in M5.3.
 //!
+//! ## Absolute position (M6)
+//!
+//! A decoder built with [`Decoder::with_absolute`] additionally
+//! demodulates the AM bitstream riding on the carrier (one LFSR bit
+//! per cycle) and, once locked, reports the **absolute groove
+//! position** in [`DecodeOutput::abs_position_frames`]. Its per-block
+//! *deltas* give bit-exact, drift-free velocity — immune to the
+//! residual cartridge-ellipse bias the carrier-phase rate carries.
+//! Deck behavior stays relative (no needle-drop); see `absolute.rs`.
+//!
 //! ## What this *doesn't* do (yet)
 //!
-//! - **Absolute position** (M6). The Serato/Traktor bitstream rides
-//!   on top of the carrier as AM modulation; we'd need to demodulate
-//!   the envelope, sample one bit per carrier cycle, and look it up
-//!   in the format's position table. Not needed for v1 relative mode.
 //! - **Stickiness on lift** (M5.4). The decoder reports `confidence`
 //!   today; the *policy* of "stop the deck and remember position"
 //!   when confidence drops belongs in the integration layer, not here.
@@ -51,6 +57,7 @@
 //! `atan2` once per block. At 48 kHz / 64-frame blocks that's 750
 //! atan2 calls/sec/deck — trivial.
 
+use crate::absolute::AbsoluteTracker;
 use crate::Format;
 
 /// Output of one [`Decoder::process`] call. Caller drives deck
@@ -87,7 +94,32 @@ pub struct DecodeOutput {
     /// noise/transients/crosstalk and the rate estimate should not
     /// drive deck transport.
     pub confidence: f32,
+
+    /// Absolute groove position in **input frames at unity speed**,
+    /// from the LFSR bitstream (M6). `Some` only while the absolute
+    /// tracker is locked on a decoder built with
+    /// [`Decoder::with_absolute`]; always `None` otherwise. Consumers
+    /// use per-block *deltas* of this for bit-exact, drift-free
+    /// velocity — never the value itself (deck behavior stays
+    /// relative; no needle-drop, PRD §5.1).
+    pub abs_position_frames: Option<f64>,
+
+    /// Bit-agreement confidence of the absolute tracker in `[0, 1]`;
+    /// `0.0` while unlocked or when absolute decoding is off.
+    pub abs_confidence: f32,
 }
+
+/// Carrier-presence amplitude ramp used to gate [`DecodeOutput::confidence`]
+/// (see [`Decoder::process`]). Phase coherence is meaningless without a
+/// live carrier, so the reported confidence is scaled by a linear ramp on
+/// RMS amplitude: zero at or below [`CARRIER_PRESENCE_OFF`], full at or
+/// above [`CARRIER_PRESENCE_FULL`]. A stopped platter / DC offset / mains
+/// hum sits below the off level and reports ~0 confidence; a healthy SL3
+/// carrier (~0.1–0.5) is far above the full level and unaffected. The off
+/// level matches the default amplitude engage threshold (0.01) so the
+/// confidence meter and the lift policy agree on "is there a carrier".
+const CARRIER_PRESENCE_OFF: f32 = 0.01;
+const CARRIER_PRESENCE_FULL: f32 = 0.05;
 
 /// Stateful timecode decoder. One instance per deck.
 ///
@@ -109,6 +141,42 @@ pub struct Decoder {
     primed: bool,
     /// Cumulative position in seconds-at-unity-speed.
     position_secs: f64,
+    /// 2×2 channel-whitening matrix applied to `(ch1, ch0)` before the
+    /// phase-difference, to correct a cartridge's L/R gain imbalance,
+    /// quadrature-phase (azimuth) error, and crosstalk. An uncorrected
+    /// cartridge turns the timecode Lissajous from a circle into an
+    /// ellipse, which injects a counter-rotating image and biases the
+    /// decoded rate **low** (`rate × 2G/(G²+1)`; a ~2 dB imbalance ≈
+    /// −2.3 %). Whitening re-circularises the signal and removes the
+    /// bias. Defaults to identity (no correction) until calibrated.
+    /// See [`compute_whitening`].
+    whitening: [[f64; 2]; 2],
+    /// Smoothed estimate of the **residual ellipse** the carrier traces
+    /// after `whitening`, measured directly from the per-block covariance:
+    /// `er = (<re²>−<im²>)/(<re²>+<im²>)` is the gain-imbalance (axis-ratio)
+    /// term, `ec = 2<re·im>/(<re²>+<im²>)` the azimuth (tilt) term. A real
+    /// cartridge's L/R response drifts with frequency, so the static
+    /// `whitening` (fixed at one frequency) leaves a residual ellipse that
+    /// grows with pitch — biasing the decoded rate into a quadratic droop
+    /// at the extremes (+8 %→+5 %, −8 %→−12 %) while coherence stays ~1.0.
+    /// From `er`,`ec` we form the rate-distortion factor
+    /// `R = √(1 − er² − ec²)` (which is `cos(azimuth)` for pure tilt and
+    /// `2g/(1+g²)` for pure gain imbalance) and divide it back out. A
+    /// self-calibrating fix — no sweep or gesture; it learns continuously
+    /// as the platter moves. EMA-smoothed over confident blocks; primed on
+    /// first lock.
+    ellipse_er: f64,
+    ellipse_ec: f64,
+    /// Whether the ellipse estimate has been seeded from a confident block
+    /// yet (so the first lock snaps instead of slewing from zero).
+    ellipse_primed: bool,
+    /// Master enable for the ellipse auto-correction (default on). Tests
+    /// of the raw decode can disable it to exercise the uncorrected path.
+    ellipse_correction: bool,
+    /// Absolute-position tracker (M6), present only on a decoder built
+    /// with [`Decoder::with_absolute`]. Fed per-sample from the
+    /// `process` loop; its LUT is allocated at construction, off-RT.
+    absolute: Option<AbsoluteTracker>,
 }
 
 impl Decoder {
@@ -144,7 +212,101 @@ impl Decoder {
             prev_im: 0.0,
             primed: false,
             position_secs: 0.0,
+            whitening: IDENTITY_WHITENING,
+            ellipse_er: 0.0,
+            ellipse_ec: 0.0,
+            ellipse_primed: false,
+            ellipse_correction: true,
+            absolute: None,
         }
+    }
+
+    /// Like [`Decoder::new`], but with **absolute-position decoding**
+    /// enabled (M6). Builds the format's position LUT — allocates a few
+    /// MB, so this MUST run off the audio thread; `process` itself
+    /// stays alloc-free. For a format whose bitstream we don't decode
+    /// (Traktor MK2, and MK1 until Phase 2) this silently degrades to
+    /// a plain relative decoder — `abs_position_frames` stays `None`.
+    ///
+    /// # Panics
+    /// `sample_rate` must be positive.
+    #[must_use]
+    pub fn with_absolute(format: Format, sample_rate: f32) -> Self {
+        let mut dec = Self::new(format, sample_rate);
+        dec.absolute = AbsoluteTracker::new(format, sample_rate);
+        dec
+    }
+
+    /// Whether the absolute tracker is currently locked to the LFSR
+    /// bitstream. Diagnostic.
+    #[must_use]
+    pub fn absolute_locked(&self) -> bool {
+        self.absolute.as_ref().is_some_and(AbsoluteTracker::locked)
+    }
+
+    /// Absolute-tracker acquisition diagnostics `(crossings, lut_hits,
+    /// max_consecutive_hits)`, or `None` when absolute decoding is off.
+    #[must_use]
+    pub fn absolute_debug(&self) -> Option<(u64, u64, u32)> {
+        self.absolute
+            .as_ref()
+            .map(AbsoluteTracker::debug_acquisition)
+    }
+
+    /// The locked Serato variant's name (e.g. `"serato_cd"`) when the
+    /// absolute tracker has auto-detected one, else `None`.
+    #[must_use]
+    pub fn absolute_variant(&self) -> Option<&'static str> {
+        self.absolute
+            .as_ref()
+            .and_then(AbsoluteTracker::locked_variant_name)
+    }
+
+    /// First 48 `(bit_mean, sliced_bit)` pairs from the absolute tracker.
+    #[must_use]
+    pub fn absolute_first_cycles(&self) -> Option<([f32; 48], u64)> {
+        self.absolute
+            .as_ref()
+            .map(AbsoluteTracker::debug_first_cycles)
+    }
+
+    /// Install a channel-whitening matrix (from [`compute_whitening`]).
+    /// Applied to every subsequent decoded sample. RT-safe — just
+    /// stores four `f64`s.
+    pub fn set_whitening(&mut self, whitening: [[f64; 2]; 2]) {
+        self.whitening = whitening;
+    }
+
+    /// Reset whitening to identity (no channel correction).
+    pub fn clear_whitening(&mut self) {
+        self.whitening = IDENTITY_WHITENING;
+    }
+
+    /// Enable/disable the azimuth auto-correction (default enabled).
+    pub fn set_ellipse_correction(&mut self, on: bool) {
+        self.ellipse_correction = on;
+    }
+
+    /// The current residual-ellipse rate-distortion factor `R` (1.0 = no
+    /// residual). Diagnostic.
+    #[must_use]
+    pub fn ellipse_factor(&self) -> f64 {
+        (1.0 - self.ellipse_er * self.ellipse_er - self.ellipse_ec * self.ellipse_ec)
+            .max(1e-6)
+            .sqrt()
+    }
+
+    /// The currently-installed whitening matrix.
+    #[must_use]
+    pub fn whitening(&self) -> [[f64; 2]; 2] {
+        self.whitening
+    }
+
+    /// Calibrate this deck from a captured buffer of its timecode
+    /// signal (a clean spin of the control record). Computes and
+    /// installs the channel-whitening matrix. See [`compute_whitening`].
+    pub fn calibrate(&mut self, stereo: &[f32]) {
+        self.whitening = compute_whitening(stereo);
     }
 
     /// Reset accumulated position and the prev-sample register. Useful
@@ -154,6 +316,9 @@ impl Decoder {
         self.prev_im = 0.0;
         self.primed = false;
         self.position_secs = 0.0;
+        if let Some(t) = self.absolute.as_mut() {
+            t.reset();
+        }
     }
 
     /// Cumulative position in seconds-at-unity-speed.
@@ -177,6 +342,14 @@ impl Decoder {
                 position_secs: self.position_secs,
                 amplitude: 0.0,
                 confidence: 0.0,
+                abs_position_frames: self
+                    .absolute
+                    .as_ref()
+                    .and_then(AbsoluteTracker::position_frames),
+                abs_confidence: self
+                    .absolute
+                    .as_ref()
+                    .map_or(0.0, AbsoluteTracker::confidence),
             };
         }
 
@@ -185,18 +358,30 @@ impl Decoder {
         // both for amplitude RMS and confidence normalization.
         let mut acc_re = 0.0_f64;
         let mut acc_im = 0.0_f64;
-        let mut mag_acc = 0.0_f64;
+        // Per-channel power Σ re², Σ im² and the inter-channel
+        // cross-correlation Σ re·im — the residual ellipse's covariance,
+        // used to linearise the rate (see the post-loop correction).
+        let mut sq_re_acc = 0.0_f64;
+        let mut sq_im_acc = 0.0_f64;
+        let mut cross_acc = 0.0_f64;
         let mut samples_consumed = 0_usize;
 
+        let w = self.whitening;
         for frame in stereo.chunks_exact(2) {
             // Serato CV02 convention (verified against a real cartridge
             // on an SL3): file ch0 ≈ A·sin(φ), file ch1 ≈ A·cos(φ).
             // Map ch1 → real, ch0 → imag so `s = re + j·im = A·e^(jφ)`
             // rotates the *positive* direction at forward play.
-            let im = f64::from(frame[0]);
-            let re = f64::from(frame[1]);
+            let re_raw = f64::from(frame[1]);
+            let im_raw = f64::from(frame[0]);
+            // Channel whitening (identity until calibrated) corrects the
+            // cartridge ellipse before the phase-difference.
+            let re = w[0][0] * re_raw + w[0][1] * im_raw;
+            let im = w[1][0] * re_raw + w[1][1] * im_raw;
             // |s|² = re² + im²; Pythagorean amplitude regardless of phase.
-            mag_acc += re * re + im * im;
+            sq_re_acc += re * re;
+            sq_im_acc += im * im;
+            cross_acc += re * im;
 
             if self.primed {
                 // s_curr · conj(s_prev) = (re + j·im)·(prev_re − j·prev_im)
@@ -209,6 +394,13 @@ impl Decoder {
             self.prev_re = re;
             self.prev_im = im;
             self.primed = true;
+            // Absolute tracker (M6) decodes the bitstream the xwax way,
+            // straight off the **raw** channels (ch0 = frame[0], ch1 =
+            // frame[1]) — its own per-channel zero-crossing detectors do
+            // the timing; whitening would only smear them. Alloc-free.
+            if let Some(t) = self.absolute.as_mut() {
+                t.on_sample(f64::from(frame[0]), f64::from(frame[1]));
+            }
         }
 
         // Block-level instantaneous frequency from the coherent sum's
@@ -225,6 +417,8 @@ impl Decoder {
         let nominal = f64::from(self.carrier_hz);
         let rate = inst_freq_hz / nominal;
 
+        let mag_acc = sq_re_acc + sq_im_acc;
+
         // Amplitude is RMS of |s| over the block. Note: |s|² = L²+R²
         // is *constant* (= A²) for a perfect quadrature signal, so RMS
         // here ≈ A, not A/√2 — which is what we want as the "carrier
@@ -238,12 +432,37 @@ impl Decoder {
         // For pure quadrature, |s_curr·conj(s_prev)| = |s|², so this
         // reduces to |sum|/Σ|s|² ≈ 1.0. Noise drives it toward 0.
         let coherent_mag = (acc_re * acc_re + acc_im * acc_im).sqrt();
-        let confidence = if mag_acc > 1e-12 {
+        let coherence = if mag_acc > 1e-12 {
             #[allow(clippy::cast_possible_truncation)]
             ((coherent_mag / mag_acc).clamp(0.0, 1.0) as f32)
         } else {
             0.0
         };
+
+        // Self-calibrating residual-ellipse correction — see
+        // `ellipse_corrected_rate`. Skipped on a scratch (huge
+        // phase_diff, where `tan` blows up and we don't trust the rate
+        // anyway) and on low-coherence blocks.
+        let rate = if self.ellipse_correction && coherence > 0.9 && phase_diff.abs() < 1.4 {
+            self.ellipse_corrected_rate(
+                phase_diff, rate, nominal, dt, sq_re_acc, sq_im_acc, cross_acc, mag_acc,
+            )
+        } else {
+            rate
+        };
+        // Phase coherence alone is *not* carrier presence: a perfectly
+        // **static** phasor — a stopped stylus, a DC offset, or mains hum
+        // — is maximally coherent (s_curr ≈ s_prev ⇒ |Σ s·conj(s_prev)|
+        // ≈ Σ|s|²), so coherence reads ~1.0 even with the platter still
+        // and the level near zero. That produced the "confidence high
+        // with no amplitude" reading. Gate coherence by a carrier-
+        // presence ramp on amplitude so a silent / very-low-level input
+        // reports low confidence; a healthy carrier (~0.1–0.5, well above
+        // the floor) is unaffected.
+        let presence = ((amplitude - CARRIER_PRESENCE_OFF)
+            / (CARRIER_PRESENCE_FULL - CARRIER_PRESENCE_OFF))
+            .clamp(0.0, 1.0);
+        let confidence = coherence * presence;
 
         // Integrate position. Block duration in seconds at the engine
         // SR (NOT scaled by rate — `rate` already encodes how fast the
@@ -260,8 +479,162 @@ impl Decoder {
             position_secs: self.position_secs,
             amplitude,
             confidence,
+            abs_position_frames: self
+                .absolute
+                .as_ref()
+                .and_then(AbsoluteTracker::position_frames),
+            abs_confidence: self
+                .absolute
+                .as_ref()
+                .map_or(0.0, AbsoluteTracker::confidence),
         }
     }
+
+    /// Self-calibrating residual-ellipse rate correction. After
+    /// whitening, any residual ellipse the carrier traces biases the
+    /// rate by a factor `R` — `measured_ω = atan(R·tan(ω_true))`. We
+    /// read the ellipse straight off the per-block covariance: `er`
+    /// (gain imbalance) and `ec` (azimuth), EMA them on confident
+    /// blocks (primed on first lock), form `R = √(1 − er² − ec²)`, and
+    /// divide it back out to linearise the rate across the whole pitch
+    /// range. Self-calibrating — no sweep or gesture; it learns as the
+    /// platter moves.
+    #[allow(clippy::too_many_arguments)] // private per-block scratch
+    fn ellipse_corrected_rate(
+        &mut self,
+        phase_diff: f64,
+        rate: f64,
+        nominal: f64,
+        dt: f64,
+        sq_re_acc: f64,
+        sq_im_acc: f64,
+        cross_acc: f64,
+        mag_acc: f64,
+    ) -> f64 {
+        if mag_acc > 1e-12 {
+            let er = (sq_re_acc - sq_im_acc) / mag_acc;
+            let ec = 2.0 * cross_acc / mag_acc;
+            if self.ellipse_primed {
+                // The residual ellipse is steady at a given pitch, so a
+                // fairly fast pole is safe (and downstream rate
+                // smoothing soaks up any per-block noise). Fast enough
+                // that it converges to the new pitch's ellipse within
+                // a fraction of a second — otherwise a reading taken
+                // soon after a pitch move retains the *previous*
+                // pitch's azimuth (opposite sign), skewing the extremes
+                // asymmetrically.
+                const ELLIPSE_ALPHA: f64 = 0.15;
+                self.ellipse_er += ELLIPSE_ALPHA * (er - self.ellipse_er);
+                self.ellipse_ec += ELLIPSE_ALPHA * (ec - self.ellipse_ec);
+            } else {
+                self.ellipse_er = er;
+                self.ellipse_ec = ec;
+                self.ellipse_primed = true;
+            }
+        }
+        let omega_nominal = std::f64::consts::TAU * nominal * dt;
+        let r = (1.0 - self.ellipse_er * self.ellipse_er - self.ellipse_ec * self.ellipse_ec)
+            .clamp(1e-6, 1.0)
+            .sqrt();
+        if omega_nominal > 0.0 {
+            (phase_diff.tan() / r).atan() / omega_nominal
+        } else {
+            rate
+        }
+    }
+}
+
+/// Identity whitening — no channel correction.
+pub const IDENTITY_WHITENING: [[f64; 2]; 2] = [[1.0, 0.0], [0.0, 1.0]];
+
+/// Compute a channel-whitening matrix from a buffer of interleaved
+/// stereo timecode (one clean spin of the control record).
+///
+/// Measures the 2×2 covariance of `(ch1, ch0)` and returns its
+/// power-preserving inverse square root, which maps the cartridge's
+/// elliptical Lissajous back to a circle — correcting gain imbalance,
+/// quadrature-phase (azimuth) error, and crosstalk in one transform.
+/// Feeding the result to [`Decoder::set_whitening`] removes the
+/// `2G/(G²+1)` rate bias an uncorrected cartridge introduces.
+///
+/// Returns [`IDENTITY_WHITENING`] for an empty or degenerate buffer
+/// (no usable signal), so an uncalibratable capture is a safe no-op.
+#[must_use]
+pub fn compute_whitening(stereo: &[f32]) -> [[f64; 2]; 2] {
+    let n = stereo.len() / 2;
+    let (mut saa, mut sbb, mut sab) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut sre, mut sim) = (0.0_f64, 0.0_f64);
+    for frame in stereo.chunks_exact(2) {
+        let re = f64::from(frame[1]); // ch1
+        let im = f64::from(frame[0]); // ch0
+        saa += re * re;
+        sbb += im * im;
+        sab += re * im;
+        sre += re;
+        sim += im;
+    }
+    whitening_from_covariance(saa, sbb, sab, sre, sim, n)
+}
+
+/// Whitening matrix from **running covariance sums** — the same math as
+/// [`compute_whitening`] but from accumulated `Σre²`, `Σim²`, `Σre·im`
+/// plus the channel means `Σre`, `Σim` over `n` frames (`re = ch1`,
+/// `im = ch0`). Lets the audio thread calibrate incrementally without
+/// buffering a window. Returns [`IDENTITY_WHITENING`] for an empty or
+/// degenerate accumulation.
+///
+/// The means are used to **DC-remove** the covariance: a real cartridge
+/// / preamp often sits on a small DC offset, and folding that offset
+/// into the raw second moments biases the cross term `sab`, which skews
+/// the whitening so forward and reverse pitch get corrected by different
+/// amounts (a reported ±pitch asymmetry). Subtracting the per-channel
+/// mean measures the AC carrier ellipse only. For a clean,
+/// zero-mean signal the subtraction is a no-op.
+#[must_use]
+#[allow(clippy::many_single_char_names)] // 2×2 linear-algebra scratch
+pub fn whitening_from_covariance(
+    saa: f64,
+    sbb: f64,
+    sab: f64,
+    sre: f64,
+    sim: f64,
+    n: usize,
+) -> [[f64; 2]; 2] {
+    if n == 0 {
+        return IDENTITY_WHITENING;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / n as f64;
+    let mre = sre * inv;
+    let mim = sim * inv;
+    // Mean-subtracted covariance [[a, b], [b, c]].
+    let a = saa * inv - mre * mre;
+    let b = sab * inv - mre * mim;
+    let c = sbb * inv - mim * mim;
+    let det = a * c - b * b;
+    if !det.is_finite() || det <= 1e-18 || !a.is_finite() || !c.is_finite() {
+        return IDENTITY_WHITENING;
+    }
+    let tr = a + c;
+    let s = ((a - c) * (a - c) + 4.0 * b * b).sqrt();
+    // Scale to preserve average carrier power (= trace) after whitening.
+    let k = (0.5 * tr).sqrt();
+    if s < 1e-12 {
+        // Already isotropic (a circle) — a pure scalar normalisation.
+        let f = k / (0.5 * tr).sqrt();
+        return [[f, 0.0], [0.0, f]];
+    }
+    // Inverse square root of the covariance via Sylvester's formula.
+    let l1 = 0.5 * (tr + s);
+    let l2 = 0.5 * (tr - s);
+    let f1 = 1.0 / l1.sqrt();
+    let f2 = 1.0 / l2.sqrt();
+    let d = l1 - l2; // = s
+    let off = (f1 * b - f2 * b) / d;
+    [
+        [k * (f1 * (a - l2) - f2 * (a - l1)) / d, k * off],
+        [k * off, k * (f1 * (c - l2) - f2 * (c - l1)) / d],
+    ]
 }
 
 #[cfg(test)]
@@ -296,6 +669,216 @@ mod tests {
         );
         assert!(out.confidence > 0.99, "confidence = {}", out.confidence);
         assert!((out.amplitude - 0.5).abs() < 0.01);
+    }
+
+    /// Scale one channel — emulates a cartridge whose L/R gains don't
+    /// match, warping the timecode Lissajous from a circle to an
+    /// ellipse.
+    fn imbalance_ch1(buf: &mut [f32], g: f32) {
+        for frame in buf.chunks_exact_mut(2) {
+            frame[1] *= g;
+        }
+    }
+
+    #[test]
+    fn channel_imbalance_biases_rate_low_and_whitening_removes_it() {
+        let sr = 48_000.0_f32;
+        let g = 1.26_f32; // ≈ 2 dB imbalance
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 1.0, 0.5); // clean unity carrier
+        imbalance_ch1(&mut buf, g);
+
+        // Uncalibrated AND with the self-calibrating ellipse correction
+        // disabled: rate reads LOW by ≈ 2G/(G²+1) — the user's "−2.3 %"
+        // reproduced from a known imbalance. (With the correction on — the
+        // default — this same imbalance is now fixed automatically; see
+        // `ellipse_correction_fixes_gain_imbalance_without_calibration`.)
+        let mut dec = Decoder::new(Format::SeratoCv02, sr);
+        dec.set_ellipse_correction(false);
+        let raw = dec.process(&buf);
+        let predicted = 2.0 * f64::from(g) / (f64::from(g) * f64::from(g) + 1.0);
+        assert!(predicted < 0.99, "sanity: predicted bias {predicted}");
+        assert!(
+            (raw.rate - predicted).abs() < 0.01,
+            "raw rate {} should match 2G/(G²+1) = {predicted}",
+            raw.rate
+        );
+
+        // Calibrate from the same signal → rate unbiased, scope circular.
+        let mut dec2 = Decoder::new(Format::SeratoCv02, sr);
+        dec2.calibrate(&buf);
+        let fixed = dec2.process(&buf);
+        assert!(
+            (fixed.rate - 1.0).abs() < RATE_TOL,
+            "whitened rate {} should be ≈ 1.0",
+            fixed.rate
+        );
+        assert!(
+            fixed.confidence > 0.99,
+            "whitened confidence {}",
+            fixed.confidence
+        );
+    }
+
+    #[test]
+    fn ellipse_correction_fixes_gain_imbalance_without_calibration() {
+        // The self-calibrating ellipse correction (default on) removes a
+        // gain-imbalance bias with no whitening calibration at all — the
+        // `R = 2g/(1+g²)` factor is measured straight off the covariance.
+        let sr = 48_000.0_f32;
+        let g = 1.26_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 1.0, 0.5);
+        imbalance_ch1(&mut buf, g);
+        let mut dec = Decoder::new(Format::SeratoCv02, sr);
+        let out = dec.process(&buf);
+        assert!(
+            (out.rate - 1.0).abs() < RATE_TOL,
+            "auto-corrected rate {} should be ≈ 1.0",
+            out.rate
+        );
+    }
+
+    #[test]
+    fn whitening_is_noop_on_a_balanced_signal() {
+        // A clean (already circular) signal should calibrate to ≈ identity.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 1.0, 0.5);
+        let w = compute_whitening(&buf);
+        // Off-diagonals ≈ 0, diagonals ≈ equal (a scalar) — no skew.
+        assert!(
+            w[0][1].abs() < 1e-3 && w[1][0].abs() < 1e-3,
+            "off-diag {w:?}"
+        );
+        assert!((w[0][0] - w[1][1]).abs() < 1e-3, "diag mismatch {w:?}");
+    }
+
+    #[test]
+    fn frequency_dependent_azimuth_causes_quadratic_pitch_droop() {
+        // Reproduces the field bug: a calibrated deck reads ~0% at
+        // nominal but droops at the pitch extremes (observed +8%→+5%,
+        // −8%→−12%). Cause: the cartridge's inter-channel quadrature
+        // phase (azimuth) varies with frequency, so a static whitening
+        // (corrected at the calibration frequency) leaves a residual
+        // azimuth proportional to pitch — a symmetric quadratic droop,
+        // invisible to the coherence metric at a 1 kHz carrier.
+        let sr = 48_000.0_f32;
+        let carrier = 1000.0_f64;
+        let beta = 3.0_f64; // radians of azimuth per unit pitch
+        for &p in &[-0.08_f64, 0.0, 0.08] {
+            let f = carrier * (1.0 + p);
+            let w = std::f64::consts::TAU * f / f64::from(sr);
+            let az = beta * p; // residual azimuth after nominal calibration
+            let n = 24_000;
+            let mut buf = vec![0.0f32; n * 2];
+            for k in 0..n {
+                #[allow(clippy::cast_precision_loss)]
+                let phi = w * k as f64;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    buf[2 * k] = (phi + az).sin() as f32; // ch0, azimuth error
+                    buf[2 * k + 1] = phi.cos() as f32; // ch1
+                }
+            }
+            let mut dec = Decoder::new(Format::SeratoCv02, sr);
+            dec.set_ellipse_correction(false); // show the raw, uncorrected bug
+            let out = dec.process(&buf);
+            let measured_pitch = (out.rate - 1.0) * 100.0;
+            // Coherence stays ~1.0 (the metric is blind to azimuth at a
+            // 1 kHz carrier) while the rate droops — exactly the field
+            // signature. At ±8% the measured pitch is pulled toward zero
+            // by ~3%, asymmetrically (more on the slow side), matching
+            // the reported +8%→+5% / −8%→−12%.
+            assert!(
+                out.confidence > 0.99,
+                "coherence stays high: {}",
+                out.confidence
+            );
+            if p > 0.0 {
+                assert!(
+                    measured_pitch < p * 100.0 - 2.0,
+                    "expected droop at +pitch, got {measured_pitch:.2}"
+                );
+            } else if p < 0.0 {
+                assert!(
+                    measured_pitch < p * 100.0 - 2.0,
+                    "expected larger droop at -pitch, got {measured_pitch:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn azimuth_auto_correction_linearises_pitch() {
+        // The self-calibrating azimuth correction (default on) reads the
+        // residual quadrature error straight off the carrier and inverts
+        // the droop, so the measured pitch tracks the platter linearly
+        // across the range — matching Traktor's exact ±8 % instead of our
+        // +5 % / −12 % droop. No slope/sweep is supplied.
+        let sr = 48_000.0_f32;
+        let carrier = 1000.0_f64;
+        let beta = 3.0_f64;
+        for &p in &[-0.08_f64, -0.04, 0.0, 0.04, 0.08] {
+            let f = carrier * (1.0 + p);
+            let w = std::f64::consts::TAU * f / f64::from(sr);
+            let az = beta * p;
+            let n = 24_000;
+            let mut buf = vec![0.0f32; n * 2];
+            for k in 0..n {
+                #[allow(clippy::cast_precision_loss)]
+                let phi = w * k as f64;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    buf[2 * k] = (phi + az).sin() as f32;
+                    buf[2 * k + 1] = phi.cos() as f32;
+                }
+            }
+            let mut dec = Decoder::new(Format::SeratoCv02, sr);
+            let out = dec.process(&buf);
+            let measured_pitch = (out.rate - 1.0) * 100.0;
+            assert!(
+                (measured_pitch - p * 100.0).abs() < 0.5,
+                "auto-corrected pitch {measured_pitch:.2}% should track {:.1}%",
+                p * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn whitening_is_dc_offset_invariant() {
+        // Calibration must measure the AC carrier ellipse, not the
+        // operating point: a per-channel DC offset (from the cartridge /
+        // preamp) must not change the computed whitening. Pre-fix the
+        // offset leaked into the cross term and skewed the correction so
+        // forward and reverse pitch were scaled differently (the reported
+        // ±pitch asymmetry on a calibrated deck).
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 8_000 * 2];
+        gen.render(&mut buf, 1.0, 0.4);
+        let w_clean = compute_whitening(&buf);
+
+        let mut biased = buf.clone();
+        for frame in biased.chunks_exact_mut(2) {
+            frame[0] += 0.10; // ch0 DC
+            frame[1] -= 0.07; // ch1 DC
+        }
+        let w_biased = compute_whitening(&biased);
+
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (w_clean[i][j] - w_biased[i][j]).abs() < 2e-3,
+                    "whitening[{i}][{j}] drifted with a DC offset: clean {} vs biased {}",
+                    w_clean[i][j],
+                    w_biased[i][j]
+                );
+            }
+        }
     }
 
     #[test]
@@ -355,6 +938,26 @@ mod tests {
     }
 
     #[test]
+    fn static_low_level_input_is_not_confident() {
+        // A stationary, low-level input — a stopped stylus, a DC offset,
+        // or mains hum — is perfectly phase-*coherent* (s_curr ≈ s_prev)
+        // yet is NOT a live carrier. The amplitude presence gate must
+        // keep confidence low so the signal-quality readout doesn't show
+        // a misleading "1.00" with the platter still and the level near
+        // zero (the reported regression).
+        let mut dec = Decoder::new(Format::SeratoCv02, 48_000.0);
+        // Constant DC well below the carrier-presence floor (0.02).
+        let buf = vec![0.005f32; 4_800 * 2];
+        let out = dec.process(&buf);
+        assert!(out.amplitude < 0.02, "amplitude = {}", out.amplitude);
+        assert!(
+            out.confidence < 0.3,
+            "static low-level input should read low confidence, got {}",
+            out.confidence
+        );
+    }
+
+    #[test]
     fn position_integrates_at_unity() {
         // 1 second at unity rate should advance position by 1 second.
         let sr = 48_000.0_f32;
@@ -410,6 +1013,8 @@ mod tests {
             position_secs: 0.0,
             amplitude: 0.0,
             confidence: 0.0,
+            abs_position_frames: None,
+            abs_confidence: 0.0,
         };
         for _ in 0..(9_600 / 64) {
             gen_small.render(&mut small, 1.0, 0.5);
@@ -577,6 +1182,84 @@ mod tests {
                 out.confidence
             );
         }
+    }
+
+    #[test]
+    fn default_decoder_reports_no_absolute_position() {
+        let out = roundtrip(1.0, 4_800);
+        assert_eq!(out.abs_position_frames, None);
+        assert!(out.abs_confidence < f32::EPSILON);
+    }
+
+    #[test]
+    fn with_absolute_decodes_position_once_locked() {
+        // Full-pipeline M6 check: AM-modulated generator → decoder with
+        // absolute enabled. After enough signal to acquire, the output
+        // carries an absolute position whose per-block delta matches
+        // the rendered rate exactly.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(Format::SeratoCv02, 0.15));
+        let mut dec = Decoder::with_absolute(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2]; // 100 ms blocks
+        gen.render(&mut buf, 1.0, 0.5);
+        let first = dec.process(&buf);
+        // Relative output unaffected by the AM modulation.
+        assert!((first.rate - 1.0).abs() < RATE_TOL, "rate {}", first.rate);
+        assert!(first.confidence > 0.9);
+
+        gen.render(&mut buf, 1.0, 0.5);
+        let second = dec.process(&buf);
+        let p0 = second.abs_position_frames.expect("locked after 200 ms");
+        assert!(second.abs_confidence > 0.9);
+
+        gen.render(&mut buf, 1.0, 0.5);
+        let third = dec.process(&buf);
+        let p1 = third.abs_position_frames.expect("stays locked");
+        // One 100 ms block at unity = 4 800 input frames of groove.
+        assert!(
+            (p1 - p0 - 4_800.0).abs() < 1.0,
+            "abs delta {} should be ≈ 4800 frames",
+            p1 - p0
+        );
+    }
+
+    #[test]
+    fn with_absolute_falls_back_to_relative_for_mk2() {
+        // MK2's bitstream isn't decoded — `with_absolute` must degrade
+        // to a plain relative decoder, not panic or mis-report.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::TraktorMk2, sr);
+        let mut dec = Decoder::with_absolute(Format::TraktorMk2, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 1.0, 0.5);
+        let out = dec.process(&buf);
+        assert!((out.rate - 1.0).abs() < RATE_TOL);
+        assert_eq!(out.abs_position_frames, None);
+        assert!(!dec.absolute_locked());
+    }
+
+    #[test]
+    fn process_with_absolute_is_alloc_free() {
+        // The LUT allocation happens in `with_absolute`; the hot path
+        // must stay clean with the tracker running and locked.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        gen.enable_absolute(Format::SeratoCv02, 0.4);
+        let mut dec = Decoder::with_absolute(Format::SeratoCv02, sr);
+        let mut big = vec![0.0f32; 24_000 * 2];
+        gen.render(&mut big, 1.0, 0.5);
+        dec.process(&big); // acquire lock outside the assertion
+        assert!(dec.absolute_locked());
+
+        let mut buf = vec![0.0f32; 64 * 2];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..100 {
+                gen.render(&mut buf, 1.0, 0.5);
+                let _ = dec.process(&buf);
+            }
+        });
+        assert!(dec.absolute_locked());
     }
 
     #[test]

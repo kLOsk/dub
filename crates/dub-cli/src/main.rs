@@ -665,8 +665,16 @@ fn analyze_cmd(args: &[String]) -> Result<()> {
 }
 
 fn decode_timecode_cmd(args: &[String]) -> Result<()> {
-    let (input, synthetic, window_ms, max_lines, format) = decode_timecode::parse_args(args)?;
-    decode_timecode::run(input.as_deref(), synthetic, window_ms, max_lines, format)
+    let (input, synthetic, sweep, window_ms, max_lines, format) =
+        decode_timecode::parse_args(args)?;
+    decode_timecode::run(
+        input.as_deref(),
+        synthetic,
+        sweep,
+        window_ms,
+        max_lines,
+        format,
+    )
 }
 
 /// One loaded deck ready to be configured into the engine.
@@ -1110,7 +1118,9 @@ impl ScheduledEvent {
             } => handle.deck(deck as usize).seek(pos_frames)?,
             Self::HotSwap { deck, source, .. } => handle
                 .deck(deck as usize)
-                .load(source)
+                // Unity gain: the CLI has no library loudness to
+                // normalize against (auto-gain is an app-path feature).
+                .load(source, 1.0)
                 .map_err(|(e, _arc)| e)
                 .context("hot-load command rejected")?,
             Self::SetMasterGain { gain, .. } => handle.set_master_gain(gain)?,

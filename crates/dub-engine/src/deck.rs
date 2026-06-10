@@ -13,7 +13,7 @@
 //! resampling for ordinary playback (with key-lock disabled) lands later
 //! when we evaluate whether linear is audibly insufficient.
 
-use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -117,6 +117,100 @@ pub struct DeckSharedState {
     /// for tests and offline-render callers that don't wire the
     /// CoreAudio timestamp through.
     publish_host_ns_override: AtomicU64,
+    /// Timecode signal-quality telemetry, published by the audio
+    /// thread from `drive_timecode_inputs` each block (the deck's
+    /// decoder `DecodeOutput` + `LiftPolicy` state). Read lock-free
+    /// by the FFI to drive the deck-header tracking dot + the
+    /// signal-quality panel. Plain relaxed atomics — a display value
+    /// tearing across one block is invisible at 60 fps, so no seqlock.
+    tc_confidence_bits: AtomicU32,
+    tc_amplitude_bits: AtomicU32,
+    /// 0 = no timecode input, 1 = engaged/clean, 2 = engaged/degraded
+    /// (in the sticky-disengage window), 3 = disengaged (lifted /
+    /// scratching / dropout). See [`TimecodeTelemetry`].
+    tc_lock_state: AtomicU8,
+    tc_has_input: AtomicBool,
+    /// Heavily low-passed playback rate for the **pitch / live-BPM
+    /// display only** (f64 bits). The raw per-block decoded rate is
+    /// far too jittery to show as a tempo — a ±1 % wobble reads as the
+    /// whole-number BPM jumping. The audio thread EMA-smooths it before
+    /// publishing here so the readout is stable to ~0.1 BPM, the way
+    /// Serato / Traktor present it. Never feeds playback (that uses the
+    /// raw rate in the position seqlock).
+    tc_display_rate_bits: AtomicU64,
+    /// Auto source-detection + calibration state for the deck-header
+    /// Internal/Timecode switch + status dot. `control_mode`: 0
+    /// Internal · 1 Timecode. `source_class`: 0 Silence · 1 Timecode ·
+    /// 2 Record. Plus whether a whitening calibration is installed /
+    /// in-progress.
+    control_mode_bits: AtomicU8,
+    source_class_bits: AtomicU8,
+    calibrated_flag: AtomicBool,
+    calibrating_flag: AtomicBool,
+    /// Whether the user has pinned the control mode (the deck-header
+    /// switch), suppressing auto source-detection until released. Lets
+    /// the UI distinguish a *pinned* TIMECODE/INTERNAL from one the
+    /// auto-classifier merely landed on.
+    control_override_flag: AtomicBool,
+    /// Diagnostic: the installed channel-whitening matrix (row-major
+    /// `[w00, w01, w10, w11]`, f32 bits) and a counter that bumps each
+    /// time a new calibration installs. Lets the signal-quality log show
+    /// what calibration actually produced — a near-identity / degenerate
+    /// result means the cartridge ellipse went uncorrected.
+    whitening_bits: [AtomicU32; 4],
+    calibration_seq: AtomicU32,
+    /// M6 absolute-position diagnostics: whether the LFSR bitstream
+    /// tracker is locked, and the decoded groove position in seconds
+    /// of record time (input frames / input SR). Display/log only —
+    /// the deck is *driven* by per-block deltas, never by this value.
+    tc_abs_locked: AtomicBool,
+    tc_abs_position_secs_bits: AtomicU64,
+}
+
+/// Lock-free snapshot of a deck's timecode signal health. Returned by
+/// [`DeckSharedState::load_timecode_telemetry`].
+///
+/// The four bools are independent telemetry flags published per block,
+/// not a state machine — a deck can be e.g. calibrated *and* overridden
+/// *and* have an input simultaneously. Collapsing them into enums would
+/// obscure the wire format the FFI mirrors, so the `excessive_bools`
+/// lint is suppressed here deliberately.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimecodeTelemetry {
+    /// Decoder coherence confidence [0, 1]; 1.0 = pure quadrature.
+    pub confidence: f32,
+    /// Decoder RMS amplitude (~0.1–0.5 for a healthy SL3 carrier).
+    pub amplitude: f32,
+    /// 0 none · 1 clean lock · 2 degraded (sticky window) · 3 disengaged.
+    pub lock_state: u8,
+    /// Whether a timecode input is attached to this deck at all.
+    pub has_input: bool,
+    /// Heavily smoothed playback rate for the pitch / live-BPM display
+    /// (1.0 = unity). Display-only; never the playback rate.
+    pub display_rate: f64,
+    /// 0 Internal · 1 Timecode — how the deck is currently driven.
+    pub control_mode: u8,
+    /// 0 Silence · 1 Timecode · 2 Record — auto source classification.
+    pub source_class: u8,
+    /// Whether a channel-whitening calibration is installed.
+    pub calibrated: bool,
+    /// Whether a calibration capture is in progress.
+    pub calibrating: bool,
+    /// Whether the user has pinned the control mode (switch override),
+    /// vs. the mode being chosen by auto source-detection.
+    pub overridden: bool,
+    /// Diagnostic: installed whitening matrix `[w00, w01, w10, w11]`
+    /// (identity until first calibration).
+    pub whitening: [f32; 4],
+    /// Diagnostic: count of calibrations installed since attach.
+    pub calibration_seq: u32,
+    /// M6: whether the absolute LFSR position tracker is locked on the
+    /// bitstream (bit-exact velocity + drift-free playhead active).
+    pub abs_locked: bool,
+    /// M6: decoded absolute groove position in seconds of record time.
+    /// Meaningful only while `abs_locked`; diagnostic/log only.
+    pub abs_position_secs: f64,
 }
 
 /// Process-local monotonic clock origin shared by the audio
@@ -165,6 +259,25 @@ impl DeckSharedState {
             rate_bits: AtomicU64::new(0.0f64.to_bits()),
             has_track: AtomicBool::new(false),
             publish_host_ns_override: AtomicU64::new(0),
+            tc_confidence_bits: AtomicU32::new(0.0f32.to_bits()),
+            tc_amplitude_bits: AtomicU32::new(0.0f32.to_bits()),
+            tc_lock_state: AtomicU8::new(0),
+            tc_has_input: AtomicBool::new(false),
+            tc_display_rate_bits: AtomicU64::new(1.0f64.to_bits()),
+            control_mode_bits: AtomicU8::new(0),
+            source_class_bits: AtomicU8::new(0),
+            calibrated_flag: AtomicBool::new(false),
+            calibrating_flag: AtomicBool::new(false),
+            control_override_flag: AtomicBool::new(false),
+            whitening_bits: [
+                AtomicU32::new(1.0f32.to_bits()),
+                AtomicU32::new(0.0f32.to_bits()),
+                AtomicU32::new(0.0f32.to_bits()),
+                AtomicU32::new(1.0f32.to_bits()),
+            ],
+            calibration_seq: AtomicU32::new(0),
+            tc_abs_locked: AtomicBool::new(false),
+            tc_abs_position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -180,11 +293,122 @@ impl DeckSharedState {
         self.at_end.store(false, Ordering::Relaxed);
         self.is_panic_play.store(false, Ordering::Relaxed);
         self.has_track.store(false, Ordering::Relaxed);
+        self.tc_confidence_bits
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.tc_amplitude_bits
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.tc_lock_state.store(0, Ordering::Relaxed);
+        self.tc_has_input.store(false, Ordering::Relaxed);
+        self.tc_display_rate_bits
+            .store(1.0f64.to_bits(), Ordering::Relaxed);
+        self.control_mode_bits.store(0, Ordering::Relaxed);
+        self.source_class_bits.store(0, Ordering::Relaxed);
+        self.calibrated_flag.store(false, Ordering::Relaxed);
+        self.calibrating_flag.store(false, Ordering::Relaxed);
+        self.control_override_flag.store(false, Ordering::Relaxed);
+        self.tc_abs_locked.store(false, Ordering::Relaxed);
+        self.tc_abs_position_secs_bits
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+        self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0);
         // Bring the seqlock-protected publish triple back to a
         // clean baseline (zero playhead, zero rate, host time at
         // "now" so no extrapolation kicks in if the snapshot
         // reader arrives before the next audio block).
         self.publish_position_secs(0.0, 0.0);
+    }
+
+    /// Publish this deck's timecode signal health (audio-thread
+    /// writer, called from `drive_timecode_inputs` each block).
+    /// A handful of relaxed stores; RT-safe (no alloc, no lock, no
+    /// syscall).
+    // Flat scalar telemetry — bundling into a struct would just move
+    // the field list without removing it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_timecode_telemetry(
+        &self,
+        confidence: f32,
+        amplitude: f32,
+        lock_state: u8,
+        has_input: bool,
+        display_rate: f64,
+        abs_locked: bool,
+        abs_position_secs: f64,
+    ) {
+        self.tc_confidence_bits
+            .store(confidence.to_bits(), Ordering::Relaxed);
+        self.tc_amplitude_bits
+            .store(amplitude.to_bits(), Ordering::Relaxed);
+        self.tc_lock_state.store(lock_state, Ordering::Relaxed);
+        self.tc_has_input.store(has_input, Ordering::Relaxed);
+        self.tc_display_rate_bits
+            .store(display_rate.to_bits(), Ordering::Relaxed);
+        self.tc_abs_locked.store(abs_locked, Ordering::Relaxed);
+        self.tc_abs_position_secs_bits
+            .store(abs_position_secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publish auto source-detection + calibration state (audio thread).
+    pub(crate) fn publish_source_state(
+        &self,
+        control_mode: u8,
+        source_class: u8,
+        calibrated: bool,
+        calibrating: bool,
+        overridden: bool,
+    ) {
+        self.control_mode_bits
+            .store(control_mode, Ordering::Relaxed);
+        self.source_class_bits
+            .store(source_class, Ordering::Relaxed);
+        self.calibrated_flag.store(calibrated, Ordering::Relaxed);
+        self.calibrating_flag.store(calibrating, Ordering::Relaxed);
+        self.control_override_flag
+            .store(overridden, Ordering::Relaxed);
+    }
+
+    /// Publish the installed whitening matrix + calibration counter
+    /// (audio thread). Diagnostic only. Four relaxed stores + one for the
+    /// seq; RT-safe.
+    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32) {
+        #[allow(clippy::cast_possible_truncation)]
+        let flat = [
+            whitening[0][0] as f32,
+            whitening[0][1] as f32,
+            whitening[1][0] as f32,
+            whitening[1][1] as f32,
+        ];
+        for (slot, v) in self.whitening_bits.iter().zip(flat) {
+            slot.store(v.to_bits(), Ordering::Relaxed);
+        }
+        self.calibration_seq.store(seq, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the deck's timecode signal health + source state.
+    #[must_use]
+    pub fn load_timecode_telemetry(&self) -> TimecodeTelemetry {
+        TimecodeTelemetry {
+            confidence: f32::from_bits(self.tc_confidence_bits.load(Ordering::Relaxed)),
+            amplitude: f32::from_bits(self.tc_amplitude_bits.load(Ordering::Relaxed)),
+            lock_state: self.tc_lock_state.load(Ordering::Relaxed),
+            has_input: self.tc_has_input.load(Ordering::Relaxed),
+            display_rate: f64::from_bits(self.tc_display_rate_bits.load(Ordering::Relaxed)),
+            control_mode: self.control_mode_bits.load(Ordering::Relaxed),
+            source_class: self.source_class_bits.load(Ordering::Relaxed),
+            calibrated: self.calibrated_flag.load(Ordering::Relaxed),
+            calibrating: self.calibrating_flag.load(Ordering::Relaxed),
+            overridden: self.control_override_flag.load(Ordering::Relaxed),
+            whitening: [
+                f32::from_bits(self.whitening_bits[0].load(Ordering::Relaxed)),
+                f32::from_bits(self.whitening_bits[1].load(Ordering::Relaxed)),
+                f32::from_bits(self.whitening_bits[2].load(Ordering::Relaxed)),
+                f32::from_bits(self.whitening_bits[3].load(Ordering::Relaxed)),
+            ],
+            calibration_seq: self.calibration_seq.load(Ordering::Relaxed),
+            abs_locked: self.tc_abs_locked.load(Ordering::Relaxed),
+            abs_position_secs: f64::from_bits(
+                self.tc_abs_position_secs_bits.load(Ordering::Relaxed),
+            ),
+        }
     }
 
     pub(crate) fn store_position(&self, frames: f64) {
@@ -496,6 +720,17 @@ pub struct Deck {
     /// completed. The engine drains this each block and ferries it
     /// through the trash channel. `None` in the steady state.
     pending_disposal: Option<Arc<Track>>,
+
+    /// Exact playhead advance (in **track frames**) to apply across
+    /// the next render block, accumulated via
+    /// [`Deck::advance_position_frames`] (M6 absolute timecode).
+    /// While set, the block still integrates `rate` per sample for
+    /// the intra-block resampling slope, but the block-boundary
+    /// position is re-pinned to `block_start + pending_advance` —
+    /// killing integration drift without a declick (the sub-frame
+    /// correction per block is far below audibility). `None` in the
+    /// steady state and whenever the deck is driven by rate alone.
+    pending_advance: Option<f64>,
 }
 
 impl Deck {
@@ -535,6 +770,7 @@ impl Deck {
             declick_envelope,
             declick: DeclickState::Idle,
             pending_disposal: None,
+            pending_advance: None,
         }
     }
 
@@ -547,6 +783,56 @@ impl Deck {
     #[allow(dead_code)]
     pub(crate) fn shared(&self) -> Arc<DeckSharedState> {
         self.shared.clone()
+    }
+
+    /// Forward timecode signal-quality telemetry to the deck's
+    /// shared state without cloning the `Arc` (RT-safe; called every
+    /// block from `drive_timecode_inputs`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_timecode_telemetry(
+        &self,
+        confidence: f32,
+        amplitude: f32,
+        lock_state: u8,
+        has_input: bool,
+        display_rate: f64,
+        abs_locked: bool,
+        abs_position_secs: f64,
+    ) {
+        self.shared.publish_timecode_telemetry(
+            confidence,
+            amplitude,
+            lock_state,
+            has_input,
+            display_rate,
+            abs_locked,
+            abs_position_secs,
+        );
+    }
+
+    /// Forward auto source-detection + calibration state to the deck's
+    /// shared state (RT-safe; called from `drive_timecode_inputs`).
+    pub(crate) fn publish_source_state(
+        &self,
+        control_mode: u8,
+        source_class: u8,
+        calibrated: bool,
+        calibrating: bool,
+        overridden: bool,
+    ) {
+        self.shared.publish_source_state(
+            control_mode,
+            source_class,
+            calibrated,
+            calibrating,
+            overridden,
+        );
+    }
+
+    /// Forward the installed whitening matrix + calibration counter to
+    /// the deck's shared state (RT-safe; diagnostic).
+    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32) {
+        self.shared.publish_calibration(whitening, seq);
     }
 
     /// Audio-thread hook: pin the `host_time_ns` the next
@@ -792,6 +1078,25 @@ impl Deck {
         // the seek target forward into the next block.
         self.shared.publish_position_secs(secs, 0.0);
         self.shared.store_at_end(false);
+        // A seek invalidates any in-flight absolute advance — it was
+        // measured relative to the pre-seek playhead.
+        self.pending_advance = None;
+    }
+
+    /// Queue an exact playhead advance of `delta_track_frames` (track
+    /// frames; negative for reverse) to be applied across the next
+    /// render block (M6 absolute timecode). Unlike
+    /// [`Deck::set_position_frames`] this is **not** a seek: no
+    /// declick ramp, no immediate position write. The render loop
+    /// still integrates `rate` per sample (that's what shapes the
+    /// audio), then re-pins the block-end position to
+    /// `block_start + delta` — so the playhead tracks the groove
+    /// exactly instead of accumulating integration drift.
+    ///
+    /// Multiple calls between renders accumulate. RT-safe: pure field
+    /// arithmetic.
+    pub fn advance_position_frames(&mut self, delta_track_frames: f64) {
+        self.pending_advance = Some(self.pending_advance.unwrap_or(0.0) + delta_track_frames);
     }
 
     /// Linear gain. Default `1.0`.
@@ -902,6 +1207,12 @@ impl Deck {
         let engine_sr_f = f64::from(engine_sr);
         let gain = self.gain;
         let mut pos = self.position;
+        // M6 absolute-timecode advance: remember where the block
+        // started and drain any queued exact advance. Taken
+        // unconditionally so a stale advance never outlives the block
+        // it was measured for.
+        let block_start = pos;
+        let advance = self.pending_advance.take();
 
         // The increment for the *current* (new-side) source. Computed
         // once per block — the source doesn't change mid-render.
@@ -1020,6 +1331,21 @@ impl Deck {
                 // No source: still advance position so tests of
                 // "paused-doesn't-advance" behave predictably (they
                 // pin `pos = 0.0` anyway when set_playing(false)).
+            }
+        }
+
+        // M6: re-pin the block-end position to the absolute anchor.
+        // The per-sample integrator above shaped the audio (intra-
+        // block slope from `rate`); this corrects the accumulated
+        // sub-frame integration error at the boundary so the playhead
+        // can never drift from the groove. Audio is untouched — the
+        // samples were already written — and the correction is far
+        // below one frame per block in practice, so the next block's
+        // read position is inaudibly close to where integration alone
+        // would have put it.
+        if self.playing && self.source.is_some() {
+            if let Some(delta) = advance {
+                pos = block_start + delta;
             }
         }
 
@@ -1191,6 +1517,34 @@ mod tests {
     }
 
     #[test]
+    fn timecode_telemetry_roundtrips_and_resets() {
+        let shared = DeckSharedState::new();
+        // Fresh state: no input, all zero.
+        let t0 = shared.load_timecode_telemetry();
+        assert!(!t0.has_input);
+        assert_eq!(t0.lock_state, 0);
+        assert_eq!(t0.confidence, 0.0);
+
+        shared.publish_timecode_telemetry(0.97, 0.31, 2, true, 0.984, true, 12.5);
+        let t1 = shared.load_timecode_telemetry();
+        assert!(t1.has_input);
+        assert_eq!(t1.lock_state, 2);
+        assert!((t1.confidence - 0.97).abs() < 1e-6);
+        assert!((t1.amplitude - 0.31).abs() < 1e-6);
+        assert!((t1.display_rate - 0.984).abs() < 1e-9);
+        assert!(t1.abs_locked);
+        assert!((t1.abs_position_secs - 12.5).abs() < 1e-9);
+
+        // reset() clears telemetry back to the empty baseline.
+        shared.reset();
+        let t2 = shared.load_timecode_telemetry();
+        assert!(!t2.has_input);
+        assert_eq!(t2.lock_state, 0);
+        assert_eq!(t2.amplitude, 0.0);
+        assert!((t2.display_rate - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn empty_deck_renders_silence() {
         let mut deck = test_deck();
         let mut rt = RealtimeContext::new();
@@ -1224,6 +1578,112 @@ mod tests {
         {
             assert_eq!(deck.position_frames(), 0.0);
         }
+    }
+
+    // M6 — absolute-timecode exact advance.
+
+    #[test]
+    fn advance_position_frames_re_pins_block_end() {
+        // A queued advance replaces the integrated block-end position
+        // with `block_start + delta` — exactly, no declick. Rate is
+        // deliberately ≠ delta/frames so integration alone would land
+        // somewhere else and the test can tell the paths apart.
+        let mut deck = test_deck();
+        deck.set_source(Arc::new(
+            Track::from_interleaved(vec![0.5; 9600], 48_000, 2).unwrap(),
+        ));
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = [0.0f32; 256];
+        // 128 frames at rate 1.0 would integrate to 128; the absolute
+        // fix says the groove actually travelled 130.25 frames.
+        deck.advance_position_frames(130.25);
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!(
+            (deck.position_frames() - 130.25).abs() < 1e-9,
+            "block end must re-pin to the absolute advance, got {}",
+            deck.position_frames()
+        );
+        // The advance is consumed — the next block integrates normally.
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!(
+            (deck.position_frames() - (130.25 + 128.0)).abs() < 1e-9,
+            "next block integrates from the re-pinned position, got {}",
+            deck.position_frames()
+        );
+    }
+
+    #[test]
+    fn advance_accumulates_across_calls() {
+        let mut deck = test_deck();
+        deck.set_source(Arc::new(
+            Track::from_interleaved(vec![0.5; 9600], 48_000, 2).unwrap(),
+        ));
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.quiesce_declick_for_test();
+        deck.advance_position_frames(100.0);
+        deck.advance_position_frames(28.5);
+        let mut rt = RealtimeContext::new();
+        let mut out = [0.0f32; 256];
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!((deck.position_frames() - 128.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paused_deck_drops_pending_advance() {
+        // A paused deck must not move — and the stale advance must not
+        // survive to fire on a later block (it was measured for the
+        // block it was queued on).
+        let mut deck = test_deck();
+        deck.set_source(Arc::new(
+            Track::from_interleaved(vec![0.5; 9600], 48_000, 2).unwrap(),
+        ));
+        deck.set_playing(false);
+        deck.quiesce_declick_for_test();
+        deck.advance_position_frames(500.0);
+        let mut rt = RealtimeContext::new();
+        let mut out = [0.0f32; 256];
+        deck.render(&mut rt, &mut out, 48_000.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(deck.position_frames(), 0.0, "paused deck must not move");
+        }
+        deck.set_playing(true);
+        deck.quiesce_declick_for_test();
+        deck.set_rate(1.0);
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!(
+            (deck.position_frames() - 128.0).abs() < 1e-9,
+            "stale advance must not fire after resume, got {}",
+            deck.position_frames()
+        );
+    }
+
+    #[test]
+    fn seek_clears_pending_advance() {
+        // An explicit seek invalidates any in-flight absolute advance —
+        // it was measured relative to the pre-seek playhead.
+        let mut deck = test_deck();
+        deck.set_source(Arc::new(
+            Track::from_interleaved(vec![0.5; 9600], 48_000, 2).unwrap(),
+        ));
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.quiesce_declick_for_test();
+        deck.advance_position_frames(999.0);
+        deck.set_position_frames(1000.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = [0.0f32; 256];
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!(
+            (deck.position_frames() - 1128.0).abs() < 1e-9,
+            "post-seek block must integrate from the seek target, got {}",
+            deck.position_frames()
+        );
     }
 
     #[test]

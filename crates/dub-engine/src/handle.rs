@@ -910,6 +910,35 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckSetGain { idx, gain })
     }
 
+    /// Pin this deck's control mode (the Internal/Timecode switch),
+    /// suppressing auto source-detection until [`Self::auto_control_mode`].
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_control_mode(self, mode: crate::ControlMode) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetControlMode { idx, mode })
+    }
+
+    /// Release this deck back to automatic source detection.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn auto_control_mode(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckAutoControlMode { idx })
+    }
+
+    /// Start a channel-whitening calibration capture on this deck's
+    /// timecode input (manual "Recalibrate").
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn calibrate_timecode(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckCalibrateTimecode { idx })
+    }
+
     /// Hot-load a track onto this deck while the engine is running.
     ///
     /// Auto-drains the trash channel before sending so the user never
@@ -925,12 +954,18 @@ impl DeckCommand<'_> {
     /// [`DeckCommand::seek`] / [`DeckCommand::pause`] to set up the
     /// new track's transport.
     ///
+    /// `gain` is the linear deck gain applied atomically with the swap
+    /// (auto-gain / loudness normalization). Pass `1.0` for unity when
+    /// the track has no stored loudness (unanalyzed / Finder drag); the
+    /// engine always overwrites the previous track's gain so a fresh
+    /// load never inherits a stale normalization.
+    ///
     /// # Errors
     /// On [`CommandError::ChannelFull`] the rejected `Arc<Track>` is
     /// returned back to the caller (cheaper to retry than to re-decode).
     /// On [`CommandError::InvalidDeck`] the Arc is dropped here on the
     /// main thread.
-    pub fn load(self, source: Arc<Track>) -> Result<(), (CommandError, Arc<Track>)> {
+    pub fn load(self, source: Arc<Track>, gain: f32) -> Result<(), (CommandError, Arc<Track>)> {
         let idx = match self.handle.check_deck(self.idx) {
             Ok(idx) => idx,
             Err(e) => return Err((e, source)),
@@ -938,7 +973,7 @@ impl DeckCommand<'_> {
         self.handle.reclaim();
         self.handle
             .tx
-            .try_push(Command::DeckLoad { idx, source })
+            .try_push(Command::DeckLoad { idx, source, gain })
             .map_err(|cmd| match cmd {
                 Command::DeckLoad { source, .. } => (CommandError::ChannelFull, source),
                 // Unreachable: we just constructed a DeckLoad above.

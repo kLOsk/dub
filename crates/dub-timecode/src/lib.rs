@@ -44,12 +44,28 @@
 // Rust symbols; clippy::doc_markdown is wrong to demand backticks.
 #![allow(clippy::doc_markdown)]
 
+mod absolute;
+mod classifier;
 mod decoder;
+mod defs;
 mod format;
 pub mod signal;
+mod smoothing;
 
-pub use decoder::{DecodeOutput, Decoder};
+pub use absolute::{
+    deep_sweep, extract_bits_xwax, extract_cycles, sweep_conventions, sweep_xwax, AbsoluteTracker,
+    ConventionResult, CycleObs, DeepResult, Observable, PositionLut, XwaxResult,
+};
+pub use classifier::{SourceClass, SourceClassifier};
+pub use decoder::{
+    compute_whitening, whitening_from_covariance, DecodeOutput, Decoder, IDENTITY_WHITENING,
+};
+pub use defs::{
+    find_def, serato_candidates, TimecodeDef, SWITCH_PHASE, SWITCH_POLARITY, SWITCH_PRIMARY,
+    TIMECODE_DEFS,
+};
 pub use format::Format;
+pub use smoothing::RateSmoother;
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

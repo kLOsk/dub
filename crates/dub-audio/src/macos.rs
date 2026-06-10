@@ -54,6 +54,43 @@ use crate::devices::{
 };
 use crate::{AudioError, DeviceInfo};
 
+/// Start an `AudioUnit`, retrying briefly on a transient start failure.
+///
+/// Some interfaces — notably the Rane SL3 — intermittently fail the
+/// initial `AudioOutputUnitStart` with a HAL "server failed to start"
+/// error (OSStatus `0x73746F70`, ASCII "stop") when the device's IO
+/// server is still settling after a previous start/stop cycle. A short
+/// bounded retry recovers that common transient case instead of
+/// hard-failing the whole session. A genuinely wedged device still
+/// surfaces the error once the attempts are exhausted — the operator
+/// then has to power-cycle the interface or restart `coreaudiod`.
+///
+/// This is the off-RT setup path (called from `start_with_options`
+/// before any render callback runs), so the blocking back-off sleeps are
+/// fine. Each retry first issues a best-effort `stop()` so a half-started
+/// IO context is reset before the next `start()`.
+fn start_audio_unit_with_retry(au: &mut AudioUnit, label: &str) -> Result<(), AudioError> {
+    const ATTEMPTS: usize = 5;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match au.start() {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < ATTEMPTS => {
+                let _ = au.stop();
+                std::thread::sleep(BACKOFF);
+            }
+            Err(e) => {
+                return Err(AudioError::Device(format!(
+                    "audio_unit.start ({label}): {e} (after {ATTEMPTS} attempts — the \
+                     interface refused to start; power-cycle it or restart coreaudiod)"
+                )));
+            }
+        }
+    }
+}
+
 // =============================================================
 // Coherent publish-clock for the engine.
 //
@@ -576,7 +613,7 @@ impl AudioOutput {
             },
         )?;
 
-        audio_unit.start()?;
+        start_audio_unit_with_retry(&mut audio_unit, "output")?;
 
         Ok(Self {
             audio_unit,
@@ -1629,9 +1666,7 @@ impl AudioInput {
             })
             .map_err(|e| AudioError::Device(format!("set_input_callback: {e}")))?;
 
-        audio_unit
-            .start()
-            .map_err(|e| AudioError::Device(format!("audio_unit.start (input): {e}")))?;
+        start_audio_unit_with_retry(&mut audio_unit, "input")?;
 
         Ok(Self {
             audio_unit,

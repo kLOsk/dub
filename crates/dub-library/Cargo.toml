@@ -29,6 +29,11 @@ dub-spectral = { workspace = true }
 # fingerprint hits the cache and the deck shows the waveform
 # instantly.
 dub-peaks = { workspace = true }
+# Auto-gain (loudness normalization) — `analyze_track` measures
+# integrated LUFS + sample peak in the same decode pass and stamps
+# them into `analysis_cache`; the deck-load path reads them back via
+# `track_normalization_gain` and applies the derived gain once on load.
+dub-dsp = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

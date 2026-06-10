@@ -113,11 +113,36 @@ pub enum Command {
     /// Set deck `idx`'s linear gain. `1.0` = unity, `0.0` = silence.
     DeckSetGain { idx: u8, gain: f32 },
 
+    /// Pin deck `idx`'s control mode (the deck-header Internal/Timecode
+    /// switch). Sets the user override so auto source-detection won't
+    /// change it until [`Self::DeckAutoControlMode`].
+    DeckSetControlMode { idx: u8, mode: crate::ControlMode },
+
+    /// Release deck `idx` back to automatic source detection.
+    DeckAutoControlMode { idx: u8 },
+
+    /// Start a channel-whitening calibration capture on deck `idx`'s
+    /// timecode input (the manual "Recalibrate" affordance). No-op if no
+    /// timecode input is attached.
+    DeckCalibrateTimecode { idx: u8 },
+
     /// Load a new track on deck `idx`. The `Arc<Track>` is sent by value;
     /// the engine swaps it onto the deck on the audio thread without
     /// dropping the previous `Arc` — that goes back through the trash
     /// channel.
-    DeckLoad { idx: u8, source: Arc<Track> },
+    ///
+    /// `gain` is the linear deck gain to apply atomically with the
+    /// swap (auto-gain / loudness normalization, M16). It is the
+    /// value resolved **once at load time** from the library's stored
+    /// loudness and held for the life of this load — the deck never
+    /// re-reads it. `1.0` (unity) is passed for unanalyzed tracks and
+    /// the Finder-drag path, so a load always sets a definite gain and
+    /// never inherits the previous track's normalization.
+    DeckLoad {
+        idx: u8,
+        source: Arc<Track>,
+        gain: f32,
+    },
 
     /// Set the engine-wide master gain applied after deck summing in the
     /// debug internal mixer. `1.0` = unity. PRD §5.3 calls for this only
@@ -203,10 +228,24 @@ impl std::fmt::Debug for Command {
                 .field("idx", idx)
                 .field("gain", gain)
                 .finish(),
-            Self::DeckLoad { idx, .. } => f
+            Self::DeckSetControlMode { idx, mode } => f
+                .debug_struct("DeckSetControlMode")
+                .field("idx", idx)
+                .field("mode", mode)
+                .finish(),
+            Self::DeckAutoControlMode { idx } => f
+                .debug_struct("DeckAutoControlMode")
+                .field("idx", idx)
+                .finish(),
+            Self::DeckCalibrateTimecode { idx } => f
+                .debug_struct("DeckCalibrateTimecode")
+                .field("idx", idx)
+                .finish(),
+            Self::DeckLoad { idx, gain, .. } => f
                 .debug_struct("DeckLoad")
                 .field("idx", idx)
                 .field("source", &"<Arc<Track>>")
+                .field("gain", gain)
                 .finish(),
             Self::SetMasterGain { gain } => {
                 f.debug_struct("SetMasterGain").field("gain", gain).finish()

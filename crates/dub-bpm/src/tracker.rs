@@ -526,8 +526,8 @@ mod tests {
             }
         }
 
-        let lock_blk = first_lock_block
-            .expect("tracker never locked on 20 s of clean 128 BPM clicks");
+        let lock_blk =
+            first_lock_block.expect("tracker never locked on 20 s of clean 128 BPM clicks");
         // Guard against a degenerate "locked only on the final block"
         // pass: the hold must be sustained, not a last-moment fluke.
         // 20 s / ~43 ms per 2048-sample block ≈ 469 blocks; locking by

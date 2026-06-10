@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci docs-check app app-release run-app open-app xcframework
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci docs-check app app-release run-app open-app xcframework snapshot
 
 help:
 	@echo "Dub — common targets"
@@ -130,6 +130,25 @@ app: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 
 app-release:
 	$(MAKE) app APP_CONFIG=Release
+
+# SwiftUI snapshot suite (C-31). Renders the app's internal views to
+# PNGs under apple/DubTests/__Snapshots__/ — no running app, no Metal.
+# On a fresh checkout the first run records baselines and reports them
+# as failures; commit the PNGs and re-run (they then pass as a visual
+# regression gate). Re-record an intentionally-changed view with
+# `record: true` on its assertion.
+snapshot: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
+	xcodebuild test \
+	    -project apple/Dub.xcodeproj -scheme Dub \
+	    -destination 'platform=macOS' \
+	    -derivedDataPath $(APP_BUILD_DIR) \
+	    -only-testing:DubTests \
+	    | xcbeautify 2>/dev/null || \
+	xcodebuild test \
+	    -project apple/Dub.xcodeproj -scheme Dub \
+	    -destination 'platform=macOS' \
+	    -derivedDataPath $(APP_BUILD_DIR) \
+	    -only-testing:DubTests
 
 trace-grid:
 	@# Capture every os_signpost from the waveform renderer into a

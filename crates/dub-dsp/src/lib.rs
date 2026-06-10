@@ -9,6 +9,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod loudness;
+
+pub use loudness::{
+    db_to_linear, measure_integrated_loudness, normalization_gain_db, LoudnessMeasurement,
+    CEILING_DBFS, DEFAULT_TARGET_LUFS,
+};
+
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

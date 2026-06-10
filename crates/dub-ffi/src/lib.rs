@@ -257,7 +257,40 @@ uniffi::setup_scaffolding!();
 ///       product" non-negotiable. The detection probe
 ///       (`has_external_audio_interface`) is now strictly
 ///       output-scope-only.
-pub const FFI_VERSION: u32 = 32;
+///   33. **Performance-mode deck telemetry.** Adds
+///       [`DubEngine::deck_telemetry`] returning a [`DeckTelemetry`]
+///       (pitch percent from the published deck rate + timecode signal
+///       health: carrier confidence / amplitude, lock state, whether a
+///       timecode input is attached). The audio thread publishes the
+///       signal health to the deck's shared state each block from
+///       `drive_timecode_inputs`; the FFI read is lock-free, same hot
+///       path as `position_snapshot`. Drives the deck-header PITCH
+///       readout + tracking dot and the signal-quality panel.
+///   34. **Auto source detection + needle calibration.** Each deck now
+///       classifies its input (timecode vs real record) and, on first
+///       confident timecode, captures a channel-whitening calibration
+///       that removes the cartridge's decoded-rate bias. [`DeckTelemetry`]
+///       grows `control_mode` / `source_class` / `calibrated` /
+///       `calibrating`; new [`DubEngine::set_deck_control_mode`] (with the
+///       [`ControlMode`] enum) / [`DubEngine::set_deck_auto_control`] /
+///       [`DubEngine::calibrate_deck`] drive the deck-header
+///       Internal/Timecode switch + manual recalibrate.
+///   35. **Auto-gain (loudness normalization).** `analyze_track` now
+///       measures BS.1770-4 integrated LUFS + sample peak and stamps
+///       them into `analysis_cache`; [`DubLibrary::track_normalization_gain`]
+///       reads them back as a clip-safe linear deck gain.
+///       [`DubEngine::load_track`] grows an `auto_gain: Option<f32>`
+///       parameter applied once at load (read-once-and-hold). The
+///       safety contract: gain is applied only on load and only when a
+///       value already exists; analysis that finishes while a track
+///       plays is store-only and never alters the live deck level.
+///   36. **Source-control pinned flag.** [`DeckTelemetry`] grows
+///       `control_overridden` — whether the user has pinned the deck's
+///       control mode via the row-3 switch (auto source-detection
+///       suppressed) vs. the mode being auto-selected. Drives the
+///       "· PINNED" badge so the live switch shows auto-vs-pinned, not
+///       just the mode.
+pub const FFI_VERSION: u32 = 36;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1319,6 +1352,7 @@ impl DubEngine {
         path: String,
         library_beat_grid: Option<LibraryBeatGrid>,
         genre: Option<String>,
+        auto_gain: Option<f32>,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let t_total = std::time::Instant::now();
@@ -1360,10 +1394,20 @@ impl DubEngine {
                 return Err(EngineError::EngineNotRunning);
             };
 
+            // Auto-gain (PRD §8.4): apply the load-time loudness
+            // normalization gain the Apple shell resolved from the
+            // library (`DubLibrary::track_normalization_gain`) and
+            // passed in. `None` → unity, which covers unanalyzed
+            // tracks, Finder drags, and the case where the user has
+            // turned auto-gain off in Preferences (the shell passes
+            // `nil` rather than resolving a gain). The engine holds this value for
+            // the life of the load; analysis that finishes later is
+            // store-only and never revisits this deck.
+            let load_gain = auto_gain.unwrap_or(1.0);
             running
                 .handle
                 .deck(idx)
-                .load(track.clone())
+                .load(track.clone(), load_gain)
                 .map_err(|(e, _arc)| match e {
                     dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
                     dub_engine::CommandError::InvalidDeck { idx, .. } => {
@@ -1814,6 +1858,119 @@ impl DubEngine {
     #[must_use]
     pub fn position_snapshot_at_host_time(&self, deck_idx: u64, host_time_ns: u64) -> PositionInfo {
         self.position_snapshot_at_host_time_inner(deck_idx, host_time_ns)
+    }
+
+    /// Per-deck live telemetry (pitch + timecode signal health) for the
+    /// Performance deck header, tracking dot, and signal-quality panel.
+    /// Lock-free read of the deck's shared state — the same hot path as
+    /// [`Self::position_snapshot`], safe to poll at UI cadence. Returns
+    /// [`DeckTelemetry::EMPTY`] for an out-of-range deck.
+    #[must_use]
+    pub fn deck_telemetry(&self, deck_idx: u64) -> DeckTelemetry {
+        let idx = match deck_idx_to_usize(deck_idx) {
+            Ok(idx) => idx,
+            Err(_) => return DeckTelemetry::empty(),
+        };
+        let shared = match self.deck_shared.get(idx) {
+            Some(arc) => arc.as_ref(),
+            None => return DeckTelemetry::empty(),
+        };
+        let tc = shared.load_timecode_telemetry();
+        // Pitch reads the **smoothed** display rate, not the raw
+        // playback rate — the per-block decode jitter would otherwise
+        // make the BPM jump whole numbers.
+        DeckTelemetry {
+            pitch_percent: (tc.display_rate - 1.0) * 100.0,
+            carrier_confidence: tc.confidence,
+            carrier_amplitude: tc.amplitude,
+            lock_state: tc.lock_state,
+            has_timecode_input: tc.has_input,
+            control_mode: tc.control_mode,
+            source_class: tc.source_class,
+            calibrated: tc.calibrated,
+            calibrating: tc.calibrating,
+            control_overridden: tc.overridden,
+            whitening: tc.whitening.to_vec(),
+            calibration_seq: tc.calibration_seq,
+            abs_locked: tc.abs_locked,
+            abs_position_secs: tc.abs_position_secs,
+        }
+    }
+
+    /// Select a deck's source mode (the deck-header three-way switch:
+    /// Internal / Timecode / Thru, PRD §5.1.1). The choice is explicit
+    /// and sticky — there is no auto source-detection. The transition
+    /// continuity (held pitch on Timecode→Internal etc.) is handled
+    /// engine-side; see `dub_engine`'s `set_deck_control_mode`.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    pub fn set_deck_control_mode(
+        &self,
+        deck_idx: u64,
+        mode: ControlMode,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        {
+            let mut state = lock_state(&self.state);
+            let EngineState::Running(running) = &mut *state else {
+                return Err(EngineError::EngineNotRunning);
+            };
+            running
+                .handle
+                .deck(idx)
+                .set_control_mode(mode.into())
+                .map_err(map_command_error)?;
+            // Thru unloads the deck: the live record is the source now.
+            // The engine already cleared its audio source; drop the FFI's
+            // peak-render track too so the waveform doesn't keep painting
+            // the ghost of the unloaded file.
+            if matches!(mode, ControlMode::Thru) {
+                running.file_tracks[idx] = None;
+            }
+        }
+        if matches!(mode, ControlMode::Thru) {
+            self.bump_peak_generation(idx);
+        }
+        Ok(())
+    }
+
+    /// Legacy no-op kept for ABI stability: auto source-detection was
+    /// removed (PRD §5.1.1), so there is nothing to release back to. The
+    /// deck stays in whatever mode the user last selected. Retained so
+    /// existing Swift call sites keep linking; safe to delete once the
+    /// shell drops the call.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    pub fn set_deck_auto_control(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .auto_control_mode()
+            .map_err(map_command_error)
+    }
+
+    /// Manually (re)calibrate a deck's timecode needle.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    pub fn calibrate_deck(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .calibrate_timecode()
+            .map_err(map_command_error)
     }
 
     /// **M11d.6 round 11** — current engine-relative host time
@@ -2667,6 +2824,110 @@ impl PositionInfo {
         debug_elapsed_ns: 0,
         debug_advance_rate: 0.0,
     };
+}
+
+/// Per-deck live telemetry for the Performance deck header: pitch
+/// (deck rate) and timecode signal health. Read lock-free from the
+/// deck's shared state; returned by [`DubEngine::deck_telemetry`].
+///
+/// The bool fields are independent UI flags (input present / calibrated
+/// / calibrating / pinned), mirroring `dub_engine::TimecodeTelemetry`'s
+/// wire format — not a state machine, so `excessive_bools` is allowed.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeckTelemetry {
+    /// Deck playback rate as a pitch percentage: `(rate - 1.0) * 100`.
+    /// `0.0` at unity. For timecode decks this tracks the platter; for
+    /// File / Casual playback it is `0.0` (no pitch control). Only
+    /// meaningful while engaged / playing — the UI gates the readout on
+    /// `lock_state` / `position_snapshot().is_playing` and shows `—`
+    /// otherwise (a paused deck publishes rate `0.0`, i.e. `-100 %`).
+    pub pitch_percent: f64,
+    /// Decoder coherence confidence [0, 1] (1.0 = pure quadrature).
+    pub carrier_confidence: f32,
+    /// Decoder RMS amplitude (~0.1–0.5 for a healthy SL3 carrier).
+    pub carrier_amplitude: f32,
+    /// Timecode lock state: 0 none · 1 clean · 2 degraded · 3 disengaged.
+    /// Drives the deck-header tracking dot (grey / green / amber / red).
+    pub lock_state: u8,
+    /// Whether a timecode input is attached to this deck.
+    pub has_timecode_input: bool,
+    /// How the deck is currently driven: 0 Internal · 1 Timecode.
+    pub control_mode: u8,
+    /// Auto source classification: 0 Silence · 1 Timecode · 2 Record.
+    pub source_class: u8,
+    /// Whether a channel-whitening calibration is installed (the needle
+    /// is calibrated).
+    pub calibrated: bool,
+    /// Whether a calibration capture is in progress right now.
+    pub calibrating: bool,
+    /// Whether the user has pinned the control mode via the deck-header
+    /// switch (auto source-detection suppressed), vs. the mode being
+    /// chosen automatically. Drives the "· PINNED" badge on the switch.
+    pub control_overridden: bool,
+    /// Diagnostic: the installed channel-whitening matrix, row-major
+    /// `[w00, w01, w10, w11]` (identity `[1,0,0,1]` until the first
+    /// calibration completes). A near-identity result on a cartridge that
+    /// needs correction, or a degenerate / huge result, means calibration
+    /// failed — surfaced in the signal-quality log.
+    pub whitening: Vec<f32>,
+    /// Diagnostic: number of calibrations installed since the input was
+    /// attached. Bumps each time a fresh whitening is computed.
+    pub calibration_seq: u32,
+    /// M6: whether the absolute LFSR position tracker is locked on the
+    /// control record's bitstream. While `true` the deck's velocity and
+    /// playhead come from exact groove-position deltas (bit-exact pitch,
+    /// drift-free position); while `false` the carrier-phase relative
+    /// path drives the deck. Diagnostic — behavior stays relative.
+    pub abs_locked: bool,
+    /// M6: decoded absolute groove position in seconds of record time.
+    /// Meaningful only while `abs_locked`. Diagnostic/log only.
+    pub abs_position_secs: f64,
+}
+
+impl DeckTelemetry {
+    fn empty() -> Self {
+        Self {
+            pitch_percent: 0.0,
+            carrier_confidence: 0.0,
+            carrier_amplitude: 0.0,
+            lock_state: 0,
+            has_timecode_input: false,
+            control_mode: 0,
+            source_class: 0,
+            calibrated: false,
+            calibrating: false,
+            control_overridden: false,
+            whitening: vec![1.0, 0.0, 0.0, 1.0],
+            calibration_seq: 0,
+            abs_locked: false,
+            abs_position_secs: 0.0,
+        }
+    }
+}
+
+/// What a deck's output is sourced from, for
+/// [`DubEngine::set_deck_control_mode`]. The user picks exactly one via
+/// the deck-header three-way switch; there is no auto-detection.
+/// (`InternalPlay`, not `Internal`, because `internal` is a Swift keyword.)
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ControlMode {
+    /// The deck plays its loaded file on its own clock.
+    InternalPlay,
+    /// The control vinyl drives the loaded file.
+    Timecode,
+    /// The live record on the platter is passed straight through.
+    Thru,
+}
+
+impl From<ControlMode> for dub_engine::ControlMode {
+    fn from(m: ControlMode) -> Self {
+        match m {
+            ControlMode::InternalPlay => dub_engine::ControlMode::Internal,
+            ControlMode::Timecode => dub_engine::ControlMode::Timecode,
+            ControlMode::Thru => dub_engine::ControlMode::Thru,
+        }
+    }
 }
 
 /// LSQ residual statistics from beat-grid analysis (M11d.7).
@@ -3741,7 +4002,23 @@ mod tests {
         // input-demux + output-routing as Thru, but each deck plays a
         // loaded file driven by a Serato CV02 `TimecodeInput` instead
         // of passing the live input through.
-        assert_eq!(FFI_VERSION, 32);
+        // 32→33: Performance-mode deck telemetry. Added `deck_telemetry`
+        // (`DeckTelemetry`: pitch percent + timecode signal health) so
+        // the deck header can show PITCH + a tracking dot + signal panel.
+        // 33→34: auto source detection + needle calibration. Each deck
+        // classifies timecode vs real record and auto-captures a
+        // channel-whitening calibration; `DeckTelemetry` grows
+        // control_mode / source_class / calibrated / calibrating, plus
+        // `set_deck_control_mode` / `set_deck_auto_control` /
+        // `calibrate_deck`.
+        // 34→35: auto-gain (loudness normalization). `load_track` grows
+        // an `auto_gain: Option<f32>` applied once at load;
+        // `track_normalization_gain` on DubLibrary returns the clip-safe
+        // linear gain derived from stored LUFS + sample peak.
+        // 35→36: source-control pinned flag. `DeckTelemetry` grows
+        // `control_overridden` so the row-3 switch can show "· PINNED"
+        // (user override) vs. an auto-selected mode.
+        assert_eq!(FFI_VERSION, 36);
     }
 
     #[test]
@@ -3756,7 +4033,7 @@ mod tests {
     fn load_track_on_stopped_engine_returns_not_running() {
         let engine = DubEngine::new();
         let err = engine
-            .load_track(0, "/nonexistent.wav".to_string(), None, None)
+            .load_track(0, "/nonexistent.wav".to_string(), None, None, None)
             .unwrap_err();
         assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
     }
@@ -3776,7 +4053,7 @@ mod tests {
         // the deck index validates. We check `deck_idx_to_usize` happens
         // first so a clearly-bad deck idx surfaces as InvalidDeckIndex.
         let err = engine
-            .load_track(99, "/tmp/x.wav".to_string(), None, None)
+            .load_track(99, "/tmp/x.wav".to_string(), None, None, None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidDeckIndex(99)));
     }
@@ -5393,6 +5670,29 @@ impl DubLibrary {
                 .active_beatgrid_for_track(&track_id)?
                 .map(LibraryBeatGrid::from))
         })
+    }
+
+    /// Linear deck gain that normalizes `track_id` toward Dub's
+    /// loudness target, or `None` when the track has no stored
+    /// loudness yet (unanalyzed, unknown id, or analyzed-but-silent).
+    ///
+    /// **Read side of auto-gain (M16).** The Apple shell calls this
+    /// immediately before [`DubEngine::load_track`] and passes the
+    /// result as `auto_gain`. `None` → the caller loads at unity, so
+    /// a freshly imported track plays at unity the first time and is
+    /// normalized on subsequent loads once background analysis has
+    /// stored its LUFS. Never applied to an already-playing deck — the
+    /// engine reads it once at load and holds it.
+    ///
+    /// Cheap: two indexed SELECTs (`tracks` → `analysis_cache`). The
+    /// unknown-id case returns `Ok(None)`, mirroring
+    /// [`Self::active_beat_grid`], so the Swift caller can use it as a
+    /// fast probe without first validating the id.
+    pub fn track_normalization_gain(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<f32>, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.track_normalization_gain(&track_id)?))
     }
 
     /// Persist a user tap-to-grid correction (M11c.3b). Deactivates

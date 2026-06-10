@@ -47,11 +47,42 @@ pub use timecode::{
     DEFAULT_STICKY_BLOCKS_TO_DISENGAGE,
 };
 
+pub use dub_timecode::{SourceClass, SourceClassifier};
+
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Number of decks in v1 (PRD §3 / §6).
 pub const DECK_COUNT: usize = 2;
+
+/// What a deck's output is sourced from, selected explicitly by the
+/// user via the deck-header three-way switch (PRD §5.1.1). There is no
+/// automatic source detection — exactly one mode is active per deck and
+/// it only changes when the operator clicks the switch (or presses an
+/// equivalent transport control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlMode {
+    /// The deck plays its loaded file on its own clock. A timecode
+    /// input, if attached, is still decoded for telemetry + calibration
+    /// but does **not** drive the deck. Switching here *from* Timecode
+    /// keeps the deck's current (last platter) rate so the music neither
+    /// stalls nor jumps; switching here from Thru lands at unity, paused.
+    Internal,
+    /// The deck is driven by the control vinyl (decoded rate applied to
+    /// the loaded file, relative mode). When the carrier stops the deck
+    /// holds its position — it never auto-falls-back to internal play.
+    Timecode,
+    /// The deck passes the live record on the platter straight through
+    /// to its output (PRD §1: real records are first-class). The loaded
+    /// file, if any, does not advance. Backed by the always-attached
+    /// timecode input's raw samples (see
+    /// [`crate::TimecodeInput::render_passthrough_into`]).
+    Thru,
+}
+
+/// Input frames captured for a channel-whitening calibration (~1 s at
+/// 48 kHz). One clean spin is plenty to measure the cartridge ellipse.
+const CALIBRATION_FRAMES: usize = 48_000;
 
 /// Per-deck output routing for [`Engine::render_routed`].
 ///
@@ -156,20 +187,27 @@ pub struct Engine {
     /// disengaged at engine construction.
     panic_play_states: [PanicPlayState; DECK_COUNT],
 
-    /// Per-deck "timecode auto-start armed" gate (PRD §5.1 / §6.4
-    /// "load never auto-plays"). `true` means a freshly loaded track
-    /// must NOT be auto-started by the timecode driver merely because
-    /// the platter happens to already be locked (or a noise burst
-    /// briefly satisfies the decoder). Set on every `Command::DeckLoad`;
-    /// cleared the moment the carrier is observed *absent*
-    /// ([`timecode::LiftIntent::DropoutHoldRate`]) so that a genuine
-    /// fresh needle-drop after the load re-engages and auto-starts the
-    /// deck as expected. Mouse-initiated play (Panic-Play) bypasses the
-    /// gate entirely. Without this, dropping a track onto an
-    /// already-spinning platter (or onto an interface carrying
-    /// preamp/mic bleed) would instantly start internal playback the
-    /// operator never asked for.
-    timecode_autostart_blocked: [bool; DECK_COUNT],
+    /// Per-deck lightly-smoothed decoded timecode rate, for the
+    /// **pitch / live-BPM display only** (1.0 = unity). Frozen while
+    /// not cleanly locked (so a needle lift doesn't drag the readout
+    /// toward 0 / −100 %) and snapped on re-lock (so the BPM recovers
+    /// instantly instead of slewing). Display-only; playback uses the
+    /// raw rate in the position seqlock.
+    tc_display_rate_ema: [f64; DECK_COUNT],
+    /// Whether `tc_display_rate_ema` is currently tracking a clean
+    /// lock. `false` after a lift / dropout so the next clean block
+    /// snaps the display rather than slewing to it.
+    tc_rate_primed: [bool; DECK_COUNT],
+    /// How each deck's transport is currently driven (Internal vs
+    /// Timecode). Set by auto source-detection unless the user has
+    /// pinned it (`control_override`).
+    control_mode: [ControlMode; DECK_COUNT],
+    /// When `true`, the user has pinned `control_mode` (the deck-header
+    /// Internal/Timecode switch) and auto source-detection won't change
+    /// it. `false` ⇒ the classifier drives the mode.
+    control_override: [bool; DECK_COUNT],
+    /// Per-deck timecode-vs-record classifier (off the lift path).
+    source_classifier: [SourceClassifier; DECK_COUNT],
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -280,7 +318,11 @@ impl Engine {
             timecode_inputs: std::array::from_fn(|_| None),
             thru_sources: std::array::from_fn(|_| None),
             panic_play_states: [PanicPlayState::default(); DECK_COUNT],
-            timecode_autostart_blocked: [false; DECK_COUNT],
+            tc_display_rate_ema: [1.0; DECK_COUNT],
+            tc_rate_primed: [false; DECK_COUNT],
+            control_mode: [ControlMode::Timecode; DECK_COUNT],
+            control_override: [false; DECK_COUNT],
+            source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
         }
     }
 
@@ -332,7 +374,11 @@ impl Engine {
             timecode_inputs: std::array::from_fn(|_| None),
             thru_sources: std::array::from_fn(|_| None),
             panic_play_states: [PanicPlayState::default(); DECK_COUNT],
-            timecode_autostart_blocked: [false; DECK_COUNT],
+            tc_display_rate_ema: [1.0; DECK_COUNT],
+            tc_rate_primed: [false; DECK_COUNT],
+            control_mode: [ControlMode::Timecode; DECK_COUNT],
+            control_override: [false; DECK_COUNT],
+            source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
         };
         (engine, handle)
     }
@@ -628,6 +674,16 @@ impl Engine {
             if let Some(thru) = self.thru_sources[idx].as_mut() {
                 let gain = self.decks[idx].gain();
                 thru.render_into(out, gain, num_channels, first_us);
+            } else if self.control_mode[idx] == ControlMode::Thru {
+                // Thru mode (deck-header switch): pass the live record
+                // straight through, reusing the samples the timecode
+                // input already drained this block. The deck's own
+                // transport is left untouched (no file advance). With no
+                // input attached the output stays silent.
+                let gain = self.decks[idx].gain();
+                if let Some(input) = self.timecode_inputs[idx].as_ref() {
+                    input.render_passthrough_into(out, gain, num_channels, first_us);
+                }
             } else {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
             }
@@ -673,6 +729,7 @@ impl Engine {
     /// before reaching for the deck. The intermediate
     /// [`timecode::LiftIntent`] carries only `Copy` data across the
     /// borrow boundary.
+    #[allow(clippy::too_many_lines)] // sequential per-block RT pipeline
     fn drive_timecode_inputs(&mut self) {
         for idx in 0..DECK_COUNT {
             // Snapshot the panic flag *before* borrowing the input.
@@ -683,6 +740,170 @@ impl Engine {
                 Some(input) => input.drive(),
                 None => continue,
             };
+            // Publish signal-quality telemetry for the deck-header
+            // tracking dot + signal panel: the decoder's last output
+            // (confidence / amplitude) plus the lift-policy lock state.
+            // Read into Copy locals so the `timecode_inputs` borrow is
+            // dropped before we touch `self.decks`. RT-safe.
+            let tc = self.timecode_inputs[idx].as_ref().map(|input| {
+                let (confidence, amplitude, rate) = input
+                    .last_output()
+                    .map_or((0.0, 0.0, 1.0), |o| (o.confidence, o.amplitude, o.rate));
+                let policy = input.policy();
+                let lock_state = if !policy.is_engaged() {
+                    3 // disengaged — lifted / scratching / dropout
+                } else if policy.consecutive_below() > 0 {
+                    2 // engaged but degraded (in the sticky window)
+                } else {
+                    1 // clean lock
+                };
+                // M6 diagnostics: absolute LFSR lock + decoded groove
+                // position (record seconds). Input SR == engine SR per
+                // attach validation.
+                let abs_frames = input.last_output().and_then(|o| o.abs_position_frames);
+                let abs_secs = abs_frames.map_or(0.0, |f| f / f64::from(self.sample_rate));
+                (
+                    confidence,
+                    amplitude,
+                    lock_state,
+                    rate,
+                    abs_frames.is_some(),
+                    abs_secs,
+                )
+            });
+            if let Some((confidence, amplitude, lock_state, rate, abs_locked, abs_secs)) = tc {
+                // Heavy EMA → the pitch / live-BPM readout. Update only
+                // while engaged (clean/degraded); freeze during a
+                // disengage/scratch so a flick doesn't drag the number
+                // around. α small ⇒ ~10× jitter reduction, so a ±1 %
+                // per-block wobble shows as ~±0.1 BPM. Display-only —
+                // playback uses the raw rate in the position seqlock.
+                if lock_state == 1 {
+                    // Clean lock: heavy denoise. The rate is already
+                    // de-spiked + steady-smoothed by the decoder's
+                    // `RateSmoother`; this second, slower pole
+                    // (τ ≈ 1/α ≈ 130 ms at 750 blocks/s) is display-only
+                    // and exists so the *readout* sits rock-steady well
+                    // inside the 0.0x-BPM range — a number can lag
+                    // freely. Playback uses the raw (smoothed) rate in
+                    // the position seqlock, so this never adds latency to
+                    // what you hear.
+                    if self.tc_rate_primed[idx] {
+                        // Eased from 0.01 → 0.06 now that the decoder's
+                        // amplitude-gated confidence killed the static-
+                        // signal jitter: the raw rate is much steadier, so
+                        // the display can track ~6× faster (τ ≈ 20 ms at
+                        // 750 blocks/s) and feel responsive without wobble.
+                        const DISPLAY_RATE_ALPHA: f64 = 0.06;
+                        let ema = self.tc_display_rate_ema[idx];
+                        self.tc_display_rate_ema[idx] = ema + DISPLAY_RATE_ALPHA * (rate - ema);
+                    } else {
+                        // First clean block after a lift/dropout — snap,
+                        // don't slew, so the BPM recovers instantly.
+                        self.tc_display_rate_ema[idx] = rate;
+                        self.tc_rate_primed[idx] = true;
+                    }
+                } else {
+                    // Degraded / disengaged / lifted: freeze the displayed
+                    // rate (don't drift toward 0), re-snap on re-lock.
+                    self.tc_rate_primed[idx] = false;
+                }
+                // Pitch / live-BPM readout source depends on what is
+                // actually driving the deck. In Timecode mode that's the
+                // smoothed platter rate; in Internal mode the file plays
+                // on its own clock, so show the deck's own rate (unity, or
+                // the pitch held from a prior Timecode hand-off) — not the
+                // platter's. In Thru the file isn't playing, so the value
+                // is gated out on the UI side by `is_playing`.
+                let display_rate = match self.control_mode[idx] {
+                    ControlMode::Timecode => self.tc_display_rate_ema[idx],
+                    ControlMode::Internal | ControlMode::Thru => self.decks[idx].rate(),
+                };
+                self.decks[idx].publish_timecode_telemetry(
+                    confidence,
+                    amplitude,
+                    lock_state,
+                    true,
+                    display_rate,
+                    abs_locked,
+                    abs_secs,
+                );
+            }
+
+            // Auto source-detection + auto-calibration (PRD §5.1.1).
+            // Classify the decoded signal; the moment it's confidently
+            // timecode and this needle isn't calibrated yet, capture a
+            // whitening window; engage Timecode control once calibrated
+            // (unless the user pinned the mode via the switch). Reads
+            // into Copy locals so the input borrow is released before we
+            // touch decks / classifiers.
+            let (last_out, calibrated, calibrating) = {
+                let input = self.timecode_inputs[idx].as_ref();
+                (
+                    input.and_then(timecode::TimecodeInput::last_output),
+                    input.is_some_and(timecode::TimecodeInput::is_calibrated),
+                    input.is_some_and(timecode::TimecodeInput::is_calibrating),
+                )
+            };
+            let class = match last_out {
+                Some(out) => self.source_classifier[idx].update(&out),
+                None => self.source_classifier[idx].current(),
+            };
+            if class == SourceClass::Timecode && !calibrated && !calibrating {
+                if let Some(input) = self.timecode_inputs[idx].as_mut() {
+                    input.begin_calibration(CALIBRATION_FRAMES);
+                }
+            }
+            // No auto source-detection: the control mode is whatever the
+            // user last selected on the deck-header switch (PRD §5.1.1).
+            // The classifier output above feeds calibration + the status
+            // dot only — it never moves the mode. This is the deliberate
+            // removal of the old "saw a record → force Internal at unity"
+            // behaviour, which yanked a stopped timecode deck into
+            // internal playback.
+
+            // Publish the source/calibration state for the deck-header
+            // switch + status dot.
+            let class_code = match class {
+                SourceClass::Silence => 0,
+                SourceClass::Timecode => 1,
+                SourceClass::Record => 2,
+            };
+            let mode_code = match self.control_mode[idx] {
+                ControlMode::Internal => 0,
+                ControlMode::Timecode => 1,
+                ControlMode::Thru => 2,
+            };
+            let (now_calibrated, now_calibrating) = {
+                let input = self.timecode_inputs[idx].as_ref();
+                (
+                    input.is_some_and(timecode::TimecodeInput::is_calibrated),
+                    input.is_some_and(timecode::TimecodeInput::is_calibrating),
+                )
+            };
+            self.decks[idx].publish_source_state(
+                mode_code,
+                class_code,
+                now_calibrated,
+                now_calibrating,
+                self.control_override[idx],
+            );
+            // Diagnostic: publish the installed whitening matrix so the
+            // signal-quality log can show what calibration computed.
+            if let Some(input) = self.timecode_inputs[idx].as_ref() {
+                let (w, seq) = input.installed_whitening();
+                self.decks[idx].publish_calibration(w, seq);
+            }
+
+            // Only Timecode mode lets the decoder drive the deck. In
+            // Internal mode the input is still decoded above (telemetry +
+            // calibration) but the deck plays on its own transport; in
+            // Thru mode the deck doesn't advance at all — the live record
+            // is passed straight through in `render_routed`.
+            if self.control_mode[idx] != ControlMode::Timecode {
+                continue;
+            }
+
             let Some(intent) = intent else {
                 // No new input data this block — keep the deck at its
                 // current rate/play state. Single-block dropouts are
@@ -722,7 +943,17 @@ impl Engine {
                 // needle off the platter is the whole point.
                 let user_initiated = self.panic_play_states[idx].user_initiated;
                 match intent {
-                    timecode::LiftIntent::Locked { rate } => {
+                    // A LockedAbsolute during panic counts as a clean
+                    // lock for the hand-back debounce (it's the
+                    // *strongest* possible lock signal). Its
+                    // `advance_frames` is intentionally dropped: in
+                    // panic the deck runs on its own clock, so groove
+                    // travel measured while internal play holds the
+                    // deck is meaningless to apply. The first
+                    // LockedAbsolute *after* hand-back advances the
+                    // deck normally via the non-panic arm.
+                    timecode::LiftIntent::Locked { rate }
+                    | timecode::LiftIntent::LockedAbsolute { rate, .. } => {
                         let relock = self.panic_play_states[idx].relock_blocks.saturating_add(1);
                         self.panic_play_states[idx].relock_blocks = relock;
                         let hand_back =
@@ -749,70 +980,80 @@ impl Engine {
             } else {
                 match intent {
                     timecode::LiftIntent::Locked { rate } => {
-                        // Snapshot the auto-start gate before borrowing
-                        // the deck (disjoint field, but the borrow
-                        // checker can't see through the index).
-                        let autostart_blocked = self.timecode_autostart_blocked[idx];
                         let deck = &mut self.decks[idx];
                         deck.set_rate(rate);
                         if !deck.is_playing() {
-                            // First lock after silence / dropout: start
-                            // playing. The 2 ms declick handles the
-                            // smooth fade-in from silence.
+                            // Clean lock on a TC-mode deck: follow the
+                            // platter and play. The 2 ms declick handles
+                            // the smooth fade-in from silence.
                             //
-                            // **M11d.5 guard: only auto-start if a
-                            // track is actually loaded.** Without a
-                            // source the deck renders silence; flipping
-                            // `is_playing = true` only confuses the UI
-                            // ("Deck B is playing without me doing
-                            // anything") because the position poll
-                            // reflects the flag verbatim. Loaded
-                            // tracks still get the canonical "platter
-                            // started ⇒ deck plays" behaviour. Thru-
-                            // mode decks render through `thru_sources`
-                            // independently of the deck transport, so
-                            // suppressing the play flag here doesn't
-                            // mute live capture.
+                            // Only auto-start when a track is actually
+                            // loaded — a sourceless deck renders silence
+                            // and flipping `is_playing` would only confuse
+                            // the UI. Thru-mode decks render through
+                            // `thru_sources` independently of deck
+                            // transport, so this never mutes live capture.
                             //
-                            // **Load-arm gate (PRD §6.4).** Right after
-                            // a load the gate is set, so a platter that
-                            // was already locked (or a noise burst that
-                            // momentarily satisfies the decoder) does
-                            // NOT auto-start the freshly loaded track.
-                            // The gate is cleared on the first carrier-
-                            // absent block below, so a genuine fresh
-                            // needle-drop re-engages and starts the deck
-                            // normally.
-                            if deck.source().is_some() && !autostart_blocked {
+                            // No load-arm gate: in the explicit-mode world
+                            // (PRD §5.1.1) "deck is in TC and the platter
+                            // is turning" *is* the operator asking it to
+                            // play — including right after a load or at
+                            // app start with the record already spinning.
+                            // That was the bug where a freshly started deck
+                            // refused to spin until the user toggled
+                            // INT→TC. Preamp/mic bleed can't trigger this:
+                            // it never satisfies the decoder's
+                            // confidence/amplitude lock.
+                            if deck.source().is_some() {
                                 deck.set_playing(true);
                             }
                         }
                     }
+                    timecode::LiftIntent::LockedAbsolute {
+                        rate,
+                        advance_frames,
+                    } => {
+                        // M6: fully locked with consecutive absolute
+                        // LFSR fixes — `advance_frames` is the exact
+                        // groove distance the record travelled this
+                        // block (input frames at unity). `rate` still
+                        // shapes the intra-block resampling slope; the
+                        // advance re-pins the block-end playhead so the
+                        // position can never drift from the groove and
+                        // the audible pitch is exactly the platter's.
+                        let deck = &mut self.decks[idx];
+                        deck.set_rate(rate);
+                        if !deck.is_playing() && deck.source().is_some() {
+                            // Same auto-start contract as `Locked` —
+                            // see that arm's comment.
+                            deck.set_playing(true);
+                        }
+                        // Convert input frames → track frames. The
+                        // attach-time validation pins the input SR to
+                        // the engine SR, so `self.sample_rate` *is*
+                        // the input rate (single-conversion guarantee,
+                        // mirroring the deck's `new_increment` math).
+                        let track_sr = deck
+                            .source()
+                            .map(|t| f64::from(t.sample_rate()))
+                            .filter(|sr| *sr > 0.0);
+                        if let Some(track_sr) = track_sr {
+                            let delta = advance_frames * track_sr / f64::from(self.sample_rate);
+                            deck.advance_position_frames(delta);
+                        }
+                    }
                     timecode::LiftIntent::DropoutHoldRate { rate } => {
-                        // Carrier is absent. Two things happen here:
-                        //
-                        // 1. Clear the load-arm gate so a genuine fresh
-                        //    needle-drop is allowed to auto-start the
-                        //    deck (see the `Locked` arm above).
-                        // 2. **Pause the deck, holding its position.**
-                        //    Lifting the needle (or any loss of timecode
-                        //    while playing) pauses — it does NOT switch
-                        //    to internal play. Internal (Panic) Play is
-                        //    reserved for the explicit internal-Play
-                        //    button.
+                        // Carrier is absent: **pause the deck, holding its
+                        // position.** Lifting the needle (or any loss of
+                        // timecode while playing) pauses — it does NOT
+                        // switch to internal play.
                         //
                         // This replaces the M10.6e §5.4.2 "Repeat"
-                        // auto-Panic-on-dropout. That behaviour tried to
-                        // keep the deck audible past the control record's
-                        // run-out groove, but it fires identically on a
-                        // normal needle lift, so a lift wrongly engaged
-                        // internal play. Telling the lead-out (end zone)
-                        // apart from a lift requires absolute-position
-                        // decoding (M6), which the relative-position
-                        // decoder does not provide. Until M6 lands, a
-                        // dropout pauses and the operator presses
-                        // internal Play to continue past the end zone.
-                        self.timecode_autostart_blocked[idx] = false;
+                        // auto-Panic-on-dropout, which fired identically on
+                        // a normal needle lift. Telling the lead-out apart
+                        // from a lift needs absolute-position decoding
+                        // (M6); until then, a dropout pauses and the
+                        // operator switches to INT to continue.
                         let deck = &mut self.decks[idx];
                         deck.set_rate(rate);
                         if deck.is_playing() {
@@ -915,6 +1156,58 @@ impl Engine {
         self.decks[idx].set_panic_play_visible(false);
     }
 
+    /// Apply a user-selected control-mode switch on deck `idx` (PRD
+    /// §5.1.1, the deck-header three-way switch). The transition is
+    /// where the "no stall, no jump" continuity lives:
+    ///
+    /// - **→ Internal** starts internal playback (the INT switch position
+    ///   *is* the play control — there is no separate Play button). From
+    ///   Timecode it keeps the deck's current (last platter) rate so the
+    ///   music continues at the same pitch the platter was turning; from
+    ///   Thru it plays at unity. An empty deck just plays silence until a
+    ///   file is loaded.
+    /// - **→ Timecode** hands transport to the platter on the next block:
+    ///   it drops any internal-play hold and clears the load-arm gate so
+    ///   an already-spinning control record takes over immediately.
+    /// - **→ Thru** stops the loaded file advancing; the live record is
+    ///   passed through in [`Self::render_routed`].
+    ///
+    /// RT-safe: a few field writes and atomic stores.
+    fn set_deck_control_mode(&mut self, idx: usize, mode: ControlMode) {
+        if idx >= DECK_COUNT {
+            return;
+        }
+        let prev = self.control_mode[idx];
+        match mode {
+            ControlMode::Internal => {
+                // The INT position *is* the play control — there is no
+                // separate Play button. Selecting it plays the loaded
+                // file internally. From Timecode we keep the platter's
+                // last pitch (seamless hand-off, no stall/jump); from
+                // Thru (or a fresh deck) we play at unity.
+                if prev == ControlMode::Thru {
+                    self.decks[idx].set_rate(1.0);
+                }
+                self.decks[idx].set_playing(true);
+            }
+            ControlMode::Timecode => {
+                // Hand transport to the platter on the next block; drop
+                // any internal-play hold so a spinning control record
+                // takes over immediately.
+                self.cancel_panic_play(idx);
+            }
+            ControlMode::Thru => {
+                // The live record is the source now — unload the file so
+                // switching back to INT starts from an empty deck (and the
+                // header/waveform don't show a ghost of the old track).
+                self.cancel_panic_play(idx);
+                self.decks[idx].clear_source();
+            }
+        }
+        self.control_mode[idx] = mode;
+        self.control_override[idx] = true;
+    }
+
     /// Drain every pending command, applying each to the engine.
     ///
     /// Bounded by the channel capacity (256). At a 48 kHz / 64-frame block
@@ -941,8 +1234,18 @@ impl Engine {
     fn apply_command(&mut self, cmd: Command) {
         match cmd {
             Command::DeckPlay { idx } => {
-                if let Some(d) = self.decks.get_mut(idx as usize) {
+                let i = idx as usize;
+                if let Some(d) = self.decks.get_mut(i) {
                     d.set_playing(true);
+                }
+                // Pressing the internal Play button is the user choosing
+                // to play this file rather than a timecode record: pin the
+                // deck to Internal so the platter can't hijack it. The
+                // Internal/Timecode switch (or auto on a fresh deck) hands
+                // back to timecode.
+                if i < DECK_COUNT {
+                    self.control_mode[i] = ControlMode::Internal;
+                    self.control_override[i] = true;
                 }
             }
             Command::DeckPause { idx } => {
@@ -978,7 +1281,20 @@ impl Engine {
                     d.set_gain(gain);
                 }
             }
-            Command::DeckLoad { idx, source } => {
+            Command::DeckSetControlMode { idx, mode } => {
+                self.set_deck_control_mode(idx as usize, mode);
+            }
+            Command::DeckAutoControlMode { idx } => {
+                if let Some(o) = self.control_override.get_mut(idx as usize) {
+                    *o = false;
+                }
+            }
+            Command::DeckCalibrateTimecode { idx } => {
+                if let Some(Some(input)) = self.timecode_inputs.get_mut(idx as usize) {
+                    input.begin_calibration(CALIBRATION_FRAMES);
+                }
+            }
+            Command::DeckLoad { idx, source, gain } => {
                 let Some(d) = self.decks.get_mut(idx as usize) else {
                     // Bad idx: bounce the new Arc back through the trash
                     // channel rather than drop here. Symmetric with the
@@ -987,16 +1303,14 @@ impl Engine {
                     return;
                 };
                 d.swap_source(source);
-                // PRD §6.4 "load never auto-plays". Arm the timecode
-                // auto-start gate so the freshly loaded track is NOT
-                // grabbed by an already-locked platter (or a noise
-                // burst) the moment it lands. The gate clears the next
-                // time the carrier is observed absent, so a genuine
-                // fresh needle-drop after the load still auto-starts
-                // the deck. Mouse-initiated Panic-Play bypasses it.
-                if let Some(blocked) = self.timecode_autostart_blocked.get_mut(idx as usize) {
-                    *blocked = true;
-                }
+                // Auto-gain (M16): apply the load-time normalization
+                // gain atomically with the swap. The new track fades in
+                // (via swap_source's de-click ramp) to this gain. Always
+                // set — `1.0` for unanalyzed tracks — so a load never
+                // inherits the previous track's normalization. This is a
+                // read-once-and-hold value; the deck never observes the
+                // library reactively.
+                d.set_gain(gain);
                 // The OLD Arc<Track> (if any) now lives inside the
                 // deck's de-click state for the duration of the ramp;
                 // we'll harvest it after the next render block via
@@ -1431,6 +1745,27 @@ mod tests {
     }
 
     #[test]
+    fn thru_passthrough_render_is_alloc_free() {
+        // The Thru passthrough runs on the audio thread (RT-sacred). It
+        // must not allocate: a bounded additive copy of the decoder's
+        // already-drained samples.
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        let input = vec![0.2_f32; block * 2];
+        assert_eq!(tx.push_slice(&input), input.len());
+        let mut out = vec![0.0_f32; block * 2];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render(&mut rt, &mut out);
+        });
+    }
+
+    #[test]
     fn handle_play_and_pause_apply_on_render() {
         // Track value is constant 0.5 across all samples. The deck
         // applies a 2 ms fade on play and pause (M3.5 de-click). We
@@ -1570,7 +1905,7 @@ mod tests {
         // Hot-load track B. The DeckLoad applies during the next render
         // and triggers a declick fade A → B. Render 256 frames so we
         // span the fade and observe steady-state B in the tail.
-        handle.deck(0).load(track_b.clone()).unwrap();
+        handle.deck(0).load(track_b.clone(), 1.0).unwrap();
         let mut buffer = vec![0.0f32; 256 * 2];
         engine.render(&mut rt, &mut buffer);
         for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
@@ -1613,7 +1948,7 @@ mod tests {
         //     handoff was already done by the sender),
         //  3. push the old Arc into the trash channel (no alloc — the
         //     channel storage is pre-allocated).
-        handle.deck(0).load(track_b).unwrap();
+        handle.deck(0).load(track_b, 1.0).unwrap();
 
         let mut buffer = vec![0.0f32; 8];
         let mut rt = RealtimeContext::new();
@@ -1632,7 +1967,7 @@ mod tests {
         let mut rt = RealtimeContext::new();
         for _ in 0..100 {
             let t = Arc::new(Track::from_interleaved(vec![0.1; 8], 48_000, 2).unwrap());
-            handle.deck(0).load(t).unwrap();
+            handle.deck(0).load(t, 1.0).unwrap();
             engine.render(&mut rt, &mut buffer);
         }
         assert_eq!(handle.trash_overflow_count(), 0);
@@ -1925,25 +2260,23 @@ mod tests {
     }
 
     #[test]
-    fn timecode_load_does_not_autostart_on_already_locked_platter() {
-        // PRD §6.4 "load never auto-plays". Load a track via the
-        // command channel onto a deck whose platter is *already*
-        // spinning a clean carrier. The freshly loaded track must NOT
-        // be grabbed and started — the operator never pressed play and
-        // never performed a fresh needle-drop. Only after the carrier
-        // goes absent (lift) and returns (drop) should the deck
-        // auto-start.
+    fn timecode_loaded_deck_autostarts_on_a_spinning_platter() {
+        // PRD §5.1.1 explicit-mode behaviour. Load a track onto a TC-mode
+        // deck whose platter is *already* spinning a clean carrier. The
+        // deck must start playing on the lock — "in TC, the record is
+        // turning" is the operator asking it to play. This is the fix for
+        // the reported bug where a freshly started deck refused to spin
+        // until the user toggled INT→TC (the old load-arm gate, removed).
         let sr = 48_000.0_f32;
         let block = 256_usize;
         let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
 
-        // Load via the real command path (this is what the FFI / app
-        // uses, and the only path that arms the auto-start gate).
         let track =
             Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
         engine.apply_command(Command::DeckLoad {
             idx: 0,
             source: track,
+            gain: 1.0,
         });
         engine.deck_mut(0).quiesce_declick_for_test();
         assert!(!engine.deck(0).is_playing(), "deck should start paused");
@@ -1952,9 +2285,9 @@ mod tests {
         let mut buf = vec![0.0_f32; block * 2];
         let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
 
-        // Phase 1: platter already spinning a clean forward carrier the
-        // moment the track lands. The decoder locks, but the deck must
-        // stay paused because the load armed the gate.
+        // Platter already spinning a clean forward carrier the moment the
+        // track lands (= app start with the record running). The deck
+        // locks and plays — no INT→TC toggle required.
         let n = block * 4;
         let mut sig = vec![0.0_f32; n * 2];
         gen.render(&mut sig, 1.0, 0.5);
@@ -1967,33 +2300,216 @@ mod tests {
             "carrier should lock cleanly"
         );
         assert!(
-            !engine.deck(0).is_playing(),
-            "freshly loaded deck must NOT auto-start on an already-locked platter"
+            engine.deck(0).is_playing(),
+            "a TC-mode deck with a track loaded must play on a spinning platter"
         );
+    }
 
-        // Phase 2: carrier goes absent (operator lifts the needle).
-        // This clears the gate. The deck stays paused.
-        let silence = vec![0.0_f32; block * 2 * 2];
-        assert_eq!(tx.push_slice(&silence), silence.len());
-        engine.render(&mut rt, &mut buf);
-        engine.render(&mut rt, &mut buf);
+    #[test]
+    fn absolute_lock_drives_deck_position_exactly() {
+        // M6 end-to-end: an AM-modulated CV02 carrier (position-encoded,
+        // like a real pressing) locks the absolute LFSR tracker, and from
+        // then on the deck playhead advances by *exactly* the groove
+        // distance — the LockedAbsolute → advance_position_frames plumbing
+        // — instead of integrating the (slightly noisy) carrier-phase rate.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+
+        // Track SR == engine SR so input frames == track frames and the
+        // expected advance needs no conversion.
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 4], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: track,
+            gain: 1.0,
+        });
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.15));
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut sig = vec![0.0_f32; block * 2];
+        // Slightly off-unity so "exact" is distinguishable from the
+        // relative path's smoothed estimate.
+        let rate = 1.02_f64;
+        let push_and_render = |engine: &mut Engine,
+                               tx: &mut ringbuf::HeapProd<f32>,
+                               gen: &mut dub_timecode::signal::Generator,
+                               rt: &mut RealtimeContext<'_>,
+                               sig: &mut [f32],
+                               buf: &mut [f32]| {
+            gen.render(sig, rate, 0.5);
+            assert_eq!(tx.push_slice(sig), sig.len());
+            engine.render(rt, buf);
+        };
+
+        // Warm-up: relative lock is immediate; absolute acquisition
+        // needs the slicer to prime + a verified 20-bit window
+        // (~25–40 carrier cycles ≈ 6–10 blocks). 40 blocks is comfy.
+        for _ in 0..40 {
+            push_and_render(&mut engine, &mut tx, &mut gen, &mut rt, &mut sig, &mut buf);
+        }
+        let out = engine.timecode_last_output(0).expect("decoded output");
         assert!(
-            !engine.deck(0).is_playing(),
-            "deck stays paused while carrier is absent"
+            out.abs_position_frames.is_some(),
+            "absolute tracker should be locked after warm-up (conf {})",
+            out.abs_confidence
+        );
+        assert!(engine.deck(0).is_playing());
+
+        // Measured stretch: every block's groove travel is
+        // block · rate input frames. With the absolute path driving the
+        // deck, the playhead advance must match to sub-frame accuracy.
+        let p0 = engine.deck(0).position_frames();
+        let blocks = 40_usize;
+        for _ in 0..blocks {
+            push_and_render(&mut engine, &mut tx, &mut gen, &mut rt, &mut sig, &mut buf);
+        }
+        let advance = engine.deck(0).position_frames() - p0;
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (blocks * block) as f64 * rate;
+        // Per-block absolute deltas are exact; the residual is a one-time
+        // sub-cycle phase-fraction offset at the lock handover (it does
+        // not accumulate). < 1 frame over 4 000+ is 0.02 % — the drift-
+        // free win versus the relative path's unbounded integration.
+        assert!(
+            (advance - expected).abs() < 1.0,
+            "deck advance {advance} should match groove travel {expected} \
+             to sub-frame accuracy"
+        );
+    }
+
+    #[test]
+    fn timecode_to_internal_keeps_held_pitch_not_unity() {
+        // PRD §5.1.1 transition continuity + the removed auto-switch
+        // bug. Lock a deck to a *non-unity* carrier (so "held" is
+        // distinguishable from "forced unity"), then have the user flip
+        // the deck-header switch to Internal while the platter is still
+        // turning. Internal play must continue at the held platter rate
+        // — not reset to 1.0, and not stall.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let n = block * 6;
+        let mut sig = vec![0.0_f32; n * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        gen.render(&mut sig, 0.9, 0.5);
+        assert_eq!(tx.push_slice(&sig), sig.len());
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..6 {
+            engine.render(&mut rt, &mut buf);
+        }
+        assert!(engine.deck(0).is_playing(), "deck plays under timecode");
+        let held = engine.deck(0).rate();
+        assert!(
+            (held - 0.9).abs() < 0.05,
+            "deck should track the ~0.9× platter (got {held})"
         );
 
-        // Phase 3: fresh needle-drop — carrier returns. Now the deck is
-        // allowed to auto-start, because the gate cleared on the
-        // carrier-absent block.
-        let mut sig2 = vec![0.0_f32; n * 2];
-        gen.render(&mut sig2, 1.0, 0.5);
-        assert_eq!(tx.push_slice(&sig2), sig2.len());
+        // User clicks INT on the switch while the record is still spinning.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Internal,
+        });
+        // Render further blocks; the (now drained) input no longer drives
+        // the deck because the mode is Internal.
         for _ in 0..4 {
             engine.render(&mut rt, &mut buf);
         }
         assert!(
             engine.deck(0).is_playing(),
-            "a fresh needle-drop after the load should auto-start the deck"
+            "internal play continues — no stall on the switch"
+        );
+        let after = engine.deck(0).rate();
+        assert!(
+            (after - held).abs() < 1e-6,
+            "internal play keeps the held pitch (was {held}, now {after}); \
+             the old code forced it to 1.0"
+        );
+    }
+
+    #[test]
+    fn thru_mode_passes_live_input_through() {
+        // PRD §5.1.1 Thru. With the deck switched to Thru, the live
+        // record's audio (the raw input the decoder drained this block)
+        // is passed straight through to the output at the deck's gain —
+        // reusing the single timecode-input consumer, no second ring.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+
+        // A constant stereo level stands in for the live record.
+        let mut input = vec![0.0_f32; block * 2];
+        for frame in input.chunks_exact_mut(2) {
+            frame[0] = 0.25;
+            frame[1] = -0.5;
+        }
+        assert_eq!(tx.push_slice(&input), input.len());
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        engine.render(&mut rt, &mut buf);
+
+        // Sample a frame the decoder definitely drained.
+        assert!(
+            (buf[2 * 100] - 0.25).abs() < 1e-6,
+            "left channel should pass through (got {})",
+            buf[2 * 100]
+        );
+        assert!(
+            (buf[2 * 100 + 1] + 0.5).abs() < 1e-6,
+            "right channel should pass through (got {})",
+            buf[2 * 100 + 1]
+        );
+    }
+
+    #[test]
+    fn thru_mode_unloads_the_loaded_file() {
+        // Switching a deck to Thru unloads its file — the live record is
+        // the source now, so going back to INT starts from an empty deck.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        assert!(engine.deck(0).source().is_some(), "track loaded");
+
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+
+        let input = vec![0.1_f32; block * 2 * 4];
+        assert_eq!(tx.push_slice(&input), input.len());
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut buf);
+        }
+        assert!(
+            engine.deck(0).source().is_none(),
+            "Thru must unload the loaded file"
+        );
+        assert!(
+            engine.deck(0).position_frames().abs() < f64::EPSILON,
+            "unloaded deck sits at position 0 (got {})",
+            engine.deck(0).position_frames()
         );
     }
 
@@ -3117,6 +3633,8 @@ mod tests {
             position_secs: 0.0,
             amplitude: 0.5,
             confidence: 0.95,
+            abs_position_frames: None,
+            abs_confidence: 0.0,
         }
     }
 
@@ -3126,6 +3644,8 @@ mod tests {
             position_secs: 0.0,
             amplitude: 0.0,
             confidence: 0.0,
+            abs_position_frames: None,
+            abs_confidence: 0.0,
         }
     }
 

@@ -331,22 +331,39 @@ Both modes share the same engine, the same library, the same file format support
 
 ### 5.1 Per-deck source modes
 
-Each deck has a **source** that drives its audio output. The user does not normally choose this — Dub detects what the deck is doing and switches automatically (§5.1.1). Manual override is available in preferences.
+Each deck has a **source** that drives its audio output. The user selects it **explicitly** via a three-way switch on the deck header (§5.1.1). There is no automatic source detection in the current build — see the deferred note below for why.
 
 | Mode | Behavior | v1 |
 |---|---|---|
-| **Internal** | Software transport controls. Debug-only in release builds. | Yes (debug menu) |
-| **Timecode** | Position driven by Serato or Traktor control vinyl. File from library is the audio source. **Relative mode only in v1** — needle drop is ignored, only motion is tracked. | **Yes — primary v1 mode** |
-| **Thru** | Audio interface input on this deck's input pair routed *through* the engine to its output pair. **Always software-path**, never hardware-bypass: BPM detection, waveform capture, and FX all need the signal in software. One buffer of round-trip latency (~2.7 ms at 64-frame buffer / 48 kHz) — constant regardless of FX state. Hardware-Thru on the interface (SL3 / TA6 physical button) is outside Dub's scope because it routes audio around the software entirely. | **Yes — v1, automatic** |
+| **Internal** | The loaded file plays on its own clock. **The INT switch position is the play control — there is no separate Play button.** Selecting Internal *from* Timecode keeps the platter's last pitch so the music continues without a stall or jump; *from* Thru (or a fresh deck) it plays at unity. | **Yes** |
+| **Timecode** | Position driven by Serato or Traktor control vinyl. File from library is the audio source. **Relative mode only in v1** — needle drop is ignored, only motion is tracked. When the carrier stops, the deck **holds its position** — it never auto-falls-back to internal play. | **Yes — primary v1 mode** |
+| **Thru** | Audio interface input on this deck's input pair routed *through* the engine to its output pair. **Always software-path**, never hardware-bypass: BPM detection, waveform capture, and FX all need the signal in software. One buffer of round-trip latency (~2.7 ms at 64-frame buffer / 48 kHz) — constant regardless of FX state. Hardware-Thru on the interface (SL3 / TA6 physical button) is outside Dub's scope because it routes audio around the software entirely. | **Yes** |
 | **Phase** | Position driven by Phase wireless (file from library is audio source). | v2 |
 
-**Source switching is live and seamless.** Mode transitions use a 5 ms equal-power crossfade. A DJ swapping a timecode record for a real record mid-set should not hear any artifact from Dub during the swap.
+**Implementation note:** all three modes share a single per-deck input consumer. The timecode decoder is always attached and always drains the deck's input ring; the selected mode decides what happens to those samples each block — Timecode feeds them to the LFSR decoder (drives the file), Thru passes them straight to the output (the live record), Internal ignores them (the file plays on its own clock). One consumer, no second ring, switch is instant and click-free.
 
-#### 5.1.1 Automatic source detection
+#### 5.1.1 Explicit source selection (three-way switch)
 
-Dub continuously analyzes each deck's audio input and decides which mode to engage, without user intervention.
+The deck header carries a three-position switch — **INT · TC · THRU** — that the user clicks (mouse, pre-alpha) to choose the deck's source. Exactly one is active per deck. The switch is sticky: a mode only changes when the operator selects another, never on its own.
 
-**Algorithm:**
+The switch is the transport — there is **no separate Play/Pause button** on the performance surface. Each position fully determines what the deck does:
+
+- **INT** — the loaded file plays internally. Selecting it *is* pressing play.
+- **TC** — the deck follows the platter: it plays when the control record moves and holds when it stops. Nothing to press.
+- **THRU** — the live record passes through.
+
+Transitions are designed for continuity:
+
+- **Timecode → Internal**: internal play starts (or continues) at the platter's last pitch — no stall, no jump.
+- **Internal → Timecode**: the platter takes over on the next block; the only speed change is the genuine difference between the internal pitch and the platter's actual speed.
+- **Thru → Internal**: the passthrough stops and the loaded file plays internally at unity. An empty deck simply plays silence until a file is loaded.
+- **→ Thru**: the live record owns the output; the loaded file (if any) stops advancing.
+
+The small ↻ next to the TC position recalibrates the needle (channel-whitening capture).
+
+> **Deferred — automatic source detection.** Earlier drafts of this spec had Dub *detect* the source and switch modes on its own (the algorithm below). During pre-alpha dogfooding this proved to be the wrong default: a stopped timecode record was misread as a "real record" and yanked the deck into internal playback mid-set, and the hidden state machine made the deck's behavior hard to predict. The explicit switch above replaces it. The classifier still runs off the audio thread for **telemetry and auto-calibration only** — it informs the status dot and triggers needle calibration, but it never moves the switch. Automatic detection may return later as an opt-in once it can reliably tell a stopped control record from a real one (the absolute LFSR decoding it needs shipped in M6 — see §5.4 — so the remaining work is the detection policy itself). The algorithm is retained here for that future work.
+
+**Algorithm (deferred — not wired to mode switching):**
 
 A short-window classifier (running on a worker thread, NOT the audio thread) examines a 250 ms sliding window of the deck's input audio:
 
@@ -384,11 +401,7 @@ A short-window classifier (running on a worker thread, NOT the audio thread) exa
 - During active scratching (timecode lock plus motion), **detection is frozen** — we never switch out of Timecode mid-scratch. Even if signal degrades briefly (dust, rough handling), Stickiness (§5.4) holds the mode.
 - Silence (needle lifted) does not trigger a switch. Mode is held until next signal arrives, then re-evaluated.
 
-**User-facing behavior:**
-
-The detected mode is shown in the deck's status indicator, but **no menus or buttons require the user to think about source switching**. They drop a needle, Dub figures it out. UI shows: 🎛 Timecode • 🎵 Real Record • 🎚 FX Active. State changes animate in/out so the DJ can see what's happening at a glance.
-
-**Why this works:** scratch-DJ workflows already involve dropping different records on the same turntable mid-set. Dub respecting this physical reality — instead of forcing a menu pick — *is* the headline UX win for this category of user.
+**User-facing behavior (if auto-detection returns):** the detected mode would be shown in the deck's status indicator and animate in/out. In the current build this is replaced by the explicit INT · TC · THRU switch (above); the status dot still reflects the *classification* (silence / timecode / record) as a health cue but does not drive the switch.
 
 **Confidence and edge cases:**
 
@@ -398,7 +411,7 @@ The detected mode is shown in the deck's status indicator, but **no menus or but
 
 **Implementation note:** the classifier runs **off the audio thread** (worker thread, ~250 ms cadence). It informs a "desired mode" for the audio thread to honor on the next block boundary, with crossfade. RT-thread is never blocked by classification.
 
-**Manual override:** preferences include a "Source mode override" per deck: `Auto` (default) / `Timecode` / `Thru` / `Internal` (debug). Pro DJs may pin the mode for predictability.
+**Source selection:** the per-deck INT · TC · THRU switch on the deck header is the source control (§5.1.1). There is no `Auto` position in the current build; if automatic detection returns it will be an opt-in alongside the explicit positions, not the default.
 
 ### 5.2 Thru Mode (real records through the software)
 
@@ -490,7 +503,7 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 
 **Required behaviors:**
 - 33⅓ and 45 RPM detection (auto, with a manual Preferences override — see §5.4.1).
-- **Relative mode only in v1.** Needle drops are ignored; only motion is tracked. Absolute mode is deferred — almost no scratch DJ uses absolute mode in practice. Skipping it cuts calibration UI complexity significantly.
+- **Relative behavior only in v1.** Needle drops are ignored; only motion is tracked. Absolute *positioning* (needle-drop seeks the track) is deferred — almost no scratch DJ uses it in practice, and skipping it cuts calibration UI complexity significantly. **However, since M6 the decoder does decode the absolute LFSR position internally** (Serato CV02; Traktor MK1 planned, MK2 has no public bitstream and stays carrier-phase-only): while the bitstream is locked, the deck's velocity and playhead advance come from per-block *deltas* of the decoded groove position — bit-exact pitch (a steady +8.0 reads +8.0, like Traktor) and a playhead that cannot drift from the groove ("sticker drift"). A lift + re-drop re-anchors the reference and never jumps the playhead; during acquisition (~20 ms) and degraded signal the carrier-phase relative path drives the deck exactly as before. No user-facing mode, no calibration UI added.
 - **Pitch range** as wide as the user's turntable (typically ±8 / ±16 / ±50 %)
 - Slow-down to stop: tracks pitch through zero cleanly without click/glitch
 - Backspin: tracks negative pitch with no audible artifact up to the resampler's limits
@@ -501,7 +514,7 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 
 **Algorithm:** port the xwax decoder (well-understood, ~2k lines C, BSD-licensed). Our port lives in `crates/dub-timecode/`. Both Serato and Traktor LFSR tables included.
 
-**Absolute mode is deferred to v1.x or later** if user demand emerges. Most likely, never.
+**Absolute *positioning* (needle-drop) is deferred to v1.x or later** if user demand emerges. Most likely, never. This is a UI/behavior decision, not a decoder limitation — the absolute position is already decoded internally (M6, see above); we deliberately use only its deltas.
 
 #### 5.4.1 RPM Preferences override
 
@@ -593,7 +606,7 @@ The button also subsumes **Casual Play in Timecode mode**: when a track is loade
 
 Two ways out of Panic Play:
 
-1. **Auto-resume.** When the engine sees a clean LFSR lock returning (carrier alive + confidence above the engage threshold), `Engine::drive_timecode_inputs` clears the panic flag and applies the new platter rate on the same block. The held playhead position is the new "zero" reference for the LFSR's relative motion (§5.4). The audience hears no interruption beyond a tiny `LiftPolicy` crossfade.
+1. **Auto-resume.** When the engine sees a clean LFSR lock returning (carrier alive + confidence above the engage threshold; an M6 absolute-position lock counts identically — it's the strongest possible lock signal), `Engine::drive_timecode_inputs` clears the panic flag and applies the new platter rate on the same block. The held playhead position is the new "zero" reference for the LFSR's relative motion (§5.4). The audience hears no interruption beyond a tiny `LiftPolicy` crossfade.
 2. **Manual cancel** (the user tapping the vinyl button). The engine clears the engaged flag and **leaves deck transport alone**; the timecode driver decides what happens on the next block:
    - Healthy carrier present → driver re-locks, deck keeps playing at the platter rate (this is the INT→ABS hand-back).
    - Carrier silent / below threshold → driver's existing `DropoutHoldRate` arm pauses the deck on the held position (this matches the pre-M10.6c "engine pauses on held position" outcome, now produced by the natural dropout path instead of a manual `set_playing(false)` that would race the next Locked sample).
@@ -870,7 +883,7 @@ Honest disclosure: tracks that drift (vintage soul cuts, live-played reggae band
 On-demand (first deck-load) or background; **not at import time** since M11c.4. Analysis is keyed by canonical fingerprint so the work runs once per recording, ever, regardless of how many file copies the user has or how many sources reference it. The first analyze pass for a freshly-imported track also computes and attaches the Chromaprint fingerprint (M11c.4 lazy-fingerprint contract; see §8.1).
 
 - **Waveform** (multi-resolution overview + zoom), pre-rendered, cached on disk via the M10.5j sidecar at `~/Library/Caches/Dub/waveforms/{fingerprint}.wf`. The sidecar key migrates from the M10.5b path-based hash to the canonical fingerprint at M11a so the cache survives file moves and dedupe merges. The renderer reads through `analysis_cache.waveform_sidecar_path`.
-- **Loudness (LUFS-I) and true-peak** measured and stored in `analysis_cache`. **Measured, not applied** in v1. A LUFS column in the browser lets the DJ scan for outliers before loading and adjust trim in their head at the hardware mixer. Auto-trim is deliberately not in v1: the external mixer is the product (§2.1), the DJ's trim knob is their gain control, and a software gain that overrides them creates the "fighting the app" failure mode the rest of the PRD militates against. Opt-in "auto-trim hint" (information only, no signal-path change) is a v1.x consideration if beta feedback supports it.
+- **Loudness (LUFS-I) and true-peak** measured and stored in `analysis_cache`, **and applied as a load-time normalization gain** — on by default, with a per-app opt-out. A LUFS column in the browser still lets the DJ scan for outliers before loading. The applied gain lines decks up at a consistent loudness on load so the DJ isn't re-trimming on every track change; it is a single multiply resolved once at load (`DubLibrary::track_normalization_gain` → `DubEngine::load_track(auto_gain)`), held for the life of the load, never revised by analysis that finishes later. **Auto-gain measures, it does not master:** it only sets the starting level — the hardware mixer trim still sits on top and has the last word, so it does not create the "fighting the app" failure mode (§2.1) the way an always-on AGC would. A DJ who wants to own level entirely turns it off in Preferences (`Loudness → Auto-match loudness on load`, persisted under `dub.loudnessAutoGainEnabled`); with it off, tracks load at unity and measurement is unaffected. The toggle gates *application* only — LUFS is always measured, cached, and surfaced regardless. *(The earlier v1 stance was "measured, not applied"; auto-gain was promoted into v1 as a default-on, opt-out convenience once it was clear an opt-out toggle resolves the "external mixer is the product" objection — the mixer still wins, this just picks a sane start.)*
 - **Beatgrid** if not imported (§8.3). Cross-validation runs even when imported (§8.3 bullet).
 - **Filename-derived metadata.** When ID3 tags are absent or matched against a junk pattern (`Track 01`, `Unknown`, the bare filename without extension, `downloaded from xyzblog.com`-class garbage), Dub parses the filename for common DJ patterns:
   - `ARTIST - TITLE.ext`

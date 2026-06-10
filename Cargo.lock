@@ -699,6 +699,7 @@ version = "0.0.1"
 dependencies = [
  "dirs",
  "dub-bpm",
+ "dub-dsp",
  "dub-fingerprint",
  "dub-io",
  "dub-peaks",

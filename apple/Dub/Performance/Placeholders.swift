@@ -36,10 +36,11 @@ struct FXBarPlaceholder: View {
     @ViewBuilder
     private func deckColumn(_ side: DeckSide) -> some View {
         HStack(spacing: DubSpacing.md) {
+            // Time-based FX stay in the bottom bar; Quick Scratch and
+            // Sampler moved to the per-deck performance pads beside the
+            // waveform (see PerformancePadsView).
             modulePlaceholder("ECHO-OUT")   // M15
             modulePlaceholder("DUB SIREN")  // M16
-            scratchPlaceholder(side: side)
-            samplerPlaceholder(side: side)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, DubSpacing.lg)

@@ -11,7 +11,9 @@ alwaysApply: true
 
 1. **No Mouse DJ Ever.** Performance interactions never require a mouse.
 2. **External mixer is the product.** No software mixer in v1/v2.
-3. **Real records are first-class.** Thru mode + auto-detection.
+3. **Real records are first-class.** Thru mode (live record passthrough),
+   selected explicitly via the per-deck INT · TC · THRU switch. (Automatic
+   source detection is deferred — see PRD §5.1.1.)
 4. **Reliability over features.** Audience-grade reliability.
 5. **Forward = backward symmetric playback.** Manual rewinds are first-class.
 6. **The audio thread is sacred.**

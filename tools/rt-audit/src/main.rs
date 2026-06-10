@@ -96,7 +96,7 @@ fn run() -> Result<()> {
                 } else {
                     track_b.clone()
                 };
-                if handle.deck(target_deck).load(next).is_ok() {
+                if handle.deck(target_deck).load(next, 1.0).is_ok() {
                     total_loads_sent += 1;
                 }
             }

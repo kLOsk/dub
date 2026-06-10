@@ -43,6 +43,10 @@ settings:
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
       SWIFT_OPTIMIZATION_LEVEL: "-Onone"
       GCC_OPTIMIZATION_LEVEL: "0"
+      # `settingPresets: none` strips Xcode's default ENABLE_TESTABILITY;
+      # restore it so `@testable import Dub` works from DubTests (the
+      # snapshot suite renders the app's internal SwiftUI views).
+      ENABLE_TESTABILITY: YES
     Release:
       SWIFT_OPTIMIZATION_LEVEL: "-O"
       GCC_OPTIMIZATION_LEVEL: "s"
@@ -139,6 +143,51 @@ targets:
             cp "${SRC}" "${DST}"
           fi
 
+  # Snapshot-test bundle (C-31). Renders the app's internal SwiftUI
+  # views to PNGs (no running app / no Metal) so the chrome — deck
+  # header, beatmatch viz, pads, panels — can be eyeballed and
+  # regression-checked. Hosted in Dub.app for `@testable import Dub`.
+  DubTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: DubTests
+    dependencies:
+      # Host app only — DubCore (and its CoreAudio/Metal symbols) resolve
+      # against the host via BUNDLE_LOADER at load time. Linking the
+      # DubCore product *into* the test would re-link libdub_ffi.a and
+      # drag in framework symbols the test target doesn't carry.
+      - target: Dub
+      - package: SnapshotTesting
+        product: SnapshotTesting
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_NAME: DubTests
+        PRODUCT_MODULE_NAME: DubTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.klos.dub.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Dub.app/Contents/MacOS/Dub"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 packages:
   DubShared:
     path: DubShared
+  SnapshotTesting:
+    url: https://github.com/pointfreeco/swift-snapshot-testing
+    from: "1.17.0"
+
+schemes:
+  # Explicit so the test action includes DubTests. `make app` builds
+  # with `-scheme Dub` (build action), and `xcodebuild test -scheme Dub`
+  # runs the snapshot suite.
+  Dub:
+    build:
+      targets:
+        Dub: all
+        DubTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - DubTests

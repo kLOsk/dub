@@ -58,3 +58,8 @@ crashes/
 # Apple developer artifacts
 ExportOptions.plist
 *.p12
+
+# SwiftUI snapshot reference images — kept local while the
+# performance UI is in flux (C-31). Recommit fresh goldens as the
+# regression baseline once the surface stabilises.
+apple/DubTests/__Snapshots__/

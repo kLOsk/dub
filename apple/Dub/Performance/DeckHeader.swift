@@ -50,6 +50,31 @@ struct DeckHeaderState: Equatable {
     /// column renders the dash in that case.
     let bpm: Double?
 
+    /// Deck pitch as a signed percentage `(rate − 1) × 100`, from
+    /// `engine.deckTelemetry`. `nil` when the deck isn't actively
+    /// driven (paused / lifted / no source) — the PITCH column shows
+    /// the dash. `var` with a default so the many `from(...)` call
+    /// sites that don't set it keep compiling. (Turntables aren't
+    /// mirrored — this column is in the same place on both decks.)
+    var pitchPercent: Double? = nil
+
+    /// Timecode lock state for the source-pill tracking dot: 0 none ·
+    /// 1 clean (green) · 2 degraded (amber) · 3 disengaged / scratching
+    /// (red — which is *normal* while scratching, per Serato). `var`
+    /// with a default so the existing `from(...)` call sites compile.
+    var timecodeLockState: UInt8 = 0
+
+    /// Source-control state for the row-3 Internal/Timecode switch
+    /// (PRD §5.1.1). `nil` ⇒ the deck has no timecode input, so the
+    /// switch is hidden (e.g. Prep mode / File-only). `var` default so
+    /// existing `from(...)` call sites compile.
+    var sourceControl: SourceControlStatus? = nil
+
+    /// Whether the row-3 source-control mode is user-pinned (override)
+    /// rather than auto-selected. Renders the "· PINNED" badge on the
+    /// switch. `var` default so existing `from(...)` call sites compile.
+    var sourceControlOverridden: Bool = false
+
     /// M11c.2. Canonical Camelot key of the loaded library track
     /// (e.g. `"8B"` for C major). `nil` when no track is loaded,
     /// when key analysis returned zero confidence, **or** when the
@@ -223,6 +248,13 @@ struct DeckHeaderCallbacks {
     /// "good to go" decision actually happens.
     var onToggleGridLocked: (() -> Void)? = nil
 
+    /// Source-control switch (PRD §5.1.1): select Internal / Timecode /
+    /// Thru for the deck, and manually recalibrate the needle.
+    var onSetInternal: (() -> Void)? = nil
+    var onSetTimecode: (() -> Void)? = nil
+    var onSetThru: (() -> Void)? = nil
+    var onRecalibrate: (() -> Void)? = nil
+
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
     static let noop = DeckHeaderCallbacks()
@@ -318,11 +350,49 @@ struct DeckHeader: View {
     private var row3Reserved: some View {
         if let time = state.timeRow, time.hasTime {
             timeRow(time)
+        } else if state.sourceControl != nil {
+            // No track loaded yet, but the deck has a timecode input —
+            // show the source switch on its own so the DJ can pick
+            // INT / TC / THRU before (or without) loading a file.
+            sourceSwitchRow
         } else {
             Color.clear
                 .frame(height: 20)
                 .frame(maxWidth: .infinity)
         }
+    }
+
+    /// The three-way source switch, when this deck has one. Pulled out
+    /// so both the time row (track loaded) and the standalone row (no
+    /// track) render the same control, on both deck orientations.
+    @ViewBuilder
+    private var sourceSwitchView: some View {
+        if let sc = state.sourceControl {
+            SourceControlView(
+                status: sc, overridden: state.sourceControlOverridden,
+                isPlaying: state.isPlaying, side: side,
+                onInternal: { callbacks.onSetInternal?() },
+                onPause: { callbacks.onPause() },
+                onTimecode: { callbacks.onSetTimecode?() },
+                onThru: { callbacks.onSetThru?() },
+                onRecalibrate: { callbacks.onRecalibrate?() })
+        }
+    }
+
+    /// Row-3 layout when no track is loaded: just the source switch,
+    /// pinned to the deck's outer edge like the rest of the header.
+    private var sourceSwitchRow: some View {
+        HStack(spacing: 0) {
+            if mirrored {
+                Spacer(minLength: 0)
+                sourceSwitchView
+            } else {
+                sourceSwitchView
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(height: 20)
+        .frame(maxWidth: .infinity, alignment: mirrored ? .trailing : .leading)
     }
 
     // MARK: - Row 1 — identity
@@ -350,13 +420,13 @@ struct DeckHeader: View {
                 if state.isMaster, !prepMode {
                     masterChip.layoutPriority(2)
                 }
-                if !prepMode || !shouldHideSourcePill {
+                if showSourcePill {
                     sourcePill.layoutPriority(2)
                 }
                 deckLabel.layoutPriority(2)
             } else {
                 deckLabel.layoutPriority(2)
-                if !prepMode || !shouldHideSourcePill {
+                if showSourcePill {
                     sourcePill.layoutPriority(2)
                 }
                 if state.isMaster, !prepMode {
@@ -414,9 +484,11 @@ struct DeckHeader: View {
             if mirrored {
                 fxChip
                 Spacer(minLength: 0)
+                statColumn(label: "PITCH", value: formattedPitch)
                 bpmStatColumn
                 statColumn(label: "KEY", value: formattedKey)
             } else {
+                statColumn(label: "PITCH", value: formattedPitch)
                 bpmStatColumn
                 statColumn(label: "KEY", value: formattedKey)
                 Spacer(minLength: 0)
@@ -441,13 +513,21 @@ struct DeckHeader: View {
     /// has emitted a rolling preview, render that preview value
     /// instead of the committed BPM so the user can see the
     /// running estimate converge in real time.
+    /// The **live** tempo: the track's analyzed BPM scaled by the
+    /// deck's current pitch, so the column reads the BPM the record is
+    /// *actually playing at*. When the platter slows the BPM drops with
+    /// it; this is the number you beatmatch against. Falls back to the
+    /// nominal BPM when the deck isn't being driven (`pitchPercent ==
+    /// nil`).
+    private var liveBpm: Double? {
+        guard let base = state.bpm, base > 0 else { return nil }
+        guard let pitch = state.pitchPercent else { return base }
+        return base * (1.0 + pitch / 100.0)
+    }
+
     private var formattedBPM: String {
-        let value: Double?
-        if let preview = tapSession.rollingBpm {
-            value = preview
-        } else {
-            value = state.bpm
-        }
+        // Tap-tempo preview wins while a tap session is rolling.
+        let value = tapSession.rollingBpm ?? liveBpm
         guard let bpm = value, bpm > 0 else { return "—" }
         if prepMode {
             return String(format: "%.2f", bpm)
@@ -464,6 +544,17 @@ struct DeckHeader: View {
     private var formattedKey: String {
         guard let k = state.key, !k.isEmpty else { return "—" }
         return k
+    }
+
+    /// Render the PITCH column: signed percentage of the deck's
+    /// playback rate vs unity (`+0.0 %` at 1.0×). For timecode decks
+    /// this tracks the platter; File playback reads `+0.0 %`. The dash
+    /// shows when the deck isn't being driven (`state.pitchPercent ==
+    /// nil`). Shown in the same place on both decks (headers aren't
+    /// mirrored) so the eye always lands on it.
+    private var formattedPitch: String {
+        guard let p = state.pitchPercent else { return "—" }
+        return String(format: "%+.1f %%", p)
     }
 
     // MARK: - Row 3 — track time + transport glyphs (track loaded)
@@ -488,9 +579,14 @@ struct DeckHeader: View {
                     Spacer(minLength: 0)
                     liveTime(slot: .elapsed, textColor: DubColor.textPrimary)
                 }
-                transportGlyphs
+                sourceSwitchView
+                // No separate Play button when the source switch is
+                // present — the INT position is the play control. The
+                // transport glyph stays only in Prep mode (no switch).
+                if state.sourceControl == nil { transportGlyphs }
             } else {
-                transportGlyphs
+                if state.sourceControl == nil { transportGlyphs }
+                sourceSwitchView
                 switch time {
                 case .remainingOnly:
                     Spacer(minLength: 0)
@@ -673,6 +769,28 @@ struct DeckHeader: View {
         }
     }
 
+    /// Whether row 1 shows its source pill.
+    ///
+    /// Two suppression rules, both about avoiding redundant chrome:
+    ///
+    /// * **Performance mode, timecode deck:** when the row-3
+    ///   Internal/Timecode switch is present, it already names the
+    ///   source *and* carries the tracking dot, so a second "FILE"
+    ///   pill in row 1 is noise. Suppress it for the steady `.file`
+    ///   state only — the transient `.loading` and panic `.tcHold`
+    ///   states stay (they say something the switch doesn't).
+    /// * **Prep mode:** hides the FILE / LOADING pill as before
+    ///   (single-deck rehearsal needs no load-target chrome).
+    private var showSourcePill: Bool {
+        if state.sourceControl != nil, state.source == .file {
+            return false
+        }
+        if prepMode, shouldHideSourcePill {
+            return false
+        }
+        return true
+    }
+
     private var sourcePillLabel: String {
         switch state.source {
         case .off:      return "OFF"
@@ -686,6 +804,17 @@ struct DeckHeader: View {
 
     private var sourcePillDotColor: Color {
         guard state.isLive else { return DubColor.textPlaceholder }
+        // When a timecode input is attached, the dot reports signal
+        // health (PRD §5.4 tracking dot) rather than just source kind:
+        // green clean · amber degraded · red disengaged (scratch/lift —
+        // red is normal there). Falls through to source-based colour
+        // when there's no timecode input.
+        switch state.timecodeLockState {
+        case 1:  return DubColor.stateLocked
+        case 2:  return DubColor.stateTentative
+        case 3:  return DubColor.stateError
+        default: break
+        }
         switch state.source {
         case .off:      return DubColor.textPlaceholder
         case .thru:     return DubColor.stateLocked
@@ -972,6 +1101,21 @@ extension DeckHeaderState {
     /// in Performance because the two-deck split is space-tight,
     /// and the full elapsed-vs-remaining split in Prep because the
     /// single-deck rehearsal surface has the screen real-estate.
+    /// Resolve the row-3 Internal/Timecode switch state from the deck's
+    /// telemetry. `nil` (switch hidden) when the deck has no timecode
+    /// input. Calibration in progress wins; otherwise the mode + class.
+    static func sourceControl(from d: DeckState) -> SourceControlStatus? {
+        guard d.hasTimecodeInput else { return nil }
+        // Reflect the user-selected mode directly (0 internal · 1
+        // timecode · 2 thru). Calibration is a transient sub-state of
+        // Timecode. No auto-detection / `detecting` state any more.
+        switch d.controlMode {
+        case 0: return .internalPlay
+        case 2: return .thru
+        default: return d.calibrating ? .calibrating : .timecode
+        }
+    }
+
     static func from(
         side: DeckSide,
         deckState: DeckState,
@@ -1045,6 +1189,10 @@ extension DeckHeaderState {
                 trackTitle: resolvedTitle,
                 trackArtist: resolvedArtist,
                 bpm: deckState.bpm,
+                pitchPercent: deckState.pitchPercent,
+                timecodeLockState: deckState.timecodeLockState,
+                sourceControl: Self.sourceControl(from: deckState),
+                sourceControlOverridden: deckState.controlOverridden,
                 key: deckState.key,
                 formatChip: deckState.formatChip,
                 timeRow: time,
@@ -1061,23 +1209,21 @@ extension DeckHeaderState {
         }
 
         if thruMode {
-            // Timecode engine mode + no File track loaded → the deck
-            // is in "Real Record" Thru mode. The pill reads
-            // `TIMECODE` because that's the *engine mode* the user
-            // picked (PRD §1: "real records are first-class citizens
-            // via Thru mode auto-detection") — even though M5.6's
-            // actual timecode decoder isn't wired through the UI
-            // yet, this is the milestone the surface advertises.
-            //
-            // No transport toggle here: panic needs a loaded track
-            // to recover *to* (PRD §6.1.2). The button only appears
-            // once the DJ has loaded a file onto the deck.
+            // Timecode engine mode + no file loaded yet. The deck is
+            // armed: show the source switch (INT / TC / THRU) so the DJ
+            // can pick a mode — including THRU to pass a real record
+            // straight through — before loading anything. No transport
+            // glyphs (those need a file); the standalone switch row
+            // renders via `sourceSwitchRow`.
             return DeckHeaderState(
                 isLive: true,
                 source: .timecode,
-                trackTitle: "Real Record",
-                trackArtist: "capturing live",
+                trackTitle: nil,
+                trackArtist: nil,
                 bpm: nil,
+                timecodeLockState: deckState.timecodeLockState,
+                sourceControl: Self.sourceControl(from: deckState),
+                sourceControlOverridden: deckState.controlOverridden,
                 key: nil,
                 formatChip: nil,
                 timeRow: nil,
