@@ -42,10 +42,6 @@
 /// §5.4.1 RPM work owns adjusting this alongside detection.)
 const REV_SECS: f64 = 1.8;
 
-/// Time constant of the light post-cancellation smoother. Small enough
-/// that dialing in 0.1 BPM reads back within ~0.3 s.
-const RESIDUAL_TAU: f64 = 0.15;
-
 /// LMS adaptation time constant — a few revolutions to learn a
 /// pressing's wobble, slow enough that noise doesn't shake the fit.
 const LMS_TAU: f64 = 1.5;
@@ -55,15 +51,36 @@ const LMS_TAU: f64 = 1.5;
 /// tracker to learn), short vs a set (so pitch drifts don't linger).
 const BASELINE_TAU: f64 = 2.0;
 
-/// Innovation (vs the smoothed display, normalized rate) beyond which
-/// the platter is genuinely being moved: snap the display and pause
-/// adaptation so nudges/scratches neither lag nor corrupt the fit.
-/// 0.75 % sits well above eccentricity wobble (≤ ~0.3 %) and well below
-/// any deliberate beatmatch nudge.
-const SNAP_DEADBAND: f64 = 0.0075;
+/// Innovation beyond which the wobble fit pauses adapting (transient
+/// error must not corrupt the learned ellipse).
+const ADAPT_GUARD: f64 = 0.0075;
 
-/// Rev-locked LMS wobble canceller + light smoother + snap gate.
-/// One per deck.
+/// Display median prefilter length (render quanta, ~50 ms at 512
+/// frames). A decode spike from a dirty needle lasts 1–2 quanta; the
+/// median removes it entirely, at any amplitude, before the pole ever
+/// sees it — amplitude-based snap gates let exactly those spikes
+/// through (the on-rig "jumps by a whole BPM and quickly back").
+const MED_WIN: usize = 5;
+
+/// Innovation below this is presence noise; above it, *sustained*, is
+/// a real fader move. ~0.05 % ≈ 0.09 BPM at 175 — fine enough that a
+/// deliberate 0.1 BPM dial-in still registers as motion.
+const MOVE_NOISE_BAND: f64 = 0.0005;
+
+/// Sign-consistent out-of-band time required to confirm a real move.
+/// Spikes last 1–2 quanta and alternate; a hand on the fader sustains.
+const MOVE_CONFIRM_SECS: f64 = 0.25;
+
+/// Pole while steady — very slow, per the operator's spec: "when the
+/// pitch fader is steady it can be very slow to move".
+const TAU_STEADY: f64 = 0.7;
+
+/// Pole once a move is confirmed — "fast and snappy".
+const TAU_FAST: f64 = 0.08;
+
+/// Rev-locked LMS wobble canceller + median prefilter + a
+/// persistence-scaled pole (slow when steady, fast once a move is
+/// confirmed). One per deck.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DisplayRateFilter {
     /// Quadrature wobble fit: fundamental (`a1·cos φ + b1·sin φ`) and
@@ -92,6 +109,15 @@ pub(crate) struct DisplayRateFilter {
     /// measuring during the first revolutions of a session instead of
     /// presenting the uncancelled wobble as truth.
     adapted_secs: f64,
+    /// Median prefilter ring over the wobble-cancelled rate.
+    med_win: [f64; MED_WIN],
+    med_len: usize,
+    med_pos: usize,
+    /// Sign-consistent time spent outside [`MOVE_NOISE_BAND`] — the
+    /// move-confirmation clock.
+    off_secs: f64,
+    /// Sign of the current out-of-band run (+1.0 / −1.0).
+    off_sign: f64,
 }
 
 /// Adaptation time after which the wobble fit is trustworthy — a bit
@@ -109,6 +135,11 @@ impl DisplayRateFilter {
             baseline: 1.0,
             primed: false,
             adapted_secs: 0.0,
+            med_win: [0.0; MED_WIN],
+            med_len: 0,
+            med_pos: 0,
+            off_secs: 0.0,
+            off_sign: 0.0,
         }
     }
 
@@ -122,6 +153,10 @@ impl DisplayRateFilter {
     /// dropout, mirroring the freeze-then-snap display policy.
     pub(crate) fn reset(&mut self) {
         self.primed = false;
+        self.med_len = 0;
+        self.med_pos = 0;
+        self.off_secs = 0.0;
+        self.off_sign = 0.0;
     }
 
     /// Fold one block's smoothed `rate` (spanning `dt` seconds, with the
@@ -134,6 +169,16 @@ impl DisplayRateFilter {
         let wobble = self.a1 * c1 + self.b1 * s1 + self.a2 * c2 + self.b2 * s2;
         let cancelled = rate - wobble;
 
+        // Median prefilter: a decode spike from a dirty needle lasts a
+        // quantum or two; the median deletes it at any amplitude
+        // before the pole ever sees it.
+        self.med_win[self.med_pos] = cancelled;
+        self.med_pos = (self.med_pos + 1) % MED_WIN;
+        if self.med_len < MED_WIN {
+            self.med_len += 1;
+        }
+        let filtered = self.median();
+
         if !self.primed {
             self.smoothed = cancelled;
             self.baseline = cancelled;
@@ -141,29 +186,56 @@ impl DisplayRateFilter {
             return self.smoothed;
         }
 
-        let innovation = cancelled - self.smoothed;
-        if innovation.abs() > SNAP_DEADBAND {
-            // A real move. Track it instantly; don't adapt the wobble
-            // fit on transient error.
-            self.smoothed = cancelled;
-            self.baseline = cancelled;
-            return self.smoothed;
+        // Persistence-scaled pole: noise doesn't sustain, a hand on
+        // the fader does. Sign-consistent out-of-band time opens the
+        // pole from very-slow to snappy; anything shorter than the
+        // confirmation window only ever meets the steady pole.
+        let innovation = filtered - self.smoothed;
+        if innovation.abs() > MOVE_NOISE_BAND {
+            let sign = innovation.signum();
+            if (sign - self.off_sign).abs() < f64::EPSILON {
+                self.off_secs += dt;
+            } else {
+                // A flip halves the clock rather than restarting it:
+                // alternating noise still never confirms, but a real
+                // move whose innovation rides the band edge (a 0.1 BPM
+                // dial-in with residual ripple) accumulates net
+                // progress instead of being reset by every ripple.
+                self.off_sign = sign;
+                self.off_secs = (self.off_secs * 0.5).max(dt);
+            }
+        } else {
+            self.off_secs = (self.off_secs - 2.0 * dt).max(0.0);
         }
+        let urgency = (self.off_secs / MOVE_CONFIRM_SECS).clamp(0.0, 1.0);
+        let tau = TAU_STEADY + (TAU_FAST - TAU_STEADY) * urgency;
+        self.smoothed += (1.0 - (-dt / tau).exp()) * innovation;
 
-        // Steady platter: adapt the fit toward whatever rev-periodic
-        // component remains (error vs the slow baseline, which holds
-        // the wobble nearly in full), then ease the cancelled rate
-        // into the display.
+        // Adapt the wobble fit whenever the error is small enough to
+        // be wobble rather than a deliberate move. Deliberately NOT
+        // gated on the move-confirmation clock: the uncancelled wobble
+        // itself sustains sign for half a revolution and trips that
+        // clock during the learning phase — gating on it deadlocks the
+        // learning the canceller needs to make the wobble disappear.
         let err = cancelled - self.baseline;
-        self.adapted_secs += dt;
-        let mu = dt / LMS_TAU;
-        self.a1 += mu * err * c1;
-        self.b1 += mu * err * s1;
-        self.a2 += mu * err * c2;
-        self.b2 += mu * err * s2;
+        if err.abs() < ADAPT_GUARD {
+            self.adapted_secs += dt;
+            let mu = dt / LMS_TAU;
+            self.a1 += mu * err * c1;
+            self.b1 += mu * err * s1;
+            self.a2 += mu * err * c2;
+            self.b2 += mu * err * s2;
+        }
         self.baseline += (dt / BASELINE_TAU) * err;
-        self.smoothed += (dt / RESIDUAL_TAU) * innovation;
         self.smoothed
+    }
+
+    fn median(&self) -> f64 {
+        let mut buf = [0.0f64; MED_WIN];
+        buf[..self.med_len].copy_from_slice(&self.med_win[..self.med_len]);
+        let s = &mut buf[..self.med_len];
+        s.sort_unstable_by(f64::total_cmp);
+        s[self.med_len / 2]
     }
 }
 
@@ -228,31 +300,40 @@ mod tests {
 
     #[test]
     fn tenth_of_a_bpm_dial_in_reads_back_fast() {
-        // The beatmatch endgame: +0.057 % (0.1 BPM on a 175 BPM tune),
-        // far below the snap gate, on a pressing with real wobble. The
-        // readout must reflect ≥ 80 % of the move within half a second
-        // (the smoother alone reaches 96 %; the rest is cancelled-
-        // wobble ripple at the sampling instant) — not crawl over a
-        // whole revolution like a boxcar would (28 % in this window).
+        // The beatmatch endgame: +0.057 % (0.1 BPM on a 175 BPM tune)
+        // on a pressing with real wobble. A move this size sits AT the
+        // noise band, so by design it rides the steady pole (jitter
+        // immunity wins, per the operator's spec): ~2/3 visible within
+        // 0.8 s, fully converged within ~2.5 s — and it must actually
+        // get there, not stall.
         let mut f = DisplayRateFilter::new();
         run(&mut f, 15.0, 3.0, 0.003, 0.0, |_| 1.0);
         let step = 0.00057;
-        let (out, _) = run(&mut f, 0.5, 0.5, 0.003, 0.0, |_| 1.0 + step);
+        let (out, _) = run(&mut f, 0.8, 0.2, 0.003, 0.0, |_| 1.0 + step);
         assert!(
-            out - 1.0 > 0.8 * step,
+            out - 1.0 > 0.55 * step,
             "fine dial-in too sluggish: moved {} of {step}",
+            out - 1.0
+        );
+        let (out, _) = run(&mut f, 1.7, 0.2, 0.003, 0.0, |_| 1.0 + step);
+        assert!(
+            out - 1.0 > 0.9 * step,
+            "fine dial-in never converged: at {} of {step}",
             out - 1.0
         );
     }
 
     #[test]
-    fn big_move_snaps_immediately() {
+    fn big_move_confirms_and_tracks_quickly() {
         let mut f = DisplayRateFilter::new();
         run(&mut f, 5.0, 1.0, 0.002, 0.0, |_| 1.0);
-        // A 5 % nudge — way past the deadband — must show on the very
-        // next update.
-        let out = f.update(1.05, 0.0, DT);
-        assert!((out - 1.05).abs() < 3e-3, "nudge lagged: {out}");
+        // A 5 % nudge sustains, so the persistence clock confirms it
+        // and the fast pole catches it — within ~0.6 s the readout is
+        // essentially there. (It deliberately does NOT show on the
+        // very next update: that instant-snap path is what let decode
+        // spikes through as whole-BPM display jumps.)
+        let (out, _) = run(&mut f, 0.6, 0.1, 0.002, 0.0, |_| 1.05);
+        assert!((out - 1.05).abs() < 4e-3, "nudge lagged: {out}");
     }
 
     #[test]
@@ -288,6 +369,35 @@ mod tests {
         assert!(f.settled(), "should be settled after ~5 s of lock");
         f.reset(); // lift — the fit (and its maturity) persist
         assert!(f.settled(), "lift must not reset the settled state");
+    }
+
+    #[test]
+    fn decode_spikes_are_invisible_at_any_amplitude() {
+        // The on-rig "left deck jumps by a whole BPM and quickly goes
+        // back": a dirty needle's bad decode block produces a 1–2
+        // quantum rate spike. The median prefilter must delete it and
+        // the steady pole must not budge — the readout may not move by
+        // more than ~0.02 BPM equivalent.
+        let mut f = DisplayRateFilter::new();
+        // Warm up on a wobble-free signal: this test isolates spike
+        // rejection (the canceller's fit stays ~zero, so flat input
+        // stays flat).
+        run(&mut f, 12.0, 2.0, 0.0, 0.0, |_| 1.0);
+        let mut pos = 12.0_f64;
+        let mut worst = 0.0_f64;
+        for i in 0..400 {
+            // Every ~50 blocks, two consecutive spiked quanta of +0.6 %
+            // (≈ +1 BPM at 175) — bigger than the old snap deadband.
+            let spiked = i % 50 < 2;
+            let rate = if spiked { 1.006 } else { 1.0 };
+            let out = f.update(rate, pos, DT);
+            pos += rate * DT;
+            worst = worst.max((out - 1.0).abs());
+        }
+        assert!(
+            worst < 1.5e-4,
+            "decode spikes reached the readout: worst dev {worst}"
+        );
     }
 
     #[test]
