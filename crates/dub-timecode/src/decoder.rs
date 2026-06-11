@@ -113,13 +113,114 @@ pub struct DecodeOutput {
 /// (see [`Decoder::process`]). Phase coherence is meaningless without a
 /// live carrier, so the reported confidence is scaled by a linear ramp on
 /// RMS amplitude: zero at or below [`CARRIER_PRESENCE_OFF`], full at or
-/// above [`CARRIER_PRESENCE_FULL`]. A stopped platter / DC offset / mains
-/// hum sits below the off level and reports ~0 confidence; a healthy SL3
-/// carrier (~0.1–0.5) is far above the full level and unaffected. The off
-/// level matches the default amplitude engage threshold (0.01) so the
-/// confidence meter and the lift policy agree on "is there a carrier".
-const CARRIER_PRESENCE_OFF: f32 = 0.01;
-const CARRIER_PRESENCE_FULL: f32 = 0.05;
+/// above [`CARRIER_PRESENCE_FULL`].
+///
+/// The levels are deliberately *permissive*: a cartridge is a velocity
+/// sensor, so a slow scratch draw (rate ~0.1) natively outputs ~10× less
+/// than unity play — gating those blocks pauses the deck mid-gesture
+/// (the on-rig "timecode didn't react" + the dominant sticker-drift
+/// mechanism: deck frozen while the record moves). The gate can afford
+/// to be permissive because the input high-pass ([`INPUT_HP_HZ`])
+/// removes the contaminants this ramp was built against *before* the
+/// amplitude is measured: a stopped stylus / DC offset reads ~0 (the HP
+/// blocks anything static) and −30…−20 dB mains hum lands ≤ 0.006 after
+/// filtering — still under or barely over the off level, and its
+/// coherence contribution is then negligible. A healthy carrier at
+/// 0.1–0.5 is orders of magnitude above the full level.
+const CARRIER_PRESENCE_OFF: f32 = 0.004;
+const CARRIER_PRESENCE_FULL: f32 = 0.016;
+
+/// Input high-pass cutoff (Hz). The coherent phase-difference estimator
+/// is unbiased under *white* noise, but **correlated** low-frequency
+/// contamination — DC offset, mains hum, turntable rumble — is nearly
+/// identical sample-to-sample, so it contributes a real-*positive* term
+/// to `Σ s·conj(s_prev)` that drags the block phase toward zero and
+/// shrinks the decoded rate multiplicatively: 50 Hz hum just 30 dB under
+/// the carrier reads ≈ −0.1 % across the whole pitch range (a fader at
+/// true 0 displays −0.1…−0.2 %). High-passing both channels identically
+/// removes the bias without touching the carrier: the lowest carrier in
+/// normal play is ~920 Hz (CV02 at −8 %), and a common per-channel filter
+/// preserves the Lissajous shape, so whitening and the ellipse correction
+/// are unaffected.
+///
+/// The cutoff is a trade between hum rejection and **slow-scratch
+/// response**: a slow draw at rate 0.1 puts the CV02 carrier at 100 Hz,
+/// already ~10× quieter natively (velocity-proportional cartridge), and
+/// every dB the filter takes there pushes the gesture toward the
+/// presence gate — on-rig that read as "timecode didn't react" and is
+/// the dominant sticker-drift mechanism (deck frozen mid-gesture while
+/// the record moves). 120 Hz keeps 50/60 Hz ≥ 15 dB down in power
+/// (residual bias ≤ 0.005 %, vs the −0.1 % defect) and DC/rumble fully
+/// blocked, while costing a rate-0.1 draw only ~5 dB. US 120 Hz
+/// rectifier hum is in the transition band and only drops ~3 dB —
+/// revisit (notch, or per-region cutoff) if a 60 Hz-land rig shows a
+/// residual offset.
+const INPUT_HP_HZ: f64 = 120.0;
+
+/// Cap on the high-pass amplitude compensation (see the carrier-
+/// presence block in [`Decoder::process`]). 8× covers carriers down to
+/// ~40 Hz (CV02 rate ≈ 0.04); below that the signal is genuinely gone
+/// and boosting further would only amplify noise.
+const MAX_AMP_BOOST: f64 = 8.0;
+
+/// Minimum |rate| for the compensation to apply: a stopped platter or
+/// pure noise decodes to ≈ 0 rate and must never have its residue
+/// boosted into "carrier present".
+const AMP_COMP_MIN_RATE: f64 = 0.02;
+
+/// One 2nd-order Butterworth high-pass section (RBJ biquad, Direct
+/// Form 1, `f64`). Allocation-free and branch-free per sample — RT-safe.
+#[derive(Debug, Clone, Copy)]
+struct BiquadHp {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl BiquadHp {
+    fn new(cutoff_hz: f64, sample_rate: f64) -> Self {
+        let w0 = std::f64::consts::TAU * cutoff_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / std::f64::consts::SQRT_2; // Q = 1/√2
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: (1.0 + cos_w0) / (2.0 * a0),
+            b1: -(1.0 + cos_w0) / a0,
+            b2: (1.0 + cos_w0) / (2.0 * a0),
+            a1: -2.0 * cos_w0 / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+}
 
 /// Stateful timecode decoder. One instance per deck.
 ///
@@ -173,6 +274,12 @@ pub struct Decoder {
     /// Master enable for the ellipse auto-correction (default on). Tests
     /// of the raw decode can disable it to exercise the uncorrected path.
     ellipse_correction: bool,
+    /// Per-channel input high-pass (`[ch1/re, ch0/im]`) removing the
+    /// DC / hum / rumble bias — see [`INPUT_HP_HZ`]. Feeds the
+    /// whitening + phase-difference path only; the absolute tracker
+    /// stays on the raw channels (its zero-crossing detectors do their
+    /// own timing).
+    input_hp: [BiquadHp; 2],
     /// Absolute-position tracker (M6), present only on a decoder built
     /// with [`Decoder::with_absolute`]. Fed per-sample from the
     /// `process` loop; its LUT is allocated at construction, off-RT.
@@ -217,6 +324,7 @@ impl Decoder {
             ellipse_ec: 0.0,
             ellipse_primed: false,
             ellipse_correction: true,
+            input_hp: [BiquadHp::new(INPUT_HP_HZ, f64::from(sample_rate)); 2],
             absolute: None,
         }
     }
@@ -316,6 +424,8 @@ impl Decoder {
         self.prev_im = 0.0;
         self.primed = false;
         self.position_secs = 0.0;
+        self.input_hp[0].reset();
+        self.input_hp[1].reset();
         if let Some(t) = self.absolute.as_mut() {
             t.reset();
         }
@@ -372,8 +482,11 @@ impl Decoder {
             // on an SL3): file ch0 ≈ A·sin(φ), file ch1 ≈ A·cos(φ).
             // Map ch1 → real, ch0 → imag so `s = re + j·im = A·e^(jφ)`
             // rotates the *positive* direction at forward play.
-            let re_raw = f64::from(frame[1]);
-            let im_raw = f64::from(frame[0]);
+            // High-passed first: DC / hum / rumble are sample-to-sample
+            // correlated and bias the coherent sum's angle toward zero
+            // (≈ −0.1 % rate at −30 dB hum) — see [`INPUT_HP_HZ`].
+            let re_raw = self.input_hp[0].process(f64::from(frame[1]));
+            let im_raw = self.input_hp[1].process(f64::from(frame[0]));
             // Channel whitening (identity until calibrated) corrects the
             // cartridge ellipse before the phase-difference.
             let re = w[0][0] * re_raw + w[0][1] * im_raw;
@@ -425,8 +538,20 @@ impl Decoder {
         // amplitude" reading.
         #[allow(clippy::cast_precision_loss)]
         let mean_sq = mag_acc / (n_frames as f64);
+        // Velocity-honest amplitude: undo the input high-pass's known
+        // attenuation at the *estimated* carrier frequency. A slow draw
+        // is doubly quiet — the cartridge outputs less (velocity
+        // sensor) AND its low carrier sits in the filter's transition
+        // band — and gating on the filtered amplitude paused the deck
+        // through slow backward draws (the velocity dead zone: profile
+        // C of `dub-engine/tests/scratch_drift.rs`, +700 ms of forward
+        // sticker drift per cycle). Dividing out |H(carrier)| reports
+        // what the needle actually picks up. The boost is capped
+        // ([`MAX_AMP_BOOST`]) and gated on a meaningfully nonzero rate
+        // so silence, DC, and a stopped platter (rate ≈ 0) are never
+        // amplified into "carrier present".
         #[allow(clippy::cast_possible_truncation)]
-        let amplitude = (mean_sq.sqrt()) as f32;
+        let amplitude = (mean_sq.sqrt() * hp_compensation(rate.abs() * nominal)) as f32;
 
         // Confidence: |coherent sum| / Σ |s_curr·conj(s_prev)|.
         // For pure quadrature, |s_curr·conj(s_prev)| = |s|², so this
@@ -542,6 +667,21 @@ impl Decoder {
             rate
         }
     }
+}
+
+/// Inverse magnitude of the input high-pass at `carrier_hz`, capped at
+/// [`MAX_AMP_BOOST`], unity below [`AMP_COMP_MIN_RATE`]-equivalent
+/// carriers so silence / DC / a stopped platter is never boosted into
+/// "carrier present". See the carrier-presence block in
+/// [`Decoder::process`].
+fn hp_compensation(carrier_hz: f64) -> f64 {
+    if carrier_hz < AMP_COMP_MIN_RATE * 1_000.0 {
+        return 1.0;
+    }
+    let x = carrier_hz / INPUT_HP_HZ;
+    let x2 = x * x;
+    let hp_mag = x2 / (1.0 + x2 * x2).sqrt();
+    1.0 / hp_mag.max(1.0 / MAX_AMP_BOOST)
 }
 
 /// Identity whitening — no channel correction.
@@ -915,13 +1055,30 @@ mod tests {
 
     #[test]
     fn stopped_decodes_to_zero_rate() {
-        let out = roundtrip(0.0, 4_800);
-        // At rate=0 the signal is DC (constant ch0=0, ch1=A). The
-        // phase-difference is zero, so rate = 0. Confidence stays
-        // high because the signal is still perfectly coherent — just
-        // at zero frequency.
-        assert!(out.rate.abs() < 1e-9, "rate = {}", out.rate);
-        assert!(out.confidence > 0.99);
+        // At rate=0 the generator emits DC (constant ch0=0, ch1=A) —
+        // but a real velocity cartridge outputs *silence* on a stopped
+        // groove, and the input high-pass treats the synthetic DC the
+        // same way: amplitude collapses and the presence gate drops
+        // confidence, so a stopped platter reads as no-carrier exactly
+        // like on real hardware. The cold-start DC *step* excites a
+        // brief filter transient in the very first block (a real stop
+        // decays smoothly and never sees it), so the sustained-stop
+        // contract is asserted on the second block. The rate must
+        // still settle to ~0 rather than some garbage value.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        let mut dec = Decoder::new(Format::SeratoCv02, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 0.0, 0.5);
+        let _ = dec.process(&buf);
+        gen.render(&mut buf, 0.0, 0.5);
+        let out = dec.process(&buf);
+        assert!(out.rate.abs() < 1e-3, "rate = {}", out.rate);
+        assert!(
+            out.confidence < 0.5,
+            "stopped platter should read as no-carrier, conf = {}",
+            out.confidence
+        );
     }
 
     #[test]
@@ -1264,25 +1421,47 @@ mod tests {
 
     #[test]
     fn varying_rate_tracks_continuously() {
-        // Slew the rate from 1.0 down to 0.0 over 1 second in 100
-        // steps. Decoded rate at each step should be within tolerance
-        // of the requested value. This is the closest unit-test
-        // approximation of a real scratch.
+        // Slew the rate from 1.0 down to 0.0 in 100 steps. While the
+        // decoder reports a confident lock, the rate must track within
+        // tolerance — this is the closest unit-test approximation of a
+        // real scratch. Near zero the carrier sweeps into the input
+        // high-pass's stopband and confidence drops; the engine's lift
+        // policy ignores those blocks, so they're excluded here too —
+        // but the confident band must reach well below half speed.
+        // 64-frame blocks: the design cadence, and since the sub-block
+        // decode fix it is also exactly what the engine feeds the
+        // decoder regardless of the render quantum.
         let sr = 48_000.0_f32;
-        let block = 480_usize; // 10 ms blocks
+        let block = 64_usize;
         let mut gen = Generator::new(Format::SeratoCv02, sr);
         let mut dec = Decoder::new(Format::SeratoCv02, sr);
         let mut buf = vec![0.0f32; block * 2];
         let mut max_err = 0.0_f64;
+        let mut slowest_confident = 1.0_f64;
         for step in 0..100i32 {
             let want = 1.0 - f64::from(step) * 0.01;
             gen.render(&mut buf, want, 0.5);
             let out = dec.process(&buf);
-            let err = (out.rate - want).abs();
-            if err > max_err {
-                max_err = err;
+            if out.confidence > 0.9 {
+                // Tight tracking is promised while the carrier is
+                // clear of the high-pass transition band; below rate
+                // 0.2 (carrier < 200 Hz) the filter's group delay
+                // during this very fast sweep (1.0 → 0 in 133 ms)
+                // distorts the instantaneous frequency — those blocks
+                // stay confident (amplitude compensation) but are
+                // judged with a wider band.
+                let err = (out.rate - want).abs();
+                if want >= 0.2 && err > max_err {
+                    max_err = err;
+                }
+                assert!(err < 0.08, "gross error at rate {want}: {err}");
+                slowest_confident = want;
             }
         }
         assert!(max_err < 0.02, "max rate err = {max_err}");
+        assert!(
+            slowest_confident <= 0.12,
+            "lock lost too early in the slowdown: {slowest_confident}"
+        );
     }
 }

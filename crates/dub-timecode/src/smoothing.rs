@@ -35,25 +35,40 @@
 //! RT-safe: fixed stack arrays, in-place sort of ≤ `WINDOW` elements, no
 //! allocation, no locks.
 
-/// Hampel window length (blocks). At 48 kHz / 64-frame blocks that's
-/// ~6.7 ms; a hard edge is accepted after ⌈WINDOW/2⌉ blocks (~4 ms),
-/// which bounds the worst-case reversal lag.
+/// Hampel window length (blocks). At the design cadence
+/// ([`DESIGN_DT_SECS`]) that's ~6.7 ms; a hard edge is accepted after
+/// ⌈WINDOW/2⌉ blocks (~4 ms), which bounds the worst-case reversal lag.
 const WINDOW: usize = 5;
 
 /// Hampel cutoff: deviations beyond `HAMPEL_K · MAD` are outliers.
 const HAMPEL_K: f64 = 3.0;
 
-/// Floor on the spike threshold (normalized rate). Below this, deviation
-/// is treated as ordinary estimator noise for the one-pole to absorb,
-/// not a spike to reject — so a flat trace isn't chased by its own MAD.
+/// Floor on the spike threshold (normalized rate **per design block**).
+/// Below this, deviation is treated as ordinary estimator noise for the
+/// one-pole to absorb, not a spike to reject — so a flat trace isn't
+/// chased by its own MAD. The applied floor scales linearly with the
+/// real block duration: a *genuine* ramp moves `accel · dt` per block,
+/// so at a 512-frame CoreAudio quantum (8× the design block) a
+/// deceleration that is obviously real at 64 frames would read as a
+/// "spike" against an unscaled floor — the Hampel then replayed the
+/// stale pre-ramp rate for half a window, which was a measured ~+9 ms
+/// of forward sticker drift per scratch decel (`tests/scratch_drift.rs`).
 const SPIKE_FLOOR: f64 = 0.012;
 
-/// One-pole coefficient when the platter is steady — heavy smoothing
-/// (τ ≈ 1/α ≈ 50 blocks ≈ 67 ms), so platter flutter and estimator
-/// noise average out to the 0.0x-BPM range instead of wandering.
-const ALPHA_MIN: f64 = 0.02;
-/// One-pole coefficient when the rate is moving fast — effectively snap.
-const ALPHA_MAX: f64 = 1.0;
+/// The block cadence the constants above were tuned at: 64 frames at
+/// 48 kHz. [`RateSmoother::smooth`] assumes it; the engine calls
+/// [`RateSmoother::smooth_for`] with the real quantum so behavior is
+/// block-size independent.
+const DESIGN_DT_SECS: f64 = 64.0 / 48_000.0;
+
+/// Steady-platter smoothing time constant (τ ≈ 67 ms — the design
+/// `ALPHA_MIN = 0.02` per 64-frame block). Expressed in time so a
+/// 512-frame quantum converges at the same *wall-clock* speed instead
+/// of 8× slower: the per-block alpha left the smoothed rate ~0.011
+/// short of the true rate through every steady stroke, and because a
+/// scratch's backward draw lasts several times longer than its push,
+/// that shortfall integrated into systematic forward sticker drift.
+const TAU_MIN_SECS: f64 = 0.0667;
 /// Innovation deadband (normalized rate). Below this the pole stays at
 /// `ALPHA_MIN` — the key fix: steady-state noise must not open the
 /// filter and defeat its own smoothing. ~1.5 % covers flutter + jitter
@@ -105,9 +120,21 @@ impl RateSmoother {
         self.primed = false;
     }
 
-    /// Smooth one block's `rate`, gated by the decoder's `confidence`.
+    /// Smooth one block's `rate`, gated by the decoder's `confidence`,
+    /// assuming the design 64-frame @ 48 kHz cadence. Tests and
+    /// diagnostic tools use this; the engine calls
+    /// [`Self::smooth_for`] with the real block duration.
     #[must_use]
     pub fn smooth(&mut self, rate: f64, confidence: f32) -> f64 {
+        self.smooth_for(rate, confidence, DESIGN_DT_SECS)
+    }
+
+    /// Smooth one block of `dt_secs` duration. Time-based: the spike
+    /// floor and the one-pole coefficient both derive from `dt_secs`,
+    /// so a 512-frame CoreAudio quantum tracks at the same wall-clock
+    /// speed as the 64-frame design cadence.
+    #[must_use]
+    pub fn smooth_for(&mut self, rate: f64, confidence: f32, dt_secs: f64) -> f64 {
         if confidence < MIN_CONFIDENCE {
             self.reset();
             return rate;
@@ -120,7 +147,8 @@ impl RateSmoother {
         }
 
         let med = self.median();
-        let threshold = (HAMPEL_K * self.mad(med)).max(SPIKE_FLOOR);
+        let floor = SPIKE_FLOOR * (dt_secs / DESIGN_DT_SECS).max(1.0);
+        let threshold = (HAMPEL_K * self.mad(med)).max(floor);
         let corrected = if (rate - med).abs() > threshold {
             med
         } else {
@@ -130,8 +158,9 @@ impl RateSmoother {
         if self.primed {
             let innovation = corrected - self.smoothed;
             let excess = (innovation.abs() - MOTION_DEADBAND).max(0.0);
-            let alpha = (ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * (excess / MOTION_SCALE))
-                .clamp(ALPHA_MIN, ALPHA_MAX);
+            let alpha_min = 1.0 - (-dt_secs / TAU_MIN_SECS).exp();
+            let alpha = (alpha_min + (1.0 - alpha_min) * (excess / MOTION_SCALE).min(1.0))
+                .clamp(alpha_min, 1.0);
             self.smoothed += alpha * innovation;
         } else {
             self.smoothed = corrected;
