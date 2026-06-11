@@ -496,6 +496,7 @@ pub fn run(args: &[String]) -> Result<()> {
         disengage_threshold: opts.disengage,
         sticky_blocks_to_disengage: opts.sticky,
         amplitude_threshold: opts.amplitude,
+        hold_until_calibrated: false,
     };
 
     // Now into TUI mode. Use a PanicGuard so a panic still leaves the
@@ -694,6 +695,7 @@ fn apply_threshold_changes(policy: &mut LiftPolicy, state: &UiState) {
         disengage_threshold: state.disengage,
         sticky_blocks_to_disengage: state.sticky,
         amplitude_threshold: state.amplitude,
+        hold_until_calibrated: false,
     });
 }
 

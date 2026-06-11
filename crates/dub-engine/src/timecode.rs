@@ -102,6 +102,20 @@ pub const DEFAULT_DISENGAGE_THRESHOLD: f32 = 0.5;
 /// mutes well within a typical fader-in window.
 pub const DEFAULT_STICKY_BLOCKS_TO_DISENGAGE: u32 = 4;
 
+/// Sub-block decode size (frames): the cadence the whole decode chain
+/// was designed and hardware-validated at. [`TimecodeInput::drive`]
+/// slices each render quantum into chunks of this size so a 512-frame
+/// CoreAudio quantum behaves identically to the 64-frame design point.
+const DECODE_CHUNK_FRAMES: usize = 64;
+
+/// Time constant for decaying a held rate through low-confidence
+/// windows (lukewarm blend remainder + sticky window from its second
+/// block). Models a platter a hand is actively stopping/turning —
+/// tens of ms — so a turnaround's collapsing carrier never keeps
+/// driving the deck at the stale pre-turnaround rate (the #1 forward
+/// sticker-drift mechanism; see `tests/scratch_drift.rs`).
+const HOLD_DECAY_TAU_SECS: f64 = 0.030;
+
 /// Default RMS amplitude floor below which the input is treated as
 /// "carrier dead" regardless of confidence.
 ///
@@ -158,6 +172,17 @@ pub struct TimecodeInputConfig {
     /// policy, equivalent to the M5.3 first-cut behavior — useful
     /// only for diagnostics).
     pub amplitude_threshold: f32,
+
+    /// Traktor-style session-start calibration hold (PRD §5.4): when
+    /// `true`, a Timecode deck does not auto-start playback until this
+    /// needle's measurements are complete (whitening calibration
+    /// installed + the display wobble fit settled — ~5 s of the record
+    /// spinning, once per attach). The DJ sets up minutes before the
+    /// first tune, so the hold costs nothing; playing during the
+    /// measurement window would run at uncorrected pitch. The deck's
+    /// Play button (Panic Play) remains the instant escape hatch.
+    /// Tests that synthesize short carriers disable this.
+    pub hold_until_calibrated: bool,
 }
 
 impl Default for TimecodeInputConfig {
@@ -170,6 +195,7 @@ impl Default for TimecodeInputConfig {
             disengage_threshold: DEFAULT_DISENGAGE_THRESHOLD,
             sticky_blocks_to_disengage: DEFAULT_STICKY_BLOCKS_TO_DISENGAGE,
             amplitude_threshold: DEFAULT_AMPLITUDE_THRESHOLD,
+            hold_until_calibrated: true,
         }
     }
 }
@@ -363,7 +389,15 @@ impl LiftPolicy {
         self.prev_abs_position = None;
     }
 
-    /// Advance the state machine by one decoder block.
+    /// Advance the state machine by one decoder block, assuming the
+    /// legacy 64-frame @ 48 kHz cadence for the hold-decay clock.
+    /// Diagnostic tools and most tests use this; the engine's audio
+    /// thread calls [`Self::step_for`] with the block's real duration.
+    pub fn step(&mut self, out: DecodeOutput) -> LiftIntent {
+        self.step_for(out, 64.0 / 48_000.0)
+    }
+
+    /// Advance the state machine by one decoder block of `dt_secs`.
     ///
     /// **Amplitude gate.** If `out.amplitude < amplitude_threshold`
     /// the carrier is considered dead — *whatever* the confidence
@@ -380,13 +414,26 @@ impl LiftPolicy {
     /// - `conf ≥ engage_threshold` → "fully locked" — track current
     ///   block's rate.
     /// - `disengage_threshold ≤ conf < engage_threshold` → "lukewarm"
-    ///   while engaged — keep last good rate, stay engaged (no
-    ///   countdown). When *disengaged*, this band does *not*
-    ///   re-engage (avoids letting noise sneak the deck back on).
+    ///   while engaged — emit a confidence-weighted blend of the
+    ///   measured rate and a **decaying** hold, stay engaged. The old
+    ///   behavior (replay the last locked rate flat, forever) was the
+    ///   #1 cause of forward sticker drift: at every scratch
+    ///   turnaround the stale **positive push rate** kept driving the
+    ///   deck forward while the record was already reversing — with
+    ///   no mirror event in the other direction (measured offline:
+    ///   ~+20 ms of forward drift per scratch cycle from this alone;
+    ///   `tests/scratch_drift.rs`). Trusting the measured rate in
+    ///   proportion to confidence, and decaying the held part like a
+    ///   physically decelerating platter ([`HOLD_DECAY_TAU_SECS`]),
+    ///   removes the bias while still riding out noisy blocks.
     /// - `conf < disengage_threshold` → if engaged, increment the
     ///   countdown; disengage when it hits
-    ///   `sticky_blocks_to_disengage`.
-    pub fn step(&mut self, out: DecodeOutput) -> LiftIntent {
+    ///   `sticky_blocks_to_disengage`. The first below-floor block
+    ///   holds the rate untouched (single-block dust ticks ride
+    ///   through perfectly); from the second on, the hold decays —
+    ///   a turnaround's collapsing carrier must not keep pushing the
+    ///   deck at the stale rate.
+    pub fn step_for(&mut self, out: DecodeOutput, dt_secs: f64) -> LiftIntent {
         let carrier_alive = out.amplitude >= self.amplitude_threshold;
 
         if self.engaged {
@@ -395,36 +442,37 @@ impl LiftPolicy {
                 self.last_locked_rate = out.rate;
                 self.locked_with_absolute(out)
             } else if carrier_alive && out.confidence >= self.disengage_threshold {
-                // Lukewarm scratch transient — hold the last good
-                // rate (don't trust the noisy current-block estimate)
-                // but keep the deck engaged. Don't count toward the
-                // disengage window: scratches can sit in this band
-                // for tens of ms while the cartridge is firmly on the
-                // groove. This branch is *only* reached when the
-                // carrier is alive, so handling-noise during lift no
-                // longer counts as "scratch transient".
+                // Lukewarm — blend toward the measured rate by
+                // confidence; decay the held remainder. The blend is
+                // stored back so the next hold continues from the
+                // evolved estimate, not the ancient locked value.
                 self.consecutive_below = 0;
                 self.prev_abs_position = None;
-                LiftIntent::Locked {
-                    rate: self.last_locked_rate,
-                }
+                let span = f64::from(self.engage_threshold - self.disengage_threshold).max(1e-6);
+                let w =
+                    (f64::from(out.confidence - self.disengage_threshold) / span).clamp(0.0, 1.0);
+                let held = self.last_locked_rate * (-dt_secs / HOLD_DECAY_TAU_SECS).exp();
+                let rate = w * out.rate + (1.0 - w) * held;
+                self.last_locked_rate = rate;
+                LiftIntent::Locked { rate }
             } else {
                 // Below floor: either confidence collapsed
                 // (carrier-alive but coherence gone — e.g. dust tick
                 // mid-scratch), or amplitude collapsed (carrier dead
-                // — e.g. stylus lift). Either way, count toward the
-                // sticky disengage window.
+                // — e.g. stylus lift or a turnaround's zero-velocity
+                // moment). Count toward the sticky disengage window;
+                // decay the hold from the second consecutive block.
                 self.prev_abs_position = None;
                 self.consecutive_below = self.consecutive_below.saturating_add(1);
+                if self.consecutive_below >= 2 {
+                    self.last_locked_rate *= (-dt_secs / HOLD_DECAY_TAU_SECS).exp();
+                }
                 if self.consecutive_below >= self.sticky_blocks_to_disengage {
                     self.engaged = false;
                     LiftIntent::DropoutHoldRate {
                         rate: self.last_locked_rate,
                     }
                 } else {
-                    // Inside the sticky window — keep the deck running
-                    // at the last good rate. Single-block dust ticks
-                    // and brief carrier dips never reach the user.
                     LiftIntent::Locked {
                         rate: self.last_locked_rate,
                     }
@@ -545,6 +593,15 @@ pub struct TimecodeInput {
     /// playback rate (via the lift policy) and the pitch readout are
     /// de-spiked. See [`RateSmoother`].
     rate_smoother: RateSmoother,
+
+    /// Traktor-style session-start gate — see
+    /// [`TimecodeInputConfig::hold_until_calibrated`].
+    hold_until_calibrated: bool,
+
+    /// Input sample rate (Hz), cached from the attach config so
+    /// `drive` can convert popped frames into the real block duration
+    /// for the policy's hold-decay clock.
+    input_sample_rate: f32,
 }
 
 /// Running covariance of the raw `(ch1, ch0)` input during a
@@ -585,7 +642,16 @@ impl TimecodeInput {
             installed_whitening: dub_timecode::IDENTITY_WHITENING,
             calibration_seq: 0,
             rate_smoother: RateSmoother::new(),
+            hold_until_calibrated: config.hold_until_calibrated,
+            input_sample_rate: config.input_sample_rate,
         }
+    }
+
+    /// Whether this input holds deck auto-start until calibration and
+    /// settling complete (Traktor-style session-start gate, PRD §5.4).
+    #[must_use]
+    pub fn hold_until_calibrated(&self) -> bool {
+        self.hold_until_calibrated
     }
 
     /// Begin a channel-whitening calibration: clear any existing
@@ -638,6 +704,13 @@ impl TimecodeInput {
     #[must_use]
     pub fn last_output(&self) -> Option<DecodeOutput> {
         self.last_output
+    }
+
+    /// Stereo frames drained by the most recent [`Self::drive`] call.
+    /// The engine's display-rate window uses this as its time base.
+    #[must_use]
+    pub(crate) fn last_popped_frames(&self) -> usize {
+        self.last_popped / 2
     }
 
     /// Read-only access to the per-input [`LiftPolicy`]. Engine
@@ -697,16 +770,64 @@ impl TimecodeInput {
         // a frame anyway: the IOProc only ever pushes whole frames
         // (channels × N). So `popped` is even in practice; the masking
         // is defensive belt-and-braces.
-        let mut out = self.decoder.process(&self.scratch[..popped_even]);
-        // De-spike + adaptively smooth the rate the instant it leaves
-        // the decoder, so the same clean value feeds both the lift
-        // policy (audible playback rate) and `last_output` (pitch /
-        // live-BPM readout). Position is left as decoded — only the
-        // velocity estimate is filtered.
-        out.rate = self.rate_smoother.smooth(out.rate, out.confidence);
-        self.last_output = Some(out);
+        // Decode in fixed 64-frame sub-blocks regardless of the render
+        // quantum. The whole chain — decoder coherence, the Hampel
+        // window, the smoother poles, the policy's sticky window — was
+        // designed and hardware-validated at 64 frames @ 48 kHz; fed
+        // one 512-frame CoreAudio quantum at a time it ran 8× off its
+        // design point, and the consequences were *directional*: the
+        // Hampel rejected genuine hand decelerations as spikes
+        // (replaying the stale fast-forward push rate at every scratch
+        // turnaround) and the reversal landed inside one coarse block
+        // as a garbage high-confidence rate. Both biased the playhead
+        // forward — the measured ~30 ms-per-stroke sticker drift
+        // (`dub-engine/tests/scratch_drift.rs`). Sub-block decoding
+        // restores the validated regime: the same audio in N small
+        // bites, ending in the same place, with the policy stepping at
+        // its design cadence. Per-quantum cost: ≤8 extra atan2 calls —
+        // trivial, allocation-free.
+        let mut final_intent = None;
+        let mut last_out = None;
+        let mut abs_advance_sum = 0.0_f64;
+        let mut all_abs = true;
+        for chunk in self.scratch[..popped_even].chunks(DECODE_CHUNK_FRAMES * 2) {
+            let mut out = self.decoder.process(chunk);
+            #[allow(clippy::cast_precision_loss)]
+            let dt_secs = (chunk.len() / 2) as f64 / f64::from(self.input_sample_rate);
+            // De-spike + adaptively smooth the rate the instant it
+            // leaves the decoder, so the same clean value feeds both
+            // the lift policy (audible playback rate) and
+            // `last_output` (pitch / live-BPM readout). Position is
+            // left as decoded — only the velocity estimate is filtered.
+            out.rate = self
+                .rate_smoother
+                .smooth_for(out.rate, out.confidence, dt_secs);
+            let intent = self.policy.step_for(out, dt_secs);
+            if let LiftIntent::LockedAbsolute { advance_frames, .. } = intent {
+                abs_advance_sum += advance_frames;
+            } else {
+                all_abs = false;
+            }
+            last_out = Some(out);
+            final_intent = Some(intent);
+        }
+        self.last_output = last_out;
         self.accumulate_calibration(popped_even);
-        Some(self.policy.step(out))
+        // One intent per quantum, as before. A quantum that was
+        // LockedAbsolute end-to-end carries the exact summed groove
+        // advance; a mixed quantum (lock transition mid-quantum)
+        // degrades to the relative path for this quantum — the same
+        // contract transition quanta always had.
+        match final_intent {
+            Some(LiftIntent::LockedAbsolute { rate, .. }) if all_abs => {
+                Some(LiftIntent::LockedAbsolute {
+                    rate,
+                    advance_frames: abs_advance_sum,
+                })
+            }
+            Some(LiftIntent::LockedAbsolute { rate, .. }) => Some(LiftIntent::Locked { rate }),
+            other => other,
+        }
     }
 
     /// Render the live input as a Thru passthrough into `out` (PRD
@@ -868,6 +989,7 @@ mod policy_tests {
             disengage_threshold: disengage,
             sticky_blocks_to_disengage: sticky,
             amplitude_threshold: 0.01,
+            hold_until_calibrated: false,
         })
     }
 
@@ -917,13 +1039,25 @@ mod policy_tests {
     #[test]
     fn sticky_window_holds_deck_during_brief_dropouts() {
         // Engage, then suffer 3 consecutive sub-disengage blocks with
-        // sticky=4. Deck must stay engaged and emit Locked at the last
-        // locked rate the whole time.
+        // sticky=4. Deck must stay engaged: the first below-floor
+        // block holds the locked rate untouched (single-block dust
+        // ticks ride through perfectly); subsequent ones decay it
+        // toward zero like a physically stopping platter — never
+        // replaying the stale rate flat (the forward-sticker-drift
+        // fix; see `tests/scratch_drift.rs`).
+        let decay = (-(64.0 / 48_000.0) / HOLD_DECAY_TAU_SECS).exp();
         let mut p = make(0.8, 0.5, 4);
         assert!(matches!(p.step(out(1.0, 0.95)), LiftIntent::Locked { .. }));
-        for _ in 0..3 {
+        let mut expected = 1.0;
+        for i in 0..3 {
+            if i >= 1 {
+                expected *= decay;
+            }
             match p.step(out(0.0, 0.0)) {
-                LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+                LiftIntent::Locked { rate } => assert!(
+                    (rate - expected).abs() < 1e-9,
+                    "block {i}: rate {rate} vs expected {expected}"
+                ),
                 LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
                 LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
             }
@@ -939,9 +1073,15 @@ mod policy_tests {
         for _ in 0..3 {
             assert!(matches!(p.step(out(0.0, 0.0)), LiftIntent::Locked { .. }));
         }
-        // 4th below-threshold block: disengage fires this block.
+        // 4th below-threshold block: disengage fires this block. The
+        // held rate has decayed across blocks 2-4 of the window.
+        let decay = (-(64.0 / 48_000.0) / HOLD_DECAY_TAU_SECS).exp();
+        let expected = decay.powi(3);
         let i = p.step(out(0.0, 0.0));
-        assert!(matches!(i, LiftIntent::DropoutHoldRate { rate } if (rate - 1.0).abs() < 1e-9));
+        assert!(
+            matches!(i, LiftIntent::DropoutHoldRate { rate } if (rate - expected).abs() < 1e-9),
+            "got {i:?}, expected held rate ~{expected}"
+        );
         // And stays disengaged.
         let i = p.step(out(0.0, 0.0));
         assert!(matches!(i, LiftIntent::DropoutHoldRate { .. }));
@@ -958,11 +1098,16 @@ mod policy_tests {
         for _ in 0..3 {
             p.step(out(0.0, 0.0));
         }
-        // Lukewarm block: should not disengage, should reset countdown,
-        // and should hold the last good rate (1.0) — *not* trust the
-        // current 0.5 rate estimate.
+        // Lukewarm block: should not disengage and should reset the
+        // countdown. The emitted rate is a confidence-weighted blend
+        // of the measured estimate (0.5) and the decaying hold — it
+        // must land strictly between them, leaning toward the hold at
+        // this low-in-band confidence (w = (0.6-0.5)/0.3 = 1/3).
         match p.step(out(0.5, 0.6)) {
-            LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+            LiftIntent::Locked { rate } => assert!(
+                rate > 0.5 && rate < 1.0,
+                "blend out of range: {rate}"
+            ),
             LiftIntent::DropoutHoldRate { .. } => panic!("disengaged in lukewarm band"),
             LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
         }
@@ -1009,10 +1154,13 @@ mod policy_tests {
         for _ in 0..3 {
             assert!(matches!(p.step(out(0.0, 0.0)), LiftIntent::Locked { .. }));
         }
-        assert!(matches!(
-            p.step(out(0.0, 0.0)),
-            LiftIntent::DropoutHoldRate { rate } if (rate - 1.2).abs() < 1e-9
-        ));
+        let decay = (-(64.0 / 48_000.0) / HOLD_DECAY_TAU_SECS).exp();
+        let expected = 1.2 * decay.powi(3);
+        let i = p.step(out(0.0, 0.0));
+        assert!(
+            matches!(i, LiftIntent::DropoutHoldRate { rate } if (rate - expected).abs() < 1e-9),
+            "got {i:?}, expected held rate ~{expected}"
+        );
     }
 
     #[test]
@@ -1042,7 +1190,10 @@ mod policy_tests {
         // engaged at last rate (sticky window not yet expired).
         for _ in 0..3 {
             match p.step(out_with_amp(0.0, 0.7, 0.001)) {
-                LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+                LiftIntent::Locked { rate } => assert!(
+                    rate > 0.85 && rate <= 1.0,
+                    "held rate should decay gently inside the window: {rate}"
+                ),
                 LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
                 LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
             }
@@ -1090,6 +1241,7 @@ mod policy_tests {
             disengage_threshold: 0.5,
             sticky_blocks_to_disengage: 1,
             amplitude_threshold: 0.0,
+            hold_until_calibrated: false,
         });
         // High confidence + zero amplitude must engage when the gate
         // is off.
@@ -1125,6 +1277,7 @@ mod policy_tests {
     fn config_validate_rejects_negative_amplitude_threshold() {
         let cfg = TimecodeInputConfig {
             amplitude_threshold: -0.001,
+            hold_until_calibrated: false,
             ..TimecodeInputConfig::default()
         };
         let err = cfg.validate(48_000.0).unwrap_err();

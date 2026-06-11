@@ -186,6 +186,9 @@ fn run_timecode_audit() -> Result<std::time::Duration> {
             disengage_threshold: 0.5,
             sticky_blocks_to_disengage: 1,
             amplitude_threshold: 0.001,
+            // The audit drives synthetic carrier straight through the
+            // render loop — no calibration phase to wait for.
+            hold_until_calibrated: false,
         },
     )?;
 

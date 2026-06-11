@@ -46,6 +46,27 @@
   *user-initiated Panic-Play* (internal playback that ignores the timecode until
   paused) — the "load auto-starts internal play and the record does nothing"
   bug. Auto-play (drag-to-play / Space-load) is **Prep-mode only**.
+- **Tune the decode chain in *time*, never in *blocks* — and decode at the
+  design cadence regardless of the render quantum.** The Hampel window, smoother
+  poles, and sticky window were tuned at 64-frame blocks; fed whole 512-frame
+  CoreAudio quanta they ran 8× off the design point, and the errors were
+  *directional*: the Hampel rejected genuine hand decelerations as spikes
+  (replaying the stale fast push rate at every scratch turnaround) and slow
+  draws under-converged — net **forward sticker drift, ~30 ms per back-and-forth
+  scratch** (half a bar in 30 strokes, on stage). `TimecodeInput::drive` now
+  slices every quantum into 64-frame sub-blocks, and the smoother/policy clocks
+  take real `dt`. The whole pathology is pinned by an offline physics harness
+  (`dub-engine/tests/scratch_drift.rs`: velocity-scaled carrier amplitude,
+  zero-net-displacement stroke cycles, drift bounds per profile) — extend that
+  harness first when touching the policy, smoother, or decoder gates.
+- **A cartridge is a velocity sensor — gate carrier presence on
+  filter-compensated amplitude.** A slow draw is doubly quiet (low velocity ×
+  input high-pass attenuation at its low carrier frequency); gating on the raw
+  filtered RMS paused the deck through every slow backward draw (+700 ms/cycle
+  of forward drift in the harness's slow-draw profile). The decoder divides the
+  measured amplitude by |H(carrier_est)| — capped, and only when |rate| is
+  meaningfully nonzero so silence and stopped platters never get boosted into
+  "carrier present".
 
 ## BPM / beat grid
 

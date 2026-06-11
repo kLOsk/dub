@@ -1894,6 +1894,8 @@ impl DubEngine {
             calibration_seq: tc.calibration_seq,
             abs_locked: tc.abs_locked,
             abs_position_secs: tc.abs_position_secs,
+            sticker_drift_ms: tc.sticker_drift_ms,
+            pitch_settled: tc.pitch_settled,
         }
     }
 
@@ -2883,6 +2885,18 @@ pub struct DeckTelemetry {
     /// M6: decoded absolute groove position in seconds of record time.
     /// Meaningful only while `abs_locked`. Diagnostic/log only.
     pub abs_position_secs: f64,
+    /// Sticker drift in milliseconds: how far the relative-mode
+    /// playhead has slid against the absolute groove position since the
+    /// engagement anchor (positive = playhead lags the record). NaN
+    /// until the first ABS-locked observation — gate the readout on
+    /// `isNaN`. Diagnostic only; never feeds back into transport.
+    pub sticker_drift_ms: f64,
+    /// Whether the pitch / live-BPM readout has finished its settling
+    /// measurements (the once-per-rev wobble fit needs ~2 revolutions
+    /// of locked play after the first needle drop of a session). Show
+    /// the number dimmed / "measuring" until `true`. Always `true` for
+    /// Internal / Thru drive.
+    pub pitch_settled: bool,
 }
 
 impl DeckTelemetry {
@@ -2902,6 +2916,8 @@ impl DeckTelemetry {
             calibration_seq: 0,
             abs_locked: false,
             abs_position_secs: 0.0,
+            sticker_drift_ms: f64::NAN,
+            pitch_settled: true,
         }
     }
 }

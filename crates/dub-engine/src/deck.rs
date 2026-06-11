@@ -165,6 +165,13 @@ pub struct DeckSharedState {
     /// the deck is *driven* by per-block deltas, never by this value.
     tc_abs_locked: AtomicBool,
     tc_abs_position_secs_bits: AtomicU64,
+    /// Sticker-drift reading in milliseconds (see [`crate::drift`]);
+    /// NaN until the first ABS-locked observation. Diagnostic only.
+    tc_sticker_drift_ms_bits: AtomicU64,
+    /// Whether the pitch / live-BPM readout has finished its settling
+    /// measurements (wobble fit converged); UI dims the number until
+    /// then. `true` for non-timecode drive.
+    tc_pitch_settled: AtomicBool,
 }
 
 /// Lock-free snapshot of a deck's timecode signal health. Returned by
@@ -211,6 +218,15 @@ pub struct TimecodeTelemetry {
     /// M6: decoded absolute groove position in seconds of record time.
     /// Meaningful only while `abs_locked`; diagnostic/log only.
     pub abs_position_secs: f64,
+    /// Sticker drift in milliseconds: how far the relative-mode
+    /// playhead has slid against the absolute groove position since
+    /// the current anchor (see [`crate::drift`]). Positive = playhead
+    /// lags the record. NaN until the first ABS-locked observation.
+    pub sticker_drift_ms: f64,
+    /// Whether the pitch / live-BPM readout has finished settling
+    /// (wobble fit converged — ~2 revolutions of locked play). The UI
+    /// shows the value dimmed / "measuring" until then.
+    pub pitch_settled: bool,
 }
 
 /// Process-local monotonic clock origin shared by the audio
@@ -277,6 +293,8 @@ impl DeckSharedState {
             ],
             calibration_seq: AtomicU32::new(0),
             tc_abs_locked: AtomicBool::new(false),
+            tc_sticker_drift_ms_bits: AtomicU64::new(f64::NAN.to_bits()),
+            tc_pitch_settled: AtomicBool::new(true),
             tc_abs_position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
@@ -309,6 +327,9 @@ impl DeckSharedState {
         self.tc_abs_locked.store(false, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
+        self.tc_sticker_drift_ms_bits
+            .store(f64::NAN.to_bits(), Ordering::Relaxed);
+        self.tc_pitch_settled.store(true, Ordering::Relaxed);
         self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0);
         // Bring the seqlock-protected publish triple back to a
         // clean baseline (zero playhead, zero rate, host time at
@@ -333,6 +354,8 @@ impl DeckSharedState {
         display_rate: f64,
         abs_locked: bool,
         abs_position_secs: f64,
+        sticker_drift_ms: f64,
+        pitch_settled: bool,
     ) {
         self.tc_confidence_bits
             .store(confidence.to_bits(), Ordering::Relaxed);
@@ -345,6 +368,10 @@ impl DeckSharedState {
         self.tc_abs_locked.store(abs_locked, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(abs_position_secs.to_bits(), Ordering::Relaxed);
+        self.tc_sticker_drift_ms_bits
+            .store(sticker_drift_ms.to_bits(), Ordering::Relaxed);
+        self.tc_pitch_settled
+            .store(pitch_settled, Ordering::Relaxed);
     }
 
     /// Publish auto source-detection + calibration state (audio thread).
@@ -408,6 +435,8 @@ impl DeckSharedState {
             abs_position_secs: f64::from_bits(
                 self.tc_abs_position_secs_bits.load(Ordering::Relaxed),
             ),
+            sticker_drift_ms: f64::from_bits(self.tc_sticker_drift_ms_bits.load(Ordering::Relaxed)),
+            pitch_settled: self.tc_pitch_settled.load(Ordering::Relaxed),
         }
     }
 
@@ -798,6 +827,8 @@ impl Deck {
         display_rate: f64,
         abs_locked: bool,
         abs_position_secs: f64,
+        sticker_drift_ms: f64,
+        pitch_settled: bool,
     ) {
         self.shared.publish_timecode_telemetry(
             confidence,
@@ -807,6 +838,8 @@ impl Deck {
             display_rate,
             abs_locked,
             abs_position_secs,
+            sticker_drift_ms,
+            pitch_settled,
         );
     }
 
@@ -1045,6 +1078,26 @@ impl Deck {
     #[must_use]
     pub fn position_frames(&self) -> f64 {
         self.position
+    }
+
+    /// Current playhead in **track seconds** (0.0 with no track
+    /// loaded). Same conversion as the seek path publishes.
+    #[must_use]
+    pub fn position_secs(&self) -> f64 {
+        self.source.as_ref().map_or(0.0, |track| {
+            let sr = f64::from(track.sample_rate());
+            if sr > 0.0 {
+                self.position / sr
+            } else {
+                0.0
+            }
+        })
+    }
+
+    /// Whether a track is currently loaded.
+    #[must_use]
+    pub fn has_track(&self) -> bool {
+        self.source.is_some()
     }
 
     /// Set the playback position in track frames. Clamped to the track's
@@ -1525,7 +1578,7 @@ mod tests {
         assert_eq!(t0.lock_state, 0);
         assert_eq!(t0.confidence, 0.0);
 
-        shared.publish_timecode_telemetry(0.97, 0.31, 2, true, 0.984, true, 12.5);
+        shared.publish_timecode_telemetry(0.97, 0.31, 2, true, 0.984, true, 12.5, 3.25, true);
         let t1 = shared.load_timecode_telemetry();
         assert!(t1.has_input);
         assert_eq!(t1.lock_state, 2);
@@ -1534,6 +1587,7 @@ mod tests {
         assert!((t1.display_rate - 0.984).abs() < 1e-9);
         assert!(t1.abs_locked);
         assert!((t1.abs_position_secs - 12.5).abs() < 1e-9);
+        assert!((t1.sticker_drift_ms - 3.25).abs() < 1e-9);
 
         // reset() clears telemetry back to the empty baseline.
         shared.reset();

@@ -27,6 +27,8 @@
 mod command;
 mod deck;
 pub mod declick;
+mod display_rate;
+mod drift;
 mod handle;
 pub mod realtime;
 pub mod thru;
@@ -83,6 +85,22 @@ pub enum ControlMode {
 /// Input frames captured for a channel-whitening calibration (~1 s at
 /// 48 kHz). One clean spin is plenty to measure the cartridge ellipse.
 const CALIBRATION_FRAMES: usize = 48_000;
+
+/// Groove-continuity healing thresholds (PRD §5.4.3), two-tier.
+///
+/// Mid-motion (scratching, riding), only drift worth a clearly audible
+/// repair is corrected — every heal is a position nudge plus a de-click
+/// ramp, and firing them at each stroke's re-lock made the routine feel
+/// jumpier than the drift it was fixing (the on-rig "much worse"
+/// report, after this was briefly a flat 4 ms).
+const DRIFT_HEAL_COARSE_SECS: f64 = 0.010;
+/// Once the platter is back near steady play, residue down to ~2 mm of
+/// groove is quietly cleaned up — this is what removes the "kick sits
+/// just off the sticker" leftover (−7 ms on-rig) without ever nudging
+/// mid-gesture.
+const DRIFT_HEAL_FINE_SECS: f64 = 0.004;
+/// |rate − 1| below this counts as steady play for the fine tier.
+const DRIFT_HEAL_STEADY_BAND: f64 = 0.25;
 
 /// Per-deck output routing for [`Engine::render_routed`].
 ///
@@ -187,17 +205,22 @@ pub struct Engine {
     /// disengaged at engine construction.
     panic_play_states: [PanicPlayState; DECK_COUNT],
 
-    /// Per-deck lightly-smoothed decoded timecode rate, for the
-    /// **pitch / live-BPM display only** (1.0 = unity). Frozen while
-    /// not cleanly locked (so a needle lift doesn't drag the readout
-    /// toward 0 / −100 %) and snapped on re-lock (so the BPM recovers
-    /// instantly instead of slewing). Display-only; playback uses the
-    /// raw rate in the position seqlock.
-    tc_display_rate_ema: [f64; DECK_COUNT],
-    /// Whether `tc_display_rate_ema` is currently tracking a clean
-    /// lock. `false` after a lift / dropout so the next clean block
-    /// snaps the display rather than slewing to it.
-    tc_rate_primed: [bool; DECK_COUNT],
+    /// Per-deck rev-locked wobble canceller over the decoded timecode
+    /// rate, for the **pitch / live-BPM display only** (see
+    /// [`display_rate`]): subtracts once-per-rev eccentricity/warp
+    /// wobble so the readout sits steady *and* fine pitch moves show
+    /// within ~0.3 s. Reset while not cleanly locked so the next clean
+    /// block snaps instead of slewing.
+    tc_display_rate: [display_rate::DisplayRateFilter; DECK_COUNT],
+    /// Per-deck sticker-drift monitor (see [`drift`]): measures how far
+    /// the relative-mode playhead has slid against the absolute groove
+    /// position. Diagnostic only — never feeds back into transport.
+    tc_drift: [drift::DriftMonitor; DECK_COUNT],
+    /// The last value [`Self::tc_display_rate`] produced under clean
+    /// lock — held frozen through lifts/dropouts so a flick doesn't
+    /// drag the readout toward 0 / −100 %. Display-only; playback uses
+    /// the raw smoothed rate in the position seqlock.
+    tc_display_value: [f64; DECK_COUNT],
     /// How each deck's transport is currently driven (Internal vs
     /// Timecode). Set by auto source-detection unless the user has
     /// pinned it (`control_override`).
@@ -318,8 +341,9 @@ impl Engine {
             timecode_inputs: std::array::from_fn(|_| None),
             thru_sources: std::array::from_fn(|_| None),
             panic_play_states: [PanicPlayState::default(); DECK_COUNT],
-            tc_display_rate_ema: [1.0; DECK_COUNT],
-            tc_rate_primed: [false; DECK_COUNT],
+            tc_display_rate: [display_rate::DisplayRateFilter::new(); DECK_COUNT],
+            tc_drift: [drift::DriftMonitor::new(); DECK_COUNT],
+            tc_display_value: [1.0; DECK_COUNT],
             control_mode: [ControlMode::Timecode; DECK_COUNT],
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
@@ -374,8 +398,9 @@ impl Engine {
             timecode_inputs: std::array::from_fn(|_| None),
             thru_sources: std::array::from_fn(|_| None),
             panic_play_states: [PanicPlayState::default(); DECK_COUNT],
-            tc_display_rate_ema: [1.0; DECK_COUNT],
-            tc_rate_primed: [false; DECK_COUNT],
+            tc_display_rate: [display_rate::DisplayRateFilter::new(); DECK_COUNT],
+            tc_drift: [drift::DriftMonitor::new(); DECK_COUNT],
+            tc_display_value: [1.0; DECK_COUNT],
             control_mode: [ControlMode::Timecode; DECK_COUNT],
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
@@ -423,6 +448,9 @@ impl Engine {
     #[must_use = "the returned TimecodeInput holds a ringbuf consumer; \
                   drop it on the main thread, not the audio thread"]
     pub fn detach_timecode_input(&mut self, deck_idx: usize) -> Option<TimecodeInput> {
+        if let Some(monitor) = self.tc_drift.get_mut(deck_idx) {
+            monitor.reset();
+        }
         self.timecode_inputs
             .get_mut(deck_idx)
             .and_then(Option::take)
@@ -740,15 +768,21 @@ impl Engine {
                 Some(input) => input.drive(),
                 None => continue,
             };
+            // Block-end groove position staged for the drift
+            // observation in the `LockedAbsolute` arm below; `None`
+            // unless this block is cleanly locked with an absolute fix
+            // outside panic.
+            let mut groove_end: Option<f64> = None;
             // Publish signal-quality telemetry for the deck-header
             // tracking dot + signal panel: the decoder's last output
             // (confidence / amplitude) plus the lift-policy lock state.
             // Read into Copy locals so the `timecode_inputs` borrow is
             // dropped before we touch `self.decks`. RT-safe.
             let tc = self.timecode_inputs[idx].as_ref().map(|input| {
-                let (confidence, amplitude, rate) = input
-                    .last_output()
-                    .map_or((0.0, 0.0, 1.0), |o| (o.confidence, o.amplitude, o.rate));
+                let (confidence, amplitude, rate, position_secs) =
+                    input.last_output().map_or((0.0, 0.0, 1.0, 0.0), |o| {
+                        (o.confidence, o.amplitude, o.rate, o.position_secs)
+                    });
                 let policy = input.policy();
                 let lock_state = if !policy.is_engaged() {
                     3 // disengaged — lifted / scratching / dropout
@@ -769,45 +803,65 @@ impl Engine {
                     rate,
                     abs_frames.is_some(),
                     abs_secs,
+                    input.last_popped_frames(),
+                    position_secs,
                 )
             });
-            if let Some((confidence, amplitude, lock_state, rate, abs_locked, abs_secs)) = tc {
-                // Heavy EMA → the pitch / live-BPM readout. Update only
-                // while engaged (clean/degraded); freeze during a
-                // disengage/scratch so a flick doesn't drag the number
-                // around. α small ⇒ ~10× jitter reduction, so a ±1 %
-                // per-block wobble shows as ~±0.1 BPM. Display-only —
-                // playback uses the raw rate in the position seqlock.
+            if let Some((
+                confidence,
+                amplitude,
+                lock_state,
+                rate,
+                abs_locked,
+                abs_secs,
+                frames,
+                position_secs,
+            )) = tc
+            {
+                // Pitch / live-BPM readout: rev-locked wobble canceller
+                // (see `display_rate`) over the already de-spiked rate.
+                // An off-center pressing FM-wobbles the rate at the
+                // rotation rate by ±0.1–0.3 % — ±0.5 BPM on a 175 BPM
+                // track. The canceller subtracts that component (phased
+                // off the decoded groove position) instead of averaging
+                // it, so the readout sits steady while a fine pitch
+                // move still shows in ~0.3 s. Update while cleanly
+                // locked; freeze through degraded/lifted blocks (so a
+                // flick doesn't drag the readout toward −100 %) and
+                // snap on re-lock. Display-only — playback uses the raw
+                // smoothed rate in the position seqlock.
+                #[allow(clippy::cast_precision_loss)]
+                let dt = frames as f64 / f64::from(self.sample_rate);
                 if lock_state == 1 {
-                    // Clean lock: heavy denoise. The rate is already
-                    // de-spiked + steady-smoothed by the decoder's
-                    // `RateSmoother`; this second, slower pole
-                    // (τ ≈ 1/α ≈ 130 ms at 750 blocks/s) is display-only
-                    // and exists so the *readout* sits rock-steady well
-                    // inside the 0.0x-BPM range — a number can lag
-                    // freely. Playback uses the raw (smoothed) rate in
-                    // the position seqlock, so this never adds latency to
-                    // what you hear.
-                    if self.tc_rate_primed[idx] {
-                        // Eased from 0.01 → 0.06 now that the decoder's
-                        // amplitude-gated confidence killed the static-
-                        // signal jitter: the raw rate is much steadier, so
-                        // the display can track ~6× faster (τ ≈ 20 ms at
-                        // 750 blocks/s) and feel responsive without wobble.
-                        const DISPLAY_RATE_ALPHA: f64 = 0.06;
-                        let ema = self.tc_display_rate_ema[idx];
-                        self.tc_display_rate_ema[idx] = ema + DISPLAY_RATE_ALPHA * (rate - ema);
-                    } else {
-                        // First clean block after a lift/dropout — snap,
-                        // don't slew, so the BPM recovers instantly.
-                        self.tc_display_rate_ema[idx] = rate;
-                        self.tc_rate_primed[idx] = true;
-                    }
+                    self.tc_display_value[idx] =
+                        self.tc_display_rate[idx].update(rate, position_secs, dt);
                 } else {
-                    // Degraded / disengaged / lifted: freeze the displayed
-                    // rate (don't drift toward 0), re-snap on re-lock.
-                    self.tc_rate_primed[idx] = false;
+                    self.tc_display_rate[idx].reset();
                 }
+                // Sticker-drift measurement (see `drift`): while
+                // ABS-locked under clean Timecode drive with a track
+                // loaded, `groove − playhead` must stay constant; its
+                // deviation is the accumulated relative-mode position
+                // error, published for the signal-quality panel + log.
+                // Carrier presence is fed every block so the monitor
+                // can tell a needle lift (sustained silence) from a
+                // scratch gap when deciding whether a big offset jump
+                // is a remap or accumulated drift.
+                self.tc_drift[idx].note_block(amplitude < 0.005, dt);
+                // Drift is *observed* (and healed) in the
+                // `LockedAbsolute` intent arm below — after this block's
+                // exact groove advance is applied — so the groove
+                // position and the playhead are sampled at the same
+                // block boundary. Observing here, pre-advance, skewed
+                // the measurement by up to a block of motion whenever
+                // the rate was changing, and the phantom drift fired
+                // spurious heals at every mid-motion re-lock (the
+                // on-rig "much worse" stutter). Here we only stage the
+                // groove reference for that arm.
+                if lock_state == 1 && abs_locked && !panic_engaged {
+                    groove_end = Some(abs_secs);
+                }
+                let sticker_drift_ms = self.tc_drift[idx].drift_secs() * 1000.0;
                 // Pitch / live-BPM readout source depends on what is
                 // actually driving the deck. In Timecode mode that's the
                 // smoothed platter rate; in Internal mode the file plays
@@ -815,9 +869,18 @@ impl Engine {
                 // the pitch held from a prior Timecode hand-off) — not the
                 // platter's. In Thru the file isn't playing, so the value
                 // is gated out on the UI side by `is_playing`.
-                let display_rate = match self.control_mode[idx] {
-                    ControlMode::Timecode => self.tc_display_rate_ema[idx],
-                    ControlMode::Internal | ControlMode::Thru => self.decks[idx].rate(),
+                // Internal/Thru readouts come from the deck's own
+                // clock — always trustworthy. Timecode readouts are
+                // "measuring" until the wobble fit has seen ~2
+                // revolutions of locked play (the UI dims the pitch /
+                // live-BPM until then instead of presenting the
+                // uncancelled wobble as truth).
+                let (display_rate, pitch_settled) = match self.control_mode[idx] {
+                    ControlMode::Timecode => (
+                        self.tc_display_value[idx],
+                        self.tc_display_rate[idx].settled(),
+                    ),
+                    ControlMode::Internal | ControlMode::Thru => (self.decks[idx].rate(), true),
                 };
                 self.decks[idx].publish_timecode_telemetry(
                     confidence,
@@ -827,6 +890,8 @@ impl Engine {
                     display_rate,
                     abs_locked,
                     abs_secs,
+                    sticker_drift_ms,
+                    pitch_settled,
                 );
             }
 
@@ -912,6 +977,18 @@ impl Engine {
                 // already set on engage and no command has touched it.
                 continue;
             };
+            // Traktor-style session-start gate (PRD §5.4): a Timecode
+            // deck doesn't *auto-start* until this needle's
+            // measurements are done — whitening installed and the
+            // wobble fit settled (~5 s of the record spinning, once
+            // per attach). Decoding, calibration, and settling all run
+            // during the hold; the deck just stays silent. Never
+            // pauses an already-playing deck, and Panic Play (the Play
+            // button) bypasses it for stage emergencies.
+            let playback_gated = self.timecode_inputs[idx].as_ref().is_some_and(|input| {
+                input.hold_until_calibrated()
+                    && !(input.is_calibrated() && self.tc_display_rate[idx].settled())
+            });
             if panic_engaged {
                 // Internal (Panic) Play is engaged on this deck — the
                 // deck runs forward on its own clock, audible while the
@@ -968,6 +1045,10 @@ impl Engine {
                             self.panic_play_states[idx].engaged = false;
                             self.panic_play_states[idx].user_initiated = false;
                             self.panic_play_states[idx].relock_blocks = 0;
+                            // The deck free-ran on its own clock during
+                            // panic — the groove↔playhead mapping is
+                            // deliberately new; never heal it back.
+                            self.tc_drift[idx].note_remap();
                         }
                     }
                     timecode::LiftIntent::DropoutHoldRate { .. } => {
@@ -1003,8 +1084,10 @@ impl Engine {
                             // refused to spin until the user toggled
                             // INT→TC. Preamp/mic bleed can't trigger this:
                             // it never satisfies the decoder's
-                            // confidence/amplitude lock.
-                            if deck.source().is_some() {
+                            // confidence/amplitude lock. The one hold is
+                            // the session-start calibration gate computed
+                            // above.
+                            if deck.source().is_some() && !playback_gated {
                                 deck.set_playing(true);
                             }
                         }
@@ -1023,9 +1106,9 @@ impl Engine {
                         // the audible pitch is exactly the platter's.
                         let deck = &mut self.decks[idx];
                         deck.set_rate(rate);
-                        if !deck.is_playing() && deck.source().is_some() {
-                            // Same auto-start contract as `Locked` —
-                            // see that arm's comment.
+                        if !deck.is_playing() && deck.source().is_some() && !playback_gated {
+                            // Same auto-start contract (and calibration
+                            // gate) as `Locked` — see that arm's comment.
                             deck.set_playing(true);
                         }
                         // Convert input frames → track frames. The
@@ -1040,6 +1123,31 @@ impl Engine {
                         if let Some(track_sr) = track_sr {
                             let delta = advance_frames * track_sr / f64::from(self.sample_rate);
                             deck.advance_position_frames(delta);
+                            // Groove-continuity healing (PRD §5.4.3):
+                            // with this block's exact advance applied,
+                            // playhead and groove position sit on the
+                            // same block boundary, so the offset
+                            // deviation is true accumulated drift —
+                            // whatever motion the relative path lost
+                            // while the needle stayed in the groove.
+                            // Apply it back (de-clicked) and the kick
+                            // returns to the cue sticker. Deliberate
+                            // moves never get here: seek/load/play/
+                            // mode/panic paths flag `note_remap` and a
+                            // lift re-anchors via the silence rule.
+                            if let Some(groove) = groove_end {
+                                let drift_secs =
+                                    self.tc_drift[idx].observe(groove, deck.position_secs());
+                                let threshold = if (rate - 1.0).abs() < DRIFT_HEAL_STEADY_BAND {
+                                    DRIFT_HEAL_FINE_SECS
+                                } else {
+                                    DRIFT_HEAL_COARSE_SECS
+                                };
+                                if drift_secs.abs() > threshold {
+                                    let target = deck.position_frames() + drift_secs * track_sr;
+                                    deck.set_position_frames(target);
+                                }
+                            }
                         }
                     }
                     timecode::LiftIntent::DropoutHoldRate { rate } => {
@@ -1154,6 +1262,9 @@ impl Engine {
         // sets the flag explicitly from its caller's context.
         self.panic_play_states[idx].user_initiated = false;
         self.decks[idx].set_panic_play_visible(false);
+        // The deck free-ran on its own clock during panic — the
+        // groove↔playhead mapping is deliberately new (PRD §5.4.3).
+        self.tc_drift[idx].note_remap();
     }
 
     /// Apply a user-selected control-mode switch on deck `idx` (PRD
@@ -1246,6 +1357,9 @@ impl Engine {
                 if i < DECK_COUNT {
                     self.control_mode[i] = ControlMode::Internal;
                     self.control_override[i] = true;
+                    // Internal play moves the playhead on its own clock —
+                    // not drift; never heal it back (PRD §5.4.3).
+                    self.tc_drift[i].note_remap();
                 }
             }
             Command::DeckPause { idx } => {
@@ -1259,6 +1373,11 @@ impl Engine {
             } => {
                 if let Some(d) = self.decks.get_mut(idx as usize) {
                     d.set_position_frames(position_frames);
+                }
+                // A deliberate jump (cue pad, overview tap) — re-anchor
+                // the drift monitor so healing never fights the seek.
+                if let Some(m) = self.tc_drift.get_mut(idx as usize) {
+                    m.note_remap();
                 }
             }
             Command::DeckSetRate { idx, rate } => {
@@ -1283,6 +1402,12 @@ impl Engine {
             }
             Command::DeckSetControlMode { idx, mode } => {
                 self.set_deck_control_mode(idx as usize, mode);
+                // Crossing into/out of Timecode drive invalidates the
+                // groove↔playhead anchor (the playhead may have moved on
+                // another clock meanwhile).
+                if let Some(m) = self.tc_drift.get_mut(idx as usize) {
+                    m.note_remap();
+                }
             }
             Command::DeckAutoControlMode { idx } => {
                 if let Some(o) = self.control_override.get_mut(idx as usize) {
@@ -1303,6 +1428,10 @@ impl Engine {
                     return;
                 };
                 d.swap_source(source);
+                // Fresh track, fresh groove↔playhead mapping.
+                if let Some(m) = self.tc_drift.get_mut(idx as usize) {
+                    m.note_remap();
+                }
                 // Auto-gain (M16): apply the load-time normalization
                 // gain atomically with the swap. The new track fades in
                 // (via swap_source's de-click ramp) to this gain. Always
@@ -2147,6 +2276,7 @@ mod tests {
             // exercises the gate code path so any future regression
             // here trips integration tests too.
             amplitude_threshold: 0.001,
+            hold_until_calibrated: false,
         };
         engine
             .attach_timecode_input(0, rx, cfg)
@@ -2257,6 +2387,143 @@ mod tests {
         let pos = engine.deck(0).position_frames();
         assert!(pos > 200.0, "deck position should advance (got {pos})");
         assert!(pos < 1100.0, "and not run away (got {pos})");
+    }
+
+    /// Drive `engine` to a clean ABS lock: feed `gen` carrier one block
+    /// at a time and render until the absolute tracker reports a
+    /// position fix (or the frame budget runs out).
+    fn render_to_abs_lock(
+        engine: &mut Engine,
+        tx: &mut ringbuf::HeapProd<f32>,
+        gen: &mut dub_timecode::signal::Generator,
+        rt: &mut RealtimeContext<'_>,
+        block: usize,
+    ) {
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..400 {
+            gen.render(&mut sig, 1.0, 0.5);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            engine.render(rt, &mut buf);
+            if engine
+                .timecode_last_output(0)
+                .is_some_and(|o| o.abs_position_frames.is_some())
+            {
+                return;
+            }
+        }
+        panic!("absolute tracker never locked on synthetic carrier");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // block = 256, exact in f64
+    fn groove_continuity_heals_lost_motion_but_not_seeks() {
+        // PRD §5.4.3: drift (playhead motion lost while the needle
+        // stayed in the groove) is healed back from the absolute groove
+        // position; deliberate seeks re-anchor instead and must never
+        // be fought.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 8 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut rt = RealtimeContext::new();
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.4));
+        render_to_abs_lock(&mut engine, &mut tx, &mut gen, &mut rt, block);
+
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut step = |engine: &mut Engine, gen: &mut dub_timecode::signal::Generator| {
+            gen.render(&mut sig, 1.0, 0.5);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            engine.render(&mut rt, &mut buf);
+        };
+        // A couple of locked blocks so the drift monitor anchors.
+        for _ in 0..8 {
+            step(&mut engine, &mut gen);
+        }
+
+        // Simulate 100 ms of lost motion: the platter moved but the
+        // playhead didn't (set directly — NOT via DeckSeek, which would
+        // legitimately flag a remap).
+        let before = engine.deck(0).position_frames();
+        engine.deck_mut(0).set_position_frames(before - 4_800.0);
+        for _ in 0..8 {
+            step(&mut engine, &mut gen);
+        }
+        let healed = engine.deck(0).position_frames();
+        let expected = before + 8.0 * block as f64;
+        assert!(
+            (healed - expected).abs() < 600.0,
+            "lost motion was not healed: at {healed}, expected ≈{expected}"
+        );
+
+        // A deliberate seek (cue jump) must stick.
+        let target = engine.deck(0).position_frames() + 48_000.0;
+        engine.apply_command(Command::DeckSeek {
+            idx: 0,
+            position_frames: target,
+        });
+        for _ in 0..8 {
+            step(&mut engine, &mut gen);
+        }
+        let after_seek = engine.deck(0).position_frames();
+        let expected = target + 8.0 * block as f64;
+        assert!(
+            (after_seek - expected).abs() < 600.0,
+            "seek was healed away: at {after_seek}, expected ≈{expected}"
+        );
+    }
+
+    #[test]
+    fn calibration_gate_holds_autostart_until_measured() {
+        // PRD §5.4 session-start gate: with `hold_until_calibrated`
+        // (the app default), a clean locked carrier must NOT auto-start
+        // an uncalibrated deck — Traktor-style "calibrating" hold. The
+        // engine keeps decoding/calibrating during the hold; playback
+        // begins only once measurements complete (exercised on-rig; the
+        // full unlock needs ~5 s of carrier, so this test pins the hold
+        // side only).
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let mut engine = Engine::new(sr, block);
+        let rb = HeapRb::<f32>::new(48_000 * 2);
+        let (mut tx, rx) = rb.split();
+        let cfg = TimecodeInputConfig {
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+            hold_until_calibrated: true,
+            ..TimecodeInputConfig::default()
+        };
+        engine.attach_timecode_input(0, rx, cfg).unwrap();
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        for _ in 0..16 {
+            gen.render(&mut sig, 1.0, 0.5);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            engine.render(&mut rt, &mut buf);
+        }
+        assert!(
+            engine.timecode_last_output(0).unwrap().confidence > 0.99,
+            "carrier should be locked"
+        );
+        assert!(
+            !engine.deck(0).is_playing(),
+            "uncalibrated deck must hold (Traktor-style calibration gate)"
+        );
     }
 
     #[test]
@@ -2705,6 +2972,7 @@ mod tests {
                     disengage_threshold: 0.5,
                     sticky_blocks_to_disengage: 1,
                     amplitude_threshold: 0.001,
+                    hold_until_calibrated: false,
                 },
             )
             .expect("empty-slot attach should succeed");
@@ -2753,6 +3021,7 @@ mod tests {
             disengage_threshold: 0.5,
             sticky_blocks_to_disengage: 1,
             amplitude_threshold: 0.001,
+            hold_until_calibrated: false,
         };
 
         // First attach.
@@ -2860,6 +3129,7 @@ mod tests {
             disengage_threshold: 0.5,
             sticky_blocks_to_disengage: 1,
             amplitude_threshold: 0.001,
+            hold_until_calibrated: false,
         };
         let rb = HeapRb::<f32>::new(64);
         let (_tx, rx) = rb.split();

@@ -510,6 +510,7 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 - **Drop-out detection (Stickiness)**: if signal quality degrades (dust, scratch, end of run-out groove), hold the last known velocity for a grace window (default 250 ms). If the signal does not recover within the window, the engine auto-engages Panic Play (§6.1.2 / §5.4.2 Repeat), continuing forward at the last known rate until the signal returns. The grace window discriminates brief stylus hiccups (held, no state change) from sustained dropouts (auto-engaged internal playback).
 - **Through groove handling**: when the needle reaches the end of the encoded area, Stickiness's grace window expires, and the engine engages Panic Play per §5.4.2 — audio continues forward at the last known rate. Recovery is automatic on the next clean Locked sample (DJ drops the needle back on a mid-timecode groove).
 - **Calibration UI**: show signal scope, S/N ratio, RPM detection, pitch readout. Live calibration with vinyl spinning. **No A/B side toggle, no abs/rel mode selector** — relative mode is universal.
+- **Session-start calibration hold (Traktor-style).** A Timecode deck does not auto-start playback until the needle's measurements complete — whitening calibration installed plus the display wobble fit settled, ~5 s of the record spinning, once per attach. Playing during the measurement window would run at uncorrected pitch; the DJ sets up minutes before the first tune, so the hold costs nothing (this matches Traktor's "calibrating" startup behavior). The deck's Play button (Panic Play) bypasses the hold instantly for stage emergencies, and the hold never pauses an already-playing deck (mid-set recalibration runs live).
 - **Tracking quality indicator (UI)**: a per-deck signal-health glyph in the deck header source pill (PRD §9) — green dot = clean lock, amber = degraded signal, red = no lock. Read off the M5.4.6 `LiftPolicy` confidence the engine already publishes. Note: it is **expected** for tracking to be red while cueing or scratching, identical to Serato's behaviour — the dot reports signal quality, not user intent.
 
 **Algorithm:** port the xwax decoder (well-understood, ~2k lines C, BSD-licensed). Our port lives in `crates/dub-timecode/`. Both Serato and Traktor LFSR tables included.
@@ -533,7 +534,20 @@ When the needle reaches the end of the timecode-encoded area of the control reco
 
 **There is no "paused" state in Timecode mode after run-out.** The deck either follows the platter (Locked) or runs internally forward (Panic / Repeat). To stop a track that has run past the encoded area, the user either lets the audio finish, drops the needle back on the groove and pulls it off the platter (lift → Stickiness pauses → re-engage on the dropped needle), or unloads the track from the deck. This is consistent with Serato Scratch Live and Traktor Scratch.
 
-#### 5.4.3 Reverse Input Control
+#### 5.4.3 Groove-continuity healing (sticker lock)
+
+Relative mode integrates decoded motion, and integration errors are permanent: every scratch turnaround or slow draw where the carrier momentarily collapses (a cartridge is a velocity sensor — slow stylus motion is inherently quiet) freezes the deck for a few ms while the record keeps moving. Accumulated over a scratch session this is **sticker drift** — the kick slides off the cue sticker (measured on-rig: ~1.5 s lost over one minute of hold-heavy scratching).
+
+Since M6 the decoder reads the absolute LFSR groove position. That makes the drift *measurable* (the `groove − playhead` offset must stay constant for an engagement; the engine publishes its deviation as the Sticker-Drift telemetry in the deck Signal panel) — and *repairable*: **as long as the needle stayed in the groove, the record's own continuity is ground truth.** When the absolute tracker re-locks after a relative-only gap, the engine applies the measured drift back to the playhead (de-clicked), returning the kick to the sticker.
+
+This is **not** needle-drop positioning (still deferred, see above): healing only ever enforces continuity of the mapping the DJ already established. The guards:
+
+- **Needle lifts re-anchor instead of healing.** A lift is detected as sustained (≥ 1.5 s) carrier silence; an offset jump after a lift is a deliberate re-drop (re-anchor if it moved > 250 ms; a re-drop back on the sticker keeps the running measurement).
+- **Deliberate playhead moves re-anchor instead of healing.** Seeks/cues, track loads, internal Play, control-mode switches, and Panic-Play exits flag the drift monitor, so the heal never fights an intentional jump.
+- **Sub-10 ms drift is left alone** — steady play is never micro-nudged.
+- A > 5 s offset jump with no lift detected is treated as a programmatic remap (safety fallback), not drift.
+
+#### 5.4.4 Reverse Input Control
 
 A keyboard-only command (no UI button on the performance surface) that **swaps deck A's and deck B's timecode input pairs**. Two motivations:
 

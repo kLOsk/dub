@@ -748,6 +748,7 @@ fn attach_timecode_via_handle(
         disengage_threshold: thresholds.disengage,
         sticky_blocks_to_disengage: thresholds.sticky_blocks_to_disengage,
         amplitude_threshold: thresholds.amplitude,
+        hold_until_calibrated: false,
     };
     handle
         .attach_timecode_input(deck_idx, consumer, cfg)
