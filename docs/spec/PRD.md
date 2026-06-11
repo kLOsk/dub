@@ -538,14 +538,16 @@ When the needle reaches the end of the timecode-encoded area of the control reco
 
 Relative mode integrates decoded motion, and integration errors are permanent: every scratch turnaround or slow draw where the carrier momentarily collapses (a cartridge is a velocity sensor — slow stylus motion is inherently quiet) freezes the deck for a few ms while the record keeps moving. Accumulated over a scratch session this is **sticker drift** — the kick slides off the cue sticker (measured on-rig: ~1.5 s lost over one minute of hold-heavy scratching).
 
-Since M6 the decoder reads the absolute LFSR groove position. That makes the drift *measurable* (the `groove − playhead` offset must stay constant for an engagement; the engine publishes its deviation as the Sticker-Drift telemetry in the deck Signal panel) — and *repairable*: **as long as the needle stayed in the groove, the record's own continuity is ground truth.** When the absolute tracker re-locks after a relative-only gap, the engine applies the measured drift back to the playhead (de-clicked), returning the kick to the sticker.
+Since M6 the decoder reads the absolute LFSR groove position. That makes the drift *measurable* (the `groove − playhead` offset must stay constant for an engagement; the engine publishes its deviation as the Sticker-Drift telemetry in the deck Signal panel) — and *repairable*: **as long as the needle stayed in the groove, the record's own continuity is ground truth.** When the absolute tracker re-locks after a relative-only gap, the engine bleeds the measured drift back into the playhead as a **bounded slew** — at most ~1 % of real time per block (an inaudible rate trim), re-measured every locked block until the residual sits inside a ~4 ms deadband. Never a step: a step correction was audible as the track "jumping slightly forward" at the first re-lock after a scratch.
 
 This is **not** needle-drop positioning (still deferred, see above): healing only ever enforces continuity of the mapping the DJ already established. The guards:
 
 - **Needle lifts re-anchor instead of healing.** A lift is detected as sustained (≥ 1.5 s) carrier silence; an offset jump after a lift is a deliberate re-drop (re-anchor if it moved > 250 ms; a re-drop back on the sticker keeps the running measurement).
 - **Deliberate playhead moves re-anchor instead of healing.** Seeks/cues, track loads, internal Play, control-mode switches, and Panic-Play exits flag the drift monitor, so the heal never fights an intentional jump.
-- **Sub-10 ms drift is left alone** — steady play is never micro-nudged.
+- **Sub-4 ms drift is left alone** — steady play is never micro-nudged.
+- **Travel gestures never late-correct.** A backspin/spin-forward physically skids the needle across grooves; a large offset jump after large groove travel re-anchors silently instead of "healing" (= audibly jumping) the song.
 - A > 5 s offset jump with no lift detected is treated as a programmatic remap (safety fallback), not drift.
+- **A held deck has no mapping.** While playback is gated (session-start calibration hold) or otherwise stopped, the playhead is pinned where the track was loaded — no groove advance, no healing. The groove↔playhead mapping is established at the moment playback engages.
 
 #### 5.4.4 Reverse Input Control
 

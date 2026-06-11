@@ -86,21 +86,17 @@ pub enum ControlMode {
 /// 48 kHz). One clean spin is plenty to measure the cartridge ellipse.
 const CALIBRATION_FRAMES: usize = 48_000;
 
-/// Groove-continuity healing thresholds (PRD §5.4.3), two-tier.
-///
-/// Mid-motion (scratching, riding), only drift worth a clearly audible
-/// repair is corrected — every heal is a position nudge plus a de-click
-/// ramp, and firing them at each stroke's re-lock made the routine feel
-/// jumpier than the drift it was fixing (the on-rig "much worse"
-/// report, after this was briefly a flat 4 ms).
-const DRIFT_HEAL_COARSE_SECS: f64 = 0.010;
-/// Once the platter is back near steady play, residue down to ~2 mm of
-/// groove is quietly cleaned up — this is what removes the "kick sits
-/// just off the sticker" leftover (−7 ms on-rig) without ever nudging
-/// mid-gesture.
-const DRIFT_HEAL_FINE_SECS: f64 = 0.004;
-/// |rate − 1| below this counts as steady play for the fine tier.
-const DRIFT_HEAL_STEADY_BAND: f64 = 0.25;
+/// Groove-continuity healing deadband (PRD §5.4.3): drift below ~2 mm
+/// of groove is left alone so steady play is never micro-nudged.
+const DRIFT_HEAL_DEADBAND_SECS: f64 = 0.004;
+/// Maximum heal slew, as a fraction of real time per block (≈ a rate
+/// trim). 1 % is below the pitch JND for almost all material and heals
+/// a typical post-scratch residue (10–50 ms) in 1–5 s. The heal is
+/// re-measured every locked block, so it converges and stops at the
+/// deadband; it is never applied as a step — a step was audible as the
+/// track "jumping a little forward" at the first re-lock after a
+/// scratch.
+const DRIFT_HEAL_SLEW_MAX: f64 = 0.01;
 
 /// Per-deck output routing for [`Engine::render_routed`].
 ///
@@ -768,11 +764,11 @@ impl Engine {
                 Some(input) => input.drive(),
                 None => continue,
             };
-            // Block-end groove position staged for the drift
-            // observation in the `LockedAbsolute` arm below; `None`
-            // unless this block is cleanly locked with an absolute fix
-            // outside panic.
-            let mut groove_end: Option<f64> = None;
+            // Block-end groove position (+ block duration, for the
+            // heal's slew bound) staged for the drift observation in
+            // the `LockedAbsolute` arm below; `None` unless this block
+            // is cleanly locked with an absolute fix outside panic.
+            let mut groove_end: Option<(f64, f64)> = None;
             // Publish signal-quality telemetry for the deck-header
             // tracking dot + signal panel: the decoder's last output
             // (confidence / amplitude) plus the lift-policy lock state.
@@ -859,7 +855,7 @@ impl Engine {
                 // on-rig "much worse" stutter). Here we only stage the
                 // groove reference for that arm.
                 if lock_state == 1 && abs_locked && !panic_engaged {
-                    groove_end = Some(abs_secs);
+                    groove_end = Some((abs_secs, dt));
                 }
                 let sticker_drift_ms = self.tc_drift[idx].drift_secs() * 1000.0;
                 // Pitch / live-BPM readout source depends on what is
@@ -1110,6 +1106,23 @@ impl Engine {
                             // Same auto-start contract (and calibration
                             // gate) as `Locked` — see that arm's comment.
                             deck.set_playing(true);
+                            // The groove↔playhead mapping is established
+                            // NOW, where the track is — not wherever the
+                            // record travelled during the calibration
+                            // hold. Re-anchor so the hold's groove
+                            // motion is never "healed" into the track.
+                            self.tc_drift[idx].note_remap();
+                        }
+                        // While the deck is held (calibration gate, or
+                        // any not-playing state), the track is not
+                        // pressed onto the record yet: do NOT advance
+                        // the playhead with the groove and do NOT
+                        // observe/heal drift — otherwise the track
+                        // silently walks forward during the ~5 s
+                        // calibration hold and "jumps to the future"
+                        // the moment playback starts (on-rig report).
+                        if !deck.is_playing() {
+                            continue;
                         }
                         // Convert input frames → track frames. The
                         // attach-time validation pins the input SR to
@@ -1130,22 +1143,25 @@ impl Engine {
                             // deviation is true accumulated drift —
                             // whatever motion the relative path lost
                             // while the needle stayed in the groove.
-                            // Apply it back (de-clicked) and the kick
-                            // returns to the cue sticker. Deliberate
-                            // moves never get here: seek/load/play/
-                            // mode/panic paths flag `note_remap` and a
-                            // lift re-anchors via the silence rule.
-                            if let Some(groove) = groove_end {
+                            // The repair is a **bounded slew**, never a
+                            // jump: at most DRIFT_HEAL_SLEW_MAX of real
+                            // time per block (≈ a 1 % rate trim —
+                            // inaudible), re-measured every block until
+                            // the residual sits inside the deadband. A
+                            // step correction here was audible as the
+                            // track "jumping a little forward" at the
+                            // first re-lock after a scratch (on-rig).
+                            // Deliberate moves never get here: seek/
+                            // load/play/mode/panic paths flag
+                            // `note_remap` and a lift re-anchors via
+                            // the silence rule.
+                            if let Some((groove, block_secs)) = groove_end {
                                 let drift_secs =
                                     self.tc_drift[idx].observe(groove, deck.position_secs());
-                                let threshold = if (rate - 1.0).abs() < DRIFT_HEAL_STEADY_BAND {
-                                    DRIFT_HEAL_FINE_SECS
-                                } else {
-                                    DRIFT_HEAL_COARSE_SECS
-                                };
-                                if drift_secs.abs() > threshold {
-                                    let target = deck.position_frames() + drift_secs * track_sr;
-                                    deck.set_position_frames(target);
+                                if drift_secs.abs() > DRIFT_HEAL_DEADBAND_SECS {
+                                    let max_step = block_secs * DRIFT_HEAL_SLEW_MAX;
+                                    let step = drift_secs.clamp(-max_step, max_step);
+                                    deck.advance_position_frames(step * track_sr);
                                 }
                             }
                         }
@@ -2447,18 +2463,22 @@ mod tests {
             step(&mut engine, &mut gen);
         }
 
-        // Simulate 100 ms of lost motion: the platter moved but the
+        // Simulate 10 ms of lost motion: the platter moved but the
         // playhead didn't (set directly — NOT via DeckSeek, which would
-        // legitimately flag a remap).
+        // legitimately flag a remap). The heal is a bounded slew (≤1 %
+        // of real time per block), so give it ~2.5 s of locked play to
+        // bleed the correction in, then expect the playhead back on the
+        // groove-continuous trajectory within the deadband.
         let before = engine.deck(0).position_frames();
-        engine.deck_mut(0).set_position_frames(before - 4_800.0);
-        for _ in 0..8 {
+        engine.deck_mut(0).set_position_frames(before - 480.0);
+        let heal_blocks = 220_i32;
+        for _ in 0..heal_blocks {
             step(&mut engine, &mut gen);
         }
         let healed = engine.deck(0).position_frames();
-        let expected = before + 8.0 * block as f64;
+        let expected = before + f64::from(heal_blocks) * block as f64;
         assert!(
-            (healed - expected).abs() < 600.0,
+            (healed - expected).abs() < 400.0,
             "lost motion was not healed: at {healed}, expected ≈{expected}"
         );
 
@@ -2523,6 +2543,56 @@ mod tests {
         assert!(
             !engine.deck(0).is_playing(),
             "uncalibrated deck must hold (Traktor-style calibration gate)"
+        );
+    }
+
+    #[test]
+    fn calibration_hold_pins_position_under_abs_lock() {
+        // While the calibration gate holds the deck, the record keeps
+        // spinning — but the track must stay exactly where it was
+        // loaded. Pre-fix, the LockedAbsolute arm advanced the playhead
+        // (and the heal chased the groove) through the hold, so the
+        // track "jumped to the future" when playback finally started.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let mut engine = Engine::new(sr, block);
+        let rb = HeapRb::<f32>::new(48_000 * 2);
+        let (mut tx, rx) = rb.split();
+        let cfg = TimecodeInputConfig {
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+            hold_until_calibrated: true,
+            ..TimecodeInputConfig::default()
+        };
+        engine.attach_timecode_input(0, rx, cfg).unwrap();
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 8 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let loaded_at = engine.deck(0).position_frames();
+
+        let mut rt = RealtimeContext::new();
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.4));
+        render_to_abs_lock(&mut engine, &mut tx, &mut gen, &mut rt, block);
+
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..200 {
+            gen.render(&mut sig, 1.0, 0.5);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            engine.render(&mut rt, &mut buf);
+        }
+        assert!(
+            !engine.deck(0).is_playing(),
+            "deck must stay held while uncalibrated"
+        );
+        let pos = engine.deck(0).position_frames();
+        assert!(
+            (pos - loaded_at).abs() < 1.0,
+            "held deck's position moved during calibration: {loaded_at} -> {pos}"
         );
     }
 

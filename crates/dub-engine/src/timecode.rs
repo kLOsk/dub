@@ -1104,10 +1104,9 @@ mod policy_tests {
         // must land strictly between them, leaning toward the hold at
         // this low-in-band confidence (w = (0.6-0.5)/0.3 = 1/3).
         match p.step(out(0.5, 0.6)) {
-            LiftIntent::Locked { rate } => assert!(
-                rate > 0.5 && rate < 1.0,
-                "blend out of range: {rate}"
-            ),
+            LiftIntent::Locked { rate } => {
+                assert!(rate > 0.5 && rate < 1.0, "blend out of range: {rate}");
+            }
             LiftIntent::DropoutHoldRate { .. } => panic!("disengaged in lukewarm band"),
             LiftIntent::LockedAbsolute { .. } => panic!("no abs fix in this test"),
         }
