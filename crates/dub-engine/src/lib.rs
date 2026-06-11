@@ -24,6 +24,7 @@
 // clippy::doc_markdown is wrong to demand backticks in prose.
 #![allow(clippy::doc_markdown)]
 
+mod anchor;
 mod command;
 mod deck;
 pub mod declick;
@@ -775,9 +776,9 @@ impl Engine {
             // Read into Copy locals so the `timecode_inputs` borrow is
             // dropped before we touch `self.decks`. RT-safe.
             let tc = self.timecode_inputs[idx].as_ref().map(|input| {
-                let (confidence, amplitude, rate, position_secs) =
-                    input.last_output().map_or((0.0, 0.0, 1.0, 0.0), |o| {
-                        (o.confidence, o.amplitude, o.rate, o.position_secs)
+                let (confidence, amplitude, position_secs) =
+                    input.last_output().map_or((0.0, 0.0, 0.0), |o| {
+                        (o.confidence, o.amplitude, o.position_secs)
                     });
                 let policy = input.policy();
                 let lock_state = if !policy.is_engaged() {
@@ -796,24 +797,24 @@ impl Engine {
                     confidence,
                     amplitude,
                     lock_state,
-                    rate,
                     abs_frames.is_some(),
                     abs_secs,
                     input.last_popped_frames(),
                     position_secs,
                     input.calibration_progress(),
+                    input.last_display_rate(),
                 )
             });
             if let Some((
                 confidence,
                 amplitude,
                 lock_state,
-                rate,
                 abs_locked,
                 abs_secs,
                 frames,
                 position_secs,
                 cal_progress,
+                display_scale_rate,
             )) = tc
             {
                 // Pitch / live-BPM readout: rev-locked wobble canceller
@@ -831,8 +832,12 @@ impl Engine {
                 #[allow(clippy::cast_precision_loss)]
                 let dt = frames as f64 / f64::from(self.sample_rate);
                 if lock_state == 1 {
+                    // The readout consumes the canonical display-scale
+                    // rate (zero anchor + display-only ±8 stop anchors)
+                    // — the fader's detent reads exactly 0 and the
+                    // stops exactly ±8, without warping playback.
                     self.tc_display_value[idx] =
-                        self.tc_display_rate[idx].update(rate, position_secs, dt);
+                        self.tc_display_rate[idx].update(display_scale_rate, position_secs, dt);
                 } else {
                     self.tc_display_rate[idx].reset();
                 }
@@ -879,8 +884,7 @@ impl Engine {
                 // which run concurrently. Reaches 1.0 only when both
                 // are done — the same condition that opens the
                 // playback gate.
-                let (display_rate, pitch_settled, measure_progress) = match self.control_mode[idx]
-                {
+                let (display_rate, pitch_settled, measure_progress) = match self.control_mode[idx] {
                     ControlMode::Timecode => {
                         // ONE ready predicate feeds the gate, the
                         // header progress line, the readout dimming,
@@ -890,8 +894,7 @@ impl Engine {
                         // clocks (~1 s + ~4 s), which reaches 1.0
                         // exactly when that predicate flips — the
                         // line finishing IS the song starting.
-                        let calibrated = self
-                            .timecode_inputs[idx]
+                        let calibrated = self.timecode_inputs[idx]
                             .as_ref()
                             .is_some_and(timecode::TimecodeInput::is_calibrated);
                         let ready = calibrated && self.tc_display_rate[idx].settled();

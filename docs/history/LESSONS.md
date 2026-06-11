@@ -81,6 +81,19 @@
   measured amplitude by |H(carrier_est)| — capped, and only when |rate| is
   meaningfully nonzero so silence and stopped platters never get boosted into
   "carrier present".
+- **Never judge a self-calibration's adoption gate on the scale that adoption
+  itself warps.** The ±8 stop anchors originally checked "is the rate near a
+  canonical stop?" on the anchor-corrected scale; each slightly-off adoption
+  (e.g. a steady beatmatch hold at +7 % inside a generous ±1.5 % band) shifted
+  the window for the next one — an unbounded ratchet that walked a healthy
+  deck's stops to +12/−14 displayed, and once the true stop fell outside the
+  shifted window the session could never self-correct. The fixed point: judge
+  the gate on a reference the adoption cannot move (here the zero-corrected
+  scale, whose own anchor carries an independent ±0.4 % guard), keep the band
+  tight, and reject dwells whose tracker slid (a ride) or whose head hadn't
+  settled. Found because the replay harness on the deck-B capture did *not*
+  reproduce the field report — the discrepancy between capture and rig is what
+  pointed at usage-dependent state (anchor learning), not decode.
 
 ## BPM / beat grid
 

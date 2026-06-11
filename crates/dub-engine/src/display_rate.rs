@@ -759,17 +759,20 @@ mod tests {
 
     /// On-rig capture replay (diagnostic, not a regression test): set
     /// `DUB_CAPTURE_WAV=/path/to/capture.wav` to feed a real
-    /// `dub capture` recording through the exact production chain —
-    /// whitening calibration, 64-frame sub-block decode, RateSmoother,
-    /// LiftPolicy, DisplayRateFilter at 512-frame quanta — and write
-    /// the per-quantum displayed pitch to `/tmp/dub_replay.csv` for
-    /// offline analysis. No-op when the env var is unset.
+    /// `dub capture` recording through the PRODUCTION decode path — a
+    /// real `TimecodeInput::drive` (decoder, smoother, anchor
+    /// learning, policy) plus the DisplayRateFilter at 512-frame
+    /// quanta — and write the per-quantum displayed pitch to
+    /// `/tmp/dub_replay.csv` for offline analysis. The session-start
+    /// calibration is triggered at the first confident block,
+    /// mirroring the engine's classifier moment. No-op when the env
+    /// var is unset.
     #[test]
-    #[allow(clippy::too_many_lines)] // offline diagnostic harness, deliberately linear
     fn replay_capture_through_display_chain() {
         use std::fmt::Write as _;
+
+        use ringbuf::traits::{Producer as _, Split as _};
         const QUANTUM: usize = 512;
-        const CHUNK: usize = 64;
         let Ok(path) = std::env::var("DUB_CAPTURE_WAV") else {
             return;
         };
@@ -788,64 +791,33 @@ mod tests {
             }
         };
 
-        let mut decoder =
-            dub_timecode::Decoder::with_absolute(dub_timecode::Format::SeratoCv02, sr);
-        let mut smoother = dub_timecode::RateSmoother::new();
+        let rb = ringbuf::HeapRb::<f32>::new(spec.sample_rate as usize * 2);
+        let (mut tx, rx) = rb.split();
         let cfg = crate::timecode::TimecodeInputConfig {
             input_sample_rate: sr,
             ..crate::timecode::TimecodeInputConfig::default()
         };
-        let mut policy = crate::timecode::LiftPolicy::new(&cfg);
+        let mut input = crate::timecode::TimecodeInput::new(rx, cfg);
         let mut display = DisplayRateFilter::new();
 
-        // Whitening calibration, mirroring the engine's auto path:
-        // once the carrier is confidently present, accumulate ~1 s of
-        // raw covariance and install.
-        let (mut saa, mut sbb, mut sab, mut sre, mut sim) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        let mut cal_frames = 0usize;
-        let mut cal_armed = false;
-        let mut calibrated = false;
-
-        let dt64 = f64::from(CHUNK as u32) / f64::from(sr);
         let dtq = f64::from(QUANTUM as u32) / f64::from(sr);
-
         let mut csv = String::from("t,conf,amp,rate,lock,displayed_pitch\n");
         let mut displayed = f64::NAN;
+        let mut calibration_started = false;
         let mut t = 0.0f64;
-        let mut confirm_starts: Vec<f64> = Vec::new();
-        let mut was_hard = false;
         for quantum in samples.chunks(QUANTUM * 2) {
-            let mut last = None;
-            for chunk in quantum.chunks(CHUNK * 2) {
-                let mut out = decoder.process(chunk);
-                out.rate = smoother.smooth_for(out.rate, out.confidence, dt64);
-                let _ = policy.step_for(out, dt64);
-                if !calibrated {
-                    if !cal_armed && out.confidence > 0.8 && out.amplitude > 0.05 {
-                        cal_armed = true;
-                    }
-                    if cal_armed {
-                        for f in chunk.chunks_exact(2) {
-                            let re = f64::from(f[1]);
-                            let im = f64::from(f[0]);
-                            saa += re * re;
-                            sbb += im * im;
-                            sab += re * im;
-                            sre += re;
-                            sim += im;
-                        }
-                        cal_frames += chunk.len() / 2;
-                        if cal_frames >= 48_000 {
-                            decoder.set_whitening(dub_timecode::whitening_from_covariance(
-                                saa, sbb, sab, sre, sim, cal_frames,
-                            ));
-                            calibrated = true;
-                        }
-                    }
-                }
-                last = Some(out);
+            assert_eq!(tx.push_slice(quantum), quantum.len());
+            let _ = input.drive();
+            let Some(out) = input.last_output() else {
+                t += dtq;
+                continue;
+            };
+            if !calibration_started && out.confidence > 0.8 && out.amplitude > 0.05 {
+                // Mirror the engine's auto-calibration trigger.
+                input.begin_calibration(48_000);
+                calibration_started = true;
             }
-            let Some(out) = last else { continue };
+            let policy = input.policy();
             let lock = if !policy.is_engaged() {
                 3
             } else if policy.consecutive_below() > 0 {
@@ -854,16 +826,9 @@ mod tests {
                 1
             };
             if lock == 1 {
-                let before = display.hard_quanta;
-                displayed = display.update(out.rate, out.position_secs, dtq);
-                let hard = display.hard_quanta > before;
-                if hard && !was_hard {
-                    confirm_starts.push(t);
-                }
-                was_hard = hard;
+                displayed = display.update(input.last_display_rate(), out.position_secs, dtq);
             } else {
                 display.reset();
-                was_hard = false;
             }
             let _ = writeln!(
                 csv,
@@ -878,15 +843,7 @@ mod tests {
             t += dtq;
         }
         std::fs::write("/tmp/dub_replay.csv", csv).expect("write csv");
-        println!("replayed {path} -> /tmp/dub_replay.csv");
-        println!(
-            "hard-confirm episodes ({}): {:?}",
-            confirm_starts.len(),
-            confirm_starts
-                .iter()
-                .map(|t| (t * 100.0).round() / 100.0)
-                .collect::<Vec<_>>()
-        );
+        println!("replayed {path} -> /tmp/dub_replay.csv (production drive path)");
     }
 
     #[test]

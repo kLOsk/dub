@@ -560,7 +560,19 @@ Implementation: the M5.4.5 late-binding-decks + per-deck input attach work alrea
 
 Trigger surface TBD (see §5.5). Visual feedback: a brief "INPUT SWAPPED" toast in the Status Strip (PRD §9). No persistent indicator — the swap is the new default state until reversed.
 
-### 5.5 Keyboard input
+#### 5.4.5 Canonical pitch anchors (perfect 0 / ±8)
+
+A DJ's pitch model is **positional**: fader at the detent → the readout says 0; fader against a stop → it says exactly ±8. Traktor and Serato honour this on every deck ever plugged in, even though no real turntable runs true (the reference rig's deck A measures +0.1–0.2 % at the detent and −0.15…−0.4 % at the stops — opposite signs, so no single trim can fix it). An app that shows +0.2 % at the detent reads as broken even when +0.2 % is the platter's true speed.
+
+Dub pins the canonical positions with a per-deck **piecewise-linear warp** over up to three anchors (−8 %, 0, +8 %): each anchor maps the rate the deck actually produces at that fader position to exactly its canonical value, segments interpolate between anchors, and the end slopes extend beyond the stops. Slopes stay within a few % of 1.0, so the map is continuous and monotonic — a deliberate 0.1 % nudge off the detent registers immediately and proportionally (the 0.1-pitch beatmatch workflow is preserved; there is **no snap zone**).
+
+Learning is **invisible** — no buttons, no trim readouts, nothing for the DJ to operate:
+
+- **Zero anchor**: measured during the session-start calibration hold (§5.4 — the record is spinning at the detent anyway), as a multi-second mean, guarded to ±0.4 %. It is the only anchor applied to **playback** (a multiplicative trim of well under half a percent, installed while the deck is still silent).
+- **Stop anchors (±8)**: adopted opportunistically whenever the fader parks against a stop for ~5 s. The gates matter (each one is a field-failure scar): the rate must dwell inside a **tight band (±0.6 %) judged on the zero-corrected scale** — never the stop-warped scale, because a window that moves with its own adoptions ratchets unboundedly (field-tested: a few beatmatch holds near the stops walked a deck's display to +12/−14 with no in-session recovery); the dwell's **settled tail must not slide** (a slow fader ride through the band is not a park); the adopted value is a **two-revolution mean** (eccentricity wobble cancels, like the zero capture) with single-chunk decode spikes excluded; and **re-parks blend halfway** toward the new measurement, so continued parking converges on the deck's long-run stop rate. A deliberate hold *inside* ±0.6 % of a stop remains the one accepted ambiguity — display-only, and the fixed window means the next true park relearns the truth. Stop anchors are **display-scale only**: a misread stop may only ever cosmetically mislabel the readout, never change the audible rate.
+- A misdetected anchor that would break monotonic ordering against already-learned neighbours is rejected outright.
+
+Anchors are **session-scoped**: DJs travel, decks differ venue to venue, and a stale map from last week's rig is worse than none. The map dies with the input attach and is relearned silently at the next session start (the zero anchor inside the existing calibration hold; the stops the first time the DJ rides the fader to them).
 
 Keyboard is first-class for **non-performance** tasks (load, navigate, settings). Performance gestures — pitch, scratch, crossfade, EQ, gain, cue — live on the turntable and the user's external mixer, per the §1 mouse rule extended to the keyboard (the keyboard is not a substitute for a turntable).
 

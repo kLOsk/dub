@@ -447,9 +447,7 @@ impl DeckSharedState {
             ),
             sticker_drift_ms: f64::from_bits(self.tc_sticker_drift_ms_bits.load(Ordering::Relaxed)),
             pitch_settled: self.tc_pitch_settled.load(Ordering::Relaxed),
-            measure_progress: f32::from_bits(
-                self.tc_measure_progress_bits.load(Ordering::Relaxed),
-            ),
+            measure_progress: f32::from_bits(self.tc_measure_progress_bits.load(Ordering::Relaxed)),
         }
     }
 
