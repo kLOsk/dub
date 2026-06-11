@@ -172,6 +172,9 @@ pub struct DeckSharedState {
     /// measurements (wobble fit converged); UI dims the number until
     /// then. `true` for non-timecode drive.
     tc_pitch_settled: AtomicBool,
+    /// Measurement progress [0, 1] for the deck-header calibration
+    /// line (f32 bits). 1.0 when nothing is measuring.
+    tc_measure_progress_bits: AtomicU32,
 }
 
 /// Lock-free snapshot of a deck's timecode signal health. Returned by
@@ -227,6 +230,9 @@ pub struct TimecodeTelemetry {
     /// (wobble fit converged — ~2 revolutions of locked play). The UI
     /// shows the value dimmed / "measuring" until then.
     pub pitch_settled: bool,
+    /// Measurement progress [0, 1] for the deck-header calibration
+    /// progress line; 1.0 when nothing is measuring.
+    pub measure_progress: f32,
 }
 
 /// Process-local monotonic clock origin shared by the audio
@@ -295,6 +301,7 @@ impl DeckSharedState {
             tc_abs_locked: AtomicBool::new(false),
             tc_sticker_drift_ms_bits: AtomicU64::new(f64::NAN.to_bits()),
             tc_pitch_settled: AtomicBool::new(true),
+            tc_measure_progress_bits: AtomicU32::new(1.0f32.to_bits()),
             tc_abs_position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
@@ -356,6 +363,7 @@ impl DeckSharedState {
         abs_position_secs: f64,
         sticker_drift_ms: f64,
         pitch_settled: bool,
+        measure_progress: f32,
     ) {
         self.tc_confidence_bits
             .store(confidence.to_bits(), Ordering::Relaxed);
@@ -372,6 +380,8 @@ impl DeckSharedState {
             .store(sticker_drift_ms.to_bits(), Ordering::Relaxed);
         self.tc_pitch_settled
             .store(pitch_settled, Ordering::Relaxed);
+        self.tc_measure_progress_bits
+            .store(measure_progress.to_bits(), Ordering::Relaxed);
     }
 
     /// Publish auto source-detection + calibration state (audio thread).
@@ -437,6 +447,9 @@ impl DeckSharedState {
             ),
             sticker_drift_ms: f64::from_bits(self.tc_sticker_drift_ms_bits.load(Ordering::Relaxed)),
             pitch_settled: self.tc_pitch_settled.load(Ordering::Relaxed),
+            measure_progress: f32::from_bits(
+                self.tc_measure_progress_bits.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -829,6 +842,7 @@ impl Deck {
         abs_position_secs: f64,
         sticker_drift_ms: f64,
         pitch_settled: bool,
+        measure_progress: f32,
     ) {
         self.shared.publish_timecode_telemetry(
             confidence,
@@ -840,6 +854,7 @@ impl Deck {
             abs_position_secs,
             sticker_drift_ms,
             pitch_settled,
+            measure_progress,
         );
     }
 
@@ -1578,7 +1593,7 @@ mod tests {
         assert_eq!(t0.lock_state, 0);
         assert_eq!(t0.confidence, 0.0);
 
-        shared.publish_timecode_telemetry(0.97, 0.31, 2, true, 0.984, true, 12.5, 3.25, true);
+        shared.publish_timecode_telemetry(0.97, 0.31, 2, true, 0.984, true, 12.5, 3.25, true, 1.0);
         let t1 = shared.load_timecode_telemetry();
         assert!(t1.has_input);
         assert_eq!(t1.lock_state, 2);

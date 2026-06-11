@@ -59,6 +59,20 @@
   (`dub-engine/tests/scratch_drift.rs`: velocity-scaled carrier amplitude,
   zero-net-displacement stroke cycles, drift bounds per profile) — extend that
   harness first when touching the policy, smoother, or decoder gates.
+- **Lag-1 phase-difference shrinks under *correlated* noise — measure the
+  phase advance over a long lag instead.** The coherent `Σ s·conj(s_prev)`
+  estimator is unbiased under white noise, but vinyl surface noise has lag-1
+  autocorrelation ~0.8, and shrink/incoherence ≈ ρ/(1−ρ): coherence 0.999 still
+  meant **−0.31 % pitch at a true 0** on a real rig (zero-crossing-counted the
+  capture to prove the carrier sat at nominal — always check whether the bias
+  is yours before "calibrating it away"; a measured zero-reference would have
+  broken Traktor's calibrate-at-any-pitch contract). The long-lag estimator
+  (16 samples for CV02, format-scaled for ambiguity) collapses ρ^L and reads
+  +0.0x %; it engages only inside |rate| < 1.2 and only when the *smoothed*
+  residual-ellipse roundness is high (the lag-1 ellipse-bias law and its
+  `atan(tan/R)` correction don't transfer to long lags — and gating on the
+  instantaneous roundness made the two paths' bias difference toggle per block,
+  which read as display jitter).
 - **A cartridge is a velocity sensor — gate carrier presence on
   filter-compensated amplitude.** A slow draw is doubly quiet (low velocity ×
   input high-pass attenuation at its low carrier frequency); gating on the raw

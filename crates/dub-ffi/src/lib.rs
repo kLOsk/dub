@@ -1896,6 +1896,7 @@ impl DubEngine {
             abs_position_secs: tc.abs_position_secs,
             sticker_drift_ms: tc.sticker_drift_ms,
             pitch_settled: tc.pitch_settled,
+            measure_progress: tc.measure_progress,
         }
     }
 
@@ -2897,6 +2898,10 @@ pub struct DeckTelemetry {
     /// the number dimmed / "measuring" until `true`. Always `true` for
     /// Internal / Thru drive.
     pub pitch_settled: bool,
+    /// Measurement progress [0, 1] for the deck-header calibration
+    /// progress line (whitening capture + pitch stabilization,
+    /// time-weighted). 1.0 when nothing is measuring.
+    pub measure_progress: f32,
 }
 
 impl DeckTelemetry {
@@ -2918,6 +2923,7 @@ impl DeckTelemetry {
             abs_position_secs: 0.0,
             sticker_drift_ms: f64::NAN,
             pitch_settled: true,
+            measure_progress: 1.0,
         }
     }
 }

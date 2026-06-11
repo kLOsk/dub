@@ -181,6 +181,10 @@ struct DeckState: Equatable {
     /// until then.
     var pitchSettled: Bool = true
 
+    /// Measurement progress [0, 1] for the deck-header calibration
+    /// progress line. 1.0 when nothing is measuring.
+    var measureProgress: Double = 1.0
+
     /// Timecode lock state from `engine.deckTelemetry`: 0 none ·
     /// 1 clean · 2 degraded (sticky window) · 3 disengaged (lifted /
     /// scratching / dropout). Drives the deck-header tracking dot.
@@ -1266,6 +1270,7 @@ final class WaveformAppModel: ObservableObject {
                 pitch=\(t.pitchPercent, format: .fixed(precision: 2), privacy: .public)% \
                 abs=\(abs, privacy: .public) \
                 drift=\(drift, privacy: .public) \
+                settled=\(t.pitchSettled, privacy: .public) \
                 cls=\(t.sourceClass, privacy: .public) \
                 calibrated=\(t.calibrated, privacy: .public) calibrating=\(t.calibrating, privacy: .public) \
                 cal#\(t.calibrationSeq, privacy: .public) whitening=\(wStr, privacy: .public)
@@ -1315,6 +1320,7 @@ final class WaveformAppModel: ObservableObject {
         let tele = engine.deckTelemetry(deckIdx: side.ffiDeckIdx)
         next.pitchPercent = nowPlaying ? tele.pitchPercent : nil
         next.pitchSettled = tele.pitchSettled
+        next.measureProgress = Double(tele.measureProgress)
         next.timecodeLockState = tele.lockState
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode

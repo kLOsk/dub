@@ -25,3 +25,7 @@ dub-peaks = { workspace = true }
 [dev-dependencies]
 assert_no_alloc = { workspace = true }
 proptest = { workspace = true }
+# On-rig capture replay (the DUB_CAPTURE_WAV diagnostic in
+# `display_rate::tests`): feed a real `dub capture` WAV through the
+# exact decode → smoother → policy → display chain offline.
+hound = { workspace = true }

@@ -157,6 +157,35 @@ const CARRIER_PRESENCE_FULL: f32 = 0.016;
 /// residual offset.
 const INPUT_HP_HZ: f64 = 120.0;
 
+/// Maximum long-lag span (samples) for the low-bias phase estimator,
+/// and the |rate| below which it is used. The coherent lag-1
+/// phase-difference is unbiased under white noise but **broadband
+/// correlated** noise (vinyl surface noise / crackle: lag-1
+/// autocorrelation ~0.8) adds a real-positive term to `Σ s·conj(s_prev)`
+/// and shrinks the measured rate — ~−0.3 % at coherence 0.999 on a real
+/// rig (tiny incoherence × highly-correlated noise ⇒ large shrink,
+/// because shrink/incoherence ≈ ρ/(1−ρ)). Measuring the phase advance
+/// over L samples instead leaves the carrier term intact while the
+/// noise autocorrelation collapses (ρ^L), killing the bias ~20× at
+/// L = 16. The lag is sized per format so the per-L-samples phase stays
+/// unambiguous (|L·ω| < π) up to [`LONG_LAG_MAX_RATE`]; above that
+/// (scratching) the lag-1 path takes over, where absolute rate
+/// precision doesn't matter.
+const LONG_LAG_MAX: usize = 16;
+
+/// |rate| (from the lag-1 estimate) above which the long-lag phase
+/// would risk ambiguity — fall back to lag-1.
+const LONG_LAG_MAX_RATE: f64 = 1.2;
+
+/// Pole for the smoothed roundness feeding the long-lag gate
+/// (τ ≈ 130 ms at 64-frame chunks).
+const ROUNDNESS_ALPHA: f64 = 0.01;
+
+/// Minimum residual-ellipse roundness (`ellipse_factor`) for the
+/// long-lag path. Post-whitening rigs sit near 1.0; an uncalibrated
+/// cartridge's strong ellipse keeps the exact lag-1 correction model.
+const LONG_LAG_MIN_ROUNDNESS: f64 = 0.99;
+
 /// Cap on the high-pass amplitude compensation (see the carrier-
 /// presence block in [`Decoder::process`]). 8× covers carriers down to
 /// ~40 Hz (CV02 rate ≈ 0.04); below that the signal is genuinely gone
@@ -240,6 +269,25 @@ pub struct Decoder {
     prev_im: f64,
     /// Whether `prev_*` have been seeded with at least one sample.
     primed: bool,
+    /// Ring of the last [`LONG_LAG_MAX`] whitened complex samples for
+    /// the long-lag estimator (only `long_lag` entries are used).
+    lag_hist: [(f64, f64); LONG_LAG_MAX],
+    lag_pos: usize,
+    /// Samples seen since reset — the long-lag sum is valid once this
+    /// reaches `long_lag`.
+    lag_warm: usize,
+    /// Format-dependent long-lag span: `floor(sr / (2.5 · carrier_hz))`
+    /// clamped to `[2, LONG_LAG_MAX]`, so `|rate| ≤` ~1.25 stays
+    /// unambiguous (CV02 @48 k → 16, MK1 → 9, MK2 → 7).
+    long_lag: usize,
+    /// Slow EMA (τ ≈ 130 ms) of the residual-ellipse roundness used by
+    /// the long-lag gate. Gating on the instantaneous roundness made
+    /// the estimator path toggle per block on a dirty rig hovering at
+    /// the threshold — alternating the ~0.3 % lag-1 bias on and off,
+    /// which read as display jitter. Starts at 0 so a fresh decoder
+    /// (and the single-block ellipse-law tests) is on the exact lag-1
+    /// path until the estimate matures.
+    roundness_smoothed: f64,
     /// Cumulative position in seconds-at-unity-speed.
     position_secs: f64,
     /// 2×2 channel-whitening matrix applied to `(ch1, ch0)` before the
@@ -325,6 +373,13 @@ impl Decoder {
             ellipse_primed: false,
             ellipse_correction: true,
             input_hp: [BiquadHp::new(INPUT_HP_HZ, f64::from(sample_rate)); 2],
+            lag_hist: [(0.0, 0.0); LONG_LAG_MAX],
+            lag_pos: 0,
+            lag_warm: 0,
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            long_lag: ((sample_rate / (2.5 * format.carrier_hz())) as usize)
+                .clamp(2, LONG_LAG_MAX),
+            roundness_smoothed: 0.0,
             absolute: None,
         }
     }
@@ -424,6 +479,8 @@ impl Decoder {
         self.prev_im = 0.0;
         self.primed = false;
         self.position_secs = 0.0;
+        self.lag_pos = 0;
+        self.lag_warm = 0;
         self.input_hp[0].reset();
         self.input_hp[1].reset();
         if let Some(t) = self.absolute.as_mut() {
@@ -443,6 +500,7 @@ impl Decoder {
     ///
     /// # Panics
     /// `stereo.len()` must be even.
+    #[allow(clippy::too_many_lines)] // one sequential per-block DSP pipeline
     pub fn process(&mut self, stereo: &[f32]) -> DecodeOutput {
         assert_eq!(stereo.len() % 2, 0, "interleaved stereo buffer required");
         let n_frames = stereo.len() / 2;
@@ -475,6 +533,9 @@ impl Decoder {
         let mut sq_im_acc = 0.0_f64;
         let mut cross_acc = 0.0_f64;
         let mut samples_consumed = 0_usize;
+        let mut acc_l_re = 0.0_f64;
+        let mut acc_l_im = 0.0_f64;
+        let mut lag_pairs = 0_usize;
 
         let w = self.whitening;
         for frame in stereo.chunks_exact(2) {
@@ -504,6 +565,18 @@ impl Decoder {
                 acc_im += im * self.prev_re - re * self.prev_im;
                 samples_consumed += 1;
             }
+            // Long-lag coherent sum: s_curr · conj(s_{n−long_lag}).
+            // The ring always advances; the sum only counts once the
+            // ring holds `long_lag` real samples.
+            if self.lag_warm >= self.long_lag {
+                let (hre, him) = self.lag_hist[self.lag_pos];
+                acc_l_re += re * hre + im * him;
+                acc_l_im += im * hre - re * him;
+                lag_pairs += 1;
+            }
+            self.lag_hist[self.lag_pos] = (re, im);
+            self.lag_pos = (self.lag_pos + 1) % self.long_lag;
+            self.lag_warm = self.lag_warm.saturating_add(1);
             self.prev_re = re;
             self.prev_im = im;
             self.primed = true;
@@ -521,16 +594,54 @@ impl Decoder {
         // decoder; on the very first call it's `n_frames − 1` (we lose
         // one sample of phase-diff to bootstrap `prev_*`).
         let dt = 1.0 / f64::from(self.sample_rate);
-        let phase_diff = if samples_consumed > 0 {
+        let phase_lag1 = if samples_consumed > 0 {
             acc_im.atan2(acc_re)
         } else {
             0.0
         };
-        let inst_freq_hz = phase_diff / (std::f64::consts::TAU * dt);
         let nominal = f64::from(self.carrier_hz);
-        let rate = inst_freq_hz / nominal;
+        let rate_lag1 = phase_lag1 / (std::f64::consts::TAU * dt) / nominal;
 
         let mag_acc = sq_re_acc + sq_im_acc;
+
+        // Confidence numerator first: the ellipse estimate must adapt
+        // from THIS block's covariance before the rate path is chosen,
+        // or the roundness gate runs one block stale (a fresh decoder
+        // would route an uncalibrated ellipse through the long-lag
+        // path on its very first block).
+        let coherent_mag = (acc_re * acc_re + acc_im * acc_im).sqrt();
+        let coherence = if mag_acc > 1e-12 {
+            #[allow(clippy::cast_possible_truncation)]
+            ((coherent_mag / mag_acc).clamp(0.0, 1.0) as f32)
+        } else {
+            0.0
+        };
+        if coherence > 0.9 {
+            self.update_ellipse_estimate(sq_re_acc, sq_im_acc, cross_acc, mag_acc);
+            self.roundness_smoothed +=
+                ROUNDNESS_ALPHA * (self.ellipse_factor() - self.roundness_smoothed);
+        }
+
+        // Prefer the long-lag phase (per-sample equivalent) inside the
+        // unambiguous band AND while the (whitened) residual ellipse is
+        // round: same carrier term, ~20× less correlated-noise shrink —
+        // this is what puts a true 0.00 % at fader 0 on a real (noisy)
+        // record. A strongly elliptical signal (uncalibrated cartridge)
+        // stays on the lag-1 path, whose ellipse-bias model and
+        // correction are exact; the long-lag weighting follows a
+        // different (uncorrected) law, but at roundness ≥
+        // [`LONG_LAG_MIN_ROUNDNESS`] the residual is second-order.
+        let use_long_lag = lag_pairs > 0
+            && rate_lag1.abs() < LONG_LAG_MAX_RATE
+            && self.roundness_smoothed > LONG_LAG_MIN_ROUNDNESS;
+        #[allow(clippy::cast_precision_loss)]
+        let phase_diff = if use_long_lag {
+            acc_l_im.atan2(acc_l_re) / self.long_lag as f64
+        } else {
+            phase_lag1
+        };
+        let inst_freq_hz = phase_diff / (std::f64::consts::TAU * dt);
+        let rate = inst_freq_hz / nominal;
 
         // Amplitude is RMS of |s| over the block. Note: |s|² = L²+R²
         // is *constant* (= A²) for a perfect quadrature signal, so RMS
@@ -553,25 +664,18 @@ impl Decoder {
         #[allow(clippy::cast_possible_truncation)]
         let amplitude = (mean_sq.sqrt() * hp_compensation(rate.abs() * nominal)) as f32;
 
-        // Confidence: |coherent sum| / Σ |s_curr·conj(s_prev)|.
-        // For pure quadrature, |s_curr·conj(s_prev)| = |s|², so this
-        // reduces to |sum|/Σ|s|² ≈ 1.0. Noise drives it toward 0.
-        let coherent_mag = (acc_re * acc_re + acc_im * acc_im).sqrt();
-        let coherence = if mag_acc > 1e-12 {
-            #[allow(clippy::cast_possible_truncation)]
-            ((coherent_mag / mag_acc).clamp(0.0, 1.0) as f32)
-        } else {
-            0.0
-        };
-
-        // Self-calibrating residual-ellipse correction — see
-        // `ellipse_corrected_rate`. Skipped on a scratch (huge
-        // phase_diff, where `tan` blows up and we don't trust the rate
-        // anyway) and on low-coherence blocks.
-        let rate = if self.ellipse_correction && coherence > 0.9 && phase_diff.abs() < 1.4 {
-            self.ellipse_corrected_rate(
-                phase_diff, rate, nominal, dt, sq_re_acc, sq_im_acc, cross_acc, mag_acc,
-            )
+        // Self-calibrating residual-ellipse correction: applied only
+        // on the lag-1 path — its `atan(tan/R)` model is specific to
+        // the lag-1 amplitude weighting (the estimate itself adapted
+        // above, before the path was chosen). Skipped on a scratch
+        // (huge phase_diff, where `tan` blows up and we don't trust
+        // the rate anyway) and on low-coherence blocks.
+        let rate = if !use_long_lag
+            && self.ellipse_correction
+            && coherence > 0.9
+            && phase_diff.abs() < 1.4
+        {
+            self.ellipse_corrected_rate(phase_diff, rate, nominal, dt)
         } else {
             rate
         };
@@ -625,17 +729,17 @@ impl Decoder {
     /// range. Self-calibrating — no sweep or gesture; it learns as the
     /// platter moves.
     #[allow(clippy::too_many_arguments)] // private per-block scratch
-    fn ellipse_corrected_rate(
+    /// Fold one block's covariance into the residual-ellipse EMA.
+    /// Adaptation is split from the correction math so it keeps
+    /// learning while the long-lag estimator (which needs no lag-1
+    /// ellipse correction) is driving the rate.
+    fn update_ellipse_estimate(
         &mut self,
-        phase_diff: f64,
-        rate: f64,
-        nominal: f64,
-        dt: f64,
         sq_re_acc: f64,
         sq_im_acc: f64,
         cross_acc: f64,
         mag_acc: f64,
-    ) -> f64 {
+    ) {
         if mag_acc > 1e-12 {
             let er = (sq_re_acc - sq_im_acc) / mag_acc;
             let ec = 2.0 * cross_acc / mag_acc;
@@ -657,6 +761,9 @@ impl Decoder {
                 self.ellipse_primed = true;
             }
         }
+    }
+
+    fn ellipse_corrected_rate(&mut self, phase_diff: f64, rate: f64, nominal: f64, dt: f64) -> f64 {
         let omega_nominal = std::f64::consts::TAU * nominal * dt;
         let r = (1.0 - self.ellipse_er * self.ellipse_er - self.ellipse_ec * self.ellipse_ec)
             .clamp(1e-6, 1.0)

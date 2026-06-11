@@ -654,6 +654,7 @@ dependencies = [
  "dub-io",
  "dub-peaks",
  "dub-timecode",
+ "hound",
  "proptest",
  "ringbuf",
  "thiserror 1.0.69",

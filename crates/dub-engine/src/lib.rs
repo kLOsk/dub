@@ -801,6 +801,7 @@ impl Engine {
                     abs_secs,
                     input.last_popped_frames(),
                     position_secs,
+                    input.calibration_progress(),
                 )
             });
             if let Some((
@@ -812,6 +813,7 @@ impl Engine {
                 abs_secs,
                 frames,
                 position_secs,
+                cal_progress,
             )) = tc
             {
                 // Pitch / live-BPM readout: rev-locked wobble canceller
@@ -871,12 +873,42 @@ impl Engine {
                 // revolutions of locked play (the UI dims the pitch /
                 // live-BPM until then instead of presenting the
                 // uncancelled wobble as truth).
-                let (display_rate, pitch_settled) = match self.control_mode[idx] {
-                    ControlMode::Timecode => (
-                        self.tc_display_value[idx],
-                        self.tc_display_rate[idx].settled(),
-                    ),
-                    ControlMode::Internal | ControlMode::Thru => (self.decks[idx].rate(), true),
+                // Measurement progress for the deck-header calibration
+                // line: time-weighted combination of the whitening
+                // capture (~1 s) and the wobble-fit settle (~4 s),
+                // which run concurrently. Reaches 1.0 only when both
+                // are done — the same condition that opens the
+                // playback gate.
+                let (display_rate, pitch_settled, measure_progress) = match self.control_mode[idx]
+                {
+                    ControlMode::Timecode => {
+                        // ONE ready predicate feeds the gate, the
+                        // header progress line, the readout dimming,
+                        // and the panel badges: whitening installed
+                        // AND the wobble fit settled. The progress
+                        // value is the time-weighted blend of the two
+                        // clocks (~1 s + ~4 s), which reaches 1.0
+                        // exactly when that predicate flips — the
+                        // line finishing IS the song starting.
+                        let calibrated = self
+                            .timecode_inputs[idx]
+                            .as_ref()
+                            .is_some_and(timecode::TimecodeInput::is_calibrated);
+                        let ready = calibrated && self.tc_display_rate[idx].settled();
+                        #[allow(clippy::cast_possible_truncation)]
+                        let progress = if ready {
+                            1.0
+                        } else {
+                            (((f64::from(cal_progress)
+                                + 4.0 * self.tc_display_rate[idx].settle_progress())
+                                / 5.0) as f32)
+                                .min(0.99)
+                        };
+                        (self.tc_display_value[idx], ready, progress)
+                    }
+                    ControlMode::Internal | ControlMode::Thru => {
+                        (self.decks[idx].rate(), true, 1.0)
+                    }
                 };
                 self.decks[idx].publish_timecode_telemetry(
                     confidence,
@@ -888,6 +920,7 @@ impl Engine {
                     abs_secs,
                     sticker_drift_ms,
                     pitch_settled,
+                    measure_progress,
                 );
             }
 
@@ -974,13 +1007,19 @@ impl Engine {
                 continue;
             };
             // Traktor-style session-start gate (PRD §5.4): a Timecode
-            // deck doesn't *auto-start* until this needle's
-            // measurements are done — whitening installed and the
-            // wobble fit settled (~5 s of the record spinning, once
-            // per attach). Decoding, calibration, and settling all run
-            // during the hold; the deck just stays silent. Never
-            // pauses an already-playing deck, and Panic Play (the Play
-            // button) bypasses it for stage emergencies.
+            // deck doesn't *auto-start* until ALL of this needle's
+            // measurements are done — whitening installed AND the
+            // pitch stabilized (wobble fit settled). Operator decision
+            // after a calibration-only gate was tried: "once the track
+            // plays the DJ thinks everything is done and starts
+            // pitching" — so the track must not start while anything
+            // is still stabilizing, even if that takes ~10 s. The
+            // feedback for the wait is the deck-header progress line,
+            // and the SINGLE ready condition here is the same one that
+            // completes the line and un-dims the readouts
+            // (`pitch_settled` = calibrated && settled): the line
+            // finishing IS the song starting. Never pauses an
+            // already-playing deck; Panic Play bypasses instantly.
             let playback_gated = self.timecode_inputs[idx].as_ref().is_some_and(|input| {
                 input.hold_until_calibrated()
                     && !(input.is_calibrated() && self.tc_display_rate[idx].settled())
@@ -2578,21 +2617,34 @@ mod tests {
         assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.4));
         render_to_abs_lock(&mut engine, &mut tx, &mut gen, &mut rt, block);
 
+        // Render until auto-calibration completes and the gate opens.
+        // While held, the position must stay pinned to the load point;
+        // the moment playback starts, it must start FROM that point —
+        // not from wherever the record travelled during the hold (the
+        // on-rig "track jumps to the future after calibrating" bug).
         let mut sig = vec![0.0_f32; block * 2];
         let mut buf = vec![0.0_f32; block * 2];
-        for _ in 0..200 {
+        let mut started_at: Option<f64> = None;
+        for _ in 0..1500 {
             gen.render(&mut sig, 1.0, 0.5);
             assert_eq!(tx.push_slice(&sig), sig.len());
             engine.render(&mut rt, &mut buf);
+            if engine.deck(0).is_playing() {
+                started_at = Some(engine.deck(0).position_frames());
+                break;
+            }
+            let pos = engine.deck(0).position_frames();
+            assert!(
+                (pos - loaded_at).abs() < 1.0,
+                "held deck's position moved during calibration: {loaded_at} -> {pos}"
+            );
         }
+        let started_at = started_at.expect("deck should auto-start once calibrated");
+        #[allow(clippy::cast_precision_loss)]
+        let two_blocks = (block * 2) as f64;
         assert!(
-            !engine.deck(0).is_playing(),
-            "deck must stay held while uncalibrated"
-        );
-        let pos = engine.deck(0).position_frames();
-        assert!(
-            (pos - loaded_at).abs() < 1.0,
-            "held deck's position moved during calibration: {loaded_at} -> {pos}"
+            (started_at - loaded_at).abs() < two_blocks,
+            "playback did not start from the load position: {loaded_at} -> {started_at}"
         );
     }
 

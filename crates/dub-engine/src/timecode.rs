@@ -684,6 +684,22 @@ impl TimecodeInput {
         self.calibrated
     }
 
+    /// Whitening-capture progress in [0, 1]: fraction of the capture
+    /// window accumulated, 1.0 once installed, 0.0 before the
+    /// classifier has triggered a capture. Feeds the deck-header
+    /// calibration progress line.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    pub fn calibration_progress(&self) -> f32 {
+        if self.calibrated {
+            return 1.0;
+        }
+        match self.cal {
+            Some(c) => ((c.frames as f64 / c.target.max(1) as f64).min(1.0)) as f32,
+            None => 0.0,
+        }
+    }
+
     /// The currently installed whitening matrix (identity until the first
     /// calibration completes) and the calibration counter. Diagnostic.
     #[must_use]
@@ -790,10 +806,17 @@ impl TimecodeInput {
         let mut last_out = None;
         let mut abs_advance_sum = 0.0_f64;
         let mut all_abs = true;
-        for chunk in self.scratch[..popped_even].chunks(DECODE_CHUNK_FRAMES * 2) {
-            let mut out = self.decoder.process(chunk);
+        // Index-based chunking (not `chunks()`): the zero-ref
+        // accumulator below needs `&mut self` mid-loop, which a live
+        // iterator borrow of `self.scratch` would forbid.
+        let mut start = 0;
+        while start < popped_even {
+            let end = (start + DECODE_CHUNK_FRAMES * 2).min(popped_even);
+            let chunk_frames = (end - start) / 2;
+            let mut out = self.decoder.process(&self.scratch[start..end]);
+            start = end;
             #[allow(clippy::cast_precision_loss)]
-            let dt_secs = (chunk.len() / 2) as f64 / f64::from(self.input_sample_rate);
+            let dt_secs = chunk_frames as f64 / f64::from(self.input_sample_rate);
             // De-spike + adaptively smooth the rate the instant it
             // leaves the decoder, so the same clean value feeds both
             // the lift policy (audible playback rate) and
@@ -891,6 +914,7 @@ impl TimecodeInput {
             }
         }
     }
+
 }
 
 /// What [`LiftPolicy::step`] tells the caller to do with the deck
@@ -1504,3 +1528,5 @@ mod policy_tests {
         );
     }
 }
+
+

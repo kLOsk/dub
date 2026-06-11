@@ -65,6 +65,13 @@ struct DeckHeaderState: Equatable {
     /// plays immediately; only the *numbers* are still measuring.
     var pitchSettled: Bool = true
 
+    /// Calibration / measurement progress [0, 1] from the engine
+    /// (whitening capture + pitch stabilization, time-weighted). While
+    /// `pitchSettled == false`, row 2 draws a progress line filling
+    /// left → right so the DJ sees the session-start hold advancing
+    /// and the exact moment the deck goes live.
+    var measureProgress: Double = 1.0
+
     /// Timecode lock state for the source-pill tracking dot: 0 none ·
     /// 1 clean (green) · 2 degraded (amber) · 3 disengaged / scratching
     /// (red — which is *normal* while scratching, per Serato). `var`
@@ -335,6 +342,15 @@ struct DeckHeader: View {
                spacing: DubSpacing.sm) {
             row1
             row2
+                .overlay(alignment: .bottom) {
+                    // Overlay, not a row: the header has a fixed
+                    // height and a new row would shift the layout
+                    // (the documented header-height-jump bug).
+                    if !state.pitchSettled {
+                        calibrationProgressLine
+                            .offset(y: 4)
+                    }
+                }
             row3Reserved
         }
         .padding(.horizontal, DubSpacing.lg)
@@ -484,6 +500,29 @@ struct DeckHeader: View {
     // mirrored side. Only the FX chip's position swaps so it stays
     // on the *inner* (divider-adjacent) edge, mirroring Row 1's
     // format-chip behaviour.
+
+    /// Thin left→right progress line shown while the deck's
+    /// session-start measurements run (the playback hold): whitening
+    /// capture + pitch stabilization. The engine publishes ONE ready
+    /// predicate for the gate, this line, and the readout dimming, so
+    /// the line completing IS the moment the gated track starts (the
+    /// short fill animation keeps the visual within ~150 ms of the
+    /// audio).
+    private var calibrationProgressLine: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(DubColor.surface2)
+                Capsule()
+                    .fill(DubColor.deckTint(side))
+                    .frame(width: geo.size.width
+                        * max(0.02, min(1.0, state.measureProgress)))
+                    .animation(.linear(duration: 0.05),
+                               value: state.measureProgress)
+            }
+        }
+        .frame(height: 3)
+        .accessibilityLabel("Calibrating")
+    }
 
     @ViewBuilder
     private var row2: some View {
@@ -1202,6 +1241,7 @@ extension DeckHeaderState {
                 bpm: deckState.bpm,
                 pitchPercent: deckState.pitchPercent,
                 pitchSettled: deckState.pitchSettled,
+                measureProgress: deckState.measureProgress,
                 timecodeLockState: deckState.timecodeLockState,
                 sourceControl: Self.sourceControl(from: deckState),
                 sourceControlOverridden: deckState.controlOverridden,

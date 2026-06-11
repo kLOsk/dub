@@ -229,10 +229,17 @@ struct DeckSignalPanel: View {
             tag(t.controlMode == 1 ? "Timecode drive" : "Internal",
                 t.controlMode == 1 ? DubColor.stateLocked : DubColor.textTertiary)
             Spacer()
+            // One story at a time: while the deck is still measuring
+            // (whitening + pitch stabilization — the same condition
+            // that holds playback and draws the header line), showing
+            // a green "Calibrated ✓" next to "Measuring…" read as a
+            // contradiction on-rig. The whitening badge only appears
+            // once the deck is fully ready.
             if !t.pitchSettled {
                 tag("Measuring…", DubColor.stateTentative)
+            } else {
+                calibrationBadge(t)
             }
-            calibrationBadge(t)
             if t.controlOverridden {
                 tag("PINNED", DubColor.stateTentative)
             }
