@@ -176,6 +176,11 @@ struct DeckState: Equatable {
     /// platter speed.
     var pitchPercent: Double? = nil
 
+    /// Whether the pitch / live-BPM readout has finished its settling
+    /// measurements (wobble fit converged). Header dims the numbers
+    /// until then.
+    var pitchSettled: Bool = true
+
     /// Timecode lock state from `engine.deckTelemetry`: 0 none ·
     /// 1 clean · 2 degraded (sticky window) · 3 disengaged (lifted /
     /// scratching / dropout). Drives the deck-header tracking dot.
@@ -1245,6 +1250,9 @@ final class WaveformAppModel: ObservableObject {
             let abs = t.absLocked
                 ? String(format: "ABS@%.2fs", t.absPositionSecs)
                 : "rel"
+            let drift = t.stickerDriftMs.isNaN
+                ? "—"
+                : String(format: "%+.1fms", t.stickerDriftMs)
             let w = t.whitening
             let wStr = w.count == 4
                 ? String(format: "[% .3f % .3f / % .3f % .3f]", w[0], w[1], w[2], w[3])
@@ -1257,6 +1265,7 @@ final class WaveformAppModel: ObservableObject {
                 amp=\(t.carrierAmplitude, format: .fixed(precision: 3), privacy: .public) \
                 pitch=\(t.pitchPercent, format: .fixed(precision: 2), privacy: .public)% \
                 abs=\(abs, privacy: .public) \
+                drift=\(drift, privacy: .public) \
                 cls=\(t.sourceClass, privacy: .public) \
                 calibrated=\(t.calibrated, privacy: .public) calibrating=\(t.calibrating, privacy: .public) \
                 cal#\(t.calibrationSeq, privacy: .public) whitening=\(wStr, privacy: .public)
@@ -1305,6 +1314,7 @@ final class WaveformAppModel: ObservableObject {
         // just gate it on playback so a paused deck reads "—".
         let tele = engine.deckTelemetry(deckIdx: side.ffiDeckIdx)
         next.pitchPercent = nowPlaying ? tele.pitchPercent : nil
+        next.pitchSettled = tele.pitchSettled
         next.timecodeLockState = tele.lockState
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
@@ -4135,7 +4145,6 @@ struct MainView: View {
     @State private var showingPreferences: Bool = false
     @State private var showingAbout: Bool = false
     @State private var showingOnboarding: Bool = false
-    @State private var showingSignalQuality: Bool = false
     @State private var showLaunchSplash: Bool = true
 
     /// U-23 — once the user finishes or skips the first-run guide we
@@ -4172,9 +4181,6 @@ struct MainView: View {
                     showingOnboarding = false
                 }
             }
-            .sheet(isPresented: $showingSignalQuality) {
-                SignalQualityView(model: model)
-            }
             .background(
                 KeyEventMonitorHost(
                     showingPreferences: $showingPreferences,
@@ -4192,10 +4198,6 @@ struct MainView: View {
                 // up onboarding on the next runloop tick.
                 showingPreferences = false
                 DispatchQueue.main.async { showingOnboarding = true }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .dubShowSignalQuality)) { _ in
-                showingPreferences = false
-                DispatchQueue.main.async { showingSignalQuality = true }
             }
             .task {
                 await runColdBoot()

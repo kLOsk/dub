@@ -1,104 +1,112 @@
 //
-//  SignalQualityView.swift
+//  DeckSignalPanel.swift
 //  Dub
 //
-//  A GUI "dub scope": live per-deck timecode signal health + calibration.
-//  Surfaces the same data the CLI `dub scope` shows — carrier confidence
-//  and amplitude, lock state, and a rolling **pitch-stability graph** —
-//  read from the engine's lock-free deck telemetry (FFI 33). Use it to
-//  check a rig before a set: a healthy SL3 carrier sits high on both
-//  bars with a green lock and a flat pitch trace; dust, a worn stylus,
-//  or an uncalibrated needle makes the pitch trace jump.
+//  Per-deck timecode signal health as a deck-pane slide-out — the GUI
+//  "dub scope", moved out of Preferences and onto the deck where a DJ
+//  actually sound-checks. A slim SIGNAL tab sits on each deck's outer
+//  edge; clicking it slides the panel over the performance-pads area
+//  (an overlay, so the waveform column never reflows).
 //
-//  Calibration: the engine auto-calibrates a deck the moment it's sure
-//  the input is timecode (channel-whitening capture, PRD §5.1.1). The
-//  **Calibrate** button forces a fresh capture (after a cartridge swap,
-//  or if the auto pass landed on a noisy window); **Auto** hands the
-//  deck back to automatic source detection.
+//  Surfaces the engine's lock-free deck telemetry (FFI 33): carrier
+//  confidence and amplitude, lock state, a rolling pitch-stability
+//  trace, calibration state, and the sticker-drift readout. A healthy
+//  carrier sits high on both bars with a green lock and a flat pitch
+//  trace; dust, a worn stylus, or an uncalibrated needle makes the
+//  trace jump.
 //
-//  Opened from Preferences (and the `.dubShowSignalQuality`
-//  notification); presented as a sheet by MainView.
+//  Calibration: the engine auto-calibrates the moment it's sure the
+//  input is timecode (PRD §5.1.1). **Calibrate** forces a fresh capture
+//  (after a cartridge swap, or if the auto pass landed on a noisy
+//  window); **Auto** hands the deck back to automatic source detection.
 //
 
 import SwiftUI
 import DubCore
 
-struct SignalQualityView: View {
+/// Outer-edge tab + slide-out signal panel for one deck. Deck A slides
+/// out from the window-left edge, deck B from the window-right.
+struct DeckSignalSlideOut: View {
 
     @ObservedObject var model: WaveformAppModel
-    @Environment(\.dismiss) private var dismiss
+    let side: DeckSide
+    let deckIdx: UInt64
 
-    /// Rolling pitch-% history per deck for the stability trace.
-    @State private var pitchHistory: [[Double]] = [[], []]
-    private static let maxSamples = 120          // ~6 s at 20 Hz
+    @State private var open = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if side == .a {
+                if open { panel }
+                tab
+            } else {
+                tab
+                if open { panel }
+            }
+        }
+        .animation(.spring(duration: 0.25), value: open)
+        .frame(maxWidth: .infinity, maxHeight: .infinity,
+               alignment: side == .a ? .leading : .trailing)
+    }
+
+    private var panel: some View {
+        DeckSignalPanel(model: model, side: side, deckIdx: deckIdx)
+            .transition(.move(edge: side == .a ? .leading : .trailing)
+                .combined(with: .opacity))
+    }
+
+    /// Slim always-visible toggle: vertical SIGNAL caps + the PRD §5.4
+    /// tracking dot, so signal health is glanceable even while closed.
+    private var tab: some View {
+        let t = model.engine.deckTelemetry(deckIdx: deckIdx)
+        return Button {
+            open.toggle()
+        } label: {
+            VStack(spacing: DubSpacing.sm) {
+                Circle()
+                    .fill(lockColor(t.lockState, hasInput: t.hasTimecodeInput))
+                    .frame(width: 6, height: 6)
+                Text("SIGNAL")
+                    .font(DubFont.caps)
+                    .tracking(1.2)
+                    .foregroundStyle(open ? DubColor.textPrimary : DubColor.textTertiary)
+                    .fixedSize()
+                    .rotationEffect(.degrees(side == .a ? 90 : -90))
+                    .frame(width: 10, height: 56)
+            }
+            .frame(width: 18, height: 96)
+            .background(DubColor.surface2.opacity(open ? 1.0 : 0.6))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Toggle deck \(side.label) signal panel")
+    }
+}
+
+/// The panel body: one deck's signal health + calibration controls.
+struct DeckSignalPanel: View {
+
+    @ObservedObject var model: WaveformAppModel
+    let side: DeckSide
+    let deckIdx: UInt64
+
+    /// Rolling pitch-% history for the stability trace (~6 s at 20 Hz).
+    @State private var pitchHistory: [Double] = []
+    private static let maxSamples = 120
     private let tick = Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.lg) {
-            header
-            Divider()
-            HStack(alignment: .top, spacing: DubSpacing.lg) {
-                deckColumn(side: .a, deckIdx: 0)
-                Divider()
-                deckColumn(side: .b, deckIdx: 1)
-            }
-            Spacer(minLength: 0)
-            Text("Pitch should sit flat on the centre line with the platter at 0. A jumpy trace means the needle isn't calibrated or the carrier is weak — drop the needle, wait for a green lock, then press Calibrate if it doesn't settle.")
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            Divider()
-            HStack {
-                Spacer()
-                Button("Close") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-        }
-        .padding(DubSpacing.xl)
-        .frame(width: 600, height: 520)
-        .background(DubColor.surface0)
-        .onReceive(tick) { _ in samplePitch() }
-    }
-
-    private func samplePitch() {
-        for idx in 0..<2 {
-            let t = model.engine.deckTelemetry(deckIdx: UInt64(idx))
-            // Only record a live timecode pitch; a paused / no-input deck
-            // would otherwise smear the trace with -100 % floor samples.
-            let playing = t.hasTimecodeInput && t.lockState != 0
-            pitchHistory[idx].append(playing ? t.pitchPercent : .nan)
-            if pitchHistory[idx].count > Self.maxSamples {
-                pitchHistory[idx].removeFirst(pitchHistory[idx].count - Self.maxSamples)
-            }
-        }
-    }
-
-    private var header: some View {
-        HStack {
-            Text("Timecode Signal Quality")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(DubColor.textPrimary)
-            Spacer()
-        }
-    }
-
-    @ViewBuilder
-    private func deckColumn(side: DeckSide, deckIdx: UInt64) -> some View {
         let t = model.engine.deckTelemetry(deckIdx: deckIdx)
         let lockTint = lockColor(t.lockState, hasInput: t.hasTimecodeInput)
         VStack(alignment: .leading, spacing: DubSpacing.md) {
             HStack(spacing: DubSpacing.sm) {
-                Text(side.label)
-                    .font(DubFont.caps)
-                    .tracking(1.0)
-                    .foregroundStyle(DubColor.deckTint(side))
-                Spacer()
                 Circle()
                     .fill(lockTint)
                     .frame(width: 7, height: 7)
                 Text(lockLabel(t.lockState, hasInput: t.hasTimecodeInput))
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textSecondary)
+                Spacer()
             }
 
             bar(label: "CONFIDENCE",
@@ -111,9 +119,11 @@ struct SignalQualityView: View {
                 tint: DubColor.deckTint(side),
                 readout: String(format: "%.3f", t.carrierAmplitude))
 
-            pitchTrace(side: side, telemetry: t)
+            pitchTrace(telemetry: t)
 
             calibrationRow(telemetry: t)
+
+            driftRow(telemetry: t)
 
             HStack(spacing: DubSpacing.sm) {
                 Button("Calibrate") { try? model.engine.calibrateDeck(deckIdx: deckIdx) }
@@ -123,14 +133,37 @@ struct SignalQualityView: View {
                 Spacer()
             }
             .font(DubFont.micro)
+
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(DubSpacing.md)
+        .frame(width: 236)
+        .frame(maxHeight: .infinity)
+        .background(DubColor.surface1.opacity(0.97))
+        .overlay(
+            Rectangle()
+                .fill(DubColor.divider)
+                .frame(width: 1),
+            alignment: side == .a ? .trailing : .leading
+        )
+        .onReceive(tick) { _ in samplePitch() }
+    }
+
+    private func samplePitch() {
+        let t = model.engine.deckTelemetry(deckIdx: deckIdx)
+        // Only record a live timecode pitch; a paused / no-input deck
+        // would otherwise smear the trace with -100 % floor samples.
+        let playing = t.hasTimecodeInput && t.lockState != 0
+        pitchHistory.append(playing ? t.pitchPercent : .nan)
+        if pitchHistory.count > Self.maxSamples {
+            pitchHistory.removeFirst(pitchHistory.count - Self.maxSamples)
+        }
     }
 
     /// Rolling pitch-% trace with a 0 reference line — the calibration
     /// visualizer. A calibrated needle at rest draws a flat line on the
     /// centre; jitter shows up as vertical wander.
-    private func pitchTrace(side: DeckSide, telemetry t: DeckTelemetry) -> some View {
+    private func pitchTrace(telemetry t: DeckTelemetry) -> some View {
         VStack(alignment: .leading, spacing: DubSpacing.xs) {
             HStack {
                 Text("PITCH")
@@ -146,7 +179,7 @@ struct SignalQualityView: View {
             }
             Canvas { ctx, size in
                 drawTrace(ctx, size: size,
-                          history: pitchHistory[Int(side == .a ? 0 : 1)],
+                          history: pitchHistory,
                           tint: lockColor(t.lockState, hasInput: t.hasTimecodeInput))
             }
             .frame(height: 56)
@@ -196,9 +229,38 @@ struct SignalQualityView: View {
             tag(t.controlMode == 1 ? "Timecode drive" : "Internal",
                 t.controlMode == 1 ? DubColor.stateLocked : DubColor.textTertiary)
             Spacer()
+            if !t.pitchSettled {
+                tag("Measuring…", DubColor.stateTentative)
+            }
             calibrationBadge(t)
             if t.controlOverridden {
                 tag("PINNED", DubColor.stateTentative)
+            }
+        }
+    }
+
+    /// Sticker-drift readout: how far the relative-mode playhead has
+    /// slid against the absolute groove position since the engagement
+    /// anchor. Measured live off the LFSR decode while ABS-locked;
+    /// holds the last reading through relative-only gaps. NaN until the
+    /// first locked observation.
+    private func driftRow(telemetry t: DeckTelemetry) -> some View {
+        HStack {
+            Text("STICKER DRIFT")
+                .font(DubFont.caps).tracking(0.6)
+                .foregroundStyle(DubColor.textSecondary)
+            Spacer()
+            if t.stickerDriftMs.isNaN {
+                Text("—")
+                    .font(DubFont.numericInline)
+                    .foregroundStyle(DubColor.textTertiary)
+            } else {
+                Text(String(format: "%+.1f ms", t.stickerDriftMs))
+                    .font(DubFont.numericInline)
+                    .foregroundStyle(abs(t.stickerDriftMs) < 5
+                                     ? DubColor.textPrimary
+                                     : DubColor.stateTentative)
+                    .monospacedDigit()
             }
         }
     }
@@ -256,28 +318,29 @@ struct SignalQualityView: View {
             .frame(height: 8)
         }
     }
+}
 
-    private func lockColor(_ state: UInt8, hasInput: Bool) -> Color {
-        guard hasInput else { return DubColor.textPlaceholder }
-        switch state {
-        case 1:  return DubColor.stateLocked
-        case 2:  return DubColor.stateTentative
-        case 3:  return DubColor.stateError
-        default: return DubColor.textPlaceholder
-        }
-    }
-
-    private func lockLabel(_ state: UInt8, hasInput: Bool) -> String {
-        guard hasInput else { return "No timecode input" }
-        switch state {
-        case 1:  return "Locked"
-        case 2:  return "Degraded"
-        case 3:  return "No lock / scratching"
-        default: return "—"
-        }
+/// Shared lock-state → colour/label mapping (PRD §5.4 tracking dot).
+func lockColor(_ state: UInt8, hasInput: Bool) -> Color {
+    guard hasInput else { return DubColor.textPlaceholder }
+    switch state {
+    case 1:  return DubColor.stateLocked
+    case 2:  return DubColor.stateTentative
+    case 3:  return DubColor.stateError
+    default: return DubColor.textPlaceholder
     }
 }
 
-#Preview("Signal quality") {
-    SignalQualityView(model: WaveformAppModel())
+func lockLabel(_ state: UInt8, hasInput: Bool) -> String {
+    guard hasInput else { return "No timecode input" }
+    switch state {
+    case 1:  return "Locked"
+    case 2:  return "Degraded"
+    case 3:  return "No lock / scratching"
+    default: return "—"
+    }
+}
+
+#Preview("Deck signal panel") {
+    DeckSignalPanel(model: WaveformAppModel(), side: .a, deckIdx: 0)
 }

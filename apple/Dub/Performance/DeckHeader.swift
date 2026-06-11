@@ -58,6 +58,13 @@ struct DeckHeaderState: Equatable {
     /// mirrored — this column is in the same place on both decks.)
     var pitchPercent: Double? = nil
 
+    /// Whether the pitch / live-BPM readout has finished its settling
+    /// measurements (the once-per-rev wobble fit needs ~2 revolutions
+    /// of locked play after the session's first needle drop). The
+    /// PITCH and BPM columns render dimmed until then — the music
+    /// plays immediately; only the *numbers* are still measuring.
+    var pitchSettled: Bool = true
+
     /// Timecode lock state for the source-pill tracking dot: 0 none ·
     /// 1 clean (green) · 2 degraded (amber) · 3 disengaged / scratching
     /// (red — which is *normal* while scratching, per Serato). `var`
@@ -485,11 +492,15 @@ struct DeckHeader: View {
                 fxChip
                 Spacer(minLength: 0)
                 statColumn(label: "PITCH", value: formattedPitch)
+                    .opacity(state.pitchSettled ? 1.0 : 0.45)
                 bpmStatColumn
+                    .opacity(state.pitchSettled ? 1.0 : 0.45)
                 statColumn(label: "KEY", value: formattedKey)
             } else {
                 statColumn(label: "PITCH", value: formattedPitch)
+                    .opacity(state.pitchSettled ? 1.0 : 0.45)
                 bpmStatColumn
+                    .opacity(state.pitchSettled ? 1.0 : 0.45)
                 statColumn(label: "KEY", value: formattedKey)
                 Spacer(minLength: 0)
                 fxChip
@@ -1190,6 +1201,7 @@ extension DeckHeaderState {
                 trackArtist: resolvedArtist,
                 bpm: deckState.bpm,
                 pitchPercent: deckState.pitchPercent,
+                pitchSettled: deckState.pitchSettled,
                 timecodeLockState: deckState.timecodeLockState,
                 sourceControl: Self.sourceControl(from: deckState),
                 sourceControlOverridden: deckState.controlOverridden,

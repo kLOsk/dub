@@ -189,16 +189,12 @@ struct PreferencesSheet: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 0)
+            // Signal quality lives on the decks now — the SIGNAL tab on
+            // each deck pane's outer edge (`DeckSignalSlideOut`)
+            // replaced the old sheet that was buried here.
             // U-23 — let users re-open the first-run guide. Dismiss
             // this sheet first; MainView brings onboarding up on the
             // next tick (two sheets can't present at once).
-            Button("Signal Quality…") {
-                dismiss()
-                NotificationCenter.default.post(name: .dubShowSignalQuality, object: nil)
-            }
-            .buttonStyle(.plain)
-            .font(DubFont.body)
-            .foregroundStyle(DubColor.textSecondary)
             Button("Show Welcome Guide") {
                 dismiss()
                 NotificationCenter.default.post(name: .dubShowOnboarding, object: nil)

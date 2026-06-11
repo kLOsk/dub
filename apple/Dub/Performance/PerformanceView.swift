@@ -349,6 +349,14 @@ struct PerformanceView: View {
                     hasSource: hasSource)
             }
             loadErrorOverlay(side: side, deckState: deckState)
+            // Timecode signal health, on the deck instead of buried in
+            // Preferences: a slim SIGNAL tab on the deck's outer edge
+            // slides the per-deck scope over the pads area. Overlay, so
+            // toggling never reflows the Metal waveform column. Prep
+            // mode is file-only — no timecode chrome there.
+            if waveformOrientation == .vertical {
+                DeckSignalSlideOut(model: model, side: side, deckIdx: deckIdx)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .modifier(DeckDropTarget(model: model, side: side))
