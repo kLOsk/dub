@@ -43,6 +43,10 @@ fuzz/corpus/
 fuzz/artifacts/
 
 # Local logs / dumps
+# Rig capture recordings at the repo root (deckA.wav etc.) — multi-MB,
+# session-specific, replayed locally via the dub-engine replay harness.
+# Committed wav fixtures live under crates/*/tests/fixtures/.
+/*.wav
 *.log
 crashes/
 .cursor/settings.json
