@@ -91,6 +91,7 @@ commit or PR, not here.
 - **PRD-BEATS** — Beat-grid hardening: uniform Traktor-style grid, explicit `bar_phase` (schema v5), set-the-1, robustness rounds 5–10, `dub diagnose` CLI, waveform + grid jitter killed end to end. Spec: [`PRD-BEATS.md`](../spec/PRD-BEATS.md).
 - **M11d-next** — Manual crates / playlists (`crates` + `crate_tracks`, drag-reorder, FFI 29).
 - **M11d.8** — Polish & First-Run: search debounce + selection-preserve, dev-text sweep, edge-of-list beep, idle-hint layout, first-run onboarding sheet; dogfood fixes for the reachability false-positive and Prep-mode Space-load auto-play.
+- **M11d-history** — Played From / Played Into, v1.0 stage: handover-inferred transitions (`SessionTracker`, min-play gate, duplicate suppression), full `play_history` capture with per-run `session_id`, deck-header "↝ usually" hint (click reveals the track in the browser), Session History smart crate (FFI 37).
 
 ---
 

@@ -290,7 +290,7 @@ uniffi::setup_scaffolding!();
 ///       suppressed) vs. the mode being auto-selected. Drives the
 ///       "· PINNED" badge so the live switch shows auto-vs-pinned, not
 ///       just the mode.
-pub const FFI_VERSION: u32 = 36;
+pub const FFI_VERSION: u32 = 37;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -4040,7 +4040,13 @@ mod tests {
         // 35→36: source-control pinned flag. `DeckTelemetry` grows
         // `control_overridden` so the row-3 switch can show "· PINNED"
         // (user override) vs. an auto-selected mode.
-        assert_eq!(FFI_VERSION, 36);
+        // 36→37: M11d-history. `DubLibrary` grows the session
+        // tracker event surface (`history_deck_loaded` /
+        // `history_deck_unloaded` / `history_play_started` /
+        // `history_play_ended`) plus the `played_into` and
+        // `session_history` queries with their
+        // `LibraryTransitionStat` / `LibrarySessionPlay` records.
+        assert_eq!(FFI_VERSION, 37);
     }
 
     #[test]
@@ -4906,6 +4912,52 @@ impl From<dub_library::TrackRow> for LibraryTrack {
     }
 }
 
+/// One Played Into aggregate (M11d-history): a track the DJ has
+/// historically handed over to from the queried track. Mirrors
+/// [`dub_library::TransitionStat`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryTransitionStat {
+    /// The other side of the transition edge.
+    pub track: LibraryTrack,
+    /// How many handovers recorded for this pair.
+    pub count: u32,
+    /// Unix-millis of the most recent one.
+    pub last_played_ms: i64,
+}
+
+impl From<dub_library::TransitionStat> for LibraryTransitionStat {
+    fn from(s: dub_library::TransitionStat) -> Self {
+        Self {
+            track: LibraryTrack::from(s.track),
+            count: s.count,
+            last_played_ms: s.last_played_ms,
+        }
+    }
+}
+
+/// One session set-list row (M11d-history). Mirrors
+/// [`dub_library::SessionPlay`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibrarySessionPlay {
+    /// The played track.
+    pub track: LibraryTrack,
+    /// Unix-millis of the track's first `play_start` this session.
+    pub first_played_ms: i64,
+    /// Display title of the track this one was mixed in from, when
+    /// a transition was recorded this session ("← from <track>").
+    pub from_track_title: Option<String>,
+}
+
+impl From<dub_library::SessionPlay> for LibrarySessionPlay {
+    fn from(p: dub_library::SessionPlay) -> Self {
+        Self {
+            track: LibraryTrack::from(p.track),
+            first_played_ms: p.first_played_ms,
+            from_track_title: p.from_track_title,
+        }
+    }
+}
+
 /// One Dub-crate node for the M11d-next "Dub Crates" sidebar
 /// section (PRD §8.5.1). Mirrors [`dub_library::CrateRow`]. The
 /// `parent_id` is `None` for a top-level crate; the Swift side
@@ -5100,6 +5152,12 @@ pub struct DubLibrary {
     /// across *separate* connections; this single-connection model
     /// is fine for v1.0 where the writer is single-shot).
     inner: Mutex<Option<dub_library::Library>>,
+    /// M11d-history mix-history tracker. One per `DubLibrary`
+    /// handle = one session id per app run (PRD §8.2). Separate
+    /// mutex from `inner` and never held across a library call —
+    /// events lock it briefly to turn transport facts into rows,
+    /// then release before touching the connection.
+    history: Mutex<dub_library::SessionTracker>,
 }
 
 #[uniffi::export]
@@ -5110,6 +5168,7 @@ impl DubLibrary {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(None),
+            history: Mutex::new(dub_library::SessionTracker::new()),
         })
     }
 
@@ -5619,6 +5678,101 @@ impl DubLibrary {
         })
     }
 
+    /// M11d-history: a library track was loaded onto `deck`. Feeds
+    /// the session tracker, which may also close the previous
+    /// track's play segment and commit a handover transition (see
+    /// `dub_library::SessionTracker`). Subsumes [`record_load`] —
+    /// the Apple shell calls this instead after a successful
+    /// library-sourced `load_track`.
+    pub fn history_deck_loaded(
+        &self,
+        track_id: String,
+        deck: u32,
+        timestamp_ms: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let writes = self
+            .history
+            .lock()
+            .unwrap()
+            .deck_loaded(deck, &track_id, timestamp_ms);
+        self.record_history_writes(&writes)
+    }
+
+    /// M11d-history: the deck no longer holds a library track
+    /// (ejected, Finder-dragged file, or Thru took over). Closes
+    /// any open play segment so a later transition can't blame the
+    /// wrong track.
+    pub fn history_deck_unloaded(
+        &self,
+        deck: u32,
+        timestamp_ms: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let writes = self
+            .history
+            .lock()
+            .unwrap()
+            .deck_unloaded(deck, timestamp_ms);
+        self.record_history_writes(&writes)
+    }
+
+    /// M11d-history: the deck's transport flipped to playing. The
+    /// Apple shell reports edges from its polled snapshot; repeats
+    /// and trackless decks are no-ops.
+    pub fn history_play_started(
+        &self,
+        deck: u32,
+        timestamp_ms: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let writes = self
+            .history
+            .lock()
+            .unwrap()
+            .play_started(deck, timestamp_ms);
+        self.record_history_writes(&writes)
+    }
+
+    /// M11d-history: the deck's transport flipped to stopped. May
+    /// commit a handover transition (the other deck keeps playing
+    /// a different track and the guards pass).
+    pub fn history_play_ended(
+        &self,
+        deck: u32,
+        timestamp_ms: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let writes = self.history.lock().unwrap().play_ended(deck, timestamp_ms);
+        self.record_history_writes(&writes)
+    }
+
+    /// Played Into for one track (M11d-history): the tracks the DJ
+    /// has historically mixed into from `track_id`, most-mixed
+    /// first. Backs the deck-header "↝ usually:" hint (`limit` 1)
+    /// and the v1.x side panel.
+    pub fn played_into(
+        &self,
+        track_id: String,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryTransitionStat>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let stats = lib.played_into(&track_id, limit)?;
+            Ok(stats.into_iter().map(LibraryTransitionStat::from).collect())
+        })
+    }
+
+    /// This session's set list (M11d-history), newest-first, with
+    /// the "← from <track>" edge where one was recorded. The
+    /// session is the one started by this `DubLibrary` handle —
+    /// i.e. this app run.
+    pub fn session_history(
+        &self,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibrarySessionPlay>, LibraryFfiError> {
+        let session_id = self.history.lock().unwrap().session_id().to_owned();
+        self.with_library(|lib| {
+            let plays = lib.session_history(&session_id, limit)?;
+            Ok(plays.into_iter().map(LibrarySessionPlay::from).collect())
+        })
+    }
+
     /// Walk a folder recursively, importing every audio file per
     /// M11c. Blocks the caller until the import finishes; the
     /// Apple shell calls this on a background queue. Per-file
@@ -5869,6 +6023,23 @@ impl DubLibrary {
             .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
         f(lib)
     }
+
+    /// Persist tracker-emitted history rows. Empty batches skip
+    /// the library lock entirely — the common case for the polled
+    /// transport edges (idempotent repeats, trackless decks).
+    fn record_history_writes(
+        &self,
+        writes: &[dub_library::HistoryWrite],
+    ) -> std::result::Result<(), LibraryFfiError> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let session_id = self.history.lock().unwrap().session_id().to_owned();
+        self.with_library(|lib| {
+            lib.record_history(&session_id, writes)?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -5918,6 +6089,40 @@ mod library_ffi_tests {
         // that as `QueryFailed` rather than panicking.
         let err = lib.record_load("ffffffff-0000-0000-0000-000000000000".into(), 0, 1);
         assert!(matches!(err, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    // === M11d-history smoke tests =============================================
+
+    #[test]
+    fn history_transport_edges_on_trackless_deck_are_noops() {
+        // The shell reports polled transport edges unconditionally;
+        // a deck with no library track (Thru, Finder drag) — or an
+        // app that hasn't opened the library yet — must produce
+        // clean no-ops, not errors.
+        let lib = DubLibrary::new();
+        assert!(lib.history_play_started(0, 1_000).is_ok());
+        assert!(lib.history_play_ended(0, 2_000).is_ok());
+        assert!(lib.history_deck_unloaded(1, 3_000).is_ok());
+    }
+
+    #[test]
+    fn history_deck_loaded_unknown_track_returns_query_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let err = lib.history_deck_loaded("ffffffff-0000-0000-0000-000000000000".into(), 0, 1_000);
+        assert!(matches!(err, Err(LibraryFfiError::QueryFailed(_))));
+    }
+
+    #[test]
+    fn history_queries_empty_on_fresh_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert!(lib.played_into("anything".into(), 5).unwrap().is_empty());
+        assert!(lib.session_history(50).unwrap().is_empty());
     }
 
     // === M11d.5 round 4: active_beat_grid FFI smoke tests ====================

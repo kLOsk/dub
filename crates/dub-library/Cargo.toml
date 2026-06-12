@@ -52,6 +52,9 @@ version = "3"
 # Temp dirs for fixture-driven tests of the migration runner /
 # fresh-DB workflow without polluting the developer's real library.
 tempfile = "3"
+# State-machine invariants for the mix-history SessionTracker
+# (M11d-history).
+proptest = { workspace = true }
 # Synthetic WAV fixture generation for the M11c importer integration
 # tests. `hound` is the standard-in-the-workspace WAV writer; we
 # generate small mono sine-wave files on the fly rather than ship

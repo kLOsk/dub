@@ -857,13 +857,13 @@ The Dub library is a SQLite database at `~/Library/Application Support/Dub/libra
 | `imported_crate_tracks` | Mirror membership. | Populated. |
 | `fingerprints` | Chromaprint hash (algorithm 2, via pure-Rust `rusty-chromaprint`) + duration + size + bitrate signature. Keyed against `tracks` for dedupe and analysis-cache lookup. | Populated (M11b). |
 | `volumes` | Known external volumes for path resolution: `(volume_uuid, last_known_mount_point, display_name, last_seen_at)`. | Populated. |
-| `play_history` | Every load, play-start, play-end, deck-to-deck transition: `(track_id, deck, event_type, timestamp, duration_played_ms, from_track_id, to_track_id)`. | Populated from v1.0 day one (data capture). Surfaces as "Last Played" sort + Recently Played smart crate in v1.0; surfaces as "Played From / Played Into" in v1.x. |
+| `play_history` | Every load, play-start, play-end, deck-to-deck transition: `(track_id, deck, event_type, timestamp, duration_played_ms, from_track_id, to_track_id, session_id)`. | Populated from v1.0 day one (data capture; transitions inferred at handover, see `LIBRARY-SCHEMA.md`). Surfaces in v1.0 as "Last Played" sort, Recently Played + Session History smart crates, and the deck-header "↝ usually" hint (M11d-history); the full Played From / Played Into side panel lands in v1.x. |
 | `analysis_cache` | LUFS-I, true-peak, prepared-flag inputs, waveform-sidecar pointer. Keyed by canonical fingerprint so the cache survives file moves and dedupe merges. | Populated. |
 | `smart_crates` | Future user-defined smart crates: `(name, sql_predicate)`. | Empty in v1; v1 ships two hardcoded smart crates as code, not data (§8.5.2). |
 
 The schema is documented in `docs/LIBRARY-SCHEMA.md` (published with M11a) and is part of Dub's public API surface (§8.7).
 
-**Mix-history capture.** From v1.0 day one, Dub writes a `play_history` event on every load, play-start, play-end, and deck-to-deck transition. The data drives "Recently Played" and "Last Played" sort immediately; it drives the "Played From / Played Into" surface in v1.x. Capture is local; nothing leaves the machine. The user can disable mix-history capture in Preferences (the table is still present, just not written to); the default is on.
+**Mix-history capture.** From v1.0 day one, Dub writes a `play_history` event on every load, play-start, play-end, and deck-to-deck transition. Because the mixer is external (§1), transitions are *inferred from deck transport*: a handover is recorded when a deck stops while the other deck keeps playing a different track, gated by a minimum-accumulated-play guard so timecode cueing (needle lifts, scratch holds) never writes false edges — the full heuristic is documented in `LIBRARY-SCHEMA.md`. The data drives "Recently Played", "Last Played" sort, and the M11d-history surfaces (Session History smart crate + deck-header "↝ usually" hint) immediately; it drives the full "Played From / Played Into" side panel in v1.x. Capture is local; nothing leaves the machine. The user can disable mix-history capture in Preferences (the table is still present, just not written to); the default is on (Preferences toggle lands with M18's preferences pass).
 
 ### 8.3 Beatgrids
 
@@ -945,12 +945,13 @@ The split between Dub Crates (editable, owned) and Imported Sources (read-only, 
 
 #### 8.5.2 Smart crates
 
-v1.0 ships exactly two hardcoded smart crates, no user-defined rule builder:
+v1.0 ships exactly three hardcoded smart crates, no user-defined rule builder:
 
 - **Recently Played**: last 200 tracks across all sessions, newest first. Backed by `play_history`. The single most-used sort column in pro Serato workflows.
+- **Session History** (M11d-history): this app run's set list — every track with a `play_start` in the current session, in play order (newest first). Rows mixed into from the other deck carry a "← from \<track\>" annotation from the session's recorded transitions (§8.2). The post-gig "what did I actually play" surface, available before the DJ has even left the booth.
 - **Just Imported**: tracks added since the last app launch. Catches the "USB stick dropped on the machine 10 minutes before the gig" workflow.
 
-**Played From / Played Into** lands in v1.x as a context-bound side panel on the browser: when a track is loaded on Deck A, the panel shows the N most-common tracks the DJ has previously mixed *into* it from Deck B, and the N most-common tracks they have mixed *from* it. Backed by the same `play_history` table that is populated from v1.0 day one (§8.2). **No commercial DJ app surfaces this**; it is a genuine differentiator for Dub and a load-bearing feature for the working scratch DJ who plays the same tracks across many sets and wants to remember which transitions worked.
+**Played From / Played Into** ships in two stages. **v1.0 (M11d-history)** records handover-inferred transitions (§8.2) and surfaces them in two places: the deck header's "↝ usually: \<track\>" hint (§9.5 row 3) — the most-common mix-out target for the just-loaded track — and the Session History annotations above. **v1.x** grows the full context-bound side panel on the browser: when a track is loaded on Deck A, the panel shows the N most-common tracks the DJ has previously mixed *into* it from Deck B, and the N most-common tracks they have mixed *from* it. Backed by the same `play_history` table. **No commercial DJ app surfaces this**; it is a genuine differentiator for Dub and a load-bearing feature for the working scratch DJ who plays the same tracks across many sets and wants to remember which transitions worked.
 
 A user-defined smart-crate rule builder is parked until v1.x at the earliest. The `smart_crates` table exists empty in v1.0 so v1.x lands without a migration. Every DJ app that shipped a rule builder in v1 (Serato, Traktor, Lexicon) ate a quarter of product roadmap on it and ended up with users who didn't know how to use it; we wait for real demand.
 
@@ -1210,7 +1211,7 @@ Each deck header (top of each deck's column) is a three-row, two-column-aware st
 - `FX` — active Smart FX state (Echo-Out / Dub Siren / off) — populated from M15 / M16 onward.
 
 **Row 3 — Track time.**
-- **Performance / Timecode mode:** `-MM:SS` remaining only. Right-aligned. Audience-facing "30 seconds to mix" cue (§6.1).
+- **Performance / Timecode mode:** `-MM:SS` remaining only. Right-aligned. Audience-facing "30 seconds to mix" cue (§6.1). The otherwise-empty middle region carries the M11d-history hint `↝ usually: <track>` (tertiary text, tail-truncated, lowest layout priority so the time never compresses): the track the DJ has most often mixed into from the loaded one, from `play_history` transitions (§8.5.2). Omitted when the track has no recorded transitions or didn't come from the library — the row's height and the time's position never change. **Clicking the hint reveals the suggested track in the library browser** (selects + scrolls, switching to All Tracks and clearing the search when the track isn't in the current listing); `Space` then loads the selection through the existing §6.4 flow. The click is a shortcut, not a requirement — keyboard search remains the no-mouse path (§1).
 - **Prep mode:** `MM:SS` elapsed (left) · `-MM:SS` remaining (right). Both shown because the single-deck rehearsal surface has the screen room and elapsed time is the natural anchor for hot-cue placement.
 - **Thru mode (no track loaded):** the row is omitted entirely — no canonical playhead concept when timecode is driving the rate.
 
@@ -1453,12 +1454,12 @@ observably do at the end.
 | **M11d.6 → M11d.7** | Full-screen launch + windowed snap-back; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **PRD-BEATS hardening** | Uniform Traktor-style grid + calibration; tap-to-grid + explicit `bar_phase` (schema v5) + relatch "set the 1"; robustness rounds 5–10 (`OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose`; waveform/beat-grid jitter killed end to end. | [`PRD-BEATS.md`](PRD-BEATS.md) |
 | **M11d-next** | Manual crates (playlists, §8.5.1): create / inline-rename / delete (cascade) / drag-add / remove / drag-to-reorder + context-menu reorder; `crates` + `crate_tracks` CRUD + ordering, FFI 29, editable "Dub Crates" sidebar. A `#` manual-order column (`crate_ordinal` on the row) is the crate's default sort and the only state where reorder is enabled; other column sorts render a read-only view, leaving manual order composable into future multi-column sorting. Nested crates deferred. | §8.5.1 |
+| **M11d-history** | Played From / Played Into, v1.0 stage (§8.5.2): `SessionTracker` handover-inferred transitions (min-play gate + duplicate suppression, `LIBRARY-SCHEMA.md`), full `play_history` event capture (load / play_start / play_end / transition pair, `session_id` per app run), `played_into` + `session_history` queries, FFI 37, deck-header "↝ usually" hint (§9.5 row 3), Session History smart crate with "← from" annotations. | §8.5.2 |
 
 ### 12.1 Planned path to v1.0
 
 | # | Name | Demo criterion | Estimate |
 | --- | --- | --- | --- |
-| **M11d-history** | **Played From / Played Into** | Deck header and session history surface useful transitions from `play_history.from_track_id` / `to_track_id`. | 1–2 days |
 | **M11e** | **Serato importer** | Read Serato DB/crates/GEOB tags, populate source metadata, beatgrids, keys, imported crates, cues, and loops. | 4–5 days |
 | **M11d-columns** | **Customizable browser columns + per-source disagreement view** | User can choose visible columns, inspect source-specific metadata, and see analysis/source disagreements without paying query cost for disabled columns. | 3–4 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |

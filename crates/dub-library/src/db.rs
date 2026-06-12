@@ -24,6 +24,7 @@ use dub_fingerprint::Fingerprint;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{LibraryError, Result};
+use crate::history::HistoryWrite;
 use crate::paths::default_library_db_path;
 use crate::schema::open_and_migrate;
 use crate::volumes::DiscoveredVolume;
@@ -248,6 +249,33 @@ pub struct TrackRow {
     pub grid_locked: bool,
     /// M11d.7: LSQ drift slope (ms/min) for the ⚠ indicator.
     pub grid_drift_quality: Option<f32>,
+}
+
+/// One Played Into aggregate row (M11d-history): a track the DJ
+/// has handed over to from the queried track, with how often and
+/// how recently.
+#[derive(Debug, Clone)]
+pub struct TransitionStat {
+    /// The other side of the transition edge.
+    pub track: TrackRow,
+    /// How many handovers recorded for this pair.
+    pub count: u32,
+    /// Unix-millis of the most recent one.
+    pub last_played_ms: i64,
+}
+
+/// One session set-list row (M11d-history): a track played this
+/// session plus the edge it was mixed in from, when one was
+/// recorded.
+#[derive(Debug, Clone)]
+pub struct SessionPlay {
+    /// The played track.
+    pub track: TrackRow,
+    /// Unix-millis of the track's first `play_start` this session.
+    pub first_played_ms: i64,
+    /// Display title of the most recent `transition_in` source
+    /// this session, for the "← from <track>" annotation.
+    pub from_track_title: Option<String>,
 }
 
 /// Sort columns the M11d.2 browser table header can drive.
@@ -983,6 +1011,155 @@ impl Library {
             )
             .map_err(|e| LibraryError::sqlite("record_load", e))?;
         Ok(())
+    }
+
+    /// Persist a batch of [`crate::SessionTracker`] writes in one
+    /// transaction, stamping `session_id` onto every row
+    /// (M11d-history). Atomic so a transition's `transition_out` /
+    /// `transition_in` pair can never half-land. Unknown track ids
+    /// surface as query errors via the FK constraints, matching
+    /// [`Self::record_load`] semantics.
+    pub fn record_history(&self, session_id: &str, writes: &[HistoryWrite]) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| LibraryError::sqlite("record_history_begin", e))?;
+        for w in writes {
+            tx.execute(
+                "INSERT INTO play_history (track_id, deck, event_type, timestamp_ms, \
+                                           duration_played_ms, from_track_id, to_track_id, \
+                                           session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    w.track_id,
+                    w.deck as i64,
+                    w.event.as_str(),
+                    w.timestamp_ms,
+                    w.duration_played_ms,
+                    w.from_track_id,
+                    w.to_track_id,
+                    session_id,
+                ],
+            )
+            .map_err(|e| LibraryError::sqlite("record_history", e))?;
+        }
+        tx.commit()
+            .map_err(|e| LibraryError::sqlite("record_history_commit", e))
+    }
+
+    /// Played Into for one track (M11d-history, PRD §8.5): the
+    /// tracks the DJ has historically handed over to from
+    /// `track_id`, most-mixed first (recency breaks ties). Counts
+    /// `transition_out` rows — each handover writes exactly one, so
+    /// the count is the number of times the pair was actually
+    /// mixed.
+    pub fn played_into(&self, track_id: &str, limit: u32) -> Result<Vec<TransitionStat>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT to_track_id, COUNT(*) AS n, MAX(timestamp_ms) AS last_ms \
+                 FROM play_history \
+                 WHERE event_type = 'transition_out' AND from_track_id = ?1 \
+                   AND to_track_id IS NOT NULL \
+                 GROUP BY to_track_id \
+                 ORDER BY n DESC, last_ms DESC LIMIT ?2",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_played_into", e))?;
+        let agg = stmt
+            .query_map(params![track_id, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| LibraryError::sqlite("query_played_into", e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LibraryError::sqlite("collect_played_into", e))?;
+        let mut out = Vec::with_capacity(agg.len());
+        for (other_id, count, last_ms) in agg {
+            // A track deleted since the transition leaves a NULL-ed
+            // edge (FK is ON DELETE SET NULL) or a missing row;
+            // skip rather than fail the whole stat list.
+            if let Some(track) = self.track_row_by_id(&other_id)? {
+                out.push(TransitionStat {
+                    track,
+                    count: u32::try_from(count).unwrap_or(u32::MAX),
+                    last_played_ms: last_ms,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// This session's set list (M11d-history): distinct tracks with
+    /// a `play_start` in `session_id`, ordered newest-first by
+    /// first play. Each row resolves the most recent
+    /// `transition_in` edge of the session so the browser can
+    /// annotate "← from <track>".
+    pub fn session_history(&self, session_id: &str, limit: u32) -> Result<Vec<SessionPlay>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT track_id, MIN(timestamp_ms) AS first_ms \
+                 FROM play_history \
+                 WHERE session_id = ?1 AND event_type = 'play_start' \
+                 GROUP BY track_id \
+                 ORDER BY first_ms DESC LIMIT ?2",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_session_history", e))?;
+        let agg = stmt
+            .query_map(params![session_id, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| LibraryError::sqlite("query_session_history", e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LibraryError::sqlite("collect_session_history", e))?;
+        let mut from_stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT from_track_id FROM play_history \
+                 WHERE session_id = ?1 AND event_type = 'transition_in' \
+                   AND track_id = ?2 AND from_track_id IS NOT NULL \
+                 ORDER BY timestamp_ms DESC LIMIT 1",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_session_history_from", e))?;
+        let mut out = Vec::with_capacity(agg.len());
+        for (track_id, first_ms) in agg {
+            let Some(track) = self.track_row_by_id(&track_id)? else {
+                continue;
+            };
+            let from_id: Option<String> = from_stmt
+                .query_row(params![session_id, track_id], |r| r.get(0))
+                .optional()
+                .map_err(|e| LibraryError::sqlite("query_session_history_from", e))?;
+            let from_track_title = match from_id {
+                Some(id) => self.track_row_by_id(&id)?.and_then(|t| t.title),
+                None => None,
+            };
+            out.push(SessionPlay {
+                track,
+                first_played_ms: first_ms,
+                from_track_title,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Single-row variant of the canonical browser query. `None`
+    /// when the id doesn't resolve (deleted track).
+    fn track_row_by_id(&self, track_id: &str) -> Result<Option<TrackRow>> {
+        let sql = format!("{TRACK_ROW_SELECT} WHERE t.id = ?1");
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_track_row_by_id", e))?;
+        stmt.query_row(params![track_id], track_row_from_columns)
+            .optional()
+            .map_err(|e| LibraryError::sqlite("query_track_row_by_id", e))
     }
 
     // === M11d.4 missing-files scanner =====================================
@@ -2303,6 +2480,126 @@ mod tests {
         // No play_history rows seeded → empty result, *not* a fallback
         // to all-tracks. Keeps the smart-crate semantics honest.
         assert!(rows.is_empty());
+    }
+
+    /// Handcraft one transition pair the way `SessionTracker`
+    /// emits it: both rows carry both edge ids.
+    fn transition_pair(from: &str, to: &str, ts: i64) -> Vec<crate::HistoryWrite> {
+        use crate::{HistoryEventType, HistoryWrite};
+        vec![
+            HistoryWrite {
+                track_id: from.into(),
+                deck: 0,
+                event: HistoryEventType::TransitionOut,
+                timestamp_ms: ts,
+                duration_played_ms: None,
+                from_track_id: Some(from.into()),
+                to_track_id: Some(to.into()),
+            },
+            HistoryWrite {
+                track_id: to.into(),
+                deck: 1,
+                event: HistoryEventType::TransitionIn,
+                timestamp_ms: ts,
+                duration_played_ms: None,
+                from_track_id: Some(from.into()),
+                to_track_id: Some(to.into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn record_history_persists_tracker_writes_end_to_end() {
+        use crate::{HistoryEventType, SessionTracker};
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B"]);
+        let mut tr = SessionTracker::new();
+        let t0 = 1_700_000_000_000_i64;
+        let min = crate::MIN_TRANSITION_PLAY_MS;
+        let mut writes = Vec::new();
+        writes.extend(tr.deck_loaded(0, &ids[0], t0));
+        writes.extend(tr.play_started(0, t0));
+        writes.extend(tr.deck_loaded(1, &ids[1], t0 + min));
+        writes.extend(tr.play_started(1, t0 + min));
+        writes.extend(tr.play_ended(0, t0 + min + 5_000));
+        assert!(writes
+            .iter()
+            .any(|w| w.event == HistoryEventType::TransitionOut));
+        lib.record_history(tr.session_id(), &writes).unwrap();
+
+        let into = lib.played_into(&ids[0], 5).unwrap();
+        assert_eq!(into.len(), 1);
+        assert_eq!(into[0].track.id, ids[1]);
+        assert_eq!(into[0].count, 1);
+        assert_eq!(into[0].last_played_ms, t0 + min + 5_000);
+
+        // The 'load' rows flow into Recently Played as before.
+        let recent = lib.recently_played(10).unwrap();
+        assert_eq!(recent.len(), 2);
+    }
+
+    #[test]
+    fn played_into_orders_by_count_then_recency() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B", "C"]);
+        let t0 = 1_700_000_000_000_i64;
+        let mut writes = Vec::new();
+        writes.extend(transition_pair(&ids[0], &ids[1], t0));
+        writes.extend(transition_pair(&ids[0], &ids[1], t0 + 1_000));
+        writes.extend(transition_pair(&ids[0], &ids[2], t0 + 2_000));
+        lib.record_history("s1", &writes).unwrap();
+
+        let into = lib.played_into(&ids[0], 5).unwrap();
+        assert_eq!(into.len(), 2);
+        // A→B twice beats A→C once despite C being more recent.
+        assert_eq!(into[0].track.id, ids[1]);
+        assert_eq!(into[0].count, 2);
+        assert_eq!(into[1].track.id, ids[2]);
+
+        // Nothing recorded out of B.
+        assert!(lib.played_into(&ids[1], 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_history_rejects_unknown_track_id() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_tracks(&lib, &["A"]);
+        let writes = transition_pair("nope-1", "nope-2", 1_000);
+        assert!(lib.record_history("s1", &writes).is_err());
+    }
+
+    #[test]
+    fn session_history_lists_session_plays_newest_first_with_from_edge() {
+        use crate::{HistoryEventType, HistoryWrite};
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B"]);
+        let t0 = 1_700_000_000_000_i64;
+        let start = |track: &str, deck: u32, ts: i64| HistoryWrite {
+            track_id: track.into(),
+            deck,
+            event: HistoryEventType::PlayStart,
+            timestamp_ms: ts,
+            duration_played_ms: None,
+            from_track_id: None,
+            to_track_id: None,
+        };
+        let mut writes = vec![start(&ids[0], 0, t0), start(&ids[1], 1, t0 + 60_000)];
+        writes.extend(transition_pair(&ids[0], &ids[1], t0 + 90_000));
+        lib.record_history("s1", &writes).unwrap();
+        // A second session that must not bleed into s1's history.
+        lib.record_history("s2", &[start(&ids[0], 0, t0 + 200_000)])
+            .unwrap();
+
+        let plays = lib.session_history("s1", 10).unwrap();
+        assert_eq!(plays.len(), 2);
+        // Newest-first: B (started later) leads.
+        assert_eq!(plays[0].track.id, ids[1]);
+        assert_eq!(plays[0].first_played_ms, t0 + 60_000);
+        assert_eq!(plays[0].from_track_title.as_deref(), Some("A"));
+        assert_eq!(plays[1].track.id, ids[0]);
+        assert_eq!(plays[1].from_track_title, None);
+
+        assert!(lib.session_history("unknown", 10).unwrap().is_empty());
     }
 
     #[test]

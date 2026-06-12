@@ -50,6 +50,15 @@ import DubCore
 /// setter chain. The single-writer invariant is a documentation
 /// concern, not a type-system one.
 @MainActor
+/// M11d-history — one reveal-in-browser request, emitted when the
+/// DJ clicks the deck header's "↝ usually: <track>" hint (PRD §9.5
+/// row 3). `token` differs per click so revealing the same track
+/// twice still fires the browser's `.onChange`.
+struct LibraryRevealRequest: Equatable {
+    let trackId: String
+    let token: UUID
+}
+
 final class LibraryAppModel: ObservableObject {
 
     /// `true` once `library.openDefault()` has succeeded. Drives
@@ -58,6 +67,12 @@ final class LibraryAppModel: ObservableObject {
     /// placeholder rather than a blank list (which a DJ would read
     /// as "Dub forgot everything").
     @Published var libraryIsOpen: Bool = false
+
+    /// M11d-history — pending reveal-in-browser request from the
+    /// deck header's hint click. LibraryView consumes it via
+    /// `.onChange`: select + scroll when the track is listed,
+    /// falling back to All Tracks with the search cleared.
+    @Published var revealTrackRequest: LibraryRevealRequest? = nil
 
     /// Total canonical-track count, refreshed after every import.
     /// Browser footer reads this directly.

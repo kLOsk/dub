@@ -276,6 +276,19 @@ struct DeckState: Equatable {
     var gridLocked: Bool = false
     var gridDriftQuality: Float? = nil
 
+    /// M11d-history — display title of the track the DJ has most
+    /// often mixed into from this one (`played_into` top-1),
+    /// fetched once at load time. Drives the deck header's row-3
+    /// "↝ usually: <track>" hint in Performance mode. `nil` for
+    /// Finder drags, never-transitioned tracks, and closed
+    /// libraries — the header simply omits the hint.
+    var historyHint: String? = nil
+
+    /// Canonical track id behind `historyHint`, kept so a click on
+    /// the hint can reveal the suggested track in the library
+    /// browser. Always set/cleared together with `historyHint`.
+    var historyHintTrackId: String? = nil
+
     /// M10.6c. `true` while the engine is in Panic-Play (PRD
     /// §6.1.2): the deck is decoupled from its timecode input and
     /// running at a held last-known-velocity rate. Driven by the
@@ -309,6 +322,8 @@ struct DeckState: Equatable {
         key = nil
         sourceURL = nil
         loadedLibraryTrackId = nil
+        historyHint = nil
+        historyHintTrackId = nil
         gridAnchorSecs = nil
         autoGridBpm = nil
         autoGridAnchorSecs = nil
@@ -1220,10 +1235,39 @@ final class WaveformAppModel: ObservableObject {
         guard isRunning else { return }
         let newA = readDeckState(side: .a, prev: deckA)
         let newB = readDeckState(side: .b, prev: deckB)
+        recordTransportHistory(
+            aWas: deckA.isPlaying, aNow: newA.isPlaying,
+            bWas: deckB.isPlaying, bNow: newB.isPlaying)
         if newA != deckA { deckA = newA }
         if newB != deckB { deckB = newB }
         recomputeMaster()
         logSignalDiagnostics()
+    }
+
+    /// M11d-history: report play-state edges to the library's
+    /// session tracker, which turns them into `play_history` rows
+    /// and inferred handover transitions. Starts are reported
+    /// before ends so a same-tick handover (A stops exactly as B
+    /// starts) still sees B playing. Trackless decks (Thru, Finder
+    /// drags) are no-ops inside the tracker, so the edges are
+    /// reported unconditionally. Failures go to the log, not a
+    /// toast — a transient DB hiccup mid-set must not interrupt
+    /// the DJ.
+    private func recordTransportHistory(aWas: Bool, aNow: Bool, bWas: Bool, bNow: Bool) {
+        guard libraryModel.libraryIsOpen, (aWas != aNow) || (bWas != bNow) else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let edges: [(deck: UInt32, was: Bool, now: Bool)] = [(0, aWas, aNow), (1, bWas, bNow)]
+        do {
+            for e in edges where !e.was && e.now {
+                try library.historyPlayStarted(deck: e.deck, timestampMs: nowMs)
+            }
+            for e in edges where e.was && !e.now {
+                try library.historyPlayEnded(deck: e.deck, timestampMs: nowMs)
+            }
+        } catch {
+            dubLog.error(
+                "mix-history transport write failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Per-deck timecode diagnostics → the unified log (subsystem
@@ -2301,23 +2345,33 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private func recordLibraryLoadIfApplicable(side: DeckSide, url: URL) {
+        let deck: UInt32 = (side == .a) ? 0 : 1
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         guard libraryModel.libraryIsOpen else {
             var cleared = state(for: side)
             cleared.loadedLibraryTrackId = nil
+            cleared.historyHint = nil
+            cleared.historyHintTrackId = nil
             setState(cleared, for: side)
             return
         }
         guard let trackId = resolveLibraryTrackId(for: url) else {
+            // Finder drag / non-library source replaced whatever
+            // the session tracker thought was on this deck — tell
+            // it so a later handover can't blame the wrong track.
             var cleared = state(for: side)
             cleared.loadedLibraryTrackId = nil
+            cleared.historyHint = nil
+            cleared.historyHintTrackId = nil
             setState(cleared, for: side)
+            try? library.historyDeckUnloaded(deck: deck, timestampMs: nowMs)
             return
         }
         do {
-            // Stamp the loaded-now glyph + write the play_history
-            // row. The track id comes from the browser selection
-            // when it matches the load URL, or from a reverse
-            // path lookup for library drags that bypassed selection.
+            // Stamp the loaded-now glyph + the mix-history hint.
+            // The track id comes from the browser selection when it
+            // matches the load URL, or from a reverse path lookup
+            // for library drags that bypassed selection.
             var stamped = state(for: side)
             stamped.loadedLibraryTrackId = trackId
             if librarySelection.selectedLibraryTrackId == trackId,
@@ -2327,11 +2381,24 @@ final class WaveformAppModel: ObservableObject {
                 stamped.gridLocked = snap.gridLocked
                 stamped.gridDriftQuality = snap.gridDriftQuality
             }
+            // M11d-history: top played-into target for the row-3
+            // "↝ usually:" hint. Best-effort — a query failure just
+            // omits the hint. The id rides along so a click on the
+            // hint can reveal the track in the browser.
+            let topInto = (try? library.playedInto(trackId: trackId, limit: 1))?.first
+            if let topInto, let label = topInto.track.title ?? topInto.track.artist {
+                stamped.historyHint = label
+                stamped.historyHintTrackId = topInto.track.id
+            } else {
+                stamped.historyHint = nil
+                stamped.historyHintTrackId = nil
+            }
             setState(stamped, for: side)
 
-            let deck: UInt32 = (side == .a) ? 0 : 1
-            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-            try library.recordLoad(trackId: trackId, deck: deck, timestampMs: nowMs)
+            // M11d-history: the tracker closes the previous track's
+            // play segment (possibly committing a handover
+            // transition) and writes the 'load' row.
+            try library.historyDeckLoaded(trackId: trackId, deck: deck, timestampMs: nowMs)
         } catch {
             surfaceError("Failed to record play history: \(error.localizedDescription)")
         }
@@ -3427,13 +3494,31 @@ final class WaveformAppModel: ObservableObject {
     func setDeckThru(side: DeckSide) {
         try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .thru)
         var s = state(for: side)
+        let hadLibraryTrack = s.loadedLibraryTrackId != nil
         s.clearLoadedTrack()
         setState(s, for: side)
+        // M11d-history: the live record replaced the library track;
+        // close its play segment in the session tracker.
+        if hadLibraryTrack {
+            let deck: UInt32 = (side == .a) ? 0 : 1
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            try? library.historyDeckUnloaded(deck: deck, timestampMs: nowMs)
+        }
     }
 
     /// Manually (re)calibrate a deck's timecode needle (the ↻ button).
     func recalibrateDeck(side: DeckSide) {
         try? engine.calibrateDeck(deckIdx: side.ffiDeckIdx)
+    }
+
+    /// M11d-history — deck-header hint click. Publishes a reveal
+    /// request the LibraryView consumes (select + scroll, falling
+    /// back to All Tracks when the track isn't in the current
+    /// listing). Space then loads the selection via the existing
+    /// flow — no separate load path from the header.
+    func revealHistoryHint(side: DeckSide) {
+        guard let trackId = state(for: side).historyHintTrackId else { return }
+        libraryModel.revealTrackRequest = LibraryRevealRequest(trackId: trackId, token: UUID())
     }
 
     // MARK: Helpers

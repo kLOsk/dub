@@ -24,11 +24,14 @@
 //! - The cancelled value then passes a **median-of-[`MED_WIN`]
 //!   prefilter** (decode spikes from a dirty needle — 1–2 quanta, any
 //!   amplitude — never reach the readout) and a **persistence-scaled
-//!   pole**: very slow ([`TAU_STEADY`]) while the value holds, opening
-//!   to snappy ([`TAU_FAST`]) once a sign-consistent change sustains
+//!   pole**: slow ([`TAU_STEADY`]) while the value holds, opening
+//!   toward snappy ([`TAU_FAST`]) as a sign-consistent change sustains
 //!   [`MOVE_CONFIRM_SECS`] — a hand on the fader sustains, noise
-//!   doesn't. Amplitude-based snap gates are deliberately gone: they
-//!   passed exactly the spikes they were meant to ignore.
+//!   doesn't. The opening is **continuous in the response-rate domain
+//!   (∝ urgency²)**, never a regime flip: a τ-domain cliff made the
+//!   digits stall through the confirmation window and then lunge.
+//!   Amplitude-based snap gates are deliberately gone: they passed
+//!   exactly the spikes they were meant to ignore.
 //! - A **trend detector** short-circuits that confirmation clock for
 //!   big deliberate moves (jumping the pitch to a target BPM): a
 //!   fast-minus-slow EMA pair over the median output measures *net
@@ -99,9 +102,13 @@ const MOVE_NOISE_BAND: f64 = 0.002;
 /// sustains.
 const MOVE_CONFIRM_SECS: f64 = 0.6;
 
-/// Pole while steady — very slow, per the operator's spec: "when the
-/// pitch fader is steady it can be very slow to move".
-const TAU_STEADY: f64 = 3.0;
+/// Pole while steady — slow, per the operator's spec: "when the
+/// pitch fader is steady it can be very slow to move". Was 3.0 when
+/// this pole carried the anti-jitter load alone; with the wobble
+/// canceller + median in front, 1.5 keeps the readout calm while a
+/// beatmatch dial-in (sub-noise-band by definition) lands in ~3 s
+/// instead of ~8 s ("slow to update", on-rig).
+const TAU_STEADY: f64 = 1.5;
 
 /// Pole once a move is confirmed — "fast and snappy".
 const TAU_FAST: f64 = 0.08;
@@ -394,16 +401,24 @@ impl DisplayRateFilter {
         {
             self.hard_quanta += u32::from(hard);
         }
-        let tau = if hard {
+        let gain = if hard {
             // Saturate the clock so the ordinary fast pole carries
             // the tail of the move once the trend condition releases.
             self.off_secs = self.off_secs.max(MOVE_CONFIRM_SECS);
-            TAU_MOVE
+            1.0 / TAU_MOVE
         } else {
+            // Interpolate in the *response-rate* domain (1/τ), with a
+            // quadratic urgency curve. τ-linear interpolation packed
+            // nearly all of the speed-up into the last sliver of the
+            // confirmation clock — on the rig the digits stalled
+            // through the window, then lunged ("jumpy and slow at the
+            // same time"). Rate-linear-in-u² builds responsiveness
+            // progressively while keeping the low-urgency end (where
+            // decode bursts briefly accumulate clock) close to steady.
             let urgency = (self.off_secs / MOVE_CONFIRM_SECS).clamp(0.0, 1.0);
-            TAU_STEADY + (TAU_FAST - TAU_STEADY) * urgency
+            1.0 / TAU_STEADY + (1.0 / TAU_FAST - 1.0 / TAU_STEADY) * urgency * urgency
         };
-        self.smoothed += (1.0 - (-dt / tau).exp()) * innovation;
+        self.smoothed += (1.0 - (-dt * gain).exp()) * innovation;
 
         // Adapt the wobble fit whenever the error is small enough to
         // be wobble rather than a deliberate move. Deliberately NOT
@@ -518,6 +533,57 @@ mod tests {
             out - 1.0 > 0.9 * step,
             "fine dial-in never converged: at {} of {step}",
             out - 1.0
+        );
+    }
+
+    /// The on-rig "jumpy and slow at the same time": a medium fader
+    /// move (below the trend detector's hard-confirm scale) must read
+    /// back *progressively* — measurable progress mid-confirmation,
+    /// convergence soon after, and never a stall-then-lunge step. The
+    /// τ-domain interpolation this replaces showed ~5 % of the move at
+    /// 0.45 s and then covered the rest almost at once.
+    #[test]
+    fn medium_move_reads_back_progressively_without_lunge() {
+        let mut f = DisplayRateFilter::new();
+        run(&mut f, 8.0, 2.0, 0.002, 0.0, |_| 1.0);
+        f.hard_quanta = 0;
+        let blocks = (2.0 / DT) as usize;
+        let mut pos = 8.0f64;
+        let (mut prev, mut max_step) = (f.smoothed, 0.0f64);
+        let (mut at_045, mut at_090) = (f64::NAN, f64::NAN);
+        for b in 0..blocks {
+            let t = b as f64 * DT;
+            // Hand-like ramp: +1.2 % over 0.4 s, then hold.
+            let rate = 1.0 + 0.012 * (t / 0.4).min(1.0);
+            let out = f.update(rate, pos, DT);
+            pos += rate * DT;
+            max_step = max_step.max((out - prev).abs());
+            prev = out;
+            if at_045.is_nan() && t >= 0.45 {
+                at_045 = out;
+            }
+            if at_090.is_nan() && t >= 0.90 {
+                at_090 = out;
+            }
+        }
+        assert_eq!(
+            f.hard_quanta, 0,
+            "medium move must stay on the ordinary path"
+        );
+        assert!(
+            at_045 - 1.0 > 0.012 * 0.25,
+            "stalled mid-confirmation: {:.4} of 0.012 at 0.45 s",
+            at_045 - 1.0
+        );
+        assert!(
+            at_090 - 1.0 > 0.012 * 0.8,
+            "too slow to land: {:.4} of 0.012 at 0.90 s",
+            at_090 - 1.0
+        );
+        assert!(
+            max_step < 0.012 * 0.2,
+            "stall-then-lunge: max per-quantum step {:.5} on a 0.012 move",
+            max_step
         );
     }
 

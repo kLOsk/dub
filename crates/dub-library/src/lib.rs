@@ -30,6 +30,7 @@ mod db;
 mod dedupe;
 mod error;
 mod filename_parser;
+mod history;
 mod importer;
 mod paths;
 mod schema;
@@ -38,7 +39,8 @@ mod volumes;
 
 pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
 pub use db::{
-    CrateRow, FileScanRow, Library, MissingTrack, StoredFingerprint, TrackRow, TrackSortKey,
+    CrateRow, FileScanRow, Library, MissingTrack, SessionPlay, StoredFingerprint, TrackRow,
+    TrackSortKey, TransitionStat,
 };
 pub use dedupe::{
     decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,
@@ -46,6 +48,7 @@ pub use dedupe::{
 };
 pub use error::{LibraryError, Result};
 pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
+pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION_PLAY_MS};
 pub use importer::{import_folder, ImportError, ImportSummary};
 pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
 pub use schema::SCHEMA_VERSION;

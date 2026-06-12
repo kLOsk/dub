@@ -153,7 +153,7 @@ final class PerformanceSnapshotTests: XCTestCase {
 
     func test_sourceControl_allStates() {
         let states: [(SourceControlStatus, Bool)] = [
-            (.internalPlay, false), (.detecting, false), (.calibrating, false),
+            (.off, false), (.internalPlay, false), (.calibrating, false),
             (.timecode, false), (.timecode, true), (.thru, false),
         ]
         let stack = VStack(alignment: .leading, spacing: 12) {

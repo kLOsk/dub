@@ -173,7 +173,8 @@ struct PerformanceView: View {
             onSetInternal: { model.setDeckInternal(side: side) },
             onSetTimecode: { model.setDeckTimecode(side: side) },
             onSetThru: { model.setDeckThru(side: side) },
-            onRecalibrate: { model.recalibrateDeck(side: side) })
+            onRecalibrate: { model.recalibrateDeck(side: side) },
+            onHistoryHintTap: { model.revealHistoryHint(side: side) })
     }
 
     // MARK: - Waveform region
@@ -202,12 +203,15 @@ struct PerformanceView: View {
         } else {
             HStack(spacing: 1) {
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
-                // Centre gutter: the beatmatch visualizations (three
-                // vertical candidates side by side — pendulum / tug bars
-                // / beat ladder — each mapping left = deck A, right =
-                // deck B to pick the winner). Grid-based; no engine FFI.
-                BeatmatchStackView(model: model)
-                    .frame(width: DubLayout.beatmatchGutterWidth)
+                // Centre gutter: Stillpoint, the round-3 beatmatch aid
+                // (docs/investigations/BEATMATCH-AID-STILLPOINT.md).
+                // One incoming-tinted band on the lock line: drifts =
+                // tempo off, frozen = matched, seated on the line =
+                // in, green line grows per beat held. Replaces the
+                // rejected round-2 candidates (`BeatmatchStackView`,
+                // kept in-tree until the rig verdict).
+                StillpointView(model: model)
+                    .frame(width: DubLayout.stillpointGutterWidth)
                     .frame(maxHeight: .infinity)
                 deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
             }

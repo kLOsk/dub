@@ -707,6 +707,7 @@ dependencies = [
  "dub-spectral",
  "hound",
  "libc",
+ "proptest",
  "rusqlite",
  "tempfile",
  "thiserror 1.0.69",

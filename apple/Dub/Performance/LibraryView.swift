@@ -197,6 +197,10 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
 private enum LibrarySource: Hashable, Identifiable {
     case allTracks
     case recentlyPlayed
+    /// M11d-history — this app run's set list, newest-first, with
+    /// the "← from <track>" transition annotation on rows that
+    /// were mixed into from the other deck.
+    case sessionHistory
     case justImported
     /// A user-created Dub crate (M11d-next, PRD §8.5.1). Carries the
     /// crate id only; the display name + track count are looked up
@@ -212,6 +216,7 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks:                   return "All Tracks"
         case .recentlyPlayed:              return "Recently Played"
+        case .sessionHistory:              return "Session History"
         case .justImported:                return "Just Imported"
         case .dubCrate:                    return "Crate"
         case .importedSourcesPlaceholder:  return "Imported Sources"
@@ -223,6 +228,7 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks:                   return "music.note.list"
         case .recentlyPlayed:              return "clock.arrow.circlepath"
+        case .sessionHistory:              return "calendar.day.timeline.left"
         case .justImported:                return "tray.and.arrow.down"
         case .dubCrate:                    return "square.stack.fill"
         case .importedSourcesPlaceholder:  return "lock.square"
@@ -239,7 +245,7 @@ private enum LibrarySource: Hashable, Identifiable {
     /// `false` for the v1.0 placeholders that render disabled.
     var isAvailable: Bool {
         switch self {
-        case .allTracks, .recentlyPlayed, .justImported: return true
+        case .allTracks, .recentlyPlayed, .sessionHistory, .justImported: return true
         case .dubCrate:                                  return true
         default:                                         return false
         }
@@ -260,8 +266,9 @@ private enum LibrarySource: Hashable, Identifiable {
         // A Dub crate's ordinal order is user-defined (it's a
         // playlist); the default title sort would clobber the order
         // the user just dragged into place, exactly like the smart
-        // crates' recency order.
-        case .recentlyPlayed, .justImported, .dubCrate: return true
+        // crates' recency order. Session History is the set's
+        // play order — same contract.
+        case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate: return true
         default: return false
         }
     }
@@ -271,7 +278,7 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks:
             return "Library"
-        case .recentlyPlayed, .justImported:
+        case .recentlyPlayed, .sessionHistory, .justImported:
             return "Smart Crates"
         case .dubCrate:
             return "Dub Crates"
@@ -312,6 +319,19 @@ struct LibraryView: View {
     /// Currently selected source-tree node. Drives which query the
     /// track list runs against.
     @State private var selectedSource: LibrarySource = .allTracks
+
+    /// M11d-history — per-row "← from <track>" annotations for the
+    /// Session History source, keyed by track id. Populated only by
+    /// the `.sessionHistory` query branch (empty for every other
+    /// source), so a non-empty lookup is also the "render the
+    /// annotation" gate.
+    @State private var sessionFromTitles: [String: String] = [:]
+
+    /// M11d-history — reveal staged across an async listing refresh.
+    /// Set when the deck-header hint targets a track that isn't in
+    /// the current listing (crate open, search active); consumed —
+    /// and always cleared — by the next `refreshTracks` completion.
+    @State private var pendingRevealTrackId: String? = nil
 
     /// M11d-next — id of the crate currently in inline-rename mode
     /// (its sidebar row shows a `TextField` instead of a label), or
@@ -524,6 +544,10 @@ struct LibraryView: View {
             guard let update else { return }
             applyAnalysisUpdate(update)
         }
+        .onChange(of: libraryModel.revealTrackRequest) { request in
+            guard let request else { return }
+            revealTrack(request.trackId)
+        }
         .onChange(of: libraryModel.crateContentGeneration) { _ in
             // A crate's membership / order changed (add / remove /
             // reorder / delete). Only the currently-open crate view
@@ -596,7 +620,7 @@ struct LibraryView: View {
                     entries: [.allTracks])
                 section(
                     heading: "Smart Crates",
-                    entries: [.recentlyPlayed, .justImported])
+                    entries: [.recentlyPlayed, .sessionHistory, .justImported])
                 dubCratesSection
                 section(
                     heading: "Imported Sources",
@@ -1508,11 +1532,25 @@ struct LibraryView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
         case .title:
-            Text(displayTitle(track))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: DubSpacing.sm) {
+                Text(displayTitle(track))
+                    .font(DubFont.body)
+                    .foregroundStyle(DubColor.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                // M11d-history: Session History rows show which
+                // track this one was mixed in from. The dict is
+                // only populated by that source, so other sources
+                // never pay the extra view.
+                if let from = sessionFromTitles[track.id] {
+                    Text("← from \(from)")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(-1)
+                }
+            }
         case .duration:
             Text(formatDuration(track.durationMs))
                 .font(DubFont.body)
@@ -2141,6 +2179,43 @@ struct LibraryView: View {
         return "Source volume is offline — plug it back in or use Relocate."
     }
 
+    /// M11d-history — reveal-in-browser for the deck header's
+    /// "↝ usually" hint. If the track is in the current listing,
+    /// select + scroll directly. Otherwise stage it as a pending
+    /// reveal and fall back to All Tracks with the search cleared —
+    /// unlike `navigateToSibling`, auto-clearing is the *point*
+    /// here: the click is an explicit "take me to this track", not
+    /// an in-list affordance. The source/search mutation triggers
+    /// the normal refresh path, whose completion consumes the
+    /// pending id (and silently drops it when the track no longer
+    /// exists in the library).
+    private func revealTrack(_ trackId: String) {
+        if sortedTrackIds.contains(trackId) {
+            completeReveal(trackId)
+            return
+        }
+        pendingRevealTrackId = trackId
+        if !searchText.isEmpty {
+            searchText = ""
+        }
+        if selectedSource != .allTracks {
+            selectedSource = .allTracks
+        } else {
+            refreshTracks()
+        }
+    }
+
+    /// Select + scroll one revealed track. Mirrors the keyboard-
+    /// navigation path: selection via `rowSelection`, scroll via
+    /// `keyboardScrollTarget` (consumed by `LibraryTableScroll`).
+    private func completeReveal(_ trackId: String) {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        rowSelection.selectedTrackIds = [trackId]
+        rowSelection.selectionAnchorId = trackId
+        syncModelPrimarySelection()
+        keyboardScrollTarget = trackId
+    }
+
     /// Highlight a track id in the visible list, scrolling it
     /// into view if necessary. Used by the sibling-version link
     /// glyph. When the sibling isn't currently visible (e.g.
@@ -2288,6 +2363,8 @@ struct LibraryView: View {
             return "Library is empty."
         case .recentlyPlayed:
             return "No play history yet."
+        case .sessionHistory:
+            return "Nothing played this session yet."
         case .justImported:
             return "No imports this session."
         case .dubCrate:
@@ -2306,6 +2383,8 @@ struct LibraryView: View {
             return "Use “Import Folder…” to add tracks."
         case .recentlyPlayed:
             return "Tracks you load on a deck show up here."
+        case .sessionHistory:
+            return "Tracks you play this session show up here, in set order."
         case .justImported:
             return "Tracks imported this session show up here."
         case .dubCrate:
@@ -2398,6 +2477,11 @@ struct LibraryView: View {
         isLoading = true
         Task.detached(priority: .userInitiated) {
             let rows: [LibraryTrack]
+            // M11d-history: per-row "← from <track>" annotations,
+            // populated only by the Session History source so the
+            // dict doubles as the "is this source active" gate at
+            // render time.
+            var fromTitles: [String: String] = [:]
             do {
                 if !query.isEmpty {
                     rows = try library.search(query: query, limit: limit)
@@ -2407,6 +2491,14 @@ struct LibraryView: View {
                         rows = try library.listTracks(limit: limit, offset: 0)
                     case .recentlyPlayed:
                         rows = try library.recentlyPlayed(limit: limit)
+                    case .sessionHistory:
+                        let plays = try library.sessionHistory(limit: limit)
+                        rows = plays.map(\.track)
+                        for play in plays {
+                            if let from = play.fromTrackTitle {
+                                fromTitles[play.track.id] = from
+                            }
+                        }
                     case .justImported:
                         rows = try library.justImported(
                             sinceUnixSecs: since, limit: limit)
@@ -2423,11 +2515,26 @@ struct LibraryView: View {
                 }
                 rows = []
             }
+            // Immutable snapshot — the @Sendable MainActor closure
+            // can't capture the mutated local `var` directly.
+            let resolvedFromTitles = fromTitles
             await MainActor.run {
                 self.tracks = rows
+                self.sessionFromTitles = resolvedFromTitles
                 self.recomputeSortedTracks()
                 self.tracksContentRevision &+= 1
                 self.isLoading = false
+                // M11d-history: a reveal staged across this refresh
+                // lands now that the rows are in. Always clears —
+                // a track that vanished from the library drops the
+                // reveal silently rather than ambushing a later
+                // unrelated refresh.
+                if let pending = self.pendingRevealTrackId {
+                    self.pendingRevealTrackId = nil
+                    if rows.contains(where: { $0.id == pending }) {
+                        self.completeReveal(pending)
+                    }
+                }
                 if preserveSelection {
                     let visible = Set(rows.map(\.id))
                     self.rowSelection.selectedTrackIds =

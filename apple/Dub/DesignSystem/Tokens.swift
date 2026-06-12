@@ -269,6 +269,11 @@ enum DubLayout {
     /// legible side by side.
     static let beatmatchGutterWidth: CGFloat = 260
 
+    /// Centre gutter for Stillpoint (round 3, the shipping candidate —
+    /// docs/investigations/BEATMATCH-AID-STILLPOINT.md). Spec target
+    /// is 100–160 px, degradable to 80.
+    static let stillpointGutterWidth: CGFloat = 132
+
     /// Height of the horizontal playing-waveform strip in Prep
     /// mode. ≈ half the vertical-mode `waveformMinHeight`, sized
     /// so the strip is tall enough to read transient envelopes

@@ -100,9 +100,9 @@ CREATE TABLE IF NOT EXISTS schema_version (
   generate volume UUIDs ourselves.
 * **All timestamps are unix epoch seconds (`INTEGER`)** unless
   documented otherwise. `play_history.timestamp` is unix epoch
-  *milliseconds* because the analysis (Played From / Played Into in
-  v1.x) needs sub-second event ordering when a load is followed
-  rapidly by a play-start.
+  *milliseconds* because the Played From / Played Into analysis
+  (M11d-history) needs sub-second event ordering when a load is
+  followed rapidly by a play-start.
 * **Integer surrogate keys** are `INTEGER PRIMARY KEY` (which in
   SQLite is the implicit `rowid` alias and gives us auto-increment
   for free). Canonical tracks use a TEXT UUID instead of an INTEGER
@@ -558,8 +558,38 @@ CREATE INDEX IF NOT EXISTS idx_play_history_session
 
 Capture starts at v1.0 day one (PRD §8.2). The user can disable capture
 in Preferences (the table is still present, just not written to). The
-v1.0 user-visible surface is "Last Played" sort + "Recently Played"
-smart crate; the v1.x surface is Played From / Played Into.
+v1.0 user-visible surfaces are "Last Played" sort, the "Recently
+Played" + "Session History" smart crates, and the deck-header
+"↝ usually" hint (M11d-history); the full Played From / Played Into
+side panel is v1.x.
+
+**Transition semantics (M11d-history).** The mixer is external
+(PRD §1), so Dub never sees the crossfader; transitions are inferred
+from deck transport by `dub_library::SessionTracker`:
+
+* A **handover** `X → Y` is recorded at the moment deck X stops
+  (pause, needle lift / carrier dropout, eject, or load-replace)
+  while the other deck Y is still playing a *different* track.
+* **Minimum-play gate:** the outgoing track must have accumulated
+  ≥ 30 s of play since load. Timecode cueing (scratch holds, needle
+  drops) flips transport constantly; the gate keeps those from
+  writing false edges.
+* **Duplicate suppression:** re-stopping the same record during one
+  mix-out doesn't repeat the edge (consecutive identical `from → to`
+  pairs are dropped); a genuine A→B→A→B juggle records all edges.
+* **Instant doubles** (same track on both decks) never record.
+
+Each committed handover writes **two rows** — `transition_out` on the
+outgoing track and `transition_in` on the incoming track — and **both
+rows carry both edge ids** (`from_track_id` *and* `to_track_id`), so
+either row alone answers either direction of the §8.5 queries and the
+per-track index serves both lookups.
+
+`session_id` is one UUID per app run, minted by the tracker at
+construction. `play_start` / `play_end` rows are written per transport
+segment (a scratch-heavy session writes many short segments; honest
+raw data, aggregated at query time). A play segment open at app quit
+is not closed — the final `play_end` of a run can be missing.
 
 ### `analysis_cache` — derived per-recording data
 
@@ -776,18 +806,35 @@ FROM track_metadata_fts
 WHERE track_metadata_fts MATCH 'donuts dilla';
 ```
 
-### Played From / Played Into (v1.x)
+### Played Into (M11d-history; the v1.x side panel reuses it)
 
 ```sql
--- Given a track loaded on Deck A, find the N tracks the DJ has most
--- often mixed *into* it from Deck B in the past.
-SELECT to_track_id, COUNT(*) AS n
+-- Given a just-loaded track, find the N tracks the DJ has most
+-- often handed over to from it (deck-header "↝ usually" hint at
+-- LIMIT 1). Counts transition_out rows — each handover writes
+-- exactly one. Recency breaks count ties.
+SELECT to_track_id, COUNT(*) AS n, MAX(timestamp_ms) AS last_ms
 FROM play_history
-WHERE event_type = 'transition_in'
+WHERE event_type = 'transition_out'
   AND from_track_id = :loaded_track_id
+  AND to_track_id IS NOT NULL
 GROUP BY to_track_id
-ORDER BY n DESC
+ORDER BY n DESC, last_ms DESC
 LIMIT 10;
+```
+
+### Session History (M11d-history)
+
+```sql
+-- This app run's set list, newest first. The "← from <track>"
+-- annotation joins each track's most recent transition_in of the
+-- session.
+SELECT track_id, MIN(timestamp_ms) AS first_ms
+FROM play_history
+WHERE session_id = :session_id AND event_type = 'play_start'
+GROUP BY track_id
+ORDER BY first_ms DESC
+LIMIT 200;
 ```
 
 ## What v1.0 does not commit to

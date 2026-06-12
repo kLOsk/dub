@@ -601,21 +601,21 @@
             <div class="ms__meta"><a href="../history/SHIPPED.md">SHIPPED.md</a> · <a href="../UI-BACKLOG.md">UI-BACKLOG.md</a></div>
         </div>
 
-        <div class="ms" data-tags="planned" data-filter-text="M11d-history played from into deck header session">
+        <div class="ms" data-tags="shipped" data-filter-text="M11d-history played from into deck header session handover transitions">
             <div class="ms__head">
                 <span class="ms__id">M11d-history</span>
                 <span class="ms__name">Played From / Played Into</span>
-                <span class="pill pill--inprog">Next up · 1–2 days</span>
+                <span class="pill pill--shipped">Shipped</span>
             </div>
-            <div class="ms__body"><strong>Demo:</strong> Deck header and session history surface useful transitions from <code>play_history.from_track_id</code> / <code>to_track_id</code>.</div>
-            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__body"><strong>Shipped:</strong> v1.0 stage of the mix-history differentiator. Transitions are inferred at <em>handover</em> (a deck stops while the other keeps playing a different track), with a 30 s minimum-play gate so timecode cueing never writes false edges, plus duplicate suppression — heuristic documented in <code>LIBRARY-SCHEMA.md</code>. Full <code>play_history</code> capture lands with it: load / play_start / play_end / transition pairs and a per-run <code>session_id</code>. Surfaces: the deck header's "↝ usually: &lt;track&gt;" hint (most-common mix-out target for the loaded track, PRD §9.5 row 3; clicking it reveals the track in the browser, where Space loads it) and a "Session History" smart crate (this run's set list with "← from" annotations). <code>FFI_VERSION 37</code>. The full side panel stays v1.x.</div>
+            <div class="ms__meta"><a href="../spec/PRD.md#852-smart-crates">PRD.md §8.5.2</a> · <a href="../spec/LIBRARY-SCHEMA.md">LIBRARY-SCHEMA.md</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11e serato importer DB crates GEOB">
             <div class="ms__head">
                 <span class="ms__id">M11e</span>
                 <span class="ms__name">Serato importer</span>
-                <span class="pill pill--planned">Planned · 4–5 days</span>
+                <span class="pill pill--inprog">Next up · 4–5 days</span>
             </div>
             <div class="ms__body"><strong>Demo:</strong> Read Serato DB / crates / GEOB tags. Populate source metadata, beatgrids, keys, imported crates, cues, and loops.</div>
             <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a> · <a href="../spec/LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
