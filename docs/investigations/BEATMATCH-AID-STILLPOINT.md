@@ -103,7 +103,7 @@ green has no render path.
 | 2 | **Beat Band** | 64 × 10 px rounded bar (48 px wide at 80 px gutter), incoming tint, 90 % opacity, horizontally centred, no halo (cut in round 5). `y = lineY + 0.75 px/ms × φms` (inverted axis, final: late = above; gain halved in round 4 — at 1.5 px/ms inaudible near-match wobble read as alarming motion), linear to ±40 ms (±30 px), arcsinh-compressed to ±50 px at ±half-beat; past clamp the band grows a chevron tip on its moving edge — never silently saturate. Display position median-filtered with a motion floor (sub-threshold jitter renders as stillness). The pill's colour is the **proximity gradient**: it blends from deck tint toward green as it approaches the line — fully green on a perfect hit, wearing off continuously to pure tint by ~1.6× the pocket. Honest by construction: it claims only "the measured offset is ≈ 0 right now"; certification stays the line's statement. |
 | 2b | **Pocket** | ±10 ms zone around the lock line (≈ the audibility threshold of a kick flam), drawn as a quiet full-width grey strip — tolerance made visible, nothing more. The "how close" colour lives on the pill, not the zone. The band keeps its true position — the zone communicates tolerance, it never snaps. |
 | 3 | **Deposits (memory + honesty)** | **Hidden since round 5** (operator: distracting, no felt purpose). The engine still stamps them (machinery + tests retained) pending a subtler memory form; the hold-line's growth is currently the only visible memory, so R10 is partially deferred. Original spec: one tick per master beat at the band's y, pile = held, ladder = leaking, gap = abstained. |
-| 4 | **Tempo belt (pre-drop face)** | 8 dots Ø10 px at 56 px pitch, incoming tint 70 %, scrolling over fixed 1 px hairlines at the same pitch. Velocity `v = sign(Δ)·(3 + 55·|ΔBPM|) px/s`, capped 110 px/s with dim+blur beyond (coarse matching belongs to the header digits). **Deadband ±0.015 BPM renders as dead stop; sign flips require |Δ| > 0.03** (kills zero-crossing flicker). Hand on record: dots hollow to grey outlines, frozen at the last honest verdict. |
+| 4 | **Tempo belt (pre-drop face)** | 8 dots Ø10 px at 56 px pitch, incoming tint 70 %, scrolling over fixed 1 px hairlines at the same pitch. Velocity `v = sign(Δ)·(3 + 55·|ΔBPM|) px/s`, capped 110 px/s with dim+blur beyond (coarse matching belongs to the header digits). **Deadband ±0.03 BPM renders as dead stop; sign flips require |Δ| > 0.06** (round 7 — widened to clear the real slip-noise floor; see the slip note below). Hand on record: dots hollow to grey outlines, frozen at the last honest verdict. |
 | 5 | **Coach glyph** | 14 px `+` / `−` disc at the gutter foot, incoming tint, suggested trim beneath in 9 pt mono at 35 % (`0.2` = +0.2 %). Pulses once on arming, 0.25 Hz breath while active; never loops. |
 | 6 | **Fine print** | Bottom 24 px: Δms / ΔBPM, 9 pt mono, 40 % grey. Hidden entirely in RIDE unless drift resumes. |
 | 7 | **Transitions** | Faces crossfade 250–400 ms; minimum dwell 1.2 s; nothing snaps; nothing anywhere animates at beat rate. |
@@ -238,12 +238,28 @@ engine's `pitch%` is display-filtered for steady header digits (median
 prefilter + persistence-gated pole) — it lags the fader and moves in
 steps, which makes a strobe null impossible to ride. The belt, the
 green-gate ΔBPM check, and the Δ fine print therefore use the
-least-squares dφ/dt over the last ~0.8 s of playhead-derived phase
-(groove truth: continuous, instant under the fader, immune to the
-display filter). Slip exists only while **both** grooves are moving; a
-paused deck falls back to the pitch/grid *prediction* ("if you drop it
-now"). Pitch-derived live BPM survives only there and in the coarse
-octave-fold ratio choice.
+least-squares dφ/dt over the last **~2.5 s** of playhead-derived phase
+(groove truth: continuous, immune to the display filter). Slip exists
+only while **both** grooves are moving; a paused deck falls back to the
+pitch/grid *prediction* ("if you drop it now"). Pitch-derived live BPM
+survives only there and in the coarse octave-fold ratio choice.
+
+**Round 7 — the slip window, sized from rig captures.** The raw
+playhead carries ~0.6–1.3 % broadband decode noise (measured: the
+vinyl is *not* meaningfully eccentric — the once-per-rev component
+explains only 3–7 % of the steady-state variance). At the original
+0.8 s window the LSQ slope of that noise gave ΔBPM noise of ~0.13 BPM —
+8× the belt deadband, so the belt was driven by pure noise ~90 % of the
+time at a perfect match, *and* (the latent bug) far above the 0.02
+green-gate threshold, so green could essentially never certify on a
+timecode deck. Lengthening to 2.5 s drops the slip noise to ~0.025 BPM
+(belt twitch 18 % → green-achievable 76–97 % on the captures). Cost:
+the belt now settles in ~2.5 s rather than instantly — acceptable for
+the ride-the-fader tempo stage; a recency-weighted slope estimator is
+the named follow-up if it reads sluggish on the rig. A **fold change**
+clears the slip history (the re-reference would otherwise read as a
+huge fake drift), exactly like a half-beat wrap release. The band
+(180 ms median) is unaffected — it was already noise-robust (~0.4 ms).
 
 **Octave folding (required for 87↔174 blends):** `k = round(log₂(liveBPM_inc
 / liveBPM_mas))`, clamped to ±2, adopted only when the folded ratio is

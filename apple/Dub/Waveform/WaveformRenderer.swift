@@ -578,6 +578,23 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private let beatGridState = OSAllocatedUnfairLock(
         initialState: BeatGridSnapshot())
 
+    /// One-shot repaint request, set once by `WaveformView` after
+    /// the render thread exists. The beat-grid fetch in
+    /// `refreshBeatGridIfNeeded` is async, so the frame that
+    /// *triggers* it paints the OLD grid; on a PAUSED deck nothing
+    /// would repaint with the freshly-committed grid until the next
+    /// Play frame. Invoking this after the fetch commits schedules
+    /// exactly one more draw so "set the 1" / re-analyze shows
+    /// immediately on a stopped deck. Stored behind a lock because
+    /// it is read on the render thread and written on main.
+    private let redrawRequest =
+        OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+
+    /// Wire the paused-deck repaint hook (see `redrawRequest`).
+    func setRedrawRequest(_ request: @escaping @Sendable () -> Void) {
+        redrawRequest.withLock { $0 = request }
+    }
+
     /// Countdown between `engine.beatGrid` FFI calls while
     /// analysis is still pending. Render-thread-only; no locking
     /// needed.
@@ -1714,6 +1731,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let observedPeaksGen = peaksGeneration
         let observedBeatGridGen = beatGridGeneration
         let stateRef = beatGridState
+        let redrawRef = redrawRequest
         Task.detached(priority: .userInitiated) {
             let grid = engineRef.beatGrid(deckIdx: deckIdxLocal)
             stateRef.withLock { state in
@@ -1728,6 +1746,13 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 state.peaksGeneration = observedPeaksGen
                 state.beatGridGeneration = observedBeatGridGen
             }
+            // Paused deck: the frame that kicked off this fetch drew
+            // the stale grid. Schedule one more draw so the committed
+            // grid shows now instead of on the next Play frame. A
+            // continuously-rendering deck coalesces this into its
+            // ongoing vsync loop (`requestOneShot` is a no-op while
+            // a draw is in flight), so it is safe to always call.
+            redrawRef.withLock { $0 }?()
         }
     }
 

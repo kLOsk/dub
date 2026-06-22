@@ -832,10 +832,13 @@ impl Engine {
                 #[allow(clippy::cast_precision_loss)]
                 let dt = frames as f64 / f64::from(self.sample_rate);
                 if lock_state == 1 {
-                    // The readout consumes the canonical display-scale
-                    // rate (zero anchor + display-only ±8 stop anchors)
-                    // — the fader's detent reads exactly 0 and the
-                    // stops exactly ±8, without warping playback.
+                    // The readout consumes the **played** rate (zero
+                    // anchor only): the header BPM is the rate the
+                    // groove actually moves at, so two decks matched to
+                    // the same shown BPM run at the same speed. The
+                    // detent still reads exactly 0 (zero anchor); the
+                    // ±8 stops read their true value, not a canonical
+                    // pin that would diverge the display from playback.
                     self.tc_display_value[idx] =
                         self.tc_display_rate[idx].update(display_scale_rate, position_secs, dt);
                 } else {

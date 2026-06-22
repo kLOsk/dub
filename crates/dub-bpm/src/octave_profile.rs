@@ -259,6 +259,24 @@ pub fn profile_skips_skank_pass(profile: OctaveProfile) -> bool {
     matches!(profile, OctaveProfile::FourOnFloor)
 }
 
+/// Returns `true` when the profile's mix tempo legitimately lives in the
+/// generic hip-hop "double-time" band (~160–180 BPM), so the
+/// genre-agnostic `hiphop_doubletime_rejected` pass must **not** throw
+/// out the true tempo.
+///
+/// A Drum & Bass tag means a ~172 BPM peak IS the quarter-note pulse —
+/// not the double-time of an ~86 BPM hip-hop beat. Without this gate the
+/// strongest, correct DnB peak (e.g. "Murder Dem": 172 raw=8.26, the top
+/// peak) is hard-rejected and the ⅔-subdivision (≈115 BPM) wins — the
+/// exact "174 reads as 116" failure on a DnB-tagged library. DnB keeps
+/// its own half-time rejection ([`profile_halftime_rejected`]), so the
+/// 87 BPM sub-octave is still killed; only the spurious hip-hop-shaped
+/// double-time veto on the true tempo is lifted.
+#[must_use]
+pub fn profile_skips_hiphop_doubletime_pass(profile: OctaveProfile) -> bool {
+    matches!(profile, OctaveProfile::DrumAndBass)
+}
+
 /// Returns `true` when the profile forbids the post-pass-2
 /// `octave_self_verify` from swapping the chosen BPM down to its
 /// half (BPM → BPM/2).
@@ -642,6 +660,34 @@ mod tests {
                 octave_profile_from_genre(tag),
                 OctaveProfile::DrumAndBass,
                 "tag {tag:?} should map to DrumAndBass"
+            );
+        }
+    }
+
+    /// Round 7 — a Drum & Bass tag must lift the genre-agnostic
+    /// hip-hop double-time veto, the bug that read 174 BPM DnB as 116
+    /// (the ⅔ subdivision) on the operator's library: the true 172 peak
+    /// was the strongest but `hiphop_doubletime_rejected` hard-killed it
+    /// as an "86 BPM hip-hop played double-time", leaving the triplet to
+    /// win. Validated end-to-end on the real corpus (LK / Murder Dem /
+    /// Evacuation / Ten Toes all 116/87 → 174 with the DnB profile).
+    #[test]
+    fn dnb_profile_lifts_the_hiphop_doubletime_veto() {
+        assert!(profile_skips_hiphop_doubletime_pass(
+            OctaveProfile::DrumAndBass
+        ));
+        // No other profile lifts it — hip-hop especially must keep it.
+        for p in [
+            OctaveProfile::Default,
+            OctaveProfile::HipHop,
+            OctaveProfile::FourOnFloor,
+            OctaveProfile::Dub,
+            OctaveProfile::Dancehall,
+            OctaveProfile::RootsReggae,
+        ] {
+            assert!(
+                !profile_skips_hiphop_doubletime_pass(p),
+                "{p:?} must NOT lift the hip-hop double-time veto"
             );
         }
     }

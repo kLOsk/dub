@@ -52,7 +52,9 @@
 
 mod beats;
 mod confidence;
+mod downbeat;
 mod estimator;
+pub mod eval;
 mod octave_profile;
 mod offline;
 mod onset;
@@ -62,15 +64,16 @@ mod tempo;
 mod tracker;
 
 pub use beats::{
-    analyze_beat_grid, analyze_beat_grid_from_taps, analyze_beat_grid_with_profile,
-    bar_phase_from_tap, latch_beat_grid_at_downbeat, median_bpm_from_beats, uniform_beats,
-    BeatGrid, GridQuality,
+    analyze_beat_grid, analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_from_taps,
+    analyze_beat_grid_with_profile, bar_phase_from_tap, latch_beat_grid_at_downbeat,
+    median_bpm_from_beats, relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid, GridQuality,
 };
 pub use confidence::{
     ConfidenceTracker, TrackerEvent, TrackerState, LOCK_CONSECUTIVE, LOCK_THRESHOLD,
     LOCK_TOLERANCE_BPM, LOST_LOCKED_CONSECUTIVE, LOST_TENTATIVE_CONSECUTIVE, REJECT_TOLERANCE_BPM,
     TENTATIVE_THRESHOLD,
 };
+pub use downbeat::{refine_downbeat_alphatheta, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
 pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
 pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};

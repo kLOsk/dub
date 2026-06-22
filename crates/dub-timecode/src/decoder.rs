@@ -377,8 +377,7 @@ impl Decoder {
             lag_pos: 0,
             lag_warm: 0,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            long_lag: ((sample_rate / (2.5 * format.carrier_hz())) as usize)
-                .clamp(2, LONG_LAG_MAX),
+            long_lag: ((sample_rate / (2.5 * format.carrier_hz())) as usize).clamp(2, LONG_LAG_MAX),
             roundness_smoothed: 0.0,
             absolute: None,
         }
@@ -580,12 +579,14 @@ impl Decoder {
             self.prev_re = re;
             self.prev_im = im;
             self.primed = true;
-            // Absolute tracker (M6) decodes the bitstream the xwax way,
-            // straight off the **raw** channels (ch0 = frame[0], ch1 =
-            // frame[1]) — its own per-channel zero-crossing detectors do
-            // the timing; whitening would only smear them. Alloc-free.
+            // Absolute tracker (M6) reads the AM position bit off the
+            // **whitened** carrier phasor `(re, im)` computed just above —
+            // the same high-passed, decorrelated phasor the relative path
+            // uses. The per-cycle RMS read decodes real vinyl ~95 % vs
+            // ~80 % for the raw zero-crossing peak (validated by
+            // `--sweep`). Alloc-free.
             if let Some(t) = self.absolute.as_mut() {
-                t.on_sample(f64::from(frame[0]), f64::from(frame[1]));
+                t.on_sample(re, im);
             }
         }
 

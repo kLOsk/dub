@@ -210,25 +210,24 @@ struct VariantState {
     consec_hits: u32,
 }
 
-/// Per-deck absolute-position tracker (M6) — the xwax decode method.
+/// Per-deck absolute-position tracker (M6) — AM bit read off the
+/// whitened carrier phasor.
 ///
-/// Fed the two **raw** channels per sample
-/// ([`AbsoluteTracker::on_sample`]). Each channel runs its own
-/// zero-crossing detector; one data bit is read per cycle from the
-/// **primary** channel's level at the instant the **secondary** crosses
-/// zero (xwax's algorithm — see `crate::defs` and the verified `--sweep`
-/// finding). The bit stream feeds N parallel LFSR validators (one per
+/// Fed the decoder's **whitened, high-passed** complex carrier `(re, im)`
+/// per sample ([`AbsoluteTracker::on_sample`]) — the same phasor the
+/// relative path uses. The running unwrapped phase marks each carrier
+/// cycle; one data bit is read per cycle from the cycle's **magnitude
+/// RMS** (the amplitude-modulated bit), sliced by a two-level threshold.
+/// This per-cycle integration reads real vinyl at ~95 % vs ~80 % for the
+/// raw zero-crossing peak read it replaces (validated by `--sweep` on a
+/// real capture); the bit model is unchanged (still AM, not the rejected
+/// phase read). The bit stream feeds N parallel LFSR validators (one per
 /// candidate pressing); the first to validate locks, and its
-/// [`PositionLut`] resolves the absolute groove position. Position is
-/// sub-cycle-interpolated between reads so the engine gets a smooth,
-/// drift-free anchor.
+/// [`PositionLut`] resolves the absolute groove position, sub-cycle-
+/// interpolated between reads.
 ///
 /// All methods are alloc-free except [`AbsoluteTracker::new`], which
 /// builds the LUTs and MUST run off the audio thread.
-// Several independent state flags (channel config + two zero-crossing
-// detectors + read/lock priming) — each is a distinct bit of hardware
-// state, not a bundle that wants its own type.
-#[allow(clippy::struct_excessive_bools)]
 pub struct AbsoluteTracker {
     /// Input frames per carrier cycle at unity — the absolute-position
     /// scale (`sample_rate / carrier_hz`).
@@ -236,22 +235,25 @@ pub struct AbsoluteTracker {
     /// Auto-detect candidates (share carrier + extraction flags).
     variants: Vec<VariantState>,
 
-    // --- xwax extraction config (shared across candidates) ---
-    /// Primary (data) channel is right/ch1 (vs left/ch0).
-    primary_right: bool,
-    /// Read on the primary's negative half-cycle.
-    switch_polarity: bool,
-    /// Per-channel zero running-average EMA pole and hysteresis.
-    zero_alpha: f64,
-
-    // --- per-channel zero-crossing detectors (raw channels) ---
-    p_zero: f64,
-    p_positive: bool,
-    s_zero: f64,
-    s_positive: bool,
-    primed: bool,
-    /// Adaptive bit reference (EMA of read peaks).
-    ref_level: f64,
+    // --- whitened-phasor cycle detector ---
+    /// Previous sample's carrier phase, for unwrapping.
+    prev_phase: f64,
+    /// Running unwrapped carrier phase; its integer-cycle crossings are
+    /// the bit-read boundaries.
+    unwrapped: f64,
+    /// Whether `prev_phase` / `unwrapped` hold a real sample yet.
+    phase_primed: bool,
+    /// Cycle index of the last completed boundary (its sign change tracks
+    /// play direction).
+    prev_cycle: i64,
+    /// Per-cycle `Σ|s|²` and sample count → the cycle's magnitude RMS,
+    /// the AM data-bit observable.
+    cyc_mag_sq: f64,
+    cyc_n: u32,
+    /// Two-level deadlock-free bit-slicer rails (EMAs of the high/low
+    /// per-cycle RMS); the bit is `rms > midpoint(env_high, env_low)`.
+    env_high: f64,
+    env_low: f64,
 
     // --- read interval / sub-cycle position interpolation ---
     /// Samples since the last bit read (the sub-cycle numerator).
@@ -337,19 +339,17 @@ impl AbsoluteTracker {
             return None;
         }
         let spc = f64::from(sample_rate) / f64::from(first.resolution);
-        let dt = 1.0 / f64::from(sample_rate);
         Some(Self {
             samples_per_cycle: spc,
             variants,
-            primary_right: first.primary_right(),
-            switch_polarity: first.switch_polarity(),
-            zero_alpha: dt / (XWAX_ZERO_RC + dt),
-            p_zero: 0.0,
-            p_positive: false,
-            s_zero: 0.0,
-            s_positive: false,
-            primed: false,
-            ref_level: XWAX_ZERO_THRESHOLD,
+            prev_phase: 0.0,
+            unwrapped: 0.0,
+            phase_primed: false,
+            prev_cycle: 0,
+            cyc_mag_sq: 0.0,
+            cyc_n: 0,
+            env_high: 0.0,
+            env_low: 0.0,
             samples_since_read: 0,
             read_interval: spc,
             read_primed: false,
@@ -430,102 +430,119 @@ impl AbsoluteTracker {
         self.position_cycles().map(|c| c * self.samples_per_cycle)
     }
 
-    /// Full reset (new record / deck re-cue): unlock, forget the
-    /// zero-crossing detectors and read clock. RT-safe.
+    /// Full reset (new record / deck re-cue): unlock, forget the phase
+    /// tracker and read clock. RT-safe.
     pub fn reset(&mut self) {
         self.unlock();
-        self.p_zero = 0.0;
-        self.p_positive = false;
-        self.s_zero = 0.0;
-        self.s_positive = false;
-        self.primed = false;
+        self.phase_primed = false;
+        self.cyc_mag_sq = 0.0;
+        self.cyc_n = 0;
         self.samples_since_read = 0;
         self.read_primed = false;
     }
 
-    /// Feed one sample's **raw** channels (`left = ch0`, `right = ch1` —
-    /// the same interleaved order the decoder receives). Runs the xwax
-    /// per-channel zero-crossing detectors and, on each cycle, reads one
-    /// data bit. Alloc-free; called per-sample on the audio thread.
-    pub fn on_sample(&mut self, left: f64, right: f64) {
-        let (primary, secondary) = if self.primary_right {
-            (right, left)
-        } else {
-            (left, right)
-        };
+    /// Feed one sample's **whitened** complex carrier `(re, im)` — the
+    /// same high-passed, whitened phasor the decoder computes for the
+    /// relative path (`s = re + j·im = A·e^(jφ)`). Tracks the unwrapped
+    /// carrier phase and, on each completed cycle, reads one AM data bit
+    /// from the cycle's magnitude RMS. Alloc-free; per-sample on the
+    /// audio thread.
+    pub fn on_sample(&mut self, re: f64, im: f64) {
+        let mag_sq = re * re + im * im;
+        self.samples_since_read = self.samples_since_read.saturating_add(1);
 
-        if !self.primed {
-            // Seed the running zeros at the signal level so they don't
-            // ramp from 0 and fabricate a startup crossing.
-            self.p_zero = primary;
-            self.s_zero = secondary;
-            self.primed = true;
+        if mag_sq < PRESENCE_FLOOR_SQ {
+            // Carrier gone (stylus lift / silence): drop the phase lock
+            // and the in-progress cycle; unlock after a sustained gap.
+            self.phase_primed = false;
+            self.cyc_mag_sq = 0.0;
+            self.cyc_n = 0;
+            if self.samples_since_read >= self.no_read_limit {
+                self.unlock();
+                self.read_primed = false;
+                self.samples_since_read = 0;
+            }
             return;
         }
 
-        let th = XWAX_ZERO_THRESHOLD;
-        // Primary: track polarity only (no swap event needed).
-        if primary > self.p_zero + th {
-            self.p_positive = true;
-        } else if primary < self.p_zero - th {
-            self.p_positive = false;
+        let phase = im.atan2(re);
+        if !self.phase_primed {
+            self.prev_phase = phase;
+            self.unwrapped = phase;
+            self.prev_cycle = floor_cycles(self.unwrapped);
+            self.phase_primed = true;
+            self.cyc_mag_sq = mag_sq;
+            self.cyc_n = 1;
+            self.samples_since_read = 0;
+            return;
         }
-        self.p_zero += self.zero_alpha * (primary - self.p_zero);
 
-        // Secondary: its zero-crossing is the bit-read trigger; the
-        // crossing *direction* (up vs down) at the gated half reveals
-        // play direction.
-        let mut s_swapped = false;
-        let mut s_up = false;
-        if secondary > self.s_zero + th && !self.s_positive {
-            self.s_positive = true;
-            s_swapped = true;
-            s_up = true;
-        } else if secondary < self.s_zero - th && self.s_positive {
-            self.s_positive = false;
-            s_swapped = true;
+        // Unwrap the phase step and integrate the cycle's energy.
+        let mut d = phase - self.prev_phase;
+        if d > std::f64::consts::PI {
+            d -= std::f64::consts::TAU;
+        } else if d < -std::f64::consts::PI {
+            d += std::f64::consts::TAU;
         }
-        self.s_zero += self.zero_alpha * (secondary - self.s_zero);
+        self.prev_phase = phase;
+        self.unwrapped += d;
+        self.cyc_mag_sq += mag_sq;
+        self.cyc_n += 1;
 
-        self.samples_since_read = self.samples_since_read.saturating_add(1);
+        let cycle = floor_cycles(self.unwrapped);
+        if cycle == self.prev_cycle {
+            return;
+        }
+        // A carrier cycle completed. Direction is the sign of the cycle
+        // step; the data bit is the cycle's magnitude RMS, two-level
+        // sliced.
+        let forward = cycle > self.prev_cycle;
+        self.prev_cycle = cycle;
+        #[allow(clippy::cast_precision_loss)]
+        let rms = (self.cyc_mag_sq / f64::from(self.cyc_n.max(1))).sqrt();
+        let full = self.cyc_n >= MIN_CYCLE_SAMPLES;
+        self.cyc_mag_sq = 0.0;
+        self.cyc_n = 0;
 
-        let want_positive = !self.switch_polarity;
-        if s_swapped && self.p_positive == want_positive {
-            // Forward play reads on the secondary's up-crossing; reverse
-            // play's gated read lands on the down-crossing instead.
-            let forward = s_up;
-            let m = (primary - self.p_zero).abs();
-            // Read interval EMA = the actual cycle period in samples
-            // (encodes speed; the sub-cycle interpolation denominator).
-            // The first read also primes `ref_level` to the signal so the
-            // bit slicer separates within a few cycles instead of waiting
-            // ~`REF_PEAKS_AVG` reads for it to climb from the noise floor.
-            let first_read = !self.read_primed;
-            if first_read {
+        let dt = f64::from(self.samples_since_read);
+        self.samples_since_read = 0;
+
+        if !self.read_primed {
+            // Seed the slicer + read clock from the first full cycle; no
+            // bit is trustworthy until then.
+            if full {
                 self.read_primed = true;
-                self.ref_level = m;
-            } else {
-                let dt = f64::from(self.samples_since_read);
-                self.read_interval += READ_INTERVAL_ALPHA * (dt - self.read_interval);
+                self.read_interval = dt;
+                self.env_high = rms;
+                self.env_low = rms;
             }
-            let bit = u32::from(m > self.ref_level);
-            self.ref_level -= self.ref_level / XWAX_REF_PEAKS_AVG;
-            self.ref_level += m / XWAX_REF_PEAKS_AVG;
-            self.samples_since_read = 0;
-
-            #[allow(clippy::cast_possible_truncation)]
-            if (self.dbg_reads as usize) < self.dbg_first_means.len() {
-                let idx = self.dbg_reads as usize;
-                self.dbg_first_means[idx] = m as f32;
-                self.dbg_first_bits |= u64::from(bit) << idx;
-            }
-            self.on_bit_read(bit, forward);
-        } else if self.samples_since_read >= self.no_read_limit {
-            // Carrier gone / stylus lifted: no read for many cycles.
-            self.unlock();
-            self.read_primed = false;
-            self.samples_since_read = 0;
+            return;
         }
+        self.read_interval += READ_INTERVAL_ALPHA * (dt - self.read_interval);
+
+        // Two-level deadlock-free slice. The rails update only on full
+        // cycles so a scratch-turnaround partial can't poison the
+        // threshold; the partial's (untrusted) bit still steps the LFSR
+        // so the position keeps tracking the groove.
+        let threshold = 0.5 * (self.env_high + self.env_low);
+        let bit = u32::from(rms > threshold);
+        if full {
+            if bit == 1 {
+                self.env_high += LEVEL_ALPHA * (rms - self.env_high);
+                self.env_low += LEVEL_UNSTICK * (rms - self.env_low);
+            } else {
+                self.env_low += LEVEL_ALPHA * (rms - self.env_low);
+                self.env_high += LEVEL_UNSTICK * (rms - self.env_high);
+            }
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        if (self.dbg_reads as usize) < self.dbg_first_means.len() {
+            let idx = self.dbg_reads as usize;
+            self.dbg_first_means[idx] = rms as f32;
+            self.dbg_first_bits |= u64::from(bit) << idx;
+        }
+        self.on_bit_read(bit, forward);
     }
 
     /// Feed one decoded bit (with its play direction) to the locked
@@ -1404,11 +1421,14 @@ mod tests {
         AbsoluteTracker::new(Format::SeratoCv02, SR).unwrap()
     }
 
-    /// Feed an interleaved stereo buffer to the xwax tracker as raw
-    /// channels: `left = ch0 = frame[0]`, `right = ch1 = frame[1]`.
+    /// Feed an interleaved stereo buffer to the tracker as the whitened
+    /// phasor. The tests use identity whitening + a clean (DC-free)
+    /// generator, so the phasor is just `re = ch1 = frame[1]`,
+    /// `im = ch0 = frame[0]` — the mapping the decoder applies before
+    /// `on_sample` (`s = re + j·im = A·e^(jφ)`).
     fn feed(t: &mut AbsoluteTracker, buf: &[f32]) {
         for frame in buf.chunks_exact(2) {
-            t.on_sample(f64::from(frame[0]), f64::from(frame[1]));
+            t.on_sample(f64::from(frame[1]), f64::from(frame[0]));
         }
     }
 
@@ -1640,7 +1660,8 @@ mod tests {
             for _ in 0..200 {
                 g.render(&mut buf, 1.0, 0.5);
                 for frame in buf.chunks_exact(2) {
-                    t.on_sample(f64::from(frame[0]), f64::from(frame[1]));
+                    // Whitened-phasor order: re = ch1, im = ch0.
+                    t.on_sample(f64::from(frame[1]), f64::from(frame[0]));
                 }
             }
         });

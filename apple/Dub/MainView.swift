@@ -588,8 +588,8 @@ final class WaveformAppModel: ObservableObject {
         tapToGridA.onTapCountChanged = { [weak self] count in
             self?.tapSessionA.tapCount = count
         }
-        tapToGridA.onCommit = { [weak self] taps in
-            self?.commitTapGrid(side: .a, playheadTimes: taps)
+        tapToGridA.onCommit = { [weak self] taps, bpm in
+            self?.commitTapGrid(side: .a, playheadTimes: taps, wallClockBpm: bpm)
         }
         tapToGridA.onRollingBpmChanged = { [weak self] bpm in
             self?.tapSessionA.rollingBpm = bpm
@@ -597,8 +597,8 @@ final class WaveformAppModel: ObservableObject {
         tapToGridB.onTapCountChanged = { [weak self] count in
             self?.tapSessionB.tapCount = count
         }
-        tapToGridB.onCommit = { [weak self] taps in
-            self?.commitTapGrid(side: .b, playheadTimes: taps)
+        tapToGridB.onCommit = { [weak self] taps, bpm in
+            self?.commitTapGrid(side: .b, playheadTimes: taps, wallClockBpm: bpm)
         }
         tapToGridB.onRollingBpmChanged = { [weak self] bpm in
             self?.tapSessionB.rollingBpm = bpm
@@ -635,7 +635,20 @@ final class WaveformAppModel: ObservableObject {
         // the transient I clicked" misalignment. `positionSnapshot()`
         // extrapolates to wall-clock now, which is within ±8 ms of
         // the last-displayed frame on a 60 Hz panel.
-        let playhead = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+        //
+        // Bug2b — audible timeline. While PLAYING the DJ taps by EAR,
+        // reacting to the kick the DAC emitted one output-latency ago,
+        // so we capture `positionSnapshotAudible` (now − latency − trim)
+        // — the track position actually coming out of the speakers.
+        // While STOPPED the playhead is exactly where the user scrubbed
+        // it, so we keep `positionSnapshot` verbatim — a set trim must
+        // not shift a prep-mode set-the-1. (The grid-side kick-edge snap
+        // in `set_bar_phase` is independent of this and applies in both
+        // modes.)
+        let playhead =
+            isPlaying
+            ? engine.positionSnapshotAudible(deckIdx: side.ffiDeckIdx).elapsedSecs
+            : engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
         // Paused decks dispatch a single set-the-1 immediately
         // through a dedicated path that drops any stale buffered
         // session first. PRD-BEATS §4.2 + gate 9 already rejects
@@ -3779,23 +3792,25 @@ final class WaveformAppModel: ObservableObject {
     /// on a now-locked deck). In that case the engine returns
     /// `EngineError.GridLocked`; we treat it as a silent no-op
     /// per PRD-BEATS §13 (no error toast).
-    func commitTapGrid(side: DeckSide, playheadTimes: [Double]) {
+    func commitTapGrid(side: DeckSide, playheadTimes: [Double], wallClockBpm: Double?) {
         guard isRunning, !playheadTimes.isEmpty else { return }
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
         let genre = librarySelection.selectedLibraryTrack?.genre
-        // PRD-BEATS §4.1, Round 8: 1–2 tap "set the 1" places
-        // the downbeat at `tap_secs` bit-exact. The engine does
-        // not snap, shift, or refine — the user owns the click
-        // coordinate, which is exactly what UI users expect.
+        // §4.1: 1–2 tap "set the 1" snaps to the nearest analyzed beat
+        // (engine.setBarPhase, Mixxx findClosestBeat model). 3+ taps
+        // re-tempo from the WALL-CLOCK BPM — never the rate-scaled playhead
+        // deltas the old installBeatGridFromTaps derived — with the first
+        // tap as the ODF-snapped anchor.
         let downbeat = playheadTimes[0]
 
         do {
-            if playheadTimes.count >= 3 {
-                try engine.installBeatGridFromTaps(
+            if playheadTimes.count >= 3, let bpm = wallClockBpm {
+                try engine.installBeatGridFromBpmAndAnchor(
                     deckIdx: side.ffiDeckIdx,
-                    tapTimes: playheadTimes,
+                    bpm: bpm,
+                    anchorSecs: downbeat,
                     genre: genre)
             } else {
                 try engine.setBarPhase(

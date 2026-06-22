@@ -896,6 +896,16 @@ private struct WaveformMetalView: NSViewRepresentable {
             label: label)
         context.coordinator.renderThread = renderThread
 
+        // Paused-deck repaint hook: when the async beat-grid fetch
+        // commits a fresh grid, ask the render thread for one more
+        // draw so "set the 1" / re-analyze shows on a stopped deck
+        // without waiting for the next Play frame. Weak capture
+        // keeps the renderer → thread reference from retaining the
+        // thread.
+        renderer.setRedrawRequest { [weak renderThread] in
+            renderThread?.requestOneShot()
+        }
+
         // Wire host-view display migration straight into the
         // render thread's CVDisplayLink. Fires on
         // `viewDidMoveToWindow` and on

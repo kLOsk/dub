@@ -94,6 +94,15 @@
   settled. Found because the replay harness on the deck-B capture did *not*
   reproduce the field report — the discrepancy between capture and rig is what
   pointed at usage-dependent state (anchor learning), not decode.
+- **The displayed rate MUST equal the played rate.** Two tracks pitched to the
+  same BPM ran at visibly different speeds because the deck-header BPM went
+  through the ±8-canonical anchor *warp* (`AnchorMap::apply`, a piecewise-linear
+  display map) while the audio used the zero-anchor only (`apply_playback`).
+  Same input, two outputs — the header lied. Fix: the header reads the audible
+  rate (xwax/Mixxx parity), and the entire ±8 anchor-warp subsystem was deleted
+  (~176 LOC) — it was a display-only transform with no audio counterpart, so it
+  could only ever diverge. A "stabilised" readout that isn't the thing you hear
+  is a bug, not a feature.
 
 ## BPM / beat grid
 
@@ -119,6 +128,41 @@
   param instead of re-running `analyze_beat_grid`. This killed ±0.02 BPM
   cross-deck drift and a ~100–400 ms per-load analysis cost. Two readers
   computing "the same" grid independently will drift.
+- **Snap the grid to the feature the user SEES, not the spectral-flux ODF.**
+  DJs set grids by eye against the rendered waveform: the kick is the burst
+  whose amplitude shoots up, and the "1" belongs on that rising edge. So the
+  grid snap (`kick_leading_edge_secs` / `broadband_amp_envelope`) targets the
+  **broadband-amplitude leading edge** — exactly what's drawn — not the
+  onset-detector peak (mid-attack, jitters ±17–44 ms between sub-peaks) nor the
+  amplitude *peak* (the old forward-only shift sat tens of ms late on slow
+  sub-bass kicks). Validated: a crisp kick locks within ~2 ms of the hand-set
+  grid, invariant to where in the bar you tap. Soft/ramping kicks with no clean
+  edge fall back to verbatim (the user's eye wins). Used by all three paths:
+  auto (`shift_grid_to_kick_edge`), set-the-1, and 3+ tap.
+- **"Set the 1" RE-ANCHORS the whole grid, it does not rotate `bar_phase`.**
+  A 1–2 tap on the deck-header BPM re-phases every beat onto the tapped kick
+  (`relatch_grid_at_downbeat_tap`), keeping BPM bit-exact. Pure rotation
+  (`bar_phase_from_tap`, "nearest analysed beat") can only pick an existing beat
+  up to ½ a beat away, so it can NEVER correct a sub-beat-off auto grid — and it
+  silently regressed once when `set_bar_phase` was reverted to rotate-only while
+  a test only exercised the dub-bpm fn, not the FFI. Stopped/prep taps land
+  verbatim; playing taps are latency-corrected upstream.
+- **The "1" is the first measurable beat (dance music).** For ~95 % of dance
+  music the downbeat is simply the first audible beat at the track start (every
+  hand-set grid is `bar_phase 0`). `apply_downbeat_refinement` picks the first
+  grid beat clearing 10 % of the track-max amplitude; the AlphaTheta snare/bass
+  rule is only the FALLBACK for the 5 % (reggae roll-ups, vocal/talk intros).
+  AlphaTheta-as-primary moved the 1 a beat late on borderline tracks (Oppidan,
+  conf 0.067). Use a PLAIN amplitude probe here, not the sharp
+  `kick_leading_edge_secs` — the edge detector skips a soft opening hit and
+  locks onto the first *loud* kick a beat later (wrong bar position).
+- **Tap-tempo integer-snap trusts the human on poor-onset tracks.**
+  `IntegerSnapPolicy::TAP` widens the tolerance to 0.25 BPM and accepts the
+  nearest integer *unconditionally* when `kept_fraction < 0.6` — a sparse fit
+  can't resolve sub-integer BPM and a ≤0.25 snap can't be an octave error, so
+  the tapped integer wins (Apocalypse: 174.8/174.9/175.10 → 175.0 regardless of
+  where you tap). `AUTO` stays strict so a clean fit at a genuine fractional
+  tempo (Chase & Status 174.98) is preserved. Don't loosen AUTO.
 
 ## Waveform rendering (Metal)
 

@@ -53,7 +53,10 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use dub_bpm::{analyze_beat_grid_with_profile, octave_profile_from_label, BeatGrid, OctaveProfile};
+use dub_bpm::{
+    analyze_beat_grid_with_profile, octave_profile_from_genre, octave_profile_from_label,
+    refine_downbeat_alphatheta, BeatGrid, OctaveProfile,
+};
 use dub_io::Track;
 use dub_library::{ActiveBeatgrid, Library, TrackSortKey};
 use rusqlite::params;
@@ -92,15 +95,16 @@ pub fn run(args: &[String]) -> Result<()> {
         return Err(anyhow!("diagnose requires a path, track id, or query"));
     }
     let target = positional.join(" ");
-    let profile = profile_label
-        .as_deref()
-        .map_or(OctaveProfile::Default, octave_profile_from_label);
 
     match mode {
         Mode::List => list_tracks(&target),
         Mode::GridsOnly => grids_only(&target),
         Mode::TapsOnly => taps_only(&target),
-        Mode::Full => full_diagnosis(&target, profile),
+        // No explicit `--profile` → derive it from the library genre,
+        // matching the app's load path (where `octave_profile_from_genre`
+        // is applied). This is why a bare `dub diagnose` now agrees with
+        // what the deck actually shows.
+        Mode::Full => full_diagnosis(&target, profile_label.as_deref()),
     }
 }
 
@@ -129,9 +133,27 @@ enum Mode {
 // Top-level modes
 // ---------------------------------------------------------------
 
-fn full_diagnosis(target: &str, profile: OctaveProfile) -> Result<()> {
+fn full_diagnosis(target: &str, profile_label: Option<&str>) -> Result<()> {
     let resolved = resolve_target(target)?;
     print_header(&resolved);
+
+    // Open the library once up front: it supplies the genre (→ octave
+    // profile, the app's load behaviour) and the beat-grid context below.
+    let lib = open_library_for(&resolved)?;
+    let genre = lib
+        .as_ref()
+        .and_then(|(library, track_id)| library_genre(library, track_id));
+    let profile = match profile_label {
+        Some(label) => octave_profile_from_label(label),
+        None => genre
+            .as_deref()
+            .map_or(OctaveProfile::Default, octave_profile_from_genre),
+    };
+    let profile_source = match (profile_label, &genre) {
+        (Some(_), _) => "explicit --profile".to_string(),
+        (None, Some(g)) => format!("genre {g:?}"),
+        (None, None) => "no genre tag → Default".to_string(),
+    };
 
     if let ResolvedRef::Path { path, .. } | ResolvedRef::PathInLibrary { path, .. } = &resolved {
         let track =
@@ -144,15 +166,36 @@ fn full_diagnosis(target: &str, profile: OctaveProfile) -> Result<()> {
             profile,
         )
         .context("analyze_beat_grid_with_profile")?;
-        println!("\n=== FRESH ANALYSIS ({profile:?} profile) ===");
+        println!("\n=== FRESH ANALYSIS ({profile:?} profile, from {profile_source}) ===");
         print_grid_summary(&grid);
+        // `grid.bar_phase` is the AlphaTheta-refined downbeat (the auto
+        // path now applies the snare-2&4 + bass-on-1 rule). Surface the
+        // confidence behind it, or note when it fell back to kick-ODF.
+        if !grid.beats.is_empty() {
+            let db = grid.beats[grid.bar_phase as usize % grid.beats.len()];
+            match refine_downbeat_alphatheta(
+                track.samples(),
+                track.sample_rate(),
+                track.channels(),
+                &grid,
+            ) {
+                Some(r) => println!(
+                    "  [downbeat] bar_phase={} t={db:.4}s  (AlphaTheta snare/bass conf={:.3})",
+                    grid.bar_phase, r.confidence
+                ),
+                None => println!(
+                    "  [downbeat] bar_phase={} t={db:.4}s  (AlphaTheta abstained → kick-ODF)",
+                    grid.bar_phase
+                ),
+            }
+        }
         println!();
         print_envelope_section(&track, &grid);
     } else {
         println!("(no on-disk path available; skipping audio analysis)");
     }
 
-    if let Some((library, track_id)) = open_library_for(&resolved)? {
+    if let Some((library, track_id)) = lib {
         println!("\n=== LIBRARY ===");
         print_library_context(&library, &track_id)?;
     } else {
@@ -162,6 +205,21 @@ fn full_diagnosis(target: &str, profile: OctaveProfile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The track's stored genre (any non-empty source), for deriving the
+/// octave profile the same way the app does. `None` when the track isn't
+/// in the library or carries no genre tag.
+fn library_genre(library: &Library, track_id: &str) -> Option<String> {
+    library
+        .connection()
+        .query_row(
+            "SELECT genre FROM track_metadata_source \
+             WHERE track_id = ?1 AND genre IS NOT NULL AND genre <> '' LIMIT 1",
+            params![track_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
 }
 
 fn list_tracks(query: &str) -> Result<()> {

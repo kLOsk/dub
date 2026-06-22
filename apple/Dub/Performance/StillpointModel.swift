@@ -142,8 +142,14 @@ enum StillpointTuning {
 
     // Belt.
     static let beltPitchPx = 56.0
-    static let beltDeadbandBpm = 0.015
-    static let beltSignFlipBpm = 0.03
+    // Deadband + sign-flip widened in round 7 to sit above the real
+    // slip-noise floor measured on rig captures: at the old 0.015 the
+    // belt was driven by pure decode noise ~90 % of the time even at a
+    // perfect tempo match (deckA/deckB diagnostic replay). 0.03 BPM
+    // clears the 2.5 s-windowed slip noise (~0.025 BPM on the noisier
+    // capture) while still showing a real ~0.1 BPM error.
+    static let beltDeadbandBpm = 0.03
+    static let beltSignFlipBpm = 0.06
     static let beltBaseVelocity = 3.0
     static let beltVelocityPerBpm = 55.0
     static let beltMaxVelocity = 110.0
@@ -156,7 +162,16 @@ enum StillpointTuning {
     // playheads. The engine's pitch% readout is display-filtered
     // (median + persistence-gated pole) for steady header digits;
     // a strobe null needs the actual relative rate, not the digits.
-    static let slipWindowSecs = 0.8
+    // Window lengthened 0.8 → 2.5 s in round 7: the raw playhead
+    // carries ~0.6–1.3 % decode noise, and at 0.8 s the LSQ slope of
+    // it gave ΔBPM noise of ~0.13 BPM — 8× the belt deadband and (the
+    // latent bug) far above the 0.02 green-gate threshold, so green
+    // could essentially never certify on timecode. 2.5 s drops the
+    // noise to ~0.025 BPM (76–97 % green-achievable on the captures).
+    // Cost: the belt settles in ~2.5 s, not instantly — acceptable for
+    // the ride-the-fader tempo stage; a recency-weighted estimator is
+    // the follow-up if it feels sluggish on the rig.
+    static let slipWindowSecs = 2.5
     static let slipMinSpanSecs = 0.35
     static let slipMinSamples = 8
 
@@ -256,6 +271,7 @@ final class StillpointEngine {
     // Slip estimator (least-squares dφ/dt over slipWindowSecs).
     private var slipRing: [(t: Double, ms: Double)] = []
     private var slipMsPerSec: Double?
+    private var lastFoldK = 0
 
     // Belt.
     private var beltOffset = 0.0
@@ -597,6 +613,21 @@ final class StillpointEngine {
             return Phase(live: nil)
         }
         frozenPhaseMs = nil
+        // A fold change re-references the whole phase computation
+        // (incoming vs frac(master × 2^k)): every buffered sample is in
+        // the old domain, so a 2.5 s-windowed slip would read the
+        // re-reference as a huge fake drift. Drop the history on the
+        // adoption, exactly like a wrap release.
+        if foldK != lastFoldK {
+            lastFoldK = foldK
+            phaseRing.removeAll()
+            coachRing.removeAll()
+            slipRing.removeAll()
+            slipMsPerSec = nil
+            displayPhaseMs = nil
+            phaseDispSign = 0
+            lastDriftSample = nil
+        }
         // Sticky half-beat wrap: crossing zero flips the shown side
         // immediately, but crossing the ±half-beat rail pins the band
         // beyond the rail until the phase has come 0.15 beat past it —

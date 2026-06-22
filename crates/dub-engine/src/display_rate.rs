@@ -912,6 +912,128 @@ mod tests {
         println!("replayed {path} -> /tmp/dub_replay.csv (production drive path)");
     }
 
+    /// Steadiness diagnostic (not a regression test): set
+    /// `DUB_DIAG_WAV=/path/capture.wav` to dump, per render quantum, the
+    /// **raw** decoder rate (pre-smoother), the **audible** rate
+    /// (post-smoother + playback anchor), the **display** pitch
+    /// (post-`DisplayRateFilter`), confidence, amplitude, groove
+    /// position, and lock state — to `/tmp/dub_diag.csv`. Lets offline
+    /// analysis separate genuine once-per-rev wobble from broadband
+    /// decode noise, and see whether the `confidence < 0.6` smoother
+    /// reset jolts the audible rate. No-op when the env var is unset.
+    #[test]
+    fn replay_capture_steadiness_diagnostic() {
+        use std::fmt::Write as _;
+
+        use ringbuf::traits::{Producer as _, Split as _};
+        const QUANTUM: usize = 512;
+        let Ok(path) = std::env::var("DUB_DIAG_WAV") else {
+            return;
+        };
+        let mut reader = hound::WavReader::open(&path).expect("open capture wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2, "capture must be stereo");
+        let sr = spec.sample_rate as f32;
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => {
+                let max = f32::from(i16::MAX);
+                reader
+                    .samples::<i16>()
+                    .map(|s| f32::from(s.unwrap()) / max)
+                    .collect()
+            }
+        };
+
+        let rb = ringbuf::HeapRb::<f32>::new(spec.sample_rate as usize * 2);
+        let (mut tx, rx) = rb.split();
+        let cfg = crate::timecode::TimecodeInputConfig {
+            input_sample_rate: sr,
+            ..crate::timecode::TimecodeInputConfig::default()
+        };
+        let mut input = crate::timecode::TimecodeInput::new(rx, cfg);
+        let mut display = DisplayRateFilter::new();
+
+        let dtq = f64::from(QUANTUM as u32) / f64::from(sr);
+        let mut csv = String::from(
+            "t,conf,amp,raw_pct,audible_pct,disp_pct,pos,lock,abs_lock,abs_pos,drift_ms\n",
+        );
+        let mut displayed = f64::NAN;
+        let mut calibration_started = false;
+        // Drift accounting: the relative playhead is the integral of the
+        // audible rate; the groove truth is the absolute LFSR position.
+        // Their (anchored) difference is the sticker drift the engine
+        // measures + heals — reproduced here from the raw capture so we
+        // can see whether the abs lock holds and whether drift runs away.
+        let mut rel_playhead = f64::NAN;
+        let mut drift_anchor: Option<f64> = None;
+        let mut t = 0.0f64;
+        for quantum in samples.chunks(QUANTUM * 2) {
+            assert_eq!(tx.push_slice(quantum), quantum.len());
+            let _ = input.drive();
+            let Some(out) = input.last_output() else {
+                t += dtq;
+                continue;
+            };
+            if !calibration_started && out.confidence > 0.8 && out.amplitude > 0.05 {
+                input.begin_calibration(48_000);
+                calibration_started = true;
+            }
+            let policy = input.policy();
+            let lock = if !policy.is_engaged() {
+                3
+            } else if policy.consecutive_below() > 0 {
+                2
+            } else {
+                1
+            };
+            if lock == 1 {
+                displayed = display.update(input.last_display_rate(), out.position_secs, dtq);
+            } else {
+                display.reset();
+            }
+            // Relative-mode playhead: integrate the audible rate whenever
+            // the deck is engaged (lock 1 or 2), exactly as the engine
+            // advances a relative-locked deck.
+            if policy.is_engaged() {
+                if rel_playhead.is_nan() {
+                    rel_playhead = out.position_secs;
+                }
+                rel_playhead += out.rate * dtq;
+            }
+            // Absolute groove truth + anchored drift (groove − playhead),
+            // engine sign: positive = playhead lags the record.
+            let abs_secs = out.abs_position_frames.map(|f| f / f64::from(sr));
+            let abs_lock = u8::from(abs_secs.is_some());
+            let drift_ms = match (abs_secs, rel_playhead.is_nan()) {
+                (Some(a), false) => {
+                    let off = a - rel_playhead;
+                    let anchor = *drift_anchor.get_or_insert(off);
+                    (off - anchor) * 1000.0
+                }
+                _ => f64::NAN,
+            };
+            let _ = writeln!(
+                csv,
+                "{:.4},{:.3},{:.4},{:+.5},{:+.5},{:+.4},{:.5},{},{},{:.5},{:+.3}",
+                t,
+                out.confidence,
+                out.amplitude,
+                (input.last_raw_rate() - 1.0) * 100.0,
+                (out.rate - 1.0) * 100.0,
+                (displayed - 1.0) * 100.0,
+                out.position_secs,
+                lock,
+                abs_lock,
+                abs_secs.unwrap_or(f64::NAN),
+                drift_ms,
+            );
+            t += dtq;
+        }
+        std::fs::write("/tmp/dub_diag.csv", csv).expect("write csv");
+        println!("replayed {path} -> /tmp/dub_diag.csv (raw/audible/display + abs_lock/drift)");
+    }
+
     #[test]
     fn fresh_filter_seeds_from_median_after_one_window() {
         let mut f = DisplayRateFilter::new();

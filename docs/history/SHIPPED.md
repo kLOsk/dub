@@ -92,6 +92,9 @@ commit or PR, not here.
 - **M11d-next** — Manual crates / playlists (`crates` + `crate_tracks`, drag-reorder, FFI 29).
 - **M11d.8** — Polish & First-Run: search debounce + selection-preserve, dev-text sweep, edge-of-list beep, idle-hint layout, first-run onboarding sheet; dogfood fixes for the reachability false-positive and Prep-mode Space-load auto-play.
 - **M11d-history** — Played From / Played Into, v1.0 stage: handover-inferred transitions (`SessionTracker`, min-play gate, duplicate suppression), full `play_history` capture with per-run `session_id`, deck-header "↝ usually" hint (click reveals the track in the browser), Session History smart crate (FFI 37).
+- **Timecode-display** — Killed the pitch/BPM divergence: the deck-header rate now equals the *audible* rate (xwax/Mixxx parity); the ±8-canonical anchor-warp display subsystem deleted (~176 LOC). Phasor-based absolute decode (whitened complex carrier) lifts vinyl abs-lock uptime (97.8 → 100 % on a steady capture).
+- **PRD-BEATS round 11** — Visual beat-grid: snap to the kick LEADING EDGE the waveform draws (auto `shift_grid_to_kick_edge`, set-the-1 relatch, 3+ tap) — ~2 ms of the hand-set grid, retiring the forward-only amplitude-peak shift (−516 LOC). Downbeat = "the 1 is the first measurable beat" (AlphaTheta demoted to the reggae/vocal-intro fallback). Set-the-1 re-anchors the grid instead of rotating `bar_phase`. Tap-tempo integer-snap policy (`IntegerSnapPolicy::{AUTO,TAP}`) lands clean integers on poor-onset tracks. DnB genre lifts the hip-hop double-time veto.
+- **Output-latency** — Full CoreAudio output-latency query (safety offset + device + stream + buffer, `dub-audio`) plumbed to an xwax-style audible-timeline snapshot (`position_snapshot_audible`) so a by-ear tap lands on the kick heard, not the one being rendered (FFI; needs on-rig validation).
 
 ---
 

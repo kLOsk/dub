@@ -32,11 +32,13 @@ use objc2_audio_toolbox::{
 };
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
-    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyTranslateUIDToDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard,
-    kAudioObjectPropertyManufacturer, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyLatency,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
+    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
+    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyElementWildcard, kAudioObjectPropertyManufacturer,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioStreamPropertyLatency,
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
@@ -664,6 +666,56 @@ impl AudioOutput {
         f64::from(self.buffer_frames) / f64::from(self.sample_rate)
     }
 
+    /// Full observable one-way output latency, in seconds:
+    ///
+    /// `safety_offset + device_latency + stream_latency + buffer_frames`,
+    /// divided by the device sample rate. This is the gap between the
+    /// engine handing a frame to the HAL and that frame leaving the DAC,
+    /// which the audible-timeline playhead (`position_snapshot_audible`)
+    /// subtracts so a tap lands on the kick the DJ actually *heard*
+    /// rather than the one the engine is rendering now.
+    ///
+    /// Each HAL property read **falls back to 0** on error, so the worst
+    /// case degrades to [`Self::latency_seconds`] (the buffer floor): a
+    /// device that doesn't publish a safety offset / latency simply
+    /// contributes 0 to the sum instead of failing the whole query. The
+    /// device id is resolved from the live output AudioUnit; if even that
+    /// fails we return the buffer floor unchanged.
+    ///
+    /// Not RT-safe — performs synchronous HAL property reads. Call once
+    /// from a non-audio thread at start and cache the result.
+    #[must_use]
+    pub fn total_output_latency_seconds(&self) -> f64 {
+        let buffer = self.buffer_frames;
+        let Ok(device) = device_id_from_audio_unit(&self.audio_unit) else {
+            return f64::from(buffer) / f64::from(self.sample_rate);
+        };
+        let safety = read_u32_property_or_zero(
+            device,
+            kAudioDevicePropertySafetyOffset,
+            kAudioObjectPropertyScopeOutput,
+        );
+        let device_latency = read_u32_property_or_zero(
+            device,
+            kAudioDevicePropertyLatency,
+            kAudioObjectPropertyScopeOutput,
+        );
+        let stream_latency = first_output_stream(device).map_or(0, |stream| {
+            read_u32_property_or_zero(
+                stream,
+                kAudioStreamPropertyLatency,
+                kAudioObjectPropertyScopeGlobal,
+            )
+        });
+        let total_frames = u64::from(buffer)
+            + u64::from(safety)
+            + u64::from(device_latency)
+            + u64::from(stream_latency);
+        #[allow(clippy::cast_precision_loss)]
+        let total_frames = total_frames as f64;
+        total_frames / f64::from(self.sample_rate)
+    }
+
     /// Number of times the render callback has fired since `start`.
     /// Useful for tests and diagnostics.
     #[must_use]
@@ -942,6 +994,87 @@ fn buffer_frame_size_range_address() -> AudioObjectPropertyAddress {
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     }
+}
+
+/// Read a `u32` HAL property, returning 0 on any failure. Used by the
+/// total-latency query, where a missing safety-offset / latency
+/// property must contribute 0 rather than fail the whole sum. `object`
+/// is a device **or** a stream `AudioObjectID`; the caller picks the
+/// matching scope.
+fn read_u32_property_or_zero(object: AudioObjectID, selector: u32, scope: u32) -> u32 {
+    let address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: u32 = 0;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut size: u32 = mem::size_of::<u32>() as u32;
+    // SAFETY: same contract as `get_buffer_frame_size` — `address` and
+    // `size` are stack-resident for the call, `out_data` points at a
+    // `u32` we own, qualifier null/0 is valid for these scalar selectors.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast::<c_void>(),
+        )
+    };
+    if status == 0 {
+        value
+    } else {
+        0
+    }
+}
+
+/// First output stream `AudioObjectID` of `device`, or `None` if the
+/// device exposes no output streams (or the query fails). Stream
+/// latency (`kAudioStreamPropertyLatency`) lives on the stream object,
+/// not the device, so the total-latency query needs this hop.
+fn first_output_stream(device: AudioObjectID) -> Option<AudioObjectID> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    // SAFETY: `address` is stack-resident; size is an out-param the call
+    // fills with the byte length of the stream-id array.
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    if status != 0 || (size as usize) < mem::size_of::<AudioObjectID>() {
+        return None;
+    }
+    let count = size as usize / mem::size_of::<AudioObjectID>();
+    let mut streams = vec![0 as AudioObjectID; count];
+    #[allow(clippy::cast_possible_truncation)]
+    let mut data_size: u32 = (count * mem::size_of::<AudioObjectID>()) as u32;
+    // SAFETY: `streams` owns `count` contiguous `AudioObjectID`s;
+    // `data_size` matches its byte length; qualifier null/0 is valid.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut data_size),
+            NonNull::new(streams.as_mut_ptr())?.cast::<c_void>(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    streams.first().copied()
 }
 
 fn get_buffer_frame_size(device: AudioObjectID) -> Result<u32, AudioError> {

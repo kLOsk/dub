@@ -73,9 +73,14 @@ final class TapToGridController {
         let playheadSecs: Double
     }
 
-    /// Called when the session window closes. Playhead times only,
-    /// in deck order.
-    var onCommit: (([Double]) -> Void)?
+    /// Called when the session window closes. Carries the buffered tap
+    /// PLAYHEAD positions (used for the grid anchor) plus, for a ≥3-tap
+    /// tempo session, the **wall-clock-derived BPM** (`nil` for a 1–2 tap
+    /// set-the-1). Tempo MUST come from wall-clock — the same value the
+    /// rolling preview shows — never from playhead-position deltas, which
+    /// are scaled by the platter's live playback rate (the cause of the
+    /// "committed BPM vastly off from the preview" bug).
+    var onCommit: ((_ playheads: [Double], _ wallClockBpm: Double?) -> Void)?
 
     /// Called whenever the open tap count changes (0 = idle).
     var onTapCountChanged: ((Int) -> Void)?
@@ -169,7 +174,7 @@ final class TapToGridController {
         entries.removeAll(keepingCapacity: true)
         onRollingBpmChanged?(nil)
         onTapCountChanged?(0)
-        onCommit?([playheadSecs])
+        onCommit?([playheadSecs], nil)
     }
 
     /// Returns the median tap interval (seconds) over the current
@@ -206,20 +211,27 @@ final class TapToGridController {
         return max(Self.minSessionWindowSecs, dynamicWindow)
     }
 
+    /// Wall-clock tap tempo (BPM) for the open session, or `nil` if fewer
+    /// than two taps / no positive interval. The single source of truth
+    /// for committed tempo — identical to the rolling-preview value, so the
+    /// committed grid BPM always matches what the DJ saw while tapping.
+    /// Derived purely from `Entry.wallTime` deltas, never the playhead.
+    func wallClockBpm() -> Double? {
+        guard let median = medianTapIntervalSecs(), median > 0 else { return nil }
+        return 60.0 / median
+    }
+
     private func publishRollingBpmIfReady() {
-        guard entries.count >= Self.previewMinTapCount,
-              let medianInterval = medianTapIntervalSecs(),
-              medianInterval > 0
-        else {
+        guard entries.count >= Self.previewMinTapCount, let bpm = wallClockBpm() else {
             return
         }
-        let bpm = 60.0 / medianInterval
-        // Sanity-clamp the preview to the same MIN/MAX BPM
-        // bounds the Rust estimator enforces. Outside this range
-        // a tap is almost certainly an accidental double-tap or
-        // a missed beat; surfacing 1500 BPM in the preview is
-        // worse than no preview at all.
-        guard bpm >= 40.0, bpm <= 240.0 else {
+        // Sanity-clamp the preview to the Rust estimator's analyzable
+        // MIN_BPM..MAX_BPM range (60..200). Outside it a tap is almost
+        // certainly an accidental double-tap or a missed beat, and
+        // committing it would build a grid the analyzer can't refine.
+        // (Previously 40..240, which let a previewed slow-tempo session
+        // commit a value the Rust path then silently dropped.)
+        guard bpm >= 60.0, bpm <= 200.0 else {
             onRollingBpmChanged?(nil)
             return
         }
@@ -244,6 +256,8 @@ final class TapToGridController {
     private func flushCommit() {
         guard !entries.isEmpty else { return }
         let playheads = entries.map(\.playheadSecs)
-        onCommit?(playheads)
+        // Tempo only for a real ≥3-tap session; 1–2 taps are set-the-1.
+        let bpm = entries.count >= Self.previewMinTapCount ? wallClockBpm() : nil
+        onCommit?(playheads, bpm)
     }
 }

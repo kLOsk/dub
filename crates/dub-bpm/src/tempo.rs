@@ -93,8 +93,8 @@
 //! with "very low confidence detection".
 
 use crate::octave_profile::{
-    profile_doubletime_rejected, profile_halftime_rejected, profile_skips_skank_pass,
-    profile_subdivision_rejected, OctaveProfile,
+    profile_doubletime_rejected, profile_halftime_rejected, profile_skips_hiphop_doubletime_pass,
+    profile_skips_skank_pass, profile_subdivision_rejected, OctaveProfile,
 };
 use crate::{BpmEstimate, BpmRange};
 
@@ -104,6 +104,141 @@ use crate::{BpmEstimate, BpmRange};
 /// genuinely weak-but-real beats. Re-evaluate when the streaming driver
 /// arrives in M8 and we have real-music data to calibrate against.
 const DETECTION_THRESHOLD: f64 = 0.05;
+
+/// How the ODF baseline is removed before autocorrelation.
+///
+/// [`DetrendMode::Global`] (default) subtracts a single whole-ODF mean —
+/// cheap, and correct when the ODF floor is flat. [`DetrendMode::Local`]
+/// subtracts an **asymmetric sliding-window mean** (the Mixxx / qm-dsp
+/// `adaptiveThreshold`, `p_pre = 8` / `p_post = 7`), which additionally
+/// removes *slow baseline drift* — build-ups, risers, filter sweeps —
+/// that the global mean leaves in to drag the autocorrelation.
+///
+/// `Local` is an **experiment** pending a corpus A/B win
+/// (`docs/investigations/BPM-DETECTOR-V2-INVESTIGATION.md` §7.4 item 2).
+/// It is selected only when the environment variable
+/// `DUB_BPM_DETREND=local` is set, so the default Classic behaviour is
+/// byte-for-byte unchanged. The maintainer runs the real-music corpus
+/// with and without the var to decide promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetrendMode {
+    Global,
+    Local,
+}
+
+/// Window half-widths for [`DetrendMode::Local`] (qm-dsp `adaptiveThreshold`
+/// defaults): `p_pre` samples before, `p_post` after the current sample.
+const DETREND_LOCAL_PRE: usize = 8;
+const DETREND_LOCAL_POST: usize = 7;
+
+/// Select the detrend mode from the environment. Default `Global`; only
+/// `DUB_BPM_DETREND=local` switches to the experimental local detrend.
+fn detrend_mode_from_env() -> DetrendMode {
+    match std::env::var("DUB_BPM_DETREND").as_deref() {
+        Ok("local") => DetrendMode::Local,
+        _ => DetrendMode::Global,
+    }
+}
+
+/// Detrend + half-wave rectify the ODF, removing the baseline that would
+/// otherwise dominate the autocorrelation at every lag.
+fn detrend_odf(odf: &[f32], mode: DetrendMode) -> Vec<f32> {
+    match mode {
+        DetrendMode::Global => {
+            #[allow(clippy::cast_precision_loss)]
+            let mean = odf.iter().sum::<f32>() / odf.len() as f32;
+            odf.iter().map(|&v| (v - mean).max(0.0)).collect()
+        }
+        DetrendMode::Local => local_mean_detrend(odf, DETREND_LOCAL_PRE, DETREND_LOCAL_POST),
+    }
+}
+
+/// Subtract an asymmetric sliding-window mean (`[i - p_pre, i + p_post]`,
+/// clamped at the edges) from each ODF sample, then half-wave rectify.
+/// Unlike the global mean this tracks and removes a slowly-moving ODF
+/// floor, so the autocorrelation sees only transient-relative energy.
+fn local_mean_detrend(odf: &[f32], p_pre: usize, p_post: usize) -> Vec<f32> {
+    let n = odf.len();
+    let mut out = vec![0.0f32; n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let lo = i.saturating_sub(p_pre);
+        let hi = (i + p_post + 1).min(n);
+        let mut sum = 0.0f32;
+        for &v in &odf[lo..hi] {
+            sum += v;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let local_mean = sum / (hi - lo) as f32;
+        *slot = (odf[i] - local_mean).max(0.0);
+    }
+    out
+}
+
+/// Goertzel magnitude of `x` at the tone whose period is exactly `lag`
+/// samples — the Fourier-tempogram bin for the tempo an ACF lag
+/// represents. `|Σ_n x[n] · e^{-j 2π n / lag}|`, computed with the
+/// Goertzel recurrence so the inner loop is trig-free.
+fn goertzel_mag(x: &[f32], lag: usize) -> f64 {
+    if lag < 2 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let omega = 2.0 * std::f64::consts::PI / lag as f64;
+    let coeff = 2.0 * omega.cos();
+    let mut s1 = 0.0f64;
+    let mut s2 = 0.0f64;
+    for &v in x {
+        let s = f64::from(v) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt()
+}
+
+/// Whether the DFT×ACF cross-tempogram experiment is enabled
+/// (`DUB_BPM_TEMPOGRAM=1`). Default off — Classic behaviour is unchanged.
+fn tempogram_enabled_from_env() -> bool {
+    std::env::var("DUB_BPM_TEMPOGRAM").as_deref() == Ok("1")
+}
+
+/// Per-candidate cross-tempogram weights for lags `[lag_min, lag_max]`,
+/// normalized so the strongest is `1.0`; `None` when the ODF has no
+/// periodic energy.
+///
+/// The autocorrelation has peaks at every **sub-multiple** of the true
+/// period — the half-tempo `174 → 87` failure mode the genre rule-forest
+/// exists to undo. A Fourier tempogram peaks at integer **multiples** of
+/// the tempo instead, so it is ~zero at the sub-harmonic. Multiplying the
+/// ACF score by the normalized DFT magnitude keeps only the periodicity
+/// present in **both**, suppressing the sub-harmonic peak the ACF alone
+/// cannot. EXPERIMENT pending a corpus A/B win
+/// (`docs/investigations/BPM-DETECTOR-V2-INVESTIGATION.md` §7.4 item 1).
+///
+/// **Empirical note (smoke test).** This only helps a *pure* sub-harmonic
+/// artifact — a slow octave with no real ODF periodicity. When the wrong
+/// octave is a *real* periodicity (a hi-hat ostinato at 2×, DnB's
+/// kick-kick spacing at ½×), the DFT magnitude there is genuinely high, so
+/// the blanket weight can *boost* the wrong octave: with this enabled, the
+/// `genre_octave` hip-hop-90 fixture flips to 180 (the real hi-hat rate).
+/// Pure click tracks (`known_bpm`) are unaffected. So this is *not* a clean
+/// win — it reinforces §4's overlapping-classes finding, and any promotion
+/// would need a sub-harmonic-restricted variant proven on the real corpus.
+fn tempogram_weights(detrended: &[f32], lag_min: usize, lag_max: usize) -> Option<Vec<f64>> {
+    if lag_max < lag_min {
+        return None;
+    }
+    let mut w: Vec<f64> = (lag_min..=lag_max)
+        .map(|lag| goertzel_mag(detrended, lag))
+        .collect();
+    let max = w.iter().copied().fold(0.0f64, f64::max);
+    if max <= 0.0 {
+        return None;
+    }
+    for v in &mut w {
+        *v /= max;
+    }
+    Some(w)
+}
 
 /// Internal helper: unbiased autocorrelation at a single lag.
 ///
@@ -647,12 +782,11 @@ pub(crate) fn estimate_tempo(
         return None;
     }
 
-    // Detrend (subtract mean) + half-wave rectify. This removes the DC
-    // bias that would otherwise dominate autocorrelation at every lag.
-    #[allow(clippy::cast_precision_loss)]
-    let n_f = odf.len() as f32;
-    let mean = odf.iter().sum::<f32>() / n_f;
-    let detrended: Vec<f32> = odf.iter().map(|&v| (v - mean).max(0.0)).collect();
+    // Detrend + half-wave rectify. Removes the baseline that would
+    // otherwise dominate autocorrelation at every lag. Default is the
+    // whole-ODF global mean; `DUB_BPM_DETREND=local` opts into the
+    // experimental sliding-window detrend (see [`DetrendMode`]).
+    let detrended = detrend_odf(odf, detrend_mode_from_env());
 
     // Pre-compute autocorrelation up to HARMONIC_DEPTH × lag_max (or
     // the end of the ODF, whichever comes first) so the harmonic-sum
@@ -748,6 +882,17 @@ pub(crate) fn estimate_tempo(
     let mut max_raw_score = f64::NEG_INFINITY;
     let mut best_lo_raw: Option<usize> = None;
 
+    // Optional DFT×ACF cross-tempogram weighting (`DUB_BPM_TEMPOGRAM=1`).
+    // When enabled, each candidate's harmonic-mean ACF score is multiplied
+    // by the normalized Fourier-tempogram magnitude at that tempo, which
+    // suppresses the sub-harmonic (half-tempo) peak the ACF alone retains.
+    // Off by default: `tempogram` is `None` and the fold is a no-op.
+    let tempogram = if tempogram_enabled_from_env() {
+        tempogram_weights(&detrended, lag_min, lag_max)
+    } else {
+        None
+    };
+
     for lo in lag_min..=lag_max {
         let mut score_sum = 0.0f64;
         let mut k_count = 0usize;
@@ -767,6 +912,10 @@ pub(crate) fn estimate_tempo(
             #[allow(clippy::cast_precision_loss)]
             let count_f = k_count as f64;
             score_sum / count_f
+        };
+        let raw_score = match &tempogram {
+            Some(w) if raw_score.is_finite() => raw_score * w[lo - lag_min],
+            _ => raw_score,
         };
         raw_scores.push(raw_score);
 
@@ -884,7 +1033,9 @@ pub(crate) fn estimate_tempo(
             }
             continue;
         }
-        if hiphop_doubletime_rejected(candidate_bpm, raw_score, &qualified_pairs) {
+        if !profile_skips_hiphop_doubletime_pass(profile)
+            && hiphop_doubletime_rejected(candidate_bpm, raw_score, &qualified_pairs)
+        {
             if std::env::var("DUB_BPM_DEBUG").is_ok() {
                 eprintln!(
                     "  PASS2 lag={lo:3} bpm={candidate_bpm:6.2} raw={raw_score:.6} REJECTED (hip-hop double-time)"
@@ -1031,6 +1182,128 @@ pub(crate) fn estimate_tempo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_detrend_matches_legacy_behavior() {
+        // The default path must be byte-for-byte the old global-mean
+        // detrend so Classic corpus results are unchanged.
+        let odf = [0.0f32, 2.0, 0.0, 4.0, 0.0, 0.0];
+        #[allow(clippy::cast_precision_loss)]
+        let mean = odf.iter().sum::<f32>() / odf.len() as f32;
+        let expected: Vec<f32> = odf.iter().map(|&v| (v - mean).max(0.0)).collect();
+        let got = detrend_odf(&odf, DetrendMode::Global);
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!((g - e).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn local_detrend_zeros_a_constant() {
+        let odf = vec![0.7f32; 64];
+        let out = local_mean_detrend(&odf, 8, 7);
+        assert!(
+            out.iter().all(|&v| v.abs() < 1e-6),
+            "a constant ODF must detrend to ~0"
+        );
+    }
+
+    #[test]
+    fn local_detrend_removes_slow_ramp_keeps_spike() {
+        // Slow linear baseline ramp + one sharp spike. The local detrend
+        // flattens the ramp and keeps the spike; the global mean leaves a
+        // large residual baseline at the ramp's high end.
+        let n = 200usize;
+        #[allow(clippy::cast_precision_loss)]
+        let mut odf: Vec<f32> = (0..n).map(|i| i as f32 * 0.05).collect();
+        odf[100] += 20.0;
+
+        let local = local_mean_detrend(&odf, 8, 7);
+        assert!(
+            local[100] > 10.0,
+            "spike must survive local detrend, got {}",
+            local[100]
+        );
+        let local_baseline: f32 = local[40..60].iter().sum::<f32>() / 20.0;
+        assert!(
+            local_baseline < 0.5,
+            "ramp baseline should be flattened by local detrend, got {local_baseline}"
+        );
+
+        let global = detrend_odf(&odf, DetrendMode::Global);
+        let global_tail: f32 = global[180..200].iter().sum::<f32>() / 20.0;
+        assert!(
+            global_tail > local_baseline,
+            "global detrend leaves more baseline drift ({global_tail}) than local ({local_baseline})"
+        );
+    }
+
+    #[test]
+    fn local_detrend_is_non_negative() {
+        let odf = [5.0f32, 0.0, 0.0, 0.0, 0.0];
+        let out = local_mean_detrend(&odf, 2, 2);
+        assert!(
+            out.iter().all(|&v| v >= 0.0),
+            "half-wave rectify must clamp negatives"
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn sine_period(n: usize, period: f64) -> Vec<f32> {
+        (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * i as f64 / period).sin() as f32)
+            .collect()
+    }
+
+    #[test]
+    fn goertzel_selects_fundamental_not_subharmonic() {
+        // A pure period-40 sinusoid: the DFT magnitude at lag 40 (the true
+        // period) must dominate lag 80 (the half-tempo sub-harmonic). This
+        // is the property that suppresses the 174→87 octave error.
+        let x = sine_period(4000, 40.0);
+        let at_fundamental = goertzel_mag(&x, 40);
+        let at_subharmonic = goertzel_mag(&x, 80);
+        assert!(
+            at_fundamental > 10.0 * at_subharmonic,
+            "DFT at the true period ({at_fundamental}) must dominate the \
+             half-tempo sub-harmonic ({at_subharmonic})"
+        );
+    }
+
+    #[test]
+    fn tempogram_weights_peak_at_true_period() {
+        let x = sine_period(2000, 50.0);
+        let w = tempogram_weights(&x, 30, 120).expect("periodic signal has weights");
+        let max = w.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            (max - 1.0).abs() < 1e-9,
+            "weights must be normalized to max 1.0"
+        );
+        let argmax = w
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0
+            + 30;
+        assert!(
+            argmax.abs_diff(50) <= 1,
+            "peak weight should land at lag ~50, got {argmax}"
+        );
+    }
+
+    #[test]
+    fn tempogram_weights_none_on_silence() {
+        let x = vec![0.0f32; 1000];
+        assert!(tempogram_weights(&x, 30, 120).is_none());
+    }
+
+    #[test]
+    fn tempogram_off_by_default() {
+        assert!(
+            !tempogram_enabled_from_env(),
+            "the cross-tempogram experiment must be off unless DUB_BPM_TEMPOGRAM=1"
+        );
+    }
 
     /// Helper for the `tempo_prior_weight_*` tests below: assert
     /// the prior at `bpm` is within `±tol` of `expected`. Uses the

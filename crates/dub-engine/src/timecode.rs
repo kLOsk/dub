@@ -55,7 +55,7 @@ use ringbuf::HeapCons;
 
 use dub_timecode::{whitening_from_covariance, DecodeOutput, Decoder, Format, RateSmoother};
 
-use crate::anchor::{AnchorMap, ANCHOR_MINUS_8, ANCHOR_PLUS_8, ANCHOR_ZERO, CANONICAL_RATES};
+use crate::anchor::AnchorMap;
 
 // -------------------------------------------------------------------
 // Re-exports from this module's public API:
@@ -130,62 +130,6 @@ const ZERO_ANCHOR_CAPTURE_SECS: f64 = 3.6;
 /// skips the anchor (truth displayed) instead of nulling a deliberate
 /// setting — the calibrate-at-any-pitch contract survives.
 const ZERO_ANCHOR_GUARD: f64 = 0.004;
-
-/// Band around a canonical ±8 stop within which a parked, stable rate
-/// is read as "fader against the stop". Judged on the **zero-corrected**
-/// scale (`apply_playback`) — never the stop-warped one: judging on the
-/// full corrected scale let every slightly-off adoption shift the next
-/// window further from the true stop, an unbounded ratchet (on-rig it
-/// walked deck B's stops to +12 / −14 displayed and, once the true stop
-/// fell outside the shifted window, the session could never recover).
-/// Tight on purpose: both rig decks' stops sit within ±0.45 % of
-/// canonical once the zero anchor removes the common-mode offset, while
-/// a deliberate beatmatch hold at +7 % must never read as "the stop".
-/// A hold inside the band (±0.6 % of a stop) is the one accepted
-/// ambiguity — display-only, and the fixed window means the next real
-/// park relearns the truth.
-const STOP_ANCHOR_BAND: f64 = 0.006;
-
-/// Maximum tracker travel across the settled portion of a stop-anchor
-/// dwell (the last two-thirds — see the trailing reference point in
-/// `learn_anchors`). The deviation gate cannot tell a park from a slow
-/// fader ride (~1 %/s keeps |rate − ema| well under the gate), but
-/// across seconds a ride moves the tracker by most of the band while a
-/// park's endpoints differ only by residual rev wobble. A drifted
-/// dwell is a ride: reject it and let the dwell restart where the
-/// fader actually stopped.
-const STOP_ANCHOR_PARK_DRIFT_MAX: f64 = 0.005;
-
-/// Total stable in-band dwell required to adopt a ±8 stop anchor: the
-/// settle prefix plus a measurement tail of two full 33⅓ revolutions
-/// (same rationale as [`ZERO_ANCHOR_CAPTURE_SECS`] — the eccentricity
-/// wobble cancels to first order; a shorter window adopted the rig's
-/// −8 stop 0.1 % off, so it displayed −8.10). A ~5 s park — a
-/// deliberate gesture — adopts; no fader ride can sustain the band
-/// that long. Continued parking refreshes the anchor every cycle,
-/// each refresh blending halfway toward the new window.
-const STOP_ANCHOR_LEARN_SECS: f64 = 4.8;
-
-/// Settle prefix of a stop dwell: for its first stretch the stability
-/// tracker (τ = 0.5 s) is still converging out of the ride-in and the
-/// decode out of lock-on, so neither the park-vs-ride reference nor
-/// the adoption mean may cover it (measured on the rig's deck B: the
-/// settling head biased the +8 adoption 0.08 % low and tripped the
-/// drift gate on a genuine −8 park).
-const STOP_ANCHOR_SETTLE_SECS: f64 = 1.2;
-
-/// Stability tracker pole for anchor learning (EMA of rate and of
-/// |rate − ema|).
-const ANCHOR_STAB_TAU_SECS: f64 = 0.5;
-
-/// Maximum rate deviation (EMA of |rate − ema|) that still counts as
-/// "parked" for stop learning. Sized from the real capture: a steady
-/// platter's raw smoothed rate carries ±0.3–0.45 % of rev-locked
-/// wobble at the stops, so this gate only rejects active hand motion
-/// (scratching, fast rides) — the dwell + band do the parked-vs-ride
-/// discrimination, and the adopted value is the windowed mean, which
-/// averages the wobble out.
-const ANCHOR_STAB_DEV_MAX: f64 = 0.012;
 
 /// Default RMS amplitude floor below which the input is treated as
 /// "carrier dead" regardless of confidence.
@@ -665,47 +609,37 @@ pub struct TimecodeInput {
     /// de-spiked. See [`RateSmoother`].
     rate_smoother: RateSmoother,
 
-    /// Per-deck canonical pitch-anchor map (see [`crate::anchor`]):
-    /// pins the fader's 0 detent and ±8 stops to exactly 0 / ±8 %,
-    /// the way the DJ's positional mental model expects. Session-
-    /// scoped — reset by [`Self::begin_calibration`], dies with the
-    /// attach (DJs travel; every venue's decks are relearned fresh).
+    /// Per-deck detent (zero) anchor (see [`crate::anchor`]): pins the
+    /// fader's 0 detent to exactly unity, the way the DJ's positional
+    /// mental model expects. Session-scoped — reset by
+    /// [`Self::begin_calibration`], dies with the attach (DJs travel;
+    /// every venue's decks are relearned fresh).
     anchors: AnchorMap,
     /// In-flight zero-anchor capture: `(Σ rate·dt, secs)` over
     /// confident chunks. Armed when the whitening calibration
     /// installs; `None` otherwise.
     zero_anchor_cap: Option<(f64, f64)>,
-    /// Anchor-learning stability tracker: EMA of the smoothed rate
-    /// and of its absolute deviation. Seeded from the first clean
-    /// chunk (converging from a cold 1.0 wasted ~2 s of any stop's
-    /// dwell budget on transient).
-    anchor_stab_ema: f64,
-    anchor_stab_dev: f64,
-    anchor_stab_primed: bool,
-    /// Consecutive chunks beyond the regime-jump threshold (see
-    /// `learn_anchors`: one chunk is a dust spike, two is a slam).
-    anchor_jump_run: u32,
-    /// Stable in-band dwell accumulated toward the [−8, +8] stop
-    /// anchors, plus the running `Σ rate·dt` over the dwell so the
-    /// adopted value is the wobble-averaged mean, not a single EMA
-    /// snapshot.
-    stop_anchor_run: [f64; 2],
-    stop_anchor_sum: [f64; 2],
-    /// Exact seconds covered by `stop_anchor_sum` (the dwell tail past
-    /// the settle prefix — `run − SETTLE` is up to a chunk off).
-    stop_anchor_secs: [f64; 2],
-    /// Tracker value at each dwell's start, for the park-vs-ride check.
-    stop_anchor_start: [f64; 2],
     /// Confidence / amplitude floors for anchor learning, copied from
     /// the attach config (a chunk participates only when it would
     /// also count as a clean lock).
     anchor_conf_floor: f32,
     anchor_amp_floor: f32,
-    /// The most recent chunk's rate on the canonical **display**
-    /// scale (all anchors, incl. the display-only ±8 stops). The
-    /// pitch/BPM readout consumes this; playback consumes the
-    /// zero-anchor-only rate in [`DecodeOutput::rate`].
+    /// The most recent chunk's displayed rate. **Identical to the
+    /// audible [`DecodeOutput::rate`]** (the zero-anchor-only scale):
+    /// the pitch/BPM readout shows exactly the rate that plays, so two
+    /// decks matched to the same shown BPM run at the same speed (xwax
+    /// `pl->pitch` / Mixxx `m_pRateRatio` parity). The ±8 stop anchors
+    /// are deliberately **not** folded in here — pinning the display to
+    /// canonical ±8 while playback stayed on the true scale made the
+    /// matched number diverge from the groove (the beatmatch bug).
     last_display_rate: f64,
+
+    /// Diagnostic tap: the most recent chunk's **raw** decoder rate,
+    /// captured *before* the [`RateSmoother`] (and anchors) touch it.
+    /// Only the offline replay harness reads this — it lets us compare
+    /// raw vs smoothed vs display and tell genuine once-per-rev wobble
+    /// from broadband decode noise. Not on any hot consumer.
+    last_raw_rate: f64,
 
     /// Traktor-style session-start gate — see
     /// [`TimecodeInputConfig::hold_until_calibrated`].
@@ -755,16 +689,9 @@ impl TimecodeInput {
             installed_whitening: dub_timecode::IDENTITY_WHITENING,
             calibration_seq: 0,
             rate_smoother: RateSmoother::new(),
+            last_raw_rate: 1.0,
             anchors: AnchorMap::new(),
             zero_anchor_cap: None,
-            anchor_stab_ema: 1.0,
-            anchor_stab_dev: 0.0,
-            anchor_stab_primed: false,
-            anchor_jump_run: 0,
-            stop_anchor_run: [0.0; 2],
-            stop_anchor_sum: [0.0; 2],
-            stop_anchor_secs: [0.0; 2],
-            stop_anchor_start: [0.0; 2],
             anchor_conf_floor: config.confidence_threshold,
             anchor_amp_floor: config.amplitude_threshold,
             last_display_rate: 1.0,
@@ -796,67 +723,31 @@ impl TimecodeInput {
             target: target_frames.max(1),
         });
         self.calibrated = false;
-        // A fresh calibration is a fresh session for the pitch
-        // anchors too: forget the map and any in-flight capture so
-        // the new measurements are of raw, unwarped rates. The zero
-        // capture re-arms when the new whitening installs.
+        // A fresh calibration is a fresh session for the zero anchor
+        // too: forget it and any in-flight capture so the new
+        // measurement is of the raw rate. The zero capture re-arms when
+        // the new whitening installs.
         self.anchors.reset();
         self.zero_anchor_cap = None;
-        self.stop_anchor_run = [0.0; 2];
-        self.stop_anchor_sum = [0.0; 2];
-        self.stop_anchor_secs = [0.0; 2];
     }
 
-    /// Fold one chunk's raw smoothed rate into the anchor learners.
+    /// Fold one chunk's raw smoothed rate into the zero (detent) anchor.
     ///
-    /// - **Zero anchor**: while a capture is armed (whitening just
-    ///   installed, fader at the detent per the calibration ritual),
-    ///   average [`ZERO_ANCHOR_CAPTURE_SECS`] of confident carrier;
-    ///   adopt only inside [`ZERO_ANCHOR_GUARD`] — calibrating at any
-    ///   other pitch position just skips the anchor.
-    /// - **±8 stop anchors**: whenever the rate parks rock-stable
-    ///   inside [`STOP_ANCHOR_BAND`] of a canonical stop (judged on
-    ///   the zero-corrected scale, so the window never moves with a
-    ///   prior stop adoption) for [`STOP_ANCHOR_LEARN_SECS`], without
-    ///   the tracker travelling (a slow fader ride is not a park),
-    ///   that's the fader against the stop — adopt the stable rate.
-    ///   Re-parking refreshes the anchor (temperature drift).
+    /// While a capture is armed (whitening just installed, fader at the
+    /// detent per the calibration ritual), average
+    /// [`ZERO_ANCHOR_CAPTURE_SECS`] of confident carrier and adopt only
+    /// inside [`ZERO_ANCHOR_GUARD`] — calibrating at any other pitch
+    /// position just skips the anchor (the calibrate-at-any-pitch
+    /// contract). The capture window spans two full 33⅓ revolutions, so
+    /// the rev-locked eccentricity wobble cancels to first order in the
+    /// mean.
     ///
     /// RT-safe: scalar arithmetic only.
-    fn learn_anchors(&mut self, raw_rate: f64, confidence: f32, amplitude: f32, dt: f64) {
+    fn learn_zero_anchor(&mut self, raw_rate: f64, confidence: f32, amplitude: f32, dt: f64) {
         let clean = confidence >= self.anchor_conf_floor && amplitude >= self.anchor_amp_floor;
         if !clean {
-            self.stop_anchor_run = [0.0; 2];
-            self.stop_anchor_sum = [0.0; 2];
-            self.stop_anchor_secs = [0.0; 2];
             return;
         }
-        if self.anchor_stab_primed && (raw_rate - self.anchor_stab_ema).abs() <= 0.05 {
-            self.anchor_jump_run = 0;
-            let a = (dt / ANCHOR_STAB_TAU_SECS).min(1.0);
-            self.anchor_stab_ema += a * (raw_rate - self.anchor_stab_ema);
-            self.anchor_stab_dev +=
-                a * ((raw_rate - self.anchor_stab_ema).abs() - self.anchor_stab_dev);
-        } else if self.anchor_stab_primed && self.anchor_jump_run == 0 {
-            // A single out-of-range chunk at a steady park is a dust
-            // click, not a fader slam (a slam sustains the excursion
-            // across chunks). Skip it entirely — folding it in, or
-            // reseeding on it, killed every stop-dwell refresh on a
-            // deck whose record threw a spike every few seconds.
-            self.anchor_jump_run = 1;
-            return;
-        } else {
-            // Cold start, or a regime jump (a fader slam to a stop):
-            // reseed instead of slewing — converging the tracker from
-            // the previous regime wasted ~1 s of every stop's dwell
-            // budget. Seed the deviation at the gate so stability
-            // still has to be *proven*, just quickly (τ ≈ 0.5 s).
-            self.anchor_stab_ema = raw_rate;
-            self.anchor_stab_dev = ANCHOR_STAB_DEV_MAX;
-            self.anchor_stab_primed = true;
-            self.anchor_jump_run = 0;
-        }
-
         if let Some((sum, secs)) = self.zero_anchor_cap.as_mut() {
             *sum += raw_rate * dt;
             *secs += dt;
@@ -864,62 +755,28 @@ impl TimecodeInput {
                 let mean = *sum / *secs;
                 self.zero_anchor_cap = None;
                 if (mean - 1.0).abs() <= ZERO_ANCHOR_GUARD {
-                    self.anchors.learn(ANCHOR_ZERO, mean);
+                    self.anchors.learn_zero(mean);
                 }
-            }
-        }
-
-        // Judge the band on the smoothed tracker, not the raw chunk:
-        // the rev wobble (±0.4 % on a real deck) crosses any sane band
-        // edge and would reset the dwell on every excursion. And on the
-        // zero-corrected scale only — the trustworthy, session-stable
-        // one (±0.4 % guard, learned silently at calibration). Judging
-        // on the stop-warped scale let each adoption shift the next
-        // window (see [`STOP_ANCHOR_BAND`]).
-        let corrected_ema = self.anchors.apply_playback(self.anchor_stab_ema);
-        for (i, slot) in [ANCHOR_MINUS_8, ANCHOR_PLUS_8].into_iter().enumerate() {
-            let in_band = (corrected_ema - CANONICAL_RATES[slot]).abs() <= STOP_ANCHOR_BAND
-                && self.anchor_stab_dev < ANCHOR_STAB_DEV_MAX;
-            if in_band {
-                self.stop_anchor_run[i] += dt;
-                if self.stop_anchor_run[i] <= STOP_ANCHOR_SETTLE_SECS {
-                    // Settle prefix: the drift reference trails and
-                    // nothing is averaged yet (see the const docs).
-                    self.stop_anchor_start[i] = self.anchor_stab_ema;
-                } else {
-                    self.stop_anchor_sum[i] += raw_rate * dt;
-                    self.stop_anchor_secs[i] += dt;
-                }
-                if self.stop_anchor_run[i] >= STOP_ANCHOR_LEARN_SECS {
-                    // A dwell whose tracker travelled is a slow ride
-                    // caught inside the band, not a park — adopting it
-                    // would pin the stop where the fader merely passed.
-                    let parked = (self.anchor_stab_ema - self.stop_anchor_start[i]).abs()
-                        <= STOP_ANCHOR_PARK_DRIFT_MAX;
-                    if parked {
-                        self.anchors
-                            .blend_learn(slot, self.stop_anchor_sum[i] / self.stop_anchor_secs[i]);
-                    }
-                    self.stop_anchor_run[i] = 0.0;
-                    self.stop_anchor_sum[i] = 0.0;
-                    self.stop_anchor_secs[i] = 0.0;
-                }
-            } else {
-                self.stop_anchor_run[i] = 0.0;
-                self.stop_anchor_sum[i] = 0.0;
-                self.stop_anchor_secs[i] = 0.0;
             }
         }
     }
 
-    /// The most recent chunk's rate on the canonical display scale
-    /// (zero anchor + display-only ±8 stop anchors). The deck-header
-    /// pitch/BPM chain consumes this instead of the playback rate so
-    /// the fader's stops read exactly ±8 without ever warping what
-    /// you hear.
+    /// The most recent chunk's displayed rate — the zero-anchored
+    /// rate that the deck-header pitch/BPM chain shows. Equal to the
+    /// audible playback rate, so the matched number is the played
+    /// rate (xwax / Mixxx parity); the detent still reads exactly 0
+    /// (zero anchor), but the ±8 stops read their true value, never a
+    /// canonical pin that would diverge the display from the groove.
     #[must_use]
     pub fn last_display_rate(&self) -> f64 {
         self.last_display_rate
+    }
+
+    /// Diagnostic: the raw decoder rate before the smoother/anchors,
+    /// for the offline replay harness. See [`Self::last_raw_rate`].
+    #[cfg(test)]
+    pub(crate) fn last_raw_rate(&self) -> f64 {
+        self.last_raw_rate
     }
 
     /// Test/diagnostic view of the anchor map.
@@ -1073,6 +930,7 @@ impl TimecodeInput {
             start = end;
             #[allow(clippy::cast_precision_loss)]
             let dt_secs = chunk_frames as f64 / f64::from(self.input_sample_rate);
+            self.last_raw_rate = out.rate;
             // De-spike + adaptively smooth the rate the instant it
             // leaves the decoder, so the same clean value feeds both
             // the lift policy (audible playback rate) and
@@ -1081,14 +939,20 @@ impl TimecodeInput {
             out.rate = self
                 .rate_smoother
                 .smooth_for(out.rate, out.confidence, dt_secs);
-            // Canonical pitch anchors (see `crate::anchor`): learn
-            // from the raw smoothed rate, then warp it so playback,
-            // policy, telemetry, and the display chain all live on
-            // the canonical scale — the fader's detent reads exactly
-            // 0, the stops exactly ±8.
-            self.learn_anchors(out.rate, out.confidence, out.amplitude, dt_secs);
-            self.last_display_rate = self.anchors.apply(out.rate);
+            // Zero (detent) anchor (see `crate::anchor`): the one
+            // correction, applied to BOTH the displayed rate and
+            // playback, so the fader's detent reads exactly 0 *and*
+            // plays at unity. Because display and playback share this
+            // single scale, two decks matched to the same shown BPM run
+            // at the same speed — xwax (`pl->pitch`) and Mixxx
+            // (`m_pRateRatio`) likewise show the one rate that plays. (A
+            // prior revision also pinned the ±8 stops to canonical on a
+            // *display-only* scale; that drove the shown BPM off the
+            // played rate and was removed with its stop-learning state
+            // machine.)
+            self.learn_zero_anchor(out.rate, out.confidence, out.amplitude, dt_secs);
             out.rate = self.anchors.apply_playback(out.rate);
+            self.last_display_rate = out.rate;
             let intent = self.policy.step_for(out, dt_secs);
             if let LiftIntent::LockedAbsolute { advance_frames, .. } = intent {
                 abs_advance_sum += advance_frames;
@@ -1800,17 +1664,17 @@ mod policy_tests {
 
 #[cfg(test)]
 mod anchor_learning_tests {
-    //! Canonical pitch anchors learned through the real ringbuf →
-    //! decoder → smoother → drive() path: the fader's 0 detent and ±8
-    //! stops must read exactly canonical, fine moves must survive, and
-    //! the guards must refuse anchors that would null a deliberate
-    //! pitch setting.
+    //! The zero (detent) anchor learned through the real ringbuf →
+    //! decoder → smoother → drive() path: the fader's 0 detent must read
+    //! exactly unity, fine moves must survive, the guard must refuse an
+    //! anchor that would null a deliberate pitch setting, and the
+    //! displayed rate must always equal the played rate (no display-only
+    //! warp — xwax/Mixxx parity).
 
     use ringbuf::traits::{Producer as _, Split as _};
     use ringbuf::HeapRb;
 
     use super::*;
-    use crate::anchor::{ANCHOR_PLUS_8, ANCHOR_ZERO};
 
     const SR: f32 = 48_000.0;
     const BLOCK: usize = 512;
@@ -1874,7 +1738,7 @@ mod anchor_learning_tests {
         let _ = run(&mut input, &mut tx, &mut gen, 1.002, 6.0);
         assert!(input.is_calibrated(), "whitening should have installed");
         assert!(
-            input.anchors().learned(ANCHOR_ZERO),
+            input.anchors().zero_learned(),
             "zero anchor should be learned"
         );
         let mean = run(&mut input, &mut tx, &mut gen, 1.002, 1.0);
@@ -1899,7 +1763,7 @@ mod anchor_learning_tests {
         let _ = run(&mut input, &mut tx, &mut gen, 1.03, 6.0);
         assert!(input.is_calibrated());
         assert!(
-            !input.anchors().learned(ANCHOR_ZERO),
+            !input.anchors().zero_learned(),
             "guard must refuse a +3 % 'zero'"
         );
         let mean = run(&mut input, &mut tx, &mut gen, 1.03, 1.0);
@@ -1907,142 +1771,24 @@ mod anchor_learning_tests {
     }
 
     #[test]
-    fn parked_stop_is_adopted_and_pinned_to_canonical() {
-        // The fader parked against a +8 stop that truly produces
-        // +8.15 %: after the stable dwell, the stop anchor is adopted
-        // and the consumed rate pins to exactly +8.00 %.
+    fn display_rate_always_equals_the_played_rate() {
+        // xwax/Mixxx parity, and the regression guard for the removed
+        // ±8 display warp: at a deliberate +7 % hold (no calibration,
+        // so the zero anchor is identity), the rate must read ~+7 % AND
+        // the displayed rate must equal the played rate. A display-only
+        // pitch warp — the thing that made two decks shown the same BPM
+        // run at different speeds — would split these apart.
         let (mut input, mut tx) = input_with_producer();
         let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
-        let _ = run(&mut input, &mut tx, &mut gen, 1.0815, 6.0);
+        let mean = run(&mut input, &mut tx, &mut gen, 1.07, 6.0);
         assert!(
-            input.anchors().learned(ANCHOR_PLUS_8),
-            "+8 stop should be adopted after a stable park"
-        );
-        // Playback is untouched by stop anchors (no audible warp)...
-        let mean = run(&mut input, &mut tx, &mut gen, 1.0815, 1.0);
-        assert!(
-            (mean - 1.0815).abs() < 5e-4,
-            "stop anchors must not warp playback, got {mean}"
-        );
-        // ...while the display scale pins the stop to exactly +8 %.
-        let disp = input.last_display_rate();
-        assert!(
-            (disp - 1.08).abs() < 5e-4,
-            "display must read exactly +8 %, got {disp}"
-        );
-    }
-
-    #[test]
-    fn mid_range_ride_never_adopts_a_stop() {
-        // Riding at +3 % for a long time is nowhere near a stop band:
-        // no anchor, rate passes through unwarped.
-        let (mut input, mut tx) = input_with_producer();
-        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
-        let mean = run(&mut input, &mut tx, &mut gen, 1.03, 5.0);
-        assert!(!input.anchors().learned(ANCHOR_PLUS_8));
-        assert!(!input.anchors().learned(ANCHOR_ZERO));
-        assert!((mean - 1.03).abs() < 1e-3);
-    }
-
-    /// Drive `secs` of carrier ramping linearly `from → to` — a fader
-    /// ride through the production path.
-    fn ramp(
-        input: &mut TimecodeInput,
-        tx: &mut ringbuf::HeapProd<f32>,
-        gen: &mut dub_timecode::signal::Generator,
-        from: f64,
-        to: f64,
-        secs: f64,
-    ) {
-        let mut sig = vec![0.0_f32; BLOCK * 2];
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let blocks = (secs * f64::from(SR) / BLOCK as f64) as usize;
-        for b in 0..blocks {
-            #[allow(clippy::cast_precision_loss)]
-            let rate = from + (to - from) * (b as f64 / blocks as f64);
-            gen.render(&mut sig, rate, 0.4);
-            assert_eq!(tx.push_slice(&sig), sig.len());
-            let _ = input.drive();
-        }
-    }
-
-    #[test]
-    fn slow_ride_to_the_stop_adopts_the_park_not_the_approach() {
-        // The on-rig deck-B failure: riding the fader slowly toward
-        // the +8 stop (beatmatching pace, ~1 %/s) keeps the stability
-        // tracker's deviation under the gate while it crosses the stop
-        // band, so the dwell fired mid-approach and adopted a "stop"
-        // ~0.8 % shy of the real one. The display at the true stop
-        // then read +8.8 instead of +8.0 — and worse, the warp shifted
-        // the band so each subsequent ride ratcheted the anchor
-        // further (on-rig: +12 at the stop). Only a genuine park may
-        // adopt.
-        let (mut input, mut tx) = input_with_producer();
-        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
-        ramp(&mut input, &mut tx, &mut gen, 1.03, 1.081, 5.0);
-        let _ = run(&mut input, &mut tx, &mut gen, 1.081, 9.0);
-        assert!(
-            input.anchors().learned(ANCHOR_PLUS_8),
-            "+8 must adopt after the park"
+            (mean - 1.07).abs() < 1e-3,
+            "deliberate +7 % was warped: {mean}"
         );
         let disp = input.last_display_rate();
         assert!(
-            (disp - 1.08).abs() < 5e-4,
-            "stop must pin to +8 after a slow ride + park, got {disp}"
-        );
-    }
-
-    #[test]
-    fn repeated_slow_rides_never_ratchet_the_stop_anchor() {
-        // Slow rides up to the stop with quick slams back (the rig's
-        // deck-B usage pattern). Pre-fix, each approach's in-band dwell
-        // adopted a "stop" up to ~1 % shy of the real one, and because
-        // the band was judged on the freshly-warped scale, every pass
-        // shifted the window further — the unbounded ratchet that left
-        // the real stop displaying +12. The scale must stay honest at
-        // every cycle top and pin exactly after a real park.
-        let (mut input, mut tx) = input_with_producer();
-        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
-        for _ in 0..6 {
-            ramp(&mut input, &mut tx, &mut gen, 1.03, 1.081, 8.0);
-            let disp = input.anchors().apply(1.081);
-            assert!(
-                (disp - 1.08).abs() < 2e-3,
-                "stop display ratcheted mid-session: {disp}"
-            );
-            ramp(&mut input, &mut tx, &mut gen, 1.081, 1.03, 0.5);
-        }
-        ramp(&mut input, &mut tx, &mut gen, 1.03, 1.081, 8.0);
-        let _ = run(&mut input, &mut tx, &mut gen, 1.081, 9.0);
-        let disp = input.last_display_rate();
-        assert!(
-            (disp - 1.08).abs() < 5e-4,
-            "stop display ratcheted after repeated rides: {disp}"
-        );
-    }
-
-    #[test]
-    fn a_beatmatch_hold_near_the_stop_is_not_the_stop() {
-        // The other half of the deck-B failure: a deliberate steady
-        // +7 % pitch hold sat inside the old generous ±1.5 % band and
-        // was adopted as "the +8 stop", nulling the DJ's setting on
-        // the display. A stable hold short of the stop must pass
-        // through unwarped.
-        let (mut input, mut tx) = input_with_producer();
-        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
-        let _ = run(&mut input, &mut tx, &mut gen, 1.07, 6.0);
-        assert!(
-            !input.anchors().learned(ANCHOR_PLUS_8),
-            "a +7 % hold was adopted as the +8 stop"
-        );
-        let disp = input.last_display_rate();
-        assert!(
-            (disp - 1.07).abs() < 1e-3,
-            "deliberate +7 % was warped: {disp}"
+            (disp - mean).abs() < 5e-4,
+            "display must equal playback (no display-only warp), got {disp} vs {mean}"
         );
     }
 }
