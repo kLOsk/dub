@@ -636,19 +636,17 @@ final class WaveformAppModel: ObservableObject {
         // extrapolates to wall-clock now, which is within ±8 ms of
         // the last-displayed frame on a 60 Hz panel.
         //
-        // Bug2b — audible timeline. While PLAYING the DJ taps by EAR,
-        // reacting to the kick the DAC emitted one output-latency ago,
-        // so we capture `positionSnapshotAudible` (now − latency − trim)
-        // — the track position actually coming out of the speakers.
-        // While STOPPED the playhead is exactly where the user scrubbed
-        // it, so we keep `positionSnapshot` verbatim — a set trim must
-        // not shift a prep-mode set-the-1. (The grid-side kick-edge snap
-        // in `set_bar_phase` is independent of this and applies in both
-        // modes.)
-        let playhead =
-            isPlaying
-            ? engine.positionSnapshotAudible(deckIdx: side.ffiDeckIdx).elapsedSecs
-            : engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+        // This is ALREADY the audible position: the engine pairs the
+        // published playhead with CoreAudio's output timestamp
+        // (`inTimeStamp.mHostTime` + block duration — see
+        // `DeckSharedState::publish_host_ns_override`), so extrapolating
+        // to "now" yields the position coming out of the speakers, not
+        // the one being rendered. No separate output-latency subtraction
+        // is needed (and doing it double-counts the buffer/safety
+        // offset). xwax derives position from the timecode; Mixxx
+        // anchors the visual playhead to the output buffer timing — same
+        // idea.
+        let playhead = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
         // Paused decks dispatch a single set-the-1 immediately
         // through a dedicated path that drops any stale buffered
         // session first. PRD-BEATS §4.2 + gate 9 already rejects

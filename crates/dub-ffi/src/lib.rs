@@ -31,7 +31,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
@@ -296,13 +296,7 @@ uniffi::setup_scaffolding!();
 ///       / `history_play_started` / `history_play_ended`) plus the
 ///       `played_into` / `session_history` queries with their
 ///       `LibraryTransitionStat` / `LibrarySessionPlay` records.
-///   38. **Audible-timeline output latency.** [`DubEngine`] grows
-///       [`DubEngine::position_snapshot_audible`] — the playhead
-///       extrapolated *back* by the measured CoreAudio output latency
-///       (xwax-style) so a by-ear tap lands on the kick heard — plus
-///       [`DubEngine::output_latency_secs`] and the diagnostic
-///       [`DubEngine::set_output_latency_trim_secs`].
-pub const FFI_VERSION: u32 = 38;
+pub const FFI_VERSION: u32 = 37;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -460,19 +454,6 @@ pub struct DubEngine {
     /// writes through these atomics; [`Self::position_snapshot`]
     /// reads them without ever touching `Mutex<EngineState>`.
     deck_shared: Arc<[Arc<DeckSharedState>; 2]>,
-    /// Measured one-way CoreAudio output latency in nanoseconds,
-    /// written once when the output AudioUnit starts (from
-    /// [`dub_audio::AudioOutput::total_output_latency_seconds`]) and
-    /// read lock-free by [`Self::position_snapshot_audible`]. `0`
-    /// while stopped. Bug2b — the audible-timeline offset that lets a
-    /// tap land on the kick the DJ *heard*, not the one being
-    /// rendered.
-    output_latency_ns: AtomicU64,
-    /// User latency trim in nanoseconds (signed), added to the
-    /// measured latency. Survives stop/start so a calibrated trim
-    /// persists across sessions; settable any time via
-    /// [`Self::set_output_latency_trim_secs`].
-    latency_trim_ns: AtomicI64,
 }
 
 /// Internal state machine for the engine.
@@ -859,8 +840,6 @@ impl DubEngine {
                 Arc::new(DeckSharedState::new()),
                 Arc::new(DeckSharedState::new()),
             ]),
-            output_latency_ns: AtomicU64::new(0),
-            latency_trim_ns: AtomicI64::new(0),
         })
     }
 
@@ -1036,7 +1015,6 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Thru,
-            &self.output_latency_ns,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1095,7 +1073,6 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Thru,
-            &self.output_latency_ns,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1141,7 +1118,6 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Timecode,
-            &self.output_latency_ns,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1199,7 +1175,6 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Timecode,
-            &self.output_latency_ns,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1244,10 +1219,6 @@ impl DubEngine {
         for slot in self.deck_shared.iter() {
             slot.reset();
         }
-        // The measured output latency belonged to the now-dropped
-        // AudioUnit. Reset so a stopped engine reports 0 (the user
-        // trim persists — it's a calibration, not session state).
-        self.output_latency_ns.store(0, Ordering::Relaxed);
     }
 
     /// Alias of [`Self::stop_thru`] for parity with the M10.5
@@ -1308,7 +1279,6 @@ impl DubEngine {
             output_channels,
             output_device_uid.as_deref(),
             &self.deck_shared,
-            &self.output_latency_ns,
         )?;
         *state = EngineState::Running(Box::new(running));
         Ok(())
@@ -1894,65 +1864,6 @@ impl DubEngine {
     #[must_use]
     pub fn position_snapshot_at_host_time(&self, deck_idx: u64, host_time_ns: u64) -> PositionInfo {
         self.position_snapshot_at_host_time_inner(deck_idx, host_time_ns)
-    }
-
-    /// **Bug2b** — the AUDIBLE-timeline playhead: where the track is at
-    /// the moment the sound currently leaving the speakers was *played*,
-    /// not where the engine is rendering right now. Equal to
-    /// [`Self::position_snapshot`] extrapolated **backward** by the full
-    /// output latency (`measured + trim`), the xwax model.
-    ///
-    /// Use this to timestamp a tap the DJ makes by ear: they react to
-    /// the kick they HEAR, which the DAC emitted `latency` ago, so the
-    /// matching track position is the one audible now — feeding it to
-    /// `set_bar_phase` / tap-tempo lands the "1" on that kick instead of
-    /// `latency` ms past it. While stopped the latency is 0, so this
-    /// degrades to [`Self::position_snapshot`].
-    ///
-    /// Lock-free: reads the same `deck_shared` atomics as
-    /// [`Self::position_snapshot`] plus two latency atomics; safe to poll
-    /// at UI cadence.
-    #[must_use]
-    pub fn position_snapshot_audible(&self, deck_idx: u64) -> PositionInfo {
-        let now_ns = DeckSharedState::host_time_now_ns();
-        let audible_ns = now_ns.saturating_sub(self.total_output_latency_ns());
-        self.position_snapshot_at_host_time_inner(deck_idx, audible_ns)
-    }
-
-    /// Full output latency applied to the audible timeline, in seconds:
-    /// the measured CoreAudio latency plus the user trim, floored at 0.
-    /// `0.0` while stopped (plus any positive trim). Exposed so the UI
-    /// can show / calibrate the value.
-    #[must_use]
-    pub fn output_latency_secs(&self) -> f64 {
-        #[allow(clippy::cast_precision_loss)]
-        let ns = self.total_output_latency_ns() as f64;
-        ns / 1.0e9
-    }
-
-    /// Set the manual output-latency trim, in seconds (may be negative).
-    /// Added to the measured latency on the audible timeline; persists
-    /// across stop/start. Non-finite input is ignored. The effective
-    /// total is floored at 0, so a large negative trim simply pins the
-    /// audible timeline to "now".
-    pub fn set_output_latency_trim_secs(&self, secs: f64) {
-        if !secs.is_finite() {
-            return;
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let ns = (secs * 1.0e9) as i64;
-        self.latency_trim_ns.store(ns, Ordering::Relaxed);
-    }
-
-    /// Effective audible-timeline latency in nanoseconds:
-    /// `max(0, measured + trim)`. Internal helper for the audible
-    /// snapshot and the seconds accessor.
-    fn total_output_latency_ns(&self) -> u64 {
-        let measured = self.output_latency_ns.load(Ordering::Relaxed);
-        let trim = self.latency_trim_ns.load(Ordering::Relaxed);
-        #[allow(clippy::cast_possible_wrap)]
-        let total = (measured as i64).saturating_add(trim);
-        u64::try_from(total).unwrap_or(0)
     }
 
     /// Per-deck live telemetry (pitch + timecode signal health) for the
@@ -3818,21 +3729,6 @@ enum PerfSource {
 /// Pulled out of `start_thru` so the `Mutex` guard stays narrow:
 /// this function never touches `self.state`, only the audio
 /// subsystem.
-/// Cache the full one-way output latency (in nanoseconds) into the
-/// engine's lock-free atomic, queried once from the freshly-started
-/// output AudioUnit. Shared by both start paths so the audible
-/// snapshot has the same number regardless of how audio came up.
-fn store_output_latency(output_latency_ns: &AtomicU64, output: &AudioOutput) {
-    let secs = output.total_output_latency_seconds().max(0.0);
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
-    let ns = (secs * 1.0e9) as u64;
-    output_latency_ns.store(ns, Ordering::Relaxed);
-}
-
 fn start_thru_inner(
     device_name: &str,
     channels_a: &[u32],
@@ -3840,7 +3736,6 @@ fn start_thru_inner(
     output_device_uid: Option<&str>,
     deck_shared: &[Arc<DeckSharedState>; 2],
     source_mode: PerfSource,
-    output_latency_ns: &AtomicU64,
 ) -> Result<RunningState, EngineError> {
     // ----- 1. Build InputOptions ------------------------------------
     // Convert 1-based user-facing channel indices to 0-based
@@ -3931,7 +3826,6 @@ fn start_thru_inner(
     };
     let output = AudioOutput::start_with_options(engine, &output_opts, output_routing)
         .map_err(|e| EngineError::AudioStartFailed(format!("starting output: {e}")))?;
-    store_output_latency(output_latency_ns, &output);
 
     // ----- 6. Attach the chosen per-deck source --------------------
     // Thru: passthrough + live peaks per deck (waveform follows the
@@ -4026,7 +3920,6 @@ fn start_engine_inner(
     output_channels: u32,
     output_device_uid: Option<&str>,
     deck_shared: &[Arc<DeckSharedState>; 2],
-    output_latency_ns: &AtomicU64,
 ) -> Result<RunningState, EngineError> {
     // We don't know the output device's SR ahead of time. The
     // existing `start_thru_inner` flow uses the *input* device's SR
@@ -4058,7 +3951,6 @@ fn start_engine_inner(
     };
     let output = AudioOutput::start_with_options(engine, &output_opts, INTERNAL_MIXER_ROUTING)
         .map_err(|e| EngineError::AudioStartFailed(format!("starting output: {e}")))?;
-    store_output_latency(output_latency_ns, &output);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let sample_rate = output.sample_rate() as u32;
@@ -4250,10 +4142,7 @@ mod tests {
         // `history_play_ended`) plus the `played_into` and
         // `session_history` queries with their
         // `LibraryTransitionStat` / `LibrarySessionPlay` records.
-        // 37→38: audible-timeline output latency
-        // (`position_snapshot_audible` / `output_latency_secs` /
-        // `set_output_latency_trim_secs`).
-        assert_eq!(FFI_VERSION, 38);
+        assert_eq!(FFI_VERSION, 37);
     }
 
     #[test]
@@ -4307,33 +4196,6 @@ mod tests {
     /// M11d.6 round 5. The lock-free path must surface the same
     /// empty-deck shape as the mutex-protected path when no
     /// session is running.
-    #[test]
-    fn output_latency_trim_floors_at_zero_and_audible_falls_back_when_stopped() {
-        let engine = DubEngine::new();
-        // Stopped: no measured latency, no trim → 0.
-        assert_eq!(engine.output_latency_secs(), 0.0);
-
-        // Positive trim is reflected verbatim (no measured latency yet).
-        engine.set_output_latency_trim_secs(0.012);
-        assert!((engine.output_latency_secs() - 0.012).abs() < 1e-9);
-
-        // A large negative trim floors the effective latency at 0 rather
-        // than wrapping; the audible timeline pins to "now".
-        engine.set_output_latency_trim_secs(-5.0);
-        assert_eq!(engine.output_latency_secs(), 0.0);
-
-        // Non-finite input is ignored (trim unchanged from the −5.0 above).
-        engine.set_output_latency_trim_secs(f64::NAN);
-        assert_eq!(engine.output_latency_secs(), 0.0);
-
-        // Audible snapshot on a stopped engine degrades to the plain
-        // snapshot: no track, nothing playing.
-        let p = engine.position_snapshot_audible(0);
-        assert!(!p.has_track);
-        assert!(!p.is_playing);
-        assert_eq!(p.elapsed_secs, 0.0);
-    }
-
     #[test]
     fn position_snapshot_on_stopped_engine_returns_empty() {
         let engine = DubEngine::new();
