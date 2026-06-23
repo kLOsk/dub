@@ -32,11 +32,13 @@ use objc2_audio_toolbox::{
 };
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
-    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyTranslateUIDToDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard,
-    kAudioObjectPropertyManufacturer, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyLatency,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
+    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
+    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyElementWildcard, kAudioObjectPropertyManufacturer,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioStreamPropertyLatency,
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
@@ -238,6 +240,188 @@ pub fn query_default_output() -> Result<DeviceInfo, AudioError> {
         buffer_frames,
         buffer_frame_range: range,
     })
+}
+
+/// Per-term CoreAudio output-latency breakdown for one output device.
+///
+/// `None` for a term means the device does not publish that HAL property —
+/// distinct from a published zero. `buffer_frames` is already reflected in
+/// the engine's `mHostTime`-paired playhead (M11d.6), so only the
+/// safety-offset / device / stream terms are candidates for output latency
+/// left *uncompensated* beyond the buffer.
+#[derive(Debug, Clone)]
+pub struct OutputLatency {
+    /// Resolved CoreAudio device name.
+    pub device_name: String,
+    /// Nominal sample rate, Hz.
+    pub sample_rate: f32,
+    /// Current device buffer size, frames per render callback.
+    pub buffer_frames: u32,
+    /// `kAudioDevicePropertySafetyOffset` (output scope), frames.
+    pub safety_offset_frames: Option<u32>,
+    /// `kAudioDevicePropertyLatency` (output scope), frames.
+    pub device_latency_frames: Option<u32>,
+    /// `kAudioStreamPropertyLatency` on the first output stream, frames.
+    pub stream_latency_frames: Option<u32>,
+}
+
+impl OutputLatency {
+    /// Total observable one-way output latency in frames: buffer plus every
+    /// published term (unpublished terms contribute 0).
+    #[must_use]
+    pub fn total_frames(&self) -> u32 {
+        self.buffer_frames
+            + self.safety_offset_frames.unwrap_or(0)
+            + self.device_latency_frames.unwrap_or(0)
+            + self.stream_latency_frames.unwrap_or(0)
+    }
+
+    /// Latency beyond the buffer (safety offset + device + stream), in frames.
+    /// This is what would be uncompensated *if* CoreAudio's output `mHostTime`
+    /// did not already fold these terms into the presentation time.
+    /// Unpublished terms contribute 0.
+    #[must_use]
+    pub fn beyond_buffer_frames(&self) -> u32 {
+        self.safety_offset_frames.unwrap_or(0)
+            + self.device_latency_frames.unwrap_or(0)
+            + self.stream_latency_frames.unwrap_or(0)
+    }
+
+    /// Convert a frame count to milliseconds at this device's sample rate.
+    #[must_use]
+    pub fn ms(&self, frames: u32) -> f64 {
+        f64::from(frames) / f64::from(self.sample_rate) * 1000.0
+    }
+}
+
+/// Resolve an output device id: `Some(name)` matches by name (exact, then
+/// case-insensitive substring, output-scope only); `None` is the system
+/// default output.
+fn resolve_output_device(device: Option<&str>) -> Result<AudioObjectID, AudioError> {
+    if let Some(query) = device {
+        lookup_output_device_id_by_name(query)
+            .ok_or_else(|| AudioError::Device(format!("no output device matching '{query}'")))
+    } else {
+        let audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
+        device_id_from_audio_unit(&audio_unit)
+    }
+}
+
+/// Query the full CoreAudio output-latency breakdown for an output device.
+///
+/// `device` selects by name (as the CLI's `--device` does); `None` uses the
+/// system default output. Off-RT — synchronous HAL property reads, so never
+/// call it from the audio thread. Diagnostic only: the engine does **not**
+/// subtract these terms (M11d.6 pairs the playhead with CoreAudio's output
+/// `mHostTime`, which already accounts for the buffer); see [`AudioOutput`].
+///
+/// # Errors
+///
+/// Returns [`AudioError::Device`] if the named device is not found, or the
+/// device's sample rate / buffer size cannot be read.
+pub fn query_output_latency(device: Option<&str>) -> Result<OutputLatency, AudioError> {
+    let id = resolve_output_device(device)?;
+    let device_name = get_device_name(id).unwrap_or_else(|_| format!("<device {id}>"));
+    #[allow(clippy::cast_possible_truncation)]
+    let sample_rate = get_device_nominal_sample_rate(id)? as f32;
+    let buffer_frames = get_buffer_frame_size(id)?;
+    let safety_offset_frames = read_u32_property(
+        id,
+        kAudioDevicePropertySafetyOffset,
+        kAudioObjectPropertyScopeOutput,
+    );
+    let device_latency_frames = read_u32_property(
+        id,
+        kAudioDevicePropertyLatency,
+        kAudioObjectPropertyScopeOutput,
+    );
+    let stream_latency_frames = first_output_stream(id).and_then(|stream| {
+        read_u32_property(
+            stream,
+            kAudioStreamPropertyLatency,
+            kAudioObjectPropertyScopeGlobal,
+        )
+    });
+    Ok(OutputLatency {
+        device_name,
+        sample_rate,
+        buffer_frames,
+        safety_offset_frames,
+        device_latency_frames,
+        stream_latency_frames,
+    })
+}
+
+/// Read a `u32` HAL property, returning `None` when the device does not
+/// publish it (so callers can tell "unsupported" from a true zero).
+fn read_u32_property(object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: u32 = 0;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut size: u32 = mem::size_of::<u32>() as u32;
+    // SAFETY: `address` and `size` are stack-resident for the call; `out_data`
+    // points at a `u32` we own; null/0 qualifier is valid for scalar selectors.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast::<c_void>(),
+        )
+    };
+    (status == 0).then_some(value)
+}
+
+/// The first output stream id of a device. `kAudioStreamPropertyLatency`
+/// lives on the stream object, not the device, so the latency query needs
+/// this hop. `None` if the device exposes no output streams.
+fn first_output_stream(device: AudioObjectID) -> Option<AudioObjectID> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    // SAFETY: `address` is stack-resident; `size` is an out-param the call
+    // fills with the byte length of the stream-id array.
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    if status != 0 || (size as usize) < mem::size_of::<AudioObjectID>() {
+        return None;
+    }
+    let count = size as usize / mem::size_of::<AudioObjectID>();
+    let mut streams = vec![0 as AudioObjectID; count];
+    #[allow(clippy::cast_possible_truncation)]
+    let mut data_size: u32 = (count * mem::size_of::<AudioObjectID>()) as u32;
+    // SAFETY: `streams` owns `count` contiguous `AudioObjectID`s; `data_size`
+    // matches its byte length; qualifier null/0 is valid.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut data_size),
+            NonNull::new(streams.as_mut_ptr())?.cast::<c_void>(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    streams.first().copied()
 }
 
 /// A live audio output: drives the engine's render method from CoreAudio's

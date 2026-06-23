@@ -42,8 +42,8 @@ pub use error::AudioError;
 #[cfg(target_os = "macos")]
 pub use macos::{
     has_external_audio_interface, list_audio_devices, list_input_devices, list_output_devices,
-    query_default_input, query_default_output, AudioInput, AudioOutput, BufferFrameRange,
-    InputDeviceInfo, InputOptions, OutputOptions,
+    query_default_input, query_default_output, query_output_latency, AudioInput, AudioOutput,
+    BufferFrameRange, InputDeviceInfo, InputOptions, OutputLatency, OutputOptions,
 };
 
 /// Library version reported by the crate.

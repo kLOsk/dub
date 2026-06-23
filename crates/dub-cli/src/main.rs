@@ -56,7 +56,7 @@ fn main() -> ExitCode {
         "thru" => thru::run(&args[2..]),
         "scope" => scope::run(&args[2..]),
         "calibrate" => calibrate::run(&args[2..]),
-        "measure-latency" => measure_latency(),
+        "measure-latency" => measure_latency(&args[2..]),
         "help" | "-h" | "--help" => {
             print_help();
             return ExitCode::SUCCESS;
@@ -84,7 +84,9 @@ fn print_help() {
     eprintln!("  smoke             engine handshake + zero-render");
     eprintln!("  rt-audit          stress the render path under assert_no_alloc");
     eprintln!("  version           print versions");
-    eprintln!("  measure-latency   query the default output device for SR + buffer + latency");
+    eprintln!("  measure-latency   [--device NAME] [--all]");
+    eprintln!("                    output latency breakdown (safety/device/stream + buffer);");
+    eprintln!("                    --device targets one interface, --all dumps every output.");
     eprintln!("  list-inputs       enumerate DJ audio interfaces (classified).");
     eprintln!("                    pass --all to dump every HAL input device.");
     eprintln!("  list-outputs      enumerate classified output devices");
@@ -334,38 +336,93 @@ fn version() -> Result<()> {
     Ok(())
 }
 
-fn measure_latency() -> Result<()> {
-    let info = dub_audio::query_default_output().context("querying default output")?;
-    let latency_ms = f64::from(info.buffer_frames) / f64::from(info.sample_rate) * 1000.0;
-
-    println!("default output device:");
-    println!("  name:             {}", info.device_name);
-    println!("  sample rate:      {} Hz", info.sample_rate);
-    println!("  channels:         {}", info.channels);
-    println!("  buffer (current): {} frames", info.buffer_frames);
-    #[cfg(target_os = "macos")]
-    println!(
-        "  buffer (range):   {}-{} frames",
-        info.buffer_frame_range.min, info.buffer_frame_range.max
-    );
-    println!("  latency:          {latency_ms:.2} ms (output buffer only)");
-
-    // Echo what each common buffer size would mean at the device's SR.
-    println!();
-    println!("latency at common buffer sizes (this device's SR):");
-    for &n in &[64u32, 128, 256, 512, 1024] {
-        let ms = f64::from(n) / f64::from(info.sample_rate) * 1000.0;
-        println!("  {n:>4} frames -> {ms:6.2} ms");
+fn measure_latency(args: &[String]) -> Result<()> {
+    let mut device: Option<&str> = None;
+    let mut all = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--device" => {
+                device = Some(next_value(args, i, "--device")?);
+                i += 2;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            other => return Err(anyhow!("measure-latency: unexpected argument '{other}'")),
+        }
     }
 
-    if latency_ms < 8.0 {
-        println!("\nOK ({latency_ms:.2} ms < 8 ms PRD target)");
+    if all {
+        return measure_latency_all();
+    }
+    print_output_latency(device)
+}
+
+/// Print the full CoreAudio output-latency breakdown for one device
+/// (`None` = system default output).
+fn print_output_latency(device: Option<&str>) -> Result<()> {
+    let lat = dub_audio::query_output_latency(device).context("querying output latency")?;
+    let term = |frames: Option<u32>| match frames {
+        Some(f) => format!("{f:>5} fr  {:7.3} ms  [published]", lat.ms(f)),
+        None => "  n/a            ms  [not published]".to_string(),
+    };
+
+    println!("output device: {}", lat.device_name);
+    println!("  sample rate:    {:.0} Hz", lat.sample_rate);
+    println!(
+        "  buffer:         {:>5} fr  {:7.3} ms  [already in the mHostTime-paired playhead]",
+        lat.buffer_frames,
+        lat.ms(lat.buffer_frames)
+    );
+    println!("  safety offset:  {}", term(lat.safety_offset_frames));
+    println!("  device latency: {}", term(lat.device_latency_frames));
+    println!("  stream latency: {}", term(lat.stream_latency_frames));
+    println!("  ------------------------------------------------------------");
+    println!(
+        "  total one-way:  {:>5} fr  {:7.3} ms",
+        lat.total_frames(),
+        lat.ms(lat.total_frames())
+    );
+    let beyond = lat.beyond_buffer_frames();
+    println!(
+        "  beyond buffer:  {beyond:>5} fr  {:7.3} ms  (uncompensated only if mHostTime omits it)",
+        lat.ms(beyond)
+    );
+
+    println!();
+    println!("buffer latency at common sizes (this device's SR):");
+    for &n in &[64u32, 128, 256, 512, 1024] {
+        println!("  {n:>4} frames -> {:6.2} ms", lat.ms(n));
+    }
+    let buf_ms = lat.ms(lat.buffer_frames);
+    if buf_ms < 8.0 {
+        println!("\nOK: current buffer {buf_ms:.2} ms < 8 ms PRD target.");
     } else {
-        println!(
-            "\nNOTE: current device buffer ({:.2} ms) exceeds the <8 ms PRD target.",
-            latency_ms
-        );
-        println!("Try `dub play --realtime --buffer-size 256` to request a smaller buffer.");
+        println!("\nNOTE: current buffer {buf_ms:.2} ms exceeds the <8 ms PRD target — it's the");
+        println!("device's idle setting; Dub requests a smaller buffer when it opens the device.");
+    }
+    Ok(())
+}
+
+/// One-line latency summary for every classified output device (`--all`).
+fn measure_latency_all() -> Result<()> {
+    let devices = dub_audio::list_output_devices().context("listing output devices")?;
+    println!("output devices — latency (buffer / beyond-buffer / total):");
+    for dev in devices {
+        match dub_audio::query_output_latency(Some(&dev.name)) {
+            Ok(lat) => println!(
+                "  {:<28} {:>6.0} Hz   buf {:>4}fr {:>6.2}ms   beyond {:>5.2}ms   total {:>6.2}ms",
+                lat.device_name,
+                lat.sample_rate,
+                lat.buffer_frames,
+                lat.ms(lat.buffer_frames),
+                lat.ms(lat.beyond_buffer_frames()),
+                lat.ms(lat.total_frames()),
+            ),
+            Err(e) => println!("  {:<28} (query failed: {e})", dev.name),
+        }
     }
     Ok(())
 }
