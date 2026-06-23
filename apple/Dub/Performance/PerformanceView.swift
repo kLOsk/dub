@@ -238,11 +238,11 @@ struct PerformanceView: View {
     /// **test** surface (PRD §3.1): the DJ sets markers and auditions
     /// them, so every control is clickable — usability, not a
     /// performance concern. The CUE row is live (click empty → set at
-    /// playhead, click set → jump, ⇧-click → clear); the LOOP row is
-    /// an honest "soon" placeholder until M13 lands the loop engine,
-    /// at which point it becomes a clickable set-region + audition
-    /// control here too. Cues persist and show as magenta markers on
-    /// the overview and the strip.
+    /// playhead, click set → jump, ⇧-click → clear). The LOOP row is
+    /// live too: each length pad (½/1/2/4 bar) triggers a grid-snapped
+    /// reverse loop of the bars just heard, ✕ exits. Cues show as
+    /// magenta markers and the loop as a green band on the overview +
+    /// strip.
     @ViewBuilder
     private var prepPadBar: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -251,7 +251,10 @@ struct PerformanceView: View {
                 onCue: { index, clear in
                     model.handleHotCue(.a, index: index, clear: clear)
                 })
-            LoopPadRowPlaceholder()
+            LoopPadRow(
+                activeBars: model.deckA.activeLoopBars,
+                onLoop: { bars in model.handleLoop(.a, bars: bars) },
+                onExit: { model.exitLoop(.a) })
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.sm)
@@ -415,7 +418,10 @@ struct PerformanceView: View {
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
                         : 1.0,
-                    hotCues: deckState.hotCues.compactMap { $0 })
+                    hotCues: deckState.hotCues.compactMap { $0 },
+                    loopActive: deckState.loopActive,
+                    loopInSecs: deckState.loopInSecs,
+                    loopOutSecs: deckState.loopOutSecs)
                     .background(DubColor.surface0)
             } else {
                 idlePane(side: side)

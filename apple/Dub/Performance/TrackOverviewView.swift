@@ -187,6 +187,7 @@ struct TrackOverviewView: View {
                     if let buckets, !buckets.isEmpty {
                         drawBars(ctx: ctx, size: size, buckets: buckets)
                         drawMinuteMarkers(ctx: ctx, size: size)
+                        drawLoopRegion(ctx: ctx, size: size)
                         drawHotCues(ctx: ctx, size: size)
                     } else {
                         drawEmptyState(ctx: ctx, size: size)
@@ -351,6 +352,39 @@ struct TrackOverviewView: View {
             }
             marker += intervalSecs
         }
+    }
+
+    /// Active reverse-loop band across the whole-track overview — a
+    /// translucent green span from loop-in to loop-out with brighter
+    /// edges, so the DJ sees the looped region at a glance. Mapped on
+    /// the same grid as the bars / cues / playhead. Green matches the
+    /// LOOP pads (`DubColor.loop`). Drawn under the cue markers so a
+    /// cue inside the loop still reads on top.
+    private func drawLoopRegion(ctx: GraphicsContext, size: CGSize) {
+        guard deckState.loopActive, deckState.loopOutSecs > deckState.loopInSecs else { return }
+        guard let duration = overviewDurationSecs(), duration > 0 else { return }
+        guard let p0 = axisPosition(fraction: deckState.loopInSecs / duration, size: size),
+            let p1 = axisPosition(fraction: deckState.loopOutSecs / duration, size: size)
+        else { return }
+        let lo = min(p0, p1)
+        let span = max(1, abs(p1 - p0))
+        let edgeW: CGFloat = 1.5
+        let band: CGRect
+        let edge0: CGRect
+        let edge1: CGRect
+        switch orientation {
+        case .vertical:
+            band = CGRect(x: 0, y: lo, width: size.width, height: span)
+            edge0 = CGRect(x: 0, y: lo, width: size.width, height: edgeW)
+            edge1 = CGRect(x: 0, y: lo + span - edgeW, width: size.width, height: edgeW)
+        case .horizontal:
+            band = CGRect(x: lo, y: 0, width: span, height: size.height)
+            edge0 = CGRect(x: lo, y: 0, width: edgeW, height: size.height)
+            edge1 = CGRect(x: lo + span - edgeW, y: 0, width: edgeW, height: size.height)
+        }
+        ctx.fill(Path(band), with: .color(DubColor.loop.opacity(0.18)))
+        ctx.fill(Path(edge0), with: .color(DubColor.loop))
+        ctx.fill(Path(edge1), with: .color(DubColor.loop))
     }
 
     /// Hot cue markers across the whole-track overview — one thin

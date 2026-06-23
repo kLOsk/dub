@@ -87,21 +87,23 @@ struct PerformancePadsView: View {
     }
 }
 
-/// One pad cell — `glyph` centred, lit in the cue accent when set.
-/// Shared by the Performance pad panel (`PerformancePadsView`) and
-/// the Prep cue bar (`CuePadRow`) so a set cue reads identically
-/// (magenta) on both, matching the waveform / overview markers.
+/// One pad cell — `glyph` centred, lit in `tint` when active. Shared
+/// by the Performance pad panel, the Prep cue bar (magenta), and the
+/// Prep loop bar (green), so a lit pad reads the same as its marker on
+/// the waveform / overview.
 @ViewBuilder
-private func hotCuePadCell(_ glyph: String, lit: Bool) -> some View {
+private func hotCuePadCell(_ glyph: String, lit: Bool, tint: Color = DubColor.hotCue)
+    -> some View
+{
     Text(glyph)
         .font(.system(size: 13, weight: .semibold, design: .rounded))
         .foregroundStyle(lit ? DubColor.textPrimary : DubColor.textTertiary)
         .frame(width: glyph.count > 1 ? 50 : 38, height: 36)
-        .background(lit ? DubColor.hotCue.opacity(0.24) : DubColor.surface1)
+        .background(lit ? tint.opacity(0.24) : DubColor.surface1)
         .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                .stroke(lit ? DubColor.hotCue : DubColor.divider, lineWidth: 1))
+                .stroke(lit ? tint : DubColor.divider, lineWidth: 1))
 }
 
 /// Horizontal, **clickable** hot cue pad row for Prep mode (where
@@ -178,14 +180,33 @@ private enum PrepPadLayout {
     static let labelWidth: CGFloat = 44
 }
 
-/// Placeholder LOOP pad row for Prep. Loops (M13) aren't built yet —
-/// there's no loop engine, FFI, or state behind them — so this is
-/// honest "soon" chrome: the IN / OUT / ½ / ×2 vocabulary laid out,
-/// dimmed and non-interactive, so the Prep surface reads as a real
-/// annotation instrument and the geometry is fixed before the
-/// controls go live. Prep's loop role is *authoring* a region to
-/// recall later, not live triggering (PRD §3.1).
-struct LoopPadRowPlaceholder: View {
+/// One reverse-loop length preset: a label and its length in bars.
+private struct LoopPreset: Identifiable {
+    let bars: Double
+    let label: String
+    var id: Double { bars }
+}
+
+/// Live LOOP pad row for Prep. Each length pad triggers a grid-snapped
+/// **reverse** loop of that many bars — the bars just heard — on
+/// mouse-down (like cues / transport). The active length lights green;
+/// the ✕ pad exits the loop. Prep's loop role is *authoring + testing*
+/// a region (PRD §3.1), so it's mouse-clickable, not keyboard-only.
+struct LoopPadRow: View {
+
+    /// Which length pad is lit (bars), or `nil` when no loop is active.
+    let activeBars: Double?
+    /// Trigger a reverse loop of `bars` bars.
+    let onLoop: (_ bars: Double) -> Void
+    /// Exit the active loop.
+    let onExit: () -> Void
+
+    private static let presets: [LoopPreset] = [
+        LoopPreset(bars: 0.5, label: "½"),
+        LoopPreset(bars: 1, label: "1"),
+        LoopPreset(bars: 2, label: "2"),
+        LoopPreset(bars: 4, label: "4"),
+    ]
 
     var body: some View {
         HStack(spacing: DubSpacing.sm) {
@@ -194,16 +215,20 @@ struct LoopPadRowPlaceholder: View {
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
                 .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
-            ForEach(["IN", "OUT", "½", "×2"], id: \.self) { glyph in
-                hotCuePadCell(glyph, lit: false)
+            ForEach(Self.presets) { preset in
+                hotCuePadCell(
+                    preset.label,
+                    lit: activeBars == preset.bars,
+                    tint: DubColor.loop
+                )
+                .onPressDown { onLoop(preset.bars) }
+                .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
             }
-            Text("soon")
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textPlaceholder)
-                .padding(.leading, DubSpacing.xs)
+            hotCuePadCell("✕", lit: false, tint: DubColor.loop)
+                .onPressDown(enabled: activeBars != nil) { onExit() }
+                .help("Exit loop")
+                .opacity(activeBars == nil ? 0.5 : 1.0)
         }
-        .opacity(0.5)
-        .allowsHitTesting(false)
     }
 }
 

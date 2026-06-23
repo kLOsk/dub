@@ -42,6 +42,7 @@ struct PreferencesSheet: View {
                     #endif
                     loadBehaviourSection
                     loudnessSection
+                    cueSection
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -157,6 +158,29 @@ struct PreferencesSheet: View {
                 }
                 .toggleStyle(.switch)
                 Text("When on, a track with a measured loudness (LUFS-I) loads at a gain that matches it to the reference level, so decks sit at consistent loudness without riding the trim. When off, tracks load untouched and you set level at the mixer. Loudness is always measured and shown regardless of this setting.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Cue points
+
+    /// Hot-cue grid-snap toggle. Default on: setting a cue snaps the
+    /// marker to the nearest beat, so a roughly-timed tap lands clean
+    /// on the grid. Recall is unaffected — it always jumps to the
+    /// stored position.
+    private var cueSection: some View {
+        section(title: "CUE POINTS") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Toggle(isOn: $model.cueSnapToGridEnabled) {
+                    Text("Snap cue points to the beat grid")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("When on, setting a hot cue snaps the marker to the nearest beat line, so you can tap roughly on the beat and the cue lands clean. When off, the cue lands exactly at the playhead. Tracks with no analysed grid keep the raw position either way.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

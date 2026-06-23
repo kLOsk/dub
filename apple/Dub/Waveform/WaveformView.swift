@@ -157,6 +157,13 @@ struct WaveformView: View {
     /// reach here.
     let hotCues: [Double]
 
+    /// Active reverse loop, mirrored from `DeckState`. `loopActive`
+    /// gates the band; `loopInSecs` / `loopOutSecs` are track seconds.
+    /// Pushed into the renderer each `updateNSView`.
+    let loopActive: Bool
+    let loopInSecs: Double
+    let loopOutSecs: Double
+
     init(engine: DubEngine, deckIdx: UInt64 = 0,
          palette: WaveformPalette = .serato,
          side: DeckSide = .a,
@@ -166,7 +173,10 @@ struct WaveformView: View {
          seekGeneration: UInt64 = 0,
          peaksGeneration: UInt64 = 0,
          timeAxisZoom: Double = 1.0,
-         hotCues: [Double] = []) {
+         hotCues: [Double] = [],
+         loopActive: Bool = false,
+         loopInSecs: Double = 0,
+         loopOutSecs: Double = 0) {
         self.engine = engine
         self.deckIdx = deckIdx
         self.palette = palette
@@ -178,6 +188,9 @@ struct WaveformView: View {
         self.peaksGeneration = peaksGeneration
         self.timeAxisZoom = timeAxisZoom
         self.hotCues = hotCues
+        self.loopActive = loopActive
+        self.loopInSecs = loopInSecs
+        self.loopOutSecs = loopOutSecs
     }
 
     var body: some View {
@@ -191,7 +204,10 @@ struct WaveformView: View {
                     seekGeneration: seekGeneration,
                     peaksGeneration: peaksGeneration,
                     timeAxisZoom: timeAxisZoom,
-                    hotCues: hotCues)
+                    hotCues: hotCues,
+                    loopActive: loopActive,
+                    loopInSecs: loopInSecs,
+                    loopOutSecs: loopOutSecs)
                 if let handler = scrubHandler {
                     scrubGestureOverlay(in: geo.size, handler: handler)
                 }
@@ -770,6 +786,9 @@ private struct WaveformMetalView: NSViewRepresentable {
     let peaksGeneration: UInt64
     let timeAxisZoom: Double
     let hotCues: [Double]
+    let loopActive: Bool
+    let loopInSecs: Double
+    let loopOutSecs: Double
 
     @MainActor
     final class Coordinator: NSObject {
@@ -790,6 +809,9 @@ private struct WaveformMetalView: NSViewRepresentable {
         private var lastPeaksGeneration: UInt64?
         private var lastContinuous: Bool?
         private var lastHotCues: [Double]?
+        private var lastLoopActive: Bool?
+        private var lastLoopInSecs: Double?
+        private var lastLoopOutSecs: Double?
 
         /// Push the new SwiftUI prop values into the renderer
         /// through its thread-safe setters and report whether a
@@ -805,7 +827,10 @@ private struct WaveformMetalView: NSViewRepresentable {
             timeAxisZoom: Double,
             seekGeneration: UInt64,
             peaksGeneration: UInt64,
-            hotCues: [Double]
+            hotCues: [Double],
+            loopActive: Bool,
+            loopInSecs: Double,
+            loopOutSecs: Double
         ) -> Bool {
             guard let renderer else {
                 lastPalette = palette
@@ -815,6 +840,9 @@ private struct WaveformMetalView: NSViewRepresentable {
                 lastSeekGeneration = seekGeneration
                 lastPeaksGeneration = peaksGeneration
                 lastHotCues = hotCues
+                lastLoopActive = loopActive
+                lastLoopInSecs = loopInSecs
+                lastLoopOutSecs = loopOutSecs
                 return false
             }
 
@@ -842,6 +870,17 @@ private struct WaveformMetalView: NSViewRepresentable {
             if lastHotCues != hotCues {
                 renderer.setHotCues(hotCues)
                 lastHotCues = hotCues
+                rendererChanged = true
+            }
+            if lastLoopActive != loopActive
+                || lastLoopInSecs != loopInSecs
+                || lastLoopOutSecs != loopOutSecs
+            {
+                renderer.setLoopRegion(
+                    active: loopActive, inSecs: loopInSecs, outSecs: loopOutSecs)
+                lastLoopActive = loopActive
+                lastLoopInSecs = loopInSecs
+                lastLoopOutSecs = loopOutSecs
                 rendererChanged = true
             }
 
@@ -899,6 +938,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         renderer.setTimeAxisZoom(timeAxisZoom)
         renderer.setBeatGridEnabled(true)
         renderer.setHotCues(hotCues)
+        renderer.setLoopRegion(active: loopActive, inSecs: loopInSecs, outSecs: loopOutSecs)
         context.coordinator.renderer = renderer
 
         // M11d.6 round 11 — capture the mach_absolute_time ↔
@@ -950,7 +990,10 @@ private struct WaveformMetalView: NSViewRepresentable {
             timeAxisZoom: timeAxisZoom,
             seekGeneration: seekGeneration,
             peaksGeneration: peaksGeneration,
-            hotCues: hotCues)
+            hotCues: hotCues,
+            loopActive: loopActive,
+            loopInSecs: loopInSecs,
+            loopOutSecs: loopOutSecs)
 
         context.coordinator.applyContinuous(continuouslyRendering)
 

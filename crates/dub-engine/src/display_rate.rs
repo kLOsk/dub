@@ -582,8 +582,7 @@ mod tests {
         );
         assert!(
             max_step < 0.012 * 0.2,
-            "stall-then-lunge: max per-quantum step {:.5} on a 0.012 move",
-            max_step
+            "stall-then-lunge: max per-quantum step {max_step:.5} on a 0.012 move"
         );
     }
 

@@ -31,17 +31,19 @@ pub mod declick;
 mod display_rate;
 mod drift;
 mod handle;
+mod looping;
 pub mod realtime;
 pub mod thru;
 pub mod timecode;
 
 pub use command::Command;
-pub use deck::{Deck, DeckSharedState, PublishState};
+pub use deck::{Deck, DeckSharedState, LoopState, PublishState};
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
     ThruAttachWithPeaksError, ThruAttachWithTelemetryError, BPM_TEE_RING_CAPACITY_SECS,
     PEAKS_TAP_RING_CAPACITY_SECS,
 };
+pub use looping::{reverse_loop_region, wrap_into};
 pub use realtime::{RealtimeContext, RtError};
 pub use thru::{ThruAttachError, ThruInputConfig, ThruSource};
 pub use timecode::{
@@ -1403,6 +1405,10 @@ impl Engine {
     /// Apply a single command. Inlined as a method so
     /// [`Command::DeckLoad`] can route the displaced `Arc<Track>`
     /// through the trash channel without dropping it on the audio thread.
+    // A flat dispatch `match` over the command enum — one short arm per
+    // variant. Splitting it would scatter the command handling without
+    // reducing complexity, so the line-count lint is suppressed.
+    #[allow(clippy::too_many_lines)]
     fn apply_command(&mut self, cmd: Command) {
         match cmd {
             Command::DeckPlay { idx } => {
@@ -1459,6 +1465,25 @@ impl Engine {
             Command::DeckSetGain { idx, gain } => {
                 if let Some(d) = self.decks.get_mut(idx as usize) {
                     d.set_gain(gain);
+                }
+            }
+            Command::DeckSetLoop {
+                idx,
+                in_frames,
+                out_frames,
+            } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_loop(in_frames, out_frames);
+                }
+                // The loop's jump-back is a deliberate reposition — let
+                // the drift monitor re-anchor like a seek.
+                if let Some(m) = self.tc_drift.get_mut(idx as usize) {
+                    m.note_remap();
+                }
+            }
+            Command::DeckClearLoop { idx } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.clear_loop();
                 }
             }
             Command::DeckSetControlMode { idx, mode } => {

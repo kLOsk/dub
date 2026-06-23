@@ -865,6 +865,31 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckSetRate { idx, rate })
     }
 
+    /// Engage a loop over `[in_frames, out_frames)` (track frames).
+    /// The grid-snapped reverse-loop region is computed off-RT by the
+    /// caller; the deck jumps the playhead into the region if needed
+    /// and wraps per block with a seam crossfade.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_loop(self, in_frames: f64, out_frames: f64) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetLoop {
+            idx,
+            in_frames,
+            out_frames,
+        })
+    }
+
+    /// Disengage any active loop; playback continues forward.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn clear_loop(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckClearLoop { idx })
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2). Decouples the deck
     /// from any attached timecode input and pins it to its last-
     /// known good velocity (or unity forward if no policy is

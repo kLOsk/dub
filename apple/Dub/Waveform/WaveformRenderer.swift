@@ -587,6 +587,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// is hidden or unconfident.
     private let hotCues = OSAllocatedUnfairLock<[Double]>(initialState: [])
 
+    /// Active loop region (track seconds) as `(in, out)`, or `nil`
+    /// when no loop is engaged. Drawn in the beat-grid pass as a
+    /// translucent green band + bright edges, sharing the waveform's
+    /// exact time→NDC mapping. Pushed in via `setLoopRegion`.
+    private let loopRegion = OSAllocatedUnfairLock<(Double, Double)?>(initialState: nil)
+
     /// One-shot repaint request, set once by `WaveformView` after
     /// the render thread exists. The beat-grid fetch in
     /// `refreshBeatGridIfNeeded` is async, so the frame that
@@ -806,6 +812,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// once per draw.
     func setHotCues(_ positions: [Double]) {
         hotCues.withLock { $0 = positions }
+    }
+
+    /// Push the deck's active loop region (track seconds). `active ==
+    /// false` clears the band. Cheap to call every `updateNSView`.
+    func setLoopRegion(active: Bool, inSecs: Double, outSecs: Double) {
+        loopRegion.withLock { $0 = (active && outSecs > inSecs) ? (inSecs, outSecs) : nil }
     }
 
     /// Drop cached beat-grid state on source swap. GPU ring slots
@@ -1470,6 +1482,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // the deck has a track. The outer gate fires if EITHER has
         // something to show.
         let hotCueSecs = hotCues.withLock { $0 }
+        let loopBounds = loopRegion.withLock { $0 }
         let drawBeats =
             appearance.beatGridEnabled
             && beats.confidence > 0
@@ -1477,7 +1490,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         if framesSinceSourceSwap > 20,
            peakChunkDurationSecs > 0,
            pos.hasTrack,
-           drawBeats || !hotCueSecs.isEmpty
+           drawBeats || !hotCueSecs.isEmpty || loopBounds != nil
         {
             drawBeatGrid(
                 encoder: encoder,
@@ -1486,6 +1499,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 beats: beats,
                 drawBeats: drawBeats,
                 hotCueSecs: hotCueSecs,
+                loopBounds: loopBounds,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
                 drawnBelow: drawnBelow,
@@ -1839,6 +1853,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         SIMD4(250.0 / 255.0, 92.0 / 255.0, 158.0 / 255.0, alpha)
     }
 
+    /// Loop region tint — the mint-green of the LOOP pads + overview
+    /// band (`DubColor.loop`, 79/209/139), so the loop reads as one
+    /// object across every surface, distinct from the cue magenta and
+    /// both deck tints.
+    private static func loopRGBA(alpha: Float) -> SIMD4<Float> {
+        SIMD4(79.0 / 255.0, 209.0 / 255.0, 139.0 / 255.0, alpha)
+    }
+
     /// First beat index with `beats[i] >= time`. Beats are sorted
     /// ascending so we can skip the prefix outside the visible
     /// window in O(log n) instead of scanning from track start
@@ -1865,6 +1887,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         beats: BeatGridSnapshot,
         drawBeats: Bool,
         hotCueSecs: [Double],
+        loopBounds: (Double, Double)?,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
@@ -1926,6 +1949,51 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let barQuadHalfNDC = (barVisibleHalfPx + 1.0) / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
+
+        // Loop region — a translucent green band over [in, out] with
+        // bright edges, appended FIRST so beats + cues overlay it. Uses
+        // the same time→NDC mapping as the beats; the fill is clamped to
+        // the visible window so a loop longer than the window still
+        // tints the whole strip without a pathologically large quad.
+        if let (loopInSecs, loopOutSecs) = loopBounds {
+            let inNDC = Self.beatTimeNDC(
+                beatSecs: loopInSecs, peakDur: peakDur, snappedChunkF: snappedChunkF,
+                drawnAbove: drawnAbove, drawnBelow: drawnBelow,
+                pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+            let outNDC = Self.beatTimeNDC(
+                beatSecs: loopOutSecs, peakDur: peakDur, snappedChunkF: snappedChunkF,
+                drawnAbove: drawnAbove, drawnBelow: drawnBelow,
+                pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+            let low = max(Float(min(inNDC, outNDC)), -1.05)
+            let high = min(Float(max(inNDC, outNDC)), 1.05)
+            if high > low {
+                let onePx = 1.0 / timeAxisPixels
+                Self.appendCrossAxisStrip(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: (low + high) * 0.5,
+                    quadHalfNDC: (high - low) * 0.5 + onePx,
+                    visibleHalfNDC: (high - low) * 0.5,
+                    color: Self.loopRGBA(alpha: 0.16),
+                    crossLow: -1.0,
+                    crossHigh: 1.0)
+            }
+            // Bright edges at the true in/out, only when on-screen.
+            let loopEdgeVisibleHalfNDC: Float = 1.25 / timeAxisPixels
+            let loopEdgeQuadHalfNDC: Float = (1.25 + 1.0) / timeAxisPixels
+            for edgeNDC in [Float(inNDC), Float(outNDC)] where edgeNDC >= -1.02 && edgeNDC <= 1.02 {
+                Self.appendBeatLineQuad(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: edgeNDC,
+                    quadHalfNDC: loopEdgeQuadHalfNDC,
+                    visibleHalfNDC: loopEdgeVisibleHalfNDC,
+                    color: Self.loopRGBA(alpha: 0.95),
+                    isDownbeat: true)
+            }
+        }
 
         if drawBeats {
             let startIdx = Self.firstBeatIndex(in: beats.beats, atOrAfter: visibleStart)

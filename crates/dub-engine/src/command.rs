@@ -113,6 +113,22 @@ pub enum Command {
     /// Set deck `idx`'s linear gain. `1.0` = unity, `0.0` = silence.
     DeckSetGain { idx: u8, gain: f32 },
 
+    /// Engage a loop on deck `idx` over `[in_frames, out_frames)`
+    /// (track frames). The reverse-loop region is computed off-RT
+    /// (grid-snapped) and sent here; the deck jumps the playhead into
+    /// the region if it's outside (the "repeat the bar just heard"
+    /// jump-back) and wraps per-block with a seam crossfade. No-op on
+    /// an empty / non-finite region.
+    DeckSetLoop {
+        idx: u8,
+        in_frames: f64,
+        out_frames: f64,
+    },
+
+    /// Disengage any loop on deck `idx`. Playback continues forward
+    /// from the current position. Idempotent.
+    DeckClearLoop { idx: u8 },
+
     /// Pin deck `idx`'s control mode (the deck-header Internal/Timecode
     /// switch). Sets the user override so auto source-detection won't
     /// change it until [`Self::DeckAutoControlMode`].
@@ -228,6 +244,19 @@ impl std::fmt::Debug for Command {
                 .field("idx", idx)
                 .field("gain", gain)
                 .finish(),
+            Self::DeckSetLoop {
+                idx,
+                in_frames,
+                out_frames,
+            } => f
+                .debug_struct("DeckSetLoop")
+                .field("idx", idx)
+                .field("in_frames", in_frames)
+                .field("out_frames", out_frames)
+                .finish(),
+            Self::DeckClearLoop { idx } => {
+                f.debug_struct("DeckClearLoop").field("idx", idx).finish()
+            }
             Self::DeckSetControlMode { idx, mode } => f
                 .debug_struct("DeckSetControlMode")
                 .field("idx", idx)

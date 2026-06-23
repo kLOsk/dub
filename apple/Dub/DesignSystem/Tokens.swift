@@ -107,6 +107,12 @@ enum DubColor {
     /// zoomed Metal waveform all render a cue in the same colour.
     static let hotCue = Color(hex: 0xFA5C9E)
 
+    /// Loop region / pad accent. A bright mint-green, the DJ-software
+    /// convention for an active loop (Traktor / Serato), and distinct
+    /// from the cue magenta and both deck tints so a loop reads as its
+    /// own thing on the pads + overview + waveform band.
+    static let loop = Color(hex: 0x4FD18B)
+
     // ----- Overview strip (M10.5c) ---------------------------------
 
     /// Deck A's amplitude colour in the Track Overview strip.

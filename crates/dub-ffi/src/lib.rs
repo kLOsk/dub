@@ -42,8 +42,8 @@ use dub_bpm::{
     GridQuality as CoreGridQuality, OctaveProfile,
 };
 use dub_engine::{
-    DeckSharedState, Engine, EngineHandle, ThruInputConfig, TimecodeInputConfig,
-    INTERNAL_MIXER_ROUTING,
+    reverse_loop_region, DeckSharedState, Engine, EngineHandle, ThruInputConfig,
+    TimecodeInputConfig, INTERNAL_MIXER_ROUTING,
 };
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
@@ -299,7 +299,11 @@ uniffi::setup_scaffolding!();
 ///   38. **Hot cues.** `DubLibrary` grows `set_hot_cue` /
 ///       `delete_hot_cue` / `hot_cues` (the [`HotCue`] record) — the
 ///       per-track jump markers behind the CUE pads (`source = 'user'`).
-pub const FFI_VERSION: u32 = 38;
+///   39. **Reverse loops.** `DubEngine` grows `set_reverse_loop` /
+///       `clear_loop`; [`PositionInfo`] grows `loop_active` /
+///       `loop_in_secs` / `loop_out_secs`. A grid-snapped loop over
+///       the bars just heard (Prep LOOP pads).
+pub const FFI_VERSION: u32 = 39;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -812,6 +816,7 @@ impl DubEngine {
         let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
         let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
         let debug_elapsed_ns = now_ns.saturating_sub(publish.host_time_ns);
+        let loop_state = shared.load_loop();
         PositionInfo {
             elapsed_secs,
             playhead_secs_unclamped,
@@ -824,6 +829,9 @@ impl DubEngine {
             debug_publish_secs: publish.position_secs,
             debug_elapsed_ns,
             debug_advance_rate: publish.rate,
+            loop_active: loop_state.active,
+            loop_in_secs: loop_state.in_secs,
+            loop_out_secs: loop_state.out_secs,
         }
     }
 }
@@ -1609,6 +1617,75 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Engage a grid-snapped **reverse** loop of `length_beats` beats
+    /// on `deck_idx`: the loop covers the `length_beats` beats ending
+    /// at the beat line nearest the current playhead — the passage the
+    /// DJ just heard. The engine jumps the playhead back into the loop
+    /// (de-clicked) so it repeats immediately, then wraps per-block
+    /// with a seam crossfade.
+    ///
+    /// The loop region is computed here off the deck's stored beat
+    /// grid (seconds) + the live playhead, converted to track frames,
+    /// and sent to the audio thread. No-op (returns `Ok`) when the
+    /// deck has no analyzable grid or the grid can't hold the loop.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::InvalidDeckIndex`]
+    pub fn set_reverse_loop(&self, deck_idx: u64, length_beats: u32) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        // Read the live playhead before taking the engine lock so the
+        // loop is anchored to where the deck actually is at the press.
+        let playhead_secs = self
+            .position_snapshot_at_host_time_inner(deck_idx, DeckSharedState::host_time_now_ns())
+            .elapsed_secs;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let Some(PeakSource::File(file)) = running.peaks[idx].as_ref() else {
+            // No File-mode grid (empty / Thru deck) — nothing to loop.
+            return Ok(());
+        };
+        let track_sr = f64::from(file.sample_rate);
+        let Some((in_secs, out_secs)) =
+            reverse_loop_region(playhead_secs, &file.beat_grid.beats, length_beats)
+        else {
+            return Ok(());
+        };
+        if track_sr <= 0.0 {
+            return Ok(());
+        }
+        let in_frames = in_secs * track_sr;
+        let out_frames = out_secs * track_sr;
+        running
+            .handle
+            .deck(idx)
+            .set_loop(in_frames, out_frames)
+            .map_err(map_command_error)
+    }
+
+    /// Disengage any loop on `deck_idx`; playback continues forward.
+    /// Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::InvalidDeckIndex`]
+    pub fn clear_loop(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .clear_loop()
+            .map_err(map_command_error)
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2).
     ///
     /// Tells the engine to ignore the deck's timecode input until
@@ -1764,6 +1841,12 @@ impl DubEngine {
         };
         let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
         let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
+        let loop_state = self
+            .deck_shared
+            .get(idx)
+            .map_or(dub_engine::LoopState { active: false, in_secs: 0.0, out_secs: 0.0 }, |s| {
+                s.load_loop()
+            });
         PositionInfo {
             elapsed_secs,
             playhead_secs_unclamped,
@@ -1776,6 +1859,9 @@ impl DubEngine {
             debug_publish_secs: playhead_secs_unclamped,
             debug_elapsed_ns: 0,
             debug_advance_rate: 0.0,
+            loop_active: loop_state.active,
+            loop_in_secs: loop_state.in_secs,
+            loop_out_secs: loop_state.out_secs,
         }
     }
 
@@ -2910,6 +2996,17 @@ pub struct PositionInfo {
     /// 1.0× File-mode playback this MUST be 1.0; for paused or
     /// no-source decks it is 0.0.
     pub debug_advance_rate: f64,
+    /// Whether a loop is currently engaged on this deck. The UI
+    /// draws the loop bracket + lights the active length pad while
+    /// this is `true`; `loop_in_secs` / `loop_out_secs` give its
+    /// bounds (track seconds).
+    pub loop_active: bool,
+    /// Loop start in track seconds (meaningful only when
+    /// `loop_active`).
+    pub loop_in_secs: f64,
+    /// Loop end in track seconds, the exclusive wrap point
+    /// (meaningful only when `loop_active`).
+    pub loop_out_secs: f64,
 }
 
 impl PositionInfo {
@@ -2925,6 +3022,9 @@ impl PositionInfo {
         debug_publish_secs: 0.0,
         debug_elapsed_ns: 0,
         debug_advance_rate: 0.0,
+        loop_active: false,
+        loop_in_secs: 0.0,
+        loop_out_secs: 0.0,
     };
 }
 
@@ -4147,7 +4247,9 @@ mod tests {
         // `LibraryTransitionStat` / `LibrarySessionPlay` records.
         // 37→38: hot cues (`set_hot_cue` / `delete_hot_cue` /
         // `hot_cues` + the `HotCue` record).
-        assert_eq!(FFI_VERSION, 38);
+        // 38→39: reverse loops (`set_reverse_loop` / `clear_loop` +
+        // `PositionInfo.loop_active` / `loop_in_secs` / `loop_out_secs`).
+        assert_eq!(FFI_VERSION, 39);
     }
 
     #[test]

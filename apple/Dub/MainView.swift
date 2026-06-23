@@ -160,6 +160,18 @@ struct DeckState: Equatable {
     /// changes bump `seekGeneration` so a paused deck repaints.
     var hotCues: [Double?] = [nil, nil, nil, nil]
 
+    /// Active reverse loop, mirrored from `positionSnapshot` each
+    /// poll. `loopActive` gates `loopInSecs` / `loopOutSecs` (track
+    /// seconds), which the overview + waveform draw as the loop band.
+    var loopActive: Bool = false
+    var loopInSecs: Double = 0
+    var loopOutSecs: Double = 0
+    /// Which LOOP length pad is lit, in bars (½, 1, 2, 4). Set when
+    /// the user presses a length; cleared when the engine reports the
+    /// loop gone (exit, or a track load dropped it). Drives the pad
+    /// highlight only — the drawn band comes from `loopIn/OutSecs`.
+    var activeLoopBars: Double? = nil
+
     /// M10.5u. Estimated tempo for the loaded track, populated
     /// from `engine.beatGrid(deckIdx:)` after a successful
     /// `loadTrack`. `nil` when no track is loaded, when BPM
@@ -531,6 +543,24 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kLoudnessAutoGain = "dub.loudnessAutoGainEnabled"
 
+    /// Cue-point grid snap toggle. When on (the default), setting a hot
+    /// cue snaps the marker to the nearest beat line of the deck's grid
+    /// instead of the raw playhead — the DJ taps roughly on the beat
+    /// and the cue lands clean. When off, the cue lands exactly where
+    /// the playhead is. Recall always jumps to the stored position
+    /// regardless; only the *set* gesture snaps. Tracks with no
+    /// analysable grid fall back to the raw position either way.
+    ///
+    /// Persisted in `UserDefaults` under `dub.cueSnapToGridEnabled`.
+    @Published var cueSnapToGridEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                cueSnapToGridEnabled, forKey: Self.kCueSnapToGrid)
+        }
+    }
+
+    private static let kCueSnapToGrid = "dub.cueSnapToGridEnabled"
+
     // MARK: Live engine state
 
     @Published private(set) var isRunning: Bool = false
@@ -775,6 +805,8 @@ final class WaveformAppModel: ObservableObject {
         // the key has never been written.
         self.loudnessAutoGainEnabled =
             UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
+        self.cueSnapToGridEnabled =
+            UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
         // the only place the cold-boot value enters the model. We
@@ -1371,6 +1403,15 @@ final class WaveformAppModel: ObservableObject {
         // `TimelineView` wrapping `TrackOverviewView`'s Canvas for
         // the new consumer-side wiring.
         next.isPanicPlay = pos.isPanicPlay
+        // Loop state (reverse loop). The engine is authoritative — a
+        // track load drops the loop — so clear the lit length pad
+        // whenever the loop goes inactive.
+        next.loopActive = pos.loopActive
+        next.loopInSecs = pos.loopInSecs
+        next.loopOutSecs = pos.loopOutSecs
+        if !pos.loopActive {
+            next.activeLoopBars = nil
+        }
         // M-perf-ui — pitch + timecode lock state for the deck header
         // (tracking dot + PITCH readout). Lock-free, same hot path as
         // the position snapshot. Pitch is only meaningful while the
@@ -3778,13 +3819,29 @@ final class WaveformAppModel: ObservableObject {
             deck.seekGeneration &+= 1
             setState(deck, for: side)
         } else {
-            let position = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+            var position = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
             guard position.isFinite, position >= 0 else { return }
+            // Snap the marker to the nearest beat when the setting is on
+            // (default) — tap roughly on the beat, land clean.
+            if cueSnapToGridEnabled {
+                position = snappedToGrid(position, side: side)
+            }
             deck.hotCues[index] = position
             deck.seekGeneration &+= 1
             setState(deck, for: side)
             persistHotCue(deck: deck, index: index, position: position)
         }
+    }
+
+    /// Snap `secs` to the nearest beat line of the deck's grid. Returns
+    /// `secs` unchanged when the deck has no analysable grid, so a cue
+    /// on an ungridded track still lands where the playhead was.
+    private func snappedToGrid(_ secs: Double, side: DeckSide) -> Double {
+        let beats = engine.beatGrid(deckIdx: side.ffiDeckIdx).beats
+        guard let nearest = beats.min(by: { abs($0 - secs) < abs($1 - secs) }) else {
+            return secs
+        }
+        return nearest
     }
 
     /// Best-effort persistence of one hot cue slot (set when
@@ -3807,6 +3864,45 @@ final class WaveformAppModel: ObservableObject {
                 // write just means it won't recall after reload.
             }
         }
+    }
+
+    /// Engage a grid-snapped reverse loop of `bars` bars on the
+    /// focused deck (PRD §3.1 prep). The engine snaps the loop to the
+    /// bars just heard and jumps the playhead back in; we light the
+    /// matching length pad immediately and let the 30 Hz poll mirror
+    /// the engine's authoritative loop state into the deck.
+    func handleLoop(_ side: DeckSide, bars: Double) {
+        guard isRunning else { return }
+        var deck = state(for: side)
+        guard deck.hasTrack else { return }
+        // Loop length in beats = bars × beats-per-bar from the deck's
+        // grid (4 when the grid hasn't reported a meter yet). The
+        // engine no-ops if the track has no analysable grid.
+        let beatsPerBar = max(1, Int(engine.beatGrid(deckIdx: side.ffiDeckIdx).beatsPerBar))
+        let lengthBeats = max(1, Int((bars * Double(beatsPerBar)).rounded()))
+        do {
+            try engine.setReverseLoop(
+                deckIdx: side.ffiDeckIdx, lengthBeats: UInt32(lengthBeats))
+        } catch {
+            surfaceError("Loop failed: \(error.localizedDescription)")
+            return
+        }
+        deck.activeLoopBars = bars
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
+    }
+
+    /// Disengage the loop on the focused deck; playback continues
+    /// forward from the current position.
+    func exitLoop(_ side: DeckSide) {
+        guard isRunning else { return }
+        var deck = state(for: side)
+        guard deck.activeLoopBars != nil || deck.loopActive else { return }
+        try? engine.clearLoop(deckIdx: side.ffiDeckIdx)
+        deck.activeLoopBars = nil
+        deck.loopActive = false
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
     }
 
     /// M11d.6 — manual phase nudge for the focused deck's beat

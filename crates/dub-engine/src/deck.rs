@@ -175,6 +175,28 @@ pub struct DeckSharedState {
     /// Measurement progress [0, 1] for the deck-header calibration
     /// line (f32 bits). 1.0 when nothing is measuring.
     tc_measure_progress_bits: AtomicU32,
+    /// Active loop region for the UI (draw the loop bracket + light
+    /// the pad). `loop_active` gates the two f64-bit position fields,
+    /// both in **track seconds**. Plain relaxed atomics — the loop
+    /// changes only on a user press, so a one-block tear of the
+    /// (active, in, out) triple is invisible and a seqlock is
+    /// overkill. The audio thread *drives* playback from the
+    /// frame-domain region on `Deck`; these are display mirrors.
+    loop_active: AtomicBool,
+    loop_in_secs_bits: AtomicU64,
+    loop_out_secs_bits: AtomicU64,
+}
+
+/// Lock-free snapshot of a deck's active loop, in **track seconds**.
+/// `active == false` means no loop; the positions are then unspecified.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoopState {
+    /// Whether a loop is currently engaged.
+    pub active: bool,
+    /// Loop start, track seconds.
+    pub in_secs: f64,
+    /// Loop end, track seconds (exclusive wrap point).
+    pub out_secs: f64,
 }
 
 /// Lock-free snapshot of a deck's timecode signal health. Returned by
@@ -303,6 +325,9 @@ impl DeckSharedState {
             tc_pitch_settled: AtomicBool::new(true),
             tc_measure_progress_bits: AtomicU32::new(1.0f32.to_bits()),
             tc_abs_position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            loop_active: AtomicBool::new(false),
+            loop_in_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -337,6 +362,7 @@ impl DeckSharedState {
         self.tc_sticker_drift_ms_bits
             .store(f64::NAN.to_bits(), Ordering::Relaxed);
         self.tc_pitch_settled.store(true, Ordering::Relaxed);
+        self.store_loop(false, 0.0, 0.0);
         self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0);
         // Bring the seqlock-protected publish triple back to a
         // clean baseline (zero playhead, zero rate, host time at
@@ -481,6 +507,30 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_at_end(&self) -> bool {
         self.at_end.load(Ordering::Relaxed)
+    }
+
+    /// Publish the active loop region for the UI (audio-thread or
+    /// command-apply writer). Three relaxed stores; RT-safe.
+    pub(crate) fn store_loop(&self, active: bool, in_secs: f64, out_secs: f64) {
+        self.loop_in_secs_bits
+            .store(in_secs.to_bits(), Ordering::Relaxed);
+        self.loop_out_secs_bits
+            .store(out_secs.to_bits(), Ordering::Relaxed);
+        // Store the flag last so a reader that sees `active` also sees
+        // coherent endpoints (Relaxed gives no ordering guarantee, but
+        // the loop changes far slower than the poll, so this is belt-
+        // and-braces rather than load-bearing).
+        self.loop_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the deck's active loop region (track seconds).
+    #[must_use]
+    pub fn load_loop(&self) -> LoopState {
+        LoopState {
+            active: self.loop_active.load(Ordering::Relaxed),
+            in_secs: f64::from_bits(self.loop_in_secs_bits.load(Ordering::Relaxed)),
+            out_secs: f64::from_bits(self.loop_out_secs_bits.load(Ordering::Relaxed)),
+        }
     }
 
     pub(crate) fn store_panic_play(&self, panic: bool) {
@@ -771,7 +821,24 @@ pub struct Deck {
     /// correction per block is far below audibility). `None` in the
     /// steady state and whenever the deck is driven by rate alone.
     pending_advance: Option<f64>,
+
+    /// Active loop region as `(in_frames, out_frames)` in **track
+    /// frames**, or `None` when no loop is engaged. While set, the
+    /// render wraps the playhead at `out_frames` back to `in_frames`
+    /// with a short seam crossfade (see [`Self::render_into`]). Loops
+    /// are an internal-playback feature (Prep); the timecode absolute
+    /// advance (`pending_advance`) is never set at the same time, and
+    /// the render guards against the two colliding.
+    loop_region: Option<(f64, f64)>,
 }
+
+/// Equal-shape seam crossfade applied at the loop wrap so the
+/// waveform discontinuity between `out` and `in` is inaudible. A few
+/// milliseconds is enough — the boundaries are already whole-beat
+/// phase-aligned, so the crossfade only has to hide sample-level
+/// content difference, not a rhythmic jump. Capped at a quarter of the
+/// loop length so very short loops keep a real body.
+const LOOP_XFADE_SECS: f64 = 0.004;
 
 impl Deck {
     /// Construct an empty deck with no track loaded. Allocates the shared
@@ -811,6 +878,7 @@ impl Deck {
             declick: DeclickState::Idle,
             pending_disposal: None,
             pending_advance: None,
+            loop_region: None,
         }
     }
 
@@ -900,6 +968,9 @@ impl Deck {
         let duration_secs = Self::track_duration_secs(&track);
         self.source = Some(track);
         self.position = 0.0;
+        // A new track invalidates any loop set against the old one.
+        self.loop_region = None;
+        self.shared.store_loop(false, 0.0, 0.0);
         self.shared.store_position(0.0);
         // Publish (secs=0, rate=0) so a snapshot reader landing
         // between source-set and the first render block sees a
@@ -928,6 +999,8 @@ impl Deck {
         let duration_secs = Self::track_duration_secs(&track);
         self.source = Some(track);
         self.position = 0.0;
+        self.loop_region = None;
+        self.shared.store_loop(false, 0.0, 0.0);
         self.shared.store_position(0.0);
         self.shared.publish_position_secs(0.0, 0.0);
         self.shared.store_at_end(false);
@@ -1165,6 +1238,62 @@ impl Deck {
         self.pending_advance = Some(self.pending_advance.unwrap_or(0.0) + delta_track_frames);
     }
 
+    /// Engage a loop over `[in_frames, out_frames)` (track frames).
+    ///
+    /// This is the audio-thread half of the reverse-loop gesture: the
+    /// region is set *behind* a playing head (the bar just heard), so
+    /// when the playhead is outside the region we jump it back in with
+    /// a de-click — the "repeat what I just heard" starts immediately
+    /// and cleanly. Every subsequent wrap is handled per-block in
+    /// [`Self::render_into`] with a seam crossfade. No-op on a
+    /// non-finite or empty region.
+    pub fn set_loop(&mut self, in_frames: f64, out_frames: f64) {
+        if !in_frames.is_finite() || !out_frames.is_finite() || out_frames <= in_frames {
+            return;
+        }
+        self.loop_region = Some((in_frames, out_frames));
+        if self.position < in_frames || self.position >= out_frames {
+            let wrapped =
+                crate::looping::wrap_into(self.position, in_frames, out_frames - in_frames);
+            // Reuses the seek path: de-click ramp + position store +
+            // `position_secs` publish + `pending_advance` clear. It
+            // deliberately does *not* touch `loop_region`, so the loop
+            // we just set survives the jump.
+            self.set_position_frames(wrapped);
+        }
+        self.publish_loop_state();
+    }
+
+    /// Disengage any active loop. Playback continues forward from the
+    /// current position. Idempotent.
+    pub fn clear_loop(&mut self) {
+        self.loop_region = None;
+        self.publish_loop_state();
+    }
+
+    /// The active loop region `(in_frames, out_frames)`, or `None`.
+    #[must_use]
+    pub fn loop_region(&self) -> Option<(f64, f64)> {
+        self.loop_region
+    }
+
+    /// Mirror the frame-domain loop region into the UI-readable shared
+    /// atomics, in track seconds. Called whenever the region changes.
+    fn publish_loop_state(&self) {
+        let (active, in_secs, out_secs) = match (self.loop_region, self.source.as_ref()) {
+            (Some((i, o)), Some(track)) => {
+                let sr = f64::from(track.sample_rate());
+                if sr > 0.0 {
+                    (true, i / sr, o / sr)
+                } else {
+                    (false, 0.0, 0.0)
+                }
+            }
+            _ => (false, 0.0, 0.0),
+        };
+        self.shared.store_loop(active, in_secs, out_secs);
+    }
+
     /// Linear gain. Default `1.0`.
     #[must_use]
     pub fn gain(&self) -> f32 {
@@ -1279,6 +1408,10 @@ impl Deck {
         // it was measured for.
         let block_start = pos;
         let advance = self.pending_advance.take();
+        // Loop region (track frames) captured once per block. While
+        // set, the per-sample advance wraps `pos` at `out` back to
+        // `in`; the steady-state read seam-crossfades the wrap.
+        let loop_region = self.loop_region;
 
         // The increment for the *current* (new-side) source. Computed
         // once per block — the source doesn't change mid-render.
@@ -1362,6 +1495,16 @@ impl Deck {
                 }
                 if self.playing {
                     pos += new_increment;
+                    if let Some((lin, lout)) = loop_region {
+                        let len = lout - lin;
+                        if len > 0.0 {
+                            if pos >= lout {
+                                pos -= len;
+                            } else if pos < lin {
+                                pos += len;
+                            }
+                        }
+                    }
                 }
                 *samples_remaining -= 1;
             }
@@ -1378,17 +1521,52 @@ impl Deck {
                 #[allow(clippy::cast_precision_loss)]
                 let track_len = track.frames() as f64;
                 let env = &self.declick_envelope;
+                let env_len = env.len();
+                // Pre-compute the loop seam crossfade window (track
+                // frames), capped at a quarter of the loop body so a
+                // short loop still has un-crossfaded audio in the middle.
+                let loop_xfade = loop_region.map(|(lin, lout)| {
+                    let len = lout - lin;
+                    let x = (f64::from(track.sample_rate()) * LOOP_XFADE_SECS).min(len * 0.25);
+                    (lin, lout, len, x.max(0.0))
+                });
 
                 for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
-                    let (l, r) = read_stereo_at(track, pos);
+                    let (mut l, mut r) = read_stereo_at(track, pos);
+                    // Loop seam crossfade: in the last `x` frames before
+                    // `out`, blend the loop tail into the audio that
+                    // leads into `in` (one loop-length back), so when the
+                    // wrap lands on `in` the waveform is already continuous.
+                    if let Some((lin, lout, len, x)) = loop_xfade {
+                        if x > 0.0 && pos >= lout - x && pos < lout && pos >= lin {
+                            let t = (pos - (lout - x)) / x;
+                            let (pl, pr) = read_stereo_at(track, pos - len);
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let idx = (t * f64::from(env_len)) as u32;
+                            let fade_in = env.fade_in(idx);
+                            let fade_out = 1.0 - fade_in;
+                            l = l * fade_out + pl * fade_in;
+                            r = r * fade_out + pr * fade_in;
+                        }
+                    }
                     let edge = track_tail_fade_scale(track_len, pos, env);
                     chunk[offset] += l * gain * edge;
                     chunk[offset + 1] += r * gain * edge;
                     pos += new_increment;
+                    if let Some((lin, lout, len, _)) = loop_xfade {
+                        if len > 0.0 {
+                            if pos >= lout {
+                                pos -= len;
+                            } else if pos < lin {
+                                pos += len;
+                            }
+                        }
+                    }
                 }
 
                 // End-of-track flag tracks the steady-state position only;
                 // during a fade the snapshot is meaningful but not load-bearing.
+                // A looping deck never reaches the end, so this stays false.
                 let off_end = pos < 0.0 || pos >= track_len;
                 if off_end != self.shared.load_at_end() {
                     self.shared.store_at_end(off_end);
@@ -1409,7 +1587,12 @@ impl Deck {
         // below one frame per block in practice, so the next block's
         // read position is inaudibly close to where integration alone
         // would have put it.
-        if self.playing && self.source.is_some() {
+        // A loop owns the playhead while engaged: the per-sample wrap
+        // above already produced the block-end position, so the M6
+        // absolute re-pin must not stomp it. In practice `advance` is
+        // never set while looping (loops are internal-play, not
+        // timecode), but the guard makes the precedence explicit.
+        if self.playing && self.source.is_some() && loop_region.is_none() {
             if let Some(delta) = advance {
                 pos = block_start + delta;
             }
@@ -1645,6 +1828,123 @@ mod tests {
         {
             assert_eq!(deck.position_frames(), 0.0);
         }
+    }
+
+    // Loops (reverse loop + RT wrap).
+
+    #[test]
+    fn loop_wraps_playhead_within_region() {
+        // 2000-frame track; engine SR == track SR ⇒ 1 frame advanced
+        // per output frame. Loop [100, 200): rendering 250 frames from
+        // 100 wraps back into the region (100 + 250 mod 100 = 150).
+        let mut deck = test_deck();
+        deck.set_source(const_track(&vec![0.1f32; 4000], 2, 48_000));
+        deck.set_position_frames(100.0);
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.set_loop(100.0, 200.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 250 * 2];
+        deck.render(&mut rt, &mut out, 48_000.0);
+        let p = deck.position_frames();
+        assert!(
+            (100.0..200.0).contains(&p),
+            "looped position {p} escaped [100, 200)"
+        );
+        assert!((p - 150.0).abs() < 1e-6, "expected ~150, got {p}");
+    }
+
+    #[test]
+    fn reverse_loop_jumps_playhead_back_into_region() {
+        // Playhead is past the region (the "pressed a hair late"
+        // reverse-loop case). set_loop must jump it back in.
+        let mut deck = test_deck();
+        deck.set_source(const_track(&vec![0.1f32; 4000], 2, 48_000));
+        deck.set_position_frames(250.0);
+        deck.set_loop(100.0, 200.0);
+        let p = deck.position_frames();
+        assert!(
+            (100.0..200.0).contains(&p),
+            "reverse jump-back failed, position {p}"
+        );
+        assert!((p - 150.0).abs() < 1e-6, "expected 150, got {p}");
+        assert_eq!(deck.loop_region(), Some((100.0, 200.0)));
+    }
+
+    #[test]
+    fn clear_loop_releases_the_playhead() {
+        let mut deck = test_deck();
+        deck.set_source(const_track(&vec![0.1f32; 8000], 2, 48_000));
+        deck.set_position_frames(100.0);
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.set_loop(100.0, 200.0);
+        deck.clear_loop();
+        assert_eq!(deck.loop_region(), None);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 300 * 2];
+        deck.render(&mut rt, &mut out, 48_000.0);
+        // No loop: 100 + 300 = 400, well past the old out = 200.
+        let p = deck.position_frames();
+        assert!(
+            (p - 400.0).abs() < 1e-6,
+            "expected 400 after clear, got {p}"
+        );
+    }
+
+    #[test]
+    fn set_loop_publishes_secs_and_rejects_empty_region() {
+        let mut deck = test_deck();
+        let shared = deck.shared();
+        deck.set_source(const_track(&vec![0.1f32; 19_200], 2, 48_000));
+        deck.set_loop(4_800.0, 9_600.0); // 0.1 s .. 0.2 s @ 48 kHz
+        let ls = shared.load_loop();
+        assert!(ls.active);
+        assert!((ls.in_secs - 0.1).abs() < 1e-9);
+        assert!((ls.out_secs - 0.2).abs() < 1e-9);
+
+        deck.clear_loop();
+        assert!(!shared.load_loop().active);
+
+        // An inverted / empty region is a no-op, not a loop.
+        deck.set_loop(200.0, 100.0);
+        assert_eq!(deck.loop_region(), None);
+        assert!(!shared.load_loop().active);
+    }
+
+    #[test]
+    fn looped_render_is_alloc_free() {
+        // The loop wrap + seam crossfade run on the audio thread, so
+        // they must not allocate. The 100-frame loop wraps several
+        // times across a 256-frame block and crosses the crossfade
+        // window each time, exercising the full hot path.
+        let mut deck = test_deck();
+        deck.set_source(const_track(&vec![0.1f32; 8000], 2, 48_000));
+        deck.set_position_frames(100.0);
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.set_loop(100.0, 200.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        assert_no_alloc::assert_no_alloc(|| {
+            deck.render(&mut rt, &mut out, 48_000.0);
+        });
+    }
+
+    #[test]
+    fn loading_a_track_clears_any_loop() {
+        let mut deck = test_deck();
+        let shared = deck.shared();
+        deck.set_source(const_track(&vec![0.1f32; 4000], 2, 48_000));
+        deck.set_loop(100.0, 200.0);
+        assert!(deck.loop_region().is_some());
+        // A fresh load drops the stale loop.
+        deck.swap_source(const_track(&vec![0.2f32; 4000], 2, 48_000));
+        assert_eq!(deck.loop_region(), None);
+        assert!(!shared.load_loop().active);
     }
 
     // M6 — absolute-timecode exact advance.
