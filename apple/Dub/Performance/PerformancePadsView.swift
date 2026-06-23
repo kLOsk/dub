@@ -9,18 +9,26 @@
 //  the phase clock), and the cue / loop / quick-scratch / sampler
 //  controls live out here on the deck's outer edge.
 //
-//  These are honest placeholders until the features land — Loops
-//  (M13), Quick Scratch + Sampler (M17), hot cues (a later
-//  milestone). They're laid out now so the surface reads as a real
-//  performance instrument rather than empty space, and so the final
-//  geometry is fixed before the controls become live.
+//  The CUE row is live: keys 1–4 set/recall a hot cue on the master
+//  deck, Shift+key clears it (see `WaveformAppModel.handleHotCue`). A
+//  pad lights in the deck's tint when its slot holds a position. The
+//  rest are honest placeholders until the features land — Loops (M13),
+//  Quick Scratch + Sampler (M17). They're laid out now so the surface
+//  reads as a real performance instrument rather than empty space, and
+//  so the final geometry is fixed before the controls become live.
 //
 
+import AppKit
 import SwiftUI
 
 struct PerformancePadsView: View {
 
     let side: DeckSide
+
+    /// Hot cue positions (track seconds) for the four CUE pads; `nil`
+    /// = empty slot. Drives which pads light. Fed from the deck's
+    /// `hotCues`, set/recalled by the 1–4 keys.
+    var cues: [Double?] = [nil, nil, nil, nil]
 
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
@@ -29,7 +37,7 @@ struct PerformancePadsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
-            padGroup("CUE", keys: ["1", "2", "3", "4"])
+            cueGroup()
             padGroup("LOOP", keys: ["IN", "OUT", "½", "×2"])
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
@@ -37,6 +45,23 @@ struct PerformancePadsView: View {
         .padding(.horizontal, DubSpacing.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: frameAlignment)
         .background(DubColor.surface0)
+    }
+
+    /// The live CUE row. No "soon" tag; pads light in the deck tint
+    /// when set.
+    @ViewBuilder
+    private func cueGroup() -> some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            Text("CUE")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+            HStack(spacing: DubSpacing.sm) {
+                ForEach(0..<4, id: \.self) { index in
+                    pad("\(index + 1)", lit: index < cues.count && cues[index] != nil)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -57,23 +82,135 @@ struct PerformancePadsView: View {
         }
     }
 
-    private func pad(_ glyph: String) -> some View {
-        Text(glyph)
-            .font(.system(size: 13, weight: .semibold, design: .rounded))
-            .foregroundStyle(DubColor.textTertiary)
-            .frame(width: glyph.count > 1 ? 50 : 38, height: 36)
-            .background(DubColor.surface1)
-            .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                    .stroke(DubColor.divider, lineWidth: 1))
+    private func pad(_ glyph: String, lit: Bool = false) -> some View {
+        hotCuePadCell(glyph, lit: lit)
+    }
+}
+
+/// One pad cell — `glyph` centred, lit in the cue accent when set.
+/// Shared by the Performance pad panel (`PerformancePadsView`) and
+/// the Prep cue bar (`CuePadRow`) so a set cue reads identically
+/// (magenta) on both, matching the waveform / overview markers.
+@ViewBuilder
+private func hotCuePadCell(_ glyph: String, lit: Bool) -> some View {
+    Text(glyph)
+        .font(.system(size: 13, weight: .semibold, design: .rounded))
+        .foregroundStyle(lit ? DubColor.textPrimary : DubColor.textTertiary)
+        .frame(width: glyph.count > 1 ? 50 : 38, height: 36)
+        .background(lit ? DubColor.hotCue.opacity(0.24) : DubColor.surface1)
+        .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                .stroke(lit ? DubColor.hotCue : DubColor.divider, lineWidth: 1))
+}
+
+/// Horizontal, **clickable** hot cue pad row for Prep mode (where
+/// the mouse is a first-class input, unlike Performance). Click an
+/// empty pad to set a cue at the playhead, a set pad to jump to it,
+/// ⇧-click to clear — mirroring the 1–4 / ⇧+1–4 keyboard gestures.
+struct CuePadRow: View {
+
+    let cues: [Double?]
+    /// `(index, clear)` — `clear` is `true` when ⇧ is held at click.
+    let onCue: (_ index: Int, _ clear: Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("CUE")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
+            ForEach(0..<4, id: \.self) { index in
+                let isSet = index < cues.count && cues[index] != nil
+                hotCuePadCell("\(index + 1)", lit: isSet)
+                    .onPressDown {
+                        onCue(index, NSEvent.modifierFlags.contains(.shift))
+                    }
+                    .help(isSet
+                        ? "Cue \(index + 1) — click to jump, ⇧-click to clear"
+                        : "Cue \(index + 1) — click to set at the playhead")
+            }
+        }
+    }
+}
+
+extension View {
+    /// Fire `perform` on mouse-**down** (press), not mouse-up.
+    ///
+    /// Use for timing-sensitive taps — hot cues, the BPM tap — where
+    /// the handler captures the live playhead (or a wall-clock tap
+    /// timestamp) at the click instant. A SwiftUI `Button` fires its
+    /// action on mouse-**up**, so on a playing deck the captured
+    /// point lands the whole click-hold duration (tens of ms) too
+    /// late; the keyboard path fires on key-down and is correct, so
+    /// the two disagreed. Pressing down matches the keyboard and a
+    /// real hardware pad (note-on = press). `enabled == false` makes
+    /// it inert (left-click does nothing) while leaving any sibling
+    /// `contextMenu` / right-click reachable.
+    func onPressDown(enabled: Bool = true, perform: @escaping () -> Void) -> some View {
+        modifier(PressDownModifier(enabled: enabled, perform: perform))
+    }
+}
+
+private struct PressDownModifier: ViewModifier {
+    let enabled: Bool
+    let perform: () -> Void
+    @State private var pressing = false
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard enabled, !pressing else { return }
+                        pressing = true
+                        perform()
+                    }
+                    .onEnded { _ in pressing = false })
+    }
+}
+
+/// Shared geometry for the Prep pad rows so the CUE and LOOP rows
+/// line their pad columns up under a fixed-width label gutter.
+private enum PrepPadLayout {
+    static let labelWidth: CGFloat = 44
+}
+
+/// Placeholder LOOP pad row for Prep. Loops (M13) aren't built yet —
+/// there's no loop engine, FFI, or state behind them — so this is
+/// honest "soon" chrome: the IN / OUT / ½ / ×2 vocabulary laid out,
+/// dimmed and non-interactive, so the Prep surface reads as a real
+/// annotation instrument and the geometry is fixed before the
+/// controls go live. Prep's loop role is *authoring* a region to
+/// recall later, not live triggering (PRD §3.1).
+struct LoopPadRowPlaceholder: View {
+
+    var body: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("LOOP")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
+            ForEach(["IN", "OUT", "½", "×2"], id: \.self) { glyph in
+                hotCuePadCell(glyph, lit: false)
+            }
+            Text("soon")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textPlaceholder)
+                .padding(.leading, DubSpacing.xs)
+        }
+        .opacity(0.5)
+        .allowsHitTesting(false)
     }
 }
 
 #Preview("Performance pads") {
     HStack(spacing: 1) {
-        PerformancePadsView(side: .a)
-        PerformancePadsView(side: .b)
+        PerformancePadsView(side: .a, cues: [12.0, nil, 48.5, nil])
+        PerformancePadsView(side: .b, cues: [nil, 4.0, nil, nil])
     }
     .frame(width: 800, height: 360)
     .background(DubColor.surface0)

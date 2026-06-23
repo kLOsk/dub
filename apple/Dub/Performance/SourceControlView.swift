@@ -87,29 +87,31 @@ struct SourceControlView: View {
     /// play), ⏸ while playing internally (click → pause, stay Internal).
     private var intSegment: some View {
         let playingInternally = status == .internalPlay && isPlaying
-        return Button(action: { playingInternally ? onPause() : onInternal() }) {
-            Image(systemName: playingInternally ? "pause.fill" : "play.fill")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(isInternalActive ? DubColor.surface0 : DubColor.textSecondary)
-                .frame(minWidth: 22)
-                .padding(.vertical, 4)
-                .background(isInternalActive ? DubColor.deckTint(side) : Color.clear)
-        }
-        .buttonStyle(.plain)
-        .help(playingInternally ? "Pause" : "Play internally")
+        // The deck source switch fires on mouse-**down**, like the
+        // transport / cue / tap controls — INT is the internal
+        // Play/Pause, so pressing it starts playback at the press
+        // instant rather than on release (see `View.onPressDown`).
+        return Image(systemName: playingInternally ? "pause.fill" : "play.fill")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(isInternalActive ? DubColor.surface0 : DubColor.textSecondary)
+            .frame(minWidth: 22)
+            .padding(.vertical, 4)
+            .background(isInternalActive ? DubColor.deckTint(side) : Color.clear)
+            .onPressDown { playingInternally ? onPause() : onInternal() }
+            .accessibilityAddTraits(.isButton)
+            .help(playingInternally ? "Pause" : "Play internally")
     }
 
     private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(DubFont.caps)
-                .tracking(0.6)
-                .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
-                .padding(.horizontal, DubSpacing.sm)
-                .padding(.vertical, 3)
-                .background(active ? DubColor.deckTint(side) : Color.clear)
-        }
-        .buttonStyle(.plain)
+        Text(title)
+            .font(DubFont.caps)
+            .tracking(0.6)
+            .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
+            .padding(.horizontal, DubSpacing.sm)
+            .padding(.vertical, 3)
+            .background(active ? DubColor.deckTint(side) : Color.clear)
+            .onPressDown(perform: action)
+            .accessibilityAddTraits(.isButton)
     }
 
     private var isInternalActive: Bool { status == .internalPlay }

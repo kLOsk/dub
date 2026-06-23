@@ -187,6 +187,7 @@ struct TrackOverviewView: View {
                     if let buckets, !buckets.isEmpty {
                         drawBars(ctx: ctx, size: size, buckets: buckets)
                         drawMinuteMarkers(ctx: ctx, size: size)
+                        drawHotCues(ctx: ctx, size: size)
                     } else {
                         drawEmptyState(ctx: ctx, size: size)
                     }
@@ -349,6 +350,35 @@ struct TrackOverviewView: View {
                     lineWidth: isMinute ? 1.25 : 0.75)
             }
             marker += intervalSecs
+        }
+    }
+
+    /// Hot cue markers across the whole-track overview — one thin
+    /// magenta line per set cue. Essential for prep: the DJ sees
+    /// every cue's place in the arrangement at a glance (intro,
+    /// drop, breakdown, outro), which the zoomed strip — showing
+    /// only the local neighbourhood — can't. Mapped on the same
+    /// `peaksLen × chunkDur` grid as the bars / minute ticks /
+    /// playhead (via `overviewDurationSecs` + `axisPosition`), so a
+    /// cue line sits exactly where the playhead lands when the deck
+    /// reaches it. Drawn in the static Canvas — cues change only on
+    /// set / clear / load, never per playhead tick.
+    private func drawHotCues(ctx: GraphicsContext, size: CGSize) {
+        let cues = deckState.hotCues
+        guard cues.contains(where: { $0 != nil }) else { return }
+        guard let duration = overviewDurationSecs(), duration > 0 else { return }
+        let lineW: CGFloat = 1.5
+        for case let cueSecs? in cues {
+            guard cueSecs.isFinite, cueSecs >= 0, cueSecs <= duration else { continue }
+            guard let p = axisPosition(fraction: cueSecs / duration, size: size) else { continue }
+            let line: CGRect
+            switch orientation {
+            case .vertical:
+                line = CGRect(x: 0, y: p - lineW * 0.5, width: size.width, height: lineW)
+            case .horizontal:
+                line = CGRect(x: p - lineW * 0.5, y: 0, width: lineW, height: size.height)
+            }
+            ctx.fill(Path(line), with: .color(DubColor.hotCue))
         }
     }
 

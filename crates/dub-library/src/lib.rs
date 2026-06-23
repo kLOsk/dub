@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 mod analysis;
+mod cues;
 mod db;
 mod dedupe;
 mod error;
@@ -38,6 +39,7 @@ mod version_tokens;
 mod volumes;
 
 pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
+pub use cues::HotCue;
 pub use db::{
     CrateRow, FileScanRow, Library, MissingTrack, SessionPlay, StoredFingerprint, TrackRow,
     TrackSortKey, TransitionStat,

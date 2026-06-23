@@ -198,6 +198,7 @@ struct PerformanceView: View {
                 prepOverviewBand
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
                     .frame(height: DubLayout.waveformPrepHeight)
+                prepPadBar
             }
             .background(DubColor.divider)
         } else {
@@ -231,6 +232,31 @@ struct PerformanceView: View {
             TrackOverviewView(model: model, side: .a, deckIdx: 0,
                               orientation: .horizontal)
         }
+    }
+
+    /// Prep-mode pad bar under the waveform. Prep is the prepare-and-
+    /// **test** surface (PRD §3.1): the DJ sets markers and auditions
+    /// them, so every control is clickable — usability, not a
+    /// performance concern. The CUE row is live (click empty → set at
+    /// playhead, click set → jump, ⇧-click → clear); the LOOP row is
+    /// an honest "soon" placeholder until M13 lands the loop engine,
+    /// at which point it becomes a clickable set-region + audition
+    /// control here too. Cues persist and show as magenta markers on
+    /// the overview and the strip.
+    @ViewBuilder
+    private var prepPadBar: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            CuePadRow(
+                cues: model.deckA.hotCues,
+                onCue: { index, clear in
+                    model.handleHotCue(.a, index: index, clear: clear)
+                })
+            LoopPadRowPlaceholder()
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DubColor.surface0)
     }
 
     /// **M11d.6 round 13 jitter-isolation toggle.** Set to `false`
@@ -319,7 +345,7 @@ struct PerformanceView: View {
                 // deck B the right (pads on the right).
                 HStack(spacing: 0) {
                     if side == .a {
-                        PerformancePadsView(side: side)
+                        PerformancePadsView(side: side, cues: deckState.hotCues)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -337,7 +363,7 @@ struct PerformanceView: View {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
                         }
-                        PerformancePadsView(side: side)
+                        PerformancePadsView(side: side, cues: deckState.hotCues)
                     }
                 }
             case .horizontal:
@@ -388,7 +414,8 @@ struct PerformanceView: View {
                     peaksGeneration: deckState.peaksGeneration,
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
-                        : 1.0)
+                        : 1.0,
+                    hotCues: deckState.hotCues.compactMap { $0 })
                     .background(DubColor.surface0)
             } else {
                 idlePane(side: side)

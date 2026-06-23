@@ -793,17 +793,20 @@ struct DeckHeader: View {
         background: Color,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .symbolRenderingMode(.monochrome)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(tint)
-                .frame(width: 20, height: 20)
-                .background(background)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        }
-        .buttonStyle(.borderless)
-        .accessibilityLabel(accessibilityLabel)
+        // Deck transport (Play / Pause / Panic / TC-engage) fires on
+        // mouse-**down**, like a hardware deck button and the cue /
+        // BPM-tap controls — pressing starts the action immediately
+        // instead of waiting for release (see `View.onPressDown`).
+        Image(systemName: systemName)
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(tint)
+            .frame(width: 20, height: 20)
+            .background(background)
+            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            .onPressDown(perform: action)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityAddTraits(.isButton)
     }
 
     // MARK: - Subviews
@@ -933,44 +936,52 @@ struct DeckHeader: View {
                 .font(DubFont.caps)
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
-            Button(action: { callbacks.onTapBpm?() }) {
-                HStack(spacing: 4) {
-                    Text(formattedBPM)
-                        .font(
-                            tapSession.rollingBpm != nil
-                                ? DubFont.numericInline.italic()
-                                : DubFont.numericInline
-                        )
-                        .foregroundStyle(bpmDisplayColor)
-                    if tapSession.tapCount > 0 {
-                        Text("(\(tapSession.tapCount))")
-                            .font(DubFont.micro)
-                            .foregroundStyle(DubColor.deckTint(side))
-                    }
-                    if state.gridLocked {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(DubColor.textSecondary)
-                    } else if let drift = state.gridDriftQuality,
-                              abs(drift) >= 3
-                    {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                    }
+            // Tap fires on mouse-**down**, not via a `Button` (mouse-
+            // up): the tap captures the live playhead + a wall-clock
+            // timestamp the instant you tap, and a `Button`'s mouse-up
+            // delay landed both the click-hold duration too late
+            // (visible as the tap sitting later than the keyboard's
+            // key-down path). See `View.onPressDown`.
+            HStack(spacing: 4) {
+                Text(formattedBPM)
+                    .font(
+                        tapSession.rollingBpm != nil
+                            ? DubFont.numericInline.italic()
+                            : DubFont.numericInline
+                    )
+                    .foregroundStyle(bpmDisplayColor)
+                if tapSession.tapCount > 0 {
+                    Text("(\(tapSession.tapCount))")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.deckTint(side))
                 }
-                .underline(
-                    tapSession.tapCount > 0,
-                    color: DubColor.deckTint(side).opacity(0.55))
+                if state.gridLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(DubColor.textSecondary)
+                } else if let drift = state.gridDriftQuality,
+                          abs(drift) >= 3
+                {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                }
             }
-            .buttonStyle(.plain)
-            .disabled(callbacks.onTapBpm == nil || state.bpm == nil || state.gridLocked)
+            .underline(
+                tapSession.tapCount > 0,
+                color: DubColor.deckTint(side).opacity(0.55))
+            .onPressDown(
+                enabled: callbacks.onTapBpm != nil && state.bpm != nil && !state.gridLocked
+            ) {
+                callbacks.onTapBpm?()
+            }
             .help(bpmColumnHelpText)
         }
-        // Attach the context menu at the HStack level (instead of
-        // on the inner Button) so it stays reachable when the
-        // button is disabled by `state.gridLocked` — that's the
-        // only path to "Unlock grid" from the performance surface.
+        // Attach the context menu at the column level (not on the
+        // tap target) so it stays reachable when the tap is disabled
+        // by `state.gridLocked` — `onPressDown(enabled:)` ignores the
+        // left-click then, but right-click must still reach "Unlock
+        // grid", the only path to it from the performance surface.
         .contextMenu { bpmContextMenu }
     }
 

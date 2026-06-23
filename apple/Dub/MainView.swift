@@ -153,6 +153,13 @@ struct DeckState: Equatable {
     /// on-demand when not playing).
     var seekGeneration: UInt64 = 0
 
+    /// Hot cue positions (track seconds) for the four CUE pads;
+    /// `nil` = empty slot. Loaded from `library.hotCues(trackId)`
+    /// on track load and driven by the cue keys (1–4 set/recall,
+    /// Shift+1–4 clear). The waveform draws a marker per set slot;
+    /// changes bump `seekGeneration` so a paused deck repaints.
+    var hotCues: [Double?] = [nil, nil, nil, nil]
+
     /// M10.5u. Estimated tempo for the loaded track, populated
     /// from `engine.beatGrid(deckIdx:)` after a successful
     /// `loadTrack`. `nil` when no track is loaded, when BPM
@@ -333,6 +340,7 @@ struct DeckState: Equatable {
         gridLocked = false
         gridDriftQuality = nil
         isLoading = false
+        hotCues = [nil, nil, nil, nil]
     }
 }
 
@@ -1655,6 +1663,10 @@ final class WaveformAppModel: ObservableObject {
             next.atEnd = false
             next.isPlaying = false
             next.isLoading = false
+            // Drop the previous track's cues; library tracks repopulate
+            // theirs in `recordLibraryLoadIfApplicable`, Finder drags
+            // stay empty.
+            next.hotCues = [nil, nil, nil, nil]
             if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
                 next.formatChip = formatChip(for: url, info: info)
@@ -2385,6 +2397,15 @@ final class WaveformAppModel: ObservableObject {
             // for library drags that bypassed selection.
             var stamped = state(for: side)
             stamped.loadedLibraryTrackId = trackId
+            // Recall persisted hot cues (best-effort; a read failure
+            // just leaves the pads empty this session).
+            if let cues = try? library.hotCues(trackId: trackId) {
+                var slots: [Double?] = [nil, nil, nil, nil]
+                for cue in cues where cue.cueIndex < 4 {
+                    slots[Int(cue.cueIndex)] = cue.positionSecs
+                }
+                stamped.hotCues = slots
+            }
             if librarySelection.selectedLibraryTrackId == trackId,
                let snap = librarySelection.selectedLibraryTrack, snap.id == trackId
             {
@@ -3720,6 +3741,74 @@ final class WaveformAppModel: ObservableObject {
         masterDeck ?? stickyMaster
     }
 
+    /// Hot cue gesture on the focused deck's pad `index` (0–3):
+    /// * `clear` → remove the cue.
+    /// * slot SET → jump to it (`engine.seek`), the recall.
+    /// * slot EMPTY → drop a marker at the current playhead, the set.
+    ///
+    /// The playhead from `positionSnapshot` is already the audible
+    /// position (the engine pairs it with CoreAudio's output
+    /// timestamp), so no latency correction is needed here. Persists
+    /// to `track_cues` (`source = 'user'`) so cues survive reload.
+    func handleHotCue(_ side: DeckSide, index: Int, clear: Bool) {
+        guard isRunning, index >= 0, index < 4 else { return }
+        var deck = state(for: side)
+        guard deck.hasTrack else { return }
+
+        if clear {
+            guard deck.hotCues[index] != nil else { return }
+            deck.hotCues[index] = nil
+            deck.seekGeneration &+= 1
+            setState(deck, for: side)
+            persistHotCue(deck: deck, index: index, position: nil)
+            return
+        }
+
+        if let position = deck.hotCues[index] {
+            do {
+                try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: position)
+            } catch {
+                surfaceError("Cue recall failed: \(error.localizedDescription)")
+                return
+            }
+            // Paused decks redraw on-demand; bump so the playhead /
+            // waveform jumps to the cue without waiting for Play.
+            deck = state(for: side)
+            deck.atEnd = false
+            deck.seekGeneration &+= 1
+            setState(deck, for: side)
+        } else {
+            let position = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+            guard position.isFinite, position >= 0 else { return }
+            deck.hotCues[index] = position
+            deck.seekGeneration &+= 1
+            setState(deck, for: side)
+            persistHotCue(deck: deck, index: index, position: position)
+        }
+    }
+
+    /// Best-effort persistence of one hot cue slot (set when
+    /// `position != nil`, else delete). The in-memory cue already
+    /// works this session regardless of the DB write.
+    private func persistHotCue(deck: DeckState, index: Int, position: Double?) {
+        guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
+        let library = self.library
+        let cueIndex = UInt32(index)
+        Task.detached(priority: .background) {
+            do {
+                if let position {
+                    try library.setHotCue(
+                        trackId: trackId, cueIndex: cueIndex, positionSecs: position)
+                } else {
+                    try library.deleteHotCue(trackId: trackId, cueIndex: cueIndex)
+                }
+            } catch {
+                // Cue still works in-memory this session; a failed
+                // write just means it won't recall after reload.
+            }
+        }
+    }
+
     /// M11d.6 — manual phase nudge for the focused deck's beat
     /// grid. Persists `user_tap` when the deck holds a library track.
     func nudgeBeatGridPhase(
@@ -4374,7 +4463,7 @@ struct MainView: View {
 /// always reachable through the captured `$showingPreferences`).
 ///
 /// **Closure props**: callbacks are wired in `Coordinator.install`
-/// (`onSpace`, `onCmdComma`, `onTapGrid`). Each closure spawns
+/// (`onSpace`, `onCmdComma`, `onTapGrid`, `onHotCue`). Each closure spawns
 /// `Task { @MainActor in … }` because the NSEvent monitor's
 /// handler block has no implicit actor isolation.
 ///
@@ -4416,6 +4505,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     model.applyTapToGrid(halve: halve, double: double)
                 }
                 return true
+            },
+            onHotCue: { index, clear in
+                Task { @MainActor in
+                    model.handleHotCue(model.focusedDeckForGridNudge, index: index, clear: clear)
+                }
+                return true
             })
         return view
     }
@@ -4437,7 +4532,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         func install(
             onSpace: @escaping () -> Bool,
             onCmdComma: @escaping () -> Bool,
-            onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool
+            onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
+            onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -4459,6 +4555,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     let halve = flags.contains(.shift)
                     let double = flags.contains(.option)
                     if onTapGrid(halve, double) { return nil }
+                }
+                // Hot cue pads 1–4. Number-row keyCodes (18–21) are
+                // layout-independent, like the spacebar's 49. Shift
+                // clears the slot; otherwise set (empty) / recall (set)
+                // on the focused deck.
+                if !isCmd, (18...21).contains(Int(event.keyCode)) {
+                    let index = Int(event.keyCode) - 18
+                    let clear = event.modifierFlags
+                        .intersection(.deviceIndependentFlagsMask).contains(.shift)
+                    if onHotCue(index, clear) { return nil }
                 }
                 // `keyCode 49` is the spacebar on every Apple keyboard
                 // layout (the keyCodes are layout-independent for the

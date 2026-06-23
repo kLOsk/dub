@@ -150,6 +150,13 @@ struct WaveformView: View {
     /// so the horizontal strip shows 20 % more audio.
     let timeAxisZoom: Double
 
+    /// Hot cue positions (track-seconds) for this deck's set CUE
+    /// pads, in any order. Pushed into the renderer each
+    /// `updateNSView` so the waveform draws a marker per cue. `nil`
+    /// slots in `DeckState.hotCues` are filtered out before they
+    /// reach here.
+    let hotCues: [Double]
+
     init(engine: DubEngine, deckIdx: UInt64 = 0,
          palette: WaveformPalette = .serato,
          side: DeckSide = .a,
@@ -158,7 +165,8 @@ struct WaveformView: View {
          continuouslyRendering: Bool = true,
          seekGeneration: UInt64 = 0,
          peaksGeneration: UInt64 = 0,
-         timeAxisZoom: Double = 1.0) {
+         timeAxisZoom: Double = 1.0,
+         hotCues: [Double] = []) {
         self.engine = engine
         self.deckIdx = deckIdx
         self.palette = palette
@@ -169,6 +177,7 @@ struct WaveformView: View {
         self.seekGeneration = seekGeneration
         self.peaksGeneration = peaksGeneration
         self.timeAxisZoom = timeAxisZoom
+        self.hotCues = hotCues
     }
 
     var body: some View {
@@ -181,7 +190,8 @@ struct WaveformView: View {
                     continuouslyRendering: continuouslyRendering,
                     seekGeneration: seekGeneration,
                     peaksGeneration: peaksGeneration,
-                    timeAxisZoom: timeAxisZoom)
+                    timeAxisZoom: timeAxisZoom,
+                    hotCues: hotCues)
                 if let handler = scrubHandler {
                     scrubGestureOverlay(in: geo.size, handler: handler)
                 }
@@ -759,6 +769,7 @@ private struct WaveformMetalView: NSViewRepresentable {
     let seekGeneration: UInt64
     let peaksGeneration: UInt64
     let timeAxisZoom: Double
+    let hotCues: [Double]
 
     @MainActor
     final class Coordinator: NSObject {
@@ -778,6 +789,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         private var lastSeekGeneration: UInt64?
         private var lastPeaksGeneration: UInt64?
         private var lastContinuous: Bool?
+        private var lastHotCues: [Double]?
 
         /// Push the new SwiftUI prop values into the renderer
         /// through its thread-safe setters and report whether a
@@ -792,7 +804,8 @@ private struct WaveformMetalView: NSViewRepresentable {
             side: DeckSide,
             timeAxisZoom: Double,
             seekGeneration: UInt64,
-            peaksGeneration: UInt64
+            peaksGeneration: UInt64,
+            hotCues: [Double]
         ) -> Bool {
             guard let renderer else {
                 lastPalette = palette
@@ -801,6 +814,7 @@ private struct WaveformMetalView: NSViewRepresentable {
                 lastTimeAxisZoom = timeAxisZoom
                 lastSeekGeneration = seekGeneration
                 lastPeaksGeneration = peaksGeneration
+                lastHotCues = hotCues
                 return false
             }
 
@@ -823,6 +837,11 @@ private struct WaveformMetalView: NSViewRepresentable {
             if lastTimeAxisZoom != timeAxisZoom {
                 renderer.setTimeAxisZoom(timeAxisZoom)
                 lastTimeAxisZoom = timeAxisZoom
+                rendererChanged = true
+            }
+            if lastHotCues != hotCues {
+                renderer.setHotCues(hotCues)
+                lastHotCues = hotCues
                 rendererChanged = true
             }
 
@@ -879,6 +898,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         renderer.setSide(side)
         renderer.setTimeAxisZoom(timeAxisZoom)
         renderer.setBeatGridEnabled(true)
+        renderer.setHotCues(hotCues)
         context.coordinator.renderer = renderer
 
         // M11d.6 round 11 — capture the mach_absolute_time ↔
@@ -929,7 +949,8 @@ private struct WaveformMetalView: NSViewRepresentable {
             side: side,
             timeAxisZoom: timeAxisZoom,
             seekGeneration: seekGeneration,
-            peaksGeneration: peaksGeneration)
+            peaksGeneration: peaksGeneration,
+            hotCues: hotCues)
 
         context.coordinator.applyContinuous(continuouslyRendering)
 

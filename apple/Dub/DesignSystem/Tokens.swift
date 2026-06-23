@@ -99,6 +99,14 @@ enum DubColor {
     /// Clip / error / destructive.
     static let stateError = Color(hex: 0xD45C5C)
 
+    /// Hot cue marker / pad accent. Vivid magenta-pink, hue- AND
+    /// luminance-distinct from both deck tints (amber, teal) and the
+    /// off-white beat ticks, so a cue reads clearly on any surface
+    /// regardless of deck. Mirrors `WaveformRenderer.hotCueRGBA`
+    /// (250, 92, 158) so the pads, the whole-track overview, and the
+    /// zoomed Metal waveform all render a cue in the same colour.
+    static let hotCue = Color(hex: 0xFA5C9E)
+
     // ----- Overview strip (M10.5c) ---------------------------------
 
     /// Deck A's amplitude colour in the Track Overview strip.

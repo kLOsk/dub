@@ -578,6 +578,15 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private let beatGridState = OSAllocatedUnfairLock(
         initialState: BeatGridSnapshot())
 
+    /// Lock-protected hot cue positions (track-seconds) for the
+    /// deck's set CUE pads. Unlike the beat grid these don't come
+    /// from the engine — they're authored in Swift (`DeckState`)
+    /// and pushed in via `setHotCues`. Drawn as full-height
+    /// markers in the beat-grid pass so they share the waveform's
+    /// exact time→NDC mapping; they render even when the beat grid
+    /// is hidden or unconfident.
+    private let hotCues = OSAllocatedUnfairLock<[Double]>(initialState: [])
+
     /// One-shot repaint request, set once by `WaveformView` after
     /// the render thread exists. The beat-grid fetch in
     /// `refreshBeatGridIfNeeded` is async, so the frame that
@@ -789,6 +798,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     func setBeatGridEnabled(_ value: Bool) {
         appearance.withLock { $0.beatGridEnabled = value }
+    }
+
+    /// Push the deck's set hot cue positions (track-seconds, any
+    /// order). Empty clears the markers. Cheap enough to call on
+    /// every `updateNSView` — the render thread copies the array
+    /// once per draw.
+    func setHotCues(_ positions: [Double]) {
+        hotCues.withLock { $0 = positions }
     }
 
     /// Drop cached beat-grid state on source swap. GPU ring slots
@@ -1447,18 +1464,28 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        if appearance.beatGridEnabled,
-           framesSinceSourceSwap > 20,
-           beats.confidence > 0,
-           !beats.beats.isEmpty,
+        // Beats and hot cues share the beat-grid pass (one pipeline,
+        // one buffer, one draw). Beats are gated on the user toggle +
+        // estimator confidence; cues are independent and draw whenever
+        // the deck has a track. The outer gate fires if EITHER has
+        // something to show.
+        let hotCueSecs = hotCues.withLock { $0 }
+        let drawBeats =
+            appearance.beatGridEnabled
+            && beats.confidence > 0
+            && !beats.beats.isEmpty
+        if framesSinceSourceSwap > 20,
            peakChunkDurationSecs > 0,
-           pos.hasTrack
+           pos.hasTrack,
+           drawBeats || !hotCueSecs.isEmpty
         {
             drawBeatGrid(
                 encoder: encoder,
                 drawableSize: drawableSize,
                 appearance: appearance,
                 beats: beats,
+                drawBeats: drawBeats,
+                hotCueSecs: hotCueSecs,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
                 drawnBelow: drawnBelow,
@@ -1804,6 +1831,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         SIMD4(232.0 / 255.0, 232.0 / 255.0, 232.0 / 255.0, alpha)
     }
 
+    /// Hot cue marker tint — a vivid magenta-pink picked to be hue-
+    /// AND luminance-distinct from both deck tints (amber, teal) and
+    /// from the off-white beat ticks, so a cue line reads clearly
+    /// against any waveform regardless of deck.
+    private static func hotCueRGBA(alpha: Float) -> SIMD4<Float> {
+        SIMD4(250.0 / 255.0, 92.0 / 255.0, 158.0 / 255.0, alpha)
+    }
+
     /// First beat index with `beats[i] >= time`. Beats are sorted
     /// ascending so we can skip the prefix outside the visible
     /// window in O(log n) instead of scanning from track start
@@ -1828,6 +1863,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         appearance: RendererAppearance,
         beats: BeatGridSnapshot,
+        drawBeats: Bool,
+        hotCueSecs: [Double],
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
@@ -1889,39 +1926,71 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let barQuadHalfNDC = (barVisibleHalfPx + 1.0) / timeAxisPixels
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
-        let startIdx = Self.firstBeatIndex(in: beats.beats, atOrAfter: visibleStart)
 
-        for idx in startIdx..<beats.beats.count {
-            let beat = beats.beats[idx]
-            if beat > visibleEnd { break }
-            let timeNDC = Self.beatTimeNDC(
-                beatSecs: beat,
-                peakDur: peakDur,
-                snappedChunkF: snappedChunkF,
-                drawnAbove: drawnAbove,
-                drawnBelow: drawnBelow,
-                pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
-            let isDownbeat =
-                beats.beatsPerBar > 0
-                && (idx % beats.beatsPerBar == beats.barPhase)
-            if isDownbeat {
+        if drawBeats {
+            let startIdx = Self.firstBeatIndex(in: beats.beats, atOrAfter: visibleStart)
+            for idx in startIdx..<beats.beats.count {
+                let beat = beats.beats[idx]
+                if beat > visibleEnd { break }
+                let timeNDC = Self.beatTimeNDC(
+                    beatSecs: beat,
+                    peakDur: peakDur,
+                    snappedChunkF: snappedChunkF,
+                    drawnAbove: drawnAbove,
+                    drawnBelow: drawnBelow,
+                    pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                    futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
+                let isDownbeat =
+                    beats.beatsPerBar > 0
+                    && (idx % beats.beatsPerBar == beats.barPhase)
+                if isDownbeat {
+                    Self.appendBeatLineQuad(
+                        vertices: &beatGridScratchVertices,
+                        orientation: appearance.orientation,
+                        timeNDC: Float(timeNDC),
+                        quadHalfNDC: barQuadHalfNDC,
+                        visibleHalfNDC: barVisibleHalfNDC,
+                        color: Self.deckTintRGBA(side: appearance.side, alpha: 1.0),
+                        isDownbeat: true)
+                } else {
+                    Self.appendMirroredBeatTick(
+                        vertices: &beatGridScratchVertices,
+                        orientation: appearance.orientation,
+                        timeNDC: Float(timeNDC),
+                        quadHalfNDC: beatQuadHalfNDC,
+                        visibleHalfNDC: beatVisibleHalfNDC,
+                        color: Self.beatTickRGBA(alpha: 0.88))
+                }
+            }
+        }
+
+        // Hot cue markers — full-height lines in the cue tint,
+        // appended after the beats so they sit on top within the same
+        // pass / draw call. A touch wider than a downbeat (2.0 vs
+        // 1.75 px visible) so a cue reads as deliberate rather than
+        // "just another bar line". Independent of the beat grid: they
+        // render even when `drawBeats` is false.
+        if !hotCueSecs.isEmpty {
+            let cueVisibleHalfPx: Float = 2.0
+            let cueVisibleHalfNDC = cueVisibleHalfPx / timeAxisPixels
+            let cueQuadHalfNDC = (cueVisibleHalfPx + 1.0) / timeAxisPixels
+            for cue in hotCueSecs where cue.isFinite && cue >= visibleStart && cue <= visibleEnd {
+                let timeNDC = Self.beatTimeNDC(
+                    beatSecs: cue,
+                    peakDur: peakDur,
+                    snappedChunkF: snappedChunkF,
+                    drawnAbove: drawnAbove,
+                    drawnBelow: drawnBelow,
+                    pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                    futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
                 Self.appendBeatLineQuad(
                     vertices: &beatGridScratchVertices,
                     orientation: appearance.orientation,
                     timeNDC: Float(timeNDC),
-                    quadHalfNDC: barQuadHalfNDC,
-                    visibleHalfNDC: barVisibleHalfNDC,
-                    color: Self.deckTintRGBA(side: appearance.side, alpha: 1.0),
+                    quadHalfNDC: cueQuadHalfNDC,
+                    visibleHalfNDC: cueVisibleHalfNDC,
+                    color: Self.hotCueRGBA(alpha: 0.95),
                     isDownbeat: true)
-            } else {
-                Self.appendMirroredBeatTick(
-                    vertices: &beatGridScratchVertices,
-                    orientation: appearance.orientation,
-                    timeNDC: Float(timeNDC),
-                    quadHalfNDC: beatQuadHalfNDC,
-                    visibleHalfNDC: beatVisibleHalfNDC,
-                    color: Self.beatTickRGBA(alpha: 0.88))
             }
         }
 

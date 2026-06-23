@@ -296,7 +296,10 @@ uniffi::setup_scaffolding!();
 ///       / `history_play_started` / `history_play_ended`) plus the
 ///       `played_into` / `session_history` queries with their
 ///       `LibraryTransitionStat` / `LibrarySessionPlay` records.
-pub const FFI_VERSION: u32 = 37;
+///   38. **Hot cues.** `DubLibrary` grows `set_hot_cue` /
+///       `delete_hot_cue` / `hot_cues` (the [`HotCue`] record) — the
+///       per-track jump markers behind the CUE pads (`source = 'user'`).
+pub const FFI_VERSION: u32 = 38;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -4142,7 +4145,9 @@ mod tests {
         // `history_play_ended`) plus the `played_into` and
         // `session_history` queries with their
         // `LibraryTransitionStat` / `LibrarySessionPlay` records.
-        assert_eq!(FFI_VERSION, 37);
+        // 37→38: hot cues (`set_hot_cue` / `delete_hot_cue` /
+        // `hot_cues` + the `HotCue` record).
+        assert_eq!(FFI_VERSION, 38);
     }
 
     #[test]
@@ -4955,6 +4960,24 @@ impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
             grid_drift_quality: g.grid_drift_quality,
             waveform_sidecar_path: g.waveform_sidecar_path,
             bar_phase: u32::from(g.bar_phase),
+        }
+    }
+}
+
+/// A persisted hot cue (FFI mirror of [`dub_library::HotCue`]).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HotCue {
+    /// Which pad this cue belongs to (0-based).
+    pub cue_index: u32,
+    /// Track position the cue points to, in seconds from sample 0.
+    pub position_secs: f64,
+}
+
+impl From<dub_library::HotCue> for HotCue {
+    fn from(c: dub_library::HotCue) -> Self {
+        Self {
+            cue_index: u32::from(c.cue_index),
+            position_secs: c.position_secs,
         }
     }
 }
@@ -5986,6 +6009,45 @@ impl DubLibrary {
         let phase = u8::try_from(bar_phase).unwrap_or(0);
         self.with_library(|lib| {
             lib.upsert_user_tap_beatgrid(&track_id, anchor_secs, bpm, phase)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Set (or move) hot cue `cue_index` for `track_id` to
+    /// `position_secs`. The DJ presses an empty cue pad to drop a
+    /// marker at the playhead; this persists it (`source = 'user'`).
+    pub fn set_hot_cue(
+        &self,
+        track_id: String,
+        cue_index: u32,
+        position_secs: f64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let idx = u8::try_from(cue_index).unwrap_or(u8::MAX);
+        self.with_library(|lib| {
+            lib.set_hot_cue(&track_id, idx, position_secs)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Clear hot cue `cue_index` for `track_id`. Idempotent.
+    pub fn delete_hot_cue(
+        &self,
+        track_id: String,
+        cue_index: u32,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let idx = u8::try_from(cue_index).unwrap_or(u8::MAX);
+        self.with_library(|lib| {
+            lib.delete_hot_cue(&track_id, idx)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// All user hot cues for `track_id`, ascending by pad index.
+    /// Read on track load to restore the deck's cue pads.
+    pub fn hot_cues(&self, track_id: String) -> std::result::Result<Vec<HotCue>, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.hot_cues(&track_id)
+                .map(|v| v.into_iter().map(HotCue::from).collect())
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }
