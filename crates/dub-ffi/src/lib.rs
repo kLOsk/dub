@@ -1841,12 +1841,14 @@ impl DubEngine {
         };
         let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
         let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
-        let loop_state = self
-            .deck_shared
-            .get(idx)
-            .map_or(dub_engine::LoopState { active: false, in_secs: 0.0, out_secs: 0.0 }, |s| {
-                s.load_loop()
-            });
+        let loop_state = self.deck_shared.get(idx).map_or(
+            dub_engine::LoopState {
+                active: false,
+                in_secs: 0.0,
+                out_secs: 0.0,
+            },
+            |s| s.load_loop(),
+        );
         PositionInfo {
             elapsed_secs,
             playhead_secs_unclamped,
@@ -2313,21 +2315,21 @@ impl DubEngine {
 
     /// PRD-BEATS §4.1 — "set the 1" (1–2 taps in a session).
     ///
-    /// Snaps the (latency-corrected) `tap_secs` to the **nearest analyzed
-    /// beat** and rotates which beat is bar position 1 — a pure phase
-    /// rotation, the Mixxx `findClosestBeat` model. The grid lines do not
-    /// move (the auto / imported beats already sit on the transients) and
-    /// BPM is untouched; only the yellow downbeat marker moves.
+    /// **Re-anchors the whole grid** so a beat lands on the kick the user
+    /// tapped: it snaps `tap_secs` to the kick's leading edge and rebuilds
+    /// the grid from that anchor, preserving BPM bit-exact
+    /// (`relatch_grid_at_downbeat_tap`). Every beat shifts by the same
+    /// offset; beat *spacing* is unchanged, only the grid's position and
+    /// which beat is the 1. This is **not** a pure `bar_phase` rotation —
+    /// rotation can only re-label an existing grid beat and cannot move the
+    /// grid onto the kick when the auto anchor is sub-beat off (Brown Paper
+    /// Bag: auto anchor in silence ~97 ms left of the first kick). The
+    /// rotation model was tried and reverted; see PRD-BEATS §4.1 / §4.3.
     ///
-    /// This supersedes the Round 8 bit-exact relatch, which rebuilt the
-    /// whole grid at the raw `tap_secs`: because the captured tap leads the
-    /// audible audio by the uncompensated CoreAudio output latency, that
-    /// planted the "1" tens of ms *after* the kick the DJ heard — "off the
-    /// transient." Snapping to the nearest analyzed beat is robust to that
-    /// residual error (the offset is far below half a beat) and lands the
-    /// "1" on a real transient. Callers should still feed a latency-
-    /// corrected `tap_secs` (the audible-timeline snapshot) so the *nearest*
-    /// beat is the intended one at fast tempos.
+    /// `tap_secs` is the playhead position at the tap. It is already on the
+    /// audible timeline — the engine pairs the playhead with CoreAudio's
+    /// output `mHostTime` (M11d.6) — so callers pass the plain position
+    /// snapshot; no separate output-latency correction is applied or needed.
     ///
     /// # Errors
     ///

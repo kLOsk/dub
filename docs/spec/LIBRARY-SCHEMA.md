@@ -419,7 +419,7 @@ are a legitimate Krumhansl-Kessler template ambiguity and are not
 flagged. The flag is computed at query time in `TRACK_ROW_SELECT`
 via `COUNT(DISTINCT substr(key_notation, 1, length-1)) > 1`.
 
-### `track_cues` — hot cues (stored from v1, surfaced in v2)
+### `track_cues` — hot cues (performance cues — authored in v1)
 
 ```sql
 CREATE TABLE IF NOT EXISTS track_cues (
@@ -441,9 +441,13 @@ CREATE TABLE IF NOT EXISTS track_cues (
 CREATE INDEX IF NOT EXISTS idx_track_cues_track ON track_cues(track_id);
 ```
 
-Per PRD §6.6, hot cues are deferred to v2. We store imported cues from
-v1.0 day one so the M11f rekordbox-XML exporter round-trips them
-losslessly. The v1 UI does not surface or edit cues.
+Hot cues are a **v1 performance feature** (PRD §6.2.1): the user sets,
+recalls, and clears them on the CUE pads (keyboard 1–4 / pad controller),
+persisted with `source='user'`. Imported cues (`serato` / `traktor` /
+`rekordbox` / `itunes`) are also stored from v1.0 day one so the M11f
+rekordbox-XML exporter round-trips them losslessly. *(Earlier drafts
+deferred all cues to v2; that conflated hot cues with the CDJ-style cue
+button — see PRD §6.6.)*
 
 ### `track_loops` — saved loops (stored from v1, surfaced in v1.x)
 

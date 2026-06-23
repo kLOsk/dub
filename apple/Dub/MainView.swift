@@ -3981,11 +3981,11 @@ final class WaveformAppModel: ObservableObject {
         guard deck.hasTrack else { return }
 
         let genre = librarySelection.selectedLibraryTrack?.genre
-        // §4.1: 1–2 tap "set the 1" snaps to the nearest analyzed beat
-        // (engine.setBarPhase, Mixxx findClosestBeat model). 3+ taps
-        // re-tempo from the WALL-CLOCK BPM — never the rate-scaled playhead
-        // deltas the old installBeatGridFromTaps derived — with the first
-        // tap as the ODF-snapped anchor.
+        // §4.1: 1–2 tap "set the 1" re-anchors the grid onto the tapped
+        // kick (engine.setBarPhase → relatch_grid_at_downbeat_tap, BPM
+        // preserved). 3+ taps re-tempo from the WALL-CLOCK BPM — never the
+        // rate-scaled playhead deltas the old installBeatGridFromTaps
+        // derived — with the first tap as the ODF-snapped anchor.
         let downbeat = playheadTimes[0]
 
         do {

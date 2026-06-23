@@ -146,13 +146,13 @@
   up to ½ a beat away, so it can NEVER correct a sub-beat-off auto grid — and it
   silently regressed once when `set_bar_phase` was reverted to rotate-only while
   a test only exercised the dub-bpm fn, not the FFI. Stopped/prep taps land
-  verbatim; playing taps are latency-corrected upstream.
+  verbatim; playing taps already read the audible timeline — the playhead is paired with CoreAudio's output `mHostTime` (M11d.6), so there is no separate upstream latency correction (the measured-latency query was removed).
 - **The "1" is the first measurable beat (dance music).** For ~95 % of dance
   music the downbeat is simply the first audible beat at the track start (every
   hand-set grid is `bar_phase 0`). `apply_downbeat_refinement` picks the first
-  grid beat clearing 10 % of the track-max amplitude; the AlphaTheta snare/bass
+  grid beat clearing 10 % of the track-max amplitude; the backbeat (snare/bass) refinement
   rule is only the FALLBACK for the 5 % (reggae roll-ups, vocal/talk intros).
-  AlphaTheta-as-primary moved the 1 a beat late on borderline tracks (Oppidan,
+  backbeat-as-primary moved the 1 a beat late on borderline tracks (Oppidan,
   conf 0.067). Use a PLAIN amplitude probe here, not the sharp
   `kick_leading_edge_secs` — the edge detector skips a soft opening hit and
   locks onto the first *loud* kick a beat later (wrong bar position).

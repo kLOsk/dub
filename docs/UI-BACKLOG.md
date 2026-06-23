@@ -225,16 +225,17 @@ record's end zone (the lead-out / indefinite loop area), the deck
 auto-switches to internal play so the track keeps going; the operator
 can then lift and reposition the needle to re-enter timecode. We cannot
 do this today because the engine cannot tell the lead-out apart from a
-normal needle lift: both look like the carrier going away. The decoder
-only integrates *relative* position from carrier phase
-(`crates/dub-timecode/src/decoder.rs`, `position_secs`); it does not
-read the absolute-position bitstream that rides on the control tone.
+normal needle lift: both look like the carrier going away. Absolute-
+position decoding **did** ship (M6 — `crates/dub-timecode/src/absolute.rs`
+reads the LFSR groove position off the whitened carrier phasor); what is
+still missing is the *classification* — deciding "the needle is in the
+lead-out region" vs "the needle was lifted" — which is what gates the
+auto-internal switch.
 
-**Fix**: implement M6 absolute-position decoding in `dub-timecode` so
-the deck knows when the needle is in the lead-out region, then
-auto-engage internal play only there (replacing the current "a dropout
-always pauses" behaviour at the end zone). Until then a dropout pauses
-and the operator presses internal Play to continue past the end zone.
+**Fix**: add lead-out-vs-lift discrimination on top of the shipped M6
+absolute decode, then auto-engage internal play (Repeat, PRD §5.4.2)
+*only* in the detected lead-out. Until then a dropout pauses and the
+operator presses internal Play to continue past the end zone.
 
 **Location**: `crates/dub-timecode/src/decoder.rs`,
 `crates/dub-engine/src/lib.rs` (`drive_timecode_inputs`).

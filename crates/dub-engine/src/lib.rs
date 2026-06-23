@@ -221,12 +221,14 @@ pub struct Engine {
     /// the raw smoothed rate in the position seqlock.
     tc_display_value: [f64; DECK_COUNT],
     /// How each deck's transport is currently driven (Internal vs
-    /// Timecode). Set by auto source-detection unless the user has
-    /// pinned it (`control_override`).
+    /// Timecode). The user sets this on the deck-header INT·TC·THRU switch
+    /// (PRD §5.1.1); the current build has no auto source-detection, so the
+    /// `source_classifier` below is telemetry-only and never moves it.
     control_mode: [ControlMode; DECK_COUNT],
-    /// When `true`, the user has pinned `control_mode` (the deck-header
-    /// Internal/Timecode switch) and auto source-detection won't change
-    /// it. `false` ⇒ the classifier drives the mode.
+    /// Set when the user has pinned `control_mode` via the deck-header
+    /// switch. The deferred auto-detect path (PRD §5.1.1) would consult this
+    /// before changing the mode; until it lands, the classifier never
+    /// overrides the user's choice regardless of this flag.
     control_override: [bool; DECK_COUNT],
     /// Per-deck timecode-vs-record classifier (off the lift path).
     source_classifier: [SourceClassifier; DECK_COUNT],

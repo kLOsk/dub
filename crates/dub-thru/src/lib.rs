@@ -1,11 +1,13 @@
-//! Thru-mode pipeline for Dub.
+//! Thru-mode source-detection types for Dub (placeholder).
 //!
-//! Routes real-record audio from the audio interface input through the
-//! engine. Implements the auto-detection classifier described in PRD §5.1.1
-//! (timecode vs real music vs silence) and the Direct/Processed switch in
-//! §5.2.2.
-//!
-//! Implementation lands in M7–M9 (see PRD §12).
+//! PRD §5.1.1 specified a per-deck auto-detection classifier (timecode vs
+//! real music vs silence). That auto-detection is **deferred** — the current
+//! build has no automatic source switching (the user picks the source on the
+//! deck-header INT·TC·THRU switch), and the telemetry-only classifier that
+//! does run lives in `dub-engine` (`SourceClassifier`). This crate currently
+//! holds only the shared `DetectedMode` enum; the Thru *passthrough* itself
+//! is `ThruSource` in `dub-engine`. The Direct/Processed switch once planned
+//! for §5.2.2 was removed.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

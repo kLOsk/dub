@@ -64,7 +64,7 @@ commit or PR, not here.
 - **M10.5e–g** — Waveform polish: compression, past-region dim, anti-alias, temporal smoothing.
 - **M10.5h–p** — Shader exploration ladder (deliberately rolled back in M10.8).
 - **M10.6a–e** — Mouse transport, Panic Play, transport-cluster redesign, Repeat auto-trigger.
-- **M10.7** — Phase-Drift Trail (beatmatch aid).
+- **M10.7** — Phase-Drift Trail (beatmatch aid; later redesigned → Stillpoint, PRD §9.4).
 - **M10.8** — Track Preparation Mode shell + Serato-parity waveform baseline freeze.
 
 ## Library + browser + beat grid
@@ -93,7 +93,9 @@ commit or PR, not here.
 - **M11d.8** — Polish & First-Run: search debounce + selection-preserve, dev-text sweep, edge-of-list beep, idle-hint layout, first-run onboarding sheet; dogfood fixes for the reachability false-positive and Prep-mode Space-load auto-play.
 - **M11d-history** — Played From / Played Into, v1.0 stage: handover-inferred transitions (`SessionTracker`, min-play gate, duplicate suppression), full `play_history` capture with per-run `session_id`, deck-header "↝ usually" hint (click reveals the track in the browser), Session History smart crate (FFI 37).
 - **Timecode-display** — Killed the pitch/BPM divergence: the deck-header rate now equals the *audible* rate (xwax/Mixxx parity); the ±8-canonical anchor-warp display subsystem deleted (~176 LOC). Phasor-based absolute decode (whitened complex carrier) lifts vinyl abs-lock uptime (97.8 → 100 % on a steady capture).
-- **PRD-BEATS round 11** — Visual beat-grid: snap to the kick LEADING EDGE the waveform draws (auto `shift_grid_to_kick_edge`, set-the-1 relatch, 3+ tap) — ~2 ms of the hand-set grid, retiring the forward-only amplitude-peak shift (−516 LOC). Downbeat = "the 1 is the first measurable beat" (AlphaTheta demoted to the reggae/vocal-intro fallback). Set-the-1 re-anchors the grid instead of rotating `bar_phase`. Tap-tempo integer-snap policy (`IntegerSnapPolicy::{AUTO,TAP}`) lands clean integers on poor-onset tracks. DnB genre lifts the hip-hop double-time veto.
+- **PRD-BEATS round 11** — Visual beat-grid: snap to the kick LEADING EDGE the waveform draws (auto `shift_grid_to_kick_edge`, set-the-1 relatch, 3+ tap) — ~2 ms of the hand-set grid, retiring the forward-only amplitude-peak shift (−516 LOC). Downbeat = "the 1 is the first measurable beat" (the backbeat snare/bass rule demoted to the reggae/vocal-intro fallback). Set-the-1 re-anchors the grid instead of rotating `bar_phase`. Tap-tempo integer-snap policy (`IntegerSnapPolicy::{AUTO,TAP}`) lands clean integers on poor-onset tracks. DnB genre lifts the hip-hop double-time veto.
+- **Hot cues** — performance cues, *not* a CDJ-style cue button (PRD §6.2.1, correcting the old §6.6 "v2" deferral): four CUE pads set / recall / clear via keyboard 1–4 (or a pad controller), persisted per track (`track_cues`, `source='user'`), drawn as waveform markers; live in both Performance and Prep. FFI 38.
+- **Reverse loops** — "repeat the bars just heard": grid-snapped backward loop (`dub-engine/src/looping.rs`), ½/1/2/4-bar beat-length select, internal-play / Prep only (timecode-correct looping still owed — acceptance §14 #8). PRD §6.2. FFI 39.
 
 ---
 

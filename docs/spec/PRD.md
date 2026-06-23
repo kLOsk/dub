@@ -253,7 +253,7 @@ Every release runs through this on real hardware. All must pass.
 
 | Version | Platforms | Headline additions |
 |---------|-----------|-------------------|
-| **v1.0** | macOS (Apple Silicon + Intel) | Timecode vinyl, 2-deck, sampler, smart FX, library import, Phase-Drift Trail beat-match aid, Track Preparation Mode (shell) |
+| **v1.0** | macOS (Apple Silicon + Intel) | Timecode vinyl, 2-deck, sampler, smart FX, library import, Stillpoint beat-match aid, Track Preparation Mode (shell) |
 | **v1.x** | macOS | Polishing, controller/mapping support if requested by community, Track Preparation Mode prep tooling (beatgrid editor, hot cues if pulled forward) |
 | **v2.0** | macOS + Windows | **Phase support**, hot cues, recording, Windows port (ASIO/WASAPI) |
 | **v3.0** | macOS + Windows + iPadOS | iOS/iPadOS port (USB-C iPads), cloud library sync |
@@ -266,7 +266,7 @@ Dub has **two top-level runtime modes**, auto-selected at launch based on which 
 
 | Mode | Triggered when | UI | Purpose |
 |---|---|---|---|
-| **Performance Mode** | A pro audio interface (≥ 4 in / 4 out) is detected | Two decks side-by-side, **vertical waveforms** scrolling bottom→top (PRD §9), Phase-Drift Trail in the centre gutter, FX bar, library | The live-DJ surface. The whole rest of this document, unless stated otherwise, describes Performance Mode. |
+| **Performance Mode** | A pro audio interface (≥ 4 in / 4 out) is detected | Two decks side-by-side, **vertical waveforms** scrolling bottom→top (PRD §9), Stillpoint in the centre gutter, FX bar, library | The live-DJ surface. The whole rest of this document, unless stated otherwise, describes Performance Mode. |
 | **Track Preparation Mode** | Only the built-in soundcard is detected (no multi-channel interface) | Single deck, **horizontal** waveform full-width, library prominent | Auditioning tracks, fixing beatgrids, prepping cues — work the DJ does in advance of a gig, on the couch with no rig attached. **v1.0 ships the shell only** (load + play + horizontal waveform); the actual prep tooling (beatgrid editor, hot-cue prep) is v1.x — see [§12 M10.8 row](#12-milestones) and [SHIPPED §M10.8](../history/SHIPPED.md). |
 
 Both modes share the same engine, the same library, the same file format support, and the same tokens / colour palette — they differ only in the surface they present. Switching modes is a window-level re-mount (not an in-place reflow); the user perceives them as "two apps in one binary" rather than as a layout switch. This is intentional — neither mode should leak vocabulary into the other.
@@ -507,8 +507,8 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 - **Pitch range** as wide as the user's turntable (typically ±8 / ±16 / ±50 %)
 - Slow-down to stop: tracks pitch through zero cleanly without click/glitch
 - Backspin: tracks negative pitch with no audible artifact up to the resampler's limits
-- **Drop-out detection (Stickiness)**: if signal quality degrades (dust, scratch, end of run-out groove), hold the last known velocity for a grace window (default 250 ms). If the signal does not recover within the window, the engine auto-engages Panic Play (§6.1.2 / §5.4.2 Repeat), continuing forward at the last known rate until the signal returns. The grace window discriminates brief stylus hiccups (held, no state change) from sustained dropouts (auto-engaged internal playback).
-- **Through groove handling**: when the needle reaches the end of the encoded area, Stickiness's grace window expires, and the engine engages Panic Play per §5.4.2 — audio continues forward at the last known rate. Recovery is automatic on the next clean Locked sample (DJ drops the needle back on a mid-timecode groove).
+- **Drop-out detection (Stickiness)**: if signal quality degrades (dust, scratch, end of run-out groove), hold the last known velocity for a grace window (default 250 ms). If the signal does not recover within the window, the engine **pauses the deck on the held position**. The grace window discriminates brief stylus hiccups (held, no state change) from sustained dropouts (pause + hold). *(Auto-continue-forward on run-out — "Repeat" — is deferred and will be scoped to the detected lead-out only; see §5.4.2.)*
+- **Through groove handling**: when the needle reaches the end of the encoded area, Stickiness's grace window expires and the deck pauses on the held position. The operator presses internal Play (Panic Play, §6.1.2) to continue forward; recovery to timecode is automatic on the next clean Locked sample (DJ drops the needle back on a mid-timecode groove). Auto-continue in the lead-out (Repeat) is deferred — see §5.4.2.
 - **Calibration UI**: show signal scope, S/N ratio, RPM detection, pitch readout. Live calibration with vinyl spinning. **No A/B side toggle, no abs/rel mode selector** — relative mode is universal.
 - **Session-start calibration hold (Traktor-style).** A Timecode deck does not auto-start playback until **all** of the needle's measurements complete — whitening calibration installed *and* the pitch stabilized (wobble fit settled): once the track plays, the DJ treats the deck as ready and starts pitching, so nothing may still be stabilizing underneath (calibration may take ~5–10 s of the record spinning; that's fine — the DJ sets up minutes before the first tune, and this matches Traktor's "calibrating" startup behavior). The non-negotiable companion is **feedback**: the deck header draws a left→right progress line while measuring, so the DJ sees calibration advancing and the exact moment the deck goes live (the readouts un-dim at the same moment). Stopping the record pauses the measurements — the line makes that visible too. The deck's Play button (Panic Play) bypasses the hold instantly for stage emergencies, and the hold never pauses an already-playing deck (mid-set recalibration runs live).
 - **Tracking quality indicator (UI)**: a per-deck signal-health glyph in the deck header source pill (PRD §9) — green dot = clean lock, amber = degraded signal, red = no lock. Read off the M5.4.6 `LiftPolicy` confidence the engine already publishes. Note: it is **expected** for tracking to be red while cueing or scratching, identical to Serato's behaviour — the dot reports signal quality, not user intent.
@@ -521,18 +521,13 @@ The internal debug mixer (§5.6) is **not** the same as a user-facing internal m
 
 The auto-detect path handles 33⅓ and 45 RPM transparently in 99 % of cases. Edge cases (unusual pressings, calibration of an under-spec'd turntable) need a manual override. This lives in the Preferences sheet under "Timecode" — a per-deck `Auto / 33⅓ / 45` selector. The override is *not* a performance gesture; the DJ sets it once during sound-check and forgets it. It must not appear on the performance surface.
 
-#### 5.4.2 Repeat (timecode run-out)
+#### 5.4.2 Repeat (timecode run-out) — deferred, rescoped to the lead-out
 
-When the needle reaches the end of the timecode-encoded area of the control record, the LFSR signal disappears. **Repeat** is the automatic engine behavior at that moment: the engine continues playing the audio track forward at the last-known velocity, decoupling audio from the (now-absent) timecode. There is no user-facing toggle. Useful and unavoidable, because the audio track is frequently longer than the timecode record's playable area; this matches the behavior of every commercial DVS app and is what the target user already expects.
+The intended end-state: when the needle reaches the end of the timecode-encoded area (the lead-out / run-out groove), the deck **auto-continues** the audio track forward at the last-known velocity — audio decouples from the now-absent timecode so a track longer than the control record's encoded area keeps playing. Every commercial DVS app does this, and it's what the target user expects.
 
-**Engine-side this is the same state as Panic Play (§6.1.2)**: "decouple audio from timecode, run forward at last-known rate, re-engage on the next clean Locked signal." Two entry points into one state:
+**Status — deferred.** The original M10.6e build auto-engaged this on *any* sustained dropout. That was removed: the engine cannot yet tell the lead-out apart from an ordinary needle lift (both look like the carrier going away), and auto-running-forward on a lift is wrong. So **today a sustained dropout pauses the deck on the held position** (§5.4 Stickiness); the operator presses internal Play (Panic Play, §6.1.2) to continue past the end zone.
 
-- **Auto-trigger** (Repeat, this section): the timecode driver emits `DropoutHoldRate` after its grace window expires (PRD §5.4 Stickiness). The engine engages Panic Play instead of pausing the deck. M10.6e.
-- **User-trigger** (Panic Play, §6.1.2): the deck-header Play button in Timecode mode (Serato-style INT/ABS toggle from M10.6d). Used for needle-dirt recovery during the encoded area of the record.
-
-**Recovery is identical for both entry points.** The user lifts the needle, drops it back on a mid-timecode groove of the encoded area; the next clean Locked intent auto-cancels Panic Play and timecode authority resumes. If the user clicks the INT/ABS toggle while the carrier is silent, the cancel call clears the engaged flag but the very next `DropoutHoldRate` block re-engages — visually a no-op, semantically correct (timecode cannot be handed back to something that isn't there).
-
-**There is no "paused" state in Timecode mode after run-out.** The deck either follows the platter (Locked) or runs internally forward (Panic / Repeat). To stop a track that has run past the encoded area, the user either lets the audio finish, drops the needle back on the groove and pulls it off the platter (lift → Stickiness pauses → re-engage on the dropped needle), or unloads the track from the deck. This is consistent with Serato Scratch Live and Traktor Scratch.
+**Path to shipping it.** Repeat returns scoped to *only the detected lead-out region*, gated on **lead-out discrimination** (UI-BACKLOG P-32). The decoder already reads absolute LFSR position internally (§5.4, since M6), but does not yet classify "needle is in the lead-out" vs "needle was lifted." Once that classification lands, the engine auto-engages Panic Play **only** in the lead-out, leaving the lift case paused. Until then run-out is a manual Panic-Play action — so there *is* now a held/paused state in Timecode mode after run-out (previously there was not).
 
 #### 5.4.3 Groove-continuity healing (sticker lock)
 
@@ -560,19 +555,13 @@ Implementation: the M5.4.5 late-binding-decks + per-deck input attach work alrea
 
 Trigger surface TBD (see §5.5). Visual feedback: a brief "INPUT SWAPPED" toast in the Status Strip (PRD §9). No persistent indicator — the swap is the new default state until reversed.
 
-#### 5.4.5 Canonical pitch anchors (perfect 0 / ±8)
+#### 5.4.5 Canonical zero (detent) anchor
 
-A DJ's pitch model is **positional**: fader at the detent → the readout says 0; fader against a stop → it says exactly ±8. Traktor and Serato honour this on every deck ever plugged in, even though no real turntable runs true (the reference rig's deck A measures +0.1–0.2 % at the detent and −0.15…−0.4 % at the stops — opposite signs, so no single trim can fix it). An app that shows +0.2 % at the detent reads as broken even when +0.2 % is the platter's true speed.
+A DJ's pitch model is **positional**: fader at the detent → the readout should say 0. Real turntables don't run true (the reference rig's deck A measures +0.1–0.2 % at the detent), and an app that shows +0.2 % at the detent reads as broken even when that is the platter's true speed.
 
-Dub pins the canonical positions with a per-deck **piecewise-linear warp** over up to three anchors (−8 %, 0, +8 %): each anchor maps the rate the deck actually produces at that fader position to exactly its canonical value, segments interpolate between anchors, and the end slopes extend beyond the stops. Slopes stay within a few % of 1.0, so the map is continuous and monotonic — a deliberate 0.1 % nudge off the detent registers immediately and proportionally (the 0.1-pitch beatmatch workflow is preserved; there is **no snap zone**).
+Dub pins **only the zero/detent anchor**: a multiplicative trim measured during the session-start calibration hold (§5.4 — the record is spinning at the detent anyway), taken as a multi-second mean, guarded to ±0.4 %, and installed while the deck is still silent. It is applied to **playback**, and the displayed rate equals the audible rate (xwax / Mixxx parity — the readout shows exactly what plays). The zero anchor is **session-scoped** (DJs travel, decks differ venue to venue, a stale trim is worse than none) and relearned silently at each session start inside the calibration hold.
 
-Learning is **invisible** — no buttons, no trim readouts, nothing for the DJ to operate:
-
-- **Zero anchor**: measured during the session-start calibration hold (§5.4 — the record is spinning at the detent anyway), as a multi-second mean, guarded to ±0.4 %. It is the only anchor applied to **playback** (a multiplicative trim of well under half a percent, installed while the deck is still silent).
-- **Stop anchors (±8)**: adopted opportunistically whenever the fader parks against a stop for ~5 s. The gates matter (each one is a field-failure scar): the rate must dwell inside a **tight band (±0.6 %) judged on the zero-corrected scale** — never the stop-warped scale, because a window that moves with its own adoptions ratchets unboundedly (field-tested: a few beatmatch holds near the stops walked a deck's display to +12/−14 with no in-session recovery); the dwell's **settled tail must not slide** (a slow fader ride through the band is not a park); the adopted value is a **two-revolution mean** (eccentricity wobble cancels, like the zero capture) with single-chunk decode spikes excluded; and **re-parks blend halfway** toward the new measurement, so continued parking converges on the deck's long-run stop rate. A deliberate hold *inside* ±0.6 % of a stop remains the one accepted ambiguity — display-only, and the fixed window means the next true park relearns the truth. Stop anchors are **display-scale only**: a misread stop may only ever cosmetically mislabel the readout, never change the audible rate.
-- A misdetected anchor that would break monotonic ordering against already-learned neighbours is rejected outright.
-
-Anchors are **session-scoped**: DJs travel, decks differ venue to venue, and a stale map from last week's rig is worse than none. The map dies with the input attach and is relearned silently at the next session start (the zero anchor inside the existing calibration hold; the stops the first time the DJ rides the fader to them).
+**The ±8 stop anchors were removed.** Earlier revisions also pinned the ±8 % stops to canonical via a per-deck piecewise-linear warp plus an opportunistic stop-learning state machine. That warp drove the *displayed* rate off the *played* rate — two decks shown the same BPM ran at different speeds — so it was deleted (~176 LOC; see `crates/dub-engine/src/anchor.rs` and `LESSONS.md`). Only the zero anchor survives; the ±8 readout now simply shows the platter's true rate at the stops rather than a forced canonical ±8.
 
 Keyboard is first-class for **non-performance** tasks (load, navigate, settings). Performance gestures — pitch, scratch, crossfade, EQ, gain, cue — live on the turntable and the user's external mixer, per the §1 mouse rule extended to the keyboard (the keyboard is not a substitute for a turntable).
 
@@ -653,7 +642,7 @@ When a Casual-Play track ends, the deck simply stops. No autoplay, no next-track
 
 #### 6.1.4 Master deck (single-master semantics)
 
-At any moment exactly one deck is the **master**. The master is the deck whose movement is currently authoritative for the rest of the surface — keyboard-load (§5.5) targets the *non*-master, the Phase-Drift Trail (§9.4) is colour-anchored to the master, the Status Strip shows the master's BPM, and future sync/quantise logic (v1.x) snaps to the master's beat phase.
+At any moment exactly one deck is the **master**. The master is the deck whose movement is currently authoritative for the rest of the surface — keyboard-load (§5.5) targets the *non*-master, the Stillpoint aid (§9.4) is anchored to the master (which *is* the lock line), the Status Strip shows the master's BPM, and future sync/quantise logic (v1.x) snaps to the master's beat phase.
 
 **Derivation (engine, not user-controlled):**
 
@@ -696,14 +685,23 @@ User does not see or configure thresholds. It just works.
 
 ### 6.2 Looping
 
-- Manual Loop In / Loop Out (sample-accurate)
-- Auto-loop: 1/8, 1/4, 1/2, 1, 2, 4, 8, 16, 32 beats
-- Loop halve / double
-- Loop relocation (move loop while active)
-- Reloop / exit
-- Loops respect timecode position when looping (loop is in-engine, not driven by needle position)
+Looping in Dub is built for the turntablist's "rewind the bit I just played" reflex, not the controller-DJ's forward loop-roll. The model is a **reverse loop**: press a loop length and the engine grabs the passage *just heard* — it snaps the press to the nearest beat, takes that many beats backwards, and jumps the playhead into the region so the loop wraps seamlessly (`crates/dub-engine/src/looping.rs`).
+
+- **Beat-length buttons** select the loop length. v1 ships ½ / 1 / 2 / 4 bars; a polish pass may relabel these in *beats* and add a few more levels — the change is cosmetic, the engine already loops an arbitrary beat count.
+- **Halve / double** is *selecting an adjacent length button*, not a separate control: tap a shorter / longer length and the loop re-grabs at the new size.
+- **Reloop / exit** — re-arm the last loop, or drop out and continue.
+- **No manual Loop In / Loop Out, and no loop relocation.** Deliberately out of scope — the beat-length + reverse-grab model is the whole loop UX. Per-edge in/out points and "move the loop while it's running" are controller-DJ idioms we are not building.
+- **Loops must work correctly under timecode** (acceptance §14 #8). The loop is in-engine (not driven by needle position), so under timecode the engine has to own the looped region without fighting the platter. **Current state:** looping ships as an *internal-play* feature (Prep / Panic-Play transport); timecode-correct looping is a v1 ship gate still to be met.
 
 **Saved loop slots** (8 numbered, recallable from keyboard) — **deferred to v1.x**. The Serato workflow of "save loops to the track, recall during performance" is real but not load-bearing for v1; v1 ships ephemeral loops only. Library schema includes an empty `track_loops` table from M11 onward so v1.x can land the feature without a migration.
+
+### 6.2.1 Hot cues (performance cues)
+
+**Hot cues are a v1 performance feature** — fixed trigger points the DJ drops onto a track and fires live for beat-juggling, finger-drumming, and re-triggering a phrase or a drop. They live on the four CUE pads, fired from the **number-row keys (1–4)** or a small pad controller next to the turntables (Shift+key clears). Per §1 they are never mouse-driven during performance — keyboard and hardware only, which keeps them squarely inside the no-mouse rule.
+
+This is a **different feature from a CDJ-style "cue" button** (a navigation affordance: set a temp cue point, jump back to audition). A turntablist does not need that — **he cues with the needle.** Earlier PRD drafts conflated the two and wrongly deferred all "cues" to v2; hot cues (performance) are v1, the CDJ cue/preview button is not built (see §6.6).
+
+Hot cues persist per track (`track_cues`, `source='user'`; see [`LIBRARY-SCHEMA.md`](LIBRARY-SCHEMA.md)) so they survive reloads and round-trip through library export. Available in both Performance and Prep mode.
 
 ### 6.3 Smart FX (per deck, mutually compatible)
 
@@ -727,11 +725,11 @@ See §8 for detail.
 
 ### 6.6 Out of scope for v1 (deferred)
 
-- **Hot cues** → **v2.** Confirmed in PRD planning: no v1 hot cues at all (not even a "single drop-cue per deck" lite version). The target user is a turntablist whose cueing is the needle; hot cues belong to the controller-DJ surface the v1 PRD does not address. v2 lands them in full alongside Phase support, the same release that opens up to controller-DJ workflows generally.
+- **CDJ-style cue / preview button** (set a temp cue point, jump back to audition) → **not built.** A turntablist cues with the needle, not a software cue button — this navigation affordance isn't needed for the target user. *Note: this is distinct from **hot cues** (performance trigger points for beat-juggling / finger-drumming), which **are** a v1 feature — see §6.2.1. Earlier drafts of this PRD conflated the two and wrongly deferred all cues to v2.*
 - **Saved loop slots** (8 numbered, recallable) → **v1.x.** v1 ships ephemeral loops only. M11 includes the empty `track_loops` table so v1.x lands without a schema migration.
 - **Sampler expansion (4 → 6 slots, à la Serato SP-6)** → **v1.x** *if real-world use demands it.* v1 ships 4 slots, symmetric with the 4 Quick Scratch slots.
-- **Track Preparation Mode tooling** (beatgrid editor, hot-cue prep, gain tweak UI) → **v1.x.** M10.8 ships the *mode shell* — load + play + horizontal waveform — but no editing surface. The mode is *visible* in v1; its *tools* arrive in v1.x.
-- **Phase-Drift Trail "numeric-only" variant** (Preferences toggle to hide the dot trail and keep just the Δ BPM / Δ ms readouts) → **v1.x** *if real use suggests it.* v1 ships the single design and learns from how DJs actually use it.
+- **Track Preparation Mode tooling** (beatgrid editor, gain tweak UI) → **v1.x.** M10.8 ships the *mode shell* — load + play + horizontal waveform — but no editing surface. The mode is *visible* in v1; its *tools* arrive in v1.x. (Hot-cue authoring shipped early, in both Performance and Prep — see §6.2.1.)
+- **Stillpoint "numeric-only" variant** (Preferences toggle to hide the band and keep just the Δ BPM / Δ ms readouts) → **v1.x** *if real use suggests it.* v1 ships the single design and learns from how DJs actually use it.
 - **Filesystem browser → full library** transition: v1.0's slim FS browser (M10.5) is intentionally minimal — folder navigation only, no metadata indexing, no crates. M11 lands the SQLite-backed library that replaces it.
 - Recording → **v2**
 - Streaming services (Tidal, Beatport, SoundCloud) → **v2+ or never**
@@ -881,11 +879,11 @@ The schema is documented in `docs/LIBRARY-SCHEMA.md` (published with M11a) and i
 > [`PRD-BEATS.md`](PRD-BEATS.md). This section is a
 > one-paragraph summary; PRD-BEATS.md is binding.
 
-The user plays a track. The deck-header BPM column accepts taps. **One or two taps** within a 2 s window is "set the 1" — pure bar-phase rotation: the existing beat nearest the tap becomes the downbeat. BPM and beat positions are unchanged; only which 1-in-4 beats are flagged yellow rotates. **Three or more taps** within a 2 s window run a **constrained re-analysis** in the tap-median ±15 % BPM window: the full estimator runs again with the search range pinned by the user's hint, the strongest real autocorrelation peak in that window is the BPM (snapped to integer if residuals don't get worse), the first tap snaps to the nearest transient as the anchor, and `bar_phase` is the value that best fits the user's tap times across the four candidates. The tap is a search hint, never the BPM — a 2 s window of 3–8 taps cannot beat a full-track spectral-flux estimator on precision.
+The user plays a track. The deck-header BPM column accepts taps. **One or two taps** within a 2 s window is "set the 1" — it **re-anchors** the grid onto the tapped kick's leading edge (BPM preserved), moving the grid onto the transient the DJ pointed at rather than merely re-labelling the nearest existing beat. **Three or more taps** within a 2 s window run a **constrained re-analysis** in a tight **±3 % LSQ window** around the tap median: the full estimator runs again with the search range pinned by the user's hint, the best-fitting real peak in that window is the BPM (snapped to integer if residuals don't get worse), the first tap snaps to the nearest transient as the anchor, and `bar_phase` is the value that best fits the user's tap times across the four candidates. The tap is a search hint, never the BPM — a 2 s window of 3–8 taps cannot beat a full-track spectral-flux estimator on precision.
 
 The tap result is written to `track_beatgrids` as `source=user_tap` and becomes the active grid; previous grids (imported, auto-detected) are preserved on the same row so the user can revert. **`grid_locked = true` is absolute**: no analyze, re-analyze, tap-tempo, or set-the-1 mutates a locked grid. The user explicitly toggles Lock grid off before any edit. The right-click menu shows a single Analyze / Re-analyze entry whose label switches on whether the track has been analyzed before, and whose enabled state follows `grid_locked`. Library row BPM and deck-header BPM are always the same value (single source of truth: the active `track_beatgrids` row); the waveform sidecar at `~/Library/Caches/Dub/waveforms/{fingerprint}.wf` is written by analyze passes and read synchronously on deck load so the waveform paints on the first frame.
 
-Per PRD-BEATS.md, beat-grid edits never trim beats, never advance the anchor past pre-roll silence, and never make the user's tap the "first beat" of the track. The grid is continuous across the whole track at all times.
+Per PRD-BEATS.md, beat-grid edits never trim beats and never force the user's tap to be the "first beat" of the track — set-the-1 re-anchors onto the tapped kick, but the grid still extends both directions and is continuous across the whole track at all times.
 
 #### 8.3.2 Key detection (Camelot canonical)
 
@@ -1096,7 +1094,7 @@ This is the ultimate anti-lock-in commitment: even if Dub disappears, the user's
 
 **Centre:** **Two decks face each other symmetrically** — A on the left, B on the right. Each deck has a **thin overview column on its outside edge** (full track at a glance, click-jumpable per §6.1) and a **wide zoomed column on its inside edge** (~4 bars visible). Beatgrid is overlaid as faint horizontal lines on the zoomed column.
 
-**Centre gutter:** the **Phase-Drift Trail** (§9.4) — Dub's beatmatching aid. A narrow vertical strip co-located between the two waveforms (where the DJ's eyes naturally focus during a mix). Replaces both Serato's Tempo Matching Display and Traktor's phase meter with a single grid-agnostic visualization. This is the only thing that lives in the centre gutter; it never houses controls.
+**Centre gutter:** **Stillpoint** (§9.4) — Dub's beatmatching aid. A narrow vertical strip co-located between the two waveforms (where the DJ's eyes naturally focus during a mix). Replaces both Serato's Tempo Matching Display and Traktor's phase meter with a single motion-nulling visualization. This is the only thing that lives in the centre gutter; it never houses controls.
 
 The `▌` marks the playhead, fixed at 25 % from the **top** of each zoomed column. **Upcoming audio fills the lower 75 % of the column;** during forward play it rises through the playhead and slides off the top of the played-region above. Reverse playback (manual rewind, backspin) inverts this: the waveform marches downward, exactly mirroring the hand on the platter. This is the load-bearing UX commitment of the layout — on-screen motion direction must equal hand-on-platter motion direction at all times, because any contradiction between them costs the DJ a frame of cognitive translation that turntablist muscle memory cannot afford during scratch work.
 
@@ -1119,9 +1117,11 @@ Left → right:
 
 The Status Strip is intentionally bare. Hardware connection status, USB dropout indicator, CPU meter, and per-deck level meters are all **out of scope for v1** (level meters: PRD §9, decided in M10.3 round; CPU + USB dropout: M18 polish if at all).
 
-### 9.4 Phase-Drift Trail (beatmatching aid)
+### 9.4 Stillpoint (beatmatching aid)
 
-The PRD's single most opinionated visual design decision. Replaces Serato's "Tempo Matching Display" (a row of peaks) + Traktor's phase meter (a needle/dial against a beatgrid) with one unified, grid-agnostic display.
+The PRD's single most opinionated visual design decision. Replaces Serato's "Tempo Matching Display" (a row of peaks) + Traktor's phase meter (a needle/dial against a beatgrid) with one **asymmetric, motion-nulling** display: **Stillpoint**.
+
+> **Binding sub-spec:** the full Stillpoint design lives in [`BEATMATCH-AID-STILLPOINT.md`](../investigations/BEATMATCH-AID-STILLPOINT.md) and is the source of truth for the centre-gutter aid (the shipped `StillpointModel` / `StillpointView`). This section is the PRD-level summary; the earlier "Phase-Drift Trail" dot-trail design it replaced is preserved only in git history.
 
 #### 9.4.1 Problem statement
 
@@ -1133,66 +1133,29 @@ Beatmatching by ear is the bedrock skill of the target user. The visual aids mos
 
 Both failure modes share a root cause: **trust in quantised abstractions (BPM numbers, inferred grid positions) instead of the actual audio.**
 
-#### 9.4.2 Design
+#### 9.4.2 Design (summary — full spec in the sub-spec)
 
-A vertical strip ≈ 80 px wide, occupying the centre gutter between the two zoomed waveforms (same height as the waveform region — typically 400–600 px depending on window size).
+Stillpoint is **asymmetric**, matching how a DJ actually thinks during a blend: the *master* deck owns the room and is never drawn as a contestant — **the master is the lock line** (a hairline collinear with the waveform playheads). The only object the DJ acts on is one **incoming-tinted band** on that line. Governing law: **nothing in the gutter moves at beat rate — only at error rate.**
 
-Time flows **bottom → top** matching the waveform direction discipline (§9.1): the bottom of the strip is "now," the top is "≈ 4 bars ago." A new sample is plotted at the bottom each ~33 ms (30 Hz); older samples advance upward, mirroring the waveform's motion through its playhead during forward playback.
+- **Tempo as drift, not position.** Tempo error renders as motion (a scrolling belt pre-drop; band drift post-drop) — matched = the world *freezes*, the same motion-null read a turntablist already trusts from a Technics strobe. Climbing = your record is slow (pitch `+`); sinking = fast.
+- **Phase as displacement.** After the drop the band sits above the line (you're late) or below (early); you nudge it into the ±10 ms pocket on the line.
+- **Lock as a growing green line.** Certified lock ignites the line green and grows it outward (~2 px/beat); lock-loss **shatters from the edges** as a one-shot event, never a slow fade. A false green has no render path.
+- **Ride-stage coach.** A repeated same-direction nudge surfaces a small `± n.n %` pitch-trim hint — the app quoting the DJ's own hands back. No shipping product does this.
+- **Honesty.** Low onset confidence renders as stillness / ghosting, never a confident-looking wrong position.
 
-**X-axis** (horizontal position across the strip) = current beat-phase offset between deck A and deck B, in milliseconds, centred at zero. Right of centre = deck B is *ahead* of deck A. Left = deck B is *behind* deck A. Default scale: ±60 ms — wider than the audible threshold (~10–15 ms), narrow enough that small mismatches are visible.
+The display runs at **60 Hz** (the round-2 dot-trail's 30 Hz was superseded). Surface: a 120 px gutter at full waveform height, lock line at y ≈ 25 %.
 
-**Plotted at each sample:**
-- A small dot at `(x = phase_offset_ms, y = time_index)`.
-- Dot *brightness* = correlation confidence — a function of the cross-correlation peak height (PRD §9.4.4).
-- Dot *colour* = a blend of the two decks' source-mode accent colours (deck A tint left of centre, deck B tint right, midline neutral).
+#### 9.4.3 Grid coupling — a known v1 limitation
 
-**Reading the trail:**
+The shipped Stillpoint derives beat phase from each deck's **inferred beatgrid** (`StillpointModel`: `φ = frac((playhead − anchor) × bpm/60)`), *not* from a grid-agnostic ODF cross-correlation. So — ironically, given §9.4.1 point 2 faults Traktor's phase meter for exactly this — **a wrong beatgrid currently does degrade the aid.** This is an accepted v1 trade-off: it is "good enough" on the genres tested, and the grid-agnostic ODF rewrite (raw log-band spectral-flux cross-correlation — the design's original promise that "a wrong grid does not affect the display") is **parked until variable beatgrids land**, at which point the φ/Δ producers swap to the ODF path behind the same UI. The Rust `dub-match` crate the earlier design sketched was **not built**; Stillpoint is implemented in Swift (`StillpointModel` + `StillpointView`), consuming the engine's existing per-deck rate/grid publish.
 
-| Pattern | Meaning |
-|---|---|
-| Dots stacked **vertically on the centre line** | Tempo and beat *both* matched. Hold position. |
-| Dots stacked vertically, but **offset from centre** | Tempos matched but beats not aligned. Nudge the platter to centre the trail. |
-| Dots forming a **diagonal slope** | Tempos *don't* match. The slope angle is proportional to BPM mismatch; the slope *direction* tells the DJ which way to move the pitch fader (slope towards the right → deck B is gaining → slow B down or speed A up). |
-| **Dim / fading dots** | Low correlation — at least one deck has a sparse / a-cappella / ambient passage. The display is *honestly* signaling "I can't be sure right now." Do not trust the position; rely on your ear. |
-| **Random-looking scatter** | Both decks have weak ODFs (no clear beats). Same honesty principle. |
+#### 9.4.4 Trade-offs we accept
 
-Numeric overlays at the top and bottom of the strip:
+1. **Novel display, first-time interpretation needed.** DJs trained on Serato/Traktor won't read it at first glance; a `?` legend mitigates ("make it stop moving, then sit it on the line").
+2. **Centre-gutter real estate** (120 px × full height) is reserved for this and nothing else — the DJ's eyes already converge there during a mix, so anywhere else costs an eye-saccade per check.
+3. **Grid coupling** (§9.4.3) until variable grids land.
 
-- **Top:** `Δ BPM = +0.3` — tempo difference, slope-derived.
-- **Bottom:** `Δ ms = +12` — instantaneous beat-phase offset.
-
-Both update at the 30 Hz cadence. The numeric values are precise; the trail is the gestalt. **Together they're the answer to "where am I, where am I heading, and how confident is the display about it."**
-
-#### 9.4.3 Why grid-agnostic
-
-The cross-correlation operates on the **raw onset-detection function** (ODF) of each deck — the same log-band spectral-flux signal `dub-bpm` already computes (§5.2.3, M7.5 / M8.1, `crates/dub-bpm/src/onset.rs`). The ODF is what the audio *actually* does: peaks at kick / snare / clap onsets, troughs at sustains. No beatgrid is inferred; no downbeat is chosen. The cross-correlation finds the lag that best aligns the two ODFs over a rolling window of ≈ 2 bars.
-
-Consequences:
-
-- **A wrong beatgrid does not affect the display.** If the M11 importer pulls a Serato grid that's off by half a beat, the Phase-Drift Trail is unaffected. Beatgrid errors degrade other features (auto-loop length, FX division snapping), but not beatmatching.
-- **Thru-mode (real record) is fully supported.** The M9-shipped ODF tap on the Thru source produces the same signal as a file source. The user can beatmatch a real record against a file with no special-casing.
-- **Micro-timing / swing / drift is visible, not hidden.** When a drummer plays slightly ahead-of-beat in the chorus, the trail shifts slightly right *honestly* — the DJ can react.
-
-#### 9.4.4 Implementation sketch
-
-Lives in a new crate, **`dub-match`** (sibling of `dub-bpm` / `dub-peaks` / `dub-spectral`), per §10.
-
-| Layer | Thread | Cost |
-|---|---|---|
-| ODF source | Audio thread (no change) | Already running — M8 `SpectralFrameStream` on each deck. Alloc-free verified. |
-| **Cross-correlation** — for each new ODF frame, compute correlation of A's last ≈ 2 bars against B's last ≈ 2 bars across a lag window of ±1 beat (~500 ms either side at 120 BPM). | New off-RT analysis thread (`MatchStream`), one per pair of decks. | ~O(N×L) where N ≈ 200 frames, L ≈ 40 lag candidates. Order of microseconds per update. |
-| Emit `MatchSample { phase_ms: f32, confidence: f32, timestamp: Instant }` at ~30 Hz to an SPSC ring. | Same off-RT thread. | Alloc-free; pre-allocated ring. |
-| Render the trail. | Renderer thread (existing `WaveformView` infrastructure can be reused). | Pull the last N samples from the ring per frame; draw via Metal vertex instancing similar to `WaveformRenderer`. |
-
-The `dub-bpm` ODF stream is already a public API; `dub-match` consumes it as a leaf. No reach-back into the audio thread.
-
-#### 9.4.5 Trade-offs we accept
-
-1. **Novel display, first-time interpretation needed.** DJs trained on Serato/Traktor will not read this at first glance. Mitigation: a `?` glyph next to the strip pops a one-line legend on hover (`make the trail straight, then centre it`).
-2. **30 Hz update cadence** → ~33 ms minimum visible response time. Acceptable: human beat-matching reaction time is ~100 ms, audible beat-error threshold ~10–15 ms; the display is faster than the user can act on it.
-3. **Centre-gutter real estate** (≈ 80 × 400 px) is reserved for this and nothing else. We considered placing it as a horizontal strip below the waveforms to free the gutter; the centre-gutter location wins because the DJ's eyes already converge there during a mix — putting the aid anywhere else costs an eye-saccade per check, which is the kind of friction Dub exists to eliminate.
-
-A **numeric-only variant** (drop the dot trail, keep just `Δ BPM` + `Δ ms` overlays) is a future possible Preferences option but **not v1**. We ship one design first, learn from real use, then offer alternatives if needed.
+A **numeric-only variant** (drop the band, keep just `Δ BPM` + `Δ ms`) is a future possible Preferences option but **not v1** (§13.4).
 
 ### 9.5 Deck header (per deck)
 
@@ -1247,7 +1210,7 @@ The full archaeology of the M10.5h–p shader ladder that was rolled back to pro
 
 #### 9.6.1 Sizing
 
-The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-history* much more than they need horizontal *peak-detail* — a clean, narrow strip reads faster at performance distance than a wide one and leaves room for the overview, the deck-header chips, and the M10.7 Phase-Drift Trail in the centre gutter. Concretely, in the SwiftUI implementation:
+The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-history* much more than they need horizontal *peak-detail* — a clean, narrow strip reads faster at performance distance than a wide one and leaves room for the overview, the deck-header chips, and the M10.7 Stillpoint aid in the centre gutter. Concretely, in the SwiftUI implementation:
 
 | Surface | Dimension | Constant | Notes |
 |---|---|---|---|
@@ -1255,7 +1218,7 @@ The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-hist
 | **Zoomed strip, Prep mode** | ≈ 140 px tall, full-width horizontal | `DubLayout.waveformPrepHeight` | Prep mode is single-deck and uses a horizontal scrolling playing waveform for screenshot/A-B judgement and track prep. |
 | **Overview band, Prep mode** | ≈ 60 px tall, full-width horizontal | `DubLayout.deckOverviewHeight` | Whole-track waveform stacked above the zoomed Prep waveform. Same click-to-jump semantics as the vertical overview. |
 | **Overview column** (M10.5c) | ≈ 36 px wide, full track top→bottom | `DubLayout.deckOverviewWidth` | Thin strip on the deck's outside edge. Shows the whole track at a glance with a playhead-bracket indicator at the current position. Click-to-jump per §6.1. |
-| **Centre gutter** (M10.7) | ≈ 80 px wide | reserved | Phase-Drift Trail and nothing else. |
+| **Centre gutter** (M10.7) | ≈ 120 px wide | reserved | Stillpoint and nothing else. |
 
 The **remaining horizontal space inside each deck pane** (window-half-width minus the zoomed column minus the overview column minus the centre-gutter share) is reserved for per-deck info chips that don't fit in the deck header — RPM toggle (33 / 45), key-lock indicator, beatgrid-offset readout, time-elapsed-vs-remaining secondary readout. Those are M10.x polish work and not specified individually here; the column-width discipline reserves the canvas they'll be drawn onto.
 
@@ -1268,7 +1231,7 @@ The M10.8 Serato-parity baseline (§9.6.0) is the line below which all future wa
 
 1. **Phrase landmarks (lead candidate).** Off-line analyzer (new `dub-segment` crate or `dub-bpm` feature) detects structural boundaries — drop, breakdown, verse-in, outro — from discontinuities in the spectral-flux ODF that `dub-bpm` already produces. Result: small chevrons painted *in the existing reserved gutter beside the waveform*, green for energy-up, red for energy-down. Conservative confidence threshold so the failure mode is "no chevron" rather than "wrong chevron." Cached in the M10.5j sidecar. Differentiator: **no commercial DJ app surfaces phrase boundaries on the playing waveform**, and this fills the cue-point role that scratch DJs on timecode otherwise can't program. Cost: ~3–4 days incl. corpus validation against hip-hop / reggae tracks before exposing the feature.
 
-2. **Ghost waveform of the other deck (cheapest win).** A second low-opacity (≈ 0.15) monochrome render of the *other* deck's `PeakBuffer` painted *behind* the current deck's coloured waveform, aligned by playhead. Makes inter-deck transient alignment visually obvious — the qualitative complement to M10.7's numeric Phase-Drift Trail. Zero new analysis (reuses existing peak data). One additional Metal draw call per deck; default-off Preferences toggle. Cost: ~0.5–1 day. The natural pairing with phrase landmarks.
+2. **Ghost waveform of the other deck (cheapest win).** A second low-opacity (≈ 0.15) monochrome render of the *other* deck's `PeakBuffer` painted *behind* the current deck's coloured waveform, aligned by playhead. Makes inter-deck transient alignment visually obvious — the qualitative complement to M10.7's Stillpoint aid. Zero new analysis (reuses existing peak data). One additional Metal draw call per deck; default-off Preferences toggle. Cost: ~0.5–1 day. The natural pairing with phrase landmarks.
 
 3. **Vocal-presence overlay (parked pending §15 ruling).** Heuristic over the existing `dub-spectral` 8-band data (strong stable mid-band harmonics + low onset density inside that band) flags vocal-heavy sections; rendered as a dotted-line texture or local desaturation across the waveform's mid stripe. Useful for hip-hop / reggae blending discipline ("don't put two rappers over each other"). **Boundary case with §15 stems / AI separation** — the proposal is a visual annotation derived from spectral statistics with no separated audio buffer ever produced, but explicit sign-off needed before any code lands. Cost: ~2.5 days if approved.
 
@@ -1300,7 +1263,6 @@ dub/                                 # repo / workspace name
 │   ├── dub-bpm/                     # M7.5 — BpmEstimator (offline + streaming drivers, pure-Rust)
 │   ├── dub-peaks/                   # M9 — off-RT decimator producing PeakChunk + BandPeakChunk for the renderer (M10)
 │   ├── dub-spectral/                # M9.5 — shared FFT + log-band magnitude pipeline (consumed by dub-bpm + dub-peaks)
-│   ├── dub-match/                   # M10.7 — Phase-Drift Trail (§9.4): cross-correlation of two decks' ODFs, off-RT
 │   ├── dub-fingerprint/             # Library dedupe (M11b, shipped) + real-record recognition (v1.1). Pure-Rust Chromaprint via rusty-chromaprint.
 │   ├── dub-library/                 # SQLite + import adapters
 │   ├── dub-controller/              # HID/MIDI abstractions (placeholder in v1)
@@ -1440,7 +1402,7 @@ observably do at the end.
 | Range | Scope | History |
 | --- | --- | --- |
 | **M0 → M8.1** | Workspace, audio engine, transport, timecode, external routing, Thru, BPM. | [`SHIPPED.md`](../history/SHIPPED.md) |
-| **M9 → M10.8** | Live peaks, spectral extraction, Metal waveform, Apple shell, Performance/Prep mode, Panic Play, Phase-Drift Trail, waveform baseline reset. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M9 → M10.8** | Live peaks, spectral extraction, Metal waveform, Apple shell, Performance/Prep mode, Panic Play, Stillpoint (beatmatch aid), waveform baseline reset. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M11a → M11d.4** | Library schema, fingerprint dedupe, filesystem importer, browser shell, smart crates, indicators, scanner, Relocate. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M11c.1 → M11c.2** | Lazy auto beat-grid analysis and Camelot key detection. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M11c.3a** | BPM octave fix (perceptual tempo prior — rap at 95, DnB at 172). | [`SHIPPED.md`](../history/SHIPPED.md) |
@@ -1523,7 +1485,6 @@ we ship Stable when the SLOs are met, not on a calendar.
 ### 13.3 Items explicitly deferred to v2
 
 - Phase support (full subsystem, including SDK access and integration)
-- Hot cues (entire system — no v1 lite version)
 - Recording (master out + per-deck)
 - Windows port
 - HID controller ecosystem
@@ -1533,8 +1494,8 @@ we ship Stable when the SLOs are met, not on a calendar.
 
 - Saved loop slots (M11 schema includes empty `track_loops` table for forward-compat)
 - Sampler expansion 4 → 6 slots (if real use demands)
-- Phase-Drift Trail numeric-only Preferences variant
-- Track Preparation Mode prep tooling (beatgrid editor, hot-cue prep, gain UI)
+- Stillpoint numeric-only Preferences variant (§9.4)
+- Track Preparation Mode prep tooling (beatgrid editor, gain UI) — *hot-cue authoring shipped early (§6.2.1); beatgrid editor + gain UI remain v1.x*
 - Additive waveform layers parked in [§9.6.2](#962-future-additive-waveform-layers-parked) — phrase landmarks, ghost waveform of the other deck, vocal-presence overlay. None scheduled; each must be re-evaluated against the M10.8 baseline guardrail (§9.6.0) when picked up.
 
 ---
@@ -1550,12 +1511,12 @@ Dub v1.0 ships when **all** of the following hold on a DMG installed on a clean 
 5. **Live waveform of a Thru-mode real record is rendered as the record plays, at 60 fps, with no glitches.** (Persistence and recognition land in v1.1.)
 6. Echo-Out and Dub Siren can be applied to a Thru deck (i.e. FX work on real records); engaging FX does not change the deck's input-to-output latency.
 7. User can import their existing Serato / Traktor / rekordbox / iTunes / Lexicon library and play tracks with imported beatgrids. Auto-detect grids fall back when source has none.
-8. Looping (manual + auto, halve/double) works correctly under timecode.
+8. Looping (reverse-loop with beat-length select + halve/double, per §6.2) works correctly under timecode. *(Ships internal-play today; timecode-correct looping is the open part of this gate.)*
 9. **Key Lock works on both decks; engages and disengages automatically based on playback rate per §6.1.1; user hears no glitches during scratching with Key Lock on.**
 10. Echo-Out, Dub Siren, Sampler (4 slots), Quick Scratch (4 slots, hotkey fast-load), Instant Doubles all work per §6 / §7.
 11. UI is keyboard-navigable end-to-end. **No performance gesture** (pitch / scratch / crossfade / EQ / gain / cue) requires the mouse — per §1's refined mouse rule. Mouse-driven *transport* (Panic Play, Casual Play, position navigation per §6.1) is in v1 and *not* in conflict with the philosophy.
 12. **Panic Play (§6.1.2)** recovers from a needle dirt event without audible interruption: keystroke transitions the deck from timecode-driven to last-known-velocity playback, audience hears no glitch, automatic resume on clean LFSR return verified in a manual rig test.
-13. **Phase-Drift Trail (§9.4)** renders in the centre gutter, updates at 30 Hz with ≤ 1 frame of stutter at 60 fps UI, correctly slopes when tempos differ and centres when in phase. Verified on canned-mix fixtures (`crates/dub-match/tests/`).
+13. **Stillpoint (§9.4)** renders in the centre gutter at 60 Hz with ≤ 1 frame of stutter, drifts when tempos differ and freezes / seats the band on the line when matched, and certifies lock honestly (no false green). Verified against its Swift test suite (`apple/DubTests/`).
 14. **Track Preparation Mode shell** (M10.8) auto-boots when no multi-channel interface is connected; can load + play a file from the library at horizontal-waveform resolution.
 15. Zero xruns in a 60-minute scratch session at 64-sample buffer on M2 Air.
 16. README + first-run experience documents how to set up a typical rig (turntables → interface → mixer → speakers) and a Thru-mode rig (real record → interface → engine → mixer).
@@ -1571,7 +1532,7 @@ Dub v1.0 ships when **all** of the following hold on a DMG installed on a clean 
 - Saved loop slots (deferred to v1.x — v1 ships ephemeral loops only)
 - Sampler beyond 4 slots (v1 is 4; expansion to Serato-parity 6 deferred to v1.x if real use demands it)
 - Track Preparation Mode editing tooling — beatgrid editor, hot-cue prep, gain tweak (v1 ships the *shell*; tools land in v1.x)
-- Phase-Drift Trail numeric-only Preferences variant (single design in v1; alternative ships in v1.x if needed)
+- Stillpoint numeric-only Preferences variant (single design in v1; alternative ships in v1.x if needed)
 - Recording
 - Streaming services
 - Phase
