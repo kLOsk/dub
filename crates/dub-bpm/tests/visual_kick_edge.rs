@@ -96,7 +96,7 @@ fn auto_grid_phases_onto_the_visual_kick_edge() {
         .expect("auto analyze");
         let period = 60.0 / grid.bpm;
         // Compare GRID PHASE (nearest beat to the anchor), not the
-        // specific downbeat marker — bar-phase is a separate (AlphaTheta)
+        // specific downbeat marker — bar-phase is a separate (backbeat refinement)
         // concern. Fold the anchor onto the grid's phase ring.
         let nearest = grid
             .beats
@@ -117,7 +117,7 @@ fn auto_grid_phases_onto_the_visual_kick_edge() {
         );
         // Bar phase: the "1" is the first measurable beat → bar_phase 0,
         // matching every one of the user's hand-set grids (incl. Oppidan,
-        // which AlphaTheta wrongly put on beat 1).
+        // which backbeat refinement wrongly put on beat 1).
         assert_eq!(
             grid.bar_phase, 0,
             "the 1 must be the first measurable beat (bar_phase 0) for {path}; got {}",

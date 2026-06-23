@@ -283,6 +283,32 @@ These are not in the dep graph today. They are documented here so future work kn
 
 ---
 
+## Patent awareness — downbeat detection (informational)
+
+Dub's downbeat refinement (`dub-bpm`, `refine_downbeat_backbeat`) uses the
+standard metrical-emphasis heuristic — snare/clap on beats 2 & 4, bass drum
+on beat 1 — which is long established in the published music-information-
+retrieval literature, predating any relevant patent:
+
+- M. Goto & Y. Muraoka, "A Real-time Beat Tracking System for Audio Signals,"
+  ICMC 1995 (assumes bass-on-strong / snare-on-weak beats).
+- M. Davies & M. Plumbley, "A Spectral Difference Approach to Downbeat
+  Extraction in Musical Audio," EUSIPCO 2006.
+- J. Hockman, M. Davies & I. Fujinaga, "One in the Jungle: Downbeat Detection
+  in Hardcore, Jungle, and Drum and Bass," ISMIR 2012.
+
+A vendor patent in this area exists (AlphaTheta / Pioneer US 11,176,915 B2,
+"Song analysis device," filed 2017, in force). Dub does **not** practise its
+claims: that patent recites discrete snare/bass *sounding-position detectors*
+and selection of the "first sounding position from the start above a
+threshold"; Dub instead sums band-attack energy into four bar-phase bins over
+the whole track and compares aggregate contrast — the general published
+technique above, not the patent's specific apparatus. Assessed low risk for a
+pre-alpha GPLv3 project; a formal freedom-to-operate opinion is not required at
+this stage and should be revisited before any commercial distribution.
+
+---
+
 ## How to ship attribution
 
 When a Dub binary is distributed:

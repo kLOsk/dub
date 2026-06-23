@@ -9,14 +9,14 @@
 //!
 //! Honest scope: the synthetic hip-hop / dnb patterns are *symmetric*
 //! between bar positions 1 and 3 (kick on both), so they cannot test
-//! the AlphaTheta downbeat method's 1-vs-3 resolution — that needs the
+//! the backbeat refinement's 1-vs-3 resolution — that needs the
 //! asymmetry of real music (the `beat_location_corpus` path). Here we
 //! assert what the synthetic ground truth *can* support — tempo +
 //! beat-phase via F-measure — and print the auto/refined downbeat
 //! placement as a diagnostic for inspection (no over-assertion on the
 //! genuinely ambiguous quantity).
 
-use dub_bpm::{analyze_beat_grid, eval, refine_downbeat_alphatheta, synthetic};
+use dub_bpm::{analyze_beat_grid, eval, refine_downbeat_backbeat, synthetic};
 
 const SR: u32 = 44_100;
 const DUR: f64 = 24.0;
@@ -48,7 +48,7 @@ fn downbeat_err_ms(downbeat_secs: f64, bpm: f64) -> f64 {
 fn report_downbeat(name: &str, grid: &dub_bpm::BeatGrid, samples: &[f32], bpm: f64) {
     let auto = grid.beats[grid.bar_phase as usize];
     let auto_err = downbeat_err_ms(auto, bpm);
-    let refined = refine_downbeat_alphatheta(samples, SR, 1, grid);
+    let refined = refine_downbeat_backbeat(samples, SR, 1, grid);
     let refined_str = refined.as_ref().map_or_else(
         || "none".to_string(),
         |r| {

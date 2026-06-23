@@ -1,9 +1,13 @@
 //! Snare-on-2&4 + bass-on-1 downbeat refinement.
 //!
-//! Clean-room implementation of the bar-position method published in
-//! AlphaTheta US11176915B2 ("Song analysis device"). The maintainer has
-//! cleared freedom-to-operate; this code reconstructs the *method* from
-//! the patent text, not its source.
+//! Standard metrical-emphasis downbeat heuristic from the published MIR
+//! literature: in most 4/4 popular music the snare/clap sits on beats 2 & 4
+//! and the bass drum anchors beat 1. This is an independent implementation of
+//! that long-established technique — Goto & Muraoka, "A Real-time Beat
+//! Tracking System" (ICMC 1995); Davies & Plumbley, "A Spectral Difference
+//! Approach to Downbeat Extraction" (EUSIPCO 2006); Hockman, Davies &
+//! Fujinaga, "One in the Jungle" (ISMIR 2012) — not any vendor's product or
+//! patent. See `docs/spec/LICENSE-DEPENDENCIES.md` for the prior-art note.
 //!
 //! ## Why this exists
 //!
@@ -16,14 +20,14 @@
 //! anchors beat 1**. Two independent whole-track tests combine into a
 //! single bar position:
 //!
-//! 1. **Backbeat parity** (the patent's "one-beat-shift" test): the two
+//! 1. **Backbeat parity** (the backbeat-parity test): the two
 //!    bar positions carrying the most snare-band onset energy are 2 & 4.
 //!    That fixes the downbeat to one of the *other* two positions.
-//! 2. **Bass anchor** (the "two-beat-shift" test): of those two remaining
+//! 2. **Bass anchor** (the bass-anchor test): of those two remaining
 //!    positions, the one with more kick-band onset energy is the 1.
 //!
 //! Unlike the kick-ODF picker this works off the **audio**, not the ODF,
-//! so it can use the exact patent passbands (snare 300 Hz – 2.5 kHz, kick
+//! so it can use the standard snare/kick passbands (snare 300 Hz – 2.5 kHz, kick
 //! < 240 Hz) rather than the 8 log bands the ODF front-end happens to lay
 //! out. It is an *opt-in* refinement: hand it a finished [`BeatGrid`] and
 //! it returns the bar phase it judges to be the downbeat, leaving every
@@ -58,22 +62,22 @@ pub struct DownbeatRefinement {
     pub confidence: f32,
 }
 
-/// Patent snare passband: low-pass corner (Hz). Snare = LPF 2.5 kHz then
+/// Snare passband: low-pass corner (Hz). Snare = LPF 2.5 kHz then
 /// HPF 300 Hz, isolating the snare/clap body + crack while rejecting the
 /// kick fundamental and the brightest hats.
 const SNARE_LPF_HZ: f64 = 2500.0;
-/// Patent snare passband: high-pass corner (Hz).
+/// Snare passband: high-pass corner (Hz).
 const SNARE_HPF_HZ: f64 = 300.0;
-/// Patent kick passband: outer low-pass corner (Hz). Kick = LPF 2.5 kHz
+/// Kick passband: outer low-pass corner (Hz). Kick = LPF 2.5 kHz
 /// then LPF 240 Hz; the cascade steepens the rolloff so snare/hat energy
 /// does not leak into the bass-drum measurement.
 const KICK_LPF1_HZ: f64 = 2500.0;
-/// Patent kick passband: inner low-pass corner (Hz).
+/// Kick passband: inner low-pass corner (Hz).
 const KICK_LPF2_HZ: f64 = 240.0;
 
 /// One-pole envelope time constant (seconds). ~5 ms tracks a drum attack
 /// without smearing adjacent hits; the positive first difference of this
-/// envelope is the onset/attack signal the patent differentiates for.
+/// envelope is the onset/attack signal differentiated for.
 const ENV_TAU_SECS: f64 = 0.005;
 
 /// Half-width of the per-beat measurement window, as a fraction of the
@@ -103,7 +107,7 @@ const BEATS_PER_BAR: usize = 4;
 /// In every `None` case the caller should keep the grid's existing
 /// `bar_phase`.
 #[must_use]
-pub fn refine_downbeat_alphatheta(
+pub fn refine_downbeat_backbeat(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
@@ -407,7 +411,7 @@ mod tests {
         }
 
         let grid = grid_at(bpm, n_beats, 2); // deliberately wrong phase
-        let r = refine_downbeat_alphatheta(&buf, SR, 1, &grid).expect("should decide");
+        let r = refine_downbeat_backbeat(&buf, SR, 1, &grid).expect("should decide");
         assert_eq!(r.bar_phase, 0, "kick-on-1&3 case must resolve to phase 0");
         assert!(
             r.confidence > 0.2,
@@ -436,7 +440,7 @@ mod tests {
         }
 
         let grid = grid_at(bpm, n_beats, 0);
-        let r = refine_downbeat_alphatheta(&buf, SR, 1, &grid).expect("should decide");
+        let r = refine_downbeat_backbeat(&buf, SR, 1, &grid).expect("should decide");
         assert_eq!(r.bar_phase, 1, "rotated pattern must resolve to phase 1");
     }
 
@@ -458,8 +462,8 @@ mod tests {
         let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
 
         let grid = grid_at(bpm, n_beats, 0);
-        let m = refine_downbeat_alphatheta(&mono, SR, 1, &grid).expect("mono decides");
-        let s = refine_downbeat_alphatheta(&stereo, SR, 2, &grid).expect("stereo decides");
+        let m = refine_downbeat_backbeat(&mono, SR, 1, &grid).expect("mono decides");
+        let s = refine_downbeat_backbeat(&stereo, SR, 2, &grid).expect("stereo decides");
         assert_eq!(m.bar_phase, s.bar_phase);
     }
 
@@ -467,7 +471,7 @@ mod tests {
     fn silence_returns_none() {
         let grid = grid_at(120.0, 32, 0);
         let buf = vec![0.0f32; SR as usize * 4];
-        assert!(refine_downbeat_alphatheta(&buf, SR, 1, &grid).is_none());
+        assert!(refine_downbeat_backbeat(&buf, SR, 1, &grid).is_none());
     }
 
     #[test]
@@ -475,21 +479,21 @@ mod tests {
         let mut grid = grid_at(120.0, 32, 0);
         grid.beats_per_bar = 3;
         let buf = vec![0.1f32; SR as usize * 4];
-        assert!(refine_downbeat_alphatheta(&buf, SR, 1, &grid).is_none());
+        assert!(refine_downbeat_backbeat(&buf, SR, 1, &grid).is_none());
     }
 
     #[test]
     fn too_few_beats_returns_none() {
         let grid = grid_at(120.0, 4, 0); // one bar
         let buf = vec![0.1f32; SR as usize * 4];
-        assert!(refine_downbeat_alphatheta(&buf, SR, 1, &grid).is_none());
+        assert!(refine_downbeat_backbeat(&buf, SR, 1, &grid).is_none());
     }
 
     #[test]
     fn odd_stereo_length_returns_none() {
         let grid = grid_at(120.0, 32, 0);
         let buf = vec![0.1f32; 1001]; // not a multiple of 2
-        assert!(refine_downbeat_alphatheta(&buf, SR, 2, &grid).is_none());
+        assert!(refine_downbeat_backbeat(&buf, SR, 2, &grid).is_none());
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub use confidence::{
     LOCK_TOLERANCE_BPM, LOST_LOCKED_CONSECUTIVE, LOST_TENTATIVE_CONSECUTIVE, REJECT_TOLERANCE_BPM,
     TENTATIVE_THRESHOLD,
 };
-pub use downbeat::{refine_downbeat_alphatheta, DownbeatRefinement};
+pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
 pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
 pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};

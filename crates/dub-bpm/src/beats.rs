@@ -234,7 +234,7 @@ pub fn analyze_beat_grid_with_profile(
     // kicks (the user's repeated "the 1 is behind the kick" reports).
     // Soft-kick tracks with no clean edge keep their LSQ phase.
     let grid = shift_grid_to_kick_edge(grid, samples, sample_rate, channels);
-    // Downbeat refinement (AlphaTheta snare-2&4 + bass-on-1):
+    // Downbeat refinement (backbeat: snare-2&4 + bass-on-1):
     // `find_downbeat_offset` votes on the kick ODF alone and cannot
     // separate bar 1 from bar 3 (both carry a kick in 4/4). The
     // snare-backbeat + bass-anchor rule resolves it from the audio. On
@@ -251,7 +251,7 @@ pub fn analyze_beat_grid_with_profile(
     ))
 }
 
-/// Minimum AlphaTheta confidence to override the kick-ODF downbeat.
+/// Minimum backbeat-refinement confidence to override the kick-ODF downbeat.
 /// Tuned on the operator's tapped corpus: every correct snare/bass
 /// override scored ≥ 0.057, the single mis-pick scored 0.039.
 const DOWNBEAT_REFINE_MIN_CONFIDENCE: f32 = 0.05;
@@ -280,7 +280,7 @@ const FIRST_BEAT_HALF_WINDOW_SECS: f64 = 0.012;
 /// Oppidan). The known failure is the operator's stated 5 %: a track
 /// whose first audible content is NOT the downbeat (reggae roll-up, a
 /// vocal / talk intro). Returns `None` only for a silent track, so the
-/// AlphaTheta fallback runs there.
+/// backbeat fallback runs there.
 fn first_audible_downbeat_phase(
     beats: &[f64],
     samples: &[f32],
@@ -326,7 +326,7 @@ fn first_audible_downbeat_phase(
 /// — the operator's dance-music rule, right ~95 % of the time and the
 /// thing the eye does. Fallback for ambiguous intros (reggae roll-ups,
 /// vocal / talk over the start) where no clean early kick exists: the
-/// AlphaTheta snare-2&4 + bass-on-1 rule. Pure bar-phase rotation; bpm,
+/// backbeat snare-2&4 + bass-on-1 rule. Pure bar-phase rotation; bpm,
 /// beats, anchor and quality are preserved.
 fn apply_downbeat_refinement(
     mut grid: BeatGrid,
@@ -346,7 +346,7 @@ fn apply_downbeat_refinement(
         return grid;
     }
     if let Some(r) =
-        crate::downbeat::refine_downbeat_alphatheta(samples, sample_rate, channels, &grid)
+        crate::downbeat::refine_downbeat_backbeat(samples, sample_rate, channels, &grid)
     {
         if r.confidence >= DOWNBEAT_REFINE_MIN_CONFIDENCE {
             grid.bar_phase = r.bar_phase;

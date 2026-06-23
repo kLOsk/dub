@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use dub_bpm::{
     analyze_beat_grid_with_profile, octave_profile_from_genre, octave_profile_from_label,
-    refine_downbeat_alphatheta, BeatGrid, OctaveProfile,
+    refine_downbeat_backbeat, BeatGrid, OctaveProfile,
 };
 use dub_io::Track;
 use dub_library::{ActiveBeatgrid, Library, TrackSortKey};
@@ -168,23 +168,23 @@ fn full_diagnosis(target: &str, profile_label: Option<&str>) -> Result<()> {
         .context("analyze_beat_grid_with_profile")?;
         println!("\n=== FRESH ANALYSIS ({profile:?} profile, from {profile_source}) ===");
         print_grid_summary(&grid);
-        // `grid.bar_phase` is the AlphaTheta-refined downbeat (the auto
+        // `grid.bar_phase` is the backbeat-refined downbeat (the auto
         // path now applies the snare-2&4 + bass-on-1 rule). Surface the
         // confidence behind it, or note when it fell back to kick-ODF.
         if !grid.beats.is_empty() {
             let db = grid.beats[grid.bar_phase as usize % grid.beats.len()];
-            match refine_downbeat_alphatheta(
+            match refine_downbeat_backbeat(
                 track.samples(),
                 track.sample_rate(),
                 track.channels(),
                 &grid,
             ) {
                 Some(r) => println!(
-                    "  [downbeat] bar_phase={} t={db:.4}s  (AlphaTheta snare/bass conf={:.3})",
+                    "  [downbeat] bar_phase={} t={db:.4}s  (backbeat snare/bass conf={:.3})",
                     grid.bar_phase, r.confidence
                 ),
                 None => println!(
-                    "  [downbeat] bar_phase={} t={db:.4}s  (AlphaTheta abstained → kick-ODF)",
+                    "  [downbeat] bar_phase={} t={db:.4}s  (backbeat abstained → kick-ODF)",
                     grid.bar_phase
                 ),
             }

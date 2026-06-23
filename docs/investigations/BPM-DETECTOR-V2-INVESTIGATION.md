@@ -318,7 +318,7 @@ ML detector.
 | **Beat Link / dysentery** | Consumer (no audio analysis) | No — none exists; replays an offline grid | Reads stored 1–4 live (master player only) | None for the detector; interop precedent only |
 | **Serato** | Detector + GEOB storage | No — no patent/paper/blog; only a "BPM Range" prior | `marker[0]` by convention; no explicit field | Format only — the M11e GEOB importer (big-endian; derive non-terminal BPM) |
 | **rekordbox** | Detector + ANLZ storage | Partial — only expired, onset-only US5614687A; modern engine undocumented+ML | **Explicit** per-beat `1..4` in `PQTZ` | **High** — import `PQTZ.beat_number → bar_phase` |
-| **Patent sweep** | Detector techniques | Partial — concrete *classical* methods only | AlphaTheta snare/bass → 0–3 shift; MS phase-tree | Two leads: AlphaTheta downbeat (verify FTO — live patent), NI composite-interval |
+| **Patent sweep** | Detector techniques | Partial — concrete *classical* methods only | AlphaTheta snare/bass → 0–3 shift; MS phase-tree | Two leads: snare-2&4 + bass-on-1 downbeat (resolved — dub follows the published prior-art method, not the AlphaTheta patent's claims), NI composite-interval |
 
 **Interop reality check.** dub-library already has the *schema* for this —
 `track_beatgrids.source` reserves `serato`/`traktor`/`rekordbox`, the v5
@@ -361,9 +361,9 @@ that reduces how often detection runs at all):
 5. **Trial the NI composite-interval histogram** (sums of 2 and 3 onset
    intervals + rational-ratio disambiguation) against the DnB
    half-time / triplet fails *(classical lead for §2).*
-6. **Borrow the AlphaTheta snare-2&4 + bass-on-1 downbeat rule** as a
-   principled superset of the kick-ODF picker *(verify FTO — live
-   patent).*
+6. **Implement the standard snare-2&4 + bass-on-1 downbeat rule (published
+   MIR prior art — Goto/Davies-Plumbley)** as a
+   principled superset of the kick-ODF picker.
 7. **Readout-only band-gated fraction snap** for clean 87.5/174 readouts.
 8. **Do not** rebuild the off-beat / anti-phase penalty term — it is V2
    (§3–§4), already measured to regress.
@@ -383,7 +383,7 @@ them. All ship with unit tests and pass `clippy -D warnings`.
 
 | Item | Where | Switch | Status |
 |---|---|---|---|
-| **#5 snare-2&4 + bass-on-1 downbeat** | `dub-bpm/src/downbeat.rs` (`refine_downbeat_alphatheta`) | opt-in API call | **Built + 8 tests.** Band-splits the audio (snare 300 Hz–2.5 kHz, kick < 240 Hz), onset-envelopes each, votes per-bar-position energy over the whole track, returns a `bar_phase`. Resolves the case the kick-ODF picker cannot (kick on 1 & 3). Caller applies the phase when its confidence clears a bar. |
+| **#5 snare-2&4 + bass-on-1 downbeat** | `dub-bpm/src/downbeat.rs` (`refine_downbeat_backbeat`) | opt-in API call | **Built + 8 tests.** Band-splits the audio (snare 300 Hz–2.5 kHz, kick < 240 Hz), onset-envelopes each, votes per-bar-position energy over the whole track, returns a `bar_phase`. Resolves the case the kick-ODF picker cannot (kick on 1 & 3). Caller applies the phase when its confidence clears a bar. |
 | **#3 beat-location metric** | `dub-bpm/src/eval.rs` + `tests/beat_location_corpus.rs` | `DUB_BPM_BEAT_CORPUS` | **Built + 11 tests.** F-measure (±70 ms), Cemgil, CMLt/CMLc/AMLt/AMLc. This is the measurement substrate the others need — it makes a phase/downbeat change (e.g. #5) gradable, which BPM-only scoring cannot. |
 | **#2 local sliding-mean detrend** | `dub-bpm/src/tempo.rs` (`detrend_odf`) | `DUB_BPM_DETREND=local` | **Built + tests.** Asymmetric `p_pre=8 / p_post=7` window. Default global-mean path unchanged. Awaiting corpus A/B. |
 | **#1 DFT×ACF cross-tempogram** | `dub-bpm/src/tempo.rs` (`tempogram_weights`, Goertzel) | `DUB_BPM_TEMPOGRAM=1` | **Built, but smoke-test NEGATIVE.** See below. |

@@ -6,7 +6,7 @@
 //! every beat on the off-beat. The survey in
 //! `docs/investigations/BPM-DETECTOR-V2-INVESTIGATION.md` §7.4 flagged this
 //! as the prerequisite for evaluating any grid-placement change (the
-//! AlphaTheta downbeat rule, a DP beat decoder, …): there is no
+//! backbeat downbeat rule, a DP beat decoder, …): there is no
 //! beat-*location* metric to measure them with.
 //!
 //! This module supplies the standard ones, operating on two slices of beat
