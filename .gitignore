@@ -47,6 +47,13 @@ fuzz/artifacts/
 # session-specific, replayed locally via the dub-engine replay harness.
 # Committed wav fixtures live under crates/*/tests/fixtures/.
 /*.wav
+# Personal DJ-library exports dropped at the repo root for importer
+# validation (Traktor NML, iTunes/rekordbox XML). Never committed — they
+# hold the developer's real library; anonymised golden fixtures live under
+# crates/dub-library/tests/fixtures/.
+/*.nml
+/iTunes Library.xml
+/rekordbox*.xml
 *.log
 crashes/
 .cursor/settings.json
