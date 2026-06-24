@@ -21,9 +21,13 @@ we are **not** building a controller-only DJ app (no Serato/rekordbox territory)
 
 ## Non-negotiable design principles
 
-1. **No Mouse DJ Ever.** Performance interactions never require a mouse. EQ,
-   crossfade, cue, gain live on the user's hardware mixer. Only the keyboard
-   and the turntable are allowed during a set.
+1. **No Mouse DJ.** A "Mouse DJ" performs the *whole set* on screen — pitch,
+   crossfade, EQ, gain, mix-cueing all by mouse. Dub refuses to be that
+   surface: those *continuous performance gestures* live on the turntable +
+   external mixer + keyboard, never the mouse. The mouse is fine for everything
+   else, including momentary **aux triggers** (loop / hot-cue / sampler pads),
+   transport, library, and config — a DVS DJ clicking a loop button is *not* a
+   Mouse DJ. See PRD §1.
 2. **External mixer is the product.** No software mixer in v1/v2. We require a
    ≥4-in/4-out audio interface; the user's external mixer does the mixing.
 3. **Real records are first-class citizens.** Thru mode passes a live record
@@ -171,6 +175,9 @@ Currently wired (in the actual `Cargo.toml` dependency graph):
 - `rusty-chromaprint` (MIT/Apache) — pure-Rust port of the Chromaprint algorithm (algorithm 2). Used in `dub-fingerprint` for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1). M11b chose pure-Rust over the LGPL-2.1 C library (`chromaprint`) for the same reasons `dub-bpm` chose pure-Rust over aubio: license isolation, no C build dep, no unsafe FFI surface, simpler distribution.
 - `rusqlite` (MIT, feature `bundled`) — SQLite for the M11 library catalog
 - `uuid` (MIT/Apache), `dirs` (MIT/Apache), `libc` (MIT/Apache), `walkdir` (MIT/Unlicense) — library plumbing
+- `quick-xml` (MIT) — streaming XML pull-parser for the M12b Traktor `collection.nml` importer + the M12c iTunes `Library.xml` (plist) importer (`dub-library`). Attributes-only, no DOM; flat memory on huge collections. GPL-compatible. The forthcoming Serato/rekordbox XML importer will reuse it.
+- `id3` (MIT) — reads ID3v2 `GEOB` frames from audio files for the M11e Serato importer (`dub-library`). Serato keeps its beat grid / hot cues / loops / gain in `GEOB` blobs (`Serato BeatGrid` / `Serato Markers2` / `Serato Autotags`); symphonia only exposes standard tag keys, so a dedicated ID3 reader is needed. MP3/AIFF/WAV; MP4/FLAC deferred. GPL-compatible.
+- `base64` (MIT/Apache) — decodes the base64 payloads inside Serato's Markers2 / Autotags GEOB blobs (M11e, `dub-library`). Already transitive; M11e makes it a direct dep.
 - `uniffi` (MPL-2.0) — Swift FFI surface generator
 - `assert_no_alloc` (MIT) — RT-safety enforcement
 - `ringbuf` (MIT) — lock-free SPSC

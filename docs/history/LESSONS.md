@@ -193,6 +193,18 @@
 - **`NSHostingController.sizingOptions` defaults pin SwiftUI's intrinsic size**
   onto AppKit Auto Layout — the cause of the full-screen "black frame around a
   1440×900 island." Set `sizingOptions = []` and drop `preferredContentSize`.
+- **A windowed renderer must never call an "extend-to-end" FFI.** The scrolling
+  waveform ingests a bounded playhead-centred window per frame, but
+  `peaks_extend(start)` returned `[start, peaks_len)` — the *whole tail*. On a
+  90-minute mix that's ~3.7 M chunks (~44 MB) allocated + serialised + marshalled
+  *every frame* near the start (the dedupe gate passes each frame during
+  playback), shrinking to nothing near the end → "jittery at the start, smooth at
+  the end." The computed `count` budget existed but was silently dropped on the
+  copy, and the single-wrap ring memcpy *overran* once the tail exceeded
+  `chunkCapacity` (~25 min). Fix: thread `max_chunks` through `peaks_extend` /
+  `band_peaks_extend` (`0` = to-end for the one-shot overview strip; the renderer
+  passes its budget). Lesson: if a symptom scales with *remaining* track length,
+  suspect per-frame work proportional to "to the end," not the grid math.
 
 ## FFI / UniFFI (Rust ↔ Swift)
 

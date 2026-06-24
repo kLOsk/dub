@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -73,6 +73,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 5,
         sql: V5_MIGRATION,
+    },
+    Migration {
+        target_version: 6,
+        sql: V6_MIGRATION,
     },
 ];
 
@@ -349,9 +353,13 @@ CREATE TABLE IF NOT EXISTS imported_crates (
                                 ('serato', 'traktor', 'rekordbox', 'itunes')),
     name                        TEXT    NOT NULL,
     parent_imported_crate_id    INTEGER REFERENCES imported_crates(id) ON DELETE CASCADE,
-    imported_at                 INTEGER NOT NULL,
-    UNIQUE (source, parent_imported_crate_id, name)
+    imported_at                 INTEGER NOT NULL
+    -- NB: no UNIQUE(source, parent, name): external sources (notably
+    -- iTunes) allow duplicate playlist names at the same level, keyed by a
+    -- persistent id, not name. The mirror is truncate-and-rewrite per source
+    -- so name uniqueness was never needed for conflict resolution.
 );
+CREATE INDEX IF NOT EXISTS idx_imported_crates_source ON imported_crates(source);
 
 CREATE TABLE IF NOT EXISTS imported_crate_tracks (
     imported_crate_id   INTEGER NOT NULL REFERENCES imported_crates(id) ON DELETE CASCADE,
@@ -545,6 +553,37 @@ ALTER TABLE tracks ADD COLUMN grid_drift_quality REAL;
 const V5_MIGRATION: &str = r#"
 ALTER TABLE track_beatgrids ADD COLUMN bar_phase INTEGER NOT NULL DEFAULT 0
     CHECK (bar_phase >= 0 AND bar_phase < 16);
+"#;
+
+/// v6 — rebuild the imported-crate mirror without the
+/// `UNIQUE(source, parent, name)` constraint. External sources allow
+/// duplicate playlist names at the same level (iTunes keys playlists by a
+/// persistent id; the same `Downloaded` name recurs), which the old
+/// constraint rejected. The mirror is truncate-and-rewrite per source, so
+/// dropping + recreating it loses nothing — the next import repopulates it.
+/// This also backfills the tables on any DB created before they existed.
+const V6_MIGRATION: &str = r#"
+DROP TABLE IF EXISTS imported_crate_tracks;
+DROP TABLE IF EXISTS imported_crates;
+
+CREATE TABLE imported_crates (
+    id                          INTEGER PRIMARY KEY,
+    source                      TEXT    NOT NULL CHECK (source IN
+                                ('serato', 'traktor', 'rekordbox', 'itunes')),
+    name                        TEXT    NOT NULL,
+    parent_imported_crate_id    INTEGER REFERENCES imported_crates(id) ON DELETE CASCADE,
+    imported_at                 INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_imported_crates_source ON imported_crates(source);
+
+CREATE TABLE imported_crate_tracks (
+    imported_crate_id   INTEGER NOT NULL REFERENCES imported_crates(id) ON DELETE CASCADE,
+    track_id            TEXT    NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    ordinal             INTEGER NOT NULL,
+    PRIMARY KEY (imported_crate_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS idx_imported_crate_tracks_ord
+    ON imported_crate_tracks(imported_crate_id, ordinal);
 "#;
 
 #[cfg(test)]

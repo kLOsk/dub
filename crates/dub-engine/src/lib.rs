@@ -1173,6 +1173,19 @@ impl Engine {
                         if !deck.is_playing() {
                             continue;
                         }
+                        // A loop owns the playhead under timecode: the decoded
+                        // `rate` (set above) drives the intra-block velocity and
+                        // `render_into`'s per-sample wrap confines the position;
+                        // the M6 abs re-pin is already suppressed by the deck's
+                        // `loop_region.is_none()` guard. Skip the absolute
+                        // advance AND the drift heal — the groove climbs
+                        // monotonically while the playhead wraps, so observing
+                        // drift here would slew the playhead forward against the
+                        // wrap. The loop is a deliberate remap (like Panic-Play);
+                        // the anchor is re-established on DeckClearLoop.
+                        if deck.loop_region().is_some() {
+                            continue;
+                        }
                         // Convert input frames → track frames. The
                         // attach-time validation pins the input SR to
                         // the engine SR, so `self.sample_rate` *is*
@@ -1486,6 +1499,14 @@ impl Engine {
             Command::DeckClearLoop { idx } => {
                 if let Some(d) = self.decks.get_mut(idx as usize) {
                     d.clear_loop();
+                }
+                // Exiting a loop is a deliberate reposition: the playhead has
+                // been wrapping in place while the groove advanced, so
+                // re-anchor the drift monitor (slip-aware) instead of healing
+                // the loop's worth of "lost" groove travel forward on the next
+                // locked block — symmetric with DeckSetLoop.
+                if let Some(m) = self.tc_drift.get_mut(idx as usize) {
+                    m.note_remap();
                 }
             }
             Command::DeckSetControlMode { idx, mode } => {
@@ -2501,6 +2522,99 @@ mod tests {
             }
         }
         panic!("absolute tracker never locked on synthetic carrier");
+    }
+
+    /// Acceptance #8 / M13: a loop set while timecode drives the deck wraps
+    /// the playhead at the platter rate WITHOUT the groove-continuity heal
+    /// slewing it forward against the wrap. The groove climbs monotonically
+    /// while the playhead wraps in place, so the drift monitor must be
+    /// suspended while a loop is active (re-anchored on exit) — otherwise it
+    /// reads ever-growing "drift" and fights the loop.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn timecode_loop_wraps_without_drift_fight() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 8 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut rt = RealtimeContext::new();
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.4));
+        render_to_abs_lock(&mut engine, &mut tx, &mut gen, &mut rt, block);
+
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut step = |engine: &mut Engine, gen: &mut dub_timecode::signal::Generator| {
+            gen.render(&mut sig, 1.0, 0.5);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            engine.render(&mut rt, &mut buf);
+        };
+        // Settle the drift anchor on a few clean locked blocks.
+        for _ in 0..8 {
+            step(&mut engine, &mut gen);
+        }
+
+        // Engage a 0.25 s loop around the current playhead via the real
+        // command path (so the engage re-anchor fires exactly as production).
+        let pos = engine.deck(0).position_frames();
+        let lin = pos.floor();
+        let lout = lin + 0.25 * f64::from(sr); // 12000 frames
+        engine.apply_command(Command::DeckSetLoop {
+            idx: 0,
+            in_frames: lin,
+            out_frames: lout,
+        });
+
+        // ~1.5 s of locked carrier at unity: the groove advances ~6
+        // loop-lengths. Every block, the playhead must stay inside the loop
+        // and the sticker-drift reading must NOT ramp (no heal fighting).
+        let loop_blocks = (1.5 * f64::from(sr) / block as f64) as i32;
+        let mut min_pos = f64::INFINITY;
+        let mut max_pos = f64::NEG_INFINITY;
+        for _ in 0..loop_blocks {
+            step(&mut engine, &mut gen);
+            let p = engine.deck(0).position_frames();
+            assert!(
+                (lin..lout).contains(&p),
+                "playhead {p} escaped loop [{lin}, {lout})"
+            );
+            min_pos = min_pos.min(p);
+            max_pos = max_pos.max(p);
+            let drift = engine.tc_drift[0].drift_secs();
+            assert!(
+                drift.abs() < 0.025,
+                "sticker drift ramped to {} ms — the heal is fighting the loop wrap",
+                drift * 1000.0
+            );
+        }
+        // It actually traversed + wrapped the loop, not sat in one spot.
+        assert!(
+            max_pos - min_pos > 0.5 * (lout - lin),
+            "playhead barely moved in the loop ({min_pos}..{max_pos})"
+        );
+
+        // The timecode-loop render path is allocation-free.
+        assert_no_alloc::assert_no_alloc(|| step(&mut engine, &mut gen));
+
+        // Exit: clear the loop and keep driving. The playhead resumes forward
+        // at the platter rate from where the loop left it — no heal-creep
+        // recovering the loop's groove travel, no stall.
+        engine.apply_command(Command::DeckClearLoop { idx: 0 });
+        let exit_pos = engine.deck(0).position_frames();
+        let resume = 64_i32;
+        for _ in 0..resume {
+            step(&mut engine, &mut gen);
+        }
+        let advanced = engine.deck(0).position_frames() - exit_pos;
+        let expected = f64::from(resume) * block as f64; // unity, engine SR == track SR
+        assert!(
+            advanced > 0.5 * expected && advanced < 1.5 * expected,
+            "post-exit advance {advanced} not ~{expected} (heal creep / stall on loop exit?)"
+        );
     }
 
     #[test]

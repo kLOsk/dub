@@ -13,6 +13,13 @@ uuid = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
+# Traktor NML (M12b) — streaming XML parse of `collection.nml`. See the
+# workspace dep note; MIT / GPL-compatible.
+quick-xml = { workspace = true }
+# Serato (M11e) — GEOB tag extraction (`id3`) + base64 payload decode. See
+# the workspace dep note; both MIT / GPL-compatible.
+id3 = { workspace = true }
+base64 = { workspace = true }
 dub-fingerprint = { workspace = true }
 dub-io = { workspace = true }
 # M11c.1 — auto-beatgrid analysis hook lives in `dub-library::analysis`

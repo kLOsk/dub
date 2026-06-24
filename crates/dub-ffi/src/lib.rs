@@ -639,27 +639,50 @@ impl PeakSource {
         }
     }
 
-    fn extend_broadband_from(&self, start: usize, out: &mut Vec<PeakChunk>) {
+    /// Append broadband chunks `[start, …)` to `out`, capped at `max`
+    /// chunks (`max == 0` means "to the end"). The cap keeps the
+    /// per-frame windowed renderer from allocating + serialising the
+    /// whole track's tail every frame on long tracks; callers that
+    /// genuinely want the whole array (the overview strip) pass `0`.
+    fn extend_broadband_from(&self, start: usize, max: usize, out: &mut Vec<PeakChunk>) {
         match self {
             PeakSource::Live { stream, .. } => {
                 let _new_end = stream.buffer().extend_chunks(start, out);
+                if max != 0 && out.len() > max {
+                    out.truncate(max);
+                }
             }
             PeakSource::File(f) => {
                 if start < f.broadband.len() {
-                    out.extend_from_slice(&f.broadband[start..]);
+                    let end = if max == 0 {
+                        f.broadband.len()
+                    } else {
+                        start.saturating_add(max).min(f.broadband.len())
+                    };
+                    out.extend_from_slice(&f.broadband[start..end]);
                 }
             }
         }
     }
 
-    fn extend_band_from(&self, start: usize, out: &mut Vec<BandPeakChunk>) {
+    /// Band-chunk twin of [`Self::extend_broadband_from`]; same `max`
+    /// cap semantics (`0` = to the end).
+    fn extend_band_from(&self, start: usize, max: usize, out: &mut Vec<BandPeakChunk>) {
         match self {
             PeakSource::Live { stream, .. } => {
                 let _new_end = stream.buffer().extend_band_chunks(start, out);
+                if max != 0 && out.len() > max {
+                    out.truncate(max);
+                }
             }
             PeakSource::File(f) => {
                 if start < f.bands.len() {
-                    out.extend_from_slice(&f.bands[start..]);
+                    let end = if max == 0 {
+                        f.bands.len()
+                    } else {
+                        start.saturating_add(max).min(f.bands.len())
+                    };
+                    out.extend_from_slice(&f.bands[start..end]);
                 }
             }
         }
@@ -2705,15 +2728,17 @@ impl DubEngine {
     /// to a `MTLBuffer`. The Swift side reinterprets each 12-byte
     /// stride as a `(f32 min, f32 max, f32 rms)` triple.
     ///
-    /// Caller cache-discipline: after each call, Swift advances
-    /// its `start_idx` by `bytes.count / 12`. `peaks_len` is the
-    /// authoritative total; this method's return covers
-    /// `[start_idx, peaks_len)`.
+    /// `peaks_len` is the authoritative total; this method's return
+    /// covers `[start_idx, min(start_idx + max_chunks, peaks_len))`.
+    /// `max_chunks == 0` means "to the end" (the overview strip pulls
+    /// the whole track that way); the per-frame scrolling renderer
+    /// passes its bounded ingest budget so a 90-minute track does not
+    /// re-serialise + marshal its entire tail every frame.
     ///
     /// Returns an empty `Vec` when the engine is stopped, the deck
     /// has no peaks source, or `start_idx >= len()`.
     #[must_use]
-    pub fn peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8> {
+    pub fn peaks_extend(&self, deck_idx: u64, start_idx: u64, max_chunks: u64) -> Vec<u8> {
         let state = lock_state(&self.state);
         let Some(running) = state.as_running() else {
             return Vec::new();
@@ -2722,7 +2747,11 @@ impl DubEngine {
             return Vec::new();
         };
         let mut chunks: Vec<PeakChunk> = Vec::new();
-        source.extend_broadband_from(usize_from_u64(start_idx), &mut chunks);
+        source.extend_broadband_from(
+            usize_from_u64(start_idx),
+            usize_from_u64(max_chunks),
+            &mut chunks,
+        );
         peak_chunks_to_bytes(&chunks)
     }
 
@@ -2777,14 +2806,17 @@ impl DubEngine {
         state.as_running().map_or(0, |r| r.sample_rate)
     }
 
-    /// Fetch new [`BandPeakChunk`]s captured since `start_idx`,
-    /// serialised as bytes (8 × `f32` per chunk = 32 bytes stride).
-    /// Used by the M10.1 multi-colour shader.
+    /// Fetch [`BandPeakChunk`]s `[start_idx, min(start_idx +
+    /// max_chunks, band_len()))`, serialised as bytes (8 × `f32` per
+    /// chunk = 32 bytes stride). Used by the M10.1 multi-colour
+    /// shader. `max_chunks == 0` means "to the end"; the scrolling
+    /// renderer passes its bounded ingest budget (see
+    /// [`Self::peaks_extend`]).
     ///
     /// Returns an empty `Vec` when band capture is disabled, the
     /// engine is stopped, or `start_idx >= band_len()`.
     #[must_use]
-    pub fn band_peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8> {
+    pub fn band_peaks_extend(&self, deck_idx: u64, start_idx: u64, max_chunks: u64) -> Vec<u8> {
         let state = lock_state(&self.state);
         let Some(running) = state.as_running() else {
             return Vec::new();
@@ -2793,7 +2825,11 @@ impl DubEngine {
             return Vec::new();
         };
         let mut chunks: Vec<BandPeakChunk> = Vec::new();
-        source.extend_band_from(usize_from_u64(start_idx), &mut chunks);
+        source.extend_band_from(
+            usize_from_u64(start_idx),
+            usize_from_u64(max_chunks),
+            &mut chunks,
+        );
         band_peak_chunks_to_bytes(&chunks)
     }
 
@@ -4487,8 +4523,8 @@ mod tests {
         assert_eq!(engine.peaks_len(1), 0);
         assert_eq!(engine.peaks_len(99), 0);
         // Extend on a stopped engine is empty (never panics).
-        assert!(engine.peaks_extend(0, 0).is_empty());
-        assert!(engine.band_peaks_extend(0, 0).is_empty());
+        assert!(engine.peaks_extend(0, 0, 0).is_empty());
+        assert!(engine.band_peaks_extend(0, 0, 0).is_empty());
         assert!(engine.onset_peaks_extend(0, 0).is_empty());
         assert!(engine.filtered_peaks_extend(0, 0).is_empty());
         assert_eq!(engine.onset_peaks_len(0), 0);
@@ -4575,6 +4611,64 @@ mod tests {
         engine.bump_peak_generation_for_occupied(&peaks);
         assert_eq!(engine.peaks_generation(0), 2);
         assert_eq!(engine.peaks_generation(1), 0);
+    }
+
+    /// Pins the per-frame ingest cap that stops a long track from
+    /// re-serialising its whole tail every frame (the "jittery at the
+    /// start, smooth at the end" bug). `max == 0` still returns the
+    /// whole tail (the overview strip relies on that); a positive
+    /// `max` bounds the slice, and a `max` past the end clamps to the
+    /// end without overrunning.
+    #[test]
+    fn extend_from_caps_at_max_chunks() {
+        let file = FilePeaks {
+            broadband: (0..10)
+                .map(|i| PeakChunk {
+                    min: -(i as f32),
+                    max: i as f32,
+                    rms: i as f32,
+                })
+                .collect(),
+            bands: (0..10)
+                .map(|i| BandPeakChunk {
+                    rms_per_band: [i as f32; 8],
+                })
+                .collect(),
+            onset: Vec::new(),
+            filtered: Vec::new(),
+            sample_rate: 44_100,
+            samples_per_broadband_chunk: 64,
+            samples_per_band_chunk: 512,
+            samples_per_onset_chunk: 512,
+            samples_per_filtered_chunk: 64,
+            beat_grid: BeatGrid::empty(),
+            grid_locked: false,
+        };
+        let source = PeakSource::File(file);
+
+        let mut out = Vec::new();
+        source.extend_broadband_from(2, 3, &mut out);
+        assert_eq!(out.len(), 3, "positive max bounds the slice");
+        assert_eq!(out[0].max, 2.0, "slice starts at `start`");
+
+        out.clear();
+        source.extend_broadband_from(2, 0, &mut out);
+        assert_eq!(out.len(), 8, "max == 0 returns the whole tail");
+
+        out.clear();
+        source.extend_broadband_from(2, 100, &mut out);
+        assert_eq!(out.len(), 8, "max past the end clamps, never overruns");
+
+        out.clear();
+        source.extend_broadband_from(99, 4, &mut out);
+        assert!(out.is_empty(), "start past the end yields nothing");
+
+        let mut band_out = Vec::new();
+        source.extend_band_from(1, 2, &mut band_out);
+        assert_eq!(band_out.len(), 2, "band path caps identically");
+        band_out.clear();
+        source.extend_band_from(1, 0, &mut band_out);
+        assert_eq!(band_out.len(), 9, "band path: max == 0 is whole tail");
     }
 
     #[test]
@@ -5208,6 +5302,62 @@ impl From<dub_library::CrateRow> for LibraryCrate {
     }
 }
 
+/// One node of a read-only imported-source crate tree (Serato / Traktor /
+/// iTunes), for the sidebar's per-source section. Mirrors
+/// [`dub_library::ImportedCrateRow`]. Unlike [`LibraryCrate`] these are not
+/// editable — they are rebuilt on each import; the Swift side rebuilds the
+/// tree from the flat list via `parent_id` and never sends mutators back.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryImportedCrate {
+    /// Stable imported-crate id; pass to `imported_crate_tracks`.
+    pub id: i64,
+    /// Source tag (`serato` / `traktor` / `rekordbox` / `itunes`).
+    pub source: String,
+    /// Display name (the source's crate / playlist / folder name).
+    pub name: String,
+    /// Parent imported-crate id, or `None` for a top-level node.
+    pub parent_id: Option<i64>,
+    /// Number of tracks directly in this node.
+    pub track_count: u64,
+}
+
+impl From<dub_library::ImportedCrateRow> for LibraryImportedCrate {
+    fn from(c: dub_library::ImportedCrateRow) -> Self {
+        Self {
+            id: c.id,
+            source: c.source,
+            name: c.name,
+            parent_id: c.parent_id,
+            track_count: c.track_count,
+        }
+    }
+}
+
+/// A default-location entry for an importable source (Serato / Traktor /
+/// iTunes), for the Preferences "Libraries" section. Mirrors
+/// [`dub_library::DiscoveredSource`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibrarySourceLocation {
+    /// Source tag (`serato` / `traktor` / `itunes`).
+    pub kind: String,
+    /// Absolute path the importer would be pointed at (the `_Serato_` folder,
+    /// `collection.nml`, or iTunes `Library.xml`). When `exists` is false
+    /// this is the expected default location.
+    pub path: String,
+    /// `true` when that path is present on disk right now.
+    pub exists: bool,
+}
+
+impl From<dub_library::DiscoveredSource> for LibrarySourceLocation {
+    fn from(s: dub_library::DiscoveredSource) -> Self {
+        Self {
+            kind: s.kind.as_str().to_string(),
+            path: s.path.to_string_lossy().into_owned(),
+            exists: s.exists,
+        }
+    }
+}
+
 /// Aggregate result of [`DubLibrary::import_folder`]. Mirrors
 /// [`dub_library::ImportSummary`] with the per-file `errors` list
 /// flattened to a `Vec<String>` so the Swift side gets ergonomic
@@ -5629,6 +5779,65 @@ impl DubLibrary {
         })
     }
 
+    // === Imported sources (Serato / Traktor / iTunes) =====================
+    //
+    // Read-only mirror of an external app's crate/playlist tree, plus a
+    // "all tracks from this source" filter. Populated by the source
+    // importers (`import_traktor` / `import_serato` / `import_itunes`); the
+    // Apple shell renders one expandable node per enabled source.
+
+    /// List the imported crate/playlist tree for `source` (`serato` /
+    /// `traktor` / `rekordbox` / `itunes`), flat with `parent_id` for the
+    /// Swift side to rebuild nesting. Empty when that source was never
+    /// imported.
+    pub fn list_imported_crates(
+        &self,
+        source: String,
+    ) -> std::result::Result<Vec<LibraryImportedCrate>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_imported_crates(&source)?;
+            Ok(rows.into_iter().map(LibraryImportedCrate::from).collect())
+        })
+    }
+
+    /// List an imported crate/playlist's member tracks in the source's
+    /// order, in the same [`LibraryTrack`] shape the rest of the browser
+    /// uses.
+    pub fn imported_crate_tracks(
+        &self,
+        imported_crate_id: i64,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.imported_crate_tracks(imported_crate_id)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// List every track carrying a `source` metadata row, paged — the
+    /// "all tracks from this source" view for a top-level source node.
+    /// Rows are the unified [`LibraryTrack`] (display fields merged across
+    /// sources by §8.1), filtered to those the source contributed to.
+    pub fn list_tracks_by_source(
+        &self,
+        source: String,
+        limit: u32,
+        offset: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.list_tracks_by_source(&source, limit, offset)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Count of tracks carrying a `source` metadata row, for the per-source
+    /// sidebar badge.
+    pub fn count_tracks_by_source(
+        &self,
+        source: String,
+    ) -> std::result::Result<u64, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.count_tracks_by_source(&source)?))
+    }
+
     // === M11d.4 — missing-files scanner + Relocate ========================
 
     /// Total count of canonical tracks the browser should flag as
@@ -6012,6 +6221,81 @@ impl DubLibrary {
         let summary = dub_library::import_folder(lib, std::path::Path::new(&path))
             .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
         Ok(LibraryImportSummary::from(summary))
+    }
+
+    /// Import a Traktor `collection.nml` (M12b). Resolves each entry to a
+    /// canonical track by `(volume, path)` — the same identity the folder
+    /// importer uses, so Traktor's grid / key / cues / loops enrich the
+    /// track the DJ already has rather than duplicating it — writes the
+    /// `traktor` metadata source, and mirrors the playlist tree into the
+    /// read-only imported-crate browser section. Blocks the caller; the
+    /// Apple shell runs it on a background queue. Per-entry failures (a
+    /// file that isn't on this machine) land in
+    /// [`LibraryImportSummary::errors`]; only an unreadable / malformed NML
+    /// returns `ImportFailed`.
+    pub fn import_traktor(
+        &self,
+        path: String,
+    ) -> std::result::Result<LibraryImportSummary, LibraryFfiError> {
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        let summary = dub_library::import_traktor(lib, std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
+        Ok(LibraryImportSummary::from(summary))
+    }
+
+    /// Import a Serato library (M11e). `path` is the `_Serato_` folder
+    /// (`~/Music/_Serato_` or a drive's `/Volumes/<drive>/_Serato_`). Reads
+    /// `database V2` for metadata + the file list, the per-file `GEOB` tags
+    /// for the beat grid / hot cues / loops / gain, and the `Subcrates`
+    /// crate files for the crate tree — all onto the shared track identity (no
+    /// duplicates with the folder/Traktor importers). Blocks the caller;
+    /// per-track failures land in [`LibraryImportSummary::errors`], only an
+    /// unreadable `database V2` / unresolvable volume returns `ImportFailed`.
+    pub fn import_serato(
+        &self,
+        path: String,
+    ) -> std::result::Result<LibraryImportSummary, LibraryFfiError> {
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        let summary = dub_library::import_serato(lib, std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
+        Ok(LibraryImportSummary::from(summary))
+    }
+
+    /// Import an iTunes / Apple Music `Library.xml` (M12c). `path` is the XML
+    /// file. Writes `source = 'itunes'` metadata onto the shared track
+    /// identity and mirrors user playlists / folders into the imported-crate
+    /// browser section (built-in Library / Music / Films lists skipped).
+    /// iTunes has no beat grids or cues. Blocks the caller; per-track
+    /// failures land in [`LibraryImportSummary::errors`].
+    pub fn import_itunes(
+        &self,
+        path: String,
+    ) -> std::result::Result<LibraryImportSummary, LibraryFfiError> {
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        let summary = dub_library::import_itunes(lib, std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
+        Ok(LibraryImportSummary::from(summary))
+    }
+
+    /// Discover the default on-disk location of each importable source
+    /// (Serato / Traktor / iTunes) under the current user's home. One entry
+    /// per source, with `exists` reflecting whether the app is set up there —
+    /// the Preferences "Libraries" section renders these and imports the ones
+    /// the user enables. Does not require the library to be open.
+    pub fn discover_default_sources(&self) -> Vec<LibrarySourceLocation> {
+        dub_library::discover_default_sources()
+            .into_iter()
+            .map(LibrarySourceLocation::from)
+            .collect()
     }
 
     /// Run M11c.1 auto-analysis against `track_id`. Decodes the

@@ -35,6 +35,52 @@
 import Foundation
 import DubCore
 
+/// The external DJ apps Dub imports from, each surfaced as a sidebar
+/// node under "Imported Sources". `rawValue` is the schema `source`
+/// tag every FFI call uses (`listImportedCrates`, `listTracksBySource`,
+/// `importSerato`, …), so it must match the Rust `source` strings.
+enum ImportedSourceKind: String, CaseIterable, Hashable, Identifiable {
+    case serato
+    case traktor
+    case itunes
+
+    var id: String { rawValue }
+
+    /// Schema / FFI `source` tag.
+    var sourceTag: String { rawValue }
+
+    /// Sidebar display name.
+    var label: String {
+        switch self {
+        case .serato:  return "Serato"
+        case .traktor: return "Traktor"
+        // The app is "Apple Music" now; the library file is still the
+        // iTunes-format XML it (or legacy iTunes) wrote.
+        case .itunes:  return "Apple Music"
+        }
+    }
+
+    /// SF Symbol for the source's sidebar row.
+    var systemImage: String {
+        switch self {
+        case .serato:  return "s.square.fill"
+        case .traktor: return "t.square.fill"
+        case .itunes:  return "music.note"
+        }
+    }
+}
+
+/// One imported source for the sidebar: its "all tracks from this
+/// source" count plus its flat crate/playlist tree (nesting via
+/// `parentId`, document order). Built by
+/// `WaveformAppModel.reloadImportedSources()` from the FFI mirror.
+struct ImportedSourceGroup: Identifiable {
+    let kind: ImportedSourceKind
+    var trackCount: UInt64
+    var crates: [LibraryImportedCrate]
+    var id: ImportedSourceKind { kind }
+}
+
 /// Library / analysis / relocate UI state split out of
 /// `WaveformAppModel` so updates here don't invalidate
 /// `PerformanceView`. See file header for the why.
@@ -189,4 +235,12 @@ final class LibraryAppModel: ObservableObject {
     /// without a per-crate push channel. The crate *list* itself
     /// (names / counts) is observed directly through `crates`.
     @Published var crateContentGeneration: UInt64 = 0
+
+    /// Imported-source nodes (Serato / Traktor / iTunes) for the
+    /// sidebar's "Imported Sources" section, one per source that has
+    /// data (or, once Preferences toggles land, is enabled). Each
+    /// carries its track count + flat crate tree. Refreshed on library
+    /// open and after every source import by
+    /// `WaveformAppModel.reloadImportedSources()`.
+    @Published var importedSources: [ImportedSourceGroup] = []
 }

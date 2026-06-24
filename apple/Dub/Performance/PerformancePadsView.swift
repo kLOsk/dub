@@ -9,13 +9,15 @@
 //  the phase clock), and the cue / loop / quick-scratch / sampler
 //  controls live out here on the deck's outer edge.
 //
-//  The CUE row is live: keys 1–4 set/recall a hot cue on the master
-//  deck, Shift+key clears it (see `WaveformAppModel.handleHotCue`). A
-//  pad lights in the deck's tint when its slot holds a position. The
-//  rest are honest placeholders until the features land — Loops (M13),
-//  Quick Scratch + Sampler (M17). They're laid out now so the surface
-//  reads as a real performance instrument rather than empty space, and
-//  so the final geometry is fixed before the controls become live.
+//  The CUE and LOOP rows are live. CUE: keys 1–4 set/recall a hot cue
+//  on the master deck, Shift+key clears it (see `handleHotCue`); a pad
+//  lights in the deck's tint when its slot holds a position. LOOP (M13):
+//  click a length pad to fire a grid-snapped reverse loop of that many
+//  bars (the bars just heard), ✕ exits. A momentary pad click is within
+//  the §1 mouse rule (not a continuous performance gesture); keyboard
+//  bindings may follow as a convenience (PRD §5.5). Quick Scratch +
+//  Sampler (M17) remain honest placeholders, laid out now so the surface
+//  reads as a real performance instrument rather than empty space.
 //
 
 import AppKit
@@ -30,6 +32,15 @@ struct PerformancePadsView: View {
     /// `hotCues`, set/recalled by the 1–4 keys.
     var cues: [Double?] = [nil, nil, nil, nil]
 
+    /// Active reverse-loop length in bars (`nil` = no loop). Lights the
+    /// matching LOOP pad green.
+    var activeLoopBars: Double? = nil
+    /// Fire a grid-snapped reverse loop of `bars` bars (the bars just
+    /// heard). No-op default keeps the `#Preview` simple.
+    var onLoop: (_ bars: Double) -> Void = { _ in }
+    /// Exit the active loop.
+    var onExit: () -> Void = {}
+
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
     /// their overview on the left.
@@ -38,7 +49,7 @@ struct PerformancePadsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             cueGroup()
-            padGroup("LOOP", keys: ["IN", "OUT", "½", "×2"])
+            loopGroup()
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
         }
@@ -60,6 +71,43 @@ struct PerformancePadsView: View {
                 ForEach(0..<4, id: \.self) { index in
                     pad("\(index + 1)", lit: index < cues.count && cues[index] != nil)
                 }
+            }
+        }
+    }
+
+    private static let loopPresets: [LoopPreset] = [
+        LoopPreset(bars: 0.5, label: "½"),
+        LoopPreset(bars: 1, label: "1"),
+        LoopPreset(bars: 2, label: "2"),
+        LoopPreset(bars: 4, label: "4"),
+    ]
+
+    /// The live LOOP row: each length pad fires a grid-snapped reverse
+    /// loop of that many bars; the lit pad is the active length, ✕ exits.
+    /// Clickable like the Prep `LoopPadRow` — a momentary loop trigger is
+    /// within the §1 mouse rule (not a continuous performance gesture);
+    /// keyboard bindings may follow as a convenience (PRD §5.5).
+    @ViewBuilder
+    private func loopGroup() -> some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            Text("LOOP")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+            HStack(spacing: DubSpacing.sm) {
+                ForEach(Self.loopPresets) { preset in
+                    hotCuePadCell(
+                        preset.label,
+                        lit: activeLoopBars == preset.bars,
+                        tint: DubColor.loop
+                    )
+                    .onPressDown { onLoop(preset.bars) }
+                    .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
+                }
+                hotCuePadCell("✕", lit: false, tint: DubColor.loop)
+                    .onPressDown(enabled: activeLoopBars != nil) { onExit() }
+                    .help("Exit loop")
+                    .opacity(activeLoopBars == nil ? 0.5 : 1.0)
             }
         }
     }

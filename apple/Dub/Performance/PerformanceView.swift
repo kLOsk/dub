@@ -348,7 +348,12 @@ struct PerformanceView: View {
                 // deck B the right (pads on the right).
                 HStack(spacing: 0) {
                     if side == .a {
-                        PerformancePadsView(side: side, cues: deckState.hotCues)
+                        PerformancePadsView(
+                            side: side,
+                            cues: deckState.hotCues,
+                            activeLoopBars: deckState.activeLoopBars,
+                            onLoop: { bars in model.handleLoop(side, bars: bars) },
+                            onExit: { model.exitLoop(side) })
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -366,7 +371,12 @@ struct PerformanceView: View {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
                         }
-                        PerformancePadsView(side: side, cues: deckState.hotCues)
+                        PerformancePadsView(
+                            side: side,
+                            cues: deckState.hotCues,
+                            activeLoopBars: deckState.activeLoopBars,
+                            onLoop: { bars in model.handleLoop(side, bars: bars) },
+                            onExit: { model.exitLoop(side) })
                     }
                 }
             case .horizontal:

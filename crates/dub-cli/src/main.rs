@@ -31,6 +31,7 @@ mod calibration;
 mod decode_timecode;
 mod device_profiles;
 mod diagnose;
+mod import;
 mod input_cmds;
 mod scope;
 mod thru;
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
         "version" => version(),
         "play" => play(&args[2..]),
         "analyze" => analyze_cmd(&args[2..]),
+        "import" => import::run(&args[2..]),
         "diagnose" => diagnose::run(&args[2..]),
         "decode-timecode" => decode_timecode_cmd(&args[2..]),
         "list-inputs" => input_cmds::list_inputs_with_args(&args[2..]),
@@ -111,6 +113,12 @@ fn print_help() {
     eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
+    eprintln!("  import            (--traktor <nml> | --serato <dir> | --itunes <xml>");
+    eprintln!("                     | --folder <dir>)");
+    eprintln!("                    headless library import into the default DB.");
+    eprintln!("                    --traktor reads a collection.nml; --serato reads a _Serato_");
+    eprintln!("                    folder (database V2 + GEOB cues/grids); --itunes reads a");
+    eprintln!("                    Library.xml; --folder walks a dir. Idempotent; prints counts.");
     eprintln!("  diagnose <path-or-id>                    grid / waveform / BPM debugger");
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");

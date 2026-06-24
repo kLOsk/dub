@@ -811,6 +811,93 @@ impl Library {
         Ok(())
     }
 
+    /// Beat-grid source priority for the single active slot, highest first.
+    /// PRD §8.3 ranks imports `serato > rekordbox > traktor` over `auto`;
+    /// `user_tap` (the DJ's deliberate Dub correction) is preserved above
+    /// imports across re-import (PRD §8.1), so it sits at the top. Kept a
+    /// function, not a constant, because §8.3 makes the order
+    /// Preferences-configurable.
+    fn grid_source_rank(source: &str) -> u8 {
+        match source {
+            "user_tap" => 5,
+            "serato" => 4,
+            "rekordbox" => 3,
+            "traktor" => 2,
+            "itunes" => 1,
+            _ => 0, // "auto" / unknown
+        }
+    }
+
+    /// Upsert an imported (`serato` / `traktor` / `rekordbox` / `itunes`)
+    /// beat-grid row, idempotent on `(track_id, source)`. Claims the single
+    /// active slot only when it outranks every currently-active row from
+    /// another source ([`Self::grid_source_rank`]); when it claims the slot,
+    /// the other active row is demoted first (the one-active-per-track index
+    /// forbids two). A non-finite / non-positive grid is skipped (graceful —
+    /// a corrupt source row never aborts an import).
+    pub fn upsert_imported_beatgrid(
+        &self,
+        track_id: &str,
+        source: &str,
+        anchor_secs: f64,
+        bpm: f64,
+        bar_phase: u8,
+    ) -> Result<()> {
+        if !bpm.is_finite() || bpm <= 0.0 || !anchor_secs.is_finite() {
+            return Ok(());
+        }
+        let rank = Self::grid_source_rank(source);
+        let conn = self.connection();
+        let active_others: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source FROM track_beatgrids \
+                     WHERE track_id = ?1 AND is_active = 1 AND source != ?2",
+                )
+                .map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid_select", e))?;
+            let rows = stmt
+                .query_map(params![track_id, source], |r| r.get::<_, String>(0))
+                .map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid_query", e))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid_row", e))?);
+            }
+            v
+        };
+        let claim_active = active_others
+            .iter()
+            .all(|s| Self::grid_source_rank(s) < rank);
+        if claim_active {
+            conn.execute(
+                "UPDATE track_beatgrids SET is_active = 0 \
+                 WHERE track_id = ?1 AND source != ?2",
+                params![track_id, source],
+            )
+            .map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid_demote", e))?;
+        }
+        conn.execute(
+            "INSERT INTO track_beatgrids \
+             (track_id, source, anchor_secs, bpm, bar_phase, is_active, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now')) \
+             ON CONFLICT(track_id, source) DO UPDATE SET \
+                 anchor_secs = excluded.anchor_secs, \
+                 bpm         = excluded.bpm, \
+                 bar_phase   = excluded.bar_phase, \
+                 is_active   = excluded.is_active, \
+                 captured_at = excluded.captured_at",
+            params![
+                track_id,
+                source,
+                anchor_secs,
+                bpm,
+                i64::from(bar_phase),
+                if claim_active { 1 } else { 0 },
+            ],
+        )
+        .map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid", e))?;
+        Ok(())
+    }
+
     /// Upsert a user tap-to-grid correction (M11c.3b). Deactivates
     /// every other grid row for the track, then writes
     /// `source = 'user_tap'` as the sole active grid.
@@ -1176,6 +1263,88 @@ impl Library {
                 ],
             )
             .map_err(|e| LibraryError::sqlite("upsert_auto_key", e))?;
+        Ok(())
+    }
+
+    /// Key-notation source priority for the single active slot, highest
+    /// first. Mirrors [`Self::grid_source_rank`]; `mixedinkey` (a dedicated
+    /// key-detection authority DJs trust) and a `user` override rank above
+    /// the library imports. Preferences-configurable later (§8.3).
+    fn key_source_rank(source: &str) -> u8 {
+        match source {
+            "user" => 6,
+            "mixedinkey" => 5,
+            "serato" => 4,
+            "rekordbox" => 3,
+            "traktor" => 2,
+            "itunes" => 1,
+            _ => 0, // "id3" / "auto" / unknown
+        }
+    }
+
+    /// Upsert an imported key row, idempotent on `(track_id, source)`.
+    /// `key_notation` is canonical Camelot (the adapter converts the
+    /// source's notation); `original_notation` keeps the source's verbatim
+    /// string. `confidence` is NULL for imports. Same active-slot priority
+    /// as [`Self::upsert_imported_beatgrid`], on `track_keys`. An empty
+    /// `key_notation` is skipped (graceful).
+    pub fn upsert_imported_key(
+        &self,
+        track_id: &str,
+        source: &str,
+        key_notation: &str,
+        original_notation: Option<&str>,
+    ) -> Result<()> {
+        if key_notation.trim().is_empty() {
+            return Ok(());
+        }
+        let rank = Self::key_source_rank(source);
+        let conn = self.connection();
+        let active_others: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source FROM track_keys \
+                     WHERE track_id = ?1 AND is_active = 1 AND source != ?2",
+                )
+                .map_err(|e| LibraryError::sqlite("upsert_imported_key_select", e))?;
+            let rows = stmt
+                .query_map(params![track_id, source], |r| r.get::<_, String>(0))
+                .map_err(|e| LibraryError::sqlite("upsert_imported_key_query", e))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(|e| LibraryError::sqlite("upsert_imported_key_row", e))?);
+            }
+            v
+        };
+        let claim_active = active_others
+            .iter()
+            .all(|s| Self::key_source_rank(s) < rank);
+        if claim_active {
+            conn.execute(
+                "UPDATE track_keys SET is_active = 0 WHERE track_id = ?1 AND source != ?2",
+                params![track_id, source],
+            )
+            .map_err(|e| LibraryError::sqlite("upsert_imported_key_demote", e))?;
+        }
+        conn.execute(
+            "INSERT INTO track_keys \
+             (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, strftime('%s','now')) \
+             ON CONFLICT(track_id, source) DO UPDATE SET \
+                 key_notation      = excluded.key_notation, \
+                 original_notation = excluded.original_notation, \
+                 confidence        = excluded.confidence, \
+                 is_active         = excluded.is_active, \
+                 captured_at       = excluded.captured_at",
+            params![
+                track_id,
+                source,
+                key_notation,
+                original_notation,
+                if claim_active { 1 } else { 0 },
+            ],
+        )
+        .map_err(|e| LibraryError::sqlite("upsert_imported_key", e))?;
         Ok(())
     }
 }
@@ -2562,5 +2731,206 @@ mod tests {
             matches!(err, Some(LibraryError::GridLocked { .. })),
             "locked grid must refuse reset, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod imported_writers_tests {
+    use crate::db::Library;
+    use rusqlite::{params, OptionalExtension};
+
+    fn seed_track(lib: &Library, id: &str) {
+        lib.connection()
+            .execute(
+                "INSERT INTO tracks (id, created_at, updated_at) VALUES (?1, 0, 0)",
+                params![id],
+            )
+            .unwrap();
+    }
+
+    /// Seed a beat-grid row directly (bypassing the writers) to set up a
+    /// precondition with an explicit `(source, is_active)`.
+    fn seed_grid(lib: &Library, track: &str, source: &str, bpm: f64, active: bool) {
+        lib.connection()
+            .execute(
+                "INSERT INTO track_beatgrids \
+                 (track_id, source, anchor_secs, bpm, bar_phase, is_active, captured_at) \
+                 VALUES (?1, ?2, 0.0, ?3, 0, ?4, 0)",
+                params![track, source, bpm, i64::from(active)],
+            )
+            .unwrap();
+    }
+
+    fn active_source(lib: &Library, track: &str) -> Option<String> {
+        lib.connection()
+            .query_row(
+                "SELECT source FROM track_beatgrids WHERE track_id = ?1 AND is_active = 1",
+                params![track],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn grid_count(lib: &Library, track: &str) -> i64 {
+        lib.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM track_beatgrids WHERE track_id = ?1",
+                params![track],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn grid_bpm(lib: &Library, track: &str, source: &str) -> Option<f64> {
+        lib.connection()
+            .query_row(
+                "SELECT bpm FROM track_beatgrids WHERE track_id = ?1 AND source = ?2",
+                params![track, source],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn imported_grid_on_bare_track_is_active() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_beatgrid("t", "traktor", 0.1, 120.0, 0)
+            .unwrap();
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("traktor"));
+    }
+
+    #[test]
+    fn import_outranks_auto() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        seed_grid(&lib, "t", "auto", 100.0, true);
+        lib.upsert_imported_beatgrid("t", "traktor", 0.0, 120.0, 0)
+            .unwrap();
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("traktor"));
+        assert_eq!(grid_count(&lib, "t"), 2); // auto demoted, still present
+    }
+
+    #[test]
+    fn serato_outranks_traktor_either_order() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_beatgrid("t", "traktor", 0.0, 120.0, 0)
+            .unwrap();
+        lib.upsert_imported_beatgrid("t", "serato", 0.0, 121.0, 0)
+            .unwrap();
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("serato"));
+        // A later Traktor re-import must not steal the slot back.
+        lib.upsert_imported_beatgrid("t", "traktor", 0.0, 122.0, 0)
+            .unwrap();
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("serato"));
+    }
+
+    #[test]
+    fn import_preserves_active_user_tap() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        seed_grid(&lib, "t", "user_tap", 128.0, true);
+        lib.upsert_imported_beatgrid("t", "serato", 0.0, 130.0, 0)
+            .unwrap();
+        // The DJ's deliberate Dub correction stays active (PRD §8.1).
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("user_tap"));
+    }
+
+    #[test]
+    fn reimport_refreshes_in_place() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_beatgrid("t", "traktor", 0.1, 120.0, 0)
+            .unwrap();
+        lib.upsert_imported_beatgrid("t", "traktor", 0.2, 124.0, 1)
+            .unwrap();
+        assert_eq!(grid_count(&lib, "t"), 1);
+        assert_eq!(active_source(&lib, "t").as_deref(), Some("traktor"));
+        assert!((grid_bpm(&lib, "t", "traktor").unwrap() - 124.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_grid_is_skipped() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_beatgrid("t", "traktor", 0.0, 0.0, 0)
+            .unwrap();
+        lib.upsert_imported_beatgrid("t", "traktor", f64::NAN, 120.0, 0)
+            .unwrap();
+        assert_eq!(grid_count(&lib, "t"), 0);
+    }
+
+    fn seed_key(lib: &Library, track: &str, source: &str, key: &str, active: bool) {
+        lib.connection()
+            .execute(
+                "INSERT INTO track_keys \
+                 (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+                 VALUES (?1, ?2, ?3, ?3, NULL, ?4, 0)",
+                params![track, source, key, i64::from(active)],
+            )
+            .unwrap();
+    }
+
+    fn active_key_source(lib: &Library, track: &str) -> Option<String> {
+        lib.connection()
+            .query_row(
+                "SELECT source FROM track_keys WHERE track_id = ?1 AND is_active = 1",
+                params![track],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn imported_key_on_bare_track_is_active() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_key("t", "traktor", "8A", Some("Am"))
+            .unwrap();
+        assert_eq!(active_key_source(&lib, "t").as_deref(), Some("traktor"));
+        let notation: String = lib
+            .connection()
+            .query_row(
+                "SELECT key_notation FROM track_keys WHERE track_id = 't' AND source = 'traktor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notation, "8A");
+    }
+
+    #[test]
+    fn imported_key_priority_serato_over_traktor_over_auto() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        seed_key(&lib, "t", "auto", "5A", true);
+        lib.upsert_imported_key("t", "traktor", "8A", None).unwrap();
+        assert_eq!(active_key_source(&lib, "t").as_deref(), Some("traktor"));
+        lib.upsert_imported_key("t", "serato", "9A", None).unwrap();
+        assert_eq!(active_key_source(&lib, "t").as_deref(), Some("serato"));
+        // A later Traktor re-import must not steal the slot back.
+        lib.upsert_imported_key("t", "traktor", "10A", None)
+            .unwrap();
+        assert_eq!(active_key_source(&lib, "t").as_deref(), Some("serato"));
+    }
+
+    #[test]
+    fn empty_imported_key_is_skipped() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t");
+        lib.upsert_imported_key("t", "traktor", "  ", None).unwrap();
+        let n: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM track_keys WHERE track_id = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

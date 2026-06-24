@@ -32,7 +32,7 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; the current applied version is **5**.
+v1.0 baseline is **version 1**; the current applied version is **6**.
 Each bump is additive (new tables / columns with safe defaults / indexes),
 so a third-party reader that ignores the new columns keeps working. Any
 change to the table set, column set, indexes, FTS5 definition, or trigger
@@ -47,6 +47,7 @@ logic requires a version bump and a migration step.
 | 3       | M11c.2 | `track_keys` table (one musical key per source per track) + `idx_one_active_key_per_track` partial unique index + `idx_track_keys_track_id`. `analysis_cache.has_active_key INTEGER NOT NULL DEFAULT 0`. Backs Camelot key detection. |
 | 4       | M11d.7 | `tracks.grid_locked INTEGER NOT NULL DEFAULT 0` + `tracks.grid_drift_quality REAL`. Per-track beat-grid lock (locked tracks skip auto re-analysis on reload) + drift-quality indicator. |
 | 5       | PRD-BEATS C2 (round 4) | `track_beatgrids.bar_phase INTEGER NOT NULL DEFAULT 0 CHECK (0 ≤ bar_phase < 16)`. Makes the downbeat phase a first-class scalar so "set the 1" is a pure rotation (BPM + anchor unchanged) instead of a grid rebuild. |
+| 6       | M12c | Rebuild `imported_crates` / `imported_crate_tracks` without the `UNIQUE (source, parent, name)` constraint — external sources (iTunes) allow duplicate playlist names at one level. Truncate-and-rewrite mirror, so the drop+recreate loses nothing; also backfills the tables on DBs created before they existed. |
 
 ### Backward compatibility contract
 
@@ -510,9 +511,10 @@ CREATE TABLE IF NOT EXISTS imported_crates (
                                 ('serato', 'traktor', 'rekordbox', 'itunes')),
     name                        TEXT    NOT NULL,
     parent_imported_crate_id    INTEGER REFERENCES imported_crates(id) ON DELETE CASCADE,
-    imported_at                 INTEGER NOT NULL,
-    UNIQUE (source, parent_imported_crate_id, name)
+    imported_at                 INTEGER NOT NULL
+    -- No UNIQUE(source, parent, name): see the schema-v6 note below.
 );
+CREATE INDEX IF NOT EXISTS idx_imported_crates_source ON imported_crates(source);
 
 CREATE TABLE IF NOT EXISTS imported_crate_tracks (
     imported_crate_id   INTEGER NOT NULL REFERENCES imported_crates(id) ON DELETE CASCADE,
@@ -527,6 +529,14 @@ CREATE INDEX IF NOT EXISTS idx_imported_crate_tracks_ord
 Read-only mirror of source-library crate/playlist trees. Re-import
 truncates and rewrites the subtree for the affected source; never
 edited by the user.
+
+**Schema v6** dropped the original `UNIQUE (source, parent_imported_crate_id,
+name)` constraint: external sources (notably iTunes) legitimately have
+duplicate playlist names at the same level — they key playlists by a persistent
+id, not by name. Because the mirror is truncate-and-rewrite per source (no
+upsert-by-name), the constraint served no conflict-resolution purpose. The v6
+migration drops + recreates both tables (the mirror is rebuilt on the next
+import), which also backfills them on any DB created before the tables existed.
 
 ### `play_history` — every event, milliseconds
 

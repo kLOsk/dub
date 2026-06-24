@@ -86,6 +86,21 @@ rusty-chromaprint = "0.3"
 # re-scan.
 walkdir = "2"
 
+# Traktor `collection.nml` is one monolithic XML file (M12b importer).
+# quick-xml is a streaming pull-parser — flat memory even on a 100k-track
+# collection. MIT (GPL-compatible). We read attributes only; no DOM, no
+# allocations beyond the small event buffer we reuse.
+quick-xml = "0.36"
+
+# Serato (M11e) keeps cue / beatgrid / gain data in ID3v2 GEOB frames inside
+# the audio files (the `database V2` carries only metadata + the file list).
+# `id3` (MIT) extracts the named GEOB blobs; `base64` (MIT) decodes the
+# Serato Markers2 / Autotags payloads (stored base64 inside the GEOB). Both
+# MIT, GPL-compatible. `base64` is already in the graph transitively; `id3`
+# is the only genuinely new crate.
+id3 = "1.16"
+base64 = "0.22"
+
 # UniFFI for the Apple FFI surface (M0.5 onward). Pinned to a recent 0.28.x
 # because that's the release the Apple build script generates bindings with.
 # `cli` feature is only enabled on the `dub-ffi`'s `uniffi-bindgen` binary —

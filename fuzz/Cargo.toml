@@ -1,0 +1,57 @@
+# Fuzz crate (PRD §2.2.5). Standalone — NOT a member of the root
+# workspace — so `cargo build/test --workspace` never tries to build the
+# libFuzzer targets (they need a nightly toolchain + `-Z sanitizer`). Run
+# them via `make fuzz-quick` or `cargo +nightly fuzz run <target>`.
+[package]
+name = "dub-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The Traktor NML parser is the first fuzz surface. `parse_nml` is a pure,
+# allocation-light byte→struct function with a documented "never panics on
+# malformed input" contract (see `dub_library::traktor`); fuzzing pins it.
+[dependencies.dub-library]
+path = "../crates/dub-library"
+
+[[bin]]
+name = "fuzz_traktor_nml"
+path = "fuzz_targets/fuzz_traktor_nml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_serato_database"
+path = "fuzz_targets/fuzz_serato_database.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_serato_markers2"
+path = "fuzz_targets/fuzz_serato_markers2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_itunes_xml"
+path = "fuzz_targets/fuzz_itunes_xml.rs"
+test = false
+doc = false
+bench = false
+
+# Release-ish profile for the fuzz binaries (cargo-fuzz default).
+[profile.release]
+debug = 1
+
+# Empty table → this directory is its own workspace, invisible to the
+# parent workspace's `members` glob.
+[workspace]

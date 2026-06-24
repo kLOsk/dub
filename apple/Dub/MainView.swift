@@ -561,6 +561,25 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kCueSnapToGrid = "dub.cueSnapToGridEnabled"
 
+    /// Per-source library-import enables (Preferences ▸ Libraries). When a
+    /// source is on, Dub scans its default folder (`~/Music/_Serato_`,
+    /// `~/Documents/Native Instruments/Traktor*/collection.nml`, the iTunes
+    /// `Library.xml`) on launch and the moment it's toggled on. Default off:
+    /// the DJ opts in to each external library. Persisted in `UserDefaults`.
+    @Published var seratoImportEnabled: Bool {
+        didSet { UserDefaults.standard.set(seratoImportEnabled, forKey: Self.kSeratoImport) }
+    }
+    @Published var traktorImportEnabled: Bool {
+        didSet { UserDefaults.standard.set(traktorImportEnabled, forKey: Self.kTraktorImport) }
+    }
+    @Published var itunesImportEnabled: Bool {
+        didSet { UserDefaults.standard.set(itunesImportEnabled, forKey: Self.kItunesImport) }
+    }
+
+    private static let kSeratoImport = "dub.seratoImportEnabled"
+    private static let kTraktorImport = "dub.traktorImportEnabled"
+    private static let kItunesImport = "dub.itunesImportEnabled"
+
     // MARK: Live engine state
 
     @Published private(set) var isRunning: Bool = false
@@ -807,6 +826,11 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
         self.cueSnapToGridEnabled =
             UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
+        // External-library import enables default OFF, so the plain
+        // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
+        self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
+        self.traktorImportEnabled = UserDefaults.standard.bool(forKey: Self.kTraktorImport)
+        self.itunesImportEnabled = UserDefaults.standard.bool(forKey: Self.kItunesImport)
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
         // the only place the cold-boot value enters the model. We
@@ -1787,8 +1811,13 @@ final class WaveformAppModel: ObservableObject {
             libraryModel.libraryIsOpen = true
             refreshLibraryStats()
             reloadCrates()
+            reloadImportedSources()
             refreshMissingTrackCount()
             startMissingFilesScanner()
+            // Auto-rescan every enabled external library (Serato / Traktor /
+            // iTunes) from its default location, in the background. Idempotent
+            // + fast for already-known files; the sidebar refreshes when done.
+            scanEnabledSources()
         } catch {
             surfaceError("Failed to open library: \(error.localizedDescription)")
         }
@@ -1822,6 +1851,31 @@ final class WaveformAppModel: ObservableObject {
         } catch {
             surfaceError("Couldn't load crates: \(error.localizedDescription)")
         }
+    }
+
+    /// Re-read the imported-source crate trees + per-source track counts
+    /// into `libraryModel.importedSources`, one group per source that has
+    /// data. Called on library open and after every source import so the
+    /// sidebar's "Imported Sources" section stays live. Cheap reads on the
+    /// main actor (the imported-crate tables are small); Phase B will also
+    /// include preference-enabled-but-empty sources so a freshly enabled
+    /// source shows a node before its scan finishes.
+    func reloadImportedSources() {
+        guard libraryModel.libraryIsOpen else {
+            libraryModel.importedSources = []
+            return
+        }
+        var groups: [ImportedSourceGroup] = []
+        for kind in ImportedSourceKind.allCases {
+            let tag = kind.sourceTag
+            let crates = (try? library.listImportedCrates(source: tag)) ?? []
+            let count = (try? library.countTracksBySource(source: tag)) ?? 0
+            if count > 0 || !crates.isEmpty {
+                groups.append(
+                    ImportedSourceGroup(kind: kind, trackCount: count, crates: crates))
+            }
+        }
+        libraryModel.importedSources = groups
     }
 
     /// Create a new top-level Dub crate, refresh the list, and
@@ -2228,6 +2282,74 @@ final class WaveformAppModel: ObservableObject {
             }
         case .failure(let err):
             surfaceError("Import failed: \(err.localizedDescription)")
+        }
+    }
+
+    // MARK: - External library sources (Serato / Traktor / iTunes)
+
+    /// Discover the default on-disk locations of the importable external
+    /// libraries. Cheap; safe to call before the library is open.
+    func discoveredSourceLocations() -> [LibrarySourceLocation] {
+        library.discoverDefaultSources()
+    }
+
+    /// Import one external source from `path` (the `_Serato_` folder, a
+    /// `collection.nml`, or an iTunes `Library.xml`), then refresh the
+    /// sidebar's Imported Sources section. Idempotent; the FFI runs on a
+    /// background queue. No-op while another import is in flight.
+    func importExternalSource(_ kind: ImportedSourceKind, path: String) async {
+        guard libraryModel.libraryIsOpen, !libraryModel.libraryImportInProgress else { return }
+        libraryModel.libraryImportInProgress = true
+        let library = self.library
+        let result: Result<LibraryImportSummary, Error> = await Task.detached(
+            priority: .userInitiated
+        ) {
+            do {
+                let summary: LibraryImportSummary
+                switch kind {
+                case .serato: summary = try library.importSerato(path: path)
+                case .traktor: summary = try library.importTraktor(path: path)
+                case .itunes: summary = try library.importItunes(path: path)
+                }
+                return .success(summary)
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        libraryModel.libraryImportInProgress = false
+        switch result {
+        case .success(let summary):
+            libraryModel.lastImportSummary = summary
+            refreshLibraryStats()
+            reloadImportedSources()
+        case .failure(let err):
+            surfaceError("\(kind.label) import failed: \(err.localizedDescription)")
+        }
+    }
+
+    /// Scan + import every *enabled* external source from its default
+    /// location (Preferences ▸ Libraries). Called on library open and after
+    /// a source is toggled on. Sources import one after another; an app
+    /// that isn't installed (location absent) is skipped silently.
+    func scanEnabledSources() {
+        guard libraryModel.libraryIsOpen else { return }
+        let wanted: [ImportedSourceKind] = [
+            (ImportedSourceKind.serato, seratoImportEnabled),
+            (ImportedSourceKind.traktor, traktorImportEnabled),
+            (ImportedSourceKind.itunes, itunesImportEnabled),
+        ]
+        .filter(\.1)
+        .map(\.0)
+        guard !wanted.isEmpty else { return }
+        let locations = discoveredSourceLocations()
+        Task { @MainActor in
+            for kind in wanted {
+                guard
+                    let loc = locations.first(where: { $0.kind == kind.sourceTag }),
+                    loc.exists
+                else { continue }
+                await importExternalSource(kind, path: loc.path)
+            }
         }
     }
 

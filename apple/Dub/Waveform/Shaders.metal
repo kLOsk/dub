@@ -138,6 +138,12 @@ struct Uniforms {
     /// See the host-side `WaveformUniforms.subChunkOffsetNDC` doc
     /// for the smoothness rationale.
     float subChunkOffsetNDC;
+    /// Fraction of this region's NDC span that holds content (`1.0`
+    /// normally; < 1.0 only near a track edge on a track too long for
+    /// the empty-groove zero-pad). The filled columns render at native
+    /// density anchored at the playhead; the rest stays background.
+    /// See the host-side `WaveformUniforms.regionFillFrac` doc.
+    float regionFillFrac;
 };
 
 /// One element of the broadband-peak ring. CPU-side
@@ -346,16 +352,23 @@ vertex VertexOut waveformVertex(uint vid                       [[vertex_id]],
     // `y ∈ [+1.0, +0.5]` (oldest at top, newest at the playhead).
     // Future region maps `chunkInWindow ∈ [0, K)` to `y ∈ [+0.5, -1.0]`
     // (oldest just under the playhead, newest at the bottom).
+    //
+    // `regionFillFrac` (= 1.0 normally) anchors the filled columns at
+    // the playhead (y = +0.5) and scales the span so content keeps its
+    // native density when the region is starved near a track edge —
+    // the unfilled remainder falls outside [−1, 1] / the region and
+    // shows as background, instead of the few available chunks being
+    // stretched across the whole region (the long-track lead-in warp).
     const float frac = (u.chunksVisible > 1u)
         ? float(chunkInWindow) / float(u.chunksVisible - 1u)
         : 0.0;
     float timeNDC;
     if (u.chunksAbovePlayhead > 0u) {
-        // Past: top at +1.0, bottom of past region at +0.5.
-        timeNDC = 1.0 - 0.5 * frac;
+        // Past: playhead at +0.5, older columns step up toward +1.0.
+        timeNDC = 0.5 + 0.5 * u.regionFillFrac * (1.0 - frac);
     } else {
-        // Future: top of future region at +0.5, bottom at -1.0.
-        timeNDC = 0.5 - 1.5 * frac;
+        // Future: playhead at +0.5, later columns step down toward -1.0.
+        timeNDC = 0.5 - 1.5 * u.regionFillFrac * frac;
     }
 
     // Add the sub-chunk geometry shift so the displayed waveform

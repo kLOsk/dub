@@ -130,6 +130,17 @@ private struct WaveformUniforms {
     /// 5 ↔ 6 logical-pixel jumps, which is what the eye wants for
     /// "smooth at display refresh rate" scrolling.
     var subChunkOffsetNDC: Float
+    /// **Fraction of this region's NDC span that actually holds
+    /// content** — `1.0` in the common case. Below `1.0` only when the
+    /// playhead is close enough to a track edge that the region has
+    /// fewer chunks than its pixel budget *and* the empty-groove
+    /// zero-pad doesn't fit (tracks longer than the ring, > ~25 min).
+    /// The shader anchors the filled columns at the playhead at native
+    /// density and leaves the unfilled remainder as background, instead
+    /// of stretching the few available chunks across the whole region
+    /// (which warped + wobbled the lead-in on long tracks). `1.0`
+    /// reproduces the original full-span mapping exactly.
+    var regionFillFrac: Float
 }
 
 /// Renderer orientation. Vertical is the Performance-mode default
@@ -446,7 +457,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     /// Byte stride between the past-region and future-region
     /// uniform slots inside one per-frame uniform buffer. The
-    /// `Uniforms` struct itself is 36 bytes naturally; we round to
+    /// `Uniforms` struct itself is 52 bytes naturally; we round to
     /// 64 to satisfy the 32-byte `setVertexBuffer(offset:)`
     /// constant-buffer alignment Metal guarantees on every Apple
     /// GPU family.
@@ -1361,8 +1372,22 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let epsChunks = max(0.0, continuousChunkF - Double(playheadChunkSigned))
         let pastChunksDenom = max(Double(drawnAbove - 1) * Double(agg), 1.0)
         let futureChunksDenom = max(Double(drawnBelow - 1) * Double(agg), 1.0)
-        let pastSubChunkOffsetNDC = Float(epsChunks * 0.5 / pastChunksDenom)
-        let futureSubChunkOffsetNDC = Float(epsChunks * 1.5 / futureChunksDenom)
+
+        // Region fill fraction (see `WaveformUniforms.regionFillFrac`).
+        // `drawnAbove`/`drawnBelow` are clamped at or below their pixel
+        // budgets, so this is `1.0` unless the playhead is near a track
+        // edge on a track too long for the empty-groove zero-pad — the
+        // only case that warped. At `1.0` the scaling below and the
+        // shader mapping reduce to the original full-span behaviour.
+        let pastFillFrac =
+            drawnAbovePixels > 0 ? Float(drawnAbove) / Float(drawnAbovePixels) : 1.0
+        let futureFillFrac =
+            drawnBelowPixels > 0 ? Float(drawnBelow) / Float(drawnBelowPixels) : 1.0
+
+        // The sub-chunk slide is an NDC distance, so it must shrink in
+        // step with the compressed region or the lead-in wobbles.
+        let pastSubChunkOffsetNDC = Float(epsChunks * 0.5 / pastChunksDenom) * pastFillFrac
+        let futureSubChunkOffsetNDC = Float(epsChunks * 1.5 / futureChunksDenom) * futureFillFrac
 
         // Per-frame trace event — every quantity the grid math
         // depends on, in one record. Subscribe via Instruments
@@ -1411,7 +1436,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             orientation: appearance.orientation.rawValue,
             chunksPerColumn: WaveformRenderer.chunksPerColumn,
             bandStartPhaseSamples: UInt32(pastBandPhase),
-            subChunkOffsetNDC: pastSubChunkOffsetNDC)
+            subChunkOffsetNDC: pastSubChunkOffsetNDC,
+            regionFillFrac: pastFillFrac)
         let futureUniforms = WaveformUniforms(
             chunkOffset: UInt32(futureFirstRingOffset),
             chunksVisible: UInt32(drawnBelow),
@@ -1424,7 +1450,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             orientation: appearance.orientation.rawValue,
             chunksPerColumn: WaveformRenderer.chunksPerColumn,
             bandStartPhaseSamples: UInt32(futureBandPhase),
-            subChunkOffsetNDC: futureSubChunkOffsetNDC)
+            subChunkOffsetNDC: futureSubChunkOffsetNDC,
+            regionFillFrac: futureFillFrac)
         let uniformBuffer = uniformBuffers[uniformIndex]
         let uniformStride = WaveformRenderer.uniformStridePerRegion
         let bufBase = uniformBuffer.contents()
@@ -1575,12 +1602,20 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         startIdx: UInt64, count: UInt64, bufferIndex: Int
     ) {
         guard count > 0 else { return }
-        let data = engine.peaksExtend(deckIdx: deckIdx, startIdx: startIdx)
+        // `maxChunks: count` bounds the engine to the `[startIdx,
+        // startIdx + count)` window instead of `[startIdx, peaksLen)`.
+        // Without it a 90-minute track re-serialises + marshals its
+        // whole tail every frame near the start (the jitter bug), and
+        // the single-wrap memcpy below overruns the ring once the tail
+        // exceeds `chunkCapacity`.
+        let data = engine.peaksExtend(
+            deckIdx: deckIdx, startIdx: startIdx, maxChunks: count)
         if data.isEmpty { return }
 
         let chunkStride = MemoryLayout<PeakChunkLayout>.stride
-        let newChunkCount = data.count / chunkStride
-        guard newChunkCount > 0, data.count % chunkStride == 0 else { return }
+        guard data.count % chunkStride == 0 else { return }
+        let newChunkCount = min(data.count / chunkStride, Int(count))
+        guard newChunkCount > 0 else { return }
 
         let ringBytes = WaveformRenderer.chunkCapacity * chunkStride
         let dstBase = chunksBuffers[bufferIndex].contents()
@@ -1651,12 +1686,16 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         startIdx: UInt64, count: UInt64, bufferIndex: Int
     ) {
         guard count > 0 else { return }
-        let data = engine.bandPeaksExtend(deckIdx: deckIdx, startIdx: startIdx)
+        // Bound to the `[startIdx, startIdx + count)` window; see
+        // `ingestBroadbandRange` for why the unbounded form jitters.
+        let data = engine.bandPeaksExtend(
+            deckIdx: deckIdx, startIdx: startIdx, maxChunks: count)
         if data.isEmpty { return }
 
         let chunkStride = MemoryLayout<BandPeakChunkLayout>.stride
-        let newChunkCount = data.count / chunkStride
-        guard newChunkCount > 0, data.count % chunkStride == 0 else { return }
+        guard data.count % chunkStride == 0 else { return }
+        let newChunkCount = min(data.count / chunkStride, Int(count))
+        guard newChunkCount > 0 else { return }
 
         let ringBytes = WaveformRenderer.bandChunkCapacity * chunkStride
         let dstBase = bandChunksBuffers[bufferIndex].contents()

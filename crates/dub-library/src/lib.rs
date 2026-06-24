@@ -32,17 +32,33 @@ mod dedupe;
 mod error;
 mod filename_parser;
 mod history;
+mod imported_crates;
 mod importer;
+/// iTunes / Apple Music `Library.xml` parser (M12c). Public so the fuzz
+/// target and the import adapter can consume `parse_library`.
+pub mod itunes;
+mod itunes_import;
 mod paths;
 mod schema;
+/// Serato library parsers (M11e). Public so the fuzz targets and the import
+/// adapter can consume the pure `parse_*` entry points.
+pub mod serato;
+mod serato_import;
+/// Default-location discovery for external libraries (Serato / Traktor /
+/// iTunes), for the Preferences "Libraries" toggles + auto-scan.
+pub mod sources;
+/// Traktor `collection.nml` parser (M12b). Public so the fuzz target and
+/// the import adapter can consume the pure `parse_nml` entry point.
+pub mod traktor;
+mod traktor_import;
 mod version_tokens;
 mod volumes;
 
 pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
 pub use cues::HotCue;
 pub use db::{
-    CrateRow, FileScanRow, Library, MissingTrack, SessionPlay, StoredFingerprint, TrackRow,
-    TrackSortKey, TransitionStat,
+    CrateRow, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay, StoredFingerprint,
+    TrackRow, TrackSortKey, TransitionStat,
 };
 pub use dedupe::{
     decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,
@@ -52,8 +68,12 @@ pub use error::{LibraryError, Result};
 pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
 pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION_PLAY_MS};
 pub use importer::{import_folder, ImportError, ImportSummary};
+pub use itunes_import::import_itunes;
 pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
 pub use schema::SCHEMA_VERSION;
+pub use serato_import::import_serato;
+pub use sources::{discover_default_sources, discover_source, DiscoveredSource, SourceKind};
+pub use traktor_import::import_traktor;
 pub use version_tokens::{parse as parse_version_tokens, VersionToken};
 pub use volumes::{discover_for_path, DiscoveredVolume};
 

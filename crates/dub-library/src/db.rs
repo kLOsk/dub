@@ -114,9 +114,11 @@ pub struct MissingTrack {
 /// One row in the M11d browser's track list. The PRD §8.1
 /// priority chain (`serato > rekordbox > traktor > id3 > filename`)
 /// is baked in at the SELECT level via COALESCE so the browser
-/// doesn't have to reimplement the chain. v1 only has the `id3`
-/// and `filename` sources wired; the Serato / rekordbox / Traktor
-/// importers slot in at M11e by extending the COALESCE chain.
+/// doesn't have to reimplement the chain. All five sources are
+/// joined; `traktor` is populated by the M12b NML importer, `id3`
+/// and `filename` by the M11c folder importer, and the `serato` /
+/// `rekordbox` slots light up once those importers land — a source
+/// with no row simply contributes NULL and the COALESCE skips it.
 ///
 /// **Per-column carve-outs.** `year` deviates and is filename-first
 /// because the `[YYYY]` filename tail is more reliable than ID3
@@ -323,25 +325,28 @@ impl TrackSortKey {
     fn sql_column(self) -> &'static str {
         match self {
             Self::CreatedAt => "t.created_at",
-            Self::Title => "COALESCE(i3.title, fn.title)",
-            Self::Artist => "COALESCE(i3.artist, fn.artist)",
-            Self::Album => "i3.album",
+            Self::Title => "COALESCE(sr.title, rb.title, tr.title, i3.title, fn.title)",
+            Self::Artist => "COALESCE(sr.artist, rb.artist, tr.artist, i3.artist, fn.artist)",
+            Self::Album => "COALESCE(sr.album, rb.album, tr.album, i3.album)",
             Self::Bpm => "ag.bpm",
             Self::Duration => "t.duration_ms",
-            Self::Year => "COALESCE(fn.year, i3.year)",
-            Self::Composer => "i3.composer",
-            Self::TrackNumber => "i3.track_number",
+            Self::Year => "COALESCE(fn.year, sr.year, rb.year, tr.year, i3.year)",
+            Self::Composer => "COALESCE(sr.composer, rb.composer, tr.composer, i3.composer)",
+            Self::TrackNumber => {
+                "COALESCE(sr.track_number, rb.track_number, tr.track_number, i3.track_number)"
+            }
         }
     }
 }
 
 /// Canonical SELECT for a [`TrackRow`]. The COALESCE chains
 /// implement the §8.1 source-priority for the display fields. We
-/// LEFT JOIN both metadata sources (filename + id3) so a track
-/// with only one source still surfaces correctly. `MIN(source)`
-/// across the per-source rows produces a deterministic "best"
-/// source label until a real source-priority column lands at
-/// M11e.
+/// LEFT JOIN all five metadata sources (serato, rekordbox, traktor,
+/// id3, filename) so a track with any subset still surfaces
+/// correctly. The `source` label is a priority CASE — the first
+/// present source in §8.1 order — replacing the old `MIN(source)`
+/// placeholder (which sorted alphabetically and so always reported
+/// 'filename' over 'id3').
 ///
 /// `pf.*` is a single-row subquery exposing the most-recently-
 /// confirmed file for the track (ordered by `last_seen_at DESC`).
@@ -353,20 +358,24 @@ impl TrackSortKey {
 /// libraries.
 const TRACK_ROW_SELECT: &str = "\
     SELECT t.id, \
-           COALESCE(i3.title,    fn.title)    AS title, \
-           COALESCE(i3.artist,   fn.artist)   AS artist, \
-           i3.album                            AS album, \
-           i3.genre                            AS genre, \
-           COALESCE(fn.year,     i3.year)     AS year, \
+           COALESCE(sr.title,  rb.title,  tr.title,  i3.title,  fn.title)  AS title, \
+           COALESCE(sr.artist, rb.artist, tr.artist, i3.artist, fn.artist) AS artist, \
+           COALESCE(sr.album,  rb.album,  tr.album,  i3.album)             AS album, \
+           COALESCE(sr.genre,  rb.genre,  tr.genre,  i3.genre)             AS genre, \
+           COALESCE(fn.year, sr.year, rb.year, tr.year, i3.year)          AS year, \
            ag.bpm                              AS bpm, \
            ak.key_notation                     AS key, \
            t.duration_ms                       AS duration_ms, \
            COALESCE(fn.version_token, i3.version_token) AS version_tokens, \
            t.duplicate_link_track_id           AS potential_duplicate_id, \
-           ( \
-               SELECT MIN(source) FROM track_metadata_source ms \
-               WHERE ms.track_id = t.id \
-           )                                   AS source, \
+           CASE \
+               WHEN sr.track_id IS NOT NULL THEN 'serato' \
+               WHEN rb.track_id IS NOT NULL THEN 'rekordbox' \
+               WHEN tr.track_id IS NOT NULL THEN 'traktor' \
+               WHEN i3.track_id IS NOT NULL THEN 'id3' \
+               WHEN fn.track_id IS NOT NULL THEN 'filename' \
+               ELSE NULL \
+           END                                 AS source, \
            pf.volume_uuid                      AS primary_volume_uuid, \
            ( \
                SELECT v.last_known_mount_point \
@@ -383,9 +392,10 @@ const TRACK_ROW_SELECT: &str = "\
                    END) > 1 THEN 1 ELSE 0 END \
                FROM track_keys tk WHERE tk.track_id = t.id \
            )                                   AS key_disagreement, \
-           i3.comment                          AS comment, \
-           i3.composer                         AS composer, \
-           i3.track_number                     AS track_number, \
+           COALESCE(sr.comment,  rb.comment,  tr.comment,  i3.comment)       AS comment, \
+           COALESCE(sr.composer, rb.composer, tr.composer, i3.composer)      AS composer, \
+           COALESCE(sr.track_number, rb.track_number, tr.track_number, i3.track_number) \
+                                               AS track_number, \
            t.grid_locked                       AS grid_locked, \
            t.grid_drift_quality                AS grid_drift_quality \
     FROM tracks t \
@@ -393,6 +403,12 @@ const TRACK_ROW_SELECT: &str = "\
               ON fn.track_id = t.id AND fn.source = 'filename' \
     LEFT JOIN track_metadata_source i3 \
               ON i3.track_id = t.id AND i3.source = 'id3' \
+    LEFT JOIN track_metadata_source sr \
+              ON sr.track_id = t.id AND sr.source = 'serato' \
+    LEFT JOIN track_metadata_source rb \
+              ON rb.track_id = t.id AND rb.source = 'rekordbox' \
+    LEFT JOIN track_metadata_source tr \
+              ON tr.track_id = t.id AND tr.source = 'traktor' \
     LEFT JOIN track_beatgrids ag \
               ON ag.track_id = t.id AND ag.is_active = 1 \
     LEFT JOIN track_keys ak \
@@ -561,6 +577,26 @@ pub struct CrateRow {
     pub parent_id: Option<i64>,
     /// Number of tracks directly in this crate (not counting
     /// descendants).
+    pub track_count: u64,
+}
+
+/// One node of the read-only imported-crate mirror (`imported_crates`),
+/// for the sidebar's per-source (Serato / Traktor / iTunes) tree. Unlike
+/// [`CrateRow`] these are **not** user-editable — they are rebuilt wholesale
+/// on each re-import (the writers live in `imported_crates.rs`).
+/// `track_count` is direct members only (no child roll-up), matching
+/// [`CrateRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedCrateRow {
+    /// `imported_crates.id` primary key.
+    pub id: i64,
+    /// Source tag (`serato` / `traktor` / `rekordbox` / `itunes`).
+    pub source: String,
+    /// Display name (the source's crate / playlist / folder name).
+    pub name: String,
+    /// Parent imported-crate id for nesting, or `None` at the top level.
+    pub parent_id: Option<i64>,
+    /// Number of tracks directly in this node (not counting descendants).
     pub track_count: u64,
 }
 
@@ -818,6 +854,24 @@ impl Library {
                 ],
             )
             .map_err(|e| LibraryError::sqlite("insert_track", e))?;
+        Ok(())
+    }
+
+    /// Set `tracks.duration_ms` from a source-provided value **only if it is
+    /// currently NULL**. Used by the external-library importers to show a
+    /// length in the browser before the track is ever decoded (Traktor
+    /// `PLAYTIME`, iTunes `Total Time`). Never clobbers a decoded duration:
+    /// once `analyze_track` runs (`attach_fingerprint` overwrites
+    /// `duration_ms` while `fingerprint_id IS NULL`), the authoritative value
+    /// wins. Safe to call on every (re-)import.
+    pub fn set_duration_if_absent(&self, track_uuid: &str, duration_ms: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tracks SET duration_ms = ?2, updated_at = strftime('%s','now') \
+                 WHERE id = ?1 AND duration_ms IS NULL",
+                params![track_uuid, i64::from(duration_ms)],
+            )
+            .map_err(|e| LibraryError::sqlite("set_duration_if_absent", e))?;
         Ok(())
     }
 
@@ -1414,6 +1468,51 @@ impl Library {
         collect_track_rows(rows, "list_tracks_sorted")
     }
 
+    /// Tracks that carry a metadata row for `source` (e.g. `serato`,
+    /// `traktor`, `itunes`), for the sidebar's per-source "all tracks from
+    /// this source" node. The rows are the **unified** [`TrackRow`] — display
+    /// fields merged across every source by the §8.1 priority chain — just
+    /// filtered to those a given source contributed to. Newest-first, paged.
+    pub fn list_tracks_by_source(
+        &self,
+        source: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             WHERE EXISTS (SELECT 1 FROM track_metadata_source ms \
+                           WHERE ms.track_id = t.id AND ms.source = ?1) \
+             ORDER BY t.created_at ASC LIMIT ?2 OFFSET ?3"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_list_tracks_by_source", e))?;
+        let rows = stmt
+            .query_map(
+                params![source, limit as i64, offset as i64],
+                track_row_from_columns,
+            )
+            .map_err(|e| LibraryError::sqlite("query_list_tracks_by_source", e))?;
+        collect_track_rows(rows, "list_tracks_by_source")
+    }
+
+    /// Count of distinct tracks carrying a `source` metadata row, for the
+    /// per-source sidebar badge.
+    pub fn count_tracks_by_source(&self, source: &str) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT track_id) FROM track_metadata_source \
+                 WHERE source = ?1",
+                params![source],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("count_tracks_by_source", e))?;
+        Ok(n.max(0) as u64)
+    }
+
     /// FTS5-backed substring search per PRD §8.5.4. Whitespace-
     /// separated tokens are ANDed; tokens are wrapped with `*`
     /// suffix-match so a partial query (`workin`) hits `Workinonit`.
@@ -1535,6 +1634,62 @@ impl Library {
             out.push(row.map_err(|e| LibraryError::sqlite("collect_list_crates", e))?);
         }
         Ok(out)
+    }
+
+    /// List the read-only imported-crate mirror for `source` (the read side
+    /// of the writers in `imported_crates.rs`), for the sidebar's per-source
+    /// tree. Document order (`id` ASC), so the tree matches the source's own
+    /// ordering and parents precede children; the caller reconstructs nesting
+    /// from `parent_id`. Direct-member counts via a LEFT JOIN.
+    pub fn list_imported_crates(&self, source: &str) -> Result<Vec<ImportedCrateRow>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT ic.id, ic.source, ic.name, ic.parent_imported_crate_id, \
+                        COUNT(ict.track_id) AS track_count \
+                 FROM imported_crates ic \
+                 LEFT JOIN imported_crate_tracks ict ON ict.imported_crate_id = ic.id \
+                 WHERE ic.source = ?1 \
+                 GROUP BY ic.id \
+                 ORDER BY ic.id ASC",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_list_imported_crates", e))?;
+        let rows = stmt
+            .query_map(params![source], |r| {
+                Ok(ImportedCrateRow {
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    name: r.get(2)?,
+                    parent_id: r.get(3)?,
+                    track_count: r.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("query_list_imported_crates", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| LibraryError::sqlite("collect_list_imported_crates", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Tracks in one imported-crate node, in the source's playlist order
+    /// (`imported_crate_tracks.ordinal`). The read-only sibling of the
+    /// user-crate track listing, against the imported mirror.
+    pub fn imported_crate_tracks(&self, imported_crate_id: i64) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             JOIN imported_crate_tracks ict ON ict.track_id = t.id \
+             WHERE ict.imported_crate_id = ?1 \
+             ORDER BY ict.ordinal ASC"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_imported_crate_tracks", e))?;
+        let rows = stmt
+            .query_map(params![imported_crate_id], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("query_imported_crate_tracks", e))?;
+        collect_track_rows(rows, "imported_crate_tracks")
     }
 
     /// Create a Dub crate and return its new id. `parent_id` nests it
@@ -2278,6 +2433,85 @@ mod tests {
         assert_eq!(row.artist.as_deref(), Some("ID3 Artist"));
     }
 
+    /// M12b: the §8.1 chain now joins serato / rekordbox / traktor above
+    /// id3 / filename. A `traktor` metadata row must win the display fields
+    /// over id3, the `source` label must report the winning source (not the
+    /// alphabetical `MIN` the old SELECT used), and a higher-priority
+    /// `serato` row must in turn win over traktor.
+    #[test]
+    fn list_tracks_prefers_external_sources_over_id3_and_labels_source() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Filename Title"]);
+        // Give id3 a real title so we can prove traktor beats it (not just
+        // fills a NULL).
+        lib.connection()
+            .execute(
+                "UPDATE track_metadata_source SET title = 'ID3 Title' \
+                 WHERE track_id = ?1 AND source = 'id3'",
+                params![ids[0]],
+            )
+            .unwrap();
+        lib.upsert_metadata_source(
+            &ids[0],
+            "traktor",
+            Some("TK Artist"),
+            Some("TK Title"),
+            Some("TK Album"),
+            Some("TK Genre"),
+            Some("TK Comment"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let find = |lib: &Library| {
+            lib.list_tracks(10, 0)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == ids[0])
+                .unwrap()
+        };
+
+        let row = find(&lib);
+        assert_eq!(row.title.as_deref(), Some("TK Title"));
+        assert_eq!(row.artist.as_deref(), Some("TK Artist"));
+        assert_eq!(row.album.as_deref(), Some("TK Album"));
+        assert_eq!(row.genre.as_deref(), Some("TK Genre"));
+        assert_eq!(row.comment.as_deref(), Some("TK Comment"));
+        assert_eq!(row.source, "traktor");
+
+        // Serato outranks traktor (§8.1).
+        lib.upsert_metadata_source(
+            &ids[0],
+            "serato",
+            None,
+            Some("SR Title"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let row = find(&lib);
+        assert_eq!(row.title.as_deref(), Some("SR Title"));
+        // Artist has no serato value → falls through to traktor.
+        assert_eq!(row.artist.as_deref(), Some("TK Artist"));
+        assert_eq!(row.source, "serato");
+    }
+
     /// Sort companion to the priority-chain regression: the sort
     /// column expression in `TrackSortKey::sql_column` must use
     /// the same COALESCE order as the SELECT, otherwise rows can
@@ -2308,6 +2542,57 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("XXX id3"));
         assert_eq!(rows[1].title.as_deref(), Some("YYY id3"));
         assert_eq!(rows[2].title.as_deref(), Some("ZZZ id3"));
+    }
+
+    #[test]
+    fn imported_crate_and_by_source_reads() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Alpha", "Bravo"]);
+        // A traktor playlist mirror holding both tracks (ordinals 0, 1).
+        let cr = lib
+            .create_imported_crate("traktor", "My Set", None)
+            .unwrap();
+        lib.add_track_to_imported_crate(cr, &ids[0], 0).unwrap();
+        lib.add_track_to_imported_crate(cr, &ids[1], 1).unwrap();
+        // Only Alpha carries a traktor metadata row.
+        lib.upsert_metadata_source(
+            &ids[0],
+            "traktor",
+            Some("A"),
+            Some("Alpha"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let crates = lib.list_imported_crates("traktor").unwrap();
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].name, "My Set");
+        assert_eq!(crates[0].parent_id, None);
+        assert_eq!(crates[0].track_count, 2);
+        assert!(lib.list_imported_crates("serato").unwrap().is_empty());
+
+        // Members come back in playlist (ordinal) order.
+        let members = lib.imported_crate_tracks(cr).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].id, ids[0]);
+        assert_eq!(members[1].id, ids[1]);
+
+        // by-source filter sees only the track with a traktor metadata row.
+        let by_src = lib.list_tracks_by_source("traktor", 10, 0).unwrap();
+        assert_eq!(by_src.len(), 1);
+        assert_eq!(by_src[0].id, ids[0]);
+        assert_eq!(lib.count_tracks_by_source("traktor").unwrap(), 1);
+        assert_eq!(lib.count_tracks_by_source("serato").unwrap(), 0);
     }
 
     #[test]

@@ -207,7 +207,14 @@ private enum LibrarySource: Hashable, Identifiable {
     /// live from `libraryModel.crates` so a rename doesn't strand a
     /// stale label in the selection state.
     case dubCrate(id: Int64)
-    case importedSourcesPlaceholder
+    /// A top-level imported-source node (Serato / Traktor / iTunes):
+    /// selecting it lists "all tracks from this source". Its crates /
+    /// playlists render as children rows.
+    case importedSource(kind: ImportedSourceKind)
+    /// A crate / playlist under an imported source (read-only). Carries
+    /// the `imported_crates.id`; the display name is looked up live from
+    /// `libraryModel.importedSources`, the same way `dubCrate` does.
+    case importedCrate(id: Int64)
     case realRecordsPlaceholder
 
     var id: Self { self }
@@ -219,7 +226,8 @@ private enum LibrarySource: Hashable, Identifiable {
         case .sessionHistory:              return "Session History"
         case .justImported:                return "Just Imported"
         case .dubCrate:                    return "Crate"
-        case .importedSourcesPlaceholder:  return "Imported Sources"
+        case .importedSource(let kind):    return kind.label
+        case .importedCrate:               return "Playlist"
         case .realRecordsPlaceholder:      return "Real Records"
         }
     }
@@ -231,7 +239,8 @@ private enum LibrarySource: Hashable, Identifiable {
         case .sessionHistory:              return "calendar.day.timeline.left"
         case .justImported:                return "tray.and.arrow.down"
         case .dubCrate:                    return "square.stack.fill"
-        case .importedSourcesPlaceholder:  return "lock.square"
+        case .importedSource(let kind):    return kind.systemImage
+        case .importedCrate:               return "list.bullet"
         case .realRecordsPlaceholder:      return "opticaldisc"
         }
     }
@@ -242,11 +251,18 @@ private enum LibrarySource: Hashable, Identifiable {
         return nil
     }
 
+    /// The backing imported-crate id when this source is an imported
+    /// crate / playlist (read-only mirror), else `nil`.
+    var importedCrateId: Int64? {
+        if case let .importedCrate(id) = self { return id }
+        return nil
+    }
+
     /// `false` for the v1.0 placeholders that render disabled.
     var isAvailable: Bool {
         switch self {
         case .allTracks, .recentlyPlayed, .sessionHistory, .justImported: return true
-        case .dubCrate:                                  return true
+        case .dubCrate, .importedSource, .importedCrate: return true
         default:                                         return false
         }
     }
@@ -268,7 +284,8 @@ private enum LibrarySource: Hashable, Identifiable {
         // the user just dragged into place, exactly like the smart
         // crates' recency order. Session History is the set's
         // play order — same contract.
-        case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate: return true
+        case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate, .importedCrate:
+            return true
         default: return false
         }
     }
@@ -282,7 +299,7 @@ private enum LibrarySource: Hashable, Identifiable {
             return "Smart Crates"
         case .dubCrate:
             return "Dub Crates"
-        case .importedSourcesPlaceholder:
+        case .importedSource, .importedCrate:
             return "Imported Sources"
         case .realRecordsPlaceholder:
             return "Real Records"
@@ -319,6 +336,13 @@ struct LibraryView: View {
     /// Currently selected source-tree node. Drives which query the
     /// track list runs against.
     @State private var selectedSource: LibrarySource = .allTracks
+
+    /// Imported-source nodes (Serato / Traktor / Apple Music) the user
+    /// has collapsed in the sidebar. Membership = collapsed, so the
+    /// default (empty) shows every source expanded with its playlist
+    /// tree visible. Toggled by the disclosure triangle on each source
+    /// row; selecting the row still lists that source's tracks.
+    @State private var collapsedImportedSources: Set<ImportedSourceKind> = []
 
     /// M11d-history — per-row "← from <track>" annotations for the
     /// Session History source, keyed by track id. Populated only by
@@ -622,9 +646,7 @@ struct LibraryView: View {
                     heading: "Smart Crates",
                     entries: [.recentlyPlayed, .sessionHistory, .justImported])
                 dubCratesSection
-                section(
-                    heading: "Imported Sources",
-                    entries: [.importedSourcesPlaceholder])
+                importedSourcesSection
                 section(
                     heading: "Real Records",
                     entries: [.realRecordsPlaceholder])
@@ -759,6 +781,152 @@ struct LibraryView: View {
         )
     }
 
+    // MARK: - Imported Sources section (Serato / Traktor / iTunes)
+
+    /// The read-only "Imported Sources" section: one top-level row per
+    /// imported source that has data, with its crate / playlist tree
+    /// indented beneath. Hidden entirely when nothing is imported, so the
+    /// sidebar doesn't carry a dead heading. Selecting a source row lists
+    /// all of that source's tracks; selecting a crate lists that crate's
+    /// members (read-only — no rename / drop / reorder, unlike Dub crates).
+    @ViewBuilder
+    private var importedSourcesSection: some View {
+        if !libraryModel.importedSources.isEmpty {
+            Text("IMPORTED SOURCES")
+                .font(DubFont.caps)
+                .tracking(1.0)
+                .foregroundStyle(DubColor.textTertiary)
+                .padding(.horizontal, DubSpacing.lg)
+                .padding(.top, DubSpacing.sm)
+                .padding(.bottom, 2)
+            ForEach(libraryModel.importedSources) { group in
+                importedSourceRow(group)
+                if !collapsedImportedSources.contains(group.kind) {
+                    ForEach(flattenedImportedCrates(group.crates), id: \.crate.id) { node in
+                        importedCrateRow(node.crate, depth: node.depth)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flatten an imported source's crate tree (flat list + `parentId`,
+    /// document order) into rows tagged with nesting depth, so a folder's
+    /// children render indented under it. Roots first, depth-first.
+    private func flattenedImportedCrates(
+        _ crates: [LibraryImportedCrate]
+    ) -> [(crate: LibraryImportedCrate, depth: Int)] {
+        var childrenByParent: [Int64: [LibraryImportedCrate]] = [:]
+        var roots: [LibraryImportedCrate] = []
+        for c in crates {
+            if let parent = c.parentId {
+                childrenByParent[parent, default: []].append(c)
+            } else {
+                roots.append(c)
+            }
+        }
+        var out: [(crate: LibraryImportedCrate, depth: Int)] = []
+        func visit(_ c: LibraryImportedCrate, _ depth: Int) {
+            out.append((c, depth))
+            for child in childrenByParent[c.id] ?? [] {
+                visit(child, depth + 1)
+            }
+        }
+        for root in roots { visit(root, 0) }
+        return out
+    }
+
+    private func importedSourceRow(_ group: ImportedSourceGroup) -> some View {
+        let source = LibrarySource.importedSource(kind: group.kind)
+        let isSelected = selectedSource == source
+        let canCollapse = !group.crates.isEmpty
+        let isCollapsed = collapsedImportedSources.contains(group.kind)
+        return HStack(spacing: DubSpacing.sm) {
+            // Disclosure triangle: only a source with playlists/crates
+            // has anything to collapse. Sources without keep an empty
+            // slot of the same width so their icons stay aligned.
+            Group {
+                if canCollapse {
+                    Button {
+                        toggleImportedSourceCollapsed(group.kind)
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DubColor.textTertiary)
+                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(isCollapsed ? "Show playlists" : "Hide playlists")
+                }
+            }
+            .frame(width: 10)
+            Image(systemName: group.kind.systemImage)
+                .frame(width: 16)
+                .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
+            Text(group.kind.label)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            Text("\(group.trackCount)")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .monospacedDigit()
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            selectedSource = source
+        }
+    }
+
+    /// Toggle whether an imported source's playlist tree is shown.
+    private func toggleImportedSourceCollapsed(_ kind: ImportedSourceKind) {
+        if collapsedImportedSources.contains(kind) {
+            collapsedImportedSources.remove(kind)
+        } else {
+            collapsedImportedSources.insert(kind)
+        }
+    }
+
+    private func importedCrateRow(_ crate: LibraryImportedCrate, depth: Int) -> some View {
+        let source = LibrarySource.importedCrate(id: crate.id)
+        let isSelected = selectedSource == source
+        return HStack(spacing: DubSpacing.sm) {
+            Image(systemName: "list.bullet")
+                .frame(width: 16)
+                .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
+            Text(crate.name)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            Text("\(crate.trackCount)")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .monospacedDigit()
+        }
+        .padding(.leading, DubSpacing.lg + CGFloat(depth + 1) * DubSpacing.md)
+        .padding(.trailing, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            selectedSource = source
+        }
+    }
+
     private func sidebarRow(_ entry: LibrarySource) -> some View {
         let isSelected = entry == selectedSource && entry.isAvailable
         return HStack(spacing: DubSpacing.sm) {
@@ -848,17 +1016,39 @@ struct LibraryView: View {
 
             Spacer(minLength: 0)
 
-            Button {
-                presentImportFolderPicker()
+            Menu {
+                Button {
+                    presentImportFolderPicker()
+                } label: {
+                    Label("Folder…", systemImage: "folder")
+                }
+                Divider()
+                Button {
+                    presentImportedSourcePicker(.serato)
+                } label: {
+                    Label("Serato Library…", systemImage: ImportedSourceKind.serato.systemImage)
+                }
+                Button {
+                    presentImportedSourcePicker(.traktor)
+                } label: {
+                    Label("Traktor collection.nml…", systemImage: ImportedSourceKind.traktor.systemImage)
+                }
+                Button {
+                    presentImportedSourcePicker(.itunes)
+                } label: {
+                    Label("iTunes Library.xml…", systemImage: ImportedSourceKind.itunes.systemImage)
+                }
             } label: {
-                Label("Import Folder…", systemImage: "tray.and.arrow.down")
+                Label("Import", systemImage: "tray.and.arrow.down")
             }
+            .menuIndicator(.visible)
+            .fixedSize()
             .controlSize(.small)
             .disabled(!libraryModel.libraryIsOpen || libraryModel.libraryImportInProgress)
             .help(
                 libraryModel.libraryImportInProgress
                     ? "An import is already running."
-                    : "Add a folder of audio files to the library.")
+                    : "Import a folder, or a Serato / Traktor / iTunes library.")
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.sm)
@@ -2369,6 +2559,10 @@ struct LibraryView: View {
             return "No imports this session."
         case .dubCrate:
             return "This crate is empty."
+        case .importedSource(let kind):
+            return "No \(kind.label) tracks."
+        case .importedCrate:
+            return "This playlist is empty."
         default:
             return "Not available in this build."
         }
@@ -2380,7 +2574,7 @@ struct LibraryView: View {
         }
         switch selectedSource {
         case .allTracks:
-            return "Use “Import Folder…” to add tracks."
+            return "Use the Import menu (or Preferences ▸ Libraries) to add tracks."
         case .recentlyPlayed:
             return "Tracks you load on a deck show up here."
         case .sessionHistory:
@@ -2389,6 +2583,10 @@ struct LibraryView: View {
             return "Tracks imported this session show up here."
         case .dubCrate:
             return "Drag tracks onto the crate in the sidebar to add them."
+        case .importedSource(let kind):
+            return "Enable and scan \(kind.label) in Preferences ▸ Libraries."
+        case .importedCrate:
+            return nil
         default:
             return nil
         }
@@ -2504,6 +2702,11 @@ struct LibraryView: View {
                             sinceUnixSecs: since, limit: limit)
                     case .dubCrate(let crateId):
                         rows = try library.crateTracks(crateId: crateId)
+                    case .importedSource(let kind):
+                        rows = try library.listTracksBySource(
+                            source: kind.sourceTag, limit: limit, offset: 0)
+                    case .importedCrate(let id):
+                        rows = try library.importedCrateTracks(importedCrateId: id)
                     default:
                         rows = []
                     }
@@ -2583,6 +2786,36 @@ struct LibraryView: View {
         if panel.runModal() == .OK, let url = panel.url {
             Task { @MainActor in
                 await model.importLibraryFolder(url)
+            }
+        }
+    }
+
+    /// Manual picker for an external source. Serato is a folder (the
+    /// `_Serato_` directory); Traktor / iTunes are single files
+    /// (`collection.nml` / `Library.xml`). The Preferences ▸ Libraries
+    /// toggles are the primary, auto-scanning path — this is the
+    /// pick-it-anywhere fallback (e.g. a library on an external drive).
+    private func presentImportedSourcePicker(_ kind: ImportedSourceKind) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Import"
+        switch kind {
+        case .serato:
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.message = "Choose a “_Serato_” folder to import."
+        case .traktor:
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.message = "Choose a Traktor “collection.nml” to import."
+        case .itunes:
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.message = "Choose an iTunes “Library.xml” to import."
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { @MainActor in
+                await model.importExternalSource(kind, path: url.path)
             }
         }
     }

@@ -4,7 +4,7 @@ This document enumerates every external library Dub links against, with its lice
 
 The list is kept in sync with the workspace `Cargo.toml` and per-crate `Cargo.toml` files by hand. If you add, remove, or upgrade an external dependency, update this document in the same commit.
 
-Last verified: M11c (workspace dependency-graph snapshot 2026-05).
+Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-xml` for the Traktor NML / iTunes importers and `id3` + `base64` for the Serato GEOB importer).
 
 ---
 
@@ -12,8 +12,8 @@ Last verified: M11c (workspace dependency-graph snapshot 2026-05).
 
 | License family | Crates | Obligation |
 |---|---|---|
-| MIT / Apache-2.0 dual-licensed | 21 | Reproduce the license text + copyright notice in distributed binaries. |
-| MIT | 6 | Reproduce the license text + copyright notice. |
+| MIT / Apache-2.0 dual-licensed | 22 | Reproduce the license text + copyright notice in distributed binaries. |
+| MIT | 8 | Reproduce the license text + copyright notice. |
 | Apache-2.0 | 1 | Reproduce the license text + copyright notice; preserve any `NOTICE` file. |
 | Unlicense / MIT | 1 | Reproduce the license text (either license satisfies). |
 | MPL-2.0 | 2 | File-level copyleft only. The library binary may ship inside a proprietary application; if the library's source files themselves are modified, the modified files must remain MPL-2.0 and be made available on request. Dub does not modify any MPL-2.0 source files. |
@@ -150,6 +150,36 @@ Last verified: M11c (workspace dependency-graph snapshot 2026-05).
 * **License:** MIT/Unlicense (dual-licensed; choose either)
 * **Upstream:** https://github.com/BurntSushi/walkdir
 * **Role in Dub:** Recursive filesystem walker for the M11c folder importer. Deterministic alphabetical iteration order (depth-first, sorted within each directory) is load-bearing so re-imports replay in a reproducible order.
+* **Used by:** `dub-library`
+
+---
+
+### `quick-xml`
+
+* **Version:** 0.36
+* **License:** MIT
+* **Upstream:** https://github.com/tafia/quick-xml
+* **Role in Dub:** Streaming XML pull-parser for the M12b Traktor `collection.nml` importer and the M12c iTunes `Library.xml` (plist) importer. We read attributes only — no DOM, no serde derive — so memory stays flat even on a 100k-track collection. MIT, GPL-compatible. (The future Serato/rekordbox XML importer will reuse it.)
+* **Used by:** `dub-library`
+
+---
+
+### `id3`
+
+* **Version:** 1.16
+* **License:** MIT
+* **Upstream:** https://github.com/polyfloyd/rust-id3
+* **Role in Dub:** Reads ID3v2 `GEOB` (general-encapsulated-object) frames out of audio files for the M11e Serato importer. Serato keeps its beat grid / hot cues / loops / gain in `GEOB` frames keyed by description (`Serato BeatGrid`, `Serato Markers2`, `Serato Autotags`); symphonia only surfaces standard tag keys, so a dedicated ID3 reader is needed. MP3 / AIFF / WAV containers; MP4 / FLAC deferred. MIT, GPL-compatible.
+* **Used by:** `dub-library`
+
+---
+
+### `base64`
+
+* **Version:** 0.22
+* **License:** MIT/Apache-2.0
+* **Upstream:** https://github.com/marshallpierce/rust-base64
+* **Role in Dub:** Decodes the base64 payloads inside Serato's `Serato Markers2` / `Serato Autotags` GEOB blobs (M11e). Already present transitively in the dependency graph; M11e makes it a direct dependency. We use a padding-indifferent STANDARD engine because Serato's payloads are inconsistently padded.
 * **Used by:** `dub-library`
 
 ---

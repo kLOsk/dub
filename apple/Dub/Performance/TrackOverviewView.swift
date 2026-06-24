@@ -789,11 +789,13 @@ struct TrackOverviewView: View {
             lastSeenGeneration = currentGen
             return
         }
-        // Pull the entire broadband peak array. `peaks_extend`
-        // with start_idx = 0 returns every chunk that has been
-        // produced so far; for File-mode sources that's the
-        // whole track (computed offline at load time per M10.5a).
-        let data = model.engine.peaksExtend(deckIdx: deckIdx, startIdx: 0)
+        // Pull the entire broadband peak array. `maxChunks: 0` keeps
+        // the unbounded "to the end" behaviour (the scrolling renderer
+        // passes a bounded budget instead); start_idx = 0 returns every
+        // chunk produced so far — for File-mode sources the whole track
+        // (computed offline at load time per M10.5a). One-shot per track
+        // load (gated on `peaksGeneration`), so the full pull is fine.
+        let data = model.engine.peaksExtend(deckIdx: deckIdx, startIdx: 0, maxChunks: 0)
         buckets = Self.decimate(data: data, bucketCount: Self.bucketCount)
         lastSeenGeneration = currentGen
     }

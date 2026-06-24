@@ -5,10 +5,11 @@
 
 ## Status
 
-This document is a format-notes stub for external DJ libraries. Dub-native
-filesystem import has shipped; Serato / Traktor / rekordbox / iTunes importers
-are still forward-looking. Fill each section as its importer lands, and keep
-format-specific quirks here rather than expanding PRD §8.
+Format notes for external DJ libraries. Shipped: Dub-native filesystem import
+(M11c), the **Serato importer (M11e)**, the **Traktor NML importer (M12b)**, and
+the **iTunes / Apple Music importer (M12c)**. rekordbox + Lexicon are still
+forward-looking. Fill each section as its importer lands, and keep format-
+specific quirks here rather than expanding PRD §8.
 
 Each section should end up with:
 
@@ -20,22 +21,130 @@ Each section should end up with:
 
 ## Sources to import
 
-### Serato
+### Serato — **shipped (M11e)**
 
-- **Database:** `_Serato_/database V2`
-- **Crate files:** `_Serato_/Subcrates/*.crate`
-- **Per-track metadata:** ID3 GEOB tags inside the audio file itself
-  - `Serato Markers_` (cues, hot cues)
-  - `Serato Markers2` (newer format)
-  - `Serato BeatGrid`
-  - `Serato Overview` (waveform overview)
-  - `Serato Autotags` (BPM, gain)
+- **Folder:** `~/Music/_Serato_` (boot volume); each external drive has its own
+  `/Volumes/<drive>/_Serato_`.
+- **Database:** `_Serato_/database V2` — metadata + the master track list.
+- **Crate files:** `_Serato_/Subcrates/*.crate` — the crate tree.
+- Parser: `crates/dub-library/src/serato/` (pure); adapter:
+  `crates/dub-library/src/serato_import.rs`.
 
-### Traktor
+**Container format** (both `database V2` and `.crate`): a flat sequence of tags,
+each `[4-byte ASCII type][4-byte big-endian u32 length][payload]`. Text payloads
+are **UTF-16 big-endian**; paths are **relative to the volume root** (no leading
+slash). `database V2` = `vrsn` then one `otrk` per track; each `otrk` payload is
+itself a tag sequence:
+
+| tag | field | tag | field |
+|-----|-------|-----|-------|
+| `pfil` | file path (rel. to volume) | `tbpm` | BPM (text) |
+| `ttyp` | file type | `tkey` | key (musical, e.g. `Em`) |
+| `tsng` | title | `tcmt` | comment |
+| `tart` | artist | `tcom` | composer |
+| `talb` | album | `tgrp` | grouping |
+| `tgen` | genre | `tlbl` | label |
+
+*(Validated against a real export: paths reconstruct as `mount_point + pfil`;
+keys come back `Em` / `Bm` / `Ebm` — converted to Camelot for display, raw kept
+in `track_keys.original_notation`.)*
+
+**Crate nesting** is encoded in the `.crate` *filename* with `%%`
+(`Hip Hop%%90s.crate` → folder "Hip Hop" › crate "90s"); each `.crate` is
+`vrsn` + sort/column tags + one `otrk` per member carrying a `ptrk` path.
+
+**Beat grid / cues / loops / gain** are **not** in `database V2` — they live in
+ID3v2 `GEOB` frames inside each audio file (read via the `id3` crate; MP3 / AIFF
+/ WAV — MP4 / FLAC deferred):
+
+- `Serato BeatGrid` — raw binary. `01 00` + u32 total-marker-count; the first
+  count-1 markers are non-terminal (`f32 position_secs` + `u32 beats_to_next`),
+  the **last** is terminal (`f32 position_secs` + `f32 bpm`). Dub takes the first
+  marker's position as the downbeat anchor + a single BPM. *(Validated: a
+  constant-tempo track is `count == 1`, 15 bytes, e.g. anchor `0.401`s / `91.0`
+  BPM — matching `tbpm`.)*
+- `Serato Markers2` — `01 01` + base64 (sometimes padded/newline-wrapped → use a
+  padding-indifferent decoder) of NUL-terminated-name entries (`name\0` +
+  `u32 len` + body). `CUE` body = `00 index(1) position_be_u32_ms 00 color(3)
+  00 00 name\0` → hot cue (ms). `LOOP` body = `00 index start_ms end_ms …`.
+  `COLOR` / `BPMLOCK` skipped.
+- `Serato Autotags` — short header + ASCII BPM / auto-gain / gain (NUL-separated;
+  parsed tolerantly). Gain → `track_metadata_source.gain_db`.
+
+### Traktor — **shipped (M12b)**
 
 - **Collection:** `~/Documents/Native Instruments/Traktor X.X.X/collection.nml`
-- XML format. Big monolithic file.
-- Beatgrids encoded as `<TEMPO>` + `<CUE_V2>` (downbeat anchor at type=4).
+- One monolithic XML file. Parsed by `crates/dub-library/src/traktor.rs`
+  (pure, streaming, `quick-xml`); imported by
+  `crates/dub-library/src/traktor_import.rs`.
+
+**Document shape**
+
+```xml
+<NML VERSION="19">
+  <COLLECTION ENTRIES="N">
+    <ENTRY TITLE="…" ARTIST="…">
+      <LOCATION DIR="/:Users/:dj/:Music/:" FILE="track.mp3" VOLUME="Macintosh HD"/>
+      <ALBUM TITLE="…"/>
+      <INFO GENRE="…" COMMENT="…"/>
+      <TEMPO BPM="174.500000"/>
+      <MUSICAL_KEY VALUE="21"/>
+      <CUE_V2 NAME="AutoGrid" TYPE="4" START="0.0"     LEN="0"      HOTCUE="-1"/>
+      <CUE_V2 NAME="Drop"     TYPE="0" START="16000.0" LEN="0"      HOTCUE="1"/>
+      <CUE_V2 NAME="Roll"     TYPE="5" START="32000.0" LEN="4000.0" HOTCUE="0"/>
+    </ENTRY>
+  </COLLECTION>
+  <PLAYLISTS>…</PLAYLISTS>
+</NML>
+```
+
+**Paths.** `<LOCATION>` splits the path across attributes: `VOLUME` is the
+volume *name*, `DIR` uses `/:` as its separator (and has a leading + trailing
+`/:`), `FILE` is the basename. Reconstruction: `DIR.replace("/:", "/")`, then
+map the volume — `"Macintosh HD"` (the boot volume) → filesystem root,
+anything else → `/Volumes/<name>`. *(Validated against a real export: e.g.
+`VOLUME="Macintosh HD" DIR="/:Users/:klos/:Downloads/:…/:" FILE="x.wav"` →
+`/Users/klos/Downloads/…/x.wav`.)*
+
+**Beatgrid.** `<TEMPO BPM>` + the first `<CUE_V2 TYPE="4">` (AutoGrid) as the
+downbeat anchor. Imported as `track_beatgrids(source='traktor')` with
+`bar_phase = 0` (a Traktor grid anchor *is* beat 1).
+
+**Cues / loops.** `<CUE_V2>` `START` and `LEN` are in **milliseconds**
+(validated — a non-zero AutoGrid at `2150.96` ms decodes to `2.15 s`).
+`TYPE`: `4` = grid anchor (→ beatgrid, not a cue), `5` = loop (→ `track_loops`,
+`out = START + LEN`), anything else = cue (→ `track_cues`). `HOTCUE ≥ 0` is the
+pad slot (→ `cue_index`, `kind='hot_cue'`); `HOTCUE = -1` is an unslotted
+memory marker (`kind='memory'`, indexed above the pad range so it can't alias
+a real pad). `NAME="n.n."` is Traktor's "no name" sentinel → dropped.
+
+**Key.** `<MUSICAL_KEY VALUE>` is `0–23` chromatic (`0–11` = major C…B,
+`12–23` = minor C…B), mapped to Camelot (e.g. `21` = A minor = `8A`). The
+raw `VALUE` is preserved in `track_keys.original_notation`. *(The 0–23
+ordering is the assumption; the file carries no text key to cross-check it
+against, so treat the exact per-value mapping as best-effort until a tagged
+export confirms it.)*
+
+**Playlists.** `<PLAYLISTS>` is a `<NODE>` tree: `TYPE="FOLDER"` (nesting),
+`TYPE="PLAYLIST"` (members via `<ENTRY><PRIMARYKEY KEY="…"/>`), `TYPE="SMARTLIST"`
+(dynamic — skipped, we can't resolve it to fixed tracks). The `$ROOT` folder is
+transparent. A `PRIMARYKEY` `KEY` is a single `VOLUME/:dir/:file` string that
+reconstructs to the *same* path as the matching `<LOCATION>` (the join key).
+The tree is mirrored into the read-only `imported_crates` /
+`imported_crate_tracks` tables (truncate-and-rewrite per source); folders
+become parentless/parented crate rows, playlists carry the members.
+
+**Import behaviour.** Idempotent by `(volume_uuid, relative_path)` — the *same*
+identity the folder importer uses, so Traktor metadata/grid/key/cues enrich a
+track the DJ already imported rather than duplicating it. Lazy (PRD §8.4): no
+decode, no fingerprint at import; a track first seen via NML lands with
+`fingerprint_id = NULL`. A reference whose file isn't on this machine is
+reported in `ImportSummary::skipped` (with a reason), never inserted. Run it
+headless with `dub import --traktor <collection.nml>`.
+
+**Fuzz target.** `fuzz/fuzz_targets/fuzz_traktor_nml.rs` over `parse_nml`
+(PRD §2.2.5). The parser's contract is *never panic / hang / OOB on any bytes*
+— only `Ok(ParsedCollection)` or `Err(ParseError)`.
 
 ### rekordbox
 
@@ -44,12 +153,40 @@ Each section should end up with:
 - **XML export** (alternative path): user-exported XML file.
 - DB6 schema: many tables; key ones are `djmdContent`, `djmdCue`, `djmdBeatGrid`.
 
-### iTunes / Apple Music
+### iTunes / Apple Music — **shipped (M12c)**
 
 - **Library:** `~/Music/iTunes/iTunes Library.xml` (legacy) or
-  `~/Music/Music/Library.xml` (Apple Music export).
-- Plain XML. BPM often missing. Beatgrids never present.
-- Useful primarily for crate / playlist structure.
+  `~/Music/Music/Library.xml` (Apple Music "Share Library XML" export).
+- Apple **plist** (XML). No beat grids, no cues — metadata + playlists only.
+- Parser: `crates/dub-library/src/itunes.rs` (streaming `quick-xml`); adapter:
+  `crates/dub-library/src/itunes_import.rs`.
+
+**Shape.** A top `<dict>` whose `Tracks` key is a dict of `trackID → <dict>`
+and whose `Playlists` key is an array of playlist `<dict>`s. Plist values pair
+positionally: `<key>NAME</key>` then a value element (`<string>`, `<integer>`,
+`<true/>`, `<dict>`, `<array>`, …). The Tracks dict is streamed entry-by-entry
+(never held whole). Track fields read: `Name` / `Artist` / `Album` / `Composer`
+/ `Genre` / `BPM` (integer) / `Year` / `Total Time` (ms) / `Location`.
+
+**Paths.** `Location` is a percent-encoded `file://` URL
+(`file:///Users/dj/Music/a%20b.mp3` or `file://localhost/…`) → strip the scheme
++ optional `localhost`, percent-decode → absolute path. Non-`file://` (remote /
+streaming) entries are skipped.
+
+**Playlists.** The `Playlists` array → `imported_crates('itunes')`, nested via
+`Parent Persistent ID` (resolved against `Playlist Persistent ID`, forward refs
+handled). **Skipped:** the `Master` library playlist and any with a
+`Distinguished Kind` (the built-in Music / Films / Downloaded / Audiobooks /
+TV Programmes lists) — only user playlists + folders become crate nodes.
+
+**Import behaviour.** Idempotent by `(volume_uuid, relative_path)` — shared
+identity with the other importers. Lazy; metadata-source `'itunes'` only (no
+grid/key/cue). *(Validated against a real export: 2022 tracks + 166 playlists
+parsed; the 158 user playlists/folders mirror cleanly — iTunes allows duplicate
+playlist names at one level, so `imported_crates` has no name-uniqueness
+constraint, schema v6.)* Run headless with `dub import --itunes <Library.xml>`.
+
+**Fuzz target.** `fuzz/fuzz_targets/fuzz_itunes_xml.rs` over `parse_library`.
 
 ### Lexicon DJ
 

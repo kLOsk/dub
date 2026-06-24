@@ -431,7 +431,9 @@ fn has_audio_extension(path: &Path) -> bool {
 /// `track_files.codec`. We don't peek inside the file; the
 /// container's codec id from symphonia is what we'd use later if
 /// we wanted finer detail. For M11c the extension is sufficient.
-fn detect_codec_from_extension(path: &Path) -> Option<&'static str> {
+/// `pub(crate)` so the Traktor adapter (`traktor_import`) records the
+/// same codec strings as the folder importer.
+pub(crate) fn detect_codec_from_extension(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "wav" => Some("wav"),

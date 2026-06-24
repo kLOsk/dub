@@ -18,7 +18,7 @@ help:
 	@echo "  make fmt-check     cargo fmt --check"
 	@echo "  make clippy        cargo clippy --all-targets -- -D warnings"
 	@echo "  make cov           coverage report (requires cargo-llvm-cov)"
-	@echo "  make fuzz-quick    run fuzz targets for 60s each (placeholder)"
+	@echo "  make fuzz-quick    run fuzz targets for 60s each (needs cargo-fuzz + nightly)"
 	@echo "  make soak          1-hour offline render soak (placeholder)"
 	@echo "  make ci            run the full CI pipeline locally"
 	@echo "  make docs-check    fail if README / docs/html drift from code constants"
@@ -60,7 +60,16 @@ cov:
 	cargo llvm-cov --workspace --html --output-dir coverage
 
 fuzz-quick:
-	@echo "[placeholder] fuzz targets are added per parser as they land. See PRD §2.2.5."
+	@if ! command -v cargo-fuzz >/dev/null 2>&1; then \
+		echo "cargo-fuzz not installed — skipping. Install: cargo install cargo-fuzz (needs a nightly toolchain)."; \
+	elif ! rustup toolchain list 2>/dev/null | grep -q nightly; then \
+		echo "nightly toolchain not installed — skipping. Install: rustup toolchain install nightly."; \
+	else \
+		cd fuzz && for t in $$(cargo +nightly fuzz list); do \
+			echo "==> fuzzing $$t for 60s"; \
+			cargo +nightly fuzz run $$t -- -max_total_time=60 || exit 1; \
+		done; \
+	fi
 
 soak:
 	@echo "[placeholder] soak harness lands in M2. See PRD §2.2.0 phase B."

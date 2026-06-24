@@ -43,6 +43,7 @@ struct PreferencesSheet: View {
                     loadBehaviourSection
                     loudnessSection
                     cueSection
+                    librariesSection
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -52,7 +53,16 @@ struct PreferencesSheet: View {
         .padding(DubSpacing.xl)
         .frame(width: 520, height: 600)
         .background(DubColor.surface0)
+        .onAppear { sourceLocations = model.discoveredSourceLocations() }
+        .onChange(of: model.seratoImportEnabled) { on in if on { model.scanEnabledSources() } }
+        .onChange(of: model.traktorImportEnabled) { on in if on { model.scanEnabledSources() } }
+        .onChange(of: model.itunesImportEnabled) { on in if on { model.scanEnabledSources() } }
     }
+
+    /// Default locations of the external libraries, loaded once on appear so
+    /// each row can show a "Found / Not found" status without re-statting the
+    /// filesystem on every render.
+    @State private var sourceLocations: [LibrarySourceLocation] = []
 
     // MARK: - Status (read-only)
 
@@ -186,6 +196,65 @@ struct PreferencesSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    // MARK: - Libraries (Serato / Traktor / iTunes import)
+
+    /// Per-source import toggles. Enabling a source scans its default folder
+    /// now and on every launch; tracks merge into the one library and the
+    /// app's crates/playlists appear in the sidebar's Imported Sources
+    /// section. Read-only on the source data.
+    private var librariesSection: some View {
+        section(title: "LIBRARIES") {
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                Text("Import from the DJ apps you already use. Dub reads each library read-only, merges its tracks into your one collection, and shows that app's crates / playlists in the sidebar. Enabling a source scans its default folder now and on every launch.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                librarySourceRow("Serato", kind: .serato, isOn: $model.seratoImportEnabled)
+                librarySourceRow("Traktor", kind: .traktor, isOn: $model.traktorImportEnabled)
+                librarySourceRow(
+                    "Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled)
+            }
+        }
+    }
+
+    private func librarySourceRow(
+        _ label: String,
+        kind: ImportedSourceKind,
+        isOn: Binding<Bool>
+    ) -> some View {
+        let loc = sourceLocations.first { $0.kind == kind.sourceTag }
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: DubSpacing.sm) {
+                Toggle(isOn: isOn) {
+                    Text(label)
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Spacer(minLength: 0)
+                if isOn.wrappedValue {
+                    Button("Rescan") { model.scanEnabledSources() }
+                        .buttonStyle(.plain)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .disabled(loc?.exists != true || !model.libraryModel.libraryIsOpen)
+                }
+            }
+            Text(sourceStatusText(loc))
+                .font(DubFont.micro)
+                .foregroundStyle(
+                    loc?.exists == true ? DubColor.textTertiary : DubColor.textPlaceholder
+                )
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func sourceStatusText(_ loc: LibrarySourceLocation?) -> String {
+        guard let loc else { return "Not found." }
+        return loc.exists ? "Found: \(loc.path)" : "Not found at \(loc.path)"
     }
 
     // MARK: - Header / footer
