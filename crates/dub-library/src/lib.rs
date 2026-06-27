@@ -61,8 +61,8 @@ mod volumes;
 pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
 pub use cues::HotCue;
 pub use db::{
-    CrateRow, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay, StoredFingerprint,
-    TrackRow, TrackSortKey, TransitionStat,
+    CrateRow, FavoriteSlot, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay,
+    StoredFingerprint, TrackRow, TrackSortKey, TransitionStat,
 };
 pub use dedupe::{
     decide as decide_dedupe, DedupeDecision, DedupeInput, SiblingReason, DURATION_DELTA_MS,

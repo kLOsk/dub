@@ -136,6 +136,32 @@ enum DubColor {
         case .b: return deckBOverview
         }
     }
+
+    // ----- Track colour labels (v8) --------------------------------
+    // A small fixed palette the DJ assigns per track (PRD §8). The
+    // token (`"red"`, `"blue"`, …) is what `tracks.color` stores; the
+    // browser draws the swatch and tints the row background with it.
+    // Eight rekordbox-style hues — fast to click, visually distinct on
+    // the dark surface ramp.
+
+    /// Ordered `(token, swatch colour)` palette for the colour picker.
+    static let trackLabelPalette: [(token: String, color: Color)] = [
+        ("red", Color(hex: 0xD45C5C)),
+        ("orange", Color(hex: 0xE08A3C)),
+        ("yellow", Color(hex: 0xD9C04A)),
+        ("green", Color(hex: 0x6FB04A)),
+        ("aqua", Color(hex: 0x4FD1B0)),
+        ("blue", Color(hex: 0x5A8FC8)),
+        ("purple", Color(hex: 0x9B6FD1)),
+        ("pink", Color(hex: 0xD46FA8)),
+    ]
+
+    /// Resolve a stored colour token to its swatch colour, or `nil`
+    /// when the track is unlabelled (or carries an unknown token).
+    static func trackLabel(_ token: String?) -> Color? {
+        guard let token else { return nil }
+        return trackLabelPalette.first { $0.token == token }?.color
+    }
 }
 
 // MARK: - Deck-side handle

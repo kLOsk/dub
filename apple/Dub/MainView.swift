@@ -1817,6 +1817,7 @@ final class WaveformAppModel: ObservableObject {
             refreshLibraryStats()
             reloadCrates()
             reloadImportedSources()
+            reloadFavoriteSlots()
             refreshMissingTrackCount()
             startMissingFilesScanner()
             // Auto-rescan every enabled external library (Serato / Traktor /
@@ -2790,6 +2791,82 @@ final class WaveformAppModel: ObservableObject {
                 _ = try? engine.setDeckGridLocked(
                     deckIdx: side.ffiDeckIdx, locked: locked)
             }
+        }
+    }
+
+    /// v8 — set the DJ's star rating for a track. `nil` clears it (the
+    /// browser falls back to any imported rating). Bumps
+    /// `rowAttributeGeneration` so the open listing repaints its stars.
+    @MainActor
+    func setTrackRating(trackId: String, rating: UInt8?) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setUserRating(trackId: trackId, rating: rating)
+            libraryModel.rowAttributeGeneration &+= 1
+        } catch {
+            surfaceError("Set rating failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// v8 — set a track's colour label (a palette token), or clear it
+    /// with `nil`. Bumps `rowAttributeGeneration` so the row tint and
+    /// swatch repaint.
+    @MainActor
+    func setTrackColor(trackId: String, color: String?) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setTrackColor(trackId: trackId, color: color)
+            libraryModel.rowAttributeGeneration &+= 1
+        } catch {
+            surfaceError("Set colour failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// v8 — refresh the favourite-slot strip from the library. Called on
+    /// library open and after every pin / clear.
+    @MainActor
+    func reloadFavoriteSlots() {
+        guard libraryModel.libraryIsOpen else {
+            libraryModel.favoriteSlots = []
+            return
+        }
+        libraryModel.favoriteSlots = (try? library.listFavoriteSlots()) ?? []
+    }
+
+    /// v8 — pin a Dub crate to favourite `slot` (0–7).
+    @MainActor
+    func setFavoriteDubCrate(slot: UInt32, crateId: Int64) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setFavoriteDubCrate(slot: slot, crateId: crateId)
+            reloadFavoriteSlots()
+        } catch {
+            surfaceError("Set favourite failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// v8 — pin an imported node playlist to favourite `slot` (0–7).
+    @MainActor
+    func setFavoriteImportedCrate(slot: UInt32, importedCrateId: Int64) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setFavoriteImportedCrate(
+                slot: slot, importedCrateId: importedCrateId)
+            reloadFavoriteSlots()
+        } catch {
+            surfaceError("Set favourite failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// v8 — empty favourite `slot`.
+    @MainActor
+    func clearFavoriteSlot(slot: UInt32) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.clearFavoriteSlot(slot: slot)
+            reloadFavoriteSlots()
+        } catch {
+            surfaceError("Clear favourite failed: \(error.localizedDescription)")
         }
     }
 

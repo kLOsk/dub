@@ -105,6 +105,12 @@ extension LibraryTrack {
     var versionTokensSortKey: String { versionTokens ?? "" }
     var composerSortKey: String { composer ?? "" }
     var trackNumberSortKey: Int32 { trackNumber ?? Int32.max }
+    /// v8 rating sort: unrated tracks fold to `-1` so a descending
+    /// sort puts the 5-star tracks on top and the unrated at the
+    /// bottom (the order a DJ scanning for their best records wants).
+    var ratingSortKey: Int32 { rating ?? -1 }
+    /// v8 colour sort: by token string; unlabelled folds to `""`.
+    var colorSortKey: String { color ?? "" }
     /// Manual-order rank inside the crate this row was listed from.
     /// `crateOrdinal` is `nil` for every non-crate listing; folding
     /// those to `UInt32.max` keeps the comparator total even though
@@ -140,6 +146,13 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
     case trackNumber
     case versionTokens
     case source
+    /// 0–5 star rating (v8). Click a star to set; click the current
+    /// rating again to clear. Reads `LibraryTrack.rating`.
+    case rating
+    /// User colour-label swatch (v8). A small menu of palette swatches
+    /// that writes `LibraryTrack.color`; the colour also tints the row
+    /// background (see `trackRow`).
+    case color
 
     var id: String { rawValue }
 
@@ -151,17 +164,20 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
     static let fixedPrefix: [LibraryColumnField] = [.artist, .title]
 
     /// Default trailing columns: Length before BPM (user request).
-    static let defaultTrailing: [LibraryColumnField] = [.duration, .bpm, .comment]
+    static let defaultTrailing: [LibraryColumnField] = [
+        .duration, .bpm, .rating, .color, .comment,
+    ]
 
     /// Columns the user can show/hide via header right-click.
     static let configurable: [LibraryColumnField] = [
-        .duration, .bpm, .album, .genre, .year, .key,
+        .duration, .bpm, .rating, .color, .album, .genre, .year, .key,
         .comment, .composer, .trackNumber, .versionTokens, .source,
     ]
 
     var pickerCategory: String {
         switch self {
-        case .artist, .title, .source, .versionTokens, .crateOrder:
+        case .artist, .title, .source, .versionTokens, .crateOrder,
+            .rating, .color:
             return "Library"
         case .album, .genre, .year, .comment, .composer, .trackNumber:
             return "ID3 metadata"
@@ -186,8 +202,160 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
         case .trackNumber: return "Track #"
         case .versionTokens: return "Version"
         case .source: return "Source"
+        case .rating: return "Rating"
+        case .color: return "Color"
         }
     }
+}
+
+// MARK: - Library filter bar (v8)
+
+/// One dimension the dynamic filter bar can filter on. Most are
+/// categorical (a list of the distinct values in the current view);
+/// `bpm` is special-cased into auto-generated tempo buckets and
+/// `rating` into a "≥ N stars" threshold.
+private enum LibraryFilterField: String, CaseIterable, Identifiable {
+    case genre, artist, album, key, color, source, version, composer, year
+    case bpm
+    case rating
+
+    var id: String { rawValue }
+
+    enum Kind { case categorical, bpmBuckets, ratingThreshold }
+    var kind: Kind {
+        switch self {
+        case .bpm: return .bpmBuckets
+        case .rating: return .ratingThreshold
+        default: return .categorical
+        }
+    }
+
+    /// Boxes shown out of the box; the rest are added via the picker.
+    static let defaultEnabled: [LibraryFilterField] = [.genre, .bpm, .key, .rating]
+    /// Every dimension offered in the box picker, in menu order.
+    static let configurable: [LibraryFilterField] = [
+        .genre, .bpm, .key, .rating, .artist, .album, .color, .source, .year,
+        .version, .composer,
+    ]
+
+    var headerLabel: String {
+        switch self {
+        case .genre: return "Genre"
+        case .artist: return "Artist"
+        case .album: return "Album"
+        case .key: return "Key"
+        case .color: return "Color"
+        case .source: return "Source"
+        case .version: return "Version"
+        case .composer: return "Composer"
+        case .year: return "Year"
+        case .bpm: return "BPM"
+        case .rating: return "Rating"
+        }
+    }
+
+    var pickerCategory: String {
+        switch self {
+        case .bpm, .key, .rating: return "Analysis"
+        case .album, .genre, .year, .composer: return "ID3 metadata"
+        case .artist, .source, .version, .color: return "Library"
+        }
+    }
+
+    /// The facet value(s) a track contributes for this categorical
+    /// dimension — the single source of truth shared by the box's value
+    /// list and the match predicate, so they can never drift. `nil` is
+    /// the canonical "(none)" bucket. `version` is multi-valued. `bpm` /
+    /// `rating` are not categorical and return `[]`.
+    func categoricalValues(of t: LibraryTrack) -> [String?] {
+        switch self {
+        case .genre: return [t.genre]
+        case .artist: return [t.artist]
+        case .album: return [t.album]
+        case .key: return [t.key]
+        case .color: return [t.color]
+        case .source: return [t.source]
+        case .composer: return [t.composer]
+        case .year: return [t.year.map { String($0) }]
+        case .version:
+            guard let v = t.versionTokens, !v.isEmpty else { return [nil] }
+            return v.split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespaces) }
+        case .bpm, .rating: return []
+        }
+    }
+}
+
+/// One auto-generated tempo bucket `[lo, hi)` for the BPM filter box.
+/// Boundaries are derived from the *full view's* BPM span so they stay
+/// stable while counts cascade (see `recomputeFacets`).
+private struct BpmBucket: Hashable {
+    let lo: Double
+    let hi: Double
+    func contains(_ bpm: Double) -> Bool { bpm >= lo && bpm < hi }
+    /// e.g. "124–128".
+    var label: String { "\(Int(lo.rounded()))–\(Int(hi.rounded()))" }
+}
+
+/// The DJ's active selections in the filter bar. Within a box the
+/// selected values are OR'd; across boxes they're AND'd. Transient —
+/// reset whenever the source view changes.
+private struct LibraryFilterState {
+    /// Selected categorical values per dimension (`nil` = "(none)").
+    var categorical: [LibraryFilterField: Set<String?>] = [:]
+    /// Selected BPM buckets.
+    var bpmBuckets: Set<BpmBucket> = []
+    /// "≥ N stars", or `nil` for no rating filter.
+    var ratingThreshold: Int32? = nil
+
+    var isActive: Bool {
+        categorical.values.contains { !$0.isEmpty }
+            || !bpmBuckets.isEmpty
+            || ratingThreshold != nil
+    }
+
+    mutating func reset() {
+        categorical = [:]
+        bpmBuckets = []
+        ratingThreshold = nil
+    }
+
+    /// `true` when `t` passes every active box. `skip` omits one
+    /// dimension's own contribution, which is how the cascading facet
+    /// counts are computed (a box never filters itself out of its own
+    /// list). A BPM / rating filter excludes nil / unrated tracks while
+    /// active — a "124–128" filter that kept un-analysed tracks would
+    /// defeat the point.
+    func passes(_ t: LibraryTrack, excluding skip: LibraryFilterField? = nil) -> Bool {
+        for (field, selected) in categorical where field != skip && !selected.isEmpty {
+            let vals = field.categoricalValues(of: t)
+            if !vals.contains(where: { selected.contains($0) }) { return false }
+        }
+        if skip != .bpm && !bpmBuckets.isEmpty {
+            guard let bpm = t.bpm, bpmBuckets.contains(where: { $0.contains(bpm) }) else {
+                return false
+            }
+        }
+        if skip != .rating, let threshold = ratingThreshold {
+            guard (t.rating ?? -1) >= threshold else { return false }
+        }
+        return true
+    }
+}
+
+/// One value row in a categorical filter box: a distinct value (`nil` =
+/// "(none)") and how many tracks in the cascaded view carry it.
+private struct LibraryFacetValue: Identifiable {
+    let value: String?
+    let count: Int
+    var id: String { value ?? "\u{0000}none" }
+}
+
+/// One BPM bucket row: the bucket and its cascaded count.
+private struct LibraryBpmBucketCount: Identifiable {
+    let bucket: BpmBucket
+    let count: Int
+    var id: String { bucket.label }
 }
 
 /// Sections in the left-hand source tree per PRD §8.5.1.
@@ -215,6 +383,11 @@ private enum LibrarySource: Hashable, Identifiable {
     /// the `imported_crates.id`; the display name is looked up live from
     /// `libraryModel.importedSources`, the same way `dubCrate` does.
     case importedCrate(id: Int64)
+    /// A favourite quick-access slot (v8): selecting it loads whatever
+    /// crate / playlist is pinned to slot `slot` (0–7). The label and
+    /// target resolve live from `libraryModel.favoriteSlots`. Selected
+    /// from the 8-slot strip above the list, not from the sidebar tree.
+    case favoriteSlot(slot: UInt32)
     case realRecordsPlaceholder
 
     var id: Self { self }
@@ -228,6 +401,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .dubCrate:                    return "Crate"
         case .importedSource(let kind):    return kind.label
         case .importedCrate:               return "Playlist"
+        case .favoriteSlot:                return "Favourite"
         case .realRecordsPlaceholder:      return "Real Records"
         }
     }
@@ -241,6 +415,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .dubCrate:                    return "square.stack.fill"
         case .importedSource(let kind):    return kind.systemImage
         case .importedCrate:               return "list.bullet"
+        case .favoriteSlot:                return "star.fill"
         case .realRecordsPlaceholder:      return "opticaldisc"
         }
     }
@@ -262,7 +437,7 @@ private enum LibrarySource: Hashable, Identifiable {
     var isAvailable: Bool {
         switch self {
         case .allTracks, .recentlyPlayed, .sessionHistory, .justImported: return true
-        case .dubCrate, .importedSource, .importedCrate: return true
+        case .dubCrate, .importedSource, .importedCrate, .favoriteSlot: return true
         default:                                         return false
         }
     }
@@ -284,7 +459,8 @@ private enum LibrarySource: Hashable, Identifiable {
         // the user just dragged into place, exactly like the smart
         // crates' recency order. Session History is the set's
         // play order — same contract.
-        case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate, .importedCrate:
+        case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate, .importedCrate,
+            .favoriteSlot:
             return true
         default: return false
         }
@@ -301,6 +477,8 @@ private enum LibrarySource: Hashable, Identifiable {
             return "Dub Crates"
         case .importedSource, .importedCrate:
             return "Imported Sources"
+        case .favoriteSlot:
+            return "Favourites"
         case .realRecordsPlaceholder:
             return "Real Records"
         }
@@ -392,6 +570,21 @@ struct LibraryView: View {
     /// Per-column widths keyed by `LibraryColumnField.rawValue` JSON.
     @AppStorage("libraryColumnWidths") private var columnWidthsStorage: String = ""
 
+    // v8 filter bar. Enabled box SET + collapsed flag persist (mirror the
+    // column config); the active selections are transient (`filterState`).
+    @AppStorage("libraryFilterBoxes") private var filterBoxesStorage: String =
+        "genre,bpm,key,rating"
+    @AppStorage("libraryFilterBarCollapsed") private var filterBarCollapsed: Bool = false
+
+    /// Active filter selections (transient; reset on source change).
+    @State private var filterState = LibraryFilterState()
+    /// Memoized categorical facet value-lists per box, recomputed only on
+    /// real changes (refresh / filter toggle / enabled-set change) — same
+    /// per-body-re-eval discipline as `sortedTracks`.
+    @State private var facets: [LibraryFilterField: [LibraryFacetValue]] = [:]
+    /// Memoized BPM bucket rows + cascaded counts.
+    @State private var bpmBucketFacet: [LibraryBpmBucketCount] = []
+
     /// In-progress resize width for one column. Header and row cells
     /// both use this preview so the table tracks the resize live.
     @State private var columnResizePreview: (field: LibraryColumnField, width: CGFloat)?
@@ -481,6 +674,10 @@ struct LibraryView: View {
     /// track-id ordering is unchanged.
     @State private var tracksContentRevision: UInt64 = 0
 
+    /// v8 — the favourite slot index currently under a drag, for the
+    /// drop-highlight ring. `nil` when no drag is hovering a slot.
+    @State private var favoriteDropTarget: UInt32? = nil
+
     @FocusState private var searchFocused: Bool
 
     /// M11d.4 — `true` while the Relocate sheet is presented.
@@ -528,6 +725,10 @@ struct LibraryView: View {
                 sortAscending = true
                 sortOrder = [KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward)]
             }
+            // v8: a new view has its own distinct values, so the active
+            // filter selections no longer apply. `refreshTracks` rebuilds
+            // the facets from the new `tracks`.
+            filterState.reset()
             refreshTracks()
         }
         .onChange(of: libraryModel.libraryIsOpen) { _ in
@@ -577,6 +778,11 @@ struct LibraryView: View {
             // reorder / delete). Only the currently-open crate view
             // needs to re-fetch; other sources are unaffected.
             guard selectedSource.crateId != nil else { return }
+            refreshTracks(preserveSelection: true)
+        }
+        .onChange(of: libraryModel.rowAttributeGeneration) { _ in
+            // v8 — a star rating or colour label changed; repaint the
+            // visible rows so the stars + tint update in place.
             refreshTracks(preserveSelection: true)
         }
         // M11d.6 round 3 — the previously-present
@@ -765,6 +971,11 @@ struct LibraryView: View {
             NSApp.keyWindow?.makeFirstResponder(nil)
             selectedSource = source
         }
+        // v8 — drag a crate onto a favourites slot (payload decoded in
+        // `handleFavoriteDrop`).
+        .onDrag {
+            NSItemProvider(object: "dubcrate:\(crate.id)" as NSString)
+        }
         .onDrop(of: [.fileURL], isTargeted: dropTargetBinding(for: crate.id)) { providers in
             handleCrateDrop(providers, crateId: crate.id)
         }
@@ -925,6 +1136,10 @@ struct LibraryView: View {
             NSApp.keyWindow?.makeFirstResponder(nil)
             selectedSource = source
         }
+        // v8 — drag an imported playlist onto a favourites slot.
+        .onDrag {
+            NSItemProvider(object: "importedcrate:\(crate.id)" as NSString)
+        }
     }
 
     private func sidebarRow(_ entry: LibrarySource) -> some View {
@@ -972,6 +1187,14 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             toolbar
             Divider().overlay(DubColor.divider)
+            if libraryModel.libraryIsOpen {
+                favoritesStrip
+                Divider().overlay(DubColor.divider)
+            }
+            if libraryModel.libraryIsOpen && !enabledFilterFields.isEmpty {
+                filterBar
+                Divider().overlay(DubColor.divider)
+            }
             trackListContainer
             Divider().overlay(DubColor.divider)
             footer
@@ -982,6 +1205,109 @@ struct LibraryView: View {
             searchFocused = false
             NSApp.keyWindow?.makeFirstResponder(nil)
         }
+    }
+
+    // MARK: - Favourites strip (v8)
+
+    /// The fixed 8-slot quick-access strip above the track list. Drag a
+    /// Dub crate or imported playlist from the sidebar onto a slot; click
+    /// an occupied slot to load it; right-click → Clear.
+    private var favoritesStrip: some View {
+        HStack(spacing: DubSpacing.sm) {
+            ForEach(0..<8, id: \.self) { index in
+                favoriteSlotView(UInt32(index))
+            }
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .background(DubColor.surface1)
+    }
+
+    @ViewBuilder
+    private func favoriteSlotView(_ index: UInt32) -> some View {
+        let slot = libraryModel.favoriteSlots.first { $0.slotIndex == index }
+        let isSelected = selectedSource == .favoriteSlot(slot: index)
+        let isDropTarget = favoriteDropTarget == index
+        // A resolved-but-now-missing target (its source playlist vanished
+        // on the last re-scan) renders dimmed.
+        let stale = slot != nil && slot?.resolvedId == nil
+        Button {
+            if slot != nil { selectedSource = .favoriteSlot(slot: index) }
+        } label: {
+            HStack(spacing: DubSpacing.xs) {
+                Image(systemName: slot == nil ? "plus" : "star.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(slot == nil ? DubColor.textTertiary : DubColor.deckATint)
+                // Empty slots prompt the drag; occupied slots show the
+                // pinned playlist name (dimmed when its target is gone).
+                Text(slot?.label ?? "Drag a playlist")
+                    .font(DubFont.micro)
+                    .foregroundStyle(
+                        (slot == nil || stale) ? DubColor.textTertiary : DubColor.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .padding(.horizontal, DubSpacing.sm)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isSelected ? DubColor.surface3 : DubColor.surface2))
+            .overlay(
+                // A dashed border on empty slots signals "drop a playlist
+                // here"; occupied / drop-hovered slots get a solid ring.
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(
+                        isDropTarget ? DubColor.deckATint : DubColor.divider,
+                        style: StrokeStyle(
+                            lineWidth: isDropTarget ? 1.5 : 1,
+                            dash: (slot == nil && !isDropTarget) ? [3, 3] : [])))
+        }
+        .buttonStyle(.plain)
+        .help(slotHelp(slot))
+        .onDrop(of: [.text], isTargeted: favoriteDropBinding(index)) { providers in
+            handleFavoriteDrop(providers, slot: index)
+        }
+        .contextMenu {
+            if slot != nil {
+                Button("Clear Slot") {
+                    Task { await model.clearFavoriteSlot(slot: index) }
+                }
+            }
+        }
+    }
+
+    private func slotHelp(_ slot: LibraryFavoriteSlot?) -> String {
+        guard let slot else { return "Drag a crate or playlist here" }
+        if slot.resolvedId == nil { return "\(slot.label) — source playlist no longer found" }
+        return slot.label
+    }
+
+    private func favoriteDropBinding(_ index: UInt32) -> Binding<Bool> {
+        Binding(
+            get: { favoriteDropTarget == index },
+            set: { isTargeted in favoriteDropTarget = isTargeted ? index : nil })
+    }
+
+    /// Decode the dragged sidebar payload (`dubcrate:<id>` /
+    /// `importedcrate:<id>`) and pin it to `slot`.
+    private func handleFavoriteDrop(_ providers: [NSItemProvider], slot: UInt32) -> Bool {
+        guard let provider = providers.first else { return false }
+        _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
+            guard let payload = obj as? String else { return }
+            Task { @MainActor in
+                if payload.hasPrefix("dubcrate:"),
+                    let id = Int64(payload.dropFirst("dubcrate:".count))
+                {
+                    await model.setFavoriteDubCrate(slot: slot, crateId: id)
+                } else if payload.hasPrefix("importedcrate:"),
+                    let id = Int64(payload.dropFirst("importedcrate:".count))
+                {
+                    await model.setFavoriteImportedCrate(slot: slot, importedCrateId: id)
+                }
+            }
+        }
+        return true
     }
 
     private var toolbar: some View {
@@ -1060,6 +1386,297 @@ struct LibraryView: View {
         .background(DubColor.surface2)
     }
 
+    // MARK: - Filter bar view (v8)
+
+    private var filterBar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: DubSpacing.sm) {
+                Button {
+                    filterBarCollapsed.toggle()
+                } label: {
+                    HStack(spacing: DubSpacing.xs) {
+                        Image(systemName: filterBarCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DubColor.textSecondary)
+                        Text("FILTER")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textTertiary)
+                    }
+                }
+                .buttonStyle(.plain)
+                if filterState.isActive {
+                    Button {
+                        filterState.reset()
+                        applyFilterChange()
+                    } label: {
+                        Text("Clear")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.deckATint)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+                filterBoxPicker
+            }
+            .padding(.horizontal, DubSpacing.lg)
+            .padding(.vertical, DubSpacing.xs)
+            if !filterBarCollapsed {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: DubSpacing.sm) {
+                        ForEach(enabledFilterFields) { field in
+                            filterBox(field)
+                        }
+                    }
+                    .padding(.horizontal, DubSpacing.lg)
+                    .padding(.bottom, DubSpacing.xs)
+                }
+            }
+        }
+        .background(DubColor.surface1)
+    }
+
+    private func filterBox(_ field: LibraryFilterField) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: DubSpacing.xs) {
+                Text(field.headerLabel.uppercased())
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textSecondary)
+                Spacer(minLength: 0)
+                if filterBoxHasSelection(field) {
+                    Button {
+                        clearFilterBox(field)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(DubColor.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, DubSpacing.sm)
+            .padding(.vertical, 4)
+            Divider().overlay(DubColor.divider)
+            filterBoxBody(field)
+        }
+        .frame(width: 168, height: 150, alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 4).fill(DubColor.surface2))
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(DubColor.divider, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private func filterBoxBody(_ field: LibraryFilterField) -> some View {
+        switch field.kind {
+        case .categorical:
+            filterValueList(field)
+        case .bpmBuckets:
+            bpmBucketList()
+        case .ratingThreshold:
+            ratingThresholdControl()
+        }
+    }
+
+    @ViewBuilder
+    private func filterValueList(_ field: LibraryFilterField) -> some View {
+        let values = facets[field] ?? []
+        if values.isEmpty {
+            Text("—")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView(showsIndicators: true) {
+                VStack(spacing: 0) {
+                    ForEach(values) { fv in
+                        let selected = filterState.categorical[field]?.contains(fv.value) ?? false
+                        filterValueRow(
+                            label: fv.value ?? "(none)",
+                            count: fv.count,
+                            selected: selected,
+                            swatch: field == .color ? DubColor.trackLabel(fv.value) : nil,
+                            dim: fv.value == nil
+                        ) {
+                            toggleCategorical(field, fv.value)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bpmBucketList() -> some View {
+        if bpmBucketFacet.isEmpty {
+            Text("No BPM")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView(showsIndicators: true) {
+                VStack(spacing: 0) {
+                    ForEach(bpmBucketFacet) { row in
+                        filterValueRow(
+                            label: row.bucket.label,
+                            count: row.count,
+                            selected: filterState.bpmBuckets.contains(row.bucket),
+                            swatch: nil,
+                            dim: false
+                        ) {
+                            toggleBpmBucket(row.bucket)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func ratingThresholdControl() -> some View {
+        VStack(alignment: .leading, spacing: DubSpacing.xs) {
+            Text(filterState.ratingThreshold.map { "≥ \($0) stars" } ?? "Any rating")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textSecondary)
+            HStack(spacing: 2) {
+                ForEach(1..<6, id: \.self) { star in
+                    let n = Int32(star)
+                    Button {
+                        filterState.ratingThreshold = (filterState.ratingThreshold == n) ? nil : n
+                        applyFilterChange()
+                    } label: {
+                        Image(systemName: n <= (filterState.ratingThreshold ?? 0) ? "star.fill" : "star")
+                            .font(.system(size: 12))
+                            .foregroundStyle(
+                                n <= (filterState.ratingThreshold ?? 0)
+                                    ? DubColor.stateTentative : DubColor.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(DubSpacing.sm)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func filterValueRow(
+        label: String,
+        count: Int,
+        selected: Bool,
+        swatch: Color?,
+        dim: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: DubSpacing.xs) {
+                Image(systemName: selected ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 9))
+                    .foregroundStyle(selected ? DubColor.deckATint : DubColor.textTertiary)
+                if let swatch {
+                    RoundedRectangle(cornerRadius: 2).fill(swatch).frame(width: 9, height: 9)
+                }
+                Text(label)
+                    .font(DubFont.micro)
+                    .foregroundStyle(dim ? DubColor.textTertiary : DubColor.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 2)
+                Text("\(count)")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, DubSpacing.sm)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? DubColor.surface3 : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Filter bar actions + picker (v8)
+
+    private func filterBoxHasSelection(_ field: LibraryFilterField) -> Bool {
+        switch field.kind {
+        case .categorical: return !(filterState.categorical[field]?.isEmpty ?? true)
+        case .bpmBuckets: return !filterState.bpmBuckets.isEmpty
+        case .ratingThreshold: return filterState.ratingThreshold != nil
+        }
+    }
+
+    private func clearFilterBox(_ field: LibraryFilterField) {
+        switch field.kind {
+        case .categorical: filterState.categorical[field] = []
+        case .bpmBuckets: filterState.bpmBuckets = []
+        case .ratingThreshold: filterState.ratingThreshold = nil
+        }
+        applyFilterChange()
+    }
+
+    private func toggleCategorical(_ field: LibraryFilterField, _ value: String?) {
+        var set = filterState.categorical[field] ?? []
+        if set.contains(value) { set.remove(value) } else { set.insert(value) }
+        filterState.categorical[field] = set
+        applyFilterChange()
+    }
+
+    private func toggleBpmBucket(_ bucket: BpmBucket) {
+        if filterState.bpmBuckets.contains(bucket) {
+            filterState.bpmBuckets.remove(bucket)
+        } else {
+            filterState.bpmBuckets.insert(bucket)
+        }
+        applyFilterChange()
+    }
+
+    /// The "+" menu that toggles which filter boxes are shown, grouped by
+    /// category — mirrors the column-visibility picker.
+    private var filterBoxPicker: some View {
+        Menu {
+            ForEach(filterPickerCategories, id: \.self) { category in
+                Section(category) {
+                    ForEach(
+                        LibraryFilterField.configurable.filter { $0.pickerCategory == category }
+                    ) { field in
+                        Toggle(field.headerLabel, isOn: filterBoxBinding(field))
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+                .font(.system(size: 11))
+                .foregroundStyle(DubColor.textSecondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private var filterPickerCategories: [String] {
+        var seen = Set<String>()
+        return LibraryFilterField.configurable
+            .map(\.pickerCategory)
+            .filter { seen.insert($0).inserted }
+    }
+
+    private func filterBoxBinding(_ field: LibraryFilterField) -> Binding<Bool> {
+        Binding(
+            get: { enabledFilterFields.contains(field) },
+            set: { setFilterBoxEnabled(field, enabled: $0) })
+    }
+
+    private func setFilterBoxEnabled(_ field: LibraryFilterField, enabled: Bool) {
+        var fields = enabledFilterFields
+        if enabled {
+            if !fields.contains(field) { fields.append(field) }
+        } else {
+            fields.removeAll { $0 == field }
+            // Drop the removed box's selection so it stops filtering.
+            filterState.categorical[field] = nil
+            if field == .bpm { filterState.bpmBuckets = [] }
+            if field == .rating { filterState.ratingThreshold = nil }
+        }
+        filterBoxesStorage = fields.map(\.rawValue).joined(separator: ",")
+        applyFilterChange()
+    }
+
     @ViewBuilder
     private var trackListContainer: some View {
         if !libraryModel.libraryIsOpen {
@@ -1074,6 +1691,25 @@ struct LibraryView: View {
             placeholderPane(
                 title: emptyTitle,
                 subtitle: emptySubtitle)
+        } else if sortedTracks.isEmpty && filterState.isActive {
+            // The view has tracks but the active filters hide them all.
+            VStack(spacing: DubSpacing.sm) {
+                Spacer()
+                Text("No tracks match the active filters")
+                    .font(DubFont.body)
+                    .foregroundStyle(DubColor.textSecondary)
+                Button {
+                    filterState.reset()
+                    applyFilterChange()
+                } label: {
+                    Text("Clear filters")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.deckATint)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             trackList
         }
@@ -1375,6 +2011,10 @@ struct LibraryView: View {
     /// render identically because `crateOrdinal` is dense `0..n`.
     private var isCrateManualOrder: Bool {
         guard isCrateView else { return false }
+        // v8: drag-to-reorder operates on the visible (filtered) ids; a
+        // reorder over a partial list would drop hidden rows, so disable
+        // it while a filter is active.
+        if filterState.isActive { return false }
         if activeSortColumn == nil { return true }
         return activeSortColumn == .crateOrder && sortAscending
     }
@@ -1619,6 +2259,10 @@ struct LibraryView: View {
             sortOrder = [KeyPathComparator(\.composerSortKey, order: order)]
         case .trackNumber:
             sortOrder = [KeyPathComparator(\.trackNumberSortKey, order: order)]
+        case .rating:
+            sortOrder = [KeyPathComparator(\.ratingSortKey, order: order)]
+        case .color:
+            sortOrder = [KeyPathComparator(\.colorSortKey, order: order)]
         }
     }
 
@@ -1634,6 +2278,8 @@ struct LibraryView: View {
         case .comment, .album, .genre, .versionTokens, .source: return 140
         case .composer: return 120
         case .trackNumber: return 52
+        case .rating: return 92
+        case .color: return 44
         }
     }
 
@@ -1821,6 +2467,84 @@ struct LibraryView: View {
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
                 .monospacedDigit()
+        case .rating:
+            // Click the Nth star to rate; click the current rating to
+            // clear it. Writes through `model.setTrackRating`.
+            let current = Int(track.rating ?? 0)
+            HStack(spacing: 1) {
+                ForEach(1..<6, id: \.self) { star in
+                    Button {
+                        let newValue: UInt8? = star == current ? nil : UInt8(star)
+                        Task { await model.setTrackRating(trackId: track.id, rating: newValue) }
+                    } label: {
+                        Image(systemName: star <= current ? "star.fill" : "star")
+                            .font(.system(size: 9))
+                            .foregroundStyle(
+                                star <= current
+                                    ? DubColor.stateTentative : DubColor.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        case .color:
+            colorCell(track)
+        }
+    }
+
+    /// Colour-label cell. The swatch box is rendered as **normal cell
+    /// content** (a `Menu` with `.borderlessButton` style drops `Shape`
+    /// label content — only symbols/text survive — which is why the box
+    /// + border were invisible). The palette `Menu` sits on top as a
+    /// clear overlay purely to handle the click, so the swatch renders
+    /// reliably underneath. Set colour also tints the row (see `trackRow`).
+    private func colorCell(_ track: LibraryTrack) -> some View {
+        let swatch = DubColor.trackLabel(track.color)
+        return RoundedRectangle(cornerRadius: 3)
+            .fill(swatch ?? DubColor.surface3)
+            .frame(width: 15, height: 15)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3)
+                    .strokeBorder(
+                        swatch != nil ? Color.white.opacity(0.75) : DubColor.textTertiary,
+                        lineWidth: 1))
+            .overlay {
+                if swatch == nil {
+                    Image(systemName: "plus")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(DubColor.textTertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .overlay {
+                Menu {
+                    colorMenuItems(track)
+                } label: {
+                    Color.clear
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+            }
+    }
+
+    @ViewBuilder
+    private func colorMenuItems(_ track: LibraryTrack) -> some View {
+        ForEach(DubColor.trackLabelPalette, id: \.token) { entry in
+            Button {
+                Task { await model.setTrackColor(trackId: track.id, color: entry.token) }
+            } label: {
+                Label {
+                    Text(entry.token.capitalized)
+                } icon: {
+                    Image(systemName: "square.fill").foregroundStyle(entry.color)
+                }
+            }
+        }
+        Divider()
+        Button {
+            Task { await model.setTrackColor(trackId: track.id, color: nil) }
+        } label: {
+            Label("None", systemImage: "slash.circle")
         }
     }
 
@@ -1847,6 +2571,11 @@ struct LibraryView: View {
             width: tableContentWidth,
             height: LibraryRowLayout.estimatedHeight,
             alignment: .leading)
+        // v8 colour label tints the whole row. NB: the selection
+        // highlight is painted by the AppKit layer *beneath* the row
+        // host, so a low opacity keeps a selected+coloured row legible;
+        // tune here if selected coloured rows read wrong.
+        .background(DubColor.trackLabel(track.color).map { $0.opacity(0.18) } ?? Color.clear)
         .contentShape(Rectangle())
         .if(dragURL != nil) { view in
             view.onDrag { [rowSelection] in
@@ -2100,13 +2829,119 @@ struct LibraryView: View {
     /// idiom. The cost is one sort + one map per real change,
     /// down from three sorts + two maps per body re-eval pre-fix.
     private func recomputeSortedTracks() {
-        let sorted = sortOrder.isEmpty
-            ? tracks
-            : tracks.sorted(using: sortOrder)
+        // v8: sort the FILTERED subset. `tracks` stays the full current
+        // view (so the filter boxes can list its distinct values); every
+        // render path reads `sortedTracks` / `sortedTrackIds`, so the
+        // whole table inherits filtering from this one choke point.
+        let base = filteredTracks
+        let sorted = sortOrder.isEmpty ? base : base.sorted(using: sortOrder)
         if sorted != sortedTracks {
             sortedTracks = sorted
             sortedTrackIds = sorted.map(\.id)
         }
+    }
+
+    // MARK: - Filter bar (v8)
+
+    /// Enabled filter boxes, parsed from `@AppStorage` exactly like
+    /// `visibleColumns`: drop unknowns, dedupe, fall back to the default
+    /// set when empty.
+    private var enabledFilterFields: [LibraryFilterField] {
+        var seen = Set<LibraryFilterField>()
+        let parsed = filterBoxesStorage
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .compactMap { LibraryFilterField(rawValue: $0) }
+            .filter { seen.insert($0).inserted }
+        return parsed.isEmpty ? LibraryFilterField.defaultEnabled : parsed
+    }
+
+    /// The current view narrowed by the active filters (the full,
+    /// unfiltered `tracks` when nothing is selected).
+    private var filteredTracks: [LibraryTrack] {
+        filterState.isActive ? tracks.filter { filterState.passes($0) } : tracks
+    }
+
+    /// Rebuild the memoized facet value-lists from the full view. Each
+    /// categorical box tallies its values over the *other* boxes' active
+    /// filters (self-excluded → cascading counts). BPM bucket boundaries
+    /// come from the full view's span (stable); their counts cascade.
+    private func recomputeFacets() {
+        guard libraryModel.libraryIsOpen, !tracks.isEmpty else {
+            facets = [:]
+            bpmBucketFacet = []
+            return
+        }
+        let fields = enabledFilterFields
+        var out: [LibraryFilterField: [LibraryFacetValue]] = [:]
+        for field in fields where field.kind == .categorical {
+            var counts: [String?: Int] = [:]
+            for t in tracks where filterState.passes(t, excluding: field) {
+                for v in field.categoricalValues(of: t) {
+                    counts[v, default: 0] += 1
+                }
+            }
+            out[field] = counts
+                .map { LibraryFacetValue(value: $0.key, count: $0.value) }
+                .sorted { lhs, rhs in
+                    // "(none)" last; then count desc, then label asc.
+                    if (lhs.value == nil) != (rhs.value == nil) { return rhs.value == nil }
+                    if lhs.count != rhs.count { return lhs.count > rhs.count }
+                    return (lhs.value ?? "") < (rhs.value ?? "")
+                }
+        }
+        facets = out
+
+        if fields.contains(.bpm) {
+            let buckets = Self.bpmBuckets(for: tracks)
+            bpmBucketFacet = buckets.compactMap { bucket in
+                let count = tracks.filter {
+                    filterState.passes($0, excluding: .bpm)
+                        && ($0.bpm.map(bucket.contains) ?? false)
+                }.count
+                return count > 0 ? LibraryBpmBucketCount(bucket: bucket, count: count) : nil
+            }
+        } else {
+            bpmBucketFacet = []
+        }
+    }
+
+    /// Auto tempo buckets covering the view's BPM span, with a nice-
+    /// rounded width targeting ~10 buckets so the ranges read cleanly.
+    private static func bpmBuckets(for tracks: [LibraryTrack]) -> [BpmBucket] {
+        let bpms = tracks.compactMap(\.bpm)
+        guard let lo = bpms.min(), let hi = bpms.max(), hi > lo else {
+            // All one tempo (or none analysed): a single tight bucket.
+            if let only = bpms.first {
+                return [BpmBucket(lo: only.rounded(.down), hi: only.rounded(.down) + 1)]
+            }
+            return []
+        }
+        let span = hi - lo
+        let width = [1.0, 2, 5, 10, 20].first { span / $0 <= 10 } ?? 20
+        let start = (lo / width).rounded(.down) * width
+        var buckets: [BpmBucket] = []
+        var edge = start
+        while edge <= hi {
+            buckets.append(BpmBucket(lo: edge, hi: edge + width))
+            edge += width
+        }
+        return buckets
+    }
+
+    /// Apply a filter-box change: re-sort the filtered set, rebuild the
+    /// cascaded facets, prune selection to the now-visible rows, and bump
+    /// the revision so the AppKit table repaints.
+    private func applyFilterChange() {
+        recomputeSortedTracks()
+        recomputeFacets()
+        let visible = Set(sortedTrackIds)
+        rowSelection.selectedTrackIds.formIntersection(visible)
+        if let anchor = rowSelection.selectionAnchorId, !visible.contains(anchor) {
+            rowSelection.selectionAnchorId = rowSelection.selectedTrackIds.sorted().first
+        }
+        syncModelPrimarySelection()
+        tracksContentRevision &+= 1
     }
 
     /// Finder drag-and-drop onto the library listing. Folders are
@@ -2568,6 +3403,8 @@ struct LibraryView: View {
             return "No \(kind.label) tracks."
         case .importedCrate:
             return "This playlist is empty."
+        case .favoriteSlot:
+            return "This favourite is empty."
         default:
             return "Not available in this build."
         }
@@ -2650,6 +3487,7 @@ struct LibraryView: View {
         guard libraryModel.libraryIsOpen else {
             tracks = []
             recomputeSortedTracks()
+            recomputeFacets()
             rowSelection.selectedTrackIds = []
             rowSelection.selectionAnchorId = nil
             syncModelPrimarySelection()
@@ -2712,6 +3550,8 @@ struct LibraryView: View {
                             source: kind.sourceTag, limit: limit, offset: 0)
                     case .importedCrate(let id):
                         rows = try library.importedCrateTracks(importedCrateId: id)
+                    case .favoriteSlot(let slot):
+                        rows = try library.favoriteSlotTracks(slot: slot)
                     default:
                         rows = []
                     }
@@ -2730,6 +3570,7 @@ struct LibraryView: View {
                 self.tracks = rows
                 self.sessionFromTitles = resolvedFromTitles
                 self.recomputeSortedTracks()
+                self.recomputeFacets()
                 self.tracksContentRevision &+= 1
                 self.isLoading = false
                 // M11d-history: a reveal staged across this refresh
@@ -2744,7 +3585,10 @@ struct LibraryView: View {
                     }
                 }
                 if preserveSelection {
-                    let visible = Set(rows.map(\.id))
+                    // Prune to the visible (filtered + sorted) set, not the
+                    // full `rows`, so a filter active across the refresh
+                    // can't resurrect selection on now-hidden rows.
+                    let visible = Set(self.sortedTrackIds)
                     self.rowSelection.selectedTrackIds =
                         preservedSelection.intersection(visible)
                     if let anchor = preservedAnchor,
@@ -4223,6 +5067,8 @@ private extension LibraryTrack {
             trackNumber: trackNumber,
             gridLocked: gridLocked,
             gridDriftQuality: gridDriftQuality,
+            rating: rating,
+            color: color,
             crateOrdinal: crateOrdinal)
     }
 }

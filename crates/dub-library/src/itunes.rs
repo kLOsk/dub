@@ -32,6 +32,9 @@ pub struct ItunesTrack {
     pub bpm: Option<f64>,
     /// `Year`.
     pub year: Option<i32>,
+    /// Star rating 0–5, derived from iTunes' `Rating` (0–100 in steps
+    /// of 20). `None` when unrated.
+    pub rating: Option<i32>,
     /// `Total Time` in milliseconds.
     pub total_time_ms: Option<i64>,
     /// Absolute filesystem path, decoded from the `Location` `file://` URL.
@@ -263,6 +266,9 @@ fn parse_track_dict(
                 "Genre" => t.genre = nonempty(text),
                 "BPM" => t.bpm = text.parse::<f64>().ok().filter(|b| *b > 0.0),
                 "Year" => t.year = text.parse().ok(),
+                // iTunes `Rating` is 0–100 in steps of 20 (20 = 1 star).
+                // Map to 0–5; clamp guards against odd values.
+                "Rating" => t.rating = text.parse::<i32>().ok().map(|r| (r / 20).clamp(0, 5)),
                 "Total Time" => t.total_time_ms = text.parse().ok(),
                 "Location" => t.path = decode_file_url(&text),
                 _ => {}
@@ -429,6 +435,7 @@ mod tests {
       <key>Genre</key><string>Mashup</string>
       <key>BPM</key><integer>135</integer>
       <key>Year</key><integer>2008</integer>
+      <key>Rating</key><integer>80</integer>
       <key>Total Time</key><integer>261459</integer>
       <key>Location</key><string>file:///Users/dj/Music/Sweet%20Child.mp3</string>
     </dict>
@@ -462,6 +469,8 @@ mod tests {
         assert_eq!(t.genre.as_deref(), Some("Mashup"));
         assert!((t.bpm.unwrap() - 135.0).abs() < 1e-9);
         assert_eq!(t.year, Some(2008));
+        // iTunes Rating 80 → 4 stars (0–100 in steps of 20).
+        assert_eq!(t.rating, Some(4));
         assert_eq!(t.total_time_ms, Some(261_459));
         assert_eq!(t.path.as_deref(), Some("/Users/dj/Music/Sweet Child.mp3"));
 

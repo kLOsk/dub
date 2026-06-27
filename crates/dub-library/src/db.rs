@@ -251,6 +251,15 @@ pub struct TrackRow {
     pub grid_locked: bool,
     /// M11d.7: LSQ drift slope (ms/min) for the ⚠ indicator.
     pub grid_drift_quality: Option<f32>,
+    /// Star rating 0–5 (v8). The DJ's own `tracks.user_rating` if set,
+    /// else the highest-priority imported per-source rating (iTunes
+    /// today). `None` when neither exists. The browser renders it as a
+    /// clickable star column.
+    pub rating: Option<i32>,
+    /// User colour label (v8) — a palette token or `#RRGGBB` from
+    /// `tracks.color`. `None` when unset. The browser tints the row
+    /// background with it.
+    pub color: Option<String>,
 }
 
 /// One Played Into aggregate row (M11d-history): a track the DJ
@@ -325,15 +334,20 @@ impl TrackSortKey {
     fn sql_column(self) -> &'static str {
         match self {
             Self::CreatedAt => "t.created_at",
-            Self::Title => "COALESCE(sr.title, rb.title, tr.title, i3.title, fn.title)",
-            Self::Artist => "COALESCE(sr.artist, rb.artist, tr.artist, i3.artist, fn.artist)",
-            Self::Album => "COALESCE(sr.album, rb.album, tr.album, i3.album)",
+            Self::Title => "COALESCE(sr.title, rb.title, tr.title, it.title, i3.title, fn.title)",
+            Self::Artist => {
+                "COALESCE(sr.artist, rb.artist, tr.artist, it.artist, i3.artist, fn.artist)"
+            }
+            Self::Album => "COALESCE(sr.album, rb.album, tr.album, it.album, i3.album)",
             Self::Bpm => "ag.bpm",
             Self::Duration => "t.duration_ms",
-            Self::Year => "COALESCE(fn.year, sr.year, rb.year, tr.year, i3.year)",
-            Self::Composer => "COALESCE(sr.composer, rb.composer, tr.composer, i3.composer)",
+            Self::Year => "COALESCE(fn.year, sr.year, rb.year, tr.year, it.year, i3.year)",
+            Self::Composer => {
+                "COALESCE(sr.composer, rb.composer, tr.composer, it.composer, i3.composer)"
+            }
             Self::TrackNumber => {
-                "COALESCE(sr.track_number, rb.track_number, tr.track_number, i3.track_number)"
+                "COALESCE(sr.track_number, rb.track_number, tr.track_number, it.track_number, \
+                 i3.track_number)"
             }
         }
     }
@@ -358,11 +372,11 @@ impl TrackSortKey {
 /// libraries.
 const TRACK_ROW_SELECT: &str = "\
     SELECT t.id, \
-           COALESCE(sr.title,  rb.title,  tr.title,  i3.title,  fn.title)  AS title, \
-           COALESCE(sr.artist, rb.artist, tr.artist, i3.artist, fn.artist) AS artist, \
-           COALESCE(sr.album,  rb.album,  tr.album,  i3.album)             AS album, \
-           COALESCE(sr.genre,  rb.genre,  tr.genre,  i3.genre)             AS genre, \
-           COALESCE(fn.year, sr.year, rb.year, tr.year, i3.year)          AS year, \
+           COALESCE(sr.title,  rb.title,  tr.title,  it.title,  i3.title,  fn.title)  AS title, \
+           COALESCE(sr.artist, rb.artist, tr.artist, it.artist, i3.artist, fn.artist) AS artist, \
+           COALESCE(sr.album,  rb.album,  tr.album,  it.album,  i3.album)             AS album, \
+           COALESCE(sr.genre,  rb.genre,  tr.genre,  it.genre,  i3.genre)             AS genre, \
+           COALESCE(fn.year, sr.year, rb.year, tr.year, it.year, i3.year)          AS year, \
            ag.bpm                              AS bpm, \
            ak.key_notation                     AS key, \
            t.duration_ms                       AS duration_ms, \
@@ -372,6 +386,7 @@ const TRACK_ROW_SELECT: &str = "\
                WHEN sr.track_id IS NOT NULL THEN 'serato' \
                WHEN rb.track_id IS NOT NULL THEN 'rekordbox' \
                WHEN tr.track_id IS NOT NULL THEN 'traktor' \
+               WHEN it.track_id IS NOT NULL THEN 'itunes' \
                WHEN i3.track_id IS NOT NULL THEN 'id3' \
                WHEN fn.track_id IS NOT NULL THEN 'filename' \
                ELSE NULL \
@@ -392,12 +407,15 @@ const TRACK_ROW_SELECT: &str = "\
                    END) > 1 THEN 1 ELSE 0 END \
                FROM track_keys tk WHERE tk.track_id = t.id \
            )                                   AS key_disagreement, \
-           COALESCE(sr.comment,  rb.comment,  tr.comment,  i3.comment)       AS comment, \
-           COALESCE(sr.composer, rb.composer, tr.composer, i3.composer)      AS composer, \
-           COALESCE(sr.track_number, rb.track_number, tr.track_number, i3.track_number) \
+           COALESCE(sr.comment,  rb.comment,  tr.comment,  it.comment,  i3.comment)       AS comment, \
+           COALESCE(sr.composer, rb.composer, tr.composer, it.composer, i3.composer)      AS composer, \
+           COALESCE(sr.track_number, rb.track_number, tr.track_number, it.track_number, i3.track_number) \
                                                AS track_number, \
            t.grid_locked                       AS grid_locked, \
-           t.grid_drift_quality                AS grid_drift_quality \
+           t.grid_drift_quality                AS grid_drift_quality, \
+           COALESCE(t.user_rating, sr.rating, rb.rating, tr.rating, it.rating, i3.rating) \
+                                               AS rating, \
+           t.color                             AS color \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
@@ -409,6 +427,8 @@ const TRACK_ROW_SELECT: &str = "\
               ON rb.track_id = t.id AND rb.source = 'rekordbox' \
     LEFT JOIN track_metadata_source tr \
               ON tr.track_id = t.id AND tr.source = 'traktor' \
+    LEFT JOIN track_metadata_source it \
+              ON it.track_id = t.id AND it.source = 'itunes' \
     LEFT JOIN track_beatgrids ag \
               ON ag.track_id = t.id AND ag.is_active = 1 \
     LEFT JOIN track_keys ak \
@@ -471,7 +491,29 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
             flag != 0
         },
         grid_drift_quality: r.get(21)?,
+        rating: r.get(22)?,
+        color: r.get(23)?,
     })
+}
+
+/// Walk an imported-crate id up its parent chain in a pre-loaded
+/// `id → (name, parent)` map and return the slash-joined root→leaf path.
+/// Bounded so a malformed cycle can't loop forever. Used by
+/// [`Library::resolve_imported_path`] to match a favourite's stored path
+/// against the current mirror.
+fn path_for(by_id: &std::collections::HashMap<i64, (String, Option<i64>)>, id: i64) -> String {
+    let mut names = Vec::new();
+    let mut current = Some(id);
+    for _ in 0..256 {
+        let Some(cur) = current else { break };
+        let Some((name, parent)) = by_id.get(&cur) else {
+            break;
+        };
+        names.push(name.clone());
+        current = *parent;
+    }
+    names.reverse();
+    names.join("/")
 }
 
 /// Collect a row-mapped iterator into `Vec<TrackRow>`, propagating
@@ -599,6 +641,34 @@ pub struct ImportedCrateRow {
     /// Number of tracks directly in this node (not counting descendants).
     pub track_count: u64,
 }
+
+/// One favourite-playlist quick-access slot (v8). Backs the fixed
+/// 8-slot strip above the library. A slot points at either a Dub crate
+/// or an imported node playlist; `resolved_id` is the *current*
+/// `crates.id` / `imported_crates.id` the reference resolves to, or
+/// `None` when the target no longer exists (e.g. an imported playlist
+/// that vanished from the source on the last re-scan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FavoriteSlot {
+    /// 0–7 slot position in the strip.
+    pub slot_index: u32,
+    /// `"dub_crate"` or `"imported_crate"`.
+    pub kind: String,
+    /// Cached display name (rendered before resolution).
+    pub label: String,
+    /// Source tag for an imported slot (`serato` / … ); `None` for a
+    /// Dub-crate slot.
+    pub source: Option<String>,
+    /// Current resolved id (`crates.id` for a Dub crate, the live
+    /// `imported_crates.id` for an imported playlist), or `None` if the
+    /// target is gone.
+    pub resolved_id: Option<i64>,
+}
+
+/// A raw `favorite_slots` reference row:
+/// `(kind, dub_crate_id, imported_source, imported_path)`. Aliased to
+/// keep the query mapper under clippy's type-complexity threshold.
+type FavoriteSlotRef = (String, Option<i64>, Option<String>, Option<String>);
 
 impl Library {
     /// Open (creating if missing) the library at the default platform
@@ -1443,6 +1513,36 @@ impl Library {
         Ok(())
     }
 
+    /// Set the DJ's own star rating (v8). `Some(0..=5)` stores a rating
+    /// that overrides any imported per-source rating; `None` clears it
+    /// (the browser falls back to the imported rating). Values are
+    /// clamped to `0..=5` so a bad caller can't trip the CHECK.
+    pub fn set_user_rating(&self, track_uuid: &str, rating: Option<u8>) -> Result<()> {
+        let clamped = rating.map(|r| i64::from(r.min(5)));
+        self.conn
+            .execute(
+                "UPDATE tracks SET user_rating = ?2, \
+                     updated_at = strftime('%s','now') WHERE id = ?1",
+                params![track_uuid, clamped],
+            )
+            .map_err(|e| LibraryError::sqlite("set_user_rating", e))?;
+        Ok(())
+    }
+
+    /// Set the user colour label (v8). `Some(token)` stores a palette
+    /// token or `#RRGGBB`; `None` clears it. The browser tints the
+    /// track's row background with it.
+    pub fn set_track_color(&self, track_uuid: &str, color: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tracks SET color = ?2, \
+                     updated_at = strftime('%s','now') WHERE id = ?1",
+                params![track_uuid, color],
+            )
+            .map_err(|e| LibraryError::sqlite("set_track_color", e))?;
+        Ok(())
+    }
+
     /// List canonical tracks for the M11d browser "All Tracks"
     /// surface. Returns the assembled [`TrackRow`] (filename →
     /// id3 priority chain per §8.1) sliced by `limit` / `offset`.
@@ -1733,6 +1833,234 @@ impl Library {
             .query_map(params![imported_crate_id], track_row_from_columns)
             .map_err(|e| LibraryError::sqlite("query_imported_crate_tracks", e))?;
         collect_track_rows(rows, "imported_crate_tracks")
+    }
+
+    // === Favourite slots (v8) ============================================
+    //
+    // The fixed 8-slot quick-access strip above the library. A Dub-crate
+    // slot stores `crates.id` directly (stable, FK-cascaded). An imported
+    // slot stores `(source, name-path)` instead of `imported_crates.id`,
+    // because the imported mirror is truncate-and-rewritten on every
+    // re-scan — the id changes, the path doesn't. The path is the slash-
+    // joined node names from the root down to the playlist.
+
+    /// Compute `(source, path, label)` for an imported crate by walking
+    /// its parent chain. `path` is the slash-joined names root→leaf (the
+    /// re-scan-stable key); `label` is the node's own name. `None` if the
+    /// id is unknown. The walk is bounded so a malformed cycle can't hang.
+    fn imported_crate_path(&self, id: i64) -> Result<Option<(String, String, String)>> {
+        let mut names: Vec<String> = Vec::new();
+        let mut source: Option<String> = None;
+        let mut current = Some(id);
+        for _ in 0..256 {
+            let Some(cur) = current else { break };
+            let row: Option<(String, String, Option<i64>)> = self
+                .conn
+                .query_row(
+                    "SELECT source, name, parent_imported_crate_id \
+                     FROM imported_crates WHERE id = ?1",
+                    params![cur],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| LibraryError::sqlite("imported_crate_path", e))?;
+            let Some((src, name, parent)) = row else {
+                break;
+            };
+            source.get_or_insert(src);
+            names.push(name);
+            current = parent;
+        }
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let label = names.first().cloned().unwrap_or_default();
+        names.reverse();
+        Ok(Some((source, names.join("/"), label)))
+    }
+
+    /// Resolve a `(source, path)` imported key back to the current
+    /// `imported_crates.id`, or `None` if no node matches (the playlist
+    /// was removed from the source before the last re-scan). If two nodes
+    /// share a path (sources like iTunes allow duplicate playlist names),
+    /// the match is arbitrary-but-stable for a given scan.
+    fn resolve_imported_path(&self, source: &str, path: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, parent_imported_crate_id \
+                 FROM imported_crates WHERE source = ?1",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_resolve_imported_path", e))?;
+        let rows = stmt
+            .query_map(params![source], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|e| LibraryError::sqlite("query_resolve_imported_path", e))?;
+        let mut by_id: std::collections::HashMap<i64, (String, Option<i64>)> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (id, name, parent) =
+                row.map_err(|e| LibraryError::sqlite("resolve_imported_path_row", e))?;
+            by_id.insert(id, (name, parent));
+        }
+        let mut best: Option<i64> = None;
+        for &id in by_id.keys() {
+            if path_for(&by_id, id) == path {
+                // Lowest id wins for determinism when paths collide.
+                best = Some(best.map_or(id, |b| b.min(id)));
+            }
+        }
+        Ok(best)
+    }
+
+    /// Pin a Dub crate to favourite `slot` (0–7), replacing whatever was
+    /// there. The crate's name is cached as the slot label.
+    pub fn set_favorite_dub_crate(&self, slot: u32, crate_id: i64) -> Result<()> {
+        let label: String = self
+            .conn
+            .query_row(
+                "SELECT name FROM crates WHERE id = ?1",
+                params![crate_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("favorite_crate_label", e))?
+            .ok_or(LibraryError::CrateNotFound { crate_id })?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO favorite_slots \
+                 (slot_index, kind, dub_crate_id, imported_source, imported_path, label, added_at) \
+                 VALUES (?1, 'dub_crate', ?2, NULL, NULL, ?3, strftime('%s','now'))",
+                params![slot, crate_id, label],
+            )
+            .map_err(|e| LibraryError::sqlite("set_favorite_dub_crate", e))?;
+        Ok(())
+    }
+
+    /// Pin an imported node playlist to favourite `slot` (0–7), stored by
+    /// its re-scan-stable `(source, path)` key. Errors if the id is
+    /// unknown.
+    pub fn set_favorite_imported_crate(&self, slot: u32, imported_crate_id: i64) -> Result<()> {
+        let (source, path, label) =
+            self.imported_crate_path(imported_crate_id)?
+                .ok_or(LibraryError::CrateNotFound {
+                    crate_id: imported_crate_id,
+                })?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO favorite_slots \
+                 (slot_index, kind, dub_crate_id, imported_source, imported_path, label, added_at) \
+                 VALUES (?1, 'imported_crate', NULL, ?2, ?3, ?4, strftime('%s','now'))",
+                params![slot, source, path, label],
+            )
+            .map_err(|e| LibraryError::sqlite("set_favorite_imported_crate", e))?;
+        Ok(())
+    }
+
+    /// Empty favourite `slot`. A no-op when the slot is already empty.
+    pub fn clear_favorite_slot(&self, slot: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM favorite_slots WHERE slot_index = ?1",
+                params![slot],
+            )
+            .map_err(|e| LibraryError::sqlite("clear_favorite_slot", e))?;
+        Ok(())
+    }
+
+    /// List the occupied favourite slots, each with its current resolved
+    /// target id (`None` if the target no longer exists). Sparse —
+    /// unoccupied slots are simply absent.
+    pub fn list_favorite_slots(&self) -> Result<Vec<FavoriteSlot>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT slot_index, kind, dub_crate_id, imported_source, imported_path, label \
+                 FROM favorite_slots ORDER BY slot_index ASC",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_list_favorite_slots", e))?;
+        let raw = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| LibraryError::sqlite("query_list_favorite_slots", e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LibraryError::sqlite("collect_list_favorite_slots", e))?;
+
+        let mut out = Vec::with_capacity(raw.len());
+        for (slot_index, kind, dub_crate_id, source, path, label) in raw {
+            let resolved_id = match kind.as_str() {
+                "dub_crate" => match dub_crate_id {
+                    Some(id) => self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM crates WHERE id = ?1",
+                            params![id],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|e| LibraryError::sqlite("favorite_resolve_dub", e))?
+                        .map(|()| id),
+                    None => None,
+                },
+                _ => match (source.as_deref(), path.as_deref()) {
+                    (Some(s), Some(p)) => self.resolve_imported_path(s, p)?,
+                    _ => None,
+                },
+            };
+            out.push(FavoriteSlot {
+                slot_index: slot_index as u32,
+                kind,
+                label,
+                source,
+                resolved_id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Tracks behind favourite `slot`, resolving its reference to the
+    /// current crate. Empty when the slot is unoccupied or its target no
+    /// longer resolves.
+    pub fn favorite_slot_tracks(&self, slot: u32) -> Result<Vec<TrackRow>> {
+        let row: Option<FavoriteSlotRef> = self
+            .conn
+            .query_row(
+                "SELECT kind, dub_crate_id, imported_source, imported_path \
+                 FROM favorite_slots WHERE slot_index = ?1",
+                params![slot],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("favorite_slot_tracks", e))?;
+        let Some((kind, dub_crate_id, source, path)) = row else {
+            return Ok(Vec::new());
+        };
+        match kind.as_str() {
+            "dub_crate" => match dub_crate_id {
+                Some(id) => self.list_crate_tracks(id),
+                None => Ok(Vec::new()),
+            },
+            _ => match (source.as_deref(), path.as_deref()) {
+                (Some(s), Some(p)) => match self.resolve_imported_path(s, p)? {
+                    Some(id) => self.imported_crate_tracks(id),
+                    None => Ok(Vec::new()),
+                },
+                _ => Ok(Vec::new()),
+            },
+        }
     }
 
     /// Create a Dub crate and return its new id. `parent_id` nests it
@@ -3447,5 +3775,173 @@ mod tests {
         lib.promote_to_collection(&id).unwrap();
         lib.promote_to_collection(&id).unwrap();
         assert_eq!(lib.track_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn user_rating_and_color_surface_and_clear() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A"]);
+        let id = &ids[0];
+        let row0 = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(row0[0].rating, None);
+        assert_eq!(row0[0].color, None);
+
+        lib.set_user_rating(id, Some(4)).unwrap();
+        lib.set_track_color(id, Some("red")).unwrap();
+        let row1 = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(row1[0].rating, Some(4));
+        assert_eq!(row1[0].color.as_deref(), Some("red"));
+
+        lib.set_user_rating(id, None).unwrap();
+        lib.set_track_color(id, None).unwrap();
+        let row2 = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(row2[0].rating, None);
+        assert_eq!(row2[0].color, None);
+    }
+
+    #[test]
+    fn itunes_rating_surfaces_and_user_rating_overrides() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&id, None, None, None).unwrap();
+        lib.promote_to_collection(&id).unwrap();
+        lib.upsert_metadata_source(
+            &id,
+            "itunes",
+            Some("A"),
+            Some("T"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+        )
+        .unwrap();
+        assert_eq!(lib.list_tracks(10, 0).unwrap()[0].rating, Some(3));
+        // User rating wins over the imported one.
+        lib.set_user_rating(&id, Some(5)).unwrap();
+        assert_eq!(lib.list_tracks(10, 0).unwrap()[0].rating, Some(5));
+        // Clearing it falls back to the imported rating again.
+        lib.set_user_rating(&id, None).unwrap();
+        assert_eq!(lib.list_tracks(10, 0).unwrap()[0].rating, Some(3));
+    }
+
+    #[test]
+    fn itunes_only_track_surfaces_its_metadata() {
+        // Regression: an iTunes-only track must show its title / artist /
+        // album / genre / year, not render as "untitled". The browse
+        // query joins the `itunes` source into the §8.1 display chain
+        // (Apple Music tracks were showing blank before v8).
+        let lib = Library::open_in_memory().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&id, None, None, None).unwrap();
+        lib.promote_to_collection(&id).unwrap();
+        lib.upsert_metadata_source(
+            &id,
+            "itunes",
+            Some("Burial"),
+            Some("Archangel"),
+            Some("Untrue"),
+            Some("Dubstep"),
+            None,
+            None,
+            Some(2007),
+            Some(2),
+            None,
+            None,
+            None,
+            Some(5),
+            None,
+        )
+        .unwrap();
+        let rows = lib.list_tracks(10, 0).unwrap();
+        let row = &rows[0];
+        assert_eq!(row.title.as_deref(), Some("Archangel"));
+        assert_eq!(row.artist.as_deref(), Some("Burial"));
+        assert_eq!(row.album.as_deref(), Some("Untrue"));
+        assert_eq!(row.genre.as_deref(), Some("Dubstep"));
+        assert_eq!(row.year, Some(2007));
+        assert_eq!(row.track_number, Some(2));
+        assert_eq!(row.source, "itunes");
+        assert_eq!(row.rating, Some(5));
+    }
+
+    #[test]
+    fn favorite_dub_crate_slot_round_trips_and_clears() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["A", "B", "C"]);
+        let crate_id = lib.create_crate("My Set", None).unwrap();
+        lib.add_track_to_crate(crate_id, &ids[0]).unwrap();
+        lib.add_track_to_crate(crate_id, &ids[1]).unwrap();
+        lib.set_favorite_dub_crate(0, crate_id).unwrap();
+
+        let slots = lib.list_favorite_slots().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].slot_index, 0);
+        assert_eq!(slots[0].kind, "dub_crate");
+        assert_eq!(slots[0].label, "My Set");
+        assert_eq!(slots[0].resolved_id, Some(crate_id));
+        assert_eq!(lib.favorite_slot_tracks(0).unwrap().len(), 2);
+
+        lib.clear_favorite_slot(0).unwrap();
+        assert!(lib.list_favorite_slots().unwrap().is_empty());
+        assert!(lib.favorite_slot_tracks(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn favorite_imported_slot_resolves_by_path_across_reimport() {
+        // An imported favourite is keyed by (source, name-path), so it
+        // survives the truncate-and-rewrite of the mirror on a re-scan
+        // even though `imported_crates.id` changes underneath it.
+        let lib = Library::open_in_memory().unwrap();
+        let now = 1_700_000_000_i64;
+        lib.connection()
+            .execute(
+                "INSERT INTO imported_crates \
+                 (id, source, name, parent_imported_crate_id, imported_at) \
+                 VALUES (1, 'serato', 'Hip Hop', NULL, ?1), \
+                        (2, 'serato', '90s', 1, ?1)",
+                params![now],
+            )
+            .unwrap();
+        lib.set_favorite_imported_crate(0, 2).unwrap();
+        let slots = lib.list_favorite_slots().unwrap();
+        assert_eq!(slots[0].kind, "imported_crate");
+        assert_eq!(slots[0].source.as_deref(), Some("serato"));
+        assert_eq!(slots[0].label, "90s");
+        assert_eq!(slots[0].resolved_id, Some(2));
+
+        // Re-scan: same tree, brand-new ids.
+        lib.connection()
+            .execute("DELETE FROM imported_crates", [])
+            .unwrap();
+        lib.connection()
+            .execute(
+                "INSERT INTO imported_crates \
+                 (id, source, name, parent_imported_crate_id, imported_at) \
+                 VALUES (10, 'serato', 'Hip Hop', NULL, ?1), \
+                        (11, 'serato', '90s', 10, ?1)",
+                params![now],
+            )
+            .unwrap();
+        let slots = lib.list_favorite_slots().unwrap();
+        assert_eq!(
+            slots[0].resolved_id,
+            Some(11),
+            "path key must resolve to the new id after a re-scan"
+        );
+
+        // A path that no longer exists resolves to None (no panic).
+        lib.connection()
+            .execute("DELETE FROM imported_crates WHERE id = 11", [])
+            .unwrap();
+        assert_eq!(lib.list_favorite_slots().unwrap()[0].resolved_id, None);
+        assert!(lib.favorite_slot_tracks(0).unwrap().is_empty());
     }
 }

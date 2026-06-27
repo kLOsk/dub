@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -81,6 +81,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 7,
         sql: V7_MIGRATION,
+    },
+    Migration {
+        target_version: 8,
+        sql: V8_MIGRATION,
     },
 ];
 
@@ -646,6 +650,52 @@ CREATE INDEX IF NOT EXISTS idx_tracks_in_collection
     ON tracks(in_collection) WHERE in_collection = 1;
 "#;
 
+/// v8 — user-owned organization attributes (star rating + color label)
+/// and the favorite-playlist quick-access slots.
+///
+/// `tracks.user_rating` (0–5) is the rating the DJ sets by clicking the
+/// stars; it overrides any imported per-source rating
+/// (`track_metadata_source.rating`, e.g. from iTunes). `NULL` = unset,
+/// so the browser falls back to the imported rating. `tracks.color` is
+/// a user-assigned colour label (a small palette token or `#RRGGBB`);
+/// the browser tints that track's row background. Both are user state,
+/// so they live on the canonical `tracks` row alongside `grid_locked`
+/// rather than in the per-source metadata table.
+///
+/// `favorite_slots` backs the fixed 8-slot favourites strip above the
+/// library: each slot points at either a Dub crate (`dub_crate_id`,
+/// FK-cascaded so deleting the crate empties the slot) or an imported
+/// node playlist, stored by `(imported_source, imported_path)` rather
+/// than by `imported_crates.id` — the imported mirror is truncate-and-
+/// rewritten on every re-scan, so its ids are unstable, but the
+/// source + name-path resolve back to the current id. `label` caches
+/// the display name for an instant render before resolution.
+const V8_MIGRATION: &str = r#"
+ALTER TABLE tracks ADD COLUMN user_rating INTEGER
+    CHECK (user_rating IS NULL OR (user_rating >= 0 AND user_rating <= 5));
+ALTER TABLE tracks ADD COLUMN color TEXT;
+
+CREATE TABLE IF NOT EXISTS favorite_slots (
+    slot_index        INTEGER PRIMARY KEY CHECK (slot_index >= 0 AND slot_index < 8),
+    kind              TEXT    NOT NULL CHECK (kind IN ('dub_crate', 'imported_crate')),
+    dub_crate_id      INTEGER REFERENCES crates(id) ON DELETE CASCADE,
+    imported_source   TEXT    CHECK (imported_source IS NULL OR imported_source IN
+                              ('serato', 'traktor', 'rekordbox', 'itunes')),
+    imported_path     TEXT,
+    label             TEXT    NOT NULL,
+    added_at          INTEGER NOT NULL,
+    CHECK (
+        (kind = 'dub_crate'
+            AND dub_crate_id IS NOT NULL
+            AND imported_source IS NULL AND imported_path IS NULL)
+        OR
+        (kind = 'imported_crate'
+            AND dub_crate_id IS NULL
+            AND imported_source IS NOT NULL AND imported_path IS NOT NULL)
+    )
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +780,7 @@ mod tests {
             "analysis_cache",
             "smart_crates",
             "track_metadata_fts",
+            "favorite_slots",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -1020,6 +1071,79 @@ mod tests {
             "external-source-only, never-played stays browse-only"
         );
         assert_eq!(member("nothing"), 0, "orphan track stays browse-only");
+    }
+
+    #[test]
+    fn migration_v8_adds_user_rating_color_and_favorite_slots() {
+        let conn = fresh_db();
+        // tracks gains nullable user_rating + color.
+        let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "user_rating"), "saw {cols:?}");
+        assert!(cols.iter().any(|c| c == "color"), "saw {cols:?}");
+
+        // user_rating CHECK rejects out-of-range, allows NULL + 0..5.
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO tracks (id, created_at, updated_at) VALUES ('t', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute("UPDATE tracks SET user_rating = 5 WHERE id = 't'", [])
+            .unwrap();
+        conn.execute("UPDATE tracks SET user_rating = NULL WHERE id = 't'", [])
+            .unwrap();
+        assert!(
+            conn.execute("UPDATE tracks SET user_rating = 6 WHERE id = 't'", [])
+                .is_err(),
+            "user_rating must reject values above 5"
+        );
+
+        // favorite_slots CHECK: a dub_crate slot must carry a crate id and
+        // no imported fields; an imported slot the reverse.
+        conn.execute(
+            "INSERT INTO crates (name, created_at, updated_at) VALUES ('C', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO favorite_slots (slot_index, kind, dub_crate_id, label, added_at) \
+             VALUES (0, 'dub_crate', 1, 'C', ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO favorite_slots \
+             (slot_index, kind, imported_source, imported_path, label, added_at) \
+             VALUES (1, 'imported_crate', 'serato', 'Hip Hop/90s', 'Hip Hop/90s', ?1)",
+            params![now],
+        )
+        .unwrap();
+        // slot_index out of range rejected.
+        assert!(
+            conn.execute(
+                "INSERT INTO favorite_slots (slot_index, kind, dub_crate_id, label, added_at) \
+                 VALUES (8, 'dub_crate', 1, 'C', ?1)",
+                params![now],
+            )
+            .is_err(),
+            "slot_index >= 8 must be rejected"
+        );
+        // Mixed/invalid combo rejected (dub kind with imported fields).
+        assert!(
+            conn.execute(
+                "INSERT INTO favorite_slots \
+                 (slot_index, kind, dub_crate_id, imported_source, imported_path, label, added_at) \
+                 VALUES (2, 'dub_crate', 1, 'serato', 'x', 'x', ?1)",
+                params![now],
+            )
+            .is_err(),
+            "a dub_crate slot must not carry imported fields"
+        );
     }
 
     #[test]

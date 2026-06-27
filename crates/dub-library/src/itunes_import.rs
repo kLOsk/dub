@@ -152,7 +152,7 @@ fn import_track(
             track.bpm,
             None, // key — iTunes has none
             None, // gain
-            None, // rating
+            track.rating,
             None, // version_token
         )
         .map_err(|e| e.to_string())?;

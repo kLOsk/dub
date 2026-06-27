@@ -4986,6 +4986,15 @@ pub struct LibraryTrack {
     pub grid_locked: bool,
     /// M11d.7: LSQ drift slope when unlocked (ms/min).
     pub grid_drift_quality: Option<f32>,
+    /// v8 star rating 0–5: the DJ's own `tracks.user_rating` if set,
+    /// else the highest-priority imported per-source rating (iTunes
+    /// today). `None` when unrated. The browser renders a clickable
+    /// star column.
+    pub rating: Option<i32>,
+    /// v8 user colour label — a palette token or `#RRGGBB` from
+    /// `tracks.color`. `None` when unset. The browser tints the row
+    /// background with it.
+    pub color: Option<String>,
     /// M11d-next: 0-based manual rank of this row inside the crate
     /// it was listed from. `None` for every listing that is not a
     /// manual crate (`all_tracks`, search, smart sections), because
@@ -5221,6 +5230,8 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             track_number: r.track_number,
             grid_locked: r.grid_locked,
             grid_drift_quality: r.grid_drift_quality,
+            rating: r.rating,
+            color: r.color,
             // Only `crate_tracks` knows a row's manual rank; every
             // other listing leaves this `None` and the Apple shell
             // hides the `#` column accordingly.
@@ -5329,6 +5340,38 @@ impl From<dub_library::ImportedCrateRow> for LibraryImportedCrate {
             name: c.name,
             parent_id: c.parent_id,
             track_count: c.track_count,
+        }
+    }
+}
+
+/// One occupied favourite-playlist slot (v8), mirroring
+/// [`dub_library::FavoriteSlot`]. Backs the fixed 8-slot quick-access
+/// strip above the library. The Swift side renders `label` immediately
+/// and uses `resolved_id` (the current crate / imported-crate id, or
+/// `None` when the target no longer exists) to load the slot's tracks.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryFavoriteSlot {
+    /// 0-7 position in the strip.
+    pub slot_index: u32,
+    /// `dub_crate` or `imported_crate`.
+    pub kind: String,
+    /// Cached display name (shown before resolution).
+    pub label: String,
+    /// Source tag for an imported slot; `None` for a Dub-crate slot.
+    pub source: Option<String>,
+    /// Current resolved crate / imported-crate id, or `None` if the
+    /// target is gone (e.g. an imported playlist removed at last scan).
+    pub resolved_id: Option<i64>,
+}
+
+impl From<dub_library::FavoriteSlot> for LibraryFavoriteSlot {
+    fn from(s: dub_library::FavoriteSlot) -> Self {
+        Self {
+            slot_index: s.slot_index,
+            kind: s.kind,
+            label: s.label,
+            source: s.source,
+            resolved_id: s.resolved_id,
         }
     }
 }
@@ -5836,6 +5879,96 @@ impl DubLibrary {
         source: String,
     ) -> std::result::Result<u64, LibraryFfiError> {
         self.with_library(|lib| Ok(lib.count_tracks_by_source(&source)?))
+    }
+
+    // === v8 — star rating + colour label ==================================
+
+    /// Set the DJ's own star rating for a track. `Some(0..=5)` overrides
+    /// any imported per-source rating; `None` clears it so the browser
+    /// falls back to the imported value. Values above 5 are clamped.
+    pub fn set_user_rating(
+        &self,
+        track_id: String,
+        rating: Option<u8>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_user_rating(&track_id, rating)?;
+            Ok(())
+        })
+    }
+
+    /// Set the user colour label for a track (a palette token or a hex
+    /// string). `None` clears it. The browser tints the track row with it.
+    pub fn set_track_color(
+        &self,
+        track_id: String,
+        color: Option<String>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_track_color(&track_id, color.as_deref())?;
+            Ok(())
+        })
+    }
+
+    // === v8 — favourite-playlist quick-access slots =======================
+
+    /// The occupied favourite slots, each with its current resolved
+    /// target id. Sparse: empty slots are absent. The Apple shell renders
+    /// the fixed 8-slot strip, filling positions from `slot_index`.
+    pub fn list_favorite_slots(
+        &self,
+    ) -> std::result::Result<Vec<LibraryFavoriteSlot>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let slots = lib.list_favorite_slots()?;
+            Ok(slots.into_iter().map(LibraryFavoriteSlot::from).collect())
+        })
+    }
+
+    /// Pin a Dub crate to favourite `slot` (0-7), replacing whatever was
+    /// there.
+    pub fn set_favorite_dub_crate(
+        &self,
+        slot: u32,
+        crate_id: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_favorite_dub_crate(slot, crate_id)?;
+            Ok(())
+        })
+    }
+
+    /// Pin an imported node playlist to favourite `slot` (0-7), stored by
+    /// its re-scan-stable source + name-path so it survives a re-import.
+    pub fn set_favorite_imported_crate(
+        &self,
+        slot: u32,
+        imported_crate_id: i64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_favorite_imported_crate(slot, imported_crate_id)?;
+            Ok(())
+        })
+    }
+
+    /// Empty favourite `slot`. A no-op when already empty.
+    pub fn clear_favorite_slot(&self, slot: u32) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.clear_favorite_slot(slot)?;
+            Ok(())
+        })
+    }
+
+    /// Tracks behind favourite `slot`, resolving its reference to the
+    /// current crate. Empty when the slot is unoccupied or its target no
+    /// longer resolves.
+    pub fn favorite_slot_tracks(
+        &self,
+        slot: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.favorite_slot_tracks(slot)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
     }
 
     // === M11d.4 — missing-files scanner + Relocate ========================
@@ -6720,6 +6853,45 @@ mod library_ffi_tests {
             "play start promotes the node track into the collection"
         );
         assert_eq!(lib.list_tracks(10, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rating_color_and_favorites_round_trip_via_ffi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+
+        // Seed a collection member.
+        let id = "t1";
+        lib.with_library(|l| {
+            l.insert_track(id, None, None, None)?;
+            l.promote_to_collection(id)?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Rating + colour set, surface, and clear.
+        lib.set_user_rating(id.into(), Some(4)).unwrap();
+        lib.set_track_color(id.into(), Some("red".into())).unwrap();
+        let row = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(row[0].rating, Some(4));
+        assert_eq!(row[0].color.as_deref(), Some("red"));
+        lib.set_user_rating(id.into(), None).unwrap();
+        assert_eq!(lib.list_tracks(10, 0).unwrap()[0].rating, None);
+
+        // Favourite slot pinning a Dub crate.
+        let crate_id = lib.create_crate("Set".into(), None).unwrap();
+        lib.add_track_to_crate(crate_id, id.into()).unwrap();
+        lib.set_favorite_dub_crate(0, crate_id).unwrap();
+        let slots = lib.list_favorite_slots().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].slot_index, 0);
+        assert_eq!(slots[0].label, "Set");
+        assert_eq!(slots[0].resolved_id, Some(crate_id));
+        assert_eq!(lib.favorite_slot_tracks(0).unwrap().len(), 1);
+        lib.clear_favorite_slot(0).unwrap();
+        assert!(lib.list_favorite_slots().unwrap().is_empty());
     }
 
     #[test]

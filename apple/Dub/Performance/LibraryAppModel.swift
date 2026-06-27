@@ -246,4 +246,16 @@ final class LibraryAppModel: ObservableObject {
     /// open and after every source import by
     /// `WaveformAppModel.reloadImportedSources()`.
     @Published var importedSources: [ImportedSourceGroup] = []
+
+    /// v8 — bumped when a user-owned per-track attribute (star rating,
+    /// colour label) changes. LibraryView observes it via `.onChange`
+    /// and re-runs `refreshTracks(preserveSelection:)` so the rating
+    /// stars + row tint update without a per-row push channel.
+    @Published var rowAttributeGeneration: UInt64 = 0
+
+    /// v8 — the occupied favourite-playlist slots (sparse, 0–7), backing
+    /// the quick-access strip above the library. Refreshed on library
+    /// open and after every favourite pin / clear by
+    /// `WaveformAppModel.reloadFavoriteSlots()`.
+    @Published var favoriteSlots: [LibraryFavoriteSlot] = []
 }
