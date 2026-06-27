@@ -235,6 +235,12 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
                 mtime,
             )
             .map_err(|e| e.to_string())?;
+        // A deliberate folder import is a "this is mine" act → the
+        // track is a collection member, even if a prior external-source
+        // scan first minted it as browse-only (PRD §8.4.1). Idempotent.
+        library
+            .promote_to_collection(&existing_uuid)
+            .map_err(|e| e.to_string())?;
         return Ok(FileOutcome::Refreshed);
     }
 
@@ -269,6 +275,12 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
         )
         .map_err(|e| e.to_string())?;
     write_metadata_rows(library, &new_track_uuid, &meta, &parsed_filename)?;
+    // Folder import = collection membership (PRD §8.4.1). Set it on the
+    // freshly-minted row so the track shows in "All Tracks" immediately,
+    // unlike an external-source scan's browse-only rows.
+    library
+        .promote_to_collection(&new_track_uuid)
+        .map_err(|e| e.to_string())?;
     Ok(FileOutcome::Added)
 }
 
@@ -606,6 +618,21 @@ mod tests {
         assert_eq!(row_count(&lib, "track_files"), 1);
         // id3 row + filename row → 2 rows per track.
         assert_eq!(row_count(&lib, "track_metadata_source"), 2);
+        // Folder import = collection membership (PRD §8.4.1): the row
+        // is in the collection immediately, unlike an external scan.
+        let members: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE in_collection = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            members, 1,
+            "folder-imported track must be a collection member"
+        );
+        assert_eq!(lib.track_count().unwrap(), 1);
     }
 
     #[test]

@@ -6,10 +6,10 @@
 ## Status
 
 Format notes for external DJ libraries. Shipped: Dub-native filesystem import
-(M11c), the **Serato importer (M11e)**, the **Traktor NML importer (M12b)**, and
-the **iTunes / Apple Music importer (M12c)**. rekordbox + Lexicon are still
-forward-looking. Fill each section as its importer lands, and keep format-
-specific quirks here rather than expanding PRD §8.
+(M11c), the **Serato importer (M11e)**, the **Traktor NML importer (M12b)**, the
+**iTunes / Apple Music importer (M12c)**, and the **rekordbox XML importer
+(M12d)**. Lexicon is still forward-looking. Fill each section as its importer
+lands, and keep format-specific quirks here rather than expanding PRD §8.
 
 Each section should end up with:
 
@@ -146,12 +146,56 @@ headless with `dub import --traktor <collection.nml>`.
 (PRD §2.2.5). The parser's contract is *never panic / hang / OOB on any bytes*
 — only `Ok(ParsedCollection)` or `Err(ParseError)`.
 
-### rekordbox
+### rekordbox — **shipped (M12d)**
 
-- **Database:** `~/Library/Pioneer/rekordbox/master.db` (encrypted SQLite, DB6)
-  - Decryption key is community-known; clean-room implementation required.
-- **XML export** (alternative path): user-exported XML file.
-- DB6 schema: many tables; key ones are `djmdContent`, `djmdCue`, `djmdBeatGrid`.
+- **Library:** the XML export (`File → Export Collection in xml format`), e.g.
+  `~/Documents/rekordbox/rekordbox.xml`. We deliberately read the **XML export**,
+  not the encrypted `~/Library/Pioneer/rekordbox/master.db` (SQLCipher, DB6):
+  the XML is the documented, GPL-clean interchange format and reuses `quick-xml`,
+  where `master.db` would need a reverse-engineered key + C crypto + an
+  undocumented, version-fragile schema. (`master.db` decode is parked; if it's
+  ever wanted it stays confined behind an opt-in feature.)
+- Parser: `crates/dub-library/src/rekordbox.rs` (streaming `quick-xml`); adapter:
+  `crates/dub-library/src/rekordbox_import.rs`.
+
+**Shape.** `<DJ_PLAYLISTS>` → a `<COLLECTION>` of `<TRACK>` elements + a
+`<PLAYLISTS>` `<NODE>` tree. A `<TRACK>` carries all metadata as attributes
+(`Name` / `Artist` / `Album` / `Composer` / `Genre` / `Comments` / `Year` /
+`TrackNumber` / `AverageBpm` / `Tonality` / `TotalTime` / `Location`); `Year` /
+`TrackNumber` `0` = unset. **`TotalTime` is integer seconds** (coarser than
+iTunes' ms). A track with a grid/cues is a container with `<TEMPO>` /
+`<POSITION_MARK>` children; otherwise it self-closes.
+
+**Paths.** `Location` is a percent-encoded `file://localhost/…` URL → strip the
+scheme + `localhost`, percent-decode → absolute path (same shape as iTunes).
+
+**Grid.** The first `<TEMPO Inizio Bpm Battito>` is the grid anchor (`Inizio`
+seconds, `Bpm`, `Battito` 1–4 → 0-based bar phase). Extra `<TEMPO>`s are
+per-beat / variable-tempo markers we don't model. `AverageBpm` is the metadata
+BPM (falls back to the grid tempo when `0`).
+
+**Cues / loops.** `<POSITION_MARK Type Start End Num Red Green Blue>`: `Type` 0 =
+cue, 4 = loop (1/2 fade, 3 load → skipped). `Num` −1 = memory cue, 0–7 = hot-cue
+pad slot. `Start`/`End` seconds; `Red`/`Green`/`Blue` 0–255 → `#RRGGBB`. Memory
+markers get an index ≥ 8 so they never alias a hot pad.
+
+**Key.** `Tonality` is stored verbatim (rekordbox's own notation — Camelot `8B`,
+Open-Key `5d`, or classical `Abm`; `track_keys` keeps it as-is).
+
+**Playlists.** `<NODE Type="0">` = folder (the top `Name="ROOT"` is transparent),
+`Type="1"` = playlist whose `<TRACK Key="…"/>` children reference collection
+tracks by `TrackID` (`KeyType="0"`). Location-keyed playlists (`KeyType="1"`) are
+rare and import with no members.
+
+**Import behaviour.** Idempotent by `(volume_uuid, relative_path)` — shared
+identity with the other importers — lazy; `metadata_source('rekordbox')` +
+imported grid / key / cues / loops + the playlist mirror. *(Validated against a
+real rekordbox 7.2 export: 18 tracks all resolved, 14 grids; the export carried
+no `POSITION_MARK` cues, `Tonality`, or populated user playlists, so those paths
+are pinned by synthetic fixtures — re-confirm against an export that has them.)*
+Run headless with `dub import --rekordbox <rekordbox.xml>`.
+
+**Fuzz target.** `fuzz/fuzz_targets/fuzz_rekordbox_xml.rs` over `parse_xml`.
 
 ### iTunes / Apple Music — **shipped (M12c)**
 
@@ -200,6 +244,14 @@ constraint, schema v6.)* Run headless with `dub import --itunes <Library.xml>`.
 - **Dub never modifies source library files or databases.** Read-only always.
   Source files open with `O_RDONLY` semantics; no advisory locks; concurrent
   use of Serato / Traktor / rekordbox is fine.
+- **External sources are browse-only until played.** Enabling Serato / Traktor /
+  rekordbox / iTunes mirrors that app's library for *browsing* (its source node
+  + playlist tree), but a track only enters Dub's collection ("All Tracks") when
+  the DJ folder-imports it or **plays** it from a node — `tracks.in_collection`,
+  schema v7; PRD §8.4.1. The importers still mint one `tracks` row per file so
+  playlists and shared-identity dedupe resolve; those rows just start
+  `in_collection = 0`. The importers never set the flag — only the folder
+  importer and the play-history path do.
 - **Canonical track identity** lives in `tracks` as a stable UUID; the
   fingerprint match is `chromaprint_similarity ≥ 0.98 AND duration_delta <
   200 ms AND no version-token differs`. See PRD §8.1 for the version-token

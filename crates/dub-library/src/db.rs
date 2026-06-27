@@ -1407,14 +1407,40 @@ impl Library {
         Ok(())
     }
 
-    /// Total canonical-track count. Backs the M11d browser footer
-    /// and the §8.5 source-tree "All Tracks" badge.
+    /// Collection-track count. Backs the M11d browser footer and the
+    /// §8.5 source-tree "All Tracks" badge — both of which describe the
+    /// user's *collection*, so this counts members only (PRD §8.4.1).
+    /// External-source-only, never-played rows are excluded, matching
+    /// what [`Self::list_tracks`] returns.
     pub fn track_count(&self) -> Result<u64> {
         let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE in_collection = 1",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|e| LibraryError::sqlite("track_count", e))?;
         Ok(n.max(0) as u64)
+    }
+
+    /// Promote a track into the user's collection (PRD §8.4.1):
+    /// `in_collection := 1`. Idempotent — a track already a member,
+    /// or already gone, is a harmless no-op. Called by the folder
+    /// importer (deliberate "this is mine" ingest) and the play-history
+    /// path (a node track the DJ actually played). External-library
+    /// scans never call it: their rows stay browse-only under the
+    /// source node until one of those two things happens.
+    pub fn promote_to_collection(&self, track_uuid: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tracks SET in_collection = 1, \
+                     updated_at = strftime('%s','now') \
+                 WHERE id = ?1 AND in_collection = 0",
+                params![track_uuid],
+            )
+            .map_err(|e| LibraryError::sqlite("promote_to_collection", e))?;
+        Ok(())
     }
 
     /// List canonical tracks for the M11d browser "All Tracks"
@@ -1452,8 +1478,16 @@ impl Library {
         // columns ignore the collate hint, so adding it
         // unconditionally is harmless and keeps the SQL shape
         // identical across sort keys.
+        // `WHERE t.in_collection = 1`: "All Tracks" is the user's
+        // *collection*, not every track Dub has a row for. External-
+        // source scans (Serato / Traktor / rekordbox / iTunes) mint
+        // browse-only rows that stay out of here until played or
+        // folder-imported (PRD §8.4.1). The per-source nodes
+        // (`list_tracks_by_source`, imported-crate listings) deliberately
+        // do *not* apply this filter.
         let sql = format!(
             "{TRACK_ROW_SELECT} \
+             WHERE t.in_collection = 1 \
              ORDER BY {column} IS NULL, {column} COLLATE NOCASE {direction}, \
                       t.created_at ASC \
              LIMIT ?1 OFFSET ?2"
@@ -1524,9 +1558,14 @@ impl Library {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
+        // Global search backs the "All Tracks" search field, so it
+        // shares that surface's collection-only scope (PRD §8.4.1).
+        // Browsing a source node and searching it is a separate, node-
+        // scoped concern (not wired here).
         let sql = format!(
             "{TRACK_ROW_SELECT} \
-             WHERE t.id IN (\
+             WHERE t.in_collection = 1 \
+               AND t.id IN (\
                 SELECT DISTINCT track_id FROM track_metadata_fts \
                 WHERE track_metadata_fts MATCH ?1\
              ) \
@@ -1574,9 +1613,13 @@ impl Library {
     /// `tracks.created_at` is >= the given unix-seconds boundary.
     /// Caller chooses the boundary (typically: app-launch time).
     pub fn just_imported(&self, since_unix_secs: i64, limit: u32) -> Result<Vec<TrackRow>> {
+        // Collection-scoped (PRD §8.4.1): enabling a source and
+        // scanning a foreign app's whole library this session is not
+        // "just imported" — only folder imports (and anything promoted
+        // by a play) are members, so this surfaces them, not the scan.
         let sql = format!(
             "{TRACK_ROW_SELECT} \
-             WHERE t.created_at >= ?1 \
+             WHERE t.in_collection = 1 AND t.created_at >= ?1 \
              ORDER BY t.created_at DESC LIMIT ?2"
         );
         let mut stmt = self
@@ -2280,6 +2323,12 @@ mod tests {
                 .unwrap();
             lib.insert_track(&id, Some(fp_id), Some(10_000), None)
                 .unwrap();
+            // These fixtures stand in for folder-imported tracks (they
+            // carry filename + id3 metadata rows), which the real
+            // importer promotes into the collection — mirror that so
+            // the `list_tracks` / `track_count` / search assertions see
+            // them under the v7 membership filter (PRD §8.4.1).
+            lib.promote_to_collection(&id).unwrap();
             lib.upsert_track_file(
                 &id,
                 &volume.volume_uuid,
@@ -3338,5 +3387,65 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(got, vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]);
+    }
+
+    #[test]
+    fn external_source_track_is_browse_only_until_promoted() {
+        // PRD §8.4.1: an external-library scan mints a `tracks` row but
+        // leaves it out of the collection until played. Simulate that —
+        // an identity + a 'serato' metadata row, never promoted.
+        let lib = Library::open_in_memory().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&id, None, None, None).unwrap();
+        lib.upsert_metadata_source(
+            &id,
+            "serato",
+            Some("Artist"),
+            Some("Browse Only"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Not a collection member: absent from All Tracks, search, and
+        // the count — but present under its source node.
+        assert!(lib.list_tracks(100, 0).unwrap().is_empty());
+        assert!(lib.search_tracks("Browse", 100).unwrap().is_empty());
+        assert_eq!(lib.track_count().unwrap(), 0);
+        let by_source = lib.list_tracks_by_source("serato", 100, 0).unwrap();
+        assert_eq!(by_source.len(), 1, "node browsing ignores membership");
+        assert_eq!(by_source[0].id, id);
+
+        // Promotion (what a play does) pulls it into the collection,
+        // without removing it from the node.
+        lib.promote_to_collection(&id).unwrap();
+        let all = lib.list_tracks(100, 0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(lib.search_tracks("Browse", 100).unwrap().len(), 1);
+        assert_eq!(lib.track_count().unwrap(), 1);
+        assert_eq!(
+            lib.list_tracks_by_source("serato", 100, 0).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn promote_to_collection_is_idempotent() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&id, None, None, None).unwrap();
+        lib.promote_to_collection(&id).unwrap();
+        lib.promote_to_collection(&id).unwrap();
+        assert_eq!(lib.track_count().unwrap(), 1);
     }
 }

@@ -48,6 +48,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_rekordbox_xml"
+path = "fuzz_targets/fuzz_rekordbox_xml.rs"
+test = false
+doc = false
+bench = false
+
 # Release-ish profile for the fuzz binaries (cargo-fuzz default).
 [profile.release]
 debug = 1

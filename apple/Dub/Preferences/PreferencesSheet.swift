@@ -56,6 +56,7 @@ struct PreferencesSheet: View {
         .onAppear { sourceLocations = model.discoveredSourceLocations() }
         .onChange(of: model.seratoImportEnabled) { on in if on { model.scanEnabledSources() } }
         .onChange(of: model.traktorImportEnabled) { on in if on { model.scanEnabledSources() } }
+        .onChange(of: model.rekordboxImportEnabled) { on in if on { model.scanEnabledSources() } }
         .onChange(of: model.itunesImportEnabled) { on in if on { model.scanEnabledSources() } }
     }
 
@@ -213,6 +214,8 @@ struct PreferencesSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
                 librarySourceRow("Serato", kind: .serato, isOn: $model.seratoImportEnabled)
                 librarySourceRow("Traktor", kind: .traktor, isOn: $model.traktorImportEnabled)
+                librarySourceRow(
+                    "rekordbox", kind: .rekordbox, isOn: $model.rekordboxImportEnabled)
                 librarySourceRow(
                     "Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled)
             }

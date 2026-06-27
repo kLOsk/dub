@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -77,6 +77,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 6,
         sql: V6_MIGRATION,
+    },
+    Migration {
+        target_version: 7,
+        sql: V7_MIGRATION,
     },
 ];
 
@@ -586,6 +590,62 @@ CREATE INDEX IF NOT EXISTS idx_imported_crate_tracks_ord
     ON imported_crate_tracks(imported_crate_id, ordinal);
 "#;
 
+/// v7 — **collection membership** (PRD §8.4.1).
+///
+/// Before v7 the catalog conflated two things: "tracks Dub knows
+/// about" and "tracks in the user's collection". Every external-
+/// library scan (Serato / Traktor / rekordbox / iTunes) minted a
+/// `tracks` row, so enabling a source dumped that app's *entire*
+/// library into the browser's "All Tracks". That is not the user's
+/// collection — it's a foreign app's collection mirrored for
+/// *browsing*. A track is in Dub's collection once the user has
+/// engaged with it: imported it from the filesystem, or **played**
+/// it from a node.
+///
+/// `in_collection` is that membership bit. The external importers
+/// keep minting `tracks` rows (the playlist mirror + shared-identity
+/// dedupe both key off `tracks.id`, and a node track must resolve to
+/// a real row to be loadable), but those rows stay `in_collection =
+/// 0` — browse-only under their source node — until promoted. The
+/// "All Tracks" surface filters on `in_collection = 1`; the per-
+/// source nodes ignore it.
+///
+/// Promotion writers:
+/// * the **folder importer** sets `1` on every file it ingests
+///   (a deliberate "this is mine" act);
+/// * the **play-history** path sets `1` the moment a deck starts
+///   playing a track (`history_play_started` → `PlayStart`).
+///
+/// **Backfill.** A column added with `DEFAULT 0` would hide every
+/// already-imported track until it was next played. Instead, seed
+/// membership from the same two signals the going-forward writers
+/// use, applied to existing rows:
+/// * folder-imported — the folder importer is the *only* writer of
+///   `track_metadata_source` rows with `source IN ('id3','filename')`,
+///   so their presence is an exact "was folder-imported" predicate;
+/// * ever-played — any `play_history` row.
+///
+/// External-source-only, never-played tracks fall through to `0`
+/// (browse-only), which is the new intended state for them.
+///
+/// Pre-alpha dev DB (per "we are not in production yet"): a plain
+/// `ALTER TABLE … ADD COLUMN` with a data backfill, no re-analysis
+/// required — same shape as the v4 / v5 column adds.
+const V7_MIGRATION: &str = r#"
+ALTER TABLE tracks ADD COLUMN in_collection INTEGER NOT NULL DEFAULT 0
+    CHECK (in_collection IN (0, 1));
+
+UPDATE tracks SET in_collection = 1
+WHERE id IN (
+        SELECT track_id FROM track_metadata_source
+        WHERE source IN ('id3', 'filename')
+    )
+   OR id IN (SELECT DISTINCT track_id FROM play_history);
+
+CREATE INDEX IF NOT EXISTS idx_tracks_in_collection
+    ON tracks(in_collection) WHERE in_collection = 1;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,6 +900,126 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, 0, "v5 default for bar_phase must be 0");
+    }
+
+    #[test]
+    fn migration_v7_adds_in_collection_column_default_zero() {
+        // v7 collection-membership: the column must be NOT NULL so
+        // query code never sees a sentinel, and default 0 so a row
+        // inserted without an explicit value (every external-source
+        // importer) lands browse-only until promoted.
+        let conn = fresh_db();
+        let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+        let cols = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i32>(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, i32)>>>()
+            .unwrap();
+        let (_, notnull) = cols
+            .iter()
+            .find(|(name, _)| name == "in_collection")
+            .unwrap_or_else(|| {
+                panic!("v7 migration must add in_collection to tracks; saw {cols:?}")
+            });
+        assert_eq!(*notnull, 1, "in_collection must be NOT NULL");
+
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO tracks (id, created_at, updated_at) VALUES ('t', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT in_collection FROM tracks WHERE id = 't'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 0, "v7 default for in_collection must be 0");
+    }
+
+    #[test]
+    fn migration_v7_backfill_flags_folder_imported_and_played() {
+        // The migration's backfill seeds membership from the same two
+        // signals the going-forward writers use. Re-run that exact
+        // UPDATE on seeded rows to pin the predicate: a folder-imported
+        // track (id3/filename metadata row) and an ever-played track
+        // become members; an external-source-only, never-played track
+        // stays browse-only.
+        let conn = fresh_db();
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO volumes (volume_uuid, display_name, last_seen_at) \
+             VALUES ('V', 'Macintosh HD', ?1)",
+            params![now],
+        )
+        .unwrap();
+        for id in ["folder", "serato_only", "played", "nothing"] {
+            conn.execute(
+                "INSERT INTO tracks (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+                params![id, now],
+            )
+            .unwrap();
+        }
+        // folder-imported → has an 'id3' metadata row.
+        conn.execute(
+            "INSERT INTO track_metadata_source (track_id, source, title, imported_at) \
+             VALUES ('folder', 'id3', 'Mine', ?1)",
+            params![now],
+        )
+        .unwrap();
+        // external-source only → a 'serato' metadata row, never played.
+        conn.execute(
+            "INSERT INTO track_metadata_source (track_id, source, title, imported_at) \
+             VALUES ('serato_only', 'serato', 'Theirs', ?1)",
+            params![now],
+        )
+        .unwrap();
+        // played → a play_history row (and a serato row, to prove the
+        // play signal alone is enough).
+        conn.execute(
+            "INSERT INTO track_metadata_source (track_id, source, title, imported_at) \
+             VALUES ('played', 'serato', 'Spun', ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO play_history (track_id, deck, event_type, timestamp_ms) \
+             VALUES ('played', 0, 'play_start', ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        // Reset all to 0, then re-run the backfill the migration ships.
+        conn.execute("UPDATE tracks SET in_collection = 0", [])
+            .unwrap();
+        conn.execute_batch(
+            "UPDATE tracks SET in_collection = 1 \
+             WHERE id IN (SELECT track_id FROM track_metadata_source \
+                          WHERE source IN ('id3', 'filename')) \
+                OR id IN (SELECT DISTINCT track_id FROM play_history);",
+        )
+        .unwrap();
+
+        let member = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT in_collection FROM tracks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            member("folder"),
+            1,
+            "folder-imported must backfill to member"
+        );
+        assert_eq!(member("played"), 1, "ever-played must backfill to member");
+        assert_eq!(
+            member("serato_only"),
+            0,
+            "external-source-only, never-played stays browse-only"
+        );
+        assert_eq!(member("nothing"), 0, "orphan track stays browse-only");
     }
 
     #[test]

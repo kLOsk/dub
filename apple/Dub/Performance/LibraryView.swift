@@ -1034,6 +1034,11 @@ struct LibraryView: View {
                     Label("Traktor collection.nml…", systemImage: ImportedSourceKind.traktor.systemImage)
                 }
                 Button {
+                    presentImportedSourcePicker(.rekordbox)
+                } label: {
+                    Label("rekordbox.xml…", systemImage: ImportedSourceKind.rekordbox.systemImage)
+                }
+                Button {
                     presentImportedSourcePicker(.itunes)
                 } label: {
                     Label("iTunes Library.xml…", systemImage: ImportedSourceKind.itunes.systemImage)
@@ -2791,8 +2796,8 @@ struct LibraryView: View {
     }
 
     /// Manual picker for an external source. Serato is a folder (the
-    /// `_Serato_` directory); Traktor / iTunes are single files
-    /// (`collection.nml` / `Library.xml`). The Preferences ▸ Libraries
+    /// `_Serato_` directory); Traktor / rekordbox / iTunes are single files
+    /// (`collection.nml` / `rekordbox.xml` / `Library.xml`). The Preferences ▸ Libraries
     /// toggles are the primary, auto-scanning path — this is the
     /// pick-it-anywhere fallback (e.g. a library on an external drive).
     private func presentImportedSourcePicker(_ kind: ImportedSourceKind) {
@@ -2808,6 +2813,10 @@ struct LibraryView: View {
             panel.canChooseFiles = true
             panel.canChooseDirectories = false
             panel.message = "Choose a Traktor “collection.nml” to import."
+        case .rekordbox:
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.message = "Choose a rekordbox “rekordbox.xml” export to import."
         case .itunes:
             panel.canChooseFiles = true
             panel.canChooseDirectories = false

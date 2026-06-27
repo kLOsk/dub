@@ -48,6 +48,7 @@ logic requires a version bump and a migration step.
 | 4       | M11d.7 | `tracks.grid_locked INTEGER NOT NULL DEFAULT 0` + `tracks.grid_drift_quality REAL`. Per-track beat-grid lock (locked tracks skip auto re-analysis on reload) + drift-quality indicator. |
 | 5       | PRD-BEATS C2 (round 4) | `track_beatgrids.bar_phase INTEGER NOT NULL DEFAULT 0 CHECK (0 ≤ bar_phase < 16)`. Makes the downbeat phase a first-class scalar so "set the 1" is a pure rotation (BPM + anchor unchanged) instead of a grid rebuild. |
 | 6       | M12c | Rebuild `imported_crates` / `imported_crate_tracks` without the `UNIQUE (source, parent, name)` constraint — external sources (iTunes) allow duplicate playlist names at one level. Truncate-and-rewrite mirror, so the drop+recreate loses nothing; also backfills the tables on DBs created before they existed. |
+| 7       | M12e (collection membership) | `tracks.in_collection INTEGER NOT NULL DEFAULT 0 CHECK (in_collection IN (0,1))` + partial index `idx_tracks_in_collection`. External-source scans mint browse-only rows; folder import and first play promote into the collection (PRD §8.4.1). Backfills existing rows: members = folder-imported (carries an `id3`/`filename` metadata row) **or** ever-played (any `play_history` row). Additive. |
 
 ### Backward compatibility contract
 
@@ -182,12 +183,20 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- drifts >= 3 ms/min and is unlocked.
     grid_locked                 INTEGER NOT NULL DEFAULT 0 CHECK (grid_locked IN (0, 1)),
     grid_drift_quality          REAL,
+    -- Collection membership (schema v7, M12e). 0 = browse-only: an
+    -- external-source scan (Serato/Traktor/rekordbox/iTunes) minted
+    -- this row but the DJ hasn't engaged with it. 1 = in the user's
+    -- collection. Folder import sets 1; the first *play* of a node
+    -- track sets 1 (PRD §8.4.1). "All Tracks" / global search / the
+    -- track count filter on = 1; the per-source nodes ignore it.
+    in_collection               INTEGER NOT NULL DEFAULT 0 CHECK (in_collection IN (0, 1)),
     created_at                  INTEGER NOT NULL,
     updated_at                  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint    ON tracks(fingerprint_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_duplicate_link ON tracks(duplicate_link_track_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_merge_target   ON tracks(explicit_merge_target_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_in_collection  ON tracks(in_collection) WHERE in_collection = 1;
 ```
 
 A `tracks` row is the canonical identity. `duration_ms` is denormalised

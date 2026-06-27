@@ -42,6 +42,7 @@ import DubCore
 enum ImportedSourceKind: String, CaseIterable, Hashable, Identifiable {
     case serato
     case traktor
+    case rekordbox
     case itunes
 
     var id: String { rawValue }
@@ -52,20 +53,22 @@ enum ImportedSourceKind: String, CaseIterable, Hashable, Identifiable {
     /// Sidebar display name.
     var label: String {
         switch self {
-        case .serato:  return "Serato"
-        case .traktor: return "Traktor"
+        case .serato:    return "Serato"
+        case .traktor:   return "Traktor"
+        case .rekordbox: return "rekordbox"
         // The app is "Apple Music" now; the library file is still the
         // iTunes-format XML it (or legacy iTunes) wrote.
-        case .itunes:  return "Apple Music"
+        case .itunes:    return "Apple Music"
         }
     }
 
     /// SF Symbol for the source's sidebar row.
     var systemImage: String {
         switch self {
-        case .serato:  return "s.square.fill"
-        case .traktor: return "t.square.fill"
-        case .itunes:  return "music.note"
+        case .serato:    return "s.square.fill"
+        case .traktor:   return "t.square.fill"
+        case .rekordbox: return "r.square.fill"
+        case .itunes:    return "music.note"
         }
     }
 }

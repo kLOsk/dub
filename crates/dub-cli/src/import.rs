@@ -6,10 +6,11 @@
 //! without standing up the UI.
 //!
 //! ```text
-//! dub import --traktor <collection.nml>   # Traktor NML (M12b)
-//! dub import --serato  <_Serato_ dir>      # Serato library (M11e)
-//! dub import --itunes  <Library.xml>       # iTunes / Apple Music (M12c)
-//! dub import --folder  <music-dir>         # recursive folder walk (M11c)
+//! dub import --traktor   <collection.nml>   # Traktor NML (M12b)
+//! dub import --serato    <_Serato_ dir>      # Serato library (M11e)
+//! dub import --itunes    <Library.xml>       # iTunes / Apple Music (M12c)
+//! dub import --rekordbox <rekordbox.xml>     # rekordbox XML export (M12d)
+//! dub import --folder    <music-dir>         # recursive folder walk (M11c)
 //! ```
 
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut traktor: Option<PathBuf> = None;
     let mut serato: Option<PathBuf> = None;
     let mut itunes: Option<PathBuf> = None;
+    let mut rekordbox: Option<PathBuf> = None;
     let mut folder: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -38,6 +40,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 itunes = Some(PathBuf::from(next_value(args, i, "--itunes")?));
                 i += 2;
             }
+            "--rekordbox" => {
+                rekordbox = Some(PathBuf::from(next_value(args, i, "--rekordbox")?));
+                i += 2;
+            }
             "--folder" => {
                 folder = Some(PathBuf::from(next_value(args, i, "--folder")?));
                 i += 2;
@@ -51,6 +57,7 @@ pub fn run(args: &[String]) -> Result<()> {
         traktor.is_some(),
         serato.is_some(),
         itunes.is_some(),
+        rekordbox.is_some(),
         folder.is_some(),
     ]
     .iter()
@@ -77,6 +84,9 @@ pub fn run(args: &[String]) -> Result<()> {
     } else if let Some(xml) = itunes {
         println!("importing iTunes library: {}", xml.display());
         dub_library::import_itunes(&mut library, &xml).context("itunes import")?
+    } else if let Some(xml) = rekordbox {
+        println!("importing rekordbox XML: {}", xml.display());
+        dub_library::import_rekordbox(&mut library, &xml).context("rekordbox import")?
     } else {
         let dir = folder.expect("folder is Some when the others are None");
         println!("importing folder: {}", dir.display());
@@ -87,8 +97,8 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-const USAGE: &str =
-    "usage: dub import (--traktor <nml> | --serato <dir> | --itunes <xml> | --folder <dir>)";
+const USAGE: &str = "usage: dub import (--traktor <nml> | --serato <dir> | \
+    --itunes <xml> | --rekordbox <xml> | --folder <dir>)";
 
 fn print_summary(s: &ImportSummary) {
     println!("  added:     {}", s.added);

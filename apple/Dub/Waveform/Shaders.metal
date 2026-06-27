@@ -346,7 +346,27 @@ vertex VertexOut waveformVertex(uint vid                       [[vertex_id]],
     // around 0 (M10.5b convention), so we flip `minSample`'s sign
     // here and let the strip topology fill the trapezoid.
     const float amp = isMaxEdge ? maxPos : -maxNeg;
-    const float ampNDC = clamp(amp * u.yScale, -1.0, 1.0);
+    // Soft-knee amplitude companding (M12e dogfood). A brick-wall-
+    // limited master has |sample| ≈ 1.0 almost everywhere, so the old
+    // linear `amp * yScale` pinned the envelope flat against the frame
+    // and the whole strip read as a solid colour block. Instead: leave
+    // magnitudes below `knee` linear (quiet material keeps full vertical
+    // detail), and above it compress asymptotically toward `ceiling`
+    // (= yScale, the existing gutter) so loud peaks bunch *softly* just
+    // under the frame with a visible gradient rather than a hard clip.
+    // The map is C¹-continuous at the knee (unit slope both sides), so
+    // there is no kink where it engages. Tunable: raise `knee` for a
+    // punchier look, lower it for a flatter/compressed one.
+    const float knee = 0.55;
+    const float ceiling = u.yScale;
+    const float mag = fabs(amp);
+    float companded = mag;
+    if (mag > knee) {
+        const float range = ceiling - knee;
+        const float over = mag - knee;
+        companded = knee + range * (over / (over + range));
+    }
+    const float ampNDC = clamp(sign(amp) * companded, -1.0, 1.0);
 
     // Time-axis NDC. Past region maps `chunkInWindow ∈ [0, K)` to
     // `y ∈ [+1.0, +0.5]` (oldest at top, newest at the playhead).

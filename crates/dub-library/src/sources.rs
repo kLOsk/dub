@@ -1,7 +1,7 @@
 //! Default-location discovery for the external DJ libraries Dub imports
-//! (M11e / M12b / M12c).
+//! (M11e / M12b / M12c / M12d).
 //!
-//! A target user already runs Serato / Traktor / iTunes, and each writes its
+//! A target user already runs Serato / Traktor / rekordbox / iTunes, and each writes its
 //! library to a well-known place. When the user enables a source in
 //! Preferences, the app scans that location and imports it. This module owns
 //! the path conventions (and the messy bits — `~` expansion, Traktor's
@@ -16,6 +16,8 @@ pub enum SourceKind {
     Serato,
     /// Traktor (`~/Documents/Native Instruments/Traktor */collection.nml`).
     Traktor,
+    /// rekordbox XML export (`~/Documents/rekordbox/rekordbox.xml`).
+    Rekordbox,
     /// iTunes / Apple Music (`~/Music/iTunes/iTunes Library.xml`).
     Itunes,
 }
@@ -26,6 +28,7 @@ impl SourceKind {
         match self {
             SourceKind::Serato => "serato",
             SourceKind::Traktor => "traktor",
+            SourceKind::Rekordbox => "rekordbox",
             SourceKind::Itunes => "itunes",
         }
     }
@@ -54,6 +57,7 @@ pub fn discover_default_sources() -> Vec<DiscoveredSource> {
     vec![
         discover_serato(&home),
         discover_traktor(&home),
+        discover_rekordbox(&home),
         discover_itunes(&home),
     ]
 }
@@ -65,6 +69,7 @@ pub fn discover_source(kind: SourceKind) -> Option<DiscoveredSource> {
     Some(match kind {
         SourceKind::Serato => discover_serato(&home),
         SourceKind::Traktor => discover_traktor(&home),
+        SourceKind::Rekordbox => discover_rekordbox(&home),
         SourceKind::Itunes => discover_itunes(&home),
     })
 }
@@ -113,6 +118,37 @@ fn discover_traktor(home: &std::path::Path) -> DiscoveredSource {
     }
 }
 
+fn discover_rekordbox(home: &std::path::Path) -> DiscoveredSource {
+    // rekordbox doesn't write its XML to a fixed place — the user picks the
+    // path on "Export Collection in xml format". Check the common spots:
+    // alongside the docs folder rekordbox suggests, and next to the encrypted
+    // `master.db`. (We read the XML export, not `master.db` — see `rekordbox`.)
+    let candidates = [
+        home.join("Documents")
+            .join("rekordbox")
+            .join("rekordbox.xml"),
+        home.join("Library")
+            .join("Pioneer")
+            .join("rekordbox")
+            .join("rekordbox.xml"),
+        home.join("Music").join("rekordbox").join("rekordbox.xml"),
+    ];
+    for path in &candidates {
+        if path.is_file() {
+            return DiscoveredSource {
+                kind: SourceKind::Rekordbox,
+                path: path.clone(),
+                exists: true,
+            };
+        }
+    }
+    DiscoveredSource {
+        kind: SourceKind::Rekordbox,
+        path: candidates.into_iter().next().unwrap_or_default(),
+        exists: false,
+    }
+}
+
 fn discover_itunes(home: &std::path::Path) -> DiscoveredSource {
     // The XML lives in `~/Music/iTunes/` under one of two names depending on
     // the iTunes version (`iTunes Music Library.xml` ≤ iTunes 11,
@@ -149,10 +185,11 @@ mod tests {
     #[test]
     fn returns_one_entry_per_kind() {
         let found = discover_default_sources();
-        assert_eq!(found.len(), 3);
+        assert_eq!(found.len(), 4);
         assert_eq!(found[0].kind, SourceKind::Serato);
         assert_eq!(found[1].kind, SourceKind::Traktor);
-        assert_eq!(found[2].kind, SourceKind::Itunes);
+        assert_eq!(found[2].kind, SourceKind::Rekordbox);
+        assert_eq!(found[3].kind, SourceKind::Itunes);
         // Paths are always populated (default expected location when absent).
         assert!(found.iter().all(|s| !s.path.as_os_str().is_empty()));
     }
@@ -161,6 +198,7 @@ mod tests {
     fn source_tags_match_schema() {
         assert_eq!(SourceKind::Serato.as_str(), "serato");
         assert_eq!(SourceKind::Traktor.as_str(), "traktor");
+        assert_eq!(SourceKind::Rekordbox.as_str(), "rekordbox");
         assert_eq!(SourceKind::Itunes.as_str(), "itunes");
     }
 }

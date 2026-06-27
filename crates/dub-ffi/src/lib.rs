@@ -5334,15 +5334,15 @@ impl From<dub_library::ImportedCrateRow> for LibraryImportedCrate {
 }
 
 /// A default-location entry for an importable source (Serato / Traktor /
-/// iTunes), for the Preferences "Libraries" section. Mirrors
+/// rekordbox / iTunes), for the Preferences "Libraries" section. Mirrors
 /// [`dub_library::DiscoveredSource`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct LibrarySourceLocation {
-    /// Source tag (`serato` / `traktor` / `itunes`).
+    /// Source tag (`serato` / `traktor` / `rekordbox` / `itunes`).
     pub kind: String,
     /// Absolute path the importer would be pointed at (the `_Serato_` folder,
-    /// `collection.nml`, or iTunes `Library.xml`). When `exists` is false
-    /// this is the expected default location.
+    /// `collection.nml`, `rekordbox.xml`, or iTunes `Library.xml`). When
+    /// `exists` is false this is the expected default location.
     pub path: String,
     /// `true` when that path is present on disk right now.
     pub exists: bool,
@@ -6286,11 +6286,33 @@ impl DubLibrary {
         Ok(LibraryImportSummary::from(summary))
     }
 
+    /// Import a rekordbox `rekordbox.xml` export (M12d). `path` is the XML
+    /// file ("File → Export Collection in xml format" in rekordbox). Writes
+    /// `source = 'rekordbox'` metadata, the imported beat grid (from `TEMPO`),
+    /// key, hot/memory cues + loops (from `POSITION_MARK`) onto the shared
+    /// track identity, and mirrors the playlist/folder tree into the read-only
+    /// imported-crate browser section. We read the XML export, not the
+    /// encrypted `master.db`. Blocks the caller; per-track failures land in
+    /// [`LibraryImportSummary::errors`], only an unreadable / malformed XML
+    /// returns `ImportFailed`.
+    pub fn import_rekordbox(
+        &self,
+        path: String,
+    ) -> std::result::Result<LibraryImportSummary, LibraryFfiError> {
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        let summary = dub_library::import_rekordbox(lib, std::path::Path::new(&path))
+            .map_err(|e| LibraryFfiError::ImportFailed(e.to_string()))?;
+        Ok(LibraryImportSummary::from(summary))
+    }
+
     /// Discover the default on-disk location of each importable source
-    /// (Serato / Traktor / iTunes) under the current user's home. One entry
-    /// per source, with `exists` reflecting whether the app is set up there —
-    /// the Preferences "Libraries" section renders these and imports the ones
-    /// the user enables. Does not require the library to be open.
+    /// (Serato / Traktor / rekordbox / iTunes) under the current user's home.
+    /// One entry per source, with `exists` reflecting whether the app is set up
+    /// there — the Preferences "Libraries" section renders these and imports
+    /// the ones the user enables. Does not require the library to be open.
     pub fn discover_default_sources(&self) -> Vec<LibrarySourceLocation> {
         dub_library::discover_default_sources()
             .into_iter()
@@ -6583,6 +6605,19 @@ impl DubLibrary {
         let session_id = self.history.lock().unwrap().session_id().to_owned();
         self.with_library(|lib| {
             lib.record_history(&session_id, writes)?;
+            // PRD §8.4.1: a deck *starting to play* a track promotes it
+            // into the collection. `PlayStart` is emitted by
+            // `play_started` and by a replace-load into an already-
+            // running deck — both are genuine plays. A merely-loaded
+            // paused deck emits only `Load`, so auditioning a node
+            // track without playing it leaves it browse-only.
+            // `promote_to_collection` is idempotent, so re-playing an
+            // existing member is a cheap no-op.
+            for w in writes {
+                if w.event == dub_library::HistoryEventType::PlayStart {
+                    lib.promote_to_collection(&w.track_id)?;
+                }
+            }
             Ok(())
         })
     }
@@ -6623,6 +6658,68 @@ mod library_ffi_tests {
         assert!(lib.just_imported(0, 100).unwrap().is_empty());
         assert!(lib.search("anything".into(), 100).unwrap().is_empty());
         assert!(lib.track_path("nonexistent".into()).unwrap().is_none());
+    }
+
+    #[test]
+    fn play_start_promotes_node_track_but_paused_load_does_not() {
+        // PRD §8.4.1: an external-source scan mints a browse-only
+        // `tracks` row; the DJ playing it is what pulls it into the
+        // collection. Verify the wiring end-to-end through the FFI
+        // history methods (the path the Apple shell drives).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+
+        // Mint a browse-only node track: an identity + a 'serato'
+        // metadata row, never promoted (mirrors what import_serato does
+        // for a track the DJ hasn't touched).
+        let id = "node-track";
+        lib.with_library(|l| {
+            l.insert_track(id, None, None, None)?;
+            l.upsert_metadata_source(
+                id,
+                "serato",
+                Some("Artist"),
+                Some("Title"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            lib.track_count().unwrap(),
+            0,
+            "node track starts browse-only"
+        );
+
+        // Load onto a paused deck → only a `Load` row, no promotion.
+        lib.history_deck_loaded(id.into(), 0, 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(
+            lib.track_count().unwrap(),
+            0,
+            "loading onto a paused deck must not promote (the DJ may be auditioning)"
+        );
+
+        // Transport rolls → `PlayStart` → promotion into the collection.
+        lib.history_play_started(0, 1_700_000_000_500).unwrap();
+        assert_eq!(
+            lib.track_count().unwrap(),
+            1,
+            "play start promotes the node track into the collection"
+        );
+        assert_eq!(lib.list_tracks(10, 0).unwrap().len(), 1);
     }
 
     #[test]
@@ -6945,6 +7042,10 @@ mod library_ffi_tests {
             let seed = dub_library::Library::open_at(&path).unwrap();
             for id in &ids {
                 seed.insert_track(id, None, Some(10_000), None).unwrap();
+                // Promote so they appear in the flat "All Tracks"
+                // listing under the v7 collection filter — the bare
+                // `insert_track` leaves them browse-only (PRD §8.4.1).
+                seed.promote_to_collection(id).unwrap();
             }
         }
 

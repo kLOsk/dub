@@ -39,12 +39,10 @@ import SwiftUI
 
 import DubCore
 
-/// One decimated amplitude value per overview bucket (M10.5r
-/// rebuild). Carries the full broadband peak + RMS shape so the
-/// renderer can paint the same two-tone envelope the Metal
-/// playing-waveform uses: a bright outer hull at `peak`, a darker
-/// inner core at `rms`. Matches the visual vocabulary of the main
-/// strip without sharing any of its Metal pipeline.
+/// One decimated value per overview bucket: the broadband `peak` +
+/// `rms` shape. The energy-map envelope (see `drawBars`) blends them
+/// (mostly RMS) so the loud/quiet structure reads — a breakdown dips,
+/// a drop rises — without a limited master saturating into a block.
 private struct OverviewBucket {
     /// Outer envelope amplitude — `max(|min|, |max|)` across the
     /// bucket's chunk range, clamped to `[0, 1]`.
@@ -89,6 +87,19 @@ struct TrackOverviewView: View {
     /// the bars merge into a smear. Tunable knob; smaller values
     /// look cleaner on very short tracks.
     private static let bucketCount: Int = 480
+
+    /// How much the energy contour leans on RMS vs. peak. 1.0 = pure
+    /// RMS (max dynamic range, but transients vanish); 0.0 = pure peak
+    /// (saturates flat on limited masters). 0.78 keeps the breakdown /
+    /// drop structure legible while letting transient-dense sections
+    /// read a touch taller. Tunable on the rig.
+    private static let energyRmsWeight: Float = 0.78
+
+    /// Fraction of the strip the *loudest* bucket fills after per-track
+    /// normalisation. < 1 so the envelope never touches the edge (the
+    /// "stop hitting the ceiling" fix); everything quieter scales below
+    /// it, so a brick-wall master shows structure instead of a block.
+    private static let energyHeadroom: Float = 0.9
 
     /// Decimated peak data. `nil` until the deck has a track and we
     /// have a peak count to read from the engine. `[]` is the
@@ -252,63 +263,176 @@ struct TrackOverviewView: View {
     private func drawBars(ctx: GraphicsContext, size: CGSize, buckets: [OverviewBucket]) {
         let n = buckets.count
         guard n > 0 else { return }
-        // Two-tone envelope matching the Metal playing-waveform's
-        // Serato-faithful look (M10.5r refresh): bright outer hull
-        // at `peak`, slightly transparent darker core at `rms`.
+        // Single-sided **energy-map** envelope. The overview's job is to
+        // be scanned — where the breakdown drops out, where the outro
+        // begins — and seeked against (PRD §9.6.1). Two things make it
+        // legible on the loud, brick-wall-limited material the audience
+        // actually hears:
         //
-        // M10.5t: bars live inside `[axisStart, axisEnd]` so the
-        // very-first and very-last bar don't kiss the strip edges
-        // (the "warping" the user reported). `axisLength` is the
-        // axis-aligned length minus 2× endPadding.
-        let peakColor = peakBarColor()
-        let rmsColor = rmsBarColor()
+        //   1. Height follows *energy*, not raw peak. A limited master
+        //      has |peak| ≈ 1.0 nearly everywhere, so a peak-driven
+        //      envelope saturates flat against the ceiling and reads as a
+        //      solid block. Weighting toward RMS (`energyRmsWeight`)
+        //      restores the loud/quiet structure the DJ scans for — a
+        //      breakdown genuinely dips, a drop genuinely rises.
+        //   2. Per-track normalisation with headroom. The loudest bucket
+        //      reaches `energyHeadroom` of the strip and never the edge;
+        //      everything else scales relative to it. The overview is a
+        //      *relative* energy map, so normalising per track (not to an
+        //      absolute level the DJ never set) is what makes the shape
+        //      pop regardless of how hot the master is.
+        //
+        // Drawn as a smooth *filled envelope* (tracing the bucket tops)
+        // with a baseline→contour gradient + a crisp top line, grown from
+        // a single flat baseline — not 480 discrete rects.
+        //
+        // M10.5t: the contour lives inside `[axisStart, axisEnd]` so the
+        // first/last bucket doesn't kiss the strip ends.
         let pad = OverviewLayout.endPadding
+
+        // Energy contour + the per-track normaliser. `energy` is mostly
+        // RMS with a touch of peak so transient-dense sections still read
+        // a little taller than sustained ones of equal loudness.
+        var energy = [Float](repeating: 0, count: n)
+        var maxEnergy: Float = 1e-6
+        for (i, b) in buckets.enumerated() {
+            let e = (1 - Self.energyRmsWeight) * b.peak + Self.energyRmsWeight * b.rms
+            energy[i] = e
+            if e > maxEnergy { maxEnergy = e }
+        }
+        let norm = Self.energyHeadroom / maxEnergy
+        let envelope: (Int) -> CGFloat = { CGFloat((energy[$0] * norm).clamped01) }
+
+        // One solid energy fill with a baseline→contour gradient (bright
+        // at the loud baseline, softening toward the energy edge) so it
+        // reads as a single intentional shape with depth — not the faint
+        // two-tone "shadow" the earlier hull + RMS-core split produced. A
+        // crisp top contour line defines the energy shape against the dark
+        // strip so it doesn't ghost out.
+        let tint = DubColor.deckTint(side)
+        let gradient = Gradient(colors: [tint.opacity(0.95), tint.opacity(0.5)])
+        let contourColor = tint.opacity(1.0)
+
         switch orientation {
         case .vertical:
+            // Time axis vertical (top→bottom); amplitude axis horizontal.
+            // Flat baseline at the strip's *outer* (window-frame) edge so
+            // the waveform hugs the frame and its energy edge faces the
+            // deck. Deck A's seam is on the right → it grows from the
+            // left; deck B mirrors. Flip `fromLeadingEdge` to put the
+            // flat side against the seam instead.
             let axisStart = pad
             let axisLength = max(0, size.height - 2 * pad)
-            let centreX = size.width * 0.5
-            let halfW = size.width * 0.5 - 2
-            var peakPath = Path()
-            var rmsPath = Path()
-            for (i, bucket) in buckets.enumerated() {
-                let y0 = axisStart + axisLength * CGFloat(i) / CGFloat(n)
-                let y1 = axisStart + axisLength * CGFloat(i + 1) / CGFloat(n)
-                let height = max(1, y1 - y0)
-                let peakW = max(1, CGFloat(bucket.peak.clamped01) * halfW)
-                peakPath.addRect(CGRect(
-                    x: centreX - peakW, y: y0,
-                    width: peakW * 2, height: height))
-                let rmsW = max(0.5, CGFloat(bucket.rms.clamped01) * halfW)
-                rmsPath.addRect(CGRect(
-                    x: centreX - rmsW, y: y0,
-                    width: rmsW * 2, height: height))
-            }
-            ctx.fill(peakPath, with: .color(peakColor))
-            ctx.fill(rmsPath, with: .color(rmsColor))
+            let fullW = max(0, size.width - 3)
+            let fromLeadingEdge = side == .a
+            let fill = Self.envelopeVertical(
+                n: n, height: envelope, axisStart: axisStart, axisLength: axisLength,
+                fullExtent: fullW, total: size.width, fromLeadingEdge: fromLeadingEdge, closed: true)
+            let contour = Self.envelopeVertical(
+                n: n, height: envelope, axisStart: axisStart, axisLength: axisLength,
+                fullExtent: fullW, total: size.width, fromLeadingEdge: fromLeadingEdge, closed: false)
+            ctx.fill(fill, with: .linearGradient(
+                gradient,
+                startPoint: CGPoint(x: fromLeadingEdge ? 0 : size.width, y: 0),
+                endPoint: CGPoint(x: fromLeadingEdge ? size.width : 0, y: 0)))
+            ctx.stroke(contour, with: .color(contourColor), lineWidth: 1)
         case .horizontal:
+            // Time axis horizontal (left→right); amplitude axis vertical.
+            // Flat baseline along the *bottom* edge, energy growing up.
             let axisStart = pad
             let axisLength = max(0, size.width - 2 * pad)
-            let centreY = size.height * 0.5
-            let halfH = size.height * 0.5 - 2
-            var peakPath = Path()
-            var rmsPath = Path()
-            for (i, bucket) in buckets.enumerated() {
-                let x0 = axisStart + axisLength * CGFloat(i) / CGFloat(n)
-                let x1 = axisStart + axisLength * CGFloat(i + 1) / CGFloat(n)
-                let width = max(1, x1 - x0)
-                let peakH = max(1, CGFloat(bucket.peak.clamped01) * halfH)
-                peakPath.addRect(CGRect(
-                    x: x0, y: centreY - peakH,
-                    width: width, height: peakH * 2))
-                let rmsH = max(0.5, CGFloat(bucket.rms.clamped01) * halfH)
-                rmsPath.addRect(CGRect(
-                    x: x0, y: centreY - rmsH,
-                    width: width, height: rmsH * 2))
-            }
-            ctx.fill(peakPath, with: .color(peakColor))
-            ctx.fill(rmsPath, with: .color(rmsColor))
+            let fullH = max(0, size.height - 3)
+            let fill = Self.envelopeHorizontal(
+                n: n, height: envelope, axisStart: axisStart, axisLength: axisLength,
+                fullExtent: fullH, total: size.height, closed: true)
+            let contour = Self.envelopeHorizontal(
+                n: n, height: envelope, axisStart: axisStart, axisLength: axisLength,
+                fullExtent: fullH, total: size.height, closed: false)
+            ctx.fill(fill, with: .linearGradient(
+                gradient,
+                startPoint: CGPoint(x: 0, y: size.height),
+                endPoint: CGPoint(x: 0, y: 0)))
+            ctx.stroke(contour, with: .color(contourColor), lineWidth: 1.25)
         }
+    }
+
+    /// Build a filled energy envelope for the **horizontal** band: time
+    /// runs left→right, the baseline is the bottom edge, and `height(i)`
+    /// (a `[0, 1]` fraction) grows upward. Traces the bucket tops as a
+    /// polyline (480 points over the band width ≈ a smooth contour) and
+    /// closes back along the baseline. A `max(1, …)` floor keeps a hair
+    /// of fill at silence so the flat baseline stays visible.
+    /// `closed: true` returns the filled area (tops + close along the
+    /// baseline); `closed: false` returns just the open top contour for
+    /// stroking the crisp energy line.
+    private static func envelopeHorizontal(
+        n: Int,
+        height: (Int) -> CGFloat,
+        axisStart: CGFloat,
+        axisLength: CGFloat,
+        fullExtent: CGFloat,
+        total: CGFloat,
+        closed: Bool
+    ) -> Path {
+        let baseline = total
+        let xEnd = axisStart + axisLength
+        var p = Path()
+        if closed {
+            p.move(to: CGPoint(x: axisStart, y: baseline))
+        } else {
+            p.move(to: CGPoint(x: axisStart, y: baseline - max(1, height(0) * fullExtent)))
+        }
+        for i in 0..<n {
+            let x = axisStart + axisLength * CGFloat(i) / CGFloat(n)
+            p.addLine(to: CGPoint(x: x, y: baseline - max(1, height(i) * fullExtent)))
+        }
+        p.addLine(to: CGPoint(x: xEnd, y: baseline - max(1, height(n - 1) * fullExtent)))
+        if closed {
+            p.addLine(to: CGPoint(x: xEnd, y: baseline))
+            p.closeSubpath()
+        }
+        return p
+    }
+
+    /// Build a filled energy envelope for the **vertical** strip: time
+    /// runs top→bottom, the baseline is one edge (`fromLeadingEdge` →
+    /// `x = 0`, else `x = total`), and `height(i)` grows toward the other
+    /// edge. Same polyline-of-tops + close-along-baseline shape as
+    /// [`envelopeHorizontal`], rotated onto the vertical axis.
+    private static func envelopeVertical(
+        n: Int,
+        height: (Int) -> CGFloat,
+        axisStart: CGFloat,
+        axisLength: CGFloat,
+        fullExtent: CGFloat,
+        total: CGFloat,
+        fromLeadingEdge: Bool,
+        closed: Bool
+    ) -> Path {
+        let baseline: CGFloat = fromLeadingEdge ? 0 : total
+        let yEnd = axisStart + axisLength
+        // Takes the already-evaluated height fraction (not the `height`
+        // closure) so it doesn't capture the non-escaping parameter.
+        func edgeX(_ h: CGFloat) -> CGFloat {
+            let w = max(1, h * fullExtent)
+            return fromLeadingEdge ? w : total - w
+        }
+        var p = Path()
+        if closed {
+            p.move(to: CGPoint(x: baseline, y: axisStart))
+        } else {
+            p.move(to: CGPoint(x: edgeX(height(0)), y: axisStart))
+        }
+        for i in 0..<n {
+            let y = axisStart + axisLength * CGFloat(i) / CGFloat(n)
+            p.addLine(to: CGPoint(x: edgeX(height(i)), y: y))
+        }
+        p.addLine(to: CGPoint(x: edgeX(height(n - 1)), y: yEnd))
+        if closed {
+            p.addLine(to: CGPoint(x: baseline, y: yEnd))
+            p.closeSubpath()
+        }
+        return p
     }
 
     /// Minute-boundary ticks along the time axis so the DJ can
@@ -642,26 +766,6 @@ struct TrackOverviewView: View {
             style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
     }
 
-    /// Outer-envelope colour for the overview's peak hull. M10.5r
-    /// refresh: matches the playing-waveform's deck tint at a
-    /// slightly reduced saturation so the overview still reads as
-    /// secondary chrome, but with the same hue as the main strip
-    /// so the two pieces visually agree. The pre-M10.5r muted
-    /// `deckAOverview` / `deckBOverview` tones read too brown /
-    /// teal-grey to feel related to the bright deck tint.
-    private func peakBarColor() -> Color {
-        DubColor.deckTint(side).opacity(0.78)
-    }
-
-    /// Inner RMS-core colour. Brighter version of the peak tint to
-    /// give the envelope a two-tone look identical to the Metal
-    /// playing-waveform's outer / inner split. Sits *on top of* the
-    /// peak fill, so its opacity stacks with the peak's — keep it
-    /// near 1.0 to read clean.
-    private func rmsBarColor() -> Color {
-        DubColor.deckTint(side).opacity(0.95)
-    }
-
     // MARK: - Overview scrub (click + drag)
 
     /// Maps a point in overview coordinates to a `[0, 1]` fraction
@@ -800,14 +904,11 @@ struct TrackOverviewView: View {
         lastSeenGeneration = currentGen
     }
 
-    /// Pure-function decimator. Takes the FFI's packed
-    /// `PeakChunk` byte buffer (12 bytes per chunk: min, max, rms
-    /// — three f32 little-endian) and reduces it to `bucketCount`
-    /// (`peak`, `rms`) pairs. Per-bucket `peak` is the max
-    /// `max(|min|, |max|)` across its chunk range; per-bucket
-    /// `rms` is the *RMS-of-RMS* (sqrt-of-mean-of-squares) across
-    /// the same range, which preserves loudness when chunks are
-    /// aggregated.
+    /// Pure-function decimator. Takes the FFI's packed broadband
+    /// `PeakChunk` buffer (12 bytes: min, max, rms — three f32 little-
+    /// endian) and reduces it to `bucketCount` `OverviewBucket`s.
+    /// Per-bucket `peak` is `max(|min|, |max|)` across the chunk range;
+    /// `rms` is the RMS-of-RMS over the same range.
     fileprivate static func decimate(data: Data, bucketCount: Int) -> [OverviewBucket] {
         let stride = MemoryLayout<Float>.size * 3 // f32 × 3
         let chunkCount = data.count / stride

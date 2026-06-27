@@ -572,12 +572,16 @@ final class WaveformAppModel: ObservableObject {
     @Published var traktorImportEnabled: Bool {
         didSet { UserDefaults.standard.set(traktorImportEnabled, forKey: Self.kTraktorImport) }
     }
+    @Published var rekordboxImportEnabled: Bool {
+        didSet { UserDefaults.standard.set(rekordboxImportEnabled, forKey: Self.kRekordboxImport) }
+    }
     @Published var itunesImportEnabled: Bool {
         didSet { UserDefaults.standard.set(itunesImportEnabled, forKey: Self.kItunesImport) }
     }
 
     private static let kSeratoImport = "dub.seratoImportEnabled"
     private static let kTraktorImport = "dub.traktorImportEnabled"
+    private static let kRekordboxImport = "dub.rekordboxImportEnabled"
     private static let kItunesImport = "dub.itunesImportEnabled"
 
     // MARK: Live engine state
@@ -830,6 +834,7 @@ final class WaveformAppModel: ObservableObject {
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
         self.traktorImportEnabled = UserDefaults.standard.bool(forKey: Self.kTraktorImport)
+        self.rekordboxImportEnabled = UserDefaults.standard.bool(forKey: Self.kRekordboxImport)
         self.itunesImportEnabled = UserDefaults.standard.bool(forKey: Self.kItunesImport)
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
@@ -2294,8 +2299,8 @@ final class WaveformAppModel: ObservableObject {
     }
 
     /// Import one external source from `path` (the `_Serato_` folder, a
-    /// `collection.nml`, or an iTunes `Library.xml`), then refresh the
-    /// sidebar's Imported Sources section. Idempotent; the FFI runs on a
+    /// `collection.nml`, a `rekordbox.xml`, or an iTunes `Library.xml`), then
+    /// refresh the sidebar's Imported Sources section. Idempotent; the FFI runs on a
     /// background queue. No-op while another import is in flight.
     func importExternalSource(_ kind: ImportedSourceKind, path: String) async {
         guard libraryModel.libraryIsOpen, !libraryModel.libraryImportInProgress else { return }
@@ -2309,6 +2314,7 @@ final class WaveformAppModel: ObservableObject {
                 switch kind {
                 case .serato: summary = try library.importSerato(path: path)
                 case .traktor: summary = try library.importTraktor(path: path)
+                case .rekordbox: summary = try library.importRekordbox(path: path)
                 case .itunes: summary = try library.importItunes(path: path)
                 }
                 return .success(summary)
@@ -2336,6 +2342,7 @@ final class WaveformAppModel: ObservableObject {
         let wanted: [ImportedSourceKind] = [
             (ImportedSourceKind.serato, seratoImportEnabled),
             (ImportedSourceKind.traktor, traktorImportEnabled),
+            (ImportedSourceKind.rekordbox, rekordboxImportEnabled),
             (ImportedSourceKind.itunes, itunesImportEnabled),
         ]
         .filter(\.1)

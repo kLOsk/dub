@@ -39,6 +39,10 @@ mod importer;
 pub mod itunes;
 mod itunes_import;
 mod paths;
+/// rekordbox `rekordbox.xml` (`DJ_PLAYLISTS`) parser (M12d). Public so the
+/// fuzz target and the import adapter can consume the pure `parse_xml` entry.
+pub mod rekordbox;
+mod rekordbox_import;
 mod schema;
 /// Serato library parsers (M11e). Public so the fuzz targets and the import
 /// adapter can consume the pure `parse_*` entry points.
@@ -70,6 +74,7 @@ pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION
 pub use importer::{import_folder, ImportError, ImportSummary};
 pub use itunes_import::import_itunes;
 pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
+pub use rekordbox_import::import_rekordbox;
 pub use schema::SCHEMA_VERSION;
 pub use serato_import::import_serato;
 pub use sources::{discover_default_sources, discover_source, DiscoveredSource, SourceKind};
