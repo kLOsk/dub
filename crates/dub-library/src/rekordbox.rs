@@ -95,6 +95,12 @@ pub struct ParsedTrack {
     pub year: Option<i32>,
     /// `TrackNumber` (0 dropped).
     pub track_number: Option<i32>,
+    /// Star rating 0–5, from `Rating` (0–255 in steps of 51). `None`
+    /// when unrated.
+    pub rating: Option<i32>,
+    /// Colour-label palette token, from `Colour` (hex → nearest of Dub's
+    /// 8 palette tokens). `None` when unset / un-mappable.
+    pub color: Option<String>,
     /// Tempo, BPM — `AverageBpm`, falling back to the first `TEMPO`'s `Bpm`.
     pub bpm: Option<f64>,
     /// Musical key, verbatim from `Tonality` (rekordbox's own notation —
@@ -287,11 +293,26 @@ fn parse_track_open(e: &BytesStart) -> ParsedTrack {
         comment: attr_present(e, b"Comments"),
         year: attr_int(e, b"Year", true),
         track_number: attr_int(e, b"TrackNumber", true),
+        rating: attr(e, b"Rating")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(star_rating),
+        color: attr(e, b"Colour")
+            .as_deref()
+            .and_then(crate::color_label::token_from_hex)
+            .map(str::to_owned),
         bpm,
         key: attr_present(e, b"Tonality"),
         duration_secs,
         ..ParsedTrack::default()
     }
+}
+
+/// rekordbox / Traktor store a star rating as 0–255 in steps of 51
+/// (some exports already use 0–5). Normalize to 0–5 stars; `0`
+/// (unrated) → `None`.
+pub(crate) fn star_rating(raw: i64) -> Option<i32> {
+    let stars = if raw > 5 { raw / 51 } else { raw };
+    (stars > 0).then(|| stars.clamp(1, 5) as i32)
 }
 
 /// Fold one child element (`<TEMPO>`, `<POSITION_MARK>`) into the track under
@@ -476,7 +497,7 @@ mod tests {
            Location="file://localhost/Users/dj/Music/one%20shot.wav" Tonality=""/>
     <TRACK TrackID="200" Name="Banger" Artist="DJ Test" Album="LP" Genre="House"
            Composer="Writer" Comments="hi" Year="2020" TrackNumber="3"
-           TotalTime="180" AverageBpm="128.00"
+           TotalTime="180" AverageBpm="128.00" Rating="204" Colour="0xFF0000"
            Location="file://localhost/Users/dj/Music/banger.mp3" Tonality="8B">
       <TEMPO Inizio="0.025" Bpm="128.00" Metro="4/4" Battito="3"/>
       <TEMPO Inizio="48.026" Bpm="128.00" Metro="4/4" Battito="1"/>
@@ -526,6 +547,10 @@ mod tests {
         assert_eq!(two.comment.as_deref(), Some("hi"));
         assert_eq!(two.year, Some(2020));
         assert_eq!(two.track_number, Some(3));
+        assert_eq!(two.rating, Some(4)); // Rating 204 / 51 = 4 stars
+        assert_eq!(two.color.as_deref(), Some("red")); // Colour 0xFF0000 → red
+        assert_eq!(one.rating, None); // unrated
+        assert_eq!(one.color, None); // no Colour
         assert!((two.bpm.unwrap() - 128.0).abs() < 1e-9);
         assert_eq!(two.key.as_deref(), Some("8B"));
         assert!((two.duration_secs.unwrap() - 180.0).abs() < 1e-9);

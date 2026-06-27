@@ -1,0 +1,13 @@
+{"run_id":"1782583735-982700000","line":578,"new":{"module_name":"dub_stretch__wsola__tests","snapshot_name":"golden_signature_stable","metadata":{"source":"crates/dub-stretch/src/wsola.rs","assertion_line":578,"expression":"sig"},"snapshot":"frames=58559 peak=1.000 rms=0.3527 fundamental_hz=439"},"old":{"module_name":"dub_stretch__wsola__tests","metadata":{},"snapshot":"frames=59976 peak=0.527 rms=0.3517 fundamental_hz=440"}}
+{"run_id":"1782583756-408326000","line":578,"new":null,"old":null}
+{"run_id":"1782584579-570645000","line":607,"new":null,"old":null}
+{"run_id":"1782586661-745043000","line":607,"new":null,"old":null}
+{"run_id":"1782586744-359525000","line":607,"new":null,"old":null}
+{"run_id":"1782591010-150271000","line":607,"new":null,"old":null}
+{"run_id":"1782591934-691201000","line":607,"new":null,"old":null}
+{"run_id":"1782591984-718849000","line":607,"new":null,"old":null}
+{"run_id":"1782599532-696546000","line":607,"new":null,"old":null}
+{"run_id":"1782599810-585953000","line":607,"new":null,"old":null}
+{"run_id":"1782600135-811490000","line":640,"new":null,"old":null}
+{"run_id":"1782600388-168782000","line":640,"new":null,"old":null}
+{"run_id":"1782600401-188272000","line":640,"new":null,"old":null}

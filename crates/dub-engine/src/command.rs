@@ -75,6 +75,18 @@ pub enum Command {
     /// reverse at unity speed; `0.0` = paused without resetting state.
     DeckSetRate { idx: u8, rate: f64 },
 
+    /// Enable / disable key lock (master tempo) on deck `idx` (M14). When on,
+    /// the engaged stretcher holds pitch while tempo follows the platter; the
+    /// engine auto-bypasses during scratch / reverse / extreme rates.
+    DeckSetKeyLock { idx: u8, on: bool },
+
+    /// Select which time-stretch engine deck `idx` uses when key lock engages
+    /// (M14 live A/B). `ResamplerOnly` = no key lock (pitch shifts with rate).
+    DeckSetStretchBackend {
+        idx: u8,
+        backend: dub_stretch::StretchBackend,
+    },
+
     /// Engage Panic-Play (M10.6b, PRD §6.1.2) on deck `idx`. The
     /// engine captures the deck's current "last known good"
     /// velocity (preferring `LiftPolicy::last_locked_rate()` if a
@@ -231,6 +243,16 @@ impl std::fmt::Debug for Command {
                 .debug_struct("DeckSetRate")
                 .field("idx", idx)
                 .field("rate", rate)
+                .finish(),
+            Self::DeckSetKeyLock { idx, on } => f
+                .debug_struct("DeckSetKeyLock")
+                .field("idx", idx)
+                .field("on", on)
+                .finish(),
+            Self::DeckSetStretchBackend { idx, backend } => f
+                .debug_struct("DeckSetStretchBackend")
+                .field("idx", idx)
+                .field("backend", backend)
                 .finish(),
             Self::DeckPanicPlay { idx } => {
                 f.debug_struct("DeckPanicPlay").field("idx", idx).finish()

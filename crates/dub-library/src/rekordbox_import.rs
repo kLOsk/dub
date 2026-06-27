@@ -184,9 +184,12 @@ fn write_rekordbox_metadata(library: &Library, track_id: &str, track: &ParsedTra
         track.bpm,
         track.key.as_deref(),
         None, // gain — rekordbox's per-track gain isn't in the XML
-        None, // rating — not modelled
+        track.rating,
         None, // version_token — derived from filename/id3, not rekordbox
     )?;
+    // Per-source colour label (schema v9). Always written (incl. `None`)
+    // so a re-import that dropped the colour clears the stale one.
+    library.set_metadata_source_color(track_id, REKORDBOX, track.color.as_deref())?;
 
     // First `<TEMPO>` → an imported beatgrid. Prefer the grid tempo; fall back
     // to AverageBpm. `bar_phase` from the anchor's `Battito`.

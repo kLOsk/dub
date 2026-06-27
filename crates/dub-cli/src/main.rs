@@ -34,6 +34,7 @@ mod diagnose;
 mod import;
 mod input_cmds;
 mod scope;
+mod stretch_bench;
 mod thru;
 mod timecode_deck;
 
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         "timecode-deck" => timecode_deck::run(&args[2..]),
         "thru" => thru::run(&args[2..]),
         "scope" => scope::run(&args[2..]),
+        "stretch-bench" => stretch_bench::run(&args[2..]),
         "calibrate" => calibrate::run(&args[2..]),
         "measure-latency" => measure_latency(&args[2..]),
         "help" | "-h" | "--help" => {
@@ -113,6 +115,9 @@ fn print_help() {
     eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
+    eprintln!("  stretch-bench     [--input <wav>] [--dump <dir>] [--full]");
+    eprintln!("                    M14 A/B: time-stretch backends (resampler vs WSOLA) —");
+    eprintln!("                    CPU + pitch/transient/timbre metrics across a rate sweep.");
     eprintln!("  import            (--traktor <nml> | --serato <dir> | --itunes <xml>");
     eprintln!("                     | --folder <dir>)");
     eprintln!("                    headless library import into the default DB.");

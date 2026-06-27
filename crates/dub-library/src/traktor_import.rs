@@ -195,9 +195,12 @@ fn write_traktor_metadata(library: &Library, track_id: &str, entry: &ParsedEntry
         entry.bpm,
         entry.key_camelot.as_deref(),
         None, // gain — Traktor's per-track gain is dB-relative; deferred
-        None, // rating
+        entry.rating,
         None, // version_token — derived from filename/id3, not Traktor
     )?;
+    // Per-source colour label (schema v9). Always written (incl. `None`)
+    // so a re-import that dropped the colour clears the stale one.
+    library.set_metadata_source_color(track_id, TRAKTOR, entry.color.as_deref())?;
 
     // AutoGrid downbeat → an imported beatgrid. `bar_phase = 0`: a Traktor
     // grid anchor *is* a downbeat (beat 1).

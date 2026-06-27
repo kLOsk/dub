@@ -49,6 +49,8 @@ logic requires a version bump and a migration step.
 | 5       | PRD-BEATS C2 (round 4) | `track_beatgrids.bar_phase INTEGER NOT NULL DEFAULT 0 CHECK (0 ≤ bar_phase < 16)`. Makes the downbeat phase a first-class scalar so "set the 1" is a pure rotation (BPM + anchor unchanged) instead of a grid rebuild. |
 | 6       | M12c | Rebuild `imported_crates` / `imported_crate_tracks` without the `UNIQUE (source, parent, name)` constraint — external sources (iTunes) allow duplicate playlist names at one level. Truncate-and-rewrite mirror, so the drop+recreate loses nothing; also backfills the tables on DBs created before they existed. |
 | 7       | M12e (collection membership) | `tracks.in_collection INTEGER NOT NULL DEFAULT 0 CHECK (in_collection IN (0,1))` + partial index `idx_tracks_in_collection`. External-source scans mint browse-only rows; folder import and first play promote into the collection (PRD §8.4.1). Backfills existing rows: members = folder-imported (carries an `id3`/`filename` metadata row) **or** ever-played (any `play_history` row). Additive. |
+| 8       | M12f (organization attrs) | `tracks.user_rating INTEGER CHECK (0..5)` (user star rating, overrides imported source ratings) + `tracks.color TEXT` (user colour-label token; tints the browser row). New `favorite_slots` table — the fixed 8-slot quick-access strip above the library; each slot points at a Dub crate (`dub_crate_id`, FK-cascaded) or an imported playlist by `(imported_source, imported_path)` (re-scan-stable, since the imported mirror's ids are rewritten on every import). Additive. |
+| 9       | M12f (per-source colour) | `track_metadata_source.color TEXT` — the imported per-source colour label (rekordbox `Colour`, Traktor `COLOR`), mapped to a Dub palette token. Displayed colour is `COALESCE(tracks.color, …source colours…)` so the DJ's own colour wins. Additive. |
 
 ### Backward compatibility contract
 
@@ -190,6 +192,13 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- track sets 1 (PRD §8.4.1). "All Tracks" / global search / the
     -- track count filter on = 1; the per-source nodes ignore it.
     in_collection               INTEGER NOT NULL DEFAULT 0 CHECK (in_collection IN (0, 1)),
+    -- User-owned organization attributes (schema v8, M12f). `user_rating`
+    -- is the DJ's own 0–5 star rating; it overrides any imported per-source
+    -- rating (e.g. iTunes) the browser would otherwise show. `color` is a
+    -- user colour-label token (e.g. "red"); the browser tints the track's
+    -- row with it. Both NULL when unset.
+    user_rating                 INTEGER CHECK (user_rating IS NULL OR (user_rating >= 0 AND user_rating <= 5)),
+    color                       TEXT,
     created_at                  INTEGER NOT NULL,
     updated_at                  INTEGER NOT NULL
 );
@@ -350,6 +359,11 @@ CREATE TABLE IF NOT EXISTS track_metadata_source (
     -- 'long' / '7in' / '12in' / 'lp'). NULL if no token detected.
     -- Stored as canonical lowercase form.
     version_token   TEXT,
+    -- Imported per-source colour label (schema v9): the source's colour
+    -- (rekordbox `Colour` hex, Traktor `COLOR` index) mapped to a Dub
+    -- palette token. Displayed colour is `COALESCE(tracks.color, …)` —
+    -- the DJ's own colour wins. NULL for sources without one.
+    color           TEXT,
     imported_at     INTEGER NOT NULL,
     UNIQUE (track_id, source)
 );
@@ -357,7 +371,7 @@ CREATE INDEX IF NOT EXISTS idx_metadata_source ON track_metadata_source(source);
 ```
 
 Per PRD §8.1, displayed-value priority chain is
-`serato > rekordbox > traktor > id3 > filename`. The browser computes
+`serato > rekordbox > traktor > itunes > id3 > filename`. The browser computes
 the displayed value at query time using a `COALESCE` chain over a
 pivoted view; there is no materialized "winner" column to keep in
 sync.
@@ -546,6 +560,39 @@ id, not by name. Because the mirror is truncate-and-rewrite per source (no
 upsert-by-name), the constraint served no conflict-resolution purpose. The v6
 migration drops + recreates both tables (the mirror is rebuilt on the next
 import), which also backfills them on any DB created before the tables existed.
+
+### `favorite_slots` — favourite-playlist quick-access strip (schema v8, M12f)
+
+```sql
+CREATE TABLE IF NOT EXISTS favorite_slots (
+    slot_index        INTEGER PRIMARY KEY CHECK (slot_index >= 0 AND slot_index < 8),
+    kind              TEXT    NOT NULL CHECK (kind IN ('dub_crate', 'imported_crate')),
+    dub_crate_id      INTEGER REFERENCES crates(id) ON DELETE CASCADE,
+    imported_source   TEXT    CHECK (imported_source IS NULL OR imported_source IN
+                              ('serato', 'traktor', 'rekordbox', 'itunes')),
+    imported_path     TEXT,
+    label             TEXT    NOT NULL,
+    added_at          INTEGER NOT NULL,
+    CHECK (
+        (kind = 'dub_crate'
+            AND dub_crate_id IS NOT NULL
+            AND imported_source IS NULL AND imported_path IS NULL)
+        OR
+        (kind = 'imported_crate'
+            AND dub_crate_id IS NULL
+            AND imported_source IS NOT NULL AND imported_path IS NOT NULL)
+    )
+);
+```
+
+The fixed 8-slot quick-access strip above the library (PRD §8.5.1). A slot points
+at either a **Dub crate** (`dub_crate_id`, FK-cascaded so deleting the crate empties
+the slot) or an **imported node playlist**. Imported playlists are stored by
+`(imported_source, imported_path)` — the slash-joined node names from the source's
+root — rather than by `imported_crates.id`, because the imported mirror is
+truncate-and-rewritten on every re-scan (its ids are unstable, the name-path is
+not). `label` caches the display name for an instant render before the path
+re-resolves to the current id. `slot_index` is the position 0–7.
 
 ### `play_history` — every event, milliseconds
 

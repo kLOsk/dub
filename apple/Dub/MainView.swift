@@ -3790,6 +3790,45 @@ final class WaveformAppModel: ObservableObject {
         try? engine.calibrateDeck(deckIdx: side.ffiDeckIdx)
     }
 
+    // MARK: - Key Lock (master tempo) — M14 live A/B
+
+    /// Per-deck key-lock engine selection (which stretch engine, or off).
+    /// `resampler` (the default) means key lock disabled — matching the engine.
+    @Published var keyLockSelectionA: KeyLockSelection = .resampler
+    @Published var keyLockSelectionB: KeyLockSelection = .resampler
+
+    func keyLockSelection(_ side: DeckSide) -> KeyLockSelection {
+        side == .a ? keyLockSelectionA : keyLockSelectionB
+    }
+
+    /// Switch a deck's key-lock engine live (the A/B control). `resampler`
+    /// disables key lock (pitch shifts with rate); `ours` / `rubberBand` enable
+    /// it on the chosen backend. The engine crossfades the transition; the
+    /// scratch-aware auto-bypass is automatic.
+    func setKeyLockSelection(side: DeckSide, _ selection: KeyLockSelection) {
+        if side == .a {
+            keyLockSelectionA = selection
+        } else {
+            keyLockSelectionB = selection
+        }
+        switch selection {
+        case .resampler:
+            try? engine.setDeckStretchBackend(deckIdx: side.ffiDeckIdx, backend: .resamplerOnly)
+            try? engine.setDeckKeyLock(deckIdx: side.ffiDeckIdx, on: false)
+        case .ours:
+            try? engine.setDeckStretchBackend(deckIdx: side.ffiDeckIdx, backend: .dubOwn)
+            try? engine.setDeckKeyLock(deckIdx: side.ffiDeckIdx, on: true)
+        }
+    }
+
+    /// **Testing only** (M14): set the prep deck's playback rate from the pitch
+    /// test buttons — `1.0 + percent/100`. With key lock on, tempo moves and
+    /// pitch holds; off, both move. Lets us A/B the key-lock engines without a
+    /// turntable.
+    func setPrepPitch(side: DeckSide, percent: Double) {
+        try? engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0 + percent / 100.0)
+    }
+
     /// M11d-history — deck-header hint click. Publishes a reveal
     /// request the LibraryView consumes (select + scroll, falling
     /// back to All Tracks when the track isn't in the current

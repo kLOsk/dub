@@ -255,6 +255,12 @@ struct PerformanceView: View {
                 activeBars: model.deckA.activeLoopBars,
                 onLoop: { bars in model.handleLoop(.a, bars: bars) },
                 onExit: { model.exitLoop(.a) })
+            // M14 — Key Lock live A/B (Resampler · Ours · Rubber Band) +
+            // engaged/standby indicator. Prep surface; clickable.
+            KeyLockControlView(model: model, side: .a)
+            // M14 — rudimentary pitch buttons for testing key lock without a
+            // turntable.
+            PitchTestView(model: model, side: .a)
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, DubSpacing.sm)

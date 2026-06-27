@@ -125,6 +125,12 @@ ordering is the assumption; the file carries no text key to cross-check it
 against, so treat the exact per-value mapping as best-effort until a tagged
 export confirms it.)*
 
+**Rating / colour.** `<INFO RANKING>` is `0–255` in steps of 51 → `0–5` stars
+(`track_metadata_source.rating`). `<INFO COLOR>` is a small palette index mapped
+best-effort to a Dub colour token (`track_metadata_source.color`, schema v9).
+*(Like the key mapping, the colour-index→token ordering is unconfirmed against a
+real tagged `collection.nml` — re-validate when one is available.)*
+
 **Playlists.** `<PLAYLISTS>` is a `<NODE>` tree: `TYPE="FOLDER"` (nesting),
 `TYPE="PLAYLIST"` (members via `<ENTRY><PRIMARYKEY KEY="…"/>`), `TYPE="SMARTLIST"`
 (dynamic — skipped, we can't resolve it to fixed tracks). The `$ROOT` folder is
@@ -181,6 +187,12 @@ markers get an index ≥ 8 so they never alias a hot pad.
 
 **Key.** `Tonality` is stored verbatim (rekordbox's own notation — Camelot `8B`,
 Open-Key `5d`, or classical `Abm`; `track_keys` keeps it as-is).
+
+**Rating / colour.** `Rating` is `0–255` in steps of 51 → `0–5` stars
+(`track_metadata_source.rating`; `0` = unrated → NULL). `Colour` is a hex value
+(`0xRRGGBB`) mapped to the nearest of Dub's 8 palette tokens by hue
+(`track_metadata_source.color`, schema v9; `crate::color_label`). The DJ's own
+`tracks.color` overrides the imported one in the browser.
 
 **Playlists.** `<NODE Type="0">` = folder (the top `Name="ROOT"` is transparent),
 `Type="1"` = playlist whose `<TRACK Key="…"/>` children reference collection
@@ -262,7 +274,7 @@ constraint, schema v6.)* Run headless with `dub import --itunes <Library.xml>`.
   Each source's row in `track_metadata_source` carries that source's
   opinion (artist / title / album / comment / bpm / key / gain /
   version_token); the browser's displayed value is chosen by the priority
-  chain `serato > rekordbox > traktor > id3 > filename` but every source's
+  chain `serato > rekordbox > traktor > itunes > id3 > filename` but every source's
   raw value remains queryable. Re-import refreshes the per-source row only.
 - **Beatgrid priority:** default order `Serato > rekordbox > Traktor >
   auto-detect`, user-configurable in Preferences (PRD §8.3). Per-track

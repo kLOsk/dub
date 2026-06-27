@@ -149,3 +149,130 @@ struct SourceControlView: View {
     .padding()
     .background(DubColor.surface0)
 }
+
+// MARK: - Key Lock (master tempo) control — M14
+
+/// Whether a deck's key lock is on. `resampler` = key lock OFF (the deck's
+/// resampler handles rate, so pitch shifts with it); `ours` = our pure-Rust
+/// WSOLA key lock (tempo follows the platter, pitch held).
+enum KeyLockSelection: Equatable {
+    case resampler
+    case ours
+}
+
+/// Per-deck Key Lock control (PRD §6.1.1): a two-way RESAMP / OURS toggle plus a
+/// status dot showing the engine's *actual* state (full green = engaged / pitch
+/// held, dim green = standby / auto-bypassed during a scratch, grey = off). A
+/// Prep / dev surface; clickable (the no-mouse rule is Performance-only).
+struct KeyLockControlView: View {
+    @ObservedObject var model: WaveformAppModel
+    let side: DeckSide
+
+    /// The engine's published key-lock state (0 off · 1 standby · 2 engaged),
+    /// polled at the signal panel's 20 Hz cadence.
+    @State private var indicatorState: UInt8 = 0
+    private let tick = Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        let selection = model.keyLockSelection(side)
+        HStack(spacing: DubSpacing.sm) {
+            HStack(spacing: DubSpacing.xs) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Text("KEY LOCK")
+                    .font(DubFont.caps)
+                    .tracking(0.6)
+                    .foregroundStyle(DubColor.textSecondary)
+                    .fixedSize()
+            }
+
+            HStack(spacing: 0) {
+                segment("OFF", active: selection == .resampler) {
+                    model.setKeyLockSelection(side: side, .resampler)
+                }
+                segment("ON", active: selection == .ours) {
+                    model.setKeyLockSelection(side: side, .ours)
+                }
+            }
+            .background(DubColor.surface2)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
+        }
+        .onReceive(tick) { _ in
+            indicatorState = model.engine.deckTelemetry(deckIdx: side.ffiDeckIdx).keyLockState
+        }
+    }
+
+    private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Text(title)
+            .font(DubFont.caps)
+            .tracking(0.6)
+            .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
+            .padding(.horizontal, DubSpacing.sm)
+            .padding(.vertical, 3)
+            .background(active ? DubColor.deckTint(side) : Color.clear)
+            .onPressDown(perform: action)
+            .accessibilityAddTraits(.isButton)
+    }
+
+    private var dotColor: Color {
+        switch indicatorState {
+        case 2: return DubColor.stateLocked // engaged — pitch held
+        case 1: return DubColor.stateLocked.opacity(0.4) // standby — auto-bypassed
+        default: return DubColor.textPlaceholder // off
+        }
+    }
+}
+
+/// Rudimentary prep-mode pitch control for **testing** key lock without a
+/// turntable (M14): tap a percent to set the deck's playback rate, then A/B the
+/// key-lock engines above to hear pitch held (Ours / Rubber Band) vs shifted
+/// (Resampler). `0` returns to unity. Not a performance control.
+struct PitchTestView: View {
+    @ObservedObject var model: WaveformAppModel
+    let side: DeckSide
+
+    @State private var current: Double = 0
+
+    private let steps: [Double] = [-10, -5, -2, 0, 2, 5, 10]
+
+    var body: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("PITCH %")
+                .font(DubFont.caps)
+                .tracking(0.6)
+                .foregroundStyle(DubColor.textSecondary)
+                .fixedSize()
+
+            HStack(spacing: 0) {
+                ForEach(steps, id: \.self) { pct in
+                    segment(label(pct), active: current == pct) {
+                        current = pct
+                        model.setPrepPitch(side: side, percent: pct)
+                    }
+                }
+            }
+            .background(DubColor.surface2)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
+        }
+    }
+
+    private func label(_ pct: Double) -> String {
+        if pct == 0 { return "0" }
+        return pct > 0 ? "+\(Int(pct))" : "\(Int(pct))"
+    }
+
+    private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Text(title)
+            .font(DubFont.caps)
+            .tracking(0.6)
+            .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
+            .frame(minWidth: 26)
+            .padding(.vertical, 3)
+            .background(active ? DubColor.deckTint(side) : Color.clear)
+            .onPressDown(perform: action)
+            .accessibilityAddTraits(.isButton)
+    }
+}

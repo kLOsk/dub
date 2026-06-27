@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 mod analysis;
+mod color_label;
 mod cues;
 mod db;
 mod dedupe;

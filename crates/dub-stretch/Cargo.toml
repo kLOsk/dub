@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Rubber Band FFI wrapper (license-isolated). Time-stretch + key lock."
+description = "Time-stretch / key-lock engine for Dub: pure-Rust WSOLA. No unsafe, no C deps."
 
 [dependencies]
+
+[dev-dependencies]
+# RT-safety: WSOLA `process` must not allocate. Tests wrap it in
+# `assert_no_alloc` with the `AllocDisabler` global allocator.
+assert_no_alloc = { workspace = true }
+# Golden DSP regression (tone + click signatures).
+insta = { workspace = true }
+# Property tests (length invariant, pitch constancy across a rate sweep).
+proptest = { workspace = true }
+# Plain forward FFT to measure a stretched tone's fundamental in tests
+# (pitch-constancy check). Not used by the crate itself.
+realfft = { workspace = true }

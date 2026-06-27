@@ -70,6 +70,12 @@ pub struct ParsedEntry {
     pub genre: Option<String>,
     /// Free-text comment.
     pub comment: Option<String>,
+    /// Star rating 0–5, from `<INFO RANKING>` (0–255 in steps of 51).
+    /// `None` when unrated.
+    pub rating: Option<i32>,
+    /// Colour-label palette token, from `<INFO COLOR>` (Traktor index →
+    /// nearest token, best-effort). `None` when unset / un-mappable.
+    pub color: Option<String>,
     /// Tempo, BPM.
     pub bpm: Option<f64>,
     /// Canonical Camelot key (from `MUSICAL_KEY VALUE`), if mappable.
@@ -246,6 +252,18 @@ fn apply_child(cur: &mut ParsedEntry, e: &BytesStart) {
             }
             if cur.comment.is_none() {
                 cur.comment = attr(e, b"COMMENT");
+            }
+            if cur.rating.is_none() {
+                // `RANKING` is 0–255 in steps of 51, same as rekordbox.
+                cur.rating = attr(e, b"RANKING")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .and_then(crate::rekordbox::star_rating);
+            }
+            if cur.color.is_none() {
+                cur.color = attr(e, b"COLOR")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .and_then(crate::color_label::token_from_traktor_index)
+                    .map(str::to_owned);
             }
             if cur.duration_secs.is_none() {
                 // PLAYTIME_FLOAT (fractional seconds) preferred; fall back to
@@ -437,7 +455,7 @@ mod tests {
     <ENTRY TITLE="Test Track" ARTIST="Test Artist">
       <LOCATION DIR="/:Users/:dj/:Music/:" FILE="track.mp3" VOLUME="Macintosh HD"/>
       <ALBUM TITLE="Test Album"/>
-      <INFO GENRE="Techno" COMMENT="hello" PLAYTIME="167" PLAYTIME_FLOAT="166.523"/>
+      <INFO GENRE="Techno" COMMENT="hello" PLAYTIME="167" PLAYTIME_FLOAT="166.523" RANKING="153" COLOR="4"/>
       <TEMPO BPM="128.000000"/>
       <MUSICAL_KEY VALUE="0"/>
       <CUE_V2 NAME="AutoGrid" TYPE="4" START="500.0" LEN="0" HOTCUE="-1"/>
@@ -460,6 +478,8 @@ mod tests {
         assert_eq!(e.album.as_deref(), Some("Test Album"));
         assert_eq!(e.genre.as_deref(), Some("Techno"));
         assert_eq!(e.comment.as_deref(), Some("hello"));
+        assert_eq!(e.rating, Some(3)); // RANKING 153 / 51 = 3 stars
+        assert_eq!(e.color.as_deref(), Some("green")); // COLOR index 4 → green (best-effort)
         assert!((e.duration_secs.unwrap() - 166.523).abs() < 1e-6); // PLAYTIME_FLOAT
         assert!((e.bpm.unwrap() - 128.0).abs() < 1e-9);
         assert_eq!(e.key_camelot.as_deref(), Some("8B")); // VALUE 0 = C major

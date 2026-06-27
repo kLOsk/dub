@@ -21,10 +21,14 @@ dub-bpm = { workspace = true }
 # wired through `EngineHandle::attach_thru_source_with_peaks_tracking`
 # (or `_with_telemetry` for both at once).
 dub-peaks = { workspace = true }
+# M14 — per-deck key-lock time-stretch (pure-Rust WSOLA).
+dub-stretch = { workspace = true }
 
 [dev-dependencies]
 assert_no_alloc = { workspace = true }
 proptest = { workspace = true }
+# M14 — measure the engaged key-lock output's fundamental (pitch-constancy test).
+realfft = { workspace = true }
 # On-rig capture replay (the DUB_CAPTURE_WAV diagnostic in
 # `display_rate::tests`): feed a real `dub capture` WAV through the
 # exact decode → smoother → policy → display chain offline.

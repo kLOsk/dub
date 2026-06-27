@@ -415,7 +415,7 @@ const TRACK_ROW_SELECT: &str = "\
            t.grid_drift_quality                AS grid_drift_quality, \
            COALESCE(t.user_rating, sr.rating, rb.rating, tr.rating, it.rating, i3.rating) \
                                                AS rating, \
-           t.color                             AS color \
+           COALESCE(t.color, sr.color, rb.color, tr.color, it.color) AS color \
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
@@ -1540,6 +1540,29 @@ impl Library {
                 params![track_uuid, color],
             )
             .map_err(|e| LibraryError::sqlite("set_track_color", e))?;
+        Ok(())
+    }
+
+    /// Set the imported per-source colour token (schema v9) on an
+    /// existing `track_metadata_source` row — the rekordbox / Traktor
+    /// importers call this after upserting their metadata row to record
+    /// the source's colour label. `None` clears it (so a re-import that
+    /// no longer carries a colour drops the stale one). The browser
+    /// shows `COALESCE(tracks.color, …source colours…)`, so the DJ's own
+    /// colour still wins. No-op when the `(track, source)` row is absent.
+    pub fn set_metadata_source_color(
+        &self,
+        track_uuid: &str,
+        source: &str,
+        color: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE track_metadata_source SET color = ?3 \
+                 WHERE track_id = ?1 AND source = ?2",
+                params![track_uuid, source, color],
+            )
+            .map_err(|e| LibraryError::sqlite("set_metadata_source_color", e))?;
         Ok(())
     }
 
@@ -3870,6 +3893,51 @@ mod tests {
         assert_eq!(row.track_number, Some(2));
         assert_eq!(row.source, "itunes");
         assert_eq!(row.rating, Some(5));
+    }
+
+    #[test]
+    fn per_source_color_surfaces_and_user_color_overrides() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        lib.insert_track(&id, None, None, None).unwrap();
+        lib.promote_to_collection(&id).unwrap();
+        lib.upsert_metadata_source(
+            &id,
+            "rekordbox",
+            Some("A"),
+            Some("T"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Imported per-source colour surfaces (schema v9 COALESCE).
+        lib.set_metadata_source_color(&id, "rekordbox", Some("blue"))
+            .unwrap();
+        assert_eq!(
+            lib.list_tracks(10, 0).unwrap()[0].color.as_deref(),
+            Some("blue")
+        );
+        // The DJ's own colour wins over the imported one.
+        lib.set_track_color(&id, Some("red")).unwrap();
+        assert_eq!(
+            lib.list_tracks(10, 0).unwrap()[0].color.as_deref(),
+            Some("red")
+        );
+        // Clearing the user colour falls back to the imported one.
+        lib.set_track_color(&id, None).unwrap();
+        assert_eq!(
+            lib.list_tracks(10, 0).unwrap()[0].color.as_deref(),
+            Some("blue")
+        );
     }
 
     #[test]

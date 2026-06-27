@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -85,6 +85,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 8,
         sql: V8_MIGRATION,
+    },
+    Migration {
+        target_version: 9,
+        sql: V9_MIGRATION,
     },
 ];
 
@@ -696,6 +700,21 @@ CREATE TABLE IF NOT EXISTS favorite_slots (
 );
 "#;
 
+/// v9 — per-source colour label (M12f follow-on).
+///
+/// rekordbox and Traktor carry a per-track colour label in their
+/// exports; like every other source opinion these are preserved per
+/// source rather than flattened. `track_metadata_source.color` holds
+/// the imported colour as one of Dub's palette tokens (mapped from the
+/// source's hex / index by `crate::color_label`). The browser's
+/// displayed colour is `COALESCE(tracks.color, <source colours>)` — the
+/// DJ's own colour (set via the Colour column) always wins, the
+/// imported colour is the fallback. NULL when the source carries none.
+/// Additive.
+const V9_MIGRATION: &str = r#"
+ALTER TABLE track_metadata_source ADD COLUMN color TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1143,6 +1162,23 @@ mod tests {
             )
             .is_err(),
             "a dub_crate slot must not carry imported fields"
+        );
+    }
+
+    #[test]
+    fn migration_v9_adds_metadata_source_color() {
+        let conn = fresh_db();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(track_metadata_source)")
+            .unwrap();
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "color"),
+            "v9 migration must add color to track_metadata_source; saw {cols:?}"
         );
     }
 

@@ -303,7 +303,21 @@ uniffi::setup_scaffolding!();
 ///       `clear_loop`; [`PositionInfo`] grows `loop_active` /
 ///       `loop_in_secs` / `loop_out_secs`. A grid-snapped loop over
 ///       the bars just heard (Prep LOOP pads).
-pub const FFI_VERSION: u32 = 39;
+///   40. **M14 key lock.** `DubEngine` grows `set_deck_key_lock` /
+///       `set_deck_stretch_backend` (+ the [`StretchBackend`] enum) —
+///       the per-deck master-tempo toggle and the live A/B engine
+///       selector (resampler-only / WSOLA / Rubber Band).
+///   41. **M14 key-lock indicator.** [`DeckTelemetry`] grows
+///       `key_lock_state` (0 off · 1 standby · 2 engaged) for the
+///       deck-header dim/green key-lock dot.
+///   42. **M14 Rubber Band availability.** Free fn
+///       `rubberband_backend_available()` so the UI greys out the
+///       Rubber Band A/B option in a permissive (non-GPL) build.
+///   43. **M14.4 Rubber Band removed.** WSOLA won the A/B (more faithful;
+///       keeps Dub permissive), so `rubberband_backend_available()` and
+///       the `StretchBackend::RubberBand` variant are gone. Key lock is
+///       now just our WSOLA (`StretchBackend` = `ResamplerOnly`/`DubOwn`).
+pub const FFI_VERSION: u32 = 43;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1640,6 +1654,49 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Enable or disable key lock (master tempo) on `deck_idx` (M14). When on,
+    /// the engaged stretcher holds pitch while tempo follows the platter; the
+    /// engine auto-bypasses during scratch, reverse, and extreme rates.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_deck_key_lock(&self, deck_idx: u64, on: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_key_lock(on)
+            .map_err(map_command_error)
+    }
+
+    /// Select a deck's key-lock state (M14). `ResamplerOnly` disables key lock
+    /// (pitch shifts with rate); `DubOwn` enables our WSOLA key lock.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_deck_stretch_backend(
+        &self,
+        deck_idx: u64,
+        backend: StretchBackend,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_stretch_backend(backend.into())
+            .map_err(map_command_error)
+    }
+
     /// Engage a grid-snapped **reverse** loop of `length_beats` beats
     /// on `deck_idx`: the loop covers the `length_beats` beats ending
     /// at the beat line nearest the current playhead — the passage the
@@ -2017,6 +2074,7 @@ impl DubEngine {
             sticker_drift_ms: tc.sticker_drift_ms,
             pitch_settled: tc.pitch_settled,
             measure_progress: tc.measure_progress,
+            key_lock_state: shared.load_key_lock_state(),
         }
     }
 
@@ -3139,6 +3197,10 @@ pub struct DeckTelemetry {
     /// progress line (whitening capture + pitch stabilization,
     /// time-weighted). 1.0 when nothing is measuring.
     pub measure_progress: f32,
+    /// M14 key-lock indicator state: 0 off · 1 standby (enabled but bypassed —
+    /// scratch / reverse / extreme rate) · 2 engaged (pitch held). Drives the
+    /// deck-header key-lock dot (dim / green). PRD §6.1.1.
+    pub key_lock_state: u8,
 }
 
 impl DeckTelemetry {
@@ -3161,6 +3223,7 @@ impl DeckTelemetry {
             sticker_drift_ms: f64::NAN,
             pitch_settled: true,
             measure_progress: 1.0,
+            key_lock_state: 0,
         }
     }
 }
@@ -3185,6 +3248,25 @@ impl From<ControlMode> for dub_engine::ControlMode {
             ControlMode::InternalPlay => dub_engine::ControlMode::Internal,
             ControlMode::Timecode => dub_engine::ControlMode::Timecode,
             ControlMode::Thru => dub_engine::ControlMode::Thru,
+        }
+    }
+}
+
+/// Whether a deck's key lock is on (M14). `ResamplerOnly` = off (pitch shifts
+/// with rate); `DubOwn` = our WSOLA key lock.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum StretchBackend {
+    /// No key lock — the deck's resampler handles rate (pitch shifts).
+    ResamplerOnly,
+    /// Dub's pure-Rust WSOLA key lock.
+    DubOwn,
+}
+
+impl From<StretchBackend> for dub_engine::StretchBackend {
+    fn from(b: StretchBackend) -> Self {
+        match b {
+            StretchBackend::ResamplerOnly => dub_engine::StretchBackend::ResamplerOnly,
+            StretchBackend::DubOwn => dub_engine::StretchBackend::DubOwn,
         }
     }
 }
@@ -4287,7 +4369,12 @@ mod tests {
         // `hot_cues` + the `HotCue` record).
         // 38→39: reverse loops (`set_reverse_loop` / `clear_loop` +
         // `PositionInfo.loop_active` / `loop_in_secs` / `loop_out_secs`).
-        assert_eq!(FFI_VERSION, 39);
+        // 39→40: M14 key lock (`set_deck_key_lock` /
+        // `set_deck_stretch_backend` + the `StretchBackend` enum).
+        // 40→41: M14 key-lock indicator (`DeckTelemetry.key_lock_state`).
+        // 41→42: M14 `rubberband_backend_available()`.
+        // 42→43: M14.4 Rubber Band removed (fn + `StretchBackend::RubberBand`).
+        assert_eq!(FFI_VERSION, 43);
     }
 
     #[test]

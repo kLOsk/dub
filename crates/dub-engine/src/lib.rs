@@ -53,6 +53,9 @@ pub use timecode::{
 };
 
 pub use dub_timecode::{SourceClass, SourceClassifier};
+// M14 — re-exported so the FFI (and other consumers) can name the key-lock
+// backend selector without depending on `dub-stretch` directly.
+pub use dub_stretch::StretchBackend;
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -325,7 +328,7 @@ impl Engine {
     #[must_use]
     pub fn new(sample_rate: f32, block_size: usize) -> Self {
         let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
-        let decks = std::array::from_fn(|_| Deck::new(envelope.clone()));
+        let decks = std::array::from_fn(|_| Deck::new(envelope.clone(), sample_rate));
         drop(envelope);
         Self {
             sample_rate,
@@ -380,8 +383,9 @@ impl Engine {
         shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT],
     ) -> (Self, EngineHandle) {
         let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
-        let decks: [Deck; DECK_COUNT] =
-            std::array::from_fn(|i| Deck::with_shared(envelope.clone(), shared[i].clone()));
+        let decks: [Deck; DECK_COUNT] = std::array::from_fn(|i| {
+            Deck::with_shared(envelope.clone(), shared[i].clone(), sample_rate)
+        });
         drop(envelope);
         let (handle, side) = EngineHandle::new(shared, sample_rate);
         let engine = Self {
@@ -1465,6 +1469,16 @@ impl Engine {
             Command::DeckSetRate { idx, rate } => {
                 if let Some(d) = self.decks.get_mut(idx as usize) {
                     d.set_rate(rate);
+                }
+            }
+            Command::DeckSetKeyLock { idx, on } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_key_lock(on);
+                }
+            }
+            Command::DeckSetStretchBackend { idx, backend } => {
+                if let Some(d) = self.decks.get_mut(idx as usize) {
+                    d.set_stretch_backend(backend);
                 }
             }
             Command::DeckPanicPlay { idx } => {

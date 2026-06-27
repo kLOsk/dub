@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use dub_io::Track;
+use dub_stretch::TimeStretcher;
 
 use crate::declick::DeclickEnvelope;
 use crate::realtime::RealtimeContext;
@@ -185,6 +186,12 @@ pub struct DeckSharedState {
     loop_active: AtomicBool,
     loop_in_secs_bits: AtomicU64,
     loop_out_secs_bits: AtomicU64,
+    /// M14 key-lock indicator state, published each block: `0` = off (key lock
+    /// disabled), `1` = standby (enabled but currently bypassed — scratch /
+    /// reverse / extreme rate), `2` = engaged (pitch held). Drives the deck
+    /// header's green/dim key-lock dot (PRD §6.1.1). Plain relaxed atomic — a
+    /// one-block tear is invisible.
+    key_lock_state: AtomicU8,
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -328,6 +335,7 @@ impl DeckSharedState {
             loop_active: AtomicBool::new(false),
             loop_in_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            key_lock_state: AtomicU8::new(0),
         }
     }
 
@@ -356,6 +364,7 @@ impl DeckSharedState {
         self.calibrated_flag.store(false, Ordering::Relaxed);
         self.calibrating_flag.store(false, Ordering::Relaxed);
         self.control_override_flag.store(false, Ordering::Relaxed);
+        self.key_lock_state.store(0, Ordering::Relaxed);
         self.tc_abs_locked.store(false, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
@@ -427,6 +436,19 @@ impl DeckSharedState {
         self.calibrating_flag.store(calibrating, Ordering::Relaxed);
         self.control_override_flag
             .store(overridden, Ordering::Relaxed);
+    }
+
+    /// Publish the M14 key-lock indicator state (0 off / 1 standby / 2
+    /// engaged) from the audio thread. One relaxed store; RT-safe.
+    pub(crate) fn store_key_lock_state(&self, state: u8) {
+        self.key_lock_state.store(state, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the M14 key-lock indicator state, for the FFI
+    /// telemetry that drives the deck-header key-lock dot.
+    #[must_use]
+    pub fn load_key_lock_state(&self) -> u8 {
+        self.key_lock_state.load(Ordering::Relaxed)
     }
 
     /// Publish the installed whitening matrix + calibration counter
@@ -830,6 +852,51 @@ pub struct Deck {
     /// advance (`pending_advance`) is never set at the same time, and
     /// the render guards against the two colliding.
     loop_region: Option<(f64, f64)>,
+
+    /// M14 key lock (master tempo): when `true`, render engages the
+    /// selected [`Self::stretch_backend`] to hold pitch while tempo
+    /// follows `rate` — subject to the scratch-aware auto-bypass. The
+    /// engaged DSP + state machine land in M14.3b; this flag is the
+    /// user-set enable, plumbed via [`Command::DeckSetKeyLock`].
+    key_lock_enabled: bool,
+
+    /// M14 live A/B: which time-stretch engine engages when key lock is
+    /// on. `ResamplerOnly` means "never engage" (no key lock — pitch
+    /// shifts with rate). Plumbed via [`Command::DeckSetStretchBackend`].
+    stretch_backend: dub_stretch::StretchBackend,
+
+    /// Resident key-lock stretchers (both backends), preallocated off-RT.
+    stretchers: DeckStretchers,
+
+    /// Engaged-path input scratch — one [`KL_FEED_HOP`] feed, interleaved.
+    stretch_in: Box<[f32]>,
+
+    /// Engaged-path output scratch — pitch-corrected frames awaiting playout.
+    stretch_out: Box<[f32]>,
+    /// Valid frames in [`Self::stretch_out`].
+    stretch_out_len: usize,
+    /// Next frame to play out of [`Self::stretch_out`].
+    stretch_out_read: usize,
+
+    /// Read-ahead cursor (track frames) feeding the stretcher while engaged.
+    /// Leads [`Self::position`] by the pipeline latency; the audible playhead
+    /// (`position`) still advances by `new_increment` per output frame, so the
+    /// publish path is unchanged.
+    read_cursor: f64,
+
+    /// Key-lock engage state machine.
+    lock_state: KeyLockState,
+
+    /// Previous block's `rate`, for the scratch-detect slew.
+    prev_rate: f64,
+
+    /// Consecutive frames the deck has been settle-eligible. Key lock engages
+    /// only once this reaches [`KL_SETTLE_FRAMES`]; any disqualifying block
+    /// resets it to 0.
+    settle_frames: u32,
+
+    /// Equal-power envelope ([`KL_XFADE_MS`]) for the bypass↔engaged crossfade.
+    lock_xfade: Arc<DeclickEnvelope>,
 }
 
 /// Equal-shape seam crossfade applied at the loop wrap so the
@@ -840,6 +907,65 @@ pub struct Deck {
 /// loop length so very short loops keep a real body.
 const LOOP_XFADE_SECS: f64 = 0.004;
 
+// === M14 key lock (master tempo) tunables. ===
+
+/// Frames fed to the engaged stretcher per refill. A small hop keeps the
+/// stretcher's internal buffering minimal and the per-callback cost even.
+const KL_FEED_HOP: usize = 256;
+/// Bypass ↔ engaged equal-power crossfade duration (PRD §6.1.1: 20–30 ms).
+const KL_XFADE_MS: f32 = 25.0;
+/// Below this |rate| key lock bypasses (near-pause: pitch_scale would blow up).
+const KL_MIN_RATE: f64 = 0.10;
+/// Above this |rate| key lock bypasses (extreme varispeed Rubber Band/WSOLA
+/// can't track musically; also the resampler is fine there).
+const KL_MAX_RATE: f64 = 2.0;
+/// `|Δrate|` per block at or below which the deck counts as "settled" this
+/// block (a candidate for engaging — gated further by the settle timer).
+const KL_SLEW_ENGAGE: f64 = 0.05;
+/// `|Δrate|` per block that forces bypass (scratch / fast jog). Set well above a
+/// deliberate pitch-fader / pitch-button step so those stay engaged (the
+/// stretcher just retunes `pitch_scale`); only fast excursions bypass. The wide
+/// hysteresis vs `KL_SLEW_ENGAGE` also stops engage/disengage flapping.
+const KL_SLEW_DISENGAGE: f64 = 0.35;
+/// Frames the deck must stay continuously settled before key lock engages
+/// (~50 ms at 48 kHz). Prevents the engage from "kicking in" during the brief
+/// lulls of a scratch — which was audible as repeated re-engage clicks.
+const KL_SETTLE_FRAMES: u32 = 2_400;
+
+/// Per-deck resident key-lock stretcher (WSOLA), preallocated off-RT.
+struct DeckStretchers {
+    wsola: dub_stretch::WsolaStretcher,
+}
+
+impl DeckStretchers {
+    /// Build the stretcher sized for `engine_sr`. Off-RT (allocates).
+    fn new(engine_sr: f32) -> Self {
+        Self {
+            wsola: dub_stretch::WsolaStretcher::new(engine_sr),
+        }
+    }
+}
+
+// The stretchers hold large preallocated buffers (and, under the feature, an
+// FFI handle) — opaque in `Deck`'s `Debug`.
+impl std::fmt::Debug for DeckStretchers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeckStretchers").finish_non_exhaustive()
+    }
+}
+
+/// Key-lock engage state machine (per deck, audio thread). See PRD §6.1.1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyLockState {
+    /// Raw resampler — pitch shifts with rate. The default and the scratch /
+    /// reverse / extreme-rate path.
+    Bypassed,
+    /// Crossfading bypass → engaged over the equal-power envelope (index `i`).
+    Engaging { i: u32 },
+    /// Stretcher fully engaged — pitch held.
+    Engaged,
+}
+
 impl Deck {
     /// Construct an empty deck with no track loaded. Allocates the shared
     /// atomic state — call this off the audio thread.
@@ -847,8 +973,12 @@ impl Deck {
     /// The declick envelope is shared across the engine's decks; cloning
     /// the `Arc` is cheap.
     #[must_use]
-    pub fn new(declick_envelope: Arc<DeclickEnvelope>) -> Self {
-        Self::with_shared(declick_envelope, Arc::new(DeckSharedState::new()))
+    pub fn new(declick_envelope: Arc<DeclickEnvelope>, engine_sr: f32) -> Self {
+        Self::with_shared(
+            declick_envelope,
+            Arc::new(DeckSharedState::new()),
+            engine_sr,
+        )
     }
 
     /// Construct an empty deck that publishes its transport into
@@ -866,7 +996,15 @@ impl Deck {
     pub fn with_shared(
         declick_envelope: Arc<DeclickEnvelope>,
         shared: Arc<DeckSharedState>,
+        engine_sr: f32,
     ) -> Self {
+        let stretchers = DeckStretchers::new(engine_sr);
+        // Size the playout scratch from WSOLA's bound; Rubber Band caps its
+        // own writes to the buffer, so this also covers it.
+        let out_cap = stretchers
+            .wsola
+            .max_output_for(KL_FEED_HOP)
+            .max(KL_FEED_HOP * 2);
         Self {
             source: None,
             position: 0.0,
@@ -879,6 +1017,18 @@ impl Deck {
             pending_disposal: None,
             pending_advance: None,
             loop_region: None,
+            key_lock_enabled: false,
+            stretch_backend: dub_stretch::StretchBackend::DubOwn,
+            stretchers,
+            stretch_in: vec![0.0; KL_FEED_HOP * 2].into_boxed_slice(),
+            stretch_out: vec![0.0; out_cap * 2].into_boxed_slice(),
+            stretch_out_len: 0,
+            stretch_out_read: 0,
+            read_cursor: 0.0,
+            lock_state: KeyLockState::Bypassed,
+            prev_rate: 1.0,
+            settle_frames: 0,
+            lock_xfade: DeclickEnvelope::new(engine_sr, KL_XFADE_MS),
         }
     }
 
@@ -1158,6 +1308,42 @@ impl Deck {
     /// playhead position. `-1.0` plays in reverse at realtime.
     pub fn set_rate(&mut self, rate: f64) {
         self.rate = rate;
+    }
+
+    /// Enable/disable key lock (M14). Just records the user intent; the render
+    /// state machine reacts on the next block (engaged DSP lands in M14.3b).
+    pub fn set_key_lock(&mut self, on: bool) {
+        self.key_lock_enabled = on;
+    }
+
+    /// Select the time-stretch engine used when key lock engages (M14 live
+    /// A/B). Field write only; applies on the next engage.
+    pub fn set_stretch_backend(&mut self, backend: dub_stretch::StretchBackend) {
+        self.stretch_backend = backend;
+    }
+
+    /// Key-lock engage decision for the current block: `(can_engage,
+    /// must_bypass)`, with slew hysteresis so engage/disengage can't flap at the
+    /// threshold. Key lock only engages in forward, settled, moderate-rate,
+    /// non-looping internal playback (M6 absolute advance ⇒ timecode ⇒ bypass).
+    fn key_lock_engage_decision(&self, has_m6_advance: bool, declick_active: bool) -> (bool, bool) {
+        let backend_ok = match self.stretch_backend {
+            dub_stretch::StretchBackend::ResamplerOnly => false,
+            dub_stretch::StretchBackend::DubOwn => true,
+        };
+        let base_ok = self.key_lock_enabled
+            && backend_ok
+            && self.playing
+            && self.rate.is_finite()
+            && self.rate > KL_MIN_RATE
+            && self.rate < KL_MAX_RATE
+            && self.loop_region.is_none()
+            && !has_m6_advance
+            && !declick_active;
+        let slew = (self.rate - self.prev_rate).abs();
+        let can_engage = base_ok && slew < KL_SLEW_ENGAGE;
+        let must_bypass = !base_ok || slew >= KL_SLEW_DISENGAGE;
+        (can_engage, must_bypass)
     }
 
     /// Current playback position in track frames.
@@ -1517,50 +1703,137 @@ impl Deck {
 
         // === Phase 2: steady-state playback (no fade) for the rest. ===
         if self.playing {
-            if let Some(track) = self.source.as_ref() {
+            // `clone` (an Arc refcount bump — RT-safe, no alloc) detaches the
+            // track from `self` so the engaged path can borrow `self.stretchers`
+            // mutably alongside the other deck fields.
+            if let Some(track_arc) = self.source.clone() {
+                let track: &Track = &track_arc;
                 #[allow(clippy::cast_precision_loss)]
                 let track_len = track.frames() as f64;
-                let env = &self.declick_envelope;
-                let env_len = env.len();
-                // Pre-compute the loop seam crossfade window (track
-                // frames), capped at a quarter of the loop body so a
-                // short loop still has un-crossfaded audio in the middle.
-                let loop_xfade = loop_region.map(|(lin, lout)| {
-                    let len = lout - lin;
-                    let x = (f64::from(track.sample_rate()) * LOOP_XFADE_SECS).min(len * 0.25);
-                    (lin, lout, len, x.max(0.0))
-                });
 
-                for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
-                    let (mut l, mut r) = read_stereo_at(track, pos);
-                    // Loop seam crossfade: in the last `x` frames before
-                    // `out`, blend the loop tail into the audio that
-                    // leads into `in` (one loop-length back), so when the
-                    // wrap lands on `in` the waveform is already continuous.
-                    if let Some((lin, lout, len, x)) = loop_xfade {
-                        if x > 0.0 && pos >= lout - x && pos < lout && pos >= lin {
-                            let t = (pos - (lout - x)) / x;
-                            let (pl, pr) = read_stereo_at(track, pos - len);
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                            let idx = (t * f64::from(env_len)) as u32;
-                            let fade_in = env.fade_in(idx);
-                            let fade_out = 1.0 - fade_in;
-                            l = l * fade_out + pl * fade_in;
-                            r = r * fade_out + pr * fade_in;
-                        }
+                // --- M14 key-lock state machine (per block). ---
+                let declick_active = frames_consumed_in_fade > 0;
+                let (eligible, must_bypass) =
+                    self.key_lock_engage_decision(advance.is_some(), declick_active);
+                // Settle timer: engage only after the deck has been continuously
+                // eligible for KL_SETTLE_FRAMES, so a scratch's brief lulls don't
+                // re-engage (which clicked). Any ineligible block resets it.
+                #[allow(clippy::cast_possible_truncation)]
+                let block_frames = (out.len() / stride) as u32;
+                self.settle_frames = if eligible {
+                    self.settle_frames.saturating_add(block_frames)
+                } else {
+                    0
+                };
+                let can_engage = self.settle_frames >= KL_SETTLE_FRAMES;
+                let starting_engage =
+                    matches!(self.lock_state, KeyLockState::Bypassed) && can_engage;
+                self.lock_state = match self.lock_state {
+                    KeyLockState::Bypassed if can_engage => KeyLockState::Engaging { i: 0 },
+                    KeyLockState::Bypassed => KeyLockState::Bypassed,
+                    s if must_bypass => {
+                        let _ = s;
+                        KeyLockState::Bypassed
                     }
-                    let edge = track_tail_fade_scale(track_len, pos, env);
-                    chunk[offset] += l * gain * edge;
-                    chunk[offset + 1] += r * gain * edge;
-                    pos += new_increment;
-                    if let Some((lin, lout, len, _)) = loop_xfade {
-                        if len > 0.0 {
-                            if pos >= lout {
-                                pos -= len;
-                            } else if pos < lin {
-                                pos += len;
+                    s => s,
+                };
+
+                if matches!(self.lock_state, KeyLockState::Bypassed) {
+                    // --- Bypass path (raw resampler) — unchanged behaviour. ---
+                    let env = &self.declick_envelope;
+                    let env_len = env.len();
+                    // Pre-compute the loop seam crossfade window (track
+                    // frames), capped at a quarter of the loop body so a
+                    // short loop still has un-crossfaded audio in the middle.
+                    let loop_xfade = loop_region.map(|(lin, lout)| {
+                        let len = lout - lin;
+                        let x = (f64::from(track.sample_rate()) * LOOP_XFADE_SECS).min(len * 0.25);
+                        (lin, lout, len, x.max(0.0))
+                    });
+
+                    for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
+                        let (mut l, mut r) = read_stereo_at(track, pos);
+                        // Loop seam crossfade: in the last `x` frames before
+                        // `out`, blend the loop tail into the audio that
+                        // leads into `in` (one loop-length back), so when the
+                        // wrap lands on `in` the waveform is already continuous.
+                        if let Some((lin, lout, len, x)) = loop_xfade {
+                            if x > 0.0 && pos >= lout - x && pos < lout && pos >= lin {
+                                let t = (pos - (lout - x)) / x;
+                                let (pl, pr) = read_stereo_at(track, pos - len);
+                                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                                let idx = (t * f64::from(env_len)) as u32;
+                                let fade_in = env.fade_in(idx);
+                                let fade_out = 1.0 - fade_in;
+                                l = l * fade_out + pl * fade_in;
+                                r = r * fade_out + pr * fade_in;
                             }
                         }
+                        let edge = track_tail_fade_scale(track_len, pos, env);
+                        chunk[offset] += l * gain * edge;
+                        chunk[offset + 1] += r * gain * edge;
+                        pos += new_increment;
+                        if let Some((lin, lout, len, _)) = loop_xfade {
+                            if len > 0.0 {
+                                if pos >= lout {
+                                    pos -= len;
+                                } else if pos < lin {
+                                    pos += len;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // --- Engaged path (key lock): pitch-correction insert. ---
+                    // Prime once on engage, then render with the crossfade. The
+                    // active backend is borrowed disjointly from the other
+                    // deck fields the helpers touch.
+                    macro_rules! engaged {
+                        ($s:expr) => {{
+                            if starting_engage {
+                                kl_prime(
+                                    $s,
+                                    track,
+                                    track_len,
+                                    &self.declick_envelope,
+                                    &mut self.read_cursor,
+                                    pos,
+                                    new_increment,
+                                    &mut self.stretch_in,
+                                    &mut self.stretch_out,
+                                    &mut self.stretch_out_len,
+                                    &mut self.stretch_out_read,
+                                );
+                            }
+                            render_engaged(
+                                $s,
+                                track,
+                                track_len,
+                                &self.declick_envelope,
+                                &self.lock_xfade,
+                                out,
+                                stride,
+                                offset,
+                                frames_consumed_in_fade,
+                                gain,
+                                self.rate,
+                                new_increment,
+                                &mut pos,
+                                &mut self.read_cursor,
+                                &mut self.stretch_in,
+                                &mut self.stretch_out,
+                                &mut self.stretch_out_len,
+                                &mut self.stretch_out_read,
+                                &mut self.lock_state,
+                            );
+                        }};
+                    }
+                    match self.stretch_backend {
+                        dub_stretch::StretchBackend::DubOwn => {
+                            engaged!(&mut self.stretchers.wsola);
+                        }
+                        // ResamplerOnly: unreachable — engage requires `backend_ok`.
+                        dub_stretch::StretchBackend::ResamplerOnly => {}
                     }
                 }
 
@@ -1599,6 +1872,19 @@ impl Deck {
         }
 
         self.position = pos;
+        // Track this block's rate so the next block's key-lock state machine can
+        // measure the rate slew (scratch / jog detection).
+        self.prev_rate = self.rate;
+        // Publish the key-lock indicator state: off / standby (enabled but
+        // bypassed) / engaged.
+        let kl_state = if !self.key_lock_enabled {
+            0
+        } else if matches!(self.lock_state, KeyLockState::Bypassed) {
+            1
+        } else {
+            2
+        };
+        self.shared.store_key_lock_state(kl_state);
         self.shared.store_position(pos);
         // Publish playhead in seconds for the lock-free
         // `position_snapshot` reader (M11d.6 round 5). One divide
@@ -1720,6 +2006,205 @@ fn read_stereo_at(track: &Track, pos: f64) -> (f32, f32) {
     (l, r)
 }
 
+// === M14 key-lock engaged-render helpers (free fns so the per-block borrow of
+// one `DeckStretchers` backend stays disjoint from the deck's other fields). ===
+
+/// Read one [`KL_FEED_HOP`] of input from `*read_cursor` (advancing at
+/// `new_increment`, with the track tail-fade), push it through `stretcher`, and
+/// advance `*read_cursor` by the frames the stretcher actually consumed.
+/// Returns frames written into `stretch_out`. RT-safe (no alloc).
+#[allow(clippy::too_many_arguments)]
+fn kl_refill<S: TimeStretcher>(
+    stretcher: &mut S,
+    track: &Track,
+    track_len: f64,
+    env: &DeclickEnvelope,
+    read_cursor: &mut f64,
+    new_increment: f64,
+    stretch_in: &mut [f32],
+    stretch_out: &mut [f32],
+) -> usize {
+    let mut rc = *read_cursor;
+    for k in 0..KL_FEED_HOP {
+        let (l, r) = read_stereo_at(track, rc);
+        let edge = track_tail_fade_scale(track_len, rc, env);
+        stretch_in[k * 2] = l * edge;
+        stretch_in[k * 2 + 1] = r * edge;
+        rc += new_increment;
+    }
+    let (consumed, produced) = stretcher.process(stretch_in, stretch_out);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        *read_cursor += consumed as f64 * new_increment;
+    }
+    produced
+}
+
+/// Pop the next pitch-corrected frame, refilling `stretch_out` from the track
+/// as needed. The refill loop is bounded so a stalled stretcher can never spin.
+#[allow(clippy::too_many_arguments)]
+fn kl_next<S: TimeStretcher>(
+    stretcher: &mut S,
+    track: &Track,
+    track_len: f64,
+    env: &DeclickEnvelope,
+    read_cursor: &mut f64,
+    new_increment: f64,
+    stretch_in: &mut [f32],
+    stretch_out: &mut [f32],
+    out_len: &mut usize,
+    out_read: &mut usize,
+) -> (f32, f32) {
+    let mut guard = 0;
+    while *out_read >= *out_len {
+        let produced = kl_refill(
+            stretcher,
+            track,
+            track_len,
+            env,
+            read_cursor,
+            new_increment,
+            stretch_in,
+            stretch_out,
+        );
+        *out_len = produced;
+        *out_read = 0;
+        guard += 1;
+        if guard > 64 {
+            return (0.0, 0.0);
+        }
+    }
+    let i = *out_read;
+    *out_read += 1;
+    (stretch_out[i * 2], stretch_out[i * 2 + 1])
+}
+
+/// Prime the stretcher at engage: reset it, point the read cursor at the
+/// audible playhead, and discard the algorithmic-latency frames so the first
+/// played frame lines up with what the bypass path reads at `start_pos` — the
+/// crossfade then blends only pitch, no phase flam.
+#[allow(clippy::too_many_arguments)]
+fn kl_prime<S: TimeStretcher>(
+    stretcher: &mut S,
+    track: &Track,
+    track_len: f64,
+    env: &DeclickEnvelope,
+    read_cursor: &mut f64,
+    start_pos: f64,
+    new_increment: f64,
+    stretch_in: &mut [f32],
+    stretch_out: &mut [f32],
+    out_len: &mut usize,
+    out_read: &mut usize,
+) {
+    stretcher.reset();
+    *read_cursor = start_pos;
+    *out_len = 0;
+    *out_read = 0;
+    let latency = stretcher.latency_frames();
+    let mut discarded = 0;
+    let mut guard = 0;
+    while discarded < latency {
+        let produced = kl_refill(
+            stretcher,
+            track,
+            track_len,
+            env,
+            read_cursor,
+            new_increment,
+            stretch_in,
+            stretch_out,
+        );
+        guard += 1;
+        if produced == 0 {
+            if guard > 256 {
+                break;
+            }
+            continue;
+        }
+        let skip = produced.min(latency - discarded);
+        discarded += skip;
+        if discarded >= latency {
+            // Keep the post-latency remainder for immediate playout.
+            *out_read = skip;
+            *out_len = produced;
+        }
+        if guard > 256 {
+            break;
+        }
+    }
+}
+
+/// Render the steady-state engaged path for one block: pitch-correct via
+/// `stretcher` (tempo already moved by `new_increment`), with the bypass↔engaged
+/// equal-power crossfade while `*lock_state` is `Engaging`. The audible playhead
+/// `*pos` advances by `new_increment` per output frame in every state, so the
+/// publish path is unchanged; `*read_cursor` is the (leading) stretcher feed.
+#[allow(clippy::too_many_arguments)]
+fn render_engaged<S: TimeStretcher>(
+    stretcher: &mut S,
+    track: &Track,
+    track_len: f64,
+    declick_env: &DeclickEnvelope,
+    lock_xfade: &DeclickEnvelope,
+    out: &mut [f32],
+    stride: usize,
+    offset: usize,
+    start: usize,
+    gain: f32,
+    rate: f64,
+    new_increment: f64,
+    pos: &mut f64,
+    read_cursor: &mut f64,
+    stretch_in: &mut [f32],
+    stretch_out: &mut [f32],
+    out_len: &mut usize,
+    out_read: &mut usize,
+    lock_state: &mut KeyLockState,
+) {
+    // Pitch-correction insert: hold tempo (the deck's resampler already applied
+    // `rate`), undo the resampler's pitch shift. `rate > 0` is guaranteed by the
+    // engage predicate.
+    stretcher.set_time_ratio(1.0);
+    stretcher.set_pitch_scale(1.0 / rate);
+
+    for chunk in out.chunks_exact_mut(stride).skip(start) {
+        let (sl, sr) = kl_next(
+            stretcher,
+            track,
+            track_len,
+            declick_env,
+            read_cursor,
+            new_increment,
+            stretch_in,
+            stretch_out,
+            out_len,
+            out_read,
+        );
+        let (l, r) = match *lock_state {
+            KeyLockState::Engaging { i } => {
+                let (bl, br) = read_stereo_at(track, *pos);
+                let edge = track_tail_fade_scale(track_len, *pos, declick_env);
+                let fade_in = lock_xfade.fade_in(i);
+                let fade_out = 1.0 - fade_in;
+                let l = bl * edge * fade_out + sl * fade_in;
+                let r = br * edge * fade_out + sr * fade_in;
+                let next = i + 1;
+                *lock_state = if next >= lock_xfade.len() {
+                    KeyLockState::Engaged
+                } else {
+                    KeyLockState::Engaging { i: next }
+                };
+                (l, r)
+            }
+            _ => (sl, sr),
+        };
+        chunk[offset] += l * gain;
+        chunk[offset + 1] += r * gain;
+        *pos += new_increment;
+    }
+}
+
 // `Default` impl removed: Deck::new now requires an Arc<DeclickEnvelope>
 // from the owning engine. Construct decks via `Engine::new` /
 // `Engine::new_with_handle`, not directly.
@@ -1762,7 +2247,7 @@ mod tests {
     /// the standard 48 kHz / 2 ms ramp so test expectations match
     /// what the engine ships.
     fn test_deck() -> Deck {
-        Deck::new(DeclickEnvelope::new(48_000.0, 2.0))
+        Deck::new(DeclickEnvelope::new(48_000.0, 2.0), 48_000.0)
     }
 
     #[test]
@@ -1931,6 +2416,138 @@ mod tests {
         let mut out = vec![0.0f32; 256 * 2];
         assert_no_alloc::assert_no_alloc(|| {
             deck.render(&mut rt, &mut out, 48_000.0);
+        });
+    }
+
+    // === M14 key lock ===
+
+    fn kl_sine_track(freq: f32, frames: usize) -> Arc<Track> {
+        let mut s = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let v = (std::f32::consts::TAU * freq * i as f32 / 48_000.0).sin() * 0.5;
+            s[i * 2] = v;
+            s[i * 2 + 1] = v;
+        }
+        const_track(&s, 2, 48_000)
+    }
+
+    fn kl_render(deck: &mut Deck, blocks: usize, block_frames: usize) -> Vec<f32> {
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; block_frames * 2];
+        let mut all = Vec::with_capacity(blocks * block_frames * 2);
+        for _ in 0..blocks {
+            out.fill(0.0);
+            deck.render(&mut rt, &mut out, 48_000.0);
+            all.extend_from_slice(&out);
+        }
+        all
+    }
+
+    /// Dominant frequency of the left channel over `N` frames starting at
+    /// `skip` (skip the engage crossfade + pipeline latency).
+    fn kl_fundamental(stereo: &[f32], skip: usize) -> f32 {
+        use realfft::RealFftPlanner;
+        const N: usize = 16_384;
+        assert!(stereo.len() / 2 >= skip + N);
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(N);
+        let mut indata = r2c.make_input_vec();
+        for (i, x) in indata.iter_mut().enumerate() {
+            let w = 0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / N as f32).cos());
+            *x = stereo[(skip + i) * 2] * w;
+        }
+        let mut spec = r2c.make_output_vec();
+        r2c.process(&mut indata, &mut spec).unwrap();
+        let (mut best, mut best_mag) = (1usize, 0.0f32);
+        for (i, c) in spec.iter().enumerate().skip(1) {
+            let m = c.norm_sqr();
+            if m > best_mag {
+                best_mag = m;
+                best = i;
+            }
+        }
+        best as f32 * 48_000.0 / N as f32
+    }
+
+    #[test]
+    fn key_lock_holds_pitch_while_resampler_shifts_it() {
+        let track = kl_sine_track(440.0, 120_000);
+        let rate = 1.06;
+
+        let mut on = test_deck();
+        on.set_source(track.clone());
+        on.set_playing(true);
+        on.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        on.set_key_lock(true);
+        on.set_rate(rate);
+        on.quiesce_declick_for_test();
+        let f_on = kl_fundamental(&kl_render(&mut on, 200, 256), 6_000);
+
+        let mut off = test_deck();
+        off.set_source(track);
+        off.set_playing(true);
+        off.set_key_lock(false);
+        off.set_rate(rate);
+        off.quiesce_declick_for_test();
+        let f_off = kl_fundamental(&kl_render(&mut off, 200, 256), 6_000);
+
+        assert!(
+            (f_on - 440.0).abs() < 12.0,
+            "key lock should hold ~440 Hz, got {f_on}"
+        );
+        assert!(
+            f_off > 455.0,
+            "resampler-only should shift to ~466 Hz, got {f_off}"
+        );
+    }
+
+    #[test]
+    fn reverse_keeps_key_lock_bypassed_bit_identical() {
+        // rate < 0 forces bypass; the engaged insert must be a true no-op there,
+        // so key-lock-on output is byte-identical to key-lock-off.
+        let track = kl_sine_track(330.0, 40_000);
+
+        let mut on = test_deck();
+        on.set_source(track.clone());
+        on.set_playing(true);
+        on.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        on.set_key_lock(true);
+        on.set_position_frames(20_000.0);
+        on.set_rate(-1.0);
+        on.quiesce_declick_for_test();
+        let out_on = kl_render(&mut on, 40, 256);
+
+        let mut off = test_deck();
+        off.set_source(track);
+        off.set_playing(true);
+        off.set_key_lock(false);
+        off.set_position_frames(20_000.0);
+        off.set_rate(-1.0);
+        off.quiesce_declick_for_test();
+        let out_off = kl_render(&mut off, 40, 256);
+
+        assert_eq!(out_on, out_off, "reverse key lock must be a bypass no-op");
+    }
+
+    #[test]
+    fn key_locked_render_is_alloc_free() {
+        let track = kl_sine_track(440.0, 80_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.set_rate(1.06);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        // Covers the engage transition + priming + crossfade + steady engaged —
+        // all on the audio thread.
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..150 {
+                out.fill(0.0);
+                deck.render(&mut rt, &mut out, 48_000.0);
+            }
         });
     }
 

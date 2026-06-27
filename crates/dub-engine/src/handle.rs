@@ -865,6 +865,28 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckSetRate { idx, rate })
     }
 
+    /// Enable / disable key lock (master tempo) on this deck (M14).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_key_lock(self, on: bool) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetKeyLock { idx, on })
+    }
+
+    /// Select the time-stretch engine for key lock on this deck (M14 live A/B).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_stretch_backend(
+        self,
+        backend: dub_stretch::StretchBackend,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle
+            .send(Command::DeckSetStretchBackend { idx, backend })
+    }
+
     /// Engage a loop over `[in_frames, out_frames)` (track frames).
     /// The grid-snapped reverse-loop region is computed off-RT by the
     /// caller; the deck jumps the playhead into the region if needed

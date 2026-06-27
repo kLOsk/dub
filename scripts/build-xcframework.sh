@@ -81,10 +81,12 @@ fi
 
 FAT_DIR="target/universal-apple-darwin/${PROFILE_DIR}"
 mkdir -p "${FAT_DIR}"
+LIPO_INPUTS=()
+for tgt in "${TARGETS[@]}"; do
+    LIPO_INPUTS+=("target/${tgt}/${PROFILE_DIR}/${RUST_LIB_NAME}")
+done
 echo "==> lipo -create -output ${FAT_DIR}/${RUST_LIB_NAME}"
-lipo -create -output "${FAT_DIR}/${RUST_LIB_NAME}" \
-    "target/aarch64-apple-darwin/${PROFILE_DIR}/${RUST_LIB_NAME}" \
-    "target/x86_64-apple-darwin/${PROFILE_DIR}/${RUST_LIB_NAME}"
+lipo -create -output "${FAT_DIR}/${RUST_LIB_NAME}" "${LIPO_INPUTS[@]}"
 
 # --- Generate Swift bindings (UniFFI library mode) -----------------------
 
@@ -95,11 +97,11 @@ mkdir -p "${SWIFT_BINDINGS_DIR}"
 # We feed the aarch64 dylib to UniFFI's library-mode bindgen. The dylib
 # embeds the UniFFI metadata that the bindgen reads back; either arch
 # would do, the metadata is arch-independent.
-UNIFFI_LIB="target/aarch64-apple-darwin/${PROFILE_DIR}/libdub_ffi.dylib"
+UNIFFI_LIB="target/${TARGETS[0]}/${PROFILE_DIR}/libdub_ffi.dylib"
 if [[ ! -f "${UNIFFI_LIB}" ]]; then
     echo "==> dylib not found at ${UNIFFI_LIB}; building it explicitly"
     cargo build \
-        --target aarch64-apple-darwin \
+        --target "${TARGETS[0]}" \
         --profile "${PROFILE}" \
         -p "${CRATE_NAME}"
 fi

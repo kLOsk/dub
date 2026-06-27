@@ -814,7 +814,7 @@ Dub reads (does not own) external libraries. **One-shot import + manual re-scan*
 
 **Read-only access discipline.** Source files and library databases are opened with `O_RDONLY` semantics. We never advisory-lock a source library file; the user can have Serato / Traktor / rekordbox running while Dub imports.
 
-**Per-source metadata preserved verbatim.** Different sources hold different opinions about the same track (Serato says "Dilla, J", rekordbox says "J Dilla", the ID3 frame in the file says "James Yancey"). Dub does not collapse these on import; each source's opinion is stored as a separate row in `track_metadata_source` keyed against the canonical track (§8.2). The browser picks a displayed value via a documented per-column priority chain (`serato > rekordbox > traktor > id3 > filename`) but every source's value is preserved and available for "what does each app think this is called?" UI in v1.x.
+**Per-source metadata preserved verbatim.** Different sources hold different opinions about the same track (Serato says "Dilla, J", rekordbox says "J Dilla", the ID3 frame in the file says "James Yancey"). Dub does not collapse these on import; each source's opinion is stored as a separate row in `track_metadata_source` keyed against the canonical track (§8.2). The browser picks a displayed value via a documented per-column priority chain (`serato > rekordbox > traktor > itunes > id3 > filename`) but every source's value is preserved and available for "what does each app think this is called?" UI in v1.x.
 
 **Idempotent re-import.** Re-running an importer against the same source matches existing tracks by canonical identity (§8.2), refreshes the per-source metadata row, and preserves Dub-only data (Dub crates, play history, tap-to-grid corrections, prepared flag).
 
@@ -968,8 +968,10 @@ A user-defined smart-crate rule builder is parked until v1.x at the earliest. Th
 
 #### 8.5.3 Track list
 
-- **Default columns.** Title, Artist, BPM, Key, Length, Comment. Sortable; user-reorderable via header drag (SwiftUI Table on macOS 14+).
+- **Default columns.** Title, Artist, BPM, Key, Length, **Rating**, **Colour**, Comment. Sortable; user-reorderable via header drag (SwiftUI Table on macOS 14+).
 - **Customizable column set** per §8.5.3.1. The user opens the column picker by right-clicking any column header; choices persist across launches.
+- **Star rating** (M12f, schema v8). A clickable 0–5 star column writing `tracks.user_rating` — click the Nth star to set, the current rating again to clear. The DJ's own rating overrides any imported per-source rating (iTunes `Rating` is imported and shown until the DJ sets their own). Sortable (descending puts the 5-stars on top).
+- **Colour label** (M12f, schema v8). A fixed 8-swatch palette column (`tracks.color`); the chosen colour also **tints the track's row background**. The swatch renders as a bordered box (empty cells show a bordered ＋); the picker opens from the cell.
 - **Loaded-now badges.** Tracks currently loaded on Deck A or Deck B carry a small accent-colored `A` / `B` glyph in the leftmost gutter. Prevents the "I just loaded the track that was already playing" mistake and visually confirms an Instant Doubles call (§7.3).
 - **Grid-disagreement indicator** (§8.3) as a small ⚠ in the BPM column.
 - **Key-disagreement indicator** (§8.3.2) as a small ⚠ in the Key column.
@@ -986,6 +988,7 @@ The available columns are exposed across the FFI as a stable Rust enum `LibraryC
 | Group | Columns |
 |---|---|
 | Identity / library | `date_added`, `source`, `in_crates`, `duplicates`, `missing` |
+| User organization (schema v8) | `rating` (`tracks.user_rating`, click-to-set stars), `color` (`tracks.color`, swatch + row tint) |
 | Active-priority metadata (the §8.1 priority chain) | `title`, `artist`, `album`, `genre`, `comment`, `composer`, `track_number`, `year`, `version_token` |
 | Per-source metadata (verbatim from `track_metadata_source`) | For each source ∈ `{id3, filename, serato, traktor, rekordbox, mixedinkey}`: `{source}_title`, `{source}_artist`, `{source}_album`, `{source}_comment`, `{source}_bpm`, `{source}_key`, `{source}_year`. (Some sources don't carry all fields — e.g. `filename` only has title / artist / version / year; the unsupported entries are simply absent from the registry.) |
 | Analysis | `bpm_active`, `bpm_auto` (Dub's analyzer, M11c.1), `key_active`, `key_auto` (Dub's analyzer, M11c.2), `length`, `lufs_i`, `true_peak`, `prepared` |
@@ -1027,6 +1030,14 @@ External SSDs unmount. Files get moved by Finder. Networked volumes disappear. T
 - **Drag** a row onto a deck pane to load (existing M10.5b drag path).
 - **`Space`** loads the focused row into the stopped, non-master deck per §6.4 (see also §5.5).
 - **`Enter`** focused-deck-load semantics are reserved for v1.x; v1.0 only commits to Drag and Space.
+
+#### 8.5.7 Favourites strip (M12f)
+
+A fixed row of **8 quick-access slots** above the track list. The DJ drags a Dub crate or an imported playlist from the sidebar onto a slot; clicking a slot loads it instantly without walking the source tree, right-click clears it. Persisted in `favorite_slots`; imported playlists are stored by `(source, name-path)` so a favourite survives the source app's next export / re-scan (the imported mirror's ids are rewritten on every import). A slot whose target playlist has since vanished renders dimmed.
+
+#### 8.5.8 Dynamic filter bar (M12f)
+
+A configurable, collapsible row of **filter boxes** below the favourites strip — the Serato / iTunes column-browser pattern. Each box filters one dimension; its values are the distinct values present in the **current view** and update automatically when the view changes (a client-side narrowing of the already-loaded ≤ 5 000-row buffer, not a re-query). Selecting values narrows the list; multi-select within a box is **OR**, across boxes is **AND**, and the value lists **cascade** (picking Genre = House narrows the Artist / Key boxes and their counts). Two dimensions are special-cased: **BPM** as auto-generated tempo buckets (not a raw list), **Rating** as a "≥ N stars" threshold. Default boxes Genre · BPM · Key · Rating; any of {Artist, Album, Colour, Source, Year, Version, Composer} can be added via the box picker (mirrors the column picker). The enabled-box set + collapsed flag persist; selections are transient and reset when the source changes. While a crate is filtered, drag-to-reorder is disabled (it operates on the visible subset).
 
 ### 8.6 Export and interop
 

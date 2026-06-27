@@ -17,6 +17,7 @@ dub-ffi = { workspace = true }
 dub-io = { workspace = true }
 dub-audio = { workspace = true }
 dub-bpm = { workspace = true }
+dub-stretch = { workspace = true }
 dub-library = { workspace = true }
 dub-peaks = { workspace = true }
 rusqlite = { workspace = true }
@@ -29,3 +30,9 @@ crossterm = "0.29.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 time = { version = "0.3.45", features = ["formatting", "parsing", "serde"] }
+# Pitch + spectral-distortion metrics for the `stretch-bench` subcommand.
+realfft = { workspace = true }
+
+[dev-dependencies]
+# Golden snapshot of the bench's deterministic quality metrics.
+insta = { workspace = true }
