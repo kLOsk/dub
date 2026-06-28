@@ -317,7 +317,12 @@ uniffi::setup_scaffolding!();
 ///       keeps Dub permissive), so `rubberband_backend_available()` and
 ///       the `StretchBackend::RubberBand` variant are gone. Key lock is
 ///       now just our WSOLA (`StretchBackend` = `ResamplerOnly`/`DubOwn`).
-pub const FFI_VERSION: u32 = 43;
+///   44. **M15 echo-out.** `DubEngine` grows `engage_echo_out` /
+///       `release_echo_out` / `set_echo_params` (the tap-toggle 100 %-wet dub
+///       echo, PRD §6.3); [`DeckTelemetry`] grows `echo_state`
+///       (0 off · 1 engaged · 2 engaged & ready to auto-off) — pad glow on
+///       1+2, the deck poll auto-disengages on 2.
+pub const FFI_VERSION: u32 = 44;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1766,6 +1771,109 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Toggle the M15 echo-out FX **on** for `deck_idx` (PRD §6.3) — the
+    /// 100 %-wet "echo out", like a Pioneer DJM. Captures the last
+    /// `division_beats` beats of the deck's output and recirculates them with
+    /// a darkening feedback decay; the dry signal is **muted** so only the
+    /// echo carries (the deck slips forward underneath). This holds for every
+    /// deck, Thru included — a Thru deck's live record flows through the
+    /// engine, so muting it is just not writing the passthrough out. Call
+    /// [`Self::release_echo_out`] to toggle it off — the dry returns at the
+    /// deck's slipped position.
+    ///
+    /// Parameters:
+    /// - `division_beats` — echo length in beats (0.25, 0.5, 1, 2, 4).
+    /// - `bpm` — the deck's current effective tempo (the value the UI already
+    ///   shows). Works for both file and Thru decks; the echo length on the
+    ///   output bus is `division_beats × 60/bpm × engine_sr`.
+    /// - `feedback` — per-repeat decay (0..1; default 0.6, capped below 1).
+    /// - `lpf_hz` — feedback low-pass cutoff (default 8000).
+    ///
+    /// The echo length and the filter coefficient are resolved here, off the
+    /// audio thread. No-op (returns `Ok`) for a non-positive `bpm` / division.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn engage_echo_out(
+        &self,
+        deck_idx: u64,
+        division_beats: f64,
+        bpm: f64,
+        feedback: f32,
+        lpf_hz: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        if !(bpm.is_finite() && bpm > 0.0 && division_beats.is_finite() && division_beats > 0.0) {
+            return Ok(());
+        }
+        // Sample rates (44.1k/48k/96k/192k) are all exact in f32.
+        #[allow(clippy::cast_precision_loss)]
+        let engine_sr = running.sample_rate as f32;
+        let delay = division_beats * 60.0 / bpm * f64::from(running.sample_rate);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let delay_frames = delay.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let lp_coeff = dub_dsp::one_pole_coeff(lpf_hz, engine_sr);
+        running
+            .handle
+            .deck(idx)
+            .engage_echo(delay_frames, feedback, lp_coeff)
+            .map_err(map_command_error)
+    }
+
+    /// Toggle echo-out **off** on `deck_idx`: restore the (muted) dry signal
+    /// — the deck has kept playing underneath, so it resumes at its slipped
+    /// position — and fade the wet echo out. Idempotent.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn release_echo_out(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .release_echo()
+            .map_err(map_command_error)
+    }
+
+    /// Live-update echo-out `feedback` and feedback low-pass cutoff (`lpf_hz`)
+    /// on `deck_idx` while held or idle (UI sliders). The echo length only
+    /// changes on a fresh [`Self::engage_echo_out`].
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_echo_params(
+        &self,
+        deck_idx: u64,
+        feedback: f32,
+        lpf_hz: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        // Sample rates (44.1k/48k/96k/192k) are all exact in f32.
+        #[allow(clippy::cast_precision_loss)]
+        let engine_sr = running.sample_rate as f32;
+        let lp_coeff = dub_dsp::one_pole_coeff(lpf_hz, engine_sr);
+        running
+            .handle
+            .deck(idx)
+            .set_echo_params(feedback, lp_coeff)
+            .map_err(map_command_error)
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2).
     ///
     /// Tells the engine to ignore the deck's timecode input until
@@ -2075,6 +2183,7 @@ impl DubEngine {
             pitch_settled: tc.pitch_settled,
             measure_progress: tc.measure_progress,
             key_lock_state: shared.load_key_lock_state(),
+            echo_state: shared.load_echo_state(),
         }
     }
 
@@ -3201,6 +3310,12 @@ pub struct DeckTelemetry {
     /// scratch / reverse / extreme rate) · 2 engaged (pitch held). Drives the
     /// deck-header key-lock dot (dim / green). PRD §6.1.1.
     pub key_lock_state: u8,
+    /// M15 echo-out state: 0 off · 1 engaged (dry muted, captured loop
+    /// repeating) · 2 engaged & ready to auto-off (the muted input and the wet
+    /// tail have both gone silent — e.g. Thru needle lifted + echo finished,
+    /// or a file deck whose track ended). The pad glows for 1 and 2; the deck
+    /// poll turns the echo off on 2. PRD §6.3.
+    pub echo_state: u8,
 }
 
 impl DeckTelemetry {
@@ -3224,6 +3339,7 @@ impl DeckTelemetry {
             pitch_settled: true,
             measure_progress: 1.0,
             key_lock_state: 0,
+            echo_state: 0,
         }
     }
 }
@@ -4374,7 +4490,9 @@ mod tests {
         // 40→41: M14 key-lock indicator (`DeckTelemetry.key_lock_state`).
         // 41→42: M14 `rubberband_backend_available()`.
         // 42→43: M14.4 Rubber Band removed (fn + `StretchBackend::RubberBand`).
-        assert_eq!(FFI_VERSION, 43);
+        // 43→44: M15 echo-out (`engage_echo_out` / `release_echo_out` /
+        // `set_echo_params` + `DeckTelemetry.echo_state`).
+        assert_eq!(FFI_VERSION, 44);
     }
 
     #[test]

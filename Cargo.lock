@@ -679,6 +679,9 @@ version = "0.0.1"
 [[package]]
 name = "dub-dsp"
 version = "0.0.1"
+dependencies = [
+ "assert_no_alloc",
+]
 
 [[package]]
 name = "dub-engine"
@@ -686,6 +689,7 @@ version = "0.0.1"
 dependencies = [
  "assert_no_alloc",
  "dub-bpm",
+ "dub-dsp",
  "dub-io",
  "dub-peaks",
  "dub-stretch",
@@ -703,6 +707,7 @@ version = "0.0.1"
 dependencies = [
  "dub-audio",
  "dub-bpm",
+ "dub-dsp",
  "dub-engine",
  "dub-fingerprint",
  "dub-io",

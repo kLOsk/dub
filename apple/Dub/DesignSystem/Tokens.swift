@@ -113,6 +113,12 @@ enum DubColor {
     /// own thing on the pads + overview + waveform band.
     static let loop = Color(hex: 0x4FD18B)
 
+    /// Echo-out FX / pad accent (M15, PRD §6.3). A bright violet — hue-
+    /// distinct from the loop mint, the cue magenta, and both deck tints
+    /// (amber, teal) — so a glowing echo pad reads as its own thing while
+    /// the dub echo is engaged or ringing out.
+    static let echo = Color(hex: 0xB07CFF)
+
     // ----- Overview strip (M10.5c) ---------------------------------
 
     /// Deck A's amplitude colour in the Track Overview strip.

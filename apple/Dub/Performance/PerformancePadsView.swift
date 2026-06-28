@@ -41,6 +41,14 @@ struct PerformancePadsView: View {
     /// Exit the active loop.
     var onExit: () -> Void = {}
 
+    /// M15 echo-out: whether the (1-beat) echo-out is currently engaged.
+    var echoEngaged: Bool = false
+    /// Toggle the dub echo on / off.
+    var onEchoToggle: () -> Void = {}
+    /// Whether the echo-out feature is enabled (Preferences). When off the
+    /// ECHO button is hidden entirely.
+    var echoEnabled: Bool = true
+
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
     /// their overview on the left.
@@ -50,6 +58,9 @@ struct PerformancePadsView: View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             cueGroup()
             loopGroup()
+            if echoEnabled {
+                EchoPadRow(engaged: echoEngaged, onToggle: onEchoToggle)
+            }
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
         }
@@ -185,6 +196,69 @@ struct CuePadRow: View {
     }
 }
 
+/// Single tap-toggle ECHO OUT button (M15, PRD §6.3). One control for the
+/// whole feature: tap on → the deck's dry mutes (100 % wet) and the last beat
+/// repeats and decays; tap again → off, the deck resumes at its slipped
+/// position. Lit while engaged. Shared by the Performance and Prep surfaces.
+///
+/// A tap is a momentary trigger, not a continuous performance gesture, so the
+/// mouse is within the §1 rule (like cues + loops).
+@ViewBuilder
+private func echoOutButton(
+    _ label: String,
+    engaged: Bool,
+    onToggle: @escaping () -> Void
+) -> some View {
+    Text(label)
+        .font(.system(size: 12, weight: .semibold, design: .rounded))
+        .foregroundStyle(engaged ? DubColor.textPrimary : DubColor.textTertiary)
+        .frame(height: 36)
+        .padding(.horizontal, DubSpacing.lg)
+        .background(engaged ? DubColor.echo.opacity(0.24) : DubColor.surface1)
+        .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                .stroke(engaged ? DubColor.echo : DubColor.divider, lineWidth: 1))
+        .contentShape(Rectangle())
+        .onPressDown { onToggle() }
+        .help("Echo out — 1 beat, 100% wet. Tap on, tap off.")
+}
+
+/// Performance echo-out row: the single ECHO OUT button.
+struct EchoPadRow: View {
+
+    /// Whether the echo-out is engaged. Lights the button.
+    let engaged: Bool
+    /// Toggle on / off.
+    let onToggle: () -> Void
+
+    var body: some View {
+        echoOutButton("ECHO OUT", engaged: engaged, onToggle: onToggle)
+    }
+}
+
+/// Prep-mode echo-out row: same single button in the inline label-gutter
+/// layout the Prep pad bar uses (matching `LoopPadRow`). Prep's role is
+/// prepare + test, so it's mouse-clickable here too.
+struct PrepEchoPadRow: View {
+
+    /// Whether the echo-out is engaged.
+    let engaged: Bool
+    /// Toggle on / off.
+    let onToggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text("ECHO")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(DubColor.textSecondary)
+                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
+            echoOutButton("OUT", engaged: engaged, onToggle: onToggle)
+        }
+    }
+}
+
 extension View {
     /// Fire `perform` on mouse-**down** (press), not mouse-up.
     ///
@@ -221,6 +295,7 @@ private struct PressDownModifier: ViewModifier {
                     .onEnded { _ in pressing = false })
     }
 }
+
 
 /// Shared geometry for the Prep pad rows so the CUE and LOOP rows
 /// line their pad columns up under a fixed-width label gutter.

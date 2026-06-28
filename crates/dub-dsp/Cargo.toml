@@ -8,3 +8,7 @@ repository.workspace = true
 description = "DSP building blocks: resamplers, filters, FX. Real-time safe."
 
 [dependencies]
+
+[dev-dependencies]
+# RT-safety enforcement for the echo-out feedback delay's render path.
+assert_no_alloc = { workspace = true }

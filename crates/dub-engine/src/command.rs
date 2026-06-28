@@ -141,6 +141,39 @@ pub enum Command {
     /// from the current position. Idempotent.
     DeckClearLoop { idx: u8 },
 
+    /// Engage (or re-trigger) the M15 echo-out FX on deck `idx`
+    /// (PRD §6.3). All parameters are resolved **off-RT** by the FFI:
+    /// `delay_frames` is the echo length on the output bus (engine
+    /// sample rate) = `division_beats × 60/bpm × engine_sr`; `feedback`
+    /// is the per-lap decay; `lp_coeff` is the one-pole low-pass
+    /// coefficient for the feedback path (computed from the cutoff Hz —
+    /// the audio thread never calls `exp`). The deck's output is already
+    /// warm-captured continuously, so engaging freezes the last beat and
+    /// recirculates it with decay. While engaged the dry is muted (100 % wet)
+    /// on every deck, Thru included.
+    DeckEngageEcho {
+        idx: u8,
+        delay_frames: u32,
+        feedback: f32,
+        lp_coeff: f32,
+    },
+
+    /// Toggle echo-out off on deck `idx`: restore the (muted) dry signal —
+    /// the deck has kept playing underneath, so it resumes at its slipped
+    /// position — and fade the wet out. Idempotent on a deck that isn't
+    /// engaged.
+    DeckReleaseEcho { idx: u8 },
+
+    /// Live-update echo-out `feedback` and feedback low-pass (`lp_coeff`,
+    /// resolved off-RT from the cutoff) on deck `idx` while held or idle
+    /// (UI sliders). The echo *length* only changes on a fresh
+    /// [`Self::DeckEngageEcho`] — changing the beat division re-triggers.
+    DeckSetEchoParams {
+        idx: u8,
+        feedback: f32,
+        lp_coeff: f32,
+    },
+
     /// Pin deck `idx`'s control mode (the deck-header Internal/Timecode
     /// switch). Sets the user override so auto source-detection won't
     /// change it until [`Self::DeckAutoControlMode`].
@@ -227,6 +260,8 @@ pub enum Command {
 }
 
 impl std::fmt::Debug for Command {
+    // One arm per variant: the match is exhaustive and intentionally flat.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DeckPlay { idx } => f.debug_struct("DeckPlay").field("idx", idx).finish(),
@@ -279,6 +314,31 @@ impl std::fmt::Debug for Command {
             Self::DeckClearLoop { idx } => {
                 f.debug_struct("DeckClearLoop").field("idx", idx).finish()
             }
+            Self::DeckEngageEcho {
+                idx,
+                delay_frames,
+                feedback,
+                lp_coeff,
+            } => f
+                .debug_struct("DeckEngageEcho")
+                .field("idx", idx)
+                .field("delay_frames", delay_frames)
+                .field("feedback", feedback)
+                .field("lp_coeff", lp_coeff)
+                .finish(),
+            Self::DeckReleaseEcho { idx } => {
+                f.debug_struct("DeckReleaseEcho").field("idx", idx).finish()
+            }
+            Self::DeckSetEchoParams {
+                idx,
+                feedback,
+                lp_coeff,
+            } => f
+                .debug_struct("DeckSetEchoParams")
+                .field("idx", idx)
+                .field("feedback", feedback)
+                .field("lp_coeff", lp_coeff)
+                .finish(),
             Self::DeckSetControlMode { idx, mode } => f
                 .debug_struct("DeckSetControlMode")
                 .field("idx", idx)

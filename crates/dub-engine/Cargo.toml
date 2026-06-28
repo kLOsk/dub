@@ -10,6 +10,8 @@ description = "Audio engine for Dub: graph, transport, RT-safety primitives."
 [dependencies]
 ringbuf = { workspace = true }
 thiserror = { workspace = true }
+# M15 — per-deck echo-out FX (RT-safe feedback delay) on the output bus.
+dub-dsp = { workspace = true }
 dub-io = { workspace = true }
 dub-timecode = { workspace = true }
 # M8 — the engine wires Thru-source attach optionally to a

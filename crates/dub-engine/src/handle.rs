@@ -912,6 +912,56 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckClearLoop { idx })
     }
 
+    /// Engage (or re-trigger) the M15 echo-out FX (PRD §6.3). `delay_frames`
+    /// (the echo length on the output bus, at engine sample rate),
+    /// `feedback`, and the feedback low-pass coefficient `lp_coeff` are all
+    /// resolved off-RT by the caller from the deck's BPM, the chosen beat
+    /// division, and the cutoff. Sending again while engaged re-triggers the
+    /// capture at the new length.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn engage_echo(
+        self,
+        delay_frames: u32,
+        feedback: f32,
+        lp_coeff: f32,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckEngageEcho {
+            idx,
+            delay_frames,
+            feedback,
+            lp_coeff,
+        })
+    }
+
+    /// Toggle echo-out **off**: the dry signal comes back (the deck has kept
+    /// playing underneath, slip-aware) and the wet echo fades out. Idempotent
+    /// on a deck that isn't engaged.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn release_echo(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckReleaseEcho { idx })
+    }
+
+    /// Live-update echo-out `feedback` and feedback low-pass (`lp_coeff`,
+    /// resolved off-RT from the cutoff) while held or idle. The echo length
+    /// changes only on a fresh [`Self::engage_echo`].
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_echo_params(self, feedback: f32, lp_coeff: f32) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetEchoParams {
+            idx,
+            feedback,
+            lp_coeff,
+        })
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2). Decouples the deck
     /// from any attached timecode input and pins it to its last-
     /// known good velocity (or unity forward if no policy is

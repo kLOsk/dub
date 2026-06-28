@@ -235,6 +235,13 @@ pub struct Engine {
     control_override: [bool; DECK_COUNT],
     /// Per-deck timecode-vs-record classifier (off the lift path).
     source_classifier: [SourceClassifier; DECK_COUNT],
+    /// Per-deck echo-out FX (M15, PRD §6.3). Sits on the deck's output bus
+    /// after the deck/Thru render writes its dry stereo pair; engaged via
+    /// the command channel. Each holds a pre-allocated delay ring sized at
+    /// engine construction — RT-safe to drive every block. Lives engine-side
+    /// (not on [`Deck`]) because the FX operates on the per-deck output bus
+    /// and applies uniformly to file, timecode, and Thru decks (PRD §5.3).
+    echo: [dub_dsp::EchoOut; DECK_COUNT],
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -351,6 +358,7 @@ impl Engine {
             control_mode: [ControlMode::Timecode; DECK_COUNT],
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
+            echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
         }
     }
 
@@ -409,6 +417,7 @@ impl Engine {
             control_mode: [ControlMode::Timecode; DECK_COUNT],
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
+            echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
         };
         (engine, handle)
     }
@@ -720,6 +729,18 @@ impl Engine {
             } else {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
             }
+
+            // M15 echo-out (PRD §6.3): the FX sits on the per-deck output
+            // bus, after the deck/Thru has summed its dry stereo pair into
+            // `out[first_us..first_us+2]`. It captures the last beat and,
+            // while engaged, mutes the dry (100 % wet, "echo out") so only the
+            // echo carries while the deck slips forward underneath. This holds
+            // for every deck, Thru included — a Thru deck's live record flows
+            // through the engine, so muting it is just not writing the
+            // passthrough out. When idle the call is a near-no-op that just
+            // keeps the delay ring warm.
+            self.echo[idx].process_block(out, num_channels, first_us);
+            self.decks[idx].store_echo_state(self.echo[idx].state_code());
         }
 
         // Master gain (M4 / M5.5): single multiplicative scale across the
@@ -1523,6 +1544,30 @@ impl Engine {
                     m.note_remap();
                 }
             }
+            Command::DeckEngageEcho {
+                idx,
+                delay_frames,
+                feedback,
+                lp_coeff,
+            } => {
+                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                    echo.engage(delay_frames as usize, feedback, lp_coeff);
+                }
+            }
+            Command::DeckReleaseEcho { idx } => {
+                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                    echo.release();
+                }
+            }
+            Command::DeckSetEchoParams {
+                idx,
+                feedback,
+                lp_coeff,
+            } => {
+                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                    echo.set_params(feedback, lp_coeff);
+                }
+            }
             Command::DeckSetControlMode { idx, mode } => {
                 self.set_deck_control_mode(idx as usize, mode);
                 // Crossing into/out of Timecode drive invalidates the
@@ -1994,6 +2039,166 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
         });
+    }
+
+    #[test]
+    fn echo_engaged_render_is_alloc_free() {
+        // M15 echo-out runs on the audio thread every block. Engaging it,
+        // updating its params, releasing it, and rendering the recirculating
+        // tail must all stay allocation-free.
+        let mut engine = engine_with_two_decks(0.3, 0.5);
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::DeckEngageEcho {
+                idx: 0,
+                delay_frames: 480,
+                feedback: 0.6,
+                lp_coeff: lp,
+            });
+            for _ in 0..200 {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+            engine.apply_command(Command::DeckSetEchoParams {
+                idx: 0,
+                feedback: 0.4,
+                lp_coeff: lp,
+            });
+            engine.apply_command(Command::DeckReleaseEcho { idx: 0 });
+            for _ in 0..400 {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+        });
+    }
+
+    #[test]
+    fn echo_engage_and_release_drive_published_state() {
+        // The command path (handle → engine → EchoOut) must drive the
+        // engagement state machine *and* the telemetry atom the UI polls.
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 256 * 2];
+
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Idle);
+        assert_eq!(engine.deck(0).load_echo_state(), 0);
+
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        handle.deck(0).engage_echo(480, 0.5, lp).unwrap();
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Engaged);
+        assert_eq!(engine.deck(0).load_echo_state(), 1);
+
+        // Toggle off → straight back to idle (the dry un-mutes; the deck has
+        // kept playing underneath, slip-aware).
+        handle.deck(0).release_echo().unwrap();
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Idle);
+        assert_eq!(engine.deck(0).load_echo_state(), 0);
+    }
+
+    #[test]
+    fn echo_out_mutes_dry_when_engaged_then_restores_it_on_off() {
+        // End-to-end "echo out" on an internal deck: engaging mutes the dry
+        // (100 % wet) and lets the captured loop decay, so the bus falls well
+        // below the dry level; toggling off restores the dry.
+        // Long track so the deck never reaches its end-of-track fade during
+        // the test (which would pull the dry below 0.5 on its own).
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 200_000], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 256 * 2];
+
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert!(
+            (out[0] - 0.5).abs() < 1e-3,
+            "baseline bus not 0.5: {}",
+            out[0]
+        );
+
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        let mut last = 0.0_f32;
+        for _ in 0..16 {
+            engine.render(&mut rt, &mut out);
+            last = out[out.len() - 2];
+        }
+        // Dry muted (100 % wet) and the captured loop has decayed over several
+        // laps ⇒ the bus sits well below the dry-only 0.5.
+        assert!(last < 0.2, "dry was not muted / echo did not decay: {last}");
+
+        // Toggle off; the dry comes back at the deck's (slipped) position.
+        handle.deck(0).release_echo().unwrap();
+        for _ in 0..4 {
+            engine.render(&mut rt, &mut out);
+        }
+        let settled = out[out.len() - 2];
+        assert!(
+            (settled - 0.5).abs() < 0.02,
+            "dry not restored after off: {settled}"
+        );
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Idle);
+    }
+
+    #[test]
+    fn echo_mutes_thru_deck_dry_too() {
+        // End-to-end on a Thru deck: the live record flows through the engine,
+        // so engaging echo-out mutes its passthrough (100 % wet) exactly like a
+        // file deck — the bus carries only the echo, NOT dry + wet.
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+
+        // A steady DC "record" on the input pair; enough frames for every
+        // render so the passthrough never underflows to silence.
+        push_thru_input(&mut tx, block * 30, 0.2, 0.2);
+        for _ in 0..12 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert!(
+            (out[0] - 0.2).abs() < 1e-3,
+            "thru baseline not 0.2: {}",
+            out[0]
+        );
+
+        // Engage; delay long enough that the rendered window stays inside the
+        // first (full-level) lap, so the wet is the captured 0.2.
+        let lp = dub_dsp::one_pole_coeff(8_000.0, sr);
+        engine.apply_command(Command::DeckEngageEcho {
+            idx: 0,
+            delay_frames: 480,
+            feedback: 0.6,
+            lp_coeff: lp,
+        });
+        let mut last = 0.0_f32;
+        for _ in 0..6 {
+            engine.render(&mut rt, &mut out);
+            last = out[0];
+        }
+        // Dry muted ⇒ the bus is the wet alone (≈ 0.2), NOT dry + wet (≈ 0.4).
+        assert!(
+            (last - 0.2).abs() < 0.05,
+            "thru dry was not muted (100% wet): {last}"
+        );
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Engaged);
     }
 
     #[test]

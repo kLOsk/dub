@@ -209,6 +209,16 @@ struct DeckState: Equatable {
     /// scratching / dropout). Drives the deck-header tracking dot.
     var timecodeLockState: UInt8 = 0
 
+    /// M15 echo-out state from `engine.deckTelemetry`: 0 off · 1 engaged.
+    /// Engine truth; the UI lights the pad from `echoDivision` (below) so the
+    /// toggle is immediate.
+    var echoState: UInt8 = 0
+
+    /// Which echo-out division (beats) is currently toggled on, or `nil` when
+    /// off. UI-local toggle state; lights the matching ECHO pad and decides
+    /// whether the next tap engages or disengages.
+    var echoDivision: Double? = nil
+
     /// Source-control state from `engine.deckTelemetry`, for the row-3
     /// Internal/Timecode switch. `hasTimecodeInput` gates whether the
     /// switch is shown at all.
@@ -561,6 +571,19 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kCueSnapToGrid = "dub.cueSnapToGridEnabled"
 
+    /// M15 echo-out feature toggle (Preferences ▸ FX). When on, each deck's
+    /// pads show a single ECHO OUT button (1-beat, 100 % wet, PRD §6.3). When
+    /// off, the button is hidden and any engaged echo is dropped. Default on.
+    /// Persisted in `UserDefaults` under `dub.echoOutEnabled`.
+    @Published var echoOutEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(echoOutEnabled, forKey: Self.kEchoOutEnabled)
+            if !echoOutEnabled { disengageAllEcho() }
+        }
+    }
+
+    private static let kEchoOutEnabled = "dub.echoOutEnabled"
+
     /// Per-source library-import enables (Preferences ▸ Libraries). When a
     /// source is on, Dub scans its default folder (`~/Music/_Serato_`,
     /// `~/Documents/Native Instruments/Traktor*/collection.nml`, the iTunes
@@ -830,6 +853,8 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
         self.cueSnapToGridEnabled =
             UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
+        self.echoOutEnabled =
+            UserDefaults.standard.object(forKey: Self.kEchoOutEnabled) as? Bool ?? true
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
@@ -1455,6 +1480,19 @@ final class WaveformAppModel: ObservableObject {
         next.pitchSettled = tele.pitchSettled
         next.measureProgress = Double(tele.measureProgress)
         next.timecodeLockState = tele.lockState
+        next.echoState = tele.echoState
+        // M15 auto-off: the engine reports echo_state == 2 once the muted
+        // input AND the wet tail have both been silent for a moment — e.g. a
+        // Thru deck whose needle was lifted and whose echo has finished, or a
+        // file deck whose track ended. Turn the echo off then so the deck
+        // doesn't stay muted in silence; this never cuts a still-ringing echo
+        // (the engine only reports 2 after the tail is gone). Un-mute the
+        // engine and clear the flag here (no separate setState — `next` is
+        // about to be committed).
+        if next.echoDivision != nil, tele.echoState == 2 {
+            releaseEcho(side)
+            next.echoDivision = nil
+        }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
         next.sourceClass = tele.sourceClass
@@ -1672,6 +1710,13 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridCaptured = false
         starting.beatGridLoadSource = preloadedGrid?.source ?? "pending_auto"
         starting.manualGridEditCount = 0
+        // Loading a new track drops any engaged echo-out — otherwise the deck
+        // stays muted (100 % wet) and the fresh track is silent until the
+        // operator works out why (M15). Un-mute the engine and clear the flag.
+        if target.echoDivision != nil {
+            releaseEcho(side)
+        }
+        starting.echoDivision = nil
         tapToGrid(for: side).cancel()
         setState(starting, for: side)
 
@@ -3759,11 +3804,13 @@ final class WaveformAppModel: ObservableObject {
     /// from Thru it lands at unity, paused.
     func setDeckInternal(side: DeckSide) {
         try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .internalPlay)
+        disengageEchoIfEngaged(side)
     }
 
     /// Select Timecode control for a deck (the deck-header switch).
     func setDeckTimecode(side: DeckSide) {
         try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .timecode)
+        disengageEchoIfEngaged(side)
     }
 
     /// Select Thru — pass the live record straight through (the
@@ -3772,6 +3819,7 @@ final class WaveformAppModel: ObservableObject {
     /// cached track identity to match so no ghost title/waveform lingers.
     func setDeckThru(side: DeckSide) {
         try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .thru)
+        disengageEchoIfEngaged(side)
         var s = state(for: side)
         let hadLibraryTrack = s.loadedLibraryTrackId != nil
         s.clearLoadedTrack()
@@ -4148,6 +4196,82 @@ final class WaveformAppModel: ObservableObject {
         deck.loopActive = false
         deck.seekGeneration &+= 1
         setState(deck, for: side)
+    }
+
+    /// M15 echo-out (PRD §6.3): engage the tap-and-hold dub echo on `side`
+    /// at `divisionBeats` beats. The engine captures the last N beats of the
+    /// deck's output and recirculates them with feedback decay — on an
+    /// internal deck the dry mutes while the echo carries (the deck slips
+    /// forward underneath); on a Thru deck it layers over the live record.
+    ///
+    /// The echo length is tempo-locked, so we pass the deck's *effective*
+    /// BPM (analysed tempo scaled by the current pitch). No-op until a BPM is
+    /// known — the pad glow follows the engine's `echoState`, so a no-op
+    /// engage simply never lights.
+    /// M15 echo-out (PRD §6.3): tap-toggle the 100 %-wet dub echo on `side` at
+    /// `divisionBeats`. Tapping the off (or a different) division engages it —
+    /// the engine mutes the deck's dry and repeats the last N beats with a
+    /// feedback decay while the deck slips forward underneath. Tapping the lit
+    /// division turns it off and the dry returns at the (slipped) position.
+    func toggleEcho(_ side: DeckSide, divisionBeats: Double) {
+        guard isRunning, echoOutEnabled else { return }
+        var deck = state(for: side)
+        if deck.echoDivision == divisionBeats {
+            releaseEcho(side)
+            deck.echoDivision = nil
+        } else {
+            engageEcho(side, divisionBeats: divisionBeats)
+            deck.echoDivision = divisionBeats
+        }
+        setState(deck, for: side)
+    }
+
+    /// Toggle the single 1-beat echo-out on `side` (the one ECHO OUT button).
+    func toggleEchoOut(_ side: DeckSide) {
+        toggleEcho(side, divisionBeats: 1.0)
+    }
+
+    /// Drop an engaged echo on `side` — called when the deck's context changes
+    /// (a new track loads, the source mode is switched) so a muted deck (100 %
+    /// wet) never strands the operator in silence (M15). No-op if not engaged.
+    func disengageEchoIfEngaged(_ side: DeckSide) {
+        var deck = state(for: side)
+        guard deck.echoDivision != nil else { return }
+        releaseEcho(side)
+        deck.echoDivision = nil
+        setState(deck, for: side)
+    }
+
+    /// Drop any engaged echo on both decks — called when the echo-out feature
+    /// is switched off in Preferences so a muted deck never gets stuck.
+    private func disengageAllEcho() {
+        disengageEchoIfEngaged(.a)
+        disengageEchoIfEngaged(.b)
+    }
+
+    func engageEcho(_ side: DeckSide, divisionBeats: Double) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        // Tempo-lock to the deck's analysed BPM when known; otherwise fall
+        // back to a neutral 120 so the echo still fires (the division is then
+        // in absolute time rather than beat-locked) — better than a silent
+        // no-op on an un-analysed track.
+        let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
+        let effectiveBpm = base * (1.0 + (deck.pitchPercent ?? 0) / 100.0)
+        guard effectiveBpm > 0 else { return }
+        try? engine.engageEchoOut(
+            deckIdx: side.ffiDeckIdx,
+            divisionBeats: divisionBeats,
+            bpm: effectiveBpm,
+            feedback: 0.6,    // PRD §6.3 default feedback (60 %)
+            lpfHz: 8000)      // PRD §6.3 default feedback low-pass (8 kHz)
+    }
+
+    /// Release a held echo-out on `side`; the captured-loop tail decays
+    /// naturally to silence and the deck's dry signal returns.
+    func releaseEcho(_ side: DeckSide) {
+        guard isRunning else { return }
+        try? engine.releaseEchoOut(deckIdx: side.ffiDeckIdx)
     }
 
     /// M11d.6 — manual phase nudge for the focused deck's beat

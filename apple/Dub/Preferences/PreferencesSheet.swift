@@ -43,6 +43,7 @@ struct PreferencesSheet: View {
                     loadBehaviourSection
                     loudnessSection
                     cueSection
+                    fxSection
                     librariesSection
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -192,6 +193,27 @@ struct PreferencesSheet: View {
                 }
                 .toggleStyle(.switch)
                 Text("When on, setting a hot cue snaps the marker to the nearest beat line, so you can tap roughly on the beat and the cue lands clean. When off, the cue lands exactly at the playhead. Tracks with no analysed grid keep the raw position either way.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - FX (echo-out)
+
+    /// Echo-out feature toggle. When on, each deck's pads carry a single
+    /// 1-beat, 100 %-wet ECHO OUT button (PRD §6.3). Off hides it.
+    private var fxSection: some View {
+        section(title: "FX") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Toggle(isOn: $model.echoOutEnabled) {
+                    Text("Echo out")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("Adds a single ECHO OUT button to each deck's pads. Tap it on and the tune cuts to 100% wet — the last beat repeats and decays — while the deck keeps playing underneath; tap off and it picks up where it's got to. When off, the button is hidden.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

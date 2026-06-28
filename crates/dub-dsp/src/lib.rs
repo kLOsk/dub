@@ -9,8 +9,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod echo;
 pub mod loudness;
 
+pub use echo::{
+    one_pole_coeff, EchoOut, EchoState, DEFAULT_FEEDBACK, DEFAULT_LPF_HZ, MAX_FEEDBACK,
+};
 pub use loudness::{
     db_to_linear, measure_integrated_loudness, normalization_gain_db, LoudnessMeasurement,
     CEILING_DBFS, DEFAULT_TARGET_LUFS,

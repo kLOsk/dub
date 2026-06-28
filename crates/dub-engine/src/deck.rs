@@ -192,6 +192,12 @@ pub struct DeckSharedState {
     /// header's green/dim key-lock dot (PRD §6.1.1). Plain relaxed atomic — a
     /// one-block tear is invisible.
     key_lock_state: AtomicU8,
+    /// M15 echo-out state, published each block: `0` = off, `1` = engaged
+    /// (dry muted, loop repeating), `2` = engaged & ready to auto-off (muted
+    /// input + wet tail both silent). Drives the deck's echo-out pad glow
+    /// (1 + 2) and the poll's auto-off (2). PRD §6.3. Plain relaxed atomic —
+    /// a one-block tear is invisible.
+    echo_state: AtomicU8,
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -336,6 +342,7 @@ impl DeckSharedState {
             loop_in_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             key_lock_state: AtomicU8::new(0),
+            echo_state: AtomicU8::new(0),
         }
     }
 
@@ -365,6 +372,7 @@ impl DeckSharedState {
         self.calibrating_flag.store(false, Ordering::Relaxed);
         self.control_override_flag.store(false, Ordering::Relaxed);
         self.key_lock_state.store(0, Ordering::Relaxed);
+        self.echo_state.store(0, Ordering::Relaxed);
         self.tc_abs_locked.store(false, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
@@ -449,6 +457,19 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_key_lock_state(&self) -> u8 {
         self.key_lock_state.load(Ordering::Relaxed)
+    }
+
+    /// Publish the M15 echo-out indicator state (0 off / 1 engaged) from the
+    /// audio thread. One relaxed store; RT-safe.
+    pub(crate) fn store_echo_state(&self, state: u8) {
+        self.echo_state.store(state, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the M15 echo-out indicator state, for the FFI
+    /// telemetry that drives the deck's echo-out pad glow.
+    #[must_use]
+    pub fn load_echo_state(&self) -> u8 {
+        self.echo_state.load(Ordering::Relaxed)
     }
 
     /// Publish the installed whitening matrix + calibration counter
@@ -1490,6 +1511,20 @@ impl Deck {
     /// allowed but generally not what the user wants.
     pub fn set_gain(&mut self, gain: f32) {
         self.gain = gain;
+    }
+
+    /// Publish this deck's echo-out indicator state (0 off / 1 engaged) into
+    /// the shared state (M15). The engine calls this each block after running
+    /// the deck's output-bus echo FX. One relaxed store; RT-safe.
+    pub(crate) fn store_echo_state(&self, state: u8) {
+        self.shared.store_echo_state(state);
+    }
+
+    /// Read back this deck's published echo-out indicator state. Used by the
+    /// FFI telemetry snapshot and engine tests.
+    #[cfg(test)]
+    pub(crate) fn load_echo_state(&self) -> u8 {
+        self.shared.load_echo_state()
     }
 
     /// `true` when the deck is currently contributing audio.

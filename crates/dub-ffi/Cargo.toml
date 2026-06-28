@@ -36,6 +36,9 @@ uniffi-cli = ["uniffi/cli"]
 
 [dependencies]
 dub-engine = { workspace = true }
+# M15 — the echo-out FFI resolves the feedback low-pass coefficient off-RT
+# (`one_pole_coeff`) before handing it to the engine.
+dub-dsp = { workspace = true }
 dub-audio = { workspace = true }
 dub-bpm = { workspace = true }
 dub-io = { workspace = true }

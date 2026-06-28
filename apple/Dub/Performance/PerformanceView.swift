@@ -255,6 +255,14 @@ struct PerformanceView: View {
                 activeBars: model.deckA.activeLoopBars,
                 onLoop: { bars in model.handleLoop(.a, bars: bars) },
                 onExit: { model.exitLoop(.a) })
+            // M15 — Echo-out (PRD §6.3): single 1-beat ECHO OUT toggle.
+            // Prep surface; clickable for prepare + test. Hidden when the
+            // feature is disabled in Preferences.
+            if model.echoOutEnabled {
+                PrepEchoPadRow(
+                    engaged: model.deckA.echoDivision != nil,
+                    onToggle: { model.toggleEchoOut(.a) })
+            }
             // M14 — Key Lock live A/B (Resampler · Ours · Rubber Band) +
             // engaged/standby indicator. Prep surface; clickable.
             KeyLockControlView(model: model, side: .a)
@@ -359,7 +367,10 @@ struct PerformanceView: View {
                             cues: deckState.hotCues,
                             activeLoopBars: deckState.activeLoopBars,
                             onLoop: { bars in model.handleLoop(side, bars: bars) },
-                            onExit: { model.exitLoop(side) })
+                            onExit: { model.exitLoop(side) },
+                            echoEngaged: deckState.echoDivision != nil,
+                            onEchoToggle: { model.toggleEchoOut(side) },
+                            echoEnabled: model.echoOutEnabled)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -382,7 +393,10 @@ struct PerformanceView: View {
                             cues: deckState.hotCues,
                             activeLoopBars: deckState.activeLoopBars,
                             onLoop: { bars in model.handleLoop(side, bars: bars) },
-                            onExit: { model.exitLoop(side) })
+                            onExit: { model.exitLoop(side) },
+                            echoEngaged: deckState.echoDivision != nil,
+                            onEchoToggle: { model.toggleEchoOut(side) },
+                            echoEnabled: model.echoOutEnabled)
                     }
                 }
             case .horizontal:
