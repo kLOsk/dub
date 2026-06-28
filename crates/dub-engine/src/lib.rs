@@ -242,6 +242,17 @@ pub struct Engine {
     /// (not on [`Deck`]) because the FX operates on the per-deck output bus
     /// and applies uniformly to file, timecode, and Thru decks (PRD §5.3).
     echo: [dub_dsp::EchoOut; DECK_COUNT],
+    /// Per-deck dub-siren synth (M16, PRD §6.3). A *generator* summed onto the
+    /// deck's output bus **after** the echo, so it sounds with or without a
+    /// track and is never swallowed by echo-out's dry-mute. Each holds its
+    /// pre-allocated wavetables + slap-back ring (sized at construction) —
+    /// RT-safe every block. Engaged via the command channel.
+    siren: [dub_dsp::SirenVoice; DECK_COUNT],
+    /// The M16 dub-siren preset bank (siren / alarm / laser / bomb / gun …),
+    /// resolved to engine-domain patches **once at construction** (the resolve
+    /// calls `exp`/`powf`). `DeckFireSirenPreset` carries only an index; the
+    /// audio thread copies the patch from here — no coefficient math on RT.
+    siren_presets: [dub_dsp::SirenPatch; dub_dsp::SIREN_PRESET_COUNT],
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -359,6 +370,8 @@ impl Engine {
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
             echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
+            siren: std::array::from_fn(|_| dub_dsp::SirenVoice::new(sample_rate)),
+            siren_presets: std::array::from_fn(|i| dub_dsp::siren_preset_patch(i, sample_rate)),
         }
     }
 
@@ -418,6 +431,8 @@ impl Engine {
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
             echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
+            siren: std::array::from_fn(|_| dub_dsp::SirenVoice::new(sample_rate)),
+            siren_presets: std::array::from_fn(|i| dub_dsp::siren_preset_patch(i, sample_rate)),
         };
         (engine, handle)
     }
@@ -741,6 +756,14 @@ impl Engine {
             // keeps the delay ring warm.
             self.echo[idx].process_block(out, num_channels, first_us);
             self.decks[idx].store_echo_state(self.echo[idx].state_code());
+
+            // M16 dub-siren (PRD §6.3): a generator summed on top of the deck's
+            // output pair, *after* the echo. After-echo (not before) means the
+            // siren is never silenced by echo-out's dry-mute and isn't captured
+            // into the echo ring — the two FX compose independently. Additive,
+            // so it sounds even on a stopped/empty deck. A no-op when idle.
+            self.siren[idx].process_block(out, num_channels, first_us);
+            self.decks[idx].store_siren_state(self.siren[idx].state_code());
         }
 
         // Master gain (M4 / M5.5): single multiplicative scale across the
@@ -1568,6 +1591,29 @@ impl Engine {
                     echo.set_params(feedback, lp_coeff);
                 }
             }
+            Command::DeckFireSirenPreset {
+                idx,
+                preset_id,
+                delay_frames_override,
+            } => {
+                // Copy the precomputed patch out first (immutable borrow of
+                // `self.siren_presets`) so the `&mut self.siren` borrow below
+                // doesn't overlap it.
+                if let Some(mut patch) = self.siren_presets.get(preset_id as usize).copied() {
+                    // Beat-matched echo: override the preset's slap-back time.
+                    if delay_frames_override > 0 {
+                        patch.delay_frames = delay_frames_override;
+                    }
+                    if let Some(siren) = self.siren.get_mut(idx as usize) {
+                        siren.engage(&patch);
+                    }
+                }
+            }
+            Command::DeckReleaseSiren { idx } => {
+                if let Some(siren) = self.siren.get_mut(idx as usize) {
+                    siren.release();
+                }
+            }
             Command::DeckSetControlMode { idx, mode } => {
                 self.set_deck_control_mode(idx as usize, mode);
                 // Crossing into/out of Timecode drive invalidates the
@@ -2102,6 +2148,95 @@ mod tests {
         engine.render(&mut rt, &mut out);
         assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Idle);
         assert_eq!(engine.deck(0).load_echo_state(), 0);
+    }
+
+    #[test]
+    fn siren_fire_preset_render_is_alloc_free() {
+        // M16 dub-siren runs on the audio thread every block. Firing presets
+        // (laser, machine gun), releasing, and rendering the slap-back tail
+        // must all stay allocation-free (the patch bank is precomputed off-RT).
+        let mut engine = engine_with_two_decks(0.3, 0.5);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::DeckFireSirenPreset {
+                idx: 0,
+                preset_id: 2,
+                delay_frames_override: 0,
+            });
+            for _ in 0..200 {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+            engine.apply_command(Command::DeckFireSirenPreset {
+                idx: 0,
+                preset_id: 4,
+                delay_frames_override: 9_600, // beat-matched echo override
+            });
+            for _ in 0..200 {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+            engine.apply_command(Command::DeckReleaseSiren { idx: 0 });
+            for _ in 0..400 {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+        });
+    }
+
+    #[test]
+    fn siren_preset_fire_drives_published_state() {
+        // The command path (handle → engine → SirenVoice) must drive the
+        // audible-state machine and the telemetry atom the UI polls.
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 256 * 2];
+
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.siren[0].state(), dub_dsp::SirenState::Idle);
+        assert_eq!(engine.deck(0).load_siren_state(), 0);
+
+        // Fire the short "Lickshot" one-shot (id 5). Sounds even with no track
+        // loaded (the siren is a generator).
+        handle.deck(0).fire_siren_preset(5, 0).unwrap();
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.siren[0].state(), dub_dsp::SirenState::Sounding);
+        assert_eq!(engine.deck(0).load_siren_state(), 1);
+
+        // Render past its gate + echo tail; it self-terminates to Idle.
+        let mut idled = false;
+        for _ in 0..2_000 {
+            engine.render(&mut rt, &mut out);
+            if engine.siren[0].state() == dub_dsp::SirenState::Idle {
+                idled = true;
+                break;
+            }
+        }
+        assert!(idled, "one-shot preset never returned to idle");
+        assert_eq!(engine.deck(0).load_siren_state(), 0);
+    }
+
+    #[test]
+    fn siren_sounds_with_no_track_and_survives_echo_mute() {
+        // The siren is a generator (sounds with no deck playing) and runs
+        // AFTER echo-out, so engaging echo (which mutes the deck dry) must not
+        // silence it — the two FX compose independently.
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 64 * 2];
+
+        // Echo first (mutes the — absent — dry), then fire the "Siren" preset
+        // (id 0) summed on top.
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        handle.deck(0).fire_siren_preset(0, 0).unwrap();
+
+        let mut peak = 0.0_f32;
+        for _ in 0..40 {
+            engine.render(&mut rt, &mut out);
+            for &s in &out {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(peak > 0.3, "siren inaudible with echo engaged: peak {peak}");
     }
 
     #[test]

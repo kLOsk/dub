@@ -263,6 +263,15 @@ struct PerformanceView: View {
                     engaged: model.deckA.echoDivision != nil,
                     onToggle: { model.toggleEchoOut(.a) })
             }
+            // M16 — Dub siren (PRD §6.3, Simple mode): the classic preset grid
+            // (siren / alarm / laser / bomb / gun …). Prep surface; mouse +
+            // keyboard. Hidden when the feature is off in Preferences.
+            if model.sirenEnabled {
+                SirenPadRow(
+                    names: model.sirenPresetLabels,
+                    sounding: model.deckA.sirenState == 1,
+                    onPreset: { idx in model.fireSirenPreset(.a, index: idx) })
+            }
             // M14 — Key Lock live A/B (Resampler · Ours · Rubber Band) +
             // engaged/standby indicator. Prep surface; clickable.
             KeyLockControlView(model: model, side: .a)
@@ -370,7 +379,11 @@ struct PerformanceView: View {
                             onExit: { model.exitLoop(side) },
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },
-                            echoEnabled: model.echoOutEnabled)
+                            echoEnabled: model.echoOutEnabled,
+                            sirenPresetNames: model.sirenPresetLabels,
+                            sirenSounding: deckState.sirenState == 1,
+                            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
+                            sirenEnabled: model.sirenEnabled)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -396,7 +409,11 @@ struct PerformanceView: View {
                             onExit: { model.exitLoop(side) },
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },
-                            echoEnabled: model.echoOutEnabled)
+                            echoEnabled: model.echoOutEnabled,
+                            sirenPresetNames: model.sirenPresetLabels,
+                            sirenSounding: deckState.sirenState == 1,
+                            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
+                            sirenEnabled: model.sirenEnabled)
                     }
                 }
             case .horizontal:

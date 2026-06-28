@@ -322,7 +322,24 @@ uniffi::setup_scaffolding!();
 ///       echo, PRD §6.3); [`DeckTelemetry`] grows `echo_state`
 ///       (0 off · 1 engaged · 2 engaged & ready to auto-off) — pad glow on
 ///       1+2, the deck poll auto-disengages on 2.
-pub const FFI_VERSION: u32 = 44;
+///   45. **M16 dub-siren.** `DubEngine` grows `engage_siren` / `release_siren`
+///       / `set_siren_params` (the synthesised siren generator + slap-back
+///       delay, PRD §6.3), driven by `SirenPatch` / `SirenKnobs` /
+///       `SirenWave`. `gate_ms == 0` holds (hold-to-wail); `> 0` is a
+///       self-releasing one-shot (keyboard presets). [`DeckTelemetry`] grows
+///       `siren_state` (0 idle · 1 sounding) — pad glow on 1, no auto-off.
+///   46. **M16 dub-siren → Simple mode.** Reworked to a fixed preset bank
+///       (siren / alarm / laser / bomb / gun …). `engage_siren` /
+///       `set_siren_params` + the `Siren*` records are replaced by
+///       `fire_siren_preset(deck_idx, preset_id)` plus the free fns
+///       [`siren_preset_names`] / [`siren_preset_count`]. `release_siren` and
+///       `DeckTelemetry.siren_state` stay. (The knob / hold-to-wail editor
+///       returns with Advanced / Expert modes later.)
+///   47. **M16 siren echo beat-match.** `fire_siren_preset` grows
+///       `sync_beats` + `bpm` args: when `sync_beats > 0` the siren's slap-back
+///       echo time is overridden to that tempo division (resolved off-RT),
+///       else the preset's own echo is used.
+pub const FFI_VERSION: u32 = 47;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1874,6 +1891,70 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Fire M16 dub-siren preset `preset_id` on `deck_idx` (Simple mode,
+    /// PRD §6.3) as a tap one-shot. The preset bank (siren / alarm / laser /
+    /// bomb / gun …, see [`siren_preset_names`]) is precomputed off the audio
+    /// thread at engine startup; this only sends the index. Out-of-range ids
+    /// are ignored. The siren is a generator summed onto the deck's output bus,
+    /// so it sounds with or without a track and survives echo-out's dry-mute.
+    ///
+    /// When the user has beat-matched the siren echo, pass `sync_beats > 0` and
+    /// the deck's effective `bpm`: the slap-back time is overridden to
+    /// `sync_beats × 60/bpm` (resolved here, off-RT), replacing the preset's own
+    /// echo time. Pass `sync_beats == 0` (or a non-positive `bpm`) to keep the
+    /// preset's slap-back.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn fire_siren_preset(
+        &self,
+        deck_idx: u64,
+        preset_id: u32,
+        sync_beats: f64,
+        bpm: f64,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let preset = u8::try_from(preset_id).unwrap_or(u8::MAX);
+        let delay_frames_override =
+            if sync_beats.is_finite() && sync_beats > 0.0 && bpm.is_finite() && bpm > 0.0 {
+                let frames = sync_beats * 60.0 / bpm * f64::from(running.sample_rate);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let f = frames.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+                f
+            } else {
+                0
+            };
+        running
+            .handle
+            .deck(idx)
+            .fire_siren_preset(preset, delay_frames_override)
+            .map_err(map_command_error)
+    }
+
+    /// Stop the dub-siren on `deck_idx`: the oscillator fades out (release ramp)
+    /// while the slap-back tail rings on. Idempotent.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn release_siren(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .release_siren()
+            .map_err(map_command_error)
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2).
     ///
     /// Tells the engine to ignore the deck's timecode input until
@@ -2184,6 +2265,7 @@ impl DubEngine {
             measure_progress: tc.measure_progress,
             key_lock_state: shared.load_key_lock_state(),
             echo_state: shared.load_echo_state(),
+            siren_state: shared.load_siren_state(),
         }
     }
 
@@ -3316,6 +3398,10 @@ pub struct DeckTelemetry {
     /// or a file deck whose track ended). The pad glows for 1 and 2; the deck
     /// poll turns the echo off on 2. PRD §6.3.
     pub echo_state: u8,
+    /// M16 dub-siren state: 0 idle · 1 sounding (gated, releasing, or the
+    /// slap-back tail still ringing). Drives the deck's siren pad glow. No
+    /// auto-off (the siren is additive). PRD §6.3.
+    pub siren_state: u8,
 }
 
 impl DeckTelemetry {
@@ -3340,6 +3426,7 @@ impl DeckTelemetry {
             measure_progress: 1.0,
             key_lock_state: 0,
             echo_state: 0,
+            siren_state: 0,
         }
     }
 }
@@ -3385,6 +3472,25 @@ impl From<StretchBackend> for dub_engine::StretchBackend {
             StretchBackend::DubOwn => dub_engine::StretchBackend::DubOwn,
         }
     }
+}
+
+/// The display names of the built-in M16 dub-siren presets (Simple mode),
+/// in fire order — the index is what [`DubEngine::fire_siren_preset`] takes.
+/// A free function (no engine instance needed) so the UI can lay out its pad
+/// grid before / regardless of engine state.
+#[uniffi::export]
+#[must_use]
+pub fn siren_preset_names() -> Vec<String> {
+    (0..dub_dsp::SIREN_PRESET_COUNT)
+        .map(|i| dub_dsp::siren_preset_name(i).to_string())
+        .collect()
+}
+
+/// The number of built-in dub-siren presets (Simple mode, M16).
+#[uniffi::export]
+#[must_use]
+pub fn siren_preset_count() -> u32 {
+    dub_dsp::SIREN_PRESET_COUNT as u32
 }
 
 /// LSQ residual statistics from beat-grid analysis (M11d.7).
@@ -4492,7 +4598,15 @@ mod tests {
         // 42→43: M14.4 Rubber Band removed (fn + `StretchBackend::RubberBand`).
         // 43→44: M15 echo-out (`engage_echo_out` / `release_echo_out` /
         // `set_echo_params` + `DeckTelemetry.echo_state`).
-        assert_eq!(FFI_VERSION, 44);
+        // 44→45: M16 dub-siren (`engage_siren` / `release_siren` /
+        // `set_siren_params` + `SirenPatch` / `SirenKnobs` / `SirenWave` +
+        // `DeckTelemetry.siren_state`).
+        // 45→46: M16 Simple mode — preset bank (`fire_siren_preset` +
+        // `siren_preset_names` / `siren_preset_count`) replaces the
+        // `engage_siren` / `set_siren_params` knob path.
+        // 46→47: M16 siren echo beat-match (`fire_siren_preset` gains
+        // `sync_beats` + `bpm`).
+        assert_eq!(FFI_VERSION, 47);
     }
 
     #[test]
@@ -4518,6 +4632,35 @@ mod tests {
         for f in [engine.play(0), engine.pause(0), engine.seek(0, 30.0)] {
             assert!(matches!(f.unwrap_err(), EngineError::EngineNotRunning));
         }
+    }
+
+    #[test]
+    fn siren_commands_on_stopped_engine_return_not_running() {
+        let engine = DubEngine::new();
+        assert!(matches!(
+            engine.fire_siren_preset(0, 0, 0.0, 0.0).unwrap_err(),
+            EngineError::EngineNotRunning
+        ));
+        assert!(matches!(
+            engine.release_siren(0).unwrap_err(),
+            EngineError::EngineNotRunning
+        ));
+    }
+
+    #[test]
+    fn deck_telemetry_on_stopped_engine_reports_idle_siren() {
+        let engine = DubEngine::new();
+        assert_eq!(engine.deck_telemetry(0).siren_state, 0);
+    }
+
+    #[test]
+    fn siren_preset_names_are_exposed_for_the_ui() {
+        let names = siren_preset_names();
+        assert_eq!(names.len() as u32, siren_preset_count());
+        assert!(names.len() >= 8, "expected the classic preset bank");
+        assert!(names.iter().all(|n| !n.is_empty()), "a preset is unnamed");
+        // The fire-order index the UI sends must line up with these names.
+        assert_eq!(names[0], "Siren");
     }
 
     #[test]

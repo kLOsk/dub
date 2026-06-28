@@ -962,6 +962,37 @@ impl DeckCommand<'_> {
         })
     }
 
+    /// Fire M16 dub-siren preset `preset_id` (Simple mode, PRD §6.3) as a tap
+    /// one-shot. The preset bank is precomputed off-RT in the engine; this just
+    /// carries the index. Out-of-range ids are ignored on the audio thread.
+    /// `delay_frames_override` (`0` = use the preset's own slap-back time) is the
+    /// beat-matched echo length, resolved off-RT by the caller.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn fire_siren_preset(
+        self,
+        preset_id: u8,
+        delay_frames_override: u32,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckFireSirenPreset {
+            idx,
+            preset_id,
+            delay_frames_override,
+        })
+    }
+
+    /// Stop the dub-siren: the oscillator fades out (release ramp) while the
+    /// slap-back tail rings on. Idempotent on a non-sounding deck.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn release_siren(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckReleaseSiren { idx })
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2). Decouples the deck
     /// from any attached timecode input and pins it to its last-
     /// known good velocity (or unity forward if no policy is

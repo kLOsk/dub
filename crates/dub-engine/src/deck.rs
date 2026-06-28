@@ -198,6 +198,12 @@ pub struct DeckSharedState {
     /// (1 + 2) and the poll's auto-off (2). PRD §6.3. Plain relaxed atomic —
     /// a one-block tear is invisible.
     echo_state: AtomicU8,
+    /// M16 dub-siren state, published each block: `0` = idle, `1` = sounding
+    /// (gated, releasing, or the slap-back tail still ringing). Drives the
+    /// deck's siren pad glow. No auto-off (the siren is additive, so unlike
+    /// echo there is nothing to strand). PRD §6.3. Plain relaxed atomic —
+    /// a one-block tear is invisible.
+    siren_state: AtomicU8,
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -343,6 +349,7 @@ impl DeckSharedState {
             loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             key_lock_state: AtomicU8::new(0),
             echo_state: AtomicU8::new(0),
+            siren_state: AtomicU8::new(0),
         }
     }
 
@@ -373,6 +380,7 @@ impl DeckSharedState {
         self.control_override_flag.store(false, Ordering::Relaxed);
         self.key_lock_state.store(0, Ordering::Relaxed);
         self.echo_state.store(0, Ordering::Relaxed);
+        self.siren_state.store(0, Ordering::Relaxed);
         self.tc_abs_locked.store(false, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
@@ -470,6 +478,19 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_echo_state(&self) -> u8 {
         self.echo_state.load(Ordering::Relaxed)
+    }
+
+    /// Publish the M16 dub-siren indicator state (0 idle / 1 sounding) from the
+    /// audio thread. One relaxed store; RT-safe.
+    pub(crate) fn store_siren_state(&self, state: u8) {
+        self.siren_state.store(state, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the M16 dub-siren indicator state, for the FFI
+    /// telemetry that drives the deck's siren pad glow.
+    #[must_use]
+    pub fn load_siren_state(&self) -> u8 {
+        self.siren_state.load(Ordering::Relaxed)
     }
 
     /// Publish the installed whitening matrix + calibration counter
@@ -1525,6 +1546,20 @@ impl Deck {
     #[cfg(test)]
     pub(crate) fn load_echo_state(&self) -> u8 {
         self.shared.load_echo_state()
+    }
+
+    /// Publish this deck's dub-siren indicator state (0 idle / 1 sounding) into
+    /// the shared state (M16). The engine calls this each block after running
+    /// the deck's output-bus siren voice. One relaxed store; RT-safe.
+    pub(crate) fn store_siren_state(&self, state: u8) {
+        self.shared.store_siren_state(state);
+    }
+
+    /// Read back this deck's published dub-siren indicator state. Used by the
+    /// FFI telemetry snapshot and engine tests.
+    #[cfg(test)]
+    pub(crate) fn load_siren_state(&self) -> u8 {
+        self.shared.load_siren_state()
     }
 
     /// `true` when the deck is currently contributing audio.

@@ -119,6 +119,12 @@ enum DubColor {
     /// the dub echo is engaged or ringing out.
     static let echo = Color(hex: 0xB07CFF)
 
+    /// Dub-siren FX / pad accent (M16, PRD §6.3). A hot siren red — hue-
+    /// distinct from the echo violet, the loop mint, the cue magenta, and
+    /// both deck tints — so the SIREN button and preset pads read as the
+    /// siren's own thing while it's wailing.
+    static let siren = Color(hex: 0xFF5247)
+
     // ----- Overview strip (M10.5c) ---------------------------------
 
     /// Deck A's amplitude colour in the Track Overview strip.

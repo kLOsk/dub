@@ -217,6 +217,29 @@ struct PreferencesSheet: View {
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(isOn: $model.sirenEnabled) {
+                    Text("Dub siren")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("Adds a grid of classic dub-siren sounds to each deck — siren, alarm, laser, bomb, machine gun and more. Tap a pad (or its Z X C V B N M , key) to fire one. Pure synthesis: an oscillator swept by an LFO, through a built-in slap-back echo. When off, the pads are hidden.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(isOn: $model.sirenDelaySync) {
+                    Text("Beat-match siren echo")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .disabled(!model.sirenEnabled)
+                Text("Locks the siren's echo to the deck's tempo (one beat per repeat) instead of each sound's own slap-back time, so the echoes fall in time with the tune. Off keeps each preset's natural echo.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

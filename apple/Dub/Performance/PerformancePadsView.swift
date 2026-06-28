@@ -49,6 +49,16 @@ struct PerformancePadsView: View {
     /// ECHO button is hidden entirely.
     var echoEnabled: Bool = true
 
+    /// M16 dub-siren preset names (fire order); empty hides the grid.
+    var sirenPresetNames: [String] = []
+    /// Whether the engine reports the siren sounding (lights the header dot).
+    var sirenSounding: Bool = false
+    /// Fire preset `index` on this deck.
+    var onSirenPreset: (_ index: Int) -> Void = { _ in }
+    /// Whether the dub-siren feature is enabled (Preferences). When off the
+    /// SIREN grid is hidden entirely.
+    var sirenEnabled: Bool = false
+
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
     /// their overview on the left.
@@ -60,6 +70,12 @@ struct PerformancePadsView: View {
             loopGroup()
             if echoEnabled {
                 EchoPadRow(engaged: echoEngaged, onToggle: onEchoToggle)
+            }
+            if sirenEnabled {
+                SirenPadRow(
+                    names: sirenPresetNames,
+                    sounding: sirenSounding,
+                    onPreset: onSirenPreset)
             }
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
@@ -255,6 +271,82 @@ struct PrepEchoPadRow: View {
                 .foregroundStyle(DubColor.textSecondary)
                 .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
             echoOutButton("OUT", engaged: engaged, onToggle: onToggle)
+        }
+    }
+}
+
+/// Layout-independent keyboard keys for the siren presets — the bottom letter
+/// row Z X C V B N M , → indices 0–7 (keyCodes wired in `KeyEventMonitorHost`).
+/// Shown as pad hints.
+private let sirenPresetKeys = ["Z", "X", "C", "V", "B", "N", "M", ","]
+
+/// One siren preset pad: its name plus the keyboard hint. Fires the one-shot on
+/// mouse-down (a momentary trigger, within the §1 mouse rule).
+@ViewBuilder
+private func sirenPresetPad(_ label: String, key: String, onPress: @escaping () -> Void)
+    -> some View
+{
+    VStack(spacing: 1) {
+        Text(label.uppercased())
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+        Text(key)
+            .font(DubFont.micro)
+            .foregroundStyle(DubColor.textPlaceholder)
+    }
+    .foregroundStyle(DubColor.textTertiary)
+    .frame(width: 64, height: 36)
+    .background(DubColor.surface1)
+    .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+    .overlay(
+        RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+            .stroke(DubColor.divider, lineWidth: 1))
+    .contentShape(Rectangle())
+    .onPressDown(perform: onPress)
+    .help("Fire the \(label) siren (\(key))")
+}
+
+/// Simple-mode dub-siren panel (M16, PRD §6.3): a grid of preset one-shot pads
+/// (siren / alarm / laser / bomb / gun …), laid out four per row. Tap a pad (or
+/// its Z X C V B N M , key) to fire the classic sound; it plays through the
+/// built-in slap-back echo and stops itself. Value-driven (names come from the
+/// engine bank); a header dot lights while the deck's siren is sounding.
+/// (Advanced / Expert modes — live tweaking — arrive later.)
+struct SirenPadRow: View {
+    /// Preset display names, in fire order (index = preset id).
+    let names: [String]
+    /// Whether the engine reports the deck's siren sounding (lights the dot).
+    let sounding: Bool
+    /// Fire preset `index` on this deck.
+    let onPreset: (_ index: Int) -> Void
+
+    private var rows: [[Int]] {
+        let idx = Array(names.indices)
+        return stride(from: 0, to: idx.count, by: 4).map { Array(idx[$0..<min($0 + 4, idx.count)]) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            HStack(spacing: DubSpacing.xs) {
+                Circle()
+                    .fill(sounding ? DubColor.siren : DubColor.divider)
+                    .frame(width: 7, height: 7)
+                Text("SIREN")
+                    .font(DubFont.caps)
+                    .tracking(0.8)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+            ForEach(rows, id: \.self) { row in
+                HStack(spacing: DubSpacing.sm) {
+                    ForEach(row, id: \.self) { idx in
+                        sirenPresetPad(
+                            names[idx],
+                            key: idx < sirenPresetKeys.count ? sirenPresetKeys[idx] : "",
+                            onPress: { onPreset(idx) })
+                    }
+                }
+            }
         }
     }
 }

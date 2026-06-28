@@ -426,7 +426,10 @@ mod tests {
             last = step(&mut echo, 0.5);
         }
         // ≈ 0.5 (pure wet) proves the dry is muted; layering would be ≈ 1.0.
-        assert!((last - 0.5).abs() < 0.06, "dry not muted (100% wet): {last}");
+        assert!(
+            (last - 0.5).abs() < 0.06,
+            "dry not muted (100% wet): {last}"
+        );
     }
 
     #[test]
@@ -446,7 +449,10 @@ mod tests {
         for _ in 0..512 {
             last = step(&mut echo, 0.5);
         }
-        assert!((last - 0.5).abs() < 1e-3, "dry not restored after off: {last}");
+        assert!(
+            (last - 0.5).abs() < 1e-3,
+            "dry not restored after off: {last}"
+        );
     }
 
     #[test]

@@ -219,6 +219,11 @@ struct DeckState: Equatable {
     /// whether the next tap engages or disengages.
     var echoDivision: Double? = nil
 
+    /// M16 dub-siren state from `engine.deckTelemetry`: 0 idle · 1 sounding
+    /// (gated, releasing, or the slap-back tail still ringing). Lights the
+    /// SIREN panel while the engine says a preset is making sound.
+    var sirenState: UInt8 = 0
+
     /// Source-control state from `engine.deckTelemetry`, for the row-3
     /// Internal/Timecode switch. `hasTimecodeInput` gates whether the
     /// switch is shown at all.
@@ -584,6 +589,28 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kEchoOutEnabled = "dub.echoOutEnabled"
 
+    /// M16 dub-siren feature toggle (Preferences ▸ FX). When on, each deck's
+    /// pads carry the SIREN panel (hold-to-wail button + WAIL/ALARM/SWEEP
+    /// preset one-shots + knobs, PRD §6.3). Off hides it and drops any held
+    /// siren. Default on. Persisted under `dub.sirenEnabled`.
+    @Published var sirenEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(sirenEnabled, forKey: Self.kSirenEnabled)
+            if !sirenEnabled { disengageAllSiren() }
+        }
+    }
+
+    private static let kSirenEnabled = "dub.sirenEnabled"
+
+    /// Beat-match the dub-siren's slap-back echo to the deck tempo (M16). When
+    /// on, a fired preset's echo time is overridden to one beat at the deck's
+    /// effective BPM instead of the preset's own slap-back. Default off.
+    @Published var sirenDelaySync: Bool {
+        didSet { UserDefaults.standard.set(sirenDelaySync, forKey: Self.kSirenDelaySync) }
+    }
+
+    private static let kSirenDelaySync = "dub.sirenDelaySync"
+
     /// Per-source library-import enables (Preferences ▸ Libraries). When a
     /// source is on, Dub scans its default folder (`~/Music/_Serato_`,
     /// `~/Documents/Native Instruments/Traktor*/collection.nml`, the iTunes
@@ -855,6 +882,9 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
         self.echoOutEnabled =
             UserDefaults.standard.object(forKey: Self.kEchoOutEnabled) as? Bool ?? true
+        self.sirenEnabled =
+            UserDefaults.standard.object(forKey: Self.kSirenEnabled) as? Bool ?? true
+        self.sirenDelaySync = UserDefaults.standard.bool(forKey: Self.kSirenDelaySync)
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
@@ -1493,6 +1523,10 @@ final class WaveformAppModel: ObservableObject {
             releaseEcho(side)
             next.echoDivision = nil
         }
+        // M16 siren: the engine publishes 0 idle / 1 sounding. No auto-off
+        // branch — the siren is additive, so a stuck-sounding deck is never
+        // stranded in silence the way a muted echo deck would be.
+        next.sirenState = tele.sirenState
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
         next.sourceClass = tele.sourceClass
@@ -4274,6 +4308,44 @@ final class WaveformAppModel: ObservableObject {
         try? engine.releaseEchoOut(deckIdx: side.ffiDeckIdx)
     }
 
+    // MARK: - M16 dub siren (Simple mode, PRD §6.3)
+
+    /// Display names of the built-in siren presets (siren / alarm / laser /
+    /// bomb / gun …), in fire order. Fetched once from the engine bank; the
+    /// index drives both the pad grid and `fireSirenPreset`.
+    @Published var sirenPresetLabels: [String] = sirenPresetNames()
+
+    /// Fire dub-siren preset `index` on `side` as a tap one-shot. The preset
+    /// bank lives in the engine; the siren is a generator, so it sounds with or
+    /// without a track and is unaffected by echo-out.
+    func fireSirenPreset(_ side: DeckSide, index: Int) {
+        guard isRunning, sirenEnabled else { return }
+        guard index >= 0, index < sirenPresetLabels.count else { return }
+        // Beat-match (optional): one beat at the deck's effective tempo, else 0
+        // = use the preset's own slap-back. Falls back to 120 with no track.
+        let deck = state(for: side)
+        let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
+        let effectiveBpm = base * (1.0 + (deck.pitchPercent ?? 0) / 100.0)
+        let syncBeats = sirenDelaySync ? 1.0 : 0.0
+        try? engine.fireSirenPreset(
+            deckIdx: side.ffiDeckIdx,
+            presetId: UInt32(index),
+            syncBeats: syncBeats,
+            bpm: effectiveBpm)
+    }
+
+    /// Stop any sounding siren on `side` (oscillator fades out, tail rings on).
+    func releaseSiren(_ side: DeckSide) {
+        guard isRunning else { return }
+        try? engine.releaseSiren(deckIdx: side.ffiDeckIdx)
+    }
+
+    private func disengageAllSiren() {
+        guard isRunning else { return }
+        try? engine.releaseSiren(deckIdx: DeckSide.a.ffiDeckIdx)
+        try? engine.releaseSiren(deckIdx: DeckSide.b.ffiDeckIdx)
+    }
+
     /// M11d.6 — manual phase nudge for the focused deck's beat
     /// grid. Persists `user_tap` when the deck holds a library track.
     func nudgeBeatGridPhase(
@@ -4976,6 +5048,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     model.handleHotCue(model.focusedDeckForGridNudge, index: index, clear: clear)
                 }
                 return true
+            },
+            onSirenPreset: { index in
+                Task { @MainActor in
+                    guard model.sirenEnabled else { return }
+                    model.fireSirenPreset(model.focusedDeckForGridNudge, index: index)
+                }
+                return true
             })
         return view
     }
@@ -4998,7 +5077,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onSpace: @escaping () -> Bool,
             onCmdComma: @escaping () -> Bool,
             onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
-            onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool
+            onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
+            onSirenPreset: @escaping (_ index: Int) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -5030,6 +5110,19 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     let clear = event.modifierFlags
                         .intersection(.deviceIndependentFlagsMask).contains(.shift)
                     if onHotCue(index, clear) { return nil }
+                }
+                // M16 siren preset one-shots on the bottom letter row
+                // Z X C V B N M , → preset indices 0–7. Layout-independent
+                // physical keyCodes (like the 18–21 hot-cue keys); these are
+                // otherwise unbound, so consuming them is safe and never steals
+                // a typed key (the text-first-responder guard above already let
+                // editable fields keep their keyDown).
+                if !isCmd {
+                    let sirenKeys: [UInt16: Int] =
+                        [6: 0, 7: 1, 8: 2, 9: 3, 11: 4, 45: 5, 46: 6, 43: 7]
+                    if let preset = sirenKeys[event.keyCode] {
+                        if onSirenPreset(preset) { return nil }
+                    }
                 }
                 // `keyCode 49` is the spacebar on every Apple keyboard
                 // layout (the keyCodes are layout-independent for the

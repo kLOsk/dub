@@ -11,6 +11,7 @@
 
 pub mod echo;
 pub mod loudness;
+pub mod siren;
 
 pub use echo::{
     one_pole_coeff, EchoOut, EchoState, DEFAULT_FEEDBACK, DEFAULT_LPF_HZ, MAX_FEEDBACK,
@@ -18,6 +19,10 @@ pub use echo::{
 pub use loudness::{
     db_to_linear, measure_integrated_loudness, normalization_gain_db, LoudnessMeasurement,
     CEILING_DBFS, DEFAULT_TARGET_LUFS,
+};
+pub use siren::{
+    siren_preset_name, siren_preset_patch, SirenPatch, SirenState, SirenVoice, SirenWave,
+    SIREN_PRESET_COUNT,
 };
 
 /// Library version reported by the crate.

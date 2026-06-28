@@ -174,6 +174,28 @@ pub enum Command {
         lp_coeff: f32,
     },
 
+    /// Fire M16 dub-siren preset `preset_id` on deck `idx` (Simple mode,
+    /// PRD §6.3). The siren is a *generator* summed onto the deck's output bus
+    /// (additive — it sounds with or without a track loaded, and survives the
+    /// deck's echo-out dry-mute). The preset bank (siren / alarm / laser / bomb
+    /// / gun …) is **precomputed off-RT** at engine construction, so this only
+    /// carries the index; the audio thread copies the resolved patch and
+    /// re-triggers the voice as a tap one-shot. Out-of-range ids are ignored.
+    ///
+    /// `delay_frames_override` (`0` = use the preset's own slap-back time)
+    /// replaces the echo length when the user has beat-matched the siren echo;
+    /// it's resolved off-RT from the deck's tempo by the FFI.
+    DeckFireSirenPreset {
+        idx: u8,
+        preset_id: u8,
+        delay_frames_override: u32,
+    },
+
+    /// Stop the dub-siren on deck `idx`: the oscillator fades out (release ramp)
+    /// while the slap-back tail rings on. Idempotent on a deck whose siren isn't
+    /// sounding.
+    DeckReleaseSiren { idx: u8 },
+
     /// Pin deck `idx`'s control mode (the deck-header Internal/Timecode
     /// switch). Sets the user override so auto source-detection won't
     /// change it until [`Self::DeckAutoControlMode`].
@@ -339,6 +361,20 @@ impl std::fmt::Debug for Command {
                 .field("feedback", feedback)
                 .field("lp_coeff", lp_coeff)
                 .finish(),
+            Self::DeckFireSirenPreset {
+                idx,
+                preset_id,
+                delay_frames_override,
+            } => f
+                .debug_struct("DeckFireSirenPreset")
+                .field("idx", idx)
+                .field("preset_id", preset_id)
+                .field("delay_frames_override", delay_frames_override)
+                .finish(),
+            Self::DeckReleaseSiren { idx } => f
+                .debug_struct("DeckReleaseSiren")
+                .field("idx", idx)
+                .finish(),
             Self::DeckSetControlMode { idx, mode } => f
                 .debug_struct("DeckSetControlMode")
                 .field("idx", idx)
@@ -398,11 +434,11 @@ mod tests {
             fn assert_send<T: Send>() {}
             assert_send::<Command>();
         };
-        // 32 bytes upper bound today (DeckLoad: 1 tag + 1 idx + 8-byte
-        // pad + 8-byte Arc pointer = 24, padded). AttachTimecodeInput
-        // is the same shape (1 tag + 1 idx + 6-byte pad + 8-byte Box).
-        // Cap at 64 to catch accidental bloat — push variants above
-        // this through indirection.
+        // ~32 bytes today. The heap-bearing variants (DeckLoad's Arc<Track>,
+        // AttachTimecodeInput / AttachThruSource's Box) each add only an 8-byte
+        // pointer; the siren fires by a 1-byte preset id (the resolved patch
+        // bank lives in the engine, not the command). Cap at 64 to catch
+        // accidental bloat — push anything larger through indirection.
         assert!(
             std::mem::size_of::<Command>() <= 64,
             "Command grew to {} bytes; consider redesigning",
