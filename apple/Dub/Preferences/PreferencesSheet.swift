@@ -240,6 +240,11 @@ struct PreferencesSheet: View {
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // The vintage FX rack is deferred to post-release (being reworked
+                // into a deck-role FX channel), so its Preferences toggle is
+                // removed and the per-deck rack UI stays hidden. The view + DSP
+                // + engine code remain in-tree, dormant.
             }
         }
     }

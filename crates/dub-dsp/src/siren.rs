@@ -627,6 +627,52 @@ pub fn siren_preset_name(id: usize) -> &'static str {
     SIREN_PRESETS.get(id).map_or("", |s| s.name)
 }
 
+/// Number of **Benidub DS01E** MODE tones (the analog-siren unit).
+pub const BENIDUB_PRESET_COUNT: usize = BENIDUB_PRESETS.len();
+
+/// Resolve Benidub DS01E MODE `id` into a [`SirenPatch`] at `sample_rate`.
+/// The DS01E is an *analog* oscillator siren (clean, no lo-fi crush), played
+/// through the [`SirenVoice`] engine. Dry — its echo is the external PT2399
+/// (the siren's onboard echo), so these carry no internal slap. **Not RT-safe**
+/// (calls `exp`/`powf`); resolve off-RT. Out-of-range ids fall back to 0.
+#[must_use]
+pub fn benidub_preset_patch(id: usize, sample_rate: f32) -> SirenPatch {
+    let spec = BENIDUB_PRESETS
+        .get(id)
+        .copied()
+        .unwrap_or(BENIDUB_PRESETS[0]);
+    spec.resolve(sample_rate)
+}
+
+/// Display name for Benidub DS01E MODE `id` (empty string if out of range).
+#[must_use]
+pub fn benidub_preset_name(id: usize) -> &'static str {
+    BENIDUB_PRESETS.get(id).map_or("", |s| s.name)
+}
+
+/// Which engine renders a given UI preset slot. The variants are the three
+/// vintage-FX voices; Simple mode currently routes everything to the HK628
+/// (the toy chip the sounds are modelled on), with the generic siren and the
+/// SN76477 reserved for Expert mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SirenRoute {
+    /// The generic [`SirenVoice`]; the id indexes its own preset bank.
+    Generic,
+    /// The analog [`crate::sn76477::Sn76477`] model at this chip-preset index.
+    Sn(usize),
+    /// The digital [`crate::hk628::Hk628`] model at this program index.
+    Hk(usize),
+}
+
+/// Route a UI preset slot to its renderer. Simple mode is the Honsitak HK628's
+/// eight sounds (rifle / alarm / dual-tone / bombs / electric guns), so every
+/// slot maps 1:1 to an HK628 program. (`Generic` / `Sn` are kept for the
+/// Expert-mode chip selector.)
+#[must_use]
+pub fn siren_preset_route(id: usize) -> SirenRoute {
+    SirenRoute::Hk(id)
+}
+
 /// A musical (human-unit) preset definition, resolved to a [`SirenPatch`].
 #[derive(Debug, Clone, Copy)]
 struct SirenPresetSpec {
@@ -734,6 +780,67 @@ fn crush_levels(bits: f32) -> f32 {
 
 /// Source cutoff that leaves a tonal preset effectively unfiltered.
 const OPEN_LPF_HZ: f32 = 20_000.0;
+
+/// The **Benidub DS01E** analog-siren voice — the unit's **MODE** selector's
+/// four classic DS01 tones (Sine 1 / Sine 2 / Test Tone / Square), played
+/// through [`SirenVoice`]. Clean (no lo-fi crush, no noise) and **dry** — the
+/// echo is the external PT2399 (the DS01E's echo section). On the real unit
+/// **PITCH** (3 base freqs) and **RATE** (LFO speed) are separate controls; these
+/// specs bake mid-pitch / mid-rate defaults that those controls will override.
+#[rustfmt::skip]
+const BENIDUB_PRESETS: [SirenPresetSpec; 4] = [
+    // MODE 1 — Sine 1: the classic siren, fat + smooth (round, meaty).
+    SirenPresetSpec {
+        name: "Sine 1", osc_wave: SirenWave::Sine, base_freq: 500.0,
+        lfo_wave: SirenWave::Triangle, lfo_rate: 5.0, lfo_depth: 280.0,
+        sweep_start_mult: 1.0, sweep_end_mult: 1.0, sweep_ms: 0.0,
+        trem_wave: SirenWave::Sine, trem_rate: 0.0, trem_depth: 0.0,
+        noise_amount: 0.0, noise_onset_ms: 0.0,
+        source_lpf_hz: OPEN_LPF_HZ, source_lpf_end_hz: OPEN_LPF_HZ, source_lp_sweep_ms: 0.0,
+        attack_ms: 6.0, release_ms: 160.0,
+        delay_ms: 250.0, delay_feedback: 0.3, delay_mix: 0.0, delay_lpf_hz: 6_000.0,
+        volume: 0.5, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
+    },
+    // MODE 2 — Sine 2: raw + mean, thinner with more bite (higher, faster).
+    SirenPresetSpec {
+        name: "Sine 2", osc_wave: SirenWave::Sine, base_freq: 760.0,
+        lfo_wave: SirenWave::Triangle, lfo_rate: 7.0, lfo_depth: 360.0,
+        sweep_start_mult: 1.0, sweep_end_mult: 1.0, sweep_ms: 0.0,
+        trem_wave: SirenWave::Sine, trem_rate: 0.0, trem_depth: 0.0,
+        noise_amount: 0.0, noise_onset_ms: 0.0,
+        source_lpf_hz: OPEN_LPF_HZ, source_lpf_end_hz: OPEN_LPF_HZ, source_lp_sweep_ms: 0.0,
+        attack_ms: 4.0, release_ms: 150.0,
+        delay_ms: 250.0, delay_feedback: 0.3, delay_mix: 0.0, delay_lpf_hz: 6_000.0,
+        volume: 0.5, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
+    },
+    // MODE 3 — Test Tone: the beep, gated on/off by the LFO (amplitude, no
+    // pitch mod). Square tremolo at the LFO rate = the steady beep-beep.
+    SirenPresetSpec {
+        name: "Test Tone", osc_wave: SirenWave::Sine, base_freq: 880.0,
+        lfo_wave: SirenWave::Sine, lfo_rate: 0.0, lfo_depth: 0.0,
+        sweep_start_mult: 1.0, sweep_end_mult: 1.0, sweep_ms: 0.0,
+        trem_wave: SirenWave::Square, trem_rate: 6.0, trem_depth: 1.0,
+        noise_amount: 0.0, noise_onset_ms: 0.0,
+        source_lpf_hz: OPEN_LPF_HZ, source_lpf_end_hz: OPEN_LPF_HZ, source_lp_sweep_ms: 0.0,
+        attack_ms: 3.0, release_ms: 120.0,
+        delay_ms: 250.0, delay_feedback: 0.3, delay_mix: 0.0, delay_lpf_hz: 6_000.0,
+        volume: 0.5, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
+    },
+    // MODE 4 — Square: high-low square-modulated pitch (two-tone). A square is
+    // perceptually much louder than a sine at equal amplitude, so its level is
+    // dropped well below the sine modes to sit level with them.
+    SirenPresetSpec {
+        name: "Square", osc_wave: SirenWave::Square, base_freq: 560.0,
+        lfo_wave: SirenWave::Square, lfo_rate: 5.0, lfo_depth: 180.0,
+        sweep_start_mult: 1.0, sweep_end_mult: 1.0, sweep_ms: 0.0,
+        trem_wave: SirenWave::Sine, trem_rate: 0.0, trem_depth: 0.0,
+        noise_amount: 0.0, noise_onset_ms: 0.0,
+        source_lpf_hz: OPEN_LPF_HZ, source_lpf_end_hz: OPEN_LPF_HZ, source_lp_sweep_ms: 0.0,
+        attack_ms: 4.0, release_ms: 140.0,
+        delay_ms: 250.0, delay_feedback: 0.3, delay_mix: 0.0, delay_lpf_hz: 6_000.0,
+        volume: 0.22, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
+    },
+];
 
 /// The built-in classic sounds (Simple mode), covering the GS1 + SN76477
 /// families — sirens, alarms, lasers, bombs, guns. Order is the UI pad /
@@ -1119,6 +1226,87 @@ mod tests {
             out.push(buf[0]);
         }
         out
+    }
+
+    const SCRATCH_DIR: &str =
+        "/private/tmp/claude-501/-Users-klos-Development-dub/05fb1678-ea88-4fb6-bb52-d61e8c879ac7/scratchpad";
+
+    fn write_wav(path: &str, samples: &[f32], rate: u32) {
+        use std::io::Write;
+        let mut d: Vec<u8> = Vec::new();
+        let data_len = (samples.len() * 2) as u32;
+        d.extend_from_slice(b"RIFF");
+        d.extend_from_slice(&(36 + data_len).to_le_bytes());
+        d.extend_from_slice(b"WAVEfmt ");
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&rate.to_le_bytes());
+        d.extend_from_slice(&(rate * 2).to_le_bytes());
+        d.extend_from_slice(&2u16.to_le_bytes());
+        d.extend_from_slice(&16u16.to_le_bytes());
+        d.extend_from_slice(b"data");
+        d.extend_from_slice(&data_len.to_le_bytes());
+        for &s in samples {
+            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::File::create(path).unwrap().write_all(&d).unwrap();
+    }
+
+    /// Render every Benidub DS01E MODE tone for offline listening. Ignored;
+    /// run with `cargo test -p dub-dsp dump_benidub_wavs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_benidub_wavs() {
+        for id in 0..BENIDUB_PRESET_COUNT {
+            let patch = benidub_preset_patch(id, SR);
+            let mut v = SirenVoice::new(SR);
+            v.engage(&patch);
+            let samples = render(&mut v, (SR * 3.0) as usize);
+            let slug = benidub_preset_name(id)
+                .to_lowercase()
+                .replace([' ', '-'], "_");
+            write_wav(
+                &format!("{SCRATCH_DIR}/benidub_{id}_{slug}.wav"),
+                &samples,
+                SR as u32,
+            );
+        }
+    }
+
+    /// Render the Advanced DUB super-knob sweep on a wailing HK628 preset
+    /// (Alarm) through the PT2399 echo, at macro 0 / 0.3 / 0.6 / 1.0 — mirrors
+    /// `siren_dub_macro()` in dub-ffi. Ignored; run with
+    /// `cargo test -p dub-dsp dump_dub_macro_wavs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_dub_macro_wavs() {
+        for (label, m) in [("00", 0.0f32), ("03", 0.3), ("06", 0.6), ("10", 1.0)] {
+            let speed = 1.0 - m * 0.35;
+            let delay_ms = 90.0 + m * 330.0;
+            let feedback = m * 0.85;
+            let mix = m * 0.8;
+            let mut voice = crate::hk628::Hk628::new(SR);
+            voice.set_speed(speed);
+            voice.trigger(crate::hk628::hk628_program(2)); // Alarm (a wail)
+            let mut echo = crate::pt2399::Pt2399::new(SR);
+            echo.set_delay_ms(delay_ms);
+            echo.set_feedback(feedback);
+            echo.set_mix(mix);
+            let mut samples = Vec::new();
+            for _ in 0..(SR * 4.0) as usize {
+                let mut buf = [0.0f32, 0.0f32];
+                voice.process_block(&mut buf, 2, 0);
+                echo.process_block(&mut buf, 2, 0); // mix 0 = transparent (dry)
+                samples.push(buf[0]);
+            }
+            write_wav(
+                &format!("{SCRATCH_DIR}/dub_macro_{label}.wav"),
+                &samples,
+                SR as u32,
+            );
+        }
     }
 
     fn count_zero_crossings(samples: &[f32]) -> usize {

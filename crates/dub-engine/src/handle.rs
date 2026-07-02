@@ -993,6 +993,90 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckReleaseSiren { idx })
     }
 
+    /// Set a vintage-FX rack slot on this deck: toggle it `active` and apply its
+    /// Advanced super-knob (`macro_value`, 0..1). The macro is RT-safe to apply
+    /// (each effect precomputed its transcendental coefficients off-RT), so the
+    /// audio thread just fans it across the effect's params.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_rack_fx(
+        self,
+        slot: crate::FxSlot,
+        active: bool,
+        macro_value: f32,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetRackFx {
+            idx,
+            slot,
+            active,
+            macro_value,
+        })
+    }
+
+    /// Set the dub-siren's live controls on this deck: `speed` (HK628 chip
+    /// clock), `delay_ms`/`feedback`/`mix`/`filter`/`echo_cut` (onboard PT2399
+    /// echo), and `volume` (output). All applied with pure RT-safe setters; the
+    /// echo is skipped when `mix` is ~0 and not cut. Both the Advanced super-knob
+    /// and Expert knobs route through here.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_siren_controls(
+        self,
+        speed: f32,
+        delay_ms: f32,
+        feedback: f32,
+        mix: f32,
+        volume: f32,
+        filter: f32,
+        echo_cut: bool,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetSirenControls {
+            idx,
+            speed,
+            delay_ms,
+            feedback,
+            mix,
+            volume,
+            filter,
+            echo_cut,
+        })
+    }
+
+    /// Pick which siren unit this deck plays (HK628 shots or the DS01E).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_siren_unit(self, unit: crate::SirenUnit) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetSirenUnit { idx, unit })
+    }
+
+    /// Set the Benidub DS01E voice controls on this deck: `pitch_factor` (PITCH),
+    /// `rate_hz` (RATE) and `continuous` (TRIGGER latch). Applied to the MODE
+    /// patch at fire time.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_siren_voice(
+        self,
+        pitch_factor: f32,
+        rate_hz: f32,
+        continuous: bool,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetSirenVoice {
+            idx,
+            pitch_factor,
+            rate_hz,
+            continuous,
+        })
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2). Decouples the deck
     /// from any attached timecode input and pins it to its last-
     /// known good velocity (or unity forward if no policy is

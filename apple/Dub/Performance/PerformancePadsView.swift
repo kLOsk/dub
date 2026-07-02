@@ -21,6 +21,7 @@
 //
 
 import AppKit
+import DubCore
 import SwiftUI
 
 struct PerformancePadsView: View {
@@ -59,6 +60,28 @@ struct PerformancePadsView: View {
     /// SIREN grid is hidden entirely.
     var sirenEnabled: Bool = false
 
+    /// Siren Advanced "dub" super-knob position (0..1).
+    var sirenDubMacro: Double = 0.0
+    /// Set the siren dub super-knob.
+    var onSirenDubMacro: (_ value: Double) -> Void = { _ in }
+    /// The selected siren unit (GS1 / DS01E / SN76477).
+    var sirenUnit: SirenUnit = .gs1
+    /// Switch the siren unit.
+    var onSirenUnit: (_ unit: SirenUnit) -> Void = { _ in }
+
+    /// Vintage-FX rack engaged flags, in `RackFx` order
+    /// (`[Spring, SpaceEcho, BigKnob, Phaser]`). Lights each slot's button.
+    var rackActive: [Bool] = [false, false, false, false]
+    /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
+    var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
+    /// Toggle rack slot `index` on / off.
+    var onRackToggle: (_ index: Int) -> Void = { _ in }
+    /// Set rack slot `index`'s macro to `value` (0..1).
+    var onRackMacro: (_ index: Int, _ value: Double) -> Void = { _, _ in }
+    /// Whether the vintage-FX rack is enabled (Preferences). When off the rack
+    /// is hidden entirely.
+    var rackEnabled: Bool = false
+
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
     /// their overview on the left.
@@ -75,7 +98,18 @@ struct PerformancePadsView: View {
                 SirenPadRow(
                     names: sirenPresetNames,
                     sounding: sirenSounding,
-                    onPreset: onSirenPreset)
+                    onPreset: onSirenPreset,
+                    dubMacro: sirenDubMacro,
+                    onDubMacro: onSirenDubMacro,
+                    unit: sirenUnit,
+                    onUnit: onSirenUnit)
+            }
+            if rackEnabled {
+                RackFxRow(
+                    active: rackActive,
+                    macro: rackMacro,
+                    onToggle: onRackToggle,
+                    onMacro: onRackMacro)
             }
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
@@ -320,6 +354,14 @@ struct SirenPadRow: View {
     let sounding: Bool
     /// Fire preset `index` on this deck.
     let onPreset: (_ index: Int) -> Void
+    /// Advanced "dub" super-knob position (0..1).
+    var dubMacro: Double = 0.0
+    /// Set the dub super-knob.
+    var onDubMacro: (_ value: Double) -> Void = { _ in }
+    /// The selected siren unit (GS1 shots · Benidub DS01E · SN76477).
+    var unit: SirenUnit = .gs1
+    /// Switch the siren unit.
+    var onUnit: (_ unit: SirenUnit) -> Void = { _ in }
 
     private var rows: [[Int]] {
         let idx = Array(names.indices)
@@ -336,6 +378,21 @@ struct SirenPadRow: View {
                     .font(DubFont.caps)
                     .tracking(0.8)
                     .foregroundStyle(DubColor.textSecondary)
+                Spacer(minLength: DubSpacing.sm)
+                // Unit selector: GS1 toy-chip shots · Benidub DS01E · SN76477.
+                Picker(
+                    "Siren unit",
+                    selection: Binding(get: { unit }, set: { onUnit($0) })
+                ) {
+                    Text("GS1").tag(SirenUnit.gs1)
+                    Text("DS01E").tag(SirenUnit.ds01e)
+                    Text("SN76477").tag(SirenUnit.sn76477)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.mini)
+                .frame(width: 210)
+                .help("Siren unit — GS1 (toy-chip shots) · Benidub DS01E (analog) · SN76477 chip")
             }
             ForEach(rows, id: \.self) { row in
                 HStack(spacing: DubSpacing.sm) {
@@ -347,6 +404,213 @@ struct SirenPadRow: View {
                     }
                 }
             }
+            // Advanced: one "DUB" super-knob driving the siren's onboard echo
+            // (Speed + Delay + Feedback + Mix). 0 = dry. The siren's own echo,
+            // separate from the FX rack.
+            HStack(spacing: DubSpacing.sm) {
+                Text("DUB")
+                    .font(DubFont.micro)
+                    .foregroundStyle(dubMacro > 0 ? DubColor.siren : DubColor.textTertiary)
+                    .frame(width: 28, alignment: .leading)
+                Slider(
+                    value: Binding(get: { dubMacro }, set: { onDubMacro($0) }),
+                    in: 0...1)
+                    .controlSize(.mini)
+                    .tint(DubColor.siren)
+                    .frame(maxWidth: 180)
+                    .help("Dub super-knob — one knob adds the siren's own echo (delay + feedback). 0 = dry.")
+            }
+        }
+    }
+}
+
+/// The **Expert** siren panel (PRD §6.3): the individual knobs/buttons, matching
+/// the real units' control surfaces. The echo section (TIME / FEEDBACK / ECHO /
+/// FILTER / VOLUME + ECHO CUT) is shared by every unit; below it are the
+/// unit-specific controls — GS1: SPEED · DS01E: PITCH / RATE / TRIGGER ·
+/// SN76477: none. Reads the deck's stored state; writes through model methods
+/// (each pushes the full `set_siren_controls` / `set_siren_voice`). An
+/// expandable section so it stays out of the way until needed.
+struct SirenExpertPanel: View {
+    /// The deck's current state (read).
+    let deck: DeckState
+    /// The app model (write — method calls push to the engine).
+    let model: WaveformAppModel
+    /// Which deck these controls drive.
+    let side: DeckSide
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.xs) {
+            Button {
+                model.toggleSirenExpert(side)
+            } label: {
+                Text(deck.sirenExpertShown ? "EXPERT ▾" : "EXPERT ▸")
+                    .font(DubFont.caps)
+                    .tracking(0.8)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+            .buttonStyle(.plain)
+
+            if deck.sirenExpertShown {
+                // Shared echo section (the PT2399, every unit).
+                knob("TIME", deck.sirenDelayMs, 50...1000) { model.setSirenDelay(side, $0) }
+                knob("FEEDBACK", deck.sirenFeedback, 0...1.0) { model.setSirenFeedback(side, $0) }
+                knob("ECHO", deck.sirenMix, 0...1) { model.setSirenMix(side, $0) }
+                knob("FILTER", deck.sirenFilter, 0...1) { model.setSirenFilter(side, $0) }
+                knob("VOLUME", deck.sirenVolume, 0...1.5) { model.setSirenVolume(side, $0) }
+                Text("ECHO CUT")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DubColor.textTertiary)
+                    .frame(width: 92, height: 28)
+                    .background(DubColor.surface1)
+                    .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                            .stroke(DubColor.divider, lineWidth: 1))
+                    .contentShape(Rectangle())
+                    .onPressHold(
+                        onDown: { model.setSirenEchoCut(side, true) },
+                        onUp: { model.setSirenEchoCut(side, false) })
+                    .help("Echo cut — hold to mute the echo (the loop keeps running underneath)")
+
+                // Unit-specific controls.
+                switch deck.sirenUnit {
+                case .gs1:
+                    knob("SPEED", deck.sirenSpeed, 0.25...4.0) { model.setSirenSpeed(side, $0) }
+                case .ds01e:
+                    HStack(spacing: DubSpacing.sm) {
+                        Text("PITCH")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textTertiary)
+                            .frame(width: 70, alignment: .leading)
+                        Picker(
+                            "Pitch",
+                            selection: Binding(
+                                get: { deck.sirenPitchIndex },
+                                set: { model.setSirenPitch(side, $0) })
+                        ) {
+                            Text("Lo").tag(0)
+                            Text("Mid").tag(1)
+                            Text("Hi").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .controlSize(.mini)
+                        .frame(width: 150)
+                    }
+                    knob("RATE", deck.sirenRate, 0...12.0) { model.setSirenRate(side, $0) }
+                    Toggle(
+                        isOn: Binding(
+                            get: { deck.sirenContinuous },
+                            set: { model.setSirenContinuous(side, $0) })
+                    ) {
+                        Text("HOLD (continuous)")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textTertiary)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                case .sn76477:
+                    EmptyView() // the SN76477 plays fixed preset patches
+                @unknown default:
+                    EmptyView()
+                }
+            }
+        }
+    }
+
+    /// One labelled mini-slider row.
+    @ViewBuilder
+    private func knob(
+        _ label: String,
+        _ value: Double,
+        _ range: ClosedRange<Double>,
+        _ set: @escaping (Double) -> Void
+    ) -> some View {
+        HStack(spacing: DubSpacing.sm) {
+            Text(label)
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .frame(width: 70, alignment: .leading)
+            Slider(value: Binding(get: { value }, set: { set($0) }), in: range)
+                .controlSize(.mini)
+                .tint(DubColor.siren)
+                .frame(maxWidth: 180)
+        }
+    }
+}
+
+/// Vintage-FX rack labels + accent colours, in `RackFx` order (index = slot id:
+/// 0 Spring · 1 Space Echo · 2 Big Knob · 3 Phaser).
+private let rackFxLabels = ["SPRING", "SPACE ECHO", "BIG KNOB", "PHASER"]
+private let rackFxColors: [Color] = [
+    DubColor.springFx, DubColor.spaceEcho, DubColor.bigKnob, DubColor.phaser,
+]
+
+/// The vintage-FX rack panel (PRD §6.3 — the King Tubby / Lee Perry processing
+/// chain). One row per effect: a tap-toggle engage button + a single **macro**
+/// "super-knob" (Advanced mode) that fans across the effect's params on a
+/// hand-tuned curve. Spring + Space Echo are reverb/echo sends; Big Knob +
+/// Phaser are inserts. (Expert per-param panels arrive later.)
+///
+/// The toggle is a momentary tap (within the §1 mouse rule). The macro slider
+/// is the one-knob Advanced control; live-riding it from a real controller is
+/// the intended performance path, the on-screen slider is for prep/testing.
+struct RackFxRow: View {
+    /// Engaged flag per slot (index = `RackFx` id).
+    let active: [Bool]
+    /// Macro position per slot, 0..1.
+    let macro: [Double]
+    /// Toggle slot `index`.
+    let onToggle: (_ index: Int) -> Void
+    /// Set slot `index`'s macro to `value`.
+    let onMacro: (_ index: Int, _ value: Double) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            HStack(spacing: DubSpacing.xs) {
+                Circle()
+                    .fill(active.contains(true) ? DubColor.bigKnob : DubColor.divider)
+                    .frame(width: 7, height: 7)
+                Text("FX RACK")
+                    .font(DubFont.caps)
+                    .tracking(0.8)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+            ForEach(0..<rackFxLabels.count, id: \.self) { slot in
+                slotRow(slot)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func slotRow(_ slot: Int) -> some View {
+        let on = slot < active.count && active[slot]
+        let tint = rackFxColors[slot]
+        HStack(spacing: DubSpacing.sm) {
+            Text(rackFxLabels[slot])
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .foregroundStyle(on ? DubColor.textPrimary : DubColor.textTertiary)
+                .frame(width: 92, height: 32)
+                .background(on ? tint.opacity(0.24) : DubColor.surface1)
+                .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                        .stroke(on ? tint : DubColor.divider, lineWidth: 1))
+                .contentShape(Rectangle())
+                .onPressDown { onToggle(slot) }
+                .help("\(rackFxLabels[slot]) — tap to engage / bypass")
+            Slider(
+                value: Binding(
+                    get: { slot < macro.count ? macro[slot] : 0.5 },
+                    set: { onMacro(slot, $0) }),
+                in: 0...1)
+                .controlSize(.mini)
+                .tint(tint)
+                .frame(width: 104)
+                .help("Macro — one knob, curated for a good-sounding result")
         }
     }
 }
@@ -366,6 +630,37 @@ extension View {
     /// `contextMenu` / right-click reachable.
     func onPressDown(enabled: Bool = true, perform: @escaping () -> Void) -> some View {
         modifier(PressDownModifier(enabled: enabled, perform: perform))
+    }
+
+    /// Fire `onDown` on mouse-down and `onUp` on release — a momentary
+    /// press-and-hold (e.g. ECHO CUT: cut while held, restore on release).
+    func onPressHold(
+        onDown: @escaping () -> Void,
+        onUp: @escaping () -> Void
+    ) -> some View {
+        modifier(PressHoldModifier(onDown: onDown, onUp: onUp))
+    }
+}
+
+private struct PressHoldModifier: ViewModifier {
+    let onDown: () -> Void
+    let onUp: () -> Void
+    @State private var pressing = false
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard !pressing else { return }
+                        pressing = true
+                        onDown()
+                    }
+                    .onEnded { _ in
+                        pressing = false
+                        onUp()
+                    })
     }
 }
 

@@ -224,6 +224,47 @@ struct DeckState: Equatable {
     /// SIREN panel while the engine says a preset is making sound.
     var sirenState: UInt8 = 0
 
+    /// Advanced siren "dub" super-knob (0..1): one knob fans across the siren's
+    /// Speed + Delay + Feedback + onboard-echo Mix. 0 = dry siren, 1 = slow,
+    /// long, self-feeding dub. UI-local (the siren is a self-contained
+    /// instrument; its echo isn't polled).
+    var sirenDubMacro: Double = 0.0
+
+    /// Siren output level (GS1 "Volume"), default unity. Held for the dub-macro
+    /// call; an Expert volume control can surface it later.
+    var sirenVolume: Double = 1.0
+
+    /// Which siren unit this deck plays — GS1 toy-chip shots, the Benidub
+    /// DS01E analog siren, or the SN76477 chip. Drives the pad labels and which
+    /// voice fires.
+    var sirenUnit: SirenUnit = .gs1
+
+    // ── Expert siren controls (the individual knobs; the DUB macro is the
+    //    Advanced one-knob shortcut over the same engine state). ────────────
+    /// Whether the EXPERT control section is expanded.
+    var sirenExpertShown: Bool = false
+    /// Echo TIME (delay, ms, 50–1000), FEEDBACK (0–1), ECHO mix (0–1), FILTER
+    /// (0 dark-LP · 0.5 open · 1 thin-HP). `sirenMix` 0 = echo off.
+    var sirenDelayMs: Double = 300
+    var sirenFeedback: Double = 0.4
+    var sirenMix: Double = 0.0
+    var sirenFilter: Double = 0.3
+    /// GS1 SPEED (HK628 chip clock: pitch + timing, 0.25–4).
+    var sirenSpeed: Double = 1.0
+    /// DS01E PITCH (0 = low · 1 = mid · 2 = high), RATE (LFO Hz, 0 = MODE
+    /// default), TRIGGER continuous (down = latched sustain).
+    var sirenPitchIndex: Int = 1
+    var sirenRate: Double = 0.0
+    var sirenContinuous: Bool = false
+
+    /// Vintage-FX rack engaged flags, in `RackFx` order
+    /// (`[Spring, SpaceEcho, BigKnob, Phaser]`). UI-local toggle state (the
+    /// rack effects never self-terminate, so there's no engine telemetry to
+    /// poll — the toggle is the truth). Lights each slot's button.
+    var rackActive: [Bool] = [false, false, false, false]
+    /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
+    var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
+
     /// Source-control state from `engine.deckTelemetry`, for the row-3
     /// Internal/Timecode switch. `hasTimecodeInput` gates whether the
     /// switch is shown at all.
@@ -611,6 +652,20 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kSirenDelaySync = "dub.sirenDelaySync"
 
+    /// Vintage-FX rack feature toggle (Preferences ▸ FX). When on, each deck's
+    /// pads carry the FX RACK panel (spring reverb · RE-201 space echo · Big
+    /// Knob HPF · phaser, each a toggle + one macro super-knob, PRD §6.3). Off
+    /// hides it and bypasses any engaged rack effect. Default on. Persisted
+    /// under `dub.rackFxEnabled`.
+    @Published var rackFxEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(rackFxEnabled, forKey: Self.kRackFxEnabled)
+            if !rackFxEnabled { disengageAllRackFx() }
+        }
+    }
+
+    private static let kRackFxEnabled = "dub.rackFxEnabled"
+
     /// Per-source library-import enables (Preferences ▸ Libraries). When a
     /// source is on, Dub scans its default folder (`~/Music/_Serato_`,
     /// `~/Documents/Native Instruments/Traktor*/collection.nml`, the iTunes
@@ -885,6 +940,12 @@ final class WaveformAppModel: ObservableObject {
         self.sirenEnabled =
             UserDefaults.standard.object(forKey: Self.kSirenEnabled) as? Bool ?? true
         self.sirenDelaySync = UserDefaults.standard.bool(forKey: Self.kSirenDelaySync)
+        // Deferred to post-release (the rack is being reworked into a deck-role
+        // FX channel — see memory). Default OFF and no Preferences toggle, so
+        // the deprecated per-deck rack UI stays hidden; the view + DSP + engine
+        // code remain in-tree, dormant, for the post-release rebuild.
+        self.rackFxEnabled =
+            UserDefaults.standard.object(forKey: Self.kRackFxEnabled) as? Bool ?? false
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
@@ -4313,14 +4374,38 @@ final class WaveformAppModel: ObservableObject {
     /// Display names of the built-in siren presets (siren / alarm / laser /
     /// bomb / gun …), in fire order. Fetched once from the engine bank; the
     /// index drives both the pad grid and `fireSirenPreset`.
-    @Published var sirenPresetLabels: [String] = sirenPresetNames()
+    @Published var sirenPresetLabels: [String] = sirenUnitPresetNames(unit: .gs1)
+
+    /// DS01E MODE names (Sine 1 / Sine 2 / Test Tone / Square), fetched once.
+    let sirenDs01eLabels: [String] = sirenUnitPresetNames(unit: .ds01e)
+
+    /// SN76477 preset names (gun / laser / bomb / explosion …), fetched once.
+    let sirenSn76477Labels: [String] = sirenUnitPresetNames(unit: .sn76477)
+
+    /// Pad labels for `side`'s currently-selected siren unit.
+    func sirenLabels(for side: DeckSide) -> [String] {
+        switch state(for: side).sirenUnit {
+        case .ds01e: return sirenDs01eLabels
+        case .sn76477: return sirenSn76477Labels
+        default: return sirenPresetLabels // .gs1
+        }
+    }
+
+    /// Switch the siren unit (HK628 shots ↔ Benidub DS01E) on `side`.
+    func setSirenUnit(_ side: DeckSide, _ unit: SirenUnit) {
+        var deck = state(for: side)
+        deck.sirenUnit = unit
+        setState(deck, for: side)
+        guard isRunning else { return }
+        try? engine.setSirenUnit(deckIdx: side.ffiDeckIdx, unit: unit)
+    }
 
     /// Fire dub-siren preset `index` on `side` as a tap one-shot. The preset
     /// bank lives in the engine; the siren is a generator, so it sounds with or
     /// without a track and is unaffected by echo-out.
     func fireSirenPreset(_ side: DeckSide, index: Int) {
         guard isRunning, sirenEnabled else { return }
-        guard index >= 0, index < sirenPresetLabels.count else { return }
+        guard index >= 0, index < sirenLabels(for: side).count else { return }
         // Beat-match (optional): one beat at the deck's effective tempo, else 0
         // = use the preset's own slap-back. Falls back to 120 with no track.
         let deck = state(for: side)
@@ -4344,6 +4429,171 @@ final class WaveformAppModel: ObservableObject {
         guard isRunning else { return }
         try? engine.releaseSiren(deckIdx: DeckSide.a.ffiDeckIdx)
         try? engine.releaseSiren(deckIdx: DeckSide.b.ffiDeckIdx)
+    }
+
+    /// Set the siren's Advanced "dub" super-knob (0..1) on `side` — drives the
+    /// onboard PT2399 echo (Speed/Delay/Feedback/Mix) on one knob. 0 = dry.
+    func setSirenDub(_ side: DeckSide, _ value: Double) {
+        guard isRunning, sirenEnabled else { return }
+        var deck = state(for: side)
+        deck.sirenDubMacro = value
+        setState(deck, for: side)
+        try? engine.setSirenDubMacro(
+            deckIdx: side.ffiDeckIdx,
+            macroValue: Float(value),
+            volume: Float(deck.sirenVolume))
+    }
+
+    // ── Expert siren controls ───────────────────────────────────────────────
+
+    /// Toggle the EXPERT control section on `side`.
+    func toggleSirenExpert(_ side: DeckSide) {
+        var deck = state(for: side)
+        deck.sirenExpertShown.toggle()
+        setState(deck, for: side)
+    }
+
+    /// Push the full echo + level state to the engine (one `set_siren_controls`).
+    /// `echoCut` is momentary (true while the ECHO CUT button is held).
+    func pushSirenControls(_ side: DeckSide, echoCut: Bool = false) {
+        guard isRunning, sirenEnabled else { return }
+        let d = state(for: side)
+        try? engine.setSirenControls(
+            deckIdx: side.ffiDeckIdx,
+            speed: Float(d.sirenSpeed),
+            delayMs: Float(d.sirenDelayMs),
+            feedback: Float(d.sirenFeedback),
+            mix: Float(d.sirenMix),
+            volume: Float(d.sirenVolume),
+            filter: Float(d.sirenFilter),
+            echoCut: echoCut)
+    }
+
+    /// Push the DS01E voice controls (PITCH / RATE / TRIGGER) to the engine.
+    func pushSirenVoice(_ side: DeckSide) {
+        guard isRunning, sirenEnabled else { return }
+        let d = state(for: side)
+        let factors: [Float] = [0.5, 1.0, 2.0]
+        let factor = factors[min(max(d.sirenPitchIndex, 0), factors.count - 1)]
+        try? engine.setSirenVoice(
+            deckIdx: side.ffiDeckIdx,
+            pitchFactor: factor,
+            rateHz: Float(d.sirenRate),
+            continuous: d.sirenContinuous)
+    }
+
+    /// Echo TIME (delay ms).
+    func setSirenDelay(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenDelayMs = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// Echo FEEDBACK.
+    func setSirenFeedback(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenFeedback = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// Echo mix (ECHO VOLUME); 0 = echo off.
+    func setSirenMix(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenMix = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// Echo FILTER (0 dark-LP · 0.5 open · 1 thin-HP).
+    func setSirenFilter(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenFilter = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// Siren output VOLUME.
+    func setSirenVolume(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenVolume = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// GS1 SPEED (chip clock).
+    func setSirenSpeed(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenSpeed = v; setState(d, for: side)
+        pushSirenControls(side)
+    }
+    /// ECHO CUT — momentary; `true` on press, `false` on release.
+    func setSirenEchoCut(_ side: DeckSide, _ cut: Bool) {
+        pushSirenControls(side, echoCut: cut)
+    }
+    /// DS01E PITCH selector (0 low · 1 mid · 2 high).
+    func setSirenPitch(_ side: DeckSide, _ index: Int) {
+        var d = state(for: side); d.sirenPitchIndex = index; setState(d, for: side)
+        pushSirenVoice(side)
+    }
+    /// DS01E RATE (LFO Hz; 0 = MODE default).
+    func setSirenRate(_ side: DeckSide, _ v: Double) {
+        var d = state(for: side); d.sirenRate = v; setState(d, for: side)
+        pushSirenVoice(side)
+    }
+    /// DS01E TRIGGER continuous (latched sustain).
+    func setSirenContinuous(_ side: DeckSide, _ on: Bool) {
+        var d = state(for: side); d.sirenContinuous = on; setState(d, for: side)
+        pushSirenVoice(side)
+    }
+
+    /// Map a rack slot index (0..3) to the generated FFI `RackFx`. Order is
+    /// load-bearing — it must match the engine's `FxSlot` / `RackFx`.
+    private func rackFx(_ index: Int) -> RackFx? {
+        switch index {
+        case 0: return .spring
+        case 1: return .spaceEcho
+        case 2: return .bigKnob
+        case 3: return .phaser
+        default: return nil
+        }
+    }
+
+    /// Toggle vintage-FX rack slot `index` on `side` (engage / bypass). Applies
+    /// the slot's current macro so engaging picks up where the knob sits.
+    func toggleRackFx(_ side: DeckSide, _ index: Int) {
+        guard isRunning, rackFxEnabled, let fx = rackFx(index) else { return }
+        var deck = state(for: side)
+        guard index < deck.rackActive.count else { return }
+        let newActive = !deck.rackActive[index]
+        deck.rackActive[index] = newActive
+        setState(deck, for: side)
+        try? engine.setRackFx(
+            deckIdx: side.ffiDeckIdx,
+            fx: fx,
+            active: newActive,
+            macroValue: Float(deck.rackMacro[index]))
+    }
+
+    /// Set rack slot `index`'s macro (super-knob, 0..1) on `side`. The engine
+    /// applies the macro whether or not the slot is engaged, so the knob is
+    /// "armed" before you toggle it on.
+    func setRackMacro(_ side: DeckSide, _ index: Int, _ value: Double) {
+        guard isRunning, let fx = rackFx(index) else { return }
+        var deck = state(for: side)
+        guard index < deck.rackMacro.count else { return }
+        deck.rackMacro[index] = value
+        setState(deck, for: side)
+        try? engine.setRackFx(
+            deckIdx: side.ffiDeckIdx,
+            fx: fx,
+            active: deck.rackActive[index],
+            macroValue: Float(value))
+    }
+
+    /// Bypass every rack slot on both decks and clear the UI flags (called when
+    /// the feature is switched off in Preferences).
+    private func disengageAllRackFx() {
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            deck.rackActive = [false, false, false, false]
+            setState(deck, for: side)
+        }
+        guard isRunning else { return }
+        for side in [DeckSide.a, DeckSide.b] {
+            for index in 0..<4 where rackFx(index) != nil {
+                try? engine.setRackFx(
+                    deckIdx: side.ffiDeckIdx,
+                    fx: rackFx(index)!,
+                    active: false,
+                    macroValue: 0.5)
+            }
+        }
     }
 
     /// M11d.6 — manual phase nudge for the focused deck's beat

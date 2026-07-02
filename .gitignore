@@ -36,6 +36,10 @@ coverage/
 *.profraw
 *.profdata
 target/llvm-cov-target/
+# insta snapshot review artifacts — regenerated on every `cargo insta test`;
+# accepted snapshots live in `*.snap`, never the pending review log.
+*.pending-snap
+.*.pending-snap
 
 # Fuzz outputs
 fuzz/target/

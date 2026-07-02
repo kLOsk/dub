@@ -310,6 +310,71 @@ render-path code must stay allocation/lock/syscall free
 
 ---
 
+## 5. FX / Dub siren (deferred)
+
+_Added 2026-07-02 when M16 (dub siren + vintage-chip FX DSP) merged. The
+instrument, its three units (GS1 / DS01E / SN76477), the shared PT2399 echo,
+and the Prep-surface Expert panel shipped; the vintage-FX DSP chain
+(spring / RE-201 / Big Knob / phaser) is in-tree but parked behind the deck-role
+FX channel below. These are the pieces explicitly held back so they're not lost._
+
+### F-36. Siren-sound fine-tuning (polish phase)
+
+The three units are voiced and level-matched (−14 LUFS), but the sounds
+themselves are a first cut, not final. GS1's 8 shots (bomb / MG / lickshot were
+flagged as the roughest), the DS01E 4 MODE tones, and the SN76477 preset bank
+all want an ear-tuning pass against reference recordings.
+
+**Fix**: during the polish phase, render fresh WAVs per unit (the `#[ignore]`
+`dump_*_wavs` tests in `dub-dsp`), audition, and tune the preset specs +
+per-unit output trims. No architectural change — data / coefficients only.
+
+**Location**: `crates/dub-dsp/src/{hk628,siren,sn76477}.rs`.
+
+### F-37. Expert panel on the Performance surface + deck B
+
+The siren Expert panel (`SirenExpertPanel`) currently lives only on the **Prep**
+surface for **deck A** — Prep is the mouse-config home, so it's the right first
+home, but the panel isn't yet mirrored onto the Performance surface or deck B.
+Doing so needs the `WaveformAppModel` threaded into `PerformancePadsView` at
+both call sites and the panel bound to the correct `DeckSide`.
+
+**Fix (later — "expert mode in the deck")**: thread the model + side into the
+Performance pad bar and render `SirenExpertPanel` there for both decks. The
+engine/FFI surface is already complete (per-deck `set_siren_*`), so this is
+Swift-only.
+
+**Location**: `apple/Dub/Performance/PerformancePadsView.swift`,
+`apple/Dub/Performance/PerformanceView.swift`.
+
+### F-38. FX rack as a deck-role FX channel (post-release)
+
+The vintage-FX rack (HPF → phaser → RE-201 → spring) is **not** per-deck insert
+FX. The decided model: it's a dedicated **FX channel** — an outboard-unit that
+**replaces a deck** via the source switch (INT · TC · THRU · **FX**), takes a
+**mic or mixer aux-send** as its input, and is **Expert-only** (no Simple /
+Advanced). Proper sound-clash "FX on the mic" routing. Deferred post-release to
+keep M16 focused on the siren.
+
+Stage 1 (engine) **shipped dormant**: `ControlMode::Fx` exists (Thru-style
+passthrough + rack processing hook), the four FX blocks + `rack_active` state
+live in the engine, and the per-deck rack UI is hidden (`rackFxEnabled` defaults
+false; the Preferences toggle was removed). Remaining:
+
+* **Stage 2 (Swift)** — surface an `FX` position on the deck source switch; move
+  the rack controls into the FX-deck pane; relabel the deck as an FX channel.
+* **Stage 3 (routing)** — input monitoring for the mic / aux-send into the FX
+  deck, and the optional "send siren → rack" bridge (off by default) for the
+  lush "siren through the Space Echo" sound.
+
+**Location**: engine `crates/dub-engine/src/lib.rs` (`ControlMode::Fx`, dormant);
+`crates/dub-ffi/src/lib.rs`; `apple/Dub/Performance/`,
+`apple/Dub/Preferences/PreferencesSheet.swift`. Tracked as task #32.
+
+---
+
+---
+
 ## Closed (archive)
 
 _One line each; full write-ups are in git history. Kept so a reopened symptom is easy to cross-reference._

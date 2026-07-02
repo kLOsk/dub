@@ -206,10 +206,50 @@
   passes its budget). Lesson: if a symptom scales with *remaining* track length,
   suspect per-frame work proportional to "to the end," not the grid math.
 
+## DSP / FX (dub siren, echo-out, vintage chips)
+
+- **Macros resolve to coefficients OFF the audio thread — never in
+  `apply_command`.** A "super-knob" (siren DUB macro, Big Knob HPF, spring
+  damping, PT2399 filter) that maps one value to many filter coefficients tempts
+  a `powf` / `sin` / `exp` in the setter — but `apply_command` runs on the audio
+  thread, so a transcendental there is a hard RT violation. The pattern: bake a
+  **LUT indexed by the knob** at `new()` (e.g. `macro_g: [f32; 65]`,
+  `filter_lut`, `macro_damp`) and have the RT-side `set_macro(m)` do a table
+  lookup + lerp. ms→samples is a plain multiply; keep it that way. Enforced by
+  the `*_render_is_alloc_free` tests under `assert_no_alloc`.
+- **The dub siren is an INSTRUMENT, not a rack effect — render it LAST.** It's a
+  self-contained box (voice + its *own* PT2399 echo + volume) summed onto the
+  bus *after* the deck echo-out and the FX rack, so it survives regardless of
+  their state (echo-out mutes the deck dry to 100 % wet; a siren rendered before
+  it would get swallowed). It's purely **additive** (`out[..] += s`), unlike
+  `EchoOut` which rewrites in place — pinned by an "additive contract" test that
+  pre-fills the buffer and asserts the original survives. This render-order flip
+  was the one behavioural gotcha when wiring it.
+- **Chip pitch and timing are coupled — model the clock, not the knob.** The GS1
+  (`Hk628`) `set_speed` scales pitch *and* step duration together, chip-clock
+  style: slower = lower + longer. When the DUB macro rises it therefore *deepens*
+  the siren (pitch couples **down**), which is what fixed the "macros too
+  high-pitched" dogfood note — don't decouple them back into an independent
+  "rate" knob.
+- **A square reads far louder than a sine at equal amplitude** (RMS, not peak).
+  Level-match by ear / integrated LUFS per waveform, not by peak — the Benidub
+  "Square" preset needed its volume dropped to ~0.22 to sit with the sine tones,
+  and every siren/FX output is trimmed to the −14 LUFS track target
+  (`hk628::OUTPUT_GAIN`).
+- **Emulate the real unit's control surface, don't invent knobs.** Expert mode
+  mirrors the physical box (DS01E = MODE / PITCH / RATE / TRIGGER + PT2399
+  TIME / FEEDBACK / ECHO VOLUME / FILTER / ECHO CUT). Confirm the real layout
+  from the manufacturer's manual before shipping the UI — the in-app controls
+  are a contract with the muscle memory of someone who owns the hardware.
+
 ## FFI / UniFFI (Rust ↔ Swift)
 
 - **Proc-macros, not UDL** — the Rust signature *is* the exposed surface, so
   there's no `.udl` to drift out of sync.
+- **A new Swift file that references an FFI type needs `import DubCore`.** The
+  siren build broke with "cannot find type 'SirenUnit' in scope" because
+  `PerformancePadsView.swift` imported only AppKit / SwiftUI. Generated enums /
+  records live in the `DubCore` module — import it in every file that names one.
 - **Regenerate bindings whenever the FFI surface changes.** A new file under
   `apple/Dub/` needs `xcodegen generate` (the `project.pbxproj` only
   regenerates when `project.yml` changes). A changed `lib.rs` needs the

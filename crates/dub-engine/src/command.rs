@@ -37,6 +37,36 @@ use dub_io::Track;
 use crate::thru::ThruSource;
 use crate::timecode::TimecodeInput;
 
+/// Which slot in the per-deck vintage-FX rack a [`Command::DeckSetRackFx`]
+/// targets. `repr(u8)` so the FFI maps a Swift enum onto it 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FxSlot {
+    /// Spring reverb (the dub tank). Additive send.
+    Spring = 0,
+    /// Roland RE-201 Space Echo (tape echo + onboard spring). Additive send.
+    SpaceEcho = 1,
+    /// King Tubby "Big Knob" high-pass filter. In-place insert.
+    BigKnob = 2,
+    /// Mu-Tron Bi-Phase phaser. In-place insert.
+    Phaser = 3,
+}
+
+/// Which siren *unit* a deck's siren plays (PRD §6.3). The DJ picks one; firing
+/// a preset routes to that unit's voice. `repr(u8)` so the FFI maps 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SirenUnit {
+    /// **GS1** — the Rigsmith-GS1-style toy-chip bank (rifle / alarm / bombs /
+    /// guns), produced by our HK628 chip recreation (`dub_dsp::Hk628`).
+    Gs1 = 0,
+    /// Benidub DS01E — the analog oscillator siren (Sine 1/2 · Test Tone · Square).
+    Ds01e = 1,
+    /// **SN76477** — the TI complex-sound-generator chip (MAME-modeled), its
+    /// own gun / laser / bomb / explosion preset bank (`dub_dsp::Sn76477`).
+    Sn76477 = 2,
+}
+
 /// One mutation request to the engine. Variants name the deck index where
 /// applicable; engine-wide commands use no index.
 ///
@@ -195,6 +225,56 @@ pub enum Command {
     /// while the slap-back tail rings on. Idempotent on a deck whose siren isn't
     /// sounding.
     DeckReleaseSiren { idx: u8 },
+
+    /// Set the vintage-FX rack slot `slot` on deck `idx`: toggle it `active`
+    /// and apply its Advanced super-knob (`macro_value`, 0..1). The macro is
+    /// RT-safe to apply (each effect precomputes its transcendental
+    /// coefficients off-RT into a LUT/constant), so the audio thread just fans
+    /// it across the effect's params. Spring + Space Echo are additive sends;
+    /// Big Knob + Phaser are in-place inserts.
+    DeckSetRackFx {
+        idx: u8,
+        slot: FxSlot,
+        active: bool,
+        macro_value: f32,
+    },
+
+    /// Set the dub-siren's live controls on deck `idx` (PRD §6.3). The siren is
+    /// a self-contained instrument: `speed` is the HK628 chip-clock (pitch +
+    /// timing); the rest drive its onboard PT2399 echo — `delay_ms`/`feedback`/
+    /// `mix`, the DS01E **FILTER** (`filter`, 0 = dark LP · 0.5 open · 1 thin HP)
+    /// and **ECHO CUT** (`echo_cut` momentarily mutes the wet, loop keeps
+    /// running); `volume` is the siren output level. All applied with pure
+    /// setters on the audio thread (the FILTER cutoff comes from a LUT). The
+    /// echo render is skipped when `mix` is ~0. Both the Advanced super-knob
+    /// (FFI fans one macro into these) and Expert (individual knobs) route here.
+    DeckSetSirenControls {
+        idx: u8,
+        speed: f32,
+        delay_ms: f32,
+        feedback: f32,
+        mix: f32,
+        volume: f32,
+        filter: f32,
+        echo_cut: bool,
+    },
+
+    /// Pick which siren **unit** deck `idx` plays (PRD §6.3): HK628 digital
+    /// shots or the Benidub DS01E analog siren. Firing a preset/MODE routes to
+    /// this unit's voice.
+    DeckSetSirenUnit { idx: u8, unit: SirenUnit },
+
+    /// Set the Benidub DS01E voice controls on deck `idx`: `pitch_factor`
+    /// (PITCH selector — multiplies the MODE's base frequency), `rate_hz` (RATE
+    /// selector — the LFO modulation rate), and `continuous` (TRIGGER down =
+    /// latched sustain vs up = momentary one-shot). Applied to the precomputed
+    /// MODE patch at fire time; pure field tweaks, RT-safe.
+    DeckSetSirenVoice {
+        idx: u8,
+        pitch_factor: f32,
+        rate_hz: f32,
+        continuous: bool,
+    },
 
     /// Pin deck `idx`'s control mode (the deck-header Internal/Timecode
     /// switch). Sets the user override so auto source-detection won't
@@ -374,6 +454,55 @@ impl std::fmt::Debug for Command {
             Self::DeckReleaseSiren { idx } => f
                 .debug_struct("DeckReleaseSiren")
                 .field("idx", idx)
+                .finish(),
+            Self::DeckSetRackFx {
+                idx,
+                slot,
+                active,
+                macro_value,
+            } => f
+                .debug_struct("DeckSetRackFx")
+                .field("idx", idx)
+                .field("slot", slot)
+                .field("active", active)
+                .field("macro_value", macro_value)
+                .finish(),
+            Self::DeckSetSirenControls {
+                idx,
+                speed,
+                delay_ms,
+                feedback,
+                mix,
+                volume,
+                filter,
+                echo_cut,
+            } => f
+                .debug_struct("DeckSetSirenControls")
+                .field("idx", idx)
+                .field("speed", speed)
+                .field("delay_ms", delay_ms)
+                .field("feedback", feedback)
+                .field("mix", mix)
+                .field("volume", volume)
+                .field("filter", filter)
+                .field("echo_cut", echo_cut)
+                .finish(),
+            Self::DeckSetSirenUnit { idx, unit } => f
+                .debug_struct("DeckSetSirenUnit")
+                .field("idx", idx)
+                .field("unit", unit)
+                .finish(),
+            Self::DeckSetSirenVoice {
+                idx,
+                pitch_factor,
+                rate_hz,
+                continuous,
+            } => f
+                .debug_struct("DeckSetSirenVoice")
+                .field("idx", idx)
+                .field("pitch_factor", pitch_factor)
+                .field("rate_hz", rate_hz)
+                .field("continuous", continuous)
                 .finish(),
             Self::DeckSetControlMode { idx, mode } => f
                 .debug_struct("DeckSetControlMode")

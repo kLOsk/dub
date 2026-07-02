@@ -268,9 +268,24 @@ struct PerformanceView: View {
             // keyboard. Hidden when the feature is off in Preferences.
             if model.sirenEnabled {
                 SirenPadRow(
-                    names: model.sirenPresetLabels,
+                    names: model.sirenLabels(for: .a),
                     sounding: model.deckA.sirenState == 1,
-                    onPreset: { idx in model.fireSirenPreset(.a, index: idx) })
+                    onPreset: { idx in model.fireSirenPreset(.a, index: idx) },
+                    dubMacro: model.deckA.sirenDubMacro,
+                    onDubMacro: { value in model.setSirenDub(.a, value) },
+                    unit: model.deckA.sirenUnit,
+                    onUnit: { unit in model.setSirenUnit(.a, unit) })
+                SirenExpertPanel(deck: model.deckA, model: model, side: .a)
+            }
+            // Vintage-FX rack (PRD §6.3): spring · space echo · big knob ·
+            // phaser, each a tap-toggle + macro super-knob. Prep surface;
+            // clickable for prepare + test. Hidden when off in Preferences.
+            if model.rackFxEnabled {
+                RackFxRow(
+                    active: model.deckA.rackActive,
+                    macro: model.deckA.rackMacro,
+                    onToggle: { idx in model.toggleRackFx(.a, idx) },
+                    onMacro: { idx, value in model.setRackMacro(.a, idx, value) })
             }
             // M14 — Key Lock live A/B (Resampler · Ours · Rubber Band) +
             // engaged/standby indicator. Prep surface; clickable.
@@ -380,10 +395,19 @@ struct PerformanceView: View {
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },
                             echoEnabled: model.echoOutEnabled,
-                            sirenPresetNames: model.sirenPresetLabels,
+                            sirenPresetNames: model.sirenLabels(for: side),
                             sirenSounding: deckState.sirenState == 1,
                             onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
-                            sirenEnabled: model.sirenEnabled)
+                            sirenEnabled: model.sirenEnabled,
+                            sirenDubMacro: deckState.sirenDubMacro,
+                            onSirenDubMacro: { value in model.setSirenDub(side, value) },
+                            sirenUnit: deckState.sirenUnit,
+                            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
+                            rackActive: deckState.rackActive,
+                            rackMacro: deckState.rackMacro,
+                            onRackToggle: { idx in model.toggleRackFx(side, idx) },
+                            onRackMacro: { idx, value in model.setRackMacro(side, idx, value) },
+                            rackEnabled: model.rackFxEnabled)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -410,10 +434,19 @@ struct PerformanceView: View {
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },
                             echoEnabled: model.echoOutEnabled,
-                            sirenPresetNames: model.sirenPresetLabels,
+                            sirenPresetNames: model.sirenLabels(for: side),
                             sirenSounding: deckState.sirenState == 1,
                             onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
-                            sirenEnabled: model.sirenEnabled)
+                            sirenEnabled: model.sirenEnabled,
+                            sirenDubMacro: deckState.sirenDubMacro,
+                            onSirenDubMacro: { value in model.setSirenDub(side, value) },
+                            sirenUnit: deckState.sirenUnit,
+                            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
+                            rackActive: deckState.rackActive,
+                            rackMacro: deckState.rackMacro,
+                            onRackToggle: { idx in model.toggleRackFx(side, idx) },
+                            onRackMacro: { idx, value in model.setRackMacro(side, idx, value) },
+                            rackEnabled: model.rackFxEnabled)
                     }
                 }
             case .horizontal:

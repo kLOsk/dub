@@ -339,7 +339,7 @@ uniffi::setup_scaffolding!();
 ///       `sync_beats` + `bpm` args: when `sync_beats > 0` the siren's slap-back
 ///       echo time is overridden to that tempo division (resolved off-RT),
 ///       else the preset's own echo is used.
-pub const FFI_VERSION: u32 = 47;
+pub const FFI_VERSION: u32 = 52;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1955,6 +1955,143 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Set a vintage-FX rack slot on `deck_idx` (PRD §6.3, the King Tubby / Lee
+    /// Perry processing chain): toggle `fx` on/off (`active`) and apply its
+    /// Advanced super-knob (`macro_value`, 0..1, clamped). The macro fans across
+    /// several of the effect's params on a hand-tuned curve; it's RT-safe to
+    /// apply (each effect precomputed its transcendental coefficients off-RT),
+    /// so no conversion is needed here. Spring + Space Echo are additive sends;
+    /// Big Knob + Phaser are in-place inserts.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_rack_fx(
+        &self,
+        deck_idx: u64,
+        fx: RackFx,
+        active: bool,
+        macro_value: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_fx(fx.into(), active, macro_value.clamp(0.0, 1.0))
+            .map_err(map_command_error)
+    }
+
+    /// Expert siren controls (PRD §6.3): set the GS1-style `speed` (HK628 chip
+    /// clock), the onboard PT2399 echo — `delay_ms` (TIME) / `feedback` /
+    /// `mix` (ECHO VOLUME) / `filter` (the DS01E FILTER, 0 dark-LP · 0.5 open ·
+    /// 1 thin-HP) / `echo_cut` (momentary wet mute) — and `volume`, individually
+    /// on `deck_idx`. The siren is a self-contained instrument (no FX rack). The
+    /// echo render is skipped when `mix` is ~0 and not cut.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_siren_controls(
+        &self,
+        deck_idx: u64,
+        speed: f32,
+        delay_ms: f32,
+        feedback: f32,
+        mix: f32,
+        volume: f32,
+        filter: f32,
+        echo_cut: bool,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_siren_controls(speed, delay_ms, feedback, mix, volume, filter, echo_cut)
+            .map_err(map_command_error)
+    }
+
+    /// Advanced siren "dub" super-knob (PRD §6.3): one 0..1 `macro_value` fans
+    /// across the siren's Speed + Delay + Feedback + echo Mix + FILTER on a
+    /// hand-tuned curve (0 = dry siren, 1 = slow, low, long, self-feeding dub).
+    /// `volume` is the siren output level. Routes through the same path as Expert.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_siren_dub_macro(
+        &self,
+        deck_idx: u64,
+        macro_value: f32,
+        volume: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let (speed, delay_ms, feedback, mix, filter) = siren_dub_macro(macro_value);
+        running
+            .handle
+            .deck(idx)
+            .set_siren_controls(speed, delay_ms, feedback, mix, volume, filter, false)
+            .map_err(map_command_error)
+    }
+
+    /// Pick which siren **unit** `deck_idx` plays: HK628 digital shots or the
+    /// Benidub DS01E analog siren. Firing a preset/MODE routes to this unit.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_siren_unit(&self, deck_idx: u64, unit: SirenUnit) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_siren_unit(unit.into())
+            .map_err(map_command_error)
+    }
+
+    /// Benidub DS01E voice controls (PRD §6.3): `pitch_factor` (PITCH selector —
+    /// multiplies the MODE base frequency), `rate_hz` (RATE — LFO modulation
+    /// rate, 0 = use the MODE's own), `continuous` (TRIGGER down = latched
+    /// sustain). Applied to the MODE patch at fire time.
+    ///
+    /// # Errors
+    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_siren_voice(
+        &self,
+        deck_idx: u64,
+        pitch_factor: f32,
+        rate_hz: f32,
+        continuous: bool,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_siren_voice(pitch_factor, rate_hz, continuous)
+            .map_err(map_command_error)
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2).
     ///
     /// Tells the engine to ignore the deck's timecode input until
@@ -2293,15 +2430,16 @@ impl DubEngine {
                 .deck(idx)
                 .set_control_mode(mode.into())
                 .map_err(map_command_error)?;
-            // Thru unloads the deck: the live record is the source now.
-            // The engine already cleared its audio source; drop the FFI's
-            // peak-render track too so the waveform doesn't keep painting
-            // the ghost of the unloaded file.
-            if matches!(mode, ControlMode::Thru) {
+            // Thru / FX unload the deck: the live input is the source now
+            // (a record for Thru; a mic / mixer aux send for FX). The engine
+            // already cleared its audio source; drop the FFI's peak-render
+            // track too so the waveform doesn't keep painting the ghost of the
+            // unloaded file.
+            if matches!(mode, ControlMode::Thru | ControlMode::Fx) {
                 running.file_tracks[idx] = None;
             }
         }
-        if matches!(mode, ControlMode::Thru) {
+        if matches!(mode, ControlMode::Thru | ControlMode::Fx) {
             self.bump_peak_generation(idx);
         }
         Ok(())
@@ -3443,6 +3581,9 @@ pub enum ControlMode {
     Timecode,
     /// The live record on the platter is passed straight through.
     Thru,
+    /// The deck slot is the dub FX channel: its input (mic / mixer aux send)
+    /// is processed by the rack instead of a track playing.
+    Fx,
 }
 
 impl From<ControlMode> for dub_engine::ControlMode {
@@ -3451,6 +3592,7 @@ impl From<ControlMode> for dub_engine::ControlMode {
             ControlMode::InternalPlay => dub_engine::ControlMode::Internal,
             ControlMode::Timecode => dub_engine::ControlMode::Timecode,
             ControlMode::Thru => dub_engine::ControlMode::Thru,
+            ControlMode::Fx => dub_engine::ControlMode::Fx,
         }
     }
 }
@@ -3474,6 +3616,53 @@ impl From<StretchBackend> for dub_engine::StretchBackend {
     }
 }
 
+/// A slot in the per-deck vintage-FX rack (M16+, PRD §6.3) — the dub
+/// processing chain. Passed to `set_rack_fx`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum RackFx {
+    /// Spring reverb (the dub tank). Additive send.
+    Spring,
+    /// Roland RE-201 Space Echo (tape echo + onboard spring). Additive send.
+    SpaceEcho,
+    /// King Tubby "Big Knob" high-pass filter. In-place insert.
+    BigKnob,
+    /// Mu-Tron Bi-Phase phaser. In-place insert.
+    Phaser,
+}
+
+impl From<RackFx> for dub_engine::FxSlot {
+    fn from(fx: RackFx) -> Self {
+        match fx {
+            RackFx::Spring => dub_engine::FxSlot::Spring,
+            RackFx::SpaceEcho => dub_engine::FxSlot::SpaceEcho,
+            RackFx::BigKnob => dub_engine::FxSlot::BigKnob,
+            RackFx::Phaser => dub_engine::FxSlot::Phaser,
+        }
+    }
+}
+
+/// Which siren unit a deck plays (PRD §6.3) — passed to `set_siren_unit`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum SirenUnit {
+    /// GS1 — the Rigsmith-GS1-style toy-chip bank (our HK628 recreation):
+    /// rifle / alarm / bombs / guns.
+    Gs1,
+    /// Benidub DS01E analog oscillator siren (Sine 1/2 · Test Tone · Square).
+    Ds01e,
+    /// SN76477 — the TI complex-sound-generator chip (gun / laser / bomb …).
+    Sn76477,
+}
+
+impl From<SirenUnit> for dub_engine::SirenUnit {
+    fn from(u: SirenUnit) -> Self {
+        match u {
+            SirenUnit::Gs1 => dub_engine::SirenUnit::Gs1,
+            SirenUnit::Ds01e => dub_engine::SirenUnit::Ds01e,
+            SirenUnit::Sn76477 => dub_engine::SirenUnit::Sn76477,
+        }
+    }
+}
+
 /// The display names of the built-in M16 dub-siren presets (Simple mode),
 /// in fire order — the index is what [`DubEngine::fire_siren_preset`] takes.
 /// A free function (no engine instance needed) so the UI can lay out its pad
@@ -3481,8 +3670,9 @@ impl From<StretchBackend> for dub_engine::StretchBackend {
 #[uniffi::export]
 #[must_use]
 pub fn siren_preset_names() -> Vec<String> {
-    (0..dub_dsp::SIREN_PRESET_COUNT)
-        .map(|i| dub_dsp::siren_preset_name(i).to_string())
+    // Simple mode is the Honsitak HK628's eight sounds.
+    (0..dub_dsp::HK628_PROGRAM_COUNT)
+        .map(|i| dub_dsp::hk628_program_name(i).to_string())
         .collect()
 }
 
@@ -3490,7 +3680,27 @@ pub fn siren_preset_names() -> Vec<String> {
 #[uniffi::export]
 #[must_use]
 pub fn siren_preset_count() -> u32 {
-    dub_dsp::SIREN_PRESET_COUNT as u32
+    dub_dsp::HK628_PROGRAM_COUNT as u32
+}
+
+/// The display names of a siren unit's preset/MODE pads, in fire order — the
+/// index is what [`DubEngine::fire_siren_preset`] takes. HK628 = 8 shots; the
+/// DS01E = its 4 MODE tones (Sine 1 / Sine 2 / Test Tone / Square). A free
+/// function so the UI can relabel its pad grid when the unit selector changes.
+#[uniffi::export]
+#[must_use]
+pub fn siren_unit_preset_names(unit: SirenUnit) -> Vec<String> {
+    match unit {
+        SirenUnit::Gs1 => (0..dub_dsp::HK628_PROGRAM_COUNT)
+            .map(|i| dub_dsp::hk628_program_name(i).to_string())
+            .collect(),
+        SirenUnit::Ds01e => (0..dub_dsp::BENIDUB_PRESET_COUNT)
+            .map(|i| dub_dsp::benidub_preset_name(i).to_string())
+            .collect(),
+        SirenUnit::Sn76477 => (0..dub_dsp::SN76477_PRESET_COUNT)
+            .map(|i| dub_dsp::sn76477_preset_name(i).to_string())
+            .collect(),
+    }
 }
 
 /// LSQ residual statistics from beat-grid analysis (M11d.7).
@@ -4413,6 +4623,22 @@ fn start_engine_inner(
 /// Translate `dub_engine::CommandError` (audio-thread feedback
 /// channel saturated, bad deck index) into the FFI-surface
 /// equivalent. Pulled out to keep the per-method bodies tidy.
+/// The Advanced siren "dub" super-knob curve: one 0..1 macro → `(speed,
+/// delay_ms, feedback, mix)`. 0 = a dry siren; turning up slows the voice a
+/// touch, lengthens the echo, feeds it back, and brings the wet in — the GS1
+/// "deeper dub" gesture in one knob. Tunable by ear.
+fn siren_dub_macro(macro_value: f32) -> (f32, f32, f32, f32, f32) {
+    let m = macro_value.clamp(0.0, 1.0);
+    // Speed scales the chip clock (pitch + timing): turning the macro up takes
+    // the siren slower AND lower — deeper, dubbier, less shrill.
+    let speed = 1.0 - m * 0.35; // 1.0 → 0.65 (~6–7 semitones down at full)
+    let delay_ms = 90.0 + m * 330.0; // 90 → 420 ms
+    let feedback = m * 0.85; // 0 → 0.85
+    let mix = m * 0.8; // 0 (echo off) → 0.8
+    let filter = 0.35 - m * 0.2; // darken the echo as it deepens (LP 0.35 → 0.15)
+    (speed, delay_ms, feedback, mix, filter)
+}
+
 fn map_command_error(e: dub_engine::CommandError) -> EngineError {
     match e {
         dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
@@ -4606,7 +4832,22 @@ mod tests {
         // `engage_siren` / `set_siren_params` knob path.
         // 46→47: M16 siren echo beat-match (`fire_siren_preset` gains
         // `sync_beats` + `bpm`).
-        assert_eq!(FFI_VERSION, 47);
+        // 47→48: vintage-FX rack — `set_rack_fx(deck_idx, fx, active,
+        // macro_value)` + the `RackFx` enum (Spring / SpaceEcho / BigKnob /
+        // Phaser). The Advanced super-knob for the dub processing chain.
+        // 48→49: siren onboard echo — `set_siren_controls` (Expert: speed /
+        // delay / feedback / mix / volume) + `set_siren_dub_macro` (Advanced
+        // super-knob). The siren is now a self-contained instrument with its
+        // own PT2399 echo, rendered independent of the rack.
+        // 49→50: deck role `ControlMode::Fx` — a deck slot can become the dub
+        // FX channel (mic / mixer aux send → rack → mixer) via the source
+        // switch, replacing a turntable.
+        // 50→51: siren unit selector — `SirenUnit` enum + `set_siren_unit`
+        // (HK628 ↔ DS01E) + `set_siren_voice` (DS01E PITCH/RATE/TRIGGER) +
+        // `siren_unit_preset_names`; `set_siren_controls` gains FILTER + ECHO CUT.
+        // 51→52: `SirenUnit` becomes Gs1 / Ds01e / Sn76477 (HK628 unit renamed
+        // GS1; SN76477 chip added as a third unit with its own preset bank).
+        assert_eq!(FFI_VERSION, 52);
     }
 
     #[test]
@@ -4659,8 +4900,9 @@ mod tests {
         assert_eq!(names.len() as u32, siren_preset_count());
         assert!(names.len() >= 8, "expected the classic preset bank");
         assert!(names.iter().all(|n| !n.is_empty()), "a preset is unnamed");
-        // The fire-order index the UI sends must line up with these names.
-        assert_eq!(names[0], "Siren");
+        // The fire-order index the UI sends must line up with these names
+        // (Simple mode = the HK628's eight sounds).
+        assert_eq!(names[0], "Rifle Gun");
     }
 
     #[test]

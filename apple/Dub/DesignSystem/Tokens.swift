@@ -125,6 +125,19 @@ enum DubColor {
     /// siren's own thing while it's wailing.
     static let siren = Color(hex: 0xFF5247)
 
+    // ----- Vintage-FX rack accents (PRD §6.3) ----------------------
+    // The dub processing chain. Each slot gets a hue-distinct accent so an
+    // engaged rack effect reads as its own thing on the pads.
+
+    /// Spring reverb (the dub tank). A watery teal-cyan.
+    static let springFx = Color(hex: 0x4FD1C5)
+    /// Roland RE-201 Space Echo. A warm tape amber.
+    static let spaceEcho = Color(hex: 0xF5A623)
+    /// King Tubby "Big Knob" high-pass. A cool filter blue.
+    static let bigKnob = Color(hex: 0x5B8DEF)
+    /// Mu-Tron Bi-Phase phaser. A swirling violet-magenta.
+    static let phaser = Color(hex: 0xC77DFF)
+
     // ----- Overview strip (M10.5c) ---------------------------------
 
     /// Deck A's amplitude colour in the Track Overview strip.
