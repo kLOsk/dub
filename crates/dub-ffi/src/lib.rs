@@ -1443,16 +1443,64 @@ impl DubEngine {
             }
         }
 
-        // Phase 2: decode (symphonia + Vec<f32> allocation). ~50 ms
-        // for a typical 4-minute MP3. Kept synchronous so we can
-        // surface decode errors to the caller before returning;
-        // the rest of the heavy work moves to a detached thread
-        // in Phase 4.
+        // Phase 2: probe + decode the HEAD of the track (a few
+        // seconds of audio) synchronously — O(head), independent of
+        // track length. The full-length buffer is pre-allocated from
+        // the container's declared frame count and the tail streams
+        // in on the `dub-decode-{idx}` thread (Phase 2b) behind an
+        // atomic watermark, at hundreds of times realtime. Playback
+        // still reads only RAM (PRD principle 5 / §6.4): a position
+        // past the watermark renders silence and self-heals as the
+        // decode frontier passes it — realistically only reachable by
+        // seeking deep into a mixtape within seconds of loading it.
+        // Pre-streaming, this phase decoded the WHOLE file here:
+        // ~0.7 s for a 4-minute tune but ~12 s for a 70-minute
+        // mixtape, all of it spent before the deck could play.
+        //
+        // Decode errors in the head still surface to the caller
+        // before anything is installed; tail-decode errors close the
+        // track at the watermark (it plays what decoded) and log.
+        const LOAD_HEAD_SECS: f64 = 4.0;
         let t_decode = std::time::Instant::now();
-        let track = Track::load_from_path(&path)
+        let mut streaming = Track::begin_streaming(&path)
             .map_err(|e| EngineError::TrackDecodeFailed(format!("{path}: {e}")))?;
-        let track = Arc::new(track);
+        streaming
+            .decode_until_secs(LOAD_HEAD_SECS)
+            .map_err(|e| EngineError::TrackDecodeFailed(format!("{path}: {e}")))?;
+        let track = Arc::new(streaming.track());
         let decode_ms = t_decode.elapsed().as_millis();
+
+        // Phase 2b: hand the tail decode to its own thread. The
+        // handle is passed through a channel so a failed spawn hands
+        // it back and the decode finishes synchronously instead —
+        // a track stranded half-decoded (worker parked forever,
+        // audible silence past the watermark) would be worse than
+        // one slow load.
+        if !streaming.is_done() {
+            let (tx, rx) = std::sync::mpsc::channel::<dub_io::StreamingLoad>();
+            let path_for_thread = path.clone();
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("dub-decode-{idx}"))
+                .spawn(move || {
+                    if let Ok(streaming) = rx.recv() {
+                        run_tail_decode(idx, streaming, &path_for_thread);
+                    }
+                });
+            match spawn_result {
+                Ok(_) => {
+                    if let Err(send_back) = tx.send(streaming) {
+                        run_tail_decode(idx, send_back.0, &path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "dub-ffi: failed to spawn dub-decode-{idx} thread: {e}; \
+                         finishing the decode synchronously on the caller"
+                    );
+                    run_tail_decode(idx, streaming, &path);
+                }
+            }
+        }
 
         // Phase 3: install the `Arc<Track>` into the deck *now*.
         // From this point on, the audio thread can render audio,
@@ -1499,7 +1547,8 @@ impl DubEngine {
         }
         let swap_ms = t_total.elapsed().as_millis();
         eprintln!(
-            "dub-ffi: load_track deck={idx} decode={decode_ms}ms swap={swap_ms}ms (playback ready)"
+            "dub-ffi: load_track deck={idx} head-decode={decode_ms}ms swap={swap_ms}ms \
+             (playback ready; tail streaming)"
         );
 
         // Phase 4: heavy analysis on a detached worker thread.
@@ -2592,8 +2641,7 @@ impl DubEngine {
             .get(idx)
             .and_then(|t| t.as_ref())
             .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
-        let duration_secs = track.samples().len() as f64
-            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let duration_secs = track.duration_seconds();
         // `install_beat_grid` is the manual "BPM + first downbeat
         // anchor" affordance. The user is asserting beats[0] is
         // the downbeat (bar position 1), so bar_phase is 0.
@@ -2633,8 +2681,7 @@ impl DubEngine {
             .get(idx)
             .and_then(|t| t.as_ref())
             .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
-        let duration_secs = track.samples().len() as f64
-            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let duration_secs = track.duration_seconds();
         let phase = u8::try_from(bar_phase).unwrap_or(0);
         let grid = synthesise_beat_grid(bpm, anchor_secs, duration_secs, phase);
         if grid.confidence <= 0.0 || grid.beats.is_empty() {
@@ -2697,8 +2744,9 @@ impl DubEngine {
         let profile = octave_profile_from_optional_genre(genre.as_deref());
         drop(state);
 
+        let samples = samples_for_offline_analysis(&track);
         let core = analyze_beat_grid_from_bpm_and_anchor(
-            track.samples(),
+            &samples,
             track.sample_rate(),
             track.channels(),
             bpm,
@@ -2799,8 +2847,9 @@ impl DubEngine {
         // verbatim when the kick has no clean edge. Works the same
         // whether the deck is stopped or playing — it lands on the
         // visible edge either way. See `relatch_grid_at_downbeat_tap`.
+        let samples = samples_for_offline_analysis(&track);
         let core = relatch_grid_at_downbeat_tap(
-            track.samples(),
+            &samples,
             track.sample_rate(),
             track.channels(),
             bpm,
@@ -2899,8 +2948,9 @@ impl DubEngine {
         let profile = octave_profile_from_optional_genre(genre.as_deref());
         drop(state);
 
+        let samples = samples_for_offline_analysis(&track);
         let core = analyze_beat_grid_from_taps(
-            track.samples(),
+            &samples,
             track.sample_rate(),
             track.channels(),
             &tap_times,
@@ -2998,8 +3048,7 @@ impl DubEngine {
             .get(idx)
             .and_then(|t| t.as_ref())
             .ok_or(EngineError::NoTrackLoaded(deck_idx))?;
-        let duration_secs = track.samples().len() as f64
-            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let duration_secs = track.duration_seconds();
         let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
             return Err(EngineError::NoTrackLoaded(deck_idx));
         };
@@ -4050,6 +4099,93 @@ fn octave_profile_from_optional_genre(genre: Option<&str>) -> OctaveProfile {
         .unwrap_or(OctaveProfile::Default)
 }
 
+/// Samples for offline (non-RT) analysis of a deck-loaded track.
+///
+/// One-shot loads borrow the buffer. A still-streaming load — a
+/// tap-to-grid within the first seconds of a long load — cannot be
+/// borrowed as `&[f32]`, so the decoded prefix is copied out instead.
+/// That prefix is already minutes deep by the time a human taps (the
+/// tail decode runs at hundreds of times realtime), which is plenty
+/// for the grid math; the synthesized grid spans the full declared
+/// duration regardless.
+fn samples_for_offline_analysis(track: &Track) -> std::borrow::Cow<'_, [f32]> {
+    let borrowed = track.samples();
+    if borrowed.is_empty() && track.decoded_frames() > 0 {
+        std::borrow::Cow::Owned(track.samples_to_vec())
+    } else {
+        std::borrow::Cow::Borrowed(borrowed)
+    }
+}
+
+/// Body of the `dub-decode-{idx}` tail-decode thread (also the
+/// synchronous fallback when that thread can't spawn). Runs the
+/// O(track-length) part of a streaming load; the deck is already
+/// playing the head. A decode failure closes the track at the
+/// watermark — it plays what decoded — rather than tearing the deck
+/// down mid-performance.
+fn run_tail_decode(idx: usize, streaming: dub_io::StreamingLoad, path: &str) {
+    let t_tail = std::time::Instant::now();
+    match streaming.finish() {
+        Ok(()) => {
+            eprintln!(
+                "dub-ffi: deck={idx} tail decode complete in {}ms",
+                t_tail.elapsed().as_millis()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "dub-ffi: deck={idx} tail decode failed after {}ms ({path}: {e}); \
+                 the track ends at the decoded watermark",
+                t_tail.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+/// Park the worker until a streaming load's tail decode has fully
+/// landed (one-shot loads pass immediately). The uncached analysis
+/// paths need the whole track; the tail thread closes the store even
+/// on a mid-file decode failure, so this always terminates.
+fn wait_for_full_decode(track: &Track) {
+    while !track.is_fully_decoded() {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Memoized whole-track samples for `background_analyze_and_install`'s
+/// uncached compute paths (peaks miss + no-library-grid analysis).
+///
+/// One-shot loads borrow the track's buffer directly. Streaming loads
+/// park until the tail decode lands, then copy out **once** — both
+/// miss paths share the copy. The cached paths (sidecar hit, library
+/// grid) never call [`Self::get`], preserving the instant-load
+/// contract for analyzed library tracks.
+struct FullSamples<'t> {
+    track: &'t Track,
+    copied: Option<Vec<f32>>,
+}
+
+impl<'t> FullSamples<'t> {
+    fn new(track: &'t Track) -> Self {
+        Self {
+            track,
+            copied: None,
+        }
+    }
+
+    fn get(&mut self) -> &[f32] {
+        let borrowed = self.track.samples();
+        if !borrowed.is_empty() {
+            return borrowed;
+        }
+        if self.copied.is_none() {
+            wait_for_full_decode(self.track);
+            self.copied = Some(self.track.samples_to_vec());
+        }
+        self.copied.as_deref().unwrap_or(&[])
+    }
+}
+
 fn background_analyze_and_install(
     idx: usize,
     track: Arc<Track>,
@@ -4060,6 +4196,10 @@ fn background_analyze_and_install(
     genre: Option<String>,
 ) {
     let profile = octave_profile_from_optional_genre(genre.as_deref());
+    // Whole-track samples for the uncached compute paths below. For
+    // a streaming load, first use parks until the tail decode lands;
+    // the cached paths never touch it.
+    let mut full_samples = FullSamples::new(&track);
     // Stage 1: offline peaks.
     //
     // PRD-BEATS §4.5 / C1 round 4 — if the library hands us a
@@ -4083,7 +4223,11 @@ fn background_analyze_and_install(
                      recomputing offline peaks"
                 );
                 (
-                    compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+                    compute_offline_peaks(
+                        full_samples.get(),
+                        track.sample_rate(),
+                        track.channels(),
+                    ),
                     false,
                 )
             }
@@ -4093,13 +4237,17 @@ fn background_analyze_and_install(
                      recomputing offline peaks"
                 );
                 (
-                    compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+                    compute_offline_peaks(
+                        full_samples.get(),
+                        track.sample_rate(),
+                        track.channels(),
+                    ),
                     false,
                 )
             }
         },
         None => (
-            compute_offline_peaks(track.samples(), track.sample_rate(), track.channels()),
+            compute_offline_peaks(full_samples.get(), track.sample_rate(), track.channels()),
             false,
         ),
     };
@@ -4209,8 +4357,7 @@ fn background_analyze_and_install(
     let (grid, bpm_ms, source_label): (BeatGrid, u128, &'static str) = if let Some(supplied) =
         library_grid.as_ref()
     {
-        let duration_secs = track.samples().len() as f64
-            / (f64::from(track.sample_rate()) * f64::from(track.channels()));
+        let duration_secs = track.duration_seconds();
         let grid = synthesise_beat_grid(
             supplied.bpm,
             supplied.anchor_secs,
@@ -4221,7 +4368,7 @@ fn background_analyze_and_install(
     } else {
         let t_bpm = std::time::Instant::now();
         let grid_result = analyze_beat_grid_with_profile(
-            track.samples(),
+            full_samples.get(),
             track.sample_rate(),
             track.channels(),
             profile,
@@ -7049,18 +7196,26 @@ impl DubLibrary {
     /// `analysis_cache`. Returns the outcome so the LibraryView
     /// can refresh the affected row's BPM badge inline.
     ///
-    /// The call holds the library lock for the duration of the
-    /// decode + analysis pass (typically 1–3 seconds for a 3-min
-    /// MP3). Swift callers drive batch analysis by looping over
-    /// this method on a background `Task`, releasing the lock
-    /// between tracks so the LibraryView can keep refreshing.
+    /// The library lock is held only for the millisecond-scale
+    /// read (prepare) and write (commit) phases; the multi-second
+    /// decode + DSP pass in between runs with **no lock held**.
+    /// Holding it across the whole pass was the "loading a deck
+    /// freezes the app" bug: every deck-load lookup on the main
+    /// actor (`active_beat_grid`, `track_normalization_gain`,
+    /// `track_path`, …) queued behind an in-flight lazy analysis
+    /// for the full length of the analysed track. The commit phase
+    /// re-checks the grid lock, so a lock toggled mid-analysis
+    /// still wins (PRD-BEATS §3.5 lock-is-absolute).
     pub fn analyze_track(
         &self,
         track_id: String,
     ) -> std::result::Result<LibraryAnalysisOutcome, LibraryFfiError> {
+        let job = self.with_library(|lib| Ok(lib.analyze_prepare(&track_id)?))?;
+        let computed = dub_library::analyze_compute(&job)?;
         self.with_library(|lib| {
-            let outcome = lib.analyze_track(&track_id)?;
-            Ok(LibraryAnalysisOutcome::from(outcome))
+            Ok(LibraryAnalysisOutcome::from(
+                lib.analyze_commit(&job, computed)?,
+            ))
         })
     }
 

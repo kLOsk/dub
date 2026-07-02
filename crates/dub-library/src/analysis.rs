@@ -192,6 +192,179 @@ impl AnalysisOutcome {
     };
 }
 
+/// Read-phase snapshot for a lock-free analysis pass.
+///
+/// Produced by [`Library::analyze_prepare`] (which needs the
+/// database), consumed by [`analyze_compute`] (which does not).
+/// The split exists so callers that serialize `Library` access
+/// behind a mutex — `dub-ffi`'s `DubLibrary` — can release the
+/// lock across the multi-second decode + DSP pass. Holding it was
+/// the "loading a deck freezes while another track analyses" bug:
+/// every deck-load lookup on the main actor queued behind an
+/// in-flight lazy analysis, for the full length of the analysed
+/// track.
+pub struct AnalysisJob {
+    track_id: String,
+    existing_fingerprint_id: Option<i64>,
+    file_path: PathBuf,
+    profile: dub_bpm::OctaveProfile,
+}
+
+/// Chromaprint computed during the lock-free phase, pending
+/// upsert + attach in [`Library::analyze_commit`].
+struct ComputedFingerprint {
+    fp: dub_fingerprint::Fingerprint,
+    sample_rate: u32,
+    channels: u32,
+}
+
+/// Beat-grid scalars computed during the lock-free phase. Only
+/// present when the analyser found periodic structure
+/// (`confidence > 0`).
+struct ComputedGrid {
+    anchor_secs: f64,
+    bpm: f64,
+    bar_phase: u8,
+    confidence: f32,
+    drift_slope_ms_per_min: Option<f32>,
+}
+
+/// Key-detection scalars computed during the lock-free phase.
+/// Only present when the analyser found a key (`confidence > 0`).
+struct ComputedKey {
+    camelot: &'static str,
+    tonic_pc: u8,
+    is_major: bool,
+    confidence: f32,
+}
+
+/// Everything [`analyze_compute`] produced without touching the
+/// database, ready for [`Library::analyze_commit`] to persist in
+/// one short write transaction window.
+pub struct AnalysisComputed {
+    /// `None` when the track already had a fingerprint attached
+    /// (the common re-analyze case) — commit then reuses the
+    /// existing id.
+    fingerprint: Option<ComputedFingerprint>,
+    grid: Option<ComputedGrid>,
+    key: Option<ComputedKey>,
+    /// Pre-rendered waveform sidecar payload. `None` when the
+    /// peaks compute failed — best-effort, mirrors the previous
+    /// inline behaviour (BPM + key are the contract; the sidecar
+    /// is a perf cache).
+    peaks: Option<dub_peaks::OfflinePeaks>,
+    lufs_i: Option<f64>,
+    sample_peak_dbfs: f64,
+}
+
+/// Lock-free phase of the analysis pipeline: decode, fingerprint,
+/// beat grid, key, waveform peaks, and loudness. Takes no
+/// `&Library`, so callers can run it with no database lock held —
+/// this is the multi-second, O(track-length) part of
+/// [`Library::analyze_track`].
+pub fn analyze_compute(job: &AnalysisJob) -> Result<AnalysisComputed> {
+    let track_id = &job.track_id;
+    let file_path = job.file_path.clone();
+    let track =
+        dub_io::Track::load_from_path(&file_path).map_err(|e| LibraryError::DecodeFailed {
+            track_id: track_id.to_string(),
+            path: file_path.clone(),
+            reason: format!("{e}"),
+        })?;
+
+    // ---- Fingerprint (M11c.4 lazy attach) --------------------
+    // If the importer left `fingerprint_id = NULL`, compute the
+    // Chromaprint now; commit upserts + attaches it.
+    let fingerprint = if job.existing_fingerprint_id.is_some() {
+        None
+    } else {
+        let fp = dub_fingerprint::Fingerprint::compute_from_f32(
+            track.samples(),
+            track.sample_rate(),
+            u32::from(track.channels()),
+        )
+        .map_err(|e| LibraryError::DecodeFailed {
+            track_id: track_id.to_string(),
+            path: file_path.clone(),
+            reason: format!("fingerprint failed: {e}"),
+        })?;
+        Some(ComputedFingerprint {
+            fp,
+            sample_rate: track.sample_rate(),
+            channels: u32::from(track.channels()),
+        })
+    };
+
+    // ---- Beat grid (M11c.1) ----------------------------------
+    let grid = dub_bpm::analyze_beat_grid_with_profile(
+        track.samples(),
+        track.sample_rate(),
+        track.channels(),
+        job.profile,
+    )
+    .map_err(|e| LibraryError::DecodeFailed {
+        track_id: track_id.to_string(),
+        path: file_path.clone(),
+        reason: format!("beat-grid analysis failed: {e}"),
+    })?;
+    let grid = (grid.confidence > 0.0).then(|| ComputedGrid {
+        anchor_secs: grid.beats.first().copied().unwrap_or(0.0),
+        bpm: grid.bpm,
+        bar_phase: grid.bar_phase,
+        confidence: grid.confidence,
+        drift_slope_ms_per_min: grid.quality.as_ref().map(|q| q.drift_slope_ms_per_min),
+    });
+
+    // ---- Key (M11c.2) ----------------------------------------
+    let key = dub_spectral::analyze_key(track.samples(), track.sample_rate(), track.channels())
+        .map_err(|e| LibraryError::DecodeFailed {
+            track_id: track_id.to_string(),
+            path: file_path.clone(),
+            reason: format!("key analysis failed: {e}"),
+        })?;
+    let key = (key.confidence > 0.0).then(|| ComputedKey {
+        camelot: key.camelot(),
+        tonic_pc: key.tonic_pc,
+        is_major: key.is_major,
+        confidence: key.confidence,
+    });
+
+    // ---- Waveform sidecar peaks (PRD-BEATS C1) ---------------
+    // Best-effort: a peaks failure is logged and analysis still
+    // succeeds — the engine treats a missing sidecar as a cache
+    // miss and recomputes on demand.
+    let peaks = match dub_peaks::compute_offline_peaks(
+        track.samples(),
+        track.sample_rate(),
+        track.channels(),
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!(
+                "dub-library: skipping waveform sidecar for {track_id} \
+                 (peaks compute failed: {e})"
+            );
+            None
+        }
+    };
+
+    // ---- Loudness / auto-gain (store-only) -------------------
+    let loudness = dub_dsp::measure_integrated_loudness(
+        track.samples(),
+        track.sample_rate(),
+        u16::from(track.channels()),
+    );
+
+    Ok(AnalysisComputed {
+        fingerprint,
+        grid,
+        key,
+        peaks,
+        lufs_i: loudness.lufs_i,
+        sample_peak_dbfs: loudness.sample_peak_dbfs,
+    })
+}
+
 impl Library {
     /// Run the M11c.1 auto-analysis pipeline against the file
     /// currently registered as the primary file for `track_id`.
@@ -229,111 +402,44 @@ impl Library {
     /// of the decode + BPM + key passes the user already paid for
     /// by loading the deck.
     pub fn analyze_track(&self, track_id: &str) -> Result<AnalysisOutcome> {
-        // PRD-BEATS §3.5 "lock is absolute": if the grid is locked
-        // we refuse the whole analysis pass rather than skipping
-        // just the beat-grid step (the previous `force` parameter
-        // dropped the lock and rebuilt the grid; round 3 removes
-        // that escape hatch). Locking is a user contract, not a
-        // performance gate, so we surface the refusal as
-        // `LibraryError::GridLocked` and let the Apple shell turn
-        // it into a no-op (the menu item that would call us is
-        // already greyed out when the grid is locked, so seeing
-        // this error in practice means a race or a tool calling
-        // us directly).
+        // The three-phase split exists for lock hygiene (see
+        // [`AnalysisJob`]); this wrapper is the single-caller
+        // convenience that preserves the original one-call
+        // behaviour for the CLI, tests, and any embedder that
+        // doesn't serialize `Library` access.
+        let job = self.analyze_prepare(track_id)?;
+        let computed = analyze_compute(&job)?;
+        self.analyze_commit(&job, computed)
+    }
+
+    /// Read phase of [`Self::analyze_track`]: snapshot everything
+    /// the lock-free [`analyze_compute`] pass needs — the primary
+    /// file path, the existing fingerprint id (or `None` for the
+    /// M11c.4 lazy-attach case), and the genre-derived octave
+    /// profile. Cheap (three indexed reads).
+    ///
+    /// PRD-BEATS §3.5 "lock is absolute": if the grid is locked we
+    /// refuse the whole analysis pass rather than skipping just the
+    /// beat-grid step. Locking is a user contract, not a
+    /// performance gate, so we surface the refusal as
+    /// [`LibraryError::GridLocked`] and let the Apple shell turn it
+    /// into a no-op. ([`Self::analyze_commit`] re-checks, since the
+    /// lock can flip while compute runs unlocked.)
+    pub fn analyze_prepare(&self, track_id: &str) -> Result<AnalysisJob> {
         if self.is_grid_locked(track_id)? {
             return Err(LibraryError::GridLocked {
                 track_id: track_id.to_string(),
             });
         }
         let (existing_fingerprint_id, file_path) = self.track_analysis_keys(track_id)?;
-        let track =
-            dub_io::Track::load_from_path(&file_path).map_err(|e| LibraryError::DecodeFailed {
-                track_id: track_id.to_string(),
-                path: file_path.clone(),
-                reason: format!("{e}"),
-            })?;
-
-        // ---- Fingerprint (M11c.4 lazy attach) --------------------
-        // If the importer left `fingerprint_id = NULL`, compute the
-        // Chromaprint now and write it back to `tracks` (and
-        // `fingerprints`). The race window (two concurrent
-        // analyse_track calls on the same UUID) is closed by
-        // `attach_fingerprint`'s `WHERE fingerprint_id IS NULL`
-        // guard: the loser's UPDATE matches zero rows and we read
-        // the winner's id back from `tracks`.
-        let fingerprint_id = match existing_fingerprint_id {
-            Some(id) => id,
-            None => {
-                let fp = dub_fingerprint::Fingerprint::compute_from_f32(
-                    track.samples(),
-                    track.sample_rate(),
-                    u32::from(track.channels()),
-                )
-                .map_err(|e| LibraryError::DecodeFailed {
-                    track_id: track_id.to_string(),
-                    path: file_path.clone(),
-                    reason: format!("fingerprint failed: {e}"),
-                })?;
-                let new_fp_id = self.upsert_fingerprint(
-                    &fp,
-                    Some(track.sample_rate()),
-                    Some(u32::from(track.channels())),
-                    None,
-                )?;
-                let attached = self.attach_fingerprint(track_id, new_fp_id, fp.duration_ms())?;
-                if attached {
-                    new_fp_id
-                } else {
-                    // A concurrent caller won the race. Re-read the
-                    // winning id from `tracks`. (Cheaper than
-                    // re-computing and the `fingerprints` row we
-                    // just inserted becomes an orphan, which the
-                    // future "Find duplicates" tool / a v1.x
-                    // sweeper can garbage-collect.)
-                    self.connection()
-                        .query_row(
-                            "SELECT fingerprint_id FROM tracks WHERE id = ?1",
-                            params![track_id],
-                            |r| r.get::<_, Option<i64>>(0),
-                        )
-                        .map_err(|e| LibraryError::sqlite("reread_fingerprint_after_race", e))?
-                        .ok_or_else(|| LibraryError::TrackHasNoFingerprint {
-                            track_id: track_id.to_string(),
-                        })?
-                }
-            }
-        };
-
-        // ---- Beat grid (M11c.1, contract M11d.7 round 3) --------
-        // PRD-BEATS §3.5 lock-is-absolute already gated us above:
-        // by the time we get here `grid_locked == false` and the
-        // user has explicitly asked for analysis. Any prior
-        // `user_tap` row is demoted unconditionally — the new
-        // auto run replaces it. This is the "re-analyze is a
-        // pure reset" contract from PRD-BEATS §4 (user actions
-        // table, "Re-analyze" row) and §4.6 idempotence: we never
-        // carry tap-derived BPM forward into the next auto pass.
-        let mut outcome = AnalysisOutcome::EMPTY;
-        let demoted = self.deactivate_user_tap_beatgrid(track_id)?;
-        if demoted > 0 {
-            eprintln!(
-                "dub-library: reanalyze demoted {demoted} active user_tap \
-                 row(s) on unlocked track {track_id} — auto grid will \
-                 claim is_active=1"
-            );
-        }
         // Genre is a pure octave-profile hint (M11c.3d). A failure
         // to read it (missing `track_metadata_source` row, NULL
         // column, or a SQLite error) must NOT abort analysis —
         // the worst that happens with no genre is we fall back to
         // `OctaveProfile::Default`, which is the profile used for
-        // every track that never had an ID3 tag to begin with.
-        // Pre-fix this branch could surface a `LibraryError::sqlite
-        // (analyze_lookup_genre, …)` for any weirdness in the
-        // metadata table and the user saw "Analysis failed for
-        // track: …" instead of a successful analysis (PRD-BEATS
-        // §4.4 contract: re-analyze is a pure reset, must succeed
-        // on any track that decodes).
+        // every track that never had an ID3 tag to begin with
+        // (PRD-BEATS §4.4 contract: re-analyze is a pure reset,
+        // must succeed on any track that decodes).
         let profile = match self.track_id3_genre(track_id) {
             Ok(g) => g
                 .as_deref()
@@ -347,60 +453,125 @@ impl Library {
                 dub_bpm::OctaveProfile::Default
             }
         };
-        let grid = dub_bpm::analyze_beat_grid_with_profile(
-            track.samples(),
-            track.sample_rate(),
-            track.channels(),
-            profile,
-        )
-        .map_err(|e| LibraryError::DecodeFailed {
+        Ok(AnalysisJob {
             track_id: track_id.to_string(),
-            path: file_path.clone(),
-            reason: format!("beat-grid analysis failed: {e}"),
-        })?;
+            existing_fingerprint_id,
+            file_path,
+            profile,
+        })
+    }
 
-        if grid.confidence > 0.0 {
-            let anchor_secs = grid.beats.first().copied().unwrap_or(0.0);
+    /// Write phase of [`Self::analyze_track`]: persist everything
+    /// [`analyze_compute`] produced. Cheap (a handful of indexed
+    /// upserts + one small sidecar file write) — this is the only
+    /// phase a serializing caller needs to hold its lock for.
+    ///
+    /// Re-checks the grid lock first: the user can toggle it while
+    /// the compute phase runs unlocked, and lock-is-absolute means
+    /// a mid-flight lock must win over the in-flight analysis.
+    pub fn analyze_commit(
+        &self,
+        job: &AnalysisJob,
+        computed: AnalysisComputed,
+    ) -> Result<AnalysisOutcome> {
+        let track_id = job.track_id.as_str();
+        if self.is_grid_locked(track_id)? {
+            return Err(LibraryError::GridLocked {
+                track_id: track_id.to_string(),
+            });
+        }
+
+        // ---- Fingerprint attach (M11c.4) -------------------------
+        // The race window (two concurrent analyse calls on the same
+        // UUID) is closed by `attach_fingerprint`'s
+        // `WHERE fingerprint_id IS NULL` guard: the loser's UPDATE
+        // matches zero rows and we read the winner's id back from
+        // `tracks`.
+        let fingerprint_id = match (job.existing_fingerprint_id, computed.fingerprint) {
+            (Some(id), _) => id,
+            (None, Some(cf)) => {
+                let new_fp_id =
+                    self.upsert_fingerprint(&cf.fp, Some(cf.sample_rate), Some(cf.channels), None)?;
+                let attached = self.attach_fingerprint(track_id, new_fp_id, cf.fp.duration_ms())?;
+                if attached {
+                    new_fp_id
+                } else {
+                    // A concurrent caller won the race. Re-read the
+                    // winning id from `tracks`. (Cheaper than
+                    // re-computing; the `fingerprints` row we just
+                    // inserted becomes an orphan a v1.x sweeper can
+                    // garbage-collect.)
+                    self.connection()
+                        .query_row(
+                            "SELECT fingerprint_id FROM tracks WHERE id = ?1",
+                            params![track_id],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )
+                        .map_err(|e| LibraryError::sqlite("reread_fingerprint_after_race", e))?
+                        .ok_or_else(|| LibraryError::TrackHasNoFingerprint {
+                            track_id: track_id.to_string(),
+                        })?
+                }
+            }
+            (None, None) => {
+                // `analyze_compute` always fills `fingerprint` when
+                // the job had none — reaching here means the caller
+                // mixed a job with someone else's computed payload.
+                return Err(LibraryError::TrackHasNoFingerprint {
+                    track_id: track_id.to_string(),
+                });
+            }
+        };
+
+        // ---- Beat grid (M11c.1, contract M11d.7 round 3) --------
+        // Any prior `user_tap` row is demoted unconditionally — the
+        // new auto run replaces it. This is the "re-analyze is a
+        // pure reset" contract from PRD-BEATS §4 and §4.6
+        // idempotence: we never carry tap-derived BPM forward into
+        // the next auto pass. Demotion now happens at commit (not
+        // before compute), so an analysis that fails mid-flight no
+        // longer strands the track without its user_tap grid.
+        let mut outcome = AnalysisOutcome::EMPTY;
+        let demoted = self.deactivate_user_tap_beatgrid(track_id)?;
+        if demoted > 0 {
+            eprintln!(
+                "dub-library: reanalyze demoted {demoted} active user_tap \
+                 row(s) on unlocked track {track_id} — auto grid will \
+                 claim is_active=1"
+            );
+        }
+        if let Some(grid) = computed.grid {
             let other_grid_active = self.has_non_auto_active_grid(track_id)?;
             let grid_auto_is_active = !other_grid_active;
             self.upsert_auto_beatgrid(
                 track_id,
-                anchor_secs,
+                grid.anchor_secs,
                 grid.bpm,
                 grid.bar_phase,
                 grid_auto_is_active,
             )?;
             outcome.bpm = grid.bpm;
-            outcome.anchor_secs = anchor_secs;
+            outcome.anchor_secs = grid.anchor_secs;
             outcome.bpm_confidence = grid.confidence;
             outcome.grid_auto_is_active = grid_auto_is_active;
             outcome.wrote_grid = true;
-            if let Some(quality) = grid.quality.as_ref() {
-                // Auto-lock disabled (user feedback: silent
-                // freezes after an auto-pass were hostile — locks
-                // now happen only when the user explicitly toggles
-                // them via the BPM right-click menu or the library
-                // row context menu). Persist the drift slope so
-                // the "⚠" indicator still appears on suspect
-                // grids, but don't touch `grid_locked`.
-                self.set_grid_drift_quality(track_id, Some(quality.drift_slope_ms_per_min))?;
+            if let Some(drift) = grid.drift_slope_ms_per_min {
+                // Auto-lock disabled (user feedback: silent freezes
+                // after an auto-pass were hostile — locks now happen
+                // only when the user explicitly toggles them).
+                // Persist the drift slope so the "⚠" indicator
+                // still appears on suspect grids, but don't touch
+                // `grid_locked`.
+                self.set_grid_drift_quality(track_id, Some(drift))?;
             }
         }
 
         // ---- Key (M11c.2) ----------------------------------------
-        let key = dub_spectral::analyze_key(track.samples(), track.sample_rate(), track.channels())
-            .map_err(|e| LibraryError::DecodeFailed {
-                track_id: track_id.to_string(),
-                path: file_path.clone(),
-                reason: format!("key analysis failed: {e}"),
-            })?;
-
-        if key.confidence > 0.0 {
-            let camelot = key.camelot();
+        if let Some(key) = computed.key {
             let other_key_active = self.has_non_auto_active_key(track_id)?;
             let key_auto_is_active = !other_key_active;
-            self.upsert_auto_key(track_id, camelot, key.confidence, key_auto_is_active)?;
-            outcome.camelot = camelot;
+            self.upsert_auto_key(track_id, key.camelot, key.confidence, key_auto_is_active)?;
+            outcome.camelot = key.camelot;
             outcome.tonic_pc = key.tonic_pc;
             outcome.is_major = key.is_major;
             outcome.key_confidence = key.confidence;
@@ -409,45 +580,37 @@ impl Library {
         }
 
         // ---- Waveform sidecar (PRD-BEATS C1, round 4) ------------
-        // Pre-render the broadband / band / onset / filtered peak
-        // streams the engine will need when a deck loads this
-        // track, and persist them to
-        // `~/Library/Caches/Dub/waveforms/{fingerprint_id}.wf`.
-        // The engine's `background_analyze_and_install` consults
-        // the same path on every load and short-circuits the
-        // 100–300 ms `compute_offline_peaks` pass on hit, which is
-        // exactly the "instant waveform" contract from PRD-BEATS
-        // §4.5. Best-effort: any failure (cache dir unwritable,
-        // disk full, `OfflinePeaksError` on a zero-length track)
-        // is logged and analysis still returns success — BPM + key
-        // are the contract here; the sidecar is a perf cache.
-        let sidecar_path = self.write_waveform_sidecar(fingerprint_id, &track);
+        // Persist the pre-rendered peak streams to
+        // `~/Library/Caches/Dub/waveforms/{fingerprint_id}.wf`. The
+        // engine's `background_analyze_and_install` consults the
+        // same path on every load and short-circuits the
+        // 100–300 ms `compute_offline_peaks` pass on hit — the
+        // "instant waveform" contract from PRD-BEATS §4.5.
+        let sidecar_path = computed
+            .peaks
+            .as_ref()
+            .and_then(|peaks| self.write_waveform_sidecar_from_peaks(fingerprint_id, peaks));
 
         // ---- Loudness / auto-gain (store-only) -------------------
-        // Measure integrated LUFS (BS.1770-4) + sample peak in this
-        // same decode pass and persist them to `analysis_cache`. The
-        // value is **store-only**: it is consumed the *next* time the
-        // track is loaded (`dub-ffi::load_track` reads it back via
+        // Persist integrated LUFS (BS.1770-4) + sample peak to
+        // `analysis_cache`. The value is **store-only**: it is
+        // consumed the *next* time the track is loaded
+        // (`dub-ffi::load_track` reads it back via
         // [`Self::track_normalization_gain`] and applies the derived
         // gain once at load time). It is deliberately never pushed to
         // a deck that is already playing this track — retroactively
         // jumping the level of a tune live in front of an audience is
         // unacceptable, so a track analysed while it plays is
         // normalized only on its subsequent loads.
-        let loudness = dub_dsp::measure_integrated_loudness(
-            track.samples(),
-            track.sample_rate(),
-            u16::from(track.channels()),
-        );
-        self.stamp_loudness(fingerprint_id, loudness.lufs_i, loudness.sample_peak_dbfs)?;
+        self.stamp_loudness(fingerprint_id, computed.lufs_i, computed.sample_peak_dbfs)?;
 
         // Stamp `analysis_cache` exactly once. `has_active_grid` and
         // `has_active_key` reflect whether the auto pass landed the
         // active row (so they can be `1` here but get flipped to `0`
         // later if an importer claims the active slot — that's
-        // tracked separately by `stamp_analysis_cache_after_import`
-        // when those importers land in M11e). `sidecar_path` and
-        // `has_waveform` mirror the C1 sidecar write outcome above.
+        // tracked separately by `stamp_analysis_cache_after_import`).
+        // `sidecar_path` + `has_waveform` mirror the C1 sidecar
+        // write outcome above.
         self.stamp_analysis_cache(
             fingerprint_id,
             outcome.grid_auto_is_active,
@@ -458,32 +621,21 @@ impl Library {
         Ok(outcome)
     }
 
-    /// Compute and persist the waveform sidecar for `fingerprint_id`
-    /// from a freshly-decoded `track`. Returns the absolute path on
-    /// success so the caller can stamp `analysis_cache`.
+    /// Persist a pre-computed waveform sidecar for `fingerprint_id`.
+    /// Returns the absolute path on success so the caller can stamp
+    /// `analysis_cache`.
     ///
-    /// **Best-effort.** All errors (peaks compute failure, missing
-    /// cache dir, disk full) are logged and the function returns
-    /// `None` — BPM + key analysis is the contract of
-    /// [`Self::analyze_track`]; the sidecar is a perf cache and a
-    /// missed write degrades to a slow first load, not a broken
-    /// one. The engine treats a missing sidecar as a cache miss
-    /// and recomputes on demand.
-    fn write_waveform_sidecar(&self, fingerprint_id: i64, track: &dub_io::Track) -> Option<String> {
-        let peaks = match dub_peaks::compute_offline_peaks(
-            track.samples(),
-            track.sample_rate(),
-            track.channels(),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "dub-library: skipping waveform sidecar for fingerprint \
-                     {fingerprint_id} (peaks compute failed: {e})"
-                );
-                return None;
-            }
-        };
+    /// **Best-effort.** All errors (missing cache dir, disk full)
+    /// are logged and the function returns `None` — BPM + key
+    /// analysis is the contract of [`Self::analyze_track`]; the
+    /// sidecar is a perf cache and a missed write degrades to a
+    /// slow first load, not a broken one. The engine treats a
+    /// missing sidecar as a cache miss and recomputes on demand.
+    fn write_waveform_sidecar_from_peaks(
+        &self,
+        fingerprint_id: i64,
+        peaks: &dub_peaks::OfflinePeaks,
+    ) -> Option<String> {
         let path = match self.waveforms_cache_dir() {
             Ok(dir) => dir.join(format!("{fingerprint_id}.wf")),
             Err(e) => {
@@ -494,7 +646,7 @@ impl Library {
                 return None;
             }
         };
-        if let Err(e) = dub_peaks::write_sidecar(&path, &peaks) {
+        if let Err(e) = dub_peaks::write_sidecar(&path, peaks) {
             eprintln!(
                 "dub-library: failed to write waveform sidecar for fingerprint \
                  {fingerprint_id} at {}: {e}",
@@ -2464,6 +2616,51 @@ mod tests {
             .expect("tap row must still be active");
         assert_eq!(post.source, "user_tap");
         assert!((post.bpm - 120.5).abs() < 1e-9);
+    }
+
+    /// PRD-BEATS §3.5 lock-is-absolute across the three-phase split:
+    /// the compute phase runs with no library lock held, so the user
+    /// can toggle the grid lock while it's in flight. Commit must
+    /// re-check and refuse — a mid-analysis lock wins over the
+    /// in-flight result, and nothing is written (no auto row, no
+    /// user_tap demotion, no `analysis_cache` stamp).
+    #[test]
+    fn analyze_commit_refuses_grid_lock_flipped_during_compute() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 8.0);
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 120.5, 0)
+            .unwrap();
+
+        let job = lib.analyze_prepare(&track_id).unwrap();
+        let computed = analyze_compute(&job).unwrap();
+        lib.set_grid_locked(&track_id, true).unwrap();
+
+        let err = lib.analyze_commit(&job, computed).err();
+        assert!(
+            matches!(err, Some(LibraryError::GridLocked { .. })),
+            "mid-compute lock flip must refuse the commit; got {err:?}"
+        );
+
+        let post = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("tap row must still be active after the refusal");
+        assert_eq!(post.source, "user_tap");
+        let auto_rows: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM track_beatgrids \
+                 WHERE track_id = ?1 AND source = 'auto'",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_rows, 0, "refused commit must not write the auto row");
+        assert!(
+            !lib.is_track_analyzed(&track_id).unwrap(),
+            "refused commit must not stamp analysis_cache"
+        );
     }
 
     #[test]

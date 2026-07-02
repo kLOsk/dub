@@ -1783,13 +1783,15 @@ final class WaveformAppModel: ObservableObject {
 
         finalizeBeatgridSessionIfNeeded(side: side, deck: target)
 
-        let preloadedGrid = libraryBeatGridForPendingLoad(url: url)
-
         // Optimistic UI: header pill flips to LOADING + new file
-        // basename appears before the decode work starts. We clear
+        // basename appears before ANY other work — including the
+        // library lookups below. Those are sub-ms when the library
+        // lock is free, but a busy library (batch import, an
+        // analysis commit) can hold it briefly; the pill must not
+        // stay frozen in its pre-load state while we wait. We clear
         // the old tag-derived title / artist so the header doesn't
         // show stale metadata from the previous track during the
-        // ~50 ms decode window.
+        // decode window.
         var starting = target
         starting.isLoading = true
         starting.sourceURL = url
@@ -1803,7 +1805,7 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridBpm = nil
         starting.autoGridAnchorSecs = nil
         starting.autoGridCaptured = false
-        starting.beatGridLoadSource = preloadedGrid?.source ?? "pending_auto"
+        starting.beatGridLoadSource = "pending_auto"
         starting.manualGridEditCount = 0
         // Loading a new track drops any engaged echo-out — otherwise the deck
         // stays muted (100 % wet) and the fresh track is silent until the
@@ -1814,6 +1816,13 @@ final class WaveformAppModel: ObservableObject {
         starting.echoDivision = nil
         tapToGrid(for: side).cancel()
         setState(starting, for: side)
+
+        let preloadedGrid = libraryBeatGridForPendingLoad(url: url)
+        if let source = preloadedGrid?.source {
+            var pending = state(for: side)
+            pending.beatGridLoadSource = source
+            setState(pending, for: side)
+        }
 
         let deckIdx = side.ffiDeckIdx
         let engineRef = engine
@@ -2866,7 +2875,15 @@ final class WaveformAppModel: ObservableObject {
         // `trackId` String; it doesn't need `self`. Reaching back
         // to the actor-isolated instance across the actor boundary
         // is done via the inner closure's own weak capture.
-        Task.detached(priority: .background) {
+        //
+        // `.utility`, not `.background`: on Apple silicon
+        // `.background` pins the decode + DSP pass to E-cores and
+        // throttles its I/O, stretching a multi-second analysis
+        // 2–4×. The pass no longer holds the library lock while it
+        // computes, but the user is still waiting on its result
+        // (BPM badge, next-load auto-gain), so give it E/P
+        // scheduling latitude.
+        Task.detached(priority: .utility) {
             let result: Result<LibraryAnalysisOutcome, Error>
             do {
                 let outcome = try library.analyzeTrack(trackId: trackId)

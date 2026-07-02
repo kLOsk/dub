@@ -19,6 +19,42 @@
   on in-`load_track` beat-grid analysis; an O(N²) blowup in `SpectralFrameStream`
   turned a "~100 ms" doc-comment into multi-second stalls. Decode + peaks +
   grid all run off the load path now. PRD §6.4.
+- **"Load never blocks playback" also means the DECODE.** The synchronous
+  whole-file decode in `load_track` scaled with track length — measured on a
+  real 70-minute 320 kbps mixtape: **11.6 s before the deck could play**
+  (release build, ~363× realtime; the "~50 ms for a 4-minute MP3" doc-comment
+  was off by ~13×; *measure, don't trust comments*). The fix is decode-ahead:
+  decode ~4 s of head synchronously, pre-allocate the full buffer from the
+  container's declared frame count, stream the tail on a `dub-decode-{idx}`
+  thread behind an atomic watermark (`dub-io::SampleStore`). `Track::frame`
+  clamps to the watermark, so a playhead past the frontier renders silence and
+  self-heals — the engine transport needed **zero** changes because
+  out-of-range-reads-silence was already `frame()`'s contract. Same mixtape
+  now playable in 1.1 s (buffer-allocation-bound); 4-minute tune in ~70 ms.
+  Two invariants to keep: streaming vs one-shot decode is pinned
+  **byte-identical** by test, and `#![forbid(unsafe_code)]` survives because
+  the streaming buffer stores f32 *bit patterns in `AtomicU32`s* (Relaxed
+  element loads are plain moves on every target we ship; the Release/Acquire
+  watermark orders them) — don't "optimise" it into `UnsafeCell` + raw slices.
+  Consequence for offline analysis: a streaming track can't borrow `&[f32]`
+  (`samples()` returns empty); tap-to-grid copies the decoded prefix
+  (`samples_for_offline_analysis`), the uncached worker paths park until the
+  tail lands (`FullSamples`). Container without a declared frame count / rate
+  / channels falls back to the old one-shot decode transparently.
+- **Never hold the library mutex across an O(track-length) pass.**
+  `dub-ffi::DubLibrary` serializes everything behind one `Mutex`;
+  `analyze_track` used to hold it for the whole decode + fingerprint + BPM +
+  key + peaks + loudness pass (seconds to tens of seconds, at `.background`
+  QoS = E-cores, stretching it further). Every deck-load lookup on the main
+  actor (`active_beat_grid`, `track_normalization_gain`, `track_path`, hot
+  cues, history) queued behind it — loads froze for the remaining analysis
+  time of the *previous* track, which read as "loading takes forever and
+  scales with track length". Fix: three-phase split (`analyze_prepare` locked
+  read → `analyze_compute` **lock-free** → `analyze_commit` locked write),
+  commit re-checks the grid lock (lock-is-absolute survives the unlocked
+  window), analysis runs at `.utility`. Pattern to keep: any Library call
+  that decodes or scans audio must take the lock only around its reads and
+  writes, never around the DSP.
 - **Prove RT-equivalence with byte-identical regression tests.** When you
   refactor the render path (e.g. `render` → `render_routed`), pin it with a test
   that asserts the old callers are byte-for-byte unchanged, and run the whole

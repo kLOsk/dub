@@ -59,7 +59,9 @@ mod traktor_import;
 mod version_tokens;
 mod volumes;
 
-pub use analysis::{ActiveBeatgrid, AnalysisOutcome};
+pub use analysis::{
+    analyze_compute, ActiveBeatgrid, AnalysisComputed, AnalysisJob, AnalysisOutcome,
+};
 pub use cues::HotCue;
 pub use db::{
     CrateRow, FavoriteSlot, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay,

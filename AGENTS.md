@@ -37,7 +37,9 @@ we are **not** building a controller-only DJ app (no Serato/rekordbox territory)
 4. **Reliability over features.** A crash on stage ends a DJ's career night.
    We accept ~20–30 % slower velocity to never ship a show-stopper.
 5. **Forward and backward playback are byte-for-byte symmetric.** Manual rewinds
-   are first-class. Whole tracks are decoded into RAM on load.
+   are first-class. Whole tracks are decoded into RAM on load (decode-ahead:
+   playback starts once the head is resident; the tail streams in behind an
+   atomic watermark at hundreds of times realtime — PRD §4.4 / §6.4).
 6. **The audio thread is sacred.** No alloc, no lock, no syscall, no logging,
    no I/O, no `unwrap()`, no `dyn Trait` heap allocation. Enforced at compile
    time via `RealtimeContext` token + at runtime via `assert_no_alloc`.

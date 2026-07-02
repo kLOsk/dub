@@ -2489,6 +2489,81 @@ mod tests {
         });
     }
 
+    #[test]
+    fn streaming_track_renders_alloc_free_and_holds_silence_past_watermark() {
+        // Progressive load (PRD §6.4): the deck plays a track whose
+        // tail is still decoding on a background thread. Reads below
+        // the decode watermark are real audio, reads past it are
+        // silence (`Track::frame`'s out-of-range contract), and the
+        // render path stays alloc-free — the watermark is an atomic
+        // load, not a lock. Once the tail lands, the same position
+        // self-heals to audio.
+        let path = std::env::temp_dir().join("dub-engine-test-streaming.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..48_000 {
+                w.write_sample(16_000i16).unwrap();
+                w.write_sample(16_000i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let mut streaming = Track::begin_streaming(&path).unwrap();
+        streaming.decode_until_secs(0.1).unwrap();
+        let track = Arc::new(streaming.track());
+        assert!(
+            !track.is_fully_decoded(),
+            "precondition: tail still pending"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let past_watermark = track.decoded_frames() as f64 + 1_000.0;
+
+        let mut deck = test_deck();
+        deck.set_source(track.clone());
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.quiesce_declick_for_test();
+
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        assert_no_alloc::assert_no_alloc(|| {
+            deck.render(&mut rt, &mut out, 48_000.0);
+        });
+        assert!(
+            out.iter().any(|s| s.abs() > 0.1),
+            "audio below the watermark must be audible"
+        );
+
+        deck.set_position_frames(past_watermark);
+        deck.quiesce_declick_for_test();
+        out.fill(0.0);
+        assert_no_alloc::assert_no_alloc(|| {
+            deck.render(&mut rt, &mut out, 48_000.0);
+        });
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-6),
+            "positions past the watermark must render silence"
+        );
+
+        streaming.finish().unwrap();
+        assert!(track.is_fully_decoded());
+        deck.set_position_frames(past_watermark);
+        deck.quiesce_declick_for_test();
+        out.fill(0.0);
+        deck.render(&mut rt, &mut out, 48_000.0);
+        assert!(
+            out.iter().any(|s| s.abs() > 0.1),
+            "the same position must self-heal to audio once the tail lands"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // === M14 key lock ===
 
     fn kl_sine_track(freq: f32, frames: usize) -> Arc<Track> {
