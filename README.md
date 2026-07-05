@@ -130,10 +130,10 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **PRD-BEATS hardening** | ✅ shipped | Uniform Traktor-style beat grid + M11d.6 calibration; tap-to-grid, explicit `bar_phase` (schema v5), relatch "set the 1"; beat-grid robustness rounds 5–10 (universal downbeat, set-the-1 contract, `OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose` CLI; waveform + beat-grid jitter killed end to end. | [`PRD-BEATS.md`](docs/spec/PRD-BEATS.md) |
 | **Manual crates** | ✅ shipped | User-created Dub crates (PRD §8.5.1): create, inline-rename, delete, drag tracks in, remove, and reorder (drag-to-reorder + context-menu move). A `#` manual-order column drives the order; reorder is enabled only in manual order, and clicking any other column header sorts the crate as a read-only view. SQLite `crates` / `crate_tracks` CRUD + ordering, FFI surface (FFI **29**), editable "Dub Crates" sidebar section. | [`PRD.md §8.5.1`](docs/spec/PRD.md#851-source-tree) |
 | **M11d-history → loops** | ✅ shipped | Played From / Played Into session history (`SessionTracker`, FFI 37); timecode-display rate = audible (xwax/Mixxx parity; ±8 anchor-warp deleted); PRD-BEATS round 11 (visual kick-edge grid, set-the-1 re-anchor, first-measurable-beat downbeat); **hot cues** (performance cues — FFI 38); **reverse loops** (internal-play — FFI 39); Stillpoint beatmatch aid (was "Phase-Drift Trail"). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **next** | ◻ planned | Serato importer, customizable browser columns, export (rekordbox XML / M3U8), then Looping polish → Key Lock → Smart FX → Sampler. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
+| **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), timecode-correct looping, then Sampler → Polish/Alpha. Importers, Key Lock (WSOLA), Echo-Out, and the Dub Siren have shipped. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **39** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **52** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 

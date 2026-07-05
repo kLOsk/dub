@@ -32,7 +32,7 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; the current applied version is **6**.
+v1.0 baseline is **version 1**; the current applied version is **9**.
 Each bump is additive (new tables / columns with safe defaults / indexes),
 so a third-party reader that ignores the new columns keeps working. Any
 change to the table set, column set, indexes, FTS5 definition, or trigger

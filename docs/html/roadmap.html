@@ -621,14 +621,14 @@
             <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a> · <a href="../spec/LIBRARY-FORMATS.md">LIBRARY-FORMATS.md</a></div>
         </div>
 
-        <div class="ms" data-tags="planned" data-filter-text="M11d-columns customizable browser columns">
+        <div class="ms" data-tags="planned" data-filter-text="M11d-columns customizable browser columns per-source disagreement">
             <div class="ms__head">
                 <span class="ms__id">M11d-columns</span>
-                <span class="ms__name">Customizable browser columns + per-source disagreement view</span>
-                <span class="pill pill--planned">Planned · 3–4 days</span>
+                <span class="ms__name">Column data plumbing + per-source disagreement view</span>
+                <span class="pill pill--planned">Planned · 2–3 days</span>
             </div>
-            <div class="ms__body"><strong>Demo:</strong> User can choose visible columns, inspect source-specific metadata, and see analysis vs source disagreements without paying query cost for disabled columns.</div>
-            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12</a></div>
+            <div class="ms__body"><strong>Re-scoped 2026-07-05:</strong> the column-picker UI (grouped picker, persistence, header reorder, Key column) already shipped with the library rounds. What remains is the data plumbing: <code>LibraryColumnId</code> FFI registry + dynamic SELECT, per-source metadata columns (<code>serato_bpm</code>, <code>traktor_key</code>, …), analysis extras (auto vs active BPM/key, LUFS), audio-file + mix-history groups, and the BPM source-vs-Dub ⚠. <strong>Demo:</strong> enable <code>serato_bpm</code> next to <code>bpm_auto</code>, sort by disagreement, fix outliers in bulk.</div>
+            <div class="ms__meta"><a href="../spec/PRD.md#12-milestones">PRD.md §12 · §8.5.3.1</a></div>
         </div>
 
         <div class="ms" data-tags="planned" data-filter-text="M11f export rekordbox xml m3u m3u8">

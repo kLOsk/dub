@@ -981,6 +981,25 @@ A user-defined smart-crate rule builder is parked until v1.x at the earliest. Th
 
 ##### 8.5.3.1 Customizable columns
 
+**Status (2026-07-05).** The UI infrastructure is **shipped** (it landed
+quietly across the library rounds rather than as a labelled milestone):
+header right-click picker with grouped categories, `@AppStorage`
+persistence, header drag-to-reorder, and the active-priority columns —
+Title / Artist / Length / BPM / **Key** / Album / Genre / Year / Comment /
+Composer / Track # / Version / Source / Rating / Colour
+(`LibraryColumnField` in `LibraryView.swift`). What **remains** — and is
+what the M11d-columns milestone in §12.1 now means — is the data plumbing
+for the deeper groups in the table below: the stable `LibraryColumnId`
+FFI registry, the dynamically generated SELECT (disabled columns must
+cost zero query time), the per-source metadata group, the analysis extras
+(`bpm_auto` vs `bpm_active`, `key_auto` vs `key_active`, `lufs_i`,
+`true_peak`, `prepared`), the audio-file group, the aggregated
+mix-history group, `date_added` / `in_crates` / sortable dupes-missing,
+and the BPM-column source-vs-Dub ⚠ badge (the FFI already computes
+`key_disagreement`; the BPM predicate + both renderings are owed). The
+per-source disagreement view is the priority slice: it is the
+migration-trust feature for DJs arriving from Serato.
+
 Right-click any column header → context menu, grouped by category, checkable items per available column. Choices persist in `~/Library/Application Support/Dub/preferences.json` as **one global column set** across all sidebar sources (v1.0 simplification; per-source layouts deferred to v1.x if real use warrants the persistence-key + crate-rename plumbing). Column order persists via the same mechanism; widths via SwiftUI's built-in `TableColumn.width`.
 
 The available columns are exposed across the FFI as a stable Rust enum `LibraryColumnId` with serde-stable string names (so preferences round-trip across schema updates without churn), grouped as:
@@ -1442,28 +1461,34 @@ observably do at the end.
 | **PRD-BEATS hardening** | Uniform Traktor-style grid + calibration; tap-to-grid + explicit `bar_phase` (schema v5) + relatch "set the 1"; robustness rounds 5–10 (`OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose`; waveform/beat-grid jitter killed end to end. | [`PRD-BEATS.md`](PRD-BEATS.md) |
 | **M11d-next** | Manual crates (playlists, §8.5.1): create / inline-rename / delete (cascade) / drag-add / remove / drag-to-reorder + context-menu reorder; `crates` + `crate_tracks` CRUD + ordering, FFI 29, editable "Dub Crates" sidebar. A `#` manual-order column (`crate_ordinal` on the row) is the crate's default sort and the only state where reorder is enabled; other column sorts render a read-only view, leaving manual order composable into future multi-column sorting. Nested crates deferred. | §8.5.1 |
 | **M11d-history** | Played From / Played Into, v1.0 stage (§8.5.2): `SessionTracker` handover-inferred transitions (min-play gate + duplicate suppression, `LIBRARY-SCHEMA.md`), full `play_history` event capture (load / play_start / play_end / transition pair, `session_id` per app run), `played_into` + `session_history` queries, FFI 37, deck-header "↝ usually" hint (§9.5 row 3), Session History smart crate with "← from" annotations. | §8.5.2 |
+| **Hot cues + reverse loops** | Four CUE pads (set / recall / clear, keys 1–4, persisted per track, waveform markers; §6.2.1) + grid-snapped "repeat the bars just heard" reverse loops (½/1/2/4 bar, internal-play / Prep only — timecode-correct looping still owed, §14 #8). | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M11e, M12b–d** | External-library importers: Serato (DB / crates / GEOB grids-cues-loops-keys-gain), Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML export. Idempotent by `(volume, path)`, shared track identity, playlist mirrors. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M12e → M12f** | Collection membership (browse-only sources until played, schema v7) + energy-map overview; ratings / colour labels / favourites strip / dynamic cascading filter bar (schema v8). Also shipped from the M11d-columns scope: header right-click column picker (grouped, persisted, header drag-to-reorder) over the active-priority columns incl. Key — see §8.5.3.1 for what remains. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M14** | Key Lock + scratch-aware auto-bypass — shipped as a **pure-Rust WSOLA** stretcher (`dub-stretch`), not Rubber Band; the GPL dep was dropped after benching (pitch parity, better transients + latency). | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M15 → M16** | Echo-out (tap-toggle, 100 % wet) + the dub siren instrument (GS1 / DS01E / SN76477 units, onboard PT2399 echo, Simple / Advanced / Expert) + vintage-chip FX DSP chain (parked behind the post-release FX-deck role). Load-latency round: streaming decode-ahead (mixtape playable in ~1 s) + lock-free library analysis. | [`SHIPPED.md`](../history/SHIPPED.md) |
 
 ### 12.1 Planned path to v1.0
 
+_Rebased 2026-07-05: the importer block (M11e / M12b–d), M12e–f, M13's
+reverse-loop half, M14, M15, and M16 have shipped — see §12.0 and
+[`SHIPPED.md`](../history/SHIPPED.md). What follows is the remaining work
+only. M11d-columns was re-scoped the same day: its UI infrastructure
+(picker / persistence / header reorder / Key column) shipped quietly with
+the library rounds, so the milestone now covers only the data plumbing —
+see §8.5.3.1._
+
 | # | Name | Demo criterion | Estimate |
 | --- | --- | --- | --- |
-| **M11e** | **Serato importer** | Read Serato DB/crates/GEOB tags, populate source metadata, beatgrids, keys, imported crates, cues, and loops. | 4–5 days |
-| **M11d-columns** | **Customizable browser columns + per-source disagreement view** | User can choose visible columns, inspect source-specific metadata, and see analysis/source disagreements without paying query cost for disabled columns. | 3–4 days |
+| **M11d-columns** | **Column data plumbing + per-source disagreement view** | The remaining §8.5.3.1 column groups exist end-to-end: stable `LibraryColumnId` FFI registry + dynamically generated SELECT (disabled columns cost zero query time), per-source metadata columns (`serato_bpm`, `traktor_key`, …), analysis extras (`bpm_auto` vs `bpm_active`, `key_auto` vs `key_active`, `lufs_i`, `true_peak`), audio-file group, aggregated mix-history group, `date_added` / `in_crates`, and the BPM-column source-vs-Dub ⚠ (the FFI already computes `key_disagreement`). Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
-| **M12a** | **rekordbox XML importer** | Read user-exported rekordbox XML; DB6 `master.db` remains v1.1 scope. | 2 days |
-| **M12b** | **Traktor NML importer** | Read `collection.nml` and populate metadata, beatgrids, and imported playlists. | 2 days |
-| **M12c** | **iTunes XML importer** | Read `Library.xml` for playlists and ratings; BPM is expected to be sparse. | 1–2 days |
-| **M12d** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
-| **M13** | **Looping** | Manual and auto-loop, halve/double, behave correctly under timecode. | 4–6 days |
-| **M14** | **Key Lock + auto-bypass** | Rubber Band integrated per deck, with scratch-aware auto-bypass. | 1 week |
-| **M15** | **Smart FX: Echo-Out** | Tap-and-hold echo-out works on both decks, including Thru decks. | 4–5 days |
-| **M16** | **Smart FX: Dub Siren** | Dub siren synth + delay + reverb are keyboard-controllable. | 3–4 days |
+| **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
+| **M13 (remainder)** | **Timecode-correct looping** | Loops behave correctly under timecode control (§14 #8); manual loop in/out + halve/double on top of the shipped reverse-loop engine. | 3–4 days |
 | **M17** | **Sampler + Quick Scratch + Instant Doubles** | All three trigger systems work per §7. | 4–6 days |
-| **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. | 2–3 weeks |
+| **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases; feature-frozen for v1.0 with hotfix discipline active. | 2–4 weeks, gated by gig time |
 | **M20** | **v1.0 Stable Release** | §2.2.6 SLOs met, DMG published, README/docs/demo ready. | 3–5 days once SLOs pass |
 
-**Aggregate:** still approximately 20–26 weeks of focused work for v1.0,
+**Aggregate:** approximately 8–12 weeks of focused work remain for v1.0,
 including beta-gated promotion. The Beta → Stable gap is deliberately variable:
 we ship Stable when the SLOs are met, not on a calendar.
 
