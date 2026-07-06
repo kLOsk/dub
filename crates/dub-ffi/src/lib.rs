@@ -42,7 +42,7 @@ use dub_bpm::{
     GridQuality as CoreGridQuality, OctaveProfile,
 };
 use dub_engine::{
-    reverse_loop_region, DeckSharedState, Engine, EngineHandle, ThruInputConfig,
+    reverse_loop_region, DeckSharedState, Engine, EngineHandle, ThruInputConfig, ThruTaps,
     TimecodeInputConfig, INTERNAL_MIXER_ROUTING,
 };
 use dub_io::{
@@ -58,6 +58,13 @@ use dub_peaks::{
 // bindings depend on. Must be called exactly once per UniFFI-exporting
 // crate.
 uniffi::setup_scaffolding!();
+
+mod rip;
+
+pub use rip::{
+    DubRipSession, RawInputDevice, RipFfiError, RipJobProgress, RipPhase, RipSegment,
+    RipSegmentJob, RipSegmentJobState, RipSessionConfig, RipSessionStatus, RipSplit, RipStopReason,
+};
 
 /// FFI surface version. Bump when adding or removing exported symbols.
 ///
@@ -339,7 +346,28 @@ uniffi::setup_scaffolding!();
 ///       `sync_beats` + `bpm` args: when `sync_beats > 0` the siren's slap-back
 ///       echo time is overridden to that tempo division (resolved off-RT),
 ///       else the preset's own echo is used.
-pub const FFI_VERSION: u32 = 52;
+///   53. **M26a vinyl rip.** [`DubEngine`] grows
+///       [`DubEngine::start_thru_for_rip`] (a `start_thru` flavour that
+///       also wires the stereo record tap on deck 0 — the tap can only
+///       be requested at Thru-attach time) and
+///       [`DubEngine::create_rip_session`], which hands the pending tap
+///       to a new [`DubRipSession`] object (start / stop / cancel /
+///       status / generation / envelope_len / envelope_extend / split
+///       CRUD with stable ids / segments / set_segment_metadata /
+///       confirm_encode_and_import / job_progress / session_dir), plus
+///       the `Rip*` records + enums and the flat [`RipFfiError`].
+///       Polling only, per house style; the encode + import commit runs
+///       on a named `dub-rip-commit` worker thread and `status()`
+///       surfaces the FFI-level `Encoding` / `Done` phases while it
+///       runs. Live per-segment encode progress lands with M26b.
+///   54. **M26a rip dev fallback.** [`DubEngine::list_raw_input_devices`]
+///       exposes the pre-classifier HAL input list (name, channel
+///       count, is-default) so DEBUG builds can record from the
+///       built-in microphone when the Developer mode override is
+///       engaged. Production pickers keep using
+///       [`DubEngine::list_audio_devices`], which stays
+///       classifier-filtered.
+pub const FFI_VERSION: u32 = 54;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -781,6 +809,17 @@ struct RunningState {
     /// `None` in output-only / File-only mode (M10.5).
     #[allow(dead_code)]
     input: Option<AudioInput>,
+    /// M26a — pending per-deck record-tap consumers. The engine's
+    /// record tap can only be requested when the `ThruSource` is
+    /// attached (the `AudioInput` consumer is take-once and a
+    /// re-attach displaces the old source), so
+    /// [`DubEngine::start_thru_for_rip`] requests it up front and
+    /// parks the consumer end here until
+    /// [`DubEngine::create_rip_session`] takes it for the capture
+    /// worker. Dropped with the session on `stop_thru` — the
+    /// producer side dies with the `ThruSource`, so a rip in
+    /// progress sees `InputLost` and keeps what it captured.
+    record_taps: [Option<ringbuf::HeapCons<f32>>; 2],
     /// Engine sample rate (= output device SR). May differ from a
     /// File-mode track's source SR — the engine resamples on render
     /// (PRD §4.4). File-mode peaks carry their own SR so the
@@ -1085,6 +1124,7 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Thru,
+            false,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1143,6 +1183,7 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Thru,
+            false,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1188,6 +1229,7 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Timecode,
+            false,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -1245,6 +1287,7 @@ impl DubEngine {
             output_device_uid.as_deref(),
             &self.deck_shared,
             PerfSource::Timecode,
+            false,
         )?;
         *state = EngineState::Running(Box::new(running));
         self.bump_peak_generation(0);
@@ -4538,6 +4581,7 @@ fn start_thru_inner(
     output_device_uid: Option<&str>,
     deck_shared: &[Arc<DeckSharedState>; 2],
     source_mode: PerfSource,
+    rip_record_tap: bool,
 ) -> Result<RunningState, EngineError> {
     // ----- 1. Build InputOptions ------------------------------------
     // Convert 1-based user-facing channel indices to 0-based
@@ -4636,6 +4680,7 @@ fn start_thru_inner(
     // attached because the waveform follows the loaded track's file
     // peaks (installed by `load_track`).
     let mut peaks: [Option<PeakSource>; 2] = [None, None];
+    let mut record_taps: [Option<ringbuf::HeapCons<f32>>; 2] = [None, None];
 
     match source_mode {
         PerfSource::Thru => {
@@ -4644,11 +4689,45 @@ fn start_thru_inner(
                 input_sample_rate: input_sr_f32,
             };
             let peaks_cfg_a = PeakStreamConfig::at(input_sr);
-            let peaks_stream_a = handle
-                .attach_thru_source_with_peaks_tracking(0, consumer_a, thru_cfg, peaks_cfg_a)
-                .map_err(|e| {
-                    EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}"))
-                })?;
+            let peaks_stream_a = if rip_record_tap {
+                // M26a rip flavour: same ThruSource + peaks tracking as
+                // the plain path, plus the stereo record tap — it must
+                // be requested here because the input consumer is
+                // take-once and a later re-attach would displace this
+                // source. The consumer end parks on `RunningState`
+                // until `create_rip_session` claims it.
+                let mut handles = handle
+                    .attach_thru_source_with_taps(
+                        0,
+                        consumer_a,
+                        thru_cfg,
+                        ThruTaps {
+                            bpm: None,
+                            peaks: Some(peaks_cfg_a),
+                            record: true,
+                        },
+                    )
+                    .map_err(|e| {
+                        EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}"))
+                    })?;
+                record_taps[0] = handles.record_rx.take();
+                if record_taps[0].is_none() {
+                    return Err(EngineError::AudioStartFailed(
+                        "record tap missing from thru attach".to_string(),
+                    ));
+                }
+                handles.peaks.take().ok_or_else(|| {
+                    EngineError::AudioStartFailed(
+                        "peaks stream missing from thru attach".to_string(),
+                    )
+                })?
+            } else {
+                handle
+                    .attach_thru_source_with_peaks_tracking(0, consumer_a, thru_cfg, peaks_cfg_a)
+                    .map_err(|e| {
+                        EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}"))
+                    })?
+            };
             peaks[0] = Some(PeakSource::Live {
                 stream: peaks_stream_a,
                 sample_rate: input_sr,
@@ -4698,6 +4777,7 @@ fn start_thru_inner(
         output,
         input: Some(input),
         sample_rate: input_sr,
+        record_taps,
     })
 }
 
@@ -4764,6 +4844,7 @@ fn start_engine_inner(
         output,
         input: None,
         sample_rate,
+        record_taps: [None, None],
     })
 }
 
@@ -4994,7 +5075,11 @@ mod tests {
         // `siren_unit_preset_names`; `set_siren_controls` gains FILTER + ECHO CUT.
         // 51→52: `SirenUnit` becomes Gs1 / Ds01e / Sn76477 (HK628 unit renamed
         // GS1; SN76477 chip added as a third unit with its own preset bank).
-        assert_eq!(FFI_VERSION, 52);
+        // 52→53: M26a vinyl rip — `start_thru_for_rip` + `create_rip_session`
+        // on `DubEngine`, the `DubRipSession` object (capture lifecycle,
+        // envelope, split CRUD, segment metadata, commit worker + job
+        // progress), the `Rip*` records / enums, and `RipFfiError`.
+        assert_eq!(FFI_VERSION, 54);
     }
 
     #[test]

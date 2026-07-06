@@ -113,8 +113,26 @@ struct PerformanceView: View {
             sampleRate: model.engine.sampleRate(),
             isRunning: model.isRunning,
             lastError: model.lastError,
+            modeSwitch: modeSwitchState,
+            onSelectMode: { mode in
+                model.setModeOverride(mode)
+            },
             openPreferences: openPreferences,
             openAbout: openAbout)
+    }
+
+    /// M26a — the manual PREP / PERF switch appears only while the
+    /// vinyl-recording feature is on and a DJ interface is present
+    /// (auto-detect rules everything else). Disabled while a rip
+    /// flow is live so a stray click can't tear the capture down —
+    /// finish or discard the rip first.
+    private var modeSwitchState: ModeSwitchState? {
+        guard model.vinylRecordingEnabled,
+              !model.performanceDevices.isEmpty
+        else { return nil }
+        return ModeSwitchState(
+            mode: model.engineMode,
+            isEnabled: model.ripPhase == .none)
     }
 
     // MARK: - Deck header derivation
@@ -228,10 +246,51 @@ struct PerformanceView: View {
     /// `VStack` layout from jumping when a track loads.
     @ViewBuilder
     private var prepOverviewBand: some View {
-        if Self.overviewEnabled {
-            TrackOverviewView(model: model, side: .a, deckIdx: 0,
-                              orientation: .horizontal)
+        if model.ripPhase == .capture, let session = model.ripSession {
+            // M26a — while a rip records, the overview slot shows the
+            // live capture envelope instead of the (empty) deck-A
+            // overview. Same wire format + decimator as the overview,
+            // so the growing shape matches what review shows.
+            RipLiveOverview(fetchEnvelope: { startIdx in
+                session.envelopeExtend(startIdx: startIdx)
+            })
+        } else if Self.overviewEnabled {
+            ZStack {
+                TrackOverviewView(model: model, side: .a, deckIdx: 0,
+                                  orientation: .horizontal)
+                // M26a — split-marker editing over the loaded spill
+                // during rip review. Shares the overview's fraction
+                // grid (`OverviewLayout.endPadding`).
+                if model.ripPhase == .review {
+                    RipSplitMarkerOverlay(
+                        markers: model.ripSplits.map {
+                            RipMarkerUi(id: $0.id, secs: $0.secs)
+                        },
+                        durationSecs: ripSideDurationSecs,
+                        callbacks: RipSplitOverlayCallbacks(
+                            addSplit: { secs in model.addRipSplit(atSecs: secs) },
+                            moveSplit: { id, secs in
+                                model.moveRipSplit(id: id, toSecs: secs)
+                            },
+                            removeSplit: { id in model.removeRipSplit(id: id) },
+                            audition: { secs in
+                                model.ripAudition(fromSecs: secs - 3)
+                            },
+                            scrub: { secs in
+                                model.seekDeck(side: .a, absoluteSecs: secs)
+                            }))
+                }
+            }
+            .frame(height: DubLayout.deckOverviewHeight)
         }
+    }
+
+    /// Side duration for the marker overlay — deck A's loaded spill
+    /// once the audition load lands, falling back to the segment
+    /// plan's end while the decode is still in flight.
+    private var ripSideDurationSecs: Double {
+        if model.deckA.durationSecs > 0 { return model.deckA.durationSecs }
+        return model.ripSegments.last?.endSecs ?? 0
     }
 
     /// Prep-mode pad bar under the waveform. Prep is the prepare-and-
@@ -245,7 +304,31 @@ struct PerformanceView: View {
     /// strip.
     @ViewBuilder
     private var prepPadBar: some View {
+        Group {
+            if showsRipReviewPanel {
+                // M26a — rip review / encode replaces the pad rows
+                // while the recorded side is split, tagged, imported.
+                RipReviewPanel(
+                    state: ripReviewPanelState,
+                    callbacks: ripReviewPanelCallbacks)
+            } else {
+                prepPadRows
+            }
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DubColor.surface0)
+    }
+
+    @ViewBuilder
+    private var prepPadRows: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            // M26a — vinyl rip control row (idle / recording / failed
+            // states; review + encoding replace the whole bar above).
+            if let ripBarState {
+                PrepRipBar(state: ripBarState, callbacks: ripBarCallbacks)
+            }
             CuePadRow(
                 cues: model.deckA.hotCues,
                 onCue: { index, clear in
@@ -294,10 +377,119 @@ struct PerformanceView: View {
             // turntable.
             PitchTestView(model: model, side: .a)
         }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.sm)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DubColor.surface0)
+    }
+
+    // MARK: - Vinyl rip state mapping (M26a)
+
+    /// Review / encoding (and their terminal states) replace the pad
+    /// rows with the review panel; a capture failure with nothing
+    /// recorded stays in the compact bar.
+    private var showsRipReviewPanel: Bool {
+        switch model.ripPhase {
+        case .review, .encoding, .done:
+            return true
+        case .failed:
+            return !model.ripSegments.isEmpty
+        case .none, .capture:
+            return false
+        }
+    }
+
+    /// `nil` hides the rip row entirely (feature off / no interface).
+    private var ripBarState: PrepRipBarState? {
+        switch model.ripPhase {
+        case .none:
+            guard model.canStartRipCapture else { return nil }
+            return PrepRipBarState(phase: .idle)
+        case .capture:
+            return PrepRipBarState(
+                phase: .recording,
+                elapsedSecs: model.ripStatus?.elapsedSecs ?? 0,
+                levelPeak: model.ripStatus?.levelPeak ?? 0)
+        case .failed:
+            return PrepRipBarState(
+                phase: .failed,
+                errorMessage: model.ripStatus?.error ?? "Recording failed.")
+        case .review, .encoding, .done:
+            // The review panel owns these phases.
+            return nil
+        }
+    }
+
+    private var ripBarCallbacks: PrepRipBarCallbacks {
+        PrepRipBarCallbacks(
+            onRecord: { model.startRipCapture() },
+            onStop: { model.stopRip() },
+            onDismiss: { model.dismissRip() },
+            onDiscard: { model.dismissRip() })
+    }
+
+    private var ripReviewPanelState: RipReviewPanelState {
+        let mode: RipReviewPanelState.Mode
+        switch model.ripPhase {
+        case .encoding: mode = .encoding
+        case .done:     mode = .done
+        case .failed:   mode = .failed
+        default:        mode = .review
+        }
+        let segments = model.ripSegments.map { seg in
+            RipSegmentUi(
+                index: seg.index,
+                startSecs: seg.startSecs,
+                endSecs: seg.endSecs,
+                title: seg.title ?? "",
+                artist: seg.artist ?? "",
+                album: seg.album ?? "",
+                genre: seg.genre ?? "",
+                year: seg.year.map(String.init) ?? "")
+        }
+        var dots: [RipJobDot] = []
+        if let jobs = model.ripJobs, !jobs.perSegment.isEmpty {
+            // M26a reports coarse progress: pending segments read as
+            // "running" (amber) while the commit worker is alive.
+            dots = jobs.perSegment
+                .sorted { $0.index < $1.index }
+                .map { job in
+                    switch job.state {
+                    case .pending: return jobs.running ? .running : .pending
+                    case .done:    return .done
+                    case .failed:  return .failed
+                    }
+                }
+        }
+        let status: String?
+        switch mode {
+        case .encoding:
+            status = "Encoding \(segments.count) track\(segments.count == 1 ? "" : "s")…"
+        case .failed:
+            status = model.ripStatus?.error ?? "Some tracks failed to import."
+        case .review, .done:
+            status = nil
+        }
+        return RipReviewPanelState(
+            mode: mode,
+            sideDurationSecs: ripSideDurationSecs,
+            segments: segments,
+            jobDots: dots,
+            overallStatus: status)
+    }
+
+    private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
+        RipReviewPanelCallbacks(
+            addSplitAtPlayhead: { model.addRipSplitAtPlayhead() },
+            audition: { secs in model.ripAudition(fromSecs: secs) },
+            setMetadata: { index, meta in
+                model.setRipSegmentMetadata(
+                    index: index,
+                    title: meta.title.isEmpty ? nil : meta.title,
+                    artist: meta.artist.isEmpty ? nil : meta.artist,
+                    album: meta.album.isEmpty ? nil : meta.album,
+                    genre: meta.genre.isEmpty ? nil : meta.genre,
+                    year: Int32(meta.year.trimmingCharacters(in: .whitespaces)))
+            },
+            cancel: { model.cancelRip() },
+            encode: { model.confirmRip() },
+            retry: { model.confirmRip() })
     }
 
     /// **M11d.6 round 13 jitter-isolation toggle.** Set to `false`

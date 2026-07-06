@@ -617,6 +617,56 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kCueSnapToGrid = "dub.cueSnapToGridEnabled"
 
+    /// M26a vinyl-recording feature toggle (Preferences ▸ Recording).
+    /// When on — and a DJ interface is present — Prep mode grows a
+    /// RIP VINYL row in the pad bar and the status strip shows a
+    /// manual PREP / PERF mode switch so a DJ can hop into Prep to
+    /// record a side without unplugging the interface. Default off.
+    /// Persisted in `UserDefaults` under `dub.vinylRecordingEnabled`.
+    @Published var vinylRecordingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                vinylRecordingEnabled, forKey: Self.kVinylRecording)
+        }
+    }
+
+    private static let kVinylRecording = "dub.vinylRecordingEnabled"
+
+    /// M26a manual Prep ↔ Performance override, persisted so the
+    /// choice survives a relaunch. `nil` = follow hardware
+    /// auto-detect (the shipping default). Non-nil wins over
+    /// auto-detect **only while a DJ interface is present and the
+    /// vinyl-recording toggle is on**; unplugging the interface
+    /// clears it (see `reevaluateModeForDeviceChange`), so the
+    /// fail-safe fallback is always auto-Prep.
+    ///
+    /// The `didSet` only persists. Mode re-detection + the engine
+    /// restart go through `setModeOverride(_:)` so the hot-plug
+    /// path can clear the override without triggering a second
+    /// restart.
+    @Published private(set) var modeOverride: EngineMode? {
+        didSet {
+            if let mode = modeOverride {
+                UserDefaults.standard.set(mode.rawValue, forKey: Self.kModeOverride)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.kModeOverride)
+            }
+        }
+    }
+
+    private static let kModeOverride = "dub.modeOverride"
+
+    /// User-facing setter for the status-strip PREP / PERF switch.
+    /// Re-runs detection and restarts the engine exactly like the
+    /// hot-plug auto-detect transition (there is deliberately no
+    /// separate teardown path to fork).
+    func setModeOverride(_ mode: EngineMode?) {
+        guard modeOverride != mode else { return }
+        modeOverride = mode
+        applyAutoDetect()
+        applyConfig()
+    }
+
     /// M15 echo-out feature toggle (Preferences ▸ FX). When on, each deck's
     /// pads show a single ECHO OUT button (1-beat, 100 % wet, PRD §6.3). When
     /// off, the button is hidden and any engaged echo is dropped. Default on.
@@ -708,6 +758,46 @@ final class WaveformAppModel: ObservableObject {
     /// Master deck per PRD §6.4 (sticky single-master). `nil` only
     /// while the engine is stopped.
     @Published private(set) var masterDeck: DeckSide? = nil
+
+    // MARK: Vinyl rip (M26a)
+    //
+    // Stored state for the rip lifecycle; the methods live in
+    // `WaveformAppModel+Rip.swift`. Everything below is only ever
+    // touched on the main actor.
+
+    /// UI-facing rip lifecycle phase. `.none` when no rip flow is
+    /// active; drives which of PrepRipBar / RipLiveOverview /
+    /// RipSplitMarkerOverlay / RipReviewPanel are mounted.
+    @Published var ripPhase: RipUiPhase = .none
+
+    /// 10 Hz value snapshot of `ripSession.status()` (phase, elapsed,
+    /// level, stop reason, error). `nil` while no session exists.
+    @Published var ripStatus: RipUiStatus? = nil
+
+    /// Split markers / derived segments, refetched whenever the
+    /// session's generation counter moves (or immediately after a
+    /// successful local edit, for responsiveness).
+    @Published var ripSplits: [RipSplit] = []
+    @Published var ripSegments: [RipSegment] = []
+
+    /// Commit progress, polled while the encode + import worker runs.
+    @Published var ripJobs: RipJobProgress? = nil
+
+    /// Live FFI session handle. Not published — every UI-visible
+    /// consequence flows through the published mirrors above.
+    var ripSession: DubRipSession? = nil
+
+    /// 10 Hz poll driving the mirrors; alive only while
+    /// `ripSession != nil`.
+    var ripPollTimer: Timer? = nil
+    var ripLastGeneration: UInt64 = 0
+
+    /// Cancellable 6 s audition auto-pause (marker double-click /
+    /// segment-card audition buttons).
+    var ripAuditionTask: Task<Void, Never>? = nil
+
+    /// Auto-clears the `.done` confirmation back to `.none`.
+    var ripDoneClearTask: Task<Void, Never>? = nil
 
     // MARK: FS-browser selection (M10.5b)
 
@@ -935,6 +1025,15 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
         self.cueSnapToGridEnabled =
             UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
+        // M26a — vinyl recording defaults OFF, so plain `bool(forKey:)`
+        // ("unset" → false) is the correct cold-boot value. The mode
+        // override is rehydrated *before* `applyAutoDetect()` below so
+        // a persisted PREP pin takes effect on the first detection.
+        self.vinylRecordingEnabled =
+            UserDefaults.standard.bool(forKey: Self.kVinylRecording)
+        self.modeOverride = UserDefaults.standard
+            .string(forKey: Self.kModeOverride)
+            .flatMap(EngineMode.init(rawValue:))
         self.echoOutEnabled =
             UserDefaults.standard.object(forKey: Self.kEchoOutEnabled) as? Bool ?? true
         self.sirenEnabled =
@@ -1065,7 +1164,20 @@ final class WaveformAppModel: ObservableObject {
             return
         }
         #endif
-        engineMode = engine.hasExternalAudioInterface() ? .timecode : .prep
+        engineMode = detectEngineMode()
+    }
+
+    /// Hardware auto-detect + the M26a manual override. The override
+    /// (status-strip PREP / PERF switch) wins only while a DJ
+    /// interface is actually present *and* the vinyl-recording
+    /// feature is on; in every other case the hardware decides,
+    /// exactly as before.
+    private func detectEngineMode() -> EngineMode {
+        let hasInterface = engine.hasExternalAudioInterface()
+        if hasInterface, vinylRecordingEnabled, let override = modeOverride {
+            return override
+        }
+        return hasInterface ? .timecode : .prep
     }
 
     // MARK: Engine lifecycle
@@ -1131,7 +1243,11 @@ final class WaveformAppModel: ObservableObject {
     ///
     /// Prep mode never calls this, so a Mac with no DJ interface never
     /// sees the prompt.
-    private func ensureInputPermission(_ completion: @escaping @MainActor (Bool) -> Void) {
+    ///
+    /// Internal (not private) since M26a: the vinyl-rip capture path
+    /// (`WaveformAppModel+Rip.swift`) opens input capture from Prep
+    /// mode and must go through the same permission gate.
+    func ensureInputPermission(_ completion: @escaping @MainActor (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             // Already on the main actor (this method is @MainActor).
@@ -1228,7 +1344,17 @@ final class WaveformAppModel: ObservableObject {
         if devForcedMode != nil { return }
         #endif
 
-        let desired: EngineMode = engine.hasExternalAudioInterface() ? .timecode : .prep
+        // M26a — the manual PREP / PERF override only makes sense
+        // while the interface it targets is plugged in. Unplug →
+        // clear it (persisted too), so the fallback is plain
+        // auto-detect (Prep). Any live rip capture is handled by
+        // the Rust side (the record tap stops with `inputLost`)
+        // and the rip poll's stopped-phase transition.
+        if !engine.hasExternalAudioInterface(), modeOverride != nil {
+            modeOverride = nil
+        }
+
+        let desired = detectEngineMode()
         guard desired != engineMode else { return }
         engineMode = desired
         applyConfig()
@@ -1342,7 +1468,21 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    private func startPrep() {
+    /// M26a — flip the model's live-engine mirrors after the rip
+    /// capture path successfully opened its Thru engine (the same
+    /// bookkeeping `openTimecodeCapture` / `startPrep` do after
+    /// their FFI start calls; the setters are `private(set)` so the
+    /// rip extension can't write them directly).
+    func markEngineStartedForRipCapture() {
+        isRunning = true
+        twoDeckMode = false
+        masterDeck = .a
+        startPolling()
+    }
+
+    // Internal (not private) since M26a: the rip flow returns to the
+    // plain Prep output engine after a capture stops / cancels.
+    func startPrep() {
         do {
             // Prep mode: pin the output device by UID when the user
             // picked one in Preferences; otherwise fall through to
@@ -1392,7 +1532,9 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: Polling
 
-    private func startPolling() {
+    // Internal (not private) since M26a: the rip capture path starts
+    // its own Thru engine and wants the same deck-chrome poll.
+    func startPolling() {
         stopPolling()
         // Use a tolerance so the timer can coalesce with other
         // main-runloop work; 30 Hz is the *target*, slightly less

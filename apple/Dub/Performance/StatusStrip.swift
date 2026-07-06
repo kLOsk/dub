@@ -37,6 +37,12 @@ struct StatusStripState: Equatable {
     /// is being surfaced.
     let lastError: String?
 
+    /// M26a manual PREP / PERF mode switch. `nil` hides it (the
+    /// shipping default — hardware decides the mode). Non-nil only
+    /// when the vinyl-recording toggle is on and a DJ interface is
+    /// connected.
+    var modeSwitch: ModeSwitchState? = nil
+
     /// Sample rate formatted as "48.0 kHz" or `nil` if `0` (engine
     /// not running yet).
     var sampleRateText: String? {
@@ -44,6 +50,21 @@ struct StatusStripState: Equatable {
         let khz = Double(sampleRate) / 1000.0
         return String(format: "%.1f kHz", khz)
     }
+}
+
+/// M26a — state for the status-strip PREP / PERF segmented switch.
+/// Shown only while the vinyl-recording feature is on and a DJ
+/// interface is present; it drives `WaveformAppModel.modeOverride`
+/// so a DJ can hop into Prep mode to rip a record without
+/// unplugging the interface (PRD §3 auto-detect still rules every
+/// other case).
+struct ModeSwitchState: Equatable {
+    /// The engine mode currently in effect (highlights the segment).
+    let mode: EngineMode
+    /// `false` greys the switch out (e.g. while a rip capture or
+    /// encode is in flight — tearing the engine down mid-rip is
+    /// handled by the fail-safes, not by a stray click).
+    let isEnabled: Bool
 }
 
 /// Lightweight power-source snapshot. Built from
@@ -67,6 +88,9 @@ struct StatusStrip: View {
     /// Tap target for the wordmark → opens the About sheet. `nil`
     /// hides the affordance (previews / snapshot tests).
     let openAbout: (() -> Void)?
+    /// M26a — mode-switch tap target. `nil` renders the switch
+    /// inert (previews / snapshot tests).
+    var onSelectMode: ((EngineMode) -> Void)? = nil
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
@@ -79,6 +103,9 @@ struct StatusStrip: View {
                 errorBadge(err)
             }
             Spacer(minLength: 0)
+            if let modeSwitch = state.modeSwitch {
+                modeSwitchView(modeSwitch)
+            }
             clockView
             batteryView
             if let openPreferences {
@@ -88,6 +115,43 @@ struct StatusStrip: View {
         .padding(.horizontal, DubSpacing.lg)
         .frame(height: DubLayout.statusStripHeight)
         .background(DubColor.surface1)
+    }
+
+    /// M26a PREP / PERF segmented switch. Compact two-segment pill,
+    /// deliberately quiet chrome — it exists for the rip workflow,
+    /// not as a general mode picker (auto-detect still rules; the
+    /// override clears itself when the interface unplugs).
+    private func modeSwitchView(_ modeSwitch: ModeSwitchState) -> some View {
+        HStack(spacing: 2) {
+            modeSegment("PREP", mode: .prep, current: modeSwitch.mode)
+            modeSegment("PERF", mode: .timecode, current: modeSwitch.mode)
+        }
+        .padding(2)
+        .background(DubColor.surface2)
+        .clipShape(Capsule())
+        .opacity(modeSwitch.isEnabled ? 1.0 : 0.4)
+        .disabled(!modeSwitch.isEnabled)
+        .help("Switch between Track Preparation and Performance (vinyl recording)")
+    }
+
+    private func modeSegment(
+        _ label: String, mode: EngineMode, current: EngineMode
+    ) -> some View {
+        let isActive = mode == current
+        return Button {
+            onSelectMode?(mode)
+        } label: {
+            Text(label)
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(
+                    isActive ? DubColor.textPrimary : DubColor.textTertiary)
+                .padding(.horizontal, DubSpacing.sm)
+                .padding(.vertical, 2)
+                .background(isActive ? DubColor.surface3 : Color.clear)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     /// Inline error pill — same colour palette as the deck-pane
@@ -231,6 +295,9 @@ struct StatusStripContainer: View {
     let sampleRate: UInt32
     let isRunning: Bool
     let lastError: String?
+    /// M26a — see `ModeSwitchState`; `nil` hides the switch.
+    var modeSwitch: ModeSwitchState? = nil
+    var onSelectMode: ((EngineMode) -> Void)? = nil
     let openPreferences: () -> Void
     let openAbout: () -> Void
 
@@ -252,9 +319,11 @@ struct StatusStripContainer: View {
                 isRunning: isRunning,
                 clockText: clockText,
                 power: power,
-                lastError: lastError),
+                lastError: lastError,
+                modeSwitch: modeSwitch),
             openPreferences: openPreferences,
-            openAbout: openAbout)
+            openAbout: openAbout,
+            onSelectMode: onSelectMode)
             .onAppear(perform: refresh)
             .onReceive(tick) { _ in refresh() }
     }

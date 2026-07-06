@@ -39,18 +39,9 @@ import SwiftUI
 
 import DubCore
 
-/// One decimated value per overview bucket: the broadband `peak` +
-/// `rms` shape. The energy-map envelope (see `drawBars`) blends them
-/// (mostly RMS) so the loud/quiet structure reads — a breakdown dips,
-/// a drop rises — without a limited master saturating into a block.
-private struct OverviewBucket {
-    /// Outer envelope amplitude — `max(|min|, |max|)` across the
-    /// bucket's chunk range, clamped to `[0, 1]`.
-    var peak: Float
-    /// Inner RMS — averaged over the bucket's chunk range, also
-    /// clamped to `[0, 1]`. Always `<= peak` by construction.
-    var rms: Float
-}
+// `OverviewBucket` + the packed-chunk decimator moved to
+// `OverviewDecimator.swift` (M26a) so the vinyl-rip live overview can
+// share them. Behaviour is unchanged.
 
 /// Background padding around the bar field. The user-facing fix
 /// from the M10.5t "no warping at the start and end" feedback —
@@ -60,7 +51,11 @@ private struct OverviewBucket {
 /// dead-zone so a stray click at the very edge doesn't snap to
 /// `0` or `durationSecs` — clicks inside the padding are clamped
 /// to the nearest bar.
-private enum OverviewLayout {
+///
+/// Internal (not file-private) since M26a: `RipSplitMarkerOverlay`
+/// shares the same end padding so its markers land on the exact
+/// fraction grid the bars are drawn on.
+enum OverviewLayout {
     /// Padding (in points) reserved as dark background at each end
     /// of the time axis. 8 pt at 2× DPR = 16 device pixels = three
     /// bar widths at the default 480-bucket cap, so the empty
@@ -900,50 +895,8 @@ struct TrackOverviewView: View {
         // (computed offline at load time per M10.5a). One-shot per track
         // load (gated on `peaksGeneration`), so the full pull is fine.
         let data = model.engine.peaksExtend(deckIdx: deckIdx, startIdx: 0, maxChunks: 0)
-        buckets = Self.decimate(data: data, bucketCount: Self.bucketCount)
+        buckets = OverviewDecimator.decimate(data: data, bucketCount: Self.bucketCount)
         lastSeenGeneration = currentGen
-    }
-
-    /// Pure-function decimator. Takes the FFI's packed broadband
-    /// `PeakChunk` buffer (12 bytes: min, max, rms — three f32 little-
-    /// endian) and reduces it to `bucketCount` `OverviewBucket`s.
-    /// Per-bucket `peak` is `max(|min|, |max|)` across the chunk range;
-    /// `rms` is the RMS-of-RMS over the same range.
-    fileprivate static func decimate(data: Data, bucketCount: Int) -> [OverviewBucket] {
-        let stride = MemoryLayout<Float>.size * 3 // f32 × 3
-        let chunkCount = data.count / stride
-        guard chunkCount > 0, bucketCount > 0 else { return [] }
-        var out = [OverviewBucket](
-            repeating: OverviewBucket(peak: 0, rms: 0),
-            count: bucketCount)
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress else { return }
-            for b in 0..<bucketCount {
-                // `[start, end)` chunk indices for this bucket.
-                let start = (b * chunkCount) / bucketCount
-                let endRaw = ((b + 1) * chunkCount) / bucketCount
-                let end = max(start + 1, endRaw)
-                var peak: Float = 0
-                var rmsAccum: Float = 0
-                var rmsN: Int = 0
-                for i in start..<min(end, chunkCount) {
-                    let p = base.advanced(by: i * stride)
-                        .assumingMemoryBound(to: Float.self)
-                    let mn = p[0]
-                    let mx = p[1]
-                    let rms = p[2]
-                    let a = max(abs(mn), abs(mx))
-                    if a > peak { peak = a }
-                    rmsAccum += rms * rms
-                    rmsN += 1
-                }
-                let rmsAvg: Float = rmsN > 0
-                    ? (rmsAccum / Float(rmsN)).squareRoot()
-                    : 0
-                out[b] = OverviewBucket(peak: peak, rms: rmsAvg)
-            }
-        }
-        return out
     }
 }
 

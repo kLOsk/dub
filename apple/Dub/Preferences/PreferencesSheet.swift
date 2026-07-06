@@ -43,6 +43,7 @@ struct PreferencesSheet: View {
                     loadBehaviourSection
                     loudnessSection
                     cueSection
+                    recordingSection
                     fxSection
                     librariesSection
                 }
@@ -193,6 +194,29 @@ struct PreferencesSheet: View {
                 }
                 .toggleStyle(.switch)
                 Text("When on, setting a hot cue snaps the marker to the nearest beat line, so you can tap roughly on the beat and the cue lands clean. When off, the cue lands exactly at the playhead. Tracks with no analysed grid keep the raw position either way.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Recording (M26a vinyl rip)
+
+    /// Vinyl-recording feature toggle. When on, Prep mode grows a RIP
+    /// VINYL row and — while a DJ interface is connected — the status
+    /// strip shows a manual PREP / PERF switch so the DJ can hop into
+    /// Prep to record without unplugging.
+    private var recordingSection: some View {
+        section(title: "RECORDING") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Toggle(isOn: $model.vinylRecordingEnabled) {
+                    Text("Vinyl recording")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("Record a vinyl side through your DJ interface in Prep mode — a PREP / PERF switch appears in the top bar while an interface is connected.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -425,7 +449,7 @@ struct PreferencesSheet: View {
                 .pickerStyle(.menu)
                 .disabled(model.engineMode == .timecode && !model.isInternalMixer)
 
-                Text("Dev-only: forces the mode and pins devices so the performance UI can be exercised without a real DJ interface. Performance source picks how the decks are driven — Timecode (control vinyl → loaded file, the product behaviour), Thru (real-record live passthrough), or Internal (both decks summed to the built-in soundcard, no input, each playing its file on its own clock — the no-hardware dogfood path). The output picker applies to Track Preparation and Internal; in Timecode / Thru the master always returns through the interface itself (deck A → 3+4, deck B → 5+6). None of this ships in Release; production mode is hardware-derived only.")
+                Text("Dev-only: forces the mode and pins devices so the performance UI can be exercised without a real DJ interface. Performance source picks how the decks are driven — Timecode (control vinyl → loaded file, the product behaviour), Thru (real-record live passthrough), or Internal (both decks summed to the built-in soundcard, no input, each playing its file on its own clock — the no-hardware dogfood path). The output picker applies to Track Preparation and Internal; in Timecode / Thru the master always returns through the interface itself (deck A → 3+4, deck B → 5+6). While the override is engaged, Vinyl recording also works without an interface: it records from the pinned input or the built-in microphone (mono is duplicated to both channels) and monitors through the pinned or default output — mind the mic→speaker feedback loop. None of this ships in Release; production mode is hardware-derived only.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
