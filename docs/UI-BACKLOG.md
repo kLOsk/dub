@@ -373,6 +373,52 @@ false; the Preferences toggle was removed). Remaining:
 
 ---
 
+## 6. Vinyl rip (M26a shipped; deliberate gaps)
+
+### R-39. Live per-segment encode progress (M26b)
+
+**Symptom**: during Encode & Import the per-segment dots only flip when the
+whole commit pass finishes — `dub-rip`'s commit loop reports no mid-run
+progress, so the FFI `job_progress()` is coarse by design (documented on the
+method). **Remediation**: a progress sink on `commit_session` (per-segment
+callback), surfaced through `RipJobProgress` and the review-panel dots.
+**Location**: `crates/dub-rip/src/commit.rs`, `crates/dub-ffi/src/rip.rs`,
+`apple/Dub/Performance/RipReviewPanel.swift`.
+
+### R-40. Session recovery banner (M26b)
+
+**Symptom**: quitting mid-rip strands a salvageable session (`side.raw.wav` +
+`rip.json` survive by design) with no UI to resume it. **Remediation**: the
+planned `list_recoverable_rip_sessions` / `resume_rip_session` FFI + a quiet
+"Unfinished rip — Review / Discard" row above the rip bar on Prep entry.
+**Location**: `crates/dub-rip/src/session.rs` (needs a `from_session_dir`
+constructor), `crates/dub-ffi/src/rip.rs`, `apple/Dub/Performance/PrepRipBar.swift`.
+
+### R-41. Deck pane shows the idle placeholder during capture
+
+**Symptom**: while recording, only the overview band renders the live signal;
+the main deck pane sits on its placeholder (the deck has no loaded track in
+Thru-for-rip). **Remediation**: either render the live Metal Thru waveform
+(the peaks stream is already attached) or design an intentional capture
+backdrop. **Location**: `apple/Dub/Performance/PerformanceView.swift`
+(`waveformRegion` prep branch), `apple/Dub/Waveform/`.
+
+### R-42. Discogs token belongs in the Keychain (M26c)
+
+**Symptom**: the recognition increment will need a user-supplied Discogs
+token; there is no Keychain plumbing anywhere yet, and `UserDefaults` stores
+it in plain text. **Remediation**: minimal Keychain helper before M26c ships
+its Preferences fields. **Location**: `apple/Dub/Preferences/`.
+
+### R-43. Performance-mode ripping + monitor-mute option
+
+**Symptom**: rip is Prep-only by design (v1); with a ≥4-out interface in
+Performance mode the same tap could record a Thru deck live. Edge setups may
+also want the Mac-output monitor muted while ripping (the tap is pre-output,
+so recording is unaffected). **Remediation**: revisit after M26c; the FFI is
+mode-agnostic already. **Location**: `apple/Dub/Performance/WaveformAppModelRip.swift`,
+`crates/dub-ffi/src/rip.rs`.
+
 ---
 
 ## Closed (archive)

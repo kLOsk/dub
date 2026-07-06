@@ -777,7 +777,7 @@ through the priority chain.
 
 Per PRD §8.7, the Chromaprint algorithm parameters Dub uses are
 documented so a third party can re-derive Dub's fingerprints with
-any algorithm-2-faithful implementation.
+any TEST1-preset-faithful implementation.
 
 * **Crate**: `rusty-chromaprint` 0.3.x (pure-Rust, MIT/Apache) via
   `dub-fingerprint`. M11b chose this over an FFI wrapper around the
@@ -785,15 +785,20 @@ any algorithm-2-faithful implementation.
   documented in PRD §10.2: license isolation, no C build dep, no
   unsafe FFI surface, simpler distribution. The Chromaprint
   **algorithm** is unchanged; only the implementation crate differs.
-* **Algorithm**: Chromaprint algorithm 2 — the same one AcoustID
-  uses. `rusty_chromaprint::Configuration::preset_test1()` is the
-  invocation that materialises this preset.
+* **Algorithm**: the Chromaprint **TEST1** preset —
+  `rusty_chromaprint::Configuration::preset_test1()` is the
+  invocation that materialises it. Note this is *not* the preset
+  AcoustID's database is built on (that is TEST2): the stored blobs
+  serve library-internal dedupe, where self-consistency is all that
+  matters. An AcoustID lookup (M26c recognition, PRD §5.2.7 /
+  §12.2) computes a separate TEST2 fingerprint transiently from the
+  same PCM; the stored dedupe blobs are unchanged.
 * **Sample rate**: 11025 Hz. Multi-channel input is supported
   natively by the algorithm (we pass `channels = 1` or `2`); the
   Chromaprint algorithm internally collapses to mono before its
   chroma analysis.
-* **Frame size**: 4096 samples, 2/3 overlap. These are the algorithm-
-  2 defaults baked into the preset.
+* **Frame size**: 4096 samples, 2/3 overlap. These are the defaults
+  baked into the preset.
 * **Duration window**: full track. Long tracks are not truncated; the
   full fingerprint is what the §8.1 dedupe similarity comparison
   runs against.
@@ -819,7 +824,7 @@ The similarity comparison for dedupe (§8.1) is in
 * The threshold for auto-merge is `≥ 0.98` per PRD §8.1.
 
 A third-party reader can compare Dub-stored fingerprints with any
-algorithm-2-faithful implementation by deserialising the
+TEST1-preset-faithful implementation by deserialising the
 `chromaprint_blob` to `u32` items and running the same Hamming
 distance computation. Cross-implementation bit-identity is not
 guaranteed (the C library and `rusty-chromaprint` differ in the
@@ -837,6 +842,7 @@ that is preserved.
 | SHM companion | `~/Library/Application Support/Dub/library.sqlite-shm` |
 | Waveform sidecars (M10.5j → M11a) | `~/Library/Caches/Dub/waveforms/{fingerprint_hex}.wf` |
 | Per-session log | `~/Library/Logs/Dub/session.log` (per PRD §2.2.7) |
+| Rip sessions (M26, v1.1) | `~/Music/Dub/Rips/{YYYYMMDD-HHMMSS}/` — see "Rip session artifacts" below |
 
 The Caches directory is intentionally separate from Application
 Support: macOS treats `~/Library/Caches/Dub/` as evictable under disk
@@ -844,6 +850,38 @@ pressure, which is correct for the waveform sidecars (regeneratable
 from the audio files). The library database is in Application Support
 which macOS does not evict, which is correct for the user's
 irreplaceable Dub-crate / mix-history / tap-grid data.
+
+## Rip session artifacts (M26, v1.1)
+
+The M26 vinyl-rip pipeline (PRD §5.2.7) stores its per-side state on
+the file system, **not in the library schema** — the schema stays at
+version 9. Each rip gets one timestamped session directory (default
+parent `~/Music/Dub/Rips/`):
+
+| File | What |
+|---|---|
+| `rip.json` | Session manifest (below). Rewritten atomically — serialize to `rip.json.tmp`, fsync, rename — on **every** mutation, so a crash mid-rip loses at most the last edit, never the plan. |
+| `side.raw.wav` | 32-bit-float WAV capture spill, written incrementally while recording. Spill-to-disk, not RAM: a crash 24 minutes into a one-take rip leaves the audio on disk for salvage. Deleted **only after** every segment imported and the side archive was written. |
+| `NN Artist - Title.flac` | Per-track encodes (FLAC 24-bit). Imported **in place** through the standard single-file import (`import_file`), so the rows are ordinary tracks with ordinary path identity (`volumes` + `track_files`) — the session dir is the tracks' home. |
+| `side.flac` | Lossless 24-bit archive of the entire captured side, kept so splits can be redone (M26b re-split) without touching the record again. |
+
+**Manifest (`rip.json`, version 1).** Fields: `version` (the loader
+rejects newer versions rather than misreading them), `sample_rate`,
+`channels`, `recorded_frames`, `boundaries_frames` (split points in
+frames; N boundaries → N+1 segments), `tracks[]` (per segment:
+`meta` with the user/recognition metadata, `encoded_file` relative
+path once encoded, `library_uuid` once imported), and `side_archive`
+(relative path once written). Commit is an **idempotent retry**:
+segments that already carry a `library_uuid` are skipped, so a crash
+or per-segment failure mid-commit is resumed by running commit again.
+
+**Tagging convention.** Track provenance rides in the FLACs
+themselves as Vorbis comments following the MusicBrainz Picard field
+convention — including `MUSICBRAINZ_TRACKID`, `MUSICBRAINZ_ALBUMID`,
+and `DISCOGS_RELEASE_ID` (filled by M26c recognition; empty until
+then) — plus a front-cover `PICTURE` block. No rip-specific tables
+or columns exist: a third-party reader sees ripped tracks as normal
+tracks whose files happen to carry rich tags.
 
 ## Query examples
 

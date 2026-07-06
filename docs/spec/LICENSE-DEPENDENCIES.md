@@ -4,7 +4,7 @@ This document enumerates every external library Dub links against, with its lice
 
 The list is kept in sync with the workspace `Cargo.toml` and per-crate `Cargo.toml` files by hand. If you add, remove, or upgrade an external dependency, update this document in the same commit.
 
-Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-xml` for the Traktor NML / iTunes importers and `id3` + `base64` for the Serato GEOB importer).
+Last verified: M26a (workspace dependency-graph snapshot 2026-07; added `flacenc` + `metaflac` for the vinyl-rip encode stack, and promoted `serde` / `serde_json` from `dub-cli`-only to workspace-wide for the `rip.json` session manifest).
 
 ---
 
@@ -13,14 +13,14 @@ Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-x
 | License family | Crates | Obligation |
 |---|---|---|
 | MIT / Apache-2.0 dual-licensed | 22 | Reproduce the license text + copyright notice in distributed binaries. |
-| MIT | 8 | Reproduce the license text + copyright notice. |
-| Apache-2.0 | 1 | Reproduce the license text + copyright notice; preserve any `NOTICE` file. |
+| MIT | 9 | Reproduce the license text + copyright notice. |
+| Apache-2.0 | 2 | Reproduce the license text + copyright notice; preserve any `NOTICE` file. |
 | Unlicense / MIT | 1 | Reproduce the license text (either license satisfies). |
 | MPL-2.0 | 2 | File-level copyleft only. The library binary may ship inside a proprietary application; if the library's source files themselves are modified, the modified files must remain MPL-2.0 and be made available on request. Dub does not modify any MPL-2.0 source files. |
-| GPL-3.0-or-later | 0 (today) | None in the dep graph as of M11c. The workspace `license` field reserves GPL-3.0-or-later in anticipation of a future `rubberband` integration; see "Forward-looking license commitments" below. |
+| GPL-3.0-or-later | 0 (today) | None in the dep graph as of M26a. The workspace `license` field reserves GPL-3.0-or-later (originally in anticipation of a `rubberband` integration; M14 shipped pure-Rust WSOLA instead); see "Forward-looking license commitments" below. |
 | LGPL-2.1 / LGPL-3.0 | 0 | Two LGPL FFIs (`chromaprint`, `aubio`) were explicitly routed around in favour of pure-Rust replacements (`rusty-chromaprint`, `dub-bpm`). See PRD §10.2 + `docs/SHIPPED.md` M7.5 / M11b. |
 
-**Net effect.** Every external dependency wired into Dub today is permissive or file-level copyleft only. Nothing in the actual dependency graph contaminates a downstream binary with a viral copyleft obligation. The project is free to be relicensed at any point before the planned M14 `rubberband` integration lands.
+**Net effect.** Every external dependency wired into Dub today is permissive or file-level copyleft only. Nothing in the actual dependency graph contaminates a downstream binary with a viral copyleft obligation. The project remains free to be relicensed — no GPL dependency is in the graph or currently planned (M14 shipped pure-Rust WSOLA instead of `rubberband`). The M26 vinyl-rip encode stack was deliberately chosen pure-Rust / permissive (`flacenc` Apache-2.0, `metaflac` MIT); MP3 via LAME (LGPL-2.0-or-later) was evaluated and deferred — see "Forward-looking license commitments" — so this posture is **unchanged**.
 
 ---
 
@@ -78,8 +78,25 @@ Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-x
 * **Version:** 3
 * **License:** Apache-2.0
 * **Upstream:** https://github.com/ruuda/hound
-* **Role in Dub:** WAV writer. Used by `dub-cli` for offline-render output (`dub render --to-wav`) and by tests for synthetic WAV fixture generation. Not part of the engine.
-* **Used by:** `dub-cli`, test-only in `dub-io`, `dub-library`, `dub-engine`
+* **Role in Dub:** WAV writer. Used by `dub-cli` for offline-render output (`dub render --to-wav`), by `dub-rip` for the M26 crash-safe 32-bit-float capture spill (`side.raw.wav`), and by tests for synthetic WAV fixture generation. Not part of the engine.
+* **Used by:** `dub-cli`, `dub-rip`, test-only in `dub-io`, `dub-library`, `dub-engine`
+
+### `flacenc`
+
+* **Version:** 0.5, `default-features = false`
+* **License:** Apache-2.0
+* **Upstream:** https://github.com/yotarok/flacenc-rs
+* **Role in Dub:** Pure-Rust FLAC encoder for the M26 vinyl-rip pipeline: per-track encodes and the lossless side archive (`side.flac`), both 24-bit. Chosen over an MP3/LAME route specifically so the encode stack stays permissive and the dependency-graph posture is unchanged — see "MP3 / LAME" under forward-looking commitments.
+* **Used by:** `dub-encode`
+* **Notes:** flacenc shrinks StreamInfo's `min_block_size` to the short final frame, which symphonia then rejects as a variable-blocksize stream. `dub-encode` forces `min_block_size == max_block_size` after encoding (as libFLAC does); the workaround is documented at the call site in `crates/dub-encode/src/encode.rs`.
+
+### `metaflac`
+
+* **Version:** 0.2
+* **License:** MIT
+* **Upstream:** https://github.com/jameshurst/rust-metaflac
+* **Role in Dub:** Vorbis-comment + PICTURE (front-cover) tagging on the FLACs the M26 rip pipeline encodes. Fields follow the MusicBrainz Picard convention, including `MUSICBRAINZ_TRACKID`, `MUSICBRAINZ_ALBUMID`, and `DISCOGS_RELEASE_ID`, so M26c recognition writes provenance into the files themselves rather than into the library schema (see `LIBRARY-SCHEMA.md`).
+* **Used by:** `dub-encode`
 
 ---
 
@@ -99,7 +116,7 @@ Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-x
 * **Version:** 0.3
 * **License:** MIT/Apache-2.0
 * **Upstream:** https://github.com/0xcaff/rusty-chromaprint
-* **Role in Dub:** Pure-Rust port of Lukáš Lalinský's Chromaprint algorithm (algorithm 2, the same one AcoustID uses). Used by `dub-fingerprint` for library deduplication (PRD §8.1) and reserved for real-record recognition (PRD §5.2.5, v1.1).
+* **Role in Dub:** Pure-Rust port of Lukáš Lalinský's Chromaprint algorithm. Used by `dub-fingerprint` for library deduplication (PRD §8.1, TEST1 preset — see `LIBRARY-SCHEMA.md` "Fingerprint parameters") and reserved for real-record recognition (PRD §5.2.5, v1.1). AcoustID's database is built on TEST2, so the planned M26c AcoustID lookup computes a separate TEST2 fingerprint transiently; stored dedupe blobs are unchanged.
 * **Used by:** `dub-fingerprint`
 * **Transitively pulls:** `rubato` (MIT) for internal resampling to the 11025 Hz target rate. Not directly used by Dub.
 * **Notes:** PRD §10.2 documents the M11b decision to use this crate instead of FFI-binding the reference C library (`chromaprint`, LGPL-2.1) for license isolation, no C build dependency, no unsafe FFI surface, and simpler distribution.
@@ -220,8 +237,8 @@ Last verified: M12c (workspace dependency-graph snapshot 2026-06; added `quick-x
 * **Version:** 1
 * **License:** MIT/Apache-2.0
 * **Upstream:** https://github.com/serde-rs/serde, https://github.com/serde-rs/json
-* **Role in Dub:** Structured output and configuration in `dub-cli` (e.g. `dub analyze --json`). Not used in the engine or library data paths.
-* **Used by:** `dub-cli`
+* **Role in Dub:** Structured output in `dub-cli` (e.g. `dub analyze --json`) and, since M26, the crash-safe `rip.json` session manifest in `dub-rip` — session state that must survive a crash mid-rip, which promoted `serde` from a `dub-cli`-only dependency to the workspace set. Still not used in the engine or the library's SQLite data path.
+* **Used by:** `dub-cli`, `dub-rip`
 
 ### `time`
 
@@ -309,7 +326,19 @@ These are not in the dep graph today. They are documented here so future work kn
 
 * **License:** LGPL-2.1
 * **Status:** Replaced at M11b by `rusty-chromaprint` (MIT/Apache-2.0).
-* **Reason:** Same set of reasons as aubio. The pure-Rust port implements algorithm 2 at full fidelity; Dub's library-internal dedupe use case does not require cross-implementation bit-identity with the reference C library, so the FFI route was unnecessary.
+* **Reason:** Same set of reasons as aubio. The pure-Rust port implements the Chromaprint presets at full fidelity; Dub's library-internal dedupe use case does not require cross-implementation bit-identity with the reference C library, so the FFI route was unnecessary.
+
+### MP3 / LAME (evaluated and deferred, M26)
+
+* **License:** LGPL-2.0-or-later (LAME itself and the Rust binding crates around it)
+* **Status:** Deliberately not linked. The M26 vinyl-rip encode stack ships FLAC-only (`flacenc`, Apache-2.0 + `metaflac`, MIT).
+* **Reason:** An MP3-320 rip export would have made LAME the first non-permissive library actually linked into Dub. FLAC is lossless, encodable in pure Rust under a permissive license, and symphonia already decodes it — the rip use case is fully covered at zero license cost. Revisit only if real users demand MP3 export for interop with other players.
+
+### `ureq` (planned, M26c)
+
+* **License:** MIT/Apache-2.0 (rustls TLS chain: also permissive)
+* **Upstream:** https://github.com/algesten/ureq
+* **Planned role in Dub:** HTTP client for the planned `dub-recognize` leaf crate — AcoustID lookup, MusicBrainz release-tracklist fetch, Discogs enrichment for ripped records. This will be Dub's **first network dependency**; it stays confined behind an `Http` trait in that one leaf crate so the rip pipeline keeps working fully offline.
 
 ---
 

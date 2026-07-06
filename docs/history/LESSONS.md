@@ -323,6 +323,36 @@
 - **Two sheets can't present at once.** Re-opening onboarding from Preferences
   dismisses Preferences, then presents onboarding on the next runloop tick.
 
+## Vinyl rip (M26)
+
+- **The record tap must be wired at Thru-attach time.** The `AudioInput`
+  consumer is take-once and re-attaching a `ThruSource` displaces the one
+  that's playing — so `start_thru_for_rip` requests the tap up front and
+  `create_rip_session` claims it later. Don't try to bolt a tap onto a
+  running Thru source.
+- **flacenc 0.5.1 writes files symphonia rejects** unless you force
+  `set_block_sizes(bs, bs)` after encoding: it shrinks StreamInfo
+  `min_block_size` to the short final frame, which makes decoders classify
+  the stream as variable-blocksize (libFLAC keeps min == max; the spec
+  exempts the last frame). Worked around in `dub-encode`; re-check on any
+  flacenc upgrade.
+- **The device classifier deliberately hides the built-in mic** (and every
+  non-DJ input). Anything that must record outside DJ gear needs the raw
+  HAL list (`DubEngine::list_raw_input_devices`) — added for the
+  DEBUG-only rip dogfood fallback; production pickers stay
+  classifier-filtered. A mono mic records duplicated to both slots via a
+  `[0, 0]` channel map (CoreAudio allows duplicate map entries).
+- **Capture spills to disk, not RAM.** A crash 24 minutes into a one-take
+  rip must not lose audio (the WAV survives for salvage), and a 25-min
+  side would pin ~576 MB while the engine may hold a loaded deck. The
+  envelope is fed from the *recorded* samples so chunk ↔ frame alignment
+  is exact — the deck's live `PeakStream` starts at Thru attach and can't
+  give that.
+- **Cancel must refuse once anything imported.** The encoded FLACs live
+  inside the session dir and the library references them by path;
+  `remove_dir_all` on discard would orphan the imported tracks. Commit is
+  idempotent — retry is the recovery path.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is
@@ -330,20 +360,27 @@
 - **No device / channel picker.** Audio mode is hardware-derived (interface →
   Performance, none → Track Preparation; hot-plug switches live). The dev-only
   overrides are `#if DEBUG`. Surfaces that explain audio should *show* the
-  auto-detected state, not offer a choice.
+  auto-detected state, not offer a choice. **One signed-off exception (M26):**
+  with "Vinyl recording" enabled and a DJ interface present, a PREP / PERF
+  switch overrides auto-detect so the DJ rig can digitize records in Prep
+  mode (PRD §5.2.7); the override clears when the interface unplugs.
 - **Whole tracks decode to RAM; forward/backward playback is byte-symmetric.**
   No per-block disk streaming. Instant rewind/backspin depends on this.
-- **GPLv3 is deliberate** (anticipates the M14 Rubber Band FFI). Check every new
-  dependency's license against it; prefer pure-Rust to avoid LGPL dynamic-link
-  complications (why `dub-bpm` and `dub-fingerprint` are pure-Rust).
+- **The dep graph is fully permissive — keep it that way.** The GPLv3 workspace
+  reservation anticipated Rubber Band; M14 shipped pure-Rust WSOLA instead and
+  M26 chose FLAC (flacenc, Apache-2.0) over MP3/LAME (LGPL) for the same
+  reason. Check every new dependency's license; prefer pure-Rust (why
+  `dub-bpm`, `dub-fingerprint`, `dub-stretch`, and `dub-encode` are pure-Rust).
 
 ## Process
 
 - **One regression test per pathology**, not one per feature. The lift state
   machine, the MK2 mis-routing, the octave cases, the SR-drift — each is a named
   test that would catch the specific class again.
-- **Snapshot tests are PRD-mandated (§2.2.4) but still don't exist** (UI-BACKLOG
-  C-31). The UI regressions each round (footer pill, locked-grid BPM colour,
-  stale multi-select label) would all have been caught by a small
-  `swift-snapshot-testing` suite around `LibraryView` footer, the row context
-  menu, and `DeckHeader`. First UI PR that adds them earns its keep.
+- **Snapshot tests exist now — keep new views value-struct-driven.** The
+  `snap(_:width:height:named:)` harness (`StillpointSnapshotTests`,
+  `PerformanceSnapshotTests`, `RipSnapshotTests`) closed the old "they
+  don't exist" gap (UI-BACKLOG C-31): views that take plain state structs
+  (no FFI) snapshot for free. The UI regressions each round (footer pill,
+  locked-grid BPM colour, stale multi-select label) are exactly the class
+  they catch.

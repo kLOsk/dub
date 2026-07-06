@@ -53,8 +53,11 @@ crates/
   dub-engine/        Audio graph, transport, RT-safety types, ThruSource (M7). Hot path.
   dub-audio/         CoreAudio HAL input + output, ringbuf-buffered handoff.
   dub-dsp/           Resamplers, filters, FX building blocks (placeholder for v1 FX).
-  dub-stretch/       Rubber Band FFI wrapper (license-isolated, M14).
+  dub-stretch/       M14 — pure-Rust WSOLA time-stretch / key-lock engine. No unsafe, no C deps
+                     (Rubber Band was benched and dropped; see the M14 row in PRD §12.0).
   dub-io/            symphonia-based decoders, in-memory track buffers.
+  dub-encode/        M26 — offline FLAC encode (flacenc) + Vorbis-comment/PICTURE tagging (metaflac)
+                     for ripped tracks. Deliberately permissive-only (MP3/LAME deferred).
   dub-timecode/      Serato CV02 + Traktor MK1 + Traktor MK2 decoders (clean-room).
   dub-thru/          Thru-mode source-detection classifier only (§5.1.1; placeholder).
                      The Thru *passthrough itself* (ThruSource) lives in dub-engine.
@@ -62,11 +65,14 @@ crates/
                      Aubio's LGPL boundary is confined to this leaf crate.
   dub-fingerprint/   Pure-Rust Chromaprint via rusty-chromaprint. Used for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1).
   dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
+  dub-rip/           M26 — vinyl-rip session engine: RipSession state machine, off-RT capture
+                     worker (record-tap ring → crash-safe WAV spill + live envelope), split plan,
+                     rip.json manifest, commit (encode + tag + import + side archive). Fully offline.
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
   dub-ffi/           UniFFI Swift bindings (placeholder; M0.5).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
-                     decode-timecode.
+                     rip / decode-timecode.
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).
@@ -174,7 +180,7 @@ Currently wired (in the actual `Cargo.toml` dependency graph):
 - `objc2-core-audio` / `objc2-core-audio-types` / `objc2-audio-toolbox` (MIT) — CoreAudio FFI for the bits `coreaudio-rs` doesn't wrap
 - `symphonia` (MPL-2.0) — audio decoding (features: wav, pcm, mp3, flac, aiff, aac, alac, isomp4)
 - `realfft` (MIT/Apache, thin wrapper on `rustfft`) — pure-Rust FFT used by `dub-bpm` for spectral-flux onset detection
-- `rusty-chromaprint` (MIT/Apache) — pure-Rust port of the Chromaprint algorithm (algorithm 2). Used in `dub-fingerprint` for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1). M11b chose pure-Rust over the LGPL-2.1 C library (`chromaprint`) for the same reasons `dub-bpm` chose pure-Rust over aubio: license isolation, no C build dep, no unsafe FFI surface, simpler distribution.
+- `rusty-chromaprint` (MIT/Apache) — pure-Rust port of the Chromaprint algorithm. Used in `dub-fingerprint` for library dedupe (M11b, shipped) with the **TEST1** preset (`Configuration::preset_test1()`); AcoustID's database is built on TEST2, so M26c recognition will compute a separate TEST2 fingerprint transiently (stored dedupe blobs unchanged). M11b chose pure-Rust over the LGPL-2.1 C library (`chromaprint`) for the same reasons `dub-bpm` chose pure-Rust over aubio: license isolation, no C build dep, no unsafe FFI surface, simpler distribution.
 - `rusqlite` (MIT, feature `bundled`) — SQLite for the M11 library catalog
 - `uuid` (MIT/Apache), `dirs` (MIT/Apache), `libc` (MIT/Apache), `walkdir` (MIT/Unlicense) — library plumbing
 - `quick-xml` (MIT) — streaming XML pull-parser for the M12b Traktor `collection.nml`, M12c iTunes `Library.xml` (plist), and M12d rekordbox `rekordbox.xml` (`DJ_PLAYLISTS`) importers (`dub-library`). Attributes-only, no DOM; flat memory on huge collections. GPL-compatible. (The rekordbox importer reads the XML export, not the encrypted `master.db` — see `LIBRARY-FORMATS.md`.)
@@ -183,17 +189,22 @@ Currently wired (in the actual `Cargo.toml` dependency graph):
 - `uniffi` (MPL-2.0) — Swift FFI surface generator
 - `assert_no_alloc` (MIT) — RT-safety enforcement
 - `ringbuf` (MIT) — lock-free SPSC
-- `hound` (Apache-2.0) — WAV writer for offline render + test fixtures
+- `hound` (Apache-2.0) — WAV writer for offline render, test fixtures, and the M26 crash-safe rip spill (`dub-rip`)
+- `flacenc` (Apache-2.0) — pure-Rust FLAC encoder for the M26 rip pipeline (ripped tracks + lossless side archive, 24-bit; `dub-encode`). Chosen over LAME/MP3 to keep the dep graph fully permissive — see `LICENSE-DEPENDENCIES.md`.
+- `metaflac` (MIT) — Vorbis-comment + PICTURE tagging on ripped FLACs (M26, `dub-encode`), Picard-convention fields (`MUSICBRAINZ_TRACKID` / `MUSICBRAINZ_ALBUMID` / `DISCOGS_RELEASE_ID`) so M26c recognition can write provenance into the files themselves
+- `serde` / `serde_json` (MIT/Apache) — was `dub-cli`-only; M26 promotes it to the workspace set for the crash-safe `rip.json` session manifest (`dub-rip`)
 - `thiserror` / `anyhow` (MIT/Apache) — error plumbing
-- `ratatui` / `crossterm` / `serde` / `serde_json` / `time` (MIT/Apache) — `dub-cli` only
+- `ratatui` / `crossterm` / `time` (MIT/Apache) — `dub-cli` only
 
 Planned but **not** in the dep graph yet (placeholder crates exist):
 
-- `rubberband` (FFI, **GPL-3.0**) — time-stretch. Slated for M14 in `crates/dub-stretch/` (currently empty). The workspace `license = "GPL-3.0-or-later"` reservation anticipates this dependency landing; until it does, the actual dep graph is fully permissive (MIT / Apache / MPL-2.0 only). Commercial-license alternatives exist if a closed-source distribution model is chosen — see PRD §11.
+- `rubberband` (FFI, **GPL-3.0**) — *evaluated at M14 and dropped.* The pure-Rust WSOLA stretcher in `dub-stretch` matched it on pitch and beat it on transients + latency, so the GPL dep never landed. The workspace still declares `license = "GPL-3.0-or-later"`, but the actual dep graph is fully permissive (MIT / Apache / MPL-2.0 only) — see PRD §11.
 - `aubio` (FFI, LGPL-3.0) — *deliberately not linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
 - `chromaprint` (FFI, LGPL-2.1) — *deliberately not linked.* Replaced at M11b by `rusty-chromaprint` (pure-Rust, MIT/Apache) for license isolation + no C build dep.
+- LAME / `mp3lame` bindings (LGPL) — *considered and deferred.* MP3-320 rip export (M26) would have been the first non-permissive library actually linked; FLAC via `flacenc` covers the rip use case at zero license cost. Revisit only if users demand MP3 export.
+- `ureq` (MIT/Apache, rustls chain) — planned for M26c recognition (`dub-recognize`: AcoustID + MusicBrainz + Discogs). First network dependency; confined behind an `Http` trait in a leaf crate so rips keep working fully offline.
 
-We are GPLv3 because of the planned Rubber Band integration. This is a deliberate choice. See PRD §11. The license posture stays flexible until M14 ships Rubber Band: today nothing in the dep graph forces GPL.
+We are GPLv3 by declaration (the reservation originally anticipated Rubber Band; M14 dropped it). See PRD §11. Nothing in the dep graph forces GPL — the posture stays flexible, and M26 deliberately kept it that way (FLAC over MP3/LAME).
 
 ---
 
