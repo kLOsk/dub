@@ -179,6 +179,13 @@ pub struct ThruSource {
     /// [`Self::with_peaks_tap`] was called.
     peaks_tx: Option<HeapProd<f32>>,
 
+    /// Optional producer end of the M26 record tap ring. Present iff
+    /// [`Self::with_record_tap`] was called. Unlike the mono
+    /// BPM/peaks taps this carries the full-quality **interleaved
+    /// stereo** input (pre-gain, incl. underrun zero-fill) for the
+    /// vinyl-rip capture worker in `dub-rip`.
+    record_tx: Option<HeapProd<f32>>,
+
     /// Pre-allocated mono-downmix scratch shared between the BPM
     /// tee and the peaks tap. Sized to `max_block_frames` mono
     /// samples at [`Self::new`] regardless of whether any tap is
@@ -199,6 +206,7 @@ impl ThruSource {
             scratch: vec![0.0_f32; scratch_len],
             bpm_tx: None,
             peaks_tx: None,
+            record_tx: None,
             mono_scratch: vec![0.0_f32; cfg.max_block_frames.max(1)],
         }
     }
@@ -240,11 +248,36 @@ impl ThruSource {
         self
     }
 
+    /// Builder-style: wire the M26 record tap that feeds `dub-rip`'s
+    /// off-RT capture worker.
+    ///
+    /// Pushes the exact per-block scratch content — interleaved
+    /// stereo, **pre-gain** (a deck-gain ride during recording must
+    /// not print into the rip archive), including the underrun
+    /// zero-fill so the recorded timeline stays continuous. No
+    /// downmix, no extra scratch: the push reuses the block buffer
+    /// the passthrough already filled, so an attached record tap
+    /// costs one `push_slice` memcpy per block.
+    ///
+    /// Returns `self` for chaining. Off-RT only.
+    #[must_use]
+    pub fn with_record_tap(mut self, record_tx: HeapProd<f32>) -> Self {
+        self.record_tx = Some(record_tx);
+        self
+    }
+
     /// Whether a BPM tee was attached at construction. Diagnostic /
     /// test-only observability.
     #[must_use]
     pub fn has_bpm_tee(&self) -> bool {
         self.bpm_tx.is_some()
+    }
+
+    /// Whether a record tap was attached at construction. Diagnostic /
+    /// test-only observability.
+    #[must_use]
+    pub fn has_record_tap(&self) -> bool {
+        self.record_tx.is_some()
     }
 
     /// Whether a peaks tap was attached at construction. Diagnostic /
@@ -312,6 +345,14 @@ impl ThruSource {
         // weren't filled this block render as silence (underrun-safe).
         for s in &mut self.scratch[popped_even..want] {
             *s = 0.0;
+        }
+
+        // M26 record tap: full-quality interleaved stereo, pre-gain,
+        // incl. the zero-fill (a dropout in the rip is honest silence,
+        // not a time-warp). Drop on overflow (capture worker too slow)
+        // — same contract as the mono taps; the audio path never waits.
+        if let Some(tx) = &mut self.record_tx {
+            let _ = tx.push_slice(&self.scratch[..want]);
         }
 
         for (i, chunk) in out.chunks_exact_mut(stride).enumerate() {
@@ -940,6 +981,210 @@ mod tests {
         assert_eq!(n, 128, "tee should push zero-fill on underrun");
         for &s in &mono {
             assert!(s.abs() < 1e-9, "underrun frame {s} should be 0");
+        }
+    }
+
+    // -------- M26 record tap --------
+
+    #[test]
+    fn fresh_thru_source_has_no_record_tap() {
+        let (src, _tx) = build(cfg_default(), 4096);
+        assert!(!src.has_record_tap());
+    }
+
+    #[test]
+    fn with_record_tap_attaches() {
+        let (src, _tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, _record_rx) = tap_ring.split();
+        let src = src.with_record_tap(record_tx);
+        assert!(src.has_record_tap());
+    }
+
+    #[test]
+    fn record_tap_receives_stereo_interleaved_input() {
+        // Unlike the mono BPM/peaks taps, the record tap carries the
+        // full-quality interleaved stereo stream for the rip archive.
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, mut record_rx) = tap_ring.split();
+        let mut src = src.with_record_tap(record_tx);
+
+        let pushed = push_const(&mut tx, 128, 0.4, -0.2);
+        assert_eq!(pushed, 256);
+
+        let mut out = zeros(128);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut captured = [0.0f32; 256];
+        let n = record_rx.pop_slice(&mut captured);
+        assert_eq!(n, 256, "expected 256 interleaved samples, got {n}");
+        for i in 0..128 {
+            assert!(
+                (captured[i * 2] - 0.4).abs() < 1e-6,
+                "frame {i} L = {}, expected 0.4",
+                captured[i * 2]
+            );
+            assert!(
+                (captured[i * 2 + 1] - (-0.2)).abs() < 1e-6,
+                "frame {i} R = {}, expected -0.2",
+                captured[i * 2 + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn record_tap_unaffected_by_gain() {
+        // The archive must capture the raw preamp'd input; a deck
+        // gain ride during recording must not print into the rip.
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, mut record_rx) = tap_ring.split();
+        let mut src = src.with_record_tap(record_tx);
+        let _ = push_const(&mut tx, 64, 1.0, 1.0);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 0.25, 2, 0);
+
+        for i in 0..64 {
+            assert!(
+                (out[i * 2] - 0.25).abs() < 1e-6,
+                "out L {} != 0.25",
+                out[i * 2]
+            );
+        }
+
+        let mut captured = [0.0f32; 128];
+        let n = record_rx.pop_slice(&mut captured);
+        assert_eq!(n, 128);
+        for (i, &s) in captured.iter().enumerate() {
+            assert!(
+                (s - 1.0).abs() < 1e-6,
+                "sample {i}: record tap = {s}, expected 1.0 (pre-gain)"
+            );
+        }
+    }
+
+    #[test]
+    fn record_tap_underrun_pushes_zero_fill() {
+        // Partial underrun: the tap must carry the zero-fill too so
+        // the recorded timeline stays continuous (a dropout in the
+        // rip is honest silence, not a time-warp).
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, mut record_rx) = tap_ring.split();
+        let mut src = src.with_record_tap(record_tx);
+        let _ = push_const(&mut tx, 16, 0.3, -0.3);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut captured = [0.0f32; 128];
+        let n = record_rx.pop_slice(&mut captured);
+        assert_eq!(n, 128, "expected full block incl. zero-fill, got {n}");
+        for i in 0..16 {
+            assert!(
+                (captured[i * 2] - 0.3).abs() < 1e-6 && (captured[i * 2 + 1] - (-0.3)).abs() < 1e-6,
+                "frame {i} should carry the received input"
+            );
+        }
+        for (i, &s) in captured.iter().enumerate().skip(32) {
+            assert!(s.abs() < 1e-9, "sample {i} = {s}, expected zero-fill");
+        }
+    }
+
+    #[test]
+    fn record_tap_silently_drops_on_full_ring() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(32);
+        let (record_tx, mut record_rx) = tap_ring.split();
+        let mut src = src.with_record_tap(record_tx);
+        let _ = push_const(&mut tx, 64, 0.5, 0.5);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        // Audio output unaffected by the full tap ring.
+        for i in 0..64 {
+            assert!((out[i * 2] - 0.5).abs() < 1e-6);
+        }
+
+        let mut captured = [0.0f32; 128];
+        let n = record_rx.pop_slice(&mut captured);
+        assert!(
+            n <= 32,
+            "record ring capacity 32 should cap reads at 32, got {n}"
+        );
+    }
+
+    #[test]
+    fn record_tap_render_is_alloc_free() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, _record_rx) = tap_ring.split();
+        let mut src = src.with_record_tap(record_tx);
+        let _ = push_const(&mut tx, 256, 0.3, 0.4);
+
+        let mut out = zeros(256);
+        assert_no_alloc(|| {
+            src.render_into(&mut out, 1.0, 2, 0);
+        });
+    }
+
+    #[test]
+    fn all_three_taps_render_is_alloc_free() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let bpm_ring = HeapRb::<f32>::new(4096);
+        let (bpm_tx, _bpm_rx) = bpm_ring.split();
+        let peaks_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, _peaks_rx) = peaks_ring.split();
+        let record_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, _record_rx) = record_ring.split();
+        let mut src = src
+            .with_bpm_tee(bpm_tx, 256)
+            .with_peaks_tap(peaks_tx)
+            .with_record_tap(record_tx);
+        let _ = push_const(&mut tx, 256, 0.3, 0.4);
+
+        let mut out = zeros(256);
+        assert_no_alloc(|| {
+            src.render_into(&mut out, 1.0, 2, 0);
+        });
+    }
+
+    #[test]
+    fn record_tap_coexists_with_mono_taps() {
+        // The record tap is stereo/pre-downmix; the mono taps keep
+        // their own stream. One render, three correct consumers.
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let bpm_ring = HeapRb::<f32>::new(4096);
+        let (bpm_tx, mut bpm_rx) = bpm_ring.split();
+        let record_ring = HeapRb::<f32>::new(4096);
+        let (record_tx, mut record_rx) = record_ring.split();
+        let mut src = src.with_bpm_tee(bpm_tx, 256).with_record_tap(record_tx);
+
+        let _ = push_const(&mut tx, 64, 0.6, 0.2);
+        let mut out = zeros(64);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut mono = [0.0f32; 64];
+        let nb = bpm_rx.pop_slice(&mut mono);
+        assert_eq!(nb, 64);
+        for (i, &s) in mono.iter().enumerate() {
+            assert!(
+                (s - 0.4).abs() < 1e-6,
+                "frame {i}: mono tee = {s}, expected 0.4"
+            );
+        }
+
+        let mut stereo = [0.0f32; 128];
+        let nr = record_rx.pop_slice(&mut stereo);
+        assert_eq!(nr, 128);
+        for i in 0..64 {
+            assert!(
+                (stereo[i * 2] - 0.6).abs() < 1e-6 && (stereo[i * 2 + 1] - 0.2).abs() < 1e-6,
+                "frame {i}: record tap must stay interleaved stereo"
+            );
         }
     }
 }

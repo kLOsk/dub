@@ -40,8 +40,8 @@ pub use command::{Command, FxSlot, SirenUnit};
 pub use deck::{Deck, DeckSharedState, LoopState, PublishState};
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
-    ThruAttachWithPeaksError, ThruAttachWithTelemetryError, BPM_TEE_RING_CAPACITY_SECS,
-    PEAKS_TAP_RING_CAPACITY_SECS,
+    ThruAttachWithPeaksError, ThruAttachWithTelemetryError, ThruTapHandles, ThruTaps,
+    BPM_TEE_RING_CAPACITY_SECS, PEAKS_TAP_RING_CAPACITY_SECS, RECORD_TAP_RING_CAPACITY_SECS,
 };
 pub use looping::{reverse_loop_region, wrap_into};
 pub use realtime::{RealtimeContext, RtError};
@@ -4914,6 +4914,140 @@ mod tests {
         assert!(matches!(
             err,
             ThruAttachWithTelemetryError::PeaksSampleRateMismatch { .. }
+        ));
+    }
+
+    // -------- M26 — options-struct taps attach --------
+
+    #[test]
+    fn handle_attach_thru_with_taps_none_is_plain_attach() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        let handles = handle
+            .attach_thru_source_with_taps(0, rx, thru_cfg(sr), ThruTaps::default())
+            .expect("attach with no taps");
+        assert!(handles.bpm.is_none());
+        assert!(handles.peaks.is_none());
+        assert!(handles.record_rx.is_none());
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_taps_record_delivers_stereo_input() {
+        use ringbuf::traits::Consumer as _;
+        // Full path: input ring → ThruSource render → record ring.
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (mut tx, rx) = rb.split();
+        for _ in 0..256 {
+            tx.try_push(0.25).unwrap();
+            tx.try_push(-0.5).unwrap();
+        }
+        let taps = ThruTaps {
+            record: true,
+            ..ThruTaps::default()
+        };
+        let mut handles = handle
+            .attach_thru_source_with_taps(0, rx, thru_cfg(sr), taps)
+            .expect("attach with record tap");
+        assert!(handles.bpm.is_none());
+        assert!(handles.peaks.is_none());
+        let mut record_rx = handles
+            .record_rx
+            .take()
+            .expect("record consumer present when requested");
+
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        pump_one_block(&mut engine, &mut rt);
+
+        let mut captured = vec![0.0_f32; 2048];
+        let n = record_rx.pop_slice(&mut captured);
+        assert!(
+            n >= 512,
+            "expected at least the 256 queued frames in the record ring, got {n} samples"
+        );
+        for i in 0..256 {
+            assert!(
+                (captured[i * 2] - 0.25).abs() < 1e-6
+                    && (captured[i * 2 + 1] - (-0.5)).abs() < 1e-6,
+                "frame {i}: record tap must carry the raw interleaved input"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_attach_thru_with_taps_all_three_spawns_streams() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        let taps = ThruTaps {
+            bpm: Some(dub_bpm::TrackerConfig::at(48_000)),
+            peaks: Some(dub_peaks::PeakStreamConfig::at(48_000)),
+            record: true,
+        };
+        let mut handles = handle
+            .attach_thru_source_with_taps(0, rx, thru_cfg(sr), taps)
+            .expect("attach with all taps");
+        assert!(handles.record_rx.is_some());
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+        // Both analysis threads must shut down cleanly.
+        handles
+            .bpm
+            .take()
+            .expect("bpm stream present when requested")
+            .shutdown();
+        handles
+            .peaks
+            .take()
+            .expect("peaks stream present when requested")
+            .shutdown();
+    }
+
+    #[test]
+    fn handle_attach_thru_with_taps_forwards_invalid_deck() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let taps = ThruTaps {
+            record: true,
+            ..ThruTaps::default()
+        };
+        let err = handle
+            .attach_thru_source_with_taps(DECK_COUNT, rx, thru_cfg(sr), taps)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithTelemetryError::Thru(ThruAttachError::InvalidDeck { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_taps_rejects_bpm_sr_mismatch() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let taps = ThruTaps {
+            bpm: Some(dub_bpm::TrackerConfig::at(44_100)),
+            peaks: None,
+            record: true,
+        };
+        let err = handle
+            .attach_thru_source_with_taps(0, rx, thru_cfg(sr), taps)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithTelemetryError::BpmSampleRateMismatch { .. }
         ));
     }
 
