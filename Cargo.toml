@@ -13,6 +13,8 @@ members = [
     "crates/dub-thru",
     "crates/dub-fingerprint",
     "crates/dub-library",
+    "crates/dub-encode",
+    "crates/dub-rip",
     "crates/dub-controller",
     "crates/dub-ffi",
     "crates/dub-cli",
@@ -37,6 +39,8 @@ dub-timecode = { path = "crates/dub-timecode" }
 dub-thru = { path = "crates/dub-thru" }
 dub-fingerprint = { path = "crates/dub-fingerprint" }
 dub-library = { path = "crates/dub-library" }
+dub-encode = { path = "crates/dub-encode" }
+dub-rip = { path = "crates/dub-rip" }
 dub-controller = { path = "crates/dub-controller" }
 dub-ffi = { path = "crates/dub-ffi" }
 dub-audio = { path = "crates/dub-audio" }
@@ -129,6 +133,22 @@ symphonia = { version = "0.5", default-features = false, features = [
 
 # WAV writer (for offline-render output in dub-cli; not used in the engine).
 hound = "3"
+
+# M26 vinyl-rip encode stack — deliberately pure-Rust/permissive so the
+# dependency graph stays fully permissive (PRD §11 posture; LAME/MP3 was
+# considered and deferred — see docs/spec/LICENSE-DEPENDENCIES.md).
+# flacenc (Apache-2.0): FLAC encoder for ripped tracks + side archive.
+# metaflac (MIT): Vorbis-comment + PICTURE tagging on the encoded FLACs
+# (Picard-conventions MusicBrainz fields ride in the files themselves).
+flacenc = { version = "0.5", default-features = false }
+metaflac = "0.2"
+
+# M26 rip manifest (`rip.json`): session state that must survive a crash
+# mid-rip (splits, per-track metadata, imported uuids). serde was
+# previously a dub-cli-only dep; the rip manifest promotes it to the
+# workspace set.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # CoreAudio (macOS only; target-gated in dub-audio's Cargo.toml). PRD §4.2:
 # v1 uses HAL via coreaudio-rs, not cpal — we want lowest possible latency

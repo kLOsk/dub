@@ -169,10 +169,13 @@ pub fn import_folder(library: &mut Library, root: &Path) -> Result<ImportSummary
             continue;
         }
         match import_one(library, path) {
-            Ok(outcome) => match outcome {
-                FileOutcome::Added => summary.added += 1,
-                FileOutcome::Refreshed => summary.refreshed += 1,
-            },
+            Ok(imported) => {
+                if imported.was_new {
+                    summary.added += 1;
+                } else {
+                    summary.refreshed += 1;
+                }
+            }
             Err(reason) => {
                 summary.errors.push(ImportError {
                     path: path.to_path_buf(),
@@ -186,15 +189,56 @@ pub fn import_folder(library: &mut Library, root: &Path) -> Result<ImportSummary
     Ok(summary)
 }
 
-/// Per-file outcome from [`import_one`]. Crate-internal because the
-/// caller (`import_folder`) maps these onto the [`ImportSummary`]
-/// counters directly.
-enum FileOutcome {
-    Added,
-    Refreshed,
+/// Outcome of a single-file import via [`import_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTrack {
+    /// Canonical `tracks.id` UUID the file now maps to — freshly
+    /// minted when `was_new` is `true`, the previously known
+    /// identity otherwise.
+    pub uuid: String,
+    /// `true` iff this call minted a new `tracks` row. `false`
+    /// means the file was already known by
+    /// `(volume_uuid, relative_path)` and its metadata rows were
+    /// refreshed instead — no duplicate identity is created,
+    /// matching [`import_folder`]'s idempotent re-import.
+    pub was_new: bool,
 }
 
-fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOutcome, String> {
+/// Import a single audio file into the library (volume resolve →
+/// insert_track → upsert_track_file → metadata source rows →
+/// promote_to_collection).
+///
+/// This is the exact per-file path [`import_folder`] runs for every
+/// file it discovers, exposed for callers that already hold one
+/// concrete path — the M26 rip pipeline imports each freshly
+/// encoded FLAC through this. Idempotent like the folder importer:
+/// re-importing a known `(volume_uuid, relative_path)` refreshes
+/// the metadata rows and returns `was_new = false` rather than
+/// duplicating identities.
+///
+/// # Errors
+///
+/// * [`LibraryError::UnsupportedExtension`] — the path does not
+///   carry a recognised audio extension (the same `AUDIO_EXTS`
+///   gate the folder walk applies before calling into the per-file
+///   path).
+/// * [`LibraryError::ImportFailed`] — volume resolution, filesystem
+///   stat, the metadata probe, or one of the SQLite writes failed;
+///   the reason string is the same one `import_folder` would have
+///   recorded in [`ImportSummary::errors`].
+pub fn import_file(library: &mut Library, path: &Path) -> Result<ImportedTrack> {
+    if !has_audio_extension(path) {
+        return Err(LibraryError::UnsupportedExtension {
+            path: path.to_path_buf(),
+        });
+    }
+    import_one(library, path).map_err(|reason| LibraryError::ImportFailed {
+        path: path.to_path_buf(),
+        reason,
+    })
+}
+
+fn import_one(library: &mut Library, path: &Path) -> std::result::Result<ImportedTrack, String> {
     // Volume + path resolution. Per-file failure rather than
     // session-level abort: a network share that doesn't expose a
     // UUID shouldn't prevent the rest of the import from running.
@@ -241,7 +285,10 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
         library
             .promote_to_collection(&existing_uuid)
             .map_err(|e| e.to_string())?;
-        return Ok(FileOutcome::Refreshed);
+        return Ok(ImportedTrack {
+            uuid: existing_uuid,
+            was_new: false,
+        });
     }
 
     // Cold path (M11c.4 lazy-fingerprint variant): metadata-only
@@ -281,7 +328,10 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<FileOut
     library
         .promote_to_collection(&new_track_uuid)
         .map_err(|e| e.to_string())?;
-    Ok(FileOutcome::Added)
+    Ok(ImportedTrack {
+        uuid: new_track_uuid,
+        was_new: true,
+    })
 }
 
 /// Write the `id3` and `filename` per-source metadata rows for the
@@ -890,6 +940,96 @@ mod tests {
             "regression: refresh must re-derive the id3 version_token \
              from meta.title rather than overwriting it with NULL"
         );
+    }
+
+    #[test]
+    fn import_file_imports_a_single_wav() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let wav = music.join("J Dilla - Workinonit.wav");
+        write_wav(&wav, 440.0, 10.0);
+
+        let mut lib = open_lib(tmp.path());
+        let imported = import_file(&mut lib, &wav).expect("import_file");
+        assert!(imported.was_new, "fresh file must mint a new identity");
+        assert!(!imported.uuid.is_empty());
+
+        assert_eq!(row_count(&lib, "tracks"), 1);
+        assert_eq!(row_count(&lib, "track_files"), 1);
+        // id3 row + filename row, same as the folder path.
+        assert_eq!(row_count(&lib, "track_metadata_source"), 2);
+        // Single-file import is the same "this is mine" act as a
+        // folder import (PRD §8.4.1): collection member immediately.
+        let members: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE in_collection = 1 AND id = ?1",
+                [&imported.uuid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 1);
+    }
+
+    #[test]
+    fn import_file_re_import_dedupes() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let wav = music.join("Track A.wav");
+        write_wav(&wav, 440.0, 10.0);
+
+        let mut lib = open_lib(tmp.path());
+        let first = import_file(&mut lib, &wav).expect("first import");
+        assert!(first.was_new);
+
+        let second = import_file(&mut lib, &wav).expect("second import");
+        assert!(!second.was_new, "re-import must not mint a new identity");
+        assert_eq!(second.uuid, first.uuid, "same file → same canonical uuid");
+
+        assert_eq!(row_count(&lib, "tracks"), 1);
+        assert_eq!(row_count(&lib, "track_files"), 1);
+        assert_eq!(row_count(&lib, "track_metadata_source"), 2);
+    }
+
+    #[test]
+    fn import_file_rejects_non_audio_extension() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let txt = music.join("notes.txt");
+        std::fs::write(&txt, b"not audio").unwrap();
+
+        let mut lib = open_lib(tmp.path());
+        let result = import_file(&mut lib, &txt);
+        assert!(
+            matches!(result, Err(LibraryError::UnsupportedExtension { .. })),
+            "expected UnsupportedExtension, got {result:?}"
+        );
+        assert_eq!(row_count(&lib, "tracks"), 0);
+    }
+
+    #[test]
+    fn import_file_then_import_folder_share_one_identity() {
+        // `import_folder` delegates to the same per-file path as
+        // `import_file`, so a folder scan over a file already
+        // imported singly must refresh, never duplicate.
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let wav = music.join("Workinonit.wav");
+        write_wav(&wav, 440.0, 10.0);
+
+        let mut lib = open_lib(tmp.path());
+        let imported = import_file(&mut lib, &wav).expect("import_file");
+        assert!(imported.was_new);
+
+        let summary = import_folder(&mut lib, &music).expect("import_folder");
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.refreshed, 1);
+        assert_eq!(row_count(&lib, "tracks"), 1);
+        assert_eq!(row_count(&lib, "track_files"), 1);
     }
 
     // Silence the unused-import warning when the parent file's

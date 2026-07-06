@@ -60,7 +60,8 @@ mod version_tokens;
 mod volumes;
 
 pub use analysis::{
-    analyze_compute, ActiveBeatgrid, AnalysisComputed, AnalysisJob, AnalysisOutcome,
+    analyze_compute, analyze_compute_with_track, ActiveBeatgrid, AnalysisComputed, AnalysisJob,
+    AnalysisOutcome,
 };
 pub use cues::HotCue;
 pub use db::{
@@ -74,7 +75,7 @@ pub use dedupe::{
 pub use error::{LibraryError, Result};
 pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
 pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION_PLAY_MS};
-pub use importer::{import_folder, ImportError, ImportSummary};
+pub use importer::{import_file, import_folder, ImportError, ImportSummary, ImportedTrack};
 pub use itunes_import::import_itunes;
 pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
 pub use rekordbox_import::import_rekordbox;

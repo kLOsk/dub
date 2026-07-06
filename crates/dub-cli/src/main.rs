@@ -33,6 +33,7 @@ mod device_profiles;
 mod diagnose;
 mod import;
 mod input_cmds;
+mod rip;
 mod scope;
 mod stretch_bench;
 mod thru;
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
         "list-outputs" => input_cmds::list_outputs(),
         "levels" => input_cmds::levels(&args[2..]),
         "capture" => input_cmds::capture(&args[2..]),
+        "rip" => rip::run(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
         "thru" => thru::run(&args[2..]),
         "scope" => scope::run(&args[2..]),
@@ -102,6 +104,13 @@ fn print_help() {
     eprintln!("                    [--input-channels N,M] [--sr SR] [--duration SECS]");
     eprintln!("                                                  record input device to WAV");
     eprintln!("                    --input-channels uses 1-based indices: SL3 deck A = 3,4");
+    eprintln!("  rip               [--device NAME] [--input-channels N,M] [--duration SECS]");
+    eprintln!("                    [--out DIR] [--splits SEC,SEC,...] [--titles T,T,...]");
+    eprintln!("                    [--artist A] [--album B] [--genre G] [--year Y]");
+    eprintln!("                    [--library PATH] [--max-duration SECS]");
+    eprintln!("                    record a vinyl side, split, encode FLAC + Vorbis tags,");
+    eprintln!("                    import into the library pre-analyzed, archive the side.");
+    eprintln!("                    without --duration, Enter starts and stops the take.");
     eprintln!("  play <deck-a> [<deck-b>]");
     eprintln!("                    [--realtime] [-o <output>] [--sr SR] [--block-size N]");
     eprintln!("                    [--duration SECS] [--buffer-size FRAMES]");

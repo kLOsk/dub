@@ -153,6 +153,31 @@ pub enum LibraryError {
         track_id: String,
     },
 
+    /// `import_file` was called with a path whose extension is not a
+    /// recognised audio type (the same `AUDIO_EXTS` gate the folder
+    /// walk applies). The folder importer silently skips such files;
+    /// the single-file API surfaces the refusal so the caller (e.g.
+    /// the M26 rip pipeline) can tell "wrong file" from "import
+    /// failed".
+    #[error("not a recognised audio file extension: {path:?}")]
+    UnsupportedExtension {
+        /// The path that was rejected.
+        path: PathBuf,
+    },
+
+    /// A single-file import via `import_file` failed. Wraps the same
+    /// per-file reason strings `import_folder` accumulates in
+    /// `ImportSummary::errors` (volume UUID unavailable, stat failed,
+    /// metadata probe failed, SQLite write failed, ...), so the two
+    /// entry points report identically for the same file.
+    #[error("import failed for {path:?}: {reason}")]
+    ImportFailed {
+        /// The path that failed to import.
+        path: PathBuf,
+        /// Short human-readable reason.
+        reason: String,
+    },
+
     /// A Dub-crate operation (rename / delete / add-track) named a
     /// `crates.id` that is not present. Indicates a stale id on the
     /// caller side (the UI raced a delete) rather than a library bug.

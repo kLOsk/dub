@@ -262,15 +262,42 @@ pub struct AnalysisComputed {
 /// `&Library`, so callers can run it with no database lock held —
 /// this is the multi-second, O(track-length) part of
 /// [`Library::analyze_track`].
+///
+/// Decodes the job's file from disk, then delegates the DSP passes
+/// to [`analyze_compute_with_track`].
 pub fn analyze_compute(job: &AnalysisJob) -> Result<AnalysisComputed> {
-    let track_id = &job.track_id;
-    let file_path = job.file_path.clone();
     let track =
-        dub_io::Track::load_from_path(&file_path).map_err(|e| LibraryError::DecodeFailed {
-            track_id: track_id.to_string(),
-            path: file_path.clone(),
+        dub_io::Track::load_from_path(&job.file_path).map_err(|e| LibraryError::DecodeFailed {
+            track_id: job.track_id.clone(),
+            path: job.file_path.clone(),
             reason: format!("{e}"),
         })?;
+    analyze_compute_with_track(job, &track)
+}
+
+/// The compute stage of [`analyze_compute`], run over a track the
+/// caller has already decoded into RAM. Same lock-free contract:
+/// takes no `&Library`, so it slots between [`Library::analyze_prepare`]
+/// and [`Library::analyze_commit`] without widening the lock window.
+///
+/// The M26 rip pipeline calls this with the
+/// [`dub_io::Track::from_interleaved`] PCM it already holds —
+/// FLAC is lossless, so the pre-encode buffer is byte-identical to
+/// what a decode of the freshly written file would produce, and the
+/// disk round-trip is pure waste.
+///
+/// `track` must be a one-shot store ([`dub_io::Track::load_from_path`]
+/// or [`dub_io::Track::from_interleaved`]): a track still owned by a
+/// streaming load returns an empty [`dub_io::Track::samples`] view
+/// and would be analysed as silence. `job` still supplies the track
+/// id, the existing fingerprint id, and the octave profile; its file
+/// path is used only to label error messages.
+pub fn analyze_compute_with_track(
+    job: &AnalysisJob,
+    track: &dub_io::Track,
+) -> Result<AnalysisComputed> {
+    let track_id = &job.track_id;
+    let file_path = job.file_path.clone();
 
     // ---- Fingerprint (M11c.4 lazy attach) --------------------
     // If the importer left `fingerprint_id = NULL`, compute the
@@ -2928,6 +2955,114 @@ mod tests {
             matches!(err, Some(LibraryError::GridLocked { .. })),
             "locked grid must refuse reset, got {err:?}"
         );
+    }
+
+    #[test]
+    fn analyze_compute_with_track_matches_decode_path() {
+        // M26a: the rip pipeline analyses the PCM it already holds in
+        // RAM (`Track::from_interleaved`) instead of re-decoding the
+        // freshly encoded FLAC. Both compute paths run the same DSP
+        // over the same samples, so every field must come out
+        // bit-identical to the decode-from-disk path.
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, path) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 8.0);
+
+        let job = lib.analyze_prepare(&track_id).unwrap();
+        let from_disk = analyze_compute(&job).unwrap();
+
+        // Rebuild the same PCM as an in-RAM one-shot track, the way
+        // the rip pipeline holds its pre-encode buffer.
+        let decoded = dub_io::Track::load_from_path(&path).unwrap();
+        let track = dub_io::Track::from_interleaved(
+            decoded.samples().to_vec(),
+            decoded.sample_rate(),
+            decoded.channels(),
+        )
+        .unwrap();
+        let in_ram = analyze_compute_with_track(&job, &track).unwrap();
+
+        let fp_disk = from_disk.fingerprint.as_ref().expect("disk fingerprint");
+        let fp_ram = in_ram.fingerprint.as_ref().expect("in-RAM fingerprint");
+        assert_eq!(
+            fp_disk.fp, fp_ram.fp,
+            "identical PCM → identical Chromaprint"
+        );
+        assert_eq!(fp_disk.fp.duration_ms(), fp_ram.fp.duration_ms());
+        assert_eq!(fp_disk.sample_rate, fp_ram.sample_rate);
+        assert_eq!(fp_disk.channels, fp_ram.channels);
+
+        let g_disk = from_disk.grid.as_ref().expect("disk grid");
+        let g_ram = in_ram.grid.as_ref().expect("in-RAM grid");
+        assert_eq!(g_disk.bpm, g_ram.bpm);
+        assert_eq!(g_disk.anchor_secs, g_ram.anchor_secs);
+        assert_eq!(g_disk.bar_phase, g_ram.bar_phase);
+        assert_eq!(g_disk.confidence, g_ram.confidence);
+        assert_eq!(g_disk.drift_slope_ms_per_min, g_ram.drift_slope_ms_per_min);
+
+        // The 1 kHz click fixture may or may not yield a key; the
+        // contract is that both paths agree exactly.
+        match (from_disk.key.as_ref(), in_ram.key.as_ref()) {
+            (Some(k_disk), Some(k_ram)) => {
+                assert_eq!(k_disk.camelot, k_ram.camelot);
+                assert_eq!(k_disk.tonic_pc, k_ram.tonic_pc);
+                assert_eq!(k_disk.is_major, k_ram.is_major);
+                assert_eq!(k_disk.confidence, k_ram.confidence);
+            }
+            (None, None) => {}
+            (d, r) => panic!(
+                "key presence diverged: disk={:?} ram={:?}",
+                d.is_some(),
+                r.is_some()
+            ),
+        }
+
+        assert_eq!(from_disk.peaks.is_some(), in_ram.peaks.is_some());
+        assert_eq!(from_disk.lufs_i, in_ram.lufs_i);
+        assert_eq!(from_disk.sample_peak_dbfs, in_ram.sample_peak_dbfs);
+    }
+
+    #[test]
+    fn analyze_compute_with_track_commits_end_to_end() {
+        // Full rip-pipeline shape: prepare → compute over in-RAM PCM
+        // → commit. The persisted state must match what the classic
+        // `analyze_track` decode path would have written.
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, path) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 8.0);
+
+        let job = lib.analyze_prepare(&track_id).unwrap();
+        let decoded = dub_io::Track::load_from_path(&path).unwrap();
+        let track = dub_io::Track::from_interleaved(
+            decoded.samples().to_vec(),
+            decoded.sample_rate(),
+            decoded.channels(),
+        )
+        .unwrap();
+        let computed = analyze_compute_with_track(&job, &track).unwrap();
+        let outcome = lib.analyze_commit(&job, computed).unwrap();
+
+        assert!(outcome.wrote_grid, "click track must produce a grid");
+        assert!(
+            (outcome.bpm - 120.0).abs() < 1.0,
+            "expected ~120 BPM, got {}",
+            outcome.bpm
+        );
+        assert!(lib.is_track_analyzed(&track_id).unwrap());
+        let fp_id: Option<i64> = lib
+            .connection()
+            .query_row(
+                "SELECT fingerprint_id FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fp_id.is_some(), "commit must attach the fingerprint");
+        let active = lib
+            .active_beatgrid_for_track(&track_id)
+            .unwrap()
+            .expect("active auto grid");
+        assert_eq!(active.source, "auto");
     }
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "dub-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline audio encoding for Dub (M26 vinyl rip). FLAC track/side-archive encoding (flacenc, pure Rust) + Vorbis-comment/PICTURE tagging (metaflac) with Picard-convention MusicBrainz fields. Deliberately permissive-only: MP3/LAME was considered and deferred (docs/spec/LICENSE-DEPENDENCIES.md)."
+
+[dependencies]
+thiserror = { workspace = true }
+# Pure-Rust FLAC encoder (Apache-2.0). default-features = false drops the
+# parallel/rayon path — rip encoding is a background batch job where a
+# single core is plenty and fewer deps beat wall-clock here.
+flacenc = { workspace = true }
+# FLAC metadata block editor (MIT): Vorbis comments + embedded PICTURE.
+metaflac = { workspace = true }
+
+[dev-dependencies]
+# Decode round-trip verification uses the same decoder the app ships.
+symphonia = { workspace = true }
+tempfile = "3"

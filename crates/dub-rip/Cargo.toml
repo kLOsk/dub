@@ -1,0 +1,30 @@
+[package]
+name = "dub-rip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vinyl-rip session engine for Dub (M26). Off-RT capture worker (record-tap ring → crash-safe WAV spill + live peak envelope), split plan over the envelope, rip.json manifest, and commit orchestration (analyze → FLAC encode+tag → library import). Fully offline; recognition lives in dub-recognize and is bridged by the caller."
+
+[dependencies]
+thiserror = { workspace = true }
+ringbuf = { workspace = true }
+# Crash-safe 32-bit-float WAV spill during capture (same writer dub-cli's
+# `capture` command uses); read back lazily for split slicing at commit.
+hound = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Live envelope: the capture worker feeds a mono downmix into the same
+# Decimator the M9 live-waveform path uses, so chunk i ↔ WAV frame i*64
+# alignment is exact (the deck's own PeakStream starts at Thru attach,
+# not at record start, so it cannot give this alignment).
+dub-peaks = { workspace = true }
+# Track::from_interleaved wraps sliced PCM for pre-encode analysis.
+dub-io = { workspace = true }
+dub-encode = { workspace = true }
+dub-library = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = { workspace = true }
