@@ -337,9 +337,7 @@ impl SpectralFrameStream {
     pub fn reset(&mut self) {
         self.input_buffer.clear();
         self.input_read_pos = 0;
-        for m in &mut self.compressed_mags {
-            *m = 0.0;
-        }
+        self.compressed_mags.fill(0.0);
     }
 }
 

@@ -373,17 +373,16 @@ pub fn analyze_key(
         return Ok(KeyEstimate::none());
     }
 
-    let mono: &[f32];
     let downmixed_storage: Vec<f32>;
-    if channels == 1 {
-        mono = samples;
+    let mono: &[f32] = if channels == 1 {
+        samples
     } else {
         downmixed_storage = samples
             .chunks_exact(2)
-            .map(|c| 0.5 * (c[0] + c[1]))
+            .map(|c| f32::midpoint(c[0], c[1]))
             .collect();
-        mono = &downmixed_storage;
-    }
+        &downmixed_storage
+    };
 
     // First pass: stream the mono buffer through the chroma STFT
     // once. For each frame, compute per-frame total tonal energy
