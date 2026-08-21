@@ -3575,6 +3575,10 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
+        /// ~300 ms of reads on an idle machine, spanning ~30
+        /// writer publishes.
+        const READS: usize = 150;
+
         let shared = StdArc::new(DeckSharedState::new());
         let stop = StdArc::new(AtomicBool::new(false));
 
@@ -3592,13 +3596,16 @@ mod tests {
         });
 
         let reader_shared = shared.clone();
-        let reader_stop = stop.clone();
         let reader = thread::spawn(move || {
             // Mimic the 60 Hz render thread: read at ~16 ms.
+            //
+            // Bounded by iteration count, never by a wall-clock
+            // deadline: a starved CI runner can spend the whole
+            // budget scheduling us, which says nothing about the
+            // publish state. Counting reads keeps the coverage
+            // guaranteed and the test honest under any load.
             let mut last_extrap = f64::NEG_INFINITY;
-            let mut samples = 0usize;
-            let deadline = Instant::now() + Duration::from_millis(300);
-            while Instant::now() < deadline && !reader_stop.load(Ordering::Relaxed) {
+            for _ in 0..READS {
                 let st = reader_shared.load_publish_state();
                 let now = DeckSharedState::host_time_now_ns();
                 let extrap = st.extrapolated_secs(now);
@@ -3617,16 +3624,13 @@ mod tests {
                     "non-monotonic extrap: {last_extrap} → {extrap}"
                 );
                 last_extrap = extrap;
-                samples += 1;
                 thread::sleep(Duration::from_millis(2));
             }
-            samples
         });
 
-        let samples = reader.join().expect("reader joined");
+        reader.join().expect("reader joined");
         stop.store(true, Ordering::Relaxed);
         writer.join().expect("writer joined");
-        assert!(samples > 20, "reader should have sampled many times");
     }
 
     proptest! {
