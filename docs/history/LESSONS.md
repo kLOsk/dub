@@ -384,3 +384,18 @@
   (no FFI) snapshot for free. The UI regressions each round (footer pill,
   locked-grid BPM colour, stale multi-select label) are exactly the class
   they catch.
+- **Never assert on how much wall-clock work a thread got.** The publish-state
+  soak (`deck.rs`) read for 300 ms and then asserted it had managed >20 samples.
+  That measures the scheduler, not the code: on a loaded CI runner it starved
+  below the floor and failed a rip PR that touched nothing near it. Bound
+  concurrency soaks by **iteration count**; keep wall-clock deadlines for
+  wait-until-condition loops, where they are an upper bound (`dub-ffi/src/rip.rs`
+  does it right).
+- **The Rust toolchain is pinned to an exact version, on purpose.** CI runs
+  clippy with `-D warnings`, so a floating `stable` makes every Rust release a
+  potential red build on untouched code — and a dev on an older stable can't
+  reproduce it locally. That is exactly how M26a's PR went red: CI moved to
+  1.98 while local sat on 1.95, and three new lints fired in `dub-spectral`.
+  The version lives in `rust-toolchain.toml` **and** `.github/workflows/ci.yml`
+  (`dtolnay/rust-toolchain@master` with an explicit `toolchain:`); bumping it is
+  its own PR, where fixing the new lint set is the whole point of the diff.

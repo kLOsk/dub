@@ -1,5 +1,11 @@
+# Pinned to an exact version, not "stable". CI runs clippy with
+# -D warnings, so a floating channel turns every Rust release into a
+# red build on code nobody touched — and a dev on an older stable
+# cannot reproduce it. Bumping this is its own PR: change the version
+# here and in .github/workflows/ci.yml, then fix whatever the new
+# lint set finds.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
 components = ["rustfmt", "clippy", "rust-src"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 profile = "default"
