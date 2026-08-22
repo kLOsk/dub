@@ -67,12 +67,15 @@ crates/
   dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
   dub-rip/           M26 — vinyl-rip session engine: RipSession state machine, off-RT capture
                      worker (record-tap ring → crash-safe WAV spill + live envelope), split plan,
-                     rip.json manifest, commit (encode + tag + import + side archive). Fully offline.
+                     rip.json manifest, commit (encode + tag + import + side archive). M26b adds
+                     adaptive gap detection, needle-drop auto-start + run-out auto-stop, spill
+                     salvage / session recovery, and re-split from the lossless archive.
+                     Fully offline.
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
   dub-ffi/           UniFFI Swift bindings (placeholder; M0.5).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
-                     rip / decode-timecode.
+                     rip / rip-tune / rip-resplit / decode-timecode.
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).

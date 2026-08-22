@@ -373,26 +373,54 @@ false; the Preferences toggle was removed). Remaining:
 
 ---
 
-## 6. Vinyl rip (M26a shipped; deliberate gaps)
+## 6. Vinyl rip (M26a + M26b shipped; deliberate gaps)
 
-### R-39. Live per-segment encode progress (M26b)
+### R-39. Live per-segment encode progress — **done (M26b)**
 
-**Symptom**: during Encode & Import the per-segment dots only flip when the
-whole commit pass finishes — `dub-rip`'s commit loop reports no mid-run
-progress, so the FFI `job_progress()` is coarse by design (documented on the
-method). **Remediation**: a progress sink on `commit_session` (per-segment
-callback), surfaced through `RipJobProgress` and the review-panel dots.
-**Location**: `crates/dub-rip/src/commit.rs`, `crates/dub-ffi/src/rip.rs`,
-`apple/Dub/Performance/RipReviewPanel.swift`.
+Shipped: `commit_session` takes a progress sink, `RipSegmentJobState::Running`
+is a real state, and the review-panel dots move during the pass instead of
+flipping together at the end.
 
-### R-40. Session recovery banner (M26b)
+### R-40. Session recovery banner — **done (M26b)**
 
-**Symptom**: quitting mid-rip strands a salvageable session (`side.raw.wav` +
-`rip.json` survive by design) with no UI to resume it. **Remediation**: the
-planned `list_recoverable_rip_sessions` / `resume_rip_session` FFI + a quiet
-"Unfinished rip — Review / Discard" row above the rip bar on Prep entry.
-**Location**: `crates/dub-rip/src/session.rs` (needs a `from_session_dir`
-constructor), `crates/dub-ffi/src/rip.rs`, `apple/Dub/Performance/PrepRipBar.swift`.
+Shipped: `RipSession::from_session_dir` + `list_recoverable_rip_sessions` /
+`resume_rip_session`, and a quiet "Unfinished rip — Review / Later" row above
+the rip bar on Prep entry. "Later" never deletes; the audio is irreplaceable
+without setting the needle back down.
+
+### R-44. Re-split has no app entry point (M26b)
+
+**Symptom**: `resplit_rip_session` exists in the FFI and `dub rip-resplit`
+drives it, but the app cannot reach it — there is no "past rips" surface
+listing committed sessions, and a track in the browser carries no back-link to
+the session that produced it. **Remediation**: either a Prep-side "Past rips"
+list (session dir, date, track count, Re-split), or a browser context action on
+a rip-sourced track that resolves its session via the manifest. Needs the
+reverse mapping either way. **Location**: `crates/dub-ffi/src/rip.rs`
+(a `list_resplittable_rip_sessions`), `apple/Dub/Performance/`,
+`apple/Dub/Library/`.
+
+### R-45. Snapshot baselines are gitignored but are Xcode build inputs
+
+**Symptom**: `apple/DubTests/__Snapshots__/` is in `.gitignore` (zero baselines
+tracked) while `project.pbxproj` names each PNG individually as a resource of
+the `DubTests` target. A fresh clone therefore cannot even *build* the snapshot
+suite — the copy phase fails on the missing files — and the baselines that do
+exist are local artifacts no review ever sees. Deleting one PNG to re-record it
+breaks the build, and git has nothing to restore. **Remediation**: either track
+the PNGs (they are the regression gate; that is what makes them reviewable) or
+reference the directory rather than the files. **Location**: `.gitignore:80`,
+`apple/project.yml`, `apple/Dub.xcodeproj/project.pbxproj`.
+
+### R-46. Eight PerformanceSnapshotTests baselines are stale
+
+**Symptom**: `test_deckHeader_*`, `test_performancePads_deckA` and
+`test_sourceControl_allStates` fail against local baselines recorded around
+`5d5b0f9` (hot-cues) — the views moved through the M11d / M14 / M15 / M16
+rounds without a re-record. Verified pre-existing: they fail with all M26b work
+stashed. **Remediation**: re-record deliberately, view by view, once R-45
+settles whether baselines are tracked. **Location**:
+`apple/DubTests/PerformanceSnapshotTests.swift`.
 
 ### R-41. Deck pane shows the idle placeholder during capture
 

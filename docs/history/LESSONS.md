@@ -353,6 +353,30 @@
   `remove_dir_all` on discard would orphan the imported tracks. Commit is
   idempotent — retry is the recovery path.
 
+- **A WAV header is a promise the writer only keeps at `finalize()`.** `hound`
+  writes the RIFF and `data` sizes when the writer is finalized, so a crash,
+  force-quit or pulled cable leaves the audio on disk under a header claiming
+  zero. Any reader that trusts it throws the side away. `dub-rip/salvage.rs`
+  takes the *format* from the header and the *length* from the file, and that
+  same rule caught a latent bug in the commit path, which had been trusting
+  `hound`'s iterator and would have encoded silence from a recovered rip.
+- **Library identity is (volume, relative path), so re-encoding to the same
+  path reuses the track row.** The M26b re-split hit this: the "new" tracks came
+  back with the *old* UUIDs, and the replacement step then deleted the tracks it
+  had just imported. Segments now carry a split generation
+  (`01 Track (v2).flac`). The same trap would have dragged the previous split's
+  hot cues and play history onto audio with different boundaries.
+- **When a commit replaces data, order the destruction last.** New segments
+  import first; the earlier split's tracks leave the library only once the
+  commit is complete. A failure part-way leaves the operator with the old split
+  rather than with neither.
+- **Detection thresholds get measured, not guessed.** Vinyl gates cannot be
+  tuned from first principles — run-out noise on a played-out 45 sits above any
+  fixed gate worth setting. `dub rip-tune` replays a recorded side through the
+  *real* detector and the *real* silence gate, so one trip to the rig becomes a
+  baseline every later change is measured against, per the standing rule about
+  reproducing offline before the turntable.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is
