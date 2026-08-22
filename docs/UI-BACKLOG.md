@@ -400,6 +400,19 @@ reverse mapping either way. **Location**: `crates/dub-ffi/src/rip.rs`
 (a `list_resplittable_rip_sessions`), `apple/Dub/Performance/`,
 `apple/Dub/Library/`.
 
+### R-47. The last track absorbs the run-out groove
+
+**Symptom**: the split plan's final segment always runs to the end of the
+recording, and auto-stop fires some seconds *after* the music ends — measured
+on a real side, 38 s, because lead-out debris keeps resetting the quiet
+counter. The last track therefore carries ~40 s of run-out noise, and there is
+no way to trim a tail: markers split, they do not bound the ends.
+**Remediation**: either a "trim to last music" action in the review panel
+(the detector already knows where the last music cell is), or let the final
+marker act as an end boundary with the remainder discarded. **Location**:
+`crates/dub-rip/src/gaps.rs` (the played region is already computed),
+`crates/dub-rip/src/plan.rs`, `apple/Dub/Performance/RipReviewPanel.swift`.
+
 ### R-45. Snapshot baselines are gitignored but are Xcode build inputs
 
 **Symptom**: `apple/DubTests/__Snapshots__/` is in `.gitignore` (zero baselines

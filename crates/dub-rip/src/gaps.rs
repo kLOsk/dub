@@ -55,9 +55,17 @@ pub struct GapConfig {
     /// How far before the returning music to place the boundary.
     pub pre_roll_secs: f32,
     /// Gap line, in dB above the measured noise floor.
+    ///
+    /// 20 dB, measured — not the 8 dB first guessed. On a real
+    /// pressing the groove between tracks is far noisier than the
+    /// quietest groove on the side (dust, wear, the tail of the last
+    /// tune): a 4-track reggae side measured its floor at −57.8 dBFS
+    /// while its inter-track gaps sat at −40, and an 8 dB margin put
+    /// the line 10 dB under every gap on the record.
     pub margin_db: f32,
     /// How far under the music a gap must sit, regardless of the
-    /// floor estimate. This is what keeps a dub breakdown intact:
+    /// floor estimate. 18 dB — measured on the same side, where the
+    /// shallowest true gap sat 18.2 dB under the music level. This is what keeps a dub breakdown intact:
     /// when a side contains no true silence the floor estimate lands
     /// on the quietest *music*, and the margin alone would happily
     /// cut there.
@@ -72,14 +80,82 @@ pub struct GapConfig {
 impl Default for GapConfig {
     fn default() -> Self {
         Self {
-            min_gap_secs: 1.2,
+            min_gap_secs: 1.5,
             min_track_secs: 30.0,
             pre_roll_secs: 0.3,
-            margin_db: 8.0,
-            min_drop_db: 20.0,
+            margin_db: 20.0,
+            min_drop_db: 18.0,
             min_contrast_db: 12.0,
         }
     }
+}
+
+/// What the detector measured off a side — the numbers every
+/// threshold decision is made from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GapAnalysis {
+    /// Noise floor of the *needle-down* audio, dBFS.
+    pub floor_db: f32,
+    /// Music level (80th percentile cell), dBFS.
+    pub music_db: f32,
+    /// The line below which a cell counts as quiet, dBFS.
+    pub threshold_db: f32,
+    /// Seconds of the side judged to be under the stylus.
+    pub played_secs: f32,
+    /// False when the side has too little dynamic range to split.
+    pub usable: bool,
+}
+
+/// The per-cell level view the detector works from: one median dBFS
+/// value per ~50 ms, plus the seconds each cell covers.
+///
+/// Exposed for tuning tools, which must look at exactly what the
+/// detector looks at rather than re-deriving it.
+#[must_use]
+pub fn cell_levels_db(
+    envelope: &[PeakChunk],
+    frames_per_chunk: usize,
+    sample_rate: u32,
+) -> (Vec<f32>, f32) {
+    if envelope.is_empty() || frames_per_chunk == 0 || sample_rate == 0 {
+        return (Vec::new(), CELL_SECS);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let chunk_secs = frames_per_chunk as f32 / sample_rate as f32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let chunks_per_cell = ((CELL_SECS / chunk_secs).round() as usize).max(1);
+    let mut scratch = Vec::with_capacity(chunks_per_cell);
+    let cells = envelope
+        .chunks(chunks_per_cell)
+        .map(|cell| median_db(cell, &mut scratch))
+        .collect();
+    (cells, chunk_secs * chunks_per_cell as f32)
+}
+
+/// Measure a side without proposing anything — what
+/// [`detect_gaps`] decides from. Exposed so tuning tools report the
+/// detector's own numbers instead of re-deriving them and drifting.
+#[must_use]
+pub fn analyze(
+    envelope: &[PeakChunk],
+    frames_per_chunk: usize,
+    sample_rate: u32,
+    cfg: &GapConfig,
+) -> GapAnalysis {
+    let unusable = GapAnalysis {
+        floor_db: -140.0,
+        music_db: -140.0,
+        threshold_db: -140.0,
+        played_secs: 0.0,
+        usable: false,
+    };
+    if envelope.is_empty() || frames_per_chunk == 0 || sample_rate == 0 {
+        return unusable;
+    }
+    let Some(measured) = measure(envelope, frames_per_chunk, sample_rate, cfg) else {
+        return unusable;
+    };
+    measured.analysis
 }
 
 /// Find the inter-track gaps in a captured side.
@@ -103,33 +179,16 @@ pub fn detect_gaps(
     if envelope.is_empty() || frames_per_chunk == 0 || sample_rate == 0 || total_frames == 0 {
         return Vec::new();
     }
+    let Some(m) = measure(envelope, frames_per_chunk, sample_rate, cfg) else {
+        return Vec::new();
+    };
+    if !m.analysis.usable {
+        return Vec::new();
+    }
+    let (cells, cell_secs, cell_frames) = (m.cells, m.cell_secs, m.cell_frames);
+    let threshold_db = m.analysis.threshold_db;
 
     #[allow(clippy::cast_precision_loss)]
-    let chunk_secs = frames_per_chunk as f32 / sample_rate as f32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let chunks_per_cell = ((CELL_SECS / chunk_secs).round() as usize).max(1);
-    let cell_secs = chunk_secs * chunks_per_cell as f32;
-    let cell_frames = (chunks_per_cell * frames_per_chunk) as u64;
-
-    let mut scratch = Vec::with_capacity(chunks_per_cell);
-    let cells: Vec<f32> = envelope
-        .chunks(chunks_per_cell)
-        .map(|cell| median_db(cell, &mut scratch))
-        .collect();
-    // Two cells cannot hold a gap with music on both sides.
-    if cells.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut ranked = cells.clone();
-    ranked.sort_by(f32::total_cmp);
-    let floor_db = ranked[FLOOR_RANK_CELLS.min(ranked.len() - 1)];
-    let music_db = percentile(&ranked, 0.80);
-    if music_db - floor_db < cfg.min_contrast_db {
-        return Vec::new();
-    }
-    let threshold_db = (floor_db + cfg.margin_db).min(music_db - cfg.min_drop_db);
-
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let min_gap_cells = ((cfg.min_gap_secs / cell_secs).ceil() as usize).max(1);
     let pre_roll_frames = secs_to_frames(cfg.pre_roll_secs, sample_rate);
@@ -179,6 +238,82 @@ pub fn detect_gaps(
         kept.push(gap);
     }
     kept
+}
+
+/// Everything the threshold decision needs, measured once.
+struct Measured {
+    cells: Vec<f32>,
+    cell_secs: f32,
+    cell_frames: u64,
+    analysis: GapAnalysis,
+}
+
+fn measure(
+    envelope: &[PeakChunk],
+    frames_per_chunk: usize,
+    sample_rate: u32,
+    cfg: &GapConfig,
+) -> Option<Measured> {
+    #[allow(clippy::cast_precision_loss)]
+    let chunk_secs = frames_per_chunk as f32 / sample_rate as f32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let chunks_per_cell = ((CELL_SECS / chunk_secs).round() as usize).max(1);
+    let cell_secs = chunk_secs * chunks_per_cell as f32;
+    let cell_frames = (chunks_per_cell * frames_per_chunk) as u64;
+
+    let mut scratch = Vec::with_capacity(chunks_per_cell);
+    let cells: Vec<f32> = envelope
+        .chunks(chunks_per_cell)
+        .map(|cell| median_db(cell, &mut scratch))
+        .collect();
+    // Two cells cannot hold a gap with music on both sides.
+    if cells.len() < 3 {
+        return None;
+    }
+
+    let mut ranked = cells.clone();
+    ranked.sort_by(f32::total_cmp);
+    let music_db = percentile(&ranked, 0.80);
+
+    // Measure the floor only where the needle was actually on the
+    // record. A capture usually ends with the stylus lifted onto the
+    // rest, and that preamp hiss sits ~20 dB below groove noise —
+    // taking it as the floor puts the gap line under every real gap on
+    // the side. Bound the estimate by the first and last music
+    // instead; whatever is quiet in between is the pressing's own.
+    let played = played_region(&cells, music_db);
+    let (first, last) = played.unwrap_or((0, cells.len() - 1));
+    let mut needle_down: Vec<f32> = cells[first..=last].to_vec();
+    needle_down.sort_by(f32::total_cmp);
+    let floor_db = needle_down[FLOOR_RANK_CELLS.min(needle_down.len() - 1)];
+    #[allow(clippy::cast_precision_loss)]
+    let played_secs = (last - first + 1) as f32 * cell_secs;
+    let usable = music_db - floor_db >= cfg.min_contrast_db;
+
+    Some(Measured {
+        cells,
+        cell_secs,
+        cell_frames,
+        analysis: GapAnalysis {
+            floor_db,
+            music_db,
+            threshold_db: (floor_db + cfg.margin_db).min(music_db - cfg.min_drop_db),
+            played_secs,
+            usable,
+        },
+    })
+}
+
+/// First and last cell carrying music, used to bound the floor
+/// estimate to needle-down audio. `None` when nothing clears the line.
+fn played_region(cells: &[f32], music_db: f32) -> Option<(usize, usize)> {
+    // 20 dB under the music still counts as playing — this only has to
+    // separate "record under the stylus" from lead-in, run-out and a
+    // lifted needle, not music from silence.
+    let line = music_db - 20.0;
+    let first = cells.iter().position(|&db| db >= line)?;
+    let last = cells.iter().rposition(|&db| db >= line)?;
+    Some((first, last))
 }
 
 /// Median chunk level of one cell, in dBFS. The median (not the max)
@@ -275,6 +410,38 @@ mod tests {
             "boundary at {} s",
             secs_of(g.boundary_frame)
         );
+    }
+
+    /// The levels measured off a real 4-track reggae side (SL 3 +
+    /// phono chain, 48 kHz): music at −18 dBFS, inter-track gaps at
+    /// −40, and the quietest groove noise on the side down at −58.
+    ///
+    /// This is the case the first cut of the detector got wrong. It
+    /// set the line at floor + 8 dB = −50 and found nothing at all,
+    /// because a gap between tracks is ~18 dB noisier than the
+    /// quietest groove: dust, wear, and the tail of the last tune.
+    #[test]
+    fn measured_vinyl_side_yields_its_four_tracks() {
+        // rms for a dBFS level.
+        let at = |db: f32| 10.0_f32.powf(db / 20.0);
+        let e = env(&[
+            (at(-58.0), 4.0),   // lead-in groove — the quietest thing
+            (at(-18.0), 193.0), // track 1
+            (at(-40.0), 1.6),   // gap
+            (at(-18.0), 165.0), // track 2
+            (at(-40.3), 2.8),   // gap
+            (at(-18.0), 157.0), // track 3
+            (at(-38.0), 1.7),   // gap — the shallowest one
+            (at(-18.0), 105.0), // track 4
+            (at(-40.0), 2.5),   // run-out
+        ]);
+        let gaps = detect_gaps(&e, FPC, SR, total(&e), &GapConfig::default());
+
+        assert_eq!(gaps.len(), 3, "expected three inter-track gaps: {gaps:?}");
+        let mins = |f: u64| secs_of(f) / 60.0;
+        assert!((mins(gaps[0].boundary_frame) - 3.28).abs() < 0.1);
+        assert!((mins(gaps[1].boundary_frame) - 6.09).abs() < 0.1);
+        assert!((mins(gaps[2].boundary_frame) - 8.75).abs() < 0.1);
     }
 
     #[test]

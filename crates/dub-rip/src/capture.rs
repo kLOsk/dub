@@ -183,7 +183,12 @@ impl PreRoll {
 struct SilenceGate {
     music_level: f32,
     quiet_frames: u64,
+    /// Consecutive non-quiet frames. A run-out groove ticks and pops;
+    /// those are not the music coming back, so they only reset the
+    /// count once they persist.
+    loud_frames: u64,
     stop_after_frames: u64,
+    tolerate_frames: u64,
     drop_ratio: f32,
 }
 
@@ -194,26 +199,40 @@ impl SilenceGate {
         Self {
             music_level: 0.0,
             quiet_frames: 0,
+            loud_frames: 0,
             stop_after_frames,
+            // 400 ms: longer than any click, shorter than a bar.
+            tolerate_frames: u64::from(sample_rate) * 2 / 5,
             drop_ratio: 10.0_f32.powf(-drop_db / 20.0),
         }
     }
 
     /// Feed one drained block. Returns true when the side is over.
     fn feed(&mut self, peak: f32, frames: u64, sample_rate: u32) -> bool {
-        // Peak-hold with a 30 s decay: one loud transient must not set
-        // the bar for the rest of the side, and a long fade must not
-        // drag it down fast enough to look like silence.
-        #[allow(clippy::cast_precision_loss)]
-        let decay = (-(frames as f32) / (30.0 * sample_rate as f32)).exp();
-        self.music_level *= decay;
+        let _ = (frames, sample_rate);
+        // Session peak-hold, deliberately without decay. An earlier
+        // version decayed over 30 s, which meant a run-out groove
+        // stopped looking quiet after ~24 s — the reference had sunk
+        // to meet it — and the counter reset forever. Measured on a
+        // real side: auto-stop never fired while the stylus sat in the
+        // locked groove, and only triggered once the needle was
+        // physically lifted. The reference has to stay where the music
+        // was, because the question is "has the side ended", not "how
+        // loud is it right now".
         if peak > self.music_level {
             self.music_level = peak;
         }
         if peak < self.music_level * self.drop_ratio {
+            self.loud_frames = 0;
             self.quiet_frames += frames;
         } else {
-            self.quiet_frames = 0;
+            self.loud_frames += frames;
+            // Only a sustained return of signal ends the quiet run;
+            // measured on a real side, run-out ticks every few seconds
+            // otherwise held the stop off for twice the timeout.
+            if self.loud_frames >= self.tolerate_frames {
+                self.quiet_frames = 0;
+            }
         }
         self.quiet_frames >= self.stop_after_frames
     }

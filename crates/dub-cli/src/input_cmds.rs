@@ -16,6 +16,8 @@
 //! across commands (`--device`, `--channels`, `--buffer-size`, `--sr`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -464,12 +466,26 @@ pub fn capture(args: &[String]) -> Result<()> {
     let block_frames = 4096_usize;
     let mut buf = vec![0.0_f32; block_frames * channels];
 
+    // Enter stops the capture. A record side does not run to a
+    // convenient number of seconds, and a rip baseline wants the whole
+    // side plus the run-out: guessing --duration either cuts the end
+    // off or leaves minutes of lifted-needle silence that drags every
+    // level estimate in `rip-tune` down. --duration still caps it.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop_flag);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        flag.store(true, Ordering::Release);
+    });
+    eprintln!("recording — press Enter to stop (or wait out --duration)");
+
     let start = Instant::now();
     let total = Duration::from_secs_f64(input_args.duration_secs());
     let mut samples_written: u64 = 0;
     let mut peak: f32 = 0.0;
 
-    while start.elapsed() < total {
+    while start.elapsed() < total && !stop_flag.load(Ordering::Acquire) {
         let n = input.read_into(&mut buf);
         if n == 0 {
             std::thread::sleep(Duration::from_millis(2));

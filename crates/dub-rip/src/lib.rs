@@ -25,7 +25,7 @@ mod session;
 
 pub use capture::{simulate as simulate_auto_capture, AutoCaptureSim};
 pub use commit::{CommitProgress, RipOutcome, SegmentOutcome};
-pub use gaps::{detect_gaps, Gap, GapConfig};
+pub use gaps::{analyze as analyze_gaps, cell_levels_db, detect_gaps, Gap, GapAnalysis, GapConfig};
 pub use manifest::{
     load as load_manifest, save as save_manifest, ManifestError, RipManifest, TrackEntry,
     MANIFEST_FILE, MANIFEST_VERSION,

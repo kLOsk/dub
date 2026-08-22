@@ -27,7 +27,23 @@ pub fn run(args: &[String]) -> Result<()> {
     if sample_rate == 0 || channels == 0 {
         return Err(anyhow!("unusable audio: {} Hz, {channels} ch", sample_rate));
     }
-    let frames = samples.len() as u64 / u64::from(channels);
+    // A capture usually runs past the record — a fixed --duration
+    // leaves minutes of lifted-needle silence that drags every level
+    // estimate down. --from / --to analyse just the side.
+    let total_frames = samples.len() as u64 / u64::from(channels);
+    let start_frame = opts
+        .from_secs
+        .map_or(0, |s| secs_to_frames(s, sample_rate).min(total_frames));
+    let end_frame = opts
+        .to_secs
+        .map_or(total_frames, |s| {
+            secs_to_frames(s, sample_rate).min(total_frames)
+        })
+        .max(start_frame);
+    let ch = u64::from(channels);
+    let samples = &samples[usize::try_from(start_frame * ch).unwrap_or(0)
+        ..usize::try_from(end_frame * ch).unwrap_or(samples.len())];
+    let frames = end_frame - start_frame;
 
     println!("file      : {}", opts.path.display());
     println!(
@@ -35,21 +51,35 @@ pub fn run(args: &[String]) -> Result<()> {
         clock(frames_to_secs(frames, sample_rate))
     );
     println!("source    : {note}");
+    if opts.from_secs.is_some() || opts.to_secs.is_some() {
+        println!(
+            "window    : {} – {}  (times below are relative to the file start)",
+            clock(frames_to_secs(start_frame, sample_rate)),
+            clock(frames_to_secs(end_frame, sample_rate))
+        );
+    }
 
-    let envelope = envelope_of(&samples, channels);
-    let stats = level_stats(&envelope);
+    let envelope = envelope_of(samples, channels);
+    // The detector's own measurement, not a second copy of it.
+    let stats = dub_rip::analyze_gaps(&envelope, DEFAULT_SAMPLES_PER_CHUNK, sample_rate, &opts.gap);
 
     println!();
     println!("LEVELS  (50 ms cells, median chunk RMS)");
+    println!(
+        "  needle-down region {:>8}   (floor measured here, not over the whole file)",
+        clock(f64::from(stats.played_secs))
+    );
     println!("  noise floor        {:>8.1} dBFS", stats.floor_db);
     println!("  music level        {:>8.1} dBFS", stats.music_db);
-    println!("  contrast           {:>8.1} dB", stats.contrast());
-    let gap_line = (stats.floor_db + opts.gap.margin_db).min(stats.music_db - opts.gap.min_drop_db);
+    println!(
+        "  contrast           {:>8.1} dB",
+        stats.music_db - stats.floor_db
+    );
     println!(
         "  gap line           {:>8.1} dBFS   (floor +{:.0}, capped at music −{:.0})",
-        gap_line, opts.gap.margin_db, opts.gap.min_drop_db
+        stats.threshold_db, opts.gap.margin_db, opts.gap.min_drop_db
     );
-    if stats.contrast() < opts.gap.min_contrast_db {
+    if !stats.usable {
         println!(
             "  ! contrast is under the {:.0} dB minimum — the detector proposes nothing here",
             opts.gap.min_contrast_db
@@ -57,7 +87,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     // ---- Auto-capture --------------------------------------------
-    let sim = dub_rip::simulate_auto_capture(&samples, sample_rate, &opts.auto);
+    let sim = dub_rip::simulate_auto_capture(samples, sample_rate, &opts.auto);
     println!();
     match opts.auto.start_threshold {
         Some(t) => {
@@ -167,6 +197,78 @@ pub fn run(args: &[String]) -> Result<()> {
         println!("  )");
     }
 
+    // Where are the most gap-like places, and how high would the line
+    // have to sit to catch them? Answers "are there gaps at all" for a
+    // side the detector reports nothing on.
+    if let Some(want) = opts.quietest {
+        let (cells, cell_secs) =
+            dub_rip::cell_levels_db(&envelope, DEFAULT_SAMPLES_PER_CHUNK, sample_rate);
+        let window = ((opts.gap.min_gap_secs / cell_secs).ceil() as usize).max(1);
+        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        if cells.len() >= window {
+            for start in 0..=cells.len() - window {
+                // The loudest cell in the window is the line a gap
+                // detector would need to clear it.
+                let needed = cells[start..start + window]
+                    .iter()
+                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                candidates.push((start, needed));
+            }
+        }
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+        println!();
+        println!(
+            "QUIETEST  {want} most gap-like {:.1} s stretches (non-overlapping)",
+            opts.gap.min_gap_secs
+        );
+        let mut shown: Vec<usize> = Vec::new();
+        for (start, needed) in candidates {
+            if shown.len() >= want {
+                break;
+            }
+            if shown.iter().any(|&s| start.abs_diff(s) < window * 2) {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let at = start as f64 * f64::from(cell_secs);
+            println!("  {:>8}   needs a line at {needed:>7.1} dBFS", clock(at));
+            shown.push(start);
+        }
+    }
+
+    if let Some(step) = opts.profile_secs {
+        println!();
+        println!("PROFILE  (median cell level per {step:.0} s)");
+        let cells_per_step = ((step / 0.05).round() as usize).max(1);
+        let mut cell_db: Vec<f32> = envelope
+            .chunks(38)
+            .map(|cell| {
+                let mut v: Vec<f32> = cell.iter().map(|c| c.rms).collect();
+                v.sort_by(f32::total_cmp);
+                20.0 * v[v.len() / 2].max(1e-7).log10()
+            })
+            .collect();
+        // Keep the tail even when it is a partial step.
+        if cell_db.is_empty() {
+            cell_db.push(-140.0);
+        }
+        for (i, group) in cell_db.chunks(cells_per_step).enumerate() {
+            let mut sorted = group.to_vec();
+            sorted.sort_by(f32::total_cmp);
+            let median = sorted[sorted.len() / 2];
+            let min = sorted[0];
+            let max = sorted[sorted.len() - 1];
+            #[allow(clippy::cast_precision_loss)]
+            let at = i as f64 * f64::from(step);
+            // A coarse bar makes the structure readable at a glance.
+            let bar = "#".repeat((((median + 90.0) / 5.0).max(0.0) as usize).min(18));
+            println!(
+                "  {:>7}  {median:>7.1}  (min {min:>6.1}, max {max:>6.1})  {bar}",
+                clock(at)
+            );
+        }
+    }
+
     let boundaries: Vec<u64> = gaps.iter().map(|g| g.boundary_frame).collect();
     let ranges = dub_rip::segments(&boundaries, frames);
     println!();
@@ -224,41 +326,10 @@ fn envelope_of(samples: &[f32], channels: u16) -> Vec<PeakChunk> {
     envelope
 }
 
-struct Levels {
-    floor_db: f32,
-    music_db: f32,
-}
-
-impl Levels {
-    fn contrast(&self) -> f32 {
-        self.music_db - self.floor_db
-    }
-}
-
-/// Mirrors the detector's own estimator: 50 ms cells at the median
-/// chunk level, floor from the 20th-quietest cell, music at p80.
-fn level_stats(envelope: &[PeakChunk]) -> Levels {
-    let per_cell = 38; // ≈50 ms at 64-frame chunks / 48 kHz
-    let mut cells: Vec<f32> = envelope
-        .chunks(per_cell)
-        .map(|cell| {
-            let mut v: Vec<f32> = cell.iter().map(|c| c.rms).collect();
-            v.sort_by(f32::total_cmp);
-            20.0 * v[v.len() / 2].max(1e-7).log10()
-        })
-        .collect();
-    if cells.is_empty() {
-        return Levels {
-            floor_db: -140.0,
-            music_db: -140.0,
-        };
-    }
-    cells.sort_by(f32::total_cmp);
-    let last = cells.len() - 1;
-    Levels {
-        floor_db: cells[20.min(last)],
-        music_db: cells[((last as f32) * 0.8).round() as usize],
-    }
+fn secs_to_frames(secs: f64, sample_rate: u32) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let frames = (secs.max(0.0) * f64::from(sample_rate)).round() as u64;
+    frames
 }
 
 fn frames_to_secs(frames: u64, sample_rate: u32) -> f64 {
@@ -278,6 +349,10 @@ fn clock(secs: f64) -> String {
 
 struct Opts {
     path: PathBuf,
+    profile_secs: Option<f32>,
+    quietest: Option<usize>,
+    from_secs: Option<f64>,
+    to_secs: Option<f64>,
     gap: GapConfig,
     auto: AutoCapture,
 }
@@ -286,6 +361,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     let mut path: Option<PathBuf> = None;
     let mut gap = GapConfig::default();
     let mut auto = AutoCapture::default();
+    let mut profile_secs: Option<f32> = None;
+    let mut quietest: Option<usize> = None;
+    let mut from_secs: Option<f64> = None;
+    let mut to_secs: Option<f64> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = |flag: &str| -> Result<String> {
@@ -313,6 +392,14 @@ fn parse_args(args: &[String]) -> Result<Opts> {
                     .context("--start-threshold-db")?;
                 auto.start_threshold = Some(10.0_f32.powf(db / 20.0));
             }
+            "--from" => from_secs = Some(value("--from")?.parse().context("--from")?),
+            "--to" => to_secs = Some(value("--to")?.parse().context("--to")?),
+            "--quietest" => {
+                quietest = Some(value("--quietest")?.parse().context("--quietest")?);
+            }
+            "--profile" => {
+                profile_secs = Some(value("--profile")?.parse().context("--profile")?);
+            }
             "--no-auto-start" => auto.start_threshold = None,
             "--silence-secs" => {
                 auto.silence_stop_secs =
@@ -331,6 +418,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         }
     }
     Ok(Opts {
+        profile_secs,
+        quietest,
+        from_secs,
+        to_secs,
         path: path.ok_or_else(|| {
             anyhow!(
                 "usage: dub rip-tune <side.wav> [--min-gap S] [--min-track S] \
