@@ -17,16 +17,23 @@
 
 mod capture;
 mod commit;
+mod gaps;
 mod manifest;
 mod plan;
+mod salvage;
 mod session;
 
-pub use commit::{RipOutcome, SegmentOutcome};
+pub use commit::{CommitProgress, RipOutcome, SegmentOutcome};
+pub use gaps::{detect_gaps, Gap, GapConfig};
 pub use manifest::{
     load as load_manifest, save as save_manifest, ManifestError, RipManifest, TrackEntry,
     MANIFEST_FILE, MANIFEST_VERSION,
 };
 pub use plan::{segments, validate_boundaries, SplitError, TrackMeta, MIN_SEGMENT_SECS};
+pub use salvage::{
+    list_recoverable, probe as probe_spill, rebuild_envelope, RecoverableRip, SpillInfo,
+};
 pub use session::{
-    RipConfig, RipError, RipSession, RipState, RipStatus, StopReason, ARCHIVE_FILE, SPILL_FILE,
+    AutoCapture, RipConfig, RipError, RipSession, RipState, RipStatus, StopReason, ARCHIVE_FILE,
+    SPILL_FILE,
 };
