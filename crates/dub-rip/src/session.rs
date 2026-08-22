@@ -297,6 +297,75 @@ impl RipSession {
         })
     }
 
+    /// Reopen a *committed* session to split it again from the
+    /// lossless side archive (M26b).
+    ///
+    /// For the case the review screen cannot catch: the split looked
+    /// right, the tracks imported, and only later — listening — does a
+    /// boundary turn out to be wrong. `side.flac` is the whole side,
+    /// so this needs no record and no turntable.
+    ///
+    /// The plan is cleared and the previously imported UUIDs move to
+    /// [`RipManifest::replaced_uuids`]: the next successful commit
+    /// imports the new segments and *then* removes the old tracks, so
+    /// a failure part-way leaves the library with the originals rather
+    /// than with nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`RipError::Manifest`] if the manifest is missing or malformed;
+    /// [`RipError::SpillUnreadable`] if the archive cannot be decoded.
+    pub fn resplit_from_archive(session_dir: PathBuf) -> Result<Self, RipError> {
+        let mut manifest = manifest::load(&session_dir)?;
+        let archive = session_dir.join(ARCHIVE_FILE);
+        if !archive.is_file() {
+            return Err(RipError::SpillUnreadable(format!(
+                "no side archive at {}",
+                archive.display()
+            )));
+        }
+        let track = dub_io::Track::load_from_path(&archive)
+            .map_err(|e| RipError::SpillUnreadable(format!("{e}")))?;
+        let frames = track.frames() as u64;
+        let sample_rate = track.sample_rate();
+
+        // Carry the old tracks forward for removal, not deletion now:
+        // nothing is destroyed until the replacement is safely in.
+        let mut replaced: Vec<String> = std::mem::take(&mut manifest.replaced_uuids);
+        replaced.extend(
+            manifest
+                .tracks
+                .iter()
+                .filter_map(|t| t.library_uuid.clone()),
+        );
+        replaced.sort_unstable();
+        replaced.dedup();
+
+        manifest.replaced_uuids = replaced;
+        manifest.split_generation = manifest.split_generation.max(1).saturating_add(1);
+        manifest.recorded_frames = frames;
+        manifest.sample_rate = sample_rate;
+        manifest.boundaries_frames.clear();
+        manifest.tracks = vec![TrackEntry::default()];
+        manifest::save(&session_dir, &manifest)?;
+
+        let envelope = crate::salvage::envelope_from_samples(track.samples(), track.channels());
+        let shared = Arc::new(CaptureShared::new());
+        shared.state.store(STATE_STOPPED, Ordering::Release);
+        shared
+            .stop_reason
+            .store(REASON_RECOVERED, Ordering::Release);
+        shared.recorded_frames.store(frames, Ordering::Release);
+        *shared.envelope_guard() = envelope;
+
+        Ok(Self {
+            cfg: RipConfig::new(sample_rate, session_dir),
+            shared,
+            worker: None,
+            manifest,
+        })
+    }
+
     /// Path of the capture spill WAV.
     #[must_use]
     pub fn spill_path(&self) -> PathBuf {

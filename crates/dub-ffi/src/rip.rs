@@ -715,6 +715,30 @@ impl DubEngine {
         )))
     }
 
+    /// Reopen a committed rip to split it again from its lossless
+    /// archive (M26b).
+    ///
+    /// Replace semantics: the new segments import first, and the
+    /// tracks from the earlier split are removed from the library only
+    /// once that succeeds — a failure part-way leaves the originals in
+    /// place rather than leaving the DJ with neither. The archive
+    /// survives, so a side can be split again as often as needed.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::WriteFailed`] if the manifest is missing or
+    /// malformed; [`RipFfiError::CaptureFailed`] if `side.flac` cannot
+    /// be decoded.
+    pub fn resplit_rip_session(
+        &self,
+        session_dir: String,
+    ) -> Result<Arc<DubRipSession>, RipFfiError> {
+        let session =
+            RipSession::resplit_from_archive(PathBuf::from(session_dir)).map_err(map_rip_error)?;
+        let sample_rate = session.manifest().sample_rate;
+        Ok(Arc::new(DubRipSession::resumed(session, sample_rate, &[])))
+    }
+
     /// Create a rip session on `deck_idx`, claiming the record tap
     /// that [`Self::start_thru_for_rip`] parked. The session is
     /// created *armed* — its capture worker is already draining the

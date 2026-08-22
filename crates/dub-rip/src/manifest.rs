@@ -51,6 +51,25 @@ pub struct RipManifest {
     /// Relative path of the lossless side archive once written
     /// (`side.flac`).
     pub side_archive: Option<String>,
+    /// Library UUIDs from an earlier split of this same side, waiting
+    /// to be removed once the new split has fully imported (M26b
+    /// re-split). Kept in the manifest rather than in memory so a
+    /// crash mid-re-split cannot strand the old tracks invisibly.
+    ///
+    /// `serde(default)` — manifests written before M26b simply have
+    /// none, so the schema version does not move.
+    #[serde(default)]
+    pub replaced_uuids: Vec<String>,
+    /// How many times this side has been split. 0/1 is the original
+    /// commit; each re-split increments it and suffixes the segment
+    /// file names, so a re-split produces genuinely new tracks rather
+    /// than overwriting the old ones in place.
+    ///
+    /// Library identity is (volume, relative path): reusing a path
+    /// would reuse the track row, dragging the old split's hot cues
+    /// and play history onto audio with different boundaries.
+    #[serde(default)]
+    pub split_generation: u32,
 }
 
 impl RipManifest {
@@ -65,6 +84,8 @@ impl RipManifest {
             boundaries_frames: Vec::new(),
             tracks: Vec::new(),
             side_archive: None,
+            replaced_uuids: Vec::new(),
+            split_generation: 1,
         }
     }
 }

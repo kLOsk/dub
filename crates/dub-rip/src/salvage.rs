@@ -259,6 +259,25 @@ fn data_offset(path: &Path) -> Result<u64, RipError> {
     }
 }
 
+/// Decimate already-decoded interleaved samples into a capture
+/// envelope, exactly as the live worker does (mono downmix,
+/// [`DEFAULT_SAMPLES_PER_CHUNK`] frames per chunk) so `chunk[i]` still
+/// maps to frame `i * 64`. Used when the source is the side archive
+/// rather than the spill (M26b re-split).
+#[must_use]
+pub fn envelope_from_samples(samples: &[f32], channels: u8) -> Vec<PeakChunk> {
+    let channels = usize::from(channels.max(1));
+    let mut envelope = Vec::new();
+    let mut decimator = Decimator::new(DEFAULT_SAMPLES_PER_CHUNK);
+    #[allow(clippy::cast_precision_loss)]
+    let mono: Vec<f32> = samples
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect();
+    decimator.feed(&mono, |chunk| envelope.push(chunk));
+    envelope
+}
+
 /// Read the whole spill as interleaved samples, header length or not.
 ///
 /// The commit path uses this rather than `hound`'s iterator for the

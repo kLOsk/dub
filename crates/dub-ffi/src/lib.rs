@@ -387,7 +387,11 @@ pub use rip::{
 ///       segment as it starts and finishes, so `job_progress()` moves
 ///       during the pass instead of flipping every dot at the end
 ///       (UI-BACKLOG R-39). Adds `RipSegmentJobState::Running`.
-pub const FFI_VERSION: u32 = 58;
+///   59. **M26b re-split.** [`DubEngine::resplit_rip_session`] reopens a
+///       committed rip from its `side.flac` for a fresh split; the
+///       earlier split's tracks leave the library only once the new
+///       one has imported.
+pub const FFI_VERSION: u32 = 59;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5112,7 +5116,8 @@ mod tests {
         // `RipStopReason::Recovered`.
         // 57→58: M26b live commit progress — per-segment Started /
         // Finished callbacks + `RipSegmentJobState::Running`.
-        assert_eq!(FFI_VERSION, 58);
+        // 58→59: M26b re-split — `resplit_rip_session`.
+        assert_eq!(FFI_VERSION, 59);
     }
 
     #[test]

@@ -626,3 +626,104 @@ fn commit_reports_progress_per_segment() {
     );
     assert_eq!(retry.segments.len(), 3, "retry still reports the segments");
 }
+
+/// M26b re-split: the case review cannot catch — the split looked
+/// right, the tracks imported, and only later does a boundary turn out
+/// to be wrong. `side.flac` is the whole side, so fixing it needs no
+/// record and no turntable.
+#[test]
+fn resplit_from_archive_replaces_the_earlier_tracks() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("rip-session");
+    let mut cfg = RipConfig::new(SR, session_dir.clone());
+    cfg.poll_interval = Duration::from_millis(1);
+    let mut session = RipSession::new(cfg).unwrap();
+
+    let ring = HeapRb::<f32>::new(1 << 20);
+    let (mut tx, rx) = ring.split();
+    session.arm(rx).unwrap();
+    session.start().unwrap();
+    let side = synthetic_side();
+    let mut pushed = 0;
+    while pushed < side.len() {
+        pushed += tx.push_slice(&side[pushed..]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    session.stop().unwrap();
+    session.wait_stopped(Duration::from_secs(10)).unwrap();
+
+    // First split: three tracks.
+    session
+        .set_splits(vec![seg_frames(), 2 * seg_frames()])
+        .unwrap();
+    let library_path = dir.path().join("library.sqlite");
+    let mut library = dub_library::Library::open_at(&library_path).unwrap();
+    let first = session.commit(&mut library).unwrap();
+    assert!(first.is_complete());
+    assert_eq!(first.replaced_removed, 0, "a first commit replaces nothing");
+    let old_uuids: Vec<String> = first
+        .segments
+        .iter()
+        .map(|s| s.library_uuid.clone().unwrap())
+        .collect();
+    assert_eq!(old_uuids.len(), 3);
+    for uuid in &old_uuids {
+        assert!(
+            library.track_exists(uuid).unwrap(),
+            "first split must be in the library"
+        );
+    }
+    // Committed: the spill is gone and only the archive remains.
+    assert!(!session.spill_path().exists());
+    assert!(session_dir.join("side.flac").exists());
+    drop(session);
+
+    // ---- Re-split, from the archive alone -------------------------
+    let mut session = RipSession::resplit_from_archive(session_dir.clone()).unwrap();
+    assert_eq!(
+        session.manifest().replaced_uuids.len(),
+        3,
+        "the old tracks are queued for removal, not removed yet"
+    );
+    for uuid in &old_uuids {
+        assert!(
+            library.track_exists(uuid).unwrap(),
+            "nothing may be destroyed before the replacement lands"
+        );
+    }
+    assert!(
+        session.envelope_len() > 0,
+        "envelope rebuilt from the archive"
+    );
+
+    // Two tracks this time, on a different boundary.
+    session
+        .set_splits(vec![seg_frames() + seg_frames() / 2])
+        .unwrap();
+    let second = session.commit(&mut library).unwrap();
+    assert!(second.is_complete(), "re-split must commit: {second:?}");
+    assert_eq!(second.segments.len(), 2);
+    assert_eq!(second.replaced_removed, 3, "old tracks removed on success");
+
+    let new_uuids: Vec<String> = second
+        .segments
+        .iter()
+        .map(|s| s.library_uuid.clone().unwrap())
+        .collect();
+    for uuid in &new_uuids {
+        assert!(library.track_exists(uuid).unwrap(), "new split is in");
+    }
+    for uuid in &old_uuids {
+        assert!(
+            !library.track_exists(uuid).unwrap(),
+            "replaced track {uuid} still in the library"
+        );
+    }
+    assert!(
+        session.manifest().replaced_uuids.is_empty(),
+        "the removal queue must be cleared once drained"
+    );
+    // The archive survives, so the side can be split again.
+    assert!(session_dir.join("side.flac").exists());
+}

@@ -2181,6 +2181,59 @@ impl Library {
     /// cascade via the schema's `ON DELETE CASCADE`. Errors with
     /// [`LibraryError::CrateNotFound`] when the id is unknown so the
     /// UI can distinguish a no-op from a real delete.
+    /// Whether a canonical track row exists.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Sqlite`] if the query fails.
+    pub fn track_exists(&self, track_id: &str) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE id = ?1",
+                params![track_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("track_exists", e))?;
+        Ok(count > 0)
+    }
+
+    /// Remove a track from the catalog entirely.
+    ///
+    /// Every table that references `tracks(id)` declares `ON DELETE
+    /// CASCADE` (files, metadata sources, cues, loops, grids, crate
+    /// membership, analysis) or `ON DELETE SET NULL` (history
+    /// transitions, duplicate links), and `foreign_keys` is `ON` for
+    /// every connection, so this one statement is the whole removal —
+    /// including the FTS rows, which a trigger on
+    /// `track_metadata_source` cleans up.
+    ///
+    /// **Does not touch the file on disk.** The only caller today is
+    /// the M26b re-split, which replaces a rip's earlier tracks with a
+    /// new split of the same side; the audio it removes is still in
+    /// the session directory.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::TrackNotFound`] if no such track exists — a
+    /// silent no-op would hide a caller working from stale ids.
+    pub fn delete_track(&self, track_id: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![track_id])
+            .map_err(|e| LibraryError::sqlite("delete_track", e))?;
+        if changed == 0 {
+            return Err(LibraryError::TrackNotFound {
+                track_id: track_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete a Dub crate. `crate_tracks` rows and any child crates
+    /// cascade via the schema's `ON DELETE CASCADE`. Errors with
+    /// [`LibraryError::CrateNotFound`] when the id is unknown so the
+    /// UI can distinguish a no-op from a real delete.
     pub fn delete_crate(&self, crate_id: i64) -> Result<()> {
         let changed = self
             .conn
@@ -2538,6 +2591,77 @@ mod tests {
         let lib = Library::open_at(&path).expect("open succeeds and creates parents");
         assert!(path.exists(), "library file must exist after open");
         assert_eq!(lib.db_path(), path);
+    }
+
+    /// M26b re-split removes the tracks an earlier split imported, so
+    /// the cascade has to be real, not just declared in the schema.
+    #[test]
+    fn delete_track_cascades_to_every_child_row() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = "11111111-2222-3333-4444-555555555555";
+        lib.upsert_volume(&DiscoveredVolume {
+            volume_uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+            mount_point: PathBuf::from("/Volumes/Rips"),
+            display_name: "Rips".to_string(),
+            is_internal: false,
+        })
+        .unwrap();
+        lib.insert_track(track, None, Some(180_000), None).unwrap();
+        lib.upsert_track_file(
+            track,
+            "00112233-4455-6677-8899-aabbccddeeff",
+            "Rips/side/01 Track.flac",
+            Some("flac"),
+            Some(44_100),
+            Some(24),
+            Some(2),
+            Some(1_024),
+            Some(0),
+        )
+        .unwrap();
+        let crate_id = lib.create_crate("Rips", None).unwrap();
+        lib.add_track_to_crate(crate_id, track).unwrap();
+
+        let count = |table: &str| -> i64 {
+            lib.conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE track_id = ?1"),
+                    params![track],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("track_files"), 1);
+        assert_eq!(count("crate_tracks"), 1);
+
+        lib.delete_track(track).unwrap();
+
+        assert_eq!(count("track_files"), 0, "files must cascade");
+        assert_eq!(count("crate_tracks"), 0, "crate membership must cascade");
+        let tracks: i64 = lib
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE id = ?1",
+                params![track],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tracks, 0);
+        // The crate itself survives — only the membership went.
+        let crates: i64 = lib
+            .conn
+            .query_row("SELECT COUNT(*) FROM crates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(crates, 1);
+    }
+
+    #[test]
+    fn delete_track_rejects_an_unknown_id() {
+        let lib = Library::open_in_memory().unwrap();
+        assert!(matches!(
+            lib.delete_track("nope"),
+            Err(LibraryError::TrackNotFound { .. })
+        ));
     }
 
     #[test]

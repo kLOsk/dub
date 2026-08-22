@@ -34,6 +34,7 @@ mod diagnose;
 mod import;
 mod input_cmds;
 mod rip;
+mod rip_resplit;
 mod rip_tune;
 mod scope;
 mod stretch_bench;
@@ -59,6 +60,7 @@ fn main() -> ExitCode {
         "capture" => input_cmds::capture(&args[2..]),
         "rip" => rip::run(&args[2..]),
         "rip-tune" => rip_tune::run(&args[2..]),
+        "rip-resplit" => rip_resplit::run(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
         "thru" => thru::run(&args[2..]),
         "scope" => scope::run(&args[2..]),

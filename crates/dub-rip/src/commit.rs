@@ -41,6 +41,9 @@ pub struct RipOutcome {
     /// Whether the WAV spill was deleted (only after every segment
     /// imported and the archive landed).
     pub spill_removed: bool,
+    /// How many tracks from an earlier split of this side were removed
+    /// from the library (M26b re-split). Always 0 for a first commit.
+    pub replaced_removed: usize,
 }
 
 impl RipOutcome {
@@ -104,10 +107,11 @@ pub(crate) fn commit_session(
                 .collect(),
             archive: manifest.side_archive.as_ref().map(|f| session_dir.join(f)),
             spill_removed: false,
+            replaced_removed: 0,
         });
     }
 
-    let (samples, sample_rate) = read_spill(spill_path)?;
+    let (samples, sample_rate) = read_spill(spill_path, &session_dir.join(ARCHIVE_FILE))?;
     let total_frames = (samples.len() / 2) as u64;
     // Trust the audio file over the manifest count (a crash between
     // WAV finalize and manifest save leaves them skewed).
@@ -132,6 +136,7 @@ pub(crate) fn commit_session(
         segments: Vec::with_capacity(ranges.len()),
         archive: manifest.side_archive.as_ref().map(|f| session_dir.join(f)),
         spill_removed: false,
+        replaced_removed: 0,
     };
 
     for (index, range) in ranges.iter().enumerate() {
@@ -139,7 +144,7 @@ pub(crate) fn commit_session(
         let file_name = entry
             .encoded_file
             .clone()
-            .unwrap_or_else(|| segment_file_name(index, &entry.meta));
+            .unwrap_or_else(|| segment_file_name(index, &entry.meta, manifest.split_generation));
         let file = session_dir.join(&file_name);
 
         if entry.library_uuid.is_some() {
@@ -212,11 +217,81 @@ pub(crate) fn commit_session(
         }
     }
 
+    // M26b re-split: the tracks an earlier split imported come out of
+    // the library only now, with the replacement safely in. A failure
+    // above leaves them in place — the operator keeps the old split
+    // rather than losing both.
+    if outcome.is_complete() && !manifest.replaced_uuids.is_empty() {
+        // A re-split reuses segment file names, and library identity is
+        // (volume, relative path) — so a new segment written to an old
+        // segment's path comes back with that track's UUID. Removing
+        // it here would delete the track this very commit imported.
+        let kept: Vec<&str> = outcome
+            .segments
+            .iter()
+            .filter_map(|s| s.library_uuid.as_deref())
+            .collect();
+        manifest
+            .replaced_uuids
+            .retain(|u| !kept.contains(&u.as_str()));
+
+        let mut removed = Vec::new();
+        for uuid in &manifest.replaced_uuids {
+            // A track the operator already deleted by hand is not an
+            // error; the goal state is "it is gone", and it is.
+            match library.delete_track(uuid) {
+                Ok(()) => removed.push(uuid.clone()),
+                Err(dub_library::LibraryError::TrackNotFound { .. }) => removed.push(uuid.clone()),
+                Err(e) => {
+                    if let Some(seg) = outcome.segments.first_mut() {
+                        let note = format!("could not remove the replaced track {uuid}: {e}");
+                        seg.error = Some(match seg.error.take() {
+                            Some(prev) => format!("{prev}; {note}"),
+                            None => note,
+                        });
+                    }
+                }
+            }
+        }
+        manifest.replaced_uuids.retain(|u| !removed.contains(u));
+        outcome.replaced_removed = removed.len();
+        manifest::save(session_dir, manifest)?;
+        // Segment files the new plan no longer references would
+        // otherwise sit in a folder under ~/Music with no library row
+        // — and get picked up as tracks by the next filesystem scan.
+        remove_orphaned_segments(session_dir, manifest);
+    }
+
     if outcome.is_complete() && spill_path.exists() {
         std::fs::remove_file(spill_path)?;
         outcome.spill_removed = true;
     }
     Ok(outcome)
+}
+
+/// Delete encoded segments the current plan does not reference.
+/// Never touches the side archive — that is the source a future
+/// re-split reads from.
+fn remove_orphaned_segments(session_dir: &Path, manifest: &RipManifest) {
+    let live: Vec<&str> = manifest
+        .tracks
+        .iter()
+        .filter_map(|t| t.encoded_file.as_deref())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return;
+    };
+    for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == ARCHIVE_FILE || !name.to_ascii_lowercase().ends_with(".flac") {
+            continue;
+        }
+        if !live.contains(&name) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Encode + tag + import + pre-analyze one segment. Returns the
@@ -277,7 +352,7 @@ fn tags_for(meta: &crate::plan::TrackMeta, track_number: u32, track_total: u32) 
 /// `NN Artist - Title.flac`, falling back to `NN Track.flac` for
 /// untagged segments. Sanitized for the filesystem; the library
 /// derives `filename`-source metadata from this, so keep it human.
-fn segment_file_name(index: usize, meta: &crate::plan::TrackMeta) -> String {
+fn segment_file_name(index: usize, meta: &crate::plan::TrackMeta, generation: u32) -> String {
     let n = index + 1;
     let stem = match (&meta.artist, &meta.title) {
         (Some(artist), Some(title)) => format!("{artist} - {title}"),
@@ -285,7 +360,15 @@ fn segment_file_name(index: usize, meta: &crate::plan::TrackMeta) -> String {
         (Some(artist), None) => format!("{artist} - Track {n}"),
         (None, None) => format!("Track {n}"),
     };
-    format!("{n:02} {}.flac", sanitize_file_stem(&stem))
+    let stem = sanitize_file_stem(&stem);
+    // A re-split must not land on the previous split's path: library
+    // identity is (volume, relative path), so the same path would hand
+    // the new audio the old track's row, cues and history included.
+    if generation > 1 {
+        format!("{n:02} {stem} (v{generation}).flac")
+    } else {
+        format!("{n:02} {stem}.flac")
+    }
 }
 
 /// Strip path separators and control characters; collapse the result
@@ -313,9 +396,28 @@ fn sanitize_file_stem(stem: &str) -> String {
 /// the recording was, and committing what the header claims would
 /// throw the side away at the last step. Format validation lives in
 /// [`crate::salvage::probe`].
-fn read_spill(spill_path: &Path) -> Result<(Vec<f32>, u32), RipError> {
-    let (samples, info) = crate::salvage::read_all(spill_path)?;
-    Ok((samples, info.sample_rate))
+///
+/// Falls back to the lossless side archive when the spill is gone: a
+/// committed session keeps only `side.flac`, and that is what a
+/// re-split re-encodes from (M26b).
+fn read_spill(spill_path: &Path, archive_path: &Path) -> Result<(Vec<f32>, u32), RipError> {
+    if spill_path.exists() {
+        let (samples, info) = crate::salvage::read_all(spill_path)?;
+        return Ok((samples, info.sample_rate));
+    }
+    let track = dub_io::Track::load_from_path(archive_path).map_err(|e| {
+        RipError::SpillUnreadable(format!(
+            "no spill and the side archive is unreadable ({}): {e}",
+            archive_path.display()
+        ))
+    })?;
+    if track.channels() != 2 {
+        return Err(RipError::SpillUnreadable(format!(
+            "side archive is {} ch, expected stereo",
+            track.channels()
+        )));
+    }
+    Ok((track.samples().to_vec(), track.sample_rate()))
 }
 
 #[cfg(test)]
@@ -331,7 +433,7 @@ mod tests {
             ..TrackMeta::default()
         };
         assert_eq!(
-            segment_file_name(0, &meta),
+            segment_file_name(0, &meta, 1),
             "01 Sound Dimension - Real Rock.flac"
         );
     }
@@ -339,14 +441,16 @@ mod tests {
     #[test]
     fn file_name_falls_back_per_missing_field() {
         assert_eq!(
-            segment_file_name(2, &TrackMeta::default()),
+            segment_file_name(2, &TrackMeta::default(), 1),
             "03 Track 3.flac"
         );
         let title_only = TrackMeta {
             title: Some("Version".into()),
             ..TrackMeta::default()
         };
-        assert_eq!(segment_file_name(9, &title_only), "10 Version.flac");
+        assert_eq!(segment_file_name(9, &title_only, 1), "10 Version.flac");
+        // A re-split writes beside the previous split, never over it.
+        assert_eq!(segment_file_name(9, &title_only, 2), "10 Version (v2).flac");
     }
 
     #[test]
@@ -356,7 +460,7 @@ mod tests {
             title: Some("pass/wd:x".into()),
             ..TrackMeta::default()
         };
-        let name = segment_file_name(0, &hostile);
+        let name = segment_file_name(0, &hostile, 1);
         assert!(!name.contains('/') && !name.contains('\\') && !name.contains(':'));
         assert!(!name.starts_with('.'));
     }
