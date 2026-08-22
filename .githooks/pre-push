@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# pre-push — run the CI gates that have actually broken `main`.
+#
+# Every red push to main so far failed on one of three checks, each of
+# which takes seconds locally: `cargo fmt --check`, `cargo clippy -D
+# warnings`, and `scripts/check-docs.sh`. Nothing ran them before the
+# code landed, so the break was only discovered minutes later in CI, on
+# a branch nobody was watching. This hook closes that gap at the last
+# moment where fixing it is still cheap.
+#
+# The test suite is deliberately NOT run here: ~11 minutes is too long
+# to sit in front of a push, and a broken test is a real failure worth
+# a CI cycle. Set DUB_PREPUSH_TESTS=1 to include it anyway.
+#
+# Install: `make hooks` (or `git config core.hooksPath .githooks`).
+# Bypass once: `git push --no-verify`.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+FAILED=()
+
+run_gate() {
+    local name="$1"
+    shift
+    printf '  %-28s' "${name}"
+    if "$@" >/tmp/dub-prepush.$$ 2>&1; then
+        echo "ok"
+    else
+        echo "FAIL"
+        FAILED+=("${name}")
+        sed 's/^/      /' /tmp/dub-prepush.$$ | tail -25
+    fi
+    rm -f /tmp/dub-prepush.$$
+}
+
+echo "pre-push: running CI gates (bypass with --no-verify)"
+
+run_gate "cargo fmt --check"  cargo fmt --all -- --check
+run_gate "cargo clippy"       cargo clippy --workspace --all-targets -- -D warnings
+run_gate "check-docs"         ./scripts/check-docs.sh
+
+if [[ "${DUB_PREPUSH_TESTS:-0}" == "1" ]]; then
+    run_gate "cargo nextest"  cargo nextest run --workspace
+fi
+
+if (( ${#FAILED[@]} > 0 )); then
+    echo
+    echo "pre-push: BLOCKED — ${FAILED[*]} would fail in CI."
+    echo "  fix, or push anyway with: git push --no-verify"
+    exit 1
+fi
+
+echo "pre-push: all gates green"
+exit 0

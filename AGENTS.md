@@ -121,7 +121,11 @@ cargo clippy -p dub-engine -- -D warnings
 - **Use `SemanticSearch` for concept queries; `Grep` for exact symbol lookups.**
 - **Use `cargo nextest run`, not `cargo test`** — faster, parallel, better output.
 - **Run `cargo clippy --all-targets -- -D warnings`** after non-trivial Rust edits.
-- **Run `cargo fmt`** before opening a PR; the pre-commit hook should do this.
+- **Run `make ci` before pushing** — `docs-check` + `fmt-check` + `clippy` +
+  tests, the exact gates CI runs. The tracked `pre-push` hook
+  (`make hooks`, or `scripts/bootstrap.sh`) runs the three fast ones for you
+  and blocks the push if any is red; bypass with `git push --no-verify`.
+  Every red `main` push in this repo's history failed on one of those three.
 - **No comments that narrate what the code does.** Comments explain *why*, not
   *what*. Code that needs `// Increment counter` should just say `counter += 1`.
 

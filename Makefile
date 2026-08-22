@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci docs-check app app-release run-app open-app xcframework snapshot
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check app app-release run-app open-app xcframework snapshot
 
 help:
 	@echo "Dub — common targets"
@@ -22,6 +22,7 @@ help:
 	@echo "  make soak          1-hour offline render soak (placeholder)"
 	@echo "  make ci            run the full CI pipeline locally"
 	@echo "  make docs-check    fail if README / docs/html drift from code constants"
+	@echo "  make hooks         install the pre-push CI gate (once per clone)"
 	@echo "  make clean         cargo clean"
 	@echo ""
 	@echo "Apple shell"
@@ -79,6 +80,12 @@ docs-check:
 
 ci: docs-check fmt-check clippy test
 	@echo "Local CI pipeline complete."
+
+# Point git at the tracked hook directory. Idempotent; run once per
+# clone (scripts/bootstrap.sh does it for you).
+hooks:
+	@git config core.hooksPath .githooks
+	@echo "git hooks -> .githooks (pre-push runs fmt + clippy + docs-check)"
 
 clean:
 	cargo clean

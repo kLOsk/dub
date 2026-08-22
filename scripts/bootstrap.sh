@@ -44,6 +44,15 @@ require_tool xcodebuild "Xcode 15+ from the Mac App Store"
 require_tool xcodegen   "brew install xcodegen"
 require_tool cargo      "rustup (https://rustup.rs)"
 
+# --- 0. Install the git hooks -------------------------------------------
+#
+# The pre-push hook runs the three CI gates that have historically
+# broken `main` (fmt / clippy / docs-check). Hooks live in a tracked
+# directory so a clone only needs this one-line opt-in.
+
+echo "==> Installing git hooks (.githooks)"
+git config core.hooksPath .githooks
+
 # --- 1. Build xcframework + Swift bindings -------------------------------
 
 echo "==> Building DubCore.xcframework + Swift bindings"
