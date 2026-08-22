@@ -4,11 +4,14 @@
 //! (crash-safe WAV spill + live envelope), then splits, encodes
 //! (FLAC + Vorbis tags), imports into the library pre-analyzed, and
 //! archives the side. This is the whole rip pipeline minus the
-//! review UI: split points come from `--splits`, metadata from
-//! flags. Runs against the same rig as `dub capture`
-//! (`--input-channels 3,4` = SL3 deck A).
+//! review UI: split points come from `--splits` or, since M26b,
+//! from `--auto-split` (gap detection over the capture envelope,
+//! tunable with `--min-track` / `--min-gap`, confirmed at the
+//! terminal unless `-y`); metadata comes from flags. Runs against
+//! the same rig as `dub capture` (`--input-channels 3,4` = SL3
+//! deck A).
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use dub_audio::AudioInput;
-use dub_rip::{RipConfig, RipSession, RipState, TrackMeta};
+use dub_rip::{AutoCapture, GapConfig, RipConfig, RipSession, RipState, TrackMeta};
 
 use crate::input_cmds::parse_input_args;
 
@@ -24,6 +27,12 @@ struct RipArgs {
     out_parent: Option<PathBuf>,
     library: Option<PathBuf>,
     splits_secs: Vec<f64>,
+    auto_split: bool,
+    auto_start: bool,
+    auto_stop: bool,
+    min_track_secs: Option<f32>,
+    min_gap_secs: Option<f32>,
+    assume_yes: bool,
     titles: Vec<String>,
     artist: Option<String>,
     album: Option<String>,
@@ -50,6 +59,20 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let session_dir = session_dir(rip_args.out_parent.clone())?;
     let mut cfg = RipConfig::new(sample_rate, session_dir.clone());
+    if rip_args.auto_start || rip_args.auto_stop {
+        let defaults = AutoCapture::default();
+        cfg.auto = AutoCapture {
+            start_threshold: rip_args
+                .auto_start
+                .then_some(defaults.start_threshold)
+                .flatten(),
+            silence_stop_secs: rip_args
+                .auto_stop
+                .then_some(defaults.silence_stop_secs)
+                .flatten(),
+            ..defaults
+        };
+    }
     if let Some(max) = rip_args.max_duration {
         #[allow(clippy::cast_possible_truncation)]
         let max_f32 = max as f32;
@@ -78,10 +101,16 @@ pub fn run(args: &[String]) -> Result<()> {
             std::thread::sleep(Duration::from_millis(200));
         }
     } else {
-        eprintln!("ARMED — cue the record, press Enter to start recording");
-        wait_for_enter_blocking();
-        session.start().context("starting capture")?;
-        eprintln!("RECORDING — press Enter to stop");
+        if rip_args.auto_start {
+            // The needle starts it; the pre-roll means the drop
+            // itself lands on the spill.
+            eprintln!("ARMED — drop the needle (auto-start); press Enter to stop");
+        } else {
+            eprintln!("ARMED — cue the record, press Enter to start recording");
+            wait_for_enter_blocking();
+            session.start().context("starting capture")?;
+            eprintln!("RECORDING — press Enter to stop");
+        }
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop_flag);
         std::thread::spawn(move || {
@@ -115,15 +144,46 @@ pub fn run(args: &[String]) -> Result<()> {
     );
 
     // ---- Split + metadata ------------------------------------------
-    let boundaries: Vec<u64> = rip_args
-        .splits_secs
-        .iter()
-        .map(|&s| secs_to_frames(s, sample_rate))
-        .collect();
-    session
-        .set_splits(boundaries)
-        .context("applying --splits")?;
+    if rip_args.auto_split {
+        let gap_cfg = GapConfig {
+            min_track_secs: rip_args
+                .min_track_secs
+                .unwrap_or(GapConfig::default().min_track_secs),
+            min_gap_secs: rip_args
+                .min_gap_secs
+                .unwrap_or(GapConfig::default().min_gap_secs),
+            ..GapConfig::default()
+        };
+        let gaps = session.detect_gaps(&gap_cfg);
+        println!("auto-split: {} gap(s) detected", gaps.len());
+        for gap in &gaps {
+            println!(
+                "  gap {} – {}  → split at {}",
+                mmss(frames_to_secs(gap.start_frame, sample_rate)),
+                mmss(frames_to_secs(gap.end_frame, sample_rate)),
+                mmss(frames_to_secs(gap.boundary_frame, sample_rate)),
+            );
+        }
+        session.auto_split(&gap_cfg).context("auto split")?;
+    } else {
+        let boundaries: Vec<u64> = rip_args
+            .splits_secs
+            .iter()
+            .map(|&s| secs_to_frames(s, sample_rate))
+            .collect();
+        session
+            .set_splits(boundaries)
+            .context("applying --splits")?;
+    }
     let segment_count = session.manifest().tracks.len().max(1);
+    print_plan(&session, sample_rate, status.recorded_frames);
+    // A mis-split rip pollutes the library silently (PRD §5.2.7
+    // "review-always"), and auto boundaries are a guess. Confirm
+    // when a human is actually watching.
+    if rip_args.auto_split && !rip_args.assume_yes && std::io::stdin().is_terminal() {
+        eprintln!("press Enter to encode + import, Ctrl-C to abort");
+        wait_for_enter_blocking();
+    }
     for i in 0..segment_count {
         let meta = TrackMeta {
             title: rip_args.titles.get(i).cloned(),
@@ -196,6 +256,12 @@ fn parse_rip_args(leftover: &[String]) -> Result<RipArgs> {
         out_parent: None,
         library: None,
         splits_secs: Vec::new(),
+        auto_split: false,
+        auto_start: false,
+        auto_stop: false,
+        min_track_secs: None,
+        min_gap_secs: None,
+        assume_yes: false,
         titles: Vec::new(),
         artist: None,
         album: None,
@@ -219,6 +285,24 @@ fn parse_rip_args(leftover: &[String]) -> Result<RipArgs> {
                     raw.split(',').map(|s| s.trim().parse::<f64>()).collect();
                 out.splits_secs = parsed.context("--splits values must be seconds")?;
             }
+            "--auto-split" => out.auto_split = true,
+            "--auto-start" => out.auto_start = true,
+            "--auto-stop" => out.auto_stop = true,
+            "--min-track" => {
+                out.min_track_secs = Some(
+                    value("--min-track")?
+                        .parse()
+                        .context("--min-track not a number")?,
+                );
+            }
+            "--min-gap" => {
+                out.min_gap_secs = Some(
+                    value("--min-gap")?
+                        .parse()
+                        .context("--min-gap not a number")?,
+                );
+            }
+            "--yes" | "-y" => out.assume_yes = true,
             "--titles" => {
                 out.titles = value("--titles")?
                     .split(',')
@@ -240,6 +324,14 @@ fn parse_rip_args(leftover: &[String]) -> Result<RipArgs> {
             }
             other => return Err(anyhow!("unknown rip flag: {other}")),
         }
+    }
+    if out.auto_split && !out.splits_secs.is_empty() {
+        return Err(anyhow!("--auto-split and --splits are mutually exclusive"));
+    }
+    if !out.auto_split && (out.min_track_secs.is_some() || out.min_gap_secs.is_some()) {
+        return Err(anyhow!(
+            "--min-track / --min-gap only apply with --auto-split"
+        ));
     }
     Ok(out)
 }
@@ -267,6 +359,38 @@ fn session_dir(parent: Option<PathBuf>) -> Result<PathBuf> {
         now.second()
     );
     Ok(parent.join(stamp))
+}
+
+fn frames_to_secs(frames: u64, sample_rate: u32) -> f64 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let secs = frames as f64 / f64::from(sample_rate);
+    secs
+}
+
+/// `m:ss` — the only timecode format a split plan needs.
+fn mmss(secs: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let total = secs.max(0.0) as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// The plan as it stands, one line per track. Printed before commit
+/// so the operator sees what is about to enter the library.
+fn print_plan(session: &RipSession, sample_rate: u32, total_frames: u64) {
+    let ranges = dub_rip::segments(&session.manifest().boundaries_frames, total_frames);
+    println!("plan: {} track(s)", ranges.len());
+    for (i, range) in ranges.iter().enumerate() {
+        println!(
+            "  {:>2}. {} – {}  ({})",
+            i + 1,
+            mmss(frames_to_secs(range.start, sample_rate)),
+            mmss(frames_to_secs(range.end, sample_rate)),
+            mmss(frames_to_secs(range.end - range.start, sample_rate)),
+        );
+    }
 }
 
 fn secs_to_frames(secs: f64, sample_rate: u32) -> u64 {
@@ -339,5 +463,39 @@ mod tests {
     fn secs_to_frames_rounds() {
         assert_eq!(secs_to_frames(1.0, 48_000), 48_000);
         assert_eq!(secs_to_frames(0.5, 44_100), 22_050);
+    }
+
+    #[test]
+    fn parses_auto_split_flags() {
+        let args: Vec<String> = ["--auto-split", "--min-track", "45", "--min-gap", "2", "-y"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let parsed = parse_rip_args(&args).unwrap();
+        assert!(parsed.auto_split);
+        assert!(parsed.assume_yes);
+        assert_eq!(parsed.min_track_secs, Some(45.0));
+        assert_eq!(parsed.min_gap_secs, Some(2.0));
+    }
+
+    #[test]
+    fn rejects_conflicting_split_modes() {
+        let both: Vec<String> = ["--auto-split", "--splits", "60"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(parse_rip_args(&both).is_err());
+
+        // Tuning without the mode it tunes is a typo, not a default.
+        let orphan: Vec<String> = ["--min-gap", "2"].iter().map(ToString::to_string).collect();
+        assert!(parse_rip_args(&orphan).is_err());
+    }
+
+    #[test]
+    fn mmss_formats_track_lengths() {
+        assert_eq!(mmss(0.0), "0:00");
+        assert_eq!(mmss(61.4), "1:01");
+        assert_eq!(mmss(603.0), "10:03");
+        assert_eq!(mmss(-5.0), "0:00");
     }
 }

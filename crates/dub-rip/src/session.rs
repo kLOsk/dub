@@ -12,7 +12,8 @@ use ringbuf::HeapCons;
 
 use crate::capture::{
     self, CaptureConfig, CaptureShared, CMD_START, CMD_STOP, REASON_INPUT_LOST, REASON_MANUAL,
-    REASON_MAX_DURATION, STATE_ARMED, STATE_FAILED, STATE_IDLE, STATE_RECORDING, STATE_STOPPED,
+    REASON_MAX_DURATION, REASON_RECOVERED, REASON_SILENCE, STATE_ARMED, STATE_FAILED, STATE_IDLE,
+    STATE_RECORDING, STATE_STOPPED,
 };
 use crate::commit;
 use crate::manifest::{self, ManifestError, RipManifest, TrackEntry};
@@ -34,6 +35,64 @@ pub enum StopReason {
     /// The record-tap producer went away (engine detached / audio
     /// device stopped). What was captured up to that point is intact.
     InputLost,
+    /// The side ran out: the input sat under the music by
+    /// [`AutoCapture::silence_drop_db`] for
+    /// [`AutoCapture::silence_stop_secs`] (M26b).
+    Silence,
+    /// Reopened from disk by [`RipSession::from_session_dir`] after an
+    /// interrupted rip — the capture never stopped, the process did.
+    Recovered,
+}
+
+/// Hands-off capture: start on the needle drop, stop in the run-out.
+///
+/// Both halves are opt-in and independent — [`AutoCapture::manual`]
+/// (the [`RipConfig::new`] default) preserves the M26a behaviour where
+/// the operator drives both ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoCapture {
+    /// Peak level that starts the recording. `None` waits for
+    /// [`RipSession::start`].
+    pub start_threshold: Option<f32>,
+    /// Seconds of pre-trigger audio kept while armed and written
+    /// ahead of the trigger, so the needle drop that started the rip
+    /// is *in* the rip. Ignored when `start_threshold` is `None`.
+    pub pre_roll_secs: f32,
+    /// Stop after this long below the quiet line. `None` waits for
+    /// [`RipSession::stop`].
+    pub silence_stop_secs: Option<f32>,
+    /// How far under the running music level counts as quiet. Keeps
+    /// the gate relative rather than absolute — see `SilenceGate`.
+    pub silence_drop_db: f32,
+}
+
+impl AutoCapture {
+    /// Operator drives both ends (M26a behaviour).
+    #[must_use]
+    pub fn manual() -> Self {
+        Self {
+            start_threshold: None,
+            pre_roll_secs: 0.0,
+            silence_stop_secs: None,
+            silence_drop_db: 25.0,
+        }
+    }
+}
+
+impl Default for AutoCapture {
+    /// Hands-off defaults: −40 dBFS trigger (a needle in the groove
+    /// clears it; room noise through a phono stage does not), 1 s of
+    /// pre-roll, and a 20 s run-out timeout — longer than any
+    /// inter-track gap, shorter than the patience of someone waiting
+    /// to flip the record.
+    fn default() -> Self {
+        Self {
+            start_threshold: Some(0.01),
+            pre_roll_secs: 1.0,
+            silence_stop_secs: Some(20.0),
+            silence_drop_db: 25.0,
+        }
+    }
 }
 
 /// Session lifecycle as seen by pollers. M26a subset: the M26b
@@ -86,6 +145,9 @@ pub struct RipConfig {
     /// Capture worker poll cadence. 20 ms in production (matches
     /// `PeakStream`); tests shrink it to drain faster than realtime.
     pub poll_interval: Duration,
+    /// Hands-off start/stop (M26b). Defaults to
+    /// [`AutoCapture::manual`].
+    pub auto: AutoCapture,
 }
 
 impl RipConfig {
@@ -97,6 +159,7 @@ impl RipConfig {
             session_dir,
             max_duration_secs: 2_400.0,
             poll_interval: Duration::from_millis(20),
+            auto: AutoCapture::manual(),
         }
     }
 }
@@ -164,6 +227,76 @@ impl RipSession {
         })
     }
 
+    /// Reopen an interrupted session from its directory (M26b).
+    ///
+    /// The session comes back **stopped**, with the plan and metadata
+    /// the manifest last recorded and an envelope rebuilt by scanning
+    /// the spill — everything the review UI needs, minus a capture
+    /// worker (that process is gone). Splits, metadata and commit all
+    /// work exactly as they did before the interruption.
+    ///
+    /// The recorded length comes from the *file*, not the manifest:
+    /// `recorded_frames` is only synced at [`Self::wait_stopped`], so
+    /// a rip that died mid-side has a manifest claiming zero frames
+    /// over a spill holding twenty minutes of music.
+    ///
+    /// # Errors
+    ///
+    /// [`RipError::Manifest`] if `rip.json` is missing or malformed,
+    /// [`RipError::SpillUnreadable`] if the spill is gone or is not a
+    /// capture WAV.
+    pub fn from_session_dir(session_dir: PathBuf) -> Result<Self, RipError> {
+        let mut manifest = manifest::load(&session_dir)?;
+        let spill = session_dir.join(SPILL_FILE);
+        let (envelope, info) = crate::salvage::rebuild_envelope(&spill)?;
+
+        manifest.recorded_frames = info.frames;
+        if manifest.sample_rate == 0 {
+            manifest.sample_rate = info.sample_rate;
+        }
+        // A plan saved before the crash may not survive the recovered
+        // length (the side is shorter than the operator thought).
+        // Drop what no longer validates rather than refusing to open.
+        if plan::validate_boundaries(
+            &manifest.boundaries_frames,
+            manifest.recorded_frames,
+            manifest.sample_rate,
+            MIN_SEGMENT_SECS,
+        )
+        .is_err()
+        {
+            manifest.boundaries_frames.clear();
+            manifest.tracks.truncate(1);
+        }
+        manifest::save(&session_dir, &manifest)?;
+
+        let shared = Arc::new(CaptureShared::new());
+        shared.state.store(STATE_STOPPED, Ordering::Release);
+        shared
+            .stop_reason
+            .store(REASON_RECOVERED, Ordering::Release);
+        shared
+            .recorded_frames
+            .store(manifest.recorded_frames, Ordering::Release);
+        *shared.envelope_guard() = envelope;
+
+        let mut cfg = RipConfig::new(manifest.sample_rate, session_dir);
+        // Nothing will record on this session; keep the cap honest
+        // anyway so a re-armed future never inherits a zero.
+        cfg.max_duration_secs = cfg.max_duration_secs.max(
+            #[allow(clippy::cast_precision_loss)]
+            {
+                manifest.recorded_frames as f32 / manifest.sample_rate.max(1) as f32
+            },
+        );
+        Ok(Self {
+            cfg,
+            shared,
+            worker: None,
+            manifest,
+        })
+    }
+
     /// Path of the capture spill WAV.
     #[must_use]
     pub fn spill_path(&self) -> PathBuf {
@@ -200,6 +333,7 @@ impl RipSession {
                 sample_rate: self.cfg.sample_rate,
                 max_frames,
                 poll_interval: self.cfg.poll_interval,
+                auto: self.cfg.auto,
             },
         )?;
         // Armed is visible the moment `arm` returns — a `start()`
@@ -305,6 +439,40 @@ impl RipSession {
         guard.get(from_chunk..).map_or_else(Vec::new, <[_]>::to_vec)
     }
 
+    /// Propose track boundaries from the captured envelope without
+    /// installing them — the review UI draws these before the
+    /// operator accepts. See [`crate::detect_gaps`].
+    #[must_use]
+    pub fn detect_gaps(&self, cfg: &crate::GapConfig) -> Vec<crate::Gap> {
+        let envelope = self.shared.envelope_guard();
+        crate::detect_gaps(
+            &envelope,
+            dub_peaks::DEFAULT_SAMPLES_PER_CHUNK,
+            self.cfg.sample_rate,
+            self.manifest.recorded_frames,
+            cfg,
+        )
+    }
+
+    /// Install the detected gaps as the split plan and persist it.
+    /// Returns the resulting segment count.
+    ///
+    /// Stopped-only, like every plan mutation: the boundaries are
+    /// validated against `recorded_frames`, which is only final once
+    /// [`Self::wait_stopped`] has synced it into the manifest. A side
+    /// with no detectable gaps stays one segment — that is a valid
+    /// plan, not an error.
+    pub fn auto_split(&mut self, cfg: &crate::GapConfig) -> Result<usize, RipError> {
+        self.require_stopped("auto split")?;
+        let boundaries = self
+            .detect_gaps(cfg)
+            .iter()
+            .map(|gap| gap.boundary_frame)
+            .collect();
+        self.set_splits(boundaries)?;
+        Ok(self.manifest.tracks.len())
+    }
+
     /// Set the split boundaries (frames where the next track starts).
     /// Only valid once stopped. Re-splitting preserves per-segment
     /// metadata by index. Persists the manifest.
@@ -351,6 +519,21 @@ impl RipSession {
         &mut self,
         library: &mut dub_library::Library,
     ) -> Result<crate::RipOutcome, RipError> {
+        self.commit_with_progress(library, &mut |_| {})
+    }
+
+    /// [`Self::commit`], reporting each segment as it starts and
+    /// finishes so a caller can show honest progress instead of one
+    /// long stall.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::commit`].
+    pub fn commit_with_progress(
+        &mut self,
+        library: &mut dub_library::Library,
+        progress: &mut dyn FnMut(crate::CommitProgress),
+    ) -> Result<crate::RipOutcome, RipError> {
         self.require_stopped("commit")?;
         if self.manifest.tracks.is_empty() {
             // No splits set: the whole side is one track.
@@ -361,6 +544,7 @@ impl RipSession {
             &self.spill_path(),
             &mut self.manifest,
             library,
+            progress,
         )
     }
 
@@ -375,6 +559,8 @@ impl RipSession {
         match self.shared.stop_reason.load(Ordering::Acquire) {
             REASON_MAX_DURATION => StopReason::MaxDuration,
             REASON_INPUT_LOST => StopReason::InputLost,
+            REASON_SILENCE => StopReason::Silence,
+            REASON_RECOVERED => StopReason::Recovered,
             // REASON_MANUAL and (defensively) anything unexpected.
             _ => StopReason::Manual,
         }

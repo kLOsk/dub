@@ -51,11 +51,36 @@ impl RipOutcome {
     }
 }
 
+/// Where a segment is in the commit pass, reported as it happens.
+///
+/// The commit worker is the slowest thing in the rip flow (encode +
+/// tag + import + full analysis, per track), so without this the UI
+/// can only flip every dot at once when the whole pass returns —
+/// minutes of apparent stall on a six-track side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitProgress {
+    /// Work has started on this segment.
+    Started {
+        /// 0-based segment index.
+        index: usize,
+    },
+    /// The segment imported (or was already imported).
+    Finished {
+        /// 0-based segment index.
+        index: usize,
+        /// Whether it landed in the library.
+        imported: bool,
+    },
+    /// Every segment is done; the lossless side archive is encoding.
+    ArchiveStarted,
+}
+
 pub(crate) fn commit_session(
     session_dir: &Path,
     spill_path: &Path,
     manifest: &mut RipManifest,
     library: &mut Library,
+    progress: &mut dyn FnMut(CommitProgress),
 ) -> Result<RipOutcome, RipError> {
     // A fully committed session (every segment imported, archive
     // written, spill already deleted) short-circuits — the retry
@@ -119,6 +144,10 @@ pub(crate) fn commit_session(
 
         if entry.library_uuid.is_some() {
             // Already imported by an earlier pass — idempotent skip.
+            progress(CommitProgress::Finished {
+                index,
+                imported: true,
+            });
             outcome.segments.push(SegmentOutcome {
                 index,
                 file,
@@ -127,6 +156,7 @@ pub(crate) fn commit_session(
             });
             continue;
         }
+        progress(CommitProgress::Started { index });
 
         let start = usize::try_from(range.start * 2).unwrap_or(usize::MAX);
         let end = usize::try_from(range.end * 2).unwrap_or(usize::MAX);
@@ -147,6 +177,10 @@ pub(crate) fn commit_session(
         }
         manifest::save(session_dir, manifest)?;
 
+        progress(CommitProgress::Finished {
+            index,
+            imported: library_uuid.is_some(),
+        });
         outcome.segments.push(SegmentOutcome {
             index,
             file,
@@ -156,6 +190,7 @@ pub(crate) fn commit_session(
     }
 
     if manifest.side_archive.is_none() {
+        progress(CommitProgress::ArchiveStarted);
         let archive = session_dir.join(ARCHIVE_FILE);
         match encode_flac_24bit(&samples, sample_rate, 2, &archive) {
             Ok(()) => {
@@ -271,22 +306,16 @@ fn sanitize_file_stem(stem: &str) -> String {
     }
 }
 
+/// Read the spill for encoding.
+///
+/// Goes through the salvage reader, not `hound`'s iterator: a session
+/// recovered after a crash has a header that never learned how long
+/// the recording was, and committing what the header claims would
+/// throw the side away at the last step. Format validation lives in
+/// [`crate::salvage::probe`].
 fn read_spill(spill_path: &Path) -> Result<(Vec<f32>, u32), RipError> {
-    let mut reader = hound::WavReader::open(spill_path)
-        .map_err(|e| RipError::SpillUnreadable(format!("{e}")))?;
-    let spec = reader.spec();
-    if spec.channels != 2
-        || spec.sample_format != hound::SampleFormat::Float
-        || spec.bits_per_sample != 32
-    {
-        return Err(RipError::SpillUnreadable(format!(
-            "unexpected spill format: {} ch, {}-bit {:?}",
-            spec.channels, spec.bits_per_sample, spec.sample_format
-        )));
-    }
-    let samples: Result<Vec<f32>, _> = reader.samples::<f32>().collect();
-    let samples = samples.map_err(|e| RipError::SpillUnreadable(format!("{e}")))?;
-    Ok((samples, spec.sample_rate))
+    let (samples, info) = crate::salvage::read_all(spill_path)?;
+    Ok((samples, info.sample_rate))
 }
 
 #[cfg(test)]

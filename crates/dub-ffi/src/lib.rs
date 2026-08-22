@@ -367,7 +367,27 @@ pub use rip::{
 ///       engaged. Production pickers keep using
 ///       [`DubEngine::list_audio_devices`], which stays
 ///       classifier-filtered.
-pub const FFI_VERSION: u32 = 54;
+///   55. **M26b auto gap detection.** [`rip::DubRipSession::auto_split`]
+///       replaces the split plan with boundaries detected from the
+///       capture envelope (adaptive noise floor, minimum track length,
+///       pre-roll before the returning music) and returns how many
+///       landed. The proposals are ordinary stable-id markers
+///       afterwards, so the existing drag / remove surface edits them.
+///   56. **M26b hands-off capture.** [`rip::RipSessionConfig`] gains
+///       `auto_start` (needle-drop trigger with a 1 s pre-roll written
+///       ahead of it) and `auto_stop` (run-out silence timeout), and
+///       [`rip::RipStopReason`] gains `Silence`.
+///   57. **M26b rip recovery.** [`DubEngine::list_recoverable_rip_sessions`]
+///       finds unfinished rips (the spill survives until every segment
+///       imports) and [`DubEngine::resume_rip_session`] reopens one at
+///       the review stage with its envelope rebuilt from the spill —
+///       no engine or record tap needed. Adds the `RipRecoverable`
+///       record and the `RipStopReason::Recovered` variant.
+///   58. **M26b live commit progress.** The commit worker reports each
+///       segment as it starts and finishes, so `job_progress()` moves
+///       during the pass instead of flipping every dot at the end
+///       (UI-BACKLOG R-39). Adds `RipSegmentJobState::Running`.
+pub const FFI_VERSION: u32 = 58;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5079,7 +5099,20 @@ mod tests {
         // on `DubEngine`, the `DubRipSession` object (capture lifecycle,
         // envelope, split CRUD, segment metadata, commit worker + job
         // progress), the `Rip*` records / enums, and `RipFfiError`.
-        assert_eq!(FFI_VERSION, 54);
+        // 53→54: M26a rip dev fallback — `list_raw_input_devices` (the
+        // pre-classifier HAL input list) so DEBUG builds can record from
+        // the built-in microphone under the Developer mode override.
+        // 54→55: M26b auto gap detection — `DubRipSession::auto_split`
+        // installs boundaries detected from the capture envelope as
+        // ordinary stable-id markers.
+        // 55→56: M26b hands-off capture — `RipSessionConfig.auto_start`
+        // / `.auto_stop` + the `RipStopReason::Silence` variant.
+        // 56→57: M26b recovery — `list_recoverable_rip_sessions` /
+        // `resume_rip_session` + `RipRecoverable` +
+        // `RipStopReason::Recovered`.
+        // 57→58: M26b live commit progress — per-segment Started /
+        // Finished callbacks + `RipSegmentJobState::Running`.
+        assert_eq!(FFI_VERSION, 58);
     }
 
     #[test]

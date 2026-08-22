@@ -39,11 +39,18 @@ pub(crate) const REASON_NONE: u8 = 0;
 pub(crate) const REASON_MANUAL: u8 = 1;
 pub(crate) const REASON_MAX_DURATION: u8 = 2;
 pub(crate) const REASON_INPUT_LOST: u8 = 3;
+pub(crate) const REASON_SILENCE: u8 = 4;
+/// Not a stop at all: the session was reopened from disk after an
+/// interrupted rip, and never had a worker in this process.
+pub(crate) const REASON_RECOVERED: u8 = 5;
 
 /// Samples drained per poll cycle. 16384 samples = 8192 frames ≈
 /// 170 ms at 48 kHz — a 20 ms cadence therefore keeps up with ~8×
 /// realtime bursts before the record ring (4 s) even starts filling.
 const SCRATCH_SAMPLES: usize = 16_384;
+
+/// The record tap is stereo, always (see `ThruSource`).
+const CHANNELS: u16 = 2;
 
 /// State shared between the capture worker and the session/pollers.
 /// Everything the 10 Hz status poll reads is an atomic; the growing
@@ -102,6 +109,114 @@ pub(crate) struct CaptureConfig {
     pub(crate) sample_rate: u32,
     pub(crate) max_frames: u64,
     pub(crate) poll_interval: Duration,
+    pub(crate) auto: crate::AutoCapture,
+}
+
+/// Ring of the last `capacity` samples seen while armed, so a trigger
+/// can write the needle drop it was triggered *by*.
+///
+/// Without this the first thing on the spill is whatever came after
+/// the threshold crossing — the drop transient and the opening
+/// fraction of a second are simply gone, and no amount of split
+/// editing brings them back.
+struct PreRoll {
+    buf: Vec<f32>,
+    write: usize,
+    filled: bool,
+}
+
+impl PreRoll {
+    fn new(samples: usize) -> Self {
+        Self {
+            buf: vec![0.0; samples],
+            write: 0,
+            filled: false,
+        }
+    }
+
+    fn push(&mut self, block: &[f32]) {
+        if self.buf.is_empty() {
+            return;
+        }
+        // Only the tail can survive; skip whatever it would overwrite.
+        let block = if block.len() > self.buf.len() {
+            self.filled = true;
+            &block[block.len() - self.buf.len()..]
+        } else {
+            block
+        };
+        for &s in block {
+            self.buf[self.write] = s;
+            self.write = (self.write + 1) % self.buf.len();
+            if self.write == 0 {
+                self.filled = true;
+            }
+        }
+    }
+
+    /// Oldest-to-newest contents, as two slices (the ring seam).
+    fn drain(&mut self) -> (Vec<f32>, Vec<f32>) {
+        if self.buf.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let out = if self.filled {
+            (
+                self.buf[self.write..].to_vec(),
+                self.buf[..self.write].to_vec(),
+            )
+        } else {
+            (self.buf[..self.write].to_vec(), Vec::new())
+        };
+        self.write = 0;
+        self.filled = false;
+        out
+    }
+}
+
+/// Tracks how long the input has sat far enough under the music to
+/// count as the run-out groove.
+///
+/// Relative, not absolute: run-out noise on a played-out 45 can sit at
+/// −40 dBFS, above any fixed gate worth setting, while a quiet passage
+/// on a well-pressed record goes lower than one. What separates them
+/// is distance from *this side's* music level.
+struct SilenceGate {
+    music_level: f32,
+    quiet_frames: u64,
+    stop_after_frames: u64,
+    drop_ratio: f32,
+}
+
+impl SilenceGate {
+    fn new(sample_rate: u32, stop_after_secs: f32, drop_db: f32) -> Self {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let stop_after_frames = (f64::from(stop_after_secs) * f64::from(sample_rate)) as u64;
+        Self {
+            music_level: 0.0,
+            quiet_frames: 0,
+            stop_after_frames,
+            drop_ratio: 10.0_f32.powf(-drop_db / 20.0),
+        }
+    }
+
+    /// Feed one drained block. Returns true when the side is over.
+    fn feed(&mut self, peak: f32, frames: u64, sample_rate: u32) -> bool {
+        // Peak-hold with a 30 s decay: one loud transient must not set
+        // the bar for the rest of the side, and a long fade must not
+        // drag it down fast enough to look like silence.
+        #[allow(clippy::cast_precision_loss)]
+        let decay = (-(frames as f32) / (30.0 * sample_rate as f32)).exp();
+        self.music_level *= decay;
+        if peak > self.music_level {
+            self.music_level = peak;
+        }
+        if peak < self.music_level * self.drop_ratio {
+            self.quiet_frames += frames;
+        } else {
+            self.quiet_frames = 0;
+        }
+        self.quiet_frames >= self.stop_after_frames
+    }
 }
 
 /// Spawn the capture worker. It creates the WAV spill immediately
@@ -140,6 +255,20 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
     let mut decimator = Decimator::new(DEFAULT_SAMPLES_PER_CHUNK);
     shared.state.store(STATE_ARMED, Ordering::Release);
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pre_roll_samples = (f64::from(cfg.auto.pre_roll_secs) * f64::from(cfg.sample_rate))
+        as usize
+        * usize::from(CHANNELS);
+    let mut pre_roll = PreRoll::new(if cfg.auto.start_threshold.is_some() {
+        pre_roll_samples
+    } else {
+        0
+    });
+    let mut silence = cfg
+        .auto
+        .silence_stop_secs
+        .map(|secs| SilenceGate::new(cfg.sample_rate, secs, cfg.auto.silence_drop_db));
+
     let reason = loop {
         match shared.command.swap(CMD_NONE, Ordering::AcqRel) {
             CMD_STOP => break REASON_MANUAL,
@@ -156,8 +285,43 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
             _ => {}
         }
 
-        let recording = shared.state.load(Ordering::Acquire) == STATE_RECORDING;
+        let mut recording = shared.state.load(Ordering::Acquire) == STATE_RECORDING;
         let n = rx.pop_slice(&mut scratch);
+
+        // Needle drop: the first block over the threshold starts the
+        // rip, and the pre-roll ring goes down ahead of it.
+        if !recording && n > 0 {
+            if let Some(threshold) = cfg.auto.start_threshold {
+                if block_peak(&scratch[..n]) >= threshold
+                    && shared
+                        .state
+                        .compare_exchange(
+                            STATE_ARMED,
+                            STATE_RECORDING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    recording = true;
+                    let (older, newer) = pre_roll.drain();
+                    // The ring holds seconds; `append` works on one
+                    // drained block at a time (its mono scratch is
+                    // sized for exactly that), so feed it in blocks.
+                    for part in [older, newer] {
+                        for block in part.chunks(SCRATCH_SAMPLES) {
+                            if let Err(e) =
+                                append(shared, &mut writer, &mut decimator, &mut mono, block)
+                            {
+                                shared.fail(e);
+                                let _ = writer.finalize();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if recording && n > 0 {
             if let Err(e) = append(
@@ -174,10 +338,17 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
             if shared.recorded_frames.load(Ordering::Acquire) >= cfg.max_frames {
                 break REASON_MAX_DURATION;
             }
+            if let Some(gate) = silence.as_mut() {
+                let frames = (n & !1) as u64 / u64::from(CHANNELS);
+                if gate.feed(block_peak(&scratch[..n]), frames, cfg.sample_rate) {
+                    break REASON_SILENCE;
+                }
+            }
         } else if !recording && n > 0 {
-            // Armed: drain and discard so recording starts at "now",
-            // not at whatever backlog sat in the ring. (M26b's
-            // needle-drop pre-roll will keep a short history here.)
+            // Armed: hold the tail in the pre-roll ring and discard the
+            // rest, so recording starts at the needle drop rather than
+            // at whatever backlog sat in the ring.
+            pre_roll.push(&scratch[..n]);
             shared.window_peak_bits.store(0, Ordering::Release);
         }
 
@@ -230,19 +401,16 @@ fn append(
     mono: &mut [f32],
     block: &[f32],
 ) -> Result<(), String> {
+    // `block` must fit the caller's mono scratch — at most
+    // `SCRATCH_SAMPLES`. The pre-roll flush chunks for this reason.
+    debug_assert!(block.len() / usize::from(CHANNELS) <= mono.len());
     // Whole frames only; the record tap pushes interleaved pairs so
     // an odd count can only come from a torn producer — the trailing
     // sample would belong to the next block anyway.
     let samples = block.len() & !1;
     let frames = samples / 2;
 
-    let mut peak = 0.0_f32;
-    for &s in &block[..samples] {
-        let a = s.abs();
-        if a > peak {
-            peak = a;
-        }
-    }
+    let peak = block_peak(&block[..samples]);
 
     for &s in &block[..samples] {
         writer
@@ -265,4 +433,9 @@ fn append(
         .window_peak_bits
         .store(peak.to_bits(), Ordering::Release);
     Ok(())
+}
+
+/// Absolute peak of one drained block.
+fn block_peak(block: &[f32]) -> f32 {
+    block.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
 }

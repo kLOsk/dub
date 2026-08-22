@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dub_rip::{RipConfig, RipError, RipSession, RipState, StopReason, TrackMeta};
+use dub_rip::{GapConfig, RipConfig, RipError, RipSession, RipState, StopReason, TrackMeta};
 
 use crate::{
     deck_idx_to_usize, lock_state, peak_chunks_to_bytes, usize_from_u64, DubEngine, DubLibrary,
@@ -94,6 +94,15 @@ pub struct RipSessionConfig {
     /// callers pass 2400 (40 min — beyond any vinyl side; a
     /// forgotten needle in the runout groove must not fill the disk).
     pub max_duration_secs: f64,
+    /// Start recording on the needle drop instead of waiting for
+    /// [`DubRipSession::start`]. The second before the trigger is kept
+    /// and written ahead of it, so the drop itself is in the rip
+    /// (M26b).
+    pub auto_start: bool,
+    /// Stop by itself in the run-out groove instead of waiting for
+    /// [`DubRipSession::stop`] (M26b). `stop_reason` reads `Silence`
+    /// when it fires.
+    pub auto_stop: bool,
 }
 
 /// Coarse lifecycle phase of a rip session as seen by the UI poll.
@@ -137,6 +146,12 @@ pub enum RipStopReason {
     /// The record-tap producer went away (Thru session stopped or the
     /// audio device died). What was captured up to then is intact.
     InputLost,
+    /// The side ran out — the input sat far enough under the music for
+    /// long enough to be the run-out groove (M26b silence auto-stop).
+    Silence,
+    /// The session was reopened from disk after an interrupted rip; it
+    /// never stopped in this process (M26b recovery).
+    Recovered,
 }
 
 /// Polled snapshot of a rip session — the rip counterpart of
@@ -156,6 +171,20 @@ pub struct RipSessionStatus {
     pub level_peak: f32,
     /// Failure message when `phase == Failed`.
     pub error: Option<String>,
+}
+
+/// An unfinished rip found on disk, offered back to the operator
+/// (M26b). A session's spill is deleted only once every segment has
+/// imported, so anything still holding one never finished.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RipRecoverable {
+    /// Absolute path of the session directory.
+    pub session_dir: String,
+    /// Recorded length in seconds, measured from the spill itself.
+    pub recorded_secs: f64,
+    /// True when the capture died mid-recording (the WAV header was
+    /// never finalized) rather than being abandoned at review.
+    pub was_interrupted: bool,
 }
 
 /// One split marker: a stable id (for SwiftUI diffing / drag
@@ -212,6 +241,9 @@ pub struct RipSegmentJob {
 pub enum RipSegmentJobState {
     /// Not committed yet.
     Pending,
+    /// Currently encoding / tagging / importing (M26b). Exactly one
+    /// segment is in this state at a time — the commit pass is serial.
+    Running,
     /// Encoded, tagged, and imported.
     Done,
     /// This segment failed; the others were still attempted
@@ -344,6 +376,8 @@ fn map_stop_reason(reason: StopReason) -> RipStopReason {
         StopReason::Manual => RipStopReason::Manual,
         StopReason::MaxDuration => RipStopReason::MaxDuration,
         StopReason::InputLost => RipStopReason::InputLost,
+        StopReason::Silence => RipStopReason::Silence,
+        StopReason::Recovered => RipStopReason::Recovered,
     }
 }
 
@@ -406,6 +440,16 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 /// Resolve the default rip destination:
 /// `~/Music/Dub/Rips/<timestamp>`, de-duplicated with a `-N` suffix
 /// if two sessions land in the same second.
+/// The directory rips live in, without minting a new session.
+fn rips_root() -> Result<PathBuf, RipFfiError> {
+    let music = dirs::audio_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+        .ok_or_else(|| {
+            RipFfiError::InvalidConfig("cannot resolve the user's Music directory".into())
+        })?;
+    Ok(music.join("Dub").join("Rips"))
+}
+
 fn default_session_dir() -> Result<PathBuf, RipFfiError> {
     let music = dirs::audio_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
@@ -423,6 +467,13 @@ fn default_session_dir() -> Result<PathBuf, RipFfiError> {
     Ok(dir)
 }
 
+/// Flip one segment's dot, ignoring an index the plan no longer has.
+fn set_segment_state(job: &mut CommitJob, index: usize, state: RipSegmentJobState) {
+    if let Some(entry) = job.per_segment.get_mut(index) {
+        entry.state = state;
+    }
+}
+
 /// Body of the `dub-rip-commit` worker thread. Locks the library for
 /// the duration of the commit (the same single-connection model every
 /// other library write uses), fills the job state from the
@@ -438,7 +489,38 @@ fn run_commit_job(
         let mut lib_guard = lock_mutex(&library.inner);
         match lib_guard.as_mut() {
             None => Err("library not open".to_string()),
-            Some(lib) => lock_mutex(session).commit(lib).map_err(|e| e.to_string()),
+            Some(lib) => {
+                // Report each segment as it happens (M26b / R-39).
+                // Locking `job` briefly here is safe: `status` scopes
+                // its job guard and drops it before ever reaching for
+                // the session, so there is no path that holds job and
+                // then waits on session.
+                let mut on_progress = |event: dub_rip::CommitProgress| {
+                    {
+                        let mut job = lock_mutex(job);
+                        match event {
+                            dub_rip::CommitProgress::Started { index } => {
+                                set_segment_state(&mut job, index, RipSegmentJobState::Running);
+                            }
+                            dub_rip::CommitProgress::Finished { index, imported } => {
+                                let state = if imported {
+                                    RipSegmentJobState::Done
+                                } else {
+                                    RipSegmentJobState::Failed
+                                };
+                                set_segment_state(&mut job, index, state);
+                            }
+                            dub_rip::CommitProgress::ArchiveStarted => {}
+                        }
+                    }
+                    // Poll-driven UI: the dots only move when the
+                    // generation does.
+                    generation.fetch_add(1, Ordering::Release);
+                };
+                lock_mutex(session)
+                    .commit_with_progress(lib, &mut on_progress)
+                    .map_err(|e| e.to_string())
+            }
         }
     };
 
@@ -578,6 +660,61 @@ impl DubEngine {
         Ok(())
     }
 
+    /// Unfinished rips sitting in the rips directory (M26b).
+    ///
+    /// Offered on entering Prep so a crashed or force-quit session can
+    /// be finished rather than silently abandoned: the spill survives
+    /// by design, and commit only deletes it once every segment has
+    /// imported, so anything still holding one has work left. Cheap —
+    /// it reads WAV headers, not audio.
+    ///
+    /// `rips_dir` overrides the default `~/Music/Dub/Rips` (tests).
+    #[must_use]
+    pub fn list_recoverable_rip_sessions(&self, rips_dir: Option<String>) -> Vec<RipRecoverable> {
+        let root = match rips_dir {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => match rips_root() {
+                Ok(dir) => dir,
+                Err(_) => return Vec::new(),
+            },
+        };
+        dub_rip::list_recoverable(&root)
+            .into_iter()
+            .map(|found| RipRecoverable {
+                session_dir: found.session_dir.to_string_lossy().into_owned(),
+                recorded_secs: found.secs(),
+                was_interrupted: found.was_interrupted,
+            })
+            .collect()
+    }
+
+    /// Reopen one of [`Self::list_recoverable_rip_sessions`].
+    ///
+    /// The session comes back at the review stage — stopped, with its
+    /// plan, its metadata, and an envelope rebuilt from the spill — and
+    /// needs no engine, no record tap, and no Thru session, because
+    /// nothing more will be recorded into it.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::WriteFailed`] if the manifest is missing or
+    /// malformed; [`RipFfiError::CaptureFailed`] if the spill cannot be
+    /// read back.
+    pub fn resume_rip_session(
+        &self,
+        session_dir: String,
+    ) -> Result<Arc<DubRipSession>, RipFfiError> {
+        let session =
+            RipSession::from_session_dir(PathBuf::from(session_dir)).map_err(map_rip_error)?;
+        let sample_rate = session.manifest().sample_rate;
+        let boundaries = session.manifest().boundaries_frames.clone();
+        Ok(Arc::new(DubRipSession::resumed(
+            session,
+            sample_rate,
+            &boundaries,
+        )))
+    }
+
     /// Create a rip session on `deck_idx`, claiming the record tap
     /// that [`Self::start_thru_for_rip`] parked. The session is
     /// created *armed* — its capture worker is already draining the
@@ -626,6 +763,19 @@ impl DubEngine {
         {
             cfg.max_duration_secs = config.max_duration_secs as f32;
         }
+        {
+            let defaults = dub_rip::AutoCapture::default();
+            cfg.auto = dub_rip::AutoCapture {
+                start_threshold: config
+                    .auto_start
+                    .then_some(defaults.start_threshold.unwrap_or(0.01)),
+                pre_roll_secs: defaults.pre_roll_secs,
+                silence_stop_secs: config
+                    .auto_stop
+                    .then_some(defaults.silence_stop_secs.unwrap_or(20.0)),
+                silence_drop_db: defaults.silence_drop_db,
+            };
+        }
         let mut session = RipSession::new(cfg).map_err(map_rip_error)?;
 
         let Some(record_rx) = running.record_taps.get_mut(idx).and_then(Option::take) else {
@@ -659,6 +809,23 @@ impl DubRipSession {
             }),
             job: Arc::new(Mutex::new(CommitJob::default())),
         }
+    }
+
+    /// A session reopened from disk: already stopped and synced (there
+    /// is no worker to join), with stable ids minted for the split
+    /// plan the manifest carried.
+    pub(crate) fn resumed(session: RipSession, sample_rate: u32, boundaries: &[u64]) -> Self {
+        let out = Self::from_parts(session, sample_rate);
+        out.synced.store(true, Ordering::Release);
+        {
+            let mut splits = lock_mutex(&out.splits);
+            for frame in boundaries {
+                let id = splits.next_id;
+                splits.next_id = splits.next_id.wrapping_add(1);
+                splits.entries.push((id, *frame));
+            }
+        }
+        out
     }
 
     fn bump_generation(&self) {
@@ -935,6 +1102,40 @@ impl DubRipSession {
                 secs: frames_to_secs(frame, self.sample_rate),
             })
             .collect()
+    }
+
+    /// Replace the plan with splits detected from the capture
+    /// envelope and return how many were installed (segments =
+    /// splits + 1). Existing markers are discarded; the proposals are
+    /// ordinary markers afterwards, so the operator drags or removes
+    /// them like any other. A side with no detectable gaps stays one
+    /// segment and returns 0 — not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::InvalidState`] while recording / after commit;
+    /// [`RipFfiError::InvalidSplit`] if the detected plan somehow
+    /// fails validation (it cannot, by construction — the detector
+    /// enforces a far larger minimum track length).
+    pub fn auto_split(&self) -> Result<u32, RipFfiError> {
+        self.guard_mutable()?;
+        self.sync_if_terminal();
+        let mut splits = lock_mutex(&self.splits);
+        let boundaries: Vec<u64> = lock_mutex(&self.session)
+            .detect_gaps(&GapConfig::default())
+            .iter()
+            .map(|gap| gap.boundary_frame)
+            .collect();
+        self.apply_splits(&boundaries)?;
+        splits.entries.clear();
+        for frame in &boundaries {
+            let id = splits.next_id;
+            splits.next_id = splits.next_id.wrapping_add(1);
+            splits.entries.push((id, *frame));
+        }
+        drop(splits);
+        self.bump_generation();
+        Ok(u32::try_from(boundaries.len()).unwrap_or(u32::MAX))
     }
 
     /// Add a split marker at `secs` and return its stable id. Only
@@ -1270,6 +1471,136 @@ mod tests {
         ffi
     }
 
+    /// M26b: a side with real inter-track silence, recorded through
+    /// the same worker the app uses. Track lengths clear the
+    /// detector's production 30 s minimum, so no tuning is involved.
+    #[test]
+    fn auto_split_installs_detected_boundaries() {
+        const TRACK_SECS: u64 = 40;
+        const GAP_SECS: f64 = 2.0;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ffi, mut tx) = armed_session(dir.path());
+        assert!(
+            ffi.auto_split().is_err(),
+            "auto split must be refused before the capture stops"
+        );
+        ffi.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ffi.status().phase != RipPhase::Recording {
+            assert!(Instant::now() < deadline, "worker never started recording");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut side: Vec<f32> = Vec::new();
+        for _ in 0..2 {
+            if !side.is_empty() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let gap_frames = (GAP_SECS * f64::from(SR)) as u64;
+                for i in 0..gap_frames {
+                    // Groove noise 54 dB down, deterministic.
+                    let s = if i % 2 == 0 { 0.002 } else { -0.002 };
+                    side.push(s);
+                    side.push(s);
+                }
+            }
+            for i in 0..TRACK_SECS * u64::from(SR) {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / SR as f32;
+                let s = 0.5 * (std::f32::consts::TAU * 220.0 * t).sin();
+                side.push(s);
+                side.push(s);
+            }
+        }
+        let mut pushed = 0;
+        while pushed < side.len() {
+            pushed += tx.push_slice(&side[pushed..]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        ffi.stop().unwrap();
+
+        let before = ffi.generation();
+        assert_eq!(ffi.auto_split().unwrap(), 1);
+        assert!(ffi.generation() > before, "plan mutation must bump");
+
+        let markers = ffi.split_markers();
+        assert_eq!(markers.len(), 1);
+        #[allow(clippy::cast_precision_loss)]
+        let expected = TRACK_SECS as f64 + GAP_SECS - 0.3;
+        assert!(
+            (markers[0].secs - expected).abs() < 0.3,
+            "split at {} s, expected ~{expected} s",
+            markers[0].secs
+        );
+
+        let segments = ffi.segments();
+        assert_eq!(segments.len(), 2);
+        assert!((segments[0].end_secs - markers[0].secs).abs() < f64::EPSILON);
+
+        // Proposals are ordinary markers: removing one merges again.
+        ffi.remove_split(markers[0].id).unwrap();
+        assert_eq!(ffi.segments().len(), 1);
+    }
+
+    /// M26b: an interrupted rip is discoverable and reopens straight
+    /// into review, with its plan and envelope intact.
+    #[test]
+    fn recoverable_session_is_listed_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let rips_root = dir.path().join("Rips");
+        std::fs::create_dir_all(&rips_root).unwrap();
+
+        // Record a side and leave it at review (spill still present).
+        // `recorded_session` puts the session in `<dir>/session`, so
+        // pass the root directly — `list_recoverable` scans immediate
+        // children for a manifest.
+        let ffi = recorded_session(&rips_root, 12);
+        let session_dir = ffi.session_dir();
+        drop(ffi);
+
+        let engine = DubEngine::new();
+        let found =
+            engine.list_recoverable_rip_sessions(Some(rips_root.to_string_lossy().into_owned()));
+        assert_eq!(found.len(), 1, "unfinished rip must be listed: {found:?}");
+        assert!(found[0].recorded_secs > 11.0);
+
+        let resumed = engine
+            .resume_rip_session(found[0].session_dir.clone())
+            .expect("resume");
+        let status = resumed.status();
+        assert_eq!(status.phase, RipPhase::Stopped);
+        assert_eq!(status.stop_reason, RipStopReason::Recovered);
+        assert!(status.recorded_frames > 0);
+        assert!(resumed.envelope_len() > 0, "envelope rebuilt from spill");
+        assert_eq!(resumed.session_dir(), session_dir);
+        // Editing works on a resumed session like any other.
+        let id = resumed.add_split(6.0).expect("split on resumed session");
+        assert_eq!(resumed.segments().len(), 2);
+        resumed.remove_split(id).unwrap();
+    }
+
+    #[test]
+    fn listing_recoverable_sessions_ignores_empty_and_missing_dirs() {
+        let engine = DubEngine::new();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(engine
+            .list_recoverable_rip_sessions(Some(dir.path().to_string_lossy().into_owned()))
+            .is_empty());
+        assert!(engine
+            .list_recoverable_rip_sessions(Some("/nope/not/here".into()))
+            .is_empty());
+    }
+
+    #[test]
+    fn auto_split_on_a_gapless_side_leaves_one_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = recorded_session(dir.path(), 12);
+        assert_eq!(ffi.auto_split().unwrap(), 0);
+        assert!(ffi.split_markers().is_empty());
+        assert_eq!(ffi.segments().len(), 1);
+    }
+
     #[test]
     fn phase_and_stop_reason_map_every_session_state() {
         assert_eq!(phase_for(&RipState::Idle), RipPhase::Idle);
@@ -1328,6 +1659,8 @@ mod tests {
                 RipSessionConfig {
                     dest_dir: None,
                     max_duration_secs: 2_400.0,
+                    auto_start: false,
+                    auto_stop: false,
                 },
             )
             .unwrap_err();
@@ -1340,6 +1673,8 @@ mod tests {
                 RipSessionConfig {
                     dest_dir: None,
                     max_duration_secs: 0.0,
+                    auto_start: false,
+                    auto_stop: false,
                 },
             )
             .unwrap_err();
@@ -1350,6 +1685,8 @@ mod tests {
                 RipSessionConfig {
                     dest_dir: None,
                     max_duration_secs: 2_400.0,
+                    auto_start: false,
+                    auto_stop: false,
                 },
             )
             .unwrap_err();
