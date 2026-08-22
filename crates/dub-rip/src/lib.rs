@@ -23,6 +23,7 @@ mod plan;
 mod salvage;
 mod session;
 
+pub use capture::{simulate as simulate_auto_capture, AutoCaptureSim};
 pub use commit::{CommitProgress, RipOutcome, SegmentOutcome};
 pub use gaps::{detect_gaps, Gap, GapConfig};
 pub use manifest::{
@@ -31,7 +32,8 @@ pub use manifest::{
 };
 pub use plan::{segments, validate_boundaries, SplitError, TrackMeta, MIN_SEGMENT_SECS};
 pub use salvage::{
-    list_recoverable, probe as probe_spill, rebuild_envelope, RecoverableRip, SpillInfo,
+    list_recoverable, probe as probe_spill, read_all as read_spill_all, rebuild_envelope,
+    RecoverableRip, SpillInfo,
 };
 pub use session::{
     AutoCapture, RipConfig, RipError, RipSession, RipState, RipStatus, StopReason, ARCHIVE_FILE,

@@ -439,3 +439,133 @@ fn append(
 fn block_peak(block: &[f32]) -> f32 {
     block.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
 }
+
+/// What the hands-off gates would have done to an already-recorded
+/// side (M26b tuning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AutoCaptureSim {
+    /// Frame the needle-drop trigger would fire at, before pre-roll.
+    pub start_frame: Option<u64>,
+    /// Frame the run-out gate would stop at.
+    pub stop_frame: Option<u64>,
+    /// Longest quiet stretch the music came *back* from, in frames.
+    /// This is the "how close did it come" number: the run-out that
+    /// actually stopped the side is excluded, because a stretch that
+    /// ended the recording says nothing about the margin.
+    pub longest_quiet_frames: u64,
+}
+
+/// Replay a recorded side through the real trigger and silence gate.
+///
+/// This exists so thresholds can be tuned against one real recording
+/// instead of against the turntable: it drives the same `SilenceGate`
+/// and the same peak comparison the worker uses, in the same block
+/// size, so what it reports is what would have happened.
+#[must_use]
+pub fn simulate(samples: &[f32], sample_rate: u32, cfg: &crate::AutoCapture) -> AutoCaptureSim {
+    let mut sim = AutoCaptureSim::default();
+    if sample_rate == 0 || samples.is_empty() {
+        return sim;
+    }
+    let mut gate = cfg
+        .silence_stop_secs
+        .map(|secs| SilenceGate::new(sample_rate, secs, cfg.silence_drop_db));
+    let mut frame = 0_u64;
+    let mut recording = cfg.start_threshold.is_none();
+
+    for block in samples.chunks(SCRATCH_SAMPLES) {
+        let frames = (block.len() & !1) as u64 / u64::from(CHANNELS);
+        let peak = block_peak(block);
+        if !recording {
+            if let Some(threshold) = cfg.start_threshold {
+                if peak >= threshold {
+                    recording = true;
+                    sim.start_frame = Some(frame);
+                }
+            }
+        }
+        if recording && sim.stop_frame.is_none() {
+            if let Some(gate) = gate.as_mut() {
+                let before = gate.quiet_frames;
+                if gate.feed(peak, frames, sample_rate) {
+                    sim.stop_frame = Some(frame + frames);
+                } else if gate.quiet_frames == 0 && before > 0 {
+                    // Music came back: that stretch survived, so it is
+                    // a real measure of the margin.
+                    sim.longest_quiet_frames = sim.longest_quiet_frames.max(before);
+                }
+            }
+        }
+        frame += frames;
+    }
+    sim
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AutoCapture;
+
+    const SR: u32 = 44_100;
+
+    fn push(out: &mut Vec<f32>, secs: f64, amp: f32) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frames = (secs * f64::from(SR)) as u64;
+        for i in 0..frames {
+            let s = if i % 2 == 0 { amp } else { -amp };
+            out.push(s);
+            out.push(s);
+        }
+    }
+
+    #[test]
+    fn simulate_reports_trigger_stop_and_real_margin() {
+        // lead-in, track, gap, track, run-out.
+        let mut side = Vec::new();
+        push(&mut side, 3.0, 0.002);
+        push(&mut side, 5.0, 0.5);
+        push(&mut side, 2.0, 0.002);
+        push(&mut side, 5.0, 0.5);
+        push(&mut side, 8.0, 0.002);
+
+        let cfg = AutoCapture {
+            start_threshold: Some(0.05),
+            pre_roll_secs: 1.0,
+            silence_stop_secs: Some(4.0),
+            silence_drop_db: 25.0,
+        };
+        let sim = simulate(&side, SR, &cfg);
+
+        let secs = |frames: u64| frames as f64 / f64::from(SR);
+        let start = sim.start_frame.expect("trigger fires on the first music");
+        assert!(
+            (secs(start) - 3.0).abs() < 0.3,
+            "trigger at {} s, expected ~3",
+            secs(start)
+        );
+        let stop = sim.stop_frame.expect("run-out stops the side");
+        // Music ends at 15 s (3 lead-in + 5 + 2 gap + 5), so the 4 s
+        // timeout lands at 19 — plus up to one block of granularity.
+        assert!(
+            (secs(stop) - 19.0).abs() < 0.5,
+            "stop at {} s, expected ~19",
+            secs(stop)
+        );
+        // The 2 s inter-track gap is the only stretch the music came
+        // back from; the run-out that ended the side must not count.
+        assert!(
+            (secs(sim.longest_quiet_frames) - 2.0).abs() < 0.4,
+            "margin measured from the wrong stretch: {} s",
+            secs(sim.longest_quiet_frames)
+        );
+    }
+
+    #[test]
+    fn simulate_without_gates_reports_nothing() {
+        let mut side = Vec::new();
+        push(&mut side, 2.0, 0.5);
+        let sim = simulate(&side, SR, &AutoCapture::manual());
+        assert_eq!(sim.start_frame, None);
+        assert_eq!(sim.stop_frame, None);
+    }
+}
