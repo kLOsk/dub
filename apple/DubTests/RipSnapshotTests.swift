@@ -53,6 +53,14 @@ final class RipSnapshotTests: XCTestCase {
              width: 720, height: 64, named: "idle")
     }
 
+    /// M26b: armed and waiting for the needle. The meter is live so a
+    /// silent input is visibly silent before the trigger ever fires.
+    func test_prepRipBar_armed() {
+        let state = PrepRipBarState(phase: .armed, levelPeak: 0.02)
+        snap(deckBg(PrepRipBar(state: state)),
+             width: 720, height: 64, named: "armed")
+    }
+
     func test_prepRipBar_recording() {
         let state = PrepRipBarState(
             phase: .recording, elapsedSecs: 754, levelPeak: 0.72)
@@ -73,6 +81,21 @@ final class RipSnapshotTests: XCTestCase {
             errorMessage: "Input lost — the interface was disconnected.")
         snap(deckBg(PrepRipBar(state: state)),
              width: 720, height: 64, named: "failed")
+    }
+
+    // MARK: - RipRecoveryBanner (M26b)
+
+    func test_ripRecoveryBanner_interrupted() {
+        let state = RipRecoveryBannerState(recordedSecs: 1_324, wasInterrupted: true)
+        snap(deckBg(RipRecoveryBanner(state: state)),
+             width: 720, height: 56, named: "recovery-interrupted")
+    }
+
+    func test_ripRecoveryBanner_abandonedWithOthers() {
+        let state = RipRecoveryBannerState(
+            recordedSecs: 812, wasInterrupted: false, others: 2)
+        snap(deckBg(RipRecoveryBanner(state: state)),
+             width: 720, height: 56, named: "recovery-abandoned")
     }
 
     // MARK: - RipReviewPanel

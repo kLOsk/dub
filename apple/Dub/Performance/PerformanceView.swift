@@ -324,6 +324,17 @@ struct PerformanceView: View {
     @ViewBuilder
     private var prepPadRows: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            // M26b — an unfinished rip from a previous launch, offered
+            // back before anything else in the rip surface.
+            if let first = model.ripRecoverable.first {
+                RipRecoveryBanner(
+                    state: RipRecoveryBannerState(
+                        recordedSecs: first.recordedSecs,
+                        wasInterrupted: first.wasInterrupted,
+                        others: model.ripRecoverable.count - 1),
+                    onReview: { model.resumeRip(first) },
+                    onDismiss: { model.dismissRecoverableRips() })
+            }
             // M26a — vinyl rip control row (idle / recording / failed
             // states; review + encoding replace the whole bar above).
             if let ripBarState {
@@ -402,8 +413,11 @@ struct PerformanceView: View {
             guard model.canStartRipCapture else { return nil }
             return PrepRipBarState(phase: .idle)
         case .capture:
+            // Armed vs recording comes straight from the FFI phase:
+            // with auto-start the worker, not the button, decides when
+            // the rip actually begins.
             return PrepRipBarState(
-                phase: .recording,
+                phase: model.ripStatus?.phase == .armed ? .armed : .recording,
                 elapsedSecs: model.ripStatus?.elapsedSecs ?? 0,
                 levelPeak: model.ripStatus?.levelPeak ?? 0)
         case .failed:
@@ -445,13 +459,15 @@ struct PerformanceView: View {
         }
         var dots: [RipJobDot] = []
         if let jobs = model.ripJobs, !jobs.perSegment.isEmpty {
-            // M26a reports coarse progress: pending segments read as
-            // "running" (amber) while the commit worker is alive.
+            // M26b reports real per-segment progress, so a dot means
+            // what it says: exactly the segment being encoded reads
+            // amber, the ones behind it are still pending.
             dots = jobs.perSegment
                 .sorted { $0.index < $1.index }
                 .map { job in
                     switch job.state {
-                    case .pending: return jobs.running ? .running : .pending
+                    case .pending: return .pending
+                    case .running: return .running
                     case .done:    return .done
                     case .failed:  return .failed
                     }
@@ -463,7 +479,17 @@ struct PerformanceView: View {
             status = "Encoding \(segments.count) track\(segments.count == 1 ? "" : "s")…"
         case .failed:
             status = model.ripStatus?.error ?? "Some tracks failed to import."
-        case .review, .done:
+        case .review:
+            // Say how the side ended when the operator wasn't the one
+            // who ended it — otherwise a rip that stopped itself looks
+            // indistinguishable from one that was cut short.
+            switch model.ripStatus?.stopReason {
+            case .silence:     status = "Side ended — stopped in the run-out."
+            case .maxDuration: status = "Hit the 40-minute recording cap."
+            case .inputLost:   status = "Input was lost — everything up to that point was kept."
+            default:           status = nil
+            }
+        case .done:
             status = nil
         }
         return RipReviewPanelState(
@@ -477,6 +503,7 @@ struct PerformanceView: View {
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
         RipReviewPanelCallbacks(
             addSplitAtPlayhead: { model.addRipSplitAtPlayhead() },
+            autoSplit: { model.autoSplitRip() },
             audition: { secs in model.ripAudition(fromSecs: secs) },
             setMetadata: { index, meta in
                 model.setRipSegmentMetadata(

@@ -186,11 +186,13 @@ extension WaveformAppModel {
                 deckIdx: 0,
                 config: RipSessionConfig(
                     destDir: nil,
-                    maxDurationSecs: Self.ripMaxDurationSecs))
-            // The FFI arms at create (drain + discard); `start()` is
-            // the moment the operator hit the record button, so there
-            // is no separate armed step in the UI.
-            try session.start()
+                    maxDurationSecs: Self.ripMaxDurationSecs,
+                    autoStart: true,
+                    autoStop: true))
+            // M26b: RIP VINYL arms; the needle starts it. The worker
+            // keeps a 1 s pre-roll while armed, so the drop lands on
+            // the spill rather than being clipped off the front — and
+            // the side ends itself in the run-out groove.
             ripSession = session
             ripLastGeneration = session.generation()
             ripSplits = []
@@ -336,11 +338,20 @@ extension WaveformAppModel {
         case .recording:
             if ripPhase != .capture { ripPhase = .capture }
         case .stopped:
-            // Covers manual stop, the max-duration cap, and input
-            // loss (interface unplug / mode switch) — the spill up
-            // to the stop is intact in all three cases.
+            // Covers manual stop, the max-duration cap, input loss
+            // (interface unplug / mode switch), and the M26b run-out
+            // auto-stop — the spill up to the stop is intact in all
+            // of them.
             if ripPhase == .capture {
-                finishCaptureIntoReview(session: session)
+                if status.recordedFrames == 0 {
+                    // Cancelled while armed: the needle never landed,
+                    // so there is nothing to review. Discarding beats
+                    // dropping the operator into an empty review
+                    // screen with a zero-length side.
+                    cancelRip()
+                } else {
+                    finishCaptureIntoReview(session: session)
+                }
             }
         case .encoding:
             ripJobs = session.jobProgress()
@@ -425,6 +436,75 @@ extension WaveformAppModel {
         let secs = engine.positionSnapshot(deckIdx: 0).elapsedSecs
         if !addRipSplit(atSecs: secs) {
             surfaceError("Can't split there — segments need at least 5 seconds.")
+        }
+    }
+
+    // MARK: Recovery (M26b)
+
+    /// Look for unfinished rips. Called on Prep entry: the spill
+    /// outlives a crash by design, and commit deletes it only once
+    /// every segment imported, so anything still holding one is work
+    /// the operator never got to finish.
+    func refreshRecoverableRips() {
+        guard vinylRecordingEnabled, ripSession == nil else {
+            ripRecoverable = []
+            return
+        }
+        ripRecoverable = engine.listRecoverableRipSessions(ripsDir: nil)
+    }
+
+    /// Reopen an unfinished rip straight into review. No engine, no
+    /// record tap, no Thru session — nothing more will be recorded
+    /// into it, so this works from plain Prep.
+    func resumeRip(_ recoverable: RipRecoverable) {
+        guard ripSession == nil else { return }
+        do {
+            let session = try engine.resumeRipSession(sessionDir: recoverable.sessionDir)
+            ripSession = session
+            ripLastGeneration = session.generation()
+            ripSplits = session.splitMarkers()
+            ripSegments = session.segments()
+            ripJobs = nil
+            ripStatus = RipUiStatus(session.status())
+            ripPhase = .review
+            ripRecoverable = []
+            startRipPolling()
+            // Audition needs the side on deck A, exactly as it is
+            // after a live capture.
+            let spill = URL(fileURLWithPath: session.sessionDir())
+                .appendingPathComponent("side.raw.wav")
+            Task { @MainActor [weak self] in
+                _ = await self?.loadTrack(side: .a, url: spill)
+            }
+        } catch {
+            surfaceError("Couldn't reopen that rip: \(Self.describeRip(error))")
+            ripRecoverable = []
+        }
+    }
+
+    /// Leave an unfinished rip on disk but stop offering it this
+    /// session. Deliberately non-destructive: the audio is
+    /// irreplaceable without setting the needle back down, so nothing
+    /// here deletes it.
+    func dismissRecoverableRips() {
+        ripRecoverable = []
+    }
+
+    /// Replace the plan with auto-detected gaps (review-panel
+    /// button). Reports what happened in the status strip: an empty
+    /// result is a legitimate answer — a continuous mix side, or a
+    /// pressing whose gaps are buried in surface noise — and the
+    /// operator still has the markers by hand.
+    func autoSplitRip() {
+        guard let session = ripSession else { return }
+        do {
+            let count = try session.autoSplit()
+            refreshRipSplits(session)
+            if count == 0 {
+                surfaceError("No track gaps found — place splits by hand.")
+            }
+        } catch {
+            surfaceError("Couldn't auto-split: \(Self.describeRip(error))")
         }
     }
 

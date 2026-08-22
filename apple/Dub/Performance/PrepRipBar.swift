@@ -20,6 +20,10 @@ import SwiftUI
 struct PrepRipBarState: Equatable {
     enum Phase: Equatable {
         case idle
+        /// Armed and waiting for the needle (M26b auto-start). The
+        /// meter is live so you can see the stylus land even before
+        /// the trigger fires.
+        case armed
         case recording
         case review
         case encoding
@@ -65,6 +69,7 @@ struct PrepRipBar: View {
         HStack(spacing: DubSpacing.md) {
             switch state.phase {
             case .idle:      idleRow
+            case .armed:     armedRow
             case .recording: recordingRow
             case .review:    statusRow(dot: DubColor.stateLocked,
                                        label: "SIDE RECORDED — \(state.elapsedText)")
@@ -101,6 +106,41 @@ struct PrepRipBar: View {
         }
         .buttonStyle(.plain)
         .help("Record the record playing on deck A's turntable")
+    }
+
+    /// Armed: the rip is live but the stylus hasn't landed. Same
+    /// shape as the recording row (meter + STOP) so nothing jumps
+    /// when the trigger fires — only the label and colour change.
+    private var armedRow: some View {
+        HStack(spacing: DubSpacing.md) {
+            HStack(spacing: DubSpacing.xs) {
+                Circle()
+                    .fill(DubColor.stateTentative)
+                    .frame(width: 8, height: 8)
+                Text("ARMED")
+                    .font(DubFont.caps)
+                    .tracking(1.2)
+                    .foregroundStyle(DubColor.stateTentative)
+            }
+            Text("drop the needle")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textSecondary)
+            RipLevelMeter(level: state.levelPeak, clipping: false)
+                .frame(width: 140, height: 8)
+            Spacer(minLength: 0)
+            Button(action: callbacks.onStop) {
+                Text("CANCEL")
+                    .font(DubFont.caps)
+                    .tracking(1.2)
+                    .foregroundStyle(DubColor.textPrimary)
+                    .padding(.horizontal, DubSpacing.md)
+                    .padding(.vertical, DubSpacing.xs)
+                    .background(DubColor.surface2)
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Cancel — nothing has been recorded yet")
+        }
     }
 
     private var recordingRow: some View {

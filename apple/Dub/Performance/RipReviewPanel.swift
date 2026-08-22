@@ -92,6 +92,8 @@ struct RipReviewPanelState: Equatable {
 
 struct RipReviewPanelCallbacks {
     var addSplitAtPlayhead: () -> Void = {}
+    /// Replace every marker with detected track gaps (M26b).
+    var autoSplit: () -> Void = {}
     /// Audition from an absolute side position (seconds).
     var audition: (Double) -> Void = { _ in }
     var setMetadata: (UInt32, RipSegmentMetadata) -> Void = { _, _ in }
@@ -129,19 +131,28 @@ struct RipReviewPanel: View {
                 .foregroundStyle(DubColor.textSecondary)
             Spacer(minLength: 0)
             if state.mode == .review {
+                Button(action: callbacks.autoSplit) {
+                    pillLabel("Auto-split")
+                }
+                .buttonStyle(.plain)
+                .help("Replace the markers with detected track gaps")
                 Button(action: callbacks.addSplitAtPlayhead) {
-                    Text("+ Split at playhead")
-                        .font(DubFont.body)
-                        .foregroundStyle(DubColor.textPrimary)
-                        .padding(.horizontal, DubSpacing.md)
-                        .padding(.vertical, 2)
-                        .background(DubColor.surface2)
-                        .clipShape(Capsule())
+                    pillLabel("+ Split at playhead")
                 }
                 .buttonStyle(.plain)
                 .help("Add a split marker at deck A's current position")
             }
         }
+    }
+
+    private func pillLabel(_ title: String) -> some View {
+        Text(title)
+            .font(DubFont.body)
+            .foregroundStyle(DubColor.textPrimary)
+            .padding(.horizontal, DubSpacing.md)
+            .padding(.vertical, 2)
+            .background(DubColor.surface2)
+            .clipShape(Capsule())
     }
 
     // MARK: Segments

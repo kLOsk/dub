@@ -783,6 +783,10 @@ final class WaveformAppModel: ObservableObject {
     /// Commit progress, polled while the encode + import worker runs.
     @Published var ripJobs: RipJobProgress? = nil
 
+    /// M26b — unfinished rips found on disk, offered above the rip bar
+    /// on Prep entry. Empty once dismissed or resumed.
+    @Published var ripRecoverable: [RipRecoverable] = []
+
     /// Live FFI session handle. Not published — every UI-visible
     /// consequence flows through the published mirrors above.
     var ripSession: DubRipSession? = nil
@@ -1497,6 +1501,10 @@ final class WaveformAppModel: ObservableObject {
             twoDeckMode = false
             masterDeck = stickyMaster
             if isRunning { startPolling() }
+            // M26b — offer any rip that never finished. Reads WAV
+            // headers only, so it stays off the critical path even
+            // with a season's worth of sessions on disk.
+            refreshRecoverableRips()
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
