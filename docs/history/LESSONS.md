@@ -376,6 +376,40 @@
   *real* detector and the *real* silence gate, so one trip to the rig becomes a
   baseline every later change is measured against, per the standing rule about
   reproducing offline before the turntable.
+- **One record is not a measurement.** Every M26b gate was fitted to a single
+  reggae 12", and both of the next two sides broke it. A quiet-mastered soul
+  sampler yielded 1 of its 9 gaps; a drum'n'bass 45 grew a phantom second track
+  out of its run-out and never auto-stopped at all. Three sides that disagree
+  pin a constant; one side only pins that side. The margin now sits at the
+  centre of a plateau (20.4–22 dB) where all three come out exactly right, and
+  each is a named regression test.
+- **Never draw a threshold from how loud the record was cut.** The first cut
+  capped the gap line at `music − 18 dB` as a safety net against splitting a dub
+  breakdown. That cap binds whenever contrast is under ~38 dB — most records —
+  so the net was silently the operative rule, and it tracked *mastering* rather
+  than the pressing's noise: on a quiet side it put the line 5 dB under every
+  gap on the record. The line is drawn from the noise floor; the breakdown case
+  is handled by *refusing* a side whose floor sits too close to its music
+  (`min_contrast_db`), which is the same idea stated honestly.
+- **Peak is the statistic a click owns.** The run-out auto-stop judged quiet on
+  block peak against a peak-hold reference, and a run-out groove is made of
+  clicks: on a 45 it never fired across 93 s of locked groove. RMS fixed it.
+  The gap detector had already learned this one level down (its cells are
+  medians of chunk RMS) — the lesson didn't transfer until a second record
+  forced it.
+- **A lone tick will stretch any span bounded by "outermost sample above a
+  line".** One pop 4 s into a run-out ended the run-out as far as a bare
+  threshold could tell, and one knock on the lifted-needle tail stretched the
+  needle-down span to the end of the capture and dropped the floor estimate
+  12 dB into preamp hiss. Both spans are now bounded by *sustained* signal — a
+  majority vote over ~1 s — and the same helper serves both.
+- **Markers split; they do not bound the ends.** Auto-stop always overshoots
+  (it has to wait out its timer: 38–101 s past the music on real sides), so
+  before M26b's follow-up the entire overshoot rode along on the last track with
+  no way to trim it. The detector now ends the side at the last music and
+  discards the rest. That is safe *only* because `side.flac` archives the whole
+  capture and re-split can reach back past the trim — a trim without a lossless
+  archive behind it would be data loss.
 
 ## Product invariants (don't relitigate without sign-off)
 

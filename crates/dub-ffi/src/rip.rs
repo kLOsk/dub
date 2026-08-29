@@ -1270,7 +1270,7 @@ impl DubRipSession {
         if manifest.recorded_frames == 0 {
             return Vec::new();
         }
-        let ranges = dub_rip::segments(&manifest.boundaries_frames, manifest.recorded_frames);
+        let ranges = dub_rip::segments(&manifest.boundaries_frames, manifest.side_end());
         ranges
             .iter()
             .enumerate()

@@ -325,6 +325,99 @@ fn auto_split_finds_the_gaps_in_a_side() {
     assert_eq!(session.manifest().tracks.len(), 3);
 }
 
+/// M26b: the run-out groove comes off the last track.
+///
+/// Auto-stop always overshoots the end of the music — it has to wait
+/// out its timer, and on a real side that landed 38–101 s past the
+/// last note. Markers only split, so before this the whole overshoot
+/// rode along on the final track. The side now ends where the music
+/// does and the groove noise behind it is dropped; `side.flac` still
+/// archives the full capture, so a re-split can reach back past it.
+#[test]
+fn the_run_out_is_trimmed_off_the_last_track() {
+    use dub_rip::GapConfig;
+
+    const TRACK_SECS: u64 = 6;
+    const RUN_OUT_SECS: u64 = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = RipConfig::new(SR, dir.path().join("s"));
+    cfg.poll_interval = Duration::from_millis(1);
+    let mut session = RipSession::new(cfg).unwrap();
+
+    let ring = HeapRb::<f32>::new(1 << 21);
+    let (mut tx, rx) = ring.split();
+    session.arm(rx).unwrap();
+    session.start().unwrap();
+
+    let mut side: Vec<f32> = Vec::new();
+    let push_tone = |side: &mut Vec<f32>| {
+        for i in 0..TRACK_SECS * u64::from(SR) {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f32 / SR as f32;
+            let s = 0.5 * (std::f32::consts::TAU * 330.0 * t).sin();
+            side.push(s);
+            side.push(s);
+        }
+    };
+    // Two tracks, because a side needs some quiet inside the music
+    // for the floor to be measurable at all — a lone unbroken tone
+    // has no contrast and the detector declines to touch it.
+    push_tone(&mut side);
+    for i in 0..(f64::from(SR) * 1.5) as u64 {
+        let s = if i % 2 == 0 { 0.002 } else { -0.002 };
+        side.push(s);
+        side.push(s);
+    }
+    push_tone(&mut side);
+    // Groove noise 54 dB down, with a lead-out tick riding over it —
+    // the tick is what used to end the run-out early.
+    for i in 0..RUN_OUT_SECS * u64::from(SR) {
+        let tick = i > u64::from(SR) && i < u64::from(SR) + 200;
+        let s = if tick { 0.05 } else { 0.002 };
+        let s = if i % 2 == 0 { s } else { -s };
+        side.push(s);
+        side.push(s);
+    }
+
+    let mut pushed = 0;
+    while pushed < side.len() {
+        pushed += tx.push_slice(&side[pushed..]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    session.stop().unwrap();
+    session.wait_stopped(Duration::from_secs(10)).unwrap();
+
+    let gap_cfg = GapConfig {
+        min_track_secs: 5.0,
+        min_gap_secs: 1.0,
+        ..GapConfig::default()
+    };
+    assert_eq!(
+        session.auto_split(&gap_cfg).unwrap(),
+        2,
+        "expected the two tracks, and the run-out as neither"
+    );
+
+    let manifest = session.manifest();
+    let recorded = manifest.recorded_frames;
+    let end = manifest.side_end();
+    assert!(end < recorded, "nothing was trimmed: {end} of {recorded}");
+
+    let secs = |frame: u64| frame as f64 / f64::from(SR);
+    let music_end = 2.0 * TRACK_SECS as f64 + 1.5;
+    assert!(
+        (secs(end) - music_end).abs() < 1.5,
+        "side ends at {:.2} s, music ends at {music_end}",
+        secs(end)
+    );
+
+    // And that is where the last segment stops.
+    let ranges = dub_rip::segments(&manifest.boundaries_frames, end);
+    assert_eq!(ranges.last().unwrap().end, end);
+}
+
 /// M26b: hands-off capture. Arm, drop the needle, walk away — the
 /// worker starts on the first sound and stops itself in the run-out.
 #[test]

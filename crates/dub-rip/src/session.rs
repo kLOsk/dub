@@ -82,15 +82,26 @@ impl AutoCapture {
 impl Default for AutoCapture {
     /// Hands-off defaults: −40 dBFS trigger (a needle in the groove
     /// clears it; room noise through a phono stage does not), 1 s of
-    /// pre-roll, and a 20 s run-out timeout — longer than any
-    /// inter-track gap, shorter than the patience of someone waiting
-    /// to flip the record.
+    /// pre-roll, and a 30 s run-out timeout at 18 dB under the side's
+    /// loudest moment.
+    ///
+    /// Both stop numbers are measured across three real sides, and
+    /// both are deliberately slack. The run-out on a worn soul
+    /// sampler sits only 20 dB under its music, so a 25 dB drop never
+    /// fired at all and 14 dB stopped that side mid-record, after two
+    /// tracks — the window that works on every side on hand is 16–18,
+    /// and 18 leaves the most room under the music. The timer is 30 s
+    /// rather than 20 for the same reason: the longest mid-side quiet
+    /// stretch measured is 11.8 s, and a false stop truncates a side
+    /// while a late one costs only the disk it writes. Stopping late
+    /// is nearly free now that the detector trims the run-out off the
+    /// last track anyway.
     fn default() -> Self {
         Self {
             start_threshold: Some(0.01),
             pre_roll_secs: 1.0,
-            silence_stop_secs: Some(20.0),
-            silence_drop_db: 25.0,
+            silence_stop_secs: Some(30.0),
+            silence_drop_db: 18.0,
         }
     }
 }
@@ -346,6 +357,10 @@ impl RipSession {
         manifest.recorded_frames = frames;
         manifest.sample_rate = sample_rate;
         manifest.boundaries_frames.clear();
+        // The archive is the whole capture, run-out included, so the
+        // previous split's trim no longer binds: a fresh auto-split
+        // measures its own, and a manual one gets the side entire.
+        manifest.side_end_frame = None;
         manifest.tracks = vec![TrackEntry::default()];
         manifest::save(&session_dir, &manifest)?;
 
@@ -533,12 +548,32 @@ impl RipSession {
     /// plan, not an error.
     pub fn auto_split(&mut self, cfg: &crate::GapConfig) -> Result<usize, RipError> {
         self.require_stopped("auto split")?;
+        // Trim the side before splitting it: the boundaries validate
+        // against the side end, and the last track has to stop at the
+        // last music rather than carrying the run-out groove.
+        let end = {
+            let envelope = self.shared.envelope_guard();
+            crate::analyze_gaps(
+                &envelope,
+                dub_peaks::DEFAULT_SAMPLES_PER_CHUNK,
+                self.cfg.sample_rate,
+                cfg,
+            )
+        };
+        let previous_end = self.manifest.side_end_frame;
+        if end.usable && end.music_end_frame > 0 {
+            self.manifest.side_end_frame =
+                Some(end.music_end_frame.min(self.manifest.recorded_frames));
+        }
         let boundaries = self
             .detect_gaps(cfg)
             .iter()
             .map(|gap| gap.boundary_frame)
             .collect();
-        self.set_splits(boundaries)?;
+        if let Err(e) = self.set_splits(boundaries) {
+            self.manifest.side_end_frame = previous_end;
+            return Err(e);
+        }
         Ok(self.manifest.tracks.len())
     }
 
@@ -549,7 +584,7 @@ impl RipSession {
         self.require_stopped("set splits")?;
         plan::validate_boundaries(
             &boundaries_frames,
-            self.manifest.recorded_frames,
+            self.manifest.side_end(),
             self.cfg.sample_rate,
             MIN_SEGMENT_SECS,
         )?;

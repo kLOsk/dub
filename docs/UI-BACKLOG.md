@@ -400,18 +400,25 @@ reverse mapping either way. **Location**: `crates/dub-ffi/src/rip.rs`
 (a `list_resplittable_rip_sessions`), `apple/Dub/Performance/`,
 `apple/Dub/Library/`.
 
-### R-47. The last track absorbs the run-out groove
+### R-47. The last track absorbs the run-out groove — **done**
 
-**Symptom**: the split plan's final segment always runs to the end of the
-recording, and auto-stop fires some seconds *after* the music ends — measured
-on a real side, 38 s, because lead-out debris keeps resetting the quiet
-counter. The last track therefore carries ~40 s of run-out noise, and there is
-no way to trim a tail: markers split, they do not bound the ends.
-**Remediation**: either a "trim to last music" action in the review panel
-(the detector already knows where the last music cell is), or let the final
-marker act as an end boundary with the remainder discarded. **Location**:
-`crates/dub-rip/src/gaps.rs` (the played region is already computed),
-`crates/dub-rip/src/plan.rs`, `apple/Dub/Performance/RipReviewPanel.swift`.
+Shipped: the detector ends the side at the last *sustained* music and the
+manifest carries that as `side_end_frame`, so commit, re-split and the FFI
+segment view all stop there and the run-out is discarded. Safe because
+`side.flac` still archives the whole capture — a re-split reaches back past
+the trim, and re-opening a session for re-split clears it.
+
+### R-48. The discarded run-out is invisible in the rip UI
+
+**Symptom**: the review overlay draws the whole capture, so the trimmed
+run-out looks like unassigned side rather than something deliberately dropped,
+and a split marker dragged into it is rejected with only a flash (the FFI
+validates against the side end). **Remediation**: dim the region past
+`side_end` in the overview and clamp marker drags to it; a "keep the run-out"
+escape hatch belongs with the same control if it turns out to be wanted.
+**Location**: `apple/Dub/Performance/RipReviewPanel.swift`,
+`apple/Dub/Performance/WaveformAppModelRip.swift`, `crates/dub-ffi/src/rip.rs`
+(needs `side_end_secs` on the status surface).
 
 ### R-45. Snapshot baselines are gitignored but are Xcode build inputs
 

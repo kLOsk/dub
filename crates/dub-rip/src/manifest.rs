@@ -70,9 +70,29 @@ pub struct RipManifest {
     /// and play history onto audio with different boundaries.
     #[serde(default)]
     pub split_generation: u32,
+    /// Frame the *side* ends at, when the detector found the run-out.
+    /// The last segment stops here and the groove noise behind it is
+    /// discarded; `None` means the whole recording is the side, which
+    /// is what a manual rip gets.
+    ///
+    /// The audio is not lost — `side.flac` archives the full capture,
+    /// so a re-split can always reach back past this.
+    ///
+    /// `serde(default)` — pre-M26b manifests simply have none.
+    #[serde(default)]
+    pub side_end_frame: Option<u64>,
 }
 
 impl RipManifest {
+    /// Frame the last track ends at: the detected end of the side, or
+    /// the end of the recording when nothing trimmed it.
+    #[must_use]
+    pub fn side_end(&self) -> u64 {
+        self.side_end_frame
+            .filter(|&end| end > 0 && end <= self.recorded_frames)
+            .unwrap_or(self.recorded_frames)
+    }
+
     /// Fresh manifest for a new capture session.
     #[must_use]
     pub fn new(sample_rate: u32, channels: u16) -> Self {
@@ -86,6 +106,7 @@ impl RipManifest {
             side_archive: None,
             replaced_uuids: Vec::new(),
             split_generation: 1,
+            side_end_frame: None,
         }
     }
 }

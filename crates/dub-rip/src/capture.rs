@@ -207,8 +207,14 @@ impl SilenceGate {
         }
     }
 
-    /// Feed one drained block. Returns true when the side is over.
-    fn feed(&mut self, peak: f32, frames: u64, sample_rate: u32) -> bool {
+    /// Feed one drained block's RMS. Returns true when the side is
+    /// over.
+    ///
+    /// RMS, not peak. Peak is the statistic a click owns, and a
+    /// run-out groove is made of clicks: measured on a drum'n'bass
+    /// 45, lead-out crackle held the peak over the quiet line often
+    /// enough that the gate never fired across 93 s of locked groove.
+    fn feed(&mut self, level: f32, frames: u64, sample_rate: u32) -> bool {
         let _ = (frames, sample_rate);
         // Session peak-hold, deliberately without decay. An earlier
         // version decayed over 30 s, which meant a run-out groove
@@ -219,10 +225,10 @@ impl SilenceGate {
         // physically lifted. The reference has to stay where the music
         // was, because the question is "has the side ended", not "how
         // loud is it right now".
-        if peak > self.music_level {
-            self.music_level = peak;
+        if level > self.music_level {
+            self.music_level = level;
         }
-        if peak < self.music_level * self.drop_ratio {
+        if level < self.music_level * self.drop_ratio {
             self.loud_frames = 0;
             self.quiet_frames += frames;
         } else {
@@ -359,7 +365,7 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
             }
             if let Some(gate) = silence.as_mut() {
                 let frames = (n & !1) as u64 / u64::from(CHANNELS);
-                if gate.feed(block_peak(&scratch[..n]), frames, cfg.sample_rate) {
+                if gate.feed(block_rms(&scratch[..n]), frames, cfg.sample_rate) {
                     break REASON_SILENCE;
                 }
             }
@@ -454,9 +460,28 @@ fn append(
     Ok(())
 }
 
-/// Absolute peak of one drained block.
+/// Absolute peak of one drained block. The right statistic for the
+/// needle drop, which *is* a transient.
 fn block_peak(block: &[f32]) -> f32 {
     block.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
+}
+
+/// RMS of one drained block — the right statistic for "has the side
+/// ended", which peak answers badly: a click is exactly what peak
+/// reports and exactly what a run-out is full of.
+fn block_rms(block: &[f32]) -> f32 {
+    if block.is_empty() {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = block
+        .iter()
+        .map(|s| f64::from(*s) * f64::from(*s))
+        .sum::<f64>()
+        / block.len() as f64;
+    #[allow(clippy::cast_possible_truncation)]
+    let rms = mean.sqrt() as f32;
+    rms
 }
 
 /// What the hands-off gates would have done to an already-recorded
@@ -494,10 +519,9 @@ pub fn simulate(samples: &[f32], sample_rate: u32, cfg: &crate::AutoCapture) -> 
 
     for block in samples.chunks(SCRATCH_SAMPLES) {
         let frames = (block.len() & !1) as u64 / u64::from(CHANNELS);
-        let peak = block_peak(block);
         if !recording {
             if let Some(threshold) = cfg.start_threshold {
-                if peak >= threshold {
+                if block_peak(block) >= threshold {
                     recording = true;
                     sim.start_frame = Some(frame);
                 }
@@ -506,7 +530,7 @@ pub fn simulate(samples: &[f32], sample_rate: u32, cfg: &crate::AutoCapture) -> 
         if recording && sim.stop_frame.is_none() {
             if let Some(gate) = gate.as_mut() {
                 let before = gate.quiet_frames;
-                if gate.feed(peak, frames, sample_rate) {
+                if gate.feed(block_rms(block), frames, sample_rate) {
                     sim.stop_frame = Some(frame + frames);
                 } else if gate.quiet_frames == 0 && before > 0 {
                     // Music came back: that stretch survived, so it is

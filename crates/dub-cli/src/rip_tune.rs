@@ -69,6 +69,19 @@ pub fn run(args: &[String]) -> Result<()> {
         "  needle-down region {:>8}   (floor measured here, not over the whole file)",
         clock(f64::from(stats.played_secs))
     );
+    println!(
+        "  side ends          {:>8}   (music {} – {}; the run-out behind it is discarded)",
+        clock(frames_to_secs(stats.music_end_frame, sample_rate)),
+        clock(frames_to_secs(stats.music_start_frame, sample_rate)),
+        clock(frames_to_secs(stats.music_end_frame, sample_rate)),
+    );
+    let trimmed = frames.saturating_sub(stats.music_end_frame);
+    if trimmed > 0 {
+        println!(
+            "  run-out discarded  {:>8}",
+            clock(frames_to_secs(trimmed, sample_rate))
+        );
+    }
     println!("  noise floor        {:>8.1} dBFS", stats.floor_db);
     println!("  music level        {:>8.1} dBFS", stats.music_db);
     println!(
@@ -76,8 +89,8 @@ pub fn run(args: &[String]) -> Result<()> {
         stats.music_db - stats.floor_db
     );
     println!(
-        "  gap line           {:>8.1} dBFS   (floor +{:.0}, capped at music −{:.0})",
-        stats.threshold_db, opts.gap.margin_db, opts.gap.min_drop_db
+        "  gap line           {:>8.1} dBFS   (floor +{:.1})",
+        stats.threshold_db, opts.gap.margin_db
     );
     if !stats.usable {
         println!(
@@ -204,15 +217,21 @@ pub fn run(args: &[String]) -> Result<()> {
         let (cells, cell_secs) =
             dub_rip::cell_levels_db(&envelope, DEFAULT_SAMPLES_PER_CHUNK, sample_rate);
         let window = ((opts.gap.min_gap_secs / cell_secs).ceil() as usize).max(1);
-        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        // A gap on a worn inner groove is not uniformly quiet: crackle
+        // spikes a handful of its cells. The loudest cell is the line
+        // an all-cells-below rule needs; the 90th percentile is the
+        // line a rule that tolerates a little debris needs. When the
+        // two are far apart, the stretch is a gap the max is hiding.
+        let mut candidates: Vec<(usize, f32, f32, f32)> = Vec::new();
         if cells.len() >= window {
+            let mut scratch = vec![0.0_f32; window];
             for start in 0..=cells.len() - window {
-                // The loudest cell in the window is the line a gap
-                // detector would need to clear it.
-                let needed = cells[start..start + window]
-                    .iter()
-                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                candidates.push((start, needed));
+                scratch.copy_from_slice(&cells[start..start + window]);
+                scratch.sort_by(f32::total_cmp);
+                let needed = scratch[window - 1];
+                let p90 = scratch[(window * 9 / 10).min(window - 1)];
+                let median = scratch[window / 2];
+                candidates.push((start, needed, p90, median));
             }
         }
         candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -221,8 +240,9 @@ pub fn run(args: &[String]) -> Result<()> {
             "QUIETEST  {want} most gap-like {:.1} s stretches (non-overlapping)",
             opts.gap.min_gap_secs
         );
+        println!("                 all cells    90 % of cells   median cell");
         let mut shown: Vec<usize> = Vec::new();
-        for (start, needed) in candidates {
+        for (start, needed, p90, median) in candidates {
             if shown.len() >= want {
                 break;
             }
@@ -231,7 +251,10 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             #[allow(clippy::cast_precision_loss)]
             let at = start as f64 * f64::from(cell_secs);
-            println!("  {:>8}   needs a line at {needed:>7.1} dBFS", clock(at));
+            println!(
+                "  {:>8}   needs {needed:>7.1}      {p90:>7.1}        {median:>7.1} dBFS",
+                clock(at)
+            );
             shown.push(start);
         }
     }
@@ -270,7 +293,13 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let boundaries: Vec<u64> = gaps.iter().map(|g| g.boundary_frame).collect();
-    let ranges = dub_rip::segments(&boundaries, frames);
+    // The last track stops at the last music, not at the end of tape.
+    let side_end = if stats.usable && stats.music_end_frame > 0 {
+        stats.music_end_frame.min(frames)
+    } else {
+        frames
+    };
+    let ranges = dub_rip::segments(&boundaries, side_end);
     println!();
     println!("PLAN  {} track(s)", ranges.len());
     for (i, range) in ranges.iter().enumerate() {
@@ -383,8 +412,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--margin-db" => {
                 gap.margin_db = value("--margin-db")?.parse().context("--margin-db")?;
             }
-            "--min-drop-db" => {
-                gap.min_drop_db = value("--min-drop-db")?.parse().context("--min-drop-db")?;
+            "--min-contrast-db" => {
+                gap.min_contrast_db = value("--min-contrast-db")?
+                    .parse()
+                    .context("--min-contrast-db")?;
             }
             "--start-threshold-db" => {
                 let db: f32 = value("--start-threshold-db")?
@@ -425,7 +456,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         path: path.ok_or_else(|| {
             anyhow!(
                 "usage: dub rip-tune <side.wav> [--min-gap S] [--min-track S] \
-                 [--margin-db DB] [--min-drop-db DB] [--start-threshold-db DB] \
+                 [--margin-db DB] [--min-contrast-db DB] [--start-threshold-db DB] \
                  [--silence-secs S] [--silence-drop-db DB]"
             )
         })?,

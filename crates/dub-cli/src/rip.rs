@@ -380,7 +380,16 @@ fn mmss(secs: f64) -> String {
 /// The plan as it stands, one line per track. Printed before commit
 /// so the operator sees what is about to enter the library.
 fn print_plan(session: &RipSession, sample_rate: u32, total_frames: u64) {
-    let ranges = dub_rip::segments(&session.manifest().boundaries_frames, total_frames);
+    let manifest = session.manifest();
+    let side_end = manifest.side_end();
+    if side_end < total_frames {
+        println!(
+            "side ends at {} — {} of run-out discarded (kept in side.flac)",
+            mmss(frames_to_secs(side_end, sample_rate)),
+            mmss(frames_to_secs(total_frames - side_end, sample_rate)),
+        );
+    }
+    let ranges = dub_rip::segments(&manifest.boundaries_frames, side_end);
     println!("plan: {} track(s)", ranges.len());
     for (i, range) in ranges.iter().enumerate() {
         println!(
