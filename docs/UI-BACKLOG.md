@@ -388,49 +388,76 @@ Shipped: `RipSession::from_session_dir` + `list_recoverable_rip_sessions` /
 the rip bar on Prep entry. "Later" never deletes; the audio is irreplaceable
 without setting the needle back down.
 
-### R-44. Re-split has no app entry point (M26b)
+### R-44. Re-split has no app entry point (M26b) — **done**
 
-**Symptom**: `resplit_rip_session` exists in the FFI and `dub rip-resplit`
-drives it, but the app cannot reach it — there is no "past rips" surface
-listing committed sessions, and a track in the browser carries no back-link to
-the session that produced it. **Remediation**: either a Prep-side "Past rips"
-list (session dir, date, track count, Re-split), or a browser context action on
-a rip-sourced track that resolves its session via the manifest. Needs the
-reverse mapping either way. **Location**: `crates/dub-ffi/src/rip.rs`
-(a `list_resplittable_rip_sessions`), `apple/Dub/Performance/`,
-`apple/Dub/Library/`.
+Shipped: `DubEngine::list_resplittable_rip_sessions` (FFI 60, the complement of
+the recovery listing) plus a live **Real Records** browser node — the reserved
+placeholder, unlocked. Sessions render in the right-hand pane rather than the
+track table (a rip has no fingerprint, grid or deck to load, so forcing it
+through `LibraryTrack`'s column model would have meant forging rows that lie to
+Space-load and the drag path). Picking one calls `resplitRip`, which mirrors
+`resumeRip` but auditions from **`side.flac`** — a committed session's spill is
+gone by design, so `ripSideAudioURL` now resolves spill-else-archive for all
+three load sites.
 
-### R-47. The last track absorbs the run-out groove — **done**
+No navigation was needed: `PerformanceView` stacks `waveformRegion` and
+`LibraryView` in one VStack, so the review panel is already on screen above the
+row that was clicked. Gated on Prep mode (that is where the panel mounts and
+where auditioning takes deck A) with the reason stated in the pane rather than
+switching modes — a mode switch restarts the audio engine, which is not
+something a browser click should do. Re-split is two-step armed for the same
+reason it clobbers whatever is on deck A.
 
-Shipped: the detector ends the side at the last *sustained* music and the
-manifest carries that as `side_end_frame`, so commit, re-split and the FFI
-segment view all stop there and the run-out is discarded. Safe because
-`side.flac` still archives the whole capture — a re-split reaches back past
-the trim, and re-opening a session for re-split clears it.
+### R-47. The end tracks absorb the lead-in and run-out grooves — **done**
 
-### R-48. The discarded run-out is invisible in the rip UI
+Shipped: the detector bounds the side at both ends — the last *sustained* music
+for the tail, the first *sustained peak onset* for the head (a needle drop is
+rejected by a forward-looking hold) — and the manifest carries them as
+`side_start_frame` / `side_end_frame`, so commit, re-split and the FFI segment
+view all honour them. Safe because `side.flac` still archives the whole
+capture: a re-split reaches back past the trims and clears them.
 
-**Symptom**: the review overlay draws the whole capture, so the trimmed
-run-out looks like unassigned side rather than something deliberately dropped,
-and a split marker dragged into it is rejected with only a flash (the FFI
-validates against the side end). **Remediation**: dim the region past
-`side_end` in the overview and clamp marker drags to it; a "keep the run-out"
-escape hatch belongs with the same control if it turns out to be wanted.
-**Location**: `apple/Dub/Performance/RipReviewPanel.swift`,
-`apple/Dub/Performance/WaveformAppModelRip.swift`, `crates/dub-ffi/src/rip.rs`
-(needs `side_end_secs` on the status surface).
+Note the first cut of this shipped **dead in the app**: the FFI's `auto_split`
+reimplemented `RipSession::auto_split` rather than calling it, and only the
+latter writes the trim. Fixed, and gated by a test that fails against the old
+code.
 
-### R-45. Snapshot baselines are gitignored but are Xcode build inputs
+### R-48. The discarded grooves are invisible in the rip UI — **done**
+
+Shipped: both discarded regions shade out in the review overlay, and each bound
+carries a draggable bracket — a different *shape* to a split marker, not just a
+different hue, since the band already has an amber envelope and magenta cues.
+Selection became an enum (`RipOverlaySelection`) rather than a sentinel marker
+id, so ← / → nudge and ⌫ work on a bracket too: ⌫ *resets* that end to the whole
+capture, because a trim always exists and can never be deleted. The context menu
+offers the same as "Keep the lead-in" / "Keep the run-out". Split drags and
+nudges clamp into the trimmed side; a double-click out in the shade is still
+refused rather than relocated, because a discrete intent deserves an answer and
+the shade has already explained it. The 5 s minimum-segment rule is deliberately
+*not* duplicated in Swift — the FFI refuses and the overlay flashes.
+
+The overlay's axis now spans the whole capture (its fallback used to be the
+segment plan's end, which is the trimmed end and would have hidden the run-out
+exactly while the deck-A decode was in flight), while the review header reports
+the length that actually commits plus what is being dropped.
+
+### R-45. Snapshot baselines are not tracked
 
 **Symptom**: `apple/DubTests/__Snapshots__/` is in `.gitignore` (zero baselines
-tracked) while `project.pbxproj` names each PNG individually as a resource of
-the `DubTests` target. A fresh clone therefore cannot even *build* the snapshot
-suite — the copy phase fails on the missing files — and the baselines that do
-exist are local artifacts no review ever sees. Deleting one PNG to re-record it
-breaks the build, and git has nothing to restore. **Remediation**: either track
-the PNGs (they are the regression gate; that is what makes them reviewable) or
-reference the directory rather than the files. **Location**: `.gitignore:80`,
-`apple/project.yml`, `apple/Dub.xcodeproj/project.pbxproj`.
+tracked), so the regression gate is a local artifact no review ever sees.
+
+The *build* half of this is **fixed**: `project.yml` globbed `- path: DubTests`
+bare, sweeping every baseline PNG into the DubTests resources phase, so deleting
+one to re-record it broke the generated project. It now excludes
+`__Snapshots__`, which is correct because SnapshotTesting resolves baselines
+from `#filePath` on disk at run time, never from the test bundle. (The original
+"a fresh clone cannot build" symptom was overstated — `apple/*.xcodeproj/` is
+itself gitignored and regenerated by XcodeGen, so a fresh clone has no PNGs to
+reference.)
+
+**Remediation for what remains**: track the PNGs, together with the R-46
+re-record pass — committing the current local set alone would enshrine eight
+known-stale baselines as the gate. **Location**: `.gitignore:80`.
 
 ### R-46. Eight PerformanceSnapshotTests baselines are stale
 

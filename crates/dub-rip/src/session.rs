@@ -267,10 +267,13 @@ impl RipSession {
         }
         // A plan saved before the crash may not survive the recovered
         // length (the side is shorter than the operator thought).
-        // Drop what no longer validates rather than refusing to open.
+        // Drop what no longer validates rather than refusing to open —
+        // the trims go with it, since they were measured against the
+        // length the manifest used to claim.
         if plan::validate_boundaries(
             &manifest.boundaries_frames,
-            manifest.recorded_frames,
+            manifest.side_start(),
+            manifest.side_end(),
             manifest.sample_rate,
             MIN_SEGMENT_SECS,
         )
@@ -278,6 +281,8 @@ impl RipSession {
         {
             manifest.boundaries_frames.clear();
             manifest.tracks.truncate(1);
+            manifest.side_start_frame = None;
+            manifest.side_end_frame = None;
         }
         manifest::save(&session_dir, &manifest)?;
 
@@ -357,10 +362,12 @@ impl RipSession {
         manifest.recorded_frames = frames;
         manifest.sample_rate = sample_rate;
         manifest.boundaries_frames.clear();
-        // The archive is the whole capture, run-out included, so the
-        // previous split's trim no longer binds: a fresh auto-split
-        // measures its own, and a manual one gets the side entire.
+        // The archive is the whole capture, lead-in and run-out
+        // included, so the previous split's trims no longer bind: a
+        // fresh auto-split measures its own, and a manual one gets the
+        // side entire.
         manifest.side_end_frame = None;
+        manifest.side_start_frame = None;
         manifest.tracks = vec![TrackEntry::default()];
         manifest::save(&session_dir, &manifest)?;
 
@@ -560,10 +567,12 @@ impl RipSession {
                 cfg,
             )
         };
-        let previous_end = self.manifest.side_end_frame;
+        let previous = (self.manifest.side_start_frame, self.manifest.side_end_frame);
         if end.usable && end.music_end_frame > 0 {
             self.manifest.side_end_frame =
                 Some(end.music_end_frame.min(self.manifest.recorded_frames));
+            self.manifest.side_start_frame =
+                Some(end.side_start_frame.min(self.manifest.recorded_frames));
         }
         let boundaries = self
             .detect_gaps(cfg)
@@ -571,19 +580,57 @@ impl RipSession {
             .map(|gap| gap.boundary_frame)
             .collect();
         if let Err(e) = self.set_splits(boundaries) {
-            self.manifest.side_end_frame = previous_end;
+            (self.manifest.side_start_frame, self.manifest.side_end_frame) = previous;
             return Err(e);
         }
         Ok(self.manifest.tracks.len())
     }
 
+    /// Move the side's bounds — where the lead-in ends and the
+    /// run-out begins. Everything outside is discarded at commit;
+    /// `side.flac` still archives the whole capture, so nothing here
+    /// is irreversible.
+    ///
+    /// Stopped-only, and validated against the existing plan: a trim
+    /// that would swallow a split marker, or leave a segment under the
+    /// minimum, is refused rather than silently moving markers.
+    ///
+    /// # Errors
+    ///
+    /// [`RipError::InvalidState`] unless stopped; [`RipError::Split`]
+    /// when the plan cannot survive the new bounds.
+    pub fn set_side_bounds(&mut self, start_frame: u64, end_frame: u64) -> Result<(), RipError> {
+        self.require_stopped("set side bounds")?;
+        let recorded = self.manifest.recorded_frames;
+        let end = end_frame.min(recorded);
+        plan::validate_boundaries(
+            &self.manifest.boundaries_frames,
+            start_frame,
+            end,
+            self.cfg.sample_rate,
+            MIN_SEGMENT_SECS,
+        )?;
+        // Store only a real trim, so an untrimmed side round-trips
+        // through the manifest as `None` rather than as its own length.
+        self.manifest.side_start_frame = (start_frame > 0).then_some(start_frame);
+        self.manifest.side_end_frame = (end < recorded).then_some(end);
+        manifest::save(&self.cfg.session_dir, &self.manifest)?;
+        Ok(())
+    }
+
     /// Set the split boundaries (frames where the next track starts).
     /// Only valid once stopped. Re-splitting preserves per-segment
     /// metadata by index. Persists the manifest.
+    ///
+    /// # Errors
+    ///
+    /// [`RipError::InvalidState`] unless stopped; [`RipError::Split`]
+    /// when the boundaries are not a valid plan for this side.
     pub fn set_splits(&mut self, boundaries_frames: Vec<u64>) -> Result<(), RipError> {
         self.require_stopped("set splits")?;
         plan::validate_boundaries(
             &boundaries_frames,
+            self.manifest.side_start(),
             self.manifest.side_end(),
             self.cfg.sample_rate,
             MIN_SEGMENT_SECS,

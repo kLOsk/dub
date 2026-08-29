@@ -63,6 +63,11 @@ struct RipUiStatus: Equatable {
     var elapsedSecs: Double
     var levelPeak: Float
     var error: String?
+    /// Where the side begins and ends inside the capture. Carried on
+    /// the polled snapshot — and therefore in the `Equatable` the poll
+    /// diffs — so moving a trim repaints the review overlay.
+    var sideStartSecs: Double
+    var sideEndSecs: Double
 
     init(_ status: RipSessionStatus) {
         phase = status.phase
@@ -70,6 +75,8 @@ struct RipUiStatus: Equatable {
         elapsedSecs = status.elapsedSecs
         levelPeak = status.levelPeak
         error = status.error
+        sideStartSecs = status.sideStartSecs
+        sideEndSecs = status.sideEndSecs
     }
 }
 
@@ -471,14 +478,80 @@ extension WaveformAppModel {
             startRipPolling()
             // Audition needs the side on deck A, exactly as it is
             // after a live capture.
-            let spill = URL(fileURLWithPath: session.sessionDir())
-                .appendingPathComponent("side.raw.wav")
+            let side = Self.ripSideAudioURL(sessionDir: session.sessionDir())
             Task { @MainActor [weak self] in
-                _ = await self?.loadTrack(side: .a, url: spill)
+                _ = await self?.loadTrack(side: .a, url: side)
             }
         } catch {
             surfaceError("Couldn't reopen that rip: \(Self.describeRip(error))")
             ripRecoverable = []
+        }
+    }
+
+    /// Reopen a committed rip for a fresh split (M26b, R-44).
+    ///
+    /// Near-identical to `resumeRip`, with one difference that matters:
+    /// the audition file is the **archive**, not the spill. Commit
+    /// deletes the spill once every segment has imported, so a
+    /// committed session has only `side.flac` — which is the whole
+    /// capture, lead-in and run-out included, so a re-split can reach
+    /// back past the previous split's trims.
+    func resplitRip(sessionDir: String) {
+        guard ripSession == nil, engineMode == .prep else { return }
+        do {
+            let session = try engine.resplitRipSession(sessionDir: sessionDir)
+            ripSession = session
+            ripLastGeneration = session.generation()
+            ripSplits = session.splitMarkers()
+            ripSegments = session.segments()
+            ripJobs = nil
+            ripStatus = RipUiStatus(session.status())
+            ripPhase = .review
+            ripRecoverable = []
+            startRipPolling()
+            let side = Self.ripSideAudioURL(sessionDir: session.sessionDir())
+            Task { @MainActor [weak self] in
+                _ = await self?.loadTrack(side: .a, url: side)
+            }
+        } catch {
+            surfaceError("Couldn't reopen that rip: \(Self.describeRip(error))")
+        }
+    }
+
+    /// The side's audio for auditioning: the spill while it still
+    /// exists, else the archive. One rule, used by every path that
+    /// puts a rip on deck A — a committed session has no spill, and a
+    /// live one has no archive until commit writes it.
+    static func ripSideAudioURL(sessionDir: String) -> URL {
+        let dir = URL(fileURLWithPath: sessionDir)
+        let spill = dir.appendingPathComponent("side.raw.wav")
+        if FileManager.default.fileExists(atPath: spill.path) { return spill }
+        return dir.appendingPathComponent("side.flac")
+    }
+
+    /// Reload the committed-rip list behind the "Real Records" node.
+    ///
+    /// Detached, unlike `refreshRecoverableRips`: that one only ever
+    /// sees unfinished sessions (a handful), while this list grows
+    /// with every record ever ripped and stats a directory per entry.
+    func refreshPastRips() {
+        libraryModel.pastRipsLoading = true
+        let engine = self.engine
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let found = engine.listResplittableRipSessions(ripsDir: nil)
+            let rows = found.map {
+                RipPastSessionUi(
+                    sessionDir: $0.sessionDir,
+                    name: $0.name,
+                    recordedSecs: $0.recordedSecs,
+                    trackCount: $0.trackCount,
+                    splitGeneration: $0.splitGeneration)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.libraryModel.pastRips = rows
+                self.libraryModel.pastRipsLoading = false
+            }
         }
     }
 
@@ -512,6 +585,34 @@ extension WaveformAppModel {
     /// by the overlay; the model just forwards. Returns `false` on
     /// rejection (the overlay's local echo snaps back on the next
     /// generation refetch).
+    /// Move where the side starts — the end of the discarded lead-in.
+    /// `false` when the FFI refuses (the trim would swallow a split or
+    /// leave a segment under the minimum).
+    @discardableResult
+    func moveRipSideStart(toSecs secs: Double) -> Bool {
+        guard let session = ripSession else { return false }
+        do {
+            try session.setSideStart(secs: secs)
+            refreshRipSplits(session)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Move where the side ends — the start of the discarded run-out.
+    @discardableResult
+    func moveRipSideEnd(toSecs secs: Double) -> Bool {
+        guard let session = ripSession else { return false }
+        do {
+            try session.setSideEnd(secs: secs)
+            refreshRipSplits(session)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     @discardableResult
     func moveRipSplit(id: UInt32, toSecs secs: Double) -> Bool {
         guard let session = ripSession else { return false }
@@ -562,6 +663,10 @@ extension WaveformAppModel {
         ripSplits = session.splitMarkers()
         ripSegments = session.segments()
         ripLastGeneration = session.generation()
+        // The side's bounds ride on the status, so a trim edit has to
+        // pull it too — otherwise the shaded region lags a poll tick
+        // behind the bracket that moved it.
+        ripStatus = RipUiStatus(session.status())
     }
 
     // MARK: Audition

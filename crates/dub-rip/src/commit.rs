@@ -116,18 +116,21 @@ pub(crate) fn commit_session(
     // Trust the audio file over the manifest count (a crash between
     // WAV finalize and manifest save leaves them skewed).
     manifest.recorded_frames = total_frames;
-    // The side may end before the recording does — the detector trims
-    // the run-out groove off the last track (the full capture stays in
-    // `side.flac`, so a re-split can reach past this).
+    // The side may start after and end before the recording does — the
+    // detector trims the lead-in and run-out grooves off the first and
+    // last tracks (the full capture stays in `side.flac`, so a re-split
+    // can reach past this).
     let side_end = manifest.side_end();
+    let side_start = manifest.side_start();
     plan::validate_boundaries(
         &manifest.boundaries_frames,
+        side_start,
         side_end,
         sample_rate,
         plan::MIN_SEGMENT_SECS,
     )?;
 
-    let ranges = plan::segments(&manifest.boundaries_frames, side_end);
+    let ranges = plan::segments(&manifest.boundaries_frames, side_start, side_end);
     if manifest.tracks.len() != ranges.len() {
         manifest
             .tracks

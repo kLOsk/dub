@@ -187,7 +187,10 @@ final class RipSnapshotTests: XCTestCase {
         }
     }
 
-    private func overlayField(selected: UInt32?) -> some View {
+    private func overlayField(
+        selected: RipOverlaySelection? = nil,
+        trim: RipTrimUi? = nil
+    ) -> some View {
         ZStack {
             RipLiveOverviewCanvas(buckets: syntheticBuckets)
             RipSplitMarkerOverlay(
@@ -196,20 +199,88 @@ final class RipSnapshotTests: XCTestCase {
                     RipMarkerUi(id: 2, secs: 878),
                 ],
                 durationSecs: 1361,
-                initialSelectedId: selected)
+                trim: trim,
+                initialSelection: selected)
         }
         .frame(height: DubLayout.deckOverviewHeight)
     }
 
+    /// The untrimmed case, which also proves a `nil` trim renders
+    /// exactly as it did before trims existed.
     func test_ripSplitOverlay_twoMarkers() {
-        snap(overlayField(selected: nil),
+        snap(overlayField(),
              width: 900, height: DubLayout.deckOverviewHeight,
              named: "two-markers")
     }
 
     func test_ripSplitOverlay_selected() {
-        snap(overlayField(selected: 2),
+        snap(overlayField(selected: .split(2)),
              width: 900, height: DubLayout.deckOverviewHeight,
              named: "selected")
     }
+
+    private static let sideTrim = RipTrimUi(startSecs: 21, endSecs: 1290)
+
+    func test_ripSplitOverlay_trimmed() {
+        snap(overlayField(trim: Self.sideTrim),
+             width: 900, height: DubLayout.deckOverviewHeight,
+             named: "trimmed")
+    }
+
+    /// Paired with `test_ripSplitOverlay_selected`, this is the gate
+    /// on "a trim bracket is visually distinct from a split marker".
+    func test_ripSplitOverlay_trimStartSelected() {
+        snap(overlayField(selected: .trimStart, trim: Self.sideTrim),
+             width: 900, height: DubLayout.deckOverviewHeight,
+             named: "trim-start-selected")
+    }
+
+    func test_ripSplitOverlay_trimEndSelected() {
+        snap(overlayField(selected: .trimEnd, trim: Self.sideTrim),
+             width: 900, height: DubLayout.deckOverviewHeight,
+             named: "trim-end-selected")
+    }
+    // MARK: - Past rips ("Real Records")
+
+    private static let pastRips = [
+        RipPastSessionUi(sessionDir: "/rips/20260828-221148", name: "20260828-221148",
+                         recordedSecs: 2263, trackCount: 10, splitGeneration: 1),
+        RipPastSessionUi(sessionDir: "/rips/20260822-124412", name: "20260822-124412",
+                         recordedSecs: 1483, trackCount: 4, splitGeneration: 2),
+        RipPastSessionUi(sessionDir: "/rips/20260614-093001", name: "20260614-093001",
+                         recordedSecs: 444, trackCount: 1, splitGeneration: 1),
+    ]
+
+    func test_ripPastSessions_list() {
+        snap(RipPastSessionsPane(state: RipPastSessionsPaneState(sessions: Self.pastRips)),
+             width: 700, height: 220, named: "list")
+    }
+
+    func test_ripPastSessions_blockedByMode() {
+        snap(RipPastSessionsPane(
+                state: RipPastSessionsPaneState(
+                    sessions: Self.pastRips,
+                    blockedReason: "Switch to PREP to re-split a side.")),
+             width: 700, height: 220, named: "blocked-by-mode")
+    }
+
+    /// The state most users see first.
+    func test_ripPastSessions_empty() {
+        snap(RipPastSessionsPane(state: RipPastSessionsPaneState()),
+             width: 700, height: 140, named: "empty")
+    }
+
+    /// A trimmed side names what it is dropping. The note is
+    /// conditional on a non-zero trim, so the four untrimmed panel
+    /// baselines are unchanged.
+    func test_ripReviewPanel_trimmed() {
+        let state = RipReviewPanelState(
+            mode: .review,
+            sideDurationSecs: 1218,
+            trimmedSecs: 143,
+            segments: threeSegments)
+        snap(deckBg(RipReviewPanel(state: state)),
+             width: 900, height: 260, named: "trimmed")
+    }
+
 }

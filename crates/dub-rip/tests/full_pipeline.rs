@@ -414,7 +414,7 @@ fn the_run_out_is_trimmed_off_the_last_track() {
     );
 
     // And that is where the last segment stops.
-    let ranges = dub_rip::segments(&manifest.boundaries_frames, end);
+    let ranges = dub_rip::segments(&manifest.boundaries_frames, manifest.side_start(), end);
     assert_eq!(ranges.last().unwrap().end, end);
 }
 

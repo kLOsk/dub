@@ -32,10 +32,7 @@ struct RipRecoveryBannerState: Equatable {
     /// How many more unfinished rips are waiting behind this one.
     var others: Int = 0
 
-    var durationText: String {
-        let total = Int(recordedSecs.rounded())
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
+    var durationText: String { RipDuration.text(recordedSecs) }
 
     var headline: String {
         wasInterrupted

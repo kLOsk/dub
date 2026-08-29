@@ -133,7 +133,7 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), timecode-correct looping, then Sampler → Polish/Alpha. Importers, Key Lock (WSOLA), Echo-Out, and the Dub Siren have shipped. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **59** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **60** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 

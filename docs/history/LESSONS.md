@@ -403,6 +403,26 @@
   needle-down span to the end of the capture and dropped the floor estimate
   12 dB into preamp hiss. Both spans are now bounded by *sustained* signal — a
   majority vote over ~1 s — and the same helper serves both.
+- **The head and the tail of a side need opposite statistics.** A run-out is a
+  sustained *level* drop, so the end of the side is found on a median of chunk
+  RMS — peak is useless there, because a run-out groove is made of the clicks
+  peak reports. A first track fades in *out of* the lead-in groove: measured on
+  three sides its median sits at groove level for 5–10 s after the music is
+  plainly audible, while its peaks jump 12–15 dB on the first note. Trimming the
+  head with the tail's detector would have cut 9 s off a reggae side's opening.
+  One detector cannot serve both ends.
+- **The needle drop is the loudest thing in the lead-in**, so any centred vote
+  looking for "sustained signal" picks it. It is separated by looking *forward*
+  instead: a drop is one to three seconds of peaks that fall back to groove
+  level, music that has started stays up. Forward also lands the onset *at* the
+  first note rather than half a window after it, which is the difference between
+  trimming the lead-in and trimming the tune.
+- **A wrapper that reimplements its callee loses whatever the callee later
+  gains.** `DubRipSession::auto_split` ran `detect_gaps` + `set_splits` itself
+  rather than calling `RipSession::auto_split`, so when the latter became the
+  only writer of the side trim, the trim shipped working from the CLI and dead
+  in the app — and every test passed, because they all counted boundaries and
+  none looked past the last one. Delegate, or assert on what delegation was for.
 - **Markers split; they do not bound the ends.** Auto-stop always overshoots
   (it has to wait out its timer: 38–101 s past the music on real sides), so
   before M26b's follow-up the entire overshoot rode along on the last track with

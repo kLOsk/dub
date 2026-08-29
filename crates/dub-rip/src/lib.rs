@@ -25,15 +25,18 @@ mod session;
 
 pub use capture::{simulate as simulate_auto_capture, AutoCaptureSim};
 pub use commit::{CommitProgress, RipOutcome, SegmentOutcome};
-pub use gaps::{analyze as analyze_gaps, cell_levels_db, detect_gaps, Gap, GapAnalysis, GapConfig};
+pub use gaps::{
+    analyze as analyze_gaps, cell_levels_db, cell_peaks_db, detect_gaps, Gap, GapAnalysis,
+    GapConfig,
+};
 pub use manifest::{
     load as load_manifest, save as save_manifest, ManifestError, RipManifest, TrackEntry,
     MANIFEST_FILE, MANIFEST_VERSION,
 };
 pub use plan::{segments, validate_boundaries, SplitError, TrackMeta, MIN_SEGMENT_SECS};
 pub use salvage::{
-    envelope_from_samples, list_recoverable, probe as probe_spill, read_all as read_spill_all,
-    rebuild_envelope, RecoverableRip, SpillInfo,
+    envelope_from_samples, list_recoverable, list_resplittable, probe as probe_spill,
+    read_all as read_spill_all, rebuild_envelope, RecoverableRip, ResplittableRip, SpillInfo,
 };
 pub use session::{
     AutoCapture, RipConfig, RipError, RipSession, RipState, RipStatus, StopReason, ARCHIVE_FILE,

@@ -32,10 +32,7 @@ struct RipSegmentUi: Equatable, Identifiable {
 
     var durationSecs: Double { max(0, endSecs - startSecs) }
 
-    var durationText: String {
-        let total = Int(durationSecs.rounded())
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
+    var durationText: String { RipDuration.text(durationSecs) }
 }
 
 /// Editable metadata bundle a card reports after its 300 ms debounce.
@@ -73,7 +70,12 @@ struct RipReviewPanelState: Equatable {
     }
 
     var mode: Mode
+    /// Length of the side that will actually commit — the capture
+    /// less whatever the trims discard.
     var sideDurationSecs: Double
+    /// Seconds of lead-in + run-out being dropped, for the header
+    /// note. `0` when nothing is trimmed, and the note disappears.
+    var trimmedSecs: Double = 0
     var segments: [RipSegmentUi]
     /// One dot per segment once a commit has been requested.
     var jobDots: [RipJobDot] = []
@@ -83,10 +85,13 @@ struct RipReviewPanelState: Equatable {
     var hasFailedSegment: Bool { jobDots.contains(.failed) }
 
     var headerText: String {
-        let total = Int(sideDurationSecs.rounded())
-        let clock = String(format: "%d:%02d", total / 60, total % 60)
         let n = segments.count
-        return "SIDE — \(clock) · \(n) TRACK\(n == 1 ? "" : "S")"
+        let clock = RipDuration.text(sideDurationSecs)
+        var text = "SIDE — \(clock) · \(n) TRACK\(n == 1 ? "" : "S")"
+        if trimmedSecs >= 1 {
+            text += " · \(RipDuration.text(trimmedSecs)) TRIMMED"
+        }
+        return text
     }
 }
 

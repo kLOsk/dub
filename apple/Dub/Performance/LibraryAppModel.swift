@@ -191,6 +191,13 @@ final class LibraryAppModel: ObservableObject {
     /// M" line.
     @Published var analysisInFlightCount: UInt32 = 0
 
+    /// Committed rip sessions for the "Real Records" node (M26b,
+    /// R-44), newest first. Lives here rather than on
+    /// `WaveformAppModel` for this file's whole reason for existing:
+    /// a browser refresh must not invalidate the performance surface.
+    @Published var pastRips: [RipPastSessionUi] = []
+    @Published var pastRipsLoading: Bool = false
+
     /// M11c.1 — number of tracks already processed in the current
     /// batch (post-fix for the "Analyzing 5 of 5…" bug where the
     /// view tried to derive `done` from `analysisInFlightCount`).

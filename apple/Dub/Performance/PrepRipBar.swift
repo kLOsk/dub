@@ -45,10 +45,7 @@ struct PrepRipBarState: Equatable {
     var isClipping: Bool { levelPeak >= 0.99 }
 
     /// `mm:ss` elapsed clock.
-    var elapsedText: String {
-        let total = Int(elapsedSecs.rounded(.down))
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
+    var elapsedText: String { RipDuration.running(elapsedSecs) }
 }
 
 /// Tap targets, split from the state so the view stays a pure

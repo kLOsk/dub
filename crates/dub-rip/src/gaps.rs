@@ -86,6 +86,36 @@ pub struct GapConfig {
     /// between the 16.5 dB a breakdown-floored side measures and the
     /// 33 dB of the tightest real record on hand.
     ///
+    /// Onset line for the head, in dB above the groove's *peak* level.
+    ///
+    /// The head needs the opposite statistic to the tail. A run-out is
+    /// a sustained level drop, so the end of the side is found on a
+    /// median of chunk RMS. A first track fades in out of the lead-in
+    /// groove: measured on three sides, its median sits at groove
+    /// level for 5–10 s after the music is plainly audible, while its
+    /// *peaks* jump 12–15 dB the moment the first note lands. Trimming
+    /// the head to where the median settles would have cut 9 s off a
+    /// reggae side's opening.
+    ///
+    /// Measured from the groove and not from the music, for the same
+    /// reason [`Self::min_contrast_db`] replaced a music-relative cap:
+    /// across the three sides the music peak ranges −1 to −15 dBFS
+    /// with the mastering, while the lead-in groove sits at −38 to
+    /// −41 dBFS on all three. The constant thing is the groove.
+    ///
+    /// 16 dB is the centre of the 14–18 dB plateau where all three
+    /// sides land within a second of where their music audibly starts.
+    /// At 22 dB the reggae side's sparse intro stops clearing the line
+    /// and the trim eats 6 s of the tune.
+    pub lead_in_margin_db: f32,
+    /// Seconds of lead-in groove kept before the first music, so the
+    /// track does not open flush against its first transient.
+    pub lead_in_secs: f32,
+    /// How long music must hold the onset line to count as the start
+    /// of the side. Separates the needle drop — a transient that falls
+    /// back to groove level within a second or three — from a tune
+    /// that has begun.
+    pub lead_in_hold_secs: f32,
     /// An earlier cut instead capped the line at `music − 18 dB`.
     /// That cap binds whenever contrast is under ~38 dB, which is
     /// most records, so the safety net was silently the operative
@@ -104,6 +134,9 @@ impl Default for GapConfig {
             pre_roll_secs: 0.3,
             margin_db: 21.0,
             min_contrast_db: 24.0,
+            lead_in_margin_db: 16.0,
+            lead_in_secs: 1.0,
+            lead_in_hold_secs: 4.0,
         }
     }
 }
@@ -122,6 +155,15 @@ pub struct GapAnalysis {
     pub played_secs: f32,
     /// First frame of music — everything before it is lead-in.
     pub music_start_frame: u64,
+    /// Frame the side starts at: a lead-in before the first music.
+    /// Everything before it — dead air, the needle drop, the lead-in
+    /// groove — is discarded.
+    pub side_start_frame: u64,
+    /// Peak level of the music, dBFS.
+    pub music_peak_db: f32,
+    /// Peak level of the groove between tracks, dBFS — the level the
+    /// lead-in sits at, and what the head onset line is drawn from.
+    pub groove_peak_db: f32,
     /// Frame the last music ends at. Everything after it is run-out,
     /// and the side is committed as if the recording stopped here.
     pub music_end_frame: u64,
@@ -155,6 +197,32 @@ pub fn cell_levels_db(
     (cells, chunk_secs * chunks_per_cell as f32)
 }
 
+/// The per-cell *peak* view — the statistic the head gate works from,
+/// as [`cell_levels_db`] is for the tail.
+///
+/// Exposed for tuning tools, for the same reason: they must look at
+/// exactly what the detector looks at rather than re-deriving it.
+#[must_use]
+pub fn cell_peaks_db(
+    envelope: &[PeakChunk],
+    frames_per_chunk: usize,
+    sample_rate: u32,
+) -> (Vec<f32>, f32) {
+    if envelope.is_empty() || frames_per_chunk == 0 || sample_rate == 0 {
+        return (Vec::new(), CELL_SECS);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let chunk_secs = frames_per_chunk as f32 / sample_rate as f32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let chunks_per_cell = ((CELL_SECS / chunk_secs).round() as usize).max(1);
+    let mut scratch = Vec::with_capacity(chunks_per_cell);
+    let cells = envelope
+        .chunks(chunks_per_cell)
+        .map(|cell| peak_db(cell, &mut scratch))
+        .collect();
+    (cells, chunk_secs * chunks_per_cell as f32)
+}
+
 /// Measure a side without proposing anything — what
 /// [`detect_gaps`] decides from. Exposed so tuning tools report the
 /// detector's own numbers instead of re-deriving them and drifting.
@@ -171,6 +239,9 @@ pub fn analyze(
         threshold_db: -140.0,
         played_secs: 0.0,
         music_start_frame: 0,
+        side_start_frame: 0,
+        music_peak_db: -140.0,
+        groove_peak_db: -140.0,
         music_end_frame: 0,
         usable: false,
     };
@@ -296,6 +367,10 @@ fn measure(
         .chunks(chunks_per_cell)
         .map(|cell| median_db(cell, &mut scratch))
         .collect();
+    let peaks: Vec<f32> = envelope
+        .chunks(chunks_per_cell)
+        .map(|cell| peak_db(cell, &mut scratch))
+        .collect();
     // Two cells cannot hold a gap with music on both sides.
     if cells.len() < 3 {
         return None;
@@ -329,13 +404,37 @@ fn measure(
     #[allow(clippy::cast_precision_loss)]
     let played_secs = played.len() as f32 * cell_secs;
 
+    // The head, on peaks. `played.start` is where the median settles,
+    // which on a fade-in or a sparse intro is many seconds after the
+    // first note — trimming to it would cut into the tune. Peaks move
+    // as soon as the music does, so the onset is found on those, and
+    // the search runs from the top of the recording rather than from
+    // `played` (which by construction starts too late).
+    let mut ranked_peaks: Vec<f32> = peaks[played.clone()].to_vec();
+    ranked_peaks.sort_by(f32::total_cmp);
+    let music_peak_db = percentile(&ranked_peaks, 0.80);
+    // The groove's own peak level, read the way the noise floor is:
+    // the quietest peaks inside the played span are its inter-track
+    // gaps, which are the same material as the lead-in groove.
+    let groove_peak_db = floor_of(&peaks[played.clone()]);
+    let onset = music_onset(
+        &peaks[..played.end],
+        groove_peak_db + cfg.lead_in_margin_db,
+        secs_to_cells(cfg.lead_in_hold_secs, cell_secs),
+    )
+    .unwrap_or(played.start);
+    let side_start = onset.saturating_sub(secs_to_cells(cfg.lead_in_secs, cell_secs));
+
     Some(Measured {
         analysis: GapAnalysis {
             floor_db,
             music_db,
+            music_peak_db,
+            groove_peak_db,
             threshold_db: floor_db + cfg.margin_db,
             played_secs,
-            music_start_frame: played.start as u64 * cell_frames,
+            music_start_frame: onset as u64 * cell_frames,
+            side_start_frame: side_start as u64 * cell_frames,
             music_end_frame: played.end as u64 * cell_frames,
             usable: music_db - floor_db >= cfg.min_contrast_db,
         },
@@ -344,6 +443,53 @@ fn measure(
         cell_frames,
         played,
     })
+}
+
+/// First cell of music, looking *forward*.
+///
+/// The tail's centred majority ([`music_span`]) is the wrong shape
+/// here, because the loudest thing in the lead-in is the needle drop
+/// itself and it wins any window centred on it. Measured on three
+/// sides, a drop is one to three seconds of elevated peaks that then
+/// fall back to groove level, while music that has started stays up.
+/// So the test is forward-looking: a cell is the onset when it clears
+/// the line and at least half of the next `hold_cells` do too.
+///
+/// Forward rather than centred also means the onset lands *at* the
+/// first note rather than half a window after it, which matters — the
+/// whole point of trimming the head is not to cut into the tune.
+fn music_onset(cells: &[f32], line: f32, hold_cells: usize) -> Option<usize> {
+    let hold = hold_cells.max(1);
+    (0..cells.len()).find(|&i| {
+        if cells[i] < line {
+            return false;
+        }
+        let window = &cells[i..(i + hold).min(cells.len())];
+        window.iter().filter(|&&db| db >= line).count() * 2 >= window.len()
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn secs_to_cells(secs: f32, cell_secs: f32) -> usize {
+    if cell_secs <= 0.0 {
+        return 1;
+    }
+    ((secs / cell_secs).round() as usize).max(1)
+}
+
+/// Peak level of one cell, in dBFS: the 95th percentile of its chunk
+/// peaks.
+///
+/// A percentile, not the maximum — one click in the lead-in groove
+/// must not read as the first note. Not the median either: over a
+/// 50 ms cell the median chunk peak of a sparse intro is still groove
+/// noise, which is the whole reason the head cannot be found the way
+/// the tail is.
+fn peak_db(cell: &[PeakChunk], scratch: &mut Vec<f32>) -> f32 {
+    scratch.clear();
+    scratch.extend(cell.iter().map(|c| c.min.abs().max(c.max.abs())));
+    scratch.sort_by(f32::total_cmp);
+    to_db(percentile(scratch, 0.95))
 }
 
 /// The `FLOOR_RANK_CELLS`-th quietest cell of a span, in dBFS.
@@ -481,6 +627,49 @@ mod tests {
         10.0_f32.powf(db / 20.0)
     }
 
+    /// Envelope from `(rms, peak, secs)` runs.
+    ///
+    /// The two gates read different statistics — the tail a median of
+    /// chunk RMS, the head a percentile of chunk peaks — and on a real
+    /// side those move independently. Measured: groove noise crackles
+    /// about 9 dB over its own level, music runs about 14 dB over
+    /// its own, and a needle drop is a huge peak over almost no level
+    /// at all. A fixture that ties peak to rms cannot express any of
+    /// that, and the head gate would be tested against a signal no
+    /// record produces.
+    fn env3(runs: &[(f32, f32, f32)]) -> Vec<PeakChunk> {
+        let mut out = Vec::new();
+        for &(rms, peak, secs) in runs {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let chunks = (secs * SR as f32 / FPC as f32).round() as usize;
+            out.extend(std::iter::repeat_n(
+                PeakChunk {
+                    min: -peak,
+                    max: peak,
+                    rms,
+                },
+                chunks,
+            ));
+        }
+        out
+    }
+
+    /// Crest measured off the three baseline sides.
+    const MUSIC_CREST_DB: f32 = 14.0;
+    const GROOVE_CREST_DB: f32 = 9.0;
+
+    /// Dead air before the needle lands: no level, no peaks.
+    fn dead_air(secs: f32) -> Vec<(f32, f32, f32)> {
+        vec![(at(-75.0), at(-72.0), secs)]
+    }
+
+    /// The needle landing: a big peak over almost no level, and gone
+    /// again in well under a second. This is the thing the head gate
+    /// has to *not* call the start of the side.
+    fn needle_drop() -> Vec<(f32, f32, f32)> {
+        vec![(at(-45.0), at(-12.0), 0.6)]
+    }
+
     /// A quiet stretch shaped like a real one: mostly groove noise
     /// with crackle riding over it, one cell in five.
     ///
@@ -490,30 +679,24 @@ mod tests {
     /// were 8 dB apart inside the same 1.5 s (a −52 median under a
     /// −44 worst). A flat run collapses the two and makes every
     /// threshold look further from the edge than it is.
-    fn quiet(worst_db: f32, groove_db: f32, secs: f32) -> Vec<(f32, f32)> {
+    fn quiet(worst_db: f32, groove_db: f32, secs: f32) -> Vec<(f32, f32, f32)> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let cells = (secs / 0.05).round() as usize;
         (0..cells)
             .map(|i| {
-                (
-                    if i % 5 == 2 {
-                        at(worst_db)
-                    } else {
-                        at(groove_db)
-                    },
-                    0.05,
-                )
+                let level = if i % 5 == 2 { worst_db } else { groove_db };
+                (at(level), at(level + GROOVE_CREST_DB), 0.05)
             })
             .collect()
     }
 
-    /// Flatten `(rms, secs)` runs and quiet stretches into one side.
-    fn side(parts: &[Vec<(f32, f32)>]) -> Vec<PeakChunk> {
-        env(&parts.iter().flatten().copied().collect::<Vec<_>>())
+    /// Flatten runs and quiet stretches into one side.
+    fn side(parts: &[Vec<(f32, f32, f32)>]) -> Vec<PeakChunk> {
+        env3(&parts.iter().flatten().copied().collect::<Vec<_>>())
     }
 
-    fn music(db: f32, secs: f32) -> Vec<(f32, f32)> {
-        vec![(at(db), secs)]
+    fn music(db: f32, secs: f32) -> Vec<(f32, f32, f32)> {
+        vec![(at(db), at(db + MUSIC_CREST_DB), secs)]
     }
 
     /// **Record A** — a 4-track reggae 12" (SL 3 + phono chain,
@@ -531,7 +714,9 @@ mod tests {
     #[test]
     fn record_a_reggae_12_yields_its_four_tracks() {
         let e = side(&[
-            quiet(-45.0, -57.0, 4.0), // lead-in groove
+            dead_air(3.0),
+            needle_drop(),
+            quiet(-45.0, -47.0, 4.0), // lead-in groove
             music(-18.0, 193.0),
             quiet(-40.0, -57.0, 1.6),
             music(-18.0, 165.0),
@@ -541,13 +726,30 @@ mod tests {
             music(-18.0, 105.0),
             quiet(-40.0, -52.0, 60.0), // run-out
         ]);
-        let gaps = detect_gaps(&e, FPC, SR, total(&e), &GapConfig::default());
+        let cfg = GapConfig::default();
+        let gaps = detect_gaps(&e, FPC, SR, total(&e), &cfg);
 
         assert_eq!(gaps.len(), 3, "expected three inter-track gaps: {gaps:?}");
         let mins = |f: u64| secs_of(f) / 60.0;
-        assert!((mins(gaps[0].boundary_frame) - 3.30).abs() < 0.1);
-        assert!((mins(gaps[1].boundary_frame) - 6.11).abs() < 0.1);
-        assert!((mins(gaps[2].boundary_frame) - 8.77).abs() < 0.1);
+        assert!((mins(gaps[0].boundary_frame) - 3.42).abs() < 0.1);
+        assert!((mins(gaps[1].boundary_frame) - 6.23).abs() < 0.1);
+        assert!((mins(gaps[2].boundary_frame) - 8.89).abs() < 0.1);
+
+        // The head: music at 7.6 s (3 dead + 0.6 drop + 4 groove),
+        // the side opening a lead-in before it. The needle drop is the
+        // loudest peak in the whole head and must not be mistaken for
+        // the first note.
+        let a = analyze(&e, FPC, SR, &cfg);
+        assert!(
+            (secs_of(a.music_start_frame) - 7.6).abs() < 0.6,
+            "music starts at {} s",
+            secs_of(a.music_start_frame)
+        );
+        assert!(
+            (secs_of(a.side_start_frame) - (7.6 - cfg.lead_in_secs)).abs() < 0.6,
+            "side starts at {} s",
+            secs_of(a.side_start_frame)
+        );
     }
 
     /// **Record B** — a 10-track soul sampler, and the side that
@@ -570,7 +772,11 @@ mod tests {
             235.0, 179.0, 195.0, 172.0, 299.0, 224.0, 176.0, 227.0, 216.0,
         ];
 
-        let mut parts = vec![quiet(-46.0, -58.4, 11.0)]; // lead-in
+        let mut parts = vec![
+            dead_air(3.0),
+            needle_drop(),
+            quiet(-46.0, -48.0, 6.0), // lead-in groove
+        ];
         for i in 0..9 {
             parts.push(music(-25.3, tracks[i]));
             parts.push(quiet(worst[i], -58.4, lengths[i]));
@@ -579,8 +785,16 @@ mod tests {
         parts.push(quiet(-45.0, -58.4, 136.0)); // run-out
         let e = side(&parts);
 
-        let gaps = detect_gaps(&e, FPC, SR, total(&e), &GapConfig::default());
+        let cfg = GapConfig::default();
+        let gaps = detect_gaps(&e, FPC, SR, total(&e), &cfg);
         assert_eq!(gaps.len(), 9, "expected nine inter-track gaps: {gaps:?}");
+
+        let a = analyze(&e, FPC, SR, &cfg);
+        assert!(
+            (secs_of(a.side_start_frame) - 8.6).abs() < 0.7,
+            "side starts at {} s",
+            secs_of(a.side_start_frame)
+        );
 
         // Every proposal has to leave a plausible track behind it.
         let mut prev = 0.0_f32;
@@ -608,10 +822,12 @@ mod tests {
     fn record_c_dnb_45_commits_one_track_and_drops_the_run_out() {
         let music_secs = 332.0;
         let e = side(&[
-            quiet(-44.0, -53.0, 3.0), // lead-in
+            dead_air(2.0),
+            needle_drop(),
+            quiet(-44.0, -50.0, 4.0), // lead-in groove
             music(-10.9, music_secs),
             quiet(-48.0, -53.0, 4.0),
-            vec![(at(-30.0), 0.05)], // the lead-out tick
+            vec![(at(-30.0), at(-21.0), 0.05)], // the lead-out tick
             quiet(-48.0, -53.0, 93.0),
         ]);
 
@@ -621,11 +837,17 @@ mod tests {
 
         // And the side ends at the music, not at the end of the tape.
         let a = analyze(&e, FPC, SR, &cfg);
+        let head = 2.0 + 0.6 + 4.0;
         let end = secs_of(a.music_end_frame);
         assert!(
-            (end - (music_secs + 3.0)).abs() < 2.0,
+            (end - (music_secs + head)).abs() < 2.0,
             "side ends at {end:.1} s, music ends at {:.1}",
-            music_secs + 3.0
+            music_secs + head
+        );
+        assert!(
+            (secs_of(a.side_start_frame) - (head - cfg.lead_in_secs)).abs() < 0.7,
+            "side starts at {} s",
+            secs_of(a.side_start_frame)
         );
     }
 
@@ -644,8 +866,8 @@ mod tests {
             music(-18.0, 120.0),
             quiet(-40.0, -57.0, 2.0),
             music(-18.0, 120.0),
-            quiet(-52.0, -70.0, 300.0), // stylus on the rest
-            vec![(at(-35.0), 0.05)],    // a knock against the deck
+            quiet(-52.0, -70.0, 300.0),         // stylus on the rest
+            vec![(at(-35.0), at(-26.0), 0.05)], // a knock against the deck
             quiet(-52.0, -70.0, 60.0),
         ]);
 
@@ -767,8 +989,17 @@ mod tests {
         let gaps = detect_gaps(&e, FPC, SR, total_frames, &GapConfig::default());
         assert_eq!(gaps.len(), 2, "expected two gaps: {gaps:?}");
 
+        // Against the trimmed side, which is what commit uses — the
+        // boundaries and the two trims have to agree with each other.
+        let a = analyze(&e, FPC, SR, &GapConfig::default());
         let bounds: Vec<u64> = gaps.iter().map(|g| g.boundary_frame).collect();
-        validate_boundaries(&bounds, total_frames, SR, MIN_SEGMENT_SECS)
-            .expect("auto boundaries must be a valid plan");
+        validate_boundaries(
+            &bounds,
+            a.side_start_frame,
+            a.music_end_frame.min(total_frames),
+            SR,
+            MIN_SEGMENT_SECS,
+        )
+        .expect("auto boundaries must be a valid plan");
     }
 }

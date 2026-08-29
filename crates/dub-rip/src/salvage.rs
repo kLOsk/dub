@@ -338,6 +338,64 @@ impl RecoverableRip {
     }
 }
 
+/// A committed rip, offered back for re-splitting.
+///
+/// The complement of [`RecoverableRip`]: commit deletes the spill only
+/// once every segment has imported, so a session with no spill and a
+/// `side.flac` is one that finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResplittableRip {
+    /// Session directory holding `rip.json` + `side.flac`.
+    pub session_dir: std::path::PathBuf,
+    /// Frames in the archived side.
+    pub frames: u64,
+    /// Capture sample rate.
+    pub sample_rate: u32,
+    /// Tracks the last split produced.
+    pub track_count: u32,
+    /// How many times this side has been split (1 = the first commit).
+    pub split_generation: u32,
+}
+
+/// Committed rips under `parent`, newest first.
+///
+/// Unlike [`list_recoverable`] this reads the manifest rather than the
+/// audio: the archive is a FLAC and decoding one per row to count its
+/// frames would make listing a season of ripping cost minutes.
+#[must_use]
+pub fn list_resplittable(parent: &Path) -> Vec<ResplittableRip> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ResplittableRip> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|dir| dir.is_dir())
+        .filter_map(|dir| {
+            // A spill still on disk means the rip never finished; that
+            // is `list_recoverable`'s business, not this one.
+            if dir.join(crate::SPILL_FILE).is_file() {
+                return None;
+            }
+            let manifest = crate::manifest::load(&dir).ok()?;
+            let archive = manifest.side_archive.as_ref()?;
+            if !dir.join(archive).is_file() {
+                return None;
+            }
+            Some(ResplittableRip {
+                session_dir: dir,
+                frames: manifest.recorded_frames,
+                sample_rate: manifest.sample_rate,
+                track_count: u32::try_from(manifest.tracks.len()).unwrap_or(u32::MAX),
+                split_generation: manifest.split_generation.max(1),
+            })
+        })
+        .collect();
+    // Session dirs are timestamp-named, so name order is time order.
+    out.sort_by(|a, b| b.session_dir.cmp(&a.session_dir));
+    out
+}
+
 /// Find rip sessions under `parent` that still hold un-committed
 /// audio, newest directory name first.
 ///
@@ -470,5 +528,56 @@ mod tests {
         std::fs::write(&path, b"this is not a wav file at all").unwrap();
         assert!(probe(&path).is_err());
         assert!(probe(&dir.path().join("missing.wav")).is_err());
+    }
+    /// The two listings are complements: an unfinished rip belongs to
+    /// `list_recoverable`, a committed one to `list_resplittable`, and
+    /// neither should ever show the same session.
+    #[test]
+    fn resplittable_lists_committed_sessions_only() {
+        let root = tempfile::tempdir().unwrap();
+
+        let commit = |name: &str, tracks: usize, archive: bool| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut m = crate::manifest::RipManifest::new(SR, 2);
+            m.recorded_frames = 60 * u64::from(SR);
+            m.tracks = vec![crate::manifest::TrackEntry::default(); tracks];
+            if archive {
+                m.side_archive = Some(crate::ARCHIVE_FILE.to_string());
+                std::fs::write(dir.join(crate::ARCHIVE_FILE), b"not really flac").unwrap();
+            }
+            crate::manifest::save(&dir, &m).unwrap();
+            dir
+        };
+
+        commit("20260101-120000", 3, true);
+        let unfinished = commit("20260102-120000", 1, true);
+        write_spill(&unfinished.join(crate::SPILL_FILE), 1000);
+        commit("20260103-120000", 2, false); // committed but no archive
+        commit("20260104-120000", 4, true);
+
+        let found = list_resplittable(root.path());
+        let names: Vec<String> = found
+            .iter()
+            .map(|r| {
+                r.session_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["20260104-120000", "20260101-120000"],
+            "expected the two committed-with-archive sessions, newest first"
+        );
+        assert_eq!(found[0].track_count, 4);
+        assert_eq!(found[1].track_count, 3);
+
+        // And the unfinished one is the other listing's business.
+        let recoverable = list_recoverable(root.path());
+        assert_eq!(recoverable.len(), 1);
+        assert!(recoverable[0].session_dir.ends_with("20260102-120000"));
     }
 }

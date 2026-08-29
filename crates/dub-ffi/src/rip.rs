@@ -171,6 +171,17 @@ pub struct RipSessionStatus {
     pub level_peak: f32,
     /// Failure message when `phase == Failed`.
     pub error: Option<String>,
+    /// Where the side starts, in seconds. The lead-in groove before
+    /// it is discarded. `0.0` when nothing trimmed the head.
+    pub side_start_secs: f64,
+    /// Where the side ends, in seconds. The run-out groove after it is
+    /// discarded. Equals the recorded length when nothing trimmed the
+    /// tail.
+    ///
+    /// Both bounds are always real numbers rather than optionals, so a
+    /// caller drawing the side never has to special-case an untrimmed
+    /// rip.
+    pub side_end_secs: f64,
 }
 
 /// An unfinished rip found on disk, offered back to the operator
@@ -196,6 +207,26 @@ pub struct RipSplit {
     pub id: u32,
     /// Marker position in seconds from the start of the recording.
     pub secs: f64,
+}
+
+/// A committed rip, offered back for re-splitting (M26b, R-44).
+///
+/// The complement of [`RipRecoverable`]: commit deletes the spill only
+/// once every segment has imported, so a session with no spill but a
+/// `side.flac` is one that finished and can be split again.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RipResplittable {
+    /// Session directory — pass to [`DubEngine::resplit_rip_session`].
+    pub session_dir: String,
+    /// Directory name, which is the capture timestamp
+    /// (`YYYYMMDD-HHMMSS`). The listing is newest-first on it.
+    pub name: String,
+    /// Length of the archived side in seconds.
+    pub recorded_secs: f64,
+    /// Tracks the last split produced.
+    pub track_count: u32,
+    /// How many times this side has been split; 1 is the first commit.
+    pub split_generation: u32,
 }
 
 /// One derived segment of the recorded side: boundaries plus the
@@ -688,6 +719,41 @@ impl DubEngine {
             .collect()
     }
 
+    /// Committed rips sitting in the rips directory, newest first
+    /// (M26b, R-44).
+    ///
+    /// This is what a "past rips" surface lists, and the only way the
+    /// app can produce a `session_dir` for
+    /// [`Self::resplit_rip_session`]. Cheap — it reads each `rip.json`
+    /// and stats the archive, and deliberately does *not* decode the
+    /// FLACs to measure them.
+    ///
+    /// `rips_dir` overrides the default `~/Music/Dub/Rips` (tests).
+    #[must_use]
+    pub fn list_resplittable_rip_sessions(&self, rips_dir: Option<String>) -> Vec<RipResplittable> {
+        let root = match rips_dir {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => match rips_root() {
+                Ok(dir) => dir,
+                Err(_) => return Vec::new(),
+            },
+        };
+        dub_rip::list_resplittable(&root)
+            .into_iter()
+            .map(|found| RipResplittable {
+                name: found
+                    .session_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                session_dir: found.session_dir.to_string_lossy().into_owned(),
+                recorded_secs: frames_to_secs(found.frames, found.sample_rate),
+                track_count: found.track_count,
+                split_generation: found.split_generation,
+            })
+            .collect()
+    }
+
     /// Reopen one of [`Self::list_recoverable_rip_sessions`].
     ///
     /// The session comes back at the review stage — stopped, with its
@@ -928,6 +994,26 @@ impl DubRipSession {
             .set_splits(candidate.to_vec())
             .map_err(map_rip_error)
     }
+
+    fn set_side_bounds(&self, start_secs: f64, end_secs: f64) -> Result<(), RipFfiError> {
+        let start = secs_to_frames(start_secs.max(0.0), self.sample_rate);
+        let end = secs_to_frames(end_secs.max(0.0), self.sample_rate);
+        lock_mutex(&self.session)
+            .set_side_bounds(start, end)
+            .map_err(map_rip_error)?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// The side's bounds in seconds, read off the manifest.
+    fn side_bounds(&self) -> (f64, f64) {
+        let session = lock_mutex(&self.session);
+        let manifest = session.manifest();
+        (
+            frames_to_secs(manifest.side_start(), self.sample_rate),
+            frames_to_secs(manifest.side_end(), self.sample_rate),
+        )
+    }
 }
 
 #[uniffi::export]
@@ -1049,11 +1135,16 @@ impl DubRipSession {
                 recorded_frames: 0,
                 level_peak: 0.0,
                 error: None,
+                side_start_secs: 0.0,
+                side_end_secs: 0.0,
             };
         }
-        {
+        // Snapshot the job and release its lock before taking the
+        // session's — the trim lives in the manifest, and holding both
+        // would be the only place in this file that nests them.
+        let commit = {
             let job = lock_mutex(&self.job);
-            if job.running || job.finished {
+            (job.running || job.finished).then(|| {
                 let phase = if job.running {
                     RipPhase::Encoding
                 } else if job.complete && job.error.is_none() {
@@ -1061,18 +1152,38 @@ impl DubRipSession {
                 } else {
                     RipPhase::Failed
                 };
-                return RipSessionStatus {
+                (
                     phase,
-                    stop_reason: job.stop_reason,
-                    elapsed_secs: job.elapsed_secs,
-                    recorded_frames: job.recorded_frames,
-                    level_peak: 0.0,
-                    error: job.error.clone(),
-                };
-            }
+                    job.stop_reason,
+                    job.elapsed_secs,
+                    job.recorded_frames,
+                    job.error.clone(),
+                )
+            })
+        };
+        if let Some((phase, stop_reason, elapsed_secs, recorded_frames, error)) = commit {
+            let (side_start_secs, side_end_secs) = self.side_bounds();
+            return RipSessionStatus {
+                phase,
+                stop_reason,
+                elapsed_secs,
+                recorded_frames,
+                level_peak: 0.0,
+                error,
+                side_start_secs,
+                side_end_secs,
+            };
         }
         self.sync_if_terminal();
-        let s = lock_mutex(&self.session).status();
+        let (s, side_start_secs, side_end_secs) = {
+            let session = lock_mutex(&self.session);
+            let manifest = session.manifest();
+            (
+                session.status(),
+                frames_to_secs(manifest.side_start(), self.sample_rate),
+                frames_to_secs(manifest.side_end(), self.sample_rate),
+            )
+        };
         RipSessionStatus {
             phase: phase_for(&s.state),
             stop_reason: stop_reason_for(&s.state),
@@ -1080,6 +1191,8 @@ impl DubRipSession {
             recorded_frames: s.recorded_frames,
             level_peak: s.window_peak,
             error: s.failure,
+            side_start_secs,
+            side_end_secs,
         }
     }
 
@@ -1135,6 +1248,10 @@ impl DubRipSession {
     /// them like any other. A side with no detectable gaps stays one
     /// segment and returns 0 — not an error.
     ///
+    /// Also trims the side: the detector reports where the music
+    /// begins and ends, and the lead-in and run-out grooves come off
+    /// the first and last tracks.
+    ///
     /// # Errors
     ///
     /// [`RipFfiError::InvalidState`] while recording / after commit;
@@ -1145,12 +1262,19 @@ impl DubRipSession {
         self.guard_mutable()?;
         self.sync_if_terminal();
         let mut splits = lock_mutex(&self.splits);
-        let boundaries: Vec<u64> = lock_mutex(&self.session)
-            .detect_gaps(&GapConfig::default())
-            .iter()
-            .map(|gap| gap.boundary_frame)
-            .collect();
-        self.apply_splits(&boundaries)?;
+        // Delegate to `RipSession::auto_split` rather than running
+        // `detect_gaps` + `set_splits` here. It is the only writer of
+        // the side trim, and an earlier version of this method
+        // reimplemented its body — which silently dropped the trim on
+        // every rip the *app* drove, while the CLI (which calls the
+        // real thing) was fine.
+        let boundaries: Vec<u64> = {
+            let mut session = lock_mutex(&self.session);
+            session
+                .auto_split(&GapConfig::default())
+                .map_err(map_rip_error)?;
+            session.manifest().boundaries_frames.clone()
+        };
         splits.entries.clear();
         for frame in &boundaries {
             let id = splits.next_id;
@@ -1160,6 +1284,39 @@ impl DubRipSession {
         drop(splits);
         self.bump_generation();
         Ok(u32::try_from(boundaries.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Move where the side starts — the end of the lead-in groove.
+    /// Everything before it is discarded at commit.
+    ///
+    /// Pass `0.0` to keep the whole head. Nothing here is
+    /// irreversible: `side.flac` archives the entire capture and a
+    /// re-split reaches back past any trim.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::InvalidState`] while recording / after commit;
+    /// [`RipFfiError::InvalidSplit`] when the trim would swallow a
+    /// split marker or leave a segment under the minimum.
+    pub fn set_side_start(&self, secs: f64) -> Result<(), RipFfiError> {
+        self.guard_mutable()?;
+        self.sync_if_terminal();
+        let (_, end) = self.side_bounds();
+        self.set_side_bounds(secs, end)
+    }
+
+    /// Move where the side ends — the start of the run-out groove.
+    /// Everything after it is discarded at commit. Pass the recorded
+    /// length to keep the whole tail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_side_start`].
+    pub fn set_side_end(&self, secs: f64) -> Result<(), RipFfiError> {
+        self.guard_mutable()?;
+        self.sync_if_terminal();
+        let (start, _) = self.side_bounds();
+        self.set_side_bounds(start, secs)
     }
 
     /// Add a split marker at `secs` and return its stable id. Only
@@ -1270,7 +1427,11 @@ impl DubRipSession {
         if manifest.recorded_frames == 0 {
             return Vec::new();
         }
-        let ranges = dub_rip::segments(&manifest.boundaries_frames, manifest.side_end());
+        let ranges = dub_rip::segments(
+            &manifest.boundaries_frames,
+            manifest.side_start(),
+            manifest.side_end(),
+        );
         ranges
             .iter()
             .enumerate()
@@ -1565,6 +1726,124 @@ mod tests {
         // Proposals are ordinary markers: removing one merges again.
         ffi.remove_split(markers[0].id).unwrap();
         assert_eq!(ffi.segments().len(), 1);
+    }
+
+    /// The run-out trim has to survive the trip through the FFI.
+    ///
+    /// It did not: this method used to run `detect_gaps` + `set_splits`
+    /// itself instead of calling [`RipSession::auto_split`], which is
+    /// the only writer of the side trim — so every rip driven from the
+    /// app kept its run-out while the CLI dropped it, and nothing here
+    /// noticed because no test looked past the boundary count.
+    #[test]
+    fn auto_split_trims_the_run_out_off_the_last_segment() {
+        const TRACK_SECS: u64 = 40;
+        const GAP_SECS: f64 = 2.0;
+        const RUN_OUT_SECS: u64 = 40;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ffi, mut tx) = armed_session(dir.path());
+        ffi.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ffi.status().phase != RipPhase::Recording {
+            assert!(Instant::now() < deadline, "worker never started recording");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut side: Vec<f32> = Vec::new();
+        let push_tone = |side: &mut Vec<f32>| {
+            for i in 0..TRACK_SECS * u64::from(SR) {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / SR as f32;
+                let s = 0.5 * (std::f32::consts::TAU * 220.0 * t).sin();
+                side.push(s);
+                side.push(s);
+            }
+        };
+        let push_groove = |side: &mut Vec<f32>, secs: f64| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let frames = (secs * f64::from(SR)) as u64;
+            for i in 0..frames {
+                let s = if i % 2 == 0 { 0.002 } else { -0.002 };
+                side.push(s);
+                side.push(s);
+            }
+        };
+        push_tone(&mut side);
+        push_groove(&mut side, GAP_SECS);
+        push_tone(&mut side);
+        #[allow(clippy::cast_precision_loss)]
+        push_groove(&mut side, RUN_OUT_SECS as f64);
+
+        let mut pushed = 0;
+        while pushed < side.len() {
+            pushed += tx.push_slice(&side[pushed..]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        ffi.stop().unwrap();
+
+        assert_eq!(ffi.auto_split().unwrap(), 1, "expected the one gap");
+
+        let recorded_secs = frames_to_secs(ffi.status().recorded_frames, SR);
+        let segments = ffi.segments();
+        let side_end = segments.last().unwrap().end_secs;
+        #[allow(clippy::cast_precision_loss)]
+        let music_end = 2.0 * TRACK_SECS as f64 + GAP_SECS;
+
+        assert!(
+            side_end < recorded_secs - 20.0,
+            "run-out kept: side ends at {side_end:.1} s of {recorded_secs:.1} s"
+        );
+        assert!(
+            (side_end - music_end).abs() < 5.0,
+            "side ends at {side_end:.1} s, music ends at {music_end:.1} s"
+        );
+    }
+
+    /// The operator can move both trims, and a trim that would
+    /// swallow a split marker is refused rather than shoving it.
+    #[test]
+    fn side_bounds_move_and_are_refused_when_they_eat_a_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = recorded_session(dir.path(), 90);
+
+        let full = ffi.status();
+        assert!((full.side_start_secs - 0.0).abs() < f64::EPSILON);
+        assert!(
+            (full.side_end_secs - 90.0).abs() < 0.5,
+            "an untrimmed side reports its whole length, got {}",
+            full.side_end_secs
+        );
+
+        ffi.add_split(45.0).unwrap();
+        ffi.set_side_start(10.0).unwrap();
+        ffi.set_side_end(80.0).unwrap();
+
+        let trimmed = ffi.status();
+        assert!((trimmed.side_start_secs - 10.0).abs() < 0.1);
+        assert!((trimmed.side_end_secs - 80.0).abs() < 0.1);
+
+        let segments = ffi.segments();
+        assert_eq!(segments.len(), 2);
+        assert!(
+            (segments[0].start_secs - 10.0).abs() < 0.1,
+            "first track starts at the side start"
+        );
+        assert!(
+            (segments[1].end_secs - 80.0).abs() < 0.1,
+            "last track ends at the side end"
+        );
+
+        // Past the marker: refused, and nothing moves.
+        assert!(ffi.set_side_start(50.0).is_err());
+        assert!((ffi.status().side_start_secs - 10.0).abs() < 0.1);
+        assert!(ffi.set_side_end(40.0).is_err());
+        assert!((ffi.status().side_end_secs - 80.0).abs() < 0.1);
+
+        // And back to the whole side.
+        ffi.set_side_start(0.0).unwrap();
+        assert!((ffi.status().side_start_secs - 0.0).abs() < f64::EPSILON);
     }
 
     /// M26b: an interrupted rip is discoverable and reopens straight

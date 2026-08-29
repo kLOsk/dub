@@ -81,6 +81,18 @@ pub struct RipManifest {
     /// `serde(default)` — pre-M26b manifests simply have none.
     #[serde(default)]
     pub side_end_frame: Option<u64>,
+    /// Frame the *side* starts at, when the detector found the lead-in
+    /// groove. The first segment starts here and the dead air, needle
+    /// drop and lead-in groove before it are discarded; `None` means
+    /// the side starts at the top of the recording, which is what a
+    /// manual rip gets.
+    ///
+    /// Recoverable like the tail: `side.flac` archives the whole
+    /// capture.
+    ///
+    /// `serde(default)` — pre-M26b manifests simply have none.
+    #[serde(default)]
+    pub side_start_frame: Option<u64>,
 }
 
 impl RipManifest {
@@ -91,6 +103,15 @@ impl RipManifest {
         self.side_end_frame
             .filter(|&end| end > 0 && end <= self.recorded_frames)
             .unwrap_or(self.recorded_frames)
+    }
+
+    /// Frame the first track starts at: the detected start of the
+    /// side, or 0 when nothing trimmed it.
+    #[must_use]
+    pub fn side_start(&self) -> u64 {
+        self.side_start_frame
+            .filter(|&start| start < self.side_end())
+            .unwrap_or(0)
     }
 
     /// Fresh manifest for a new capture session.
@@ -107,6 +128,7 @@ impl RipManifest {
             replaced_uuids: Vec::new(),
             split_generation: 1,
             side_end_frame: None,
+            side_start_frame: None,
         }
     }
 }

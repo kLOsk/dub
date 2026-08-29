@@ -70,20 +70,33 @@ pub fn run(args: &[String]) -> Result<()> {
         clock(f64::from(stats.played_secs))
     );
     println!(
-        "  side ends          {:>8}   (music {} – {}; the run-out behind it is discarded)",
-        clock(frames_to_secs(stats.music_end_frame, sample_rate)),
+        "  music              {:>8} – {}",
         clock(frames_to_secs(stats.music_start_frame, sample_rate)),
         clock(frames_to_secs(stats.music_end_frame, sample_rate)),
     );
-    let trimmed = frames.saturating_sub(stats.music_end_frame);
-    if trimmed > 0 {
+    println!(
+        "  side               {:>8} – {}   (everything outside is discarded)",
+        clock(frames_to_secs(stats.side_start_frame, sample_rate)),
+        clock(frames_to_secs(stats.music_end_frame, sample_rate)),
+    );
+    let head = stats.side_start_frame;
+    let tail = frames.saturating_sub(stats.music_end_frame);
+    if head > 0 || tail > 0 {
         println!(
-            "  run-out discarded  {:>8}",
-            clock(frames_to_secs(trimmed, sample_rate))
+            "  discarded          {:>8} lead-in + {} run-out",
+            clock(frames_to_secs(head, sample_rate)),
+            clock(frames_to_secs(tail, sample_rate)),
         );
     }
     println!("  noise floor        {:>8.1} dBFS", stats.floor_db);
     println!("  music level        {:>8.1} dBFS", stats.music_db);
+    println!("  music peak         {:>8.1} dBFS", stats.music_peak_db);
+    println!(
+        "  groove peak        {:>8.1} dBFS   (lead-in ends at groove +{:.0} = {:.1})",
+        stats.groove_peak_db,
+        opts.gap.lead_in_margin_db,
+        stats.groove_peak_db + opts.gap.lead_in_margin_db,
+    );
     println!(
         "  contrast           {:>8.1} dB",
         stats.music_db - stats.floor_db
@@ -259,6 +272,34 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
+    // Per-second view of the head, on the statistic the head gate
+    // actually uses. "above" is how many of the second's 20 cells clear
+    // the onset line — a needle drop lights up one or two rows, music
+    // holds.
+    if let Some(secs) = opts.head_secs {
+        let (peak_cells, cell_secs) =
+            dub_rip::cell_peaks_db(&envelope, DEFAULT_SAMPLES_PER_CHUNK, sample_rate);
+        let line = stats.groove_peak_db + opts.gap.lead_in_margin_db;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let per_row = (1.0 / cell_secs).round() as usize;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rows = (secs / 1.0).round() as usize;
+        println!();
+        println!("HEAD  (cell peaks, 1 s rows; line {line:.1} dBFS)");
+        for (i, row) in peak_cells.chunks(per_row).take(rows).enumerate() {
+            let mut sorted = row.to_vec();
+            sorted.sort_by(f32::total_cmp);
+            let above = row.iter().filter(|&&db| db >= line).count();
+            println!(
+                "  {:>7}   p50 {:>7.1}   max {:>7.1}   above {above:>3}/{}",
+                clock(i as f64),
+                sorted[sorted.len() / 2],
+                sorted[sorted.len() - 1],
+                row.len(),
+            );
+        }
+    }
+
     if let Some(step) = opts.profile_secs {
         println!();
         println!("PROFILE  (median cell level per {step:.0} s)");
@@ -294,12 +335,15 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let boundaries: Vec<u64> = gaps.iter().map(|g| g.boundary_frame).collect();
     // The last track stops at the last music, not at the end of tape.
-    let side_end = if stats.usable && stats.music_end_frame > 0 {
-        stats.music_end_frame.min(frames)
+    let (side_start, side_end) = if stats.usable && stats.music_end_frame > 0 {
+        (
+            stats.side_start_frame.min(frames),
+            stats.music_end_frame.min(frames),
+        )
     } else {
-        frames
+        (0, frames)
     };
-    let ranges = dub_rip::segments(&boundaries, side_end);
+    let ranges = dub_rip::segments(&boundaries, side_start, side_end);
     println!();
     println!("PLAN  {} track(s)", ranges.len());
     for (i, range) in ranges.iter().enumerate() {
@@ -379,6 +423,7 @@ fn clock(secs: f64) -> String {
 struct Opts {
     path: PathBuf,
     profile_secs: Option<f32>,
+    head_secs: Option<f32>,
     quietest: Option<usize>,
     from_secs: Option<f64>,
     to_secs: Option<f64>,
@@ -391,6 +436,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     let mut gap = GapConfig::default();
     let mut auto = AutoCapture::default();
     let mut profile_secs: Option<f32> = None;
+    let mut head_secs: Option<f32> = None;
     let mut quietest: Option<usize> = None;
     let mut from_secs: Option<f64> = None;
     let mut to_secs: Option<f64> = None;
@@ -412,6 +458,19 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--margin-db" => {
                 gap.margin_db = value("--margin-db")?.parse().context("--margin-db")?;
             }
+            "--lead-in-hold-secs" => {
+                gap.lead_in_hold_secs = value("--lead-in-hold-secs")?
+                    .parse()
+                    .context("--lead-in-hold-secs")?;
+            }
+            "--lead-in-margin-db" => {
+                gap.lead_in_margin_db = value("--lead-in-margin-db")?
+                    .parse()
+                    .context("--lead-in-margin-db")?;
+            }
+            "--lead-in-secs" => {
+                gap.lead_in_secs = value("--lead-in-secs")?.parse().context("--lead-in-secs")?;
+            }
             "--min-contrast-db" => {
                 gap.min_contrast_db = value("--min-contrast-db")?
                     .parse()
@@ -427,6 +486,9 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--to" => to_secs = Some(value("--to")?.parse().context("--to")?),
             "--quietest" => {
                 quietest = Some(value("--quietest")?.parse().context("--quietest")?);
+            }
+            "--head" => {
+                head_secs = Some(value("--head")?.parse().context("--head")?);
             }
             "--profile" => {
                 profile_secs = Some(value("--profile")?.parse().context("--profile")?);
@@ -450,6 +512,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     }
     Ok(Opts {
         profile_secs,
+        head_secs,
         quietest,
         from_secs,
         to_secs,

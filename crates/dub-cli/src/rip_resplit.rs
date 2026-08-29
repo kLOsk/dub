@@ -56,7 +56,15 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let segment_count = session.manifest().tracks.len().max(1);
-    let ranges = dub_rip::segments(&session.manifest().boundaries_frames, total_frames);
+    // Against the *side*, not the tape: after an auto re-split the
+    // detector has trimmed the lead-in and run-out, and printing the
+    // plan against `total_frames` disagreed with what commit writes.
+    let manifest = session.manifest();
+    let ranges = dub_rip::segments(
+        &manifest.boundaries_frames,
+        manifest.side_start(),
+        manifest.side_end(),
+    );
     println!("new plan: {} track(s)", ranges.len());
     for (i, range) in ranges.iter().enumerate() {
         println!(

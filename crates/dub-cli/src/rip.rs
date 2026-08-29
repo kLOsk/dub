@@ -382,14 +382,17 @@ fn mmss(secs: f64) -> String {
 fn print_plan(session: &RipSession, sample_rate: u32, total_frames: u64) {
     let manifest = session.manifest();
     let side_end = manifest.side_end();
-    if side_end < total_frames {
+    let side_start = manifest.side_start();
+    if side_start > 0 || side_end < total_frames {
         println!(
-            "side ends at {} — {} of run-out discarded (kept in side.flac)",
+            "side is {} – {} — {} of lead-in and {} of run-out discarded (kept in side.flac)",
+            mmss(frames_to_secs(side_start, sample_rate)),
             mmss(frames_to_secs(side_end, sample_rate)),
+            mmss(frames_to_secs(side_start, sample_rate)),
             mmss(frames_to_secs(total_frames - side_end, sample_rate)),
         );
     }
-    let ranges = dub_rip::segments(&manifest.boundaries_frames, side_end);
+    let ranges = dub_rip::segments(&manifest.boundaries_frames, side_start, side_end);
     println!("plan: {} track(s)", ranges.len());
     for (i, range) in ranges.iter().enumerate() {
         println!(

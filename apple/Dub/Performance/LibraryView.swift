@@ -388,7 +388,7 @@ private enum LibrarySource: Hashable, Identifiable {
     /// target resolve live from `libraryModel.favoriteSlots`. Selected
     /// from the 8-slot strip above the list, not from the sidebar tree.
     case favoriteSlot(slot: UInt32)
-    case realRecordsPlaceholder
+    case realRecords
 
     var id: Self { self }
 
@@ -402,7 +402,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .importedSource(let kind):    return kind.label
         case .importedCrate:               return "Playlist"
         case .favoriteSlot:                return "Favourite"
-        case .realRecordsPlaceholder:      return "Real Records"
+        case .realRecords:                 return "Real Records"
         }
     }
 
@@ -416,7 +416,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .importedSource(let kind):    return kind.systemImage
         case .importedCrate:               return "list.bullet"
         case .favoriteSlot:                return "star.fill"
-        case .realRecordsPlaceholder:      return "opticaldisc"
+        case .realRecords:                 return "opticaldisc"
         }
     }
 
@@ -438,7 +438,9 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks, .recentlyPlayed, .sessionHistory, .justImported: return true
         case .dubCrate, .importedSource, .importedCrate, .favoriteSlot: return true
-        default:                                         return false
+        // M26b: no longer a placeholder — it lists committed rips and
+        // hands one back for re-splitting (R-44).
+        case .realRecords:                               return true
         }
     }
 
@@ -479,7 +481,7 @@ private enum LibrarySource: Hashable, Identifiable {
             return "Imported Sources"
         case .favoriteSlot:
             return "Favourites"
-        case .realRecordsPlaceholder:
+        case .realRecords:
             return "Real Records"
         }
     }
@@ -729,7 +731,17 @@ struct LibraryView: View {
             // filter selections no longer apply. `refreshTracks` rebuilds
             // the facets from the new `tracks`.
             filterState.reset()
-            refreshTracks()
+            if newSource == .realRecords {
+                model.refreshPastRips()
+            } else {
+                refreshTracks()
+            }
+        }
+        .onChange(of: model.ripPhase) { phase in
+            // A rip that just committed is re-splittable from now on.
+            if phase == .done && selectedSource == .realRecords {
+                model.refreshPastRips()
+            }
         }
         .onChange(of: libraryModel.libraryIsOpen) { _ in
             refreshTracks()
@@ -855,7 +867,7 @@ struct LibraryView: View {
                 importedSourcesSection
                 section(
                     heading: "Real Records",
-                    entries: [.realRecordsPlaceholder])
+                    entries: [.realRecords])
             }
             .padding(.vertical, DubSpacing.xs)
         }
@@ -1187,15 +1199,23 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             toolbar
             Divider().overlay(DubColor.divider)
-            if libraryModel.libraryIsOpen {
-                favoritesStrip
-                Divider().overlay(DubColor.divider)
+            if selectedSource == .realRecords {
+                // Past rips are not tracks: they have no fingerprint,
+                // no grid and nothing to load on a deck, so they get
+                // the pane rather than being forced through the
+                // track table's `LibraryTrack` column model.
+                pastRipsPane
+            } else {
+                if libraryModel.libraryIsOpen {
+                    favoritesStrip
+                    Divider().overlay(DubColor.divider)
+                }
+                if libraryModel.libraryIsOpen && !enabledFilterFields.isEmpty {
+                    filterBar
+                    Divider().overlay(DubColor.divider)
+                }
+                trackListContainer
             }
-            if libraryModel.libraryIsOpen && !enabledFilterFields.isEmpty {
-                filterBar
-                Divider().overlay(DubColor.divider)
-            }
-            trackListContainer
             Divider().overlay(DubColor.divider)
             footer
         }
@@ -1205,6 +1225,41 @@ struct LibraryView: View {
             searchFocused = false
             NSApp.keyWindow?.makeFirstResponder(nil)
         }
+    }
+
+    /// The "Real Records" pane: committed rips, each re-splittable
+    /// from its archive. Re-split opens the side in the review panel
+    /// in the column *above* this one — both are on screen at once —
+    /// so it is gated on Prep mode, which is where that panel mounts
+    /// and where auditioning may commandeer deck A.
+    private var pastRipsPane: some View {
+        RipPastSessionsPane(
+            state: RipPastSessionsPaneState(
+                sessions: libraryModel.pastRips,
+                isLoading: libraryModel.pastRipsLoading,
+                blockedReason: pastRipsBlockedReason),
+            callbacks: RipPastSessionsPaneCallbacks(
+                resplit: { session in model.resplitRip(sessionDir: session.sessionDir) },
+                revealInFinder: { session in
+                    NSWorkspace.shared.selectFile(
+                        nil, inFileViewerRootedAtPath: session.sessionDir)
+                }))
+    }
+
+    private var pastRipsBlockedReason: String? {
+        if model.ripSession != nil {
+            return "Finish the rip in progress before re-splitting another side."
+        }
+        if model.engineMode != .prep {
+            // Offering a mode switch here would restart the audio
+            // engine from a browser click, and the switch is itself
+            // only honoured when vinyl recording is enabled — so say
+            // what to do rather than doing it.
+            return model.vinylRecordingEnabled
+                ? "Switch to PREP to re-split a side."
+                : "Turn on Preferences ▸ Recording ▸ Vinyl recording to re-split a side."
+        }
+        return nil
     }
 
     // MARK: - Favourites strip (v8)

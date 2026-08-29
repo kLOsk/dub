@@ -19,6 +19,10 @@
 //      as MainView's key handling (SwiftUI focus is unreliable here)
 //    • double-click a marker → audition across the boundary
 //    • right-click a marker → Remove Split
+//    • drag either trim bracket → move where the side starts / ends;
+//      the discarded lead-in and run-out shade out. ⌫ on a bracket
+//      resets that end to the whole capture (a trim can be reset but
+//      never removed, unlike a split).
 //
 //  Value-driven (markers + duration + callbacks); the only local
 //  state is interaction bookkeeping, so the snapshot suite renders
@@ -35,9 +39,27 @@ struct RipMarkerUi: Equatable, Identifiable {
     var secs: Double
 }
 
-/// Split-edit callbacks. `addSplit` / `moveSplit` report rejection
-/// (`false`) so the overlay can flash; the model owns the actual
-/// FFI calls + error surfacing.
+/// Where the side begins and ends inside the capture. The lead-in
+/// groove before `startSecs` and the run-out after `endSecs` are
+/// discarded at commit — `side.flac` keeps them, so nothing here is
+/// irreversible.
+struct RipTrimUi: Equatable {
+    var startSecs: Double
+    var endSecs: Double
+}
+
+/// What a click selected. A trim bracket is not a marker: its
+/// position is not a stable FFI id and it can never be deleted, only
+/// reset — so it gets its own case rather than a sentinel id.
+enum RipOverlaySelection: Equatable {
+    case split(UInt32)
+    case trimStart
+    case trimEnd
+}
+
+/// Split-edit callbacks. `addSplit` / `moveSplit` / `setSideStart` /
+/// `setSideEnd` report rejection (`false`) so the overlay can flash;
+/// the model owns the actual FFI calls + error surfacing.
 struct RipSplitOverlayCallbacks {
     var addSplit: (Double) -> Bool = { _ in true }
     var moveSplit: (UInt32, Double) -> Bool = { _, _ in true }
@@ -46,15 +68,37 @@ struct RipSplitOverlayCallbacks {
     var audition: (Double) -> Void = { _ in }
     /// Seek deck A (single click / drag on empty band).
     var scrub: (Double) -> Void = { _ in }
+    var setSideStart: (Double) -> Bool = { _ in true }
+    var setSideEnd: (Double) -> Bool = { _ in true }
+}
+
+/// Where a split may sit once the side is trimmed.
+///
+/// File-scope and `internal` rather than a method on the view: it is
+/// the one piece of this overlay with real off-by-one risk (a zero
+/// duration between review and the deck-A decode landing, inverted
+/// bounds from a salvaged manifest) and it should be testable without
+/// rendering anything.
+enum RipTrimClamp {
+    static func split(_ secs: Double, in trim: RipTrimUi?, duration: Double) -> Double {
+        let lower = max(0, trim?.startSecs ?? 0)
+        let upper = min(duration, trim?.endSecs ?? duration)
+        guard upper > lower else { return lower }
+        return min(max(lower, secs), upper)
+    }
 }
 
 struct RipSplitMarkerOverlay: View {
 
     let markers: [RipMarkerUi]
     let durationSecs: Double
+    /// `nil` when nothing is trimmed — the whole capture is the side,
+    /// which is what a manual rip and every pre-M26b session get. The
+    /// overlay then renders exactly as it did before trims existed.
+    var trim: RipTrimUi? = nil
     var callbacks = RipSplitOverlayCallbacks()
-    /// Snapshot hook: pre-select a marker without a click.
-    var initialSelectedId: UInt32? = nil
+    /// Snapshot hook: pre-select something without a click.
+    var initialSelection: RipOverlaySelection? = nil
 
     /// Hit radius around a marker line, in points.
     private static let hitRadius: CGFloat = 6
@@ -64,7 +108,7 @@ struct RipSplitMarkerOverlay: View {
     private static let doubleClickSecs: TimeInterval = 0.4
     private static let moveDispatchMinInterval: TimeInterval = 1.0 / 30.0
 
-    @State private var selectedId: UInt32?
+    @State private var selection: RipOverlaySelection?
     @State private var drag: DragBookkeeping? = nil
     @State private var dragEchoSecs: Double? = nil
     @State private var lastClick: (date: Date, x: CGFloat)? = nil
@@ -72,7 +116,8 @@ struct RipSplitMarkerOverlay: View {
     @State private var rejectFlash = false
 
     private struct DragBookkeeping {
-        var markerId: UInt32?
+        /// What the drag grabbed; `nil` is an empty-band scrub.
+        var target: RipOverlaySelection?
         var startX: CGFloat
         var moved: Bool
     }
@@ -80,14 +125,16 @@ struct RipSplitMarkerOverlay: View {
     init(
         markers: [RipMarkerUi],
         durationSecs: Double,
+        trim: RipTrimUi? = nil,
         callbacks: RipSplitOverlayCallbacks = RipSplitOverlayCallbacks(),
-        initialSelectedId: UInt32? = nil
+        initialSelection: RipOverlaySelection? = nil
     ) {
         self.markers = markers
         self.durationSecs = durationSecs
+        self.trim = trim
         self.callbacks = callbacks
-        self.initialSelectedId = initialSelectedId
-        _selectedId = State(initialValue: initialSelectedId)
+        self.initialSelection = initialSelection
+        _selection = State(initialValue: initialSelection)
     }
 
     var body: some View {
@@ -100,23 +147,49 @@ struct RipSplitMarkerOverlay: View {
                         .fill(DubColor.stateError.opacity(0.25))
                         .allowsHitTesting(false)
                 }
+                // The discarded ends, drawn under the markers so a
+                // rejected drag echo that strays into one is still
+                // visible. Deliberately from x = 0 rather than from
+                // the 8 pt gutter: the gutter is dropped material too.
+                if let t = displayTrim {
+                    trimShade(from: 0, to: xPosition(secs: t.startSecs, width: geo.size.width),
+                              height: geo.size.height)
+                    trimShade(from: xPosition(secs: t.endSecs, width: geo.size.width),
+                              to: geo.size.width, height: geo.size.height)
+                }
                 ForEach(displayMarkers) { marker in
                     let x = xPosition(secs: marker.secs, width: geo.size.width)
                     RipMarkerGlyph(
-                        selected: marker.id == selectedId,
+                        selected: selection == .split(marker.id),
                         height: geo.size.height)
                         .position(x: x, y: geo.size.height * 0.5)
                         .contextMenu {
                             Button("Remove Split", role: .destructive) {
                                 callbacks.removeSplit(marker.id)
-                                if selectedId == marker.id { selectedId = nil }
+                                if selection == .split(marker.id) { selection = nil }
                             }
                         }
                 }
+                if let t = displayTrim {
+                    RipTrimGlyph(edge: .start, selected: selection == .trimStart,
+                                 height: geo.size.height)
+                        .position(x: xPosition(secs: t.startSecs, width: geo.size.width),
+                                  y: geo.size.height * 0.5)
+                        .contextMenu {
+                            Button("Keep the lead-in") { _ = callbacks.setSideStart(0) }
+                        }
+                    RipTrimGlyph(edge: .end, selected: selection == .trimEnd,
+                                 height: geo.size.height)
+                        .position(x: xPosition(secs: t.endSecs, width: geo.size.width),
+                                  y: geo.size.height * 0.5)
+                        .contextMenu {
+                            Button("Keep the run-out") { _ = callbacks.setSideEnd(durationSecs) }
+                        }
+                }
                 RipSplitKeyCapture(
-                    isActive: selectedId != nil,
-                    onNudge: { deltaSecs in nudgeSelected(by: deltaSecs) },
-                    onDelete: { removeSelected() })
+                    isActive: selection != nil,
+                    onNudge: { deltaSecs in nudgeSelection(by: deltaSecs) },
+                    onDelete: { deleteSelection() })
                     .frame(width: 0, height: 0)
             }
             .contentShape(Rectangle())
@@ -135,11 +208,38 @@ struct RipSplitMarkerOverlay: View {
     /// dragged marker tracks the pointer every frame while the FFI
     /// dispatch stays throttled.
     private var displayMarkers: [RipMarkerUi] {
-        guard let drag, let id = drag.markerId, let echo = dragEchoSecs else {
+        guard let drag, case .split(let id)? = drag.target, let echo = dragEchoSecs else {
             return markers
         }
         return markers.map { m in
             m.id == id ? RipMarkerUi(id: m.id, secs: echo) : m
+        }
+    }
+
+    /// The trim with the in-flight drag echo substituted, so a bracket
+    /// tracks the pointer every frame while the FFI stays throttled —
+    /// the same single echo the markers use, because only one thing is
+    /// ever dragged at a time.
+    private var displayTrim: RipTrimUi? {
+        guard var t = trim else { return nil }
+        guard let drag, let echo = dragEchoSecs else { return t }
+        switch drag.target {
+        case .trimStart: t.startSecs = echo
+        case .trimEnd: t.endSecs = echo
+        default: break
+        }
+        return t
+    }
+
+    @ViewBuilder
+    private func trimShade(from: CGFloat, to: CGFloat, height: CGFloat) -> some View {
+        let width = max(0, to - from)
+        if width > 0 {
+            Rectangle()
+                .fill(DubColor.surface0.opacity(0.62))
+                .frame(width: width, height: height)
+                .position(x: from + width * 0.5, y: height * 0.5)
+                .allowsHitTesting(false)
         }
     }
 
@@ -165,19 +265,55 @@ struct RipSplitMarkerOverlay: View {
         return pad + axisLength * CGFloat(f)
     }
 
-    private func hitTestMarker(atX x: CGFloat, width: CGFloat) -> UInt32? {
-        var best: (id: UInt32, distance: CGFloat)? = nil
-        for m in markers {
-            let mx = xPosition(secs: m.secs, width: width)
-            let d = abs(mx - x)
+    /// Nearest grabbable thing within the hit radius. Splits are
+    /// offered first so an exact tie with a bracket keeps the split —
+    /// a bracket sits at the edge of the band where nothing else is,
+    /// while a split can legitimately be dragged right up to one.
+    private func hitTest(atX x: CGFloat, width: CGFloat) -> RipOverlaySelection? {
+        var candidates: [(RipOverlaySelection, Double)] = markers.map { (.split($0.id), $0.secs) }
+        if let t = trim {
+            candidates.append((.trimStart, t.startSecs))
+            candidates.append((.trimEnd, t.endSecs))
+        }
+        var best: (target: RipOverlaySelection, distance: CGFloat)? = nil
+        for (target, secs) in candidates {
+            let d = abs(xPosition(secs: secs, width: width) - x)
             guard d <= Self.hitRadius else { continue }
             if let current = best {
-                if d < current.distance { best = (m.id, d) }
+                if d < current.distance { best = (target, d) }
             } else {
-                best = (m.id, d)
+                best = (target, d)
             }
         }
-        return best?.id
+        return best?.target
+    }
+
+    /// Seconds the given target currently sits at.
+    private func secsOf(_ target: RipOverlaySelection) -> Double? {
+        switch target {
+        case .split(let id): return marker(id: id)?.secs
+        case .trimStart: return trim?.startSecs
+        case .trimEnd: return trim?.endSecs
+        }
+    }
+
+    /// Push a target to `secs`. Returns false when the FFI refuses.
+    private func move(_ target: RipOverlaySelection, to secs: Double) -> Bool {
+        switch target {
+        case .split(let id):
+            return callbacks.moveSplit(
+                id, RipTrimClamp.split(secs, in: trim, duration: durationSecs))
+        // Clamped only to the structural bound the UI can know. The
+        // 5 s minimum-segment rule lives in Rust; duplicating it here
+        // would fork silently the day it changes, so a bracket that
+        // eats a track is refused by the FFI and flashes.
+        case .trimStart:
+            let upper = trim?.endSecs ?? durationSecs
+            return callbacks.setSideStart(min(max(0, secs), upper))
+        case .trimEnd:
+            let lower = trim?.startSecs ?? 0
+            return callbacks.setSideEnd(max(min(durationSecs, secs), lower))
+        }
     }
 
     private func marker(id: UInt32) -> RipMarkerUi? {
@@ -190,7 +326,7 @@ struct RipSplitMarkerOverlay: View {
         guard durationSecs > 0 else { return }
         if drag == nil {
             drag = DragBookkeeping(
-                markerId: hitTestMarker(atX: value.startLocation.x, width: size.width),
+                target: hitTest(atX: value.startLocation.x, width: size.width),
                 startX: value.startLocation.x,
                 moved: false)
         }
@@ -202,12 +338,17 @@ struct RipSplitMarkerOverlay: View {
         guard bookkeeping.moved else { return }
 
         let targetSecs = secs(atX: value.location.x, width: size.width)
-        if let id = bookkeeping.markerId {
+        if let target = bookkeeping.target {
+            // Echo where the pointer is, not where the clamp would put
+            // it: the shade moving under a bracket that has stopped is
+            // what tells the operator they have hit a limit.
             dragEchoSecs = targetSecs
             let now = ProcessInfo.processInfo.systemUptime
             if now - lastMoveDispatch >= Self.moveDispatchMinInterval {
                 lastMoveDispatch = now
-                _ = callbacks.moveSplit(id, targetSecs)
+                // Fire and forget mid-drag: a boundary that momentarily
+                // crosses another must not strobe the band at 30 Hz.
+                _ = move(target, to: targetSecs)
             }
         } else {
             // Empty-band drag: forward as a seek scrub so the review
@@ -235,12 +376,14 @@ struct RipSplitMarkerOverlay: View {
             handleClick(atX: x, secs: endSecs, width: size.width)
             return
         }
-        if let id = bookkeeping.markerId {
+        if let target = bookkeeping.target {
+            // Clear the echo before the final call, so a refused move
+            // visibly snaps back instead of leaving a stale position.
             dragEchoSecs = nil
-            if !callbacks.moveSplit(id, endSecs) {
+            if !move(target, to: endSecs) {
                 flashRejection()
             }
-            selectedId = id
+            selection = target
         } else {
             callbacks.scrub(endSecs)
         }
@@ -258,36 +401,52 @@ struct RipSplitMarkerOverlay: View {
             lastClick = (Date(), x)
         }
 
-        if let id = hitTestMarker(atX: x, width: width) {
+        if let target = hitTest(atX: x, width: width) {
             if isDouble {
-                if let m = marker(id: id) { callbacks.audition(m.secs) }
+                if let at = secsOf(target) { callbacks.audition(at) }
             } else {
-                selectedId = id
+                selection = target
             }
         } else if isDouble {
+            // Deliberately *not* clamped into the side. A drag is a
+            // continuous gesture that wants a wall; a double-click out
+            // in the shaded lead-in is a discrete intent, and refusing
+            // it says something the shade has already explained.
             if !callbacks.addSplit(secs) {
                 flashRejection()
             }
         } else {
-            selectedId = nil
+            selection = nil
             callbacks.scrub(secs)
         }
     }
 
     // MARK: Keyboard
 
-    private func nudgeSelected(by deltaSecs: Double) {
-        guard let id = selectedId, let m = marker(id: id) else { return }
-        let target = min(max(0, m.secs + deltaSecs), durationSecs)
-        if !callbacks.moveSplit(id, target) {
+    /// Nudging is the highest-value gesture here: trimming to the
+    /// exact second the groove noise starts is not a drag job.
+    private func nudgeSelection(by deltaSecs: Double) {
+        guard let target = selection, let at = secsOf(target) else { return }
+        if !move(target, to: min(max(0, at + deltaSecs), durationSecs)) {
             flashRejection()
         }
     }
 
-    private func removeSelected() {
-        guard let id = selectedId else { return }
-        callbacks.removeSplit(id)
-        selectedId = nil
+    /// ⌫ removes a split, but a trim bracket always exists — it can
+    /// only be reset to the whole capture, which is what the context
+    /// menu offers too.
+    private func deleteSelection() {
+        switch selection {
+        case .split(let id):
+            callbacks.removeSplit(id)
+            selection = nil
+        case .trimStart:
+            if !callbacks.setSideStart(0) { flashRejection() }
+        case .trimEnd:
+            if !callbacks.setSideEnd(durationSecs) { flashRejection() }
+        case nil:
+            break
+        }
     }
 
     private func flashRejection() {
@@ -322,6 +481,47 @@ private struct RipMarkerGlyph: View {
                 .offset(y: 2)
         }
         .frame(width: 12, height: height)
+    }
+}
+
+/// A side bound: a full-height line with stubs pointing *into* the
+/// part of the capture that is kept, so the bracket reads as a
+/// boundary rather than as another split.
+///
+/// Deliberately a different shape, not just a different hue — the
+/// band already carries the deck-A envelope and magenta cue markers,
+/// and a fourth colour would not be a distinction anyone could rely
+/// on at a glance.
+private struct RipTrimGlyph: View {
+    enum Edge { case start, end }
+
+    let edge: Edge
+    let selected: Bool
+    let height: CGFloat
+
+    private var tint: Color {
+        DubColor.textSecondary.opacity(selected ? 1.0 : 0.8)
+    }
+
+    var body: some View {
+        let stub: CGFloat = 6
+        return ZStack(alignment: edge == .start ? .leading : .trailing) {
+            Rectangle()
+                .fill(tint)
+                .frame(width: 2, height: height)
+            VStack(spacing: 0) {
+                Rectangle().fill(tint).frame(width: stub, height: 2)
+                Spacer(minLength: 0)
+                Rectangle().fill(tint).frame(width: stub, height: 2)
+            }
+            .frame(width: stub, height: height)
+            if selected {
+                Rectangle()
+                    .stroke(Color.white, lineWidth: 1)
+                    .frame(width: stub, height: height)
+            }
+        }
+        .frame(width: stub, height: height)
     }
 }
 

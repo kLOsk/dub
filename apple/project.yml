@@ -151,7 +151,15 @@ targets:
     type: bundle.unit-test
     platform: macOS
     sources:
+      # Exclude the snapshot baselines from the *resources* phase. A bare
+      # glob sweeps every PNG in as a build input, so deleting one to
+      # re-record it breaks the generated project until the next
+      # xcodegen run. SnapshotTesting resolves baselines from `#filePath`
+      # on disk at run time (see `snap()` in RipSnapshotTests.swift), not
+      # from the test bundle, so nothing needs them copied.
       - path: DubTests
+        excludes:
+          - "__Snapshots__"
     dependencies:
       # Host app only — DubCore (and its CoreAudio/Metal symbols) resolve
       # against the host via BUNDLE_LOADER at load time. Linking the

@@ -267,6 +267,7 @@ struct PerformanceView: View {
                             RipMarkerUi(id: $0.id, secs: $0.secs)
                         },
                         durationSecs: ripSideDurationSecs,
+                        trim: ripTrim,
                         callbacks: RipSplitOverlayCallbacks(
                             addSplit: { secs in model.addRipSplit(atSecs: secs) },
                             moveSplit: { id, secs in
@@ -278,19 +279,50 @@ struct PerformanceView: View {
                             },
                             scrub: { secs in
                                 model.seekDeck(side: .a, absoluteSecs: secs)
-                            }))
+                            },
+                            setSideStart: { secs in model.moveRipSideStart(toSecs: secs) },
+                            setSideEnd: { secs in model.moveRipSideEnd(toSecs: secs) }))
                 }
             }
             .frame(height: DubLayout.deckOverviewHeight)
         }
     }
 
-    /// Side duration for the marker overlay — deck A's loaded spill
-    /// once the audition load lands, falling back to the segment
-    /// plan's end while the decode is still in flight.
+    /// Duration for the marker overlay: the **whole capture**, not the
+    /// trimmed side. The axis has to span the lead-in and run-out for
+    /// the shaded regions to be visible at all.
+    ///
+    /// Deck A's loaded spill once the audition load lands; until then
+    /// the recorded length off the status. (The old fallback — the
+    /// segment plan's end — is now the *trimmed* end, which would have
+    /// hidden the run-out exactly while the decode was in flight.)
     private var ripSideDurationSecs: Double {
         if model.deckA.durationSecs > 0 { return model.deckA.durationSecs }
+        if let elapsed = model.ripStatus?.elapsedSecs, elapsed > 0 { return elapsed }
         return model.ripSegments.last?.endSecs ?? 0
+    }
+
+    /// Length of the side that actually commits — the capture less the
+    /// discarded lead-in and run-out. The review panel reports this
+    /// while the overlay's axis spans the whole capture: two different
+    /// numbers, and the panel must not overstate what it is about to
+    /// write to disk.
+    private var ripCommittedSideSecs: Double {
+        guard let trim = ripTrim else { return ripSideDurationSecs }
+        return max(0, trim.endSecs - trim.startSecs)
+    }
+
+    /// The side's bounds for the overlay, or `nil` when nothing is
+    /// trimmed — a manual rip and every pre-trim session then render
+    /// exactly as they did before, with no shade and no brackets.
+    private var ripTrim: RipTrimUi? {
+        guard let status = model.ripStatus else { return nil }
+        let total = ripSideDurationSecs
+        guard total > 0 else { return nil }
+        let start = max(0, min(status.sideStartSecs, total))
+        let end = min(total, max(status.sideEndSecs, start))
+        guard start > 0.01 || end < total - 0.01 else { return nil }
+        return RipTrimUi(startSecs: start, endSecs: end)
     }
 
     /// Prep-mode pad bar under the waveform. Prep is the prepare-and-
@@ -494,7 +526,8 @@ struct PerformanceView: View {
         }
         return RipReviewPanelState(
             mode: mode,
-            sideDurationSecs: ripSideDurationSecs,
+            sideDurationSecs: ripCommittedSideSecs,
+            trimmedSecs: max(0, ripSideDurationSecs - ripCommittedSideSecs),
             segments: segments,
             jobDots: dots,
             overallStatus: status)

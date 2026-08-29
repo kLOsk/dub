@@ -391,7 +391,14 @@ pub use rip::{
 ///       committed rip from its `side.flac` for a fresh split; the
 ///       earlier split's tracks leave the library only once the new
 ///       one has imported.
-pub const FFI_VERSION: u32 = 59;
+///   60. **Side trim + past rips.** `RipSessionStatus` carries the
+///       side's bounds (`side_start_secs` / `side_end_secs`) so the
+///       review overlay can show the lead-in and run-out grooves the
+///       detector discards, `set_side_start` / `set_side_end` move
+///       them, and [`DubEngine::list_resplittable_rip_sessions`]
+///       enumerates committed rips — the only way the app can reach
+///       `resplit_rip_session`.
+pub const FFI_VERSION: u32 = 60;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5117,7 +5124,11 @@ mod tests {
         // 57→58: M26b live commit progress — per-segment Started /
         // Finished callbacks + `RipSegmentJobState::Running`.
         // 58→59: M26b re-split — `resplit_rip_session`.
-        assert_eq!(FFI_VERSION, 59);
+        // 59→60: side trim + past rips — `side_start_secs` /
+        // `side_end_secs` on `RipSessionStatus`, `set_side_start` /
+        // `set_side_end`, and `list_resplittable_rip_sessions` +
+        // `RipResplittable`.
+        assert_eq!(FFI_VERSION, 60);
     }
 
     #[test]
