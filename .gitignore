@@ -78,3 +78,9 @@ ExportOptions.plist
 # performance UI is in flux (C-31). Recommit fresh goldens as the
 # regression baseline once the surface stabilises.
 apple/DubTests/__Snapshots__/
+
+# Rip tuning baselines — real record captures (748 MB of 24-bit FLAC).
+# Ground truth behind every constant in `dub-rip/src/gaps.rs`; kept out of
+# git for size, replayed with `dub rip-tune`. See testdata/rip-baselines/.
+testdata/rip-baselines/*.flac
+testdata/rip-baselines/*.wav

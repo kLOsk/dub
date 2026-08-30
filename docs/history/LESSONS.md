@@ -444,6 +444,18 @@
   which a ramp probe showed immediately (both directions read identically). The
   fix would have been real code solving nothing.
 
+- **A bloated `target/debug/deps/` makes the whole suite 30x slower.** Process
+  exec from a directory holding 178 000 files costs **562 ms**; from a normal
+  one, 7 ms — and it scales with sibling count (1k → 7 ms, 5k → 15 ms,
+  20k → 41 ms). nextest runs one process per test, so 1401 tests x 555 ms was
+  ~780 s of pure overhead, which *was* the entire workspace suite time.
+  `cargo clean` took it from **789 s to 26 s** (dub-dsp: 51.9 s → 0.25 s), and
+  CPU utilisation from 4 % to 930 %. Artifacts accumulate silently — this build
+  tree had files going back four months and 43 GB on a volume with 10 GB free.
+  **Check `ls target/debug/deps | wc -l` before theorising about slow tests.**
+  The first diagnosis here was "sleep-bound DSP tests", reasoned from the low
+  CPU reading; the low CPU was real and the conclusion was wrong.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is
