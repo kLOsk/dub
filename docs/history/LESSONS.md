@@ -456,6 +456,17 @@
   The first diagnosis here was "sleep-bound DSP tests", reasoned from the low
   CPU reading; the low CPU was real and the conclusion was wrong.
 
+- **Making the suite fast exposed a flake that idleness had been hiding.**
+  `auto_start_fires_on_the_needle_drop_and_keeps_the_pre_roll` slept a fixed
+  10 ms for the capture worker to drain, then stopped the session — and the
+  worker breaks out of its loop on stop *without* draining what is left in the
+  ring, so a starved worker meant a truncated recording and a failure with
+  nothing to do with what the test tests. It never fired while the suite was
+  exec-bound and the CPU sat idle; it started firing the moment all 16 cores
+  were busy. Six sites shared the pattern; they now wait for the frame count
+  to reach a floor and settle (`drain_then_stop`). **A fixed sleep waiting for
+  another thread is a flake that has not happened yet.**
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is

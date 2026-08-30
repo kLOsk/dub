@@ -9,9 +9,12 @@
 # a branch nobody was watching. This hook closes that gap at the last
 # moment where fixing it is still cheap.
 #
-# The test suite is deliberately NOT run here: ~11 minutes is too long
-# to sit in front of a push, and a broken test is a real failure worth
-# a CI cycle. Set DUB_PREPUSH_TESTS=1 to include it anyway.
+# The test suite runs here too, since it stopped being expensive: it
+# was ~11 minutes, which was too long to sit in front of a push, but
+# nearly all of that turned out to be process-exec overhead from a
+# bloated target/debug/deps rather than the tests themselves (see
+# LESSONS). It is ~26 s now. Set DUB_PREPUSH_TESTS=0 to skip it on a
+# slow machine or a huge rebuild.
 #
 # Install: `make hooks` (or `git config core.hooksPath .githooks`).
 # Bypass once: `git push --no-verify`.
@@ -43,7 +46,7 @@ run_gate "cargo fmt --check"  cargo fmt --all -- --check
 run_gate "cargo clippy"       cargo clippy --workspace --all-targets -- -D warnings
 run_gate "check-docs"         ./scripts/check-docs.sh
 
-if [[ "${DUB_PREPUSH_TESTS:-0}" == "1" ]]; then
+if [[ "${DUB_PREPUSH_TESTS:-1}" == "1" ]]; then
     run_gate "cargo nextest"  cargo nextest run --workspace
 fi
 

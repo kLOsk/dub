@@ -41,6 +41,35 @@ fn synthetic_side() -> Vec<f32> {
     out
 }
 
+/// Wait until the capture worker has drained at least `at_least`
+/// frames and stopped growing, then stop the session.
+///
+/// Replaces a fixed `sleep(5ms)` before `stop()`. The worker breaks out
+/// of its loop on the stop command without draining what is left in the
+/// ring, so on a loaded machine a fixed sleep truncates the recording
+/// and the test fails for a reason unrelated to what it tests. This was
+/// a real intermittent failure once the suite started saturating all
+/// cores.
+fn drain_then_stop(session: &mut RipSession, at_least: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last = u64::MAX;
+    let mut settled = 0;
+    while std::time::Instant::now() < deadline {
+        let n = session.status().recorded_frames;
+        if n >= at_least && n == last {
+            settled += 1;
+            if settled >= 10 {
+                break;
+            }
+        } else {
+            settled = 0;
+            last = n;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    session.stop().unwrap();
+}
+
 #[test]
 fn record_split_commit_full_pipeline() {
     let dir = tempfile::tempdir().unwrap();
@@ -61,9 +90,7 @@ fn record_split_commit_full_pipeline() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    // Give the worker one cycle to drain the tail, then stop.
-    std::thread::sleep(Duration::from_millis(5));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, 3 * seg_frames());
     let status = session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     assert_eq!(status.state, RipState::Stopped(StopReason::Manual));
@@ -219,8 +246,7 @@ fn splits_rejected_while_recording_and_when_invalid() {
         pushed += tx.push_slice(&tone[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(5));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, (tone.len() / 2) as u64);
     session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     // 12 s recording: a 1 s head segment violates MIN_SEGMENT_SECS.
@@ -285,8 +311,7 @@ fn auto_split_finds_the_gaps_in_a_side() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(5));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, (side.len() / 2) as u64);
     session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     // Short tracks, so the production 30 s minimum has to come down.
@@ -385,8 +410,7 @@ fn the_run_out_is_trimmed_off_the_last_track() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(5));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, (side.len() / 2) as u64);
     session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     let gap_cfg = GapConfig {
@@ -476,8 +500,9 @@ fn auto_start_fires_on_the_needle_drop_and_keeps_the_pre_roll() {
         pushed += tx.push_slice(&tone[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(10));
-    session.stop().unwrap();
+    // Only the tone is recorded — the armed session discards the lead-in
+    // beyond its pre-roll — so that is the floor to wait for.
+    drain_then_stop(&mut session, 3 * u64::from(SR));
     let status = session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     assert_eq!(status.state, RipState::Stopped(StopReason::Manual));
