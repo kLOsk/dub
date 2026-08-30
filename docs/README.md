@@ -13,13 +13,13 @@ docs/
     PRD.md  PRD-BEATS.md  ARCHITECTURE.md
     LIBRARY-SCHEMA.md  LIBRARY-FORMATS.md  LICENSE-DEPENDENCIES.md
   history/             durable, backward-looking
+    CURRENT.md         what is in flight, blocked, and next — read first
     SHIPPED.md         one-line-per-milestone index (detail in git)
     LESSONS.md         pitfalls + load-bearing decisions
   investigations/      research / runbooks
     BEATMATCH-AID-STILLPOINT.md       binding sub-spec for the shipped Stillpoint
                                       aid — PRD §9.4 is only the summary
     BPM-DETECTOR-V2-INVESTIGATION.md  WAVEFORM-JITTER-CAPTURE.md
-  html/                read-only status dashboard (index / roadmap / backlog)
 ```
 
 Outside `docs/`: **`testdata/rip-baselines/README.md`** indexes the three real
@@ -66,24 +66,11 @@ above says where each lives.
   investigated jitter was fixed end to end; this remains the procedure if it
   recurs (the probes and `make trace-grid` targets are still wired).
 
-## Human-facing HTML dashboard (read-only, optional)
-
-`docs/html/` is a **status dashboard only** — three hand-kept pages, openable
-from `file://` with no build step. It is deliberately *not* a mirror of the
-reference docs (the old `architecture.html` / `schema.html` / `beats.html`
-duplicated Markdown and rotted, so they were deleted). **AI agents should not
-load these** — read the Markdown directly. See `html/README.md` for the rule.
-
-| Page | Mirrors |
-| --- | --- |
-| `html/index.html` | Project landing + non-negotiables + doc routing |
-| `html/roadmap.html` | `PRD.md` §12 + `SHIPPED.md` (milestone timeline, filter chips) |
-| `html/backlog.html` | `UI-BACKLOG.md` (kanban with filter chips) |
-
 ## Load By Task
 
 | Task | Read |
 | --- | --- |
+| **Starting a session — what should I work on?** | `history/CURRENT.md` |
 | Product scope, out-of-scope, milestone planning | Relevant `PRD.md` section |
 | Pitfalls before touching a subsystem | Relevant `LESSONS.md` section |
 | Why a past implementation looks this way | `LESSONS.md`, then `git log` the crate (`SHIPPED.md` indexes the milestone) |
@@ -114,6 +101,12 @@ load these** — read the Markdown directly. See `html/README.md` for the rule.
 When adding a new doc, update this routing guide in the same change. When a
 backlog item ships, move it to the `UI-BACKLOG.md` "Closed (archive)" list and,
 if it carries a durable lesson, add that to `LESSONS.md`. When a milestone
-ships, add its one-liner to `SHIPPED.md` and reflect the headline in
-`html/roadmap.html`. Keep `docs/html/` to the three status pages — reference
-material belongs in Markdown, never a new HTML page (see `html/README.md`).
+ships, add its one-liner to `SHIPPED.md` and update `history/CURRENT.md`.
+
+**No HTML.** `docs/html/` held three hand-kept status pages mirroring the
+Markdown. They drifted ten milestones behind — `roadmap.html` showed a
+milestone as "Planned · 4–6 days" while it was shipping — because nothing on
+the path of real work ever read them, so nobody noticed. Deleted. Status lives
+in `history/CURRENT.md` (in flight) and `history/SHIPPED.md` (done); if a
+rendered view is ever wanted again, generate it in CI rather than keeping it by
+hand.

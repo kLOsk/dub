@@ -39,7 +39,7 @@ help:
 	@echo "  make fuzz-quick    run fuzz targets for 60s each (needs cargo-fuzz + nightly)"
 	@echo "  make soak          1-hour offline render soak (placeholder)"
 	@echo "  make ci            run the full CI pipeline locally"
-	@echo "  make docs-check    fail if README / docs/html drift from code constants"
+	@echo "  make docs-check    fail if the docs drift from the code"
 	@echo "  make hooks         install the pre-push CI gate (once per clone)"
 	@echo "  make clean         cargo clean (removes everything; forces a full rebuild)"
 	@echo "  make sweep         drop build artifacts unused for $(STALE_DAYS) days"

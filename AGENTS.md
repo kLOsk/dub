@@ -85,11 +85,11 @@ tools/rt-audit/      RT-thread allocation auditor (binary tool).
 docs/                README.md (routing guide — which doc to load for a task) + UI-BACKLOG.md.
   spec/              PRD.md (forward-looking spec), PRD-BEATS.md, ARCHITECTURE.md,
                      LIBRARY-SCHEMA.md, LIBRARY-FORMATS.md, LICENSE-DEPENDENCIES.md.
-  history/           SHIPPED.md (one-line-per-milestone index; detail in git) +
+  history/           CURRENT.md (in flight / blocked / next — read at session start),
+                     SHIPPED.md (one-line-per-milestone index; detail in git),
                      LESSONS.md (pitfalls + load-bearing decisions — read before touching a subsystem).
   investigations/    BPM-DETECTOR-V2 + WAVEFORM-JITTER runbooks, and BEATMATCH-AID-STILLPOINT
                      (the binding sub-spec for the shipped Stillpoint aid; PRD §9.4 is the summary).
-  html/              status dashboard (index / roadmap / backlog).
 scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
 .claude/             Claude Code settings + hooks (mirrors .cursor/; see CLAUDE.md).

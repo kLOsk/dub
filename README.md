@@ -180,7 +180,7 @@ dub/                                 repo root (workspace)
 ├── docs/                            README.md = routing guide; spec/ (PRD, PRD-BEATS, ARCHITECTURE,
 │                                    LIBRARY-SCHEMA, LIBRARY-FORMATS, LICENSE-DEPENDENCIES),
 │                                    history/ (SHIPPED, LESSONS), investigations/, UI-BACKLOG.md,
-│                                    html/ hand-kept dashboard
+│                                    UI-BACKLOG.md
 ├── testdata/rip-baselines/          three real record sides (24-bit FLAC, gitignored) — ground
 │                                    truth for the rip gates; replay with `dub rip-tune`
 ├── fuzz/                            cargo-fuzz targets for the library parsers

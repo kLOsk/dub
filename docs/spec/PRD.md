@@ -1306,70 +1306,9 @@ Guardrail: each of these is a *layer*, not a rewrite. They land behind a Prefere
 
 ### 10.1 Workspace
 
-```
-dub/                                 # repo / workspace name
-├── Cargo.toml                       # Rust workspace
-├── crates/
-│   ├── dub-engine/                  # Audio graph, transport, mixer, ThruSource, no_std-ish hot path
-│   ├── dub-audio/                   # CoreAudio HAL input + output, ringbuf-buffered handoff
-│   ├── dub-dsp/                     # rubato, biquads, EchoOut, PT2399, siren voices (GS1 / DS01E / SN76477), spring / RE-201 / BigKnob / phaser
-│   ├── dub-stretch/                 # Pure-Rust WSOLA time-stretch / key lock (no unsafe, no C deps)
-│   ├── dub-io/                      # symphonia-based decoders (everything in RAM, see §4.4)
-│   ├── dub-timecode/                # Serato CV02 + Traktor MK1/MK2 decoder (clean-room)
-│   ├── dub-thru/                    # Thru-mode source-detection classifier (§5.1.1)
-│   ├── dub-bpm/                     # M7.5 — BpmEstimator (offline + streaming drivers, pure-Rust)
-│   ├── dub-peaks/                   # M9 — off-RT decimator producing PeakChunk + BandPeakChunk for the renderer (M10)
-│   ├── dub-spectral/                # M9.5 — shared FFT + log-band magnitude pipeline (consumed by dub-bpm + dub-peaks)
-│   ├── dub-fingerprint/             # Library dedupe (M11b, shipped) + real-record recognition (v1.1). Pure-Rust Chromaprint via rusty-chromaprint.
-│   ├── dub-library/                 # SQLite + import adapters
-│   ├── dub-encode/                  # M26 — offline FLAC encode (flacenc) + Vorbis-comment / PICTURE tagging
-│   ├── dub-rip/                     # M26 — vinyl-rip session engine: capture worker, gap detection, side trim, manifest, commit
-│   ├── dub-controller/              # HID/MIDI abstractions (placeholder in v1)
-│   ├── dub-ffi/                     # UniFFI-generated bindings to Swift
-│   └── dub-cli/                     # `dub` binary (smoke / play / capture / levels / timecode-deck / thru / scope / calibrate / analyze / diagnose / import / rip / rip-tune / rip-resplit / decode-timecode)
-├── apple/                           # M0.5 shipped — AppKit + SwiftUI shell
-│   ├── project.yml                  # XcodeGen manifest (source of truth)
-│   ├── Dub.xcodeproj                # generated, gitignored
-│   ├── DubCore.xcframework/         # generated, gitignored — universal Rust static lib
-│   ├── Dub/                         # @main AppKit lifecycle + SwiftUI views (bundle id: com.klos.dub)
-│   │   ├── DubAppDelegate.swift     # NSApplicationDelegate lifecycle
-│   │   ├── MainWindowController.swift # NSWindow holding an NSHostingController
-│   │   ├── MainView.swift           # Top-level shell — hosts PerformanceView + Preferences sheet (M10.3)
-│   │   ├── DesignSystem/Tokens.swift # Colour / type / spacing tokens — single source of truth (M10.3)
-│   │   ├── Performance/             # PerformanceView, DeckHeader, StatusStrip, Stillpoint (M10.7), LibraryView, PerformancePadsView, the rip surfaces
-│   │   ├── Preferences/             # PreferencesSheet (⌘,)
-│   │   └── Waveform/                # Metal renderer + MTKView host (M10-B → M10.4 vertical rotation)
-│   └── DubShared/                   # Swift Package wrapping DubCore.xcframework + bindings
-├── scripts/                         # M0.5 shipped — Apple toolchain orchestration
-│   ├── build-xcframework.sh         # cargo build (aarch64+x86_64) + lipo + xcodebuild -create-xcframework + UniFFI bindgen
-│   ├── bootstrap.sh                 # one-shot: build-xcframework + xcodegen generate
-│   ├── codesign.sh                  # v1.1 (placeholder)
-│   └── notarize.sh                  # v1.1
-├── tools/
-│   └── rt-audit/                    # Static + runtime check: no alloc on audio thread
-├── fuzz/                            # cargo-fuzz targets (parsers: NML / plist / rekordbox XML / Serato)
-├── testdata/
-│   └── rip-baselines/               # Three real record sides (24-bit FLAC, gitignored) + a tracked README.
-│                                    # Ground truth for every constant in dub-rip/src/gaps.rs; replay with `dub rip-tune`.
-├── .githooks/pre-push               # fmt-check + clippy + docs-check + tests, the gates that break main
-├── Makefile                         # test / app / ci / sweep / docs-check …
-├── docs/
-│   ├── README.md                    # Routing guide: which doc to load for which task
-│   ├── spec/
-│   │   ├── PRD.md                   # ← this file
-│   │   ├── PRD-BEATS.md             # Beat-grid sub-spec
-│   │   ├── ARCHITECTURE.md          # How the crates fit together
-│   │   ├── LIBRARY-SCHEMA.md        # Public SQLite schema contract
-│   │   ├── LIBRARY-FORMATS.md       # Field notes on Serato / Traktor / rekordbox / iTunes / Lexicon parsing
-│   │   └── LICENSE-DEPENDENCIES.md  # Dependency license + attribution inventory
-│   ├── history/
-│   │   ├── SHIPPED.md               # One line per milestone; detail lives in git
-│   │   └── LESSONS.md               # Pitfalls + load-bearing decisions — read before touching a subsystem
-│   ├── investigations/              # BPM-DETECTOR-V2, WAVEFORM-JITTER, BEATMATCH-AID-STILLPOINT runbooks
-│   ├── UI-BACKLOG.md                # Deferred SwiftUI/AppKit bugs and polish
-│   └── html/                        # Hand-kept status dashboard (index / roadmap / backlog)
-└── README.md
-```
+The repo layout lives in **[`AGENTS.md`](../../AGENTS.md)**, which is loaded
+on every task — one tree, in the file that is always open. A copy here was
+kept for years and was wrong in both places by the time anyone checked.
 
 **Notes on the tree:**
 
