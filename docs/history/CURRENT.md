@@ -19,6 +19,10 @@ Two things are implemented, tested and green — **against synthetic signals
 only**. `LESSONS.md` is explicit that timecode and vinyl behaviour are
 confirmed on hardware, and neither has been.
 
+0. ~~Timecode decode against real vinyl~~ — **done**: `testdata/timecode/`
+   holds three SL 3 excerpts driving `real_vinyl_tests.rs`. Still uncovered
+   there: a stalled platter, a mid-play lift, pitch extremes, and *both*
+   Traktor formats. See that README.
 1. **Loops under a real needle.** Acceptance §14 #8 is met on a synthetic
    Serato CV02 carrier. Not tried: scratching inside a loop, lifting the needle
    mid-loop, re-locking after a lift, key lock at a pitched platter.

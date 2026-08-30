@@ -485,6 +485,15 @@
   They are tracked now; `project.yml` excludes them from the DubTests
   *resources* phase so deleting one to re-record does not break the build.
 
+- **A synthetic carrier cannot reproduce the bug that cost a rig session.**
+  Every timecode test fed the decoder a generated sine pair until real captures
+  landed in `testdata/timecode/`. Vinyl surface noise is *correlated* (lag-1
+  ≈ 0.8) and that is precisely what shrank the lag-1 phase estimator into a
+  −0.31 % pitch bias at a true zero; white synthetic noise reads a clean 1.0
+  either way. The fixture now decodes at −0.034 % and the test fails past
+  0.15 %, verified by injecting ±0.3 %. **When a bug is only findable on the
+  rig, the fix is a captured fixture, not a better generator.**
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is

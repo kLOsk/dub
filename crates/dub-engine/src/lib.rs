@@ -32,6 +32,8 @@ mod display_rate;
 mod drift;
 mod handle;
 mod looping;
+#[cfg(test)]
+mod real_vinyl_tests;
 pub mod realtime;
 pub mod thru;
 pub mod timecode;

@@ -84,3 +84,8 @@ ExportOptions.plist
 # git for size, replayed with `dub rip-tune`. See testdata/rip-baselines/.
 testdata/rip-baselines/*.flac
 testdata/rip-baselines/*.wav
+
+# Full 60 s timecode captures — kept for cutting new fixtures, too big to
+# track. The 10 s excerpts in testdata/timecode/ ARE tracked, because the
+# tests that read them have to run in CI.
+testdata/timecode/full/

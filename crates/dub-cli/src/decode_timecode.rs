@@ -62,22 +62,19 @@ pub fn run(
 /// if every row sits near 0.5, the one-bit-per-cycle model itself
 /// doesn't match this disc.
 fn run_sweep(path: &Path, format: Format) -> Result<()> {
-    let mut reader =
-        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let spec = reader.spec();
-    if spec.channels != 2 {
+    let loaded = load_stereo(path)?;
+    if loaded.channels != 2 {
         return Err(anyhow!(
-            "decode-timecode --sweep requires a stereo WAV; got {} channels",
-            spec.channels
+            "decode-timecode --sweep requires stereo; got {} channels",
+            loaded.channels
         ));
     }
-    let interleaved = read_stereo_f32(&mut reader)
-        .with_context(|| format!("reading samples from {}", path.display()))?;
+    let interleaved = loaded.samples;
 
     println!(
         "convention sweep: {}\n  sr={} Hz, fmt={:?} ({}-bit LFSR, carrier {} Hz)",
         path.display(),
-        spec.sample_rate,
+        loaded.sample_rate,
         format,
         format.position_bits(),
         format.carrier_hz(),
@@ -153,7 +150,7 @@ fn run_sweep(path: &Path, format: Format) -> Result<()> {
     // crossing timing, read the primary channel's peak at the secondary's
     // crossing. Sweeps both channel assignments and polarities.
     println!("\n  xwax-style decode (the real Serato algorithm, all variants):");
-    let xwax = sweep_xwax(&interleaved, spec.sample_rate as f32);
+    let xwax = sweep_xwax(&interleaved, loaded.sample_rate as f32);
     println!(
         "  {:>10}  {:>9}  {:>9}  {:>10}  {:>11}  {:>8}",
         "variant", "primary", "polarity", "agreement", "longest-run", "balance"
@@ -252,37 +249,33 @@ fn run_sweep(path: &Path, format: Format) -> Result<()> {
 }
 
 fn run_file(path: &Path, window_ms: f32, max_lines: usize, format: Format) -> Result<()> {
-    let mut reader =
-        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let spec = reader.spec();
-    if spec.channels != 2 {
+    let loaded = load_stereo(path)?;
+    if loaded.channels != 2 {
         return Err(anyhow!(
-            "decode-timecode requires a stereo WAV; got {} channels",
-            spec.channels
+            "decode-timecode requires stereo; got {} channels",
+            loaded.channels
         ));
     }
-    let sample_rate = spec.sample_rate as f32;
+    let sample_rate = loaded.sample_rate as f32;
     if !(32_000.0..=192_000.0).contains(&sample_rate) {
         eprintln!(
             "warning: unusual sample rate {} Hz — decoder is tuned for 44.1–96 kHz",
-            spec.sample_rate
+            loaded.sample_rate
         );
     }
 
     println!(
-        "decode-timecode: {}\n  sr={} Hz, ch={}, bps={}, fmt={:?}",
+        "decode-timecode: {}\n  sr={} Hz, ch={}, {}, fmt={:?}",
         path.display(),
-        spec.sample_rate,
-        spec.channels,
-        spec.bits_per_sample,
-        spec.sample_format
+        loaded.sample_rate,
+        loaded.channels,
+        loaded.note,
+        format
     );
 
-    // Read everything into memory. Real-world timecode WAVs are short
-    // (< 2 min for a captured groove); we don't need streaming for the
-    // offline tool.
-    let interleaved = read_stereo_f32(&mut reader)
-        .with_context(|| format!("reading samples from {}", path.display()))?;
+    // Everything is already in memory: real captures are short (a
+    // minute or two of groove), so the offline tool never streams.
+    let interleaved = loaded.samples;
 
     decode_and_report(format, sample_rate, &interleaved, window_ms, max_lines)
 }
@@ -528,6 +521,42 @@ impl SummaryStats {
         };
         println!("verdict: {verdict}");
     }
+}
+
+/// A decoded capture plus what it came from.
+struct Loaded {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    note: String,
+}
+
+/// Load any decodable capture as interleaved f32.
+///
+/// WAV goes through `hound` so the header detail still prints; anything
+/// else falls back to the symphonia decoder, which is what lets the
+/// FLAC-archived fixtures in `testdata/timecode/` be read without being
+/// unpacked first. `rip-tune` does the same thing for the same reason.
+fn load_stereo(path: &Path) -> Result<Loaded> {
+    if let Ok(mut reader) = hound::WavReader::open(path) {
+        let spec = reader.spec();
+        let samples = read_stereo_f32(&mut reader)
+            .with_context(|| format!("reading samples from {}", path.display()))?;
+        return Ok(Loaded {
+            samples,
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            note: format!("{}-bit {:?}", spec.bits_per_sample, spec.sample_format),
+        });
+    }
+    let track = dub_io::Track::load_from_path(path)
+        .map_err(|e| anyhow!("cannot decode {}: {e}", path.display()))?;
+    Ok(Loaded {
+        samples: track.samples().to_vec(),
+        sample_rate: track.sample_rate(),
+        channels: u16::from(track.channels()),
+        note: "decoded".to_string(),
+    })
 }
 
 /// Read a (potentially integer-PCM) WAV into normalized stereo f32.
