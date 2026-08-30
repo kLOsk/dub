@@ -4,10 +4,10 @@
 
 **A timecode-vinyl DJ application for scratch DJs and vinyl enthusiasts.**
 
-*Mac-first. Rust-cored. GPLv3.*
+*Mac-first. Rust-cored. MIT OR Apache-2.0.*
 
 [![CI](https://github.com/kLOsk/dub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kLOsk/dub/actions/workflows/ci.yml)
-[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#status)
 [![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#milestone-progress)
@@ -245,11 +245,22 @@ These are validated end-to-end on real hardware as each milestone lands.
 
 ## License
 
-GPLv3 — see [`LICENSE`](LICENSE).
+**MIT OR Apache-2.0**, at your option — see [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE).
 
-This means: if you distribute a binary based on this code, you must release the
-source under GPLv3 too. We chose GPL deliberately so that engine improvements
-made by anyone in the community come back to the community.
+This means: do what you like with it, keep the copyright notice. Apache-2.0
+additionally carries an explicit patent grant, which is why both are offered —
+it is the Rust ecosystem's convention and what most of Dub's dependency graph
+already uses.
+
+*Relicensed from GPL-3.0-or-later.* The GPL was only ever a reservation for a
+planned `rubberband` (GPL-3.0) time-stretch dependency; M14 shipped a pure-Rust
+WSOLA instead, so it never landed and nothing in the graph ever forced the
+licence. Going permissive keeps open what GPL forecloses — a proprietary
+controller SDK, a Mac App Store build, a commercial tier — and the choice was
+made while the project is still single-author, because relicensing later needs
+every contributor's agreement. Full reasoning in
+[`LICENSE-DEPENDENCIES.md`](docs/spec/LICENSE-DEPENDENCIES.md).
 
 ## Contributing
 

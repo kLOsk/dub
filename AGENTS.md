@@ -8,7 +8,7 @@
 ## What is Dub?
 
 Dub is a **timecode-vinyl DJ application** for scratch DJs and vinyl enthusiasts.
-Mac-first, Rust-cored, GPLv3, pre-alpha.
+Mac-first, Rust-cored, MIT OR Apache-2.0, pre-alpha.
 
 The audience is the urban / sound-system / scratch DJ — hip hop, reggae, dnb,
 dubstep — playing in front of audiences of hundreds to thousands. Reliability is
@@ -255,13 +255,13 @@ Currently wired (in the actual `Cargo.toml` dependency graph):
 
 Planned but **not** in the dep graph yet (placeholder crates exist):
 
-- `rubberband` (FFI, **GPL-3.0**) — *evaluated at M14 and dropped.* The pure-Rust WSOLA stretcher in `dub-stretch` matched it on pitch and beat it on transients + latency, so the GPL dep never landed. The workspace still declares `license = "GPL-3.0-or-later"`, but the actual dep graph is fully permissive (MIT / Apache / MPL-2.0 only) — see PRD §11.
+- `rubberband` (FFI, **GPL-3.0**) — *evaluated at M14 and dropped.* The pure-Rust WSOLA stretcher in `dub-stretch` matched it on pitch and beat it on transients + latency, so the GPL dep never landed — which is what later made relicensing to MIT / Apache-2.0 available. See PRD §11.
 - `aubio` (FFI, LGPL-3.0) — *deliberately not linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
 - `chromaprint` (FFI, LGPL-2.1) — *deliberately not linked.* Replaced at M11b by `rusty-chromaprint` (pure-Rust, MIT/Apache) for license isolation + no C build dep.
 - LAME / `mp3lame` bindings (LGPL) — *considered and deferred.* MP3-320 rip export (M26) would have been the first non-permissive library actually linked; FLAC via `flacenc` covers the rip use case at zero license cost. Revisit only if users demand MP3 export.
 - `ureq` (MIT/Apache, rustls chain) — planned for M26c recognition (`dub-recognize`: AcoustID + MusicBrainz + Discogs). First network dependency; confined behind an `Http` trait in a leaf crate so rips keep working fully offline.
 
-We are GPLv3 by declaration (the reservation originally anticipated Rubber Band; M14 dropped it). See PRD §11. Nothing in the dep graph forces GPL — the posture stays flexible, and M26 deliberately kept it that way (FLAC over MP3/LAME).
+We are **MIT OR Apache-2.0** (dual, at the user's option). Dub was GPLv3 by *declaration* only — a reservation for the Rubber Band dependency that M14 dropped — and nothing in the dep graph ever forced it, so it was relicensed to match. Keep it that way: **check every new dependency's licence before adding it**, and treat a GPL or LGPL dep as a decision to escalate rather than take. M7.5, M11b and M26 each routed around one (aubio, chromaprint, LAME) and that is why the option existed at all. See PRD §11 and `LICENSE-DEPENDENCIES.md`.
 
 ---
 
@@ -274,4 +274,4 @@ We are GPLv3 by declaration (the reservation originally anticipated Rubber Band;
 - Skip writing tests for non-trivial logic.
 - Use `unwrap()` outside test code.
 - Commit secrets.
-- Add a dependency without checking its license against our GPL stance.
+- Add a dependency without checking its license. Dub is MIT OR Apache-2.0 and the graph is fully permissive; a GPL or LGPL dep would drag the whole binary back to copyleft.

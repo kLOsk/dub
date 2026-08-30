@@ -30,11 +30,13 @@
 //! mixers we don't target in v1").
 //!
 //! License note: this is a **clean-room implementation** of the
-//! published timecode-vinyl format documented by xwax (BSD) and the
-//! Mixxx project. No xwax code is copied or derived — we re-implement
-//! from the algorithm description because dub is GPL-3.0 and we want
-//! attribution to remain unambiguous. See `format.rs` for the source
-//! list.
+//! published timecode-vinyl format documented by the xwax and Mixxx
+//! projects. No xwax or Mixxx code is copied or derived — everything
+//! here is re-implemented from the algorithm description. That is the
+//! load-bearing fact: an algorithm is not copyrightable, its
+//! expression is, so a clean-room rewrite leaves Dub free to pick its
+//! own licence regardless of what those projects use. Do not paste
+//! code in from either of them. See `format.rs` for the source list.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

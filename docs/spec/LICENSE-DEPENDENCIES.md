@@ -17,10 +17,10 @@ Last verified: M26b (workspace dependency-graph snapshot 2026-07; added `flacenc
 | Apache-2.0 | 2 | Reproduce the license text + copyright notice; preserve any `NOTICE` file. |
 | Unlicense / MIT | 1 | Reproduce the license text (either license satisfies). |
 | MPL-2.0 | 2 | File-level copyleft only. The library binary may ship inside a proprietary application; if the library's source files themselves are modified, the modified files must remain MPL-2.0 and be made available on request. Dub does not modify any MPL-2.0 source files. |
-| GPL-3.0-or-later | 0 (today) | None in the dep graph as of M26b. The workspace `license` field reserves GPL-3.0-or-later (originally in anticipation of a `rubberband` integration; M14 shipped pure-Rust WSOLA instead); see "Forward-looking license commitments" below. |
+| GPL-3.0-or-later | 0 | None, ever. The workspace `license` field used to *reserve* GPL-3.0-or-later in anticipation of a `rubberband` integration; M14 shipped pure-Rust WSOLA instead, the dependency never landed, and the workspace is now **MIT OR Apache-2.0**. See "Forward-looking license commitments" below. |
 | LGPL-2.1 / LGPL-3.0 | 0 | Two LGPL FFIs (`chromaprint`, `aubio`) were explicitly routed around in favour of pure-Rust replacements (`rusty-chromaprint`, `dub-bpm`). See PRD §10.2 + `docs/SHIPPED.md` M7.5 / M11b. |
 
-**Net effect.** Every external dependency wired into Dub today is permissive or file-level copyleft only. Nothing in the actual dependency graph contaminates a downstream binary with a viral copyleft obligation. The project remains free to be relicensed — no GPL dependency is in the graph or currently planned (M14 shipped pure-Rust WSOLA instead of `rubberband`). The M26 vinyl-rip encode stack was deliberately chosen pure-Rust / permissive (`flacenc` Apache-2.0, `metaflac` MIT); MP3 via LAME (LGPL-2.0-or-later) was evaluated and deferred — see "Forward-looking license commitments" — so this posture is **unchanged**.
+**Net effect.** Every external dependency wired into Dub today is permissive or file-level copyleft only. Nothing in the actual dependency graph contaminates a downstream binary with a viral copyleft obligation. This is what made the relicense to **MIT OR Apache-2.0** possible — no GPL dependency is in the graph or planned (M14 shipped pure-Rust WSOLA instead of `rubberband`), so nothing ever forced the old GPL declaration. **Keeping it possible is now a standing constraint, not a nice-to-have:** a new GPL or LGPL dependency would drag the whole distributed binary back to copyleft, so treat one as a decision to escalate rather than take. The M26 vinyl-rip encode stack was deliberately chosen pure-Rust / permissive (`flacenc` Apache-2.0, `metaflac` MIT); MP3 via LAME (LGPL-2.0-or-later) was evaluated and deferred — see "Forward-looking license commitments" — so this posture is **unchanged**.
 
 ---
 
@@ -328,7 +328,7 @@ These are not in the dep graph today. They are documented here so future work kn
 * **License:** GPL-3.0
 * **Upstream:** https://breakfastquay.com/rubberband/ (Particular Programs Ltd / Chris Cannam)
 * **Outcome: not linked, and not planned.** M14 benched it against a pure-Rust WSOLA written for `dub-stretch`: the WSOLA held pitch as well, beat it on transients and latency, and cost ~30 % more CPU (tunable via the search window). The GPL dependency never landed, and `crates/dub-stretch/` is a complete implementation rather than a placeholder.
-* **License implications, had it landed:** every distributed Dub binary would have become GPL-3.0, subject to source-disclosure on request. The workspace still declares `license = "GPL-3.0-or-later"`, but that is now a choice rather than an obligation — nothing in the graph forces it.
+* **License implications, had it landed:** every distributed Dub binary would have become GPL-3.0, subject to source-disclosure on request. Because it did not land, nothing in the graph ever forced the licence — and the workspace has since been relicensed to **MIT OR Apache-2.0** (PRD §11).
 * **Alternatives evaluated at M14** (the last one won):
   - **zplane élastique** (commercial). The de-facto standard for DJ time-stretch (Serato / Traktor / rekordbox all use it). Per-product commercial licensing.
   - **Signalsmith Stretch** (MIT). Younger but maturing; pure DSP; permissive.
@@ -381,8 +381,10 @@ and selection of the "first sounding position from the start above a
 threshold"; Dub instead sums band-attack energy into four bar-phase bins over
 the whole track and compares aggregate contrast — the general published
 technique above, not the patent's specific apparatus. Assessed low risk for a
-pre-alpha GPLv3 project; a formal freedom-to-operate opinion is not required at
-this stage and should be revisited before any commercial distribution.
+pre-alpha project; a formal freedom-to-operate opinion is not required at this
+stage and should be revisited before any commercial distribution. Note that
+Apache-2.0 (one half of Dub's dual licence) carries an explicit patent grant
+and retaliation clause, which is part of why it is offered alongside MIT.
 
 ---
 

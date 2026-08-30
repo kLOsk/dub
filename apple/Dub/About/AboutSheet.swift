@@ -75,7 +75,7 @@ struct AboutSheet: View {
                 aboutRow("Bundle", bundleIdentifier)
                 aboutRow("Status", "Pre-alpha · Phase A")
                 aboutRow("Platform", "macOS 13+ · Apple Silicon + Intel")
-                aboutRow("License", "GPLv3-or-later")
+                aboutRow("License", "MIT OR Apache-2.0")
             }
 
             HStack(spacing: DubSpacing.md) {

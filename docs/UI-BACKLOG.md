@@ -523,7 +523,8 @@ backdrop. **Location**: `apple/Dub/Performance/PerformanceView.swift`
 stores it in plain text; there is still no Keychain plumbing anywhere.
 **No longer an M26c blocker.** The AcoustID key turned out not to need the
 Keychain at all — it is an *application* key that identifies Dub rather than
-the user, and Dub is GPLv3, so it is public by construction; recognition
+the user, and Dub's source is public, so it is public by construction;
+recognition
 therefore ships with its key in `UserDefaults` and works fully without
 Discogs. The token field is empty by default and the Discogs half stays off
 until someone types one, so nothing sensitive is stored unless the operator

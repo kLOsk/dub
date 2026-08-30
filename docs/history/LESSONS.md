@@ -545,11 +545,20 @@
   mode (PRD §5.2.7); the override clears when the interface unplugs.
 - **Whole tracks decode to RAM; forward/backward playback is byte-symmetric.**
   No per-block disk streaming. Instant rewind/backspin depends on this.
-- **The dep graph is fully permissive — keep it that way.** The GPLv3 workspace
-  reservation anticipated Rubber Band; M14 shipped pure-Rust WSOLA instead and
-  M26 chose FLAC (flacenc, Apache-2.0) over MP3/LAME (LGPL) for the same
-  reason. Check every new dependency's license; prefer pure-Rust (why
-  `dub-bpm`, `dub-fingerprint`, `dub-stretch`, and `dub-encode` are pure-Rust).
+- **The dep graph is fully permissive — keep it that way.** The old GPLv3
+  workspace declaration was a *reservation* for Rubber Band, nothing more;
+  M14 shipped pure-Rust WSOLA instead, so the dependency never landed and
+  nothing ever forced the licence. M7.5 (aubio), M11b (chromaprint) and M26
+  (MP3/LAME) each routed around a copyleft FFI for the same reason. That
+  accumulated discipline is what made the **relicense to MIT OR Apache-2.0**
+  available at all — a single GPL dep taken casually anywhere along the way
+  would have closed the door. Check every new dependency's license and prefer
+  pure-Rust (why `dub-bpm`, `dub-fingerprint`, `dub-stretch` and `dub-encode`
+  are pure-Rust).
+- **Relicensing has a closing window.** It needs every copyright holder's
+  agreement, so it is a one-line change while a project is single-author and a
+  CLA problem the moment it is not. Dub moved to MIT / Apache-2.0 while that
+  window was open; if it ever needs moving again, the same clock applies.
 
 ## Process
 

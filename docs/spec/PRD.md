@@ -485,7 +485,7 @@ metadata features are not.
 
 **WhoSampled is the best data and the hardest to get.** There is no public
 developer API. Their terms prohibit scraping, and building on a scrape would
-put a shipped GPLv3 app in breach and break the first time their markup
+put a shipped app in breach and break the first time their markup
 changed. A real integration needs a commercial data agreement, which is a
 business decision rather than an engineering one — so it is not a milestone
 we can simply schedule.
@@ -1427,7 +1427,8 @@ Notarization via `notarytool` arrives in **v1.1** (M22) once Developer ID is acq
 
 ## 11. Distribution & licensing
 
-- **License:** GPLv3, top-level `LICENSE` file.
+- **License:** **MIT OR Apache-2.0** (dual, at the user's option) — top-level `LICENSE-MIT` and `LICENSE-APACHE`. The Rust-ecosystem convention, and what most of the dependency graph already uses. Apache-2.0 carries an explicit patent grant; MIT is there for anyone who wants the simplest possible terms.
+  *Relicensed from GPL-3.0-or-later.* The GPL declaration was only ever a **reservation** for a planned `rubberband` (GPL-3.0) time-stretch dependency; M14 shipped a pure-Rust WSOLA instead and that dependency never landed, leaving the licence a choice rather than an obligation with nothing in the graph forcing it. Going permissive keeps the options GPL forecloses — linking a proprietary controller / Phase SDK (§12), a Mac App Store build, and a dual-tier commercial offering — and the decision was taken while the project is single-author, since relicensing later needs every copyright holder's agreement. See `LICENSE-DEPENDENCIES.md`.
 - **Distribution:** GitHub Releases. Notarized DMG. Apple Silicon + Intel universal binary.
 - **No Mac App Store** in v1 (sandboxing breaks USB HID access for v1.x controller plans, and the Phase RF/SDK story for v2 is hostile to MAS).
 - **Source:** public on GitHub from day one.

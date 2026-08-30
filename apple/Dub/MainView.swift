@@ -641,8 +641,8 @@ final class WaveformAppModel: ObservableObject {
     ///
     /// `UserDefaults`, not the Keychain, and deliberately: an AcoustID
     /// *application* key identifies the app rather than the user, and
-    /// Dub is GPLv3, so it is public by construction. The Discogs
-    /// token below is the opposite and is the one R-42 is about.
+    /// Dub's source is public, so it is public by construction. The
+    /// Discogs token below is the opposite and is the one R-42 is about.
     /// Persisted under `dub.acoustIdKey`.
     @Published var acoustIdKey: String {
         didSet { UserDefaults.standard.set(acoustIdKey, forKey: Self.kAcoustIdKey) }

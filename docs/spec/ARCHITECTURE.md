@@ -420,10 +420,17 @@ the integration layer can implement those policies without
 modifying the DSP.
 
 **License + provenance.** Clean-room implementation from the
-xwax/Mixxx algorithm description; no xwax code copied (xwax is BSD;
-dub is GPL-3.0 — the *direction* of compatibility allows BSD → GPL,
-but we want attribution to remain unambiguous, hence the rewrite from
-spec).
+xwax/Mixxx algorithm description; **no xwax or Mixxx code is copied or
+derived**. That is the load-bearing fact rather than any argument about
+licence compatibility: an algorithm is not copyrightable, its
+expression is, so a clean-room rewrite leaves Dub free to license
+itself however it likes — which is what made the move to MIT /
+Apache-2.0 available. (An earlier version of this note claimed xwax is
+BSD and reasoned from "BSD → GPL is a permitted direction". That
+reasoning was both unnecessary and resting on an unverified premise —
+xwax is believed to be GPL-2.0. The rewrite-from-spec is the answer,
+not the direction of compatibility.) Do not paste code in from either
+project.
 
 ### Live timecode → deck — M5.3
 
