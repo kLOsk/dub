@@ -39,12 +39,24 @@ pub struct TrackTags {
     pub musicbrainz_release_id: Option<String>,
     /// `DISCOGS_RELEASE_ID`.
     pub discogs_release_id: Option<String>,
+    /// `BPM` — detected tempo. Dub's own catalog already holds this;
+    /// the tag is what survives the file being moved to Serato,
+    /// Traktor or rekordbox.
+    pub bpm: Option<f64>,
+    /// `INITIALKEY` — detected key in **Camelot** notation ("8B").
+    ///
+    /// Camelot rather than musical notation because that is what Dub
+    /// itself stores and compares (`dub_spectral::camelot_keys_disagree`)
+    /// and what a DJ reads when matching keys. `INITIALKEY` is the
+    /// Vorbis mirror of ID3's `TKEY`, and every DJ tool that reads the
+    /// field accepts a Camelot string in it.
+    pub initial_key: Option<String>,
 }
 
 /// Every Vorbis key this crate manages. All of them are cleared before each
 /// write so `write_tags` has replace semantics: re-tagging never duplicates
 /// values and never leaves stale fields behind from an earlier rip pass.
-const MANAGED_KEYS: [&str; 12] = [
+const MANAGED_KEYS: [&str; 14] = [
     "TITLE",
     "ARTIST",
     "ALBUM",
@@ -57,7 +69,24 @@ const MANAGED_KEYS: [&str; 12] = [
     "MUSICBRAINZ_TRACKID",
     "MUSICBRAINZ_ALBUMID",
     "DISCOGS_RELEASE_ID",
+    "BPM",
+    "INITIALKEY",
 ];
+
+/// Render a tempo for the `BPM` tag.
+///
+/// Two decimals, with trailing zeros trimmed, so a detected 128.0 writes
+/// as `128` rather than `128.00`: readers accept both, but a whole
+/// number is what a DJ expects to see in another app's browser.
+fn format_bpm(bpm: f64) -> String {
+    let s = format!("{bpm:.2}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// Write (or replace) Vorbis comments and the front-cover PICTURE block on an
 /// existing FLAC file.
@@ -113,6 +142,9 @@ pub fn write_tags(path: &Path, tags: &TrackTags) -> Result<(), EncodeError> {
         "DISCOGS_RELEASE_ID",
         tags.discogs_release_id.as_deref(),
     );
+
+    set_opt(&mut tag, "BPM", tags.bpm.map(format_bpm).as_deref());
+    set_opt(&mut tag, "INITIALKEY", tags.initial_key.as_deref());
 
     tag.remove_picture_type(PictureType::CoverFront);
     if let Some(jpeg) = &tags.cover_art_jpeg {

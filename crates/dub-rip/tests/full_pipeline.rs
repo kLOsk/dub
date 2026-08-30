@@ -41,6 +41,31 @@ fn synthetic_side() -> Vec<f32> {
     out
 }
 
+/// A click track at a fixed tempo.
+///
+/// Decaying noise bursts, not tones: spectral flux needs *onsets*, and
+/// a steady sine has none, so [`synthetic_side`] analyses to no tempo at
+/// all. This is the smallest input that yields a real beat grid.
+fn click_side(bpm: f64, secs: u64) -> Vec<f32> {
+    let frames = usize::try_from(secs * u64::from(SR)).unwrap();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let period = (60.0 / bpm * f64::from(SR)) as usize;
+    let decay = 0.02 * SR as f32;
+    let mut out = Vec::with_capacity(frames * 2);
+    let mut seed = 0x1234_5678_u32;
+    for i in 0..frames {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        #[allow(clippy::cast_precision_loss)]
+        let noise = (seed as f32 / u32::MAX as f32).mul_add(2.0, -1.0);
+        #[allow(clippy::cast_precision_loss)]
+        let env = (-((i % period) as f32) / decay).exp();
+        let s = noise * env * 0.8;
+        out.push(s);
+        out.push(s);
+    }
+    out
+}
+
 /// Wait until the capture worker has drained at least `at_least`
 /// frames and stopped growing, then stop the session.
 ///
@@ -196,6 +221,62 @@ fn record_split_commit_full_pipeline() {
         .map(|s| s.library_uuid.clone().unwrap())
         .collect();
     assert_eq!(uuids, uuids_again, "retry must not re-import");
+}
+
+/// A committed rip must carry its detected tempo and key **in the
+/// file**, not only in Dub's catalog. A FLAC dragged into Serato,
+/// Traktor or rekordbox arrives with nothing but its tags, and a rip
+/// that loses its BPM on the way out is half a rip.
+///
+/// This asserts the plumbing — that whatever analysis found reaches the
+/// metadata block. How accurate the tempo is belongs to `dub-bpm`.
+#[test]
+fn a_committed_track_carries_its_bpm_and_key_in_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = RipConfig::new(SR, dir.path().join("rip-session"));
+    cfg.poll_interval = Duration::from_millis(1);
+    let mut session = RipSession::new(cfg).unwrap();
+
+    let ring = HeapRb::<f32>::new(1 << 20);
+    let (mut tx, rx) = ring.split();
+    session.arm(rx).unwrap();
+    session.start().unwrap();
+
+    const SECS: u64 = 10;
+    let side = click_side(120.0, SECS);
+    let mut pushed = 0;
+    while pushed < side.len() {
+        pushed += tx.push_slice(&side[pushed..]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drain_then_stop(&mut session, SECS * u64::from(SR));
+    session.wait_stopped(Duration::from_secs(10)).unwrap();
+
+    let mut library = dub_library::Library::open_at(&dir.path().join("library.sqlite")).unwrap();
+    let outcome = session.commit(&mut library).unwrap();
+    let seg = &outcome.segments[0];
+    assert!(seg.library_uuid.is_some(), "commit failed: {:?}", seg.error);
+    // The re-tag pass reports through the same non-fatal channel as
+    // analysis, so a silent tagging failure would show up here.
+    assert!(seg.error.is_none(), "commit reported: {:?}", seg.error);
+
+    let tag = metaflac::Tag::read_from_path(&seg.file).expect("read committed tags");
+    let bpm: f64 = tag
+        .get_vorbis("BPM")
+        .and_then(|mut v| v.next().map(str::to_owned))
+        .expect("a click track must land a BPM tag")
+        .parse()
+        .expect("the BPM tag must parse as a number");
+    assert!(bpm.is_finite() && bpm > 0.0, "BPM tag was {bpm}");
+
+    // Key is allowed to come back empty on non-musical input, but if it
+    // is written it must be Camelot, which is what Dub compares on.
+    if let Some(key) = tag.get_vorbis("INITIALKEY").and_then(|mut v| v.next()) {
+        assert!(
+            dub_spectral::parse_camelot(key).is_some(),
+            "INITIALKEY must be Camelot notation, got {key:?}"
+        );
+    }
 }
 
 #[test]

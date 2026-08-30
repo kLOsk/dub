@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use dub_encode::{encode_flac_24bit, write_tags, TrackTags};
-use dub_library::{analyze_compute_with_track, import_file, Library};
+use dub_library::{analyze_compute_with_track, import_file, AnalysisOutcome, Library};
 
 use crate::manifest::{self, RipManifest};
 use crate::plan;
@@ -316,8 +316,33 @@ fn commit_segment(
 
     let imported = import_file(library, file).map_err(|e| format!("import failed: {e}"))?;
 
-    let analysis_error = analyze_segment(library, &imported.uuid, pcm, sample_rate).err();
+    // Analysis needs the imported track's id, so it cannot run before
+    // the file exists — BPM and key only exist after the first tag
+    // write. They are folded in with a second one, which rewrites the
+    // metadata block and leaves the audio frames untouched.
+    let analysis_error = match analyze_segment(library, &imported.uuid, pcm, sample_rate) {
+        Ok(outcome) => write_tags(file, &with_analysis(tags, &outcome))
+            .map_err(|e| format!("re-tagging with BPM/key failed: {e}"))
+            .err(),
+        Err(e) => Some(e),
+    };
     Ok((imported.uuid, analysis_error))
+}
+
+/// Fold the analysis result into the tags other DJ software reads.
+///
+/// Dub's own catalog already holds the tempo and key; a FLAC carried
+/// over to Serato, Traktor or rekordbox does not, and a rip that loses
+/// its BPM on the way out is half a rip. Written only when analysis
+/// actually produced them — non-musical input writes no row and must
+/// not write a `BPM=0` tag either.
+fn with_analysis(tags: &TrackTags, outcome: &AnalysisOutcome) -> TrackTags {
+    TrackTags {
+        bpm: outcome.wrote_grid.then_some(outcome.bpm),
+        initial_key: (outcome.wrote_key && !outcome.camelot.is_empty())
+            .then(|| outcome.camelot.to_string()),
+        ..tags.clone()
+    }
 }
 
 /// Pre-analyze from the PCM already in hand (FLAC is lossless, so
@@ -329,7 +354,7 @@ fn analyze_segment(
     uuid: &str,
     pcm: &[f32],
     sample_rate: u32,
-) -> Result<(), String> {
+) -> Result<AnalysisOutcome, String> {
     let job = library
         .analyze_prepare(uuid)
         .map_err(|e| format!("analysis prepare failed: {e}"))?;
@@ -339,8 +364,7 @@ fn analyze_segment(
         .map_err(|e| format!("analysis compute failed: {e}"))?;
     library
         .analyze_commit(&job, computed)
-        .map_err(|e| format!("analysis commit failed: {e}"))?;
-    Ok(())
+        .map_err(|e| format!("analysis commit failed: {e}"))
 }
 
 fn tags_for(meta: &crate::plan::TrackMeta, track_number: u32, track_total: u32) -> TrackTags {

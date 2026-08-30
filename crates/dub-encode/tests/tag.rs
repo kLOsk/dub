@@ -32,6 +32,8 @@ fn full_tags() -> TrackTags {
         musicbrainz_recording_id: Some("8b0d47f4-e2f5-4e34-a855-4f9c9f1c7e2a".into()),
         musicbrainz_release_id: Some("0b6b4e28-9d0a-3a8e-a53a-6c294b0f0c9d".into()),
         discogs_release_id: Some("438249".into()),
+        bpm: Some(74.5),
+        initial_key: Some("8B".into()),
     }
 }
 
@@ -78,12 +80,90 @@ fn all_fields_round_trip() {
         "0b6b4e28-9d0a-3a8e-a53a-6c294b0f0c9d",
     );
     assert_single(&tag, "DISCOGS_RELEASE_ID", "438249");
+    assert_single(&tag, "BPM", "74.5");
+    assert_single(&tag, "INITIALKEY", "8B");
 
     let pictures: Vec<_> = tag.pictures().collect();
     assert_eq!(pictures.len(), 1);
     assert_eq!(pictures[0].picture_type, PictureType::CoverFront);
     assert_eq!(pictures[0].mime_type, "image/jpeg");
     assert_eq!(pictures[0].data, JPEG_STUB.to_vec());
+}
+
+/// A whole tempo writes as a whole number: readers accept "128.00" but
+/// another app's browser showing that is noise a DJ has to read past.
+#[test]
+fn a_whole_tempo_writes_without_decimals() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("whole.flac");
+    encode_fixture(&path);
+
+    write_tags(
+        &path,
+        &TrackTags {
+            bpm: Some(128.0),
+            ..TrackTags::default()
+        },
+    )
+    .expect("write tags");
+    let tag = Tag::read_from_path(&path).expect("read back");
+    assert_single(&tag, "BPM", "128");
+}
+
+/// Non-musical input analyses to no grid and no key. It must leave the
+/// fields absent rather than claim a tempo of zero.
+#[test]
+fn an_undetected_tempo_and_key_write_no_field_at_all() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("nokey.flac");
+    encode_fixture(&path);
+
+    write_tags(
+        &path,
+        &TrackTags {
+            title: Some("Locked Groove".into()),
+            ..TrackTags::default()
+        },
+    )
+    .expect("write tags");
+    let tag = Tag::read_from_path(&path).expect("read back");
+    assert!(vorbis_values(&tag, "BPM").is_empty(), "BPM must be absent");
+    assert!(
+        vorbis_values(&tag, "INITIALKEY").is_empty(),
+        "INITIALKEY must be absent"
+    );
+}
+
+/// Re-tagging is how BPM and key reach the file: commit writes tags,
+/// imports, analyses, then writes again. The second pass must replace,
+/// not duplicate.
+#[test]
+fn a_second_write_adds_analysis_without_duplicating_anything() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("retag.flac");
+    encode_fixture(&path);
+
+    let first = TrackTags {
+        title: Some("Chase the Devil".into()),
+        artist: Some("Max Romeo".into()),
+        ..TrackTags::default()
+    };
+    write_tags(&path, &first).expect("first write");
+    write_tags(
+        &path,
+        &TrackTags {
+            bpm: Some(74.5),
+            initial_key: Some("8B".into()),
+            ..first.clone()
+        },
+    )
+    .expect("second write");
+
+    let tag = Tag::read_from_path(&path).expect("read back");
+    assert_single(&tag, "TITLE", "Chase the Devil");
+    assert_single(&tag, "ARTIST", "Max Romeo");
+    assert_single(&tag, "BPM", "74.5");
+    assert_single(&tag, "INITIALKEY", "8B");
 }
 
 #[test]

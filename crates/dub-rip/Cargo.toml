@@ -28,3 +28,8 @@ dub-library = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 proptest = { workspace = true }
+# Read committed tags back off disk, so the BPM/key assertions check the
+# real metadata block rather than our own writer's view of it.
+metaflac = { workspace = true }
+# parse_camelot, to assert the key tag is in the notation Dub compares on.
+dub-spectral = { workspace = true }
