@@ -398,7 +398,11 @@ pub use rip::{
 ///       them, and [`DubEngine::list_resplittable_rip_sessions`]
 ///       enumerates committed rips — the only way the app can reach
 ///       `resplit_rip_session`.
-pub const FFI_VERSION: u32 = 60;
+///   61. **Manual loop in / out (M13).** [`DubEngine::set_manual_loop`]
+///       loops an explicit region, so a passage can be looped on a
+///       track the analyser could not grid — the reverse grab needs a
+///       grid, this does not.
+pub const FFI_VERSION: u32 = 61;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1888,6 +1892,66 @@ impl DubEngine {
             .handle
             .deck(idx)
             .set_loop(in_frames, out_frames)
+            .map_err(map_command_error)
+    }
+
+    /// Engage a loop over an explicit `[in_secs, out_secs)` region —
+    /// the manual Loop In / Loop Out gesture, as opposed to the
+    /// grid-snapped reverse grab of [`Self::set_reverse_loop`].
+    ///
+    /// No beat grid is required. That is the point of the manual
+    /// gesture: it is the only way to loop a passage on a track the
+    /// analyser could not grid, or one whose grid disagrees with the
+    /// bar the DJ actually wants. Snapping, when wanted, happens in
+    /// the caller against the same preference hot cues use — the
+    /// engine takes the region as given.
+    ///
+    /// Pressing OUT at the playhead makes the playhead the region's
+    /// exclusive end, so the engine wraps it back to `in_secs` and the
+    /// loop starts repeating immediately, de-clicked, exactly as the
+    /// reverse grab does.
+    ///
+    /// No-op (returns `Ok`) for an empty or non-finite region, or on a
+    /// deck with no track.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::InvalidDeckIndex`]
+    pub fn set_manual_loop(
+        &self,
+        deck_idx: u64,
+        in_secs: f64,
+        out_secs: f64,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        // Region validity is a no-op, not an error — same contract as
+        // `set_reverse_loop`, where an ungriddable track simply yields
+        // no loop. Checked after the engine guard so the two methods
+        // report a stopped engine identically.
+        if !in_secs.is_finite() || !out_secs.is_finite() || out_secs <= in_secs {
+            return Ok(());
+        }
+        // The deck owns the frame domain, so the conversion needs the
+        // *track's* rate, not the engine's — the same single-conversion
+        // rule `set_reverse_loop` follows.
+        let Some(track_sr) = running.peaks[idx].as_ref().and_then(|p| match p {
+            PeakSource::File(file) => Some(f64::from(file.sample_rate)),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        if track_sr <= 0.0 {
+            return Ok(());
+        }
+        running
+            .handle
+            .deck(idx)
+            .set_loop(in_secs * track_sr, out_secs * track_sr)
             .map_err(map_command_error)
     }
 
@@ -5128,7 +5192,8 @@ mod tests {
         // `side_end_secs` on `RipSessionStatus`, `set_side_start` /
         // `set_side_end`, and `list_resplittable_rip_sessions` +
         // `RipResplittable`.
-        assert_eq!(FFI_VERSION, 60);
+        // 60→61: manual loop in/out — `set_manual_loop`.
+        assert_eq!(FFI_VERSION, 61);
     }
 
     #[test]
@@ -5406,6 +5471,31 @@ mod tests {
             assert_eq!(engine.band_peaks_chunk_duration_secs(0), 0.0);
             assert_eq!(engine.onset_peaks_chunk_duration_secs(0), 0.0);
         }
+    }
+
+    #[test]
+    fn manual_loop_guards_deck_index_and_engine_state() {
+        let engine = DubEngine::new();
+        // Out of range is an error before anything else is touched.
+        assert!(matches!(
+            engine.set_manual_loop(99, 1.0, 2.0),
+            Err(EngineError::InvalidDeckIndex { .. })
+        ));
+        // A stopped engine reports itself as such — including for an
+        // empty region, so the guard order matches `set_reverse_loop`
+        // and a caller cannot mistake "engine down" for "region no-op".
+        assert!(matches!(
+            engine.set_manual_loop(0, 1.0, 2.0),
+            Err(EngineError::EngineNotRunning)
+        ));
+        assert!(matches!(
+            engine.set_manual_loop(0, 2.0, 1.0),
+            Err(EngineError::EngineNotRunning)
+        ));
+        assert!(matches!(
+            engine.set_manual_loop(0, f64::NAN, 2.0),
+            Err(EngineError::EngineNotRunning)
+        ));
     }
 
     #[test]

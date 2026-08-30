@@ -379,7 +379,11 @@ struct PerformanceView: View {
                 })
             LoopPadRow(
                 activeBars: model.deckA.activeLoopBars,
+                loopEngaged: model.deckA.loopActive,
+                loopInArmed: model.deckA.pendingLoopInSecs != nil,
                 onLoop: { bars in model.handleLoop(.a, bars: bars) },
+                onLoopIn: { model.setLoopIn(.a) },
+                onLoopOut: { model.setLoopOut(.a) },
                 onExit: { model.exitLoop(.a) })
             // M15 — Echo-out (PRD §6.3): single 1-beat ECHO OUT toggle.
             // Prep surface; clickable for prepare + test. Hidden when the
@@ -642,7 +646,11 @@ struct PerformanceView: View {
                             side: side,
                             cues: deckState.hotCues,
                             activeLoopBars: deckState.activeLoopBars,
+                            loopEngaged: deckState.loopActive,
+                            loopInArmed: deckState.pendingLoopInSecs != nil,
                             onLoop: { bars in model.handleLoop(side, bars: bars) },
+                            onLoopIn: { model.setLoopIn(side) },
+                            onLoopOut: { model.setLoopOut(side) },
                             onExit: { model.exitLoop(side) },
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },
@@ -681,7 +689,11 @@ struct PerformanceView: View {
                             side: side,
                             cues: deckState.hotCues,
                             activeLoopBars: deckState.activeLoopBars,
+                            loopEngaged: deckState.loopActive,
+                            loopInArmed: deckState.pendingLoopInSecs != nil,
                             onLoop: { bars in model.handleLoop(side, bars: bars) },
+                            onLoopIn: { model.setLoopIn(side) },
+                            onLoopOut: { model.setLoopOut(side) },
                             onExit: { model.exitLoop(side) },
                             echoEngaged: deckState.echoDivision != nil,
                             onEchoToggle: { model.toggleEchoOut(side) },

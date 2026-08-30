@@ -171,6 +171,11 @@ struct DeckState: Equatable {
     /// loop gone (exit, or a track load dropped it). Drives the pad
     /// highlight only — the drawn band comes from `loopIn/OutSecs`.
     var activeLoopBars: Double? = nil
+    /// Armed manual Loop In point (track seconds), waiting for the OUT
+    /// press that closes the region. `nil` when nothing is armed. Local
+    /// UI state, not engine state — the engine only learns about a
+    /// manual loop once both edges exist.
+    var pendingLoopInSecs: Double? = nil
 
     /// M10.5u. Estimated tempo for the loaded track, populated
     /// from `engine.beatGrid(deckIdx:)` after a successful
@@ -4447,15 +4452,74 @@ final class WaveformAppModel: ObservableObject {
         setState(deck, for: side)
     }
 
+    /// Arm the manual Loop In point at the playhead.
+    ///
+    /// Manual in/out is the escape hatch from the beat-length grab: it
+    /// is the only way to loop a passage on a track the analyser could
+    /// not grid, or one whose grid disagrees with the bar the DJ wants.
+    /// It snaps to the grid under the same preference hot cues use, so
+    /// a track *with* a grid still lands clean.
+    func setLoopIn(_ side: DeckSide) {
+        guard isRunning else { return }
+        var deck = state(for: side)
+        guard deck.hasTrack else { return }
+        var position = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+        guard position.isFinite, position >= 0 else { return }
+        if cueSnapToGridEnabled {
+            position = snappedToGrid(position, side: side)
+        }
+        deck.pendingLoopInSecs = position
+        setState(deck, for: side)
+    }
+
+    /// Close the manual loop at the playhead and engage it.
+    ///
+    /// The playhead becomes the region's exclusive end, so the engine
+    /// wraps it straight back to the IN point — the loop starts
+    /// repeating on the press, as the beat-length grab does. A no-op
+    /// unless an IN point is armed and the region has length.
+    func setLoopOut(_ side: DeckSide) {
+        guard isRunning else { return }
+        var deck = state(for: side)
+        guard let inSecs = deck.pendingLoopInSecs else { return }
+        var outSecs = engine.positionSnapshot(deckIdx: side.ffiDeckIdx).elapsedSecs
+        guard outSecs.isFinite else { return }
+        if cueSnapToGridEnabled {
+            outSecs = snappedToGrid(outSecs, side: side)
+        }
+        // Snapping can collapse a short region onto one beat line. Keep
+        // the IN armed rather than dropping it, so the DJ can simply
+        // press OUT again a beat later.
+        guard outSecs > inSecs else { return }
+        do {
+            try engine.setManualLoop(
+                deckIdx: side.ffiDeckIdx, inSecs: inSecs, outSecs: outSecs)
+        } catch {
+            surfaceError("Loop failed: \(error.localizedDescription)")
+            return
+        }
+        deck.pendingLoopInSecs = nil
+        // A manual region is not one of the preset lengths, so no
+        // length pad lights; `loopActive` from the poll is what tells
+        // the UI a loop is running.
+        deck.activeLoopBars = nil
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
+    }
+
     /// Disengage the loop on the focused deck; playback continues
     /// forward from the current position.
     func exitLoop(_ side: DeckSide) {
         guard isRunning else { return }
         var deck = state(for: side)
-        guard deck.activeLoopBars != nil || deck.loopActive else { return }
+        guard deck.activeLoopBars != nil || deck.loopActive || deck.pendingLoopInSecs != nil
+        else { return }
         try? engine.clearLoop(deckIdx: side.ffiDeckIdx)
         deck.activeLoopBars = nil
         deck.loopActive = false
+        // ✕ also disarms a half-set manual loop, so the pad is one
+        // "never mind" rather than two different ones.
+        deck.pendingLoopInSecs = nil
         deck.seekGeneration &+= 1
         setState(deck, for: side)
     }

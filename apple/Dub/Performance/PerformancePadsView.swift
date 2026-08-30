@@ -36,9 +36,16 @@ struct PerformancePadsView: View {
     /// Active reverse-loop length in bars (`nil` = no loop). Lights the
     /// matching LOOP pad green.
     var activeLoopBars: Double? = nil
+    /// A loop is running — either a length preset or a manual region.
+    /// A manual loop lights no length pad, so ✕ needs its own signal.
+    var loopEngaged: Bool = false
+    /// A manual Loop In point is armed, waiting for OUT.
+    var loopInArmed: Bool = false
     /// Fire a grid-snapped reverse loop of `bars` bars (the bars just
     /// heard). No-op default keeps the `#Preview` simple.
     var onLoop: (_ bars: Double) -> Void = { _ in }
+    var onLoopIn: () -> Void = {}
+    var onLoopOut: () -> Void = {}
     /// Exit the active loop.
     var onExit: () -> Void = {}
 
@@ -165,12 +172,26 @@ struct PerformancePadsView: View {
                     .onPressDown { onLoop(preset.bars) }
                     .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
                 }
+                // Manual in/out: the escape hatch from the beat-length
+                // grab, for a track the analyser could not grid or one
+                // whose grid disagrees with the bar you want.
+                hotCuePadCell("IN", lit: loopInArmed, tint: DubColor.loop)
+                    .onPressDown { onLoopIn() }
+                    .help("Set the loop start at the playhead")
+                hotCuePadCell("OUT", lit: false, tint: DubColor.loop)
+                    .onPressDown(enabled: loopInArmed) { onLoopOut() }
+                    .help("Close the loop at the playhead and start it")
+                    .opacity(loopInArmed ? 1.0 : 0.5)
                 hotCuePadCell("✕", lit: false, tint: DubColor.loop)
-                    .onPressDown(enabled: activeLoopBars != nil) { onExit() }
+                    .onPressDown(enabled: canExitLoop) { onExit() }
                     .help("Exit loop")
-                    .opacity(activeLoopBars == nil ? 0.5 : 1.0)
+                    .opacity(canExitLoop ? 1.0 : 0.5)
             }
         }
+    }
+
+    private var canExitLoop: Bool {
+        activeLoopBars != nil || loopEngaged || loopInArmed
     }
 
     @ViewBuilder
@@ -700,14 +721,25 @@ private struct LoopPreset: Identifiable {
 /// Live LOOP pad row for Prep. Each length pad triggers a grid-snapped
 /// **reverse** loop of that many bars — the bars just heard — on
 /// mouse-down (like cues / transport). The active length lights green;
-/// the ✕ pad exits the loop. Prep's loop role is *authoring + testing*
-/// a region (PRD §3.1), so it's mouse-clickable, not keyboard-only.
+/// IN / OUT set a manual region — the escape hatch for a track the
+/// analyser could not grid — and the ✕ pad exits the loop (or disarms a
+/// half-set manual one). Prep's loop role is *authoring + testing* a
+/// region (PRD §3.1), so it's mouse-clickable, not keyboard-only.
 struct LoopPadRow: View {
 
     /// Which length pad is lit (bars), or `nil` when no loop is active.
     let activeBars: Double?
+    /// A loop is running — preset or manual. A manual region lights no
+    /// length pad, so ✕ needs its own signal.
+    var loopEngaged: Bool = false
+    /// A manual Loop In point is armed, waiting for OUT.
+    var loopInArmed: Bool = false
     /// Trigger a reverse loop of `bars` bars.
     let onLoop: (_ bars: Double) -> Void
+    /// Arm the manual loop start at the playhead.
+    var onLoopIn: () -> Void = {}
+    /// Close the manual loop at the playhead and start it.
+    var onLoopOut: () -> Void = {}
     /// Exit the active loop.
     let onExit: () -> Void
 
@@ -734,8 +766,17 @@ struct LoopPadRow: View {
                 .onPressDown { onLoop(preset.bars) }
                 .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
             }
+            hotCuePadCell("IN", lit: loopInArmed, tint: DubColor.loop)
+                .onPressDown { onLoopIn() }
+                .help("Set the loop start at the playhead")
+            hotCuePadCell("OUT", lit: false, tint: DubColor.loop)
+                .onPressDown(enabled: loopInArmed) { onLoopOut() }
+                .help("Close the loop at the playhead and start it")
+                .opacity(loopInArmed ? 1.0 : 0.5)
             hotCuePadCell("✕", lit: false, tint: DubColor.loop)
-                .onPressDown(enabled: activeBars != nil) { onExit() }
+                .onPressDown(enabled: activeBars != nil || loopEngaged || loopInArmed) {
+                    onExit()
+                }
                 .help("Exit loop")
                 .opacity(activeBars == nil ? 0.5 : 1.0)
         }

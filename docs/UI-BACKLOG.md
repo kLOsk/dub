@@ -318,6 +318,30 @@ and the Prep-surface Expert panel shipped; the vintage-FX DSP chain
 (spring / RE-201 / Big Knob / phaser) is in-tree but parked behind the deck-role
 FX channel below. These are the pieces explicitly held back so they're not lost._
 
+### P-39. Key lock is hard-bypassed while a loop is engaged — **done**
+
+Shipped: the wrap and its seam crossfade moved into the stretcher's *feed*
+(`kl_refill`), so the engaged path is handed an already-wrapped, already
+seam-faded stream and needs no reset, no re-prime and no knowledge that a loop
+exists. `loop_region.is_none()` is gone from `key_lock_engage_decision`. Pinned
+by a test that measures the rendered fundamental: 480 Hz into a 12 000-frame
+loop (exactly 120 periods, so the wrap is phase-seamless in the source) reads
+480 Hz engaged, and read 509.8 Hz — the resampler shift — before the fix.
+
+### P-40. The position extrapolator does not know about loops
+
+**Symptom**: `PublishState::extrapolated_secs` is `position_secs + elapsed ×
+rate` with no loop wrap, so between publishes the UI playhead reads past
+`loop_out` — by about one block normally, more at a scratched platter rate, and
+up to the 100 ms clamp if the audio thread stalls. The same unwrapped value is
+what `set_reverse_loop` uses as the press playhead, so re-gripping a loop while
+one is running can snap off a reading that is past the loop end. **Remediation**:
+wrap the extrapolation into `[loop_in, loop_out)` when `loop_active` — the bounds
+are already published in the same shared state. Small; the reason it is filed
+rather than fixed is that the visible error is normally sub-frame.
+**Location**: `crates/dub-engine/src/deck.rs` (`PublishState`),
+`crates/dub-ffi/src/lib.rs` (`set_reverse_loop`).
+
 ### F-36. Siren-sound fine-tuning (polish phase)
 
 The three units are voiced and level-matched (−14 LUFS), but the sounds
@@ -465,7 +489,9 @@ known-stale baselines as the gate. **Location**: `.gitignore:80`.
 `test_sourceControl_allStates` fail against local baselines recorded around
 `5d5b0f9` (hot-cues) — the views moved through the M11d / M14 / M15 / M16
 rounds without a re-record. Verified pre-existing: they fail with all M26b work
-stashed. **Remediation**: re-record deliberately, view by view, once R-45
+stashed. M13 added a second reason for one of them — `test_performancePads_deckA`
+now also disagrees because the LOOP row grew IN / OUT pads — but the failing set
+is unchanged at the same eight. **Remediation**: re-record deliberately, view by view, once R-45
 settles whether baselines are tracked. **Location**:
 `apple/DubTests/PerformanceSnapshotTests.swift`.
 

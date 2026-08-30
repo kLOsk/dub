@@ -431,6 +431,19 @@
   capture and re-split can reach back past the trim — a trim without a lossless
   archive behind it would be data loss.
 
+- **A "still owed" note in the spec is a claim about the code, and it rots.**
+  Timecode-correct looping was listed as an open v1 ship gate in four documents
+  while the engine had implemented *and* acceptance-tested it — the arbitration
+  landed inside an unrelated squashed commit and nobody went back to the docs.
+  Two hours of the milestone went into re-deriving what was already there.
+  Before building against a status line, grep for the thing it says is missing.
+- **Verify a bug report by measuring, not by reading.** The obvious reading of
+  the loop seam said the reverse wrap had no crossfade and would click. It does
+  not: the crossfade window sits exactly where a backwards wrap lands and the
+  blend is symmetric in time, so the seam is continuous in both directions —
+  which a ramp probe showed immediately (both directions read identically). The
+  fix would have been real code solving nothing.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is

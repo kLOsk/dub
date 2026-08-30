@@ -1206,6 +1206,12 @@ impl Deck {
         self.start_declick();
         self.source = None;
         self.position = 0.0;
+        // A loop is set against a specific track's frames and means
+        // nothing without it — same reasoning as `set_source`. Missing
+        // this left a region on a sourceless deck (and a loop bracket
+        // drawn in the UI) when a looping deck switched to Thru / FX.
+        self.loop_region = None;
+        self.shared.store_loop(false, 0.0, 0.0);
         self.shared.store_position(0.0);
         self.shared.publish_position_secs(0.0, 0.0);
         self.shared.store_at_end(false);
@@ -1367,7 +1373,13 @@ impl Deck {
     /// Key-lock engage decision for the current block: `(can_engage,
     /// must_bypass)`, with slew hysteresis so engage/disengage can't flap at the
     /// threshold. Key lock only engages in forward, settled, moderate-rate,
-    /// non-looping internal playback (M6 absolute advance ⇒ timecode ⇒ bypass).
+    /// internal playback (M6 absolute advance ⇒ timecode ⇒ bypass).
+    ///
+    /// A loop no longer forces bypass: the wrap and its seam crossfade
+    /// live in the stretcher's *feed* (`kl_refill`), so the engaged
+    /// path sees a continuous stream. Without that, a looped deck at a
+    /// pitched platter shifted pitch while an unlooped one did not —
+    /// the one thing key lock exists to prevent (§14 #9).
     fn key_lock_engage_decision(&self, has_m6_advance: bool, declick_active: bool) -> (bool, bool) {
         let backend_ok = match self.stretch_backend {
             dub_stretch::StretchBackend::ResamplerOnly => false,
@@ -1379,7 +1391,6 @@ impl Deck {
             && self.rate.is_finite()
             && self.rate > KL_MIN_RATE
             && self.rate < KL_MAX_RATE
-            && self.loop_region.is_none()
             && !has_m6_advance
             && !declick_active;
         let slew = (self.rate - self.prev_rate).abs();
@@ -1675,6 +1686,19 @@ impl Deck {
             self.rate * (f64::from(t.sample_rate()) / engine_sr_f)
         });
 
+        // Loop seam window, computed once per block. Capped at a
+        // quarter of the loop body so a short loop keeps some
+        // un-crossfaded audio in the middle. Shared by the bypass and
+        // key-locked paths — both read the source, so both wrap and
+        // both cross-fade through the same definition.
+        let loop_seam: Option<LoopSeam> = loop_region.and_then(|(lin, lout)| {
+            self.source.as_ref().map(|t| {
+                let len = lout - lin;
+                let x = (f64::from(t.sample_rate()) * LOOP_XFADE_SECS).min(len * 0.25);
+                (lin, lout, len, x.max(0.0))
+            })
+        });
+
         // === Phase 1: crossfade (if a declick is active). ===
         let mut frames_consumed_in_fade = 0usize;
         if let DeclickState::Active {
@@ -1750,17 +1774,7 @@ impl Deck {
                     *prev_position += prev_increment;
                 }
                 if self.playing {
-                    pos += new_increment;
-                    if let Some((lin, lout)) = loop_region {
-                        let len = lout - lin;
-                        if len > 0.0 {
-                            if pos >= lout {
-                                pos -= len;
-                            } else if pos < lin {
-                                pos += len;
-                            }
-                        }
-                    }
+                    pos = wrap_looped(pos + new_increment, loop_seam);
                 }
                 *samples_remaining -= 1;
             }
@@ -1811,47 +1825,12 @@ impl Deck {
                 if matches!(self.lock_state, KeyLockState::Bypassed) {
                     // --- Bypass path (raw resampler) — unchanged behaviour. ---
                     let env = &self.declick_envelope;
-                    let env_len = env.len();
-                    // Pre-compute the loop seam crossfade window (track
-                    // frames), capped at a quarter of the loop body so a
-                    // short loop still has un-crossfaded audio in the middle.
-                    let loop_xfade = loop_region.map(|(lin, lout)| {
-                        let len = lout - lin;
-                        let x = (f64::from(track.sample_rate()) * LOOP_XFADE_SECS).min(len * 0.25);
-                        (lin, lout, len, x.max(0.0))
-                    });
-
                     for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
-                        let (mut l, mut r) = read_stereo_at(track, pos);
-                        // Loop seam crossfade: in the last `x` frames before
-                        // `out`, blend the loop tail into the audio that
-                        // leads into `in` (one loop-length back), so when the
-                        // wrap lands on `in` the waveform is already continuous.
-                        if let Some((lin, lout, len, x)) = loop_xfade {
-                            if x > 0.0 && pos >= lout - x && pos < lout && pos >= lin {
-                                let t = (pos - (lout - x)) / x;
-                                let (pl, pr) = read_stereo_at(track, pos - len);
-                                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                                let idx = (t * f64::from(env_len)) as u32;
-                                let fade_in = env.fade_in(idx);
-                                let fade_out = 1.0 - fade_in;
-                                l = l * fade_out + pl * fade_in;
-                                r = r * fade_out + pr * fade_in;
-                            }
-                        }
+                        let (l, r) = read_looped(track, pos, loop_seam, env);
                         let edge = track_tail_fade_scale(track_len, pos, env);
                         chunk[offset] += l * gain * edge;
                         chunk[offset + 1] += r * gain * edge;
-                        pos += new_increment;
-                        if let Some((lin, lout, len, _)) = loop_xfade {
-                            if len > 0.0 {
-                                if pos >= lout {
-                                    pos -= len;
-                                } else if pos < lin {
-                                    pos += len;
-                                }
-                            }
-                        }
+                        pos = wrap_looped(pos + new_increment, loop_seam);
                     }
                 } else {
                     // --- Engaged path (key lock): pitch-correction insert. ---
@@ -1869,6 +1848,7 @@ impl Deck {
                                     &mut self.read_cursor,
                                     pos,
                                     new_increment,
+                                    loop_seam,
                                     &mut self.stretch_in,
                                     &mut self.stretch_out,
                                     &mut self.stretch_out_len,
@@ -1888,6 +1868,7 @@ impl Deck {
                                 gain,
                                 self.rate,
                                 new_increment,
+                                loop_seam,
                                 &mut pos,
                                 &mut self.read_cursor,
                                 &mut self.stretch_in,
@@ -2079,6 +2060,50 @@ fn read_stereo_at(track: &Track, pos: f64) -> (f32, f32) {
 // === M14 key-lock engaged-render helpers (free fns so the per-block borrow of
 // one `DeckStretchers` backend stays disjoint from the deck's other fields). ===
 
+/// The loop seam window in track frames: `(in, out, len, xfade)`.
+///
+/// Computed once per block and shared by the bypass and key-locked
+/// paths — both read the source, so both must wrap and both must
+/// cross-fade, and one definition means they cannot drift apart.
+type LoopSeam = (f64, f64, f64, f64);
+
+/// Read the source at `pos` with the loop seam applied.
+///
+/// In the last `x` frames before `out` the loop tail is blended into
+/// the audio that leads into `in` (one loop-length back), so when the
+/// wrap lands the waveform is already continuous. Read backwards the
+/// same blend runs in reverse, which is why a platter pulled back
+/// through the seam is de-clicked too.
+fn read_looped(
+    track: &Track,
+    pos: f64,
+    seam: Option<LoopSeam>,
+    env: &DeclickEnvelope,
+) -> (f32, f32) {
+    let (mut l, mut r) = read_stereo_at(track, pos);
+    if let Some((lin, lout, len, x)) = seam {
+        if x > 0.0 && pos >= lout - x && pos < lout && pos >= lin {
+            let t = (pos - (lout - x)) / x;
+            let (pl, pr) = read_stereo_at(track, pos - len);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let idx = (t * f64::from(env.len())) as u32;
+            let fade_in = env.fade_in(idx);
+            let fade_out = 1.0 - fade_in;
+            l = l * fade_out + pl * fade_in;
+            r = r * fade_out + pr * fade_in;
+        }
+    }
+    (l, r)
+}
+
+/// Confine `pos` to the loop, if there is one.
+fn wrap_looped(pos: f64, seam: Option<LoopSeam>) -> f64 {
+    match seam {
+        Some((lin, _, len, _)) if len > 0.0 => crate::looping::wrap_into(pos, lin, len),
+        _ => pos,
+    }
+}
+
 /// Read one [`KL_FEED_HOP`] of input from `*read_cursor` (advancing at
 /// `new_increment`, with the track tail-fade), push it through `stretcher`, and
 /// advance `*read_cursor` by the frames the stretcher actually consumed.
@@ -2091,21 +2116,26 @@ fn kl_refill<S: TimeStretcher>(
     env: &DeclickEnvelope,
     read_cursor: &mut f64,
     new_increment: f64,
+    seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
 ) -> usize {
-    let mut rc = *read_cursor;
+    // The wrap belongs *here*, in the feed, not around the stretcher:
+    // fed a seam-crossfaded, already-wrapped stream the stretcher sees
+    // ordinary continuous audio and needs no reset, no re-prime and no
+    // knowledge that a loop exists.
+    let mut rc = wrap_looped(*read_cursor, seam);
     for k in 0..KL_FEED_HOP {
-        let (l, r) = read_stereo_at(track, rc);
+        let (l, r) = read_looped(track, rc, seam, env);
         let edge = track_tail_fade_scale(track_len, rc, env);
         stretch_in[k * 2] = l * edge;
         stretch_in[k * 2 + 1] = r * edge;
-        rc += new_increment;
+        rc = wrap_looped(rc + new_increment, seam);
     }
     let (consumed, produced) = stretcher.process(stretch_in, stretch_out);
     #[allow(clippy::cast_precision_loss)]
     {
-        *read_cursor += consumed as f64 * new_increment;
+        *read_cursor = wrap_looped(*read_cursor + consumed as f64 * new_increment, seam);
     }
     produced
 }
@@ -2120,6 +2150,7 @@ fn kl_next<S: TimeStretcher>(
     env: &DeclickEnvelope,
     read_cursor: &mut f64,
     new_increment: f64,
+    seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
     out_len: &mut usize,
@@ -2134,6 +2165,7 @@ fn kl_next<S: TimeStretcher>(
             env,
             read_cursor,
             new_increment,
+            seam,
             stretch_in,
             stretch_out,
         );
@@ -2162,6 +2194,7 @@ fn kl_prime<S: TimeStretcher>(
     read_cursor: &mut f64,
     start_pos: f64,
     new_increment: f64,
+    seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
     out_len: &mut usize,
@@ -2182,6 +2215,7 @@ fn kl_prime<S: TimeStretcher>(
             env,
             read_cursor,
             new_increment,
+            seam,
             stretch_in,
             stretch_out,
         );
@@ -2224,6 +2258,7 @@ fn render_engaged<S: TimeStretcher>(
     gain: f32,
     rate: f64,
     new_increment: f64,
+    seam: Option<LoopSeam>,
     pos: &mut f64,
     read_cursor: &mut f64,
     stretch_in: &mut [f32],
@@ -2246,6 +2281,7 @@ fn render_engaged<S: TimeStretcher>(
             declick_env,
             read_cursor,
             new_increment,
+            seam,
             stretch_in,
             stretch_out,
             out_len,
@@ -2253,7 +2289,7 @@ fn render_engaged<S: TimeStretcher>(
         );
         let (l, r) = match *lock_state {
             KeyLockState::Engaging { i } => {
-                let (bl, br) = read_stereo_at(track, *pos);
+                let (bl, br) = read_looped(track, *pos, seam, declick_env);
                 let edge = track_tail_fade_scale(track_len, *pos, declick_env);
                 let fade_in = lock_xfade.fade_in(i);
                 let fade_out = 1.0 - fade_in;
@@ -2271,7 +2307,7 @@ fn render_engaged<S: TimeStretcher>(
         };
         chunk[offset] += l * gain;
         chunk[offset + 1] += r * gain;
-        *pos += new_increment;
+        *pos = wrap_looped(*pos + new_increment, seam);
     }
 }
 
@@ -2467,6 +2503,133 @@ mod tests {
         deck.set_loop(200.0, 100.0);
         assert_eq!(deck.loop_region(), None);
         assert!(!shared.load_loop().active);
+    }
+
+    /// A track whose sample value is its frame index over `frames`, so
+    /// any positional discontinuity in the render shows up directly as
+    /// a sample-to-sample step.
+    fn ramp_track(frames: usize) -> Arc<Track> {
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            #[allow(clippy::cast_precision_loss)]
+            let v = i as f32 / frames as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        const_track(&samples, 2, 48_000)
+    }
+
+    /// Largest sample-to-sample step in one channel of an interleaved
+    /// buffer — a click detector.
+    fn max_step(out: &[f32]) -> f32 {
+        out.chunks_exact(2)
+            .map(|c| c[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// The loop seam has to be de-clicked in **both** directions.
+    ///
+    /// Under internal play the rate is always positive, so only the
+    /// `out -> in` wrap ever fires. Under timecode the platter can be
+    /// pulled backwards inside a loop, which wraps `in -> out`, and
+    /// that direction had no test.
+    ///
+    /// It turns out to be de-clicked *by construction*: the crossfade
+    /// window sits at `[out - x, out)`, which is exactly where a
+    /// backwards wrap lands, and the blend is symmetric in time — read
+    /// forwards it fades the loop tail into the pre-`in` audio, read
+    /// backwards it fades the pre-`in` audio back into the loop tail.
+    /// Either way the sample across the seam is continuous. This test
+    /// pins that, because nothing else did and the next person to
+    /// touch the window bounds would not know.
+    ///
+    /// The threshold is not a click threshold: crossfading a jump of a
+    /// loop-length over `x` frames sweeps a ramp signal by ~4 frames
+    /// per sample no matter which way it is played, so ~5.5x is the
+    /// floor for *correct* behaviour here. An un-faded wrap steps ~100x
+    /// (the whole loop length in one sample), which is what this
+    /// catches. Acceptance §14 #8.
+    #[test]
+    fn loop_seam_is_declicked_pulling_backwards() {
+        const FRAMES: usize = 4000;
+        let mut deck = test_deck();
+        deck.set_source(ramp_track(FRAMES));
+        deck.set_position_frames(150.0);
+        deck.set_playing(true);
+        deck.set_rate(-1.0);
+        deck.set_loop(100.0, 200.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 300 * 2];
+        deck.render(&mut rt, &mut out, 48_000.0);
+
+        // One frame of ramp. The wrap itself is a 100-frame jump, so an
+        // un-faded seam steps ~100x this.
+        #[allow(clippy::cast_precision_loss)]
+        let slope = 1.0 / FRAMES as f32;
+        let step = max_step(&out);
+        assert!(
+            step < slope * 8.0,
+            "reverse loop wrap clicked: {step} (one frame of ramp is {slope})"
+        );
+    }
+
+    /// The forward seam, measured the same way, so the two directions
+    /// are held to one standard — they should read identically, and
+    /// they do (both ~5.5x a ramp frame).
+    #[test]
+    fn loop_seam_is_declicked_playing_forwards() {
+        const FRAMES: usize = 4000;
+        let mut deck = test_deck();
+        deck.set_source(ramp_track(FRAMES));
+        deck.set_position_frames(150.0);
+        deck.set_playing(true);
+        deck.set_rate(1.0);
+        deck.set_loop(100.0, 200.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 300 * 2];
+        deck.render(&mut rt, &mut out, 48_000.0);
+
+        #[allow(clippy::cast_precision_loss)]
+        let slope = 1.0 / FRAMES as f32;
+        let step = max_step(&out);
+        assert!(
+            step < slope * 8.0,
+            "forward loop wrap clicked: {step} (one frame of ramp is {slope})"
+        );
+    }
+
+    /// Clearing the track has to clear the loop with it.
+    ///
+    /// `set_source` and `swap_source` both drop the loop — a loop is
+    /// set against a specific track's frames and means nothing without
+    /// it. `clear_source` did not, so switching a looping deck to Thru
+    /// or FX (which calls it) left a region set on a sourceless deck
+    /// and `loop_active: true` published to the UI, drawing a loop
+    /// bracket over a deck with no track.
+    #[test]
+    fn clearing_the_track_clears_the_loop() {
+        let mut deck = test_deck();
+        deck.set_source(const_track(&vec![0.1f32; 4000], 2, 48_000));
+        deck.set_position_frames(150.0);
+        deck.set_loop(100.0, 200.0);
+        assert!(deck.loop_region().is_some());
+        assert!(deck.shared().load_loop().active);
+
+        deck.clear_source();
+
+        assert!(
+            deck.loop_region().is_none(),
+            "loop survived the track it was set against"
+        );
+        assert!(
+            !deck.shared().load_loop().active,
+            "UI still told there is a loop on an empty deck"
+        );
     }
 
     #[test]
@@ -2672,6 +2835,76 @@ mod tests {
         let out_off = kl_render(&mut off, 40, 256);
 
         assert_eq!(out_on, out_off, "reverse key lock must be a bypass no-op");
+    }
+
+    /// Key lock has to survive a loop.
+    ///
+    /// A looped deck at a pitched platter otherwise shifts pitch while
+    /// an unlooped one does not, which is the one thing key lock
+    /// exists to prevent (acceptance §14 #9). The engaged path feeds a
+    /// stretcher from its own read cursor, so the loop wrap has to
+    /// happen *in that read* — the stretcher then sees a continuous
+    /// stream and never learns there was a seam.
+    ///
+    /// 480 Hz into a 12 000-frame loop is exactly 120 periods, so the
+    /// wrap is phase-seamless in the source and any pitch error in the
+    /// result is the resampler's, not the fixture's.
+    #[test]
+    fn key_lock_holds_pitch_inside_a_loop() {
+        let track = kl_sine_track(480.0, 120_000);
+        let rate = 1.06;
+
+        let mut on = test_deck();
+        on.set_source(track.clone());
+        on.set_position_frames(12_000.0);
+        on.set_playing(true);
+        on.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        on.set_key_lock(true);
+        on.set_rate(rate);
+        on.set_loop(12_000.0, 24_000.0);
+        on.quiesce_declick_for_test();
+        let f_on = kl_fundamental(&kl_render(&mut on, 200, 256), 6_000);
+
+        assert!(
+            (f_on - 480.0).abs() < 12.0,
+            "key lock should hold ~480 Hz inside a loop, got {f_on} \
+             (508.8 means it bypassed and the resampler shifted it)"
+        );
+        assert!(
+            on.loop_region().is_some(),
+            "the loop must still be engaged after the render"
+        );
+        let p = on.position_frames();
+        assert!(
+            (12_000.0..24_000.0).contains(&p),
+            "key-locked playhead {p} escaped the loop"
+        );
+    }
+
+    /// The key-locked *loop* path is on the audio thread too: the wrap
+    /// and its seam crossfade now run inside the stretcher feed.
+    #[test]
+    fn key_locked_loop_render_is_alloc_free() {
+        let track = kl_sine_track(480.0, 120_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_position_frames(12_000.0);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.set_rate(1.06);
+        // 12 000 frames at 1.06 wraps every ~44 blocks, so 150 blocks
+        // cross the seam repeatedly — engage, prime, crossfade, wrap.
+        deck.set_loop(12_000.0, 24_000.0);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..150 {
+                out.fill(0.0);
+                deck.render(&mut rt, &mut out, 48_000.0);
+            }
+        });
     }
 
     #[test]
