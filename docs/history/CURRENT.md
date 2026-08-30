@@ -33,6 +33,19 @@ confirmed on hardware, and neither has been.
 
 ## Next milestone
 
+**M26c — rip recognition. In progress.** The `dub-recognize` crate is built
+and tested offline: TEST2 fingerprint in AcoustID's wire format, AcoustID and
+MusicBrainz clients, and the side-level release vote. What remains is Discogs
+enrichment (blocked on R-42, the Keychain token), a `dub recognize` CLI, and
+wiring the result into the rip review panel.
+
+**It cannot be run for real yet**: AcoustID needs a free API key from
+acoustid.org/new-application, which has to be registered by a person. Until
+one is configured every lookup returns `MissingCredential` — deliberately, so
+the failure names the cause instead of looking like an unknown record.
+
+Original scope note follows.
+
 **M26c — rip recognition.** The last M26 sub-milestone and the only thing
 between a rip and a fully-tagged record. AcoustID (a TEST2 fingerprint computed
 transiently — the stored dedupe blobs are TEST1) → MusicBrainz release

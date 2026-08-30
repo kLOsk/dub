@@ -73,6 +73,10 @@ crates/
                      adaptive gap detection, needle-drop auto-start + run-out auto-stop, spill
                      salvage / session recovery, and re-split from the lossless archive.
                      Fully offline.
+  dub-recognize/     M26c — recognition for ripped vinyl: AcoustID lookup on a TEST2
+                     Chromaprint, MusicBrainz release resolution, Discogs enrichment.
+                     The workspace's ONLY network dependency (`ureq`), reachable from one
+                     type behind an `Http` trait — a rip never depends on the network.
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
   dub-ffi/           UniFFI Swift bindings — `DubEngine`, `DubLibrary` and `DubRipSession`.
                      `FFI_VERSION` is the contract number; bump it and README together (docs-check gates it).

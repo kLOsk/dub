@@ -1,0 +1,24 @@
+[package]
+name = "dub-recognize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Recognition for ripped vinyl (M26c): AcoustID lookup on a TEST2 Chromaprint, MusicBrainz release resolution, Discogs enrichment. Network access is confined behind an `Http` trait so the rip pipeline stays fully offline — recognition is optional enrichment, never a dependency."
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# TEST2 fingerprint + AcoustID's compressed wire format. Dedupe (M11b)
+# uses TEST1 and its stored blobs are untouched; AcoustID's database is
+# built on TEST2, so recognition computes its own from the same PCM.
+rusty-chromaprint = { workspace = true }
+# AcoustID takes the compressed fingerprint base64url-encoded.
+base64 = { workspace = true }
+# The only network dependency in the workspace, and only behind `Http`.
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

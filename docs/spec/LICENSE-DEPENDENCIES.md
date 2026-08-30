@@ -196,6 +196,7 @@ Last verified: M26b (workspace dependency-graph snapshot 2026-07; added `flacenc
 * **Version:** 0.22
 * **License:** MIT/Apache-2.0
 * **Upstream:** https://github.com/marshallpierce/rust-base64
+* **Role in Dub (M26c):** Encodes the compressed Chromaprint fingerprint as base64url-unpadded, which is the form AcoustID's `fingerprint` field takes.
 * **Role in Dub:** Decodes the base64 payloads inside Serato's `Serato Markers2` / `Serato Autotags` GEOB blobs (M11e). Already present transitively in the dependency graph; M11e makes it a direct dependency. We use a padding-indifferent STANDARD engine because Serato's payloads are inconsistently padded.
 * **Used by:** `dub-library`
 
@@ -298,6 +299,26 @@ These are `dev-dependencies` only. They do **not** appear in any shipped binary.
 
 ---
 
+## Network (M26c)
+
+### `ureq` (the first and only network dependency)
+
+* **License:** MIT OR Apache-2.0.
+* **Upstream:** https://github.com/algesten/ureq
+* **Role in Dub:** the HTTP client behind `dub-recognize`'s `Http` trait —
+  AcoustID, MusicBrainz and Discogs lookups for ripped vinyl.
+* **Why this one.** Blocking, so no async runtime is dragged in for what is a
+  background batch job over a handful of tracks. TLS via **rustls**, not
+  OpenSSL, so there is no C build dependency and the pure-Rust posture that
+  `dub-bpm`, `dub-fingerprint`, `dub-stretch` and `dub-encode` all chose
+  survives its first contact with the network.
+* **Blast radius.** Reachable from exactly one type (`http::UreqHttp`) in one
+  leaf crate. Nothing else in the workspace links it, and `dub-rip` never calls
+  recognition on a path that can fail a commit — a rip works with the cable
+  out. That containment is the point: it is what lets a network dependency into
+  a project whose first principle is reliability on stage.
+* **License effect:** none. Permissive, GPL-compatible, no copyleft obligation.
+
 ## Forward-looking license commitments
 
 These are not in the dep graph today. They are documented here so future work knows the constraints they will impose.
@@ -334,11 +355,8 @@ These are not in the dep graph today. They are documented here so future work kn
 * **Status:** Deliberately not linked. The M26 vinyl-rip encode stack ships FLAC-only (`flacenc`, Apache-2.0 + `metaflac`, MIT).
 * **Reason:** An MP3-320 rip export would have made LAME the first non-permissive library actually linked into Dub. FLAC is lossless, encodable in pure Rust under a permissive license, and symphonia already decodes it — the rip use case is fully covered at zero license cost. Revisit only if real users demand MP3 export for interop with other players.
 
-### `ureq` (planned, M26c)
-
-* **License:** MIT/Apache-2.0 (rustls TLS chain: also permissive)
-* **Upstream:** https://github.com/algesten/ureq
-* **Planned role in Dub:** HTTP client for the planned `dub-recognize` leaf crate — AcoustID lookup, MusicBrainz release-tracklist fetch, Discogs enrichment for ripped records. This will be Dub's **first network dependency**; it stays confined behind an `Http` trait in that one leaf crate so the rip pipeline keeps working fully offline.
+**`ureq` is no longer forward-looking** — it landed with M26c and is
+documented in the wired-dependency section above.
 
 ---
 

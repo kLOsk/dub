@@ -15,6 +15,7 @@ members = [
     "crates/dub-library",
     "crates/dub-encode",
     "crates/dub-rip",
+    "crates/dub-recognize",
     "crates/dub-controller",
     "crates/dub-ffi",
     "crates/dub-cli",
@@ -149,6 +150,13 @@ metaflac = "0.2"
 # workspace set.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M26c — Dub's FIRST network dependency, and deliberately a small one.
+# `ureq` is blocking, has no async runtime, and brings rustls rather than
+# OpenSSL (no C build dep, matching the pure-Rust posture everywhere else).
+# MIT/Apache. It is reachable only from `dub-recognize`, which sits behind
+# an `Http` trait so the rip pipeline never depends on the network —
+# recognition is enrichment, and a rip must work with the cable out.
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
 
 # CoreAudio (macOS only; target-gated in dub-audio's Cargo.toml). PRD §4.2:
 # v1 uses HAL via coreaudio-rs, not cpal — we want lowest possible latency
