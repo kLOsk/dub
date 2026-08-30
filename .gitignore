@@ -74,10 +74,10 @@ crashes/
 ExportOptions.plist
 *.p12
 
-# SwiftUI snapshot reference images — kept local while the
-# performance UI is in flux (C-31). Recommit fresh goldens as the
-# regression baseline once the surface stabilises.
-apple/DubTests/__Snapshots__/
+# SwiftUI snapshot baselines ARE tracked — they are the regression gate,
+# and a gate no review ever sees is not one. They are excluded from the
+# DubTests *resources* phase in apple/project.yml, so deleting one to
+# re-record it does not break the generated project.
 
 # Rip tuning baselines — real record captures (748 MB of 24-bit FLAC).
 # Ground truth behind every constant in `dub-rip/src/gaps.rs`; kept out of

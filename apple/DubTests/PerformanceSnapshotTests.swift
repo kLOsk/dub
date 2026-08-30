@@ -37,7 +37,13 @@ final class PerformanceSnapshotTests: XCTestCase {
         host.frame = CGRect(x: 0, y: 0, width: width, height: height)
         host.layoutSubtreeIfNeeded()
         assertSnapshot(
-            of: host, as: .image, named: name,
+        // Anti-aliasing is not reproducible across machines or OS
+        // versions. Eight baselines here were failing with a *visually
+        // identical* render — 310 differing bytes out of 1.25 MB, max
+        // delta 16/255 — and were misdiagnosed as views that had moved.
+        // `perceptualPrecision` tolerates that per-pixel noise; a real
+        // layout change moves far more than this and still fails.
+            of: host, as: .image(perceptualPrecision: 0.98), named: name,
             file: file, testName: testName, line: line)
     }
 
@@ -107,8 +113,12 @@ final class PerformanceSnapshotTests: XCTestCase {
     // MARK: - Performance pads
 
     func test_performancePads_deckA() {
+        // Wide enough for the whole LOOP row. It was 320 pt, chosen when
+        // the row was four length pads and an exit; M13 added IN / OUT
+        // and the baseline started clipping its own content — labels
+        // read "UE" / "OOP" and the exit pad fell off the right edge.
         snap(deckBg(PerformancePadsView(side: .a)),
-             width: 320, height: 360, named: "pads-deck-a")
+             width: 560, height: 360, named: "pads-deck-a")
     }
 
     func test_deckHeader_withSourceControl() {
@@ -130,15 +140,19 @@ final class PerformanceSnapshotTests: XCTestCase {
              width: 720, height: 108, named: "with-source-control-timecode")
     }
 
-    func test_deckHeader_withSourceControl_pinned() {
-        // User-pinned TIMECODE: the switch shows "· PINNED" (override),
-        // distinguishing it from the auto-selected case above.
+    func test_deckHeader_withSourceControl_thru() {
+        // THRU: a live record straight through. The third switch
+        // position, added when auto-detection was deferred in favour of
+        // an explicit INT · TC · THRU choice (PRD §5.1.1). This replaced
+        // a "· PINNED" case that no longer renders differently —
+        // `SourceControlView.overridden` is documented dead, because
+        // with an explicit switch every mode is pinned.
         let state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: "Bow Down", trackArtist: "Westside Connection",
             bpm: 92.9, pitchPercent: -2.3, timecodeLockState: 1,
-            sourceControl: .timecode,
-            sourceControlOverridden: true,
+            sourceControl: .thru,
+            sourceControlOverridden: false,
             key: "7A",
             formatChip: "MP3 · 44.1 kHz · stereo",
             timeRow: .remainingOnly,
@@ -146,15 +160,18 @@ final class PerformanceSnapshotTests: XCTestCase {
             isPanicPlay: false, useTimecodeToggle: false,
             gridLocked: false, gridDriftQuality: nil)
         snap(deckBg(DeckHeader(side: .a, state: state)),
-             width: 720, height: 108, named: "with-source-control-pinned")
+             width: 720, height: 108, named: "with-source-control-thru")
     }
 
     // MARK: - Source control (Internal/Timecode switch + status)
 
     func test_sourceControl_allStates() {
+        // One row per real state. `overridden` used to add a "· PINNED"
+        // variant; the explicit switch retired it (every mode is pinned),
+        // so a second `.timecode` row would render identically.
         let states: [(SourceControlStatus, Bool)] = [
             (.off, false), (.internalPlay, false), (.calibrating, false),
-            (.timecode, false), (.timecode, true), (.thru, false),
+            (.timecode, false), (.thru, false),
         ]
         let stack = VStack(alignment: .leading, spacing: 12) {
             ForEach(0..<states.count, id: \.self) { i in

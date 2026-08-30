@@ -29,7 +29,13 @@ final class StillpointSnapshotTests: XCTestCase {
         let host = NSHostingView(rootView: view)
         host.frame = CGRect(x: 0, y: 0, width: 120, height: 500)
         host.layoutSubtreeIfNeeded()
-        assertSnapshot(of: host, as: .image, named: name,
+        // Anti-aliasing is not reproducible across machines or OS
+        // versions. Eight baselines here were failing with a *visually
+        // identical* render — 310 differing bytes out of 1.25 MB, max
+        // delta 16/255 — and were misdiagnosed as views that had moved.
+        // `perceptualPrecision` tolerates that per-pixel noise; a real
+        // layout change moves far more than this and still fails.
+        assertSnapshot(of: host, as: .image(perceptualPrecision: 0.98), named: name,
                        file: file, testName: testName, line: line)
     }
 

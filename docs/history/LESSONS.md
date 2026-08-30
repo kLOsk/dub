@@ -471,6 +471,20 @@
   to reach a floor and settle (`drain_then_stop`). **A fixed sleep waiting for
   another thread is a flake that has not happened yet.**
 
+- **A snapshot test with no pixel tolerance fails on anti-aliasing.** Eight
+  baselines were carried as "stale — the views moved through M11d / M14 / M15 /
+  M16"; measured, two of them differed by **310 bytes out of 1.25 MB** (0.025 %,
+  max delta 16/255) and were visually identical. Every suite now compares at
+  `perceptualPrecision: 0.98`. Diagnose an image failure by *measuring the
+  diff*, not by assuming the view changed — and re-record view by view, because
+  the six that really had changed hid a test asserting a distinction the code
+  had deliberately dropped (`SourceControlView.overridden`) and a frame too
+  narrow for its own content.
+- **An untracked regression gate is not a gate.** The baselines were gitignored
+  for months, so no review ever saw them and nobody noticed eight were wrong.
+  They are tracked now; `project.yml` excludes them from the DubTests
+  *resources* phase so deleting one to re-record does not break the build.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is
