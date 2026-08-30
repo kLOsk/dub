@@ -842,7 +842,7 @@ that is preserved.
 | SHM companion | `~/Library/Application Support/Dub/library.sqlite-shm` |
 | Waveform sidecars (M10.5j → M11a) | `~/Library/Caches/Dub/waveforms/{fingerprint_hex}.wf` |
 | Per-session log | `~/Library/Logs/Dub/session.log` (per PRD §2.2.7) |
-| Rip sessions (M26, v1.1) | `~/Music/Dub/Rips/{YYYYMMDD-HHMMSS}/` — see "Rip session artifacts" below |
+| Rip sessions (M26a + M26b, shipped) | `~/Music/Dub/Rips/{YYYYMMDD-HHMMSS}/` — see "Rip session artifacts" below |
 
 The Caches directory is intentionally separate from Application
 Support: macOS treats `~/Library/Caches/Dub/` as evictable under disk
@@ -870,8 +870,15 @@ rejects newer versions rather than misreading them), `sample_rate`,
 `channels`, `recorded_frames`, `boundaries_frames` (split points in
 frames; N boundaries → N+1 segments), `tracks[]` (per segment:
 `meta` with the user/recognition metadata, `encoded_file` relative
-path once encoded, `library_uuid` once imported), and `side_archive`
-(relative path once written). Commit is an **idempotent retry**:
+path once encoded, `library_uuid` once imported), `side_archive`
+(relative path once written), `side_start_frame` / `side_end_frame`
+(the detected bounds of the side — the lead-in and run-out grooves
+outside them are discarded at commit; `None` means the whole
+recording), and `replaced_uuids` / `split_generation` (re-split
+bookkeeping). Every field added after M26a carries `serde(default)`,
+which is exactly why the **SQLite schema stays at v9**: the manifest is
+a sidecar that versions itself, and an older `rip.json` still loads.
+Commit is an **idempotent retry**:
 segments that already carry a `library_uuid` are skipped, so a crash
 or per-segment failure mid-commit is resumed by running commit again.
 

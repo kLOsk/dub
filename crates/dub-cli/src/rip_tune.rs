@@ -518,9 +518,15 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         to_secs,
         path: path.ok_or_else(|| {
             anyhow!(
-                "usage: dub rip-tune <side.wav> [--min-gap S] [--min-track S] \
-                 [--margin-db DB] [--min-contrast-db DB] [--start-threshold-db DB] \
-                 [--silence-secs S] [--silence-drop-db DB]"
+                "usage: dub rip-tune <side.wav or any decodable audio>\n\
+                 \x20 window:   [--from SECS] [--to SECS]\n\
+                 \x20 gaps:     [--min-gap S] [--min-track S] [--pre-roll S] \
+                 [--margin-db DB] [--min-contrast-db DB]\n\
+                 \x20 lead-in:  [--lead-in-margin-db DB] [--lead-in-hold-secs S] \
+                 [--lead-in-secs S]\n\
+                 \x20 capture:  [--start-threshold-db DB] [--no-auto-start] \
+                 [--silence-secs S] [--silence-drop-db DB] [--no-auto-stop]\n\
+                 \x20 reports:  [--head SECS] [--profile SECS] [--quietest N]"
             )
         })?,
         gap,

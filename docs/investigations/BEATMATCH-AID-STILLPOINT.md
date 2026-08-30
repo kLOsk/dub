@@ -1,9 +1,11 @@
 # Stillpoint — beatmatch aid, round 3 (design proposal)
 
-Status: **proposal for review** — supersedes the round-2 gutter candidates
-(Pendulum / Tug Bars / Beat Ladder, `BeatmatchViz.swift`) and, if adopted,
-replaces PRD §9.4's Phase-Drift Trail as the centre-gutter design. The PRD
-edit is deliberately left to the design owner; this doc carries the full spec.
+Status: **adopted and shipped.** This is the binding sub-spec for PRD §9.4 —
+the PRD carries the summary, this doc carries the full spec, and acceptance
+§14 #13 is written against it. It superseded the round-2 gutter candidates
+(Pendulum / Tug Bars / Beat Ladder, `BeatmatchViz.swift`) and replaced the
+Phase-Drift Trail, which no longer exists under that name anywhere in the
+code (`StillpointModel` / `StillpointView`).
 
 Round-2 verdict from the rig: "none of them feels how DJs think — more like a
 programmer." This round started from a diagnosis of *why* (below), ran a

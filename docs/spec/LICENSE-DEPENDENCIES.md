@@ -4,7 +4,7 @@ This document enumerates every external library Dub links against, with its lice
 
 The list is kept in sync with the workspace `Cargo.toml` and per-crate `Cargo.toml` files by hand. If you add, remove, or upgrade an external dependency, update this document in the same commit.
 
-Last verified: M26a (workspace dependency-graph snapshot 2026-07; added `flacenc` + `metaflac` for the vinyl-rip encode stack, and promoted `serde` / `serde_json` from `dub-cli`-only to workspace-wide for the `rip.json` session manifest).
+Last verified: M26b (workspace dependency-graph snapshot 2026-07; added `flacenc` + `metaflac` for the vinyl-rip encode stack, and promoted `serde` / `serde_json` from `dub-cli`-only to workspace-wide for the `rip.json` session manifest).
 
 ---
 
@@ -17,7 +17,7 @@ Last verified: M26a (workspace dependency-graph snapshot 2026-07; added `flacenc
 | Apache-2.0 | 2 | Reproduce the license text + copyright notice; preserve any `NOTICE` file. |
 | Unlicense / MIT | 1 | Reproduce the license text (either license satisfies). |
 | MPL-2.0 | 2 | File-level copyleft only. The library binary may ship inside a proprietary application; if the library's source files themselves are modified, the modified files must remain MPL-2.0 and be made available on request. Dub does not modify any MPL-2.0 source files. |
-| GPL-3.0-or-later | 0 (today) | None in the dep graph as of M26a. The workspace `license` field reserves GPL-3.0-or-later (originally in anticipation of a `rubberband` integration; M14 shipped pure-Rust WSOLA instead); see "Forward-looking license commitments" below. |
+| GPL-3.0-or-later | 0 (today) | None in the dep graph as of M26b. The workspace `license` field reserves GPL-3.0-or-later (originally in anticipation of a `rubberband` integration; M14 shipped pure-Rust WSOLA instead); see "Forward-looking license commitments" below. |
 | LGPL-2.1 / LGPL-3.0 | 0 | Two LGPL FFIs (`chromaprint`, `aubio`) were explicitly routed around in favour of pure-Rust replacements (`rusty-chromaprint`, `dub-bpm`). See PRD §10.2 + `docs/SHIPPED.md` M7.5 / M11b. |
 
 **Net effect.** Every external dependency wired into Dub today is permissive or file-level copyleft only. Nothing in the actual dependency graph contaminates a downstream binary with a viral copyleft obligation. The project remains free to be relicensed — no GPL dependency is in the graph or currently planned (M14 shipped pure-Rust WSOLA instead of `rubberband`). The M26 vinyl-rip encode stack was deliberately chosen pure-Rust / permissive (`flacenc` Apache-2.0, `metaflac` MIT); MP3 via LAME (LGPL-2.0-or-later) was evaluated and deferred — see "Forward-looking license commitments" — so this posture is **unchanged**.
@@ -302,19 +302,19 @@ These are `dev-dependencies` only. They do **not** appear in any shipped binary.
 
 These are not in the dep graph today. They are documented here so future work knows the constraints they will impose.
 
-### `rubberband` (planned, M14)
+### ~~`rubberband`~~ — evaluated at M14 and **dropped**
 
 * **License:** GPL-3.0
 * **Upstream:** https://breakfastquay.com/rubberband/ (Particular Programs Ltd / Chris Cannam)
-* **Planned role in Dub:** Time-stretch and key-lock. `crates/dub-stretch/` is the reserved location; the crate exists as an empty placeholder.
-* **License implications:** The workspace currently declares `license = "GPL-3.0-or-later"` in anticipation of this dependency landing. Once `rubberband` is wired in, every distributed Dub binary becomes GPL-3.0 and is subject to source-disclosure on request.
-* **Alternatives evaluated for v1:**
+* **Outcome: not linked, and not planned.** M14 benched it against a pure-Rust WSOLA written for `dub-stretch`: the WSOLA held pitch as well, beat it on transients and latency, and cost ~30 % more CPU (tunable via the search window). The GPL dependency never landed, and `crates/dub-stretch/` is a complete implementation rather than a placeholder.
+* **License implications, had it landed:** every distributed Dub binary would have become GPL-3.0, subject to source-disclosure on request. The workspace still declares `license = "GPL-3.0-or-later"`, but that is now a choice rather than an obligation — nothing in the graph forces it.
+* **Alternatives evaluated at M14** (the last one won):
   - **zplane élastique** (commercial). The de-facto standard for DJ time-stretch (Serato / Traktor / rekordbox all use it). Per-product commercial licensing.
   - **Signalsmith Stretch** (MIT). Younger but maturing; pure DSP; permissive.
   - **SoundTouch** (LGPL-2.1). Older, lower quality; LGPL dynamic-linking complications for iOS.
-  - **Custom phase-vocoder / WSOLA implementation in pure Rust.** Higher implementation cost; full control.
+  - **Custom phase-vocoder / WSOLA implementation in pure Rust.** Higher implementation cost; full control. ← **chosen**.
   - **No time-stretch in v1.** Scratch DJs ride the turntable pitch slider; time-stretch is a club-DJ feature first.
-* **Commercial-license escape:** Rubber Band is dual-licensed by its author. The commercial license lifts the GPL obligation entirely, allowing a closed-source distribution. Pricing is per-product; contact `breakfastquay.com` for current rates.
+* **Commercial-license escape (moot):** Rubber Band is dual-licensed, and the commercial licence would have lifted the GPL obligation. Not needed — the dependency was never taken.
 
 ### `aubio` (deliberately not linked)
 

@@ -168,7 +168,7 @@
         <a href="../spec/LIBRARY-SCHEMA.md">Library schema</a>
         <a href="backlog.html">UI backlog</a>
     </div>
-    <span class="dub-nav__source">source: UI-BACKLOG.md · triaged 2026-05-17</span>
+    <span class="dub-nav__source">source: UI-BACKLOG.md · triaged 2026-08-30</span>
 </nav>
 
 <main class="dub-shell">
@@ -177,7 +177,7 @@
     <div class="dub-page-head__eyebrow">UI / UX backlog · SwiftUI shell</div>
     <h1>UI backlog</h1>
     <p class="dub-page-head__lede">
-        Items found during the 2026-05-17 SwiftUI review that were
+        Items found during the SwiftUI reviews of 2026-05-17, 2026-06-04, 2026-07-02, and the M26 / M13 rounds that were
         <em>not</em> immediately fixed in-session. Triaged into three buckets
         ordered roughly by priority within each. Closed and stale items are
         kept at the bottom for archaeology; the kanban above only shows
@@ -203,37 +203,19 @@
                 <span class="column__count">correctness or visible user pain</span>
             </div>
 
-            <article class="card card--bug" data-tags="bug" data-filter-text="B-7 scanMissingFilesBatch identical if else branches">
-                <div class="card__head"><span class="card__id">B-7</span><span class="pill">low impact · wasteful</span></div>
-                <div class="card__title"><code>scanMissingFilesBatch</code> has identical if / else branches</div>
+            <article class="card card--bug" data-tags="closed" data-filter-text="B-7 B-8 B-9 closed fixed M11d.8">
+                <div class="card__head"><span class="card__id">B-7 · B-8 · B-9</span><span class="pill">closed</span></div>
+                <div class="card__title">All three closed in M11d.8</div>
                 <div class="card__body">
-                    Both arms call <code>library.markFileState</code> with the same arguments. Behaviour is correct; it just writes the same row to SQLite twice the database hits otherwise would on first-import days.<br><br>
-                    <strong>Fix:</strong> collapse the branches, or split the FFI so the unchanged path is a cheap <code>UPDATE … SET last_seen_at = ?</code>.
+                    <code>scanMissingFilesBatch</code>'s duplicate branches, the
+                    <code>libraryTrackCount</code> selection clobber, and the missing search
+                    debounce were all fixed in the M11d.8 polish round.<br><br>
+                    <strong>No open correctness bugs are tracked here today.</strong> The live
+                    list is <a href="../UI-BACKLOG.md">UI-BACKLOG.md</a>, which now runs to six
+                    sections — timecode follow-ups (P-32…P-35), FX / siren (F-36…F-38), and
+                    vinyl rip (R-41…R-48) — none of which this board has ever shown.
                 </div>
-                <div class="card__meta">
-                    <span>swift</span>
-                    <span>MainView.swift ~L957</span>
-                </div>
-            </article>
-
-            <article class="card card--bug" data-tags="bug" data-filter-text="B-8 libraryTrackCount refresh clobbers user selection">
-                <div class="card__head"><span class="card__id">B-8</span><span class="pill">selection</span></div>
-                <div class="card__title"><code>libraryTrackCount</code> refresh clobbers selection</div>
-                <div class="card__body">
-                    The <code>onChange(of: model.libraryTrackCount)</code> path calls <code>refreshTracks()</code> with <code>preserveSelection: false</code>. Intended trigger is "another window just imported tracks"; in practice it also fires during the user's own session and loses the highlighted row.<br><br>
-                    <strong>Fix:</strong> pass <code>preserveSelection: true</code> from this <code>onChange</code>. The preserve path already exists.
-                </div>
-                <div class="card__meta"><span>swift</span><span>LibraryView.swift</span></div>
-            </article>
-
-            <article class="card card--bug" data-tags="bug" data-filter-text="B-9 search field debounce FTS5 250ms keystroke">
-                <div class="card__head"><span class="card__id">B-9</span><span class="pill">scales to 100 k rows</span></div>
-                <div class="card__title">Search field has no debounce</div>
-                <div class="card__body">
-                    Every keystroke re-queries FTS5 synchronously and triggers a full list rebuild. Fast today, but a 500 ms-long word means six queries plus six rebuilds.<br><br>
-                    <strong>Fix:</strong> wrap the <code>onChange</code> in <code>.task(id: searchText)</code> with a 250 ms sleep. Cancel-on-new-input is automatic with that pattern.
-                </div>
-                <div class="card__meta"><span>swift</span><span>LibraryView.swift</span></div>
+                <div class="card__meta"><span>see</span><span>UI-BACKLOG.md "Closed (archive)"</span></div>
             </article>
         </div>
 
@@ -408,7 +390,7 @@
             <li><strong>B-7 → B-9</strong> should land before major new library UI features, since they affect existing functionality.</li>
             <li>The beat-grid cluster (<strong>B-11 octave</strong>, <strong>U-18 grid jitter</strong>, <strong>U-19 tap-to-grid</strong>) has shipped / closed. Further automatic octave gains are gated on a learned beat tracker — see <a href="../investigations/BPM-DETECTOR-V2-INVESTIGATION.md">BPM-DETECTOR-V2-INVESTIGATION.md</a>, not a heuristic-tuning task.</li>
             <li><strong>C-24 / C-25</strong> (<code>FileBrowserView</code> + <code>LibraryPlaceholder</code> dead code) are deleted.</li>
-            <li>The UX bucket can land alongside <strong>M11e (Library polish)</strong> — most items are surface-level copy or layout tweaks.</li>
+            <li>The UX bucket can land alongside <strong>M11d-columns</strong> — most items are surface-level copy or layout tweaks.</li>
             <li>Code-health items are not blocking but should be ticked off as PRs touch the affected files.</li>
             <li><strong>Hygiene note:</strong> <code>UI-BACKLOG.md</code> has two cards each at <code>U-18</code> and <code>U-19</code> (beat-grid jitter / sort semantics, and tap-to-grid / idle-hint truncation). Preserved as written here; worth a one-line renumber when the next backlog pass lands.</li>
         </ul>
@@ -435,7 +417,7 @@
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">C-25</span> · <code>LibraryPlaceholder</code> dead code · <span class="pill pill--shipped">deleted</span></h3>
-                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deleted from <code>Placeholders.swift</code> (struct + <code>#Preview</code> + header comment). <code>FXBarPlaceholder</code> stays — it still marks the unshipped M15/M16/M17 FX slots.</p>
+                    <p style="color: var(--dub-text-muted); font-size: 13px;">Deleted from <code>Placeholders.swift</code> (struct + <code>#Preview</code> + header comment). <code>FXBarPlaceholder</code> stays — M15 (echo-out) and M16 (siren) shipped, so it now marks the M17 sampler slot and the deferred FX-deck role.</p>
                 </div>
                 <div class="dub-card">
                     <h3 style="margin: 0 0 6px;"><span style="font-family: var(--font-mono); color: var(--dub-text-muted);">B-11</span> · Auto BPM locks at 2× · <span class="pill pill--shipped">addressed M11c.3 + PRD-BEATS</span></h3>
@@ -479,10 +461,10 @@
 </section>
 
 <div class="dub-source-row">
-    <span>Generated from</span>
+    <span>Hand-kept from</span>
     <a href="../UI-BACKLOG.md">docs/UI-BACKLOG.md</a>
     <span>·</span>
-    <span>review date 2026-05-17</span>
+    <span>review date 2026-08-30</span>
 </div>
 
 </main>

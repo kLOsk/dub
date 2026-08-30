@@ -567,7 +567,7 @@ _One line each; full write-ups are in git history. Kept so a reopened symptom is
 * C-24 / C-25 (`FileBrowserView` + `LibraryPlaceholder` dead code) are
   deleted. The remaining open code-health items (C-27, C-28, C-30, C-31)
   are non-blocking and should ride along with the next library PR.
-* The UX bucket can land alongside M11e (Library polish) — most
+* The UX bucket can land alongside M11d-columns — most
   items are surface-level copy or layout tweaks.
 * Code-health items are not blocking but should be ticked off
   during routine refactors rather than left to accrete.

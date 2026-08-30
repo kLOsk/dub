@@ -1,6 +1,6 @@
 # LESSONS.md — pitfalls and hard-won decisions
 
-> Distilled from the M0→M11d.8 build (the blow-by-blow lives in git history
+> Distilled from the M0→M26b build (the blow-by-blow lives in git history
 > and the `SHIPPED.md` milestone index). This is the "don't repeat these
 > mistakes" file: every entry cost us a debugging session or a dogfood night.
 > Read it before touching the subsystem it names.
@@ -431,6 +431,8 @@
   capture and re-split can reach back past the trim — a trim without a lossless
   archive behind it would be data loss.
 
+## Looping / key lock (M13)
+
 - **A "still owed" note in the spec is a claim about the code, and it rots.**
   Timecode-correct looping was listed as an open v1 ship gate in four documents
   while the engine had implemented *and* acceptance-tested it — the arbitration
@@ -443,6 +445,8 @@
   blend is symmetric in time, so the seam is continuous in both directions —
   which a ramp probe showed immediately (both directions read identically). The
   fix would have been real code solving nothing.
+
+## Build + test hygiene
 
 - **A bloated `target/debug/deps/` makes the whole suite 30x slower.** Process
   exec from a directory holding 178 000 files costs **562 ms**; from a normal

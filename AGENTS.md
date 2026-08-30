@@ -52,7 +52,9 @@ we are **not** building a controller-only DJ app (no Serato/rekordbox territory)
 crates/
   dub-engine/        Audio graph, transport, RT-safety types, ThruSource (M7). Hot path.
   dub-audio/         CoreAudio HAL input + output, ringbuf-buffered handoff.
-  dub-dsp/           Resamplers, filters, FX building blocks (placeholder for v1 FX).
+  dub-dsp/           Resamplers, filters, and the shipped FX: EchoOut (M15), the PT2399 dub echo,
+                     the three siren units (GS1 / DS01E / SN76477) and the vintage chain
+                     (spring / RE-201 / BigKnob / phaser) parked behind the deferred FX-deck role (M16).
   dub-stretch/       M14 — pure-Rust WSOLA time-stretch / key-lock engine. No unsafe, no C deps
                      (Rubber Band was benched and dropped; see the M14 row in PRD §12.0).
   dub-io/            symphonia-based decoders, in-memory track buffers.
@@ -72,7 +74,8 @@ crates/
                      salvage / session recovery, and re-split from the lossless archive.
                      Fully offline.
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
-  dub-ffi/           UniFFI Swift bindings (placeholder; M0.5).
+  dub-ffi/           UniFFI Swift bindings — `DubEngine`, `DubLibrary` and `DubRipSession`.
+                     `FFI_VERSION` is the contract number; bump it and README together (docs-check gates it).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
                      rip / rip-tune / rip-resplit / decode-timecode.
@@ -84,12 +87,20 @@ docs/                README.md (routing guide — which doc to load for a task) 
                      LIBRARY-SCHEMA.md, LIBRARY-FORMATS.md, LICENSE-DEPENDENCIES.md.
   history/           SHIPPED.md (one-line-per-milestone index; detail in git) +
                      LESSONS.md (pitfalls + load-bearing decisions — read before touching a subsystem).
-  investigations/    BPM-DETECTOR-V2 + WAVEFORM-JITTER runbooks.
+  investigations/    BPM-DETECTOR-V2 + WAVEFORM-JITTER runbooks, and BEATMATCH-AID-STILLPOINT
+                     (the binding sub-spec for the shipped Stillpoint aid; PRD §9.4 is the summary).
   html/              status dashboard (index / roadmap / backlog).
 scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
 .claude/             Claude Code settings + hooks (mirrors .cursor/; see CLAUDE.md).
+.githooks/pre-push   fmt-check + clippy + docs-check + tests — the gates that break main.
 .github/workflows/   CI pipeline.
+fuzz/                cargo-fuzz targets for the library parsers.
+testdata/
+  rip-baselines/     Three real record sides (24-bit FLAC, gitignored — 748 MB) + a tracked
+                     README. Ground truth for every constant in dub-rip/src/gaps.rs; replay
+                     with `dub rip-tune`. Never re-fit those gates against a single record.
+Makefile             test / app / ci / sweep / docs-check / snapshot …
 ```
 
 ---
@@ -108,6 +119,10 @@ make cov           # cargo llvm-cov (requires cargo-llvm-cov installed)
 make fuzz-quick    # run all fuzz targets for 60s each (placeholder until parsers exist)
 make soak          # run the offline render soak harness for 1 hour
 make sweep         # drop build artifacts unused for 14 days (see below)
+make check-stale   # sweep only when target/debug/deps is over STALE_MAX (runs before test / app)
+make docs-check    # FFI / schema / crate-count numbers in docs match the code
+make app           # build the macOS app
+make ci            # docs-check + fmt-check + clippy + test — exactly what CI runs
 ```
 
 **If the suite suddenly feels slow, count the build artifacts first.**

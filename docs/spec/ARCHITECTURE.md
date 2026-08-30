@@ -63,17 +63,21 @@ buffers, never callbacks across thread boundaries.
               ┌────────────────────┬─────────────┬─────────────┬──────────────┬────────────────┐
               ▼                    ▼             ▼             ▼              ▼                ▼
           dub-timecode         dub-dsp       dub-stretch   dub-io          dub-bpm          dub-peaks
-          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5+M8+M8.1 —  (M9 — off-RT
-           Traktor MK1/MK2,    biquads,      FFI; GPLv3    decoders, in-    pure-Rust log-   decimator +
-           clean-room)         FX placeholders) license)   RAM tracks)     band ODF +        PeakBuffer for
+          (Serato CV02 +      (rubato,      (pure-Rust    (symphonia       (M7.5+M8+M8.1 —  (M9 — off-RT
+           Traktor MK1/MK2,    biquads,      WSOLA; no C   decoders, in-    pure-Rust log-   decimator +
+           clean-room)         EchoOut,      deps, no GPL) RAM tracks)     band ODF +        PeakBuffer for
+                               PT2399, siren,                               windowed-energy
                                                                            windowed-energy   live waveform
                                                                            picker)           rendering)
 
           ┌─────────────────────────────────────────────────────────────────────┐
           │ Off-RT / app-side services and future features:                     │
-          │   dub-thru        (source-detection classifier, §5.1.1 — empty)     │
+          │   dub-thru        (source-detection classifier — §5.1.1 DEFERRED)   │
           │   dub-fingerprint (pure-Rust Chromaprint for library dedupe)         │
           │   dub-library     (SQLite catalog, importer, analysis cache)         │
+          │   dub-spectral    (shared STFT + log-bands, feeds bpm + peaks)       │
+          │   dub-encode      (M26 — FLAC encode + Vorbis-comment tagging)       │
+          │   dub-rip         (M26 — capture worker, gap detect, trim, commit)   │
           │   dub-controller  (HID/MIDI abstractions for v1.x+)                 │
           └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -82,7 +86,7 @@ buffers, never callbacks across thread boundaries.
 
 1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M9 per-Thru-deck peak decimators via `dub_peaks::PeakStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). FFI-heavy or license-sensitive code stays in leaf crates. `dub-bpm`, `dub-peaks`, and `dub-fingerprint` are pure Rust today; if an aubio backend ever lands behind a feature flag it stays confined to `dub-bpm`.
 
-2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only. It exposes the `DubEngine` surface for engine lifecycle, deck control, waveform peaks, beat grids, and loads, plus a separate `DubLibrary` surface for the SQLite catalog, import, scanner, Relocate, and analysis actions. The two FFI objects stay separate so disk-backed library work never becomes an engine or audio-thread dependency.
+2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only. It exposes the `DubEngine` surface for engine lifecycle, deck control, waveform peaks, beat grids, and loads, plus a separate `DubLibrary` surface for the SQLite catalog, import, scanner, Relocate, and analysis actions. The three FFI objects stay separate so disk-backed library work never becomes an engine or audio-thread dependency.
 
 ## RT-safety enforcement
 

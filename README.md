@@ -129,8 +129,12 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **M11d.5 → M11d.7** | ✅ shipped | Dogfooding bug-fix rounds (Performance-mode play, library-sourced beat grid as single source of truth); full-screen launch; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **PRD-BEATS hardening** | ✅ shipped | Uniform Traktor-style beat grid + M11d.6 calibration; tap-to-grid, explicit `bar_phase` (schema v5), relatch "set the 1"; beat-grid robustness rounds 5–10 (universal downbeat, set-the-1 contract, `OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose` CLI; waveform + beat-grid jitter killed end to end. | [`PRD-BEATS.md`](docs/spec/PRD-BEATS.md) |
 | **Manual crates** | ✅ shipped | User-created Dub crates (PRD §8.5.1): create, inline-rename, delete, drag tracks in, remove, and reorder (drag-to-reorder + context-menu move). A `#` manual-order column drives the order; reorder is enabled only in manual order, and clicking any other column header sorts the crate as a read-only view. SQLite `crates` / `crate_tracks` CRUD + ordering, FFI surface (FFI **29**), editable "Dub Crates" sidebar section. | [`PRD.md §8.5.1`](docs/spec/PRD.md#851-source-tree) |
-| **M11d-history → loops** | ✅ shipped | Played From / Played Into session history (`SessionTracker`, FFI 37); timecode-display rate = audible (xwax/Mixxx parity; ±8 anchor-warp deleted); PRD-BEATS round 11 (visual kick-edge grid, set-the-1 re-anchor, first-measurable-beat downbeat); **hot cues** (performance cues — FFI 38); **reverse loops** (internal-play — FFI 39); Stillpoint beatmatch aid (was "Phase-Drift Trail"). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), timecode-correct looping, then Sampler → Polish/Alpha. Importers, Key Lock (WSOLA), Echo-Out, and the Dub Siren have shipped. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
+| **M11d-history → loops** | ✅ shipped | Played From / Played Into session history (`SessionTracker`, FFI 37); timecode-display rate = audible (xwax/Mixxx parity; ±8 anchor-warp deleted); PRD-BEATS round 11 (visual kick-edge grid, set-the-1 re-anchor, first-measurable-beat downbeat); **hot cues** (performance cues — FFI 38); **reverse loops** (FFI 39); Stillpoint beatmatch aid (was "Phase-Drift Trail"). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M11e, M12b–f** | ✅ shipped | External-library importers (Serato DB + GEOB grids/cues, Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML), collection membership + energy overview, ratings / colours / favourites / dynamic filters. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M14 → M16** | ✅ shipped | Key Lock — a **pure-Rust WSOLA** stretcher, not Rubber Band, which was benched and dropped; Echo-Out (100 % wet tap-toggle); the Dub Siren instrument (GS1 / DS01E / SN76477 units, PT2399 echo) + the vintage-chip FX chain. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M13** | ✅ shipped | Looping complete: grid-snapped reverse grab, **manual Loop In / Loop Out**, correct under timecode, and key lock holding through a loop (FFI **61**). Closes acceptance §14 #8. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M26a + M26b** | ✅ shipped | **Vinyl rip**: drop the needle, get split, tagged, pre-analyzed FLAC tracks in the library. Record tap → crash-safe spill → adaptive gap detection → both-end side trim → encode + tag + import, plus session recovery, re-split from the lossless archive, the Prep review UI and the Real Records browser node. Fully offline. Gates fitted against three real records. | [`PRD.md §5.2.7`](docs/spec/PRD.md) |
+| **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), then Sampler → Polish/Alpha. **M26c** (rip recognition: AcoustID + MusicBrainz + Discogs) is the next rip increment. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
 before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **61** at the
@@ -145,8 +149,8 @@ dub/                                 repo root (workspace)
 ├── crates/
 │   ├── dub-engine/                  audio graph, transport, RT-safety, LiftPolicy, ThruSource
 │   ├── dub-audio/                   CoreAudio HAL input + output (M1.4, M5.2, M5.5.2, M5.6)
-│   ├── dub-dsp/                     resamplers, filters, FX (placeholder for v1 FX work)
-│   ├── dub-stretch/                 Rubber Band FFI wrapper (M14, placeholder)
+│   ├── dub-dsp/                     resamplers, filters, EchoOut + PT2399 + siren units + vintage FX chain
+│   ├── dub-stretch/                 pure-Rust WSOLA time-stretch / key lock (M14; Rubber Band dropped)
 │   ├── dub-io/                      symphonia-based decoders (everything in RAM)
 │   ├── dub-timecode/                Serato CV02 + Traktor MK1/MK2 decoder (clean-room)
 │   ├── dub-thru/                    Thru-mode source-detection classifier (§5.1.1, placeholder)
@@ -155,11 +159,14 @@ dub/                                 repo root (workspace)
 │   ├── dub-peaks/                   M9 + M9.5b — Decimator + BandDecimator, PeakBuffer (broadband + bands), PeakStream — live waveform capture
 │   ├── dub-fingerprint/             Pure-Rust Chromaprint (M11b library dedupe; v1.1 recognition parked)
 │   ├── dub-library/                 SQLite catalog + import adapters (M11, shipped)
+│   ├── dub-encode/                  M26 — FLAC encode (flacenc) + Vorbis-comment tagging
+│   ├── dub-rip/                     M26 — vinyl-rip engine: capture, gap detection, side trim, commit
 │   ├── dub-controller/              HID/MIDI abstractions (v1.x+, placeholder)
-│   ├── dub-ffi/                     UniFFI Swift bindings (DubEngine: devices / thru / file playback / peaks / beat grid / tap-to-grid / library beat-grid handshake)
-│   └── dub-cli/                     `dub` binary (smoke / play / capture /
-│                                                 timecode-deck / thru / scope /
-│                                                 calibrate / analyze / diagnose / …)
+│   ├── dub-ffi/                     UniFFI Swift bindings — DubEngine, DubLibrary, DubRipSession
+│   └── dub-cli/                     `dub` binary (smoke / play / capture / levels /
+│                                                 timecode-deck / thru / scope / calibrate /
+│                                                 analyze / diagnose / import / rip /
+│                                                 rip-tune / rip-resplit / decode-timecode)
 ├── apple/                           AppKit + SwiftUI shell (Performance + Prep mode, library browser — XcodeGen-managed)
 │   ├── project.yml                  XcodeGen manifest (links CoreAudio + Metal SDK frameworks)
 │   ├── Dub/                         AppKit @main + SwiftUI shell
@@ -170,8 +177,13 @@ dub/                                 repo root (workspace)
 │   └── DubShared/                   Swift Package wrapping DubCore.xcframework
 ├── tools/
 │   └── rt-audit/                    RT-thread allocation auditor
-├── docs/                            PRD.md, PRD-BEATS.md, SHIPPED.md, ARCHITECTURE.md,
-│                                    LIBRARY-SCHEMA.md, LIBRARY-FORMATS.md, html/ dashboard (README.md = routing guide)
+├── docs/                            README.md = routing guide; spec/ (PRD, PRD-BEATS, ARCHITECTURE,
+│                                    LIBRARY-SCHEMA, LIBRARY-FORMATS, LICENSE-DEPENDENCIES),
+│                                    history/ (SHIPPED, LESSONS), investigations/, UI-BACKLOG.md,
+│                                    html/ hand-kept dashboard
+├── testdata/rip-baselines/          three real record sides (24-bit FLAC, gitignored) — ground
+│                                    truth for the rip gates; replay with `dub rip-tune`
+├── fuzz/                            cargo-fuzz targets for the library parsers
 ├── scripts/                         build-xcframework.sh, bootstrap.sh (M0.5)
 ├── .cursor/                         Cursor rules + hooks for AI-assisted dev
 └── AGENTS.md                        always-loaded project context for AI
@@ -202,7 +214,9 @@ socially and in CI:
 make test          # cargo nextest run + clippy
 make smoke         # run the CLI smoke test
 make rt-audit      # run the RT-safety harness
-make ci            # everything CI runs (fmt-check + clippy + test + rt-audit)
+make ci            # everything CI runs (docs-check + fmt-check + clippy + test)
+make docs-check    # FFI / schema / crate-count numbers in the docs match the code
+make sweep         # drop build artifacts unused for 14 days (keeps the suite fast)
 make clippy        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt           # cargo fmt
 make app           # build Dub.app (Debug) — also regenerates xcodeproj if project.yml changed

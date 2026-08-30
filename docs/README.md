@@ -16,9 +16,16 @@ docs/
     SHIPPED.md         one-line-per-milestone index (detail in git)
     LESSONS.md         pitfalls + load-bearing decisions
   investigations/      research / runbooks
+    BEATMATCH-AID-STILLPOINT.md       binding sub-spec for the shipped Stillpoint
+                                      aid — PRD §9.4 is only the summary
     BPM-DETECTOR-V2-INVESTIGATION.md  WAVEFORM-JITTER-CAPTURE.md
   html/                read-only status dashboard (index / roadmap / backlog)
 ```
+
+Outside `docs/`: **`testdata/rip-baselines/README.md`** indexes the three real
+record captures the vinyl-rip gates were fitted against. The audio is
+gitignored; the README is the tracked part, and it carries the `rip-tune`
+output each record should still produce.
 
 Doc names below are unique, so they're referenced by bare name; the folder map
 above says where each lives.
@@ -86,6 +93,10 @@ load these** — read the Markdown directly. See `html/README.md` for the rule.
 | SwiftUI/AppKit UI polish backlog | `UI-BACKLOG.md` |
 | Beat-grid BPM octave / tap-to-grid / downbeat / waveform-overlay work | `PRD-BEATS.md` (source of truth); `BPM-DETECTOR-V2-INVESTIGATION.md` before any detector replacement |
 | License review, release acknowledgements | `LICENSE-DEPENDENCIES.md` |
+| Vinyl rip — capture, gap detection, side trim, commit, re-split | `PRD.md §5.2.7`, then `LESSONS.md` "Vinyl rip"; rip artifacts in `LIBRARY-SCHEMA.md`; open UI gaps in `UI-BACKLOG.md §6` |
+| Re-tuning the rip gap / trim constants | `testdata/rip-baselines/README.md`, then replay with `dub rip-tune`. **Never re-fit against one record** — `LESSONS.md` "One record is not a measurement" |
+| Looping, key lock, the deck render path | `PRD.md §6.2` + `§6.1.1`, then `LESSONS.md` "Looping / key lock (M13)" |
+| "The test suite got slow" / disk filling up | `LESSONS.md` "Build + test hygiene" — check `ls target/debug/deps \| wc -l` first, then `make sweep` |
 
 ## Context Budget Rules
 

@@ -60,7 +60,7 @@ We chose Rust as the language of the engine. The reasoning is not marketing.
 
 C++ would only be the right call if (a) we leveraged a large existing C++ codebase, (b) JUCE was a hard requirement, or (c) we hired from a senior C++ DSP talent pool. None apply.
 
-We *do* link to C/C++ libraries (Rubber Band, Aubio, optionally Chromaprint) via FFI. This is fine; FFI is one-way and well-isolated.
+We link to no C/C++ libraries at all: Rubber Band, aubio and Chromaprint were each evaluated and each replaced by a pure-Rust implementation (`dub-stretch`, `dub-bpm`, `dub-fingerprint`). This is fine; FFI is one-way and well-isolated.
 
 ### Performance philosophy
 
@@ -133,7 +133,7 @@ Every commit pushes through this stack:
 |---|---|---|---|
 | **Unit** | Pure functions, small modules | All Rust modules | Per commit (every push, every PR) |
 | **Property** (`proptest`) | Invariants over generated input | State machines, DSP buffer math, parsers, timecode decoder | Per commit |
-| **Golden** | DSP regression — hash a reference output, compare | All DSP stages, Rubber Band integration, resampler, FX | Per commit |
+| **Golden** | DSP regression — hash a reference output, compare | All DSP stages, the WSOLA stretcher, resampler, FX | Per commit |
 | **Integration** | Multi-crate orchestration via offline render | Full engine pipelines (load track → render N seconds with synthetic input → assert output) | Per commit |
 | **RT-safety** | `assert_no_alloc` engaged during render call | Audio thread code path | Per commit (**hard gate**) |
 | **Fuzz** (`cargo-fuzz`) | Malformed input does not crash | All file-format parsers (NML, GEOB, DB6, ID3, ALAC, FLAC, MP3 frame headers) | Continuous (dedicated fuzzer host or CI nightly) |
@@ -480,9 +480,9 @@ The differentiating feature, planned for v1.1.
 - The user must drop the needle near the start of a record for waveform capture to be meaningful. We do not "stitch" partial captures across plays in v1; that's a v1.x consideration.
 - Auto-BPM cannot detect tempo on solo a-cappella or beat-less ambient sections. UI must communicate "no beat detected" honestly, not lie with a fake number.
 
-#### 5.2.7 Vinyl rip (v1.1 — record real records into the library)
+#### 5.2.7 Vinyl rip (record real records into the library — M26a + M26b shipped)
 
-The natural completion of Thru Mode: the same signal path that plays a real record can **record** it. The DJ rips a side in Prep, splits it into tracks, and the tracks land in the library pre-analyzed — from then on they behave like any imported file. Once M21 recognition ships, ripped records also seed the fingerprint database Thru-mode recognition matches against: rip a record once, and Dub recognizes it under the needle forever after.
+The natural completion of Thru Mode: the same signal path that plays a real record can **record** it. The DJ rips a side in Prep, splits it into tracks, and the tracks land in the library pre-analyzed — from then on they behave like any imported file. Once recognition ships — M26c for the rips themselves, M21 for Thru-mode matching — ripped records also seed the fingerprint database Thru-mode recognition matches against: rip a record once, and Dub recognizes it under the needle forever after.
 
 - **Workflow (review-always).** Arm → drop the needle → record the side → review the captured envelope and confirm the split markers → each segment is encoded to FLAC 24-bit with Vorbis tags, imported, and pre-analyzed (fingerprint, beat grid, key, LUFS, waveform) at import. The whole side is also archived losslessly (`side.flac`) so splits can be redone later without touching the record again. The split review is never auto-committed: a mis-split rip pollutes the library silently, so the user looks once before commit. Mouse freely allowed throughout — this is Prep work; the §1 rule constrains performance gestures only.
 - **DJ-interface-only recording.** The record is captured through the same ≥ 4-out interface (the §5.3 / §3.1 Performance-class rig) and phono chain the DJ performs on — Thru on deck A — never the built-in soundcard. Product decision, not a technical limit: the rip should sound exactly like the rig. Consequence: ripping happens with the rig attached, which §3.1's auto-detect classifies as Performance Mode. A Preferences toggle ("Vinyl recording") therefore enables a **manual Prep ↔ Performance mode-switch button** that overrides the hardware auto-detect — a deliberate, documented exception to §3.1's auto-selection, gated behind Preferences precisely because it is one.
@@ -609,7 +609,7 @@ Includes: per-deck play/pause/scrub-bar, master gain, channel gain, primitive cr
 
 - Timecode-driven play/scrub/scratch
 - Slip mode (always on for timecode mode; configurable for internal)
-- **Key lock** (master tempo) toggle, via Rubber Band — see §6.1.1 for scratch-aware auto-bypass
+- **Key lock** (master tempo) toggle, via the pure-Rust WSOLA stretcher (`dub-stretch`) — see §6.1.1 for scratch-aware auto-bypass
 - **Pitch range** display (informational; pitch is set by the turntable, not software)
 - **Track time display** — shown in the deck header. Live read of the engine's deck-rate-aware playhead, formatted `MM:SS`. **Performance / Timecode mode** shows *only* the remaining time as `-MM:SS` — the two-deck split is space-tight in the header and "how long until I have to mix" is the only number the DJ touches mid-set (PRD §1 "every screen pixel earns its keep"). **Prep / Track-Preparation mode** shows both elapsed (`MM:SS`) and remaining (`-MM:SS`) because the single-deck rehearsal surface has the real estate and elapsed time is useful for hot-cue placement. Total length is omitted in both modes — duration + the displayed value gives total trivially.
 - Auto **gain trim** based on track loudness (LUFS-I or peak normalization, user choice)
@@ -673,24 +673,24 @@ The master is **not** chosen by mouse or by a focus ring. There is no `Tab` to c
 
 #### 6.1.1 Key Lock with scratch-aware auto-bypass
 
-Rubber Band cannot handle the rate excursions of scratching (rapid back/forward, very high `|rate|`, sub-millisecond rate changes). When Key Lock is enabled, the engine **automatically bypasses** the time-stretcher during scratching and re-engages it when the playhead settles, transparently to the user.
+A time-stretcher cannot handle the rate excursions of scratching (rapid back/forward, very high `|rate|`, sub-millisecond rate changes). When Key Lock is enabled, the engine **automatically bypasses** the time-stretcher during scratching and re-engages it when the playhead settles, transparently to the user.
 
 **Decision logic** (runs every audio block):
 
 - Compute current playback rate `r` (samples-per-output-sample) and rate-of-change `dr/dt`.
-- **Bypass** Rubber Band when ANY of:
+- **Bypass** the stretcher when ANY of:
   - `|r|` > 1.5× (scratching at speed)
   - `|dr/dt|` > threshold (rapid rate change, e.g. needle just hit)
   - `r` < 0.05 or `r` < 0 (near-stop or reverse)
-- **Re-engage** Rubber Band when ALL of:
+- **Re-engage** the stretcher when ALL of:
   - `|r - r_user|` < 0.1 (rate has settled near user's set tempo, where `r_user` is the turntable's current pitch slider position as inferred from timecode)
   - This condition has held for ≥ 200 ms
 
-**Crossfade**: bypass → engaged transition uses a 20–30 ms equal-power crossfade between the resampler-only signal and the Rubber Band signal to avoid clicks. Engaged → bypass is instantaneous (drop the Rubber Band stage; resampler picks up the same input pointer).
+**Crossfade**: bypass → engaged transition uses a 20–30 ms equal-power crossfade between the resampler-only signal and the stretched signal to avoid clicks. Engaged → bypass is instantaneous (drop the stretcher; resampler picks up the same input pointer).
 
 **UI**: a "Key Lock" indicator with two states:
-- **Green / on** — Rubber Band currently active (deck is playing in tempo).
-- **Dim green / standby** — Rubber Band bypassed for now (user is scratching), will re-engage automatically.
+- **Green / on** — the stretcher is currently active (deck is playing in tempo).
+- **Dim green / standby** — the stretcher is bypassed for now (user is scratching), will re-engage automatically.
 
 User does not see or configure thresholds. It just works.
 
@@ -963,7 +963,7 @@ Top to bottom:
 - **Smart Crates** (v1.0 hardcoded list, §8.5.2).
 - **Dub Crates** (user-created, full-color icon, editable). Drag tracks in from any source. Nestable. Persisted in `crates` / `crate_tracks`.
 - **Imported Sources**, one node per configured source (Serato, Traktor, rekordbox, iTunes), each containing a **read-only mirror** of that source's crates / playlists. Visually distinguished from Dub Crates (greyscale icon + lock glyph). Re-import rewrites this subtree without touching anything else.
-- **Real Records** (v1.1, fingerprint-recognized records the user has played in Thru mode; see §5.2.2, M21).
+- **Real Records** — live: lists committed vinyl-rip sessions and reopens one into the review panel for re-splitting (M26b, Prep-only). Fingerprint-recognized records the user has played in Thru mode remain the v1.1 expansion (§5.2.2, M21).
 
 The split between Dub Crates (editable, owned) and Imported Sources (read-only, mirrored) is non-negotiable. The user already has 200 Serato crates that took them eight years to organize; we are not the system of record for that. If we let the user "edit" an imported crate, the next re-import clobbers the edit and the DJ loses trust forever. Imported crates are sacred mirrors of the source app's truth; Dub Crates are the user's free space.
 
@@ -1312,8 +1312,8 @@ dub/                                 # repo / workspace name
 ├── crates/
 │   ├── dub-engine/                  # Audio graph, transport, mixer, ThruSource, no_std-ish hot path
 │   ├── dub-audio/                   # CoreAudio HAL input + output, ringbuf-buffered handoff
-│   ├── dub-dsp/                     # rubato, biquads, dub-siren synth, echo-out
-│   ├── dub-stretch/                 # Rubber Band FFI wrapper (separate crate for license clarity)
+│   ├── dub-dsp/                     # rubato, biquads, EchoOut, PT2399, siren voices (GS1 / DS01E / SN76477), spring / RE-201 / BigKnob / phaser
+│   ├── dub-stretch/                 # Pure-Rust WSOLA time-stretch / key lock (no unsafe, no C deps)
 │   ├── dub-io/                      # symphonia-based decoders (everything in RAM, see §4.4)
 │   ├── dub-timecode/                # Serato CV02 + Traktor MK1/MK2 decoder (clean-room)
 │   ├── dub-thru/                    # Thru-mode source-detection classifier (§5.1.1)
@@ -1322,9 +1322,11 @@ dub/                                 # repo / workspace name
 │   ├── dub-spectral/                # M9.5 — shared FFT + log-band magnitude pipeline (consumed by dub-bpm + dub-peaks)
 │   ├── dub-fingerprint/             # Library dedupe (M11b, shipped) + real-record recognition (v1.1). Pure-Rust Chromaprint via rusty-chromaprint.
 │   ├── dub-library/                 # SQLite + import adapters
+│   ├── dub-encode/                  # M26 — offline FLAC encode (flacenc) + Vorbis-comment / PICTURE tagging
+│   ├── dub-rip/                     # M26 — vinyl-rip session engine: capture worker, gap detection, side trim, manifest, commit
 │   ├── dub-controller/              # HID/MIDI abstractions (placeholder in v1)
 │   ├── dub-ffi/                     # UniFFI-generated bindings to Swift
-│   └── dub-cli/                     # `dub` binary (smoke / play / capture / timecode-deck / scope / calibrate / thru)
+│   └── dub-cli/                     # `dub` binary (smoke / play / capture / levels / timecode-deck / thru / scope / calibrate / analyze / diagnose / import / rip / rip-tune / rip-resplit / decode-timecode)
 ├── apple/                           # M0.5 shipped — AppKit + SwiftUI shell
 │   ├── project.yml                  # XcodeGen manifest (source of truth)
 │   ├── Dub.xcodeproj                # generated, gitignored
@@ -1334,7 +1336,7 @@ dub/                                 # repo / workspace name
 │   │   ├── MainWindowController.swift # NSWindow holding an NSHostingController
 │   │   ├── MainView.swift           # Top-level shell — hosts PerformanceView + Preferences sheet (M10.3)
 │   │   ├── DesignSystem/Tokens.swift # Colour / type / spacing tokens — single source of truth (M10.3)
-│   │   ├── Performance/             # PerformanceView, DeckHeader, StatusStrip, PhaseDriftView (M10.7), placeholders
+│   │   ├── Performance/             # PerformanceView, DeckHeader, StatusStrip, Stillpoint (M10.7), LibraryView, PerformancePadsView, the rip surfaces
 │   │   ├── Preferences/             # PreferencesSheet (⌘,)
 │   │   └── Waveform/                # Metal renderer + MTKView host (M10-B → M10.4 vertical rotation)
 │   └── DubShared/                   # Swift Package wrapping DubCore.xcframework + bindings
@@ -1345,15 +1347,27 @@ dub/                                 # repo / workspace name
 │   └── notarize.sh                  # v1.1
 ├── tools/
 │   └── rt-audit/                    # Static + runtime check: no alloc on audio thread
+├── fuzz/                            # cargo-fuzz targets (parsers: NML / plist / rekordbox XML / Serato)
+├── testdata/
+│   └── rip-baselines/               # Three real record sides (24-bit FLAC, gitignored) + a tracked README.
+│                                    # Ground truth for every constant in dub-rip/src/gaps.rs; replay with `dub rip-tune`.
+├── .githooks/pre-push               # fmt-check + clippy + docs-check + tests, the gates that break main
+├── Makefile                         # test / app / ci / sweep / docs-check …
 ├── docs/
-│   ├── PRD.md                       # ← this file
 │   ├── README.md                    # Routing guide: which doc to load for which task
-│   ├── SHIPPED.md                   # Full shipped design history; load by anchor
-│   ├── ARCHITECTURE.md              # How the crates fit together
-│   ├── LIBRARY-SCHEMA.md            # Public SQLite schema contract
-│   ├── LICENSE-DEPENDENCIES.md      # Dependency license + attribution inventory
+│   ├── spec/
+│   │   ├── PRD.md                   # ← this file
+│   │   ├── PRD-BEATS.md             # Beat-grid sub-spec
+│   │   ├── ARCHITECTURE.md          # How the crates fit together
+│   │   ├── LIBRARY-SCHEMA.md        # Public SQLite schema contract
+│   │   ├── LIBRARY-FORMATS.md       # Field notes on Serato / Traktor / rekordbox / iTunes / Lexicon parsing
+│   │   └── LICENSE-DEPENDENCIES.md  # Dependency license + attribution inventory
+│   ├── history/
+│   │   ├── SHIPPED.md               # One line per milestone; detail lives in git
+│   │   └── LESSONS.md               # Pitfalls + load-bearing decisions — read before touching a subsystem
+│   ├── investigations/              # BPM-DETECTOR-V2, WAVEFORM-JITTER, BEATMATCH-AID-STILLPOINT runbooks
 │   ├── UI-BACKLOG.md                # Deferred SwiftUI/AppKit bugs and polish
-│   └── LIBRARY-FORMATS.md           # Field notes on Serato / Traktor / rekordbox / iTunes / Lexicon parsing
+│   └── html/                        # Hand-kept status dashboard (index / roadmap / backlog)
 └── README.md
 ```
 
@@ -1371,7 +1385,7 @@ dub/                                 # repo / workspace name
 | `coreaudio-rs` | macOS audio I/O | MIT/Apache | Direct HAL access |
 | `symphonia` | Decoding | MPL-2.0 | All formats incl. ALAC |
 | `rubato` | Resampling | MIT | Sinc-based, FixedOut variant |
-| `rubberband` (FFI) | Time-stretch / key lock | **GPLv3** | Forces whole project to GPL — accepted. |
+| ~~`rubberband` (FFI)~~ | Time-stretch / key lock | GPL-3.0 | **Evaluated at M14 and dropped** — the pure-Rust WSOLA in `dub-stretch` matched it on pitch and beat it on transients + latency. Never entered the dep graph. |
 | `aubio` (FFI) | Beat detection (fallback) + live tempo tracking on Thru — *not currently used* | **LGPL-3.0** | M7.5 shipped a pure-Rust baseline (see [`docs/SHIPPED.md`](../history/SHIPPED.md)). Aubio is parked as a future opt-in feature backend on `dub-bpm`; if added it would be dynamically linked and confined to that single crate. |
 | `rusty-chromaprint` | Audio fingerprinting (library dedupe M11b, real-record recognition v1.1) | MIT/Apache | Pure-Rust port of Lukáš Lalinský's Chromaprint. Library dedupe runs the **TEST1** preset (`Configuration::preset_test1()`); AcoustID's database is built on **TEST2**, so M26c recognition computes a separate TEST2 fingerprint transiently from the same PCM (stored dedupe blobs unchanged). M11b chose this over an FFI wrapper around the reference C library (`chromaprint`, LGPL-2.1) for the same reasons `dub-bpm` chose pure-Rust over aubio at M7.5: license isolation, no C build dep, no unsafe FFI surface, simpler distribution. Library-internal similarity-based dedupe needs only self-consistency, not cross-implementation bit-identity. The Chromaprint parameters Dub uses are documented in `docs/LIBRARY-SCHEMA.md` so the schema stays implementation-portable. |
 | `ringbuf` | Lock-free SPSC | MIT | RT-safe |
@@ -1477,13 +1491,15 @@ observably do at the end.
 | **Hot cues + reverse loops** | Four CUE pads (set / recall / clear, keys 1–4, persisted per track, waveform markers; §6.2.1) + grid-snapped "repeat the bars just heard" reverse loops (½/1/2/4 bar). | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M11e, M12b–d** | External-library importers: Serato (DB / crates / GEOB grids-cues-loops-keys-gain), Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML export. Idempotent by `(volume, path)`, shared track identity, playlist mirrors. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M12e → M12f** | Collection membership (browse-only sources until played, schema v7) + energy-map overview; ratings / colour labels / favourites strip / dynamic cascading filter bar (schema v8). Also shipped from the M11d-columns scope: header right-click column picker (grouped, persisted, header drag-to-reorder) over the active-priority columns incl. Key — see §8.5.3.1 for what remains. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M13** | Looping, complete: the grid-snapped reverse grab (½/1/2/4 bar), **manual Loop In / Loop Out** for tracks the analyser could not grid, correct behaviour under timecode (the platter drives the loop's velocity; the absolute re-pin and drift heal are suspended while it runs), and key lock holding *through* a loop. Closes §14 #8. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M26a + M26b** | Vinyl rip end to end: record tap → crash-safe spill → adaptive gap detection → both-end side trim → FLAC + tags → library import, plus session recovery, re-split from the lossless archive, the Prep review UI and the **Real Records** browser node. Gates fitted against three real records. Spec §5.2.7. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M14** | Key Lock + scratch-aware auto-bypass — shipped as a **pure-Rust WSOLA** stretcher (`dub-stretch`), not Rubber Band; the GPL dep was dropped after benching (pitch parity, better transients + latency). | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M15 → M16** | Echo-out (tap-toggle, 100 % wet) + the dub siren instrument (GS1 / DS01E / SN76477 units, onboard PT2399 echo, Simple / Advanced / Expert) + vintage-chip FX DSP chain (parked behind the post-release FX-deck role). Load-latency round: streaming decode-ahead (mixtape playable in ~1 s) + lock-free library analysis. | [`SHIPPED.md`](../history/SHIPPED.md) |
 
 ### 12.1 Planned path to v1.0
 
-_Rebased 2026-07-05: the importer block (M11e / M12b–d), M12e–f, M13's
-reverse-loop half, M14, M15, and M16 have shipped — see §12.0 and
+_Rebased 2026-08-30: the importer block (M11e / M12b–d), M12e–f, M13 **in
+full**, M14, M15, M16, and M26a + M26b have shipped — see §12.0 and
 [`SHIPPED.md`](../history/SHIPPED.md). What follows is the remaining work
 only. M11d-columns was re-scoped the same day: its UI infrastructure
 (picker / persistence / header reorder / Key column) shipped quietly with
@@ -1513,7 +1529,7 @@ we ship Stable when the SLOs are met, not on a calendar.
 | **M23** | **Code signing + notarization** | Apple Developer ID acquired; notarized DMG; auto-update mechanism. |
 | **M24** | **Beatgrid editor** | Full grid editing UX (drag downbeat, nudge BPM, halve/double, taps). |
 | **M25** | **Opt-in crash reporting** | Sentry (or similar) integration with explicit user toggle, redaction of file paths, per §2.2.7. |
-| **M26** | **Vinyl rip (record real records into the library)** | Record one side on the DJ rig (`dub rip` today, Prep-mode review UI later), split it into tracks, encode FLAC 24-bit + Vorbis tags, and the tracks appear in the library **pre-analyzed** (fingerprint, beat grid, key, LUFS, waveform) — fully offline, with the whole side archived losslessly. Spec in §5.2.7. Sub-milestones: **M26a** capture + manual split + encode + import (Rust core + CLI, shipped first as headless dogfood); **M26b** auto gap detection over the envelope, needle-drop auto-start / silence auto-stop, session recovery, re-split from archive; **M26c** recognition (AcoustID + MusicBrainz release tracklist + Discogs enrichment via a new `dub-recognize` leaf crate); plus the Swift review UI (draggable split markers). Synergy with M21: ripped records seed the library that Thru-mode fingerprint recognition matches against. |
+| **M26** | **Vinyl rip (record real records into the library)** | Record one side on the DJ rig (`dub rip` today, Prep-mode review UI later), split it into tracks, encode FLAC 24-bit + Vorbis tags, and the tracks appear in the library **pre-analyzed** (fingerprint, beat grid, key, LUFS, waveform) — fully offline, with the whole side archived losslessly. Spec in §5.2.7. Sub-milestones: **M26a ✅ shipped** capture + manual split + encode + import; **M26b ✅ shipped** auto gap detection, needle-drop auto-start / silence auto-stop, both-end side trim, session recovery, re-split from archive, review UI + Real Records browser node; **M26c** recognition (AcoustID + MusicBrainz release tracklist + Discogs enrichment via a new `dub-recognize` leaf crate); plus the Swift review UI (draggable split markers). Synergy with M21: ripped records seed the library that Thru-mode fingerprint recognition matches against. |
 
 ---
 
@@ -1524,14 +1540,14 @@ we ship Stable when the SLOs are met, not on a calendar.
 | Risk | Severity | Mitigation |
 |---|---|---|
 | Timecode quality on cheap interfaces | High | Test matrix from day one (SL3, Audio 6, generic class-compliant); document supported interfaces. We have both reference rigs in-house. |
-| Rubber Band CPU at 2 decks + key lock + active playback | Medium | Profile early (M14). Have a lower-quality fallback flag (`R3` engine off, use `Faster` engine). Scratch-aware auto-bypass (§6.1.1) reduces total Rubber Band load substantially during real DJ use. |
+| Stretcher CPU at 2 decks + key lock + active playback | Medium | Profiled at M14: the WSOLA stretcher costs ~30 % more CPU than Rubber Band, tunable via the search window. Scratch-aware auto-bypass (§6.1.1) removes the cost entirely while the platter is being worked, which is most of a scratch set. |
 | Auto-BPM accuracy on dub / minimal genres (sparse beats, half-time feels) | Medium → Low | **First-line:** M7.5's offline driver lets us evaluate the BPM engine against a fixture corpus of target genres on the bench (`cargo test`) before risking it on live audio. M8.1's log-band ODF + windowed-energy picker resolved the synthetic-fixture half-tempo / double-tempo cases (reggae 65, hip-hop 90/100, rolling dnb 174); see [`docs/SHIPPED.md`](../history/SHIPPED.md). M11c.3a's perceptual tempo prior extends the resolution to real catalogs, fixing the symmetric hip-hop at 2× (95 → 190) and DnB at 1/2× (172 → 86) failure modes that the synthetic-only M8.1 calibration missed; see [`docs/SHIPPED.md`](../history/SHIPPED.md). **Second-line (already shipped):** `BpmRange` escape hatch (`dub thru --bpm-range MIN,MAX`, `analyze_bpm_with_range(samples, sr, ch, range)`) constrains the search to a user-chosen window for the irreducibly-ambiguous genres (dubstep 140 / 70, reggae one-drop 65 / 130, slow soul) the algorithm cannot resolve without a prior. **Third-line (shipped):** tap-to-grid (M11c.3b) lets the DJ override the auto-detected BPM on a per-track basis with one keystroke (`G` / `Shift+G` / `Option+G`); see [`docs/SHIPPED.md`](../history/SHIPPED.md). **Fourth-line (future):** real-music validation can still motivate an `aubio-rs` feature backend on `dub-bpm` if a class of tracks falls outside both the algorithmic gate and the manual escape hatch — but the M8.1 + M11c.3 architecture has reduced this risk from the "blocking" level we started at. |
 | Chromaprint robustness to turntable pitch drift / mixer EQ (v1.1) | Medium | Validate during v1.1 with real-world test corpus. Fall back to Shazam-style constellation hashing if Chromaprint underperforms. |
 | Thru latency perceived as "feel different" by sensitive scratch DJs | Low–Medium | Hold latency below the ~5 ms scratch-imperceptibility threshold (PRD §6.1) with a 64-frame buffer / 48 kHz path. Keep it *constant* across FX state (Option A in-chain FX bypass, §5.2.1 / §5.2.2) so the DJ internalises one timing relationship for the whole set instead of one per FX engage. Document the trade-off; if hardware Thru is required, the operator uses the interface's physical button (which trades away BPM/waveform/FX for zero latency). |
 | rekordbox DB6 format changes | Medium | Always offer XML-export path as fallback. |
 | CoreAudio aggregate device weirdness | Medium | Document recommended interface configs. SL3 and Audio 6 both don't need aggregation. |
-| Notarization / code-signing setup | Low | Defer to v1.1 (M22). v1.0 ships unsigned-with-instructions per current decision. |
-| GPL incompatibility with future commercial plans | Medium | Explicit decision: GPL for now, revisit at v2. Rubber Band commercial license = ~£600 one-time when/if needed. |
+| Notarization / code-signing setup | Low | Defer to v1.1 (M23). v1.0 ships unsigned-with-instructions per current decision. |
+| GPL incompatibility with future commercial plans | Low | Nothing in the dep graph forces GPL — the reservation anticipated Rubber Band, which M14 dropped. The `GPL-3.0-or-later` workspace declaration is now a choice, not a constraint; revisit at v2. |
 | SL3 discontinued by Serato | Low | Class-compliant on macOS, works fine. We test against it but recommend the Audio 6 (or successors) as the reference modern interface in our docs. |
 
 ### 13.2 Open questions (to resolve during development)
@@ -1575,7 +1591,7 @@ Dub v1.0 ships when **all** of the following hold on a DMG installed on a clean 
 6. Echo-Out and Dub Siren can be applied to a Thru deck (i.e. FX work on real records); engaging FX does not change the deck's input-to-output latency.
 7. User can import their existing Serato / Traktor / rekordbox / iTunes / Lexicon library and play tracks with imported beatgrids. Auto-detect grids fall back when source has none.
 8. Looping (reverse-loop with beat-length select + halve/double, plus manual in/out, per §6.2) works correctly under timecode. ✅ **met** — M13.
-9. **Key Lock works on both decks; engages and disengages automatically based on playback rate per §6.1.1; user hears no glitches during scratching with Key Lock on.** Key Lock holds through a loop — the wrap happens in the stretcher's feed, so a looped deck at a pitched platter does not shift pitch while an unlooped one holds.
+9. **Key Lock works on both decks; engages and disengages automatically based on playback rate per §6.1.1; user hears no glitches during scratching with Key Lock on.** ✅ **met** — M14, and M13 for the loop case. Key Lock holds through a loop — the wrap happens in the stretcher's feed, so a looped deck at a pitched platter does not shift pitch while an unlooped one holds.
 10. Echo-Out, Dub Siren, Sampler (4 slots), Quick Scratch (4 slots, hotkey fast-load), Instant Doubles all work per §6 / §7.
 11. UI is keyboard-navigable end-to-end. **No performance gesture** (pitch / scratch / crossfade / EQ / gain / cue) requires the mouse — per §1's refined mouse rule. Mouse-driven *transport* (Panic Play, Casual Play, position navigation per §6.1) is in v1 and *not* in conflict with the philosophy.
 12. **Panic Play (§6.1.2)** recovers from a needle dirt event without audible interruption: keystroke transitions the deck from timecode-driven to last-known-velocity playback, audience hears no glitch, automatic resume on clean LFSR return verified in a manual rig test.
@@ -1591,12 +1607,12 @@ Dub v1.0 ships when **all** of the following hold on a DMG installed on a clean 
 
 - Internal mixer mode (user-facing)
 - Mouse-driven **performance gestures** (pitch / scratch / crossfade / EQ / gain / cue). Mouse-driven transport (Panic Play, Casual Play, position navigation) is **in scope** — see §1 for the rule, §6.1 for the surface.
-- Hot cues (entirely deferred to v2 — no v1 "lite" version)
+- The CDJ-style cue / preview button (a navigation affordance — a turntablist cues with the needle). Hot *cues*, the performance trigger points, are v1 and shipped: §6.2.1.
 - Saved loop slots (deferred to v1.x — v1 ships ephemeral loops only)
 - Sampler beyond 4 slots (v1 is 4; expansion to Serato-parity 6 deferred to v1.x if real use demands it)
 - Track Preparation Mode editing tooling — beatgrid editor, hot-cue prep, gain tweak (v1 ships the *shell*; tools land in v1.x)
 - Stillpoint numeric-only Preferences variant (single design in v1; alternative ships in v1.x if needed)
-- Recording
+- Recording of the master out, or per-deck session recording. (Vinyl *rip* — capturing a Thru deck into the library — is in scope and shipped: §5.2.7.)
 - Streaming services
 - Phase
 - HID controllers

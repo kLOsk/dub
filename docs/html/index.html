@@ -47,7 +47,7 @@
         <span>·</span>
         <span>SwiftUI / AppKit shell</span>
         <span>·</span>
-        <span>v0.1 working spec · 2026-05-31</span>
+        <span>v0.1 working spec · 2026-08-30</span>
     </div>
 </header>
 
@@ -82,8 +82,9 @@
         <div class="dub-card">
             <h3>Real records are first-class</h3>
             <p style="color: var(--dub-text-muted);">
-                Thru mode auto-detects when a real record is on the deck and
-                switches transparently. FX work on real records the same way
+                Thru mode passes a live record straight through; the DJ picks it
+                per deck with the INT · TC · THRU switch. Auto-detection is
+                deferred (PRD §5.1.1). FX work on real records the same way
                 they work on files.
             </p>
         </div>
@@ -122,7 +123,7 @@
 <section>
     <h2>Where to look</h2>
     <p style="color: var(--dub-text-muted); max-width: 72ch;">
-        The HTML views below are human-facing dashboards generated from the
+        The HTML views below are human-facing dashboards hand-kept alongside the
         Markdown sources in <code>docs/</code>. The Markdown stays the source
         of truth (agents and the build read it directly); these are for you
         and anyone you share a link with.
@@ -151,8 +152,8 @@
                 <code><a href="../spec/PRD.md">PRD.md</a></code> §12.
             </p>
             <div style="margin-top: var(--sp-md);">
-                <span class="pill pill--shipped">M0 → M11d.7 shipped</span>
-                <span class="pill pill--inprog">Library polish + importers next</span>
+                <span class="pill pill--shipped">M0 → M16, M26a/b, M13 shipped</span>
+                <span class="pill pill--inprog">Rip recognition (M26c) next</span>
             </div>
         </div>
 
@@ -253,7 +254,7 @@
 </section>
 
 <footer class="dub-footer">
-    Generated from the Markdown sources in <code>docs/</code>. Refresh manually
+    Hand-kept alongside the Markdown sources in <code>docs/</code>. Refresh manually
     when the source diverges. The Markdown wins; this surface is a reading
     aid.
 </footer>
