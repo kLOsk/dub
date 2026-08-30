@@ -7,7 +7,25 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check app app-release run-app open-app xcframework snapshot
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check app app-release run-app open-app xcframework snapshot sweep check-stale
+
+# --- Build-artifact hygiene -------------------------------------------
+#
+# Stale artifacts in target/debug/deps cost far more than disk. Process
+# exec from a directory that large gets dramatically slower, and nextest
+# runs one process per *test* — so the penalty is paid 1400 times a run.
+# Measured on this tree at 177,922 accumulated files: 562 ms per exec
+# against 7 ms from a normal directory, i.e. ~780 s of the 789 s
+# workspace suite. Cleaning took it to 26 s. The cost scales with
+# sibling count (1k -> 7 ms, 5k -> 15 ms, 20k -> 41 ms), which is where
+# STALE_MAX is set.
+#
+# `sweep` removes only what cargo has not touched for STALE_DAYS, so the
+# current build survives and nothing is rebuilt. Deliberately *not*
+# `cargo clean` on every build — that would force a full rebuild every
+# time, which is the opposite of the point.
+STALE_MAX  ?= 20000
+STALE_DAYS ?= 14
 
 help:
 	@echo "Dub — common targets"
@@ -23,7 +41,8 @@ help:
 	@echo "  make ci            run the full CI pipeline locally"
 	@echo "  make docs-check    fail if README / docs/html drift from code constants"
 	@echo "  make hooks         install the pre-push CI gate (once per clone)"
-	@echo "  make clean         cargo clean"
+	@echo "  make clean         cargo clean (removes everything; forces a full rebuild)"
+	@echo "  make sweep         drop build artifacts unused for $(STALE_DAYS) days"
 	@echo ""
 	@echo "Apple shell"
 	@echo "  make app           build Dub.app (Debug) -> apple/build/Build/Products/Debug/Dub.app"
@@ -41,7 +60,7 @@ clippy:
 	cargo clippy --all-targets --workspace -- -D warnings
 
 # Prefer nextest if installed; fall back to cargo test.
-test: clippy
+test: check-stale clippy
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		cargo nextest run --workspace; \
 	else \
@@ -126,7 +145,7 @@ xcframework:
 	    echo "==> DubCore.xcframework up to date"; \
 	fi
 
-app: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
+app: check-stale xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 	@mkdir -p $(APP_BUILD_DIR)
 	xcodebuild build \
 	    -project apple/Dub.xcodeproj \
@@ -255,4 +274,24 @@ open-app:
 	    echo "No build at $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/ yet."; \
 	    echo "Run: make app"; \
 	    exit 1; \
+	fi
+
+# Remove build artifacts cargo has not used for STALE_DAYS. Safe to run
+# any time: it never removes the current build, so nothing is rebuilt.
+sweep:
+	@if command -v cargo-sweep >/dev/null 2>&1; then \
+		cargo sweep --time $(STALE_DAYS); \
+	else \
+		echo "[hint] cargo install cargo-sweep --locked   — then 'make sweep'"; \
+		echo "       (or 'cargo clean' to remove everything and rebuild)"; \
+	fi
+
+# Cheap guard in front of test / app. Counts, and only acts when the
+# directory is big enough for the exec penalty to matter.
+check-stale:
+	@n=$$(ls target/debug/deps 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$${n:-0}" -gt $(STALE_MAX) ]; then \
+		echo "[hygiene] target/debug/deps holds $$n files; every test process pays for that."; \
+		echo "[hygiene] sweeping artifacts unused for $(STALE_DAYS) days..."; \
+		$(MAKE) --no-print-directory sweep; \
 	fi

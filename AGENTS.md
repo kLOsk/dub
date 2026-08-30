@@ -107,7 +107,25 @@ make clippy        # cargo clippy --all-targets -- -D warnings
 make cov           # cargo llvm-cov (requires cargo-llvm-cov installed)
 make fuzz-quick    # run all fuzz targets for 60s each (placeholder until parsers exist)
 make soak          # run the offline render soak harness for 1 hour
+make sweep         # drop build artifacts unused for 14 days (see below)
 ```
+
+**If the suite suddenly feels slow, count the build artifacts first.**
+`target/debug/deps` accumulates, and process exec from a directory that size
+gets dramatically slower — nextest runs one process per *test*, so the penalty
+lands 1400 times per run. Measured here at 177,922 files: **562 ms per exec
+against 7 ms**, which was ~780 s of a 789 s workspace suite; cleaning took it
+to **26 s**. `make test` and `make app` now guard against it — over
+`STALE_MAX` files they sweep artifacts unused for `STALE_DAYS` — but the
+diagnostic is worth knowing:
+
+```bash
+ls target/debug/deps | wc -l    # 20k+ and the exec penalty is measurable
+make sweep                      # safe any time; never touches the current build
+```
+
+Reach for `cargo clean` only when you want the space back — it forces a full
+rebuild.
 
 For a single crate:
 ```bash
