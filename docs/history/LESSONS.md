@@ -431,6 +431,44 @@
   capture and re-split can reach back past the trim — a trim without a lossless
   archive behind it would be data loss.
 
+### Recognition: name the track, don't gate on the album (M26c)
+
+- **A rip is often one song, not a side.** The first design made a
+  side-level *release vote* the gate: each segment's candidate recordings
+  were asked which releases contained them, and only tracks on the
+  winning release got named. The constraint is real — a side is one
+  release in one order — but as a **precondition** it was wrong. Measured
+  against a real Philadelphia International sampler it named 2 of 10
+  while AcoustID had confidently identified 6, because MusicBrainz models
+  each compilation appearance as its own recording entity, so the votes
+  never converge. Naming now comes straight off the AcoustID match
+  (title + artist arrive with it), the release is opt-in enrichment, and
+  a regression test pins the compilation case so it cannot be re-gated.
+- **Naming needs no MusicBrainz at all**, which is the other half of the
+  win: 10 requests instead of 25, no one-request-a-second throttle, and
+  no exposure to MusicBrainz's 503s on the path that matters.
+- **Stub tests cannot find integration bugs, and two hid here.** A bad
+  AcoustID key arrives as **HTTP 400** with the explanation in the body,
+  not as the 200-with-`status:"error"` the code assumed, so the friendly
+  "invalid API key" path was dead and the operator saw a raw
+  `http 400: {…}`. And MusicBrainz's 503 killed a 10-track side *after*
+  all ten AcoustID lookups were spent. Both were invisible to a stub
+  answering 200 and obvious within one real request. `StubHttp::failing`
+  now exists so a status and its body travel together in tests.
+- **The tie-break has a limit worth knowing.** AcoustID scores the audio,
+  not the sleeve, so pressings of one recording tie exactly. A consensus
+  on the side's artist separates them only when the *artist credits*
+  differ; a Japanese "TSOP" still credited to MFSB ties all the way down.
+  The review panel is where a human corrects that.
+- **BPM and key were already computed and going nowhere.** `commit.rs`
+  has pre-analysed every segment since M26a, but the results landed only
+  in the SQLite catalog — `dub-encode` wrote no `BPM` and no
+  `INITIALKEY`, so a FLAC dragged into Serato or Traktor arrived with
+  neither. Analysis cannot move before the encode (it needs the imported
+  track's id), so commit writes tags, imports, analyses, then writes tags
+  a second time; `write_tags` already had replace semantics, so the
+  second pass costs one metadata rewrite and no audio.
+
 ## Looping / key lock (M13)
 
 - **A "still owed" note in the spec is a claim about the code, and it rots.**

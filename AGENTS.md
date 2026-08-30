@@ -60,11 +60,17 @@ crates/
   dub-io/            symphonia-based decoders, in-memory track buffers.
   dub-encode/        M26 — offline FLAC encode (flacenc) + Vorbis-comment/PICTURE tagging (metaflac)
                      for ripped tracks. Deliberately permissive-only (MP3/LAME deferred).
+                     Writes BPM + INITIALKEY (Camelot) too, so a rip keeps its tempo and key
+                     when the file leaves Dub for Serato / Traktor / rekordbox.
   dub-timecode/      Serato CV02 + Traktor MK1 + Traktor MK2 decoders (clean-room).
   dub-thru/          Thru-mode source-detection classifier only (§5.1.1; placeholder).
                      The Thru *passthrough itself* (ThruSource) lives in dub-engine.
   dub-bpm/           M7.5 + M8 — BpmEstimator (DSP core), BpmTracker (estimator + hysteresis), BpmStream (per-deck off-RT analysis thread), analyze_bpm (offline). Pure-Rust spectral-flux + harmonic-summed autocorrelation. Aubio backend deferred to a future opt-in feature flag.
                      Aubio's LGPL boundary is confined to this leaf crate.
+  dub-peaks/         M9 — Decimator + PeakChunk: the shared waveform/envelope decimation.
+                     The rip capture worker feeds the same one, so chunk i ↔ frame i*64 exactly.
+  dub-spectral/      M9.5a — shared STFT + log-bands, and `analyze_key` (Camelot). Key detection
+                     for the library and for rip tags lives here.
   dub-fingerprint/   Pure-Rust Chromaprint via rusty-chromaprint. Used for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1).
   dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
   dub-rip/           M26 — vinyl-rip session engine: RipSession state machine, off-RT capture
@@ -82,7 +88,7 @@ crates/
                      `FFI_VERSION` is the contract number; bump it and README together (docs-check gates it).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
-                     rip / rip-tune / rip-resplit / decode-timecode.
+                     rip / rip-tune / rip-resplit / recognize / decode-timecode.
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).

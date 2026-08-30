@@ -161,12 +161,15 @@ dub/                                 repo root (workspace)
 │   ├── dub-library/                 SQLite catalog + import adapters (M11, shipped)
 │   ├── dub-encode/                  M26 — FLAC encode (flacenc) + Vorbis-comment tagging
 │   ├── dub-rip/                     M26 — vinyl-rip engine: capture, gap detection, side trim, commit
+│   ├── dub-recognize/               M26c — AcoustID + MusicBrainz behind an `Http` trait (the only
+│   │                                network dep; rips work fully offline without it)
 │   ├── dub-controller/              HID/MIDI abstractions (v1.x+, placeholder)
 │   ├── dub-ffi/                     UniFFI Swift bindings — DubEngine, DubLibrary, DubRipSession
 │   └── dub-cli/                     `dub` binary (smoke / play / capture / levels /
 │                                                 timecode-deck / thru / scope / calibrate /
 │                                                 analyze / diagnose / import / rip /
-│                                                 rip-tune / rip-resplit / decode-timecode)
+│                                                 rip-tune / rip-resplit / recognize /
+│                                                 decode-timecode)
 ├── apple/                           AppKit + SwiftUI shell (Performance + Prep mode, library browser — XcodeGen-managed)
 │   ├── project.yml                  XcodeGen manifest (links CoreAudio + Metal SDK frameworks)
 │   ├── Dub/                         AppKit @main + SwiftUI shell
@@ -179,7 +182,7 @@ dub/                                 repo root (workspace)
 │   └── rt-audit/                    RT-thread allocation auditor
 ├── docs/                            README.md = routing guide; spec/ (PRD, PRD-BEATS, ARCHITECTURE,
 │                                    LIBRARY-SCHEMA, LIBRARY-FORMATS, LICENSE-DEPENDENCIES),
-│                                    history/ (SHIPPED, LESSONS), investigations/, UI-BACKLOG.md,
+│                                    history/ (CURRENT, SHIPPED, LESSONS), investigations/,
 │                                    UI-BACKLOG.md
 ├── testdata/rip-baselines/          three real record sides (24-bit FLAC, gitignored) — ground
 │                                    truth for the rip gates; replay with `dub rip-tune`

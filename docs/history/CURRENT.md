@@ -33,29 +33,39 @@ confirmed on hardware, and neither has been.
 
 ## Next milestone
 
-**M26c — rip recognition. In progress.** The `dub-recognize` crate is built
-and tested offline: TEST2 fingerprint in AcoustID's wire format, AcoustID and
-MusicBrainz clients, and the side-level release vote. What remains is Discogs
-enrichment (blocked on R-42, the Keychain token), a `dub recognize` CLI, and
-wiring the result into the rip review panel.
+**M26c — rip recognition. In progress.** The last M26 sub-milestone and the
+only thing between a rip and a fully-tagged record: AcoustID (a TEST2
+fingerprint computed transiently — the stored dedupe blobs are TEST1) →
+MusicBrainz release tracklist → Discogs enrichment. It is **Dub's first network
+dependency**, confined to the `Http` trait in the `dub-recognize` leaf crate so
+rips keep working fully offline.
 
-**It cannot be run for real yet**: AcoustID needs a free API key from
-acoustid.org/new-application, which has to be registered by a person. Until
-one is configured every lookup returns `MissingCredential` — deliberately, so
-the failure names the cause instead of looking like an unknown record.
+Done: the crate — TEST2 fingerprint in AcoustID's wire format, both clients,
+and the side-level release vote — plus `dub recognize <session-dir | side.wav>`,
+validated end to end against the live services and against all three baseline
+records. **Naming is the primary path and needs no MusicBrainz**; identifying
+the pressing is opt-in (`--album`). Committed rips also carry `BPM` and
+`INITIALKEY` in their tags now, not just in the catalog.
 
-Original scope note follows.
+**The key is not in the repo and must not be.** `dub recognize` reads
+`$DUB_ACOUSTID_KEY` or takes `--key`; register a free one at
+acoustid.org/new-application. Without it every lookup returns
+`MissingCredential` deliberately, so the failure names the cause instead of
+looking like an unknown record.
 
-**M26c — rip recognition.** The last M26 sub-milestone and the only thing
-between a rip and a fully-tagged record. AcoustID (a TEST2 fingerprint computed
-transiently — the stored dedupe blobs are TEST1) → MusicBrainz release
-tracklist → Discogs enrichment, in a new `dub-recognize` leaf crate behind an
-`Http` trait so rips keep working fully offline. The Picard-convention tag
-fields are already written by `dub-encode`; they are simply never populated.
+Remaining:
 
-Two things to know before starting: it is **Dub's first network dependency**,
-and **R-42 blocks the Discogs half** — the token needs Keychain storage and
-there is no Keychain plumbing anywhere in the app yet. Start there.
+- **Discogs enrichment — blocked on R-42**, the Keychain token. There is no
+  Keychain plumbing anywhere in the app yet, so that is where it starts. The
+  same store should take over the AcoustID key once it exists; the env var is
+  the CLI's answer, not the app's.
+- **Wiring the result into the rip review panel** (FFI + Swift). The
+  Picard-convention tag fields are already written by `dub-encode`; they are
+  simply never populated.
+- **A better tie-break for same-artist pressings.** A foreign-language
+  pressing credited to the same artist ties with the domestic one all the way
+  down (record B's "TSOP" comes back with its Japanese title). The artist
+  consensus cannot separate those; a script-coherence heuristic could.
 
 Alternatives on the roadmap if M26c is not the appetite: **M11d-columns**
 (browser column data plumbing, 2–3 days), **M11f** (export: rekordbox XML +
