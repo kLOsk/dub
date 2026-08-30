@@ -81,6 +81,8 @@ struct RipReviewPanelState: Equatable {
     var jobDots: [RipJobDot] = []
     /// Footer status line (encode progress / failure summary).
     var overallStatus: String? = nil
+    /// M26c recognition: `nil` until a pass has been asked for.
+    var recognition: RipRecognitionUi? = nil
 
     var hasFailedSegment: Bool { jobDots.contains(.failed) }
 
@@ -95,6 +97,35 @@ struct RipReviewPanelState: Equatable {
     }
 }
 
+/// What the review panel shows about a recognition pass (M26c).
+///
+/// Deliberately a summary, not the per-track result: the names land in
+/// the metadata cards the panel already renders, so there is nothing to
+/// duplicate here. What the operator needs from this row is whether it
+/// is still running, how much it found, and whether to accept it.
+struct RipRecognitionUi: Equatable {
+    var running: Bool = false
+    var finished: Bool = false
+    var named: Int = 0
+    var total: Int = 0
+    var error: String? = nil
+    /// Release line, when a pressing was identified.
+    var release: String? = nil
+
+    var summary: String {
+        if running { return "Identifying…" }
+        if let error { return error }
+        guard finished else { return "" }
+        if named == 0 { return "No match — not in the database" }
+        var text = "Named \(named) of \(total)"
+        if let release { text += " · \(release)" }
+        return text
+    }
+
+    /// Only worth offering "Use these" when something was found.
+    var canApply: Bool { finished && named > 0 && error == nil }
+}
+
 struct RipReviewPanelCallbacks {
     var addSplitAtPlayhead: () -> Void = {}
     /// Replace every marker with detected track gaps (M26b).
@@ -103,6 +134,10 @@ struct RipReviewPanelCallbacks {
     var audition: (Double) -> Void = { _ in }
     var setMetadata: (UInt32, RipSegmentMetadata) -> Void = { _, _ in }
     var cancel: () -> Void = {}
+    /// Ask AcoustID what these tracks are (M26c).
+    var identify: () -> Void = {}
+    /// Write the recognised names into the metadata cards.
+    var applyRecognition: () -> Void = {}
     var encode: () -> Void = {}
     var retry: () -> Void = {}
 }
@@ -146,7 +181,39 @@ struct RipReviewPanel: View {
                 }
                 .buttonStyle(.plain)
                 .help("Add a split marker at deck A's current position")
+                identifyControls
             }
+        }
+    }
+
+    /// Identify, and — once something came back — accept it.
+    ///
+    /// Accepting is a separate press on purpose: recognition writes
+    /// into the metadata cards, and a wrong match committed into the
+    /// library is worse than no match at all.
+    @ViewBuilder
+    private var identifyControls: some View {
+        let state = self.state.recognition
+        Button(action: callbacks.identify) {
+            pillLabel(state?.running == true ? "Identifying…" : "Identify")
+        }
+        .buttonStyle(.plain)
+        .disabled(state?.running == true)
+        .help("Ask AcoustID for the artist and title of each track")
+        if state?.canApply == true {
+            Button(action: callbacks.applyRecognition) {
+                pillLabel("Use these")
+            }
+            .buttonStyle(.plain)
+            .help("Write the recognised names into the metadata cards")
+        }
+        if let summary = state?.summary, !summary.isEmpty, state?.running != true {
+            Text(summary)
+                .font(DubFont.body)
+                .foregroundStyle(
+                    state?.error == nil ? DubColor.textSecondary : DubColor.stateError
+                )
+                .lineLimit(1)
         }
     }
 

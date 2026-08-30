@@ -220,6 +220,41 @@ struct PreferencesSheet: View {
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Divider().padding(.vertical, DubSpacing.xs)
+
+                Text("IDENTIFY RIPPED TRACKS")
+                    .font(DubFont.caps)
+                    .tracking(1.2)
+                    .foregroundStyle(DubColor.textSecondary)
+                TextField("AcoustID key", text: $model.acoustIdKey)
+                    .textFieldStyle(.roundedBorder)
+                    .font(DubFont.body)
+                Text("Free from acoustid.org/new-application. Without it, Identify in the rip review panel does nothing. Naming a track costs one request and never contacts MusicBrainz.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(isOn: $model.ripIdentifyPressing) {
+                    Text("Also identify the pressing")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("Adds album, label and catalogue number by asking MusicBrainz at one request a second. Slower, and it often cannot settle on one release for a compilation — artist and title arrive without it.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if model.ripIdentifyPressing {
+                    TextField("Discogs token (optional)", text: $model.discogsToken)
+                        .textFieldStyle(.roundedBorder)
+                        .font(DubFont.body)
+                    Text("Adds Discogs' style tags and pressing detail. Stored in preferences, not the Keychain, so leave it empty unless you want it.")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }

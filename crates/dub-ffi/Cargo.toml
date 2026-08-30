@@ -47,6 +47,9 @@ dub-library = { workspace = true }
 dub-fingerprint = { workspace = true }
 # M26a — the vinyl-rip FFI surface (`src/rip.rs`) wraps `dub_rip::RipSession`.
 dub-rip = { workspace = true }
+# M26c — recognition, run on a background worker like the commit job.
+# The only crate in the workspace that reaches the network.
+dub-recognize = { workspace = true }
 # M26a — the record-tap consumer handed from `start_thru_for_rip` to
 # `create_rip_session` is a `ringbuf::HeapCons<f32>`.
 ringbuf = { workspace = true }

@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dub_recognize::http::UreqHttp;
+use dub_recognize::{DiscogsRelease, Recognizer, SegmentAudio};
 use dub_rip::{GapConfig, RipConfig, RipError, RipSession, RipState, StopReason, TrackMeta};
 
 use crate::{
@@ -319,6 +321,62 @@ struct CommitJob {
     stop_reason: RipStopReason,
 }
 
+/// What recognition made of one segment (M26c).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RipRecognizedTrack {
+    /// Segment index, in side order.
+    pub index: u32,
+    /// Track title, when it was identified.
+    pub title: Option<String>,
+    /// Credited artist.
+    pub artist: Option<String>,
+    /// Printed vinyl track number, only when a release lookup ran.
+    pub number: Option<String>,
+    /// Why there is no name, when there is none — so the review panel
+    /// can say "not in the database" rather than showing a blank.
+    pub note: Option<String>,
+}
+
+/// Polled snapshot of a recognition pass (M26c).
+///
+/// Recognition is network work and can take tens of seconds, so it
+/// runs on a worker and is polled exactly like the commit job. The
+/// release fields are all optional because identifying the *pressing*
+/// is opt-in and often does not converge on a compilation — the track
+/// names are the part that matters and they arrive without it.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct RipRecognitionStatus {
+    /// A pass is in flight.
+    pub running: bool,
+    /// A pass has completed at least once.
+    pub finished: bool,
+    /// Failure message when the pass could not run at all.
+    pub error: Option<String>,
+    /// How many segments got a name.
+    pub named: u32,
+    /// One entry per segment, in side order.
+    pub tracks: Vec<RipRecognizedTrack>,
+    /// Release title, when a release lookup ran and converged.
+    pub album: Option<String>,
+    /// Release artist.
+    pub album_artist: Option<String>,
+    /// Release year.
+    pub year: Option<i32>,
+    /// Label name.
+    pub label: Option<String>,
+    /// Catalogue number stamped in the run-out.
+    pub catalog_number: Option<String>,
+    /// Discogs style or genre, when a Discogs token was supplied and
+    /// MusicBrainz carried a link to follow.
+    pub style: Option<String>,
+}
+
+/// Worker-side state behind [`DubRipSession::recognition_status`].
+#[derive(Default)]
+struct RecognizeJob {
+    status: RipRecognitionStatus,
+}
+
 /// One record-a-side rip session (M26a).
 ///
 /// Created by [`DubEngine::create_rip_session`], already armed on the
@@ -347,6 +405,8 @@ pub struct DubRipSession {
     cancelled: AtomicBool,
     splits: Mutex<SplitIds>,
     job: Arc<Mutex<CommitJob>>,
+    /// M26c recognition, polled the same way as `job`.
+    recognize: Arc<Mutex<RecognizeJob>>,
 }
 
 // Hand-rolled: `RipSession` owns a live worker thread and has no
@@ -898,6 +958,7 @@ impl DubRipSession {
                 entries: Vec::new(),
             }),
             job: Arc::new(Mutex::new(CommitJob::default())),
+            recognize: Arc::new(Mutex::new(RecognizeJob::default())),
         }
     }
 
@@ -1497,6 +1558,143 @@ impl DubRipSession {
         Ok(())
     }
 
+    /// Start a recognition pass over the current split plan (M26c).
+    ///
+    /// Runs on a worker and is polled through
+    /// [`Self::recognition_status`], because the network calls take
+    /// tens of seconds and the review panel keeps repainting.
+    ///
+    /// Track names come from AcoustID alone and cost one request per
+    /// segment. `album` additionally identifies the pressing through
+    /// MusicBrainz at one request a second. A non-empty `discogs_token`
+    /// adds Discogs style and pressing detail and implies `album`.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::InvalidState`] if the session was cancelled, if
+    /// capture has not stopped, or if a pass is already running.
+    pub fn start_recognition(
+        &self,
+        acoustid_key: String,
+        album: bool,
+        discogs_token: Option<String>,
+    ) -> Result<(), RipFfiError> {
+        self.guard_not_cancelled()?;
+        self.sync_if_terminal();
+
+        {
+            let session = lock_mutex(&self.session);
+            if !matches!(session.status().state, RipState::Stopped(_)) {
+                return Err(RipFfiError::InvalidState(
+                    "cannot recognise while capture is running".into(),
+                ));
+            }
+        }
+        {
+            let mut job = lock_mutex(&self.recognize);
+            if job.status.running {
+                return Err(RipFfiError::InvalidState(
+                    "a recognition pass is already running".into(),
+                ));
+            }
+            job.status = RipRecognitionStatus {
+                running: true,
+                ..RipRecognitionStatus::default()
+            };
+        }
+
+        let session = Arc::clone(&self.session);
+        let recognize = Arc::clone(&self.recognize);
+        let generation = Arc::clone(&self.generation);
+        let spawned = std::thread::Builder::new()
+            .name("dub-rip-recognize".into())
+            .spawn(move || {
+                let outcome =
+                    recognize_side(&session, &acoustid_key, album, discogs_token.as_deref());
+                let mut job = lock_mutex(&recognize);
+                job.status = match outcome {
+                    Ok(status) => status,
+                    Err(error) => RipRecognitionStatus {
+                        error: Some(error),
+                        ..RipRecognitionStatus::default()
+                    },
+                };
+                job.status.running = false;
+                job.status.finished = true;
+                generation.fetch_add(1, Ordering::Relaxed);
+            });
+        if spawned.is_err() {
+            let mut job = lock_mutex(&self.recognize);
+            job.status.running = false;
+            return Err(RipFfiError::InvalidState(
+                "could not spawn the recognition worker".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Poll the recognition pass.
+    #[must_use]
+    pub fn recognition_status(&self) -> RipRecognitionStatus {
+        lock_mutex(&self.recognize).status.clone()
+    }
+
+    /// Write the recognised names into the split plan's metadata.
+    ///
+    /// Deliberately separate from [`Self::start_recognition`]: a wrong
+    /// match written into the library is worse than no match, so the
+    /// operator sees the result and accepts it. Segments that were not
+    /// named keep whatever metadata they already had.
+    ///
+    /// Returns how many segments were written.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::InvalidState`] if no pass has finished.
+    pub fn apply_recognition(&self) -> Result<u32, RipFfiError> {
+        self.guard_not_cancelled()?;
+        let status = self.recognition_status();
+        if !status.finished {
+            return Err(RipFfiError::InvalidState(
+                "no recognition result to apply".into(),
+            ));
+        }
+
+        let mut written = 0_u32;
+        {
+            let mut session = lock_mutex(&self.session);
+            for track in &status.tracks {
+                let Some(title) = track.title.clone() else {
+                    continue;
+                };
+                let index = usize_from_u64(u64::from(track.index));
+                let mut meta = session
+                    .manifest()
+                    .tracks
+                    .get(index)
+                    .map(|entry| entry.meta.clone())
+                    .unwrap_or_default();
+                meta.title = Some(title);
+                if track.artist.is_some() {
+                    meta.artist.clone_from(&track.artist);
+                }
+                if status.album.is_some() {
+                    meta.album.clone_from(&status.album);
+                }
+                if let Some(year) = status.year {
+                    meta.year = Some(year);
+                }
+                if status.style.is_some() {
+                    meta.genre.clone_from(&status.style);
+                }
+                session.set_track_meta(index, meta).map_err(map_rip_error)?;
+                written += 1;
+            }
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(written)
+    }
+
     /// Encode + tag + import every segment on a background worker
     /// (`dub-rip-commit`): FLAC-encode each segment, write the
     /// lossless side archive, import into `library` pre-analyzed, and
@@ -1603,6 +1801,114 @@ impl DubRipSession {
     }
 }
 
+/// Recognise the current split plan off the spill.
+///
+/// Runs on the recognition worker with no lock held across the network
+/// calls: the session mutex is taken only to copy the plan out, because
+/// the review panel keeps polling `status` for tens of seconds while
+/// this runs.
+fn recognize_side(
+    session: &Arc<Mutex<RipSession>>,
+    acoustid_key: &str,
+    album: bool,
+    discogs_token: Option<&str>,
+) -> Result<RipRecognitionStatus, String> {
+    let (spill, boundaries, side_start, side_end) = {
+        let session = lock_mutex(session);
+        let manifest = session.manifest();
+        (
+            session.spill_path(),
+            manifest.boundaries_frames.clone(),
+            manifest.side_start(),
+            manifest.side_end(),
+        )
+    };
+
+    let (samples, info) = dub_rip::read_spill_all(&spill).map_err(|e| format!("{e}"))?;
+    let ranges = dub_rip::segments(&boundaries, side_start, side_end);
+    if ranges.is_empty() {
+        return Err("nothing to recognise".into());
+    }
+
+    let channels = usize::from(info.channels.max(1));
+    // Chromaprint takes i16; the spill is 32-bit float.
+    let pcm: Vec<Vec<i16>> = ranges
+        .iter()
+        .map(|range| {
+            let from = usize_from_u64(range.start)
+                .saturating_mul(channels)
+                .min(samples.len());
+            let to = usize_from_u64(range.end)
+                .saturating_mul(channels)
+                .min(samples.len());
+            samples[from..to]
+                .iter()
+                .map(|s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)
+                .collect()
+        })
+        .collect();
+    let segments: Vec<SegmentAudio<'_>> = pcm
+        .iter()
+        .map(|samples| SegmentAudio {
+            samples,
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+        })
+        .collect();
+
+    // One second between requests is MusicBrainz's published limit and
+    // the tightest of the three services, so it governs.
+    let http = UreqHttp::new(Duration::from_secs(1));
+    let mut recognizer = Recognizer::new(&http, acoustid_key).with_release_lookup(album);
+    if let Some(token) = discogs_token {
+        recognizer = recognizer.with_discogs(token);
+    }
+    let result = recognizer
+        .recognize_side(&segments)
+        .map_err(|e| format!("{e}"))?;
+
+    let release = result.release.as_ref();
+    Ok(RipRecognitionStatus {
+        running: false,
+        finished: true,
+        error: None,
+        named: u32::try_from(result.named).unwrap_or(u32::MAX),
+        tracks: result
+            .segments
+            .iter()
+            .map(|seg| RipRecognizedTrack {
+                index: u32::try_from(seg.index).unwrap_or(u32::MAX),
+                title: seg.named.as_ref().map(|n| n.title.clone()),
+                artist: seg.named.as_ref().and_then(|n| n.artist.clone()),
+                number: seg.named.as_ref().and_then(|n| n.number.clone()),
+                note: seg.note.clone(),
+            })
+            .collect(),
+        album: release.map(|r| r.title.clone()),
+        album_artist: release.and_then(|r| r.artist.clone()),
+        // MusicBrainz dates are often just a year; take the leading four
+        // digits and only when they parse. Discogs, when it answered,
+        // knows the year of *this* pressing and is preferred.
+        year: result.discogs.as_ref().and_then(|d| d.year).or_else(|| {
+            release
+                .and_then(|r| r.date.as_deref())
+                .and_then(|d| d.get(..4))
+                .and_then(|y| y.parse::<i32>().ok())
+        }),
+        label: result
+            .discogs
+            .as_ref()
+            .and_then(|d| d.label.clone())
+            .or_else(|| release.and_then(|r| r.label.clone())),
+        catalog_number: result
+            .discogs
+            .as_ref()
+            .and_then(|d| d.catalog_number.clone())
+            .or_else(|| release.and_then(|r| r.catalog_number.clone())),
+        style: result.discogs.as_ref().and_then(DiscogsRelease::genre_tag),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,6 +1931,59 @@ mod tests {
     }
 
     /// Record `secs` seconds of a stereo tone and stop.
+    /// A pass that has not run yet has nothing to accept. Applying is
+    /// deliberately a second call — a wrong match written into the
+    /// library is worse than no match — so the guard matters.
+    #[test]
+    fn applying_recognition_before_a_pass_finishes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = recorded_session(dir.path(), 1);
+
+        let status = ffi.recognition_status();
+        assert!(!status.running && !status.finished);
+        assert!(status.tracks.is_empty());
+
+        let err = ffi.apply_recognition().unwrap_err();
+        assert!(
+            matches!(err, RipFfiError::InvalidState(_)),
+            "expected InvalidState, got {err}"
+        );
+    }
+
+    /// Recognition reads the spill, which is only whole once capture
+    /// has stopped.
+    #[test]
+    fn recognition_is_refused_while_capture_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ffi, _tx) = armed_session(dir.path());
+        ffi.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ffi.status().phase != RipPhase::Recording {
+            assert!(Instant::now() < deadline, "worker never started recording");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let err = ffi
+            .start_recognition("key".into(), false, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, RipFfiError::InvalidState(_)),
+            "expected InvalidState, got {err}"
+        );
+        let _ = ffi.cancel();
+    }
+
+    /// A cancelled session refuses recognition like every other
+    /// mutation.
+    #[test]
+    fn a_cancelled_session_refuses_recognition() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = recorded_session(dir.path(), 1);
+        let _ = ffi.cancel();
+        assert!(ffi.start_recognition("key".into(), false, None).is_err());
+        assert!(ffi.apply_recognition().is_err());
+    }
+
     fn recorded_session(dir: &std::path::Path, secs: u64) -> DubRipSession {
         let (ffi, mut tx) = armed_session(dir);
         ffi.start().unwrap();

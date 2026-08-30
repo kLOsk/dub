@@ -637,6 +637,49 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kVinylRecording = "dub.vinylRecordingEnabled"
 
+    /// M26c — AcoustID application key for rip recognition.
+    ///
+    /// `UserDefaults`, not the Keychain, and deliberately: an AcoustID
+    /// *application* key identifies the app rather than the user, and
+    /// Dub is GPLv3, so it is public by construction. The Discogs
+    /// token below is the opposite and is the one R-42 is about.
+    /// Persisted under `dub.acoustIdKey`.
+    @Published var acoustIdKey: String {
+        didSet { UserDefaults.standard.set(acoustIdKey, forKey: Self.kAcoustIdKey) }
+    }
+
+    private static let kAcoustIdKey = "dub.acoustIdKey"
+
+    /// M26c — also identify the *pressing*, not just the tracks.
+    ///
+    /// Off by default: naming needs one AcoustID request per track,
+    /// while identifying the release adds MusicBrainz at one request a
+    /// second and often cannot converge on a compilation. Artist and
+    /// title are what a rip is for. Persisted under
+    /// `dub.ripIdentifyPressing`.
+    @Published var ripIdentifyPressing: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                ripIdentifyPressing, forKey: Self.kRipIdentifyPressing)
+        }
+    }
+
+    private static let kRipIdentifyPressing = "dub.ripIdentifyPressing"
+
+    /// M26c — Discogs personal access token, for style + pressing
+    /// detail on top of a release match.
+    ///
+    /// **R-42**: this is a *user* credential and belongs in the
+    /// Keychain, not here. It is empty by default and the feature is
+    /// off until someone types one, so nothing is stored in plain text
+    /// unless the operator opts in — but that is a mitigation, not the
+    /// fix. Persisted under `dub.discogsToken`.
+    @Published var discogsToken: String {
+        didSet { UserDefaults.standard.set(discogsToken, forKey: Self.kDiscogsToken) }
+    }
+
+    private static let kDiscogsToken = "dub.discogsToken"
+
     /// M26a manual Prep ↔ Performance override, persisted so the
     /// choice survives a relaunch. `nil` = follow hardware
     /// auto-detect (the shipping default). Non-nil wins over
@@ -787,6 +830,10 @@ final class WaveformAppModel: ObservableObject {
 
     /// Commit progress, polled while the encode + import worker runs.
     @Published var ripJobs: RipJobProgress? = nil
+
+    /// M26c — recognition summary, polled while the worker runs. `nil`
+    /// until a pass has been asked for.
+    @Published var ripRecognition: RipRecognitionUi? = nil
 
     /// M26b — unfinished rips found on disk, offered above the rip bar
     /// on Prep entry. Empty once dismissed or resumed.
@@ -1040,6 +1087,14 @@ final class WaveformAppModel: ObservableObject {
         // a persisted PREP pin takes effect on the first detection.
         self.vinylRecordingEnabled =
             UserDefaults.standard.bool(forKey: Self.kVinylRecording)
+        // M26c — all three default to "off / empty": recognition is
+        // opt-in and does nothing at all until a key is supplied.
+        self.acoustIdKey =
+            UserDefaults.standard.string(forKey: Self.kAcoustIdKey) ?? ""
+        self.ripIdentifyPressing =
+            UserDefaults.standard.bool(forKey: Self.kRipIdentifyPressing)
+        self.discogsToken =
+            UserDefaults.standard.string(forKey: Self.kDiscogsToken) ?? ""
         self.modeOverride = UserDefaults.standard
             .string(forKey: Self.kModeOverride)
             .flatMap(EngineMode.init(rawValue:))

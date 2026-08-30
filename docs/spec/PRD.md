@@ -474,6 +474,41 @@ The differentiating feature, planned for v1.1.
 
 **v1.1 adds:** persistence, fingerprinting, recognition, beatgrid storage. This is the magic.
 
+#### 5.2.5a Sample lineage — WhoSampled and the open alternatives (idea, unscheduled)
+
+Once a track has a name (M26c) or a fingerprint (§5.2.5), the obvious next
+question for this audience is **what it samples and what samples it**. For a
+hip-hop / reggae / dnb DJ that is not trivia — it is how a set gets built:
+knowing the break on the record in your hand is the one on a record three
+crates over is the whole game. It is squarely on-audience in a way most
+metadata features are not.
+
+**WhoSampled is the best data and the hardest to get.** There is no public
+developer API. Their terms prohibit scraping, and building on a scrape would
+put a shipped GPLv3 app in breach and break the first time their markup
+changed. A real integration needs a commercial data agreement, which is a
+business decision rather than an engineering one — so it is not a milestone
+we can simply schedule.
+
+Three things we *can* do, cheapest first:
+
+1. **Link out.** With artist + title already in hand from recognition, a
+   "Samples" affordance that opens WhoSampled's own search costs nothing,
+   breaks no terms, needs no key, and puts the DJ one click from the answer.
+   This is the v1-shaped move and belongs in the rip review panel and the
+   library row context menu. Tracked as **R-49** in `UI-BACKLOG.md`.
+2. **MusicBrainz work relationships.** MusicBrainz records `samples` /
+   `is based on` relations between recordings and works, free, and we already
+   talk to it in `dub-recognize`. Coverage is far thinner than WhoSampled's,
+   but the cost is one more `inc=` parameter on a call we already make, with
+   no new dependency and no terms problem. Worth surfacing next to the
+   link-out rather than instead of it.
+3. **A licensed feed**, if the feature ever proves itself enough to justify
+   the conversation.
+
+Deliberately *not* on the table: scraping, or shipping a bundled copy of
+someone else's database.
+
 #### 5.2.6 Constraints
 
 - Thru Mode adds **one buffer of round-trip latency** (input + output), e.g. ~2.7 ms at 64 samples / 48 kHz. This is unavoidable physics. It is *constant* with respect to FX state (engaging FX does not change the input-to-output delay; FX modules add to the dry path, they don't replace it), so the DJ's hand→ear muscle memory stays calibrated across the whole set.

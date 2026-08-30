@@ -53,15 +53,17 @@ acoustid.org/new-application. Without it every lookup returns
 `MissingCredential` deliberately, so the failure names the cause instead of
 looking like an unknown record.
 
-Remaining:
+Done since: **Discogs enrichment** (through MusicBrainz's curated link, never
+a fuzzy search) and the **FFI + Swift wiring** — `Identify` / `Use these` in
+the rip review panel, backed by a background worker polled like the commit
+job, with the key and options in Preferences.
 
-- **Discogs enrichment — blocked on R-42**, the Keychain token. There is no
-  Keychain plumbing anywhere in the app yet, so that is where it starts. The
-  same store should take over the AcoustID key once it exists; the env var is
-  the CLI's answer, not the app's.
-- **Wiring the result into the rip review panel** (FFI + Swift). The
-  Picard-convention tag fields are already written by `dub-encode`; they are
-  simply never populated.
+Remaining:
+- **R-42 — the Discogs token in the Keychain.** No longer a blocker: the
+  AcoustID key is an *application* key and needs no Keychain, so recognition
+  ships without one and Discogs stays optional. The token sits in
+  `UserDefaults` until a helper exists.
+- **R-49 — sample lineage link-out** (WhoSampled). New; see PRD §5.2.5a.
 - **A better tie-break for same-artist pressings.** A foreign-language
   pressing credited to the same artist ties with the domestic one all the way
   down (record B's "TSOP" comes back with its Japanese title). The artist

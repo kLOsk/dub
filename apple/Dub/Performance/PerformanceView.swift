@@ -534,7 +534,8 @@ struct PerformanceView: View {
             trimmedSecs: max(0, ripSideDurationSecs - ripCommittedSideSecs),
             segments: segments,
             jobDots: dots,
-            overallStatus: status)
+            overallStatus: status,
+            recognition: model.ripRecognition)
     }
 
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
@@ -552,6 +553,8 @@ struct PerformanceView: View {
                     year: Int32(meta.year.trimmingCharacters(in: .whitespaces)))
             },
             cancel: { model.cancelRip() },
+            identify: { model.identifyRip() },
+            applyRecognition: { model.applyRipRecognition() },
             encode: { model.confirmRip() },
             retry: { model.confirmRip() })
     }

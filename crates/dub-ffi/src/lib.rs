@@ -402,7 +402,16 @@ pub use rip::{
 ///       loops an explicit region, so a passage can be looped on a
 ///       track the analyser could not grid — the reverse grab needs a
 ///       grid, this does not.
-pub const FFI_VERSION: u32 = 61;
+///   62. **Rip recognition (M26c).** [`DubRipSession::start_recognition`]
+///       names the split plan's tracks off AcoustID on a background
+///       worker, polled through `recognition_status` like the commit
+///       job; `apply_recognition` writes the accepted names into the
+///       plan's metadata. Naming needs no MusicBrainz — identifying
+///       the pressing is the opt-in `album` flag, and a Discogs token
+///       adds style and pressing detail on top of it. Applying is a
+///       separate call because a wrong match written into the library
+///       is worse than no match.
+pub const FFI_VERSION: u32 = 62;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5193,7 +5202,7 @@ mod tests {
         // `set_side_end`, and `list_resplittable_rip_sessions` +
         // `RipResplittable`.
         // 60→61: manual loop in/out — `set_manual_loop`.
-        assert_eq!(FFI_VERSION, 61);
+        assert_eq!(FFI_VERSION, 62);
     }
 
     #[test]

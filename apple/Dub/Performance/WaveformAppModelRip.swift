@@ -332,6 +332,14 @@ extension WaveformAppModel {
         let ui = RipUiStatus(status)
         if ripStatus != ui { ripStatus = ui }
 
+        // M26c: only poll while a pass is live, so an untouched review
+        // panel makes no extra FFI calls at 10 Hz.
+        if ripRecognition?.running == true {
+            let recognized = session.recognitionStatus()
+            let next = RipRecognitionUi(recognized, total: ripSegments.count)
+            if ripRecognition != next { ripRecognition = next }
+        }
+
         let gen = session.generation()
         if gen != ripLastGeneration {
             ripLastGeneration = gen
@@ -705,5 +713,75 @@ extension WaveformAppModel {
             return engineError.localizedDescription
         }
         return error.localizedDescription
+    }
+}
+
+// MARK: - M26c recognition
+
+extension RipRecognitionUi {
+    /// Map the polled FFI snapshot onto what the panel shows.
+    init(_ status: RipRecognitionStatus, total: Int) {
+        running = status.running
+        finished = status.finished
+        named = Int(status.named)
+        self.total = total
+        error = status.error
+        if let album = status.album {
+            var text = album
+            if let artist = status.albumArtist { text = "\(artist) — \(album)" }
+            if let catno = status.catalogNumber { text += " (\(catno))" }
+            release = text
+        } else {
+            release = nil
+        }
+    }
+}
+
+extension WaveformAppModel {
+
+    /// Ask AcoustID what the tracks on this side are (M26c).
+    ///
+    /// Fire-and-poll: the worker does blocking network for tens of
+    /// seconds, so nothing here waits on it. Names are *not* written
+    /// into the plan — `applyRipRecognition` does that on a second,
+    /// explicit press, because a wrong match committed into the library
+    /// is worse than no match.
+    func identifyRip() {
+        guard let session = ripSession else { return }
+        let key = acoustIdKey
+        guard !key.trimmingCharacters(in: .whitespaces).isEmpty else {
+            ripRecognition = RipRecognitionUi(
+                finished: true,
+                error: "No AcoustID key — add one in Preferences"
+            )
+            return
+        }
+        do {
+            try session.startRecognition(
+                acoustidKey: key,
+                album: ripIdentifyPressing,
+                discogsToken: discogsToken.isEmpty ? nil : discogsToken
+            )
+            ripRecognition = RipRecognitionUi(running: true, total: ripSegments.count)
+        } catch {
+            ripRecognition = RipRecognitionUi(
+                finished: true, error: "\(error)"
+            )
+        }
+    }
+
+    /// Write the recognised names into the metadata cards.
+    func applyRipRecognition() {
+        guard let session = ripSession else { return }
+        do {
+            _ = try session.applyRecognition()
+            // The names land in the plan's metadata, which the review
+            // panel already renders — refetch rather than mirror them.
+            ripSegments = session.segments()
+            ripSplits = session.splitMarkers()
+            ripLastGeneration = session.generation()
+        } catch {
+            ripRecognition?.error = "\(error)"
+        }
     }
 }

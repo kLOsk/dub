@@ -519,10 +519,31 @@ backdrop. **Location**: `apple/Dub/Performance/PerformanceView.swift`
 
 ### R-42. Discogs token belongs in the Keychain (M26c)
 
-**Symptom**: the recognition increment will need a user-supplied Discogs
-token; there is no Keychain plumbing anywhere yet, and `UserDefaults` stores
-it in plain text. **Remediation**: minimal Keychain helper before M26c ships
-its Preferences fields. **Location**: `apple/Dub/Preferences/`.
+**Symptom**: the Discogs token is a user credential and `UserDefaults`
+stores it in plain text; there is still no Keychain plumbing anywhere.
+**No longer an M26c blocker.** The AcoustID key turned out not to need the
+Keychain at all — it is an *application* key that identifies Dub rather than
+the user, and Dub is GPLv3, so it is public by construction; recognition
+therefore ships with its key in `UserDefaults` and works fully without
+Discogs. The token field is empty by default and the Discogs half stays off
+until someone types one, so nothing sensitive is stored unless the operator
+opts in — a mitigation, not the fix. **Remediation**: minimal Keychain
+helper, and move `dub.discogsToken` into it. **Location**:
+`apple/Dub/Preferences/`.
+
+### R-49. Sample lineage link-out (WhoSampled)
+
+**Symptom**: recognition gives a rip its artist and title, and the question
+this audience asks next — what does it sample, what samples it — has no
+affordance anywhere. **Remediation**: a "Samples" item in the rip review
+panel's track cards and the library row context menu that opens WhoSampled's
+search for the track's artist + title. Link-out only: WhoSampled has no
+public API and their terms forbid scraping, so an in-app data integration
+needs a commercial agreement (PRD §5.2.5a). Cheap, breaks no terms, needs no
+key. Optionally surface MusicBrainz's own `samples` / `is based on` relations
+beside it — free, thinner coverage, one extra `inc=` on a call
+`dub-recognize` already makes. **Location**: `apple/Dub/Performance/
+RipReviewPanel.swift`, `apple/Dub/Performance/LibraryView.swift`.
 
 ### R-43. Performance-mode ripping + monitor-mute option
 
