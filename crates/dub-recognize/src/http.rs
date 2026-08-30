@@ -95,6 +95,44 @@ impl UreqHttp {
     }
 }
 
+/// How many times a request is attempted before giving up.
+const MAX_ATTEMPTS: u32 = 4;
+
+/// Statuses that mean "busy, come back" rather than "no".
+///
+/// MusicBrainz answers 503 when its web server is loaded and asks
+/// clients to back off and retry. 429 is the explicit rate-limit signal.
+/// Everything else — a 400 bad key, a 404 — fails again identically, so
+/// retrying it only spends the operator's time to reach the same answer.
+fn is_backpressure(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Run `send`, retrying backpressure responses with doubling backoff.
+///
+/// Recognition is a sequential batch over a whole side, so one transient
+/// 503 partway through would otherwise throw away every lookup already
+/// paid for — measured: a 10-track side died on its MusicBrainz calls
+/// after all ten AcoustID lookups had been spent. `sleep` is injected so
+/// the policy is testable without actually waiting.
+fn with_retry(
+    attempts: u32,
+    sleep: &mut dyn FnMut(Duration),
+    send: &mut dyn FnMut() -> Result<String, HttpError>,
+) -> Result<String, HttpError> {
+    let mut backoff = Duration::from_secs(1);
+    for _ in 1..attempts.max(1) {
+        match send() {
+            Err(HttpError::Status { status, .. }) if is_backpressure(status) => {
+                sleep(backoff);
+                backoff *= 2;
+            }
+            other => return other,
+        }
+    }
+    send()
+}
+
 fn finish(resp: Result<ureq::Response, ureq::Error>) -> Result<String, HttpError> {
     match resp {
         Ok(r) => r
@@ -110,12 +148,14 @@ fn finish(resp: Result<ureq::Response, ureq::Error>) -> Result<String, HttpError
 
 impl Http for UreqHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<String, HttpError> {
-        self.throttle();
-        let mut req = self.agent.get(url);
-        for (k, v) in headers {
-            req = req.set(k, v);
-        }
-        finish(req.call())
+        with_retry(MAX_ATTEMPTS, &mut std::thread::sleep, &mut || {
+            self.throttle();
+            let mut req = self.agent.get(url);
+            for (k, v) in headers {
+                req = req.set(k, v);
+            }
+            finish(req.call())
+        })
     }
 
     fn post_form(
@@ -124,12 +164,14 @@ impl Http for UreqHttp {
         form: &[(&str, &str)],
         headers: &[(&str, &str)],
     ) -> Result<String, HttpError> {
-        self.throttle();
-        let mut req = self.agent.post(url);
-        for (k, v) in headers {
-            req = req.set(k, v);
-        }
-        finish(req.send_form(form))
+        with_retry(MAX_ATTEMPTS, &mut std::thread::sleep, &mut || {
+            self.throttle();
+            let mut req = self.agent.post(url);
+            for (k, v) in headers {
+                req = req.set(k, v);
+            }
+            finish(req.send_form(form))
+        })
     }
 }
 
@@ -142,7 +184,7 @@ impl Http for UreqHttp {
 /// asked*, which is usually the interesting half.
 #[derive(Default)]
 pub struct StubHttp {
-    rules: Vec<(String, String)>,
+    rules: Vec<(String, u16, String)>,
     seen: Mutex<Vec<String>>,
 }
 
@@ -156,7 +198,19 @@ impl StubHttp {
     /// Answer any request whose URL or body contains `needle` with `body`.
     #[must_use]
     pub fn on(mut self, needle: &str, body: &str) -> Self {
-        self.rules.push((needle.to_string(), body.to_string()));
+        self.rules.push((needle.to_string(), 200, body.to_string()));
+        self
+    }
+
+    /// Answer `needle` with a non-2xx and a body.
+    ///
+    /// Both services put their real explanation in the body of an error
+    /// response, so the status and the body have to travel together for
+    /// a test to cover how that is read.
+    #[must_use]
+    pub fn failing(mut self, needle: &str, status: u16, body: &str) -> Self {
+        self.rules
+            .push((needle.to_string(), status, body.to_string()));
         self
     }
 
@@ -171,9 +225,15 @@ impl StubHttp {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(key.to_string());
-        for (needle, body) in &self.rules {
+        for (needle, status, body) in &self.rules {
             if key.contains(needle.as_str()) {
-                return Ok(body.clone());
+                return match status {
+                    200 => Ok(body.clone()),
+                    &status => Err(HttpError::Status {
+                        status,
+                        body: body.clone(),
+                    }),
+                };
             }
         }
         Err(HttpError::Status {
@@ -231,6 +291,67 @@ mod tests {
             format!("{err}").contains("example.test/thing"),
             "the error should name the unmatched URL: {err}"
         );
+    }
+
+    #[test]
+    fn a_busy_service_is_retried_until_it_answers() {
+        // MusicBrainz's 503 means "come back", so the batch must survive
+        // it rather than lose every lookup already paid for.
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let got = with_retry(4, &mut |d| slept.push(d), &mut || {
+            calls += 1;
+            if calls < 3 {
+                Err(HttpError::Status {
+                    status: 503,
+                    body: "busy".into(),
+                })
+            } else {
+                Ok("{}".to_string())
+            }
+        })
+        .unwrap();
+        assert_eq!(got, "{}");
+        assert_eq!(calls, 3);
+        assert_eq!(
+            slept,
+            vec![Duration::from_secs(1), Duration::from_secs(2)],
+            "backoff must widen between attempts"
+        );
+    }
+
+    #[test]
+    fn a_persistent_outage_gives_up_rather_than_hanging_on() {
+        let mut calls = 0;
+        let err = with_retry(4, &mut |_| {}, &mut || {
+            calls += 1;
+            Err(HttpError::Status {
+                status: 503,
+                body: "busy".into(),
+            })
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("503"), "{err}");
+        assert_eq!(calls, 4, "MAX_ATTEMPTS is the ceiling, not a suggestion");
+    }
+
+    #[test]
+    fn a_refusal_is_never_retried() {
+        // A bad key answers 400 every time; retrying it only makes the
+        // operator wait longer to be told the same thing.
+        let mut calls = 0;
+        let _ = with_retry(
+            4,
+            &mut |_| panic!("must not back off for a 400"),
+            &mut || {
+                calls += 1;
+                Err(HttpError::Status {
+                    status: 400,
+                    body: "invalid API key".into(),
+                })
+            },
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

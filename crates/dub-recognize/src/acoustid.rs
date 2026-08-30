@@ -4,11 +4,13 @@
 //! so a match arrives with its MusicBrainz recording ids attached and we
 //! do not pay a second round trip to learn what matched.
 //!
-//! AcoustID answers `200 OK` with `{"status":"error"}` for a bad key or
-//! a malformed fingerprint, so the status field is checked rather than
-//! the HTTP code — trusting the code here would turn "your API key is
-//! wrong" into "this record is unknown", which is a much worse thing to
-//! tell someone.
+//! A refusal has to be told apart from "no match", because turning
+//! "your API key is wrong" into "this record is unknown" sends someone
+//! hunting for a rare pressing over a typo. AcoustID signals it two
+//! ways — verified against the live service, which answers a bad key
+//! with **HTTP 400** and an error body, while some conditions come back
+//! `200 OK` carrying `{"status":"error"}`. Both are handled: the error
+//! body is parsed whichever status it arrives under.
 
 use serde::Deserialize;
 
@@ -90,7 +92,7 @@ pub fn lookup(
         });
     }
     let duration = fp.duration_secs.to_string();
-    let body = http.post_form(
+    let body = match http.post_form(
         ENDPOINT,
         &[
             ("client", api_key),
@@ -99,8 +101,35 @@ pub fn lookup(
             ("meta", "recordings"),
         ],
         &[("User-Agent", crate::USER_AGENT)],
-    )?;
+    ) {
+        Ok(b) => b,
+        // A non-2xx still carries AcoustID's own explanation. Parsing it
+        // turns `http 400: {...json...}` into "AcoustID refused: invalid
+        // API key", which is the difference between a user fixing their
+        // key and a user filing a bug.
+        Err(crate::http::HttpError::Status { status, body }) => {
+            // Fall back to the raw status only when the body is not an
+            // AcoustID error — an unreadable 502 from a proxy, say.
+            return Err(refusal_in(&body)
+                .unwrap_or_else(|| crate::http::HttpError::Status { status, body }.into()));
+        }
+        Err(e) => return Err(e.into()),
+    };
     parse(&body)
+}
+
+/// Read AcoustID's own explanation out of a body, whatever status
+/// carried it. `None` means this is not an error body.
+fn refusal_in(body: &str) -> Option<RecognizeError> {
+    let parsed: Response = serde_json::from_str(body).ok()?;
+    (parsed.status != "ok").then(|| refusal(parsed))
+}
+
+fn refusal(parsed: Response) -> RecognizeError {
+    RecognizeError::Refused {
+        service: SERVICE,
+        message: parsed.error.map_or(parsed.status, |e| e.message),
+    }
 }
 
 fn parse(body: &str) -> Result<Vec<Candidate>, RecognizeError> {
@@ -109,16 +138,8 @@ fn parse(body: &str) -> Result<Vec<Candidate>, RecognizeError> {
         detail: e.to_string(),
     })?;
 
-    // A 200 with status "error" is how a bad key arrives. Reporting that
-    // as "no match" would send someone hunting for a rare pressing when
-    // the real problem is a typo in their key.
     if parsed.status != "ok" {
-        return Err(RecognizeError::Refused {
-            service: SERVICE,
-            message: parsed
-                .error
-                .map_or_else(|| parsed.status.clone(), |e| e.message),
-        });
+        return Err(refusal(parsed));
     }
 
     let mut out: Vec<Candidate> = parsed
@@ -193,14 +214,9 @@ mod tests {
         );
     }
 
-    /// AcoustID reports a bad key as HTTP 200 with `status: error`.
-    #[test]
-    fn a_bad_key_is_reported_as_refusal_not_as_no_match() {
-        let http = StubHttp::new().on(
-            "acoustid.org",
-            r#"{"status":"error","error":{"message":"invalid API key"}}"#,
-        );
-        let err = lookup(&http, "wrong", &fp()).unwrap_err();
+    const BAD_KEY: &str = r#"{"status":"error","error":{"code":4,"message":"invalid API key"}}"#;
+
+    fn assert_bad_key(err: RecognizeError) {
         match err {
             RecognizeError::Refused { service, message } => {
                 assert_eq!(service, "AcoustID");
@@ -208,6 +224,31 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other}"),
         }
+    }
+
+    /// What the live service actually does: HTTP 400 with the error body.
+    /// Checking only the JSON `status` field would let this arrive as a
+    /// bare `http 400: {...}` and send someone off to file a bug.
+    #[test]
+    fn a_bad_key_is_a_refusal_when_it_arrives_as_a_400() {
+        let http = StubHttp::new().failing("acoustid.org", 400, BAD_KEY);
+        assert_bad_key(lookup(&http, "wrong", &fp()).unwrap_err());
+    }
+
+    /// The other shape AcoustID uses for refusals.
+    #[test]
+    fn a_bad_key_is_a_refusal_when_it_arrives_as_a_200() {
+        let http = StubHttp::new().on("acoustid.org", BAD_KEY);
+        assert_bad_key(lookup(&http, "wrong", &fp()).unwrap_err());
+    }
+
+    #[test]
+    fn a_non_acoustid_error_body_keeps_its_status() {
+        // A proxy's HTML 502 is not a refusal and must not be dressed up
+        // as one — the status is the only diagnostic it carries.
+        let http = StubHttp::new().failing("acoustid.org", 502, "<html>bad gateway</html>");
+        let err = lookup(&http, "k", &fp()).unwrap_err();
+        assert!(format!("{err}").contains("502"), "{err}");
     }
 
     #[test]

@@ -42,6 +42,7 @@ dub-fingerprint = { path = "crates/dub-fingerprint" }
 dub-library = { path = "crates/dub-library" }
 dub-encode = { path = "crates/dub-encode" }
 dub-rip = { path = "crates/dub-rip" }
+dub-recognize = { path = "crates/dub-recognize" }
 dub-controller = { path = "crates/dub-controller" }
 dub-ffi = { path = "crates/dub-ffi" }
 dub-audio = { path = "crates/dub-audio" }

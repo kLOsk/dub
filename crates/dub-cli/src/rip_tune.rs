@@ -360,7 +360,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// Load a side. Prefers the salvage reader for WAVs so an interrupted
 /// spill reports its real length instead of what its header claims.
-fn load(path: &Path) -> Result<(Vec<f32>, u32, u16, String)> {
+pub(crate) fn load(path: &Path) -> Result<(Vec<f32>, u32, u16, String)> {
     let is_wav = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
@@ -387,7 +387,7 @@ fn load(path: &Path) -> Result<(Vec<f32>, u32, u16, String)> {
 
 /// Mono-downmix envelope, decimated exactly as the capture worker does
 /// so chunk indices line up with the detector's expectations.
-fn envelope_of(samples: &[f32], channels: u16) -> Vec<PeakChunk> {
+pub(crate) fn envelope_of(samples: &[f32], channels: u16) -> Vec<PeakChunk> {
     let channels = usize::from(channels.max(1));
     let mono: Vec<f32> = samples
         .chunks_exact(channels)
@@ -405,7 +405,7 @@ fn secs_to_frames(secs: f64, sample_rate: u32) -> u64 {
     frames
 }
 
-fn frames_to_secs(frames: u64, sample_rate: u32) -> f64 {
+pub(crate) fn frames_to_secs(frames: u64, sample_rate: u32) -> f64 {
     if sample_rate == 0 {
         return 0.0;
     }
@@ -413,7 +413,7 @@ fn frames_to_secs(frames: u64, sample_rate: u32) -> f64 {
 }
 
 /// `m:ss.d` — tight enough to place a split by eye.
-fn clock(secs: f64) -> String {
+pub(crate) fn clock(secs: f64) -> String {
     let total = secs.max(0.0);
     let mins = (total / 60.0).floor();
     let rest = total - mins * 60.0;

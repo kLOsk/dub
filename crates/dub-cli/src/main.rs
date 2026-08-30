@@ -33,6 +33,7 @@ mod device_profiles;
 mod diagnose;
 mod import;
 mod input_cmds;
+mod recognize;
 mod rip;
 mod rip_resplit;
 mod rip_tune;
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
         "capture" => input_cmds::capture(&args[2..]),
         "rip" => rip::run(&args[2..]),
         "rip-tune" => rip_tune::run(&args[2..]),
+        "recognize" => recognize::run(&args[2..]),
         "rip-resplit" => rip_resplit::run(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
         "thru" => thru::run(&args[2..]),
@@ -138,6 +140,10 @@ fn print_help() {
     eprintln!("                    folder (database V2 + GEOB cues/grids); --itunes reads a");
     eprintln!("                    Library.xml; --folder walks a dir. Idempotent; prints counts.");
     eprintln!("  diagnose <path-or-id>                    grid / waveform / BPM debugger");
+    eprintln!("  recognize <session-dir> [--key KEY] [--apply]");
+    eprintln!("                    name a committed rip's tracks — AcoustID + MusicBrainz.");
+    eprintln!("                    Key from --key or $DUB_ACOUSTID_KEY (free at");
+    eprintln!("                    acoustid.org/new-application). Read-only unless --apply.");
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--window MS] [--head N]");

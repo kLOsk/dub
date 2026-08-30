@@ -21,6 +21,9 @@ dub-stretch = { workspace = true }
 dub-library = { workspace = true }
 dub-peaks = { workspace = true }
 dub-rip = { workspace = true }
+# M26c — `dub recognize`. The only crate in the workspace that reaches
+# the network, and only through its own `Http` trait.
+dub-recognize = { workspace = true }
 rusqlite = { workspace = true }
 dub-timecode = { workspace = true }
 anyhow = { workspace = true }
