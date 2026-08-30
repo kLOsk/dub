@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Audio fingerprinting (Chromaprint algorithm 2, pure-Rust). Used by the library subsystem for dedupe (M11b) and by Thru-mode real-record recognition (v1.1)."
 

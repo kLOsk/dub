@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Vinyl-rip session engine for Dub (M26). Off-RT capture worker (record-tap ring → crash-safe WAV spill + live peak envelope), split plan over the envelope, rip.json manifest, and commit orchestration (analyze → FLAC encode+tag → library import). Fully offline; recognition lives in dub-recognize and is bridged by the caller."
 

@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check app app-release run-app open-app xcframework snapshot sweep check-stale
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check deny audit attribution app app-release run-app open-app xcframework snapshot sweep check-stale
 
 # --- Build-artifact hygiene -------------------------------------------
 #
@@ -40,6 +40,9 @@ help:
 	@echo "  make soak          1-hour offline render soak (placeholder)"
 	@echo "  make ci            run the full CI pipeline locally"
 	@echo "  make docs-check    fail if the docs drift from the code"
+	@echo "  make deny          fail if a dependency licence is not allowed (deny.toml)"
+	@echo "  make audit         RUSTSEC advisories (needs network; not in ci)"
+	@echo "  make attribution   regenerate the bundled open-source licence file"
 	@echo "  make hooks         install the pre-push CI gate (once per clone)"
 	@echo "  make clean         cargo clean (removes everything; forces a full rebuild)"
 	@echo "  make sweep         drop build artifacts unused for $(STALE_DAYS) days"
@@ -97,7 +100,31 @@ soak:
 docs-check:
 	./scripts/check-docs.sh
 
-ci: docs-check fmt-check clippy test
+# Licence / dependency policy — see deny.toml. Offline and fast, so it
+# belongs in the push gate: Dub is MIT OR Apache-2.0 and a copyleft
+# dependency taken by accident would drag every distributed binary with
+# it.
+deny:
+	@if command -v cargo-deny >/dev/null 2>&1; then \
+		cargo deny check licenses bans sources; \
+	else \
+		echo "cargo-deny not installed - skipping (cargo install cargo-deny --locked)"; \
+	fi
+
+# RUSTSEC advisories. Deliberately NOT in `ci`: it needs the network,
+# and an advisory published upstream would turn an unrelated push red.
+# Run it when you want to know, not on every commit.
+audit:
+	cargo deny check advisories
+
+# The attribution bundle that ships inside the app. Regenerate whenever
+# the dependency graph changes; the file is tracked so a release build
+# never depends on cargo-about being installed.
+attribution:
+	cargo about generate about.hbs -o apple/Dub/Resources/Acknowledgments.html
+	@echo "wrote apple/Dub/Resources/Acknowledgments.html"
+
+ci: docs-check deny fmt-check clippy test
 	@echo "Local CI pipeline complete."
 
 # Point git at the tracked hook directory. Idempotent; run once per

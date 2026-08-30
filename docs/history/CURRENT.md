@@ -74,6 +74,23 @@ Alternatives on the roadmap if M26c is not the appetite: **M11d-columns**
 M3U8, 3 days), **M17** (sampler / quick scratch / instant doubles, 4–6 days).
 See `../spec/PRD.md` §12.1.
 
+## Licence posture is now enforced, not just documented
+
+Dub is **MIT OR Apache-2.0**. `make deny` (in `make ci`, and its own CI job)
+fails the build on any dependency licence not on `deny.toml`'s allow-list, and
+bans the four copyleft FFIs that were each deliberately routed around
+(rubberband, aubio, chromaprint, mp3lame) by name and with a reason. Before the
+relicense a copyleft dep cost nothing — the workspace already declared GPL —
+so this guard is new risk cover, not tidying.
+
+`make attribution` generates `apple/Dub/Resources/Acknowledgments.html` from
+the real build graph and the About panel links to it, which retires the
+"How to ship attribution" to-do. Regenerate it when dependencies change;
+nothing fails yet if it goes stale.
+
+RUSTSEC advisories are `make audit`, deliberately **not** in `ci`: they need
+the network, and an upstream publication would turn an unrelated push red.
+
 ## Known gaps worth naming
 
 - **P-40** — the FFI position extrapolator does not wrap into the loop region,

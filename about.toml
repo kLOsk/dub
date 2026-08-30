@@ -1,0 +1,56 @@
+# cargo-about — generates the attribution file that ships inside the app.
+#
+# `docs/spec/LICENSE-DEPENDENCIES.md` explains *why* each direct
+# dependency is in Dub and what it costs us; a human writes that and it
+# is worth reading. This generates the other half: the exhaustive
+# licence-text bundle every MIT/Apache/BSD dependency obliges us to
+# reproduce in a distributed binary. Roughly 390 crates, which is not a
+# list anyone should maintain by hand — and the hand-maintained one was
+# already wrong about `assert_no_alloc` (BSD-1-Clause, documented as
+# MIT).
+#
+# Run: `make attribution` → apple/Dub/Resources/Acknowledgments.html
+# The About panel links to it (PRD §11, LICENSE-DEPENDENCIES.md
+# "How to ship attribution").
+
+# Only what ships. A user never receives our dev-dependencies, so their
+# licences carry no distribution obligation — same graph cargo-deny
+# gates.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+]
+
+# Dub is macOS-only (PRD §4). Without this the graph pulls in every
+# Windows and Linux target's dependencies, and the attribution file ends
+# up crediting crates that are never compiled into anything a user runs.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+# Build-time-only crates (proc macros, build scripts) do not ship code
+# in the binary, but their licences are cheap to include and being
+# over-inclusive in attribution is the safe direction.
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Fail rather than quietly omit a crate whose licence file cannot be
+# found — a missing attribution is exactly the failure this file exists
+# to prevent.
+workarounds = ["ring"]

@@ -135,6 +135,9 @@ make soak          # run the offline render soak harness for 1 hour
 make sweep         # drop build artifacts unused for 14 days (see below)
 make check-stale   # sweep only when target/debug/deps is over STALE_MAX (runs before test / app)
 make docs-check    # FFI / schema / crate-count numbers in docs match the code
+make deny          # dependency licences against deny.toml (offline; part of ci)
+make audit         # RUSTSEC advisories (needs network; deliberately NOT in ci)
+make attribution   # regenerate apple/Dub/Resources/Acknowledgments.html
 make app           # build the macOS app
 make ci            # docs-check + fmt-check + clippy + test — exactly what CI runs
 ```
@@ -274,4 +277,4 @@ We are **MIT OR Apache-2.0** (dual, at the user's option). Dub was GPLv3 by *dec
 - Skip writing tests for non-trivial logic.
 - Use `unwrap()` outside test code.
 - Commit secrets.
-- Add a dependency without checking its license. Dub is MIT OR Apache-2.0 and the graph is fully permissive; a GPL or LGPL dep would drag the whole binary back to copyleft.
+- Add a dependency without checking its license. Dub is MIT OR Apache-2.0 and the graph is fully permissive; a GPL or LGPL dep would drag the whole binary back to copyleft. `make deny` enforces this and runs in `make ci` — if it fails, that is a licensing decision, not a config problem to silence.

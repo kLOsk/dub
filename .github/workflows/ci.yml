@@ -71,3 +71,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: check-docs
         run: ./scripts/check-docs.sh
+
+  deny:
+    name: Dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      # Licences, bans and sources only. Advisories are `make audit`:
+      # they need the advisory database and an upstream publication
+      # would fail this job for reasons unrelated to the change.
+      - name: cargo deny
+        run: cargo deny check licenses bans sources

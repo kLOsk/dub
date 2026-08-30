@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Recognition for ripped vinyl (M26c): AcoustID lookup on a TEST2 Chromaprint, MusicBrainz release resolution, Discogs enrichment. Network access is confined behind an `Http` trait so the rip pipeline stays fully offline — recognition is optional enrichment, never a dependency."
 

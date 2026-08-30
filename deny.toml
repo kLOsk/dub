@@ -1,0 +1,120 @@
+# cargo-deny — the gate behind Dub's licence posture.
+#
+# Dub is MIT OR Apache-2.0 (PRD §11). That was only ever *available*
+# because no copyleft dependency was taken: M7.5 routed around aubio
+# (LGPL-3.0), M11b around chromaprint (LGPL-2.1), M14 around rubberband
+# (GPL-3.0) and M26 around LAME (LGPL-2.0). Each of those was a
+# deliberate decision, and any one of them going the other way would
+# have dragged every distributed binary into copyleft.
+#
+# Before the relicense that risk was theoretical — the workspace already
+# declared GPL, so a copyleft dep cost nothing. It is real now. This
+# file is what keeps the rule from living only in prose, the same way
+# `scripts/check-docs.sh` keeps the docs honest.
+#
+# Run: `make deny` (or `cargo deny check licenses bans sources`).
+# Security advisories are deliberately a separate target — see the note
+# under [advisories] below.
+
+[graph]
+# Only what we actually ship. Dev-dependencies never reach a user's
+# machine, so their licences are not a distribution obligation.
+all-features = false
+exclude-dev = true
+
+[licenses]
+version = 2
+# Anything not listed is a build failure. Adding to this list is a
+# licensing decision — make it deliberately, and update
+# `docs/spec/LICENSE-DEPENDENCIES.md` in the same commit.
+allow = [
+    # The permissive core. Dub itself is the first two.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unlicense",
+    # Unicode character-data tables (the `unicode-ident` family and
+    # friends). Data, not code, and permissive.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # File-level copyleft, and the one non-permissive family we accept.
+    # symphonia (decode) and uniffi (Swift bindings) are both MPL-2.0.
+    # MPL obliges source disclosure only for *modified* MPL files; Dub
+    # modifies none, so a notice suffices and the binary may ship
+    # closed if it ever needs to. Do not vendor-and-patch either of
+    # them without revisiting this.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+# Named exceptions rather than blanket allowances: each of these is one
+# crate we accept, so a *second* crate arriving under the same licence
+# still fails the gate and gets a decision.
+[[licenses.exceptions]]
+# The rustls CA-certificate bundle. CDLA-Permissive-2.0 is a data
+# licence (Linux Foundation), permissive, with no copyleft reach into
+# the binary. Reached only through `ureq` in dub-recognize.
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[[licenses.exceptions]]
+# Transitive under the dub-cli TUI stack (ratatui → crossterm). WTFPL
+# is permissive in intent but is not OSI-approved and is unusual enough
+# that it should not be a licence we accept in general.
+name = "terminfo"
+allow = ["WTFPL"]
+
+[bans]
+# Duplicate versions are a size and confusion problem, not a
+# correctness one, so they warn rather than fail.
+multiple-versions = "warn"
+# A `*` version on a crates.io dependency is a supply-chain hazard: any
+# future release satisfies it. Dub's own crates are path dependencies
+# inside an unpublished workspace and carry no version by design, which
+# is what `allow-wildcard-paths` exempts.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[[bans.deny]]
+# The copyleft FFIs that were each deliberately routed around. Named
+# explicitly so anyone reaching for one gets told why rather than
+# discovering it from a licence error three layers down.
+name = "rubberband-sys"
+reason = "GPL-3.0. M14 shipped the pure-Rust WSOLA in dub-stretch instead; taking this makes every distributed binary GPL (PRD §11)."
+
+[[bans.deny]]
+name = "aubio"
+reason = "LGPL-3.0. M7.5 shipped the pure-Rust dub-bpm engine instead. If a backend is ever wanted, it needs an opt-in feature and a licence decision first."
+
+[[bans.deny]]
+name = "aubio-sys"
+reason = "LGPL-3.0. See `aubio`."
+
+[[bans.deny]]
+name = "chromaprint-sys"
+reason = "LGPL-2.1. M11b shipped rusty-chromaprint (MIT/Apache) instead."
+
+[[bans.deny]]
+name = "mp3lame-sys"
+reason = "LGPL-2.0-or-later. M26 shipped FLAC (flacenc, Apache-2.0) instead; revisit only with a licence decision."
+
+[advisories]
+# RUSTSEC advisories are checked by `make audit`, NOT by `make ci`.
+#
+# The split is deliberate. `make ci` runs on every push via
+# .githooks/pre-push and must stay offline and fast — the advisory
+# database is a network fetch, and an advisory published upstream would
+# turn an unrelated push red through no fault of the change. Security
+# news is worth having; it is not worth blocking a commit on.
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

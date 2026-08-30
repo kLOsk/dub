@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Live waveform-peak capture for Dub (M9). Off-RT decimator thread that consumes a mono-downmixed audio tap from ThruSource and produces multi-resolution PeakChunks for live waveform rendering (M10)."
 

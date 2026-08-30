@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dub — Open Source Acknowledgments</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 13px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    margin: 0 auto; max-width: 46rem; padding: 2rem 1.5rem 4rem;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  .lede { opacity: .75; margin-top: 0; }
+  .count { font-size: .85rem; opacity: .6; margin-bottom: 2rem; }
+  section { margin-top: 2rem; }
+  h2 { font-size: .95rem; margin: 0 0 .1rem; }
+  .lic { font-size: .8rem; opacity: .6; margin: 0 0 .5rem; text-transform: uppercase; letter-spacing: .04em; }
+  pre {
+    white-space: pre-wrap;
+    font: 11px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+    background: rgba(128,128,128,.10);
+    padding: .9rem; border-radius: 6px; overflow-x: auto; margin: 0;
+  }
+  a { color: inherit; }
+  hr { border: 0; border-top: 1px solid rgba(128,128,128,.25); margin: 2.5rem 0 0; }
+</style>
+</head>
+<body>
+<h1>Open Source Acknowledgments</h1>
+<p class="lede">
+  Dub is built on the work below, and is itself available under
+  <strong>MIT OR Apache-2.0</strong>. Every licence that requires its text be
+  reproduced is included in full.
+</p>
+<p class="count">
+  Generated from the actual build graph by <code>cargo-about</code>, so it
+  cannot drift from what ships.
+</p>
+
+{{#each licenses}}
+<section>
+  <h2>{{#each used_by}}{{crate.name}}{{#unless @last}}, {{/unless}}{{/each}}</h2>
+  <p class="lic">{{name}}</p>
+  <pre>{{text}}</pre>
+</section>
+{{/each}}
+
+<hr>
+</body>
+</html>

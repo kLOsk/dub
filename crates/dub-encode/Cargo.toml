@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Offline audio encoding for Dub (M26 vinyl rip). FLAC track/side-archive encoding (flacenc, pure Rust) + Vorbis-comment/PICTURE tagging (metaflac) with Picard-convention MusicBrainz fields. Deliberately permissive-only: MP3/LAME was considered and deferred (docs/spec/LICENSE-DEPENDENCIES.md)."
 

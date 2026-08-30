@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "Shared STFT + log-band + magnitude-compression pipeline for dub-bpm and dub-peaks."
 

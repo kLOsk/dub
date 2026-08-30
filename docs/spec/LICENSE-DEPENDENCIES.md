@@ -2,7 +2,14 @@
 
 This document enumerates every external library Dub links against, with its license, role, and attribution requirement. It is the **source of truth** for the "Acknowledgments" / "Open Source Licenses" panel a shipped binary must surface.
 
-The list is kept in sync with the workspace `Cargo.toml` and per-crate `Cargo.toml` files by hand. If you add, remove, or upgrade an external dependency, update this document in the same commit.
+This document covers the ~40 **direct** dependencies — what each one is for, why it was chosen, and what it costs us. That reasoning is worth a human writing and reading, so it is maintained by hand: if you add, remove or upgrade a direct dependency, update this document in the same commit.
+
+Two machine-checked companions carry what a human should not maintain:
+
+- **`deny.toml`** (`make deny`, and a CI job) is the *gate*. Every licence in the shipped graph must be on its allow-list, the copyleft FFIs Dub deliberately routed around are banned by name, and wildcard versions are refused. Dub is MIT OR Apache-2.0 only because no copyleft dependency was ever taken; this is what keeps that true rather than merely intended.
+- **`about.toml` / `about.hbs`** (`make attribution`) generate the exhaustive licence-text bundle that ships in the app — roughly **390 crates** once transitives are counted, against the ~40 documented below. That is not a hand-maintainable list, and the hand-maintained version was already wrong: `assert_no_alloc` is BSD-1-Clause, not MIT, as recorded here for months.
+
+The tables below count direct dependencies. The generated bundle counts everything distributed, which is the number the attribution obligation actually attaches to.
 
 Last verified: M26b (workspace dependency-graph snapshot 2026-07; added `flacenc` + `metaflac` for the vinyl-rip encode stack, and promoted `serde` / `serde_json` from `dub-cli`-only to workspace-wide for the `rip.json` session manifest).
 
@@ -46,7 +53,7 @@ Last verified: M26b (workspace dependency-graph snapshot 2026-07; added `flacenc
 ### `assert_no_alloc`
 
 * **Version:** 1.1, `default-features = false`
-* **License:** MIT
+* **License:** BSD-1-Clause
 * **Upstream:** https://github.com/Windfisch/rust-assert-no-alloc
 * **Role in Dub:** Compile- and runtime-time enforcement that the audio render thread never allocates. PRD §2.2.7 "The audio thread is sacred" is enforced through this crate.
 * **Used by:** `dub-engine`, `dub-audio`, tools/rt-audit
@@ -390,12 +397,24 @@ and retaliation clause, which is part of why it is offered alongside MIT.
 
 ## How to ship attribution
 
-When a Dub binary is distributed:
+**This is done and automated.** `make attribution` runs `cargo-about`
+(`about.toml` + `about.hbs`) over the real macOS build graph and writes
+`apple/Dub/Resources/Acknowledgments.html` — every licence text, one section
+per distinct copyright, headed by the crates it covers. `apple/project.yml`
+bundles it into `Dub.app/Contents/Resources/`, and the About panel links to it
+("Open source licenses"). The generated file is **tracked**, so a release build
+never depends on `cargo-about` being installed.
 
-1. Bundle this document (or its rendered equivalent) inside the application bundle at `Contents/Resources/Acknowledgments.md` or similar.
-2. Surface it in the macOS `About Dub` panel via a button or `NSAppKit` link.
-3. For every MIT-licensed and Apache-licensed dependency listed above, include the full license text and the copyright notice. The canonical practice is one section per dependency, in the same order as this document.
-4. Apache-2.0 dependencies require preservation of any `NOTICE` file the upstream ships. `hound` does not currently ship one; `insta` does not currently ship one. If an upgrade brings one in, copy it across.
-5. MPL-2.0 dependencies (`symphonia`, `uniffi`) require the full MPL-2.0 license text to be bundled. The MPL only requires source disclosure if Dub modifies the library source itself — Dub does not, so a notice is sufficient.
+That satisfies the obligations directly: full text and copyright notice for
+every MIT / Apache / BSD / ISC / Zlib dependency, and the full MPL-2.0 text for
+`symphonia` and `uniffi` (MPL requires source disclosure only for *modified*
+MPL files, and Dub modifies none, so a notice suffices).
 
-Generating this list automatically from the cargo build graph is a worthwhile follow-up project (`cargo-about` or `cargo-deny` are the standard tools), gated on the first shipped binary milestone.
+Two things still need a human:
+
+1. **Regenerate after any dependency change** — `make attribution`, committed
+   alongside. Nothing yet fails the build if it goes stale; a checked-in-diff
+   CI step would close that.
+2. **Apache-2.0 `NOTICE` files** must be preserved if an upstream starts
+   shipping one. `hound` and `insta` do not today. `cargo-about` does not
+   collect `NOTICE` files, so this remains a manual check on upgrade.
