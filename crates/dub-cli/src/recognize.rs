@@ -32,6 +32,10 @@ use crate::rip_tune::{clock, envelope_of, frames_to_secs, load};
 
 /// Env var holding the AcoustID application key.
 const KEY_ENV: &str = "DUB_ACOUSTID_KEY";
+/// Env var holding the Discogs personal access token. Unlike the
+/// AcoustID key this is a *user* credential; in the app it belongs in
+/// the Keychain (R-42), and the env var is the CLI's answer only.
+const DISCOGS_ENV: &str = "DUB_DISCOGS_TOKEN";
 
 /// One segment's audio, plus how to name it in the report.
 struct Loaded {
@@ -99,9 +103,15 @@ pub fn run(args: &[String]) -> Result<()> {
     // One second between requests is MusicBrainz's published limit and
     // the tightest of the three services, so it governs.
     let http = UreqHttp::new(std::time::Duration::from_secs(1));
-    let result = Recognizer::new(&http, key)
-        .with_release_lookup(opts.album)
-        .recognize_side(&segments)?;
+    let discogs = opts
+        .discogs_token
+        .clone()
+        .or_else(|| std::env::var(DISCOGS_ENV).ok());
+    let mut recognizer = Recognizer::new(&http, key).with_release_lookup(opts.album);
+    if let Some(token) = discogs {
+        recognizer = recognizer.with_discogs(token);
+    }
+    let result = recognizer.recognize_side(&segments)?;
     report(&result, &loaded);
 
     if opts.apply {
@@ -256,6 +266,18 @@ fn report(result: &SideRecognition, loaded: &[Loaded]) {
                 }
             }
             println!("  mbid     {}", rel.mbid);
+            if let Some(d) = &result.discogs {
+                if let Some(g) = d.genre_tag() {
+                    println!("  style    {g}");
+                }
+                if let Some(c) = &d.country {
+                    println!(
+                        "  pressed  {c}{}",
+                        d.year.map_or(String::new(), |y| format!(", {y}"))
+                    );
+                }
+                println!("  discogs  {}", d.id);
+            }
             if let Some(side) = result.side {
                 println!("  side     {side}");
             }
@@ -325,6 +347,13 @@ fn apply(session_dir: &Path, result: &SideRecognition, loaded: &[Loaded]) -> Res
         if let Some(a) = &named.artist {
             entry.meta.artist = Some(a.clone());
         }
+        if let Some(d) = &result.discogs {
+            // Discogs' style taxonomy is the reason to ask it at all —
+            // "Philly Soul" files a record where "Funk / Soul" does not.
+            if let Some(g) = d.genre_tag() {
+                entry.meta.genre = Some(g);
+            }
+        }
         if let Some(rel) = &result.release {
             entry.meta.album = Some(rel.title.clone());
             // MusicBrainz dates are often just a year; take the leading
@@ -355,6 +384,7 @@ struct Opts {
     key: Option<String>,
     apply: bool,
     album: bool,
+    discogs_token: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -362,6 +392,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     let mut key = None;
     let mut apply = false;
     let mut album = false;
+    let mut discogs_token = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -374,6 +405,13 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             }
             "--apply" => apply = true,
             "--album" => album = true,
+            "--discogs-token" => {
+                discogs_token = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow!("--discogs-token expects a value"))?,
+                );
+            }
             other if other.starts_with("--") => {
                 return Err(anyhow!("unknown recognize flag: {other}"));
             }
@@ -387,6 +425,8 @@ fn parse_args(args: &[String]) -> Result<Opts> {
                  names each track's artist + title from AcoustID — no MusicBrainz, no throttle.\n  \
                  --album  also identify the pressing (album / label / cat no / A1-B3 numbers),\n           \
                  at one MusicBrainz request a second.\n  \
+                 --discogs-token TOK  add Discogs style / pressing detail (implies --album);\n           \
+                 also read from ${DISCOGS_ENV}.\n  \
                  --apply  write the result into a session's rip.json.\n  \
                  a session dir recognises its committed tracks; any decodable audio file is\n  \
                  auto-split first and is read-only.\n  \
@@ -396,5 +436,6 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         key,
         apply,
         album,
+        discogs_token,
     })
 }

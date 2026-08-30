@@ -21,6 +21,7 @@
 #![warn(missing_docs)]
 
 pub mod acoustid;
+pub mod discogs;
 mod error;
 mod fingerprint;
 pub mod http;
@@ -37,7 +38,8 @@ pub const USER_AGENT: &str = concat!(
 );
 
 pub use acoustid::Candidate;
+pub use discogs::DiscogsRelease;
 pub use error::RecognizeError;
 pub use fingerprint::{fingerprint, AcoustIdFingerprint, MIN_DURATION_SECS};
 pub use musicbrainz::{Release, ReleaseRef, Track};
-pub use side::{Recognizer, SegmentAudio, SegmentMatch, SideRecognition};
+pub use side::{NamedTrack, Recognizer, SegmentAudio, SegmentMatch, SideRecognition};

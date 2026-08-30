@@ -71,6 +71,10 @@ pub struct Release {
     pub label: Option<String>,
     /// Catalogue number — what is actually stamped in the run-out.
     pub catalog_number: Option<String>,
+    /// Discogs release id, from MusicBrainz's own curated link. The
+    /// only way this crate reaches Discogs: searching for a pressing by
+    /// name would sooner or later attach the wrong one's paperwork.
+    pub discogs_release_id: Option<String>,
     /// Every track, in order, across all media.
     pub tracks: Vec<Track>,
 }
@@ -105,6 +109,22 @@ struct ReleaseBody {
     label_info: Vec<LabelInfo>,
     #[serde(default)]
     media: Vec<Medium>,
+    #[serde(default)]
+    relations: Vec<Relation>,
+}
+
+#[derive(Deserialize)]
+struct Relation {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    url: Option<UrlRow>,
+}
+
+#[derive(Deserialize)]
+struct UrlRow {
+    #[serde(default)]
+    resource: String,
 }
 
 #[derive(Deserialize)]
@@ -186,8 +206,9 @@ pub fn releases_for_recording(
 
 /// Fetch a release with its full tracklist.
 pub fn release(http: &dyn Http, release_mbid: &str) -> Result<Release, RecognizeError> {
-    let url =
-        format!("{BASE}/release/{release_mbid}?inc=recordings+artist-credits+labels&fmt=json");
+    let url = format!(
+        "{BASE}/release/{release_mbid}         ?inc=recordings+artist-credits+labels+url-rels&fmt=json"
+    );
     let body = http.get(&url, &headers())?;
     let parsed: ReleaseBody = serde_json::from_str(&body).map_err(malformed)?;
 
@@ -209,6 +230,13 @@ pub fn release(http: &dyn Http, release_mbid: &str) -> Result<Release, Recognize
             )
         },
     );
+
+    let discogs_release_id = parsed
+        .relations
+        .iter()
+        .filter(|r| r.kind == "discogs")
+        .filter_map(|r| r.url.as_ref())
+        .find_map(|u| crate::discogs::release_id_from_url(&u.resource));
 
     let tracks = parsed
         .media
@@ -233,6 +261,7 @@ pub fn release(http: &dyn Http, release_mbid: &str) -> Result<Release, Recognize
         date: parsed.date,
         label,
         catalog_number,
+        discogs_release_id,
         tracks,
     })
 }

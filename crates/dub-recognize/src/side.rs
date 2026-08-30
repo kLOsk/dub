@@ -30,6 +30,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::acoustid::{self, Candidate};
+use crate::discogs::{self, DiscogsRelease};
 use crate::error::RecognizeError;
 use crate::fingerprint::{self, AcoustIdFingerprint};
 use crate::http::Http;
@@ -90,6 +91,10 @@ pub struct SideRecognition {
     /// How many segments the winning release explained. Zero when no
     /// release lookup ran; naming does not depend on it.
     pub explained: usize,
+    /// What Discogs adds about the pressing: genre, style, country and
+    /// the catalogue number. `None` unless a token was supplied and
+    /// MusicBrainz carried a curated link to follow.
+    pub discogs: Option<DiscogsRelease>,
     /// Recordings MusicBrainz could not be asked about, because it was
     /// busy or unreachable. Non-zero means the vote saw less than the
     /// whole side, so a thin answer here is not the same as "unknown
@@ -111,6 +116,7 @@ pub struct Recognizer<'a> {
     acoustid_key: String,
     max_candidates: usize,
     release_lookup: bool,
+    discogs_token: Option<String>,
 }
 
 impl<'a> Recognizer<'a> {
@@ -128,6 +134,7 @@ impl<'a> Recognizer<'a> {
             // often one song, where a release vote over a single segment
             // buys little and costs a request a second.
             release_lookup: false,
+            discogs_token: None,
         }
     }
 
@@ -140,6 +147,26 @@ impl<'a> Recognizer<'a> {
     #[must_use]
     pub fn with_release_lookup(mut self, on: bool) -> Self {
         self.release_lookup = on;
+        self
+    }
+
+    /// Also ask Discogs about the pressing — genre, style, country,
+    /// catalogue number.
+    ///
+    /// Implies [`Self::with_release_lookup`], since Discogs is reached
+    /// only through the link on a MusicBrainz release. Enrichment is
+    /// best-effort: a Discogs failure leaves `discogs` empty rather than
+    /// failing a recognition that has already named the tracks.
+    ///
+    /// The token is a *user* credential (unlike the AcoustID
+    /// application key) and belongs in the Keychain.
+    #[must_use]
+    pub fn with_discogs(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.trim().is_empty() {
+            self.discogs_token = Some(token);
+            self.release_lookup = true;
+        }
         self
     }
 
@@ -203,6 +230,7 @@ impl<'a> Recognizer<'a> {
                 named: count_named(&per_segment),
                 segments: per_segment,
                 explained: 0,
+                discogs: None,
                 unresolved: 0,
             });
         }
@@ -271,12 +299,22 @@ impl<'a> Recognizer<'a> {
                 named: count_named(&per_segment),
                 segments: per_segment,
                 explained: 0,
+                discogs: None,
                 unresolved,
             });
         };
 
         // 5. Pull the tracklist and assign each segment its track.
         let release = musicbrainz::release(self.http, &winner)?;
+
+        // 5a. Discogs, if asked for and if MusicBrainz carried a link.
+        //     Enrichment only: a failure here must not sink tracks that
+        //     are already named.
+        let discogs = self
+            .discogs_token
+            .as_deref()
+            .zip(release.discogs_release_id.as_deref())
+            .and_then(|(token, id)| discogs::release(self.http, token, id).ok());
         let mut explained = 0;
         // Walk each segment's candidates *best first* and take the first
         // track no earlier segment has claimed.
@@ -343,6 +381,7 @@ impl<'a> Recognizer<'a> {
             named: count_named(&per_segment),
             segments: per_segment,
             explained,
+            discogs,
             unresolved,
         })
     }
@@ -827,6 +866,90 @@ mod tests {
             got.segments[0].named.as_ref().unwrap().title,
             "TSOP",
             "the side is credited to The O Jays, so break the tie that way"
+        );
+    }
+
+    /// Discogs is reached only through MusicBrainz's curated link, and
+    /// only adds to an answer that already exists.
+    #[test]
+    fn discogs_enriches_the_pressing_through_the_musicbrainz_link() {
+        let (a, b, c) = (tone(440.0), tone(523.25), tone(659.25));
+        let http = stub_side_on(
+            StubHttp::new()
+                .on(
+                    "/release/rel-lp",
+                    r#"{"id":"rel-lp","title":"There Is",
+                        "relations":[{"type":"discogs","url":
+                          {"resource":"https://www.discogs.com/release/438249"}}],
+                        "media":[{"tracks":[
+                          {"number":"A1","title":"Stay In My Corner",
+                           "recording":{"id":"rec-a"}}]}]}"#,
+                )
+                .on(
+                    "/releases/438249",
+                    r#"{"id":438249,"year":1968,"country":"US",
+                        "genres":["Funk / Soul"],"styles":["Philly Soul"],
+                        "labels":[{"name":"Cadet","catno":"LPS-804"}]}"#,
+                ),
+            &a,
+            &b,
+            &c,
+        );
+
+        let got = Recognizer::new(&http, "key")
+            .with_discogs("tok")
+            .recognize_side(&[audio(&a), audio(&b), audio(&c)])
+            .unwrap();
+        let d = got.discogs.as_ref().expect("Discogs should have answered");
+        assert_eq!(d.id, "438249");
+        assert_eq!(d.genre_tag().as_deref(), Some("Philly Soul"));
+        assert_eq!(d.country.as_deref(), Some("US"));
+    }
+
+    /// Enrichment must never sink an answer that already names tracks.
+    #[test]
+    fn a_discogs_failure_leaves_the_naming_intact() {
+        let (a, b, c) = (tone(440.0), tone(523.25), tone(659.25));
+        let http = stub_side_on(
+            StubHttp::new()
+                .failing("/releases/", 502, "bad gateway")
+                .on(
+                    "/release/rel-lp",
+                    r#"{"id":"rel-lp","title":"There Is",
+                        "relations":[{"type":"discogs","url":
+                          {"resource":"https://www.discogs.com/release/438249"}}],
+                        "media":[{"tracks":[
+                          {"number":"A1","title":"Stay In My Corner",
+                           "recording":{"id":"rec-a"}}]}]}"#,
+                ),
+            &a,
+            &b,
+            &c,
+        );
+
+        let got = Recognizer::new(&http, "key")
+            .with_discogs("tok")
+            .recognize_side(&[audio(&a), audio(&b), audio(&c)])
+            .unwrap();
+        assert!(got.discogs.is_none(), "no enrichment");
+        assert!(got.release.is_some(), "but the release still stands");
+        assert_eq!(got.explained, 1);
+    }
+
+    /// No token means no Discogs call at all, not a failed one.
+    #[test]
+    fn without_a_token_discogs_is_never_asked() {
+        let (a, b, c) = (tone(440.0), tone(523.25), tone(659.25));
+        let http = stub_side(&a, &b, &c);
+        let got = Recognizer::new(&http, "key")
+            .with_release_lookup(true)
+            .recognize_side(&[audio(&a), audio(&b), audio(&c)])
+            .unwrap();
+        assert!(got.discogs.is_none());
+        assert!(
+            !http.requests().iter().any(|r| r.contains("discogs")),
+            "{:?}",
+            http.requests()
         );
     }
 
