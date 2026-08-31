@@ -323,3 +323,136 @@ mod tests {
         assert!((i - 4.0).abs() < 1e-9 && (o - 8.0).abs() < 1e-9);
     }
 }
+
+/// One stored cue, whatever source wrote it (M11f export).
+///
+/// [`Library::hot_cues`] deliberately returns only the DJ's own cues,
+/// because that is what the deck plays. Export needs the other kind
+/// too: the whole point of storing imported cues from v1.0 day one
+/// (PRD §8.6) is that a DJ who imports a Serato library and exports to
+/// rekordbox gets their hot cues back on the other side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCue {
+    /// `serato` / `traktor` / `rekordbox` / `itunes` / `user`.
+    pub source: String,
+    /// Pad slot for a hot cue; memory cues are indexed above the pads.
+    pub cue_index: i64,
+    /// Seconds from track start.
+    pub position_secs: f64,
+    /// Label, if the source carried one.
+    pub name: Option<String>,
+    /// `#RRGGBB`, if the source carried one.
+    pub color: Option<String>,
+    /// `hot_cue` / `memory` / `load` / `loop_in` / `loop_out`.
+    pub kind: String,
+}
+
+/// One stored loop (M11f export). Loops had no read path at all before
+/// export needed one — they were write-only since M11e.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredLoop {
+    /// Source that wrote it.
+    pub source: String,
+    /// Pad slot.
+    pub loop_index: i64,
+    /// Loop in-point, seconds.
+    pub in_secs: f64,
+    /// Loop out-point, seconds.
+    pub out_secs: f64,
+    /// Label, if any.
+    pub name: Option<String>,
+    /// `#RRGGBB`, if any.
+    pub color: Option<String>,
+}
+
+impl Library {
+    /// Every cue on a track, from every source, ordered by source then
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Sqlite`] if the query fails.
+    pub fn all_cues(&self, track_id: &str) -> Result<Vec<StoredCue>> {
+        let conn = self.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, cue_index, position_secs, name, color, kind \
+                 FROM track_cues WHERE track_id = ?1 ORDER BY source, cue_index",
+            )
+            .map_err(|e| LibraryError::sqlite("all_cues_prepare", e))?;
+        let rows = stmt
+            .query_map(params![track_id], |r| {
+                Ok(StoredCue {
+                    source: r.get(0)?,
+                    cue_index: r.get(1)?,
+                    position_secs: r.get(2)?,
+                    name: r.get(3)?,
+                    color: r.get(4)?,
+                    kind: r.get(5)?,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("all_cues_query", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| LibraryError::sqlite("all_cues_row", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Every stored loop on a track, from every source.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Sqlite`] if the query fails.
+    pub fn all_loops(&self, track_id: &str) -> Result<Vec<StoredLoop>> {
+        let conn = self.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, loop_index, in_secs, out_secs, name, color \
+                 FROM track_loops WHERE track_id = ?1 ORDER BY source, loop_index",
+            )
+            .map_err(|e| LibraryError::sqlite("all_loops_prepare", e))?;
+        let rows = stmt
+            .query_map(params![track_id], |r| {
+                Ok(StoredLoop {
+                    source: r.get(0)?,
+                    loop_index: r.get(1)?,
+                    in_secs: r.get(2)?,
+                    out_secs: r.get(3)?,
+                    name: r.get(4)?,
+                    color: r.get(5)?,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("all_loops_query", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| LibraryError::sqlite("all_loops_row", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Absolute path of a track's most-recently-confirmed file.
+    ///
+    /// Joins `track_files` to its volume's last known mount point,
+    /// which is how every other path-consuming call site resolves one.
+    /// `None` when the track has no file row.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Sqlite`] if the query fails.
+    pub fn track_path(&self, track_id: &str) -> Result<Option<std::path::PathBuf>> {
+        let conn = self.connection();
+        let found: rusqlite::Result<(String, String)> = conn.query_row(
+            "SELECT v.last_known_mount_point, tf.relative_path \
+             FROM track_files tf JOIN volumes v ON v.volume_uuid = tf.volume_uuid \
+             WHERE tf.track_id = ?1 ORDER BY tf.last_seen_at DESC LIMIT 1",
+            params![track_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        match found {
+            Ok((mount, rel)) => Ok(Some(std::path::Path::new(&mount).join(rel))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LibraryError::sqlite("track_path", e)),
+        }
+    }
+}

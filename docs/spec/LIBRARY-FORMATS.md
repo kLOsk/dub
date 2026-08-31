@@ -209,6 +209,63 @@ Run headless with `dub import --rekordbox <rekordbox.xml>`.
 
 **Fuzz target.** `fuzz/fuzz_targets/fuzz_rekordbox_xml.rs` over `parse_xml`.
 
+### rekordbox XML + M3U8 — **export, shipped (M11f)**
+
+The other direction, and PRD §8.6's anti-lock-in commitment: `dub export
+--rekordbox <out.xml>` / `--m3u8 <out.m3u8>`, optionally `--crate NAME`.
+
+**The writer is the reader's inverse, deliberately.**
+`rekordbox_export::write_xml` takes the same `ParsedLibrary` that
+`rekordbox::parse_xml` produces, so the round trip is testable with no
+database at all: build a library, write it, read it back, assert
+equality. If the two ever drift, that test fails rather than a user
+quietly losing their cues.
+
+**What it emits.** `<DJ_PLAYLISTS>` → `<PRODUCT Name="Dub">` → a
+`<COLLECTION>` of `<TRACK>` (metadata as attributes, `Location` as a
+percent-encoded `file://localhost/…` URL) with `<TEMPO>` and
+`<POSITION_MARK>` children where a grid / cues / loops exist, then a
+`<PLAYLISTS>` tree with the `ROOT` folder and one `Type="1"` node per
+Dub crate. `TrackID` is positional (1-based) because Dub's own ids are
+UUIDs the format cannot carry.
+
+**Fidelity, precisely.** Seconds are written to 3 decimals and BPM to 2
+— rekordbox's own precision, so "lossless" means at the format's
+resolution rather than bit-exact on an `f64`; pinned by a test so it is
+not a surprise. Colour round-trips at *token* fidelity: import already
+mapped any hue onto one of eight palette tokens, so what is guaranteed
+is that a token survives unchanged, not the original hex. Key is emitted
+as Camelot (`track_keys`' active notation); the per-source original
+notation is still in the schema if exact source fidelity is ever wanted.
+
+**Two gaps M11f had to close.** `hot_cues` returns only the DJ's own
+cues, and loops had **no read path at all** — they had been write-only
+since M11e. PRD §8.6 promises imported cues and loops round-trip, and
+the storage was there from day one, but nothing could read them back;
+`Library::all_cues` / `all_loops` / `track_path` are the missing half.
+
+**Scope.** Export uses `list_tracks_for_export`, which deliberately does
+*not* filter on `in_collection` the way the browser's "All Tracks" does.
+A DJ who imported a Serato library and never promoted anything would
+otherwise export an empty file — exactly the failure this feature
+exists to prevent. Tracks with no file row are skipped, since
+`Location` is the whole point.
+
+**One source's cues, not a merge.** A track can carry a Serato set and a
+Traktor set on overlapping pad indices; emitting both would put two
+markers on pad 1. The DJ's own cues win, then the source with the most
+to say, tie-broken by name so the same library always exports the same
+bytes.
+
+**M3U8** (`m3u.rs`) is the lossy universal option: `#EXTM3U`, one
+`#EXTINF:<secs>,<artist> - <title>` + absolute path per track, `-1` for
+an unknown length. UTF-8 (the `8` in M3U8) because a plain `.m3u` is
+nominally Latin-1 and mangles the first non-ASCII artist it meets.
+
+*(Validated end-to-end against a real 469-track library: well-formed to
+an independent XML parser, and all 469 `Location` URLs decode back to
+files that exist on disk.)*
+
 ### iTunes / Apple Music — **shipped (M12c)**
 
 - **Library:** `~/Music/iTunes/iTunes Library.xml` (legacy) or

@@ -2578,6 +2578,48 @@ impl Library {
     }
 }
 
+impl Library {
+    /// Every track Dub holds a file for, for export (M11f).
+    ///
+    /// Deliberately **not** filtered by `in_collection`, unlike
+    /// [`Self::list_tracks`]. "All Tracks" is the user's curated
+    /// collection and external-source scans mint browse-only rows that
+    /// stay out of it until played or folder-imported (PRD §8.4.1) —
+    /// correct for a browser, wrong for an export whose entire purpose
+    /// is that the user's data is not trapped. A DJ who imported a
+    /// Serato library and never promoted anything would otherwise
+    /// export an empty file, which is exactly the failure PRD §8.6 is
+    /// written to prevent.
+    ///
+    /// Tracks with no file row are skipped: the interchange format is
+    /// keyed on `Location`, so a row we cannot point at is not
+    /// something another app can use.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Sqlite`] if the query fails.
+    pub fn list_tracks_for_export(&self, limit: u32, offset: u32) -> Result<Vec<TrackRow>> {
+        let sql = format!(
+            "{TRACK_ROW_SELECT} \
+             WHERE EXISTS (SELECT 1 FROM track_files tf WHERE tf.track_id = t.id) \
+             ORDER BY t.created_at ASC, t.id ASC \
+             LIMIT ?1 OFFSET ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| LibraryError::sqlite("list_tracks_for_export_prepare", e))?;
+        let rows = stmt
+            .query_map(params![limit, offset], track_row_from_columns)
+            .map_err(|e| LibraryError::sqlite("list_tracks_for_export_query", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| LibraryError::sqlite("list_tracks_for_export_row", e))?);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

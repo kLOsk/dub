@@ -39,10 +39,12 @@ mod importer;
 /// target and the import adapter can consume `parse_library`.
 pub mod itunes;
 mod itunes_import;
+pub mod m3u;
 mod paths;
 /// rekordbox `rekordbox.xml` (`DJ_PLAYLISTS`) parser (M12d). Public so the
 /// fuzz target and the import adapter can consume the pure `parse_xml` entry.
 pub mod rekordbox;
+pub mod rekordbox_export;
 mod rekordbox_import;
 mod schema;
 /// Serato library parsers (M11e). Public so the fuzz targets and the import

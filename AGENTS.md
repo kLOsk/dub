@@ -72,7 +72,9 @@ crates/
   dub-spectral/      M9.5a — shared STFT + log-bands, and `analyze_key` (Camelot). Key detection
                      for the library and for rip tags lives here.
   dub-fingerprint/   Pure-Rust Chromaprint via rusty-chromaprint. Used for library dedupe (M11b, shipped) and parked for real-record recognition (v1.1).
-  dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
+  dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon)
+                     and the M11f **export** side: `rekordbox_export` (the reader's exact
+                     inverse, round-trip tested) + `m3u`. Anti-lock-in, PRD §8.6.
   dub-rip/           M26 — vinyl-rip session engine: RipSession state machine, off-RT capture
                      worker (record-tap ring → crash-safe WAV spill + live envelope), split plan,
                      rip.json manifest, commit (encode + tag + import + side archive). M26b adds
@@ -88,7 +90,7 @@ crates/
                      `FFI_VERSION` is the contract number; bump it and README together (docs-check gates it).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
-                     rip / rip-tune / rip-resplit / recognize / decode-timecode.
+                     rip / rip-tune / rip-resplit / recognize / export / decode-timecode.
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).

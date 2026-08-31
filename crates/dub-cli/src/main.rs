@@ -31,6 +31,7 @@ mod calibration;
 mod decode_timecode;
 mod device_profiles;
 mod diagnose;
+mod export;
 mod import;
 mod input_cmds;
 mod recognize;
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
         "version" => version(),
         "play" => play(&args[2..]),
         "analyze" => analyze_cmd(&args[2..]),
+        "export" => export::run(&args[2..]),
         "import" => import::run(&args[2..]),
         "diagnose" => diagnose::run(&args[2..]),
         "decode-timecode" => decode_timecode_cmd(&args[2..]),
@@ -139,6 +141,11 @@ fn print_help() {
     eprintln!("                    --traktor reads a collection.nml; --serato reads a _Serato_");
     eprintln!("                    folder (database V2 + GEOB cues/grids); --itunes reads a");
     eprintln!("                    Library.xml; --folder walks a dir. Idempotent; prints counts.");
+    eprintln!("  export            (--rekordbox <out.xml> | --m3u8 <out.m3u8>)");
+    eprintln!("                     [--crate NAME] [--library PATH]");
+    eprintln!("                    get the library back out. --rekordbox carries grid, key,");
+    eprintln!("                    cues, loops, colours and playlists and is read by Serato,");
+    eprintln!("                    Traktor, rekordbox and Lexicon; --m3u8 is paths only.");
     eprintln!("  diagnose <path-or-id>                    grid / waveform / BPM debugger");
     eprintln!("  recognize <session-dir> [--key KEY] [--apply]");
     eprintln!("                    name a committed rip's tracks — AcoustID + MusicBrainz.");

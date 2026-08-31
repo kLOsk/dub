@@ -69,9 +69,13 @@ Remaining:
   down (record B's "TSOP" comes back with its Japanese title). The artist
   consensus cannot separate those; a script-coherence heuristic could.
 
-Alternatives on the roadmap if M26c is not the appetite: **M11d-columns**
-(browser column data plumbing, 2–3 days), **M11f** (export: rekordbox XML +
-M3U8, 3 days), **M17** (sampler / quick scratch / instant doubles, 4–6 days).
+**M11f (export) is shipped** — `dub export --rekordbox | --m3u8`, the
+anti-lock-in commitment. Not yet surfaced in the app: PRD §8.6 calls for a
+one-click `File → Export Crate As...` with the format as a dropdown, and today
+it is CLI-only.
+
+Alternatives on the roadmap: **M11d-columns** (browser column data plumbing,
+2–3 days), **M17** (sampler / quick scratch / instant doubles, 4–6 days).
 See `../spec/PRD.md` §12.1.
 
 ## Licence posture is now enforced, not just documented

@@ -170,7 +170,7 @@ dub/                                 repo root (workspace)
 │                                                 timecode-deck / thru / scope / calibrate /
 │                                                 analyze / diagnose / import / rip /
 │                                                 rip-tune / rip-resplit / recognize /
-│                                                 decode-timecode)
+│                                                 export / decode-timecode)
 ├── apple/                           AppKit + SwiftUI shell (Performance + Prep mode, library browser — XcodeGen-managed)
 │   ├── project.yml                  XcodeGen manifest (links CoreAudio + Metal SDK frameworks)
 │   ├── Dub/                         AppKit @main + SwiftUI shell

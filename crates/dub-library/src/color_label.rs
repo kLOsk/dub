@@ -67,6 +67,32 @@ pub(crate) fn token_from_hex(s: &str) -> Option<&'static str> {
     token_from_rgb(r, g, b)
 }
 
+/// Canonical `R,G,B` for a palette token — the inverse of
+/// [`token_from_rgb`], for export (M11f).
+///
+/// Import is lossy on purpose: any hue lands on the nearest of eight
+/// tokens, so the original hex cannot be recovered. What *can* be
+/// guaranteed is that these eight values map back to the token they
+/// came from, which is what makes a Dub → rekordbox → Dub round-trip
+/// stable rather than drifting a colour each pass. The pinned test
+/// below is the guarantee.
+///
+/// `purple` is `8000FF` rather than the more obvious `800080`: that
+/// sits at hue 300 and would come back as `pink`.
+pub(crate) fn rgb_from_token(token: &str) -> Option<(u8, u8, u8)> {
+    Some(match token {
+        "red" => (0xFF, 0x00, 0x00),
+        "orange" => (0xFF, 0xA5, 0x00),
+        "yellow" => (0xFF, 0xFF, 0x00),
+        "green" => (0x00, 0xFF, 0x00),
+        "aqua" => (0x00, 0xFF, 0xFF),
+        "blue" => (0x00, 0x00, 0xFF),
+        "purple" => (0x80, 0x00, 0xFF),
+        "pink" => (0xFF, 0x00, 0xFF),
+        _ => return None,
+    })
+}
+
 /// Map Traktor's 1-based track-colour index to a palette token.
 ///
 /// **Best-effort.** Traktor's NML colour encoding is not confirmed
@@ -90,6 +116,19 @@ pub(crate) fn token_from_traktor_index(n: i64) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Export → import must land on the token it started from, or a
+    /// colour drifts one band every round trip.
+    #[test]
+    fn every_palette_token_survives_a_round_trip() {
+        for token in [
+            "red", "orange", "yellow", "green", "aqua", "blue", "purple", "pink",
+        ] {
+            let (r, g, b) = rgb_from_token(token).expect(token);
+            assert_eq!(token_from_rgb(r, g, b), Some(token), "{token} drifted");
+        }
+        assert_eq!(rgb_from_token("chartreuse"), None);
+    }
 
     #[test]
     fn hex_maps_the_eight_dj_colours() {

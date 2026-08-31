@@ -1484,7 +1484,7 @@ see §8.5.3.1._
 | # | Name | Demo criterion | Estimate |
 | --- | --- | --- | --- |
 | **M11d-columns** | **Column data plumbing + per-source disagreement view** | The remaining §8.5.3.1 column groups exist end-to-end: stable `LibraryColumnId` FFI registry + dynamically generated SELECT (disabled columns cost zero query time), per-source metadata columns (`serato_bpm`, `traktor_key`, …), analysis extras (`bpm_auto` vs `bpm_active`, `key_auto` vs `key_active`, `lufs_i`, `true_peak`), audio-file group, aggregated mix-history group, `date_added` / `in_crates`, and the BPM-column source-vs-Dub ⚠ (the FFI already computes `key_disagreement`). Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
-| **M11f** | **Export: rekordbox XML + M3U / M3U8** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
+| **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
 | **M17** | **Sampler + Quick Scratch + Instant Doubles** | All three trigger systems work per §7. | 4–6 days |
 | **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
