@@ -993,6 +993,16 @@ struct LibraryView: View {
         }
         .contextMenu {
             Button("Rename") { beginCrateRename(crate) }
+            // PRD §8.6: making leaving easy is load-bearing, so it sits
+            // on the crate itself rather than only in a menu bar.
+            Button("Export As…") {
+                LibraryExport.present(
+                    library: model.library,
+                    crateId: crate.id,
+                    crateName: crate.name,
+                    onError: { model.surfaceError($0) })
+            }
+            Divider()
             Button("Delete", role: .destructive) { confirmDeleteCrate(crate) }
         }
     }

@@ -5458,6 +5458,13 @@ struct MainView: View {
             .onReceive(NotificationCenter.default.publisher(for: .dubShowPreferences)) { _ in
                 showingPreferences = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: .dubExportLibrary)) { _ in
+                LibraryExport.present(
+                    library: model.library,
+                    crateId: nil,
+                    crateName: nil,
+                    onError: { model.surfaceError($0) })
+            }
             .onReceive(NotificationCenter.default.publisher(for: .dubShowOnboarding)) { _ in
                 // Re-opened from Preferences. Close that sheet first so
                 // we don't try to present two sheets at once, then bring

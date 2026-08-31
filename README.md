@@ -132,13 +132,14 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **M11d-history → loops** | ✅ shipped | Played From / Played Into session history (`SessionTracker`, FFI 37); timecode-display rate = audible (xwax/Mixxx parity; ±8 anchor-warp deleted); PRD-BEATS round 11 (visual kick-edge grid, set-the-1 re-anchor, first-measurable-beat downbeat); **hot cues** (performance cues — FFI 38); **reverse loops** (FFI 39); Stillpoint beatmatch aid (was "Phase-Drift Trail"). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M11e, M12b–f** | ✅ shipped | External-library importers (Serato DB + GEOB grids/cues, Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML), collection membership + energy overview, ratings / colours / favourites / dynamic filters. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M14 → M16** | ✅ shipped | Key Lock — a **pure-Rust WSOLA** stretcher, not Rubber Band, which was benched and dropped; Echo-Out (100 % wet tap-toggle); the Dub Siren instrument (GS1 / DS01E / SN76477 units, PT2399 echo) + the vintage-chip FX chain. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **M11f** | ✅ shipped | Export: rekordbox XML (grid, key, cues, loops, colours, playlists) + M3U8, from the CLI and from the library sidebar. PRD §8.6's anti-lock-in commitment (FFI **63**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M26c** | 🚧 in progress | Rip recognition: AcoustID names each track (artist + title, no MusicBrainz needed), opt-in release + Discogs enrichment, BPM/key written into the FLAC tags (FFI **62**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M13** | ✅ shipped | Looping complete: grid-snapped reverse grab, **manual Loop In / Loop Out**, correct under timecode, and key lock holding through a loop (FFI **61**). Closes acceptance §14 #8. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M26a + M26b** | ✅ shipped | **Vinyl rip**: drop the needle, get split, tagged, pre-analyzed FLAC tracks in the library. Record tap → crash-safe spill → adaptive gap detection → both-end side trim → encode + tag + import, plus session recovery, re-split from the lossless archive, the Prep review UI and the Real Records browser node. Fully offline. Gates fitted against three real records. | [`PRD.md §5.2.7`](docs/spec/PRD.md) |
 | **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), then Sampler → Polish/Alpha. **M26c** (rip recognition: AcoustID + MusicBrainz + Discogs) is the next rip increment. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **62** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **63** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 

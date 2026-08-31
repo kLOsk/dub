@@ -116,6 +116,21 @@ final class DubAppDelegate: NSObject, NSApplicationDelegate {
                         action: #selector(NSApplication.terminate(_:)),
                         keyEquivalent: "q")
 
+        // File, in its conventional slot between the app menu and
+        // Edit. Export is the only thing in it, and deliberately so:
+        // PRD §8.6 says burying the way out costs the user's trust.
+        let fileMenuItem = NSMenuItem()
+        mainMenu.addItem(fileMenuItem)
+        let fileMenu = NSMenu(title: "File")
+        fileMenuItem.submenu = fileMenu
+        let exportItem = NSMenuItem(
+            title: "Export Library As…",
+            action: #selector(exportLibrary(_:)),
+            keyEquivalent: "e")
+        exportItem.keyEquivalentModifierMask = [.command, .shift]
+        exportItem.target = self
+        fileMenu.addItem(exportItem)
+
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
@@ -181,5 +196,9 @@ final class DubAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showPreferences(_ sender: Any?) {
         NotificationCenter.default.post(name: .dubShowPreferences, object: nil)
+    }
+
+    @objc private func exportLibrary(_ sender: Any?) {
+        NotificationCenter.default.post(name: .dubExportLibrary, object: nil)
     }
 }

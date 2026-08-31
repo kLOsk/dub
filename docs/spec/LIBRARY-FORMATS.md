@@ -262,6 +262,11 @@ bytes.
 an unknown length. UTF-8 (the `8` in M3U8) because a plain `.m3u` is
 nominally Latin-1 and mangles the first non-ASCII artist it meets.
 
+**In the app.** File → Export Library As… (⇧⌘E) and Export As… on a
+crate's context menu, both opening an `NSSavePanel` with a Format popup
+that renames the extension as it changes. `DubLibrary::export` (FFI 63)
+runs it. Success reveals the file in Finder.
+
 *(Validated end-to-end against a real 469-track library: well-formed to
 an independent XML parser, and all 469 `Location` URLs decode back to
 files that exist on disk.)*

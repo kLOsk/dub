@@ -411,7 +411,12 @@ pub use rip::{
 ///       adds style and pressing detail on top of it. Applying is a
 ///       separate call because a wrong match written into the library
 ///       is worse than no match.
-pub const FFI_VERSION: u32 = 62;
+///   63. **Library export (M11f).** [`DubLibrary::export`] writes the
+///       library, or one crate, as rekordbox XML or M3U8. PRD §8.6's
+///       anti-lock-in commitment reaching the app: the CLI could
+///       already do it, and an export a DJ cannot find is an export
+///       that does not count.
+pub const FFI_VERSION: u32 = 63;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5202,7 +5207,7 @@ mod tests {
         // `set_side_end`, and `list_resplittable_rip_sessions` +
         // `RipResplittable`.
         // 60→61: manual loop in/out — `set_manual_loop`.
-        assert_eq!(FFI_VERSION, 62);
+        assert_eq!(FFI_VERSION, 63);
     }
 
     #[test]
@@ -5799,6 +5804,16 @@ mod tests {
 // a background queue and the SQLite WAL mode (set in
 // `dub_library::schema::open_and_migrate`) keeps them off the
 // read-path's critical section.
+
+/// What [`DubLibrary::export`] writes (M11f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LibraryExportFormat {
+    /// The interchange format: grid, key, cues, loops, colours and
+    /// playlists, read by Serato, Traktor, rekordbox and Lexicon.
+    RekordboxXml,
+    /// Paths only. Universal, and lossy by construction.
+    M3u8,
+}
 
 /// Errors surfaced from the library FFI. Mirrors the structure of
 /// [`EngineError`] — `flat_error` because Swift consumers only need a
@@ -6725,6 +6740,70 @@ impl DubLibrary {
         new_name: String,
     ) -> std::result::Result<(), LibraryFfiError> {
         self.with_library(|lib| Ok(lib.rename_crate(crate_id, &new_name)?))
+    }
+
+    /// Write the library, or one crate, to an interchange file (M11f).
+    ///
+    /// `crate_id` of `None` exports everything Dub holds a file for —
+    /// deliberately not only the curated collection, since a library
+    /// imported from Serato and never promoted would otherwise write an
+    /// empty file. Returns how many tracks were written.
+    ///
+    /// PRD §8.6: making leaving easy is the load-bearing behaviour.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryFfiError`] if the library cannot be read or the file
+    /// cannot be written.
+    pub fn export(
+        &self,
+        out_path: String,
+        format: LibraryExportFormat,
+        crate_id: Option<i64>,
+    ) -> std::result::Result<u32, LibraryFfiError> {
+        self.with_library(|lib| {
+            let path = std::path::PathBuf::from(&out_path);
+            let file = std::fs::File::create(&path).map_err(|e| {
+                LibraryFfiError::QueryFailed(format!("cannot write {}: {e}", path.display()))
+            })?;
+            let mut sink = std::io::BufWriter::new(file);
+
+            let written = match format {
+                LibraryExportFormat::RekordboxXml => {
+                    let parsed = match crate_id {
+                        Some(id) => {
+                            let name = lib
+                                .list_crates()?
+                                .into_iter()
+                                .find(|c| c.id == id)
+                                .map_or_else(|| "Crate".to_string(), |c| c.name);
+                            dub_library::rekordbox_export::crate_to_parsed(lib, id, &name)?
+                        }
+                        None => dub_library::rekordbox_export::collection_to_parsed(lib)?,
+                    };
+                    let n = parsed.tracks.len();
+                    dub_library::rekordbox_export::write_xml(&parsed, &mut sink)
+                        .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))?;
+                    n
+                }
+                LibraryExportFormat::M3u8 => {
+                    let rows = match crate_id {
+                        Some(id) => lib.list_crate_tracks(id)?,
+                        None => lib.list_tracks_for_export(u32::MAX, 0)?,
+                    };
+                    let entries = dub_library::m3u::entries_from_tracks(lib, &rows)?;
+                    let n = entries.len();
+                    dub_library::m3u::write_m3u8(&entries, &mut sink)
+                        .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))?;
+                    n
+                }
+            };
+            // Flush before reporting success: a BufWriter dropped on a
+            // full disk would report a write that never landed.
+            std::io::Write::flush(&mut sink)
+                .map_err(|e| LibraryFfiError::QueryFailed(format!("flushing the export: {e}")))?;
+            Ok(u32::try_from(written).unwrap_or(u32::MAX))
+        })
     }
 
     /// Delete a Dub crate. Member rows and child crates cascade. Errors

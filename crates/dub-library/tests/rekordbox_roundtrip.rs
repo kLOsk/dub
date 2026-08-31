@@ -101,14 +101,21 @@ fn an_imported_library_exports_with_its_cues_loops_and_grid_intact() {
     let back = parse_xml(text.as_bytes()).expect("re-parse our own output");
 
     assert_eq!(back.tracks.len(), 2, "both tracks survived");
-    let t = &back.tracks[0];
 
-    // Paths must resolve through the volume mount point, which is the
-    // part that only a real database exercises.
-    assert_eq!(
-        t.path.as_deref(),
-        Some(a.as_path()),
-        "the file path must survive the volume/relative-path split"
+    // Find it by path rather than by position. Export orders by
+    // `created_at, id`, and two tracks imported in the same second
+    // tie-break on a UUID — stable for a given library, arbitrary
+    // across a fresh import. Indexing here would be a flake.
+    let t = back
+        .tracks
+        .iter()
+        .find(|t| t.path.as_deref() == Some(a.as_path()))
+        .expect("a.wav must be in the export, path intact through the volume/relative-path split");
+    assert!(
+        back.tracks
+            .iter()
+            .any(|t| t.path.as_deref() == Some(b.as_path())),
+        "b.wav too"
     );
 
     assert_eq!(t.artist.as_deref(), Some("Sound Dimension"));

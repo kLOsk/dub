@@ -69,10 +69,12 @@ Remaining:
   down (record B's "TSOP" comes back with its Japanese title). The artist
   consensus cannot separate those; a script-coherence heuristic could.
 
-**M11f (export) is shipped** — `dub export --rekordbox | --m3u8`, the
-anti-lock-in commitment. Not yet surfaced in the app: PRD §8.6 calls for a
-one-click `File → Export Crate As...` with the format as a dropdown, and today
-it is CLI-only.
+**M11f (export) is shipped, CLI and app.** `dub export --rekordbox | --m3u8`,
+plus **File → Export Library As…** (⇧⌘E) and **Export As…** on a crate's
+right-click, both opening a save panel with the format as a popup — the shape
+PRD §8.6 asks for, since burying the way out is what costs the trust. Success
+reveals the file in Finder rather than raising a toast: the status strip's only
+channel is an error badge, and finding the file is what you do next anyway.
 
 Alternatives on the roadmap: **M11d-columns** (browser column data plumbing,
 2–3 days), **M17** (sampler / quick scratch / instant doubles, 4–6 days).
