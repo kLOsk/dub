@@ -416,7 +416,15 @@ pub use rip::{
 ///       anti-lock-in commitment reaching the app: the CLI could
 ///       already do it, and an export a DJ cannot find is an export
 ///       that does not count.
-pub const FFI_VERSION: u32 = 63;
+///   64. **Configurable column data (M11d-columns).** [`library_columns`]
+///       publishes the registry behind PRD §8.5.3.1's picker,
+///       [`DubLibrary::set_visible_columns`] chooses which of them the
+///       browser is paying for, and each [`LibraryTrack`] carries their
+///       cells in [`LibraryTrack::extras`] plus the §8.3
+///       [`LibraryTrack::bpm_disagreement`] flag. A column that is off
+///       adds no expression and no join to the query, so the deep
+///       groups cost nothing until a DJ asks for them.
+pub const FFI_VERSION: u32 = 64;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5207,7 +5215,12 @@ mod tests {
         // `set_side_end`, and `list_resplittable_rip_sessions` +
         // `RipResplittable`.
         // 60→61: manual loop in/out — `set_manual_loop`.
-        assert_eq!(FFI_VERSION, 63);
+        // 61→62: rip recognition — `start_recognition` / `apply_recognition`.
+        // 62→63: library export — `export`.
+        // 63→64: configurable column data — `library_columns`,
+        // `set_visible_columns`, `LibraryTrack::extras` +
+        // `bpm_disagreement`.
+        assert_eq!(FFI_VERSION, 64);
     }
 
     #[test]
@@ -5991,6 +6004,138 @@ pub struct LibraryTrack {
     /// browser's `#` column and uses it as the manual-order sort key
     /// (which doubles as the drag-reorder enable gate).
     pub crate_ordinal: Option<u32>,
+    /// M11d-columns: `true` when two sources' beat grids disagree by
+    /// more than 5 % in tempo or 50 ms in downbeat phase (PRD §8.3).
+    /// Drives the ⚠ in the BPM column, the counterpart of
+    /// [`Self::key_disagreement`]. Always `false` for a track with one
+    /// grid, so a Dub-only library never sees it.
+    pub bpm_disagreement: bool,
+    /// M11d-columns: cells for the configurable columns, in the order
+    /// last passed to [`DubLibrary::set_visible_columns`]. Empty — and
+    /// free, no expression and no join in the query — until the user
+    /// switches a column on.
+    pub extras: Vec<LibraryColumnValue>,
+}
+
+/// How a configurable column's cell should be formatted and sorted
+/// (PRD §8.5.3.1). Mirrors [`dub_library::ColumnKind`].
+///
+/// The kind travels with the column's registry entry rather than with
+/// each cell, so an empty cell in a numeric column still sorts and
+/// aligns like a number.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum LibraryColumnKind {
+    /// Free text.
+    Text,
+    /// Whole number.
+    Integer,
+    /// Decimal, one place.
+    Real,
+    /// Tempo, two places.
+    Bpm,
+    /// Unix seconds. Millisecond sources are converted in SQL, so the
+    /// renderer never has to know which table a column came from.
+    Timestamp,
+    /// Byte count.
+    Bytes,
+    /// Yes / no.
+    Flag,
+}
+
+/// One configurable column's cell. Mirrors [`dub_library::ColumnValue`].
+///
+/// `Empty` is not `Text("")`: the browser renders an em-dash for "this
+/// source recorded nothing" and an empty cell for "this source recorded
+/// an empty string", and telling those apart is the point of the
+/// per-source group.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum LibraryColumnValue {
+    /// No value recorded.
+    Empty,
+    /// Text.
+    Text {
+        /// The value.
+        value: String,
+    },
+    /// Whole number, byte count, or unix-seconds timestamp.
+    Int {
+        /// The value.
+        value: i64,
+    },
+    /// Decimal or tempo.
+    Real {
+        /// The value.
+        value: f64,
+    },
+    /// Yes / no.
+    Flag {
+        /// The value.
+        value: bool,
+    },
+}
+
+/// One entry in the configurable-column registry (PRD §8.5.3.1).
+///
+/// The Apple shell builds its grouped header context menu straight off
+/// this list rather than restating the column vocabulary in Swift,
+/// which is what kept the two halves in sync through M11d-columns.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryColumnInfo {
+    /// Stable id, e.g. `serato_bpm`. Persisted in the shell's
+    /// preferences and passed back to
+    /// [`DubLibrary::set_visible_columns`]; never displayed.
+    pub id: String,
+    /// Header label, e.g. `Serato BPM`.
+    pub label: String,
+    /// Picker section label, e.g. `Serato` or `Mix history`.
+    pub group: String,
+    /// How to format and sort the cells.
+    pub kind: LibraryColumnKind,
+}
+
+impl From<dub_library::ColumnKind> for LibraryColumnKind {
+    fn from(kind: dub_library::ColumnKind) -> Self {
+        match kind {
+            dub_library::ColumnKind::Text => LibraryColumnKind::Text,
+            dub_library::ColumnKind::Integer => LibraryColumnKind::Integer,
+            dub_library::ColumnKind::Real => LibraryColumnKind::Real,
+            dub_library::ColumnKind::Bpm => LibraryColumnKind::Bpm,
+            dub_library::ColumnKind::Timestamp => LibraryColumnKind::Timestamp,
+            dub_library::ColumnKind::Bytes => LibraryColumnKind::Bytes,
+            dub_library::ColumnKind::Flag => LibraryColumnKind::Flag,
+        }
+    }
+}
+
+impl From<dub_library::ColumnValue> for LibraryColumnValue {
+    fn from(value: dub_library::ColumnValue) -> Self {
+        match value {
+            dub_library::ColumnValue::Empty => LibraryColumnValue::Empty,
+            dub_library::ColumnValue::Text(value) => LibraryColumnValue::Text { value },
+            dub_library::ColumnValue::Int(value) => LibraryColumnValue::Int { value },
+            dub_library::ColumnValue::Real(value) => LibraryColumnValue::Real { value },
+            dub_library::ColumnValue::Flag(value) => LibraryColumnValue::Flag { value },
+        }
+    }
+}
+
+/// Every configurable column the browser can offer, in picker order
+/// (PRD §8.5.3.1).
+///
+/// Static data — no open library required, so the Preferences and the
+/// header menu can both read it before a database exists.
+#[uniffi::export]
+#[must_use]
+pub fn library_columns() -> Vec<LibraryColumnInfo> {
+    dub_library::LibraryColumnId::all()
+        .into_iter()
+        .map(|column| LibraryColumnInfo {
+            id: column.as_str(),
+            label: column.label(),
+            group: column.group().label(),
+            kind: column.kind().into(),
+        })
+        .collect()
 }
 
 /// Column the M11d.2 browser table can sort by. Mirrors
@@ -6221,6 +6366,8 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             // other listing leaves this `None` and the Apple shell
             // hides the `#` column accordingly.
             crate_ordinal: None,
+            bpm_disagreement: r.bpm_disagreement,
+            extras: r.extras.into_iter().map(LibraryColumnValue::from).collect(),
         }
     }
 }
@@ -6602,6 +6749,46 @@ impl DubLibrary {
     /// Total canonical-track count. The browser footer reads this.
     pub fn track_count(&self) -> std::result::Result<u64, LibraryFfiError> {
         self.with_library(|lib| Ok(lib.track_count()?))
+    }
+
+    /// Choose the configurable columns every subsequent listing
+    /// returns cells for (PRD §8.5.3.1), by the stable ids
+    /// [`library_columns`] hands out.
+    ///
+    /// Returns the ids actually applied, in order. Ids this build does
+    /// not know are dropped rather than erroring — a preferences file
+    /// written by a newer build must degrade to "that column is gone",
+    /// never to a browser that cannot list — and the returned list is
+    /// what [`LibraryTrack::extras`] is aligned with, so the caller
+    /// should render from it rather than from what it asked for.
+    pub fn set_visible_columns(
+        &self,
+        column_ids: Vec<String>,
+    ) -> std::result::Result<Vec<String>, LibraryFfiError> {
+        let columns: Vec<dub_library::LibraryColumnId> = column_ids
+            .iter()
+            .filter_map(|id| dub_library::LibraryColumnId::from_id(id))
+            .collect();
+        let set = dub_library::ColumnSet::new(columns);
+        let applied = set.columns().iter().map(|c| c.as_str()).collect();
+        let mut guard = self.inner.lock().unwrap();
+        let lib = guard
+            .as_mut()
+            .ok_or_else(|| LibraryFfiError::QueryFailed("library not open".into()))?;
+        lib.set_extra_columns(set);
+        Ok(applied)
+    }
+
+    /// The configurable columns currently in effect, in cell order.
+    pub fn visible_columns(&self) -> std::result::Result<Vec<String>, LibraryFfiError> {
+        self.with_library(|lib| {
+            Ok(lib
+                .extra_columns()
+                .columns()
+                .iter()
+                .map(|c| c.as_str())
+                .collect())
+        })
     }
 
     /// "All Tracks" listing for the M11d browser. `limit` /
@@ -7816,6 +8003,103 @@ impl DubLibrary {
 #[cfg(test)]
 mod library_ffi_tests {
     use super::*;
+
+    /// PRD §8.5.3.1: the registry is what the Apple shell builds its
+    /// grouped picker from, so it has to be readable before a library
+    /// is open and every id has to survive the round trip through
+    /// preferences.
+    #[test]
+    fn the_column_registry_is_static_and_grouped() {
+        let columns = library_columns();
+        assert!(
+            columns.len() > 40,
+            "the per-source group alone is six sources wide"
+        );
+        assert!(columns
+            .iter()
+            .all(|c| !c.id.is_empty() && !c.label.is_empty()));
+        let serato_bpm = columns
+            .iter()
+            .find(|c| c.id == "serato_bpm")
+            .expect("the migration-trust column exists");
+        assert_eq!(serato_bpm.label, "Serato BPM");
+        assert_eq!(serato_bpm.group, "Serato");
+        assert!(matches!(serato_bpm.kind, LibraryColumnKind::Bpm));
+    }
+
+    #[test]
+    fn setting_visible_columns_drops_ids_this_build_does_not_know() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        assert!(lib.visible_columns().unwrap().is_empty());
+
+        let applied = lib
+            .set_visible_columns(vec![
+                "serato_bpm".into(),
+                "energy_rating_from_2027".into(),
+                "play_count".into(),
+                "serato_bpm".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            applied,
+            vec!["serato_bpm".to_string(), "play_count".to_string()],
+            "unknown ids drop and duplicates collapse — the returned \
+             order is what the cells are aligned with"
+        );
+        assert_eq!(lib.visible_columns().unwrap(), applied);
+    }
+
+    #[test]
+    fn track_rows_carry_the_configured_cells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        let id = "column-track";
+        lib.with_library(|l| {
+            l.insert_track(id, None, Some(200_000), None)?;
+            l.promote_to_collection(id)?;
+            l.upsert_metadata_source(
+                id,
+                "serato",
+                Some("Artist"),
+                Some("Title"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(93.5),
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Nothing switched on: no cells, and the fixed row is unchanged.
+        let row = &lib.list_tracks(10, 0).unwrap()[0];
+        assert!(row.extras.is_empty());
+        assert!(!row.bpm_disagreement);
+
+        lib.set_visible_columns(vec!["serato_bpm".into(), "traktor_bpm".into()])
+            .unwrap();
+        let row = &lib.list_tracks(10, 0).unwrap()[0];
+        assert!(matches!(
+            row.extras[0],
+            LibraryColumnValue::Real { value } if (value - 93.5).abs() < 1e-9
+        ));
+        assert!(
+            matches!(row.extras[1], LibraryColumnValue::Empty),
+            "a source that never touched this track is Empty, not zero"
+        );
+    }
 
     #[test]
     fn handle_starts_closed_then_opens_via_open_at() {

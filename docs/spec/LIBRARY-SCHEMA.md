@@ -440,8 +440,27 @@ PRD §8.3.2 cross-validation is relative-major aware: the browser only
 flags ⚠ when two sources sit in **different** Camelot families (`8B`
 vs `5A`); relative-major pairs (`8B` vs `8A` — C major vs A minor)
 are a legitimate Krumhansl-Kessler template ambiguity and are not
-flagged. The flag is computed at query time in `TRACK_ROW_SELECT`
+flagged. The flag is computed at query time in the track SELECT
 via `COUNT(DISTINCT substr(key_notation, 1, length-1)) > 1`.
+
+The **grid** counterpart (PRD §8.3, M11d-columns) is computed the same
+way over `track_beatgrids`: a correlated subquery pairs the track's
+grid sources and flags when two differ by more than 5 % in BPM — no
+octave folding, since an octave split is exactly what it exists to
+catch — or by more than 50 ms in downbeat **phase**. Phase, not raw
+`anchor_secs`: two sources that agree on the beat but anchor different
+bars are not in conflict, so the difference is taken modulo one beat
+period and folded into ±half a beat.
+
+The track SELECT itself is assembled per query from the browser's
+active column set (PRD §8.5.3.1, `dub-library/src/columns.rs`): the
+fixed columns above are always there, and each configurable column
+contributes its expression plus at most one join — the `auto` grid,
+the `auto` key, the crate-name aggregate, or the `play_history`
+aggregate. A column that is switched off contributes nothing, which
+is why the deep groups can exist without every listing paying for
+them. The six per-source metadata groups need no join at all: the
+§8.1 priority chain already reads all six.
 
 ### `track_cues` — hot cues (performance cues — authored in v1)
 

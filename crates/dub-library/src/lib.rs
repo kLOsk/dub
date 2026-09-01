@@ -27,6 +27,9 @@
 
 mod analysis;
 mod color_label;
+/// Configurable browser columns (PRD §8.5.3.1). Public so the FFI can
+/// mirror the registry to Swift without restating it.
+pub mod columns;
 mod cues;
 mod db;
 mod dedupe;
@@ -64,6 +67,9 @@ mod volumes;
 pub use analysis::{
     analyze_compute, analyze_compute_with_track, ActiveBeatgrid, AnalysisComputed, AnalysisJob,
     AnalysisOutcome,
+};
+pub use columns::{
+    ColumnGroup, ColumnKind, ColumnSet, ColumnValue, LibraryColumnId, MetadataField, MetadataSource,
 };
 pub use cues::HotCue;
 pub use db::{

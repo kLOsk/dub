@@ -136,10 +136,11 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **M26c** | 🚧 in progress | Rip recognition: AcoustID names each track (artist + title, no MusicBrainz needed), opt-in release + Discogs enrichment, BPM/key written into the FLAC tags (FFI **62**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M13** | ✅ shipped | Looping complete: grid-snapped reverse grab, **manual Loop In / Loop Out**, correct under timecode, and key lock holding through a loop (FFI **61**). Closes acceptance §14 #8. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
 | **M26a + M26b** | ✅ shipped | **Vinyl rip**: drop the needle, get split, tagged, pre-analyzed FLAC tracks in the library. Record tap → crash-safe spill → adaptive gap detection → both-end side trim → encode + tag + import, plus session recovery, re-split from the lossless archive, the Prep review UI and the Real Records browser node. Fully offline. Gates fitted against three real records. | [`PRD.md §5.2.7`](docs/spec/PRD.md) |
-| **next** | ◻ planned | Browser-column data plumbing (per-source disagreement view), export (rekordbox XML / M3U8), then Sampler → Polish/Alpha. **M26c** (rip recognition: AcoustID + MusicBrainz + Discogs) is the next rip increment. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
+| **M11d-columns** | ✅ shipped | Browser column data plumbing (PRD §8.5.3.1): per-source metadata columns next to Dub's own analysis, audio-file and mix-history groups, and the ⚠ where an imported grid disagrees with the analysed one — the migration-trust view for DJs arriving from Serato. A column that is switched off costs nothing (FFI **64**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
+| **next** | ◻ planned | Sampler / quick scratch / instant doubles (M17), then Polish → Alpha. **M26c** (rip recognition) is finishing. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **63** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **64** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 

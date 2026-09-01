@@ -76,9 +76,22 @@ PRD §8.6 asks for, since burying the way out is what costs the trust. Success
 reveals the file in Finder rather than raising a toast: the status strip's only
 channel is an error badge, and finding the file is what you do next anyway.
 
-Alternatives on the roadmap: **M11d-columns** (browser column data plumbing,
-2–3 days), **M17** (sampler / quick scratch / instant doubles, 4–6 days).
-See `../spec/PRD.md` §12.1.
+**M11d-columns (browser column data plumbing) is shipped.** PRD §8.5.3.1's
+deep column groups now exist end to end: a stable `LibraryColumnId`
+registry in `dub-library/src/columns.rs`, a SELECT assembled from the
+active set (a switched-off column contributes no expression and no join —
+`an_empty_column_set_adds_nothing_to_the_query` is the guard), per-source
+metadata verbatim, analysis extras, audio-file facts, aggregated mix
+history, and the §8.3 BPM-disagreement ⚠ next to the key one. The Apple
+shell reads the registry rather than restating it, so a new column is a
+Rust-side change. FFI 64.
+
+Two registry gaps are deliberate and noted in §8.5.3.1: `bit_rate` is not
+stored in `track_files`, and `mixedinkey` is not a metadata source (MIK
+writes through the id3 comment).
+
+Next on the roadmap: **M17** (sampler / quick scratch / instant doubles,
+4–6 days). See `../spec/PRD.md` §12.1.
 
 ## Licence posture is now enforced, not just documented
 

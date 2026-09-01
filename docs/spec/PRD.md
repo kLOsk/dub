@@ -1029,24 +1029,28 @@ A user-defined smart-crate rule builder is parked until v1.x at the earliest. Th
 
 ##### 8.5.3.1 Customizable columns
 
-**Status (2026-07-05).** The UI infrastructure is **shipped** (it landed
-quietly across the library rounds rather than as a labelled milestone):
-header right-click picker with grouped categories, `@AppStorage`
-persistence, header drag-to-reorder, and the active-priority columns —
-Title / Artist / Length / BPM / **Key** / Album / Genre / Year / Comment /
-Composer / Track # / Version / Source / Rating / Colour
-(`LibraryColumnField` in `LibraryView.swift`). What **remains** — and is
-what the M11d-columns milestone in §12.1 now means — is the data plumbing
-for the deeper groups in the table below: the stable `LibraryColumnId`
-FFI registry, the dynamically generated SELECT (disabled columns must
-cost zero query time), the per-source metadata group, the analysis extras
-(`bpm_auto` vs `bpm_active`, `key_auto` vs `key_active`, `lufs_i`,
-`true_peak`, `prepared`), the audio-file group, the aggregated
-mix-history group, `date_added` / `in_crates` / sortable dupes-missing,
-and the BPM-column source-vs-Dub ⚠ badge (the FFI already computes
-`key_disagreement`; the BPM predicate + both renderings are owed). The
-per-source disagreement view is the priority slice: it is the
-migration-trust feature for DJs arriving from Serato.
+**Status (2026-09-01): shipped, both halves.** The UI infrastructure
+landed quietly across the library rounds — header right-click picker with
+grouped categories, `@AppStorage` persistence, header drag-to-reorder,
+and the active-priority columns (Title / Artist / Length / BPM / **Key** /
+Album / Genre / Year / Comment / Composer / Track # / Version / Source /
+Rating / Colour, `LibraryColumnField` in `LibraryView.swift`).
+**M11d-columns** then landed the data plumbing behind the table below:
+the stable `LibraryColumnId` registry (`dub-library/src/columns.rs`,
+published to Swift by `library_columns()`), the dynamically generated
+SELECT, the per-source metadata group, the analysis extras, the
+audio-file group, the aggregated mix-history group, `date_added` /
+`in_crates` / dupes / missing, and the BPM-column source-vs-Dub ⚠ badge
+alongside the `key_disagreement` one the FFI already computed. A column
+that is switched off contributes no expression and no join, so the deep
+groups cost nothing until a DJ asks for them.
+
+Two entries in the table below are **not** in the registry, and
+deliberately: `bit_rate` (`track_files` doesn't store it — it would have
+to be measured at import, not read), and the `mixedinkey` per-source
+group (Mixed In Key writes through the id3 comment rather than a
+`track_metadata_source` row of its own, so there is nothing to select
+until an importer mints one). `itunes` is in the registry in its place.
 
 Right-click any column header → context menu, grouped by category, checkable items per available column. Choices persist in `~/Library/Application Support/Dub/preferences.json` as **one global column set** across all sidebar sources (v1.0 simplification; per-source layouts deferred to v1.x if real use warrants the persistence-key + crate-rename plumbing). Column order persists via the same mechanism; widths via SwiftUI's built-in `TableColumn.width`.
 
@@ -1057,9 +1061,9 @@ The available columns are exposed across the FFI as a stable Rust enum `LibraryC
 | Identity / library | `date_added`, `source`, `in_crates`, `duplicates`, `missing` |
 | User organization (schema v8) | `rating` (`tracks.user_rating`, click-to-set stars), `color` (`tracks.color`, swatch + row tint) |
 | Active-priority metadata (the §8.1 priority chain) | `title`, `artist`, `album`, `genre`, `comment`, `composer`, `track_number`, `year`, `version_token` |
-| Per-source metadata (verbatim from `track_metadata_source`) | For each source ∈ `{id3, filename, serato, traktor, rekordbox, mixedinkey}`: `{source}_title`, `{source}_artist`, `{source}_album`, `{source}_comment`, `{source}_bpm`, `{source}_key`, `{source}_year`. (Some sources don't carry all fields — e.g. `filename` only has title / artist / version / year; the unsupported entries are simply absent from the registry.) |
+| Per-source metadata (verbatim from `track_metadata_source`) | For each source ∈ `{id3, filename, serato, traktor, rekordbox, itunes}`: `{source}_title`, `{source}_artist`, `{source}_album`, `{source}_comment`, `{source}_bpm`, `{source}_key`, `{source}_year`. (Some sources don't carry all fields — `filename` only has title / artist / year / version, and only `filename` + `id3` carry `version`; the unsupported entries are simply absent from the registry.) |
 | Analysis | `bpm_active`, `bpm_auto` (Dub's analyzer, M11c.1), `key_active`, `key_auto` (Dub's analyzer, M11c.2), `length`, `lufs_i`, `true_peak`, `prepared` |
-| Audio file (from `track_files`) | `codec`, `bit_rate`, `sample_rate`, `bit_depth`, `channel_count`, `file_size`, `file_path`, `file_modified` |
+| Audio file (from `track_files`) | `codec`, `sample_rate`, `bit_depth`, `channel_count`, `file_size`, `file_path`, `file_modified` (`bit_rate` is not stored — see the status note) |
 | Mix history (from `play_history`, aggregated) | `play_count`, `last_played`, `last_loaded`, `played_last_7d` |
 
 The per-source metadata group is the **load-bearing differentiator** versus single-source DJ apps: a user migrating from Serato can enable `serato_bpm` alongside `bpm_auto` to scan for tracks where Serato's grid disagrees with Dub's, click to sort, fix outliers in bulk. The ⚠ disagreement indicator (§8.3, §8.3.2) is the at-a-glance summary; the explicit per-source columns are the spreadsheet view.
@@ -1465,7 +1469,8 @@ observably do at the end.
 | **M11d-history** | Played From / Played Into, v1.0 stage (§8.5.2): `SessionTracker` handover-inferred transitions (min-play gate + duplicate suppression, `LIBRARY-SCHEMA.md`), full `play_history` event capture (load / play_start / play_end / transition pair, `session_id` per app run), `played_into` + `session_history` queries, FFI 37, deck-header "↝ usually" hint (§9.5 row 3), Session History smart crate with "← from" annotations. | §8.5.2 |
 | **Hot cues + reverse loops** | Four CUE pads (set / recall / clear, keys 1–4, persisted per track, waveform markers; §6.2.1) + grid-snapped "repeat the bars just heard" reverse loops (½/1/2/4 bar). | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M11e, M12b–d** | External-library importers: Serato (DB / crates / GEOB grids-cues-loops-keys-gain), Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML export. Idempotent by `(volume, path)`, shared track identity, playlist mirrors. | [`SHIPPED.md`](../history/SHIPPED.md) |
-| **M12e → M12f** | Collection membership (browse-only sources until played, schema v7) + energy-map overview; ratings / colour labels / favourites strip / dynamic cascading filter bar (schema v8). Also shipped from the M11d-columns scope: header right-click column picker (grouped, persisted, header drag-to-reorder) over the active-priority columns incl. Key — see §8.5.3.1 for what remains. | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M12e → M12f** | Collection membership (browse-only sources until played, schema v7) + energy-map overview; ratings / colour labels / favourites strip / dynamic cascading filter bar (schema v8). Also shipped from the M11d-columns scope: header right-click column picker (grouped, persisted, header drag-to-reorder) over the active-priority columns incl. Key — the data plumbing behind it followed in M11d-columns (§8.5.3.1). | [`SHIPPED.md`](../history/SHIPPED.md) |
+| **M11d-columns** | Column data plumbing (§8.5.3.1): the `LibraryColumnId` registry + dynamically generated SELECT (a switched-off column adds no expression and no join), the per-source metadata group, analysis extras (`bpm_auto` / `key_auto` / `lufs_i` / `true_peak` / `prepared`), audio-file and aggregated mix-history groups, `date_added` / `in_crates` / dupes / missing, and the §8.3 BPM-disagreement ⚠. FFI 64. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M13** | Looping, complete: the grid-snapped reverse grab (½/1/2/4 bar), **manual Loop In / Loop Out** for tracks the analyser could not grid, correct behaviour under timecode (the platter drives the loop's velocity; the absolute re-pin and drift heal are suspended while it runs), and key lock holding *through* a loop. Closes §14 #8. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M26a + M26b** | Vinyl rip end to end: record tap → crash-safe spill → adaptive gap detection → both-end side trim → FLAC + tags → library import, plus session recovery, re-split from the lossless archive, the Prep review UI and the **Real Records** browser node. Gates fitted against three real records. Spec §5.2.7. | [`SHIPPED.md`](../history/SHIPPED.md) |
 | **M14** | Key Lock + scratch-aware auto-bypass — shipped as a **pure-Rust WSOLA** stretcher (`dub-stretch`), not Rubber Band; the GPL dep was dropped after benching (pitch parity, better transients + latency). | [`SHIPPED.md`](../history/SHIPPED.md) |
@@ -1473,17 +1478,14 @@ observably do at the end.
 
 ### 12.1 Planned path to v1.0
 
-_Rebased 2026-08-30: the importer block (M11e / M12b–d), M12e–f, M13 **in
-full**, M14, M15, M16, and M26a + M26b have shipped — see §12.0 and
-[`SHIPPED.md`](../history/SHIPPED.md). What follows is the remaining work
-only. M11d-columns was re-scoped the same day: its UI infrastructure
-(picker / persistence / header reorder / Key column) shipped quietly with
-the library rounds, so the milestone now covers only the data plumbing —
-see §8.5.3.1._
+_Rebased 2026-09-01: the importer block (M11e / M12b–d), M12e–f, M13 **in
+full**, M14, M15, M16, M26a + M26b, M11f and M11d-columns have shipped —
+see §12.0 and [`SHIPPED.md`](../history/SHIPPED.md). What follows is the
+remaining work only._
 
 | # | Name | Demo criterion | Estimate |
 | --- | --- | --- | --- |
-| **M11d-columns** | **Column data plumbing + per-source disagreement view** | The remaining §8.5.3.1 column groups exist end-to-end: stable `LibraryColumnId` FFI registry + dynamically generated SELECT (disabled columns cost zero query time), per-source metadata columns (`serato_bpm`, `traktor_key`, …), analysis extras (`bpm_auto` vs `bpm_active`, `key_auto` vs `key_active`, `lufs_i`, `true_peak`), audio-file group, aggregated mix-history group, `date_added` / `in_crates`, and the BPM-column source-vs-Dub ⚠ (the FFI already computes `key_disagreement`). Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
+| **M11d-columns** | **Column data plumbing + per-source disagreement view** — ✅ **shipped** | The remaining §8.5.3.1 column groups exist end-to-end. Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
 | **M17** | **Sampler + Quick Scratch + Instant Doubles** | All three trigger systems work per §7. | 4–6 days |

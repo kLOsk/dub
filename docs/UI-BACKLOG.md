@@ -82,6 +82,13 @@ source of truth. The FFI path is preferable once M11d.4 paging
 lands, since client-side sort doesn't scale to a paginated
 listing anyway.
 
+**Narrowed (M11d-columns).** The configurable columns
+(§8.5.3.1) sort through `LibraryRowComparator`, which holds
+empty cells last in *both* directions — the FFI's contract. Only
+the built-in columns still go through a bare
+`KeyPathComparator`, so this item is now scoped to those; the
+comparator to copy already exists.
+
 ---
 
 ### U-21. StatusStrip mixes engine + library state

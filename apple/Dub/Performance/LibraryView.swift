@@ -120,12 +120,171 @@ extension LibraryTrack {
     var crateOrderSortKey: UInt32 { crateOrdinal ?? UInt32.max }
 }
 
-// MARK: - Configurable library columns (PRD §8.5.3.1 lite)
+// MARK: - Configurable library columns (PRD §8.5.3.1)
+
+/// The Rust column registry, read once per launch.
+///
+/// The vocabulary of configurable columns — ids, labels, groups and
+/// value kinds — lives in `dub-library`; restating it in Swift is how
+/// the two halves would drift, so the picker, the header labels and
+/// the cell renderers all read it from here (`libraryColumns()`).
+/// Static data, so it needs no open library.
+final class LibraryColumnCatalog {
+    static let shared = LibraryColumnCatalog()
+
+    let columns: [LibraryColumnInfo]
+    /// Group labels in registry order — the order the picker's
+    /// sections appear in.
+    let groups: [String]
+    private let byId: [String: LibraryColumnInfo]
+
+    private init() {
+        let registry = libraryColumns()
+        columns = registry
+        byId = Dictionary(registry.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var seen = Set<String>()
+        groups = registry.map(\.group).filter { seen.insert($0).inserted }
+    }
+
+    func info(for id: String) -> LibraryColumnInfo? { byId[id] }
+
+    func columns(inGroup group: String) -> [LibraryColumnInfo] {
+        columns.filter { $0.group == group }
+    }
+}
+
+extension LibraryColumnKind {
+    /// Numeric kinds right-align and sort by magnitude; text kinds
+    /// left-align and sort naturally.
+    var isNumeric: Bool {
+        if case .text = self { return false }
+        return true
+    }
+}
+
+/// Sort comparator for the browser's in-memory page, over either a
+/// fixed `LibraryTrack` field or one configurable column's cell.
+///
+/// The browser sorts client-side (the FFI is reserved for the fetch
+/// and page boundaries), so a configurable column has to be comparable
+/// without a round trip. Empty cells sort last in both directions —
+/// the same contract the SQL sorts hold to, so a column of mostly
+/// untagged rows doesn't bury the tagged ones on a reverse click.
+private struct LibraryRowComparator: SortComparator {
+    enum Basis: Hashable {
+        case field(KeyPathComparator<LibraryTrack>)
+        case extra(index: Int, numeric: Bool)
+    }
+
+    var basis: Basis
+    var order: SortOrder
+
+    init(field comparator: KeyPathComparator<LibraryTrack>, order: SortOrder) {
+        self.basis = .field(comparator)
+        self.order = order
+    }
+
+    init(extraIndex: Int, numeric: Bool, order: SortOrder) {
+        self.basis = .extra(index: extraIndex, numeric: numeric)
+        self.order = order
+    }
+
+    func compare(_ lhs: LibraryTrack, _ rhs: LibraryTrack) -> ComparisonResult {
+        switch basis {
+        case .field(let comparator):
+            var comparator = comparator
+            comparator.order = order
+            return comparator.compare(lhs, rhs)
+        case .extra(let index, let numeric):
+            let left = Self.cell(lhs, index)
+            let right = Self.cell(rhs, index)
+            let result: ComparisonResult
+            if numeric {
+                guard let leftValue = left.numericSortKey else {
+                    return right.numericSortKey == nil ? .orderedSame : .orderedDescending
+                }
+                guard let rightValue = right.numericSortKey else { return .orderedAscending }
+                if leftValue == rightValue { return .orderedSame }
+                result = leftValue < rightValue ? .orderedAscending : .orderedDescending
+            } else {
+                guard let leftValue = left.textSortKey else {
+                    return right.textSortKey == nil ? .orderedSame : .orderedDescending
+                }
+                guard let rightValue = right.textSortKey else { return .orderedAscending }
+                result = leftValue.localizedStandardCompare(rightValue)
+            }
+            guard order == .reverse else { return result }
+            switch result {
+            case .orderedAscending: return .orderedDescending
+            case .orderedDescending: return .orderedAscending
+            case .orderedSame: return .orderedSame
+            }
+        }
+    }
+
+    private static func cell(_ track: LibraryTrack, _ index: Int) -> LibraryColumnValue {
+        track.extras.indices.contains(index) ? track.extras[index] : .empty
+    }
+}
+
+extension LibraryColumnValue {
+    /// Text for a cell, formatted per its column's kind. `nil` renders
+    /// as the browser's em-dash — "nothing recorded", as distinct from
+    /// a recorded empty string.
+    func display(kind: LibraryColumnKind) -> String? {
+        switch self {
+        case .empty:
+            return nil
+        case .text(let value):
+            return value
+        case .flag(let value):
+            return value ? "Yes" : "No"
+        case .int(let value):
+            switch kind {
+            case .timestamp:
+                return Self.dateFormatter.string(
+                    from: Date(timeIntervalSince1970: TimeInterval(value)))
+            case .bytes:
+                return ByteCountFormatter.string(
+                    fromByteCount: value, countStyle: .file)
+            default:
+                return String(value)
+            }
+        case .real(let value):
+            return kind == .bpm
+                ? String(format: "%.2f", value) : String(format: "%.1f", value)
+        }
+    }
+
+    /// Sort key. Numbers sort as numbers even when the column is
+    /// mostly empty; empty cells sort last in both directions, the
+    /// same contract the SQL sorts use.
+    var numericSortKey: Double? {
+        switch self {
+        case .int(let value): return Double(value)
+        case .real(let value): return value
+        case .flag(let value): return value ? 1 : 0
+        default: return nil
+        }
+    }
+
+    var textSortKey: String? {
+        if case .text(let value) = self { return value }
+        return nil
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .none
+        return formatter
+    }()
+}
 
 /// Display + sort identity for a library browser column. Artist
 /// and title are always shown; the trailing set is user-configurable
 /// via header right-click and persisted in `@AppStorage`.
-private enum LibraryColumnField: String, CaseIterable, Identifiable {
+private enum LibraryColumnField: Hashable, Identifiable {
     /// Manual-order rank column (`#`). Injected as a fixed leading
     /// column only while a Dub crate is selected; never part of the
     /// user-configurable / persisted column set, so it stays out of
@@ -153,8 +312,68 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
     /// that writes `LibraryTrack.color`; the colour also tints the row
     /// background (see `trackRow`).
     case color
+    /// M11d-columns: one of the configurable columns the Rust registry
+    /// publishes (PRD §8.5.3.1), carried by its stable id. The cases
+    /// above are the ones the fixed `LibraryTrack` fields back and
+    /// that predate the registry; everything deeper — per-source
+    /// metadata, analysis extras, audio-file facts, mix history —
+    /// arrives here without a Swift-side case per column.
+    case extra(String)
 
     var id: String { rawValue }
+
+    /// Stable persisted identity. Configurable columns are prefixed so
+    /// a registry id can never collide with a built-in case name.
+    var rawValue: String {
+        switch self {
+        case .crateOrder: return "crateOrder"
+        case .artist: return "artist"
+        case .title: return "title"
+        case .duration: return "duration"
+        case .bpm: return "bpm"
+        case .album: return "album"
+        case .genre: return "genre"
+        case .year: return "year"
+        case .key: return "key"
+        case .comment: return "comment"
+        case .composer: return "composer"
+        case .trackNumber: return "trackNumber"
+        case .versionTokens: return "versionTokens"
+        case .source: return "source"
+        case .rating: return "rating"
+        case .color: return "color"
+        case .extra(let id): return "x:\(id)"
+        }
+    }
+
+    /// Parse persisted storage. An `x:` id this build's registry no
+    /// longer knows returns `nil` and so drops out of the column list,
+    /// which is what keeps a preferences file from a newer build from
+    /// breaking the browser.
+    init?(rawValue: String) {
+        if rawValue.hasPrefix("x:") {
+            let id = String(rawValue.dropFirst(2))
+            guard LibraryColumnCatalog.shared.info(for: id) != nil else { return nil }
+            self = .extra(id)
+            return
+        }
+        guard let match = Self.builtinCases.first(where: { $0.rawValue == rawValue }) else {
+            return nil
+        }
+        self = match
+    }
+
+    /// The registry id when this is a configurable column.
+    var extraId: String? {
+        if case .extra(let id) = self { return id }
+        return nil
+    }
+
+    static let builtinCases: [LibraryColumnField] = [
+        .crateOrder, .artist, .title, .duration, .bpm, .album, .genre, .year,
+        .key, .comment, .composer, .trackNumber, .versionTokens, .source,
+        .rating, .color,
+    ]
 
     /// Always pinned left; not toggleable from the column picker.
     var isFixed: Bool {
@@ -183,11 +402,15 @@ private enum LibraryColumnField: String, CaseIterable, Identifiable {
             return "ID3 metadata"
         case .duration, .bpm, .key:
             return "Analysis"
+        case .extra(let id):
+            return LibraryColumnCatalog.shared.info(for: id)?.group ?? "Library"
         }
     }
 
     var headerLabel: String {
         switch self {
+        case .extra(let id):
+            return LibraryColumnCatalog.shared.info(for: id)?.label ?? id
         case .crateOrder: return "#"
         case .artist: return "Artist"
         case .title: return "Title"
@@ -636,9 +859,16 @@ struct LibraryView: View {
     /// the FFI's natural order (Recently Played / Just Imported).
     @State private var activeSortColumn: LibraryColumnField? = .title
     @State private var sortAscending: Bool = true
-    @State private var sortOrder: [KeyPathComparator<LibraryTrack>] = [
-        KeyPathComparator(\.titleSortKey, order: .forward),
+    @State private var sortOrder: [LibraryRowComparator] = [
+        LibraryRowComparator(
+            field: KeyPathComparator(\.titleSortKey, order: .forward), order: .forward),
     ]
+
+    /// M11d-columns: where each configurable column's cell sits in
+    /// `LibraryTrack.extras`, keyed by registry id. Rebuilt from what
+    /// `setVisibleColumns` actually applied, so a column this build
+    /// doesn't know can never shift the others' cells.
+    @State private var extraColumnIndex: [String: Int] = [:]
 
     /// Selection state owned by the view, deliberately stored on
     /// `@State` rather than `@StateObject` / `@ObservedObject`.
@@ -701,7 +931,16 @@ struct LibraryView: View {
         .frame(minHeight: DubLayout.libraryMinHeight)
         .background(DubColor.surface0)
         .onAppear {
-            refreshTracks()
+            applyExtraColumns()
+        }
+        .onChange(of: visibleColumnsStorage) { _ in
+            // The cells a row carries are chosen per library handle, so
+            // switching a configurable column on means re-fetching the
+            // page — the fixed fields alone can't answer for it. Only
+            // then, though: hiding a built-in column or dragging the
+            // header order about must not cost 5 000 rows of FFI.
+            guard visibleColumns.compactMap(\.extraId) != orderedExtraColumnIds else { return }
+            applyExtraColumns(preserveSelection: true)
         }
         .onChange(of: selectedSource) { newSource in
             // Pick the default sort for the new source. The user can
@@ -714,7 +953,11 @@ struct LibraryView: View {
                 // disables) and click `#` to come back.
                 activeSortColumn = .crateOrder
                 sortAscending = true
-                sortOrder = [KeyPathComparator(\LibraryTrack.crateOrderSortKey, order: .forward)]
+                sortOrder = [
+                    LibraryRowComparator(
+                        field: KeyPathComparator(\LibraryTrack.crateOrderSortKey, order: .forward),
+                        order: .forward)
+                ]
             } else if newSource.preservesNaturalOrder {
                 // Smart crates with a meaningful natural order
                 // (Recently Played, Just Imported) start out
@@ -725,7 +968,11 @@ struct LibraryView: View {
                 // `allTracks` falls back to title-ascending.
                 activeSortColumn = .title
                 sortAscending = true
-                sortOrder = [KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward)]
+                sortOrder = [
+                    LibraryRowComparator(
+                        field: KeyPathComparator(\LibraryTrack.titleSortKey, order: .forward),
+                        order: .forward)
+                ]
             }
             // v8: a new view has its own distinct values, so the active
             // filter selections no longer apply. `refreshTracks` rebuilds
@@ -744,7 +991,7 @@ struct LibraryView: View {
             }
         }
         .onChange(of: libraryModel.libraryIsOpen) { _ in
-            refreshTracks()
+            applyExtraColumns()
         }
         .onChange(of: libraryModel.libraryTrackCount) { _ in
             // Track count bumped → either an import just landed
@@ -2250,6 +2497,23 @@ struct LibraryView: View {
                 }
             }
         }
+        // M11d-columns: the deeper groups (per-source metadata,
+        // analysis extras, audio file, mix history) come straight off
+        // the Rust registry — PRD §8.5.3.1. Each is its own submenu
+        // because the per-source group alone is six sources wide and
+        // would otherwise bury the columns above.
+        Menu("More columns") {
+            ForEach(LibraryColumnCatalog.shared.groups, id: \.self) { group in
+                Menu(group) {
+                    ForEach(LibraryColumnCatalog.shared.columns(inGroup: group), id: \.id) { info in
+                        Toggle(isOn: columnVisibilityBinding(.extra(info.id))) {
+                            Text(info.label)
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                }
+            }
+        }
     }
 
     private var columnPickerCategories: [String] {
@@ -2296,38 +2560,100 @@ struct LibraryView: View {
         }
         let order: SortOrder = sortAscending ? .forward : .reverse
         switch column {
+        case .extra(let id):
+            // A column whose cells aren't loaded yet (the set changed
+            // but the rows haven't come back) sorts by nothing rather
+            // than by a stale index.
+            guard let index = extraColumnIndex[id],
+                let info = LibraryColumnCatalog.shared.info(for: id)
+            else {
+                sortOrder = []
+                return
+            }
+            sortOrder = [
+                LibraryRowComparator(
+                    extraIndex: index, numeric: info.kind.isNumeric, order: order)
+            ]
         case .crateOrder:
-            sortOrder = [KeyPathComparator(\.crateOrderSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.crateOrderSortKey, order: order), order: order)
+            ]
         case .artist:
-            sortOrder = [KeyPathComparator(\.artistSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.artistSortKey, order: order), order: order)
+            ]
         case .title:
-            sortOrder = [KeyPathComparator(\.titleSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.titleSortKey, order: order), order: order)
+            ]
         case .duration:
-            sortOrder = [KeyPathComparator(\.durationSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.durationSortKey, order: order), order: order)
+            ]
         case .bpm:
-            sortOrder = [KeyPathComparator(\.bpmSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.bpmSortKey, order: order), order: order)
+            ]
         case .album:
-            sortOrder = [KeyPathComparator(\.albumSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.albumSortKey, order: order), order: order)
+            ]
         case .genre:
-            sortOrder = [KeyPathComparator(\.genreSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.genreSortKey, order: order), order: order)
+            ]
         case .year:
-            sortOrder = [KeyPathComparator(\.yearSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.yearSortKey, order: order), order: order)
+            ]
         case .key:
-            sortOrder = [KeyPathComparator(\.keySortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.keySortKey, order: order), order: order)
+            ]
         case .comment:
-            sortOrder = [KeyPathComparator(\.commentSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.commentSortKey, order: order), order: order)
+            ]
         case .versionTokens:
-            sortOrder = [KeyPathComparator(\.versionTokensSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.versionTokensSortKey, order: order), order: order)
+            ]
         case .source:
-            sortOrder = [KeyPathComparator(\.sourceSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.sourceSortKey, order: order), order: order)
+            ]
         case .composer:
-            sortOrder = [KeyPathComparator(\.composerSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.composerSortKey, order: order), order: order)
+            ]
         case .trackNumber:
-            sortOrder = [KeyPathComparator(\.trackNumberSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.trackNumberSortKey, order: order), order: order)
+            ]
         case .rating:
-            sortOrder = [KeyPathComparator(\.ratingSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.ratingSortKey, order: order), order: order)
+            ]
         case .color:
-            sortOrder = [KeyPathComparator(\.colorSortKey, order: order)]
+            sortOrder = [
+                LibraryRowComparator(
+                    field: KeyPathComparator(\.colorSortKey, order: order), order: order)
+            ]
         }
     }
 
@@ -2345,6 +2671,14 @@ struct LibraryView: View {
         case .trackNumber: return 52
         case .rating: return 92
         case .color: return 44
+        case .extra(let id):
+            switch LibraryColumnCatalog.shared.info(for: id)?.kind {
+            case .flag: return 56
+            case .bpm, .integer, .real: return 72
+            case .timestamp: return 88
+            case .bytes: return 76
+            default: return 140
+            }
         }
     }
 
@@ -2465,6 +2799,19 @@ struct LibraryView: View {
         case .bpm:
             HStack(spacing: 4) {
                 Text(formatBpm(track.bpm))
+                // PRD §8.3 — two sources' grids disagree on the tempo
+                // or the downbeat. Shown ahead of the drift warning:
+                // "Serato says 92, the audio looks like 184" is a
+                // bigger problem than a slow drift, and the per-source
+                // BPM columns are where the DJ goes to resolve it.
+                if track.bpmDisagreement {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(DubColor.stateTentative)
+                        .help(
+                            "Imported and analysed grids disagree · "
+                                + "enable the per-source BPM columns to compare")
+                }
                 if track.gridLocked {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 9))
@@ -2553,7 +2900,36 @@ struct LibraryView: View {
             }
         case .color:
             colorCell(track)
+        case .extra(let id):
+            extraColumnCell(id: id, track: track)
         }
+    }
+
+    /// One configurable column's cell (PRD §8.5.3.1). Formatting comes
+    /// from the registry's kind rather than a per-column branch, which
+    /// is what lets the deeper groups ship without a Swift case each.
+    @ViewBuilder
+    private func extraColumnCell(id: String, track: LibraryTrack) -> some View {
+        let info = LibraryColumnCatalog.shared.info(for: id)
+        let cell: LibraryColumnValue = {
+            guard let index = extraColumnIndex[id], track.extras.indices.contains(index) else {
+                return .empty
+            }
+            return track.extras[index]
+        }()
+        let kind = info?.kind ?? .text
+        let text = cell.display(kind: kind)
+        Text(text ?? "—")
+            .font(DubFont.body)
+            .foregroundStyle(text == nil ? DubColor.textTertiary : DubColor.textSecondary)
+            .lineLimit(1)
+            .truncationMode(kind == .text ? .middle : .tail)
+            .monospacedDigit()
+            .frame(
+                maxWidth: .infinity,
+                alignment: kind.isNumeric ? .trailing : .leading
+            )
+            .help(text ?? "")
     }
 
     /// Colour-label cell. The swatch box is rendered as **normal cell
@@ -3547,6 +3923,45 @@ struct LibraryView: View {
     }
 
     // MARK: - Async refresh
+
+    /// Tell the library handle which configurable columns to select
+    /// (PRD §8.5.3.1), then reload the page so the rows carry their
+    /// cells.
+    ///
+    /// The index map is rebuilt from what the FFI *applied*, not from
+    /// what we asked for: a persisted id this build's registry no
+    /// longer knows is dropped there, and reading the returned order
+    /// is what keeps the remaining columns pointed at the right cells.
+    /// The configurable columns currently loaded, in cell order.
+    private var orderedExtraColumnIds: [String] {
+        extraColumnIndex.sorted { $0.value < $1.value }.map(\.key)
+    }
+
+    private func applyExtraColumns(preserveSelection: Bool = false) {
+        let ids = visibleColumns.compactMap(\.extraId)
+        let library = model.library
+        guard libraryModel.libraryIsOpen else {
+            extraColumnIndex = [:]
+            refreshTracks(preserveSelection: preserveSelection)
+            return
+        }
+        Task.detached(priority: .userInitiated) {
+            let applied = (try? library.setVisibleColumns(columnIds: ids)) ?? []
+            await MainActor.run {
+                var index: [String: Int] = [:]
+                for (offset, id) in applied.enumerated() {
+                    index[id] = offset
+                }
+                self.extraColumnIndex = index
+                // A sort on a configurable column was resolved against
+                // the old indices; re-resolve before the rows land.
+                if self.activeSortColumn?.extraId != nil {
+                    self.syncSortOrderFromHeader()
+                }
+                self.refreshTracks(preserveSelection: preserveSelection)
+            }
+        }
+    }
 
     private func refreshTracks(preserveSelection: Bool = false) {
         guard libraryModel.libraryIsOpen else {
@@ -5134,7 +5549,12 @@ private extension LibraryTrack {
             gridDriftQuality: gridDriftQuality,
             rating: rating,
             color: color,
-            crateOrdinal: crateOrdinal)
+            crateOrdinal: crateOrdinal,
+            // Analysis can land a second grid on a track that already
+            // had an imported one, so the ⚠ has to survive the patch;
+            // the row is only re-fetched on the next refresh.
+            bpmDisagreement: bpmDisagreement,
+            extras: extras)
     }
 }
 

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use dub_fingerprint::Fingerprint;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::columns::{ColumnSet, ColumnValue};
 use crate::error::{LibraryError, Result};
 use crate::history::HistoryWrite;
 use crate::paths::default_library_db_path;
@@ -260,6 +261,18 @@ pub struct TrackRow {
     /// `tracks.color`. `None` when unset. The browser tints the row
     /// background with it.
     pub color: Option<String>,
+    /// `true` when two sources' beat grids for this track disagree by
+    /// more than [`BPM_DISAGREEMENT_FRACTION`] in tempo or
+    /// [`ANCHOR_DISAGREEMENT_SECS`] in downbeat phase (PRD §8.3).
+    /// Drives the ⚠ in the BPM column — the at-a-glance form of what
+    /// the per-source `{source}_bpm` columns spell out. Always `false`
+    /// until a second grid source exists for the track, so a
+    /// Dub-only library never sees it.
+    pub bpm_disagreement: bool,
+    /// Cells for the configurable columns (PRD §8.5.3.1), in the
+    /// order of the [`Library`]'s active [`ColumnSet`]. Empty — and
+    /// free — until the user switches a column on.
+    pub extras: Vec<ColumnValue>,
 }
 
 /// One Played Into aggregate row (M11d-history): a track the DJ
@@ -370,8 +383,13 @@ impl TrackSortKey {
 /// is fetched via a correlated subquery against `volumes` so the
 /// JOIN order doesn't reshuffle the per-row cost on huge
 /// libraries.
-const TRACK_ROW_SELECT: &str = "\
-    SELECT t.id, \
+///
+/// Split into a fixed column list, a fixed join list and a
+/// dynamically assembled tail (see [`track_row_select`]) so the
+/// M11d-columns configurable groups can add expressions and joins
+/// without a second, drifting copy of this SELECT.
+const TRACK_ROW_COLUMNS: &str = "\
+    t.id, \
            COALESCE(sr.title,  rb.title,  tr.title,  it.title,  i3.title,  fn.title)  AS title, \
            COALESCE(sr.artist, rb.artist, tr.artist, it.artist, i3.artist, fn.artist) AS artist, \
            COALESCE(sr.album,  rb.album,  tr.album,  it.album,  i3.album)             AS album, \
@@ -415,7 +433,51 @@ const TRACK_ROW_SELECT: &str = "\
            t.grid_drift_quality                AS grid_drift_quality, \
            COALESCE(t.user_rating, sr.rating, rb.rating, tr.rating, it.rating, i3.rating) \
                                                AS rating, \
-           COALESCE(t.color, sr.color, rb.color, tr.color, it.color) AS color \
+           COALESCE(t.color, sr.color, rb.color, tr.color, it.color) AS color";
+
+/// Fixed column count in [`TRACK_ROW_COLUMNS`] plus the appended
+/// `bpm_disagreement`. Configurable columns start at this index.
+const FIXED_COLUMN_COUNT: usize = 25;
+
+/// PRD §8.3: two sources' grids disagree when their tempi differ by
+/// more than this fraction. The motivating case is an octave error —
+/// "Serato says 92 BPM but the audio looks like 184" — which no
+/// tolerance should ever fold away, so the comparison is on raw BPM
+/// with no octave normalisation.
+const BPM_DISAGREEMENT_FRACTION: f64 = 0.05;
+
+/// PRD §8.3: …or when their downbeats sit more than this many seconds
+/// apart. Compared as *phase* within one beat, because two grids that
+/// agree on the beat but anchor on different bars are not in conflict.
+const ANCHOR_DISAGREEMENT_SECS: f64 = 0.050;
+
+/// The §8.3 grid-disagreement predicate, as a correlated subquery over
+/// every pair of grid sources on the track. `g2.source > g1.source`
+/// visits each unordered pair once.
+fn bpm_disagreement_sql() -> String {
+    let period = "(60.0 / g1.bpm)";
+    let delta = "ABS(g1.anchor_secs - g2.anchor_secs)";
+    // `CAST(x AS INTEGER)` truncates toward zero, which is a floor for
+    // the non-negative `delta` — i.e. `delta` modulo one beat.
+    let phase = format!("({delta} - CAST({delta} / {period} AS INTEGER) * {period})");
+    format!(
+        "( \
+             SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END \
+             FROM track_beatgrids g1 \
+             JOIN track_beatgrids g2 \
+               ON g2.track_id = g1.track_id AND g2.source > g1.source \
+             WHERE g1.track_id = t.id AND g1.bpm > 0 AND g2.bpm > 0 \
+               AND (ABS(g1.bpm - g2.bpm) > \
+                        {BPM_DISAGREEMENT_FRACTION} * MIN(g1.bpm, g2.bpm) \
+                    OR MIN({phase}, {period} - {phase}) > {ANCHOR_DISAGREEMENT_SECS}) \
+         )"
+    )
+}
+
+/// Joins the fixed columns need. Every metadata source is here
+/// because the §8.1 priority chain reads all of them — which is why
+/// the per-source column group costs no extra join.
+const TRACK_ROW_JOINS: &str = "\
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
               ON fn.track_id = t.id AND fn.source = 'filename' \
@@ -434,28 +496,60 @@ const TRACK_ROW_SELECT: &str = "\
     LEFT JOIN track_keys ak \
               ON ak.track_id = t.id AND ak.is_active = 1 \
     LEFT JOIN analysis_cache ac \
-              ON ac.fingerprint_id = t.fingerprint_id \
-    LEFT JOIN ( \
-        SELECT tf.track_id, tf.volume_uuid, tf.relative_path \
-        FROM track_files tf \
-        JOIN ( \
-            SELECT track_id, MAX(id) AS max_id \
-            FROM track_files \
-            WHERE last_seen_at = ( \
-                SELECT MAX(last_seen_at) FROM track_files tf2 \
-                WHERE tf2.track_id = track_files.track_id \
-            ) \
-            GROUP BY track_id \
-        ) latest \
-          ON latest.track_id = tf.track_id \
-          AND latest.max_id   = tf.id \
-    ) pf ON pf.track_id = t.id \
-    ";
+              ON ac.fingerprint_id = t.fingerprint_id ";
+
+/// The primary-file subquery, with the projected `track_files`
+/// columns left to the caller so the audio-file column group is paid
+/// for only when it is switched on.
+fn primary_file_join(extra_columns: &[&str]) -> String {
+    let extra: String = extra_columns
+        .iter()
+        .map(|c| format!(", tf.{c}"))
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "LEFT JOIN ( \
+            SELECT tf.track_id, tf.volume_uuid, tf.relative_path{extra} \
+            FROM track_files tf \
+            JOIN ( \
+                SELECT track_id, MAX(id) AS max_id \
+                FROM track_files \
+                WHERE last_seen_at = ( \
+                    SELECT MAX(last_seen_at) FROM track_files tf2 \
+                    WHERE tf2.track_id = track_files.track_id \
+                ) \
+                GROUP BY track_id \
+            ) latest \
+              ON latest.track_id = tf.track_id \
+              AND latest.max_id   = tf.id \
+        ) pf ON pf.track_id = t.id "
+    )
+}
+
+/// Assemble the track SELECT for a given configurable column set.
+///
+/// An empty set produces the fixed browser query and nothing else —
+/// PRD §8.5.3.1's "disabled columns cost zero query time" is a
+/// property of this function, and `column_set_generates_no_extra_sql`
+/// is what holds it to that.
+fn track_row_select(set: &ColumnSet) -> String {
+    format!(
+        "SELECT {TRACK_ROW_COLUMNS}, {disagreement} AS bpm_disagreement{extras} \
+         {TRACK_ROW_JOINS}{files}{joins}",
+        disagreement = bpm_disagreement_sql(),
+        extras = set.select_fragment(),
+        files = primary_file_join(&set.primary_file_columns()),
+        joins = set.join_fragment(),
+    )
+}
 
 /// Map a SELECT-shaped row to [`TrackRow`]. Used by every
 /// `list_*` / `search_*` / `recently_*` method so column order
-/// stays in lockstep with `TRACK_ROW_SELECT`.
-fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
+/// stays in lockstep with [`track_row_select`].
+fn track_row_from_columns(
+    r: &rusqlite::Row<'_>,
+    extra_columns: &ColumnSet,
+) -> rusqlite::Result<TrackRow> {
     let duration_ms: Option<i64> = r.get(8)?;
     Ok(TrackRow {
         id: r.get(0)?,
@@ -493,6 +587,11 @@ fn track_row_from_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         grid_drift_quality: r.get(21)?,
         rating: r.get(22)?,
         color: r.get(23)?,
+        bpm_disagreement: {
+            let flag: i64 = r.get(24)?;
+            flag != 0
+        },
+        extras: extra_columns.read_row(r, FIXED_COLUMN_COUNT)?,
     })
 }
 
@@ -576,6 +675,15 @@ pub struct Library {
     /// via `open_default` / `open_at` (those use the platform
     /// cache and want it persisted across runs).
     _owned_waveforms_tempdir: Option<tempfile::TempDir>,
+    /// M11d-columns — the configurable columns the browser currently
+    /// shows (PRD §8.5.3.1). Held on the handle rather than passed to
+    /// every listing call because the Apple shell keeps **one global
+    /// column set** across all sidebar sources, and because it keeps
+    /// the column vocabulary out of a dozen call signatures.
+    extra_columns: ColumnSet,
+    /// [`track_row_select`] for [`Self::extra_columns`], assembled
+    /// once per column-set change rather than per query.
+    track_select: String,
 }
 
 /// A fingerprint row read back from the `fingerprints` table.
@@ -698,6 +806,8 @@ impl Library {
             db_path: path.to_path_buf(),
             waveforms_cache_dir_override: None,
             _owned_waveforms_tempdir: None,
+            extra_columns: ColumnSet::default(),
+            track_select: track_row_select(&ColumnSet::default()),
         })
     }
 
@@ -723,7 +833,30 @@ impl Library {
             db_path: PathBuf::from(":memory:"),
             waveforms_cache_dir_override: Some(dir_path),
             _owned_waveforms_tempdir: Some(tempdir),
+            extra_columns: ColumnSet::default(),
+            track_select: track_row_select(&ColumnSet::default()),
         })
+    }
+
+    /// Set the configurable columns every subsequent listing returns
+    /// cells for (PRD §8.5.3.1). The Apple shell calls this when the
+    /// user changes the column picker; the order given is the order
+    /// [`TrackRow::extras`] comes back in.
+    pub fn set_extra_columns(&mut self, columns: ColumnSet) {
+        self.track_select = track_row_select(&columns);
+        self.extra_columns = columns;
+    }
+
+    /// The active configurable column set.
+    pub fn extra_columns(&self) -> &ColumnSet {
+        &self.extra_columns
+    }
+
+    /// Row mapper bound to the active column set, for the `query_map`
+    /// / `query_row` calls in every listing method.
+    fn map_track_row(&self) -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> + '_ {
+        let extra_columns = &self.extra_columns;
+        move |row| track_row_from_columns(row, extra_columns)
     }
 
     /// Redirect waveform-sidecar writes to `dir` instead of the
@@ -1276,12 +1409,12 @@ impl Library {
     /// Single-row variant of the canonical browser query. `None`
     /// when the id doesn't resolve (deleted track).
     fn track_row_by_id(&self, track_id: &str) -> Result<Option<TrackRow>> {
-        let sql = format!("{TRACK_ROW_SELECT} WHERE t.id = ?1");
+        let sql = format!("{} WHERE t.id = ?1", self.track_select);
         let mut stmt = self
             .conn
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_track_row_by_id", e))?;
-        stmt.query_row(params![track_id], track_row_from_columns)
+        stmt.query_row(params![track_id], self.map_track_row())
             .optional()
             .map_err(|e| LibraryError::sqlite("query_track_row_by_id", e))
     }
@@ -1608,8 +1741,9 @@ impl Library {
         // folder-imported (PRD §8.4.1). The per-source nodes
         // (`list_tracks_by_source`, imported-crate listings) deliberately
         // do *not* apply this filter.
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              WHERE t.in_collection = 1 \
              ORDER BY {column} IS NULL, {column} COLLATE NOCASE {direction}, \
                       t.created_at ASC \
@@ -1620,7 +1754,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_list_tracks_sorted", e))?;
         let rows = stmt
-            .query_map(params![limit as i64, offset as i64], track_row_from_columns)
+            .query_map(params![limit as i64, offset as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_list_tracks_sorted", e))?;
         collect_track_rows(rows, "list_tracks_sorted")
     }
@@ -1636,8 +1770,9 @@ impl Library {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              WHERE EXISTS (SELECT 1 FROM track_metadata_source ms \
                            WHERE ms.track_id = t.id AND ms.source = ?1) \
              ORDER BY t.created_at ASC LIMIT ?2 OFFSET ?3"
@@ -1649,7 +1784,7 @@ impl Library {
         let rows = stmt
             .query_map(
                 params![source, limit as i64, offset as i64],
-                track_row_from_columns,
+                self.map_track_row(),
             )
             .map_err(|e| LibraryError::sqlite("query_list_tracks_by_source", e))?;
         collect_track_rows(rows, "list_tracks_by_source")
@@ -1685,8 +1820,9 @@ impl Library {
         // shares that surface's collection-only scope (PRD §8.4.1).
         // Browsing a source node and searching it is a separate, node-
         // scoped concern (not wired here).
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              WHERE t.in_collection = 1 \
                AND t.id IN (\
                 SELECT DISTINCT track_id FROM track_metadata_fts \
@@ -1699,7 +1835,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_search_tracks", e))?;
         let rows = stmt
-            .query_map(params![fts_query, limit as i64], track_row_from_columns)
+            .query_map(params![fts_query, limit as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_search_tracks", e))?;
         collect_track_rows(rows, "search_tracks")
     }
@@ -1712,8 +1848,9 @@ impl Library {
     /// default state until the deck transport actually fires the
     /// history-write hook in a follow-up sub-milestone).
     pub fn recently_played(&self, limit: u32) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              JOIN (\
                 SELECT track_id, MAX(timestamp_ms) AS last_loaded \
                 FROM play_history \
@@ -1727,7 +1864,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_recently_played", e))?;
         let rows = stmt
-            .query_map(params![limit as i64], track_row_from_columns)
+            .query_map(params![limit as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_recently_played", e))?;
         collect_track_rows(rows, "recently_played")
     }
@@ -1740,8 +1877,9 @@ impl Library {
         // scanning a foreign app's whole library this session is not
         // "just imported" — only folder imports (and anything promoted
         // by a play) are members, so this surfaces them, not the scan.
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              WHERE t.in_collection = 1 AND t.created_at >= ?1 \
              ORDER BY t.created_at DESC LIMIT ?2"
         );
@@ -1750,10 +1888,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_just_imported", e))?;
         let rows = stmt
-            .query_map(
-                params![since_unix_secs, limit as i64],
-                track_row_from_columns,
-            )
+            .query_map(params![since_unix_secs, limit as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_just_imported", e))?;
         collect_track_rows(rows, "just_imported")
     }
@@ -1842,8 +1977,9 @@ impl Library {
     /// (`imported_crate_tracks.ordinal`). The read-only sibling of the
     /// user-crate track listing, against the imported mirror.
     pub fn imported_crate_tracks(&self, imported_crate_id: i64) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              JOIN imported_crate_tracks ict ON ict.track_id = t.id \
              WHERE ict.imported_crate_id = ?1 \
              ORDER BY ict.ordinal ASC"
@@ -1853,7 +1989,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_imported_crate_tracks", e))?;
         let rows = stmt
-            .query_map(params![imported_crate_id], track_row_from_columns)
+            .query_map(params![imported_crate_id], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_imported_crate_tracks", e))?;
         collect_track_rows(rows, "imported_crate_tracks")
     }
@@ -2330,8 +2466,9 @@ impl Library {
     /// the same [`TrackRow`] shape the browser uses everywhere else.
     /// Empty for an empty (or unknown) crate.
     pub fn list_crate_tracks(&self, crate_id: i64) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              JOIN crate_tracks ct ON ct.track_id = t.id \
              WHERE ct.crate_id = ?1 \
              ORDER BY ct.ordinal ASC"
@@ -2341,7 +2478,7 @@ impl Library {
             .prepare_cached(&sql)
             .map_err(|e| LibraryError::sqlite("prepare_list_crate_tracks", e))?;
         let rows = stmt
-            .query_map(params![crate_id], track_row_from_columns)
+            .query_map(params![crate_id], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_list_crate_tracks", e))?;
         collect_track_rows(rows, "list_crate_tracks")
     }
@@ -2599,8 +2736,9 @@ impl Library {
     ///
     /// [`LibraryError::Sqlite`] if the query fails.
     pub fn list_tracks_for_export(&self, limit: u32, offset: u32) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
         let sql = format!(
-            "{TRACK_ROW_SELECT} \
+            "{select} \
              WHERE EXISTS (SELECT 1 FROM track_files tf WHERE tf.track_id = t.id) \
              ORDER BY t.created_at ASC, t.id ASC \
              LIMIT ?1 OFFSET ?2"
@@ -2610,7 +2748,7 @@ impl Library {
             .prepare(&sql)
             .map_err(|e| LibraryError::sqlite("list_tracks_for_export_prepare", e))?;
         let rows = stmt
-            .query_map(params![limit, offset], track_row_from_columns)
+            .query_map(params![limit, offset], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("list_tracks_for_export_query", e))?;
         let mut out = Vec::new();
         for row in rows {
@@ -2623,6 +2761,7 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::{LibraryColumnId, MetadataField, MetadataSource};
     use tempfile::tempdir;
 
     #[test]
@@ -4177,5 +4316,404 @@ mod tests {
             .unwrap();
         assert_eq!(lib.list_favorite_slots().unwrap()[0].resolved_id, None);
         assert!(lib.favorite_slot_tracks(0).unwrap().is_empty());
+    }
+
+    // ---- M11d-columns: configurable column plumbing (PRD §8.5.3.1) ----
+
+    /// A track with two sources that disagree about it, a file row on a
+    /// known volume, one crate, and one play — everything the
+    /// configurable groups read from.
+    fn seed_column_fixture(lib: &Library) -> String {
+        let track = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+        lib.upsert_volume(&DiscoveredVolume {
+            volume_uuid: "11112222-3333-4444-5555-666677778888".to_string(),
+            mount_point: PathBuf::from("/Volumes/Crates"),
+            display_name: "Crates".to_string(),
+            is_internal: false,
+        })
+        .unwrap();
+        lib.insert_track(&track, None, Some(240_000), None).unwrap();
+        lib.upsert_track_file(
+            &track,
+            "11112222-3333-4444-5555-666677778888",
+            "Hip Hop/apache.flac",
+            Some("flac"),
+            Some(44_100),
+            Some(24),
+            Some(2),
+            Some(4_096),
+            Some(1_700_000_000),
+        )
+        .unwrap();
+        lib.upsert_metadata_source(
+            &track,
+            "id3",
+            Some("Incredible Bongo Band"),
+            Some("Apache"),
+            Some("Bongo Rock"),
+            None,
+            Some("energy 8"),
+            None,
+            Some(1973),
+            None,
+            Some(115.0),
+            Some("8A"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        lib.upsert_metadata_source(
+            &track,
+            "serato",
+            Some("Incredible Bongo Band"),
+            Some("Apache"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(57.5),
+            Some("8B"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        track
+    }
+
+    fn insert_grid(lib: &Library, track: &str, source: &str, anchor_secs: f64, bpm: f64) {
+        lib.connection()
+            .execute(
+                "INSERT INTO track_beatgrids \
+                 (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, 0)",
+                params![track, source, anchor_secs, bpm],
+            )
+            .unwrap();
+    }
+
+    fn extras_for(lib: &Library, track: &str) -> Vec<ColumnValue> {
+        lib.track_row_by_id(track)
+            .unwrap()
+            .expect("fixture track resolves")
+            .extras
+    }
+
+    /// PRD §8.5.3.1: "disabled columns cost zero query time". The
+    /// default handle must generate the query the browser used before
+    /// the registry existed — no extra expressions, no extra joins, and
+    /// no extra columns projected out of the primary-file subquery.
+    #[test]
+    fn an_empty_column_set_adds_nothing_to_the_query() {
+        let lib = Library::open_in_memory().unwrap();
+        let sql = &lib.track_select;
+        assert!(!sql.contains(" AS x0"), "no configurable expression");
+        for alias in ["track_beatgrids xg", "track_keys xk", ") xc ", ") xh "] {
+            assert!(!sql.contains(alias), "{alias} must not be joined");
+        }
+        assert!(
+            sql.contains("SELECT tf.track_id, tf.volume_uuid, tf.relative_path FROM"),
+            "primary-file subquery projects only what the fixed row needs"
+        );
+    }
+
+    /// The migration-trust feature: Serato's tempo claim next to
+    /// Dub's, in the same row, sortable by the difference.
+    #[test]
+    fn per_source_columns_show_each_source_verbatim() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::PerSource(MetadataSource::Serato, MetadataField::Bpm),
+            LibraryColumnId::PerSource(MetadataSource::Id3, MetadataField::Bpm),
+            LibraryColumnId::PerSource(MetadataSource::Serato, MetadataField::Key),
+            LibraryColumnId::PerSource(MetadataSource::Id3, MetadataField::Comment),
+            LibraryColumnId::PerSource(MetadataSource::Traktor, MetadataField::Bpm),
+        ]));
+
+        assert_eq!(
+            extras_for(&lib, &track),
+            vec![
+                ColumnValue::Real(57.5),
+                ColumnValue::Real(115.0),
+                ColumnValue::Text("8B".to_string()),
+                ColumnValue::Text("energy 8".to_string()),
+                ColumnValue::Empty,
+            ],
+            "cells come back in the configured order; an absent source is Empty"
+        );
+    }
+
+    #[test]
+    fn changing_the_column_set_changes_the_cells() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        lib.set_extra_columns(ColumnSet::new([LibraryColumnId::Codec]));
+        assert_eq!(
+            extras_for(&lib, &track),
+            vec![ColumnValue::Text("flac".to_string())]
+        );
+
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::SampleRate,
+            LibraryColumnId::BitDepth,
+            LibraryColumnId::ChannelCount,
+            LibraryColumnId::FileSize,
+            LibraryColumnId::FileModified,
+            LibraryColumnId::FilePath,
+        ]));
+        assert_eq!(
+            extras_for(&lib, &track),
+            vec![
+                ColumnValue::Int(44_100),
+                ColumnValue::Int(24),
+                ColumnValue::Int(2),
+                ColumnValue::Int(4_096),
+                ColumnValue::Int(1_700_000_000),
+                ColumnValue::Text("/Volumes/Crates/Hip Hop/apache.flac".to_string()),
+            ]
+        );
+
+        lib.set_extra_columns(ColumnSet::default());
+        assert!(extras_for(&lib, &track).is_empty());
+    }
+
+    #[test]
+    fn mix_history_columns_aggregate_play_history() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // Two plays inside the window, one a fortnight old.
+        lib.record_load(&track, 0, now_ms - 60_000).unwrap();
+        lib.record_history(
+            "session-1",
+            &[
+                HistoryWrite {
+                    track_id: track.clone(),
+                    deck: 0,
+                    event: crate::HistoryEventType::PlayStart,
+                    timestamp_ms: now_ms - 60_000,
+                    duration_played_ms: None,
+                    from_track_id: None,
+                    to_track_id: None,
+                },
+                HistoryWrite {
+                    track_id: track.clone(),
+                    deck: 0,
+                    event: crate::HistoryEventType::PlayStart,
+                    timestamp_ms: now_ms - 3 * 86_400_000,
+                    duration_played_ms: None,
+                    from_track_id: None,
+                    to_track_id: None,
+                },
+                HistoryWrite {
+                    track_id: track.clone(),
+                    deck: 0,
+                    event: crate::HistoryEventType::PlayStart,
+                    timestamp_ms: now_ms - 14 * 86_400_000,
+                    duration_played_ms: None,
+                    from_track_id: None,
+                    to_track_id: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::PlayCount,
+            LibraryColumnId::PlayedLast7d,
+            LibraryColumnId::LastPlayed,
+            LibraryColumnId::LastLoaded,
+        ]));
+        let cells = extras_for(&lib, &track);
+        assert_eq!(cells[0], ColumnValue::Int(3), "lifetime plays");
+        assert_eq!(cells[1], ColumnValue::Int(2), "plays in the last 7 days");
+        assert_eq!(
+            cells[2],
+            ColumnValue::Int((now_ms - 60_000) / 1000),
+            "timestamps are unix seconds regardless of the source table"
+        );
+        assert_eq!(cells[3], ColumnValue::Int((now_ms - 60_000) / 1000));
+    }
+
+    /// A track no one has played must still list — the aggregate is a
+    /// LEFT JOIN, and "never played" is 0, not absent.
+    #[test]
+    fn mix_history_columns_are_zero_for_an_unplayed_track() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::PlayCount,
+            LibraryColumnId::LastPlayed,
+        ]));
+        assert_eq!(
+            extras_for(&lib, &track),
+            vec![ColumnValue::Int(0), ColumnValue::Empty]
+        );
+    }
+
+    #[test]
+    fn library_group_columns_read_crates_dupes_and_missing() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        let hip_hop = lib.create_crate("Hip Hop", None).unwrap();
+        let breaks = lib.create_crate("Breaks", None).unwrap();
+        lib.add_track_to_crate(hip_hop, &track).unwrap();
+        lib.add_track_to_crate(breaks, &track).unwrap();
+
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::InCrates,
+            LibraryColumnId::Duplicate,
+            LibraryColumnId::Missing,
+            LibraryColumnId::DateAdded,
+        ]));
+        let cells = extras_for(&lib, &track);
+        match &cells[0] {
+            ColumnValue::Text(names) => {
+                assert!(names.contains("Hip Hop") && names.contains("Breaks"));
+            }
+            other => panic!("crate names must be text, got {other:?}"),
+        }
+        assert_eq!(cells[1], ColumnValue::Flag(false));
+        assert_eq!(cells[2], ColumnValue::Flag(false));
+        assert!(matches!(cells[3], ColumnValue::Int(_)), "date added");
+
+        let file_id: i64 = lib
+            .connection()
+            .query_row(
+                "SELECT id FROM track_files WHERE track_id = ?1",
+                params![track],
+                |r| r.get(0),
+            )
+            .unwrap();
+        lib.mark_file_state(file_id, true, 0).unwrap();
+        assert_eq!(extras_for(&lib, &track)[2], ColumnValue::Flag(true));
+    }
+
+    #[test]
+    fn analysis_columns_sit_next_to_the_active_ones() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.5, 115.0);
+        lib.connection()
+            .execute(
+                "INSERT INTO track_keys \
+                 (track_id, source, key_notation, is_active, captured_at) \
+                 VALUES (?1, 'auto', '8A', 0, 0)",
+                params![track],
+            )
+            .unwrap();
+
+        lib.set_extra_columns(ColumnSet::new([
+            LibraryColumnId::BpmAuto,
+            LibraryColumnId::KeyAuto,
+            LibraryColumnId::Prepared,
+        ]));
+        let cells = extras_for(&lib, &track);
+        assert_eq!(cells[0], ColumnValue::Real(115.0));
+        assert_eq!(cells[1], ColumnValue::Text("8A".to_string()));
+        assert_eq!(
+            cells[2],
+            ColumnValue::Flag(false),
+            "no analysis_cache row is a definite 'not ready for tonight', not a blank"
+        );
+    }
+
+    /// PRD §8.3's motivating case: an imported grid claiming half the
+    /// tempo the analyser found.
+    #[test]
+    fn bpm_disagreement_flags_an_octave_split() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.5, 184.0);
+        insert_grid(&lib, &track, "serato", 0.5, 92.0);
+        assert!(
+            lib.track_row_by_id(&track)
+                .unwrap()
+                .unwrap()
+                .bpm_disagreement
+        );
+    }
+
+    /// Two grids that agree on the beat but anchor a whole bar apart
+    /// are not in conflict — the phase, not the raw offset, is what
+    /// §8.3's 50 ms is about.
+    #[test]
+    fn bpm_disagreement_ignores_an_anchor_a_whole_beat_apart() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        let beat = 60.0 / 120.0;
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        insert_grid(&lib, &track, "serato", 0.25 + 4.0 * beat, 120.0);
+        assert!(
+            !lib.track_row_by_id(&track)
+                .unwrap()
+                .unwrap()
+                .bpm_disagreement
+        );
+    }
+
+    #[test]
+    fn bpm_disagreement_flags_a_downbeat_off_by_more_than_50ms() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        insert_grid(&lib, &track, "serato", 0.33, 120.0);
+        assert!(
+            lib.track_row_by_id(&track)
+                .unwrap()
+                .unwrap()
+                .bpm_disagreement
+        );
+    }
+
+    #[test]
+    fn a_single_grid_never_disagrees_with_itself() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        assert!(
+            !lib.track_row_by_id(&track)
+                .unwrap()
+                .unwrap()
+                .bpm_disagreement
+        );
+    }
+
+    /// Every listing surface returns the configured cells, not just the
+    /// single-row lookup the other tests use.
+    #[test]
+    fn every_listing_surface_carries_the_configured_cells() {
+        let mut lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        lib.promote_to_collection(&track).unwrap();
+        let crate_id = lib.create_crate("Tonight", None).unwrap();
+        lib.add_track_to_crate(crate_id, &track).unwrap();
+        lib.set_extra_columns(ColumnSet::new([LibraryColumnId::Codec]));
+
+        let expected = vec![ColumnValue::Text("flac".to_string())];
+        assert_eq!(lib.list_tracks(10, 0).unwrap()[0].extras, expected);
+        assert_eq!(
+            lib.list_tracks_sorted(10, 0, TrackSortKey::Title, true)
+                .unwrap()[0]
+                .extras,
+            expected
+        );
+        assert_eq!(lib.search_tracks("Apache", 10).unwrap()[0].extras, expected);
+        assert_eq!(lib.list_crate_tracks(crate_id).unwrap()[0].extras, expected);
+        assert_eq!(
+            lib.list_tracks_by_source("serato", 10, 0).unwrap()[0].extras,
+            expected
+        );
+        assert_eq!(
+            lib.list_tracks_for_export(10, 0).unwrap()[0].extras,
+            expected
+        );
     }
 }
