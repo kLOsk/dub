@@ -731,6 +731,19 @@ final class WaveformAppModel: ObservableObject {
     private static let kDiscogsAccount = "discogsToken"
     private static let secrets: SecretStore = KeychainSecretStore()
 
+    /// M17 §7.2 — the four Quick Scratch slots (`Q W E R`).
+    ///
+    /// Persisted under `dub.quickScratchSlots` as the table's own
+    /// encoded form, so an unreadable value resolves to empty slots
+    /// rather than throwing on the keypress that reads it.
+    @Published var quickScratch: QuickScratchSlots {
+        didSet {
+            UserDefaults.standard.set(quickScratch.persisted, forKey: Self.kQuickScratch)
+        }
+    }
+
+    private static let kQuickScratch = "dub.quickScratchSlots"
+
     /// M26a manual Prep ↔ Performance override, persisted so the
     /// choice survives a relaunch. `nil` = follow hardware
     /// auto-detect (the shipping default). Non-nil wins over
@@ -1147,6 +1160,8 @@ final class WaveformAppModel: ObservableObject {
         // R-42: the token is a user credential, so it comes from the
         // Keychain — dragging any plaintext copy an earlier build left
         // in the preferences plist across on the way.
+        self.quickScratch = QuickScratchSlots(
+            persisted: UserDefaults.standard.string(forKey: Self.kQuickScratch) ?? "")
         self.discogsToken = SecretMigration.migrateFromDefaults(
             account: Self.kDiscogsAccount,
             defaultsKey: Self.kDiscogsToken,
@@ -4490,6 +4505,31 @@ final class WaveformAppModel: ObservableObject {
         setState(destination, for: to)
     }
 
+    /// Quick Scratch (M17, PRD §7.2): `Q W E R` load a bound sample
+    /// onto its target deck.
+    ///
+    /// Deliberately the *same* call the library's drag-and-drop and
+    /// Space-load use — §7.2 is explicit that this is a fast load, not
+    /// a second playback mechanism, so the sample arrives at position
+    /// 0 fully under timecode control and the DJ scratches it with
+    /// their needle. There is no "restore the previous track": §7.2
+    /// dropped it as more complicated than valuable.
+    ///
+    /// An unbound slot does nothing. A bound file that has since moved
+    /// says so once, because silence would look like a dead key.
+    func triggerQuickScratch(_ index: Int) {
+        guard isRunning, let slot = quickScratch.slot(index) else { return }
+        guard FileManager.default.fileExists(atPath: slot.url.path) else {
+            let key = QuickScratchSlots.keyLabels.indices.contains(index)
+                ? QuickScratchSlots.keyLabels[index] : "\(index + 1)"
+            surfaceError("Quick Scratch \(key): \(slot.url.lastPathComponent) has moved.")
+            return
+        }
+        Task { @MainActor in
+            _ = await loadTrack(side: slot.deck, url: slot.url)
+        }
+    }
+
     func handleHotCue(_ side: DeckSide, index: Int, clear: Bool) {
         guard isRunning, index >= 0, index < 4 else { return }
         var deck = state(for: side)
@@ -5688,6 +5728,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     model.instantDouble(toDeckB: toDeckB)
                 }
                 return true
+            },
+            onQuickScratch: { index in
+                Task { @MainActor in
+                    model.triggerQuickScratch(index)
+                }
+                return true
             })
         return view
     }
@@ -5712,7 +5758,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
             onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
-            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool
+            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool,
+            onQuickScratch: @escaping (_ index: Int) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -5756,6 +5803,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                         [6: 0, 7: 1, 8: 2, 9: 3, 11: 4, 45: 5, 46: 6, 43: 7]
                     if let preset = sirenKeys[event.keyCode] {
                         if onSirenPreset(preset) { return nil }
+                    }
+                }
+                // Quick Scratch (M17 §7.2): Q W E R load a bound
+                // sample onto its target deck. Physical keyCodes like
+                // the rows above, so the binding survives a non-QWERTY
+                // layout. Unmodified only — ⌘Q must stay Quit.
+                if !isCmd {
+                    let quickScratchKeys: [UInt16: Int] = [12: 0, 13: 1, 14: 2, 15: 3]
+                    if let slot = quickScratchKeys[event.keyCode] {
+                        if onQuickScratch(slot) { return nil }
                     }
                 }
                 // Instant Doubles (M17 §7.3): ⌘→ duplicates deck A

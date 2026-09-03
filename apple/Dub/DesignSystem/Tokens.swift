@@ -193,7 +193,11 @@ enum DubColor {
 
 /// Tiny enum to keep deck identity type-safe in call sites that
 /// don't need the full `UInt64` deck index.
-enum DeckSide: Hashable {
+///
+/// `Codable` because M17's Quick Scratch slots persist a target deck
+/// per slot; a case-less enum encodes as its case name, which is
+/// stable across reordering.
+enum DeckSide: Hashable, Codable {
     case a
     case b
 

@@ -18,6 +18,7 @@
 //  Opened via `⌘,` or the status-strip gear icon. Esc / Close dismiss.
 //
 
+import AppKit
 import SwiftUI
 import DubCore
 
@@ -45,6 +46,7 @@ struct PreferencesSheet: View {
                     cueSection
                     recordingSection
                     fxSection
+                    quickScratchSection
                     librariesSection
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -260,6 +262,81 @@ struct PreferencesSheet: View {
     }
 
     // MARK: - FX (echo-out)
+
+    /// Quick Scratch slots (M17, PRD §7.2). Binding a slot is prep,
+    /// not performance — the no-mouse rule governs the *set*, and this
+    /// is the config surface for it. Drag-and-drop assignment onto the
+    /// performance pads is the nicer affordance §7.2 also asks for and
+    /// is not wired yet.
+    private var quickScratchSection: some View {
+        section(title: "Quick Scratch") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Text("Press a key to load its sample onto a deck instantly — it lands at the start, under your needle, ready to scratch. Loading works exactly like dragging the file from the library.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(Array(QuickScratchSlots.keyLabels.enumerated()), id: \.offset) {
+                    index, key in
+                    quickScratchRow(index: index, key: key)
+                }
+            }
+        }
+    }
+
+    private func quickScratchRow(index: Int, key: String) -> some View {
+        let slot = model.quickScratch.slot(index)
+        return HStack(spacing: DubSpacing.sm) {
+            Text(key)
+                .font(DubFont.caps)
+                .frame(width: 18)
+                .foregroundStyle(DubColor.textSecondary)
+
+            Text(slot?.url.lastPathComponent ?? "—")
+                .font(DubFont.body)
+                .foregroundStyle(slot == nil ? DubColor.textTertiary : DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(slot?.url.path ?? "")
+
+            Picker(
+                "",
+                selection: Binding(
+                    get: { slot?.deck ?? .a },
+                    set: { model.quickScratch.setDeck($0, for: index) })
+            ) {
+                Text("A").tag(DeckSide.a)
+                Text("B").tag(DeckSide.b)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 72)
+            .disabled(slot == nil)
+
+            Button(slot == nil ? "Choose…" : "Change…") {
+                chooseQuickScratchSample(index: index)
+            }
+            .font(DubFont.micro)
+
+            Button("Clear") { model.quickScratch.clear(index) }
+                .font(DubFont.micro)
+                .disabled(slot == nil)
+        }
+    }
+
+    private func chooseQuickScratchSample(index: Int) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Bind"
+        panel.message = "Choose the sample for Quick Scratch slot \(QuickScratchSlots.keyLabels[index])."
+        if panel.runModal() == .OK, let url = panel.url {
+            let deck = model.quickScratch.slot(index)?.deck ?? .a
+            model.quickScratch.assign(url: url, deck: deck, to: index)
+        }
+    }
 
     /// Echo-out feature toggle. When on, each deck's pads carry a single
     /// 1-beat, 100 %-wet ECHO OUT button (PRD §6.3). Off hides it.
