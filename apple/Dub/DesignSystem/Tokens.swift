@@ -249,6 +249,28 @@ enum DubFont {
 
     /// Micro caption (format chips, "fingerprint pending").
     static let micro = Font.system(size: 10, weight: .regular, design: baseFontDesign)
+
+    // Letter-spacing for `caps`. Three intentional values, collapsed
+    // from six accidental ones (0.5 / 0.6 / 0.8 / 1.0 / 1.2 / 1.5) that
+    // had accumulated across 57 call sites — 0.6 and 0.8 sat side by
+    // side in the same Prep column, which read as a rendering bug.
+    //
+    // A sweep of the remaining sites in StatusStrip / DeckHeader /
+    // LibraryView / About is deliberately *not* part of the layout
+    // work: it would re-record ~15 snapshot baselines for no functional
+    // gain. It belongs to a dedicated typography pass.
+
+    /// Section labels — CUE, LOOP, SIREN, KEY LOCK. The default, and
+    /// already what every pad row used.
+    static let capsTracking: CGFloat = 0.8
+
+    /// Full-width banner headers (rip bar, review panel), sparse by
+    /// intent so they read as a lane rather than a section.
+    static let bannerTracking: CGFloat = 1.2
+
+    /// Text *inside* a segmented capsule, where extra tracking widens
+    /// the pill rather than the label.
+    static let controlTracking: CGFloat = 0.6
 }
 
 // MARK: - Spacing scale
