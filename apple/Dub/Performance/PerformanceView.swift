@@ -195,6 +195,44 @@ struct PerformanceView: View {
             onHistoryHintTap: { model.revealHistoryHint(side: side) })
     }
 
+    // MARK: - Performance pad column
+
+    /// Snapshot of the model for one deck's pad column, mirroring
+    /// `headerState(side:)`. Both deck panes used to spell this out as
+    /// a twenty-argument initialiser, written twice.
+    private func padsState(side: DeckSide, deckState: DeckState) -> PerformancePadsState {
+        PerformancePadsState(
+            cues: deckState.hotCues,
+            activeLoopBars: deckState.activeLoopBars,
+            loopEngaged: deckState.loopActive,
+            loopInArmed: deckState.pendingLoopInSecs != nil,
+            echoEnabled: model.echoOutEnabled,
+            echoEngaged: deckState.echoDivision != nil,
+            sirenEnabled: model.sirenEnabled,
+            sirenPresetNames: model.sirenLabels(for: side),
+            sirenSounding: deckState.sirenState == 1,
+            sirenDubMacro: deckState.sirenDubMacro,
+            sirenUnit: deckState.sirenUnit,
+            rackEnabled: model.rackFxEnabled,
+            rackActive: deckState.rackActive,
+            rackMacro: deckState.rackMacro)
+    }
+
+    /// Pure forwarders into the model, as with `headerCallbacks`.
+    private func padsCallbacks(side: DeckSide) -> PerformancePadsCallbacks {
+        PerformancePadsCallbacks(
+            onLoop: { bars in model.handleLoop(side, bars: bars) },
+            onLoopIn: { model.setLoopIn(side) },
+            onLoopOut: { model.setLoopOut(side) },
+            onExit: { model.exitLoop(side) },
+            onEchoToggle: { model.toggleEchoOut(side) },
+            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
+            onSirenDubMacro: { value in model.setSirenDub(side, value) },
+            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
+            onRackToggle: { idx in model.toggleRackFx(side, idx) },
+            onRackMacro: { idx, value in model.setRackMacro(side, idx, value) })
+    }
+
     // MARK: - Waveform region
 
     /// Centre region. **Two-deck modes** keep the §9.2 symmetric
@@ -647,30 +685,8 @@ struct PerformanceView: View {
                     if side == .a {
                         PerformancePadsView(
                             side: side,
-                            cues: deckState.hotCues,
-                            activeLoopBars: deckState.activeLoopBars,
-                            loopEngaged: deckState.loopActive,
-                            loopInArmed: deckState.pendingLoopInSecs != nil,
-                            onLoop: { bars in model.handleLoop(side, bars: bars) },
-                            onLoopIn: { model.setLoopIn(side) },
-                            onLoopOut: { model.setLoopOut(side) },
-                            onExit: { model.exitLoop(side) },
-                            echoEngaged: deckState.echoDivision != nil,
-                            onEchoToggle: { model.toggleEchoOut(side) },
-                            echoEnabled: model.echoOutEnabled,
-                            sirenPresetNames: model.sirenLabels(for: side),
-                            sirenSounding: deckState.sirenState == 1,
-                            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
-                            sirenEnabled: model.sirenEnabled,
-                            sirenDubMacro: deckState.sirenDubMacro,
-                            onSirenDubMacro: { value in model.setSirenDub(side, value) },
-                            sirenUnit: deckState.sirenUnit,
-                            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
-                            rackActive: deckState.rackActive,
-                            rackMacro: deckState.rackMacro,
-                            onRackToggle: { idx in model.toggleRackFx(side, idx) },
-                            onRackMacro: { idx, value in model.setRackMacro(side, idx, value) },
-                            rackEnabled: model.rackFxEnabled)
+                            state: padsState(side: side, deckState: deckState),
+                            callbacks: padsCallbacks(side: side))
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -690,30 +706,8 @@ struct PerformanceView: View {
                         }
                         PerformancePadsView(
                             side: side,
-                            cues: deckState.hotCues,
-                            activeLoopBars: deckState.activeLoopBars,
-                            loopEngaged: deckState.loopActive,
-                            loopInArmed: deckState.pendingLoopInSecs != nil,
-                            onLoop: { bars in model.handleLoop(side, bars: bars) },
-                            onLoopIn: { model.setLoopIn(side) },
-                            onLoopOut: { model.setLoopOut(side) },
-                            onExit: { model.exitLoop(side) },
-                            echoEngaged: deckState.echoDivision != nil,
-                            onEchoToggle: { model.toggleEchoOut(side) },
-                            echoEnabled: model.echoOutEnabled,
-                            sirenPresetNames: model.sirenLabels(for: side),
-                            sirenSounding: deckState.sirenState == 1,
-                            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
-                            sirenEnabled: model.sirenEnabled,
-                            sirenDubMacro: deckState.sirenDubMacro,
-                            onSirenDubMacro: { value in model.setSirenDub(side, value) },
-                            sirenUnit: deckState.sirenUnit,
-                            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
-                            rackActive: deckState.rackActive,
-                            rackMacro: deckState.rackMacro,
-                            onRackToggle: { idx in model.toggleRackFx(side, idx) },
-                            onRackMacro: { idx, value in model.setRackMacro(side, idx, value) },
-                            rackEnabled: model.rackFxEnabled)
+                            state: padsState(side: side, deckState: deckState),
+                            callbacks: padsCallbacks(side: side))
                     }
                 }
             case .horizontal:

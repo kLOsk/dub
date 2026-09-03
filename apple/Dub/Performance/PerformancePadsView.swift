@@ -28,66 +28,10 @@ struct PerformancePadsView: View {
 
     let side: DeckSide
 
-    /// Hot cue positions (track seconds) for the four CUE pads; `nil`
-    /// = empty slot. Drives which pads light. Fed from the deck's
-    /// `hotCues`, set/recalled by the 1–4 keys.
-    var cues: [Double?] = [nil, nil, nil, nil]
-
-    /// Active reverse-loop length in bars (`nil` = no loop). Lights the
-    /// matching LOOP pad green.
-    var activeLoopBars: Double? = nil
-    /// A loop is running — either a length preset or a manual region.
-    /// A manual loop lights no length pad, so ✕ needs its own signal.
-    var loopEngaged: Bool = false
-    /// A manual Loop In point is armed, waiting for OUT.
-    var loopInArmed: Bool = false
-    /// Fire a grid-snapped reverse loop of `bars` bars (the bars just
-    /// heard). No-op default keeps the `#Preview` simple.
-    var onLoop: (_ bars: Double) -> Void = { _ in }
-    var onLoopIn: () -> Void = {}
-    var onLoopOut: () -> Void = {}
-    /// Exit the active loop.
-    var onExit: () -> Void = {}
-
-    /// M15 echo-out: whether the (1-beat) echo-out is currently engaged.
-    var echoEngaged: Bool = false
-    /// Toggle the dub echo on / off.
-    var onEchoToggle: () -> Void = {}
-    /// Whether the echo-out feature is enabled (Preferences). When off the
-    /// ECHO button is hidden entirely.
-    var echoEnabled: Bool = true
-
-    /// M16 dub-siren preset names (fire order); empty hides the grid.
-    var sirenPresetNames: [String] = []
-    /// Whether the engine reports the siren sounding (lights the header dot).
-    var sirenSounding: Bool = false
-    /// Fire preset `index` on this deck.
-    var onSirenPreset: (_ index: Int) -> Void = { _ in }
-    /// Whether the dub-siren feature is enabled (Preferences). When off the
-    /// SIREN grid is hidden entirely.
-    var sirenEnabled: Bool = false
-
-    /// Siren Advanced "dub" super-knob position (0..1).
-    var sirenDubMacro: Double = 0.0
-    /// Set the siren dub super-knob.
-    var onSirenDubMacro: (_ value: Double) -> Void = { _ in }
-    /// The selected siren unit (GS1 / DS01E / SN76477).
-    var sirenUnit: SirenUnit = .gs1
-    /// Switch the siren unit.
-    var onSirenUnit: (_ unit: SirenUnit) -> Void = { _ in }
-
-    /// Vintage-FX rack engaged flags, in `RackFx` order
-    /// (`[Spring, SpaceEcho, BigKnob, Phaser]`). Lights each slot's button.
-    var rackActive: [Bool] = [false, false, false, false]
-    /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
-    var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
-    /// Toggle rack slot `index` on / off.
-    var onRackToggle: (_ index: Int) -> Void = { _ in }
-    /// Set rack slot `index`'s macro to `value` (0..1).
-    var onRackMacro: (_ index: Int, _ value: Double) -> Void = { _, _ in }
-    /// Whether the vintage-FX rack is enabled (Preferences). When off the rack
-    /// is hidden entirely.
-    var rackEnabled: Bool = false
+    /// What this column draws. See `PerformancePadsState`.
+    var state = PerformancePadsState()
+    /// What its pads fire.
+    var callbacks = PerformancePadsCallbacks()
 
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
@@ -98,25 +42,25 @@ struct PerformancePadsView: View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             cueGroup()
             loopGroup()
-            if echoEnabled {
-                EchoPadRow(engaged: echoEngaged, onToggle: onEchoToggle)
+            if state.echoEnabled {
+                EchoPadRow(engaged: state.echoEngaged, onToggle: callbacks.onEchoToggle)
             }
-            if sirenEnabled {
+            if state.sirenEnabled {
                 SirenPadRow(
-                    names: sirenPresetNames,
-                    sounding: sirenSounding,
-                    onPreset: onSirenPreset,
-                    dubMacro: sirenDubMacro,
-                    onDubMacro: onSirenDubMacro,
-                    unit: sirenUnit,
-                    onUnit: onSirenUnit)
+                    names: state.sirenPresetNames,
+                    sounding: state.sirenSounding,
+                    onPreset: callbacks.onSirenPreset,
+                    dubMacro: state.sirenDubMacro,
+                    onDubMacro: callbacks.onSirenDubMacro,
+                    unit: state.sirenUnit,
+                    onUnit: callbacks.onSirenUnit)
             }
-            if rackEnabled {
+            if state.rackEnabled {
                 RackFxRow(
-                    active: rackActive,
-                    macro: rackMacro,
-                    onToggle: onRackToggle,
-                    onMacro: onRackMacro)
+                    active: state.rackActive,
+                    macro: state.rackMacro,
+                    onToggle: callbacks.onRackToggle,
+                    onMacro: callbacks.onRackMacro)
             }
             padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
             padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
@@ -137,7 +81,8 @@ struct PerformancePadsView: View {
                 .foregroundStyle(DubColor.textSecondary)
             HStack(spacing: DubSpacing.sm) {
                 ForEach(0..<4, id: \.self) { index in
-                    pad("\(index + 1)", lit: index < cues.count && cues[index] != nil)
+                    pad("\(index + 1)",
+                        lit: index < state.cues.count && state.cues[index] != nil)
                 }
             }
         }
@@ -167,24 +112,24 @@ struct PerformancePadsView: View {
                     DubPadCell(
                         preset.label,
                         size: .glyph,
-                        lit: activeLoopBars == preset.bars,
+                        lit: state.activeLoopBars == preset.bars,
                         tint: DubColor.loop
                     )
-                    .onPressDown { onLoop(preset.bars) }
+                    .onPressDown { callbacks.onLoop(preset.bars) }
                     .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
                 }
                 // Manual in/out: the escape hatch from the beat-length
                 // grab, for a track the analyser could not grid or one
                 // whose grid disagrees with the bar you want.
-                DubPadCell("IN", size: .word, lit: loopInArmed, tint: DubColor.loop)
-                    .onPressDown { onLoopIn() }
+                DubPadCell("IN", size: .word, lit: state.loopInArmed, tint: DubColor.loop)
+                    .onPressDown { callbacks.onLoopIn() }
                     .help("Set the loop start at the playhead")
                 DubPadCell("OUT", size: .word, tint: DubColor.loop)
-                    .onPressDown(enabled: loopInArmed) { onLoopOut() }
+                    .onPressDown(enabled: state.loopInArmed) { callbacks.onLoopOut() }
                     .help("Close the loop at the playhead and start it")
-                    .opacity(loopInArmed ? 1.0 : 0.5)
+                    .opacity(state.loopInArmed ? 1.0 : 0.5)
                 DubPadCell("✕", size: .glyph, tint: DubColor.loop)
-                    .onPressDown(enabled: canExitLoop) { onExit() }
+                    .onPressDown(enabled: canExitLoop) { callbacks.onExit() }
                     .help("Exit loop")
                     .opacity(canExitLoop ? 1.0 : 0.5)
             }
@@ -192,7 +137,7 @@ struct PerformancePadsView: View {
     }
 
     private var canExitLoop: Bool {
-        activeLoopBars != nil || loopEngaged || loopInArmed
+        state.activeLoopBars != nil || state.loopEngaged || state.loopInArmed
     }
 
     @ViewBuilder
@@ -743,8 +688,10 @@ struct LoopPadRow: View {
 
 #Preview("Performance pads") {
     HStack(spacing: 1) {
-        PerformancePadsView(side: .a, cues: [12.0, nil, 48.5, nil])
-        PerformancePadsView(side: .b, cues: [nil, 4.0, nil, nil])
+        PerformancePadsView(
+            side: .a, state: PerformancePadsState(cues: [12.0, nil, 48.5, nil]))
+        PerformancePadsView(
+            side: .b, state: PerformancePadsState(cues: [nil, 4.0, nil, nil]))
     }
     .frame(width: 800, height: 360)
     .background(DubColor.surface0)
