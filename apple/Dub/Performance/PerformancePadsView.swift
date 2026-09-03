@@ -35,25 +35,20 @@ struct PerformancePadsView: View {
 
     /// Hug the deck: deck A's pads (window-left) sit against their
     /// overview on the right; deck B's (window-right) sit against
-    /// their overview on the left.
-    private var frameAlignment: Alignment { side == .a ? .trailing : .leading }
+    /// their overview on the left. Top-aligned vertically — the space
+    /// below is the §9.6.1 canvas reserved for per-deck info chips,
+    /// and growth downward is visible where growth from a centred
+    /// column was not.
+    private var frameAlignment: Alignment { side == .a ? .topTrailing : .topLeading }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.lg) {
+    /// The column's content. Pulled out of `body` so `ViewThatFits` can
+    /// offer it twice — plain, then wrapped in a scroll view.
+    private var stack: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.md) {
             cueGroup()
             loopGroup()
             if state.echoEnabled {
                 EchoPadRow(engaged: state.echoEngaged, onToggle: callbacks.onEchoToggle)
-            }
-            if state.sirenEnabled {
-                SirenPadRow(
-                    names: state.sirenPresetNames,
-                    sounding: state.sirenSounding,
-                    onPreset: callbacks.onSirenPreset,
-                    dubMacro: state.sirenDubMacro,
-                    onDubMacro: callbacks.onSirenDubMacro,
-                    unit: state.sirenUnit,
-                    onUnit: callbacks.onSirenUnit)
             }
             if state.rackEnabled {
                 RackFxRow(
@@ -62,11 +57,25 @@ struct PerformancePadsView: View {
                     onToggle: callbacks.onRackToggle,
                     onMacro: callbacks.onRackMacro)
             }
-            padGroup("QUICK SCRATCH", keys: side == .a ? ["Q", "W"] : ["E", "R"])
-            padGroup("SAMPLER", keys: side == .a ? ["A", "S"] : ["D", "F"])
         }
-        .padding(.horizontal, DubSpacing.xl)
+    }
+
+    var body: some View {
+        // Three guards against the overflow that hid the sampler pads
+        // behind the FX bar for a whole milestone. `ViewThatFits`
+        // scrolls rather than spilling when the pane is genuinely too
+        // short; `.top` alignment means any future growth goes
+        // downward instead of symmetrically out of both ends; and
+        // `.clipped()` turns a silent overflow (drawn over a
+        // neighbour) into a visible one. The real fix is that the
+        // column now holds only per-deck controls — see GlobalRackBar.
+        ViewThatFits(in: .vertical) {
+            stack
+            ScrollView(.vertical, showsIndicators: false) { stack }
+        }
+        .padding(.horizontal, DubSpacing.lg)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: frameAlignment)
+        .clipped()
         .background(DubColor.surface0)
     }
 
@@ -107,6 +116,9 @@ struct PerformancePadsView: View {
                 .font(DubFont.caps)
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
+            // Two rows, unlike Prep's single-row LoopPadRow. All seven
+            // pads side by side need 338 pt; the deck column is 224.
+            // Prep has 344 and keeps them on one line.
             HStack(spacing: DubSpacing.sm) {
                 ForEach(Self.loopPresets) { preset in
                     DubPadCell(
@@ -118,9 +130,11 @@ struct PerformancePadsView: View {
                     .onPressDown { callbacks.onLoop(preset.bars) }
                     .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
                 }
-                // Manual in/out: the escape hatch from the beat-length
-                // grab, for a track the analyser could not grid or one
-                // whose grid disagrees with the bar you want.
+            }
+            // Manual in/out: the escape hatch from the beat-length
+            // grab, for a track the analyser could not grid or one
+            // whose grid disagrees with the bar you want.
+            HStack(spacing: DubSpacing.sm) {
                 DubPadCell("IN", size: .word, lit: state.loopInArmed, tint: DubColor.loop)
                     .onPressDown { callbacks.onLoopIn() }
                     .help("Set the loop start at the playhead")
@@ -138,24 +152,6 @@ struct PerformancePadsView: View {
 
     private var canExitLoop: Bool {
         state.activeLoopBars != nil || state.loopEngaged || state.loopInArmed
-    }
-
-    @ViewBuilder
-    private func padGroup(_ label: String, keys: [String]) -> some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            HStack(spacing: DubSpacing.sm) {
-                Text(label)
-                    .font(DubFont.caps)
-                    .tracking(0.8)
-                    .foregroundStyle(DubColor.textSecondary)
-                Text("soon")
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textPlaceholder)
-            }
-            HStack(spacing: DubSpacing.sm) {
-                ForEach(keys, id: \.self) { pad($0) }
-            }
-        }
     }
 
     private func pad(_ glyph: String, lit: Bool = false) -> some View {

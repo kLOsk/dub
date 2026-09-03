@@ -52,8 +52,14 @@ struct PerformanceView: View {
             deckHeaders
             Rectangle().fill(DubColor.divider).frame(height: 1)
             waveformRegion
-            Rectangle().fill(DubColor.divider).frame(height: 1)
-            FXBarPlaceholder()
+            // Prep gets no rack bar. Its vertical budget is the
+            // tightest on either surface, its siren has its own column,
+            // and the 100 pt this slot used to cost it went to
+            // "Coming soon" cards for two features that had shipped.
+            if model.engineMode != .prep {
+                Rectangle().fill(DubColor.divider).frame(height: 1)
+                GlobalRackBar(state: rackBarState, callbacks: rackBarCallbacks)
+            }
             Rectangle().fill(DubColor.divider).frame(height: 1)
             LibraryView(model: model, libraryModel: model.libraryModel)
         }
@@ -208,11 +214,6 @@ struct PerformanceView: View {
             loopInArmed: deckState.pendingLoopInSecs != nil,
             echoEnabled: model.echoOutEnabled,
             echoEngaged: deckState.echoDivision != nil,
-            sirenEnabled: model.sirenEnabled,
-            sirenPresetNames: model.sirenLabels(for: side),
-            sirenSounding: deckState.sirenState == 1,
-            sirenDubMacro: deckState.sirenDubMacro,
-            sirenUnit: deckState.sirenUnit,
             rackEnabled: model.rackFxEnabled,
             rackActive: deckState.rackActive,
             rackMacro: deckState.rackMacro)
@@ -226,11 +227,64 @@ struct PerformanceView: View {
             onLoopOut: { model.setLoopOut(side) },
             onExit: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
-            onSirenPreset: { idx in model.fireSirenPreset(side, index: idx) },
-            onSirenDubMacro: { value in model.setSirenDub(side, value) },
-            onSirenUnit: { unit in model.setSirenUnit(side, unit) },
             onRackToggle: { idx in model.toggleRackFx(side, idx) },
             onRackMacro: { idx, value in model.setRackMacro(side, idx, value) })
+    }
+
+    // MARK: - Global rack bar
+
+    /// Snapshot for the bar. The siren block is omitted in Prep, where
+    /// the siren and its Expert panel already have their own column.
+    private var rackBarState: GlobalRackBarState {
+        let focus = model.focusedDeckForGridNudge
+        let deck = (focus == .a) ? model.deckA : model.deckB
+        return GlobalRackBarState(
+            siren: (model.sirenEnabled && model.engineMode != .prep)
+                ? SirenRackState(
+                    focusedDeck: focus,
+                    presetNames: model.sirenLabels(for: focus),
+                    sounding: deck.sirenState == 1,
+                    unit: deck.sirenUnit,
+                    dubMacro: deck.sirenDubMacro)
+                : nil,
+            quickScratch: (0..<QuickScratchSlots.count).map { index in
+                let slot = model.quickScratch.slot(index)
+                return TriggerPadState(
+                    index: index,
+                    key: QuickScratchSlots.keyLabels[index],
+                    sampleName: slot.map { SampleBank.label(for: $0.url) },
+                    deck: slot?.deck)
+            },
+            sampler: (0..<SamplerSlots.count).map { index in
+                let slot = model.samplerSlots.slot(index)
+                return TriggerPadState(
+                    index: index,
+                    key: SamplerSlots.keyLabels[index],
+                    sampleName: slot.map { SampleBank.label(for: $0.url) },
+                    deck: slot?.deck,
+                    // PRD §7.1 — A S D F land with M18's remapping pass.
+                    keyBound: false)
+            })
+    }
+
+    /// The siren's focused deck is re-read inside each closure rather
+    /// than captured, so a master switch between render and click
+    /// routes the press to the deck that has focus *now* — the same
+    /// discipline `KeyEventMonitorHost` uses.
+    private var rackBarCallbacks: GlobalRackBarCallbacks {
+        GlobalRackBarCallbacks(
+            onSirenPreset: { idx in
+                model.fireSirenPreset(model.focusedDeckForGridNudge, index: idx)
+            },
+            onSirenUnit: { unit in
+                model.setSirenUnit(model.focusedDeckForGridNudge, unit)
+            },
+            onSirenDubMacro: { value in
+                model.setSirenDub(model.focusedDeckForGridNudge, value)
+            },
+            onQuickScratch: { idx in model.triggerQuickScratch(idx) },
+            onSampler: { idx in model.triggerSampler(idx) },
+            onSamplerStop: { idx in model.stopSampler(idx) })
     }
 
     // MARK: - Waveform region

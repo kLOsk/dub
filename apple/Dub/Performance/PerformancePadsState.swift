@@ -37,12 +37,10 @@ struct PerformancePadsState: Equatable {
     var echoEnabled: Bool = true
     var echoEngaged: Bool = false
 
-    /// Preferences gate; when off the siren block is not rendered.
-    var sirenEnabled: Bool = false
-    var sirenPresetNames: [String] = []
-    var sirenSounding: Bool = false
-    var sirenDubMacro: Double = 0
-    var sirenUnit: SirenUnit = .gs1
+    // The siren is not here. It is one instrument with one keymap
+    // firing the focused deck, so it lives once in `GlobalRackBar`
+    // rather than twice in the deck columns. Its ~134 pt per column is
+    // most of what used to overflow this pane.
 
     /// Preferences gate, default off (the per-deck rack is dormant
     /// pending the FX-channel rebuild — UI-BACKLOG F-38).
@@ -61,9 +59,6 @@ struct PerformancePadsCallbacks {
     var onLoopOut: () -> Void = {}
     var onExit: () -> Void = {}
     var onEchoToggle: () -> Void = {}
-    var onSirenPreset: (_ index: Int) -> Void = { _ in }
-    var onSirenDubMacro: (_ value: Double) -> Void = { _ in }
-    var onSirenUnit: (_ unit: SirenUnit) -> Void = { _ in }
     var onRackToggle: (_ index: Int) -> Void = { _ in }
     var onRackMacro: (_ index: Int, _ value: Double) -> Void = { _, _ in }
 }

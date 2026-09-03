@@ -326,8 +326,6 @@ enum DubLayout {
     /// invariant and lets the un-loaded deck reserve the same
     /// vertical slot with an empty `Color.clear` placeholder.
     static let deckHeaderHeight: CGFloat = 108
-    static let fxBarHeight: CGFloat = 100
-
     /// The global rack bar (siren · Quick Scratch · sampler), which
     /// replaces the old placeholder FX bar. 12 top padding + a 20 pt
     /// header row (the label, the deck pill, a `.mini` segmented
@@ -356,6 +354,29 @@ enum DubLayout {
     /// vertical time-history over horizontal peak-detail. The phase
     /// clock sits between the two, overviews on the outer edges.
     static let performanceWaveformWidth: CGFloat = 200
+
+    /// Fixed width of each deck's performance-pad column. The widest
+    /// row is CUE / the four LOOP lengths at 4 × 38 + 3 × 8 = 176, plus
+    /// `DubSpacing.lg` of breathing room each side. Fixed, because the
+    /// column used to be `maxWidth: .infinity` and ate every pixel the
+    /// waveform did not have nailed down.
+    static let performancePadColumnWidth: CGFloat = 224
+
+    /// The playing waveform absorbs the width the pad column leaves,
+    /// up to this cap; past it the remainder stays as the §9.6.1
+    /// reserved info-chip canvas. PRD §9.6.1 argues a fatter waveform
+    /// buys nothing — information density per pixel peaks around 140 —
+    /// so this grows the strip without chasing the whole pane.
+    static let performanceWaveformWidthCap: CGFloat = 280
+    static let performanceWaveformMinWidth: CGFloat = 132
+
+    /// The narrowest window the layout is designed for. `MainView`
+    /// reads this so the SwiftUI floor and the AppKit `minSize` cannot
+    /// drift apart — they disagreed by 240 × 120 for a long time, and
+    /// because `sizingOptions = []` hands SwiftUI exactly what AppKit
+    /// gives, the smaller one silently won.
+    static let mainWindowMinWidth: CGFloat = 960
+    static let mainWindowMinHeight: CGFloat = 600
 
     /// The centre-gutter beatmatch phase clock (PhaseClockView). The
     /// ring diameter and the gutter column it lives in.

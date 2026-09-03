@@ -112,13 +112,73 @@ final class PerformanceSnapshotTests: XCTestCase {
 
     // MARK: - Performance pads
 
-    func test_performancePads_deckA() {
-        // Wide enough for the whole LOOP row. It was 320 pt, chosen when
-        // the row was four length pads and an exit; M13 added IN / OUT
-        // and the baseline started clipping its own content — labels
-        // read "UE" / "OOP" and the exit pad fell off the right edge.
-        snap(deckBg(PerformancePadsView(side: .a)),
-             width: 560, height: 360, named: "pads-deck-a")
+    // Sizes come from the layout tokens, never from a hand-picked
+    // number. The previous baseline rendered at 560 × 360 with the
+    // struct's *defaults* — where the siren was off — so it was green
+    // on a configuration nobody runs, while the real column needed
+    // ~478 pt of a ~330 pt pane and spilled behind the FX bar. A
+    // snapshot forced to `.frame(width:height:)` cannot catch an
+    // overflow anyway; it just renders the smaller thing correctly.
+    // `PerformanceLayoutTests` is what actually asserts fit.
+
+    /// Deck A exactly as the 1440 × 900 surface lays it out: the column
+    /// token wide, and as tall as the 0.60 split leaves the pane.
+    func test_performancePads_deckA_production() {
+        snap(deckBg(PerformancePadsView(side: .a, state: .shippingDefault)),
+             width: DubLayout.performancePadColumnWidth, height: 398,
+             named: "pads-deck-a-production")
+    }
+
+    /// The same column in the shortest pane the window can produce.
+    func test_performancePads_deckA_minimumWindow() {
+        snap(deckBg(PerformancePadsView(side: .a, state: .shippingDefault)),
+             width: DubLayout.performancePadColumnWidth, height: 218,
+             named: "pads-deck-a-minimum")
+    }
+
+    /// The dormant FX rack (UI-BACKLOG F-38) flipped on — the tallest
+    /// the column can get, and the case that exercises the scroll
+    /// fallback. Recorded now so the hidden path has a baseline before
+    /// anyone un-hides it.
+    func test_performancePads_deckB_rackEnabled() {
+        var state = PerformancePadsState.shippingDefault
+        state.rackEnabled = true
+        snap(deckBg(PerformancePadsView(side: .b, state: state)),
+             width: DubLayout.performancePadColumnWidth, height: 398,
+             named: "pads-deck-b-rack-on")
+    }
+
+    // MARK: - Global rack bar
+
+    func test_globalRackBar_focusDeckA() {
+        snap(deckBg(GlobalRackBar(state: .fixture(focus: .a))),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-focus-deck-a")
+    }
+
+    /// Same state, focus moved. Pins that the `→ B` pill and its tint
+    /// follow the master deck.
+    func test_globalRackBar_focusDeckB() {
+        snap(deckBg(GlobalRackBar(state: .fixture(focus: .b))),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-focus-deck-b")
+    }
+
+    /// The narrowest window the layout supports.
+    func test_globalRackBar_narrow() {
+        snap(deckBg(GlobalRackBar(state: .fixture(focus: .a))),
+             width: DubLayout.mainWindowMinWidth, height: DubLayout.rackBarHeight,
+             named: "rack-bar-narrow")
+    }
+
+    /// Prep, where the siren has its own column and the bar carries
+    /// only the two trigger racks.
+    func test_globalRackBar_noSiren() {
+        var state = GlobalRackBarState.fixture(focus: .a)
+        state.siren = nil
+        snap(deckBg(GlobalRackBar(state: state)),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-no-siren")
     }
 
     func test_deckHeader_withSourceControl() {
