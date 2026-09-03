@@ -58,7 +58,13 @@ run_gate "cargo clippy"       cargo clippy --workspace --all-targets -- -D warni
 run_gate "check-docs"         ./scripts/check-docs.sh
 
 if [[ "${DUB_PREPUSH_TESTS:-1}" == "1" ]]; then
-    run_gate "cargo nextest"  cargo nextest run --workspace
+    # `check-stale` first, the way `make test` does it. nextest runs one
+    # process per test, so a bloated target/debug/deps taxes all ~1500
+    # of them — a push measured here spent ~20 minutes in this gate at
+    # 23k files against ~2 minutes swept (LESSONS). Not `make test`
+    # itself, because that re-runs the clippy gate above.
+    run_gate "cargo nextest" \
+        bash -c 'make check-stale && cargo nextest run --workspace'
 fi
 
 if [[ "${DUB_PREPUSH_SNAPSHOT:-1}" == "1" ]]; then
