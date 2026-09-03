@@ -250,7 +250,8 @@ struct PrepEchoPadRow: View {
 /// Layout-independent keyboard keys for the siren presets — the bottom letter
 /// row Z X C V B N M , → indices 0–7 (keyCodes wired in `KeyEventMonitorHost`).
 /// Shown as pad hints.
-private let sirenPresetKeys = ["Z", "X", "C", "V", "B", "N", "M", ","]
+// `sirenPresetKeys` lives in SirenRackGroup.swift — one keymap, shared
+// by the Prep siren row and the global rack bar.
 
 /// One siren preset pad: its name plus the keyboard hint. Fires the one-shot on
 /// mouse-down (a momentary trigger, within the §1 mouse rule).

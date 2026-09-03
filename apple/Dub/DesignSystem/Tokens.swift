@@ -327,6 +327,13 @@ enum DubLayout {
     /// vertical slot with an empty `Color.clear` placeholder.
     static let deckHeaderHeight: CGFloat = 108
     static let fxBarHeight: CGFloat = 100
+
+    /// The global rack bar (siren · Quick Scratch · sampler), which
+    /// replaces the old placeholder FX bar. 12 top padding + a 20 pt
+    /// header row (the label, the deck pill, a `.mini` segmented
+    /// picker) + 8 + a 36 pt pad row + 12 bottom = 88, with 4 pt of
+    /// slack so a font-metric change doesn't clip the pads.
+    static let rackBarHeight: CGFloat = 92
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
 
