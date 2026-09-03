@@ -46,6 +46,8 @@ struct PreferencesSheet: View {
                     cueSection
                     recordingSection
                     fxSection
+                    samplesSection
+                    samplerSection
                     quickScratchSection
                     librariesSection
                 }
@@ -263,6 +265,151 @@ struct PreferencesSheet: View {
 
     // MARK: - FX (echo-out)
 
+    /// The shared sample bank (M17). Both racks below bind from it, so
+    /// a horn wanted on a sampler pad *and* a Quick Scratch key is
+    /// chosen once.
+    private var samplesSection: some View {
+        section(title: "Samples") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Text("Air horns, stabs, sirens, drops. Add them here once; the sampler pads and Quick Scratch keys below both bind from this list.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if model.sampleBank.isEmpty {
+                    Text("No samples yet.")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textTertiary)
+                } else {
+                    ForEach(model.sampleBank.all, id: \.self) { url in
+                        HStack(spacing: DubSpacing.sm) {
+                            Text(SampleBank.label(for: url))
+                                .font(DubFont.body)
+                                .foregroundStyle(DubColor.textPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .help(url.path)
+                            Button("Reveal") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                                .font(DubFont.micro)
+                            Button("Remove") { model.sampleBank.remove(url) }
+                                .font(DubFont.micro)
+                        }
+                    }
+                }
+
+                Button("Add Samples…") { addSamplesToBank() }
+                    .font(DubFont.micro)
+            }
+        }
+    }
+
+    /// The sampler rack (M17, PRD §7.1): four one-shot pads, each with
+    /// its own level and output bus.
+    ///
+    /// **The keys are not bound yet** — `A S D F` arrives with M18's
+    /// remapping pass — so Play here is how a pad is auditioned while
+    /// its level is set. That is prep, and prep is clickable.
+    private var samplerSection: some View {
+        section(title: "Sampler") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Text("One-shot pads. A pad plays over whatever the decks are doing, on the deck bus you assign it to, after that deck's FX. Keyboard triggers arrive with the key-remapping pass; use Play to audition.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(Array(SamplerSlots.keyLabels.enumerated()), id: \.offset) { index, key in
+                    samplerRow(index: index, key: key)
+                }
+            }
+        }
+    }
+
+    private func samplerRow(index: Int, key: String) -> some View {
+        let slot = model.samplerSlots.slot(index)
+        return HStack(spacing: DubSpacing.sm) {
+            Text(key)
+                .font(DubFont.caps)
+                .frame(width: 14)
+                .foregroundStyle(DubColor.textSecondary)
+
+            sampleBindingMenu(
+                current: slot?.url,
+                onPick: { model.samplerSlots.assign(url: $0, to: index) },
+                onClear: { model.samplerSlots.clear(index) })
+
+            // Level. A stab sits over the music, so its own trim is
+            // the difference between "lands" and "buries the mix".
+            Slider(
+                value: Binding(
+                    get: { slot?.gain ?? 1.0 },
+                    set: { model.samplerSlots.setGain($0, for: index) }),
+                in: 0...2
+            )
+            .frame(width: 70)
+            .disabled(slot == nil)
+
+            Picker(
+                "",
+                selection: Binding(
+                    get: { slot?.deck ?? .a },
+                    set: { model.samplerSlots.setDeck($0, for: index) })
+            ) {
+                Text("A").tag(DeckSide.a)
+                Text("B").tag(DeckSide.b)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 64)
+            .disabled(slot == nil)
+
+            Button("Play") { model.triggerSampler(index) }
+                .font(DubFont.micro)
+                .disabled(slot == nil || !model.isRunning)
+        }
+    }
+
+    /// Menu of the bank's samples for one slot, plus a way to unbind.
+    /// Empty bank offers the file panel directly rather than an
+    /// unhelpful empty menu.
+    @ViewBuilder
+    private func sampleBindingMenu(
+        current: URL?,
+        onPick: @escaping (URL) -> Void,
+        onClear: @escaping () -> Void
+    ) -> some View {
+        if model.sampleBank.isEmpty {
+            Button("Add Samples…") { addSamplesToBank() }
+                .font(DubFont.micro)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Menu(current.map(SampleBank.label(for:)) ?? "—") {
+                ForEach(model.sampleBank.all, id: \.self) { url in
+                    Button(SampleBank.label(for: url)) { onPick(url) }
+                }
+                Divider()
+                Button("None") { onClear() }
+            }
+            .menuStyle(.borderlessButton)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(current?.path ?? "Nothing bound")
+        }
+    }
+
+    private func addSamplesToBank() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Choose sample files for the sampler pads and Quick Scratch keys."
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                model.sampleBank.add(url)
+            }
+        }
+    }
+
     /// Quick Scratch slots (M17, PRD §7.2). Binding a slot is prep,
     /// not performance — the no-mouse rule governs the *set*, and this
     /// is the config surface for it. Drag-and-drop assignment onto the
@@ -292,13 +439,10 @@ struct PreferencesSheet: View {
                 .frame(width: 18)
                 .foregroundStyle(DubColor.textSecondary)
 
-            Text(slot?.url.lastPathComponent ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(slot == nil ? DubColor.textTertiary : DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(slot?.url.path ?? "")
+            sampleBindingMenu(
+                current: slot?.url,
+                onPick: { model.quickScratch.assign(url: $0, deck: slot?.deck ?? .a, to: index) },
+                onClear: { model.quickScratch.clear(index) })
 
             Picker(
                 "",
@@ -314,27 +458,6 @@ struct PreferencesSheet: View {
             .frame(width: 72)
             .disabled(slot == nil)
 
-            Button(slot == nil ? "Choose…" : "Change…") {
-                chooseQuickScratchSample(index: index)
-            }
-            .font(DubFont.micro)
-
-            Button("Clear") { model.quickScratch.clear(index) }
-                .font(DubFont.micro)
-                .disabled(slot == nil)
-        }
-    }
-
-    private func chooseQuickScratchSample(index: Int) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Bind"
-        panel.message = "Choose the sample for Quick Scratch slot \(QuickScratchSlots.keyLabels[index])."
-        if panel.runModal() == .OK, let url = panel.url {
-            let deck = model.quickScratch.slot(index)?.deck ?? .a
-            model.quickScratch.assign(url: url, deck: deck, to: index)
         }
     }
 

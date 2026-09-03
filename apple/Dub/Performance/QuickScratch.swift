@@ -35,30 +35,13 @@ struct QuickScratchSlots: Equatable {
 
     /// Restore from [`persisted`]. Anything unreadable — empty,
     /// truncated, a shape from a future build — comes back as empty
-    /// slots.
+    /// slots. See [`SlotPersistence`], which the sampler rack shares.
     init(persisted: String) {
-        self.init()
-        guard let data = persisted.data(using: .utf8),
-            let decoded = try? JSONDecoder().decode([QuickScratchSlot?].self, from: data)
-        else {
-            return
-        }
-        // Normalised rather than rejected, so changing the slot count
-        // later does not reset everyone's bindings.
-        for (index, slot) in decoded.prefix(Self.count).enumerated() {
-            slots[index] = slot
-        }
+        slots = SlotPersistence.decodeSlots(persisted, count: Self.count)
     }
 
     /// The table in the form the shell stores in `UserDefaults`.
-    var persisted: String {
-        guard let data = try? JSONEncoder().encode(slots),
-            let text = String(data: data, encoding: .utf8)
-        else {
-            return ""
-        }
-        return text
-    }
+    var persisted: String { SlotPersistence.encodeSlots(slots) }
 
     var all: [QuickScratchSlot?] { slots }
 
@@ -68,6 +51,9 @@ struct QuickScratchSlots: Equatable {
     func slot(_ index: Int) -> QuickScratchSlot? {
         slots.indices.contains(index) ? slots[index] : nil
     }
+
+    /// Every bound URL, for adopting into the shared bank on load.
+    var boundUrls: [URL] { slots.compactMap { $0?.url } }
 
     mutating func assign(url: URL, deck: DeckSide = .a, to index: Int) {
         guard slots.indices.contains(index) else { return }

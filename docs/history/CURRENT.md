@@ -34,25 +34,35 @@ confirmed on hardware, and neither has been.
 
 ## Next milestone
 
-**M17 — Sampler, Quick Scratch & Instant Doubles** (PRD §7, 4–6 days). The
-last feature milestone before the polish ladder. Three mechanisms, very
-unevenly priced:
+**M18 — Polish + Alpha** (2–3 weeks). M17 was the last feature milestone;
+what remains before trusted-DJ hands is polish, and it carries real
+deferred work rather than only cosmetics:
 
-1. **Instant Doubles** (§7.3) — `Cmd+→` / `Cmd+←` duplicate the loaded track
-   to the other deck at a sample-accurate position. Both decks and a load
-   path already exist; this is wiring plus a rebindable hotkey.
-2. **Quick Scratch** (§7.2) — `Q W E R` load a bound sample to a target deck.
-   The PRD is explicit that it shares the library drag-and-drop load path, so
-   it is slot persistence, a binding UI and a keymap, not new audio work.
-3. **Sampler** (§7.1) — the real engine work. Four one-shot voices
-   (`A S D F`) mixed **additively** into the deck's output bus *post-FX*,
-   each with gain and output assignment. A new RT-safe mixing path, and where
-   the risk sits.
+- **Key remapping** — and with it the M17 keymaps. `⌘←→` (instant doubles)
+  and `Q W E R` (Quick Scratch) are bound but fixed; the sampler's
+  `A S D F` are **not bound at all** and its rack is driven from
+  Preferences until they are.
+- **The deferred M16 fine-tuning**: siren sound polish (GS1 shots / DS01E
+  tones / SN76477 bank) and the Performance-surface + deck-B siren Expert
+  panel (`UI-BACKLOG.md` §5 F-36 / F-37).
+- Calibration UX, preferences, dark-mode polish, and the manual rig
+  checklist.
 
-That order gets something dogfoodable on the rig first and leaves the piece
-needing careful RT work with room.
+**M12-lexicon** (0.5 day, docs only) is the other open row: document the
+Lexicon → Serato / rekordbox / Traktor export paths in
+`LIBRARY-FORMATS.md`.
 
 ## Recently shipped (detail in `SHIPPED.md`)
+
+- **M17 — Sampler, Quick Scratch & Instant Doubles.** All three of §7's
+  trigger mechanisms. **Instant Doubles** duplicates a deck's track onto
+  the other at a sample-accurate playhead — done *on the audio thread* off
+  the loaded `Arc<Track>`, which is what makes it sample-accurate and
+  instant. **Quick Scratch** loads a bound sample through the library's own
+  load path. **The sampler** is four additive one-shot voices summed onto
+  the assigned deck bus after the FX, reading rate-converted buffers with
+  an integer cursor because the conversion happens at bind time off-RT.
+  Both racks bind from one shared sample bank. FFI 66.
 
 - **M26c — rip recognition. Complete.** AcoustID naming (no MusicBrainz on
   the common path), opt-in pressing identification, Discogs enrichment

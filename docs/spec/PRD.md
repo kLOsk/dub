@@ -810,6 +810,40 @@ Classic DJ sampler. v1: **4 slots** (`A S D F`). The PRD considered matching Ser
 - Output is **additive** — sample plays *over* whatever Deck A/B are currently playing. Mixed into the deck's output bus, post-FX.
 - Use case: air horns, vocal stabs, dub-siren one-shots, "rewind!" FX, drops.
 
+**Status: shipped** (FFI 66) — with one deliberate gap: **the `A S D F`
+keys are not bound yet**, so the pads are triggered from the Preferences
+rack (which is also where a DJ auditions one while setting its level).
+The keymap lands with M18's remapping pass, alongside §7.3's.
+
+Three things the implementation pins down that this section left open:
+
+- **The voice reads with an integer cursor.** A slot's file is decoded
+  *and resampled to the engine rate* when it is bound, off the audio
+  thread (`dub_io::resample_track`). A one-shot has to sound on the
+  frame the key goes down: it cannot decode on the press, and it should
+  not be converting rates per frame either. Consequence to know about:
+  the conversion is engine-rate-specific, so changing interface (48 k →
+  44.1 k) re-binds the rack — which happens anyway, because the engine
+  owns the buffers and a fresh engine starts with an empty rack. The
+  conversion is currently linear, matching the deck; because it is
+  offline, a better kernel can replace it without touching the render
+  path.
+- **Rendered last on the deck bus, after the FX.** Same reasoning as the
+  siren (§6.3): a horn stab is not the music, so the deck's echo-out and
+  vintage rack have no business processing it. Additive by construction —
+  the voice adds and never writes, so the deck plays on underneath.
+- **A retrigger crossfades.** Mashing the same pad is the normal way
+  this gets used and a hard restart steps the output every time, so the
+  outgoing take ramps out under the new one (~1.3 ms), as do the head,
+  the tail, and an early stop.
+
+**Sample bank.** §7.1 and §7.2 bind from one shared list of files rather
+than a file picker per slot: the same horn is routinely wanted on a pad
+*and* on a Quick Scratch key. The slots still store their own URL, so
+the bank is a convenience over binding rather than a layer they depend
+on, and a binding made before the bank existed is adopted into it on
+load.
+
 ### 7.2 Quick Scratch (hotkey-bound fast load)
 
 Hotkey-triggered fast load of a sample to a deck. Semantically identical to dragging a track from the library — just instant.
@@ -1503,7 +1537,7 @@ remaining work only._
 | **M11d-columns** | **Column data plumbing + per-source disagreement view** — ✅ **shipped** | The remaining §8.5.3.1 column groups exist end-to-end. Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
-| **M17** | **Sampler + Quick Scratch + Instant Doubles** — Instant Doubles ✅ shipped | All three trigger systems work per §7. Remaining: the sampler's four additive one-shot voices (§7.1, the RT work) and Quick Scratch's bound-slot loads (§7.2, which reuse the library's load path). | 4–6 days |
+| **M17** | **Sampler + Quick Scratch + Instant Doubles** — ✅ **shipped** | All three trigger systems work per §7. The `A S D F` / `Q W E R` / `⌘←→` keymaps are fixed until M18's remapping pass; the sampler rack is driven from Preferences until then. | 4–6 days |
 | **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases; feature-frozen for v1.0 with hotfix discipline active. | 2–4 weeks, gated by gig time |
 | **M20** | **v1.0 Stable Release** | §2.2.6 SLOs met, DMG published, README/docs/demo ready. | 3–5 days once SLOs pass |
