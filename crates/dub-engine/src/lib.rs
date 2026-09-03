@@ -5870,6 +5870,10 @@ mod tests {
     /// `Arc<Track>`, so "duplicate" is a refcount bump — both decks
     /// share one buffer.
     #[test]
+    // Exact comparison is the assertion: these values are *copied*
+    // between decks, not computed, so anything short of bit equality
+    // would be a weaker claim than "sample-accurate".
+    #[allow(clippy::float_cmp)]
     fn instant_double_copies_the_track_and_the_playhead() {
         let mut engine = Engine::new(48_000.0, 64);
         let track = Arc::new(Track::from_interleaved(vec![0.5; 200_000], 48_000, 2).unwrap());
@@ -5911,6 +5915,10 @@ mod tests {
     /// Under timecode the driver overwrites both on the next block, so
     /// mirroring is harmless there.
     #[test]
+    // Exact comparison is the assertion: these values are *copied*
+    // between decks, not computed, so anything short of bit equality
+    // would be a weaker claim than "sample-accurate".
+    #[allow(clippy::float_cmp)]
     fn instant_double_mirrors_transport_so_the_copy_runs_in_sync() {
         let mut engine = Engine::new(48_000.0, 64);
         let track = Arc::new(Track::from_interleaved(vec![0.5; 200_000], 48_000, 2).unwrap());
@@ -5998,6 +6006,10 @@ mod tests {
     }
 
     #[test]
+    // Exact comparison is the assertion: these values are *copied*
+    // between decks, not computed, so anything short of bit equality
+    // would be a weaker claim than "sample-accurate".
+    #[allow(clippy::float_cmp)]
     fn instant_double_onto_the_same_deck_is_a_no_op() {
         let mut engine = Engine::new(48_000.0, 64);
         let track = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
