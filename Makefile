@@ -131,7 +131,7 @@ ci: docs-check deny fmt-check clippy test
 # clone (scripts/bootstrap.sh does it for you).
 hooks:
 	@git config core.hooksPath .githooks
-	@echo "git hooks -> .githooks (pre-push runs fmt + clippy + docs-check)"
+	@echo "git hooks -> .githooks (pre-push runs fmt + clippy + docs-check + tests + snapshots)"
 
 clean:
 	cargo clean

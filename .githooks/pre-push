@@ -16,6 +16,17 @@
 # LESSONS). It is ~26 s now. Set DUB_PREPUSH_TESTS=0 to skip it on a
 # slow machine or a huge rebuild.
 #
+# The Swift snapshot suite runs here as well, and *only* here: GitHub
+# CI has no macOS app job, so `make ci` deliberately mirrors what CI
+# runs and this is the one gate that has to be local. It earned the
+# slot — `test_ripReviewPanel_*` sat red for four days after the
+# Identify button landed without re-recorded baselines, because
+# nothing ran the suite unless someone remembered to. It costs ~30 s
+# when the xcframework is current, and a couple of minutes when a
+# Rust FFI change forces a universal rebuild first. Set
+# DUB_PREPUSH_SNAPSHOT=0 to skip it; it skips itself when there is no
+# xcodebuild (a non-Mac clone, or Xcode not installed).
+#
 # Install: `make hooks` (or `git config core.hooksPath .githooks`).
 # Bypass once: `git push --no-verify`.
 
@@ -48,6 +59,14 @@ run_gate "check-docs"         ./scripts/check-docs.sh
 
 if [[ "${DUB_PREPUSH_TESTS:-1}" == "1" ]]; then
     run_gate "cargo nextest"  cargo nextest run --workspace
+fi
+
+if [[ "${DUB_PREPUSH_SNAPSHOT:-1}" == "1" ]]; then
+    if command -v xcodebuild >/dev/null 2>&1; then
+        run_gate "swift snapshots"  make snapshot
+    else
+        printf '  %-28s%s\n' "swift snapshots" "skipped (no xcodebuild)"
+    fi
 fi
 
 if (( ${#FAILED[@]} > 0 )); then

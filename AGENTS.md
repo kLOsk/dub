@@ -105,7 +105,7 @@ docs/                README.md (routing guide — which doc to load for a task) 
 scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
 .claude/             Claude Code settings + hooks (mirrors .cursor/; see CLAUDE.md).
-.githooks/pre-push   fmt-check + clippy + docs-check + tests — the gates that break main.
+.githooks/pre-push   fmt-check + clippy + docs-check + tests + Swift snapshots — the gates that break main.
 .github/workflows/   CI pipeline.
 fuzz/                cargo-fuzz targets for the library parsers.
 testdata/
@@ -184,6 +184,13 @@ cargo clippy -p dub-engine -- -D warnings
   to be skipped there as too slow at ~11 minutes; nearly all of that was
   build-artifact overhead rather than tests (below), and it is ~26 s now — set
   `DUB_PREPUSH_TESTS=0` to skip it anyway.
+- **The Swift snapshot suite (`make snapshot`) runs in the hook only.**
+  GitHub CI has no macOS app job, so `make ci` stays a mirror of what CI
+  runs and the app gate has to be local — which is why it belongs in the
+  hook rather than in `ci`. Two rip-review baselines sat red for four days
+  before that was wired up. Set `DUB_PREPUSH_SNAPSHOT=0` to skip it; it
+  skips itself where there is no `xcodebuild`. **Changing a view means
+  re-recording its baseline** in the same change.
 - **No comments that narrate what the code does.** Comments explain *why*, not
   *what*. Code that needs `// Increment counter` should just say `counter += 1`.
 
