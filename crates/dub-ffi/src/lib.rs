@@ -424,7 +424,14 @@ pub use rip::{
 ///       [`LibraryTrack::bpm_disagreement`] flag. A column that is off
 ///       adds no expression and no join to the query, so the deep
 ///       groups cost nothing until a DJ asks for them.
-pub const FFI_VERSION: u32 = 64;
+///   65. **Instant Doubles (M17 §7.3).** [`DubEngine::instant_double`]
+///       puts one deck's track on the other at the same playhead for
+///       juggling. The duplication happens on the audio thread off the
+///       loaded `Arc<Track>` — no decode, no file read — so the
+///       alignment is sample-accurate and the press is instant; the
+///       destination's waveform and beat grid are cloned rather than
+///       recomputed.
+pub const FFI_VERSION: u32 = 65;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -636,6 +643,14 @@ enum PeakSource {
 /// treat both variants uniformly. The underlying storage is just a
 /// pair of `Vec`s — no analysis thread, no SPSC ring, no Drop work
 /// at shutdown.
+///
+/// `Clone` for Instant Doubles (M17 §7.3): the destination deck needs
+/// the same waveform *and* the same beat grid, and both live here. It
+/// copies a few `Vec`s — megabytes on a long track, on the main thread,
+/// once per deliberate user action — which buys a doubled deck that
+/// draws its waveform immediately instead of falling back to the
+/// empty-groove rendering.
+#[derive(Clone)]
 struct FilePeaks {
     broadband: Vec<PeakChunk>,
     bands: Vec<BandPeakChunk>,
@@ -2400,6 +2415,58 @@ impl DubEngine {
             .deck(idx)
             .seek(position_frames)
             .map_err(map_command_error)
+    }
+
+    /// Instant Doubles (M17, PRD §7.3): put the track playing on
+    /// `from_deck` onto `to_deck` at the same playhead, for juggling.
+    ///
+    /// The duplication happens on the audio thread off one already
+    /// loaded `Arc<Track>` — no decode, no file read — which is what
+    /// makes the alignment sample-accurate and the press instant. The
+    /// destination's transport is mirrored so the copy runs in sync
+    /// rather than landing paused; under timecode the platter takes
+    /// over on the next block. If the destination already had a track
+    /// it is replaced without confirmation: this is a performance
+    /// control.
+    ///
+    /// A `from_deck` with nothing loaded is a no-op rather than an
+    /// error — a mis-keyed shortcut mid-set should do nothing, not
+    /// empty a deck or raise a banner.
+    pub fn instant_double(&self, from_deck: u64, to_deck: u64) -> Result<(), EngineError> {
+        let from = deck_idx_to_usize(from_deck)?;
+        let to = deck_idx_to_usize(to_deck)?;
+        if from == to {
+            return Ok(());
+        }
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        let Some(track) = running.file_tracks[from].clone() else {
+            return Ok(());
+        };
+
+        running
+            .handle
+            .instant_double(from, to)
+            .map_err(map_command_error)?;
+
+        // Mirror what the UI reads off the FFI, the same fields
+        // `load_track` maintains. Unlike a load there is no decode to
+        // wait for, so the destination's waveform and grid are simply
+        // the source's — cloned rather than recomputed.
+        running.file_tracks[to] = Some(track);
+        running.peaks[to] = match running.peaks[from].as_ref() {
+            Some(PeakSource::File(fp)) => Some(PeakSource::File(fp.clone())),
+            // A Live (Thru) deck carries no track, so this arm is
+            // unreachable via the guard above; clearing is the honest
+            // fallback rather than leaving the old deck's peaks.
+            _ => None,
+        };
+        if let Some(a) = self.peak_generation_seq.get(to) {
+            a.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Read the current playhead position on the deck (M10.5).
@@ -5220,7 +5287,8 @@ mod tests {
         // 63→64: configurable column data — `library_columns`,
         // `set_visible_columns`, `LibraryTrack::extras` +
         // `bpm_disagreement`.
-        assert_eq!(FFI_VERSION, 64);
+        // 64→65: instant doubles — `instant_double`.
+        assert_eq!(FFI_VERSION, 65);
     }
 
     #[test]
@@ -5238,6 +5306,34 @@ mod tests {
             .load_track(0, "/nonexistent.wav".to_string(), None, None, None)
             .unwrap_err();
         assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+    }
+
+    /// M17 §7.3. The engine-side behaviour is covered in
+    /// `dub-engine`; what the FFI owns is the guard rail and the
+    /// argument validation, both of which fire mid-set on a stray
+    /// keypress.
+    #[test]
+    fn instant_double_on_stopped_engine_returns_not_running() {
+        let engine = DubEngine::new();
+        let err = engine.instant_double(0, 1).unwrap_err();
+        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+    }
+
+    #[test]
+    fn instant_double_onto_the_same_deck_is_accepted_and_does_nothing() {
+        let engine = DubEngine::new();
+        // Checked before the engine-running guard: doubling a deck
+        // onto itself is meaningless rather than an error, and it must
+        // not raise a banner on a stopped engine either.
+        assert!(engine.instant_double(1, 1).is_ok());
+    }
+
+    #[test]
+    fn instant_double_rejects_an_out_of_range_deck() {
+        let engine = DubEngine::new();
+        for f in [engine.instant_double(0, 7), engine.instant_double(7, 0)] {
+            assert!(matches!(f.unwrap_err(), EngineError::InvalidDeckIndex(_)));
+        }
     }
 
     #[test]

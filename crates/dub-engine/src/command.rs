@@ -307,6 +307,23 @@ pub enum Command {
         gain: f32,
     },
 
+    /// Instant Doubles (M17, PRD §7.3): put the track loaded on deck
+    /// `from` onto deck `to` at `from`'s current playhead, for
+    /// juggling.
+    ///
+    /// Carries no payload because it needs none — the source is
+    /// already an `Arc<Track>` on the audio thread, so duplicating it
+    /// is a refcount bump rather than a decode, and reading both decks
+    /// inside one command application is what makes the alignment
+    /// sample-accurate. Routing it through the load path off-RT would
+    /// re-decode the file and land the playhead wherever the deck had
+    /// drifted to by the time it finished.
+    ///
+    /// The displaced source on `to` leaves through the same de-click →
+    /// trash path as [`Self::DeckLoad`]; the audio thread never drops
+    /// an `Arc<Track>`.
+    DeckInstantDouble { from: u8, to: u8 },
+
     /// Set the engine-wide master gain applied after deck summing in the
     /// debug internal mixer. `1.0` = unity. PRD §5.3 calls for this only
     /// in the debug/internal mixer mode; external-mixer mode (M5+) bypasses
@@ -367,6 +384,11 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DeckPlay { idx } => f.debug_struct("DeckPlay").field("idx", idx).finish(),
+            Self::DeckInstantDouble { from, to } => f
+                .debug_struct("DeckInstantDouble")
+                .field("from", from)
+                .field("to", to)
+                .finish(),
             Self::DeckPause { idx } => f.debug_struct("DeckPause").field("idx", idx).finish(),
             Self::DeckSeek {
                 idx,

@@ -391,6 +391,24 @@ impl EngineHandle {
         self.send(Command::SetMasterGain { gain })
     }
 
+    /// Instant Doubles (M17, PRD §7.3): put deck `from`'s track onto
+    /// deck `to` at `from`'s current playhead.
+    ///
+    /// Not a [`DeckCommand`] method because it names two decks; the
+    /// duplication itself happens on the audio thread, which is what
+    /// makes the alignment sample-accurate (see
+    /// [`Command::DeckInstantDouble`]).
+    ///
+    /// # Errors
+    /// [`CommandError::InvalidDeck`] if either index is out of range;
+    /// [`CommandError::ChannelFull`] if the audio thread is not
+    /// draining (recoverable; retry on the next render block).
+    pub fn instant_double(&mut self, from: usize, to: usize) -> Result<(), CommandError> {
+        let from = self.check_deck(from)?;
+        let to = self.check_deck(to)?;
+        self.send(Command::DeckInstantDouble { from, to })
+    }
+
     /// Attach a [`TimecodeInput`] to deck `idx` mid-stream (M5.4.5).
     ///
     /// This is the command-channel counterpart to

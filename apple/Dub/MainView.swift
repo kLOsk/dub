@@ -415,6 +415,48 @@ struct DeckState: Equatable {
         isLoading = false
         hotCues = [nil, nil, nil, nil]
     }
+
+    /// Take on another deck's loaded track (M17 §7.3, Instant
+    /// Doubles). The inverse of [`clearLoadedTrack`] over the same
+    /// field set, and deliberately next to it: these are the fields the
+    /// 30 Hz poll does *not* refresh, so a new load-time field needs
+    /// adding in both places or a doubled deck will show the previous
+    /// track's metadata.
+    ///
+    /// Transport, duration, waveform generation and loop state are all
+    /// polled from the engine, so they are left alone — except the loop
+    /// *pads*, which are Swift-only and belong to the track that just
+    /// left.
+    mutating func adoptLoadedTrack(from other: DeckState) {
+        hasTrack = other.hasTrack
+        displayName = other.displayName
+        trackTitle = other.trackTitle
+        trackArtist = other.trackArtist
+        formatChip = other.formatChip
+        bpm = other.bpm
+        bpmConfidence = other.bpmConfidence
+        key = other.key
+        sourceURL = other.sourceURL
+        loadedLibraryTrackId = other.loadedLibraryTrackId
+        historyHint = other.historyHint
+        historyHintTrackId = other.historyHintTrackId
+        gridAnchorSecs = other.gridAnchorSecs
+        gridBeatsPerBar = other.gridBeatsPerBar
+        autoGridBpm = other.autoGridBpm
+        autoGridAnchorSecs = other.autoGridAnchorSecs
+        autoGridCaptured = other.autoGridCaptured
+        beatGridLoadSource = other.beatGridLoadSource
+        manualGridEditCount = other.manualGridEditCount
+        gridLocked = other.gridLocked
+        gridDriftQuality = other.gridDriftQuality
+        // The same track carries the same cues; they are persisted per
+        // track, not per deck.
+        hotCues = other.hotCues
+        // Nothing is being fetched — the engine already has the buffer.
+        isLoading = false
+        activeLoopBars = nil
+        pendingLoopInSecs = nil
+    }
 }
 
 /// View-model owning the shared `DubEngine` for the lifetime of the
@@ -4421,6 +4463,33 @@ final class WaveformAppModel: ObservableObject {
     /// position (the engine pairs it with CoreAudio's output
     /// timestamp), so no latency correction is needed here. Persists
     /// to `track_cues` (`source = 'user'`) so cues survive reload.
+    /// Instant Doubles (M17, PRD §7.3). `⌘→` puts deck A's track on
+    /// deck B, `⌘←` the reverse, both at the source deck's playhead.
+    ///
+    /// Silent when the source deck is empty: this is a performance
+    /// shortcut, and a mis-keyed `⌘←` mid-set should do nothing rather
+    /// than throw a banner across the window.
+    func instantDouble(toDeckB: Bool) {
+        guard isRunning else { return }
+        let from: DeckSide = toDeckB ? .a : .b
+        let to: DeckSide = toDeckB ? .b : .a
+        let source = state(for: from)
+        guard source.hasTrack else { return }
+
+        do {
+            try engine.instantDouble(fromDeck: from.ffiDeckIdx, toDeck: to.ffiDeckIdx)
+        } catch {
+            surfaceError("Instant double failed: \(error.localizedDescription)")
+            return
+        }
+
+        var destination = state(for: to)
+        destination.adoptLoadedTrack(from: source)
+        // The playhead jumped; paused decks redraw on demand.
+        destination.seekGeneration &+= 1
+        setState(destination, for: to)
+    }
+
     func handleHotCue(_ side: DeckSide, index: Int, clear: Bool) {
         guard isRunning, index >= 0, index < 4 else { return }
         var deck = state(for: side)
@@ -5613,6 +5682,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     model.fireSirenPreset(model.focusedDeckForGridNudge, index: index)
                 }
                 return true
+            },
+            onInstantDouble: { toDeckB in
+                Task { @MainActor in
+                    model.instantDouble(toDeckB: toDeckB)
+                }
+                return true
             })
         return view
     }
@@ -5636,7 +5711,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onCmdComma: @escaping () -> Bool,
             onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
             onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
-            onSirenPreset: @escaping (_ index: Int) -> Bool
+            onSirenPreset: @escaping (_ index: Int) -> Bool,
+            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -5681,6 +5757,15 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if let preset = sirenKeys[event.keyCode] {
                         if onSirenPreset(preset) { return nil }
                     }
+                }
+                // Instant Doubles (M17 §7.3): ⌘→ duplicates deck A
+                // onto deck B, ⌘← the reverse. Arrow keyCodes 123/124
+                // are layout-independent like the keys above. Not
+                // guarded on the text-first-responder check — that
+                // already returned early — so ⌘← in a search field
+                // still moves the caret.
+                if isCmd, event.keyCode == 123 || event.keyCode == 124 {
+                    if onInstantDouble(event.keyCode == 124) { return nil }
                 }
                 // `keyCode 49` is the spacebar on every Apple keyboard
                 // layout (the keyCodes are layout-independent for the

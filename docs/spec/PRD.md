@@ -833,6 +833,18 @@ Press a hotkey → the track currently loaded on one deck is duplicated to the o
 - Both decks remain independently controlled afterward.
 - If the destination deck has a track loaded, it is replaced (no confirmation; this is a performance feature).
 
+**Status: shipped** (FFI 65, `DubEngine::instant_double`). The duplication
+happens *on the audio thread*, off the `Arc<Track>` the source deck already
+holds — no decode, no file read — which is what makes the alignment
+sample-accurate: routing it through the load path would re-decode the file
+and land the playhead wherever the deck had drifted to by the time it
+finished. The destination's transport is mirrored so the copy runs in sync
+rather than landing paused (under timecode the platter takes over on the
+next block), and its waveform + beat grid are cloned rather than recomputed.
+An empty source deck is a no-op, not an error — a mis-keyed shortcut mid-set
+should do nothing. **Rebinding is not wired yet**: the keys are fixed until
+the M18 key-remapping pass.
+
 ### 7.4 Sample bundling
 
 v1 ships with **no bundled samples**. UI prompts user to load samples on first run with a "Browse..." button. We may publish a curated CC0/royalty-free starter pack as a separate optional download from the GitHub releases page once we've vetted samples that don't sound like a free pack. **Decision deferred until late in v1 development.**
@@ -1491,7 +1503,7 @@ remaining work only._
 | **M11d-columns** | **Column data plumbing + per-source disagreement view** — ✅ **shipped** | The remaining §8.5.3.1 column groups exist end-to-end. Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
-| **M17** | **Sampler + Quick Scratch + Instant Doubles** | All three trigger systems work per §7. | 4–6 days |
+| **M17** | **Sampler + Quick Scratch + Instant Doubles** — Instant Doubles ✅ shipped | All three trigger systems work per §7. Remaining: the sampler's four additive one-shot voices (§7.1, the RT work) and Quick Scratch's bound-slot loads (§7.2, which reuse the library's load path). | 4–6 days |
 | **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases; feature-frozen for v1.0 with hotfix discipline active. | 2–4 weeks, gated by gig time |
 | **M20** | **v1.0 Stable Release** | §2.2.6 SLOs met, DMG published, README/docs/demo ready. | 3–5 days once SLOs pass |

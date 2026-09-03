@@ -1898,6 +1898,52 @@ impl Engine {
                 // pending_disposal slot — sweep that immediately.
                 self.sweep_deck_disposal(idx as usize);
             }
+            Command::DeckInstantDouble { from, to } => {
+                if from == to {
+                    return;
+                }
+                let (from_idx, to_idx) = (from as usize, to as usize);
+                // Read everything off the source deck first: the
+                // borrow checker will not let both decks be borrowed
+                // mutably, and an `Arc::clone` here is a refcount bump,
+                // not an allocation.
+                let Some(src) = self.decks.get(from_idx) else {
+                    return;
+                };
+                let Some(source) = src.source().map(std::sync::Arc::clone) else {
+                    // Nothing loaded to double. Leaving the destination
+                    // alone beats clearing it — a mis-keyed shortcut
+                    // mid-set should do nothing, not empty a deck.
+                    return;
+                };
+                let position = src.position_frames();
+                let (gain, playing, rate) = (src.gain(), src.is_playing(), src.rate());
+
+                let Some(dst) = self.decks.get_mut(to_idx) else {
+                    return;
+                };
+                // Mirror the transport *before* the swap. Juggling
+                // starts from a playing deck, and a copy that landed
+                // paused would have to be started by hand and would no
+                // longer be in sync. (Under timecode the driver
+                // overwrites both on the next block, so this only bites
+                // in internal mode — where it is exactly what is
+                // wanted.) Ordering matters because `set_playing`
+                // de-clicks on a transition: doing it after the swap
+                // would fade the just-installed track out and back in,
+                // instead of the outgoing one.
+                dst.set_rate(rate);
+                dst.set_playing(playing);
+                dst.swap_source(source);
+                dst.set_position_frames(position);
+                // Same track, so the same load-time normalization.
+                dst.set_gain(gain);
+
+                if let Some(m) = self.tc_drift.get_mut(to_idx) {
+                    m.note_remap();
+                }
+                self.sweep_deck_disposal(to_idx);
+            }
             Command::SetMasterGain { gain } => {
                 self.master_gain = gain;
             }
@@ -5814,6 +5860,199 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             engine.engage_panic_play(0, false);
             engine.cancel_panic_play(0);
+        });
+    }
+
+    // ---- M17 §7.3: Instant Doubles ----
+
+    /// The point of the feature: deck B gets deck A's track at deck A's
+    /// playhead, sample-accurately, with no decode. The source is an
+    /// `Arc<Track>`, so "duplicate" is a refcount bump — both decks
+    /// share one buffer.
+    #[test]
+    fn instant_double_copies_the_track_and_the_playhead() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 200_000], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: Arc::clone(&track),
+            gain: 0.8,
+        });
+        engine.apply_command(Command::DeckSeek {
+            idx: 0,
+            position_frames: 12_345.75,
+        });
+
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
+
+        let src = engine
+            .deck(0)
+            .source()
+            .expect("source deck keeps its track");
+        let dst = engine.deck(1).source().expect("destination deck is loaded");
+        assert!(
+            Arc::ptr_eq(src, dst),
+            "one buffer, two decks — not a second decode"
+        );
+        assert_eq!(
+            engine.deck(1).position_frames(),
+            engine.deck(0).position_frames(),
+            "PRD §7.3: position alignment is sample-accurate"
+        );
+        assert_eq!(
+            engine.deck(1).gain(),
+            0.8,
+            "same track means the same load-time normalization"
+        );
+    }
+
+    /// Juggling starts from a playing deck; a double that lands paused
+    /// would have to be started by hand and would no longer be in sync.
+    /// Under timecode the driver overwrites both on the next block, so
+    /// mirroring is harmless there.
+    #[test]
+    fn instant_double_mirrors_transport_so_the_copy_runs_in_sync() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 200_000], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: track,
+            gain: 1.0,
+        });
+        engine.apply_command(Command::DeckPlay { idx: 0 });
+        engine.apply_command(Command::DeckSetRate { idx: 0, rate: 1.5 });
+
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
+
+        assert!(engine.deck(1).is_playing());
+        assert_eq!(engine.deck(1).rate(), 1.5);
+    }
+
+    /// §7.3: "If the destination deck has a track loaded, it is
+    /// replaced (no confirmation; this is a performance feature)" — and
+    /// the audio thread must not be the one to free it.
+    #[test]
+    fn instant_double_bounces_the_replaced_track_to_the_trash_channel() {
+        let a = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        let b = Arc::new(Track::from_interleaved(vec![0.25; 4096], 48_000, 2).unwrap());
+
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(Arc::clone(&a));
+        engine.deck_mut(1).set_source(Arc::clone(&b));
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(1).quiesce_declick_for_test();
+
+        // Track B: us + deck 1 = 2.
+        assert_eq!(Arc::strong_count(&b), 2);
+
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
+        // Span the de-click ramp so the displaced source is harvested.
+        let mut buf = vec![0.0f32; 2048];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buf);
+        engine.render(&mut rt, &mut buf);
+
+        assert_eq!(
+            Arc::strong_count(&b),
+            2,
+            "deck B's displaced track: us + the trash channel slot, never dropped \
+             on the audio thread"
+        );
+        // The invariant is that the displaced track leaves through the
+        // channel, not how many ramps the swap stacked: mirroring the
+        // transport and swapping the source are two de-clicks, and the
+        // machinery bounces whatever each one displaces.
+        assert!(
+            handle.reclaim() >= 1,
+            "the displaced track must come back for disposal"
+        );
+        assert_eq!(handle.trash_overflow_count(), 0);
+        assert_eq!(
+            Arc::strong_count(&b),
+            1,
+            "after reclaim, deck B's old track is ours alone — dropped on the \
+             main thread, never on the audio thread"
+        );
+    }
+
+    #[test]
+    fn instant_double_from_an_empty_deck_leaves_the_destination_alone() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&track),
+            gain: 1.0,
+        });
+
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
+
+        let dst = engine
+            .deck(1)
+            .source()
+            .expect("destination keeps its track");
+        assert!(
+            Arc::ptr_eq(dst, &track),
+            "doubling from an empty deck must not clear a loaded one"
+        );
+    }
+
+    #[test]
+    fn instant_double_onto_the_same_deck_is_a_no_op() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: Arc::clone(&track),
+            gain: 1.0,
+        });
+        engine.apply_command(Command::DeckSeek {
+            idx: 0,
+            position_frames: 1024.0,
+        });
+
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 0 });
+
+        assert_eq!(engine.deck(0).position_frames(), 1024.0);
+        assert!(Arc::ptr_eq(
+            engine.deck(0).source().expect("still loaded"),
+            &track
+        ));
+    }
+
+    #[test]
+    fn instant_double_out_of_range_deck_is_a_no_op() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: track,
+            gain: 1.0,
+        });
+        engine.apply_command(Command::DeckInstantDouble { from: 0, to: 9 });
+        engine.apply_command(Command::DeckInstantDouble { from: 9, to: 1 });
+        assert!(engine.deck(1).source().is_none());
+    }
+
+    /// The command runs on the audio thread, so it may not allocate.
+    /// An `Arc::clone` is a refcount bump; the displaced `Arc` leaves
+    /// through the trash channel rather than being dropped here.
+    #[test]
+    fn instant_double_is_alloc_free() {
+        let a = Arc::new(Track::from_interleaved(vec![0.5; 4096], 48_000, 2).unwrap());
+        let b = Arc::new(Track::from_interleaved(vec![0.25; 4096], 48_000, 2).unwrap());
+        let (mut engine, _handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(a);
+        engine.deck_mut(1).set_source(b);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(1).quiesce_declick_for_test();
+        let mut buf = vec![0.0f32; 128];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buf);
+
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
+            engine.render(&mut rt, &mut buf);
         });
     }
 }
