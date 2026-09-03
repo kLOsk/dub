@@ -363,6 +363,41 @@ enum DubLayout {
     static let performanceWaveformWidthCap: CGFloat = 280
     static let performanceWaveformMinWidth: CGFloat = 132
 
+    /// The shortest the Prep playing strip is allowed to get before the
+    /// pad bar starts giving up height instead.
+    static let waveformPrepMinHeight: CGFloat = 96
+
+    /// Floor for Prep's pad bar: the tallest collapsed column (~203)
+    /// plus the rip lane (56) plus padding.
+    ///
+    /// **If you add a Prep section, re-measure this.** The
+    /// deck/library divider clamps against `prepRegionMinHeight`, so a
+    /// stale value here silently under-budgets the region and the grid
+    /// starts scrolling when it should not.
+    static let prepPadBarMinHeight: CGFloat = 280
+
+    /// Overview band + playing strip + pad bar + the two 1 pt dividers.
+    static let prepRegionMinHeight: CGFloat =
+        deckOverviewHeight + waveformPrepHeight + prepPadBarMinHeight + 2
+
+    // Prep's three-column pad grid. Widths are measured from the pad
+    // metrics, not chosen: column 1's LOOP row is 4 × 38 + 2 × 50 + 38
+    // + 6 × 8 = 338; column 2's siren row is 4 × 64 + 3 × 8 = 280;
+    // column 3's PITCH % switch is 7 × 26 plus its label.
+    static let prepTransportColumn: CGFloat = 344
+    static let prepFxColumnMin: CGFloat = 288
+    static let prepFxColumnMax: CGFloat = 560
+    static let prepTuningColumn: CGFloat = 248
+    static let prepColumnGap: CGFloat = DubSpacing.lg
+
+    /// Narrowest width at which the Prep grid renders three columns
+    /// without clipping. `PerformanceLayoutTests` asserts this stays
+    /// within `mainWindowMinWidth` less the pad bar's padding, so a
+    /// future section cannot quietly bust the budget.
+    static let prepPadGridIntrinsicWidth: CGFloat =
+        prepTransportColumn + prepColumnGap + prepFxColumnMin
+            + prepColumnGap + prepTuningColumn
+
     /// The narrowest window the layout is designed for. `MainView`
     /// reads this so the SwiftUI floor and the AppKit `minSize` cannot
     /// drift apart — they disagreed by 240 × 120 for a long time, and

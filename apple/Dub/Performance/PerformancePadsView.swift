@@ -45,10 +45,20 @@ struct PerformancePadsView: View {
     /// offer it twice — plain, then wrapped in a scroll view.
     private var stack: some View {
         VStack(alignment: .leading, spacing: DubSpacing.md) {
-            cueGroup()
-            loopGroup()
+            CuePadSection(cues: state.cues, onCue: callbacks.onCue)
+            LoopPadSection(
+                activeBars: state.activeLoopBars,
+                loopEngaged: state.loopEngaged,
+                loopInArmed: state.loopInArmed,
+                // Seven pads need 338 pt; this column is 224.
+                wrap: true,
+                onLoop: callbacks.onLoop,
+                onLoopIn: callbacks.onLoopIn,
+                onLoopOut: callbacks.onLoopOut,
+                onExit: callbacks.onExit)
             if state.echoEnabled {
-                EchoPadRow(engaged: state.echoEngaged, onToggle: callbacks.onEchoToggle)
+                EchoPadSection(
+                    engaged: state.echoEngaged, onToggle: callbacks.onEchoToggle)
             }
             if state.rackEnabled {
                 RackFxRow(
@@ -79,173 +89,8 @@ struct PerformancePadsView: View {
         .background(DubColor.surface0)
     }
 
-    /// The live CUE row. No "soon" tag; pads light in the deck tint
-    /// when set.
-    @ViewBuilder
-    private func cueGroup() -> some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            Text("CUE")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-            HStack(spacing: DubSpacing.sm) {
-                ForEach(0..<4, id: \.self) { index in
-                    pad("\(index + 1)",
-                        lit: index < state.cues.count && state.cues[index] != nil)
-                }
-            }
-        }
-    }
-
-    private static let loopPresets: [LoopPreset] = [
-        LoopPreset(bars: 0.5, label: "½"),
-        LoopPreset(bars: 1, label: "1"),
-        LoopPreset(bars: 2, label: "2"),
-        LoopPreset(bars: 4, label: "4"),
-    ]
-
-    /// The live LOOP row: each length pad fires a grid-snapped reverse
-    /// loop of that many bars; the lit pad is the active length, ✕ exits.
-    /// Clickable like the Prep `LoopPadRow` — a momentary loop trigger is
-    /// within the §1 mouse rule (not a continuous performance gesture);
-    /// keyboard bindings may follow as a convenience (PRD §5.5).
-    @ViewBuilder
-    private func loopGroup() -> some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            Text("LOOP")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-            // Two rows, unlike Prep's single-row LoopPadRow. All seven
-            // pads side by side need 338 pt; the deck column is 224.
-            // Prep has 344 and keeps them on one line.
-            HStack(spacing: DubSpacing.sm) {
-                ForEach(Self.loopPresets) { preset in
-                    DubPadCell(
-                        preset.label,
-                        size: .glyph,
-                        lit: state.activeLoopBars == preset.bars,
-                        tint: DubColor.loop
-                    )
-                    .onPressDown { callbacks.onLoop(preset.bars) }
-                    .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
-                }
-            }
-            // Manual in/out: the escape hatch from the beat-length
-            // grab, for a track the analyser could not grid or one
-            // whose grid disagrees with the bar you want.
-            HStack(spacing: DubSpacing.sm) {
-                DubPadCell("IN", size: .word, lit: state.loopInArmed, tint: DubColor.loop)
-                    .onPressDown { callbacks.onLoopIn() }
-                    .help("Set the loop start at the playhead")
-                DubPadCell("OUT", size: .word, tint: DubColor.loop)
-                    .onPressDown(enabled: state.loopInArmed) { callbacks.onLoopOut() }
-                    .help("Close the loop at the playhead and start it")
-                    .opacity(state.loopInArmed ? 1.0 : 0.5)
-                DubPadCell("✕", size: .glyph, tint: DubColor.loop)
-                    .onPressDown(enabled: canExitLoop) { callbacks.onExit() }
-                    .help("Exit loop")
-                    .opacity(canExitLoop ? 1.0 : 0.5)
-            }
-        }
-    }
-
-    private var canExitLoop: Bool {
-        state.activeLoopBars != nil || state.loopEngaged || state.loopInArmed
-    }
-
-    private func pad(_ glyph: String, lit: Bool = false) -> some View {
-        DubPadCell(glyph, size: .glyph, lit: lit)
-    }
 }
 
-/// Horizontal, **clickable** hot cue pad row for Prep mode (where
-/// the mouse is a first-class input, unlike Performance). Click an
-/// empty pad to set a cue at the playhead, a set pad to jump to it,
-/// ⇧-click to clear — mirroring the 1–4 / ⇧+1–4 keyboard gestures.
-struct CuePadRow: View {
-
-    let cues: [Double?]
-    /// `(index, clear)` — `clear` is `true` when ⇧ is held at click.
-    let onCue: (_ index: Int, _ clear: Bool) -> Void
-
-    var body: some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text("CUE")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
-            ForEach(0..<4, id: \.self) { index in
-                let isSet = index < cues.count && cues[index] != nil
-                DubPadCell("\(index + 1)", size: .glyph, lit: isSet)
-                    .onPressDown {
-                        onCue(index, NSEvent.modifierFlags.contains(.shift))
-                    }
-                    .help(isSet
-                        ? "Cue \(index + 1) — click to jump, ⇧-click to clear"
-                        : "Cue \(index + 1) — click to set at the playhead")
-            }
-        }
-    }
-}
-
-/// Single tap-toggle ECHO OUT button (M15, PRD §6.3). One control for the
-/// whole feature: tap on → the deck's dry mutes (100 % wet) and the last beat
-/// repeats and decays; tap again → off, the deck resumes at its slipped
-/// position. Lit while engaged. Shared by the Performance and Prep surfaces.
-///
-/// A tap is a momentary trigger, not a continuous performance gesture, so the
-/// mouse is within the §1 rule (like cues + loops).
-@ViewBuilder
-private func echoOutButton(
-    _ label: String,
-    engaged: Bool,
-    onToggle: @escaping () -> Void
-) -> some View {
-    DubPadCell(label, size: .hugging, lit: engaged, tint: DubColor.echo)
-        .onPressDown { onToggle() }
-        .help("Echo out — 1 beat, 100% wet. Tap on, tap off.")
-}
-
-/// Performance echo-out row: the single ECHO OUT button.
-struct EchoPadRow: View {
-
-    /// Whether the echo-out is engaged. Lights the button.
-    let engaged: Bool
-    /// Toggle on / off.
-    let onToggle: () -> Void
-
-    var body: some View {
-        echoOutButton("ECHO OUT", engaged: engaged, onToggle: onToggle)
-    }
-}
-
-/// Prep-mode echo-out row: same single button in the inline label-gutter
-/// layout the Prep pad bar uses (matching `LoopPadRow`). Prep's role is
-/// prepare + test, so it's mouse-clickable here too.
-struct PrepEchoPadRow: View {
-
-    /// Whether the echo-out is engaged.
-    let engaged: Bool
-    /// Toggle on / off.
-    let onToggle: () -> Void
-
-    var body: some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text("ECHO")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
-            echoOutButton("OUT", engaged: engaged, onToggle: onToggle)
-        }
-    }
-}
-
-/// Layout-independent keyboard keys for the siren presets — the bottom letter
-/// row Z X C V B N M , → indices 0–7 (keyCodes wired in `KeyEventMonitorHost`).
-/// Shown as pad hints.
 // `sirenPresetKeys` lives in SirenRackGroup.swift — one keymap, shared
 // by the Prep siren row and the global rack bar.
 
@@ -606,85 +451,6 @@ private struct PressDownModifier: ViewModifier {
     }
 }
 
-
-/// Shared geometry for the Prep pad rows so the CUE and LOOP rows
-/// line their pad columns up under a fixed-width label gutter.
-private enum PrepPadLayout {
-    static let labelWidth: CGFloat = 44
-}
-
-/// One reverse-loop length preset: a label and its length in bars.
-private struct LoopPreset: Identifiable {
-    let bars: Double
-    let label: String
-    var id: Double { bars }
-}
-
-/// Live LOOP pad row for Prep. Each length pad triggers a grid-snapped
-/// **reverse** loop of that many bars — the bars just heard — on
-/// mouse-down (like cues / transport). The active length lights green;
-/// IN / OUT set a manual region — the escape hatch for a track the
-/// analyser could not grid — and the ✕ pad exits the loop (or disarms a
-/// half-set manual one). Prep's loop role is *authoring + testing* a
-/// region (PRD §3.1), so it's mouse-clickable, not keyboard-only.
-struct LoopPadRow: View {
-
-    /// Which length pad is lit (bars), or `nil` when no loop is active.
-    let activeBars: Double?
-    /// A loop is running — preset or manual. A manual region lights no
-    /// length pad, so ✕ needs its own signal.
-    var loopEngaged: Bool = false
-    /// A manual Loop In point is armed, waiting for OUT.
-    var loopInArmed: Bool = false
-    /// Trigger a reverse loop of `bars` bars.
-    let onLoop: (_ bars: Double) -> Void
-    /// Arm the manual loop start at the playhead.
-    var onLoopIn: () -> Void = {}
-    /// Close the manual loop at the playhead and start it.
-    var onLoopOut: () -> Void = {}
-    /// Exit the active loop.
-    let onExit: () -> Void
-
-    private static let presets: [LoopPreset] = [
-        LoopPreset(bars: 0.5, label: "½"),
-        LoopPreset(bars: 1, label: "1"),
-        LoopPreset(bars: 2, label: "2"),
-        LoopPreset(bars: 4, label: "4"),
-    ]
-
-    var body: some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text("LOOP")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-                .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
-            ForEach(Self.presets) { preset in
-                DubPadCell(
-                    preset.label,
-                    size: .glyph,
-                    lit: activeBars == preset.bars,
-                    tint: DubColor.loop
-                )
-                .onPressDown { onLoop(preset.bars) }
-                .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
-            }
-            DubPadCell("IN", size: .word, lit: loopInArmed, tint: DubColor.loop)
-                .onPressDown { onLoopIn() }
-                .help("Set the loop start at the playhead")
-            DubPadCell("OUT", size: .word, tint: DubColor.loop)
-                .onPressDown(enabled: loopInArmed) { onLoopOut() }
-                .help("Close the loop at the playhead and start it")
-                .opacity(loopInArmed ? 1.0 : 0.5)
-            DubPadCell("✕", size: .glyph, tint: DubColor.loop)
-                .onPressDown(enabled: activeBars != nil || loopEngaged || loopInArmed) {
-                    onExit()
-                }
-                .help("Exit loop")
-                .opacity(activeBars == nil ? 0.5 : 1.0)
-        }
-    }
-}
 
 #Preview("Performance pads") {
     HStack(spacing: 1) {

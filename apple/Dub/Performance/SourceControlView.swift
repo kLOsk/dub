@@ -209,9 +209,12 @@ struct PitchTestView: View {
     @ObservedObject var model: WaveformAppModel
     let side: DeckSide
 
-    @State private var current: Double = 0
-
     private let steps: [Double] = [-10, -5, -2, 0, 2, 5, 10]
+
+    /// On the model, not `@State` — see `DeckState.prepPitchPercent`.
+    private var current: Double {
+        (side == .a ? model.deckA : model.deckB).prepPitchPercent
+    }
 
     var body: some View {
         HStack(spacing: DubSpacing.sm) {
@@ -222,10 +225,7 @@ struct PitchTestView: View {
                 segments: steps.map { .init($0, label($0), width: .minWidth(26)) },
                 selection: current,
                 tint: DubColor.deckTint(side),
-                onSelect: { pct in
-                    current = pct
-                    model.setPrepPitch(side: side, percent: pct)
-                })
+                onSelect: { pct in model.setPrepPitch(side: side, percent: pct) })
         }
     }
 

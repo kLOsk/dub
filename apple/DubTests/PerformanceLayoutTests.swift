@@ -109,6 +109,25 @@ final class PerformanceLayoutTests: XCTestCase {
             "rack bar overflows the minimum window width")
     }
 
+    // MARK: - The Prep grid
+
+    /// Three columns must fit the narrowest supported window, or the
+    /// LOOP row clips — which is why the grid is a plain `HStack` with
+    /// measured widths rather than a `LazyVGrid` distributing equal
+    /// ones.
+    ///
+    /// The margin here is small by design (the columns are sized to
+    /// their content), so if a future Prep section is wider than its
+    /// column this fails immediately rather than shipping a clipped
+    /// pad. The documented remedy at that point is a two-column
+    /// `ViewThatFits` candidate — not a bigger minimum window.
+    func test_prepGrid_fitsTheNarrowestSupportedWindow() {
+        let available = DubLayout.mainWindowMinWidth - 2 * DubSpacing.lg
+        XCTAssertLessThanOrEqual(
+            DubLayout.prepPadGridIntrinsicWidth, available,
+            "Prep's three columns overflow the minimum window")
+    }
+
     // MARK: - Token coupling
 
     /// The deck pane has to hold the pad column, the overview, its gap

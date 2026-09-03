@@ -239,6 +239,15 @@ struct DeckState: Equatable {
     /// call; an Expert volume control can surface it later.
     var sirenVolume: Double = 1.0
 
+    /// Prep-mode pitch test step, in percent (M14 key-lock A/B). Lives
+    /// here rather than in `PitchTestView`'s `@State` because Prep's
+    /// pad grid re-parents that view between layouts, and SwiftUI drops
+    /// `@State` when a view's structural identity changes — the
+    /// selection would silently reset to 0 while the engine kept the
+    /// old rate. Not a performance control (PRD §6.1.3: no pitch
+    /// fader); a discrete test affordance.
+    var prepPitchPercent: Double = 0
+
     /// Which siren unit this deck plays — GS1 toy-chip shots, the Benidub
     /// DS01E analog siren, or the SN76477 chip. Drives the pad labels and which
     /// voice fires.
@@ -4317,6 +4326,10 @@ final class WaveformAppModel: ObservableObject {
     /// turntable.
     func setPrepPitch(side: DeckSide, percent: Double) {
         try? engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0 + percent / 100.0)
+        switch side {
+        case .a: deckA.prepPitchPercent = percent
+        case .b: deckB.prepPitchPercent = percent
+        }
     }
 
     /// M11d-history — deck-header hint click. Publishes a reveal

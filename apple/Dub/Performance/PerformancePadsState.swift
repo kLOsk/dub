@@ -52,6 +52,12 @@ struct PerformancePadsState: Equatable {
 /// What the pads fire. Separate from the state so the state stays
 /// `Equatable`.
 struct PerformancePadsCallbacks {
+    /// Set / jump a hot cue; `clear` is a ⇧-click. Performance gained
+    /// this when the CUE row moved onto the shared `CuePadSection` —
+    /// Prep's pads were always clickable and there is no reason the
+    /// same pad should be inert on the other surface (PRD §6.2.1: a
+    /// hot-cue press is a momentary trigger, so the mouse is fine).
+    var onCue: (_ index: Int, _ clear: Bool) -> Void = { _, _ in }
     /// Fire a grid-snapped reverse loop of `bars` bars — the bars just
     /// heard.
     var onLoop: (_ bars: Double) -> Void = { _ in }

@@ -222,6 +222,9 @@ struct PerformanceView: View {
     /// Pure forwarders into the model, as with `headerCallbacks`.
     private func padsCallbacks(side: DeckSide) -> PerformancePadsCallbacks {
         PerformancePadsCallbacks(
+            onCue: { index, clear in
+                model.handleHotCue(side, index: index, clear: clear)
+            },
             onLoop: { bars in model.handleLoop(side, bars: bars) },
             onLoopIn: { model.setLoopIn(side) },
             onLoopOut: { model.setLoopOut(side) },
@@ -306,10 +309,19 @@ struct PerformanceView: View {
         if model.engineMode == .prep {
             VStack(spacing: 1) {
                 prepOverviewBand
+                // Squeeze the waveform, never the controls. When the
+                // region is short the strip gives up height first: a
+                // shorter waveform on a prep surface is a graceful
+                // degradation, an unreachable STOP button is not.
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
-                    .frame(height: DubLayout.waveformPrepHeight)
+                    .frame(
+                        minHeight: DubLayout.waveformPrepMinHeight,
+                        idealHeight: DubLayout.waveformPrepHeight,
+                        maxHeight: DubLayout.waveformPrepHeight)
                 prepPadBar
+                    .layoutPriority(1)
             }
+            .frame(minHeight: DubLayout.prepRegionMinHeight)
             .background(DubColor.divider)
         } else {
             HStack(spacing: 1) {
@@ -448,7 +460,11 @@ struct PerformanceView: View {
     @ViewBuilder
     private var prepPadRows: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            // M26b — an unfinished rip from a previous launch, offered
+            // The rip lane spans all three columns and stays *above*
+            // them. During a capture it carries the REC clock, the
+            // level meter and STOP; burying STOP under ~200 pt of pads
+            // inside a scroll view would be a reliability regression,
+            // and `RipRecoveryBanner` is by its own contract offered
             // back before anything else in the rip surface.
             if let first = model.ripRecoverable.first {
                 RipRecoveryBanner(
@@ -459,62 +475,17 @@ struct PerformanceView: View {
                     onReview: { model.resumeRip(first) },
                     onDismiss: { model.dismissRecoverableRips() })
             }
-            // M26a — vinyl rip control row (idle / recording / failed
-            // states; review + encoding replace the whole bar above).
             if let ripBarState {
                 PrepRipBar(state: ripBarState, callbacks: ripBarCallbacks)
             }
-            CuePadRow(
-                cues: model.deckA.hotCues,
-                onCue: { index, clear in
-                    model.handleHotCue(.a, index: index, clear: clear)
-                })
-            LoopPadRow(
-                activeBars: model.deckA.activeLoopBars,
-                loopEngaged: model.deckA.loopActive,
-                loopInArmed: model.deckA.pendingLoopInSecs != nil,
-                onLoop: { bars in model.handleLoop(.a, bars: bars) },
-                onLoopIn: { model.setLoopIn(.a) },
-                onLoopOut: { model.setLoopOut(.a) },
-                onExit: { model.exitLoop(.a) })
-            // M15 — Echo-out (PRD §6.3): single 1-beat ECHO OUT toggle.
-            // Prep surface; clickable for prepare + test. Hidden when the
-            // feature is disabled in Preferences.
-            if model.echoOutEnabled {
-                PrepEchoPadRow(
-                    engaged: model.deckA.echoDivision != nil,
-                    onToggle: { model.toggleEchoOut(.a) })
+            // Scrolls only when it has to. The grid fits its floor at
+            // every supported window size; an expanded DS01E Expert
+            // panel adds ~250 pt of user-triggered content that no
+            // static budget can plan for, and this is the escape hatch
+            // for it.
+            ScrollView(.vertical, showsIndicators: false) {
+                PrepPadGrid(model: model)
             }
-            // M16 — Dub siren (PRD §6.3, Simple mode): the classic preset grid
-            // (siren / alarm / laser / bomb / gun …). Prep surface; mouse +
-            // keyboard. Hidden when the feature is off in Preferences.
-            if model.sirenEnabled {
-                SirenPadRow(
-                    names: model.sirenLabels(for: .a),
-                    sounding: model.deckA.sirenState == 1,
-                    onPreset: { idx in model.fireSirenPreset(.a, index: idx) },
-                    dubMacro: model.deckA.sirenDubMacro,
-                    onDubMacro: { value in model.setSirenDub(.a, value) },
-                    unit: model.deckA.sirenUnit,
-                    onUnit: { unit in model.setSirenUnit(.a, unit) })
-                SirenExpertPanel(deck: model.deckA, model: model, side: .a)
-            }
-            // Vintage-FX rack (PRD §6.3): spring · space echo · big knob ·
-            // phaser, each a tap-toggle + macro super-knob. Prep surface;
-            // clickable for prepare + test. Hidden when off in Preferences.
-            if model.rackFxEnabled {
-                RackFxRow(
-                    active: model.deckA.rackActive,
-                    macro: model.deckA.rackMacro,
-                    onToggle: { idx in model.toggleRackFx(.a, idx) },
-                    onMacro: { idx, value in model.setRackMacro(.a, idx, value) })
-            }
-            // M14 — Key Lock live A/B (Resampler · Ours · Rubber Band) +
-            // engaged/standby indicator. Prep surface; clickable.
-            KeyLockControlView(model: model, side: .a)
-            // M14 — rudimentary pitch buttons for testing key lock without a
-            // turntable.
-            PitchTestView(model: model, side: .a)
         }
     }
 
