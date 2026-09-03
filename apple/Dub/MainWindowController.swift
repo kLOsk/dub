@@ -76,7 +76,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window.title = "Dub"
         window.contentViewController = hostingController
         window.setContentSize(defaultSize)
-        window.minSize = NSSize(width: 720, height: 480)
+        // Matches `MainView`'s SwiftUI floor. These disagreed by
+        // 240 × 120 — and because `sizingOptions = []` hands SwiftUI
+        // exactly what AppKit offers, the SwiftUI minimum never
+        // resisted: the smaller AppKit number silently won and the
+        // layout was asked to render at a size it was never designed
+        // for.
+        window.minSize = NSSize(
+            width: DubLayout.mainWindowMinWidth,
+            height: DubLayout.mainWindowMinHeight)
         // `.fullScreenPrimary` enables the green traffic-light
         // button's full-screen action, the `View → Enter Full
         // Screen` menu item, and macOS' standard `Cmd+Ctrl+F`

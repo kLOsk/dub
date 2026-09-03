@@ -51,17 +51,29 @@ struct PerformanceView: View {
             statusStrip
             deckHeaders
             Rectangle().fill(DubColor.divider).frame(height: 1)
-            waveformRegion
-            // Prep gets no rack bar. Its vertical budget is the
-            // tightest on either surface, its siren has its own column,
-            // and the 100 pt this slot used to cost it went to
-            // "Coming soon" cards for two features that had shipped.
-            if model.engineMode != .prep {
-                Rectangle().fill(DubColor.divider).frame(height: 1)
-                GlobalRackBar(state: rackBarState, callbacks: rackBarCallbacks)
+            DeckLibrarySplit(
+                mode: model.engineMode,
+                deckChrome: deckChromeHeight,
+                deckMinimum: model.engineMode == .prep
+                    ? DubLayout.prepRegionMinHeight
+                    : DubLayout.waveformMinHeight
+            ) { _ in
+                VStack(spacing: 0) {
+                    waveformRegion
+                    // Prep gets no rack bar. Its vertical budget is the
+                    // tightest on either surface, its siren has its own
+                    // column, and the 100 pt this slot used to cost it
+                    // went to "Coming soon" cards for two features that
+                    // had already shipped.
+                    if model.engineMode != .prep {
+                        Rectangle().fill(DubColor.divider).frame(height: 1)
+                        GlobalRackBar(
+                            state: rackBarState, callbacks: rackBarCallbacks)
+                    }
+                }
+            } library: {
+                LibraryView(model: model, libraryModel: model.libraryModel)
             }
-            Rectangle().fill(DubColor.divider).frame(height: 1)
-            LibraryView(model: model, libraryModel: model.libraryModel)
         }
         .background(DubColor.surface0)
     }
@@ -234,6 +246,11 @@ struct PerformanceView: View {
             onRackMacro: { idx, value in model.setRackMacro(side, idx, value) })
     }
 
+    /// Fixed chrome carried on the deck side of the divider.
+    private var deckChromeHeight: CGFloat {
+        model.engineMode == .prep ? 0 : DubLayout.rackBarHeight + 1
+    }
+
     // MARK: - Global rack bar
 
     /// Snapshot for the bar. The siren block is omitted in Prep, where
@@ -338,7 +355,12 @@ struct PerformanceView: View {
                     .frame(maxHeight: .infinity)
                 deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
             }
-            .frame(minHeight: DubLayout.waveformMinHeight)
+            // No `minHeight` here. `DeckLibrarySplit` assigns this
+            // region an explicit height and `SplitMetrics` owns the
+            // floor. A `minHeight` inside an explicitly-framed parent
+            // reports and draws its minimum regardless of the frame —
+            // which is precisely how the pad column came to be painted
+            // over by the bar below it.
             .background(DubColor.divider)
         }
     }

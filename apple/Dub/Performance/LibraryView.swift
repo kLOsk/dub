@@ -928,7 +928,10 @@ struct LibraryView: View {
             Rectangle().fill(DubColor.divider).frame(width: 1)
             rightPane
         }
-        .frame(minHeight: DubLayout.libraryMinHeight)
+        // No `minHeight`: `DeckLibrarySplit` frames this explicitly and
+        // `SplitMetrics` owns the floor (`DubLayout.libraryMinHeight`).
+        // A minimum here would be reported and drawn even inside a
+        // shorter frame, overflowing rather than clamping.
         .background(DubColor.surface0)
         .onAppear {
             applyExtraColumns()

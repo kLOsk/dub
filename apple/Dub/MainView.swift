@@ -5686,7 +5686,9 @@ struct MainView: View {
                 model: model,
                 openPreferences: { showingPreferences = true },
                 openAbout: { showingAbout = true })
-                .frame(minWidth: 960, minHeight: 600)
+                .frame(
+                    minWidth: DubLayout.mainWindowMinWidth,
+                    minHeight: DubLayout.mainWindowMinHeight)
 
             if showLaunchSplash {
                 LaunchSplashOverlay()

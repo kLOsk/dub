@@ -326,6 +326,9 @@ enum DubLayout {
     /// invariant and lets the un-loaded deck reserve the same
     /// vertical slot with an empty `Color.clear` placeholder.
     static let deckHeaderHeight: CGFloat = 108
+    /// The draggable deck / library divider.
+    static let splitterThickness: CGFloat = 6
+
     /// The global rack bar (siren · Quick Scratch · sampler), which
     /// replaces the old placeholder FX bar. 12 top padding + a 20 pt
     /// header row (the label, the deck pill, a `.mini` segmented
