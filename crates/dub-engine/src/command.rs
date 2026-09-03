@@ -307,6 +307,34 @@ pub enum Command {
         gain: f32,
     },
 
+    /// Bind a sample to sampler slot `slot` (M17, PRD §7.1).
+    ///
+    /// Carries an `Arc<Track>` for the same reason [`Self::DeckLoad`]
+    /// does, and with the same contract: the audio thread installs it
+    /// and bounces whatever it displaced back through the trash
+    /// channel. The sample arrives already at the engine rate — the
+    /// conversion happens off-RT at bind time (`dub_io::resample_track`),
+    /// so the voice reads it with an integer cursor.
+    SamplerLoad { slot: u8, source: Arc<Track> },
+
+    /// Unbind sampler slot `slot`, returning its sample for disposal
+    /// off the audio thread.
+    SamplerClear { slot: u8 },
+
+    /// Fire sampler slot `slot`'s one-shot (§7.1). Retriggering a
+    /// sounding voice crossfades rather than cutting.
+    SamplerTrigger { slot: u8 },
+
+    /// Stop sampler slot `slot` before its sample ends, ramping out.
+    SamplerStop { slot: u8 },
+
+    /// Per-slot linear gain (§7.1).
+    SamplerSetGain { slot: u8, gain: f32 },
+
+    /// Which deck's output bus slot `slot` sums onto (§7.1 "output
+    /// assignment"; default deck A).
+    SamplerSetOutputDeck { slot: u8, deck: u8 },
+
     /// Instant Doubles (M17, PRD §7.3): put the track loaded on deck
     /// `from` onto deck `to` at `from`'s current playhead, for
     /// juggling.
@@ -384,6 +412,29 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DeckPlay { idx } => f.debug_struct("DeckPlay").field("idx", idx).finish(),
+            Self::SamplerLoad { slot, .. } => {
+                f.debug_struct("SamplerLoad").field("slot", slot).finish()
+            }
+            Self::SamplerClear { slot } => {
+                f.debug_struct("SamplerClear").field("slot", slot).finish()
+            }
+            Self::SamplerTrigger { slot } => f
+                .debug_struct("SamplerTrigger")
+                .field("slot", slot)
+                .finish(),
+            Self::SamplerStop { slot } => {
+                f.debug_struct("SamplerStop").field("slot", slot).finish()
+            }
+            Self::SamplerSetGain { slot, gain } => f
+                .debug_struct("SamplerSetGain")
+                .field("slot", slot)
+                .field("gain", gain)
+                .finish(),
+            Self::SamplerSetOutputDeck { slot, deck } => f
+                .debug_struct("SamplerSetOutputDeck")
+                .field("slot", slot)
+                .field("deck", deck)
+                .finish(),
             Self::DeckInstantDouble { from, to } => f
                 .debug_struct("DeckInstantDouble")
                 .field("from", from)

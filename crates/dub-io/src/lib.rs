@@ -15,7 +15,7 @@
 
 mod track;
 
-pub use track::{read_metadata, LoadError, StreamingLoad, Track, TrackMetadata};
+pub use track::{read_metadata, resample_track, LoadError, StreamingLoad, Track, TrackMetadata};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

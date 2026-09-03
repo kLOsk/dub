@@ -140,7 +140,7 @@ sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
 | **next** | ◻ planned | Sampler / quick scratch / instant doubles (M17) — the last feature milestone — then Polish → Alpha. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **65** at the
+before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **66** at the
 time of writing (`dub version` prints the live crate versions); `dub diagnose
 <track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
 

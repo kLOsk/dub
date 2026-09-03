@@ -35,6 +35,8 @@ mod looping;
 #[cfg(test)]
 mod real_vinyl_tests;
 pub mod realtime;
+/// M17 §7.1 one-shot sampler voices.
+pub mod sampler;
 pub mod thru;
 pub mod timecode;
 
@@ -312,6 +314,10 @@ pub struct Engine {
     /// echo, processed in [`SIREN_CHUNK`]-frame slices so any block size is
     /// handled without allocation.
     siren_scratch: Box<[f32]>,
+    /// M17 §7.1 one-shot sampler voices. Engine-wide rather than
+    /// per-deck: a voice chooses which deck bus it sums onto, so the
+    /// same rack serves both.
+    samplers: [crate::sampler::SamplerVoice; crate::sampler::SAMPLER_SLOTS],
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -442,6 +448,7 @@ impl Engine {
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
+            samplers: Default::default(),
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -519,6 +526,7 @@ impl Engine {
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
+            samplers: Default::default(),
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -902,6 +910,24 @@ impl Engine {
                 .max(self.sn76477[idx].state_code())
                 .max(self.hk628[idx].state_code());
             self.decks[idx].store_siren_state(siren_code);
+
+            // M17 §7.1 sampler one-shots, summed onto whichever deck
+            // bus each slot is assigned to. Last, for the same reason
+            // the siren is late: a horn stab is not the music, so the
+            // deck's echo-out and vintage rack have no business
+            // processing it. Additive by construction — the voice adds
+            // and never writes, so the deck keeps playing underneath.
+            //
+            // A voice assigned to a deck with no routing is silent for
+            // this block; the deck's channels are where its output
+            // physically goes, and there is nowhere else to put it.
+            #[allow(clippy::cast_possible_truncation)]
+            let deck_id = idx as u8;
+            for voice in &mut self.samplers {
+                if voice.output_deck() == deck_id {
+                    voice.render_add(out, num_channels, first_us);
+                }
+            }
         }
 
         // Master gain (M4 / M5.5): single multiplicative scale across the
@@ -1897,6 +1923,44 @@ impl Engine {
                 // Arc may have been displaced into the deck's
                 // pending_disposal slot — sweep that immediately.
                 self.sweep_deck_disposal(idx as usize);
+            }
+            Command::SamplerLoad { slot, source } => {
+                let Some(voice) = self.samplers.get_mut(slot as usize) else {
+                    // Bad slot: bounce the new Arc rather than drop it
+                    // here, symmetric with `DeckLoad`.
+                    self.send_to_trash(source);
+                    return;
+                };
+                if let Some(displaced) = voice.set_source(source) {
+                    self.send_to_trash(displaced);
+                }
+            }
+            Command::SamplerClear { slot } => {
+                if let Some(voice) = self.samplers.get_mut(slot as usize) {
+                    if let Some(displaced) = voice.clear_source() {
+                        self.send_to_trash(displaced);
+                    }
+                }
+            }
+            Command::SamplerTrigger { slot } => {
+                if let Some(voice) = self.samplers.get_mut(slot as usize) {
+                    voice.trigger();
+                }
+            }
+            Command::SamplerStop { slot } => {
+                if let Some(voice) = self.samplers.get_mut(slot as usize) {
+                    voice.stop();
+                }
+            }
+            Command::SamplerSetGain { slot, gain } => {
+                if let Some(voice) = self.samplers.get_mut(slot as usize) {
+                    voice.set_gain(gain);
+                }
+            }
+            Command::SamplerSetOutputDeck { slot, deck } => {
+                if let Some(voice) = self.samplers.get_mut(slot as usize) {
+                    voice.set_output_deck(deck);
+                }
             }
             Command::DeckInstantDouble { from, to } => {
                 if from == to {
@@ -6066,5 +6130,151 @@ mod tests {
             engine.apply_command(Command::DeckInstantDouble { from: 0, to: 1 });
             engine.render(&mut rt, &mut buf);
         });
+    }
+
+    // ---- M17 §7.1: sampler wiring ----
+
+    /// §7.1: the sample plays *over* the decks, on the deck's own
+    /// output bus, and after the FX — so a deck mid-track keeps its
+    /// audio and the horn lands on top of it.
+    #[test]
+    fn a_sampler_voice_sums_onto_its_deck_bus_without_replacing_the_deck() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let deck_track = Arc::new(Track::from_interleaved(vec![0.4; 8192], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(deck_track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 8192], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 0,
+            source: sample,
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 0, gain: 1.0 });
+        engine.apply_command(Command::SamplerTrigger { slot: 0 });
+
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buf);
+
+        // Past the voice's attack ramp the bus carries deck + sample.
+        let tail = &buf[400 * 2..];
+        assert!(
+            tail.iter().all(|s| *s > 0.5),
+            "deck 0.4 + sample 0.5 should sum, got {:?}",
+            &tail[..4]
+        );
+    }
+
+    #[test]
+    fn a_sampler_voice_renders_only_onto_the_deck_it_is_assigned_to() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 8192], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 1,
+            source: sample,
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 1, gain: 1.0 });
+        engine.apply_command(Command::SamplerSetOutputDeck { slot: 1, deck: 1 });
+        engine.apply_command(Command::SamplerTrigger { slot: 1 });
+
+        // Four channels, external-mixer routing: deck A on 0+1, deck B
+        // on 2+3.
+        let mut buf = vec![0.0f32; 256 * 4];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut buf, 4, &[Some(0), Some(2)]);
+
+        assert!(
+            buf.chunks_exact(4).all(|f| f[0] == 0.0 && f[1] == 0.0),
+            "deck A's pair must stay silent"
+        );
+        assert!(
+            buf.chunks_exact(4).any(|f| f[2] > 0.0),
+            "deck B's pair carries it"
+        );
+    }
+
+    #[test]
+    fn loading_a_sampler_slot_returns_the_displaced_sample_through_the_trash() {
+        let first = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        let second = Arc::new(Track::from_interleaved(vec![0.25; 1024], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+
+        engine.apply_command(Command::SamplerLoad {
+            slot: 2,
+            source: Arc::clone(&first),
+        });
+        assert_eq!(Arc::strong_count(&first), 2, "us + the voice");
+
+        engine.apply_command(Command::SamplerLoad {
+            slot: 2,
+            source: second,
+        });
+        assert_eq!(
+            Arc::strong_count(&first),
+            2,
+            "us + the trash channel — never dropped on the audio thread"
+        );
+        assert_eq!(handle.reclaim(), 1);
+        assert_eq!(Arc::strong_count(&first), 1, "ours alone after reclaim");
+
+        engine.apply_command(Command::SamplerClear { slot: 2 });
+        assert_eq!(handle.reclaim(), 1, "clearing returns the sample too");
+    }
+
+    #[test]
+    fn a_sampler_slot_out_of_range_bounces_the_sample_rather_than_dropping_it() {
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 512], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.apply_command(Command::SamplerLoad {
+            slot: 9,
+            source: Arc::clone(&sample),
+        });
+        assert_eq!(Arc::strong_count(&sample), 2, "us + the trash channel");
+        assert_eq!(handle.reclaim(), 1);
+    }
+
+    #[test]
+    fn sampler_rendering_is_alloc_free() {
+        let (mut engine, _handle) = Engine::new_with_handle(48_000.0, 64);
+        let deck_track = Arc::new(Track::from_interleaved(vec![0.4; 8192], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(deck_track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 8192], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 0,
+            source: sample,
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 0, gain: 1.0 });
+
+        let mut buf = vec![0.0f32; 128];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buf);
+
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::SamplerTrigger { slot: 0 });
+            engine.render(&mut rt, &mut buf);
+            engine.apply_command(Command::SamplerTrigger { slot: 0 });
+            engine.render(&mut rt, &mut buf);
+            engine.apply_command(Command::SamplerStop { slot: 0 });
+            engine.render(&mut rt, &mut buf);
+        });
+    }
+
+    /// The handle is what the FFI drives; a slot that does not exist
+    /// must come back as an error with the sample intact rather than
+    /// vanishing.
+    #[test]
+    fn the_handle_rejects_an_out_of_range_sampler_slot() {
+        let (_engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 512], 48_000, 2).unwrap());
+        let (err, returned) = handle
+            .sampler_load(9, Arc::clone(&sample))
+            .expect_err("slot 9 does not exist");
+        assert!(matches!(err, CommandError::InvalidDeck { .. }));
+        assert!(Arc::ptr_eq(&returned, &sample), "the sample comes back");
+        assert!(handle.sampler_trigger(9).is_err());
+        assert!(handle.sampler_set_gain(9, 1.0).is_err());
     }
 }

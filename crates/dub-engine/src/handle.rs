@@ -391,6 +391,96 @@ impl EngineHandle {
         self.send(Command::SetMasterGain { gain })
     }
 
+    /// Bind a sample to sampler slot `slot` (M17, PRD §7.1).
+    ///
+    /// `source` must already be at the engine's sample rate — convert
+    /// with `dub_io::resample_track` at bind time. The displaced sample
+    /// (if any) comes back through the trash channel.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] if the audio thread is not
+    /// draining; the `Arc` is handed back with the error so the caller
+    /// can retry or drop it on its own thread.
+    pub fn sampler_load(
+        &mut self,
+        slot: usize,
+        source: Arc<Track>,
+    ) -> Result<(), (CommandError, Arc<Track>)> {
+        let Ok(slot) = Self::check_sampler_slot(slot) else {
+            return Err((CommandError::InvalidDeck { idx: 0, count: 0 }, source));
+        };
+        match self.tx.try_push(Command::SamplerLoad { slot, source }) {
+            Ok(()) => Ok(()),
+            Err(Command::SamplerLoad { source, .. }) => Err((CommandError::ChannelFull, source)),
+            Err(_) => unreachable!("try_push returns the command it was given"),
+        }
+    }
+
+    /// Unbind sampler slot `slot`.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_clear(&mut self, slot: usize) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        self.send(Command::SamplerClear { slot })
+    }
+
+    /// Fire sampler slot `slot`'s one-shot.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_trigger(&mut self, slot: usize) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        self.send(Command::SamplerTrigger { slot })
+    }
+
+    /// Stop sampler slot `slot` early, ramping out.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_stop(&mut self, slot: usize) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        self.send(Command::SamplerStop { slot })
+    }
+
+    /// Set sampler slot `slot`'s linear gain.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_set_gain(&mut self, slot: usize, gain: f32) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        self.send(Command::SamplerSetGain { slot, gain })
+    }
+
+    /// Choose the deck bus sampler slot `slot` sums onto.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_set_output_deck(
+        &mut self,
+        slot: usize,
+        deck: usize,
+    ) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        let deck = self.check_deck(deck)?;
+        self.send(Command::SamplerSetOutputDeck { slot, deck })
+    }
+
+    /// Validate a sampler slot index. Reuses [`CommandError::InvalidDeck`]
+    /// rather than minting a parallel error: the caller's recovery is the
+    /// same either way, and one variant keeps the FFI mapping single.
+    fn check_sampler_slot(slot: usize) -> Result<u8, CommandError> {
+        if slot < crate::sampler::SAMPLER_SLOTS {
+            #[allow(clippy::cast_possible_truncation)]
+            return Ok(slot as u8);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        Err(CommandError::InvalidDeck {
+            idx: 0,
+            count: crate::sampler::SAMPLER_SLOTS as u8,
+        })
+    }
+
     /// Instant Doubles (M17, PRD §7.3): put deck `from`'s track onto
     /// deck `to` at `from`'s current playhead.
     ///

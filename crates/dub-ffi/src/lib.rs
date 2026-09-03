@@ -431,7 +431,15 @@ pub use rip::{
 ///       alignment is sample-accurate and the press is instant; the
 ///       destination's waveform and beat grid are cloned rather than
 ///       recomputed.
-pub const FFI_VERSION: u32 = 65;
+///   66. **Sampler (M17 §7.1).** [`DubEngine::sampler_load`] binds a
+///       sample to one of four one-shot slots, decoding **and
+///       converting it to the engine's rate off the audio thread** so
+///       the voice reads it with an integer cursor;
+///       `sampler_trigger` / `sampler_stop` / `sampler_set_gain` /
+///       `sampler_set_output_deck` / `sampler_clear` drive it. Voices
+///       sum onto the assigned deck's bus after the FX chain — the
+///       stab plays *over* the music rather than through its echo.
+pub const FFI_VERSION: u32 = 66;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -900,6 +908,20 @@ struct RunningState {
 }
 
 impl DubEngine {
+    /// Run `f` against the running engine, or fail with
+    /// [`EngineError::NotRunning`]. The M17 sampler calls are all this
+    /// shape: lock, require running, forward one command.
+    fn with_running<T>(
+        &self,
+        f: impl FnOnce(&mut RunningState) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        f(running)
+    }
+
     /// Bump `peak_generation_seq[deck_idx]` by one with `Release`
     /// ordering. Internal helper called at every `PeakSource`
     /// assignment site so the Swift renderer can detect source
@@ -1502,7 +1524,7 @@ impl DubEngine {
     ///
     /// The check between phases 1 and 3 is repeated — the engine
     /// can theoretically be stopped while decode is in flight, in
-    /// which case phase 3 returns [`EngineError::EngineNotRunning`]
+    /// which case phase 3 returns [`EngineError::NotRunning`]
     /// and the decoded `Arc<Track>` + peak vectors are dropped on
     /// the caller's thread (off-RT, harmless). Two concurrent
     /// loads on the same deck race for phase 3: whichever lands
@@ -1512,7 +1534,7 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`] if `start_engine` /
+    /// * [`EngineError::NotRunning`] if `start_engine` /
     ///   `start_thru` hasn't been called (checked at phases 1 and 3).
     /// * [`EngineError::InvalidDeckIndex`] if `deck_idx >=
     ///   DECK_COUNT`.
@@ -1554,7 +1576,7 @@ impl DubEngine {
         {
             let state = lock_state(&self.state);
             if !matches!(*state, EngineState::Running(_)) {
-                return Err(EngineError::EngineNotRunning);
+                return Err(EngineError::NotRunning);
             }
         }
 
@@ -1630,7 +1652,7 @@ impl DubEngine {
         {
             let mut state = lock_state(&self.state);
             let EngineState::Running(running) = &mut *state else {
-                return Err(EngineError::EngineNotRunning);
+                return Err(EngineError::NotRunning);
             };
 
             // Auto-gain (PRD §8.4): apply the load-time loudness
@@ -1754,7 +1776,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running.handle.deck(idx).play().map_err(map_command_error)
     }
@@ -1772,7 +1794,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running.handle.deck(idx).pause().map_err(map_command_error)
     }
@@ -1816,7 +1838,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
 
         // **M11d.6 round 8.** `rate` here is the **musical** rate
@@ -1845,13 +1867,13 @@ impl DubEngine {
     /// engine auto-bypasses during scratch, reverse, and extreme rates.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_deck_key_lock(&self, deck_idx: u64, on: bool) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -1864,7 +1886,7 @@ impl DubEngine {
     /// (pitch shifts with rate); `DubOwn` enables our WSOLA key lock.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_deck_stretch_backend(
         &self,
@@ -1874,7 +1896,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -1897,7 +1919,7 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
     pub fn set_reverse_loop(&self, deck_idx: u64, length_beats: u32) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
@@ -1908,7 +1930,7 @@ impl DubEngine {
             .elapsed_secs;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let Some(PeakSource::File(file)) = running.peaks[idx].as_ref() else {
             // No File-mode grid (empty / Thru deck) — nothing to loop.
@@ -1953,7 +1975,7 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
     pub fn set_manual_loop(
         &self,
@@ -1964,7 +1986,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         // Region validity is a no-op, not an error — same contract as
         // `set_reverse_loop`, where an ungriddable track simply yields
@@ -1997,13 +2019,13 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
     pub fn clear_loop(&self, deck_idx: u64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2034,7 +2056,7 @@ impl DubEngine {
     /// audio thread. No-op (returns `Ok`) for a non-positive `bpm` / division.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn engage_echo_out(
         &self,
@@ -2047,7 +2069,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         if !(bpm.is_finite() && bpm > 0.0 && division_beats.is_finite() && division_beats > 0.0) {
             return Ok(());
@@ -2071,13 +2093,13 @@ impl DubEngine {
     /// position — and fade the wet echo out. Idempotent.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn release_echo_out(&self, deck_idx: u64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2091,7 +2113,7 @@ impl DubEngine {
     /// changes on a fresh [`Self::engage_echo_out`].
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_echo_params(
         &self,
@@ -2102,7 +2124,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         // Sample rates (44.1k/48k/96k/192k) are all exact in f32.
         #[allow(clippy::cast_precision_loss)]
@@ -2129,7 +2151,7 @@ impl DubEngine {
     /// preset's slap-back.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn fire_siren_preset(
         &self,
@@ -2141,7 +2163,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let preset = u8::try_from(preset_id).unwrap_or(u8::MAX);
         let delay_frames_override =
@@ -2164,13 +2186,13 @@ impl DubEngine {
     /// while the slap-back tail rings on. Idempotent.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn release_siren(&self, deck_idx: u64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2188,7 +2210,7 @@ impl DubEngine {
     /// Big Knob + Phaser are in-place inserts.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_rack_fx(
         &self,
@@ -2200,7 +2222,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2217,7 +2239,7 @@ impl DubEngine {
     /// echo render is skipped when `mix` is ~0 and not cut.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     #[allow(clippy::too_many_arguments)]
     pub fn set_siren_controls(
@@ -2234,7 +2256,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2249,7 +2271,7 @@ impl DubEngine {
     /// `volume` is the siren output level. Routes through the same path as Expert.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_siren_dub_macro(
         &self,
@@ -2260,7 +2282,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let (speed, delay_ms, feedback, mix, filter) = siren_dub_macro(macro_value);
         running
@@ -2274,13 +2296,13 @@ impl DubEngine {
     /// Benidub DS01E analog siren. Firing a preset/MODE routes to this unit.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_siren_unit(&self, deck_idx: u64, unit: SirenUnit) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2295,7 +2317,7 @@ impl DubEngine {
     /// sustain). Applied to the MODE patch at fire time.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running;
+    /// [`EngineError::NotRunning`] if the engine isn't running;
     /// [`EngineError::InvalidDeck`] on a bad index.
     pub fn set_siren_voice(
         &self,
@@ -2307,7 +2329,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2343,7 +2365,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2372,7 +2394,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2397,7 +2419,7 @@ impl DubEngine {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
 
         // Convert seconds → track frames using the loaded track's
@@ -2415,6 +2437,110 @@ impl DubEngine {
             .deck(idx)
             .seek(position_frames)
             .map_err(map_command_error)
+    }
+
+    /// Bind a sample file to sampler slot `slot` (M17, PRD §7.1).
+    ///
+    /// Decodes the file and converts it to the engine's sample rate
+    /// **here, off the audio thread**, because a one-shot has to sound
+    /// on the frame the key goes down: it cannot decode on the press,
+    /// and it should not be converting rates per frame either. The
+    /// voice then reads the buffer with an integer cursor.
+    ///
+    /// Blocking — the Apple shell calls it off the main queue like the
+    /// other load paths. The sample file is left untouched: Quick
+    /// Scratch (§7.2) loads the same file from disk through the deck,
+    /// and the two must not fight over it.
+    pub fn sampler_load(&self, slot: u64, path: String) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        let engine_sr = {
+            let state = lock_state(&self.state);
+            let EngineState::Running(running) = &*state else {
+                return Err(EngineError::NotRunning);
+            };
+            running.sample_rate
+        };
+
+        let decoded = dub_io::Track::load_from_path(std::path::Path::new(&path))
+            .map_err(|e| EngineError::TrackDecodeFailed(e.to_string()))?;
+        // `RunningState::sample_rate` is already the engine rate in Hz.
+        let target_sr = engine_sr;
+        let converted = dub_io::resample_track(&decoded, target_sr).ok_or_else(|| {
+            EngineError::TrackDecodeFailed(format!(
+                "could not convert {path} to {target_sr} Hz — the file may be empty \
+                 or shorter than one output frame"
+            ))
+        })?;
+
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .sampler_load(slot, std::sync::Arc::new(converted))
+            .map_err(|(e, _arc)| map_command_error(e))
+    }
+
+    /// Unbind sampler slot `slot`.
+    pub fn sampler_clear(&self, slot: u64) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        self.with_running(|running| {
+            running
+                .handle
+                .sampler_clear(slot)
+                .map_err(map_command_error)
+        })
+    }
+
+    /// Fire sampler slot `slot`'s one-shot (§7.1). Retriggering a
+    /// sounding voice crossfades rather than cutting.
+    pub fn sampler_trigger(&self, slot: u64) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        self.with_running(|running| {
+            running
+                .handle
+                .sampler_trigger(slot)
+                .map_err(map_command_error)
+        })
+    }
+
+    /// Stop sampler slot `slot` before its sample ends, ramping out.
+    pub fn sampler_stop(&self, slot: u64) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        self.with_running(|running| running.handle.sampler_stop(slot).map_err(map_command_error))
+    }
+
+    /// Set sampler slot `slot`'s linear gain (§7.1 per-slot gain).
+    pub fn sampler_set_gain(&self, slot: u64, gain: f32) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        self.with_running(|running| {
+            running
+                .handle
+                .sampler_set_gain(slot, gain)
+                .map_err(map_command_error)
+        })
+    }
+
+    /// Choose which deck's output bus sampler slot `slot` sums onto
+    /// (§7.1 "output assignment"; default deck A).
+    pub fn sampler_set_output_deck(&self, slot: u64, deck_idx: u64) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
+        let deck = deck_idx_to_usize(deck_idx)?;
+        self.with_running(|running| {
+            running
+                .handle
+                .sampler_set_output_deck(slot, deck)
+                .map_err(map_command_error)
+        })
+    }
+
+    /// Number of sampler slots (§7.1: four, `A S D F`). Exposed so the
+    /// shell builds its rack from the engine's count rather than its
+    /// own copy of it.
+    #[must_use]
+    pub fn sampler_slot_count(&self) -> u64 {
+        dub_engine::sampler::SAMPLER_SLOTS as u64
     }
 
     /// Instant Doubles (M17, PRD §7.3): put the track playing on
@@ -2440,7 +2566,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let Some(track) = running.file_tracks[from].clone() else {
             return Ok(());
@@ -2689,7 +2815,7 @@ impl DubEngine {
     /// engine-side; see `dub_engine`'s `set_deck_control_mode`.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    /// [`EngineError::NotRunning`] if the engine isn't running.
     pub fn set_deck_control_mode(
         &self,
         deck_idx: u64,
@@ -2699,7 +2825,7 @@ impl DubEngine {
         {
             let mut state = lock_state(&self.state);
             let EngineState::Running(running) = &mut *state else {
-                return Err(EngineError::EngineNotRunning);
+                return Err(EngineError::NotRunning);
             };
             running
                 .handle
@@ -2728,12 +2854,12 @@ impl DubEngine {
     /// shell drops the call.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    /// [`EngineError::NotRunning`] if the engine isn't running.
     pub fn set_deck_auto_control(&self, deck_idx: u64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2745,12 +2871,12 @@ impl DubEngine {
     /// Manually (re)calibrate a deck's timecode needle.
     ///
     /// # Errors
-    /// [`EngineError::EngineNotRunning`] if the engine isn't running.
+    /// [`EngineError::NotRunning`] if the engine isn't running.
     pub fn calibrate_deck(&self, deck_idx: u64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         running
             .handle
@@ -2846,7 +2972,7 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
     /// * [`EngineError::NoTrackLoaded`] when the deck has no File source
     pub fn install_beat_grid(
@@ -2861,7 +2987,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -2901,7 +3027,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -2954,7 +3080,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -2988,7 +3114,7 @@ impl DubEngine {
 
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
             fp.beat_grid = grid;
@@ -3019,7 +3145,7 @@ impl DubEngine {
     /// # Errors
     ///
     /// * [`EngineError::InvalidDeckIndex`] when `deck_idx` is out of range.
-    /// * [`EngineError::EngineNotRunning`] when the engine isn't running.
+    /// * [`EngineError::NotRunning`] when the engine isn't running.
     /// * [`EngineError::NoTrackLoaded`] when no file is loaded on the deck.
     /// * [`EngineError::GridLocked`] when the deck's grid is locked
     ///   (PRD-BEATS §3.5: lock is absolute).
@@ -3045,7 +3171,7 @@ impl DubEngine {
         // octave profile for the ODF transient snap.
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -3091,7 +3217,7 @@ impl DubEngine {
 
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
             fp.beat_grid = grid;
@@ -3112,14 +3238,14 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`] when the engine isn't running.
+    /// * [`EngineError::NotRunning`] when the engine isn't running.
     /// * [`EngineError::InvalidDeckIndex`] when `deck_idx` is out of range.
     /// * [`EngineError::NoTrackLoaded`] when the deck has no File source.
     pub fn set_deck_grid_locked(&self, deck_idx: u64, locked: bool) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
             return Err(EngineError::NoTrackLoaded(deck_idx));
@@ -3145,7 +3271,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -3191,7 +3317,7 @@ impl DubEngine {
 
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
             fp.beat_grid = grid;
@@ -3216,7 +3342,7 @@ impl DubEngine {
     ///
     /// # Errors
     ///
-    /// * [`EngineError::EngineNotRunning`]
+    /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
     /// * [`EngineError::NoTrackLoaded`] when the deck has no File source
     /// * [`EngineError::InvalidBeatGridParams`] when the current
@@ -3229,7 +3355,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
             return Err(EngineError::NoTrackLoaded(deck_idx))?;
@@ -3268,7 +3394,7 @@ impl DubEngine {
         }
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
+            return Err(EngineError::NotRunning);
         };
         let track = running
             .file_tracks
@@ -4711,6 +4837,20 @@ fn track_still_loaded(running: &RunningState, idx: usize, track: &Arc<Track>) ->
     )
 }
 
+/// Validate a sampler slot index coming across the FFI (M17 §7.1).
+/// Reuses [`EngineError::InvalidDeckIndex`] rather than minting a
+/// parallel variant — the caller's recovery is identical, and one
+/// variant keeps the Swift error mapping single.
+fn sampler_slot_to_usize(slot: u64) -> Result<usize, EngineError> {
+    let idx: usize = slot
+        .try_into()
+        .map_err(|_| EngineError::InvalidDeckIndex(slot))?;
+    if idx >= dub_engine::sampler::SAMPLER_SLOTS {
+        return Err(EngineError::InvalidDeckIndex(slot));
+    }
+    Ok(idx)
+}
+
 fn deck_idx_to_usize(deck_idx: u64) -> Result<usize, EngineError> {
     let idx: usize = deck_idx
         .try_into()
@@ -5288,7 +5428,9 @@ mod tests {
         // `set_visible_columns`, `LibraryTrack::extras` +
         // `bpm_disagreement`.
         // 64→65: instant doubles — `instant_double`.
-        assert_eq!(FFI_VERSION, 65);
+        // 65→66: sampler — `sampler_load` + trigger / stop / gain /
+        // output-deck / clear.
+        assert_eq!(FFI_VERSION, 66);
     }
 
     #[test]
@@ -5305,7 +5447,7 @@ mod tests {
         let err = engine
             .load_track(0, "/nonexistent.wav".to_string(), None, None, None)
             .unwrap_err();
-        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+        assert!(matches!(err, EngineError::NotRunning), "got {err:?}");
     }
 
     /// M17 §7.3. The engine-side behaviour is covered in
@@ -5316,7 +5458,7 @@ mod tests {
     fn instant_double_on_stopped_engine_returns_not_running() {
         let engine = DubEngine::new();
         let err = engine.instant_double(0, 1).unwrap_err();
-        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+        assert!(matches!(err, EngineError::NotRunning), "got {err:?}");
     }
 
     #[test]
@@ -5336,11 +5478,52 @@ mod tests {
         }
     }
 
+    /// M17 §7.1. The voice behaviour lives in `dub-engine`; the FFI
+    /// owns the guard rails, and both fire on a stray press mid-set.
+    #[test]
+    fn sampler_calls_on_a_stopped_engine_return_not_running() {
+        let engine = DubEngine::new();
+        for f in [
+            engine.sampler_trigger(0),
+            engine.sampler_stop(0),
+            engine.sampler_clear(0),
+            engine.sampler_set_gain(0, 1.0),
+            engine.sampler_set_output_deck(0, 1),
+            engine.sampler_load(0, "/nonexistent.wav".to_string()),
+        ] {
+            assert!(matches!(f.unwrap_err(), EngineError::NotRunning));
+        }
+    }
+
+    #[test]
+    fn sampler_rejects_a_slot_that_does_not_exist() {
+        let engine = DubEngine::new();
+        // Checked before the running guard, so the error names the
+        // real problem rather than "engine not running".
+        for f in [
+            engine.sampler_trigger(9),
+            engine.sampler_set_gain(9, 1.0),
+            engine.sampler_load(9, "/nonexistent.wav".to_string()),
+        ] {
+            assert!(matches!(f.unwrap_err(), EngineError::InvalidDeckIndex(9)));
+        }
+    }
+
+    #[test]
+    fn the_shell_reads_the_slot_count_from_the_engine() {
+        let engine = DubEngine::new();
+        assert_eq!(
+            engine.sampler_slot_count(),
+            dub_engine::sampler::SAMPLER_SLOTS as u64,
+            "the rack's width is the engine's to state, not the shell's"
+        );
+    }
+
     #[test]
     fn play_pause_seek_on_stopped_engine_return_not_running() {
         let engine = DubEngine::new();
         for f in [engine.play(0), engine.pause(0), engine.seek(0, 30.0)] {
-            assert!(matches!(f.unwrap_err(), EngineError::EngineNotRunning));
+            assert!(matches!(f.unwrap_err(), EngineError::NotRunning));
         }
     }
 
@@ -5349,11 +5532,11 @@ mod tests {
         let engine = DubEngine::new();
         assert!(matches!(
             engine.fire_siren_preset(0, 0, 0.0, 0.0).unwrap_err(),
-            EngineError::EngineNotRunning
+            EngineError::NotRunning
         ));
         assert!(matches!(
             engine.release_siren(0).unwrap_err(),
-            EngineError::EngineNotRunning
+            EngineError::NotRunning
         ));
     }
 
@@ -5439,7 +5622,7 @@ mod tests {
         let err = engine
             .install_beat_grid_with_phase(0, 120.0, 0.0, 0)
             .unwrap_err();
-        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+        assert!(matches!(err, EngineError::NotRunning), "got {err:?}");
     }
 
     #[test]
@@ -5609,15 +5792,15 @@ mod tests {
         // and a caller cannot mistake "engine down" for "region no-op".
         assert!(matches!(
             engine.set_manual_loop(0, 1.0, 2.0),
-            Err(EngineError::EngineNotRunning)
+            Err(EngineError::NotRunning)
         ));
         assert!(matches!(
             engine.set_manual_loop(0, 2.0, 1.0),
-            Err(EngineError::EngineNotRunning)
+            Err(EngineError::NotRunning)
         ));
         assert!(matches!(
             engine.set_manual_loop(0, f64::NAN, 2.0),
-            Err(EngineError::EngineNotRunning)
+            Err(EngineError::NotRunning)
         ));
     }
 

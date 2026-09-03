@@ -1016,8 +1016,164 @@ impl StreamingLoad {
     }
 }
 
+/// Convert `track` to `target_sr`, for callers that need a buffer the
+/// audio thread can read with an integer cursor (M17 §7.1's sampler
+/// slots).
+///
+/// **Off the audio thread, once, at bind time.** A sampler one-shot has
+/// to sound on the frame the key goes down, so it cannot decode on the
+/// press and it should not be doing rate conversion per frame either;
+/// doing the conversion when the slot is bound moves both costs to a
+/// moment where a few milliseconds do not matter.
+///
+/// Linear interpolation, matching what `dub-engine`'s deck does today
+/// (`deck.rs` is explicit that anti-aliased sinc is deferred). The
+/// point of converting here is *where* the work happens, not the
+/// kernel: because this runs offline, a better kernel can replace this
+/// one later without touching the render path.
+///
+/// Returns the track unchanged when it is already at `target_sr`.
+/// Returns `None` for a zero target rate, or for a streaming track
+/// whose samples are not all resident — the caller wants a complete
+/// buffer, and half a horn is worse than a refused bind.
+#[must_use]
+pub fn resample_track(track: &Track, target_sr: u32) -> Option<Track> {
+    if target_sr == 0 {
+        return None;
+    }
+    let source_sr = track.sample_rate();
+    let channels = track.channels();
+    let samples = track.samples();
+    if samples.is_empty() {
+        return None;
+    }
+    if source_sr == target_sr {
+        return Track::from_interleaved(samples.to_vec(), target_sr, channels);
+    }
+
+    let ch = usize::from(channels);
+    let in_frames = samples.len() / ch;
+    let ratio = f64::from(source_sr) / f64::from(target_sr);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let out_frames = ((in_frames as f64) / ratio).floor() as usize;
+    if out_frames == 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(out_frames * ch);
+    for f in 0..out_frames {
+        #[allow(clippy::cast_precision_loss)]
+        let src = f as f64 * ratio;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = src.floor() as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let frac = (src - src.floor()) as f32;
+        for c in 0..ch {
+            let a = samples[i * ch + c];
+            // The final output frame can land on the last input frame;
+            // hold it rather than reading past the end.
+            let b = if i + 1 < in_frames {
+                samples[(i + 1) * ch + c]
+            } else {
+                a
+            };
+            out.push(a + (b - a) * frac);
+        }
+    }
+    Track::from_interleaved(out, target_sr, channels)
+}
+
 #[cfg(test)]
 mod tests {
+
+    // ---- M17 §7.1: bind-time rate conversion ----
+
+    #[test]
+    fn resample_is_a_copy_when_the_rate_already_matches() {
+        let track = Track::from_interleaved(vec![0.5, -0.5, 0.25, -0.25], 48_000, 2).unwrap();
+        let out = resample_track(&track, 48_000).expect("same-rate conversion");
+        assert_eq!(out.sample_rate(), 48_000);
+        assert_eq!(out.samples(), track.samples());
+    }
+
+    /// The case the sampler exists for: a 44.1k horn on a 48k engine.
+    /// Played one-for-one it would come out 8.8 % sharp and short.
+    #[test]
+    fn resample_44k_to_48k_lengthens_by_the_rate_ratio() {
+        let frames = 4410;
+        let track = Track::from_interleaved(vec![0.25; frames * 2], 44_100, 2).unwrap();
+        let out = resample_track(&track, 48_000).expect("conversion");
+
+        assert_eq!(out.sample_rate(), 48_000);
+        assert_eq!(out.channels(), 2);
+        // 4410 frames at 44.1k is 100 ms; at 48k that is 4800 frames.
+        assert_eq!(out.frames(), 4800);
+        assert!(
+            (out.duration_seconds() - track.duration_seconds()).abs() < 1e-3,
+            "the horn must last as long as it did: {} vs {}",
+            out.duration_seconds(),
+            track.duration_seconds()
+        );
+    }
+
+    #[test]
+    fn resample_48k_to_44k_shortens_by_the_rate_ratio() {
+        let track = Track::from_interleaved(vec![0.25; 4800 * 2], 48_000, 2).unwrap();
+        let out = resample_track(&track, 44_100).expect("conversion");
+        assert_eq!(out.frames(), 4410);
+        assert!((out.duration_seconds() - track.duration_seconds()).abs() < 1e-3);
+    }
+
+    /// A constant signal must survive interpolation unchanged — the
+    /// cheapest check that the kernel is not leaking energy or
+    /// attenuating the body of a sample.
+    #[test]
+    fn resample_preserves_a_constant_signal() {
+        let track = Track::from_interleaved(vec![0.75; 1000 * 2], 44_100, 2).unwrap();
+        let out = resample_track(&track, 48_000).expect("conversion");
+        // Skip the final frame, which holds the last input sample.
+        for (i, s) in out.samples().iter().enumerate().take(out.frames() * 2 - 2) {
+            assert!((s - 0.75).abs() < 1e-5, "sample {i} drifted to {s}");
+        }
+    }
+
+    /// A ramp interpolates monotonically rather than stepping — linear
+    /// interpolation's whole job.
+    #[test]
+    fn resample_interpolates_between_input_frames() {
+        #[allow(clippy::cast_precision_loss)]
+        let ramp: Vec<f32> = (0..200).map(|i| i as f32 / 200.0).collect();
+        let track = Track::from_interleaved(ramp, 44_100, 1).unwrap();
+        let out = resample_track(&track, 48_000).expect("conversion");
+        let samples = out.samples();
+        for pair in samples.windows(2) {
+            assert!(pair[1] >= pair[0], "ramp must not step backwards");
+        }
+    }
+
+    #[test]
+    fn resample_mono_stays_mono() {
+        let track = Track::from_interleaved(vec![0.5; 500], 22_050, 1).unwrap();
+        let out = resample_track(&track, 48_000).expect("conversion");
+        assert_eq!(out.channels(), 1);
+        assert!(out.frames() > 1000, "22k → 48k roughly doubles the frames");
+    }
+
+    #[test]
+    fn resample_refuses_what_it_cannot_convert() {
+        let track = Track::from_interleaved(vec![0.5; 64], 44_100, 2).unwrap();
+        assert!(resample_track(&track, 0).is_none(), "zero target rate");
+
+        // A sample so short that the target rate rounds it away is a
+        // refused bind rather than an empty buffer the voice would
+        // render as silence.
+        let tiny = Track::from_interleaved(vec![0.5; 2], 48_000, 2).unwrap();
+        assert!(resample_track(&tiny, 8_000).is_none());
+    }
     use super::*;
     use proptest::prelude::*;
 
