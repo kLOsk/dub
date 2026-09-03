@@ -669,16 +669,25 @@ final class WaveformAppModel: ObservableObject {
     /// M26c — Discogs personal access token, for style + pressing
     /// detail on top of a release match.
     ///
-    /// **R-42**: this is a *user* credential and belongs in the
-    /// Keychain, not here. It is empty by default and the feature is
-    /// off until someone types one, so nothing is stored in plain text
-    /// unless the operator opts in — but that is a mitigation, not the
-    /// fix. Persisted under `dub.discogsToken`.
+    /// **R-42, fixed**: a *user* credential, so it lives in the login
+    /// Keychain rather than the preferences plist. Any value left in
+    /// `UserDefaults` by an earlier build is moved across on first
+    /// launch (`SecretMigration`) and the plaintext copy removed.
+    ///
+    /// A refused Keychain write leaves the token in memory for this
+    /// session and simply doesn't persist; the setter can't report
+    /// that, and the alternative — discarding what the DJ typed — is
+    /// worse. The empty string means "no token", which turns Discogs
+    /// enrichment off and leaves recognition itself untouched.
     @Published var discogsToken: String {
-        didSet { UserDefaults.standard.set(discogsToken, forKey: Self.kDiscogsToken) }
+        didSet { Self.secrets.setSecret(discogsToken, for: Self.kDiscogsAccount) }
     }
 
+    /// Legacy plaintext location, read once by the migration and then
+    /// removed. Do not write to it.
     private static let kDiscogsToken = "dub.discogsToken"
+    private static let kDiscogsAccount = "discogsToken"
+    private static let secrets: SecretStore = KeychainSecretStore()
 
     /// M26a manual Prep ↔ Performance override, persisted so the
     /// choice survives a relaunch. `nil` = follow hardware
@@ -1093,8 +1102,14 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.string(forKey: Self.kAcoustIdKey) ?? ""
         self.ripIdentifyPressing =
             UserDefaults.standard.bool(forKey: Self.kRipIdentifyPressing)
-        self.discogsToken =
-            UserDefaults.standard.string(forKey: Self.kDiscogsToken) ?? ""
+        // R-42: the token is a user credential, so it comes from the
+        // Keychain — dragging any plaintext copy an earlier build left
+        // in the preferences plist across on the way.
+        self.discogsToken = SecretMigration.migrateFromDefaults(
+            account: Self.kDiscogsAccount,
+            defaultsKey: Self.kDiscogsToken,
+            defaults: .standard,
+            store: Self.secrets)
         self.modeOverride = UserDefaults.standard
             .string(forKey: Self.kModeOverride)
             .flatMap(EngineMode.init(rawValue:))

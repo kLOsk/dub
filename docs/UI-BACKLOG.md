@@ -524,21 +524,6 @@ Thru-for-rip). **Remediation**: either render the live Metal Thru waveform
 backdrop. **Location**: `apple/Dub/Performance/PerformanceView.swift`
 (`waveformRegion` prep branch), `apple/Dub/Waveform/`.
 
-### R-42. Discogs token belongs in the Keychain (M26c)
-
-**Symptom**: the Discogs token is a user credential and `UserDefaults`
-stores it in plain text; there is still no Keychain plumbing anywhere.
-**No longer an M26c blocker.** The AcoustID key turned out not to need the
-Keychain at all — it is an *application* key that identifies Dub rather than
-the user, and Dub's source is public, so it is public by construction;
-recognition
-therefore ships with its key in `UserDefaults` and works fully without
-Discogs. The token field is empty by default and the Discogs half stays off
-until someone types one, so nothing sensitive is stored unless the operator
-opts in — a mitigation, not the fix. **Remediation**: minimal Keychain
-helper, and move `dub.discogsToken` into it. **Location**:
-`apple/Dub/Preferences/`.
-
 ### R-49. Sample lineage link-out (WhoSampled)
 
 **Symptom**: recognition gives a rip its artist and title, and the question
@@ -568,6 +553,7 @@ mode-agnostic already. **Location**: `apple/Dub/Performance/WaveformAppModelRip.
 
 _One line each; full write-ups are in git history. Kept so a reopened symptom is easy to cross-reference._
 
+- R-42. Discogs token stored in plain text — fixed: `SecretStore` / `KeychainSecretStore` in `apple/Dub/Preferences/`, with a one-way migration off `dub.discogsToken`
 - B-26. Waveform scrub lag and playback stutter — fixed (M11d.5 follow-up)
 - B-11. Auto BPM locks at 2× tempo on real hip-hop / rap — largely addressed; residual cases handled by tap-to-grid
 - B-7. `scanMissingFilesBatch` has identical `if/else` branches — already fixed (M11d.8)

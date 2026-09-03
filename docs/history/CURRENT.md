@@ -58,11 +58,20 @@ a fuzzy search) and the **FFI + Swift wiring** — `Identify` / `Use these` in
 the rip review panel, backed by a background worker polled like the commit
 job, with the key and options in Preferences.
 
+**R-42 is fixed.** The Discogs personal access token lives in the login
+Keychain now (`SecretStore` / `KeychainSecretStore`,
+`apple/Dub/Preferences/`), and a one-way migration moves any plaintext copy
+an earlier build left under `dub.discogsToken` across on first launch. It is
+the **file-based** keychain deliberately: the data-protection keychain wants
+a `keychain-access-groups` entitlement, which needs a real Team ID, and Dub
+is ad-hoc signed with the sandbox off. Consequence until Developer ID
+signing (M20): an ad-hoc signature changes on every rebuild, so macOS may
+re-ask permission after a `make app` — a denied prompt reads as "no token",
+which turns Discogs enrichment off and leaves recognition itself untouched.
+The AcoustID key stays in `UserDefaults` on purpose (an *application* key
+identifies Dub, not the user, and Dub's source is public).
+
 Remaining:
-- **R-42 — the Discogs token in the Keychain.** No longer a blocker: the
-  AcoustID key is an *application* key and needs no Keychain, so recognition
-  ships without one and Discogs stays optional. The token sits in
-  `UserDefaults` until a helper exists.
 - **R-49 — sample lineage link-out** (WhoSampled). New; see PRD §5.2.5a.
 - **A better tie-break for same-artist pressings.** A foreign-language
   pressing credited to the same artist ties with the domestic one all the way

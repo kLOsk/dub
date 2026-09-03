@@ -250,7 +250,7 @@ struct PreferencesSheet: View {
                     TextField("Discogs token (optional)", text: $model.discogsToken)
                         .textFieldStyle(.roundedBorder)
                         .font(DubFont.body)
-                    Text("Adds Discogs' style tags and pressing detail. Stored in preferences, not the Keychain, so leave it empty unless you want it.")
+                    Text("Adds Discogs' style tags and pressing detail. Kept in your login Keychain, not in Dub's preferences.")
                         .font(DubFont.micro)
                         .foregroundStyle(DubColor.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
