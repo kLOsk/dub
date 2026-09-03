@@ -164,8 +164,9 @@ struct PerformancePadsView: View {
                 .foregroundStyle(DubColor.textSecondary)
             HStack(spacing: DubSpacing.sm) {
                 ForEach(Self.loopPresets) { preset in
-                    hotCuePadCell(
+                    DubPadCell(
                         preset.label,
+                        size: .glyph,
                         lit: activeLoopBars == preset.bars,
                         tint: DubColor.loop
                     )
@@ -175,14 +176,14 @@ struct PerformancePadsView: View {
                 // Manual in/out: the escape hatch from the beat-length
                 // grab, for a track the analyser could not grid or one
                 // whose grid disagrees with the bar you want.
-                hotCuePadCell("IN", lit: loopInArmed, tint: DubColor.loop)
+                DubPadCell("IN", size: .word, lit: loopInArmed, tint: DubColor.loop)
                     .onPressDown { onLoopIn() }
                     .help("Set the loop start at the playhead")
-                hotCuePadCell("OUT", lit: false, tint: DubColor.loop)
+                DubPadCell("OUT", size: .word, tint: DubColor.loop)
                     .onPressDown(enabled: loopInArmed) { onLoopOut() }
                     .help("Close the loop at the playhead and start it")
                     .opacity(loopInArmed ? 1.0 : 0.5)
-                hotCuePadCell("✕", lit: false, tint: DubColor.loop)
+                DubPadCell("✕", size: .glyph, tint: DubColor.loop)
                     .onPressDown(enabled: canExitLoop) { onExit() }
                     .help("Exit loop")
                     .opacity(canExitLoop ? 1.0 : 0.5)
@@ -213,27 +214,8 @@ struct PerformancePadsView: View {
     }
 
     private func pad(_ glyph: String, lit: Bool = false) -> some View {
-        hotCuePadCell(glyph, lit: lit)
+        DubPadCell(glyph, size: .glyph, lit: lit)
     }
-}
-
-/// One pad cell — `glyph` centred, lit in `tint` when active. Shared
-/// by the Performance pad panel, the Prep cue bar (magenta), and the
-/// Prep loop bar (green), so a lit pad reads the same as its marker on
-/// the waveform / overview.
-@ViewBuilder
-private func hotCuePadCell(_ glyph: String, lit: Bool, tint: Color = DubColor.hotCue)
-    -> some View
-{
-    Text(glyph)
-        .font(.system(size: 13, weight: .semibold, design: .rounded))
-        .foregroundStyle(lit ? DubColor.textPrimary : DubColor.textTertiary)
-        .frame(width: glyph.count > 1 ? 50 : 38, height: 36)
-        .background(lit ? tint.opacity(0.24) : DubColor.surface1)
-        .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                .stroke(lit ? tint : DubColor.divider, lineWidth: 1))
 }
 
 /// Horizontal, **clickable** hot cue pad row for Prep mode (where
@@ -255,7 +237,7 @@ struct CuePadRow: View {
                 .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
             ForEach(0..<4, id: \.self) { index in
                 let isSet = index < cues.count && cues[index] != nil
-                hotCuePadCell("\(index + 1)", lit: isSet)
+                DubPadCell("\(index + 1)", size: .glyph, lit: isSet)
                     .onPressDown {
                         onCue(index, NSEvent.modifierFlags.contains(.shift))
                     }
@@ -280,17 +262,7 @@ private func echoOutButton(
     engaged: Bool,
     onToggle: @escaping () -> Void
 ) -> some View {
-    Text(label)
-        .font(.system(size: 12, weight: .semibold, design: .rounded))
-        .foregroundStyle(engaged ? DubColor.textPrimary : DubColor.textTertiary)
-        .frame(height: 36)
-        .padding(.horizontal, DubSpacing.lg)
-        .background(engaged ? DubColor.echo.opacity(0.24) : DubColor.surface1)
-        .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                .stroke(engaged ? DubColor.echo : DubColor.divider, lineWidth: 1))
-        .contentShape(Rectangle())
+    DubPadCell(label, size: .hugging, lit: engaged, tint: DubColor.echo)
         .onPressDown { onToggle() }
         .help("Echo out — 1 beat, 100% wet. Tap on, tap off.")
 }
@@ -341,23 +313,17 @@ private let sirenPresetKeys = ["Z", "X", "C", "V", "B", "N", "M", ","]
 private func sirenPresetPad(_ label: String, key: String, onPress: @escaping () -> Void)
     -> some View
 {
-    VStack(spacing: 1) {
-        Text(label.uppercased())
-            .font(.system(size: 11, weight: .semibold, design: .rounded))
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
-        Text(key)
-            .font(DubFont.micro)
-            .foregroundStyle(DubColor.textPlaceholder)
+    DubPadCell(size: .preset) {
+        VStack(spacing: 1) {
+            Text(label.uppercased())
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(key)
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textPlaceholder)
+        }
     }
-    .foregroundStyle(DubColor.textTertiary)
-    .frame(width: 64, height: 36)
-    .background(DubColor.surface1)
-    .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-    .overlay(
-        RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-            .stroke(DubColor.divider, lineWidth: 1))
-    .contentShape(Rectangle())
     .onPressDown(perform: onPress)
     .help("Fire the \(label) siren (\(key))")
 }
@@ -485,16 +451,7 @@ struct SirenExpertPanel: View {
                 knob("ECHO", deck.sirenMix, 0...1) { model.setSirenMix(side, $0) }
                 knob("FILTER", deck.sirenFilter, 0...1) { model.setSirenFilter(side, $0) }
                 knob("VOLUME", deck.sirenVolume, 0...1.5) { model.setSirenVolume(side, $0) }
-                Text("ECHO CUT")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DubColor.textTertiary)
-                    .frame(width: 92, height: 28)
-                    .background(DubColor.surface1)
-                    .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                            .stroke(DubColor.divider, lineWidth: 1))
-                    .contentShape(Rectangle())
+                DubPadCell("ECHO CUT", size: .chip)
                     .onPressHold(
                         onDown: { model.setSirenEchoCut(side, true) },
                         onUp: { model.setSirenEchoCut(side, false) })
@@ -615,18 +572,12 @@ struct RackFxRow: View {
         let on = slot < active.count && active[slot]
         let tint = rackFxColors[slot]
         HStack(spacing: DubSpacing.sm) {
-            Text(rackFxLabels[slot])
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .foregroundStyle(on ? DubColor.textPrimary : DubColor.textTertiary)
-                .frame(width: 92, height: 32)
-                .background(on ? tint.opacity(0.24) : DubColor.surface1)
-                .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                        .stroke(on ? tint : DubColor.divider, lineWidth: 1))
-                .contentShape(Rectangle())
+            DubPadCell(size: .slot, lit: on, tint: tint) {
+                Text(rackFxLabels[slot])
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
                 .onPressDown { onToggle(slot) }
                 .help("\(rackFxLabels[slot]) — tap to engage / bypass")
             Slider(
@@ -764,22 +715,23 @@ struct LoopPadRow: View {
                 .foregroundStyle(DubColor.textSecondary)
                 .frame(width: PrepPadLayout.labelWidth, alignment: .leading)
             ForEach(Self.presets) { preset in
-                hotCuePadCell(
+                DubPadCell(
                     preset.label,
+                    size: .glyph,
                     lit: activeBars == preset.bars,
                     tint: DubColor.loop
                 )
                 .onPressDown { onLoop(preset.bars) }
                 .help("Loop the last \(preset.label) bar\(preset.bars == 1 ? "" : "s")")
             }
-            hotCuePadCell("IN", lit: loopInArmed, tint: DubColor.loop)
+            DubPadCell("IN", size: .word, lit: loopInArmed, tint: DubColor.loop)
                 .onPressDown { onLoopIn() }
                 .help("Set the loop start at the playhead")
-            hotCuePadCell("OUT", lit: false, tint: DubColor.loop)
+            DubPadCell("OUT", size: .word, tint: DubColor.loop)
                 .onPressDown(enabled: loopInArmed) { onLoopOut() }
                 .help("Close the loop at the playhead and start it")
                 .opacity(loopInArmed ? 1.0 : 0.5)
-            hotCuePadCell("✕", lit: false, tint: DubColor.loop)
+            DubPadCell("✕", size: .glyph, tint: DubColor.loop)
                 .onPressDown(enabled: activeBars != nil || loopEngaged || loopInArmed) {
                     onExit()
                 }

@@ -176,44 +176,20 @@ struct KeyLockControlView: View {
     var body: some View {
         let selection = model.keyLockSelection(side)
         HStack(spacing: DubSpacing.sm) {
-            HStack(spacing: DubSpacing.xs) {
-                Circle()
-                    .fill(dotColor)
-                    .frame(width: 7, height: 7)
-                Text("KEY LOCK")
-                    .font(DubFont.caps)
-                    .tracking(0.6)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .fixedSize()
-            }
-
-            HStack(spacing: 0) {
-                segment("OFF", active: selection == .resampler) {
-                    model.setKeyLockSelection(side: side, .resampler)
-                }
-                segment("ON", active: selection == .ours) {
-                    model.setKeyLockSelection(side: side, .ours)
-                }
-            }
-            .background(DubColor.surface2)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
+            DubSectionLabel("KEY LOCK", dot: dotColor)
+                .fixedSize()
+            DubSegmentedControl(
+                segments: [
+                    .init(KeyLockSelection.resampler, "OFF"),
+                    .init(KeyLockSelection.ours, "ON"),
+                ],
+                selection: selection,
+                tint: DubColor.deckTint(side),
+                onSelect: { model.setKeyLockSelection(side: side, $0) })
         }
         .onReceive(tick) { _ in
             indicatorState = model.engine.deckTelemetry(deckIdx: side.ffiDeckIdx).keyLockState
         }
-    }
-
-    private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Text(title)
-            .font(DubFont.caps)
-            .tracking(0.6)
-            .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
-            .padding(.horizontal, DubSpacing.sm)
-            .padding(.vertical, 3)
-            .background(active ? DubColor.deckTint(side) : Color.clear)
-            .onPressDown(perform: action)
-            .accessibilityAddTraits(.isButton)
     }
 
     private var dotColor: Color {
@@ -239,23 +215,17 @@ struct PitchTestView: View {
 
     var body: some View {
         HStack(spacing: DubSpacing.sm) {
-            Text("PITCH %")
-                .font(DubFont.caps)
-                .tracking(0.6)
-                .foregroundStyle(DubColor.textSecondary)
+            DubSectionLabel("PITCH %")
                 .fixedSize()
 
-            HStack(spacing: 0) {
-                ForEach(steps, id: \.self) { pct in
-                    segment(label(pct), active: current == pct) {
-                        current = pct
-                        model.setPrepPitch(side: side, percent: pct)
-                    }
-                }
-            }
-            .background(DubColor.surface2)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
+            DubSegmentedControl(
+                segments: steps.map { .init($0, label($0), width: .minWidth(26)) },
+                selection: current,
+                tint: DubColor.deckTint(side),
+                onSelect: { pct in
+                    current = pct
+                    model.setPrepPitch(side: side, percent: pct)
+                })
         }
     }
 
@@ -264,15 +234,4 @@ struct PitchTestView: View {
         return pct > 0 ? "+\(Int(pct))" : "\(Int(pct))"
     }
 
-    private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Text(title)
-            .font(DubFont.caps)
-            .tracking(0.6)
-            .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
-            .frame(minWidth: 26)
-            .padding(.vertical, 3)
-            .background(active ? DubColor.deckTint(side) : Color.clear)
-            .onPressDown(perform: action)
-            .accessibilityAddTraits(.isButton)
-    }
 }
