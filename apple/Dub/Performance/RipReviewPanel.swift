@@ -463,6 +463,15 @@ struct RipSegmentCard: View {
                 auditionButton("▶ OUT", help: "Audition out of this track",
                                action: onAuditionOutOf)
                 Spacer(minLength: 0)
+                // R-49 — the question this audience asks straight after
+                // "what is it": what does it sample. Disabled until the
+                // card carries a name, which is what Identify fills in.
+                auditionButton(
+                    "SAMPLES", help: SampleLineage.helpText,
+                    action: { SampleLineage.lookUp(artist: artist, title: title) }
+                )
+                .disabled(sampleLookupUnavailable)
+                .opacity(sampleLookupUnavailable ? 0.4 : 1.0)
             }
         }
         .padding(DubSpacing.sm)
@@ -503,6 +512,13 @@ struct RipSegmentCard: View {
             guard !Task.isCancelled else { return }
             onMetadata(meta)
         }
+    }
+
+    /// R-49: the live field values, not `segment`'s, so a name the DJ
+    /// has just typed (or applied from Identify) is searchable without
+    /// waiting for the debounce to land it back on the plan.
+    private var sampleLookupUnavailable: Bool {
+        SampleLineage.whoSampledSearchURL(artist: artist, title: title) == nil
     }
 
     private func field(_ placeholder: String, text: Binding<String>) -> some View {

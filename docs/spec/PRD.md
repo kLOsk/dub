@@ -496,7 +496,10 @@ Three things we *can* do, cheapest first:
    "Samples" affordance that opens WhoSampled's own search costs nothing,
    breaks no terms, needs no key, and puts the DJ one click from the answer.
    This is the v1-shaped move and belongs in the rip review panel and the
-   library row context menu. Tracked as **R-49** in `UI-BACKLOG.md`.
+   library row context menu. **Shipped** (was R-49): `SampleLineage` in
+   `apple/Dub/Performance/`, a SAMPLES button on each rip review track card
+   and a "Look Up Samples" item in the library row context menu, both
+   disabled on a row that carries neither artist nor title.
 2. **MusicBrainz work relationships.** MusicBrainz records `samples` /
    `is based on` relations between recordings and works, free, and we already
    talk to it in `dub-recognize`. Coverage is far thinner than WhoSampled's,

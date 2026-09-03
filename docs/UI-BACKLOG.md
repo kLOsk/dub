@@ -524,20 +524,6 @@ Thru-for-rip). **Remediation**: either render the live Metal Thru waveform
 backdrop. **Location**: `apple/Dub/Performance/PerformanceView.swift`
 (`waveformRegion` prep branch), `apple/Dub/Waveform/`.
 
-### R-49. Sample lineage link-out (WhoSampled)
-
-**Symptom**: recognition gives a rip its artist and title, and the question
-this audience asks next — what does it sample, what samples it — has no
-affordance anywhere. **Remediation**: a "Samples" item in the rip review
-panel's track cards and the library row context menu that opens WhoSampled's
-search for the track's artist + title. Link-out only: WhoSampled has no
-public API and their terms forbid scraping, so an in-app data integration
-needs a commercial agreement (PRD §5.2.5a). Cheap, breaks no terms, needs no
-key. Optionally surface MusicBrainz's own `samples` / `is based on` relations
-beside it — free, thinner coverage, one extra `inc=` on a call
-`dub-recognize` already makes. **Location**: `apple/Dub/Performance/
-RipReviewPanel.swift`, `apple/Dub/Performance/LibraryView.swift`.
-
 ### R-43. Performance-mode ripping + monitor-mute option
 
 **Symptom**: rip is Prep-only by design (v1); with a ≥4-out interface in
@@ -553,6 +539,7 @@ mode-agnostic already. **Location**: `apple/Dub/Performance/WaveformAppModelRip.
 
 _One line each; full write-ups are in git history. Kept so a reopened symptom is easy to cross-reference._
 
+- R-49. Sample lineage had no affordance — fixed: `SampleLineage` link-out to WhoSampled's search, in the rip review track cards and the library row context menu. MusicBrainz's own `samples` / `is based on` relations (PRD §5.2.5a option 2) are still open as a follow-up
 - R-42. Discogs token stored in plain text — fixed: `SecretStore` / `KeychainSecretStore` in `apple/Dub/Preferences/`, with a one-way migration off `dub.discogsToken`
 - B-26. Waveform scrub lag and playback stutter — fixed (M11d.5 follow-up)
 - B-11. Auto BPM locks at 2× tempo on real hip-hop / rap — largely addressed; residual cases handled by tap-to-grid

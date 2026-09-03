@@ -5027,6 +5027,25 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             }
             menu.addItem(lockItem)
 
+            // R-49 — sample lineage (PRD §5.2.5a). A link-out, so it
+            // needs no key and no network of ours; it is disabled only
+            // when the row carries neither artist nor title.
+            menu.addItem(.separator())
+            let samplesItem = NSMenuItem(
+                title: SampleLineage.actionTitle, action: nil, keyEquivalent: "")
+            if SampleLineage.whoSampledSearchURL(artist: track.artist, title: track.title) != nil {
+                let target = LibraryMenuActionTarget {
+                    SampleLineage.lookUp(artist: track.artist, title: track.title)
+                }
+                menuActionAnchors.append(target)
+                samplesItem.target = target
+                samplesItem.action = #selector(LibraryMenuActionTarget.dubMenuPerform(_:))
+                samplesItem.isEnabled = true
+            } else {
+                samplesItem.isEnabled = false
+            }
+            menu.addItem(samplesItem)
+
             // M11d-next — crate-specific items, only when the visible
             // listing is a Dub crate. "Remove from Crate" is
             // selection-aware (matches the analyze target set); the
