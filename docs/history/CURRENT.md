@@ -43,10 +43,52 @@ deferred work rather than only cosmetics:
   `A S D F` are **not bound at all** and its rack is driven from
   Preferences until they are.
 - **The deferred M16 fine-tuning**: siren sound polish (GS1 shots / DS01E
-  tones / SN76477 bank) and the Performance-surface + deck-B siren Expert
-  panel (`UI-BACKLOG.md` §5 F-36 / F-37).
+  tones / SN76477 bank) and the deck-B siren Expert panel
+  (`UI-BACKLOG.md` §5 F-36 / F-37). Note F-37's Performance half is moot:
+  the siren is one rack in the global bar now, bound to the focused deck.
 - Calibration UX, preferences, dark-mode polish, and the manual rig
   checklist.
+
+### The layout pass — shipped
+
+Both surfaces were misallocating space, and Performance was hiding a
+shipped feature. The per-deck pad column needed ~478 pt of a ~330 pt
+pane, spilled ~72 pt off each end (centre-aligned, nothing clipped), and
+the bottom spill was painted over by the opaque `FXBarPlaceholder`
+declared after it — so M17's sampler pads rendered sliced in half.
+
+What changed:
+
+- **`GlobalRackBar`** replaces the placeholder bar: one siren (bound to
+  the focused deck, with a `→ A` / `→ B` pill), one Quick Scratch, one
+  sampler. These were never per-deck — there is a single siren keymap
+  and the trigger racks are four-slot tables whose slots carry their own
+  target deck. The deck columns keep CUE / LOOP / ECHO OUT and come to
+  218 pt.
+- **Width flipped.** The waveform was a hard 200 pt while the pads were
+  `maxWidth: .infinity`; now the column is a fixed 224 and the strip
+  grows to a 280 cap.
+- **Prep is a three-column grid** instead of one narrow gutter with 70 %
+  of the window empty. The sections behind both surfaces are shared, so
+  the `cueGroup()`/`CuePadRow` duplication (a live PRD §3.1 violation) is
+  gone.
+- **A draggable deck/library divider**, persisted per mode, deck-heavy in
+  Performance per PRD §9.2. It is also the structural fix: both halves
+  get explicit heights that sum to the space available, so nothing can
+  overflow its slot and be drawn over. That meant deleting the
+  `minHeight` on the waveform region *and* on `LibraryView`.
+
+**Gap this closed in the test suite.** `pads-deck-a` rendered at a
+hand-picked 560 × 360 with `sirenEnabled` defaulting to *false* — green
+on a configuration nobody runs. More fundamentally a snapshot forces
+`.frame(width:height:)`, so it can never catch an overflow; it just
+renders the smaller thing correctly. `PerformanceLayoutTests` asserts fit
+via `NSHostingView.fittingSize` instead, and baselines are now framed
+from layout tokens so they move when the layout does.
+
+Still open: `SirenExpertPanel`, `KeyLockControlView` and `PitchTestView`
+take the model directly, so Prep's grid has no snapshot coverage. Making
+them value-driven (the `PrepRipBarState` pattern) is what unlocks it.
 
 **M12-lexicon** (0.5 day, docs only) is the other open row: document the
 Lexicon → Serato / rekordbox / Traktor export paths in
