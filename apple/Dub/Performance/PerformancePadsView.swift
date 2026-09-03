@@ -399,7 +399,13 @@ struct SirenPadRow: View {
                     .font(DubFont.caps)
                     .tracking(0.8)
                     .foregroundStyle(DubColor.textSecondary)
-                Spacer(minLength: DubSpacing.sm)
+                // A fixed gap, deliberately not a `Spacer`. A `Spacer` has
+                // infinite maximum width, which made this header the only
+                // greedy child of an otherwise rigid row — so the whole
+                // SirenPadRow inflated to whatever width it was proposed and
+                // the unit picker rode the far window edge, ~1200 pt from
+                // this label, on the Prep surface.
+                Spacer().frame(width: DubSpacing.md)
                 // Unit selector: GS1 toy-chip shots · Benidub DS01E · SN76477.
                 Picker(
                     "Siren unit",
