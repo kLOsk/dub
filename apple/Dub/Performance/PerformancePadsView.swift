@@ -529,7 +529,10 @@ struct RackFxRow: View {
                 in: 0...1)
                 .controlSize(.mini)
                 .tint(tint)
-                .frame(width: 104)
+                // Compresses rather than clipping: 92 pt of label plus
+                // a fixed 104 pt slider overruns the 224 pt deck
+                // column. Prep's wider column still gets the full 104.
+                .frame(minWidth: 60, maxWidth: 104)
                 .help("Macro — one knob, curated for a good-sounding result")
         }
     }

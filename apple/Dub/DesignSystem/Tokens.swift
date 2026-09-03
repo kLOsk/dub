@@ -335,24 +335,17 @@ enum DubLayout {
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
 
-    /// Width of the vertical playing-waveform column in Performance
-    /// (Timecode) mode. Sized to match Serato Scratch Live's
-    /// playing-waveform height (≈ 110–140 px in its horizontal
-    /// layout) — translated into our bottom-→-top vertical
-    /// orientation, the *width* of each deck's strip is the Serato-
-    /// equivalent dimension. The remaining horizontal space inside
-    /// the deck pane is reserved for the deck header (already
-    /// rendered above the strip), the M10.5c per-deck Track-
-    /// Overview waveform, and future per-deck info chips (track
-    /// time, RPM, key-lock, beatgrid offset).
-    static let deckColumnWidth: CGFloat = 80
-
-    /// Width of each deck's playing waveform in the redesigned
-    /// Performance surface. Wider than the original Serato-slim
-    /// `deckColumnWidth` (80) so the two waveforms read as prominent
-    /// "records" pulled into a centred cluster, while still favouring
-    /// vertical time-history over horizontal peak-detail. The phase
-    /// clock sits between the two, overviews on the outer edges.
+    /// Ideal width of each deck's playing waveform in Performance
+    /// (Timecode) mode — the strip's *width* is the equivalent of
+    /// Serato Scratch Live's playing-waveform height, translated into
+    /// our bottom→top vertical orientation. The two waveforms read as
+    /// prominent "records" pulled into a centred cluster, favouring
+    /// vertical time-history over horizontal peak-detail; Stillpoint
+    /// sits between them, overviews on the outer edges.
+    ///
+    /// This is the *ideal*: the strip grows toward
+    /// `performanceWaveformWidthCap` when the pane allows and shrinks
+    /// to `performanceWaveformMinWidth` when it does not.
     static let performanceWaveformWidth: CGFloat = 200
 
     /// Fixed width of each deck's performance-pad column. The widest
@@ -383,11 +376,6 @@ enum DubLayout {
     static let phaseClockDiameter: CGFloat = 132
     static let phaseClockWidth: CGFloat = 160
 
-    /// Centre gutter holding the beatmatch visualizations (the A/B/C
-    /// trial stack). Wider than the old clock gutter so the three are
-    /// legible side by side.
-    static let beatmatchGutterWidth: CGFloat = 260
-
     /// Centre gutter for Stillpoint (round 3, the shipping candidate —
     /// docs/investigations/BEATMATCH-AID-STILLPOINT.md). Spec target
     /// is 100–160 px, degradable to 80.
@@ -402,21 +390,11 @@ enum DubLayout {
     static let waveformPrepHeight: CGFloat = 140
 
     /// Height of the horizontal Track-Overview band in Prep mode.
-    /// The same ratio to `waveformPrepHeight` (≈ 0.45) that
-    /// `deckOverviewWidth` (≈ 36 px) has to `deckColumnWidth`
-    /// (80 px) in Performance mode, so the overview reads as the
-    /// secondary chrome it is rather than dominating the strip.
+    /// Roughly 0.45 of `waveformPrepHeight`, the same ratio
+    /// `deckOverviewWidth` (36) has to the playing strip in
+    /// Performance mode, so the overview reads as the secondary
+    /// chrome it is rather than dominating the strip.
     static let deckOverviewHeight: CGFloat = 60
-
-    /// Width of the horizontal playing-waveform in Prep mode (M10.5c).
-    /// Prep mode rotates the strip 90° — it's a single horizontal
-    /// band across the top of the single-deck surface, sized
-    /// generously so a track-prep DJ can read beat-grids and place
-    /// hot cues comfortably, but bounded so the surrounding region
-    /// has room for the (forthcoming) horizontal overview + cue
-    /// strip + waveform-zoom controls. Read as **height** in Prep
-    /// mode, since the strip runs left-to-right there.
-    static let deckColumnWidthPrep: CGFloat = 280
 
     /// Width of the per-deck Track Overview strip (M10.5c) — the
     /// thin vertical waveform on each deck's *outside* edge

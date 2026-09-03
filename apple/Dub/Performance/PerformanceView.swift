@@ -674,13 +674,6 @@ struct PerformanceView: View {
         model.engineMode == .prep ? .horizontal : .vertical
     }
 
-    /// Column width the playing waveform strip is rendered at in
-    /// **vertical** orientation (Performance / Timecode mode). In
-    /// Prep mode the strip is horizontal and uses
-    /// `DubLayout.waveformPrepHeight` instead.
-    private var waveformColumnWidth: CGFloat {
-        DubLayout.performanceWaveformWidth
-    }
 
     /// One deck's pane — Metal waveform when the deck has any
     /// source, idle placeholder otherwise. The pane (drop target,
@@ -732,15 +725,29 @@ struct PerformanceView: View {
                 // space.
                 // Scratch-Live-style deck pane. Inner→outer:
                 //   waveform (hugs the centre phase clock) · overview ·
-                //   performance pads (fill the outer space).
+                //   performance pads · air on the outer edge.
                 // Deck A is the window-left half (pads on the left),
                 // deck B the right (pads on the right).
+                //
+                // The pad column is a fixed width and the waveform
+                // takes what is left, up to its cap. It used to be the
+                // other way round — the pads were `maxWidth: .infinity`
+                // and the waveform a hard 200 — so the element PRD §9.2
+                // calls "front and center" was the only one with a cap
+                // while the pads ate ~575 pt per pane at full screen.
+                //
+                // `layoutPriority` on the waveform is load-bearing:
+                // without it the HStack splits the slack evenly with
+                // the outer `Spacer` and the strip never reaches its
+                // cap.
                 HStack(spacing: 0) {
                     if side == .a {
+                        Spacer(minLength: 0)
                         PerformancePadsView(
                             side: side,
                             state: padsState(side: side, deckState: deckState),
                             callbacks: padsCallbacks(side: side))
+                            .frame(width: DubLayout.performancePadColumnWidth)
                         if Self.overviewEnabled {
                             TrackOverviewView(
                                 model: model, side: side, deckIdx: deckIdx)
@@ -749,10 +756,12 @@ struct PerformanceView: View {
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
+                            .layoutPriority(1)
                     } else {
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
+                            .layoutPriority(1)
                         if Self.overviewEnabled {
                             Color.clear.frame(width: DubLayout.deckOverviewGap)
                             TrackOverviewView(
@@ -762,6 +771,8 @@ struct PerformanceView: View {
                             side: side,
                             state: padsState(side: side, deckState: deckState),
                             callbacks: padsCallbacks(side: side))
+                            .frame(width: DubLayout.performancePadColumnWidth)
+                        Spacer(minLength: 0)
                     }
                 }
             case .horizontal:
@@ -830,7 +841,10 @@ struct PerformanceView: View {
             // a vertical scratch waveform wants time-history, not a
             // metre of horizontal peak detail.
             content
-                .frame(width: waveformColumnWidth)
+                .frame(
+                    minWidth: DubLayout.performanceWaveformMinWidth,
+                    idealWidth: DubLayout.performanceWaveformWidth,
+                    maxWidth: DubLayout.performanceWaveformWidthCap)
                 .frame(maxHeight: .infinity)
         case .horizontal:
             // Horizontal Prep-mode strip: full window width, fixed
