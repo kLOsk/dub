@@ -223,3 +223,95 @@ extension LibraryTrack {
             extras: [])
     }
 }
+
+/// The assembled row: gutter, cells, colour tint.
+///
+/// These pin the two details most likely to drift in the `NSTableView`
+/// port, both of which look incidental:
+///
+/// * `DimUnanalyzed` is per *cell*, inside the width frame — an
+///   unanalyzed row dims its cell text but not the gutter badges and
+///   not the colour tint. Applying it to a row view changes them.
+/// * The row tint is faint on purpose. Selection paints in AppKit
+///   *beneath* the row, so a heavier tint makes a selected coloured
+///   row unreadable.
+final class LibraryRowSnapshotTests: XCTestCase {
+
+    private static let columns: [LibraryRowColumn] = [
+        LibraryRowColumn(field: .artist, width: 120),
+        LibraryRowColumn(field: .title, width: 180),
+        LibraryRowColumn(field: .duration, width: 52),
+        LibraryRowColumn(field: .bpm, width: 56),
+        LibraryRowColumn(field: .rating, width: 92),
+        LibraryRowColumn(field: .color, width: 44),
+    ]
+
+    private static var totalWidth: CGFloat {
+        LibraryColumnLayout.gutterWidth
+            + columns.map(\.width).reduce(0, +)
+            + DubSpacing.lg * 2
+    }
+
+    private func snap(
+        _ state: LibraryRowState,
+        named name: String,
+        file: StaticString = #filePath,
+        testName: String = #function,
+        line: UInt = #line
+    ) {
+        let row = LibraryRowView(
+            state: state,
+            columns: Self.columns,
+            totalWidth: Self.totalWidth)
+            .background(DubColor.surface0)
+        let host = NSHostingView(rootView: row)
+        host.frame = CGRect(
+            x: 0, y: 0,
+            width: Self.totalWidth, height: LibraryRowLayout.estimatedHeight)
+        host.layoutSubtreeIfNeeded()
+        assertSnapshot(
+            of: host, as: .image(perceptualPrecision: 0.98), named: name,
+            file: file, testName: testName, line: line)
+    }
+
+    private func state(
+        _ track: LibraryTrack = .fixture(),
+        deckA: Bool = false,
+        deckB: Bool = false,
+        unreachable: Bool = false
+    ) -> LibraryRowState {
+        LibraryRowState(
+            cell: LibraryCellState(track: track),
+            isOnDeckA: deckA,
+            isOnDeckB: deckB,
+            showsUnreachableWarning: unreachable,
+            unreachableTooltip: "Source volume is offline — plug it back in or use Relocate.")
+    }
+
+    func test_row_plain() {
+        snap(state(), named: "row-plain")
+    }
+
+    /// Both badges can show at once — Instant Doubles puts one track on
+    /// both decks.
+    func test_row_onBothDecks() {
+        snap(state(deckA: true, deckB: true), named: "row-both-decks")
+    }
+
+    func test_row_unreachableAndDuplicate() {
+        var track = LibraryTrack.fixture()
+        track.potentialDuplicateId = "t2"
+        snap(state(track, unreachable: true), named: "row-unreachable-duplicate")
+    }
+
+    /// The dim must reach the cell text but not the gutter badge and not
+    /// the colour tint.
+    func test_row_unanalyzed_dimsCellsOnly() {
+        let track = LibraryTrack.fixture(color: "green", isAnalyzed: false)
+        snap(state(track, deckA: true), named: "row-unanalyzed")
+    }
+
+    func test_row_colourTinted() {
+        snap(state(.fixture(color: "red")), named: "row-colour-tinted")
+    }
+}

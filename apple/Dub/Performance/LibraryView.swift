@@ -2885,29 +2885,6 @@ rows: AnyView(trackRowsStack(preview: nil)),
         columnWidthsStorage = encoded
     }
 
-    /// Delegates to the value-driven `LibraryColumnCell`, which the
-    /// `NSTableView` migration reuses and the snapshot tests cover.
-    private func columnCell(for field: LibraryColumnField, track: LibraryTrack) -> some View {
-        LibraryColumnCell(
-            field: field,
-            state: LibraryCellState(
-                track: track,
-                sessionFromTitle: sessionFromTitles[track.id],
-                keyNotationMode: keyNotationMode,
-                extraIndexById: extraColumnIndex),
-            actions: LibraryCellActions(
-                onRate: { rating in
-                    Task { @MainActor in
-                        await model.setTrackRating(trackId: track.id, rating: rating)
-                    }
-                },
-                onColor: { token in
-                    Task { @MainActor in
-                        await model.setTrackColor(trackId: track.id, color: token)
-                    }
-                }))
-    }
-
     @ViewBuilder
     private func trackRow(
         for track: LibraryTrack,
@@ -2919,26 +2896,13 @@ rows: AnyView(trackRowsStack(preview: nil)),
         // click never has to round-trip through SwiftUI's view
         // diff before the colour appears. See
         // `LibraryTableScrollContainer` for the layer wiring.
-        HStack(spacing: 0) {
-            rowIndicators(for: track)
-                .frame(width: 36, alignment: .leading)
-            ForEach(displayedColumns) { field in
-                columnCell(for: field, track: track)
-                    .padding(.leading, LibraryColumnLayout.columnLeadingInset)
-                    .modifier(DimUnanalyzed(track: track))
-                    .frame(width: columnWidth(field, preview: preview), alignment: .leading)
-            }
-        }
-        .padding(.horizontal, DubSpacing.lg)
-        .frame(
-            width: tableContentWidth(preview: preview),
-            height: LibraryRowLayout.estimatedHeight,
-            alignment: .leading)
-        // v8 colour label tints the whole row. NB: the selection
-        // highlight is painted by the AppKit layer *beneath* the row
-        // host, so a low opacity keeps a selected+coloured row legible;
-        // tune here if selected coloured rows read wrong.
-        .background(DubColor.trackLabel(track.color).map { $0.opacity(0.18) } ?? Color.clear)
+        LibraryRowView(
+            state: rowState(for: track),
+            columns: displayedColumns.map {
+                LibraryRowColumn(field: $0, width: columnWidth($0, preview: preview))
+            },
+            totalWidth: tableContentWidth(preview: preview),
+            actions: rowActions(for: track))
         .contentShape(Rectangle())
         .if(dragURL != nil) { view in
             view.onDrag { [rowSelection] in
@@ -3541,46 +3505,43 @@ rows: AnyView(trackRowsStack(preview: nil)),
     ///
     /// Glyphs are deliberately small (10–11 pt) so they fit in
     /// the 36 pt gutter without crowding the title row.
-    @ViewBuilder
-    private func rowIndicators(for track: LibraryTrack) -> some View {
-        HStack(spacing: 2) {
-            if model.deckA.loadedLibraryTrackId == track.id {
-                deckBadge("A", tint: DubColor.deckATint)
-            }
-            if model.deckB.loadedLibraryTrackId == track.id {
-                deckBadge("B", tint: DubColor.deckBTint)
-            }
-            if track.potentialDuplicateId != nil {
-                Button {
-                    if let sibling = track.potentialDuplicateId {
-                        navigateToSibling(sibling)
-                    }
-                } label: {
-                    Image(systemName: "link")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(DubColor.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .help("Potential duplicate — click to jump to sibling.")
-            }
-            if libraryModel.libraryIsOpen && !model.isTrackReachable(track) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.red.opacity(0.65))
-                    .help(missingFileTooltip(for: track))
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+    /// Resolve the live values a row needs into a snapshot. The four
+    /// impure ones — both deck ids, `libraryIsOpen`, and the volume
+    /// reachability verdict — are read here so the row view itself
+    /// stays a pure function of values, which is what lets a reused
+    /// cell render it.
+    private func rowState(for track: LibraryTrack) -> LibraryRowState {
+        LibraryRowState(
+            cell: LibraryCellState(
+                track: track,
+                sessionFromTitle: sessionFromTitles[track.id],
+                keyNotationMode: keyNotationMode,
+                extraIndexById: extraColumnIndex),
+            isOnDeckA: model.deckA.loadedLibraryTrackId == track.id,
+            isOnDeckB: model.deckB.loadedLibraryTrackId == track.id,
+            showsUnreachableWarning: libraryModel.libraryIsOpen
+                && !model.isTrackReachable(track),
+            unreachableTooltip: missingFileTooltip(for: track))
     }
 
-    private func deckBadge(_ letter: String, tint: Color) -> some View {
-        Text(letter)
-            .font(.system(size: 9, weight: .bold, design: .rounded))
-            .foregroundStyle(.white)
-            .frame(width: 13, height: 13)
-            .background(tint)
-            .clipShape(RoundedRectangle(cornerRadius: 2))
-            .help("Loaded on deck \(letter).")
+    private func rowActions(for track: LibraryTrack) -> LibraryRowActions {
+        LibraryRowActions(
+            cell: LibraryCellActions(
+                onRate: { rating in
+                    Task { @MainActor in
+                        await model.setTrackRating(trackId: track.id, rating: rating)
+                    }
+                },
+                onColor: { token in
+                    Task { @MainActor in
+                        await model.setTrackColor(trackId: track.id, color: token)
+                    }
+                }),
+            onDuplicateJump: {
+                if let sibling = track.potentialDuplicateId {
+                    navigateToSibling(sibling)
+                }
+            })
     }
 
     private func missingFileTooltip(for track: LibraryTrack) -> String {
@@ -4126,7 +4087,7 @@ extension LibraryView {
     var keyColumnHeader: String { keyNotationMode.columnLabel }
 }
 
-private struct LibraryColumnLayout {
+struct LibraryColumnLayout {
     static let minWidth: CGFloat = 48
     static let maxWidth: CGFloat = 480
     /// The leading gutter before the first column (row colour chip /
@@ -4240,7 +4201,7 @@ private struct LibraryColumnResizeHandle: View {
     }
 }
 
-private enum LibraryRowLayout {
+enum LibraryRowLayout {
     static let estimatedHeight: CGFloat = 28
     static let headerHeight: CGFloat = 22
 }
@@ -5583,15 +5544,15 @@ private struct LibraryTextFocusDismissMonitor: NSViewRepresentable {
 /// the inputs change, so the visible label "(N of M)" tracks the
 /// live selection rather than whatever was selected when the row
 /// first appeared.
-private struct DimUnanalyzed: ViewModifier {
-    let track: LibraryTrack
+struct DimUnanalyzed: ViewModifier {
+    let isAnalyzed: Bool
     func body(content: Content) -> some View {
         // 0.55 chosen to read as "this row is waiting for
         // analysis" without losing legibility of the title /
         // artist text. Slightly higher than the 0.40 we use for
         // disabled controls; rows are still selectable +
         // draggable, just visually deferred.
-        content.opacity(track.isAnalyzed ? 1.0 : 0.55)
+        content.opacity(isAnalyzed ? 1.0 : 0.55)
     }
 }
 
