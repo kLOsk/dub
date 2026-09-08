@@ -1067,10 +1067,14 @@ struct LibraryView: View {
             guard selectedSource.crateId != nil else { return }
             refreshTracks(preserveSelection: true)
         }
-        .onChange(of: libraryModel.rowAttributeGeneration) { _ in
-            // v8 — a star rating or colour label changed; repaint the
-            // visible rows so the stars + tint update in place.
-            refreshTracks(preserveSelection: true)
+        .onChange(of: libraryModel.rowAttributePatch) { patch in
+            // v8 — a star rating or colour label changed. Patch that one
+            // row, exactly as `applyAnalysisUpdate` does. This used to
+            // call `refreshTracks(preserveSelection:)`, re-fetching every
+            // row over FFI and rebuilding the whole table to repaint one
+            // swatch — about a second of latency on a click.
+            guard let patch else { return }
+            applyRowAttributePatch(patch)
         }
         // M11d.6 round 3 — the previously-present
         // `.onChange(of: sortOrder) { _ in recomputeSortedTracks() }`
@@ -2101,23 +2105,15 @@ struct LibraryView: View {
                 tracksContentRevision: tracksContentRevision,
                 columnResize: columnResize,
                 rowSelection: rowSelection,
+                // Neither half observes the drag. Header and rows both
+                // hold their committed widths and commit together on
+                // release; the live feedback is the AppKit guide line
+                // (`LibraryDocumentWrapper.showResizeGuide`). Moving
+                // either one costs a full SwiftUI layout of the table.
                 header: AnyView(
-                    ColumnResizeScope(model: columnResize) { preview in
-                        trackListHeader(preview: preview)
-                    }
-                    // Outside the scope: built once per `body`, not once
-                    // per drag frame. See the note in `trackListHeader`.
-                    .contextMenu { libraryColumnContextMenu() }),
-                // Rows stay at their committed widths for the duration
-                // of a drag. Measured: rebuilding them costs ~1.15 ms
-                // per row (~134 ms for this library), which caps the
-                // drag at ~5 Hz. The dominant term is the per-row
-                // `Menu` in `colorCell` — SwiftUI builds menu content
-                // eagerly, so every row rebuild constructs a menu and
-                // its palette. Finder resizes rows live because
-                // `NSTableView` reuses cells and only moves frames; a
-                // SwiftUI row of this weight cannot.
-                rows: AnyView(trackRowsStack(preview: nil)),
+                    trackListHeader(preview: nil)
+                        .contextMenu { libraryColumnContextMenu() }),
+rows: AnyView(trackRowsStack(preview: nil)),
                 trackIds: sortedTrackIds,
                 visibleTracks: sortedTracks,
                 menu: LibraryTableMenu(
@@ -2355,9 +2351,13 @@ struct LibraryView: View {
             }
         )
         .contentShape(Rectangle())
-        .contextMenu {
-            libraryColumnContextMenu()
-        }
+        // No `.contextMenu` here. The header-level one at the
+        // `trackList` call site is an ancestor of every column, so
+        // right-click behaviour is unchanged — but attached per column
+        // it was inside the resize scope, so the whole registry menu
+        // (13 built-in toggles plus a "More columns" tree over 40+
+        // entries) was built eagerly, once per column, on every frame
+        // of a drag. About 500 menu items a frame.
     }
 
     /// User-ordered visible columns. Artist + Title are always present
@@ -2833,15 +2833,18 @@ struct LibraryView: View {
         }
         guard let origin = columnResizeDragOrigin, origin.field == field else { return }
         let width = clampColumnWidth(origin.width + locationGlobalX - origin.globalX)
+        let sizing = ColumnWidthPreview(
+            field: field, width: width, tableWidth: 0, dividerX: 0)
         let preview = ColumnWidthPreview(
             field: field,
             width: width,
-            tableWidth: tableContentWidth(
-                preview: ColumnWidthPreview(field: field, width: width, tableWidth: 0)))
+            tableWidth: tableContentWidth(preview: sizing),
+            dividerX: columnDividers(preview: sizing)
+                .first { $0.field == field }?.x ?? 0)
         columnResize.preview = preview
         // The representable's `updateNSView` does not run during the
-        // drag, so the AppKit hosts are resized straight from here.
-        columnResize.onLiveTableWidth?(preview.tableWidth)
+        // drag, so AppKit is driven straight from here.
+        columnResize.onLiveResize?(preview.tableWidth, preview.dividerX)
     }
 
     private func endColumnResize(
@@ -2865,6 +2868,7 @@ struct LibraryView: View {
     }
 
     private func persistColumnWidth(_ field: LibraryColumnField, to width: CGFloat) {
+        columnResize.onResizeEnded?()
         let clamped = clampColumnWidth(width)
         // Clearing the preview and writing the storage below both feed
         // the committed path: `columnWidthsStorage` changing refreshes
@@ -3082,36 +3086,40 @@ struct LibraryView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
+            // The palette menu is built on click, not on render — see
+            // `LazyMenuClickTarget`. As a SwiftUI `Menu` its ~10 items
+            // were constructed for every row on every rebuild.
             .overlay {
-                Menu {
-                    colorMenuItems(track)
-                } label: {
-                    Color.clear
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
+                LazyMenuClickTarget { colorMenuEntries(track) }
             }
     }
 
-    @ViewBuilder
-    private func colorMenuItems(_ track: LibraryTrack) -> some View {
-        ForEach(DubColor.trackLabelPalette, id: \.token) { entry in
-            Button {
-                Task { await model.setTrackColor(trackId: track.id, color: entry.token) }
-            } label: {
-                Label {
-                    Text(entry.token.capitalized)
-                } icon: {
-                    Image(systemName: "square.fill").foregroundStyle(entry.color)
+    /// The palette, as menu data rather than as views. Evaluated on
+    /// click by `LazyMenuClickTarget`.
+    ///
+    /// The AppKit menu dispatches on the main thread, so the actions
+    /// hop to `@MainActor` themselves — the `LibraryTableMenu` contract
+    /// note applies here too.
+    private func colorMenuEntries(_ track: LibraryTrack) -> [LazyMenuEntry] {
+        var entries: [LazyMenuEntry] = DubColor.trackLabelPalette.map { entry in
+            .item(
+                title: entry.token.capitalized,
+                symbol: "square.fill",
+                tint: NSColor(entry.color)
+            ) {
+                Task { @MainActor in
+                    await model.setTrackColor(trackId: track.id, color: entry.token)
                 }
             }
         }
-        Divider()
-        Button {
-            Task { await model.setTrackColor(trackId: track.id, color: nil) }
-        } label: {
-            Label("None", systemImage: "slash.circle")
-        }
+        entries.append(.separator)
+        entries.append(
+            .item(title: "None", symbol: "slash.circle", tint: nil) {
+                Task { @MainActor in
+                    await model.setTrackColor(trackId: track.id, color: nil)
+                }
+            })
+        return entries
     }
 
     @ViewBuilder
@@ -3364,6 +3372,24 @@ struct LibraryView: View {
             return
         }
         tracks[idx] = tracks[idx].patchedAfterAnalysis(update)
+        recomputeSortedTracks()
+        tracksContentRevision &+= 1
+    }
+
+    /// Apply a rating / colour change to its row in place. Rating can
+    /// be the active sort column, so the memoised arrays are recomputed;
+    /// `tracksContentRevision` then forces the row host to re-render
+    /// without changing the row id list.
+    private func applyRowAttributePatch(_ patch: LibraryRowAttributePatch) {
+        guard let idx = tracks.firstIndex(where: { $0.id == patch.trackId }) else {
+            return
+        }
+        var row = tracks[idx]
+        switch patch.attribute {
+        case let .rating(value): row.rating = value
+        case let .color(value): row.color = value
+        }
+        tracks[idx] = row
         recomputeSortedTracks()
         tracksContentRevision &+= 1
     }
@@ -4404,26 +4430,14 @@ private struct LibraryColumnLayout {
     static let columnLeadingInset: CGFloat = DubSpacing.sm
 }
 
-/// Re-renders its content when a resize preview changes.
-///
-/// This is what keeps a drag off `LibraryView.body` and off the scroll
-/// container's `rootView` reassignment: the observation happens *inside*
-/// the already-hosted tree, so SwiftUI does an ordinary targeted update
-/// with view identity — and therefore the in-flight drag gesture —
-/// intact.
-private struct ColumnResizeScope<Content: View>: View {
-    @ObservedObject var model: ColumnResizeModel
-    @ViewBuilder let content: (ColumnWidthPreview?) -> Content
-
-    var body: some View { content(model.preview) }
-}
-
 /// One column's in-progress resize width, plus the table width it
 /// implies so the AppKit hosts can follow without a SwiftUI round-trip.
 fileprivate struct ColumnWidthPreview: Equatable {
     let field: LibraryColumnField
     let width: CGFloat
     let tableWidth: CGFloat
+    /// x of the dragged divider, for the AppKit guide line.
+    let dividerX: CGFloat
 }
 
 /// Live column-resize state, deliberately held *off* `LibraryView`'s
@@ -4450,7 +4464,9 @@ fileprivate final class ColumnResizeModel: ObservableObject {
     /// representable's `updateNSView` does not run during a drag —
     /// nothing it reads has changed — so the AppKit host widths are
     /// driven straight from here.
-    var onLiveTableWidth: ((CGFloat) -> Void)?
+    var onLiveResize: ((_ tableWidth: CGFloat, _ dividerX: CGFloat) -> Void)?
+    /// Called once when a drag commits, so the guide can be hidden.
+    var onResizeEnded: (() -> Void)?
 }
 
 /// One column's trailing divider and where it sits, for the resize
@@ -4608,8 +4624,8 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
     let columnOrderKey: String
     let headerStateKey: String
     let tracksContentRevision: UInt64
-    /// Live resize state. The coordinator installs `onLiveTableWidth`
-    /// so the AppKit host widths follow a drag directly — SwiftUI never
+    /// Live resize state. The coordinator installs the callbacks so
+    /// the guide line follows a drag directly; SwiftUI never
     /// re-evaluates this representable while one is in flight, which is
     /// the whole point (see `ColumnResizeModel`).
     let columnResize: ColumnResizeModel
@@ -4740,9 +4756,17 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         // constraint writes: no view diff, no layout pass through
         // SwiftUI.
         let coordinator = context.coordinator
-        columnResize.onLiveTableWidth = { [weak coordinator] width in
-            coordinator?.headerWidthConstraint?.constant = max(width, 1)
-            coordinator?.updateWidths(width)
+        // Deliberately does NOT call `updateWidths`. That resizes the
+        // document wrapper, `bodyHost` autoresizes with it, and
+        // `NSHostingView` re-lays out every row — measured ~45 ms for
+        // ~116 rows, which alone caps the drag near 18 Hz. Skipping it
+        // takes the drag to ~53 Hz; the columns commit on release and
+        // the guide line shows where they will land.
+        columnResize.onLiveResize = { [weak coordinator] _, dividerX in
+            coordinator?.showResizeGuide(atX: dividerX)
+        }
+        columnResize.onResizeEnded = { [weak coordinator] in
+            coordinator?.showResizeGuide(atX: nil)
         }
         context.coordinator.recordSnapshot(
             tableWidth: tableWidth,
@@ -5032,6 +5056,11 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             guard let bodyScroll else { return }
             let x = bodyScroll.contentView.bounds.origin.x
             headerLeadingConstraint?.constant = -x
+        }
+
+        /// Position (or hide, with `nil`) the column-resize guide.
+        func showResizeGuide(atX x: CGFloat?) {
+            documentWrapper?.showResizeGuide(atX: x)
         }
 
         func updateWidths(_ tableWidth: CGFloat) {
@@ -5439,6 +5468,39 @@ private final class LibraryDocumentWrapper: NSView {
         return view
     }()
 
+    /// Vertical guide showing where a column divider will land.
+    ///
+    /// Live column resize is not affordable here: moving a width
+    /// re-lays out every SwiftUI row (measured ~45 ms for ~116 rows,
+    /// and ~180 ms more when their bodies rebuild too), because a
+    /// `LazyVStack` in an `NSHostingView` has no cell reuse. So the
+    /// columns commit on release and this line shows where they are
+    /// going — the interaction a spreadsheet uses, and coherent in a
+    /// way that a header moving without its rows is not.
+    ///
+    /// Drawn in AppKit for the same reason `insertionLine` is: it has
+    /// to track the pointer without a SwiftUI update.
+    private lazy var resizeGuideLine: NSView = {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor(DubColor.deckATint).cgColor
+        view.isHidden = true
+        return view
+    }()
+
+    /// `nil` hides the guide.
+    func showResizeGuide(atX x: CGFloat?) {
+        guard let x else {
+            resizeGuideLine.isHidden = true
+            return
+        }
+        if resizeGuideLine.superview !== self {
+            addSubview(resizeGuideLine, positioned: .above, relativeTo: nil)
+        }
+        resizeGuideLine.frame = NSRect(x: x - 1, y: 0, width: 2, height: bounds.height)
+        resizeGuideLine.isHidden = false
+    }
+
     override var isFlipped: Bool { true }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -5543,6 +5605,80 @@ private final class LibraryDocumentWrapper: NSView {
 /// class that wasted multiple debugging rounds before the
 /// collision was identified. Using a project-scoped name like
 /// `dubMenuPerform:` sidesteps the collision entirely.
+/// One item in a lazily-built menu.
+private enum LazyMenuEntry {
+    case item(title: String, symbol: String, tint: NSColor?, action: () -> Void)
+    case separator
+}
+
+/// A transparent click target that pops an `NSMenu` built **when it is
+/// shown**, not when the view is built.
+///
+/// The colour swatch used a SwiftUI `Menu` purely to catch its click.
+/// SwiftUI builds menu content eagerly, so every row carried ~10
+/// pre-built palette items — and rebuilding the table constructed all
+/// of them, ~1,160 menu items per frame during a resize drag. That was
+/// the dominant term in a ~1.15 ms row rebuild.
+///
+/// AppKit builds a menu when it opens. This is the same reason the row
+/// right-click menu is built in `LibraryDocumentWrapper.menu(for:)`
+/// rather than with SwiftUI's `.contextMenu` — see the note there.
+private struct LazyMenuClickTarget: NSViewRepresentable {
+    /// Evaluated on click. Cheap to *store*, which is the whole point.
+    let entries: () -> [LazyMenuEntry]
+
+    func makeNSView(context: Context) -> NSView {
+        let view = ClickView()
+        view.entries = entries
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? ClickView)?.entries = entries
+    }
+
+    final class ClickView: NSView {
+        var entries: (() -> [LazyMenuEntry])?
+
+        /// NSMenuItem holds its target weakly; without keeping the
+        /// targets alive the actions would die before they dispatch.
+        /// Same hazard `Coordinator.menuActionAnchors` guards against.
+        private var anchors: [LibraryMenuActionTarget] = []
+
+        override func mouseDown(with event: NSEvent) {
+            guard let entries = entries?(), !entries.isEmpty else { return }
+            anchors.removeAll()
+            let menu = NSMenu()
+            for entry in entries {
+                switch entry {
+                case .separator:
+                    menu.addItem(.separator())
+                case let .item(title, symbol, tint, action):
+                    let item = NSMenuItem(
+                        title: title,
+                        action: #selector(LibraryMenuActionTarget.dubMenuPerform(_:)),
+                        keyEquivalent: "")
+                    let target = LibraryMenuActionTarget(action)
+                    anchors.append(target)
+                    item.target = target
+                    item.image = Self.icon(symbol: symbol, tint: tint)
+                    menu.addItem(item)
+                }
+            }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height), in: self)
+        }
+
+        private static func icon(symbol: String, tint: NSColor?) -> NSImage? {
+            guard let image = NSImage(
+                systemSymbolName: symbol, accessibilityDescription: nil)
+            else { return nil }
+            guard let tint else { return image }
+            return image.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(paletteColors: [tint]))
+        }
+    }
+}
+
 private final class LibraryMenuActionTarget: NSObject {
     private let work: () -> Void
 

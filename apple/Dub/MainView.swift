@@ -3292,27 +3292,31 @@ final class WaveformAppModel: ObservableObject {
 
     /// v8 — set the DJ's star rating for a track. `nil` clears it (the
     /// browser falls back to any imported rating). Bumps
-    /// `rowAttributeGeneration` so the open listing repaints its stars.
+    /// a row patch so the open listing repaints its stars in place.
     @MainActor
     func setTrackRating(trackId: String, rating: UInt8?) async {
         guard libraryModel.libraryIsOpen else { return }
         do {
             try library.setUserRating(trackId: trackId, rating: rating)
-            libraryModel.rowAttributeGeneration &+= 1
+            libraryModel.rowAttributePatch = LibraryRowAttributePatch(
+                trackId: trackId,
+                attribute: .rating(rating.map(Int32.init)),
+                token: UUID())
         } catch {
             surfaceError("Set rating failed: \(error.localizedDescription)")
         }
     }
 
     /// v8 — set a track's colour label (a palette token), or clear it
-    /// with `nil`. Bumps `rowAttributeGeneration` so the row tint and
-    /// swatch repaint.
+    /// with `nil`. Publishes a row patch so the tint and swatch repaint
+    /// in place — a full `refreshTracks` here cost about a second.
     @MainActor
     func setTrackColor(trackId: String, color: String?) async {
         guard libraryModel.libraryIsOpen else { return }
         do {
             try library.setTrackColor(trackId: trackId, color: color)
-            libraryModel.rowAttributeGeneration &+= 1
+            libraryModel.rowAttributePatch = LibraryRowAttributePatch(
+                trackId: trackId, attribute: .color(color), token: UUID())
         } catch {
             surfaceError("Set colour failed: \(error.localizedDescription)")
         }

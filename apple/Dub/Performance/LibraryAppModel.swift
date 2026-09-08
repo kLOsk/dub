@@ -254,15 +254,35 @@ final class LibraryAppModel: ObservableObject {
     /// `WaveformAppModel.reloadImportedSources()`.
     @Published var importedSources: [ImportedSourceGroup] = []
 
-    /// v8 — bumped when a user-owned per-track attribute (star rating,
-    /// colour label) changes. LibraryView observes it via `.onChange`
-    /// and re-runs `refreshTracks(preserveSelection:)` so the rating
-    /// stars + row tint update without a per-row push channel.
-    @Published var rowAttributeGeneration: UInt64 = 0
+    /// v8 — the last user-owned per-track attribute change (star
+    /// rating, colour label).
+    ///
+    /// This used to be a bare generation counter, and `LibraryView`
+    /// answered it with `refreshTracks(preserveSelection:)` — a full
+    /// re-fetch of every row over FFI, a re-sort, and a rebuild of the
+    /// whole table, to repaint one swatch. Clicking a colour took about
+    /// a second to land. Carrying *which* row changed lets the view
+    /// patch that row in place, the same way `applyAnalysisUpdate` does.
+    @Published var rowAttributePatch: LibraryRowAttributePatch?
 
     /// v8 — the occupied favourite-playlist slots (sparse, 0–7), backing
     /// the quick-access strip above the library. Refreshed on library
     /// open and after every favourite pin / clear by
     /// `WaveformAppModel.reloadFavoriteSlots()`.
     @Published var favoriteSlots: [LibraryFavoriteSlot] = []
+}
+
+/// One user-owned per-track attribute change, pushed to the browser so
+/// it can patch a single row instead of re-fetching the listing.
+struct LibraryRowAttributePatch: Equatable {
+    enum Attribute: Equatable {
+        case rating(Int32?)
+        case color(String?)
+    }
+
+    let trackId: String
+    let attribute: Attribute
+    /// Makes two identical changes distinct, so setting the same colour
+    /// twice still publishes.
+    let token: UUID
 }
