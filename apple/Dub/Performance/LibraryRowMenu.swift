@@ -12,9 +12,8 @@
 //
 //  Lifted out of the old scroll container's coordinator so the new
 //  table can use it unchanged. Pure construction — no AppKit display
-//  side effects — which is what lets it be tested without an `NSWindow`
-//  to host the popup. The old code said as much and the test was never
-//  written; `LibraryRowMenuTests` is it.
+//  side effects — which is what lets `LibraryRowMenuTests` cover it
+//  without an `NSWindow` to host the popup.
 //
 
 import AppKit
