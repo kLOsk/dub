@@ -315,3 +315,59 @@ final class LibraryRowSnapshotTests: XCTestCase {
         snap(state(.fixture(color: "red")), named: "row-colour-tinted")
     }
 }
+
+/// Column headers. Sizes mirror the header's real insets: leading 8 and
+/// trailing 14, so usable width is `w − 22` — 14 pt narrower than the
+/// cell beneath, which is deliberate and would be easy to lose in the
+/// `NSTableView` port.
+final class LibraryHeaderSnapshotTests: XCTestCase {
+
+    private func snap(
+        _ states: [LibraryHeaderState],
+        width: CGFloat,
+        named name: String,
+        file: StaticString = #filePath,
+        testName: String = #function,
+        line: UInt = #line
+    ) {
+        let row = HStack(spacing: 0) {
+            ForEach(Array(states.enumerated()), id: \.offset) { _, state in
+                LibraryHeaderCell(state: state)
+                    .padding(.leading, LibraryColumnLayout.columnLeadingInset)
+                    .frame(
+                        width: max(0, 120 - LibraryColumnLayout.columnTrailingInset),
+                        alignment: .leading)
+                    .padding(.trailing, LibraryColumnLayout.columnTrailingInset)
+                    .frame(width: 120, alignment: .leading)
+            }
+        }
+        .frame(height: LibraryRowLayout.headerHeight)
+        .background(DubColor.surface1)
+        let host = NSHostingView(rootView: row)
+        host.frame = CGRect(
+            x: 0, y: 0, width: width, height: LibraryRowLayout.headerHeight)
+        host.layoutSubtreeIfNeeded()
+        assertSnapshot(
+            of: host, as: .image(perceptualPrecision: 0.98), named: name,
+            file: file, testName: testName, line: line)
+    }
+
+    func test_header_sortStates() {
+        snap(
+            [
+                LibraryHeaderState(title: "Artist"),
+                LibraryHeaderState(title: "Title", isActive: true, ascending: true),
+                LibraryHeaderState(title: "BPM", isActive: true, ascending: false),
+                LibraryHeaderState(title: "Key (♪)"),
+            ],
+            width: 480, named: "header-sort-states")
+    }
+
+    /// A label wider than its column truncates; the trailing inset is
+    /// what keeps it off the divider.
+    func test_header_truncation() {
+        snap(
+            [LibraryHeaderState(title: "Serato Beatgrid Offset", isActive: true)],
+            width: 120, named: "header-truncation")
+    }
+}

@@ -2533,26 +2533,12 @@ rows: AnyView(trackRowsStack(preview: nil)),
     }
 
     private func sortHeaderContent(for field: LibraryColumnField) -> some View {
-        let label = field == .key ? keyColumnHeader : field.headerLabel
-        let isActive = activeSortColumn == field
-        return Button {
-            toggleSort(field)
-        } label: {
-            HStack(spacing: 3) {
-                Text(label.uppercased())
-                    .font(DubFont.micro.weight(.semibold))
-                    .foregroundStyle(isActive ? DubColor.textPrimary : DubColor.textSecondary)
-                if isActive {
-                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(DubColor.textSecondary)
-                }
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        LibraryHeaderCell(
+            state: LibraryHeaderState(
+                title: field == .key ? keyColumnHeader : field.headerLabel,
+                isActive: activeSortColumn == field,
+                ascending: sortAscending),
+            onToggleSort: { toggleSort(field) })
     }
 
     @ViewBuilder
