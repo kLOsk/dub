@@ -105,6 +105,23 @@ struct LibraryRowAnalysisUpdate: Equatable {
 /// All time values are wall-clock seconds. `nil`-able fields are
 /// `nil` when the deck has no track loaded; the deck header
 /// renders em-dashes in that case.
+/// One hot cue as the surface needs it: where it points, and what the DJ
+/// called it.
+///
+/// Position alone was enough while a cue pad drew its index and nothing
+/// else. The Prep cue bank shows a *named mark* — the Serato convention,
+/// and what makes four pads readable instead of four squares — so the name
+/// and colour travel with the position rather than being fetched
+/// separately at render time.
+struct CueMark: Equatable {
+    var positionSecs: Double
+    /// `nil` renders as the pad number alone.
+    var name: String?
+    /// Colour-label token from the browser's palette (`"red"`, `"aqua"`).
+    /// `nil` renders in the cue accent rather than picking for the DJ.
+    var color: String?
+}
+
 struct DeckState: Equatable {
     /// True once `load_track` has succeeded on this deck. Cleared
     /// when the engine stops or a load fails.
@@ -158,7 +175,7 @@ struct DeckState: Equatable {
     /// on track load and driven by the cue keys (1–4 set/recall,
     /// Shift+1–4 clear). The waveform draws a marker per set slot;
     /// changes bump `seekGeneration` so a paused deck repaints.
-    var hotCues: [Double?] = [nil, nil, nil, nil]
+    var hotCues: [CueMark?] = [nil, nil, nil, nil]
 
     /// Active reverse loop, mirrored from `positionSnapshot` each
     /// poll. `loopActive` gates `loopInSecs` / `loopOutSecs` (track
@@ -3059,9 +3076,10 @@ final class WaveformAppModel: ObservableObject {
             // Recall persisted hot cues (best-effort; a read failure
             // just leaves the pads empty this session).
             if let cues = try? library.hotCues(trackId: trackId) {
-                var slots: [Double?] = [nil, nil, nil, nil]
+                var slots: [CueMark?] = [nil, nil, nil, nil]
                 for cue in cues where cue.cueIndex < 4 {
-                    slots[Int(cue.cueIndex)] = cue.positionSecs
+                    slots[Int(cue.cueIndex)] = CueMark(
+                        positionSecs: cue.positionSecs, name: cue.name, color: cue.color)
                 }
                 stamped.hotCues = slots
             }
@@ -4686,7 +4704,7 @@ final class WaveformAppModel: ObservableObject {
             return
         }
 
-        if let position = deck.hotCues[index] {
+        if let position = deck.hotCues[index]?.positionSecs {
             do {
                 try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: position)
             } catch {
@@ -4707,7 +4725,7 @@ final class WaveformAppModel: ObservableObject {
             if cueSnapToGridEnabled {
                 position = snappedToGrid(position, side: side)
             }
-            deck.hotCues[index] = position
+            deck.hotCues[index] = CueMark(positionSecs: position)
             deck.seekGeneration &+= 1
             setState(deck, for: side)
             persistHotCue(deck: deck, index: index, position: position)
@@ -4728,6 +4746,30 @@ final class WaveformAppModel: ObservableObject {
     /// Best-effort persistence of one hot cue slot (set when
     /// `position != nil`, else delete). The in-memory cue already
     /// works this session regardless of the DB write.
+    /// Name and/or colour an existing cue on `side`.
+    ///
+    /// Prep work: the DJ sets a mark by ear, then labels it so the bank
+    /// reads as `INTRO` / `FIRST VERSE` rather than `1` / `2`. Writes
+    /// through the FFI's separate label call, which leaves the position
+    /// alone — see `Library::set_hot_cue_label`.
+    func setHotCueLabel(_ side: DeckSide, index: Int, name: String?, color: String?) {
+        guard index >= 0, index < 4 else { return }
+        var deck = state(for: side)
+        guard var mark = deck.hotCues[index] else { return }
+        mark.name = name
+        mark.color = color
+        deck.hotCues[index] = mark
+        setState(deck, for: side)
+
+        guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
+        let library = self.library
+        let cueIndex = UInt32(index)
+        Task.detached(priority: .background) {
+            try? library.setHotCueLabel(
+                trackId: trackId, cueIndex: cueIndex, name: name, color: color)
+        }
+    }
+
     private func persistHotCue(deck: DeckState, index: Int, position: Double?) {
         guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
         let library = self.library

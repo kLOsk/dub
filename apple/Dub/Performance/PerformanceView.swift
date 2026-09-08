@@ -27,7 +27,7 @@
 //  The rack bar holds the three racks that were never per-deck: one
 //  siren keymap firing the focused deck, and two four-slot tables whose
 //  slots each carry their own target deck. Prep omits it — its siren
-//  has a column in `PrepPadGrid` and its vertical budget is the
+//  has a section in `PrepRack` and its vertical budget is the
 //  tightest on either surface.
 //
 //  M10.5b deck panes accept Finder-drop URLs onto each pane,
@@ -227,7 +227,9 @@ struct PerformanceView: View {
     /// a twenty-argument initialiser, written twice.
     func padsState(side: DeckSide, deckState: DeckState) -> PerformancePadsState {
         PerformancePadsState(
-            cues: deckState.hotCues,
+            // Performance still draws cues as numbered pads; its own
+            // redesign is open. Positions only until then.
+            cues: deckState.hotCues.map { $0?.positionSecs },
             activeLoopBars: deckState.activeLoopBars,
             loopEngaged: deckState.loopActive,
             loopInArmed: deckState.pendingLoopInSecs != nil,
@@ -294,6 +296,83 @@ struct PerformanceView: View {
                     // binding goes live the cap follows with no edit.
                     keyBound: DubKeymap.isLive(.samplerSlot(index)))
             })
+    }
+
+    /// Prep's surface, as values. Read fresh each render; nothing here
+    /// holds the model, which is what lets `PrepRack` be snapshotted.
+    private var prepRackState: PrepRackState {
+        PrepRackState(
+            cues: (0..<4).map { CueSlotState(index: $0, mark: model.deckA.hotCues[$0]) },
+            activeLoopBars: model.deckA.activeLoopBars,
+            loopEngaged: model.deckA.loopActive,
+            loopInArmed: model.deckA.pendingLoopInSecs != nil,
+            sampleNames: model.sampleBank.all.map { SampleBank.label(for: $0) },
+            hasTrack: model.deckA.hasTrack)
+    }
+
+    private var prepRackCallbacks: PrepRackCallbacks {
+        PrepRackCallbacks(
+            onCue: { index, clear in model.handleHotCue(.a, index: index, clear: clear) },
+            onRenameCue: { index in renameCue(index) },
+            onColorCue: { index, token in
+                model.setHotCueLabel(
+                    .a, index: index,
+                    name: model.deckA.hotCues[index]?.name, color: token)
+            },
+            onLoop: { bars in model.handleLoop(.a, bars: bars) },
+            onLoopStep: { double in
+                guard let bars = model.deckA.activeLoopBars else { return }
+                let next = double ? bars * 2 : bars / 2
+                // The engine only grids these four; a step past either end
+                // is a no-op rather than an error the DJ has to read.
+                guard (0.5...4).contains(next) else { return }
+                model.handleLoop(.a, bars: next)
+            },
+            onLoopIn: { model.setLoopIn(.a) },
+            onLoopOut: { model.setLoopOut(.a) },
+            onLoopExit: { model.exitLoop(.a) },
+            onAddSamples: { addSamplesToBank() },
+            onRemoveSample: { index in
+                let all = model.sampleBank.all
+                guard all.indices.contains(index) else { return }
+                model.sampleBank.remove(all[index])
+            })
+    }
+
+    /// Name a cue. A sheet would be heavier than the gesture deserves —
+    /// this is a one-field edit on a mark you just dropped — so it is an
+    /// `NSAlert` with a text field, the same weight as Finder's rename.
+    private func renameCue(_ index: Int) {
+        guard let mark = model.deckA.hotCues[index] else { return }
+        let alert = NSAlert()
+        alert.messageText = "Name cue \(index + 1)"
+        alert.informativeText = "At \(CueTimecode.format(mark.positionSecs))."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = mark.name ?? ""
+        field.placeholderString = "INTRO"
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.setHotCueLabel(
+            .a, index: index,
+            name: trimmed.isEmpty ? nil : trimmed,
+            color: mark.color)
+    }
+
+    /// Add files to the shared sample bank. Same panel Preferences uses —
+    /// Prep is now the other home for it, because choosing sounds is work
+    /// you do while auditioning rather than while configuring.
+    private func addSamplesToBank() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Choose sample files for the sampler pads and Quick Scratch keys."
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls { model.sampleBank.add(url) }
     }
 
     /// The siren's focused deck is re-read inside each closure rather
@@ -515,7 +594,7 @@ struct PerformanceView: View {
             // static budget can plan for, and this is the escape hatch
             // for it.
             ScrollView(.vertical, showsIndicators: false) {
-                PrepPadGrid(model: model)
+                PrepRack(state: prepRackState, callbacks: prepRackCallbacks)
             }
         }
     }

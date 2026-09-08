@@ -517,7 +517,7 @@ struct TrackOverviewView: View {
     /// reaches it. Drawn in the static Canvas — cues change only on
     /// set / clear / load, never per playhead tick.
     private func drawHotCues(ctx: GraphicsContext, size: CGSize) {
-        let cues = deckState.hotCues
+        let cues = deckState.hotCues.map { $0?.positionSecs }
         guard cues.contains(where: { $0 != nil }) else { return }
         guard let duration = overviewDurationSecs(), duration > 0 else { return }
         let lineW: CGFloat = 1.5

@@ -202,6 +202,13 @@ struct SirenPadRow: View {
     }
 }
 
+/// **Currently unmounted.** The siren left Prep — it is a thing you play
+/// over a record, not something you prepare — and `PrepRack` does not
+/// draw it. This and `SirenPadRow` are kept rather than deleted because
+/// F-37 mounts the Expert panel on *Performance* for both decks, and the
+/// engine/FFI surface behind it is already complete. Delete them if that
+/// plan changes; do not let them rot unnoticed.
+///
 /// The **Expert** siren panel (PRD §6.3): the individual knobs/buttons, matching
 /// the real units' control surfaces. The echo section (TIME / FEEDBACK / ECHO /
 /// FILTER / VOLUME + ECHO CUT) is shared by every unit; below it are the
@@ -215,7 +222,7 @@ struct SirenExpertPanel: View {
     /// The panel took `WaveformAppModel` + `DeckSide` and called methods
     /// on them. It never read the model — only `deck` drives the render —
     /// but holding it made the panel unconstructible in a test, which is
-    /// why `PrepPadGrid` had no snapshot coverage at all. Same pattern as
+    /// why Prep had no snapshot coverage at all. Same pattern as
     /// `PrepRipBarState`: values in, closures out.
     struct Callbacks {
         var onToggleExpert: () -> Void = {}

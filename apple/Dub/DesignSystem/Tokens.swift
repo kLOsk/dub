@@ -393,6 +393,16 @@ enum DubLayout {
     static let prepTuningColumn: CGFloat = 248
     static let prepColumnGap: CGFloat = DubSpacing.lg
 
+    // Prep's surface (`PrepRack`). Three sections with three different
+    // shapes, so the widths are measured from their contents rather than
+    // equalised: the cue column is set by a readable name plus a
+    // timecode; the loop unit by its readout + steppers + 4×40 ladder
+    // plus padding; the sample shelf flexes because a filename is the one
+    // thing here whose length is not ours to choose.
+    static let prepCueColumn: CGFloat = 236
+    static let prepSampleShelfMin: CGFloat = 260
+    static let prepSampleShelfMax: CGFloat = 420
+
     /// Narrowest width at which the Prep grid renders three columns
     /// without clipping. `PerformanceLayoutTests` asserts this stays
     /// within `mainWindowMinWidth` less the pad bar's padding, so a

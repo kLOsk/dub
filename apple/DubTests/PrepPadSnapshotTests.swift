@@ -4,23 +4,22 @@ import XCTest
 
 @testable import Dub
 
-/// Baselines for the Prep pad bar, recorded **before** the surface is
-/// touched.
+/// Baselines for Prep's control surface.
 ///
-/// `CURRENT.md` named the gap and the reason: `SirenExpertPanel` took
-/// `WaveformAppModel` directly, so nothing under `PrepPadGrid` could be
-/// constructed in a test and Prep shipped with no pixel coverage at all —
-/// while Performance's pad column has had baselines since C-31. The panel
-/// is value-driven now, so the whole bar is reachable.
+/// These began as a "before" record of the old two-column pad grid, taken
+/// so the contrast package would land as a reviewable image diff rather
+/// than a claim. They did that job; the grid is gone and they now pin
+/// `PrepRack`.
 ///
-/// These exist to make the next changes reviewable. The contrast package
-/// alters `DubPadCell` itself, which is every control on this surface; the
-/// rack overhaul replaces the arrangement. Both should land as an image
-/// diff someone can look at, not as a claim.
+/// What they are actually guarding is the thing the redesign exists for:
+/// **the three sections must not converge**. A list of marks, a boxed
+/// instrument and a dashed drop zone are three recognisable objects with
+/// the labels covered. If a future change gives them one shared frame
+/// again, these images say so.
 ///
-/// Widths are the real Prep tokens (`prepTransportColumn` 344,
-/// `prepFxColumnMin` 288), so a section that stops fitting its column
-/// fails here rather than in the app.
+/// Sections that moved to Performance — the siren row, its Expert panel,
+/// echo out — are covered by `PerformanceSnapshotTests` instead, which is
+/// where they now render.
 @MainActor
 final class PrepPadSnapshotTests: XCTestCase {
 
@@ -33,7 +32,12 @@ final class PrepPadSnapshotTests: XCTestCase {
         testName: String = #function,
         line: UInt = #line
     ) {
+        // `prepPadRows` pads the bar; matching it here means the
+        // snapshot frames the surface the way the app does rather than
+        // running it to the pixel edge.
         let sized = view
+            .padding(.horizontal, DubSpacing.lg)
+            .padding(.vertical, DubSpacing.sm)
             .frame(width: width, height: height, alignment: .topLeading)
             .background(DubColor.surface0)
         let host = NSHostingView(rootView: sized)
@@ -44,115 +48,115 @@ final class PrepPadSnapshotTests: XCTestCase {
             file: file, testName: testName, line: line)
     }
 
-    // MARK: - Transport column (the 344 pt column, PRD §3.1 prep tooling)
+    /// Roughly the pad bar's real width at the minimum window.
+    private static let surfaceWidth: CGFloat = 900
 
-    /// Resting state: no cues set, no loop, echo idle. This is what the DJ
-    /// actually opens Prep to, and the state the contrast package is aimed
-    /// at — every control here is currently `textTertiary` on `surface1`.
-    func test_prepTransport_idle() {
-        snap(
-            VStack(alignment: .leading, spacing: DubSpacing.lg) {
-                CuePadSection(cues: [nil, nil, nil, nil], onCue: { _, _ in })
-                LoopPadSection(
-                    activeBars: nil, loopEngaged: false, loopInArmed: false,
-                    onLoop: { _ in }, onLoopIn: {}, onLoopOut: {}, onExit: {})
-                EchoPadSection(engaged: false, onToggle: {})
-            },
-            width: DubLayout.prepTransportColumn, height: 210,
-            named: "prep-transport-idle")
+    private func mark(_ secs: Double, _ name: String?, _ color: String? = nil) -> CueMark {
+        CueMark(positionSecs: secs, name: name, color: color)
     }
 
-    /// Everything lit at once: two cues set, a 2-bar loop running, echo
-    /// engaged. Pins the lit/unlit contrast the redesign turns on.
-    func test_prepTransport_engaged() {
+    // MARK: - The whole surface
+
+    /// What the DJ opens Prep to with nothing loaded. Every section has to
+    /// say what it needs rather than sitting inert.
+    func test_prepRack_noTrack() {
         snap(
-            VStack(alignment: .leading, spacing: DubSpacing.lg) {
-                CuePadSection(cues: [0, 102.4, nil, nil], onCue: { _, _ in })
-                LoopPadSection(
-                    activeBars: 2, loopEngaged: true, loopInArmed: false,
-                    onLoop: { _ in }, onLoopIn: {}, onLoopOut: {}, onExit: {})
-                EchoPadSection(engaged: true, onToggle: {})
-            },
-            width: DubLayout.prepTransportColumn, height: 210,
-            named: "prep-transport-engaged")
+            PrepRack(state: PrepRackState()),
+            width: Self.surfaceWidth, height: 210, named: "rack-no-track")
     }
 
-    /// `IN` taken and `OUT` armed — the one state where a disabled pad sits
-    /// beside an enabled one, which is what the caller-side `.opacity(0.5)`
-    /// currently makes indistinguishable.
-    func test_prepTransport_loopInArmed() {
+    /// A track loaded, two cues named and coloured, a 2-bar loop running,
+    /// samples in the bank. The state the surface is designed around.
+    func test_prepRack_working() {
+        let state = PrepRackState(
+            cues: [
+                CueSlotState(index: 0, mark: mark(0, "INTRO", "aqua")),
+                CueSlotState(index: 1, mark: mark(102.3, "FIRST VERSE", "orange")),
+                CueSlotState(index: 2, mark: nil),
+                CueSlotState(index: 3, mark: nil),
+            ],
+            activeLoopBars: 2,
+            loopEngaged: true,
+            loopInArmed: false,
+            sampleNames: ["Air Horn", "Reload", "Siren Up"],
+            hasTrack: true)
         snap(
-            LoopPadSection(
-                activeBars: nil, loopEngaged: false, loopInArmed: true,
-                onLoop: { _ in }, onLoopIn: {}, onLoopOut: {}, onExit: {}),
-            width: DubLayout.prepTransportColumn, height: 70,
-            named: "prep-loop-in-armed")
+            PrepRack(state: state),
+            width: Self.surfaceWidth, height: 210, named: "rack-working")
     }
 
-    // MARK: - FX column (the 288 pt column)
-
-    /// GS1's eight presets over two rows, plus the DUB slider. This is the
-    /// baseline that carries the truncation — `ELECTRIC GUN` is scaled to
-    /// about 7.7 pt inside a 64 pt pad here.
-    func test_prepSiren_gs1() {
+    /// The three silhouettes with nothing set: an unboxed list of dashed
+    /// rows, a boxed instrument, a dashed drop zone. This is the image to
+    /// look at if anyone asks whether the sections still read as different
+    /// objects.
+    func test_prepRack_loadedButEmpty() {
         snap(
-            SirenPadRow(
-                names: [
-                    "Rifle Gun", "Rifle Echo", "Alarm", "Dual Tone",
-                    "Bomb 1", "Bomb 2", "Electric Gun", "Electric Gun 2",
-                ],
-                sounding: false,
-                onPreset: { _ in },
-                dubMacro: 0,
-                unit: .gs1),
-            width: DubLayout.prepFxColumnMin, height: 168,
-            named: "prep-siren-gs1")
+            PrepRack(state: PrepRackState(hasTrack: true)),
+            width: Self.surfaceWidth, height: 210, named: "rack-loaded-empty")
     }
 
-    /// DS01E publishes four presets where GS1 has eight, so the row halves
-    /// and every pad moves. Pinned deliberately: the redesign proposes a
-    /// fixed eight-slot bay precisely so this stops happening.
-    func test_prepSiren_ds01e_isShorter() {
+    /// An unnamed cue is the common case — most are dropped mid-listen and
+    /// never labelled — so the row must still read without a name.
+    func test_prepRack_unnamedCues() {
+        let state = PrepRackState(
+            cues: [
+                CueSlotState(index: 0, mark: mark(12.4, nil)),
+                CueSlotState(index: 1, mark: mark(63.0, nil)),
+                CueSlotState(index: 2, mark: mark(180.75, nil)),
+                CueSlotState(index: 3, mark: nil),
+            ],
+            hasTrack: true)
         snap(
-            SirenPadRow(
-                names: ["Siren", "Horn", "Whistle", "Zap"],
-                sounding: true,
-                onPreset: { _ in },
-                dubMacro: 0.62,
-                unit: .ds01e),
-            width: DubLayout.prepFxColumnMin, height: 128,
-            named: "prep-siren-ds01e")
+            PrepRack(state: state),
+            width: Self.surfaceWidth, height: 210, named: "rack-unnamed-cues")
     }
 
-    /// Collapsed — the default, and all most sessions ever see of it.
-    func test_prepSirenExpert_collapsed() {
+    /// `IN` taken, waiting for `OUT` — the one state where a disabled
+    /// control sits beside an enabled one, and the case the contrast
+    /// package's real `enabled` state exists for.
+    func test_prepRack_loopInArmed() {
         snap(
-            SirenExpertPanel(deck: DeckState()),
-            width: DubLayout.prepFxColumnMin, height: 28,
-            named: "prep-expert-collapsed")
+            PrepRack(state: PrepRackState(loopInArmed: true, hasTrack: true)),
+            width: Self.surfaceWidth, height: 210, named: "rack-loop-in-armed")
     }
 
-    /// Expanded on GS1: the shared PT2399 echo section plus SPEED.
-    func test_prepSirenExpert_gs1Expanded() {
-        var deck = DeckState()
-        deck.sirenExpertShown = true
-        deck.sirenUnit = .gs1
+    /// A long sample name has to truncate inside the shelf rather than
+    /// pushing it wider — the one string on this surface whose length is
+    /// not ours to choose.
+    func test_prepRack_longSampleNames() {
+        let state = PrepRackState(
+            sampleNames: [
+                "Amen Break Full Length Reference Bounce 24bit",
+                "Horn",
+                "Reload Siren (Benidub DS01E, long tail)",
+            ],
+            hasTrack: true)
         snap(
-            SirenExpertPanel(deck: deck),
-            width: DubLayout.prepFxColumnMin, height: 244,
-            named: "prep-expert-gs1")
+            PrepRack(state: state),
+            width: Self.surfaceWidth, height: 210, named: "rack-long-sample-names")
     }
 
-    /// Expanded on DS01E, which adds the PITCH switch, RATE and HOLD — the
-    /// tallest this panel ever gets, and the case `prepPadBarMinHeight`'s
-    /// doc comment is worried about.
-    func test_prepSirenExpert_ds01eExpanded() {
-        var deck = DeckState()
-        deck.sirenExpertShown = true
-        deck.sirenUnit = .ds01e
-        snap(
-            SirenExpertPanel(deck: deck),
-            width: DubLayout.prepFxColumnMin, height: 320,
-            named: "prep-expert-ds01e")
+    // MARK: - Formatting
+
+    /// Tenths, because a cue set by ear is placed to about that precision.
+    func testCueTimecodeFormatsToTenths() {
+        XCTAssertEqual(CueTimecode.format(0), "0:00.0")
+        XCTAssertEqual(CueTimecode.format(102.34), "1:42.3")
+        // Binary float: 102.3 - 102 is 0.2999…, so truncating the
+        // remainder rendered this as 1:42.2.
+        XCTAssertEqual(CueTimecode.format(102.3), "1:42.3")
+        XCTAssertEqual(CueTimecode.format(0.999), "0:01.0")
+        XCTAssertEqual(CueTimecode.format(3599.94), "59:59.9")
+        // Rounding carries across the minute rather than clamping.
+        XCTAssertEqual(CueTimecode.format(3599.95), "60:00.0")
+        XCTAssertEqual(CueTimecode.format(59.97), "1:00.0")
+    }
+
+    /// A cue that has not been set has no time, and must not render as
+    /// `0:00.0` — that reads as a mark at the top of the track.
+    func testCueTimecodeRefusesNonsense() {
+        XCTAssertEqual(CueTimecode.format(-1), "—")
+        XCTAssertEqual(CueTimecode.format(.nan), "—")
+        XCTAssertEqual(CueTimecode.format(.infinity), "—")
     }
 }

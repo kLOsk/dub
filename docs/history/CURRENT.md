@@ -175,12 +175,21 @@ dependency order, not a preference.
    dropping them. `HotCue` now carries both, and `set_hot_cue_label` is
    separate from `set_hot_cue` so re-dropping a cue to nudge its position
    cannot silently erase the label.
-5. **The rack overhaul.** Four modules that do not look alike: cue as a
-   bank of named marks, loop as a size engine (numeric readout, ×2/÷2
-   steppers, contiguous ladder, ACTIVE lamp), echo as a single throw that
-   says `DRY MUTED` when engaged, siren as an instrument unit with a model
-   display and the only knob on the surface. One horizontal rack across the
-   full width, which is where the phantom 264 pt goes.
+5. **The surface overhaul — Prep done, Performance open.**
+   `PrepRack` replaces `PrepPadGrid`: **CUE** as an unboxed list of named,
+   coloured marks with timecodes; **LOOP** as a boxed instrument built
+   around a numeral in a well, with ×2/÷2 steppers, one contiguous ladder
+   and an ACTIVE lamp; **SAMPLES** as a drop shelf whose own border is
+   dashed while empty. No shared module wrapper — a first pass gave all
+   three the same frame, which re-flattened the hierarchy one level up
+   from where it started.
+   The FX left Prep entirely (echo, siren, Expert, Quick Scratch, rack),
+   and sample *loading* moved in from Preferences.
+   **Performance is deliberately untouched** — its design is not settled,
+   and `CuePadSection` still draws numbered pads there.
+   `SirenPadRow` / `SirenExpertPanel` are kept but unmounted, staged for
+   F-37's move to Performance; the file says so rather than letting them
+   rot.
 6. **Map mode.** Serato's mechanism: turn on MAP, click a control, press
    the key or move the knob. Not a Preferences screen — a mode over the
    live interface, so it is on both surfaces by construction. Keyboard lane
