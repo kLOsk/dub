@@ -116,6 +116,7 @@ struct PrepRack: View {
                 onIn: callbacks.onLoopIn,
                 onOut: callbacks.onLoopOut,
                 onExit: callbacks.onLoopExit)
+                .frame(width: DubLayout.prepLoopSection, alignment: .leading)
 
             SampleShelf(
                 names: state.sampleNames,
@@ -313,11 +314,11 @@ private struct LoopEngine: View {
                     DubPadCell("EXIT", size: .word, enabled: canExit, tint: DubColor.loop)
                         .onPressDown(enabled: canExit) { onExit() }
                         .help("Exit the loop")
-                    Text("reverse — loops the bars just played")
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textTertiary)
-                        .padding(.leading, DubSpacing.xs)
+                    Spacer(minLength: 0)
                 }
+                Text("reverse — loops the bars just played")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
             }
             .padding(DubSpacing.md)
             .background(DubColor.surface1)

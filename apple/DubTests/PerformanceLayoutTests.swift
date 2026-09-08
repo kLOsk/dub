@@ -121,6 +121,42 @@ final class PerformanceLayoutTests: XCTestCase {
     /// column this fails immediately rather than shipping a clipped
     /// pad. The documented remedy at that point is a two-column
     /// `ViewThatFits` candidate — not a bigger minimum window.
+    /// `prepPadBarMinHeight`'s doc comment asks for a re-measure whenever a
+    /// Prep section changes, and `PrepRack` replaced every section at once.
+    /// This asserts the floor is derived from what the surface actually
+    /// needs — including the 56 pt rip lane, which renders *inside*
+    /// `prepPadRows` and which three separate estimates have dropped.
+    func test_prepRackFitsItsHeightFloor() {
+        let rack = fittingSize(
+            PrepRack(state: PrepRackState(hasTrack: true)),
+            width: DubLayout.mainWindowMinWidth - DubSpacing.lg * 2)
+        // The bar is the rack + its own vertical padding + the rip lane.
+        let needed = rack.height + DubSpacing.sm * 2 + 56
+        XCTAssertLessThanOrEqual(
+            needed, DubLayout.prepPadBarMinHeight,
+            "the Prep bar's floor no longer covers what it draws — "
+                + "rack \(rack.height), needed \(needed)")
+        // And it must not be wildly generous either: a floor far above the
+        // content is height taken from the waveform for nothing.
+        XCTAssertGreaterThan(
+            needed + 60, DubLayout.prepPadBarMinHeight,
+            "the floor is over-reserved — give the height back to the strip")
+    }
+
+    /// The three sections have to fit side by side at the narrowest
+    /// supported window, or the surface starts scrolling sideways.
+    func test_prepRackFitsTheNarrowestWindow() {
+        let size = fittingSize(
+            PrepRack(state: PrepRackState(hasTrack: true)),
+            width: DubLayout.mainWindowMinWidth - DubSpacing.lg * 2)
+        XCTAssertLessThanOrEqual(
+            DubLayout.prepCueColumn + DubLayout.prepLoopSection
+                + DubLayout.prepSampleShelfMin + DubSpacing.xl * 2,
+            DubLayout.mainWindowMinWidth - DubSpacing.lg * 2,
+            "cue + loop + shelf no longer fit at 960")
+        XCTAssertGreaterThan(size.width, 0)
+    }
+
     func test_prepGrid_fitsTheNarrowestSupportedWindow() {
         let available = DubLayout.mainWindowMinWidth - 2 * DubSpacing.lg
         XCTAssertLessThanOrEqual(

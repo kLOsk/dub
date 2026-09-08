@@ -400,6 +400,11 @@ enum DubLayout {
     // plus padding; the sample shelf flexes because a filename is the one
     // thing here whose length is not ours to choose.
     static let prepCueColumn: CGFloat = 236
+    /// Readout 90 + 8 + steppers 32 + 8 + ladder 4×40, plus `md` padding
+    /// each side. Fixed, because a section heading's rule expands to fill
+    /// whatever it is given — unbounded, the LOOP heading stretched the
+    /// section to ~750 pt and pushed SAMPLES to the far edge.
+    static let prepLoopSection: CGFloat = 322
     static let prepSampleShelfMin: CGFloat = 260
     static let prepSampleShelfMax: CGFloat = 420
 
