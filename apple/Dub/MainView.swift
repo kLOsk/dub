@@ -4987,6 +4987,43 @@ final class WaveformAppModel: ObservableObject {
         setState(deck, for: side)
     }
 
+    /// Halve or double the running loop, **keeping its start**.
+    ///
+    /// Not the same operation as picking a length. `set_reverse_loop`
+    /// re-anchors from the playhead, so re-firing at half the length
+    /// would move the loop; the DJ pressing ÷2 wants the first half of
+    /// what is already looping, not a new loop somewhere else. So this
+    /// reads the live region and re-issues it as a manual in/out with
+    /// the same in-point.
+    ///
+    /// Clamped to the same 1/8…16-beat range the buttons offer, and a
+    /// no-op when nothing is looping — there is nothing to halve.
+    func scaleLoop(_ side: DeckSide, double: Bool) {
+        guard isRunning else { return }
+        var deck = state(for: side)
+        guard deck.hasTrack, deck.loopActive else { return }
+
+        let inSecs = deck.loopInSecs
+        let length = deck.loopOutSecs - inSecs
+        guard length > 0, inSecs.isFinite else { return }
+
+        if let beats = deck.activeLoopBeats {
+            let next = double ? beats * 2 : beats / 2
+            guard next >= 0.125 - 1e-9, next <= 16 + 1e-9 else { return }
+            deck.activeLoopBeats = next
+        }
+        let scaled = double ? length * 2 : length / 2
+        do {
+            try engine.setManualLoop(
+                deckIdx: side.ffiDeckIdx, inSecs: inSecs, outSecs: inSecs + scaled)
+        } catch {
+            surfaceError("Loop resize failed: \(error.localizedDescription)")
+            return
+        }
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
+    }
+
     /// Disengage the loop on the focused deck; playback continues
     /// forward from the current position.
     func exitLoop(_ side: DeckSide) {

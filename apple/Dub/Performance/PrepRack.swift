@@ -90,6 +90,10 @@ struct PrepRackCallbacks {
     var onRenameCue: (_ index: Int) -> Void = { _ in }
     var onColorCue: (_ index: Int, _ token: String?) -> Void = { _, _ in }
     var onLoop: (_ beats: Double) -> Void = { _ in }
+    /// Halve or double the running loop, keeping its start.
+    var onScaleLoop: (_ double: Bool) -> Void = { _ in }
+    /// Pressing the lit length again leaves the loop.
+    var onExitLoop: () -> Void = {}
     /// A file dropped onto slot `index` — from the library or Finder.
     /// Dropping onto a filled slot replaces it.
     var onDropSample: (_ index: Int, _ url: URL) -> Void = { _, _ in }
@@ -119,7 +123,9 @@ struct PrepRack: View {
                 activeBeats: state.activeLoopBeats,
                 engaged: state.loopEngaged,
                 hasTrack: state.hasTrack,
-                onLoop: callbacks.onLoop)
+                onLoop: callbacks.onLoop,
+                onScale: callbacks.onScaleLoop,
+                onExit: callbacks.onExitLoop)
                 .frame(width: DubLayout.prepLoopSection, alignment: .leading)
 
             // Takes the rest. There is no fourth section coming, so
@@ -207,11 +213,12 @@ private struct CueBank: View {
             // two columns keep the section the height of its neighbour.
             HStack(alignment: .top, spacing: DubSpacing.sm) {
                 ForEach(0..<2, id: \.self) { column in
-                    VStack(spacing: DubSpacing.xs) {
+                    VStack(spacing: 2) {
                         ForEach(slots.filter { $0.index / 4 == column }) { row($0) }
                     }
                 }
             }
+            .frame(height: DubLayout.prepSectionContent)
         }
     }
 
@@ -240,7 +247,9 @@ private struct CueBank: View {
                 .fixedSize()
         }
         .padding(.trailing, DubSpacing.sm)
-        .frame(height: 30)
+        // No fixed height: four rows divide `prepSectionContent`, which
+        // is what keeps this section level with the other two.
+        .frame(maxHeight: .infinity)
         .background(slot.isSet ? DubColor.surface2 : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
         .overlay(
@@ -316,44 +325,40 @@ enum CueTimecode {
 
 // MARK: - LOOP — a size selector
 
-/// Loop lengths in **beats**, windowed.
+/// Loop lengths in **beats**, ascending, windowed three at a time.
 ///
-/// Three changes from the first pass, all of them corrections:
+/// Ascending left-to-right: shorter on the left, longer on the right,
+/// which is the direction `÷2` and `×2` sit and the direction every
+/// hardware loop control runs.
 ///
-/// * **Beats, not bars.** The engine has always taken beats; the bars
-///   wrapper multiplied by the grid's meter and rounded, which put every
-///   sub-beat size out of reach. 1/2, 1/4 and 1/8 are ordinary auto-loop
-///   values, so the wrapper was not a simplification, it was a ceiling.
-/// * **No numeric readout.** The lit button *is* the readout. A separate
-///   panel restating the number it is next to earns none of its width.
-/// * **No IN / OUT / EXIT.** Manual in/out is a different gesture from
-///   picking a length, and mixing them made one block do two jobs.
+/// The two steppers do not move a window — they **resize the running
+/// loop**, keeping its start, so `÷2` gives you the first half of what
+/// is currently looping rather than a new loop somewhere else. The three
+/// visible buttons follow whatever length is engaged, so the neighbours
+/// you would reach next are always the ones on screen.
 ///
-/// The range runs 16 down to 1/8 — eight values, more than fit as
-/// buttons — so `÷2` and `×2` slide a three-wide window along it and sit
-/// on either side of the buttons, which is where the thing that moves
-/// them belongs.
+/// Pressing the lit length again exits the loop. A loop you engaged with
+/// one press should not need a different control to leave.
 private struct LoopEngine: View {
     let activeBeats: Double?
     let engaged: Bool
     let hasTrack: Bool
     let onLoop: (Double) -> Void
+    let onScale: (_ double: Bool) -> Void
+    let onExit: () -> Void
 
-    /// Longest first, so `÷2` moves right and `×2` moves left — the
-    /// direction the labels imply.
-    static let sizes: [Double] = [16, 8, 4, 2, 1, 0.5, 0.25, 0.125]
-    /// How many sit on the surface at once.
+    static let sizes: [Double] = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16]
     static let windowSize = 3
+    /// Where the window sits with nothing engaged: 1 · 2 · 4, the
+    /// lengths a DJ reaches for first.
+    private static let idleStart = 3
 
-    @State private var windowStart = 2
-
-    /// Keeps the engaged length inside the visible window, so a loop
-    /// fired from the keyboard or a controller does not light a button
-    /// that is scrolled off.
-    private var resolvedStart: Int {
+    /// Centre the window on the engaged length so both neighbours are
+    /// reachable without a stepper press.
+    private var windowStart: Int {
         guard let active = activeBeats,
               let idx = Self.sizes.firstIndex(where: { abs($0 - active) < 1e-9 })
-        else { return windowStart }
+        else { return Self.idleStart }
         return min(max(idx - Self.windowSize / 2, 0), Self.sizes.count - Self.windowSize)
     }
 
@@ -365,11 +370,12 @@ private struct LoopEngine: View {
                 trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
 
             HStack(spacing: DubSpacing.sm) {
-                stepper("÷2", shift: 1)
+                stepper("÷2", double: false)
                 sizeButtons
-                stepper("×2", shift: -1)
+                stepper("×2", double: true)
             }
-            .padding(DubSpacing.md)
+            .frame(height: DubLayout.prepSectionContent)
+            .padding(.horizontal, DubSpacing.md)
             .background(DubColor.surface1)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous))
             .overlay(
@@ -379,16 +385,16 @@ private struct LoopEngine: View {
     }
 
     private var sizeButtons: some View {
-        let start = resolvedStart
+        let start = windowStart
         return HStack(spacing: 0) {
             ForEach(0..<Self.windowSize, id: \.self) { offset in
                 let index = start + offset
                 let beats = Self.sizes[index]
-                let on = activeBeats.map { abs($0 - beats) < 1e-9 } ?? false
+                let on = engaged && (activeBeats.map { abs($0 - beats) < 1e-9 } ?? false)
                 Text(Self.label(beats))
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(on ? DubColor.textPrimary : DubColor.textSecondary)
-                    .frame(width: 52, height: 52)
+                    .frame(width: 52, height: 64)
                     .background(on ? DubColor.loop.opacity(0.26) : Color.clear)
                     .overlay(alignment: .trailing) {
                         if offset < Self.windowSize - 1 {
@@ -396,9 +402,13 @@ private struct LoopEngine: View {
                         }
                     }
                     .contentShape(Rectangle())
-                    .onPressDown(enabled: hasTrack) { onLoop(beats) }
-                    .help("Loop the last \(Self.label(beats)) beat"
-                        + (beats == 1 ? "" : "s"))
+                    .onPressDown(enabled: hasTrack) {
+                        if on { onExit() } else { onLoop(beats) }
+                    }
+                    .help(on
+                        ? "Looping \(Self.label(beats)) — press again to exit"
+                        : "Loop the last \(Self.label(beats)) beat"
+                            + (beats == 1 ? "" : "s"))
             }
         }
         .background(DubColor.surface0)
@@ -408,25 +418,25 @@ private struct LoopEngine: View {
                 .stroke(DubColor.divider, lineWidth: 1))
     }
 
-    /// `shift` moves the window, it does not halve a running loop —
-    /// these choose which lengths are reachable, and the buttons choose
-    /// the length.
-    private func stepper(_ glyph: String, shift: Int) -> some View {
-        let limit = Self.sizes.count - Self.windowSize
-        let next = resolvedStart + shift
-        let enabled = next >= 0 && next <= limit
+    /// Resizes the *running* loop. Dead without one — there is nothing
+    /// to halve — and dead at the ends of the range.
+    private func stepper(_ glyph: String, double: Bool) -> some View {
+        let next = activeBeats.map { double ? $0 * 2 : $0 / 2 }
+        let enabled = engaged && next.map { $0 >= 0.125 - 1e-9 && $0 <= 16 + 1e-9 } ?? false
         return Text(glyph)
             .font(.system(size: 12, weight: .medium, design: .monospaced))
             .foregroundStyle(enabled ? DubColor.textSecondary : DubColor.textPlaceholder)
-            .frame(width: 34, height: 52)
+            .frame(width: 34, height: 64)
             .background(DubColor.surface2)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
                     .stroke(DubColor.divider, lineWidth: 1))
             .contentShape(Rectangle())
-            .onPressDown(enabled: enabled) { windowStart = next }
-            .help(shift > 0 ? "Shorter lengths" : "Longer lengths")
+            .onPressDown(enabled: enabled) { onScale(double) }
+            .help(double
+                ? "Double the running loop"
+                : "Halve the running loop, keeping its start")
     }
 
     /// `1/8` rather than `0.125` — a DJ reads loop sizes as fractions.
@@ -460,7 +470,7 @@ private struct SampleShelf: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             SectionHeading(
                 title: "SAMPLES", accent: DubColor.deckATint,
-                trailing: filled == 0 ? "DRAG FROM THE LIBRARY" : "\(filled) OF 8")
+                trailing: "\(filled) OF \(slots.count)")
 
             LazyVGrid(
                 columns: Array(
@@ -480,9 +490,16 @@ private struct SampleShelf: View {
     /// when they decide something should be a stab.
     private func slotTile(index: Int, name: String?) -> some View {
         let isEmpty = name == nil
+        // An empty slot shows its number, the way an empty cue row
+        // shows its own. Eight tiles each reading "drop" was the
+        // instruction printed eight times; the dashed border already
+        // says the slot takes something.
         return VStack(spacing: 2) {
-            Text(name ?? "drop")
-                .font(.system(size: 11, weight: isEmpty ? .regular : .semibold))
+            Text(name ?? "\(index + 1)")
+                .font(.system(
+                    size: isEmpty ? 13 : 11,
+                    weight: isEmpty ? .medium : .semibold,
+                    design: isEmpty ? .monospaced : .default))
                 .foregroundStyle(isEmpty ? DubColor.textPlaceholder : DubColor.textPrimary)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)

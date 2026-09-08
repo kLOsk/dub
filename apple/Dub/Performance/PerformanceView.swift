@@ -62,7 +62,7 @@ struct PerformanceView: View {
                 mode: model.engineMode,
                 deckChrome: deckChromeHeight,
                 deckMinimum: model.engineMode == .prep
-                    ? DubLayout.prepRegionMinHeight
+                    ? DubLayout.prepRegionMinHeight + prepRipLaneHeight
                     : DubLayout.waveformMinHeight
             ) { _ in
                 VStack(spacing: 0) {
@@ -330,6 +330,8 @@ struct PerformanceView: View {
                     name: model.deckA.hotCues[index]?.name, color: token)
             },
             onLoop: { beats in model.handleLoopBeats(.a, beats: beats) },
+            onScaleLoop: { double in model.scaleLoop(.a, double: double) },
+            onExitLoop: { model.exitLoop(.a) },
             onDropSample: { index, url in model.setSampleSlot(index, url: url) },
             onUnloadSample: { index in model.clearSampleSlot(index) })
     }
@@ -549,6 +551,19 @@ struct PerformanceView: View {
         .background(DubColor.surface0)
     }
 
+    /// Extra height the pad bar needs while the rip lane is showing.
+    ///
+    /// The bar used to absorb this in a `ScrollView`; without one the
+    /// region has to actually ask for the space, or a capture would push
+    /// the rack off its own surface. Rip is leaving Prep for its own
+    /// surface, at which point this goes with it.
+    private var prepRipLaneHeight: CGFloat {
+        var extra: CGFloat = 0
+        if model.ripRecoverable.first != nil { extra += 56 }
+        if ripBarState != nil { extra += 56 }
+        return extra
+    }
+
     @ViewBuilder
     private var prepPadRows: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -570,14 +585,15 @@ struct PerformanceView: View {
             if let ripBarState {
                 PrepRipBar(state: ripBarState, callbacks: ripBarCallbacks)
             }
-            // Scrolls only when it has to. The grid fits its floor at
-            // every supported window size; an expanded DS01E Expert
-            // panel adds ~250 pt of user-triggered content that no
-            // static budget can plan for, and this is the escape hatch
-            // for it.
-            ScrollView(.vertical, showsIndicators: false) {
-                PrepRack(state: prepRackState, callbacks: prepRackCallbacks)
-            }
+            // No `ScrollView`. It was the escape hatch for the DS01E
+            // Expert panel's ~250 pt of user-triggered content, and the
+            // Expert panel left Prep with the rest of the FX. A scroll
+            // view is greedy — it takes every pixel offered — so with
+            // nothing left to expand it was silently claiming the space
+            // below the rack and holding it empty, which is the gap the
+            // three height re-measurements above kept failing to close.
+            // The rack is a fixed height now; the bar sizes to it.
+            PrepRack(state: prepRackState, callbacks: prepRackCallbacks)
         }
     }
 

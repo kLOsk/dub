@@ -373,6 +373,10 @@ enum DubLayout {
     /// Floor for Prep's pad bar: what `PrepRack` actually draws, plus
     /// its own vertical padding.
     ///
+    /// All three sections now share `prepSectionContent`, so the rack is
+    /// a heading (14) + gap (8) + 88, and the bar is that plus its own
+    /// 8 pt top and bottom. Everything below goes to the library.
+    ///
     /// Was 280, sized for the two-column grid it replaced *and* carrying
     /// a permanent allowance for the 56 pt rip lane. The rack needs about
     /// 170, and the rip lane is conditional — reserving for it on every
@@ -384,7 +388,7 @@ enum DubLayout {
     /// **Re-measure if you change a Prep section.**
     /// `PerformanceLayoutTests.test_prepRackFitsItsHeightFloor` fails
     /// both ways: too small clips, too generous steals from the strip.
-    static let prepPadBarMinHeight: CGFloat = 192
+    static let prepPadBarMinHeight: CGFloat = 128
 
     /// Overview band + playing strip + pad bar + the two 1 pt dividers.
     static let prepRegionMinHeight: CGFloat =
@@ -410,6 +414,12 @@ enum DubLayout {
     /// fixed-width timecode, so the width is set by the name being
     /// readable rather than merely present — at 236 (the one-column
     /// figure this replaced) `FIRST VERSE` truncated to `FI…`.
+    /// Content height shared by all three Prep sections, below their
+    /// headings. Set by the sample shelf — two rows of 42 pt slots plus
+    /// a 4 pt gap — and matched by the other two, so the three sections
+    /// end on one baseline and the library starts there.
+    static let prepSectionContent: CGFloat = 88
+
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
     /// padding each side. Fixed, because a section heading's rule
