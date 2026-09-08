@@ -132,12 +132,14 @@ enum DubKeymap {
                 action: .instantDouble(toDeckB: false), match: .code(123),
                 requiresCommand: true, legend: "⌘←"),
         ]
-        // Number row 1–4.
-        for i in 0..<4 {
+        // Number row 1–8. The codes are not contiguous past 4 — macOS
+        // orders them 18,19,20,21,23,22,26,28 — so they are listed
+        // rather than computed, which is also how a typo becomes
+        // visible.
+        let cueCodes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28]
+        for (i, code) in cueCodes.enumerated() {
             all.append(
-                DubBinding(
-                    action: .hotCue(i), match: .code(UInt16(18 + i)),
-                    legend: "\(i + 1)"))
+                DubBinding(action: .hotCue(i), match: .code(code), legend: "\(i + 1)"))
         }
         for (i, code) in sirenCodes.enumerated() {
             all.append(

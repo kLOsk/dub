@@ -41,32 +41,93 @@ fn nearest_beat_index(beats: &[f64], target: f64) -> Option<usize> {
     }
 }
 
+/// Whole beats of `value`, as an index, when it lands inside `0..=max`.
+///
+/// The cast is the reason this is a function: clippy denies a bare
+/// `f64 as usize` and it is right to, so the guard and the cast live
+/// together where the guard is visible.
+fn whole_beats_index(value: f64, max: usize) -> Option<usize> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let floored = value.floor();
+    // `max` is a slice length, so it always round-trips through f64 at
+    // the sizes a beat grid reaches.
+    #[allow(clippy::cast_precision_loss)]
+    if floored > max as f64 {
+        return None;
+    }
+    // Guarded above: finite, non-negative, and no larger than `max`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(floored as usize)
+}
+
 /// Compute a grid-snapped **reverse** loop of `length_beats` beats for a
 /// press at `playhead` over the ascending grid `beats`.
 ///
 /// Returns `(loop_in, loop_out)` in the inputs' unit, where `loop_out`
 /// is the beat line nearest the press and `loop_in` is `length_beats`
-/// grid lines earlier. Returns `None` when `length_beats == 0` or the
-/// grid is too short to hold the loop. Near the track start the window
-/// is clamped forward so it still fits (loops the first `length_beats`
+/// earlier. Returns `None` when the length is not positive or the grid
+/// is too short to hold the loop. Near the track start the window is
+/// clamped forward so it still fits (loops the first `length_beats`
 /// beats) rather than refusing the loop outright.
+///
+/// **Fractional lengths are supported**, because DJ loop sizes run
+/// below a beat — 1/2, 1/4, 1/8 are ordinary auto-loop values. A whole
+/// length still lands on grid lines exactly (index arithmetic, no
+/// floating-point drift accumulated across a long grid); a fractional
+/// one interpolates back from `loop_out` using the local beat interval,
+/// which is the only honest reading when the grid has no line there.
 #[must_use]
-pub fn reverse_loop_region(playhead: f64, beats: &[f64], length_beats: u32) -> Option<(f64, f64)> {
-    let len = length_beats as usize;
-    if len == 0 || beats.len() < len + 1 {
+pub fn reverse_loop_region(playhead: f64, beats: &[f64], length_beats: f64) -> Option<(f64, f64)> {
+    if !length_beats.is_finite() || length_beats <= 0.0 {
         return None;
     }
     let raw = nearest_beat_index(beats, playhead)?;
-    // Clamp so the whole window lands on the grid: `out_idx` can't be
-    // below `len` (no room behind) or above the last beat.
-    let out_idx = raw.clamp(len, beats.len() - 1);
-    let in_idx = out_idx - len;
-    let (lin, lout) = (beats[in_idx], beats[out_idx]);
-    if lout > lin {
-        Some((lin, lout))
-    } else {
-        None
+
+    // Whole lengths keep the exact index path: `beats[out - len]` is the
+    // grid line itself, not a value reconstructed from an interval.
+    let whole = length_beats.round();
+    if (length_beats - whole).abs() < 1e-9 {
+        let len = whole_beats_index(whole, beats.len())?;
+        if len == 0 || beats.len() < len + 1 {
+            return None;
+        }
+        let out_idx = raw.clamp(len, beats.len() - 1);
+        let in_idx = out_idx - len;
+        let (lin, lout) = (beats[in_idx], beats[out_idx]);
+        return if lout > lin { Some((lin, lout)) } else { None };
     }
+
+    // Sub-beat: step back a fraction of the interval *entering*
+    // `loop_out`, so a 1/4 loop at 174 BPM is a quarter of the beat the
+    // DJ is actually on rather than a quarter of some track average.
+    if beats.len() < 2 {
+        return None;
+    }
+    let out_idx = raw.max(1);
+    let lout = beats[out_idx];
+    let interval = beats[out_idx] - beats[out_idx - 1];
+    if interval.is_nan() || interval <= 0.0 {
+        return None;
+    }
+    // Longer-than-a-beat fractional lengths (1.5, 2.5) walk whole beats
+    // first and take the remainder from the interval before those, so
+    // the walk stays on the grid for as long as it can.
+    let whole_back = whole_beats_index(length_beats, out_idx)?;
+    let anchor_idx = out_idx - whole_back;
+    let anchor = beats[anchor_idx];
+    let frac = length_beats - length_beats.floor();
+    let frac_interval = if anchor_idx >= 1 {
+        beats[anchor_idx] - beats[anchor_idx - 1]
+    } else {
+        interval
+    };
+    let lin = anchor - frac * frac_interval;
+    if lin < 0.0 || lout <= lin {
+        return None;
+    }
+    Some((lin, lout))
 }
 
 /// Bring `pos` into the half-open window `[lo, lo + len)` by adding or
@@ -118,14 +179,14 @@ mod tests {
         // Pressed at 6.4 — a hair past beat 6 — for a 1-bar (4-beat)
         // loop. loop_out snaps back to beat 6, loop_in is 4 beats
         // earlier (beat 2): the bar that just played.
-        assert_eq!(reverse_loop_region(6.4, &g, 4), Some((2.0, 6.0)));
+        assert_eq!(reverse_loop_region(6.4, &g, 4.0), Some((2.0, 6.0)));
     }
 
     #[test]
     fn more_than_half_a_beat_late_rounds_up_to_the_next_line() {
         let g = grid();
         // 6.6 is closer to beat 7 → loop_out = 7, loop_in = 3.
-        assert_eq!(reverse_loop_region(6.6, &g, 4), Some((3.0, 7.0)));
+        assert_eq!(reverse_loop_region(6.6, &g, 4.0), Some((3.0, 7.0)));
     }
 
     #[test]
@@ -133,27 +194,27 @@ mod tests {
         let g = grid();
         // Pressed at 1.2 (nearest beat 1) with a 4-beat loop — only
         // one beat behind, so clamp to the first 4 beats [0, 4].
-        assert_eq!(reverse_loop_region(1.2, &g, 4), Some((0.0, 4.0)));
+        assert_eq!(reverse_loop_region(1.2, &g, 4.0), Some((0.0, 4.0)));
     }
 
     #[test]
     fn half_and_two_bar_lengths() {
         let g = grid();
         // ½ bar = 2 beats ending at beat 6 → [4, 6].
-        assert_eq!(reverse_loop_region(6.1, &g, 2), Some((4.0, 6.0)));
+        assert_eq!(reverse_loop_region(6.1, &g, 2.0), Some((4.0, 6.0)));
         // 2 bars = 8 beats ending at beat 8 → [0, 8].
-        assert_eq!(reverse_loop_region(7.9, &g, 8), Some((0.0, 8.0)));
+        assert_eq!(reverse_loop_region(7.9, &g, 8.0), Some((0.0, 8.0)));
     }
 
     #[test]
     fn rejects_zero_length_or_too_short_grid() {
         let g = grid();
-        assert_eq!(reverse_loop_region(4.0, &g, 0), None);
+        assert_eq!(reverse_loop_region(4.0, &g, 0.0), None);
         // A 9-beat grid can't hold a 16-beat loop.
-        assert_eq!(reverse_loop_region(4.0, &g, 16), None);
+        assert_eq!(reverse_loop_region(4.0, &g, 16.0), None);
         // Empty / single-beat grids can't loop.
-        assert_eq!(reverse_loop_region(0.0, &[], 4), None);
-        assert_eq!(reverse_loop_region(0.0, &[1.0], 4), None);
+        assert_eq!(reverse_loop_region(0.0, &[], 4.0), None);
+        assert_eq!(reverse_loop_region(0.0, &[1.0], 4.0), None);
     }
 
     #[test]
@@ -161,7 +222,7 @@ mod tests {
         // Beats drifting wider over time (a track that slows).
         let g = [0.0, 1.0, 2.1, 3.3, 4.6, 6.0];
         // Nearest to 4.7 is beat index 4 (4.6); 2-beat loop → [2.1, 4.6].
-        let (lin, lout) = reverse_loop_region(4.7, &g, 2).unwrap();
+        let (lin, lout) = reverse_loop_region(4.7, &g, 2.0).unwrap();
         assert!((lin - 2.1).abs() < 1e-9);
         assert!((lout - 4.6).abs() < 1e-9);
     }
@@ -178,5 +239,72 @@ mod tests {
         assert!((wrap_into(14.5, 2.0, 4.0) - 2.5).abs() < 1e-9);
         // Degenerate length is a no-op.
         assert!((wrap_into(5.0, 2.0, 0.0) - 5.0).abs() < 1e-9);
+    }
+
+    /// Sub-beat loops are ordinary DJ sizes — 1/2, 1/4, 1/8 are on every
+    /// auto-loop control — and the grid has no line to index for them,
+    /// so they interpolate back from `loop_out`.
+    #[test]
+    fn a_half_beat_loop_is_half_the_interval() {
+        let g: Vec<f64> = (0..9).map(f64::from).collect();
+        let (lin, lout) = reverse_loop_region(4.1, &g, 0.5).unwrap();
+        assert!((lout - 4.0).abs() < 1e-9, "out snaps to the nearest line");
+        assert!((lin - 3.5).abs() < 1e-9, "in is half an interval earlier");
+    }
+
+    #[test]
+    fn an_eighth_beat_loop_is_an_eighth_of_the_interval() {
+        let g: Vec<f64> = (0..9).map(f64::from).collect();
+        let (lin, lout) = reverse_loop_region(6.0, &g, 0.125).unwrap();
+        assert!((lout - 6.0).abs() < 1e-9);
+        assert!((lin - 5.875).abs() < 1e-9);
+    }
+
+    /// The fraction comes from the interval the DJ is actually on, not a
+    /// track average — on a drifting or hand-tapped grid those differ.
+    #[test]
+    fn a_fraction_uses_the_local_interval() {
+        // Beat 3 -> 4 is twice as long as the beats before it.
+        let g = vec![0.0, 1.0, 2.0, 3.0, 5.0, 6.0];
+        let (lin, lout) = reverse_loop_region(5.0, &g, 0.5).unwrap();
+        assert!((lout - 5.0).abs() < 1e-9);
+        assert!((lin - 4.0).abs() < 1e-9, "half of the 2.0-long interval");
+    }
+
+    /// A length over a beat with a remainder walks whole beats on the
+    /// grid first, so only the remainder is reconstructed.
+    #[test]
+    fn a_mixed_length_walks_the_grid_then_interpolates() {
+        let g: Vec<f64> = (0..9).map(f64::from).collect();
+        let (lin, lout) = reverse_loop_region(6.0, &g, 2.5).unwrap();
+        assert!((lout - 6.0).abs() < 1e-9);
+        assert!((lin - 3.5).abs() < 1e-9);
+    }
+
+    /// A whole length still lands on grid lines exactly rather than
+    /// being reconstructed from an interval — no drift on a long grid.
+    #[test]
+    fn whole_lengths_stay_on_the_grid_exactly() {
+        let g = vec![0.0, 0.9, 2.1, 2.9, 4.2, 5.0];
+        assert_eq!(reverse_loop_region(4.2, &g, 2.0), Some((2.1, 4.2)));
+    }
+
+    /// At the very start there is no interval *behind* the nearest line
+    /// to take a fraction of, so the window clamps forward — the same
+    /// rule whole lengths already follow (`near_track_start_clamps_
+    /// forward_to_fit`), rather than the press doing nothing.
+    #[test]
+    fn a_fraction_at_the_track_start_clamps_forward() {
+        let g: Vec<f64> = (0..5).map(f64::from).collect();
+        let (lin, lout) = reverse_loop_region(0.0, &g, 0.5).unwrap();
+        assert!((lout - 1.0).abs() < 1e-9);
+        assert!((lin - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_negative_or_nan_length_is_refused() {
+        let g: Vec<f64> = (0..5).map(f64::from).collect();
+        assert_eq!(reverse_loop_region(2.0, &g, -1.0), None);
+        assert_eq!(reverse_loop_region(2.0, &g, f64::NAN), None);
     }
 }

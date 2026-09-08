@@ -21,11 +21,13 @@ final class DubKeymapTests: XCTestCase {
     /// Number row, layout-independent. `⇧` clears rather than selecting a
     /// different action, so it must not change the match.
     func testHotCuesKeepTheNumberRow() {
-        for i in 0..<4 {
+        // 1-8. Not contiguous past 4 on macOS: 5 and 6 are 23 and 22.
+        let codes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28]
+        for (i, code) in codes.enumerated() {
             XCTAssertEqual(
-                DubKeymap.action(
-                    forKeyCode: UInt16(18 + i), character: "\(i + 1)", command: false),
-                .hotCue(i))
+                DubKeymap.action(forKeyCode: code, character: "\(i + 1)", command: false),
+                .hotCue(i),
+                "cue \(i + 1)")
         }
     }
 

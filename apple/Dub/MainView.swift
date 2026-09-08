@@ -175,7 +175,15 @@ struct DeckState: Equatable {
     /// on track load and driven by the cue keys (1–4 set/recall,
     /// Shift+1–4 clear). The waveform draws a marker per set slot;
     /// changes bump `seekGeneration` so a paused deck repaints.
-    var hotCues: [CueMark?] = [nil, nil, nil, nil]
+    /// Eight pads, like every DJ surface the DJ already knows. Four was
+    /// the number the pad row happened to fit, not a decision.
+    static let hotCueCount = 8
+    var hotCues: [CueMark?] = Array(repeating: nil, count: DeckState.hotCueCount)
+
+    /// Length in *beats* of the loop currently engaged; `nil` when none
+    /// is. Beats because that is what the engine takes — the bars field
+    /// beside it is the older, lossier view of the same fact.
+    var activeLoopBeats: Double?
 
     /// Set while a hot-cue press-and-hold preview is running; the
     /// position the playhead returns to on release. `nil` when no
@@ -444,7 +452,7 @@ struct DeckState: Equatable {
         gridLocked = false
         gridDriftQuality = nil
         isLoading = false
-        hotCues = [nil, nil, nil, nil]
+        hotCues = Array(repeating: nil, count: DeckState.hotCueCount)
     }
 
     /// Take on another deck's loaded track (M17 §7.3, Instant
@@ -486,6 +494,7 @@ struct DeckState: Equatable {
         // Nothing is being fetched — the engine already has the buffer.
         isLoading = false
         activeLoopBars = nil
+        activeLoopBeats = nil
         pendingLoopInSecs = nil
     }
 }
@@ -1917,6 +1926,7 @@ final class WaveformAppModel: ObservableObject {
         next.loopOutSecs = pos.loopOutSecs
         if !pos.loopActive {
             next.activeLoopBars = nil
+            next.activeLoopBeats = nil
         }
         // M-perf-ui — pitch + timecode lock state for the deck header
         // (tracking dot + PITCH readout). Lock-free, same hot path as
@@ -2246,7 +2256,7 @@ final class WaveformAppModel: ObservableObject {
             // Drop the previous track's cues; library tracks repopulate
             // theirs in `recordLibraryLoadIfApplicable`, Finder drags
             // stay empty.
-            next.hotCues = [nil, nil, nil, nil]
+            next.hotCues = Array(repeating: nil, count: DeckState.hotCueCount)
             if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
                 next.formatChip = formatChip(for: url, info: info)
@@ -3081,8 +3091,8 @@ final class WaveformAppModel: ObservableObject {
             // Recall persisted hot cues (best-effort; a read failure
             // just leaves the pads empty this session).
             if let cues = try? library.hotCues(trackId: trackId) {
-                var slots: [CueMark?] = [nil, nil, nil, nil]
-                for cue in cues where cue.cueIndex < 4 {
+                var slots: [CueMark?] = Array(repeating: nil, count: DeckState.hotCueCount)
+                for cue in cues where cue.cueIndex < UInt32(DeckState.hotCueCount) {
                     slots[Int(cue.cueIndex)] = CueMark(
                         positionSecs: cue.positionSecs, name: cue.name, color: cue.color)
                 }
@@ -4696,7 +4706,7 @@ final class WaveformAppModel: ObservableObject {
     }
 
     func handleHotCue(_ side: DeckSide, index: Int, clear: Bool) {
-        guard isRunning, index >= 0, index < 4 else { return }
+        guard isRunning, index >= 0, index < DeckState.hotCueCount else { return }
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
@@ -4752,7 +4762,7 @@ final class WaveformAppModel: ObservableObject {
     /// knows whether to expect a matching `endHotCuePreview`.
     @discardableResult
     func beginHotCuePreview(_ side: DeckSide, index: Int) -> Bool {
-        guard isRunning, index >= 0, index < 4 else { return false }
+        guard isRunning, index >= 0, index < DeckState.hotCueCount else { return false }
         var deck = state(for: side)
         guard deck.hasTrack, !deck.isPlaying,
               let position = deck.hotCues[index]?.positionSecs
@@ -4805,6 +4815,30 @@ final class WaveformAppModel: ObservableObject {
     /// Best-effort persistence of one hot cue slot (set when
     /// `position != nil`, else delete). The in-memory cue already
     /// works this session regardless of the DB write.
+    /// Put `url` in sample slot `index`, replacing whatever was there.
+    ///
+    /// Slots are positional: the bank is a list, so filling slot 5 while
+    /// 3 and 4 are empty pads the gaps rather than sliding the file
+    /// left. A pad bound to slot 5 must keep pointing at slot 5.
+    func setSampleSlot(_ index: Int, url: URL) {
+        guard index >= 0, index < 8 else { return }
+        var urls = sampleBank.all
+        while urls.count <= index { urls.append(Self.emptySampleSlotURL) }
+        urls[index] = url
+        sampleBank = SampleBank(urls: urls.filter { $0 != Self.emptySampleSlotURL })
+    }
+
+    /// Empty a sample slot.
+    func clearSampleSlot(_ index: Int) {
+        let all = sampleBank.all
+        guard all.indices.contains(index) else { return }
+        sampleBank.remove(all[index])
+    }
+
+    /// Placeholder for a gap while re-indexing the bank. Never persisted
+    /// — `setSampleSlot` filters it out before storing.
+    private static let emptySampleSlotURL = URL(fileURLWithPath: "/dev/null")
+
     /// Name and/or colour an existing cue on `side`.
     ///
     /// Prep work: the DJ sets a mark by ear, then labels it so the bank
@@ -4812,7 +4846,7 @@ final class WaveformAppModel: ObservableObject {
     /// through the FFI's separate label call, which leaves the position
     /// alone — see `Library::set_hot_cue_label`.
     func setHotCueLabel(_ side: DeckSide, index: Int, name: String?, color: String?) {
-        guard index >= 0, index < 4 else { return }
+        guard index >= 0, index < DeckState.hotCueCount else { return }
         var deck = state(for: side)
         guard var mark = deck.hotCues[index] else { return }
         mark.name = name
@@ -4853,6 +4887,30 @@ final class WaveformAppModel: ObservableObject {
     /// bars just heard and jumps the playhead back in; we light the
     /// matching length pad immediately and let the 30 Hz poll mirror
     /// the engine's authoritative loop state into the deck.
+    /// Engage a reverse loop of `beats` beats.
+    ///
+    /// Beats, not bars. The engine has always taken beats; the bars
+    /// wrapper above it multiplied by the grid's meter and rounded to a
+    /// whole number, which made every sub-beat size unreachable — and
+    /// sub-beat sizes are ordinary auto-loop values. FFI 68 takes the
+    /// fraction straight through.
+    func handleLoopBeats(_ side: DeckSide, beats: Double) {
+        guard isRunning, beats > 0 else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack else { return }
+        do {
+            try engine.setReverseLoop(deckIdx: side.ffiDeckIdx, lengthBeats: beats)
+        } catch {
+            surfaceError("Loop failed: \(error.localizedDescription)")
+            return
+        }
+        var next = state(for: side)
+        next.activeLoopBeats = beats
+        next.loopActive = true
+        next.seekGeneration &+= 1
+        setState(next, for: side)
+    }
+
     func handleLoop(_ side: DeckSide, bars: Double) {
         guard isRunning else { return }
         var deck = state(for: side)
@@ -4864,7 +4922,7 @@ final class WaveformAppModel: ObservableObject {
         let lengthBeats = max(1, Int((bars * Double(beatsPerBar)).rounded()))
         do {
             try engine.setReverseLoop(
-                deckIdx: side.ffiDeckIdx, lengthBeats: UInt32(lengthBeats))
+                deckIdx: side.ffiDeckIdx, lengthBeats: Double(lengthBeats))
         } catch {
             surfaceError("Loop failed: \(error.localizedDescription)")
             return
@@ -4934,10 +4992,12 @@ final class WaveformAppModel: ObservableObject {
     func exitLoop(_ side: DeckSide) {
         guard isRunning else { return }
         var deck = state(for: side)
-        guard deck.activeLoopBars != nil || deck.loopActive || deck.pendingLoopInSecs != nil
+        guard deck.activeLoopBars != nil || deck.activeLoopBeats != nil
+            || deck.loopActive || deck.pendingLoopInSecs != nil
         else { return }
         try? engine.clearLoop(deckIdx: side.ffiDeckIdx)
         deck.activeLoopBars = nil
+        deck.activeLoopBeats = nil
         deck.loopActive = false
         // ✕ also disarms a half-set manual loop, so the pad is one
         // "never mind" rather than two different ones.

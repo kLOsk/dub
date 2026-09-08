@@ -62,27 +62,28 @@ final class PrepPadSnapshotTests: XCTestCase {
     func test_prepRack_noTrack() {
         snap(
             PrepRack(state: PrepRackState()),
-            width: Self.surfaceWidth, height: 210, named: "rack-no-track")
+            width: Self.surfaceWidth, height: 230, named: "rack-no-track")
     }
 
     /// A track loaded, two cues named and coloured, a 2-bar loop running,
     /// samples in the bank. The state the surface is designed around.
     func test_prepRack_working() {
         let state = PrepRackState(
-            cues: [
-                CueSlotState(index: 0, mark: mark(0, "INTRO", "aqua")),
-                CueSlotState(index: 1, mark: mark(102.3, "FIRST VERSE", "orange")),
-                CueSlotState(index: 2, mark: nil),
-                CueSlotState(index: 3, mark: nil),
-            ],
-            activeLoopBars: 2,
+            cues: (0..<8).map { i in
+                switch i {
+                case 0: return CueSlotState(index: 0, mark: mark(0, "INTRO", "aqua"))
+                case 1: return CueSlotState(index: 1, mark: mark(102.3, "FIRST VERSE", "orange"))
+                case 4: return CueSlotState(index: 4, mark: mark(190.0, "BREAK", "green"))
+                default: return CueSlotState(index: i)
+                }
+            },
+            activeLoopBeats: 4,
             loopEngaged: true,
-            loopInArmed: false,
-            sampleNames: ["Air Horn", "Reload", "Siren Up"],
+            sampleSlots: ["Air Horn", "Reload", nil, "Siren Up", nil, nil, nil, nil],
             hasTrack: true)
         snap(
             PrepRack(state: state),
-            width: Self.surfaceWidth, height: 210, named: "rack-working")
+            width: Self.surfaceWidth, height: 230, named: "rack-working")
     }
 
     /// The three silhouettes with nothing set: an unboxed list of dashed
@@ -92,32 +93,32 @@ final class PrepPadSnapshotTests: XCTestCase {
     func test_prepRack_loadedButEmpty() {
         snap(
             PrepRack(state: PrepRackState(hasTrack: true)),
-            width: Self.surfaceWidth, height: 210, named: "rack-loaded-empty")
+            width: Self.surfaceWidth, height: 230, named: "rack-loaded-empty")
     }
 
     /// An unnamed cue is the common case — most are dropped mid-listen and
     /// never labelled — so the row must still read without a name.
     func test_prepRack_unnamedCues() {
         let state = PrepRackState(
-            cues: [
-                CueSlotState(index: 0, mark: mark(12.4, nil)),
-                CueSlotState(index: 1, mark: mark(63.0, nil)),
-                CueSlotState(index: 2, mark: mark(180.75, nil)),
-                CueSlotState(index: 3, mark: nil),
-            ],
+            cues: (0..<8).map { i in
+                i < 3
+                    ? CueSlotState(index: i, mark: mark(Double(i) * 40 + 12.4, nil))
+                    : CueSlotState(index: i)
+            },
             hasTrack: true)
         snap(
             PrepRack(state: state),
-            width: Self.surfaceWidth, height: 210, named: "rack-unnamed-cues")
+            width: Self.surfaceWidth, height: 230, named: "rack-unnamed-cues")
     }
 
-    /// `IN` taken, waiting for `OUT` — the one state where a disabled
-    /// control sits beside an enabled one, and the case the contrast
-    /// package's real `enabled` state exists for.
-    func test_prepRack_loopInArmed() {
+    /// A sub-beat loop. These were unreachable before FFI 68 — the bars
+    /// wrapper rounded them to a whole beat — so the window has scrolled
+    /// to show 1/4 lit.
+    func test_prepRack_subBeatLoop() {
         snap(
-            PrepRack(state: PrepRackState(loopInArmed: true, hasTrack: true)),
-            width: Self.surfaceWidth, height: 210, named: "rack-loop-in-armed")
+            PrepRack(state: PrepRackState(activeLoopBeats: 0.25, loopEngaged: true,
+                                          hasTrack: true)),
+            width: Self.surfaceWidth, height: 230, named: "rack-sub-beat-loop")
     }
 
     /// A long sample name has to truncate inside the shelf rather than
@@ -125,15 +126,15 @@ final class PrepPadSnapshotTests: XCTestCase {
     /// not ours to choose.
     func test_prepRack_longSampleNames() {
         let state = PrepRackState(
-            sampleNames: [
+            sampleSlots: [
                 "Amen Break Full Length Reference Bounce 24bit",
-                "Horn",
-                "Reload Siren (Benidub DS01E, long tail)",
+                "Horn", nil, "Reload Siren (Benidub DS01E, long tail)",
+                nil, nil, nil, nil,
             ],
             hasTrack: true)
         snap(
             PrepRack(state: state),
-            width: Self.surfaceWidth, height: 210, named: "rack-long-sample-names")
+            width: Self.surfaceWidth, height: 230, named: "rack-long-sample-names")
     }
 
     // MARK: - Formatting

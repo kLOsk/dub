@@ -42,8 +42,13 @@ struct CuePadSection: View {
 
     var body: some View {
         DubSectionPanel("HOTCUE") {
-            HStack(spacing: DubSpacing.sm) {
-                ForEach(0..<4, id: \.self) { index in
+            // Wrapped, not a single row: eight pads at 38 pt do not fit
+            // Performance's 224 pt column, and four-per-row is the shape
+            // every hardware pad section uses anyway.
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                ForEach(Array(stride(from: 0, to: cues.count, by: 4)), id: \.self) { rowStart in
+                    HStack(spacing: DubSpacing.sm) {
+                        ForEach(rowStart..<min(rowStart + 4, cues.count), id: \.self) { index in
                     let isSet = index < cues.count && cues[index] != nil
                     let previewable = isSet && !isPlaying
                     DubPadCell("\(index + 1)", size: .glyph, lit: isSet)
@@ -61,6 +66,8 @@ struct CuePadSection: View {
                                 : previewable
                                     ? "Hot cue \(index + 1) — hold to preview, ⇧-click to clear"
                                     : "Hot cue \(index + 1) — click to jump, ⇧-click to clear")
+                        }
+                    }
                 }
             }
         }

@@ -74,9 +74,46 @@ struct PowerState: Equatable {
     let isCharging: Bool
     /// Battery state-of-charge, 0...100. Clamped at the boundaries.
     let percent: Int
-    /// True when the battery is below 20 %. Drives the amber tint
-    /// + (M18) attention pulse.
+    /// True when the battery is below 20 %. Drives the amber tint.
     var isLow: Bool { !isCharging && percent < 20 }
+
+    /// Running unplugged at all.
+    ///
+    /// A laptop on battery mid-set is a risk whatever the charge —
+    /// sleep settings, a thermal throttle, someone's foot on the cable.
+    /// The indicator pulses red for that, rather than waiting until 20 %
+    /// when it is already too late to do much about it.
+    var isUnplugged: Bool { !isCharging }
+}
+
+/// Pulses the battery glyph while the machine is on battery.
+///
+/// Opacity, not colour: a colour blink competes with the deck tints and
+/// the state lamps that already mean something on this strip, while a
+/// fade reads as "attention" without inventing a fifth semantic colour.
+/// Slow — 1.1 s — because this is a standing condition to notice, not an
+/// alarm to react to, and a fast blink on a surface someone stares at
+/// for four hours is hostile.
+///
+/// Honours `prefers-reduced-motion` via `accessibilityReduceMotion`: the
+/// red tint alone still carries the fact, so the animation is genuinely
+/// optional.
+private struct UnpluggedPulse: ViewModifier {
+    let active: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var dim = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(active && dim && !reduceMotion ? 0.35 : 1.0)
+            .animation(
+                active && !reduceMotion
+                    ? .easeInOut(duration: 1.1).repeatForever(autoreverses: true)
+                    : .default,
+                value: dim)
+            .onAppear { dim = active }
+            .onChange(of: active) { now in dim = now }
+    }
 }
 
 struct StatusStrip: View {
@@ -254,6 +291,7 @@ struct StatusStrip: View {
                 Image(systemName: batteryGlyph(for: power))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(batteryTint(for: power))
+                    .modifier(UnpluggedPulse(active: power.isUnplugged))
                 Text("\(power.percent)%")
                     .font(DubFont.caps)
                     .tracking(0.6)
@@ -276,8 +314,11 @@ struct StatusStrip: View {
     }
 
     private func batteryTint(for power: PowerState) -> Color {
-        if power.isLow {
-            return DubColor.stateTentative   // amber: visible warning
+        if power.isUnplugged {
+            // Red for "no mains", amber-on-red is not a distinction
+            // worth drawing at this size — the pulse carries the
+            // urgency, the colour carries the fact.
+            return DubColor.stateError
         }
         return DubColor.textSecondary
     }

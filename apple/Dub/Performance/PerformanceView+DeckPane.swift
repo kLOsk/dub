@@ -317,10 +317,14 @@ extension PerformanceView {
                     size: geo.size,
                     subdued: true)
                 VStack(spacing: DubSpacing.sm) {
-                    Text(side.label)
-                        .font(DubFont.caps)
-                        .tracking(1.2)
-                        .foregroundStyle(DubColor.deckTint(side).opacity(0.7))
+                    // Prep is single-deck, so naming the deck on its own
+                    // empty pane says nothing the surface does not.
+                    if model.engineMode != .prep {
+                        Text(side.label)
+                            .font(DubFont.caps)
+                            .tracking(1.2)
+                            .foregroundStyle(DubColor.deckTint(side).opacity(0.7))
+                    }
                     Text(idleCaption(side: side))
                         .font(DubFont.caps)
                         .tracking(0.6)
@@ -348,7 +352,8 @@ extension PerformanceView {
     func idleCaption(side: DeckSide) -> String {
         switch side {
         case .a:
-            return model.isRunning ? "DECK STOPPED" : "ENGINE STOPPED"
+            guard model.isRunning else { return "ENGINE STOPPED" }
+            return model.engineMode == .prep ? "NO TRACK LOADED" : "DECK STOPPED"
         case .b:
             if !model.isRunning { return "ENGINE STOPPED" }
             switch model.engineMode {

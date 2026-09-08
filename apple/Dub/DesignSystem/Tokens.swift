@@ -406,18 +406,23 @@ enum DubLayout {
     // timecode; the loop unit by its readout + steppers + 4×40 ladder
     // plus padding; the sample shelf flexes because a filename is the one
     // thing here whose length is not ours to choose.
-    static let prepCueColumn: CGFloat = 236
-    /// Readout 90 + 8 + steppers 32 + 8 + ladder 4×40, plus `md` padding
-    /// each side. Fixed, because a section heading's rule expands to fill
-    /// whatever it is given — unbounded, the LOOP heading stretched the
-    /// section to ~750 pt and pushed SAMPLES to the far edge.
-    static let prepLoopSection: CGFloat = 322
+    /// Two columns of four rows. Each row holds a name and a
+    /// fixed-width timecode, so the width is set by the name being
+    /// readable rather than merely present — at 236 (the one-column
+    /// figure this replaced) `FIRST VERSE` truncated to `FI…`.
+    static let prepCueColumn: CGFloat = 380
+    /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
+    /// padding each side. Fixed, because a section heading's rule
+    /// expands to fill whatever it is given — unbounded, the LOOP
+    /// heading stretched the section to ~750 pt and pushed SAMPLES to
+    /// the far edge.
+    static let prepLoopSection: CGFloat = 268
     /// The shelf has no maximum — it takes whatever the other two
     /// sections leave. There is no fourth Prep section planned (the
     /// beatgrid editor was ruled out: setting the 1 plus Analyze is
     /// enough), so reserving trailing width would only recreate the dead
     /// space this redesign removed.
-    static let prepSampleShelfMin: CGFloat = 260
+    static let prepSampleShelfMin: CGFloat = 200
 
     /// Narrowest width at which the Prep grid renders three columns
     /// without clipping. `PerformanceLayoutTests` asserts this stays

@@ -305,11 +305,15 @@ struct PerformanceView: View {
     /// holds the model, which is what lets `PrepRack` be snapshotted.
     private var prepRackState: PrepRackState {
         PrepRackState(
-            cues: (0..<4).map { CueSlotState(index: $0, mark: model.deckA.hotCues[$0]) },
-            activeLoopBars: model.deckA.activeLoopBars,
+            cues: (0..<DeckState.hotCueCount).map {
+                CueSlotState(index: $0, mark: model.deckA.hotCues[$0])
+            },
+            activeLoopBeats: model.deckA.activeLoopBeats,
             loopEngaged: model.deckA.loopActive,
-            loopInArmed: model.deckA.pendingLoopInSecs != nil,
-            sampleNames: model.sampleBank.all.map { SampleBank.label(for: $0) },
+            sampleSlots: (0..<8).map { index in
+                let all = model.sampleBank.all
+                return all.indices.contains(index) ? SampleBank.label(for: all[index]) : nil
+            },
             hasTrack: model.deckA.hasTrack,
             isPlaying: model.deckA.isPlaying)
     }
@@ -325,24 +329,9 @@ struct PerformanceView: View {
                     .a, index: index,
                     name: model.deckA.hotCues[index]?.name, color: token)
             },
-            onLoop: { bars in model.handleLoop(.a, bars: bars) },
-            onLoopStep: { double in
-                guard let bars = model.deckA.activeLoopBars else { return }
-                let next = double ? bars * 2 : bars / 2
-                // The engine only grids these four; a step past either end
-                // is a no-op rather than an error the DJ has to read.
-                guard (0.5...4).contains(next) else { return }
-                model.handleLoop(.a, bars: next)
-            },
-            onLoopIn: { model.setLoopIn(.a) },
-            onLoopOut: { model.setLoopOut(.a) },
-            onLoopExit: { model.exitLoop(.a) },
-            onAddSamples: { addSamplesToBank() },
-            onRemoveSample: { index in
-                let all = model.sampleBank.all
-                guard all.indices.contains(index) else { return }
-                model.sampleBank.remove(all[index])
-            })
+            onLoop: { beats in model.handleLoopBeats(.a, beats: beats) },
+            onDropSample: { index, url in model.setSampleSlot(index, url: url) },
+            onUnloadSample: { index in model.clearSampleSlot(index) })
     }
 
     /// Name a cue. A sheet would be heavier than the gesture deserves —
@@ -367,19 +356,6 @@ struct PerformanceView: View {
             color: mark.color)
     }
 
-    /// Add files to the shared sample bank. Same panel Preferences uses —
-    /// Prep is now the other home for it, because choosing sounds is work
-    /// you do while auditioning rather than while configuring.
-    private func addSamplesToBank() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Add"
-        panel.message = "Choose sample files for the sampler pads and Quick Scratch keys."
-        guard panel.runModal() == .OK else { return }
-        for url in panel.urls { model.sampleBank.add(url) }
-    }
 
     /// The siren's focused deck is re-read inside each closure rather
     /// than captured, so a master switch between render and click

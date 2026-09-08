@@ -439,7 +439,7 @@ pub use rip::{
 ///       `sampler_set_output_deck` / `sampler_clear` drive it. Voices
 ///       sum onto the assigned deck's bus after the FX chain — the
 ///       stab plays *over* the music rather than through its echo.
-pub const FFI_VERSION: u32 = 67;
+pub const FFI_VERSION: u32 = 68;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -1906,6 +1906,13 @@ impl DubEngine {
     }
 
     /// Engage a grid-snapped **reverse** loop of `length_beats` beats
+    ///
+    /// `length_beats` is fractional: DJ auto-loop ranges run below a
+    /// beat (1/2, 1/4, 1/8) and the grid has no line to index for those,
+    /// so the engine interpolates back from the loop's out point using
+    /// the local beat interval. Whole lengths still land on grid lines
+    /// exactly. FFI 68 widened this from `u32`.
+    ///
     /// on `deck_idx`: the loop covers the `length_beats` beats ending
     /// at the beat line nearest the current playhead — the passage the
     /// DJ just heard. The engine jumps the playhead back into the loop
@@ -1921,7 +1928,7 @@ impl DubEngine {
     ///
     /// * [`EngineError::NotRunning`]
     /// * [`EngineError::InvalidDeckIndex`]
-    pub fn set_reverse_loop(&self, deck_idx: u64, length_beats: u32) -> Result<(), EngineError> {
+    pub fn set_reverse_loop(&self, deck_idx: u64, length_beats: f64) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         // Read the live playhead before taking the engine lock so the
         // loop is anchored to where the deck actually is at the press.
@@ -5430,7 +5437,7 @@ mod tests {
         // 64→65: instant doubles — `instant_double`.
         // 65→66: sampler — `sampler_load` + trigger / stop / gain /
         // output-deck / clear.
-        assert_eq!(FFI_VERSION, 67);
+        assert_eq!(FFI_VERSION, 68);
     }
 
     #[test]
