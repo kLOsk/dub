@@ -439,7 +439,7 @@ pub use rip::{
 ///       `sampler_set_output_deck` / `sampler_clear` drive it. Voices
 ///       sum onto the assigned deck's bus after the FX chain — the
 ///       stab plays *over* the music rather than through its echo.
-pub const FFI_VERSION: u32 = 66;
+pub const FFI_VERSION: u32 = 67;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5430,7 +5430,7 @@ mod tests {
         // 64→65: instant doubles — `instant_double`.
         // 65→66: sampler — `sampler_load` + trigger / stop / gain /
         // output-deck / clear.
-        assert_eq!(FFI_VERSION, 66);
+        assert_eq!(FFI_VERSION, 67);
     }
 
     #[test]
@@ -6587,6 +6587,11 @@ pub struct HotCue {
     pub cue_index: u32,
     /// Track position the cue points to, in seconds from sample 0.
     pub position_secs: f64,
+    /// What the DJ called it. `None` renders as the pad number alone.
+    pub name: Option<String>,
+    /// Colour-label token from the browser's palette (`"red"`, `"aqua"`).
+    /// `None` renders in the pad's own accent.
+    pub color: Option<String>,
 }
 
 impl From<dub_library::HotCue> for HotCue {
@@ -6594,6 +6599,8 @@ impl From<dub_library::HotCue> for HotCue {
         Self {
             cue_index: u32::from(c.cue_index),
             position_secs: c.position_secs,
+            name: c.name,
+            color: c.color,
         }
     }
 }
@@ -8091,6 +8098,25 @@ impl DubLibrary {
         let idx = u8::try_from(cue_index).unwrap_or(u8::MAX);
         self.with_library(|lib| {
             lib.set_hot_cue(&track_id, idx, position_secs)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Name and/or colour an existing hot cue. `None` clears the field.
+    ///
+    /// Separate from [`Self::set_hot_cue`] on purpose: re-dropping a cue
+    /// to nudge its position is the common gesture and must not wipe the
+    /// label. No-op when the pad holds no cue.
+    pub fn set_hot_cue_label(
+        &self,
+        track_id: String,
+        cue_index: u32,
+        name: Option<String>,
+        color: Option<String>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        let idx = u8::try_from(cue_index).unwrap_or(u8::MAX);
+        self.with_library(|lib| {
+            lib.set_hot_cue_label(&track_id, idx, name.as_deref(), color.as_deref())
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }

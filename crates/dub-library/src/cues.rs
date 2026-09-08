@@ -5,7 +5,13 @@
 //! gesture, so cues survive a library reload. Stored in `track_cues`
 //! under `source = 'user'` (user-authored, vs the imported
 //! `serato/traktor/rekordbox/itunes` rows) and `kind = 'hot_cue'`.
-//! Position-only in v1 — the `name` / `color` columns are left NULL.
+//!
+//! A cue carries an optional `name` and `color` alongside its position.
+//! Both columns already existed — the importers have written them since
+//! M11e, because Serato and rekordbox cues carry them — and only the
+//! user-authored path was dropping them on the floor. A cue the DJ set by
+//! ear is now the same shape as one that arrived from another library,
+//! which is what lets the browser and the pads render either identically.
 
 use rusqlite::params;
 
@@ -20,6 +26,13 @@ pub struct HotCue {
     pub cue_index: u8,
     /// Track position the cue points to, in seconds from sample 0.
     pub position_secs: f64,
+    /// What the DJ called it — `INTRO`, `FIRST VERSE`. `None` for an
+    /// unnamed cue, which renders as the pad number alone.
+    pub name: Option<String>,
+    /// Colour-label token, from the same palette the browser's row
+    /// colours use (`"red"`, `"aqua"`, …). `None` renders in the pad's
+    /// own accent rather than picking a colour on the DJ's behalf.
+    pub color: Option<String>,
 }
 
 /// User-authored cue source. The imported sources keep their own rows;
@@ -31,6 +44,11 @@ const USER_SOURCE: &str = "user";
 impl Library {
     /// Set (or move) hot cue `cue_index` for `track_id` to
     /// `position_secs`. No-op on a non-finite / negative position.
+    ///
+    /// Deliberately leaves `name` and `color` alone on an update: dropping
+    /// a cue again to nudge its position is the common gesture, and it
+    /// must not silently erase the label the DJ typed. Use
+    /// [`Self::set_hot_cue_label`] to change those.
     pub fn set_hot_cue(&self, track_id: &str, cue_index: u8, position_secs: f64) -> Result<()> {
         if !position_secs.is_finite() || position_secs < 0.0 {
             return Ok(());
@@ -45,6 +63,29 @@ impl Library {
                 params![track_id, USER_SOURCE, i64::from(cue_index), position_secs],
             )
             .map_err(|e| LibraryError::sqlite("set_hot_cue", e))?;
+        Ok(())
+    }
+
+    /// Name and/or colour an existing user cue. `None` clears that field.
+    ///
+    /// No-op when the cue does not exist — naming a pad you have not set
+    /// would otherwise create a cue at position 0, which is a marker the
+    /// DJ never placed.
+    pub fn set_hot_cue_label(
+        &self,
+        track_id: &str,
+        cue_index: u8,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<()> {
+        self.connection()
+            .execute(
+                "UPDATE track_cues SET name = ?4, color = ?5 \
+                 WHERE track_id = ?1 AND source = ?2 AND cue_index = ?3 \
+                   AND kind = 'hot_cue'",
+                params![track_id, USER_SOURCE, i64::from(cue_index), name, color],
+            )
+            .map_err(|e| LibraryError::sqlite("set_hot_cue_label", e))?;
         Ok(())
     }
 
@@ -65,7 +106,7 @@ impl Library {
         let conn = self.connection();
         let mut stmt = conn
             .prepare(
-                "SELECT cue_index, position_secs FROM track_cues \
+                "SELECT cue_index, position_secs, name, color FROM track_cues \
                  WHERE track_id = ?1 AND source = ?2 AND kind = 'hot_cue' \
                  ORDER BY cue_index",
             )
@@ -75,6 +116,8 @@ impl Library {
                 Ok(HotCue {
                     cue_index: u8::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
                     position_secs: r.get(1)?,
+                    name: r.get(2)?,
+                    color: r.get(3)?,
                 })
             })
             .map_err(|e| LibraryError::sqlite("hot_cues_query", e))?;
@@ -321,6 +364,77 @@ mod tests {
             )
             .unwrap();
         assert!((i - 4.0).abs() < 1e-9 && (o - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_user_cue_carries_name_and_colour() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue("t1", 0, 12.5).unwrap();
+        lib.set_hot_cue_label("t1", 0, Some("INTRO"), Some("aqua"))
+            .unwrap();
+
+        let cues = lib.hot_cues("t1").unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].name.as_deref(), Some("INTRO"));
+        assert_eq!(cues[0].color.as_deref(), Some("aqua"));
+    }
+
+    /// Re-dropping a cue to nudge its position is the common gesture. It
+    /// must move the marker and leave the label alone — silently erasing
+    /// a name the DJ typed because they adjusted the position by 40 ms
+    /// would be worse than not having names at all.
+    #[test]
+    fn moving_a_cue_keeps_its_label() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue("t1", 2, 10.0).unwrap();
+        lib.set_hot_cue_label("t1", 2, Some("DROP"), Some("red"))
+            .unwrap();
+
+        lib.set_hot_cue("t1", 2, 10.04).unwrap();
+
+        let cue = &lib.hot_cues("t1").unwrap()[0];
+        assert!((cue.position_secs - 10.04).abs() < 1e-9, "position moved");
+        assert_eq!(cue.name.as_deref(), Some("DROP"), "label survived");
+        assert_eq!(cue.color.as_deref(), Some("red"));
+    }
+
+    /// Naming a pad that holds no cue must not conjure one at 0.0 — that
+    /// is a marker the DJ never placed, and it would jump the deck to the
+    /// top of the track on the next press.
+    #[test]
+    fn labelling_an_empty_pad_creates_nothing() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue_label("t1", 1, Some("GHOST"), None).unwrap();
+        assert!(lib.hot_cues("t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_label_can_be_cleared() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue("t1", 0, 5.0).unwrap();
+        lib.set_hot_cue_label("t1", 0, Some("TEMP"), Some("blue"))
+            .unwrap();
+        lib.set_hot_cue_label("t1", 0, None, None).unwrap();
+
+        let cue = &lib.hot_cues("t1").unwrap()[0];
+        assert!(cue.name.is_none());
+        assert!(cue.color.is_none());
+    }
+
+    /// An unnamed cue is the default and must stay legal — most cues are
+    /// dropped by ear mid-listen and never named.
+    #[test]
+    fn an_unnamed_cue_reads_back_as_none() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue("t1", 3, 88.0).unwrap();
+        let cue = &lib.hot_cues("t1").unwrap()[0];
+        assert!(cue.name.is_none());
+        assert!(cue.color.is_none());
     }
 }
 

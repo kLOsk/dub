@@ -169,9 +169,12 @@ dependency order, not a preference.
    modelled as **reserved** — the cap renders, the key falls through.
    Behaviour-neutral by construction: all 20 pad baselines still match
    after the legends started coming from the table.
-4. **Cue names + colours through the FFI.** Schema + FFI + `FFI_VERSION`
-   bump. Rust-side and independent, so it can run alongside 2 and 3. The
-   one part of the rack that is not free.
+4. ~~Cue names + colours through the FFI~~ — **done, FFI 67.** No schema
+   migration was needed: `track_cues` has carried `name` and `color` since
+   M11e because the importers write them, and only the *user* cue path was
+   dropping them. `HotCue` now carries both, and `set_hot_cue_label` is
+   separate from `set_hot_cue` so re-dropping a cue to nudge its position
+   cannot silently erase the label.
 5. **The rack overhaul.** Four modules that do not look alike: cue as a
    bank of named marks, loop as a size engine (numeric readout, ×2/÷2
    steppers, contiguous ladder, ACTIVE lamp), echo as a single throw that
