@@ -363,6 +363,101 @@ struct LibraryTable: NSViewRepresentable {
             return item
         }
 
+        /// The drag picture: a compact `♪ Artist — Title` chip.
+        ///
+        /// **KNOWN ISSUE — the image animates in from off-screen.** The
+        /// chip's content and drop behaviour are correct; only its
+        /// entrance is wrong. Ruled out by measurement, so do not
+        /// re-try these:
+        ///
+        ///   * `draggingFrame` is applied and correct. Logged set vs.
+        ///     read-back: identical, centred on the pointer in screen
+        ///     coordinates, e.g. set (618,1791,293,24) with the pointer
+        ///     at (775,1803).
+        ///   * Coordinate space is not the cause. Table-space with
+        ///     `for: tableView`, and screen-space with `for: nil`, both
+        ///     fly. The start position tracked the *display* the window
+        ///     was on, which is what identified the space.
+        ///   * `setDraggingFrame(_:contents:)` is ignored outright;
+        ///     only the `draggingFrame` property takes.
+        ///   * `draggingFormation = .none` and
+        ///     `animatesToStartingPositionsOnCancelOrFail = false` do
+        ///     not stop it.
+        ///   * Overriding `draggingImageComponents` on `NSTableCellView`
+        ///     yields no components at all (drag shows only the drop
+        ///     badge); `NSTableRowView` has no such property.
+        ///   * There is no competing SwiftUI drag — `trackRowsStack`
+        ///     and its `.onDrag` are dead code on this path.
+        ///
+        /// Next thing to try is an isolated sample project, not another
+        /// substitution in here.
+        ///
+        /// Two things matter here, both learned the hard way.
+        ///
+        /// `imageComponentsProvider` rather than an override of
+        /// `NSTableCellView.draggingImageComponents` — that override
+        /// was never collected and the drag showed only the drop badge.
+        /// AppKit calls this closure itself, when it needs the image.
+        ///
+        /// And the frame is in **screen coordinates**, centred on the
+        /// pointer. `enumerateDraggingItems(for:)` is documented to
+        /// re-base frames into the given view's space, but it does not
+        /// here: passing the table and a table-space point put the chip
+        /// at that point on the *desktop*, which showed up as the image
+        /// flying in from a different screen edge depending on which
+        /// display the window was on. Passing `nil` asks for screen
+        /// coordinates explicitly, and `screenPoint` is already in them.
+        ///
+        /// AppKit animates the image from whatever frame the item
+        /// carries to the cursor, so any other position visibly flies.
+        /// Note it only takes via the `draggingFrame` property;
+        /// `setDraggingFrame(_:contents:)` was ignored outright.
+        func tableView(
+            _ tableView: NSTableView,
+            draggingSession session: NSDraggingSession,
+            willBeginAt screenPoint: NSPoint,
+            forRowIndexes rowIndexes: IndexSet
+        ) {
+            let rows = Array(rowIndexes)
+            let tracks = MainActor.assumeIsolated { self.parent.tracks }
+            guard let first = rows.first, tracks.indices.contains(first) else { return }
+            let chip = LibraryDragChip.image(
+                for: tracks[first], extraCount: rows.count - 1)
+            let centre = screenPoint
+
+            // `.none` is load-bearing. The default formation *gathers*
+            // the items toward the cursor, and that gather is the
+            // animation — it runs off the frames AppKit had before this
+            // method ran, so setting a correct frame here did nothing.
+            // Verified: the frame reads back exactly as set, centred on
+            // the pointer, and the image still flew in until this line.
+            session.draggingFormation = .none
+            session.animatesToStartingPositionsOnCancelOrFail = false
+            session.enumerateDraggingItems(
+                options: [], for: nil, classes: [NSPasteboardItem.self],
+                searchOptions: [:]
+            ) { item, index, _ in
+                guard index == 0 else {
+                    // One chip for the whole drag; the rest collapse
+                    // into it rather than stacking N images.
+                    item.imageComponentsProvider = nil
+                    item.draggingFrame = NSRect(origin: centre, size: .zero)
+                    return
+                }
+                item.draggingFrame = NSRect(
+                    x: centre.x - chip.size.width / 2,
+                    y: centre.y - chip.size.height / 2,
+                    width: chip.size.width,
+                    height: chip.size.height)
+                item.imageComponentsProvider = {
+                    let component = NSDraggingImageComponent(key: .icon)
+                    component.contents = chip
+                    component.frame = NSRect(origin: .zero, size: chip.size)
+                    return [component]
+                }
+            }
+        }
+
         /// The dragged ids in visual order. A multi-row selection moves
         /// as a contiguous block; a drag on an unselected row carries
         /// just that row (Finder semantics).
@@ -643,21 +738,58 @@ enum LibraryGutterColumn {
     static let width = LibraryColumnLayout.gutterWidth
 }
 
-// The drag image is AppKit's default.
-//
-// A compact `♪ Artist — Title` chip was attempted three ways and none
-// worked, so it is deliberately not here rather than half-present:
-//
-//   * setting `NSDraggingItem.draggingFrame` in
-//     `draggingSession:willBeginAt:` — the frame was correct in the
-//     table's coordinate space (measured), but AppKit's own default was
-//     x = -443, off-screen, and the image animated in from there.
-//     `draggingFormation = .none` did not stop it.
-//   * overriding `draggingImageComponents` on `NSTableRowView` — that
-//     property does not exist there.
-//   * overriding it on `NSTableCellView`, keyed first on the column
-//     identifier and then on a stored flag — the components were never
-//     collected, and the drag showed only the drop badge.
-//
-// Worth revisiting with an isolated test case rather than by
-// substitution; the drag itself works, this is only its picture.
+
+/// The picture a dragged library row shows: `♪ Artist — Title` on a
+/// tinted chip. Deliberately small — it follows the pointer, so it has
+/// to say what is being dragged without covering the drop target.
+enum LibraryDragChip {
+    static func image(for track: LibraryTrack, extraCount: Int = 0) -> NSImage {
+        let artist = track.artist ?? "—"
+        var text = "\(artist) — \(LibraryCellFormat.displayTitle(track))"
+        if extraCount > 0 { text += "   +\(extraCount)" }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor(DubColor.textPrimary),
+            .paragraphStyle: paragraph,
+        ]
+
+        let padding: CGFloat = 8
+        let icon: CGFloat = 11
+        let gap: CGFloat = 6
+        let height: CGFloat = 24
+        let natural = (text as NSString).size(withAttributes: attributes).width
+        let textWidth = min(natural, 260)
+        let width = padding + icon + gap + textWidth + padding
+
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.lockFocus()
+        let body = NSRect(x: 0, y: 0, width: width, height: height)
+            .insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: body, xRadius: 4, yRadius: 4)
+        NSColor(DubColor.surface2).setFill()
+        path.fill()
+        NSColor(DubColor.deckATint).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        if let note = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
+            .withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: icon, weight: .medium))?
+            .withSymbolConfiguration(
+                NSImage.SymbolConfiguration(paletteColors: [NSColor(DubColor.deckATint)]))
+        {
+            note.draw(in: NSRect(
+                x: padding, y: (height - icon) / 2 - 1, width: icon, height: icon))
+        }
+        (text as NSString).draw(
+            in: NSRect(
+                x: padding + icon + gap, y: (height - 14) / 2,
+                width: textWidth, height: 14),
+            withAttributes: attributes)
+        image.unlockFocus()
+        return image
+    }
+}
