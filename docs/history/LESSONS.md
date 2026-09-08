@@ -322,6 +322,29 @@
   similarity ≥ 0.98 **and** |Δduration| < 200 ms (same axis as M11b auto-merge).
 - **Two sheets can't present at once.** Re-opening onboarding from Preferences
   dismisses Preferences, then presents onboarding on the next runloop tick.
+- **A reused `NSTableView` cell is only reconfigured when the row set or
+  `contentRevision` moves.** `LibraryTable.updateNSView` calls `reloadData()`
+  on an id-list change or a `tracksContentRevision` bump — nothing else. So any
+  state that changes how a cell *draws* without changing which rows exist has
+  to bump that revision, or it lands on the header and nowhere else. The
+  Camelot ↔ musical key toggle did exactly that: the header relabelled to
+  `KEY (♪)` and every row underneath kept showing `7B` / `6A`, because
+  `rowState(for:)` was producing the right value and nothing asked for it
+  again. One line beside the other handlers
+  (`.onChange(of: keyNotationMode) { _ in tracksContentRevision &+= 1 }`).
+  The same trap waits for any future display-mode toggle — a duration format,
+  a second rating style.
+- **A unit test on a menu builder cannot see this class of bug.** It proves the
+  item fires its closure, not that the closure's effect reaches the screen.
+  `LibraryColumnMenuTests` was green through the whole notation bug. Launch the
+  app and look.
+- **A test-only replica of a production view goes stale silently.** The row
+  snapshots hosted a SwiftUI `LibraryRowView` that composed the same cells as
+  the real table — and kept passing while the real row drifted (it still
+  carried `DubSpacing.lg` outer padding the `NSTableView` doesn't have, and
+  could never cover the selection-fill-under-tint ordering, which is the
+  detail most likely to break). Snapshot the production assembly —
+  `LibraryTintedRowView` + `LibraryHostingCellView` — not a stand-in.
 
 ## Vinyl rip (M26)
 

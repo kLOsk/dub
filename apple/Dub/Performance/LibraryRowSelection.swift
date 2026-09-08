@@ -1,28 +1,21 @@
-import Combine
 import Foundation
 
 /// Selection state for the library row list.
 ///
-/// ## Why this is an `ObservableObject` owned via `@State`
+/// ## Why this is a class held in `@State`
 ///
-/// In `LibraryView` we hold a `LibraryRowSelection` instance using
-/// `@State`, **not** `@StateObject` or `@ObservedObject`. That is
-/// the entire point of the type: `@State` preserves the class
-/// reference across body re-evaluations (so the same selection
-/// outlives every `LibraryView.body` invocation), but `@State`
-/// does **not** subscribe to the class's `objectWillChange`
-/// publisher. As a result, mutating
-/// `rowSelection.selectedTrackIds` or
-/// `rowSelection.selectionAnchorId` does not trigger a
-/// `LibraryView` body re-eval.
+/// `LibraryView` holds a `LibraryRowSelection` instance in `@State`.
+/// `@State` preserves the reference across body re-evaluations, so the
+/// same selection outlives every `LibraryView.body` invocation — but
+/// because the state *is* the reference, mutating a property on it
+/// invalidates nothing. That is the entire point of the type: the
+/// selection can change without SwiftUI re-rendering anything.
 ///
-/// Subviews that need to *observe* the selection (e.g. the
-/// footer's "N selected" label, or any row-decoration view that
-/// renders highlight chrome) declare it as `@ObservedObject` and
-/// will re-render on each change. The track row list itself uses
-/// the AppKit `LibrarySelectionLayerView` to paint the highlight
-/// directly, bypassing SwiftUI entirely, so it doesn't need to
-/// observe at all.
+/// It is deliberately **not** an `ObservableObject`. Nothing observes
+/// it: `NSTableView` owns both the selection and the highlight, and
+/// pushes changes out through `LibraryTableCallbacks.onSelectionChanged`
+/// rather than through a publisher. Adding `@Published` back would
+/// re-open the path this type exists to close.
 ///
 /// ## What problem this solves
 ///
@@ -36,23 +29,19 @@ import Foundation
 /// waveform playback, which the user saw as a "waveform jump on
 /// row click".
 ///
-/// By routing the selection state through a non-observed class
-/// reference, the click handler can mutate selection state
-/// without invalidating any SwiftUI view in the tree. The
-/// `LibrarySelectionLayerView` repaints from its coordinator on
-/// the same tick (via the
-/// `LibraryTableScrollContainer.updateNSView` path), and
-/// `syncModelPrimarySelection()` is called explicitly at every
-/// write site so the model-side `librarySelection` keeps up.
+/// By routing the selection through a non-observed class reference,
+/// the click handler mutates it without invalidating any SwiftUI view
+/// in the tree, and `syncModelPrimarySelection()` is called explicitly
+/// at every write site so the model-side `librarySelection` keeps up.
 @MainActor
-final class LibraryRowSelection: ObservableObject {
+final class LibraryRowSelection {
     /// Currently selected row ids (canonical UUIDs). Cmd+click
     /// toggles membership; Shift+click selects a contiguous range
     /// in the current sort order. The primary id drives
     /// Space-load.
-    @Published var selectedTrackIds: Set<String> = []
+    var selectedTrackIds: Set<String> = []
 
     /// Anchor for Shift+click range selection in the current sort
     /// order.
-    @Published var selectionAnchorId: String? = nil
+    var selectionAnchorId: String? = nil
 }

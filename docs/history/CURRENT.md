@@ -5,14 +5,43 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-09-03.
+> Last updated: 2026-09-08.
 
 ## Where the branch is
 
-`main` — all work merged and pushed, nothing in flight, working tree clean.
+`main` — the library's `NSTableView` migration (b949f0d…8d6335c) plus its
+follow-up cleanup are committed locally and **unpushed**. Nothing in flight.
 Pushing is a deliberate act: `.githooks/pre-push` runs fmt-check + clippy +
 docs-check + the Rust suite + the Swift snapshot suite first, and that last
 gate is local-only because GitHub CI has no macOS app job.
+
+### The migration's cleanup pass — done
+
+The hand-rolled `LazyVStack`-in-an-`NSHostingView` the table replaced is
+gone: the scroll container and its coordinator, the document wrapper, the
+AppKit selection layer, the arrow-key view, the whole SwiftUI column
+resize / reorder / header stack, and `handleRowClick` / `selectRange`
+(`NSTableView` does click, ⇧-range and ⌘-toggle natively). ~2,100 lines.
+
+Three things the migration had quietly dropped, found while deleting and
+now fixed:
+
+- **The column picker had no entry point.** It was the old SwiftUI header's
+  `.contextMenu`, and `LibraryTableHeaderView` had no menu — so there was no
+  way to add or remove a column, or to switch key notation, at all. Now
+  `LibraryColumnMenu`, an AppKit builder in the same shape as
+  `LibraryRowMenu` (SwiftUI builds menu content eagerly, and this menu
+  enumerates the whole registry behind "More columns").
+- **Key notation relabelled the header and not the cells** — see the
+  `contentRevision` entry in `LESSONS.md`.
+- **Reveal selected but never scrolled.** `keyboardScrollTarget` lost its
+  consumer; it is wired to `LibraryTable.Coordinator.scrollToTrack(id:)` now.
+
+Test coverage went 131 → 166: `LibraryColumnMenuTests`, `LibraryRowMenuTests`
+(whose file `LibraryRowMenu.swift` had claimed to exist since the migration
+— it did not), and the row snapshots repointed off a test-only replica onto
+the production `LibraryTintedRowView` + `LibraryHostingCellView` assembly,
+with two new baselines covering selection-under-tint.
 
 ## Owed before v1: validate on the rig
 

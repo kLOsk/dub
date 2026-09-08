@@ -224,53 +224,83 @@ extension LibraryTrack {
     }
 }
 
-/// The assembled row: gutter, cells, colour tint.
+/// The assembled row, built the way `LibraryTable` builds it: a
+/// `LibraryTintedRowView` holding one `LibraryHostingCellView` per
+/// column, gutter first.
 ///
-/// These pin the two details most likely to drift in the `NSTableView`
-/// port, both of which look incidental:
+/// It renders the production classes rather than a stand-in. A
+/// stand-in row composed the same cells and could stay green while the
+/// real table drifted away from it — which is exactly what happened to
+/// the `LibraryRowView` these replaced.
 ///
-/// * `DimUnanalyzed` is per *cell*, inside the width frame — an
-///   unanalyzed row dims its cell text but not the gutter badges and
-///   not the colour tint. Applying it to a row view changes them.
-/// * The row tint is faint on purpose. Selection paints in AppKit
-///   *beneath* the row, so a heavier tint makes a selected coloured
-///   row unreadable.
+/// Three details are pinned here, all of which look incidental:
+///
+/// * `DimUnanalyzed` is per *cell*, inside the column — an unanalyzed
+///   row dims its cell text but not the gutter badges and not the
+///   colour tint. Applying it to the row changes them.
+/// * The row tint is faint on purpose, because it sits *above* the
+///   selection fill.
+/// * That ordering is what keeps a selected coloured row legible, and
+///   it is drawn in one override, so only a selected-and-coloured row
+///   catches a regression in it.
+@MainActor
 final class LibraryRowSnapshotTests: XCTestCase {
 
-    private static let columns: [LibraryRowColumn] = [
-        LibraryRowColumn(field: .artist, width: 120),
-        LibraryRowColumn(field: .title, width: 180),
-        LibraryRowColumn(field: .duration, width: 52),
-        LibraryRowColumn(field: .bpm, width: 56),
-        LibraryRowColumn(field: .rating, width: 92),
-        LibraryRowColumn(field: .color, width: 44),
+    /// The table has no outer horizontal padding — the gutter column
+    /// starts at x = 0 and `intercellSpacing` is zero.
+    private static let columns: [(field: LibraryColumnField, width: CGFloat)] = [
+        (.artist, 120), (.title, 180), (.duration, 52),
+        (.bpm, 56), (.rating, 92), (.color, 44),
     ]
 
     private static var totalWidth: CGFloat {
-        LibraryColumnLayout.gutterWidth
-            + columns.map(\.width).reduce(0, +)
-            + DubSpacing.lg * 2
+        LibraryGutterColumn.width + columns.map(\.width).reduce(0, +)
+    }
+
+    /// Assembles the real row. Cell frames are laid out by hand because
+    /// `NSTableView` is what normally does it, and hosting a whole
+    /// table would drag a scroll view and a data source into a test
+    /// about how one row draws.
+    private func rowView(_ state: LibraryRowState, selected: Bool) -> NSTableRowView {
+        let height = LibraryRowLayout.estimatedHeight
+        let row = LibraryTintedRowView()
+        row.frame = CGRect(x: 0, y: 0, width: Self.totalWidth, height: height)
+        row.backgroundColor = NSColor(DubColor.surface0)
+        row.tint = DubColor.trackLabel(state.track.color)
+            .map { NSColor($0).withAlphaComponent(0.18) }
+        row.isSelected = selected
+
+        let actions = LibraryRowActions()
+        var x: CGFloat = 0
+        let gutter = LibraryHostingCellView(identifier: LibraryGutterColumn.identifier)
+        gutter.configureGutter(state: state, actions: actions)
+        gutter.frame = CGRect(x: x, y: 0, width: LibraryGutterColumn.width, height: height)
+        row.addSubview(gutter)
+        x += LibraryGutterColumn.width
+
+        for column in Self.columns {
+            let cell = LibraryHostingCellView(
+                identifier: NSUserInterfaceItemIdentifier(column.field.rawValue))
+            cell.configure(field: column.field, state: state, actions: actions)
+            cell.frame = CGRect(x: x, y: 0, width: column.width, height: height)
+            row.addSubview(cell)
+            x += column.width
+        }
+        row.layoutSubtreeIfNeeded()
+        return row
     }
 
     private func snap(
         _ state: LibraryRowState,
+        selected: Bool = false,
         named name: String,
         file: StaticString = #filePath,
         testName: String = #function,
         line: UInt = #line
     ) {
-        let row = LibraryRowView(
-            state: state,
-            columns: Self.columns,
-            totalWidth: Self.totalWidth)
-            .background(DubColor.surface0)
-        let host = NSHostingView(rootView: row)
-        host.frame = CGRect(
-            x: 0, y: 0,
-            width: Self.totalWidth, height: LibraryRowLayout.estimatedHeight)
-        host.layoutSubtreeIfNeeded()
         assertSnapshot(
-            of: host, as: .image(perceptualPrecision: 0.98), named: name,
+            of: rowView(state, selected: selected),
+            as: .image(perceptualPrecision: 0.98), named: name,
             file: file, testName: testName, line: line)
     }
 
@@ -313,6 +343,18 @@ final class LibraryRowSnapshotTests: XCTestCase {
 
     func test_row_colourTinted() {
         snap(state(.fixture(color: "red")), named: "row-colour-tinted")
+    }
+
+    /// Selection is a flat `surface2` fill, not the system accent.
+    func test_row_selected() {
+        snap(state(), selected: true, named: "row-selected")
+    }
+
+    /// The one that catches the ordering: tint over fill, not under.
+    /// Reversed, the 0.18 tint disappears beneath the selection and a
+    /// selected coloured row loses its label.
+    func test_row_selectedAndColourTinted() {
+        snap(state(.fixture(color: "red")), selected: true, named: "row-selected-colour-tinted")
     }
 }
 

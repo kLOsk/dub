@@ -24,11 +24,16 @@
 //
 //  ## Keeping the look
 //
-//  Cell content is still the same SwiftUI — `LibraryColumnCell`,
-//  `LibraryRowView`'s indicators, `LibraryHeaderCell` — hosted in
-//  reused cells. That is why those three were made value-driven first:
-//  a reused cell is configured with values and must not consult a live
-//  object afterwards. `LibraryCellSnapshotTests` is the baseline.
+//  Cell content is still the same SwiftUI — `LibraryColumnCell` and
+//  `LibraryRowIndicators` — hosted in reused cells. That is why they
+//  were made value-driven first: a reused cell is configured with
+//  values and must not consult a live object afterwards.
+//  `LibraryCellSnapshotTests` is the baseline.
+//
+//  The header is the exception: `LibraryHeaderTextCell` draws it in
+//  AppKit, to match the SwiftUI `LibraryHeaderCell` that the header
+//  baselines pin. `LibraryHeaderCell` is a reference rendering for
+//  those baselines only; nothing on the live path draws it.
 //
 //  Two pieces of the old look are reproduced in AppKit drawing rather
 //  than SwiftUI, because they belong to the row, not a cell:
@@ -73,6 +78,11 @@ struct LibraryTableCallbacks {
     var onCrateReorder: ([String], Int) -> Void = { _, _ in }
     /// Build the right-click menu for a row, or `nil` for no menu.
     var menuForRow: (Int) -> NSMenu? = { _ in nil }
+    /// Build the header's column picker, or `nil` for no menu.
+    var menuForHeader: () -> NSMenu? = { nil }
+    /// Fired after a `scrollToTrackId` request has been acted on, so
+    /// the caller can clear it.
+    var onScrollHandled: () -> Void = {}
 }
 
 /// In-process drag type carrying the crate-reorder payload. Kept
@@ -110,6 +120,10 @@ struct LibraryTable: NSViewRepresentable {
     /// only, which is the point of the migration.
     let rowState: (LibraryTrack) -> LibraryRowState
     let rowActions: (LibraryTrack) -> LibraryRowActions
+    /// One-shot scroll request: the row a reveal wants brought into
+    /// view. Cleared through `onScrollHandled` once acted on, or the
+    /// next update would scroll again on every unrelated change.
+    var scrollToTrackId: String?
     var callbacks = LibraryTableCallbacks()
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -135,6 +149,14 @@ struct LibraryTable: NSViewRepresentable {
         table.delegate = context.coordinator
         table.menu = NSMenu()
         table.menu?.delegate = context.coordinator
+        // The column picker. `NSTableHeaderView` has no menu of its
+        // own, so right-clicking a header did nothing until this was
+        // hung on it — the SwiftUI header it replaced carried the
+        // picker in a `.contextMenu`.
+        let headerMenu = NSMenu()
+        headerMenu.delegate = context.coordinator
+        table.headerView?.menu = headerMenu
+        context.coordinator.headerMenu = headerMenu
         table.registerForDraggedTypes([LibraryCrateReorder.pasteboardType])
         // Rows drag out as file URLs and reorder in place; AppKit picks
         // the drag image from the real row views, which is what the old
@@ -177,6 +199,15 @@ struct LibraryTable: NSViewRepresentable {
         }
         coordinator.lastContentRevision = contentRevision
         coordinator.syncSelectionFromModel()
+
+        // Last, so the row indices the scroll resolves against are the
+        // ones just reloaded. The clear is deferred: `onScrollHandled`
+        // writes the caller's `@State`, and doing that inside
+        // `updateNSView` is a mutation during a view update.
+        if let scrollToTrackId {
+            coordinator.scrollToTrack(id: scrollToTrackId)
+            DispatchQueue.main.async { self.callbacks.onScrollHandled() }
+        }
     }
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate,
@@ -184,6 +215,9 @@ struct LibraryTable: NSViewRepresentable {
         var parent: LibraryTable
         weak var table: NSTableView?
         var lastTrackIds: [String] = []
+        /// Identity, so `menuNeedsUpdate` can tell the header's menu
+        /// from the rows'. Both share this coordinator as delegate.
+        weak var headerMenu: NSMenu?
         var lastContentRevision: UInt64 = 0
         private var lastSpecs: [LibraryTableColumnSpec] = []
         private var applyingSelection = false
@@ -386,8 +420,8 @@ struct LibraryTable: NSViewRepresentable {
         ///   * Overriding `draggingImageComponents` on `NSTableCellView`
         ///     yields no components at all (drag shows only the drop
         ///     badge); `NSTableRowView` has no such property.
-        ///   * There is no competing SwiftUI drag — `trackRowsStack`
-        ///     and its `.onDrag` are dead code on this path.
+        ///   * There is no competing SwiftUI drag — the old
+        ///     `LazyVStack` rows and their `.onDrag` are gone.
         ///
         /// Next thing to try is an isolated sample project, not another
         /// substitution in here.
@@ -506,13 +540,26 @@ struct LibraryTable: NSViewRepresentable {
         /// that row alone" semantics for free.
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
+            if menu === headerMenu {
+                guard let built = MainActor.assumeIsolated({
+                    self.parent.callbacks.menuForHeader()
+                }) else { return }
+                adopt(built.items, into: menu)
+                return
+            }
             guard let table, table.clickedRow >= 0 else { return }
             let row = table.clickedRow
             guard let built = MainActor.assumeIsolated({
                 self.parent.callbacks.menuForRow(row)
             }) else { return }
-            for item in built.items {
-                built.removeItem(item)
+            adopt(built.items, into: menu)
+        }
+
+        /// An `NSMenuItem` belongs to one menu, so the built items are
+        /// moved across rather than copied.
+        private func adopt(_ items: [NSMenuItem], into menu: NSMenu) {
+            for item in items {
+                item.menu?.removeItem(item)
                 menu.addItem(item)
             }
         }
