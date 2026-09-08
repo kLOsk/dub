@@ -73,5 +73,8 @@ struct QuickScratchSlots: Equatable {
 
     /// Key labels, in slot order — the default `Q W E R` binding.
     /// Rebinding arrives with the M18 key-remapping pass.
-    static let keyLabels = ["Q", "W", "E", "R"]
+    /// Derived, not typed — see `DubKeymap`.
+    static var keyLabels: [String] {
+        DubKeymap.legends({ .quickScratch($0) }, count: count)
+    }
 }

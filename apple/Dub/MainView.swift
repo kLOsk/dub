@@ -5920,59 +5920,41 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 if self.isTextFirstResponder() {
                     return event
                 }
-                if !isCmd, event.charactersIgnoringModifiers?.lowercased() == "g" {
-                    let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                    let halve = flags.contains(.shift)
-                    let double = flags.contains(.option)
-                    if onTapGrid(halve, double) { return nil }
-                }
-                // Hot cue pads 1–4. Number-row keyCodes (18–21) are
-                // layout-independent, like the spacebar's 49. Shift
-                // clears the slot; otherwise set (empty) / recall (set)
-                // on the focused deck.
-                if !isCmd, (18...21).contains(Int(event.keyCode)) {
-                    let index = Int(event.keyCode) - 18
-                    let clear = event.modifierFlags
-                        .intersection(.deviceIndependentFlagsMask).contains(.shift)
-                    if onHotCue(index, clear) { return nil }
-                }
-                // M16 siren preset one-shots on the bottom letter row
-                // Z X C V B N M , → preset indices 0–7. Layout-independent
-                // physical keyCodes (like the 18–21 hot-cue keys); these are
-                // otherwise unbound, so consuming them is safe and never steals
-                // a typed key (the text-first-responder guard above already let
-                // editable fields keep their keyDown).
-                if !isCmd {
-                    let sirenKeys: [UInt16: Int] =
-                        [6: 0, 7: 1, 8: 2, 9: 3, 11: 4, 45: 5, 46: 6, 43: 7]
-                    if let preset = sirenKeys[event.keyCode] {
-                        if onSirenPreset(preset) { return nil }
-                    }
-                }
-                // Quick Scratch (M17 §7.2): Q W E R load a bound
-                // sample onto its target deck. Physical keyCodes like
-                // the rows above, so the binding survives a non-QWERTY
-                // layout. Unmodified only — ⌘Q must stay Quit.
-                if !isCmd {
-                    let quickScratchKeys: [UInt16: Int] = [12: 0, 13: 1, 14: 2, 15: 3]
-                    if let slot = quickScratchKeys[event.keyCode] {
-                        if onQuickScratch(slot) { return nil }
-                    }
-                }
-                // Instant Doubles (M17 §7.3): ⌘→ duplicates deck A
-                // onto deck B, ⌘← the reverse. Arrow keyCodes 123/124
-                // are layout-independent like the keys above. Not
-                // guarded on the text-first-responder check — that
-                // already returned early — so ⌘← in a search field
-                // still moves the caret.
-                if isCmd, event.keyCode == 123 || event.keyCode == 124 {
-                    if onInstantDouble(event.keyCode == 124) { return nil }
-                }
-                // `keyCode 49` is the spacebar on every Apple keyboard
-                // layout (the keyCodes are layout-independent for the
-                // physical-key tier of NSEvent).
-                if !isCmd, event.keyCode == 49 {
+                // Every binding below resolves through `DubKeymap` —
+                // one table shared with the caps the pads print, so a
+                // rendered legend and the key that fires it cannot drift.
+                // Modifiers other than ⌘ are arguments to the action, not
+                // part of the match; see the keymap's header.
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                guard let action = DubKeymap.action(
+                    forKeyCode: event.keyCode,
+                    character: event.charactersIgnoringModifiers,
+                    command: isCmd)
+                else { return event }
+
+                switch action {
+                case .tapGrid:
+                    if onTapGrid(flags.contains(.shift), flags.contains(.option)) { return nil }
+                case .hotCue(let index):
+                    if onHotCue(index, flags.contains(.shift)) { return nil }
+                case .sirenPreset(let index):
+                    if onSirenPreset(index) { return nil }
+                case .quickScratch(let slot):
+                    if onQuickScratch(slot) { return nil }
+                case .instantDouble(let toDeckB):
+                    if onInstantDouble(toDeckB) { return nil }
+                case .loadSelection:
                     if onSpace() { return nil }
+                case .samplerSlot:
+                    // Reserved — `DubKeymap.action` filters these out, so
+                    // this is unreachable. Listed rather than defaulted so
+                    // wiring it at M18 is a compiler error here, not an
+                    // omission nobody notices.
+                    break
+                case .openPreferences:
+                    // Handled above, before the text-field guard, because
+                    // ⌘, must win even while typing.
+                    break
                 }
                 return event
             }

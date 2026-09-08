@@ -162,11 +162,13 @@ dependency order, not a preference.
    header stats, and the hardcoded `FX —` chip deleted. It landed on
    Performance in the same pass by construction — the primitives are
    shared — which 13 of the 20 moved baselines confirm.
-3. **The binding registry.** One `DubKeymap` table replacing the hardcoded
-   `keyCode` dictionaries in `KeyEventMonitorHost`, with every rendered
-   legend derived from it. Makes "a pad advertising a key that does
-   nothing" — the bug `SirenRackGroup`'s doc comment records — unwritable.
-   Prerequisite for both 5 and 6.
+3. ~~The binding registry~~ — **done.** `DubKeymap` replaces three inline
+   `[UInt16: Int]` dictionaries in `KeyEventMonitorHost` *and* three
+   hand-typed legend arrays. A binding carries a transport (key / MIDI /
+   HID) from the start so profiles need no migration, and `A S D F` are
+   modelled as **reserved** — the cap renders, the key falls through.
+   Behaviour-neutral by construction: all 20 pad baselines still match
+   after the legends started coming from the table.
 4. **Cue names + colours through the FFI.** Schema + FFI + `FFI_VERSION`
    bump. Rust-side and independent, so it can run alongside 2 and 3. The
    one part of the rack that is not free.

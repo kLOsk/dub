@@ -33,7 +33,11 @@ struct SamplerSlots: Equatable {
     /// Default key labels. **Not bound yet** — the keymap lands with
     /// the M18 remapping pass, so today the pads are driven from the
     /// Preferences rack.
-    static let keyLabels = ["A", "S", "D", "F"]
+    /// Derived, not typed. See `DubKeymap` — these are reserved, so the
+    /// caps render but the keys do not fire until M18 wires them.
+    static var keyLabels: [String] {
+        DubKeymap.legends({ .samplerSlot($0) }, count: count)
+    }
 
     private var slots: [SamplerSlot?]
 

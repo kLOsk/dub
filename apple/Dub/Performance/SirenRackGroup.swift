@@ -19,7 +19,7 @@ import SwiftUI
 /// Keyboard bindings for the siren presets, in fire order. One row of
 /// keys because there is one keymap — the handler resolves the deck at
 /// press time, not the pad.
-let sirenPresetKeys = ["Z", "X", "C", "V", "B", "N", "M", ","]
+let sirenPresetKeys = DubKeymap.legends({ .sirenPreset($0) }, count: 8)
 
 /// The siren: eight preset pads under a header carrying the unit
 /// selector and the dub knob.

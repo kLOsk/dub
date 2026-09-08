@@ -289,8 +289,10 @@ struct PerformanceView: View {
                     key: SamplerSlots.keyLabels[index],
                     sampleName: slot.map { SampleBank.label(for: $0.url) },
                     deck: slot?.deck,
-                    // PRD §7.1 — A S D F land with M18's remapping pass.
-                    keyBound: false)
+                    // PRD §7.1 — reserved until M18 wires them. Read from
+                    // the keymap rather than asserted here, so the day the
+                    // binding goes live the cap follows with no edit.
+                    keyBound: DubKeymap.isLive(.samplerSlot(index)))
             })
     }
 
