@@ -62,6 +62,39 @@ struct LibraryTableCallbacks {
     var onColumnResized: (LibraryColumnField, CGFloat) -> Void = { _, _ in }
     var onColumnsReordered: ([LibraryColumnField]) -> Void = { _ in }
     var onSelectionChanged: () -> Void = {}
+    /// Resolve a track's file URL for drag-out. `nil` when the source
+    /// volume is unmounted — an unreachable row is simply not
+    /// draggable, rather than vending a path the decoder would choke on.
+    var dragURL: (LibraryTrack) -> URL? = { _ in nil }
+    /// `true` while the open crate is in manual order, which is the
+    /// only state where an in-list reorder has a persistent meaning.
+    var crateReorderEnabled: () -> Bool = { false }
+    /// Commit a reorder: the dragged ids and the 0-based insertion slot.
+    var onCrateReorder: ([String], Int) -> Void = { _, _ in }
+    /// Build the right-click menu for a row, or `nil` for no menu.
+    var menuForRow: (Int) -> NSMenu? = { _ in nil }
+}
+
+/// In-process drag type carrying the crate-reorder payload. Kept
+/// distinct from `public.file-url` — the deck / sidebar drop — so an
+/// in-list reorder only ever reacts to a row drag that started inside
+/// the open crate, never to a Finder file drag.
+enum LibraryCrateReorder {
+    static let pasteboardType =
+        NSPasteboard.PasteboardType("com.dub.crate-track-order")
+    /// Sentinel prefixing the newline-joined ids, so a foreign payload
+    /// on the same type cannot be mistaken for ours.
+    static let sentinel = "DUBCRATE"
+
+    static func payload(ids: [String]) -> Data {
+        Data(([sentinel] + ids).joined(separator: "\n").utf8)
+    }
+
+    static func ids(from data: Data) -> [String]? {
+        let parts = String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+        guard parts.first == sentinel else { return nil }
+        return Array(parts.dropFirst())
+    }
 }
 
 struct LibraryTable: NSViewRepresentable {
@@ -96,6 +129,14 @@ struct LibraryTable: NSViewRepresentable {
         table.intercellSpacing = .zero
         table.dataSource = context.coordinator
         table.delegate = context.coordinator
+        table.menu = NSMenu()
+        table.menu?.delegate = context.coordinator
+        table.registerForDraggedTypes([LibraryCrateReorder.pasteboardType])
+        // Rows drag out as file URLs and reorder in place; AppKit picks
+        // the drag image from the real row views, which is what the old
+        // per-column `onDrag` was approximating.
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
+        table.setDraggingSourceOperationMask(.move, forLocal: true)
         context.coordinator.table = table
 
         let scroll = NSScrollView()
@@ -133,7 +174,8 @@ struct LibraryTable: NSViewRepresentable {
         coordinator.syncSelectionFromModel()
     }
 
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate,
+        NSMenuDelegate {
         var parent: LibraryTable
         weak var table: NSTableView?
         var lastTrackIds: [String] = []
@@ -274,6 +316,99 @@ struct LibraryTable: NSViewRepresentable {
                   let field = LibraryColumnField(rawValue: tableColumn.identifier.rawValue)
             else { return }
             parent.callbacks.onToggleSort(field)
+        }
+
+        // MARK: - Drag out
+
+        /// Always vends the file URL — the contract `MainView
+        /// .addDroppedURLsToCrate` and the decks' `dropDestination`
+        /// both read. While the open crate is in manual order it also
+        /// vends the in-process reorder payload, so one drag can either
+        /// load a deck or reorder in place depending on where it lands.
+        func tableView(
+            _ tableView: NSTableView,
+            pasteboardWriterForRow row: Int
+        ) -> NSPasteboardWriting? {
+            guard parent.tracks.indices.contains(row),
+                  let url = parent.callbacks.dragURL(parent.tracks[row])
+            else { return nil }
+            let item = NSPasteboardItem()
+            item.setString(url.absoluteString, forType: .fileURL)
+            if parent.callbacks.crateReorderEnabled() {
+                let ids = MainActor.assumeIsolated { self.draggedIds(primaryRow: row) }
+                item.setData(
+                    LibraryCrateReorder.payload(ids: ids),
+                    forType: LibraryCrateReorder.pasteboardType)
+            }
+            return item
+        }
+
+        /// The dragged ids in visual order. A multi-row selection moves
+        /// as a contiguous block; a drag on an unselected row carries
+        /// just that row (Finder semantics).
+        @MainActor
+        private func draggedIds(primaryRow: Int) -> [String] {
+            let primary = parent.tracks[primaryRow].id
+            let selected = parent.rowSelection.selectedTrackIds
+            guard selected.contains(primary), selected.count > 1 else { return [primary] }
+            return parent.tracks.map(\.id).filter { selected.contains($0) }
+        }
+
+        // MARK: - Reorder drop
+
+        func tableView(
+            _ tableView: NSTableView,
+            validateDrop info: NSDraggingInfo,
+            proposedRow row: Int,
+            proposedDropOperation dropOperation: NSTableView.DropOperation
+        ) -> NSDragOperation {
+            guard dropOperation == .above,
+                  MainActor.assumeIsolated({ self.parent.callbacks.crateReorderEnabled() }),
+                  info.draggingPasteboard.data(
+                      forType: LibraryCrateReorder.pasteboardType) != nil
+            else { return [] }
+            return .move
+        }
+
+        func tableView(
+            _ tableView: NSTableView,
+            acceptDrop info: NSDraggingInfo,
+            row: Int,
+            dropOperation: NSTableView.DropOperation
+        ) -> Bool {
+            guard let data = info.draggingPasteboard.data(
+                      forType: LibraryCrateReorder.pasteboardType),
+                  let ids = LibraryCrateReorder.ids(from: data), !ids.isEmpty
+            else { return false }
+            MainActor.assumeIsolated { self.parent.callbacks.onCrateReorder(ids, row) }
+            return true
+        }
+
+        // MARK: - Right-click menu
+
+        /// Built when the menu opens, against `clickedRow` — which also
+        /// gives Finder's "right-click outside the selection acts on
+        /// that row alone" semantics for free.
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            guard let table, table.clickedRow >= 0 else { return }
+            let row = table.clickedRow
+            guard let built = MainActor.assumeIsolated({
+                self.parent.callbacks.menuForRow(row)
+            }) else { return }
+            for item in built.items {
+                built.removeItem(item)
+                menu.addItem(item)
+            }
+        }
+
+        // MARK: - Scroll
+
+        @MainActor
+        func scrollToTrack(id: String) {
+            guard let table, let row = parent.tracks.firstIndex(where: { $0.id == id })
+            else { return }
+            table.scrollRowToVisible(row)
         }
 
         // MARK: - Selection
