@@ -932,7 +932,7 @@ struct LibraryView: View {
             rightPane
         }
         // No `minHeight`: `DeckLibrarySplit` frames this explicitly and
-        // `SplitMetrics` owns the floor (`DubLayout.libraryMinHeight`).
+        // `DeckLibrarySplit` owns the floor (`DubLayout.libraryMinHeight`).
         // A minimum here would be reported and drawn even inside a
         // shorter frame, overflowing rather than clamping.
         .background(DubColor.surface0)

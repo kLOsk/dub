@@ -596,7 +596,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// markers in the beat-grid pass so they share the waveform's
     /// exact time→NDC mapping; they render even when the beat grid
     /// is hidden or unconfident.
-    private let hotCues = OSAllocatedUnfairLock<[Double]>(initialState: [])
+    private let hotCues = OSAllocatedUnfairLock<[HotCueMarker]>(initialState: [])
 
     /// Active loop region (track seconds) as `(in, out)`, or `nil`
     /// when no loop is engaged. Drawn in the beat-grid pass as a
@@ -821,8 +821,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// order). Empty clears the markers. Cheap enough to call on
     /// every `updateNSView` — the render thread copies the array
     /// once per draw.
-    func setHotCues(_ positions: [Double]) {
-        hotCues.withLock { $0 = positions }
+    func setHotCues(_ markers: [HotCueMarker]) {
+        hotCues.withLock { $0 = markers }
     }
 
     /// Push the deck's active loop region (track seconds). `active ==
@@ -1508,7 +1508,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // estimator confidence; cues are independent and draw whenever
         // the deck has a track. The outer gate fires if EITHER has
         // something to show.
-        let hotCueSecs = hotCues.withLock { $0 }
+        let hotCueMarkers = hotCues.withLock { $0 }
         let loopBounds = loopRegion.withLock { $0 }
         let drawBeats =
             appearance.beatGridEnabled
@@ -1517,7 +1517,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         if framesSinceSourceSwap > 20,
            peakChunkDurationSecs > 0,
            pos.hasTrack,
-           drawBeats || !hotCueSecs.isEmpty || loopBounds != nil
+           drawBeats || !hotCueMarkers.isEmpty || loopBounds != nil
         {
             drawBeatGrid(
                 encoder: encoder,
@@ -1525,7 +1525,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 appearance: appearance,
                 beats: beats,
                 drawBeats: drawBeats,
-                hotCueSecs: hotCueSecs,
+                hotCueMarkers: hotCueMarkers,
                 loopBounds: loopBounds,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
@@ -1888,7 +1888,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// AND luminance-distinct from both deck tints (amber, teal) and
     /// from the off-white beat ticks, so a cue line reads clearly
     /// against any waveform regardless of deck.
-    private static func hotCueRGBA(alpha: Float) -> SIMD4<Float> {
+    static func hotCueRGBA(alpha: Float) -> SIMD4<Float> {
         SIMD4(250.0 / 255.0, 92.0 / 255.0, 158.0 / 255.0, alpha)
     }
 
@@ -1925,7 +1925,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         appearance: RendererAppearance,
         beats: BeatGridSnapshot,
         drawBeats: Bool,
-        hotCueSecs: [Double],
+        hotCueMarkers: [HotCueMarker],
         loopBounds: (Double, Double)?,
         snappedChunkF: Double,
         drawnAbove: Int,
@@ -2071,19 +2071,26 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        // Hot cue markers — full-height lines in the cue tint,
-        // appended after the beats so they sit on top within the same
-        // pass / draw call. A touch wider than a downbeat (2.0 vs
-        // 1.75 px visible) so a cue reads as deliberate rather than
-        // "just another bar line". Independent of the beat grid: they
-        // render even when `drawBeats` is false.
-        if !hotCueSecs.isEmpty {
+        // Hot cue markers — full-height lines, appended after the beats
+        // so they sit on top within the same pass / draw call. A touch
+        // wider than a downbeat (2.0 vs 1.75 px visible) so a cue reads
+        // as deliberate rather than "just another bar line". Independent
+        // of the beat grid: they render even when `drawBeats` is false.
+        //
+        // Each line carries its own colour, so a cue the DJ labelled
+        // `aqua` is aqua here as well as on the pad. A mark is one
+        // object; it should not change identity between the two places
+        // you look at it.
+        if !hotCueMarkers.isEmpty {
             let cueVisibleHalfPx: Float = 2.0
             let cueVisibleHalfNDC = cueVisibleHalfPx / timeAxisPixels
             let cueQuadHalfNDC = (cueVisibleHalfPx + 1.0) / timeAxisPixels
-            for cue in hotCueSecs where cue.isFinite && cue >= visibleStart && cue <= visibleEnd {
+            for marker in hotCueMarkers
+            where marker.secs.isFinite && marker.secs >= visibleStart
+                && marker.secs <= visibleEnd
+            {
                 let timeNDC = Self.beatTimeNDC(
-                    beatSecs: cue,
+                    beatSecs: marker.secs,
                     peakDur: peakDur,
                     snappedChunkF: snappedChunkF,
                     drawnAbove: drawnAbove,
@@ -2096,7 +2103,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     timeNDC: Float(timeNDC),
                     quadHalfNDC: cueQuadHalfNDC,
                     visibleHalfNDC: cueVisibleHalfNDC,
-                    color: Self.hotCueRGBA(alpha: 0.95),
+                    color: SIMD4(marker.rgb.x, marker.rgb.y, marker.rgb.z, 0.95),
                     isDownbeat: true)
             }
         }

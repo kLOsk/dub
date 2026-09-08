@@ -370,14 +370,21 @@ enum DubLayout {
     /// pad bar starts giving up height instead.
     static let waveformPrepMinHeight: CGFloat = 96
 
-    /// Floor for Prep's pad bar: the tallest collapsed column (~203)
-    /// plus the rip lane (56) plus padding.
+    /// Floor for Prep's pad bar: what `PrepRack` actually draws, plus
+    /// its own vertical padding.
     ///
-    /// **If you add a Prep section, re-measure this.** The
-    /// deck/library divider clamps against `prepRegionMinHeight`, so a
-    /// stale value here silently under-budgets the region and the grid
-    /// starts scrolling when it should not.
-    static let prepPadBarMinHeight: CGFloat = 280
+    /// Was 280, sized for the two-column grid it replaced *and* carrying
+    /// a permanent allowance for the 56 pt rip lane. The rack needs about
+    /// 170, and the rip lane is conditional — reserving for it on every
+    /// session cost ~110 pt of Prep on the surface where the track list
+    /// wants the room. A rip in progress grows the bar (the region
+    /// scrolls, which is what the `ScrollView` in `prepPadRows` is for),
+    /// and rip is leaving Prep for its own surface anyway.
+    ///
+    /// **Re-measure if you change a Prep section.**
+    /// `PerformanceLayoutTests.test_prepRackFitsItsHeightFloor` fails
+    /// both ways: too small clips, too generous steals from the strip.
+    static let prepPadBarMinHeight: CGFloat = 192
 
     /// Overview band + playing strip + pad bar + the two 1 pt dividers.
     static let prepRegionMinHeight: CGFloat =

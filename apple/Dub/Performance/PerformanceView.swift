@@ -231,6 +231,7 @@ struct PerformanceView: View {
             // redesign is open. Positions only until then.
             cues: deckState.hotCues.map { $0?.positionSecs },
             activeLoopBars: deckState.activeLoopBars,
+            isPlaying: deckState.isPlaying,
             loopEngaged: deckState.loopActive,
             loopInArmed: deckState.pendingLoopInSecs != nil,
             echoEnabled: model.echoOutEnabled,
@@ -246,6 +247,8 @@ struct PerformanceView: View {
             onCue: { index, clear in
                 model.handleHotCue(side, index: index, clear: clear)
             },
+            onPreviewDown: { index in model.beginHotCuePreview(side, index: index) },
+            onPreviewUp: { model.endHotCuePreview(side) },
             onLoop: { bars in model.handleLoop(side, bars: bars) },
             onLoopIn: { model.setLoopIn(side) },
             onLoopOut: { model.setLoopOut(side) },
@@ -307,12 +310,15 @@ struct PerformanceView: View {
             loopEngaged: model.deckA.loopActive,
             loopInArmed: model.deckA.pendingLoopInSecs != nil,
             sampleNames: model.sampleBank.all.map { SampleBank.label(for: $0) },
-            hasTrack: model.deckA.hasTrack)
+            hasTrack: model.deckA.hasTrack,
+            isPlaying: model.deckA.isPlaying)
     }
 
     private var prepRackCallbacks: PrepRackCallbacks {
         PrepRackCallbacks(
             onCue: { index, clear in model.handleHotCue(.a, index: index, clear: clear) },
+            onPreviewDown: { index in model.beginHotCuePreview(.a, index: index) },
+            onPreviewUp: { model.endHotCuePreview(.a) },
             onRenameCue: { index in renameCue(index) },
             onColorCue: { index, token in
                 model.setHotCueLabel(
@@ -444,7 +450,7 @@ struct PerformanceView: View {
                 deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
             }
             // No `minHeight` here. `DeckLibrarySplit` assigns this
-            // region an explicit height and `SplitMetrics` owns the
+            // region an explicit height and `DeckLibrarySplit` owns the
             // floor. A `minHeight` inside an explicitly-framed parent
             // reports and draws its minimum regardless of the frame —
             // which is precisely how the pad column came to be painted

@@ -45,7 +45,12 @@ struct PerformancePadsView: View {
     /// offer it twice — plain, then wrapped in a scroll view.
     private var stack: some View {
         VStack(alignment: .leading, spacing: DubSpacing.md) {
-            CuePadSection(cues: state.cues, onCue: callbacks.onCue)
+            CuePadSection(
+                cues: state.cues,
+                isPlaying: state.isPlaying,
+                onCue: callbacks.onCue,
+                onPreviewDown: callbacks.onPreviewDown,
+                onPreviewUp: callbacks.onPreviewUp)
             LoopPadSection(
                 activeBars: state.activeLoopBars,
                 loopEngaged: state.loopEngaged,

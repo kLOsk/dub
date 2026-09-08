@@ -27,6 +27,10 @@ struct PerformancePadsState: Equatable {
 
     /// Active reverse-loop length in bars; `nil` is no loop.
     var activeLoopBars: Double?
+    /// A paused deck previews a cue while its pad is held; a running one
+    /// jumps and keeps playing. Same gesture as Prep.
+    var isPlaying: Bool = false
+
     /// A loop is running — a manual in/out region lights no length pad,
     /// so ✕ needs its own signal.
     var loopEngaged: Bool = false
@@ -58,6 +62,10 @@ struct PerformancePadsCallbacks {
     /// same pad should be inert on the other surface (PRD §6.2.1: a
     /// hot-cue press is a momentary trigger, so the mouse is fine).
     var onCue: (_ index: Int, _ clear: Bool) -> Void = { _, _ in }
+    /// Mouse-down on a set cue while the deck is paused: play from it.
+    var onPreviewDown: (_ index: Int) -> Void = { _ in }
+    /// Mouse-up: stop and return to the mark.
+    var onPreviewUp: () -> Void = {}
     /// Fire a grid-snapped reverse loop of `bars` bars — the bars just
     /// heard.
     var onLoop: (_ bars: Double) -> Void = { _ in }

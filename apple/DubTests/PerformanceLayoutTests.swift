@@ -126,12 +126,57 @@ final class PerformanceLayoutTests: XCTestCase {
     /// This asserts the floor is derived from what the surface actually
     /// needs — including the 56 pt rip lane, which renders *inside*
     /// `prepPadRows` and which three separate estimates have dropped.
+    /// Prep hands the library everything the deck does not draw. The
+    /// drag handle that used to decide this is gone; the rule replacing
+    /// it has to be checked, because getting it wrong silently starves
+    /// one half.
+    func test_prepGivesTheLibraryEverythingLeftOver() {
+        let total: CGFloat = 900
+        let chrome: CGFloat = 0
+        let deck = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .prep, total: total,
+            deckChrome: chrome, deckMinimum: DubLayout.prepRegionMinHeight)
+        XCTAssertEqual(deck, DubLayout.prepRegionMinHeight,
+                       "Prep's deck should size to its content, not a fraction")
+        XCTAssertGreaterThan(total - deck, DubLayout.libraryMinHeight,
+                             "the library takes the remainder")
+    }
+
+    /// Performance keeps the decks dominant — PRD §9.2 is explicit that
+    /// they own the vertical real estate, so the library must not take
+    /// the space Prep gives it.
+    func test_performanceKeepsTheDecksDominant() {
+        let total: CGFloat = 900
+        let deck = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .timecode, total: total,
+            deckChrome: DubLayout.rackBarHeight,
+            deckMinimum: DubLayout.waveformMinHeight)
+        XCTAssertGreaterThan(deck, total * 0.5)
+    }
+
+    /// On a window too short for both, the deck yields first and the
+    /// library keeps its floor — the same degradation order the drag
+    /// used to enforce.
+    func test_shortWindowProtectsTheLibraryFloor() {
+        let total: CGFloat = 420
+        for mode in [EngineMode.prep, .timecode] {
+            let deck = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+                mode: mode, total: total,
+                deckChrome: 0, deckMinimum: DubLayout.prepRegionMinHeight)
+            XCTAssertGreaterThanOrEqual(
+                total - deck, DubLayout.libraryMinHeight, "\(mode)")
+        }
+    }
+
     func test_prepRackFitsItsHeightFloor() {
         let rack = fittingSize(
             PrepRack(state: PrepRackState(hasTrack: true)),
             width: DubLayout.mainWindowMinWidth - DubSpacing.lg * 2)
-        // The bar is the rack + its own vertical padding + the rip lane.
-        let needed = rack.height + DubSpacing.sm * 2 + 56
+        // The bar is the rack plus its own vertical padding. The rip
+        // lane is *not* reserved for: it renders only during a capture,
+        // and it is leaving Prep for its own surface. Reserving for it
+        // permanently cost ~110 pt of every session.
+        let needed = rack.height + DubSpacing.sm * 2
         XCTAssertLessThanOrEqual(
             needed, DubLayout.prepPadBarMinHeight,
             "the Prep bar's floor no longer covers what it draws — "
@@ -139,7 +184,7 @@ final class PerformanceLayoutTests: XCTestCase {
         // And it must not be wildly generous either: a floor far above the
         // content is height taken from the waveform for nothing.
         XCTAssertGreaterThan(
-            needed + 60, DubLayout.prepPadBarMinHeight,
+            needed + 30, DubLayout.prepPadBarMinHeight,
             "the floor is over-reserved — give the height back to the strip")
     }
 

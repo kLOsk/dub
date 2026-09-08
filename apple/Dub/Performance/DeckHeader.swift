@@ -470,9 +470,11 @@ struct DeckHeader: View {
                 if showSourcePill {
                     sourcePill.layoutPriority(2)
                 }
-                deckLabel.layoutPriority(2)
+                // Prep is single-deck. Naming the only deck on screen is
+                // noise, and the space belongs to the title.
+                if !prepMode { deckLabel.layoutPriority(2) }
             } else {
-                deckLabel.layoutPriority(2)
+                if !prepMode { deckLabel.layoutPriority(2) }
                 if showSourcePill {
                     sourcePill.layoutPriority(2)
                 }
@@ -507,8 +509,16 @@ struct DeckHeader: View {
         } else {
             placeholderText("—", font: DubFont.title)
         }
+        if state.trackArtist != nil {
+            // Its own element, so the gap is the `HStack`'s on both
+            // sides. Glued to the artist as `"· \(artist)"` it sat hard
+            // against the name and adrift from the title.
+            Text("—")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPlaceholder)
+        }
         if let artist = state.trackArtist {
-            Text("· \(artist)")
+            Text(artist)
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
                 .lineLimit(1)
@@ -553,14 +563,20 @@ struct DeckHeader: View {
         HStack(spacing: DubSpacing.lg) {
             if mirrored {
                 Spacer(minLength: 0)
-                statColumn(label: "PITCH", value: formattedPitch)
-                    .opacity(state.pitchSettled ? 1.0 : 0.45)
+                if !prepMode {
+                    statColumn(label: "PITCH", value: formattedPitch)
+                        .opacity(state.pitchSettled ? 1.0 : 0.45)
+                }
                 bpmStatColumn
                     .opacity(state.pitchSettled ? 1.0 : 0.45)
                 statColumn(label: "KEY", value: formattedKey)
             } else {
-                statColumn(label: "PITCH", value: formattedPitch)
-                    .opacity(state.pitchSettled ? 1.0 : 0.45)
+                // No platter in Prep, so pitch can only ever read
+                // `+0.0 %` — a readout with one possible value is noise.
+                if !prepMode {
+                    statColumn(label: "PITCH", value: formattedPitch)
+                        .opacity(state.pitchSettled ? 1.0 : 0.45)
+                }
                 bpmStatColumn
                     .opacity(state.pitchSettled ? 1.0 : 0.45)
                 statColumn(label: "KEY", value: formattedKey)

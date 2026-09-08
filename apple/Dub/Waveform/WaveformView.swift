@@ -155,7 +155,7 @@ struct WaveformView: View {
     /// `updateNSView` so the waveform draws a marker per cue. `nil`
     /// slots in `DeckState.hotCues` are filtered out before they
     /// reach here.
-    let hotCues: [Double]
+    let hotCues: [HotCueMarker]
 
     /// Active reverse loop, mirrored from `DeckState`. `loopActive`
     /// gates the band; `loopInSecs` / `loopOutSecs` are track seconds.
@@ -173,7 +173,7 @@ struct WaveformView: View {
          seekGeneration: UInt64 = 0,
          peaksGeneration: UInt64 = 0,
          timeAxisZoom: Double = 1.0,
-         hotCues: [Double] = [],
+         hotCues: [HotCueMarker] = [],
          loopActive: Bool = false,
          loopInSecs: Double = 0,
          loopOutSecs: Double = 0) {
@@ -785,7 +785,7 @@ private struct WaveformMetalView: NSViewRepresentable {
     let seekGeneration: UInt64
     let peaksGeneration: UInt64
     let timeAxisZoom: Double
-    let hotCues: [Double]
+    let hotCues: [HotCueMarker]
     let loopActive: Bool
     let loopInSecs: Double
     let loopOutSecs: Double
@@ -808,7 +808,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         private var lastSeekGeneration: UInt64?
         private var lastPeaksGeneration: UInt64?
         private var lastContinuous: Bool?
-        private var lastHotCues: [Double]?
+        private var lastHotCues: [HotCueMarker]?
         private var lastLoopActive: Bool?
         private var lastLoopInSecs: Double?
         private var lastLoopOutSecs: Double?
@@ -827,7 +827,7 @@ private struct WaveformMetalView: NSViewRepresentable {
             timeAxisZoom: Double,
             seekGeneration: UInt64,
             peaksGeneration: UInt64,
-            hotCues: [Double],
+            hotCues: [HotCueMarker],
             loopActive: Bool,
             loopInSecs: Double,
             loopOutSecs: Double

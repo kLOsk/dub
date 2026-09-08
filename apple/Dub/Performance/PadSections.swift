@@ -33,22 +33,54 @@ struct LoopPreset: Identifiable {
 /// The four hot-cue pads. Click sets or jumps, ⇧-click clears.
 struct CuePadSection: View {
     let cues: [Double?]
+    /// A paused deck previews while the pad is held; a running one jumps
+    /// and keeps going.
+    var isPlaying: Bool = false
     let onCue: (_ index: Int, _ clear: Bool) -> Void
+    var onPreviewDown: (_ index: Int) -> Void = { _ in }
+    var onPreviewUp: () -> Void = {}
 
     var body: some View {
-        DubSectionPanel("CUE") {
+        DubSectionPanel("HOTCUE") {
             HStack(spacing: DubSpacing.sm) {
                 ForEach(0..<4, id: \.self) { index in
                     let isSet = index < cues.count && cues[index] != nil
+                    let previewable = isSet && !isPlaying
                     DubPadCell("\(index + 1)", size: .glyph, lit: isSet)
-                        .onPressDown {
-                            onCue(index, NSEvent.modifierFlags.contains(.shift))
-                        }
-                        .help(isSet
-                            ? "Cue \(index + 1) — click to jump, ⇧-click to clear"
-                            : "Cue \(index + 1) — click to set at the playhead")
+                        .modifier(
+                            CuePadGesture(
+                                previewable: previewable,
+                                onDown: { onPreviewDown(index) },
+                                onUp: onPreviewUp,
+                                onClick: {
+                                    onCue(index, NSEvent.modifierFlags.contains(.shift))
+                                }))
+                        .help(
+                            !isSet
+                                ? "Hot cue \(index + 1) — click to set at the playhead"
+                                : previewable
+                                    ? "Hot cue \(index + 1) — hold to preview, ⇧-click to clear"
+                                    : "Hot cue \(index + 1) — click to jump, ⇧-click to clear")
                 }
             }
+        }
+    }
+}
+
+/// Hold-to-preview on a paused deck, mouse-down otherwise. One or the
+/// other: carrying both would let the hold gesture swallow the click that
+/// sets an empty pad.
+private struct CuePadGesture: ViewModifier {
+    let previewable: Bool
+    let onDown: () -> Void
+    let onUp: () -> Void
+    let onClick: () -> Void
+
+    func body(content: Content) -> some View {
+        if previewable {
+            content.onPressHold(onDown: onDown, onUp: onUp)
+        } else {
+            content.onPressDown(perform: onClick)
         }
     }
 }

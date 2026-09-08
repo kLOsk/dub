@@ -177,6 +177,11 @@ struct DeckState: Equatable {
     /// changes bump `seekGeneration` so a paused deck repaints.
     var hotCues: [CueMark?] = [nil, nil, nil, nil]
 
+    /// Set while a hot-cue press-and-hold preview is running; the
+    /// position the playhead returns to on release. `nil` when no
+    /// preview is in flight.
+    var hotCuePreviewFrom: Double?
+
     /// Active reverse loop, mirrored from `positionSnapshot` each
     /// poll. `loopActive` gates `loopInSecs` / `loopOutSecs` (track
     /// seconds), which the overview + waveform draw as the loop band.
@@ -4730,6 +4735,60 @@ final class WaveformAppModel: ObservableObject {
             setState(deck, for: side)
             persistHotCue(deck: deck, index: index, position: position)
         }
+    }
+
+    /// Press-and-hold preview from a hot cue on a **paused** deck.
+    ///
+    /// The CDJ / Serato gesture: hold the pad and the track plays from
+    /// the mark, release and it stops and returns there. It is how you
+    /// audition a cue you just set without committing the deck to
+    /// playing — which is most of what setting cues *is*.
+    ///
+    /// Only for a paused deck. On a running deck a hot cue jumps and
+    /// keeps playing (`handleHotCue`), because stopping a playing record
+    /// on mouse-up would be a way to kill a set.
+    ///
+    /// Returns `true` when a preview actually started, so the caller
+    /// knows whether to expect a matching `endHotCuePreview`.
+    @discardableResult
+    func beginHotCuePreview(_ side: DeckSide, index: Int) -> Bool {
+        guard isRunning, index >= 0, index < 4 else { return false }
+        var deck = state(for: side)
+        guard deck.hasTrack, !deck.isPlaying,
+              let position = deck.hotCues[index]?.positionSecs
+        else { return false }
+
+        do {
+            try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: position)
+        } catch {
+            surfaceError("Cue preview failed: \(error.localizedDescription)")
+            return false
+        }
+        deck = state(for: side)
+        deck.atEnd = false
+        deck.seekGeneration &+= 1
+        deck.hotCuePreviewFrom = position
+        setState(deck, for: side)
+        play(side: side)
+        return true
+    }
+
+    /// End a preview: stop, and return the playhead to the mark it
+    /// started from.
+    ///
+    /// Returning to the mark is the point — a preview that leaves the
+    /// playhead wherever the finger came off has moved the thing you
+    /// were auditioning.
+    func endHotCuePreview(_ side: DeckSide) {
+        var deck = state(for: side)
+        guard let origin = deck.hotCuePreviewFrom else { return }
+        pause(side: side)
+        try? engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: origin)
+        deck = state(for: side)
+        deck.hotCuePreviewFrom = nil
+        deck.atEnd = false
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
     }
 
     /// Snap `secs` to the nearest beat line of the deck's grid. Returns

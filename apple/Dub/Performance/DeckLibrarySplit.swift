@@ -2,25 +2,32 @@
 //  DeckLibrarySplit.swift
 //  Dub
 //
-//  The draggable boundary between the deck cluster and the library.
+//  The boundary between the deck cluster and the library. **Not
+//  draggable.**
 //
-//  Not `NSSplitView`: that needs an `NSViewRepresentable` wrapping two
-//  `NSHostingView`s, which breaks environment and observation
-//  propagation into the library and the deck panes and puts a second
-//  layout system on the app's hottest surface — to buy a divider style
-//  we already draw by hand.
+//  It was, and the handle is gone. A pane boundary the DJ has to place
+//  is a setting disguised as a gesture: it has a correct answer per mode,
+//  the app knows what that answer is, and every session started with the
+//  library either starved or eating the waveform until someone dragged it
+//  back. Removing it also removes a persisted per-mode fraction, a drag
+//  gesture on the app's hottest surface, and a class of "why is my
+//  waveform tiny today".
 //
-//  Dragging a pane boundary is chrome, not a performance gesture. PRD
-//  §1 forbids *continuous performance gestures* (pitch, crossfade, EQ,
-//  gain, cueing); AGENTS.md is explicit that the mouse is fine for
-//  everything else. This is not a software pitch fader.
+//  The two modes want different things, so they get different rules:
+//
+//  * **Prep** sizes the deck to exactly what it draws — overview, playing
+//    strip and the `PrepRack` — and gives everything below to the
+//    library. Prep is where you read a track list, so the list should
+//    have the room the controls do not need.
+//  * **Performance** keeps the decks dominant (PRD §9.2: "the decks
+//    dominate vertical real estate intentionally"), at the proportion the
+//    drag used to default to. The library is subordinate there by design.
 //
 
 import AppKit
 import SwiftUI
 
-/// Splits its container between a deck side and a library side, with a
-/// draggable handle between them.
+/// Splits its container between a deck side and a library side.
 struct DeckLibrarySplit<Deck: View, Library: View>: View {
     let mode: EngineMode
     /// Fixed chrome that rides with the deck side — the rack bar and
@@ -32,86 +39,44 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
     @ViewBuilder let deck: (_ contentHeight: CGFloat) -> Deck
     @ViewBuilder let library: () -> Library
 
-    @State private var fraction: CGFloat
-    @State private var dragStart: CGFloat?
-
-    init(
-        mode: EngineMode,
-        deckChrome: CGFloat,
-        deckMinimum: CGFloat,
-        @ViewBuilder deck: @escaping (_ contentHeight: CGFloat) -> Deck,
-        @ViewBuilder library: @escaping () -> Library
-    ) {
-        self.mode = mode
-        self.deckChrome = deckChrome
-        self.deckMinimum = deckMinimum
-        self.deck = deck
-        self.library = library
-        _fraction = State(initialValue: SplitMetrics.load(mode))
-    }
-
     var body: some View {
         GeometryReader { geo in
-            let total = max(0, geo.size.height - DubLayout.splitterThickness)
-            let deckHeight = SplitMetrics.deckHeight(
-                fraction: fraction, total: total,
+            let total = max(0, geo.size.height - 1)
+            let deckHeight = Self.deckHeight(
+                mode: mode, total: total,
                 deckChrome: deckChrome, deckMinimum: deckMinimum)
             VStack(spacing: 0) {
                 deck(max(0, deckHeight - deckChrome))
                     .frame(height: deckHeight)
-                handle(total: total)
+                Rectangle()
+                    .fill(DubColor.divider)
+                    .frame(height: 1)
                 library()
                     .frame(height: max(0, total - deckHeight))
             }
         }
-        // The two surfaces remember independently, so switching modes
-        // restores that mode's boundary rather than carrying one over.
-        .onChange(of: mode) { newMode in
-            fraction = SplitMetrics.load(newMode)
-        }
     }
 
-    private func handle(total: CGFloat) -> some View {
-        ZStack {
-            Rectangle().fill(DubColor.surface2)
-            Rectangle()
-                .fill(DubColor.textPlaceholder.opacity(0.5))
-                .frame(width: 24, height: 2)
-                .clipShape(Capsule())
+    /// Prep pins the deck to its content and hands the rest over;
+    /// Performance keeps the decks dominant.
+    ///
+    /// Both are clamped so the library keeps `libraryMinHeight` — on a
+    /// short window the deck gives way first, which is the same
+    /// degradation order the drag enforced.
+    static func deckHeight(
+        mode: EngineMode,
+        total: CGFloat,
+        deckChrome: CGFloat,
+        deckMinimum: CGFloat
+    ) -> CGFloat {
+        let wanted: CGFloat
+        switch mode {
+        case .prep:
+            wanted = deckMinimum + deckChrome
+        case .timecode:
+            wanted = max(deckMinimum + deckChrome, total * 0.60)
         }
-        .frame(height: DubLayout.splitterThickness)
-        .overlay(alignment: .top) {
-            Rectangle().fill(DubColor.divider).frame(height: 1)
-        }
-        .contentShape(Rectangle())
-        .onHover { inside in
-            if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
-        }
-        .gesture(
-            DragGesture(minimumDistance: 1)
-                .onChanged { value in
-                    let start = dragStart ?? fraction
-                    dragStart = start
-                    let target = SplitMetrics.deckHeight(
-                        fraction: start + value.translation.height / max(total, 1),
-                        total: total, deckChrome: deckChrome,
-                        deckMinimum: deckMinimum)
-                    fraction = SplitMetrics.fraction(deckHeight: target, total: total)
-                }
-                // One write per drag, not one per frame: the fraction
-                // is `@State` so a drag never republishes the app model
-                // (which would invalidate every deck pane and the
-                // Stillpoint view at 60 Hz, on the surface that must
-                // not drop frames), and never touches `@AppStorage`
-                // (which writes defaults on every assignment).
-                .onEnded { _ in
-                    dragStart = nil
-                    SplitMetrics.save(fraction, mode)
-                })
-        .onTapGesture(count: 2) {
-            fraction = SplitMetrics.defaultFraction(mode)
-            SplitMetrics.save(fraction, mode)
-        }
-        .help("Drag to resize · double-click to reset")
+        let ceiling = max(0, total - DubLayout.libraryMinHeight)
+        return max(0, min(wanted, ceiling))
     }
 }

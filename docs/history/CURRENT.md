@@ -187,6 +187,14 @@ dependency order, not a preference.
    and sample *loading* moved in from Preferences.
    The sample shelf takes the remaining width and lays its bank out in
    adaptive columns, because no fourth section is coming.
+   Since then: the header drops the deck label and PITCH in Prep (one
+   deck, and no platter to pitch), the title/artist separator has equal
+   air on both sides, CUE is **HOTCUE**, a hot cue on a *paused* deck
+   previews while held and returns to the mark on release (both
+   surfaces), a cue's colour now paints its waveform line, and the
+   deck/library drag handle is gone — Prep sizes the deck to its content
+   and hands the rest to the library, Performance keeps the decks
+   dominant. `prepPadBarMinHeight` re-measured 280 → 192.
    **Performance is deliberately untouched** — its design is not settled,
    and `CuePadSection` still draws numbered pads there.
    `SirenPadRow` / `SirenExpertPanel` are kept but unmounted, staged for

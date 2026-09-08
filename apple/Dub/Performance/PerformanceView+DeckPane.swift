@@ -192,7 +192,9 @@ extension PerformanceView {
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
                         : 1.0,
-                    hotCues: deckState.hotCues.compactMap { $0?.positionSecs },
+                    hotCues: deckState.hotCues.compactMap { cue in
+                        cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
+                    },
                     loopActive: deckState.loopActive,
                     loopInSecs: deckState.loopInSecs,
                     loopOutSecs: deckState.loopOutSecs)

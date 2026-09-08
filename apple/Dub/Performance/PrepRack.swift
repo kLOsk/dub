@@ -76,11 +76,18 @@ struct PrepRackState: Equatable {
     /// Cue and loop controls do nothing without a deck loaded, and should
     /// say so rather than fail quietly.
     var hasTrack: Bool = false
+    /// A paused deck previews a cue while the pad is held; a running one
+    /// jumps and keeps going.
+    var isPlaying: Bool = false
 }
 
 /// Everything it does.
 struct PrepRackCallbacks {
     var onCue: (_ index: Int, _ clear: Bool) -> Void = { _, _ in }
+    /// Mouse-down on a set cue while the deck is paused: play from it.
+    var onPreviewDown: (_ index: Int) -> Void = { _ in }
+    /// Mouse-up: stop and return to the mark.
+    var onPreviewUp: () -> Void = {}
     var onRenameCue: (_ index: Int) -> Void = { _ in }
     var onColorCue: (_ index: Int, _ token: String?) -> Void = { _, _ in }
     var onLoop: (_ bars: Double) -> Void = { _ in }
@@ -103,7 +110,10 @@ struct PrepRack: View {
             CueBank(
                 slots: state.cues,
                 hasTrack: state.hasTrack,
+                isPlaying: state.isPlaying,
                 onCue: callbacks.onCue,
+                onPreviewDown: callbacks.onPreviewDown,
+                onPreviewUp: callbacks.onPreviewUp,
                 onRename: callbacks.onRenameCue,
                 onColor: callbacks.onColorCue)
                 .frame(width: DubLayout.prepCueColumn, alignment: .leading)
@@ -178,16 +188,27 @@ private struct SectionHeading: View {
 private struct CueBank: View {
     let slots: [CueSlotState]
     let hasTrack: Bool
+    let isPlaying: Bool
     let onCue: (Int, Bool) -> Void
+    let onPreviewDown: (Int) -> Void
+    let onPreviewUp: () -> Void
     let onRename: (Int) -> Void
     let onColor: (Int, String?) -> Void
 
     private var setCount: Int { slots.filter(\.isSet).count }
 
+    private func helpText(_ slot: CueSlotState) -> String {
+        let n = slot.index + 1
+        guard slot.isSet else { return "Hot cue \(n) — click to set at the playhead" }
+        return isPlaying
+            ? "Hot cue \(n) — click to jump, ⇧-click to clear"
+            : "Hot cue \(n) — hold to preview, ⇧-click to clear"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             SectionHeading(
-                title: "CUE", accent: DubColor.hotCue,
+                title: "HOTCUE", accent: DubColor.hotCue,
                 trailing: "\(setCount) OF 4")
             VStack(spacing: DubSpacing.xs) {
                 ForEach(slots) { row($0) }
@@ -226,12 +247,18 @@ private struct CueBank: View {
                     slot.isSet ? DubColor.divider : DubColor.divider.opacity(0.7),
                     style: StrokeStyle(lineWidth: 1, dash: slot.isSet ? [] : [3, 3])))
         .contentShape(Rectangle())
-        .onPressDown(enabled: hasTrack) {
-            onCue(slot.index, NSEvent.modifierFlags.contains(.shift))
-        }
-        .help(slot.isSet
-            ? "Cue \(slot.index + 1) — click to jump, ⇧-click to clear"
-            : "Cue \(slot.index + 1) — click to set at the playhead")
+        // A set cue on a *paused* deck previews while held — the CDJ
+        // gesture. Everything else (setting an empty pad, ⇧-clearing,
+        // jumping on a running deck) stays mouse-down, because a cue
+        // handler has to capture the playhead at the press.
+        .modifier(
+            CueRowGesture(
+                previewable: hasTrack && slot.isSet && !isPlaying,
+                enabled: hasTrack,
+                onDown: { onPreviewDown(slot.index) },
+                onUp: onPreviewUp,
+                onClick: { onCue(slot.index, NSEvent.modifierFlags.contains(.shift)) }))
+        .help(helpText(slot))
         .contextMenu {
             if slot.isSet {
                 Button("Rename…") { onRename(slot.index) }
@@ -248,6 +275,25 @@ private struct CueBank: View {
         }
     }
 
+}
+
+/// Routes a cue row to press-and-hold or to mouse-down. One or the
+/// other — a view carrying both would have the hold gesture swallow the
+/// click that sets an empty pad.
+private struct CueRowGesture: ViewModifier {
+    let previewable: Bool
+    let enabled: Bool
+    let onDown: () -> Void
+    let onUp: () -> Void
+    let onClick: () -> Void
+
+    func body(content: Content) -> some View {
+        if previewable {
+            content.onPressHold(onDown: onDown, onUp: onUp)
+        } else {
+            content.onPressDown(enabled: enabled, perform: onClick)
+        }
+    }
 }
 
 /// `m:ss.t` — tenths, because a cue set by ear is placed to about that
