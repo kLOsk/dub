@@ -111,14 +111,12 @@ struct LoopPadSection: View {
         DubPadCell("IN", size: .word, lit: loopInArmed, tint: DubColor.loop)
             .onPressDown { onLoopIn() }
             .help("Set the loop start at the playhead")
-        DubPadCell("OUT", size: .word, tint: DubColor.loop)
+        DubPadCell("OUT", size: .word, enabled: loopInArmed, tint: DubColor.loop)
             .onPressDown(enabled: loopInArmed) { onLoopOut() }
             .help("Close the loop at the playhead and start it")
-            .opacity(loopInArmed ? 1.0 : 0.5)
-        DubPadCell("✕", size: .glyph, tint: DubColor.loop)
+        DubPadCell("✕", size: .glyph, enabled: canExit, tint: DubColor.loop)
             .onPressDown(enabled: canExit) { onExit() }
             .help("Exit loop")
-            .opacity(canExit ? 1.0 : 0.5)
     }
 }
 

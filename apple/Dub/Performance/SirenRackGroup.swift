@@ -105,9 +105,7 @@ struct SirenRackGroup: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                Text(key)
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textPlaceholder)
+                DubKeycap(key: key)
             }
         }
         .onPressDown { onPreset(index) }

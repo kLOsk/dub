@@ -81,19 +81,46 @@ struct DubPadCell<Label: View>: View {
 
     let size: Size
     var lit: Bool = false
+    /// A control that exists but cannot be used right now — LOOP's `OUT`
+    /// before `IN` is taken, `✕` with no loop to exit.
+    ///
+    /// It is a state of the cell, not a modifier on it. Callers used to
+    /// wrap the whole pad in `.opacity(0.5)`, which dimmed the *stroke*
+    /// along with the label and took an already-low-contrast label to
+    /// about 1.84:1 — so a dead control and a merely idle one were hard to
+    /// tell apart. Here the stroke stays at full strength and only the
+    /// fill and the label move, which is what makes "unavailable" read as
+    /// a different thing from "off".
+    var enabled: Bool = true
     var tint: Color = DubColor.hotCue
     @ViewBuilder let label: () -> Label
 
+    /// Resting label colour.
+    ///
+    /// `textSecondary`, not `textTertiary`. The old value measured
+    /// **3.64:1** on `surface1` — under the 4.5:1 floor, and the single
+    /// reason the whole pad surface read as disabled in a dim booth. This
+    /// is 6.27:1 and costs nothing.
+    private var labelColor: Color {
+        if !enabled { return DubColor.textPlaceholder }
+        return lit ? DubColor.textPrimary : DubColor.textSecondary
+    }
+
+    private var fill: Color {
+        if !enabled { return DubColor.surface2 }
+        return lit ? tint.opacity(0.24) : DubColor.surface1
+    }
+
     var body: some View {
         label()
-            .foregroundStyle(lit ? DubColor.textPrimary : DubColor.textTertiary)
+            .foregroundStyle(labelColor)
             .frame(width: size.width, height: size.height)
             .padding(.horizontal, size.horizontalPadding)
-            .background(lit ? tint.opacity(0.24) : DubColor.surface1)
+            .background(fill)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                    .stroke(lit ? tint : DubColor.divider, lineWidth: 1))
+                    .stroke(lit && enabled ? tint : DubColor.divider, lineWidth: 1))
             .contentShape(Rectangle())
     }
 }
@@ -104,9 +131,10 @@ extension DubPadCell where Label == Text {
         _ glyph: String,
         size: Size,
         lit: Bool = false,
+        enabled: Bool = true,
         tint: Color = DubColor.hotCue
     ) {
-        self.init(size: size, lit: lit, tint: tint) {
+        self.init(size: size, lit: lit, enabled: enabled, tint: tint) {
             Text(glyph).font(size.font)
         }
     }

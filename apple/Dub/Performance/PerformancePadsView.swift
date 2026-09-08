@@ -106,9 +106,7 @@ private func sirenPresetPad(_ label: String, key: String, onPress: @escaping () 
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-            Text(key)
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textPlaceholder)
+            DubKeycap(key: key)
         }
     }
     .onPressDown(perform: onPress)

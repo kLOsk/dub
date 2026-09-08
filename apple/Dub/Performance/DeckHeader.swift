@@ -552,7 +552,6 @@ struct DeckHeader: View {
     private var row2: some View {
         HStack(spacing: DubSpacing.lg) {
             if mirrored {
-                fxChip
                 Spacer(minLength: 0)
                 statColumn(label: "PITCH", value: formattedPitch)
                     .opacity(state.pitchSettled ? 1.0 : 0.45)
@@ -566,7 +565,6 @@ struct DeckHeader: View {
                     .opacity(state.pitchSettled ? 1.0 : 0.45)
                 statColumn(label: "KEY", value: formattedKey)
                 Spacer(minLength: 0)
-                fxChip
             }
         }
         .frame(maxWidth: .infinity,
@@ -1068,30 +1066,18 @@ struct DeckHeader: View {
                 .font(DubFont.caps)
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
+            // `numericLarge`, whose doc comment reads "Large numeric stat
+            // (BPM, pitch %)" — the role this column *is*. It was set in
+            // 13 pt `numericInline` while the 18 pt token went unused
+            // everywhere except the rip bar. These three numbers are read
+            // at glance distance with a record running; they should be the
+            // largest thing in the header after the title.
             Text(value)
-                .font(DubFont.numericInline)
+                .font(DubFont.numericLarge)
                 .foregroundStyle(
                     value == "—" ? DubColor.textPlaceholder : DubColor.textPrimary
                 )
         }
-    }
-
-    private var fxChip: some View {
-        HStack(spacing: DubSpacing.xs) {
-            Text("FX")
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(DubColor.textSecondary)
-            Text("—")
-                .font(DubFont.numericInline)
-                .foregroundStyle(DubColor.textPlaceholder)
-        }
-        .padding(.horizontal, DubSpacing.sm)
-        .padding(.vertical, 3)
-        .overlay(
-            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                .stroke(DubColor.divider, lineWidth: 1)
-        )
     }
 
     @ViewBuilder

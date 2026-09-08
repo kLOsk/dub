@@ -155,12 +155,13 @@ dependency order, not a preference.
 1. **Baseline the Prep surface** — done, `PrepPadSnapshotTests`. Required
    `SirenExpertPanel` to become value-driven, which is the unlock this file
    named. Everything below is now an image diff rather than a claim.
-2. **The contrast package.** Unlit labels onto `textSecondary` (6.27:1), a
-   real disabled state *inside* `DubPadCell`, bindings as punched
-   `surface0` wells, `numericLarge` on the header stats, and the hardcoded
-   `FX —` chip deleted. Token-only and direction-independent. **It has to
-   land on the Performance pad column in the same pass** — two pad
-   languages is worse than either one.
+2. ~~The contrast package~~ — **done.** Unlit labels onto `textSecondary`
+   (3.64:1 → 6.27:1), a real `enabled` state *inside* `DubPadCell` replacing
+   the caller-side `.opacity(0.5)`, a `DubKeycap` primitive for bindings
+   (a punched `surface0` well, 2.20:1 → 6.27:1), `numericLarge` on the
+   header stats, and the hardcoded `FX —` chip deleted. It landed on
+   Performance in the same pass by construction — the primitives are
+   shared — which 13 of the 20 moved baselines confirm.
 3. **The binding registry.** One `DubKeymap` table replacing the hardcoded
    `keyCode` dictionaries in `KeyEventMonitorHost`, with every rendered
    legend derived from it. Makes "a pad advertising a key that does
@@ -194,9 +195,12 @@ dependency order, not a preference.
   capture/review surface rather than leaving it squatting in the pad bar,
   where it currently evicts the pad rows during review, borrows the Track
   Overview band during capture, leaves the deck pane on its idle
-  placeholder (R-41) and spends Prep's scarce vertical axis. *One thing to
-  pin before building: whether that surface takes the whole window (a third
-  mode) or opens inside Prep. Both readings are live.*
+  placeholder (R-41) and spends Prep's scarce vertical axis. The surface
+  itself takes the **whole window** — capture and review need it, and the
+  PRD's "no vocabulary leaking between modes" rule is the argument against
+  leaving it inside Prep. The mode switch is a consequence of selecting the
+  source, not a tab to remember; coming back lands in Prep with the new
+  tracks selected.
 - **The sampler is a Prep citizen too.** Firing stays a Performance move,
   but **loading and binding samples belongs in Prep** — that is work a DJ
   does in advance, and routing it through Preferences only was wrong.

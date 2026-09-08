@@ -51,12 +51,7 @@ struct TriggerPadGroup: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                Text(pad.key)
-                    .font(DubFont.micro)
-                    .foregroundStyle(
-                        pad.keyBound
-                            ? DubColor.textPlaceholder
-                            : DubColor.textPlaceholder.opacity(0.45))
+                DubKeycap(key: pad.key, bound: pad.keyBound, lit: bound)
             }
         }
         .onPressDown(enabled: bound) { onTrigger(pad.index) }
