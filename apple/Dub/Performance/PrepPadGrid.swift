@@ -90,7 +90,20 @@ struct PrepPadGrid: View {
                     onDubMacro: { value in model.setSirenDub(.a, value) },
                     unit: model.deckA.sirenUnit,
                     onUnit: { unit in model.setSirenUnit(.a, unit) })
-                SirenExpertPanel(deck: model.deckA, model: model, side: .a)
+                SirenExpertPanel(
+                    deck: model.deckA,
+                    callbacks: SirenExpertPanel.Callbacks(
+                        onToggleExpert: { model.toggleSirenExpert(.a) },
+                        onDelay: { model.setSirenDelay(.a, $0) },
+                        onFeedback: { model.setSirenFeedback(.a, $0) },
+                        onMix: { model.setSirenMix(.a, $0) },
+                        onFilter: { model.setSirenFilter(.a, $0) },
+                        onVolume: { model.setSirenVolume(.a, $0) },
+                        onEchoCut: { model.setSirenEchoCut(.a, $0) },
+                        onSpeed: { model.setSirenSpeed(.a, $0) },
+                        onPitch: { model.setSirenPitch(.a, $0) },
+                        onRate: { model.setSirenRate(.a, $0) },
+                        onContinuous: { model.setSirenContinuous(.a, $0) }))
             }
             // Dormant by default (UI-BACKLOG F-38 rebuilds it as an FX
             // channel rather than a per-deck row); at the bottom of

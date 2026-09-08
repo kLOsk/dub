@@ -123,6 +123,112 @@ them value-driven (the `PrepRipBarState` pattern) is what unlocks it.
 Lexicon → Serato / rekordbox / Traktor export paths in
 `LIBRARY-FORMATS.md`.
 
+## The Prep UI overhaul — designed, queued
+
+The Prep control surface was reviewed end to end and redesigned. Nothing is
+built; this is the sequence and the decisions it waits on. Four design
+artifacts exist (private, on claude.ai/code/artifact): the pad-surface
+studies, the **Prep Rack** overhaul, the **Surface Map**, and **Map Mode**.
+
+**What the review found.** The measurements are in the artifacts; the ones
+that matter here:
+
+- Unlit pad labels are `textTertiary` on `surface1` — **3.64:1**, under the
+  4.5:1 floor. Key bindings, which are the actual performance input path,
+  render in `textPlaceholder` at **2.20:1**. A caller-side `.opacity(0.5)`
+  disabled pad lands near 1.84:1.
+- `DubPadCell` carries one `lit: Bool`, so "cue is set", "loop is running"
+  and "you are pressing it" all render identically.
+- `prepPadGridIntrinsicWidth` still sums **three** columns (912) while
+  `PrepPadGrid` renders two (648). `prepTuningColumn` (248) is referenced by
+  nothing else, and `PerformanceLayoutTests` asserts against the inflated
+  figure.
+- The siren unit switch changes the pad row's length (GS1 has 8 presets,
+  DS01E 4), so every mouse target and key-addressed pad relocates.
+- `SirenPadRow` still uses a raw AppKit `Picker(.segmented)` rather than
+  the house `DubSegmentedControl`.
+
+**The sequence.** Each step is safe to land alone, and the order is a
+dependency order, not a preference.
+
+0. ~~Push the library cleanup~~ — done.
+1. **Baseline the Prep surface** — done, `PrepPadSnapshotTests`. Required
+   `SirenExpertPanel` to become value-driven, which is the unlock this file
+   named. Everything below is now an image diff rather than a claim.
+2. **The contrast package.** Unlit labels onto `textSecondary` (6.27:1), a
+   real disabled state *inside* `DubPadCell`, bindings as punched
+   `surface0` wells, `numericLarge` on the header stats, and the hardcoded
+   `FX —` chip deleted. Token-only and direction-independent. **It has to
+   land on the Performance pad column in the same pass** — two pad
+   languages is worse than either one.
+3. **The binding registry.** One `DubKeymap` table replacing the hardcoded
+   `keyCode` dictionaries in `KeyEventMonitorHost`, with every rendered
+   legend derived from it. Makes "a pad advertising a key that does
+   nothing" — the bug `SirenRackGroup`'s doc comment records — unwritable.
+   Prerequisite for both 5 and 6.
+4. **Cue names + colours through the FFI.** Schema + FFI + `FFI_VERSION`
+   bump. Rust-side and independent, so it can run alongside 2 and 3. The
+   one part of the rack that is not free.
+5. **The rack overhaul.** Four modules that do not look alike: cue as a
+   bank of named marks, loop as a size engine (numeric readout, ×2/÷2
+   steppers, contiguous ladder, ACTIVE lamp), echo as a single throw that
+   says `DRY MUTED` when engaged, siren as an instrument unit with a model
+   display and the only knob on the surface. One horizontal rack across the
+   full width, which is where the phantom 264 pt goes.
+6. **Map mode.** Serato's mechanism: turn on MAP, click a control, press
+   the key or move the knob. Not a Preferences screen — a mode over the
+   live interface, so it is on both surfaces by construction. Keyboard lane
+   at M18; the MIDI lane is the same mechanism pointed at
+   `dub-controller` once that crate is real, and it is the missing half of
+   Expert FX ("a real MIDI controller used instead of a second turntable").
+   Shape is settled below: two lanes per control, latch-vs-momentary owned
+   by the control, LED output in from the start, one shared map, and a
+   binding that carries a transport (key / MIDI / HID) so profiles are
+   possible later without a migration.
+
+**Decisions — settled 2026-09-08.**
+
+- **Vinyl rip's home.** Entered from a `VINYL RIP` entry in the library
+  source tree, alongside the other five import sources — a rip *is* an
+  import, and that is where a user looks for one. Selecting it opens the
+  capture/review surface rather than leaving it squatting in the pad bar,
+  where it currently evicts the pad rows during review, borrows the Track
+  Overview band during capture, leaves the deck pane on its idle
+  placeholder (R-41) and spends Prep's scarce vertical axis. *One thing to
+  pin before building: whether that surface takes the whole window (a third
+  mode) or opens inside Prep. Both readings are live.*
+- **The sampler is a Prep citizen too.** Firing stays a Performance move,
+  but **loading and binding samples belongs in Prep** — that is work a DJ
+  does in advance, and routing it through Preferences only was wrong.
+- **The vintage FX rack gets a real home.** A Preferences toggle enables
+  it; once enabled the deck source switch grows a fourth position named
+  **`DUB FX`** (INT · TC · THRU · DUB FX). That settles F-38 stage 2: the
+  rack is a deck role, and the switch is how you select it.
+- **Map mode, all five.** Two binding lanes per control (key **and** MIDI,
+  so the laptop keymap and the controller can coexist). Momentary-vs-
+  latching is a property of the **control**, not the binding — fewer ways
+  to get it wrong. **LED output back to the controller is in**, designed
+  from the start rather than retrofitted. **One shared map** across
+  surfaces. **Profiles come later, but the model must allow for them
+  now** — and they have to span keyboard, MIDI *and* HID, so a binding
+  carries a transport dimension from day one even while only the keyboard
+  lane ships.
+
+**Two gaps the map exposed, both bigger than a step.** Prep has **no
+beatgrid editor** — PRD §3.1 names it as Prep's reason to exist and six FFI
+calls sit behind no surface. And the **vintage FX rack** cannot live
+anywhere until the deck source switch grows an `FX` position (F-38).
+
+**Placement rule, for future features.** A capability belongs where the DJ
+is in that state of mind. Prep is couch work with no rig; Performance is a
+record running in front of people. Corrected against that: pitch and key
+lock are Performance-only (Prep is always `+0.0 %`); every FX is
+Performance-only; loading a track is drag-and-drop or a key, never a
+button; crates, imports, analysis and keymap remapping are reachable from
+**both**; and sample *loading* is Prep work even though sample *firing* is
+not. That group is the surprise — Prep is not "the library mode". The two
+surfaces differ almost entirely in the deck.
+
 ## Recently shipped (detail in `SHIPPED.md`)
 
 - **M17 — Sampler, Quick Scratch & Instant Doubles.** All three of §7's

@@ -212,17 +212,35 @@ struct SirenPadRow: View {
 /// (each pushes the full `set_siren_controls` / `set_siren_voice`). An
 /// expandable section so it stays out of the way until needed.
 struct SirenExpertPanel: View {
-    /// The deck's current state (read).
+    /// Every write this panel makes, as closures.
+    ///
+    /// The panel took `WaveformAppModel` + `DeckSide` and called methods
+    /// on them. It never read the model — only `deck` drives the render —
+    /// but holding it made the panel unconstructible in a test, which is
+    /// why `PrepPadGrid` had no snapshot coverage at all. Same pattern as
+    /// `PrepRipBarState`: values in, closures out.
+    struct Callbacks {
+        var onToggleExpert: () -> Void = {}
+        var onDelay: (Double) -> Void = { _ in }
+        var onFeedback: (Double) -> Void = { _ in }
+        var onMix: (Double) -> Void = { _ in }
+        var onFilter: (Double) -> Void = { _ in }
+        var onVolume: (Double) -> Void = { _ in }
+        var onEchoCut: (Bool) -> Void = { _ in }
+        var onSpeed: (Double) -> Void = { _ in }
+        var onPitch: (Int) -> Void = { _ in }
+        var onRate: (Double) -> Void = { _ in }
+        var onContinuous: (Bool) -> Void = { _ in }
+    }
+
+    /// The deck's current state (read). The only thing the body reads.
     let deck: DeckState
-    /// The app model (write — method calls push to the engine).
-    let model: WaveformAppModel
-    /// Which deck these controls drive.
-    let side: DeckSide
+    var callbacks = Callbacks()
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.xs) {
             Button {
-                model.toggleSirenExpert(side)
+                callbacks.onToggleExpert()
             } label: {
                 Text(deck.sirenExpertShown ? "EXPERT ▾" : "EXPERT ▸")
                     .font(DubFont.caps)
@@ -233,21 +251,21 @@ struct SirenExpertPanel: View {
 
             if deck.sirenExpertShown {
                 // Shared echo section (the PT2399, every unit).
-                knob("TIME", deck.sirenDelayMs, 50...1000) { model.setSirenDelay(side, $0) }
-                knob("FEEDBACK", deck.sirenFeedback, 0...1.0) { model.setSirenFeedback(side, $0) }
-                knob("ECHO", deck.sirenMix, 0...1) { model.setSirenMix(side, $0) }
-                knob("FILTER", deck.sirenFilter, 0...1) { model.setSirenFilter(side, $0) }
-                knob("VOLUME", deck.sirenVolume, 0...1.5) { model.setSirenVolume(side, $0) }
+                knob("TIME", deck.sirenDelayMs, 50...1000) { callbacks.onDelay($0) }
+                knob("FEEDBACK", deck.sirenFeedback, 0...1.0) { callbacks.onFeedback($0) }
+                knob("ECHO", deck.sirenMix, 0...1) { callbacks.onMix($0) }
+                knob("FILTER", deck.sirenFilter, 0...1) { callbacks.onFilter($0) }
+                knob("VOLUME", deck.sirenVolume, 0...1.5) { callbacks.onVolume($0) }
                 DubPadCell("ECHO CUT", size: .chip)
                     .onPressHold(
-                        onDown: { model.setSirenEchoCut(side, true) },
-                        onUp: { model.setSirenEchoCut(side, false) })
+                        onDown: { callbacks.onEchoCut(true) },
+                        onUp: { callbacks.onEchoCut(false) })
                     .help("Echo cut — hold to mute the echo (the loop keeps running underneath)")
 
                 // Unit-specific controls.
                 switch deck.sirenUnit {
                 case .gs1:
-                    knob("SPEED", deck.sirenSpeed, 0.25...4.0) { model.setSirenSpeed(side, $0) }
+                    knob("SPEED", deck.sirenSpeed, 0.25...4.0) { callbacks.onSpeed($0) }
                 case .ds01e:
                     HStack(spacing: DubSpacing.sm) {
                         Text("PITCH")
@@ -258,7 +276,7 @@ struct SirenExpertPanel: View {
                             "Pitch",
                             selection: Binding(
                                 get: { deck.sirenPitchIndex },
-                                set: { model.setSirenPitch(side, $0) })
+                                set: { callbacks.onPitch($0) })
                         ) {
                             Text("Lo").tag(0)
                             Text("Mid").tag(1)
@@ -269,11 +287,11 @@ struct SirenExpertPanel: View {
                         .controlSize(.mini)
                         .frame(width: 150)
                     }
-                    knob("RATE", deck.sirenRate, 0...12.0) { model.setSirenRate(side, $0) }
+                    knob("RATE", deck.sirenRate, 0...12.0) { callbacks.onRate($0) }
                     Toggle(
                         isOn: Binding(
                             get: { deck.sirenContinuous },
-                            set: { model.setSirenContinuous(side, $0) })
+                            set: { callbacks.onContinuous($0) })
                     ) {
                         Text("HOLD (continuous)")
                             .font(DubFont.micro)
