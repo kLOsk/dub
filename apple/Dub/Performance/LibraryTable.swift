@@ -101,6 +101,10 @@ struct LibraryTable: NSViewRepresentable {
     let tracks: [LibraryTrack]
     let columns: [LibraryTableColumnSpec]
     let rowSelection: LibraryRowSelection
+    /// Bumped when in-memory row fields change without the id list
+    /// changing — a colour label, a rating, an analysis patch. Without
+    /// it those edits were saved and never repainted.
+    let contentRevision: UInt64
     /// Resolves the live per-row values at configure time — the deck
     /// badges and the reachability verdict. Called for visible rows
     /// only, which is the point of the migration.
@@ -166,11 +170,12 @@ struct LibraryTable: NSViewRepresentable {
             coordinator.lastTrackIds = ids
             table.reloadData()
             coordinator.applySelection()
-        } else if coordinator.lastContentRevision != coordinator.pendingContentRevision {
+        } else if coordinator.lastContentRevision != contentRevision {
+            // Row *contents* changed under the same ids. Reloading data
+            // keeps the selection, so it does not need re-applying.
             table.reloadData()
-            coordinator.applySelection()
         }
-        coordinator.lastContentRevision = coordinator.pendingContentRevision
+        coordinator.lastContentRevision = contentRevision
         coordinator.syncSelectionFromModel()
     }
 
@@ -180,7 +185,6 @@ struct LibraryTable: NSViewRepresentable {
         weak var table: NSTableView?
         var lastTrackIds: [String] = []
         var lastContentRevision: UInt64 = 0
-        var pendingContentRevision: UInt64 = 0
         private var lastSpecs: [LibraryTableColumnSpec] = []
         private var applyingSelection = false
         private var observers: [NSObjectProtocol] = []
@@ -202,7 +206,20 @@ struct LibraryTable: NSViewRepresentable {
             guard let table, specs != lastSpecs else { return }
             defer { lastSpecs = specs }
 
+            // The indicator gutter is always the leading column and is
+            // never persisted, sorted, resized or reordered.
+            if table.tableColumn(withIdentifier: LibraryGutterColumn.identifier) == nil {
+                let gutter = NSTableColumn(identifier: LibraryGutterColumn.identifier)
+                gutter.width = LibraryGutterColumn.width
+                gutter.minWidth = LibraryGutterColumn.width
+                gutter.maxWidth = LibraryGutterColumn.width
+                gutter.title = ""
+                gutter.headerCell = LibraryHeaderTextCell(textCell: "")
+                table.addTableColumn(gutter)
+            }
+
             let wanted = specs.map { $0.field.rawValue }
+                + [LibraryGutterColumn.identifier.rawValue]
             for column in table.tableColumns
             where !wanted.contains(column.identifier.rawValue) {
                 table.removeTableColumn(column)
@@ -225,10 +242,13 @@ struct LibraryTable: NSViewRepresentable {
                 if abs(column.width - spec.width) > 0.5 { column.width = spec.width }
                 (column.headerCell as? LibraryHeaderTextCell)?.apply(spec)
             }
-            // Order the columns to match.
-            for (target, spec) in specs.enumerated() {
+            // Order the columns to match, with the gutter pinned first.
+            let gutterIndex = table.column(withIdentifier: LibraryGutterColumn.identifier)
+            if gutterIndex > 0 { table.moveColumn(gutterIndex, toColumn: 0) }
+            for (offset, spec) in specs.enumerated() {
                 let id = NSUserInterfaceItemIdentifier(spec.field.rawValue)
                 let current = table.column(withIdentifier: id)
+                let target = offset + 1
                 if current >= 0, current != target {
                     table.moveColumn(current, toColumn: target)
                 }
@@ -258,9 +278,9 @@ struct LibraryTable: NSViewRepresentable {
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, let table = self.table else { return }
-                    let order = table.tableColumns.compactMap {
-                        LibraryColumnField(rawValue: $0.identifier.rawValue)
-                    }
+                    let order = table.tableColumns
+                        .filter { $0.identifier != LibraryGutterColumn.identifier }
+                        .compactMap { LibraryColumnField(rawValue: $0.identifier.rawValue) }
                     self.parent.callbacks.onColumnsReordered(order)
                 }
             })
@@ -541,6 +561,8 @@ final class LibraryTintedRowView: NSTableRowView {
     /// Selection is painted in `drawBackground` so the tint can sit on
     /// top of it; this must not paint again.
     override func drawSelection(in dirtyRect: NSRect) {}
+
+
 }
 
 /// The header background and hairline. Column labels are drawn by
@@ -620,3 +642,22 @@ enum LibraryGutterColumn {
     static let identifier = NSUserInterfaceItemIdentifier("dub.gutter")
     static let width = LibraryColumnLayout.gutterWidth
 }
+
+// The drag image is AppKit's default.
+//
+// A compact `♪ Artist — Title` chip was attempted three ways and none
+// worked, so it is deliberately not here rather than half-present:
+//
+//   * setting `NSDraggingItem.draggingFrame` in
+//     `draggingSession:willBeginAt:` — the frame was correct in the
+//     table's coordinate space (measured), but AppKit's own default was
+//     x = -443, off-screen, and the image animated in from there.
+//     `draggingFormation = .none` did not stop it.
+//   * overriding `draggingImageComponents` on `NSTableRowView` — that
+//     property does not exist there.
+//   * overriding it on `NSTableCellView`, keyed first on the column
+//     identifier and then on a stored flag — the components were never
+//     collected, and the drag showed only the drop badge.
+//
+// Worth revisiting with an isolated test case rather than by
+// substitution; the drag itself works, this is only its picture.

@@ -11,27 +11,31 @@
 //  screen to spare and it was using the least of it.
 //
 //  A plain `HStack`, not `Grid` or `LazyVGrid`. There is one row of
-//  three heterogeneous stacks with no cell relationship across columns,
-//  so `Grid` would be an `HStack` with ceremony; and `LazyVGrid`'s
-//  equal widths are actively wrong here — column 1 needs 344 and
-//  column 3 needs 248, so equalising would clip the LOOP row, which is
-//  the exact bug class this work exists to remove.
+//  heterogeneous stacks with no cell relationship across columns, so
+//  `Grid` would be an `HStack` with ceremony; and `LazyVGrid`'s equal
+//  widths are actively wrong here — the transport column needs 344 and
+//  equalising would clip the LOOP row, which is the exact bug class
+//  this work exists to remove.
 //
-//  Only the FX column flexes. Columns 1 and 3 are pads and segmented
-//  switches, fixed by design; stretching them just adds dead pixels.
-//  The FX column is all sliders, where extra width is finer resolution
-//  on a prepare-and-test surface.
+//  Only the FX column flexes. Column 1 is pads, fixed by design;
+//  stretching it just adds dead pixels. The FX column is all sliders,
+//  where extra width is finer resolution on a prepare-and-test surface.
+//
+//  Key lock and the pitch-test steps used to sit in a third column.
+//  They were M14 instrumentation for A/B-ing the key-lock engines
+//  without a turntable, not something a DJ preparing a track reaches
+//  for, so they are gone.
 //
 
 import SwiftUI
 
-/// Transport · FX · tuning, side by side.
+/// Transport pads and the FX column, side by side.
 struct PrepPadGrid: View {
     @ObservedObject var model: WaveformAppModel
 
     /// The FX column disappears entirely when both its features are
-    /// off — an empty 288 pt gap between transport and tuning would
-    /// read as a rendering fault.
+    /// off, rather than leaving a 288 pt gap that reads as a rendering
+    /// fault.
     private var showsFxColumn: Bool { model.sirenEnabled || model.rackFxEnabled }
 
     var body: some View {
@@ -45,8 +49,6 @@ struct PrepPadGrid: View {
                         maxWidth: DubLayout.prepFxColumnMax,
                         alignment: .leading)
             }
-            tuningColumn
-                .frame(width: DubLayout.prepTuningColumn, alignment: .leading)
             Spacer(minLength: 0)
         }
     }
@@ -100,13 +102,6 @@ struct PrepPadGrid: View {
                     onToggle: { idx in model.toggleRackFx(.a, idx) },
                     onMacro: { idx, value in model.setRackMacro(.a, idx, value) })
             }
-        }
-    }
-
-    private var tuningColumn: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.lg) {
-            KeyLockControlView(model: model, side: .a)
-            PitchTestView(model: model, side: .a)
         }
     }
 }

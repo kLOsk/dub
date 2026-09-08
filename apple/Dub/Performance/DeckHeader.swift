@@ -391,7 +391,17 @@ struct DeckHeader: View {
             // No track loaded yet, but the deck has a timecode input —
             // show the source switch on its own so the DJ can pick
             // INT / TC / THRU before (or without) loading a file.
-            sourceSwitchRow
+            // Prep keeps its transport glyph here too: this is the
+            // branch that renders before a track is loaded, and it was
+            // where the Play button went missing.
+            if prepMode {
+                HStack(spacing: DubSpacing.md) {
+                    transportGlyphs
+                    sourceSwitchRow
+                }
+            } else {
+                sourceSwitchRow
+            }
         } else {
             Color.clear
                 .frame(height: 20)
@@ -646,11 +656,15 @@ struct DeckHeader: View {
                 }
                 sourceSwitchView
                 // No separate Play button when the source switch is
-                // present — the INT position is the play control. The
-                // transport glyph stays only in Prep mode (no switch).
-                if state.sourceControl == nil { transportGlyphs }
+                // present — the INT position is the play control.
+                // **Except in Prep**, which is a file-playback surface
+                // and needs Play/Pause (PRD §6.1.3). The old condition
+                // assumed Prep never had a source switch; it does once
+                // a timecode input is connected, and the button
+                // silently disappeared.
+                if state.sourceControl == nil || prepMode { transportGlyphs }
             } else {
-                if state.sourceControl == nil { transportGlyphs }
+                if state.sourceControl == nil || prepMode { transportGlyphs }
                 sourceSwitchView
                 switch time {
                 case .remainingOnly:

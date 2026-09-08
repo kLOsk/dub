@@ -830,6 +830,12 @@ struct LibraryView: View {
     @State private var columnWidthCache: [String: CGFloat]?
     @State private var visibleColumnsCache: [LibraryColumnField]?
 
+    /// Held across clicks on purpose. `NSMenuItem` keeps only a weak
+    /// reference to its target, so a builder created per right-click
+    /// would be released the moment the menu appeared, taking the
+    /// action closures with it — the menu opens and nothing fires.
+    @State private var rowMenuBuilder = LibraryRowMenu()
+
     /// Live resize state. `@State`, not `@StateObject`, on purpose:
     /// `LibraryView` must **not** observe this. The header and the rows
     /// do, so a drag repaints them without re-running this body — see
@@ -2098,78 +2104,38 @@ struct LibraryView: View {
     /// arrow-key-style selection changes.
     private var trackList: some View {
         VStack(spacing: 0) {
-            LibraryTableScrollContainer(
-                tableWidth: tableContentWidth,
-                columnOrderKey: displayedColumns.map(\.rawValue).joined(separator: ","),
-                headerStateKey: columnReorderHeaderStateKey,
-                tracksContentRevision: tracksContentRevision,
-                columnResize: columnResize,
+            LibraryTable(
+                tracks: sortedTracks,
+                columns: tableColumnSpecs,
                 rowSelection: rowSelection,
-                // Neither half observes the drag. Header and rows both
-                // hold their committed widths and commit together on
-                // release; the live feedback is the AppKit guide line
-                // (`LibraryDocumentWrapper.showResizeGuide`). Moving
-                // either one costs a full SwiftUI layout of the table.
-                header: AnyView(
-                    trackListHeader(preview: nil)
-                        .contextMenu { libraryColumnContextMenu() }),
-rows: AnyView(trackRowsStack(preview: nil)),
-                trackIds: sortedTrackIds,
-                visibleTracks: sortedTracks,
-                menu: LibraryTableMenu(
-                    analysisBatchInProgress: libraryModel.analysisBatchTotal > 0,
-                    onAnalyzeRequested: { ids in
-                        Task { @MainActor in
-                            await model.analyzeTracks(ids)
-                        }
+                contentRevision: tracksContentRevision,
+                rowState: { rowState(for: $0) },
+                rowActions: { rowActions(for: $0) },
+                callbacks: LibraryTableCallbacks(
+                    onToggleSort: { field in toggleSort(field) },
+                    onColumnResized: { field, width in
+                        persistColumnWidth(field, to: width)
                     },
-                    onSetGridLocked: { trackId, locked in
-                        Task { @MainActor in
-                            await model.setGridLocked(trackId: trackId, locked: locked)
-                        }
+                    onColumnsReordered: { order in
+                        // The `#` column is injected at render time and
+                        // is not part of the persisted set.
+                        persistColumnOrder(order.filter { $0 != .crateOrder })
                     },
-                    crateId: selectedSource.crateId,
-                    onCrateRemove: { ids in
-                        guard let crateId = selectedSource.crateId else { return }
-                        for id in ids {
-                            model.removeTrackFromCrate(crateId, trackId: id)
-                        }
+                    onSelectionChanged: syncModelPrimarySelection,
+                    dragURL: { libraryDragURL(for: $0) },
+                    crateReorderEnabled: { isCrateManualOrder },
+                    onCrateReorder: { ids, slot in
+                        performCrateReorder(draggedIds: ids, toSlot: slot)
                     },
-                    // Move… is offered only in manual order, mirroring
-                    // the drag-reorder gate. With a foreign column sort
-                    // active, "Move Up" against the sorted view wouldn't
-                    // map to a persistent manual position, so the items
-                    // are withheld (Remove from Crate stays available).
-                    onCrateMove: isCrateManualOrder
-                        ? { trackId, move in
-                            guard let crateId = selectedSource.crateId else { return }
-                            let reordered = reorderedCrateIds(
-                                moving: trackId, move: move, current: sortedTrackIds)
-                            model.setCrateOrder(crateId, orderedTrackIds: reordered)
-                        }
-                        : nil),
-                scroll: LibraryTableScroll(
-                    scrollToTrackId: keyboardScrollTarget,
-                    scrollDelta: keyboardScrollDelta,
-                    onScrollHandled: { keyboardScrollTarget = nil }),
-                crateReorderEnabled: isCrateManualOrder,
-                onCrateReorder: { ids, slot in
-                    performCrateReorder(draggedIds: ids, toSlot: slot)
-                }
-            )
+                    menuForRow: { row in
+                        guard sortedTracks.indices.contains(row) else { return nil }
+                        return rowMenu(for: sortedTracks[row])
+                    }))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(
-            LibraryArrowKeyView(
-                rowSelection: rowSelection,
-                trackIds: sortedTrackIds,
-                onArrowNavigate: { trackId, delta in
-                    keyboardScrollDelta = delta
-                    keyboardScrollTarget = trackId
-                },
-                onSelectionChanged: syncModelPrimarySelection)
-            .allowsHitTesting(false)
-        )
+        // Arrow keys are `NSTableView`'s natively, as first responder.
+        // `LibraryArrowKeyView` moved `rowSelection` instead, which no
+        // longer drives the table — the keys did nothing.
         // M11d.6 round 4 — the previously-present
         // `.onChange(of: selectedTrackIds)` handler was deleted
         // alongside the migration of selection to
@@ -2205,6 +2171,56 @@ rows: AnyView(trackRowsStack(preview: nil)),
             columnReorderDropTarget?.rawValue ?? "",
             columnReorderInsertBefore ? "before" : "after",
         ].joined(separator: "|")
+    }
+
+    /// The table's columns: the pinned indicator gutter, then the
+    /// displayed set at their committed widths and sort state.
+    private var tableColumnSpecs: [LibraryTableColumnSpec] {
+        displayedColumns.map { field in
+            LibraryTableColumnSpec(
+                field: field,
+                title: field == .key ? keyColumnHeader : field.headerLabel,
+                width: columnWidth(field, preview: nil),
+                isSortActive: activeSortColumn == field,
+                sortAscending: sortAscending,
+                // `#` is the crate's manual order; resizing or moving
+                // it would be meaningless.
+                isPinned: field == .crateOrder)
+        }
+    }
+
+    /// Build the right-click menu for one row. The builder reads the
+    /// live selection so a multi-select label is correct at click time.
+    private func rowMenu(for track: LibraryTrack) -> NSMenu {
+        let builder = rowMenuBuilder
+        builder.tracks = sortedTracks
+        builder.selectedTrackIds = rowSelection.selectedTrackIds
+        builder.analysisBatchInProgress = libraryModel.analysisBatchTotal > 0
+        builder.onAnalyzeRequested = { ids in
+            Task { @MainActor in await model.analyzeTracks(ids) }
+        }
+        builder.onSetGridLocked = { trackId, locked in
+            Task { @MainActor in
+                await model.setGridLocked(trackId: trackId, locked: locked)
+            }
+        }
+        builder.crateId = selectedSource.crateId
+        builder.onCrateRemove = { ids in
+            guard let crateId = selectedSource.crateId else { return }
+            for id in ids { model.removeTrackFromCrate(crateId, trackId: id) }
+        }
+        // Offered only in manual order, mirroring the drag-reorder
+        // gate: with a foreign column sort active, "Move Up" would not
+        // map to a persistent position.
+        builder.onCrateMove = isCrateManualOrder
+            ? { trackId, move in
+                guard let crateId = selectedSource.crateId else { return }
+                let reordered = reorderedCrateIds(
+                    moving: trackId, move: move, current: sortedTrackIds)
+                model.setCrateOrder(crateId, orderedTrackIds: reordered)
+            }
+            : nil
+        return builder.menu(for: track)
     }
 
     /// Gutter + columns + horizontal padding, at the committed widths.
