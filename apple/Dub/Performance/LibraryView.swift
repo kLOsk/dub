@@ -810,9 +810,31 @@ struct LibraryView: View {
     /// Memoized BPM bucket rows + cascaded counts.
     @State private var bpmBucketFacet: [LibraryBpmBucketCount] = []
 
-    /// In-progress resize width for one column. Header and row cells
-    /// both use this preview so the table tracks the resize live.
-    @State private var columnResizePreview: (field: LibraryColumnField, width: CGFloat)?
+    // MARK: - columnParseCaches
+    //
+    // Both column-layout settings persist as strings, and both were
+    // computed properties that reparsed on every read. That would be
+    // fine if they were read once per render — but `displayedColumns`
+    // drives the per-row `ForEach` and `columnWidth` is applied to
+    // every cell inside it, so a table of ~10 columns × ~100 rows did
+    // ~100 string splits and ~1000 `JSONDecoder` allocations *per
+    // render*. A resize drag renders at display rate, which put that
+    // squarely in the frame budget and is most of why the drag felt
+    // like it was hauling the table around.
+    //
+    // Same discipline as `sortedTracks` / `sortedTrackIds`, which were
+    // memoised for exactly this reason. `nil` means "not parsed yet" —
+    // an empty widths dictionary is a legitimate value, so the cache
+    // has to distinguish the two.
+
+    @State private var columnWidthCache: [String: CGFloat]?
+    @State private var visibleColumnsCache: [LibraryColumnField]?
+
+    /// Live resize state. `@State`, not `@StateObject`, on purpose:
+    /// `LibraryView` must **not** observe this. The header and the rows
+    /// do, so a drag repaints them without re-running this body — see
+    /// `ColumnResizeModel`.
+    @State private var columnResize = ColumnResizeModel()
 
     /// Screen-space drag origin. Lives on `LibraryView`, not on the
     /// resize handle, so it survives header `NSHostingView` rebuilds
@@ -933,6 +955,9 @@ struct LibraryView: View {
         // A minimum here would be reported and drawn even inside a
         // shorter frame, overflowing rather than clamping.
         .background(DubColor.surface0)
+        .onAppear { refreshColumnParseCaches() }
+        .onChange(of: columnWidthsStorage) { _ in refreshColumnParseCaches() }
+        .onChange(of: visibleColumnsStorage) { _ in refreshColumnParseCaches() }
         .onAppear {
             applyExtraColumns()
         }
@@ -2074,9 +2099,25 @@ struct LibraryView: View {
                 columnOrderKey: displayedColumns.map(\.rawValue).joined(separator: ","),
                 headerStateKey: columnReorderHeaderStateKey,
                 tracksContentRevision: tracksContentRevision,
+                columnResize: columnResize,
                 rowSelection: rowSelection,
-                header: AnyView(trackListHeader),
-                rows: AnyView(trackRowsStack),
+                header: AnyView(
+                    ColumnResizeScope(model: columnResize) { preview in
+                        trackListHeader(preview: preview)
+                    }
+                    // Outside the scope: built once per `body`, not once
+                    // per drag frame. See the note in `trackListHeader`.
+                    .contextMenu { libraryColumnContextMenu() }),
+                // Rows stay at their committed widths for the duration
+                // of a drag. Measured: rebuilding them costs ~1.15 ms
+                // per row (~134 ms for this library), which caps the
+                // drag at ~5 Hz. The dominant term is the per-row
+                // `Menu` in `colorCell` — SwiftUI builds menu content
+                // eagerly, so every row rebuild constructs a menu and
+                // its palette. Finder resizes rows live because
+                // `NSTableView` reuses cells and only moves frames; a
+                // SwiftUI row of this weight cannot.
+                rows: AnyView(trackRowsStack(preview: nil)),
                 trackIds: sortedTrackIds,
                 visibleTracks: sortedTracks,
                 menu: LibraryTableMenu(
@@ -2149,10 +2190,10 @@ struct LibraryView: View {
         }
     }
 
-    private var trackRowsStack: some View {
+    private func trackRowsStack(preview: ColumnWidthPreview?) -> some View {
         LazyVStack(spacing: 0) {
             ForEach(sortedTracks) { track in
-                trackRow(for: track)
+                trackRow(for: track, preview: preview)
                     .id(track.id)
             }
         }
@@ -2170,32 +2211,36 @@ struct LibraryView: View {
         ].joined(separator: "|")
     }
 
-    /// Gutter + columns + horizontal padding. Header and rows share
-    /// this width, including the in-progress resize preview.
+    /// Gutter + columns + horizontal padding, at the committed widths.
+    /// During a drag the live value comes from the resize preview
+    /// instead — see `tableContentWidth(preview:)`.
     private var tableContentWidth: CGFloat {
-        let columnSum = displayedColumns.map { columnWidth($0) }.reduce(0, +)
-        return 36 + columnSum + DubSpacing.lg * 2
+        tableContentWidth(preview: nil)
     }
 
-    private var trackListHeader: some View {
+    private func trackListHeader(preview: ColumnWidthPreview?) -> some View {
         HStack(spacing: 0) {
-            Color.clear.frame(width: 36)
+            Color.clear.frame(width: LibraryColumnLayout.gutterWidth)
                 .overlay(alignment: .trailing) {
                     columnHeaderDivider
                 }
             ForEach(displayedColumns) { field in
-                resizableColumnHeader(for: field)
+                resizableColumnHeader(for: field, preview: preview)
             }
         }
         .padding(.horizontal, DubSpacing.lg)
         .padding(.vertical, 2)
         .frame(height: 22)
-        .frame(width: tableContentWidth, alignment: .leading)
+        .frame(width: tableContentWidth(preview: preview), alignment: .leading)
         .background(DubColor.surface1)
         .contentShape(Rectangle())
-        .contextMenu {
-            libraryColumnContextMenu()
-        }
+        // The column context menu is applied *outside* the resize
+        // scope, at the `trackList` call site. It enumerates the whole
+        // M11d column registry — six metadata sources plus the analysis
+        // / file / history groups, every entry a bound `Toggle` — and
+        // SwiftUI builds `.contextMenu` content eagerly. Attached here
+        // it was rebuilt on every frame of a resize drag, which is
+        // where most of a ~66 ms header rebuild went.
         .overlay(alignment: .bottom) {
             Rectangle().fill(DubColor.divider).frame(height: 1)
         }
@@ -2203,41 +2248,74 @@ struct LibraryView: View {
             searchFocused = false
             NSApp.keyWindow?.makeFirstResponder(nil)
         }
+        // Last, so the handles sit above every column's sort button.
+        .overlay(alignment: .topLeading) { columnResizeLayer(preview: preview) }
         .onPreferenceChange(ColumnHeaderFramesKey.self) { columnHeaderFrames = $0 }
     }
 
-    private func resizableColumnHeader(for field: LibraryColumnField) -> some View {
-        let width = columnWidth(field)
-        let isReorderSource = columnReorderDrag == field
-        let isReorderTarget = columnReorderDropTarget == field
-            && columnReorderDrag != nil
-            && columnReorderDrag != field
-        return ZStack(alignment: .leading) {
-            sortHeaderContent(for: field)
-                .padding(.leading, LibraryColumnLayout.columnLeadingInset)
-                .frame(
-                    width: max(0, width - LibraryColumnLayout.resizeHandleTotalWidth),
-                    alignment: .leading
-                )
-                .padding(.trailing, LibraryColumnLayout.resizeHandleTotalWidth)
-                .simultaneousGesture(columnReorderGesture(for: field))
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
+    /// Every column's resize handle, in one layer above the header.
+    ///
+    /// They cannot live inside their own column header: the hit zone is
+    /// centred on the divider, so its right half lands inside the next
+    /// column — and that column is a later sibling in the header
+    /// `HStack`, whose sort button (a `Button` with a full-bleed
+    /// `contentShape`) would draw over it. Half the target would look
+    /// right and do nothing.
+    private func columnResizeLayer(preview: ColumnWidthPreview?) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(columnDividers(preview: preview)) { divider in
                 LibraryColumnResizeHandle(
                     onDragChanged: { startX, locationX in
                         columnResizeLive(
-                            field: field,
+                            field: divider.field,
                             dragStartGlobalX: startX,
                             locationGlobalX: locationX)
                     },
                     onDragEnded: { startX, locationX in
                         endColumnResize(
-                            field: field,
+                            field: divider.field,
                             dragStartGlobalX: startX,
                             locationGlobalX: locationX)
                     }
                 )
+                .offset(x: divider.x - LibraryColumnLayout.resizeHandleHitWidth / 2)
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Each column's trailing divider, in the header's own coordinate
+    /// space: leading padding, then the row-number gutter, then the
+    /// widths so far. Uses `columnWidth`, so it tracks a resize live.
+    private func columnDividers(preview: ColumnWidthPreview?) -> [ColumnDivider] {
+        var x = DubSpacing.lg + LibraryColumnLayout.gutterWidth
+        return displayedColumns.map { field in
+            x += columnWidth(field, preview: preview)
+            return ColumnDivider(field: field, x: x)
+        }
+    }
+
+    private func resizableColumnHeader(
+        for field: LibraryColumnField,
+        preview: ColumnWidthPreview?
+    ) -> some View {
+        let width = columnWidth(field, preview: preview)
+        let isReorderSource = columnReorderDrag == field
+        let isReorderTarget = columnReorderDropTarget == field
+            && columnReorderDrag != nil
+            && columnReorderDrag != field
+        // The resize handle is not here — it lives in `columnResizeLayer`
+        // above the whole header, because its hit zone straddles the
+        // divider and the right half falls inside the *next* column.
+        return ZStack(alignment: .leading) {
+            sortHeaderContent(for: field)
+                .padding(.leading, LibraryColumnLayout.columnLeadingInset)
+                .frame(
+                    width: max(0, width - LibraryColumnLayout.columnTrailingInset),
+                    alignment: .leading
+                )
+                .padding(.trailing, LibraryColumnLayout.columnTrailingInset)
+                .simultaneousGesture(columnReorderGesture(for: field))
         }
         .frame(width: width, alignment: .leading)
         .frame(maxHeight: .infinity)
@@ -2284,7 +2362,15 @@ struct LibraryView: View {
 
     /// User-ordered visible columns. Artist + Title are always present
     /// but may be swapped relative to each other (PRD §8.5.3.1).
+    ///
+    /// Memoised: `displayedColumns` drives the per-row `ForEach`, so
+    /// the uncached parse below ran once per *row*. See
+    /// `columnParseCaches`.
     private var visibleColumns: [LibraryColumnField] {
+        visibleColumnsCache ?? computeVisibleColumns()
+    }
+
+    private func computeVisibleColumns() -> [LibraryColumnField] {
         let raw = visibleColumnsStorage
             .split(separator: ",")
             .map { String($0).trimmingCharacters(in: .whitespaces) }
@@ -2685,7 +2771,13 @@ struct LibraryView: View {
         }
     }
 
+    /// Memoised: applied to every cell, so the uncached decode below
+    /// ran once per *cell*. See `columnParseCaches`.
     private var parsedColumnWidths: [String: CGFloat] {
+        columnWidthCache ?? computeParsedColumnWidths()
+    }
+
+    private func computeParsedColumnWidths() -> [String: CGFloat] {
         guard let data = columnWidthsStorage.data(using: .utf8),
               let dict = try? JSONDecoder().decode([String: CGFloat].self, from: data)
         else {
@@ -2694,17 +2786,37 @@ struct LibraryView: View {
         return dict
     }
 
+    /// Reparse both persisted column strings. Called on appear and
+    /// whenever either string changes — never per render.
+    private func refreshColumnParseCaches() {
+        columnWidthCache = computeParsedColumnWidths()
+        visibleColumnsCache = computeVisibleColumns()
+    }
+
     private func storedColumnWidth(_ field: LibraryColumnField) -> CGFloat {
         let stored = parsedColumnWidths[field.rawValue]
         let width = stored ?? defaultColumnWidth(field)
         return clampColumnWidth(width)
     }
 
-    private func columnWidth(_ field: LibraryColumnField) -> CGFloat {
-        if let preview = columnResizePreview, preview.field == field {
+    /// The preview is passed in rather than read off the view, so the
+    /// only things that re-render during a drag are the ones that
+    /// actually observe it.
+    private func columnWidth(
+        _ field: LibraryColumnField,
+        preview: ColumnWidthPreview?
+    ) -> CGFloat {
+        if let preview, preview.field == field {
             return preview.width
         }
         return storedColumnWidth(field)
+    }
+
+    private func tableContentWidth(preview: ColumnWidthPreview?) -> CGFloat {
+        let columnSum = displayedColumns
+            .map { columnWidth($0, preview: preview) }
+            .reduce(0, +)
+        return LibraryColumnLayout.gutterWidth + columnSum + DubSpacing.lg * 2
     }
 
     private func clampColumnWidth(_ width: CGFloat) -> CGFloat {
@@ -2720,10 +2832,16 @@ struct LibraryView: View {
             columnResizeDragOrigin = (field, storedColumnWidth(field), dragStartGlobalX)
         }
         guard let origin = columnResizeDragOrigin, origin.field == field else { return }
-        columnResizePreview = (
-            field,
-            clampColumnWidth(origin.width + locationGlobalX - origin.globalX)
-        )
+        let width = clampColumnWidth(origin.width + locationGlobalX - origin.globalX)
+        let preview = ColumnWidthPreview(
+            field: field,
+            width: width,
+            tableWidth: tableContentWidth(
+                preview: ColumnWidthPreview(field: field, width: width, tableWidth: 0)))
+        columnResize.preview = preview
+        // The representable's `updateNSView` does not run during the
+        // drag, so the AppKit hosts are resized straight from here.
+        columnResize.onLiveTableWidth?(preview.tableWidth)
     }
 
     private func endColumnResize(
@@ -2736,7 +2854,7 @@ struct LibraryView: View {
         }
         guard let origin = columnResizeDragOrigin, origin.field == field else {
             columnResizeDragOrigin = nil
-            columnResizePreview = nil
+            columnResize.preview = nil
             return
         }
         persistColumnWidth(
@@ -2748,7 +2866,11 @@ struct LibraryView: View {
 
     private func persistColumnWidth(_ field: LibraryColumnField, to width: CGFloat) {
         let clamped = clampColumnWidth(width)
-        columnResizePreview = nil
+        // Clearing the preview and writing the storage below both feed
+        // the committed path: `columnWidthsStorage` changing refreshes
+        // the parse cache and re-evaluates the body once, which is the
+        // single re-host a drag costs.
+        columnResize.preview = nil
         var dict = parsedColumnWidths
         dict[field.rawValue] = clamped
         guard let data = try? JSONEncoder().encode(dict),
@@ -2993,7 +3115,10 @@ struct LibraryView: View {
     }
 
     @ViewBuilder
-    private func trackRow(for track: LibraryTrack) -> some View {
+    private func trackRow(
+        for track: LibraryTrack,
+        preview: ColumnWidthPreview?
+    ) -> some View {
         let dragURL = libraryDragURL(for: track)
         // Selection highlight is painted by the AppKit
         // `LibrarySelectionLayerView` beneath the row host so a
@@ -3007,12 +3132,12 @@ struct LibraryView: View {
                 columnCell(for: field, track: track)
                     .padding(.leading, LibraryColumnLayout.columnLeadingInset)
                     .modifier(DimUnanalyzed(track: track))
-                    .frame(width: columnWidth(field), alignment: .leading)
+                    .frame(width: columnWidth(field, preview: preview), alignment: .leading)
             }
         }
         .padding(.horizontal, DubSpacing.lg)
         .frame(
-            width: tableContentWidth,
+            width: tableContentWidth(preview: preview),
             height: LibraryRowLayout.estimatedHeight,
             alignment: .leading)
         // v8 colour label tints the whole row. NB: the selection
@@ -4254,18 +4379,86 @@ private extension LibraryView {
 private struct LibraryColumnLayout {
     static let minWidth: CGFloat = 48
     static let maxWidth: CGFloat = 480
-    /// Interactive hit target on the trailing edge (wider than the
-    /// 1 px divider so the resize cursor is easy to acquire).
-    static let resizeHandleHitWidth: CGFloat = 14
-    /// Extends the hit zone left into the column label area.
-    static let resizeHandleHitPadding: CGFloat = 6
-    static var resizeHandleTotalWidth: CGFloat {
-        resizeHandleHitPadding + resizeHandleHitWidth
-    }
+    /// The leading gutter before the first column (row colour chip /
+    /// add button). Header and rows share it, and `columnDividers`
+    /// measures from it.
+    static let gutterWidth: CGFloat = 36
+    /// Interactive hit target for a column resize, wider than the 1 px
+    /// divider so the cursor is easy to acquire.
+    ///
+    /// **Centred on the divider — half each side.** It used to sit
+    /// entirely inside the column's trailing edge, so the target was
+    /// 20 pt to the left of the line and 0 pt to the right: approaching
+    /// a divider from the right never armed the resize cursor, which
+    /// reads as the handle belonging to the wrong column. Every table
+    /// on the web straddles the line.
+    static let resizeHandleHitWidth: CGFloat = 16
+
+    /// Breathing room between the header label and the column divider,
+    /// so the uppercase micro headers don't sit flush against the rule.
+    /// Purely visual now that the hit zone is a separate layer.
+    static let columnTrailingInset: CGFloat = 14
     /// Breathing room between the column divider (`|`) and the
     /// header label / row text. Without this the uppercase micro
     /// headers sit flush against the 1 px rule.
     static let columnLeadingInset: CGFloat = DubSpacing.sm
+}
+
+/// Re-renders its content when a resize preview changes.
+///
+/// This is what keeps a drag off `LibraryView.body` and off the scroll
+/// container's `rootView` reassignment: the observation happens *inside*
+/// the already-hosted tree, so SwiftUI does an ordinary targeted update
+/// with view identity — and therefore the in-flight drag gesture —
+/// intact.
+private struct ColumnResizeScope<Content: View>: View {
+    @ObservedObject var model: ColumnResizeModel
+    @ViewBuilder let content: (ColumnWidthPreview?) -> Content
+
+    var body: some View { content(model.preview) }
+}
+
+/// One column's in-progress resize width, plus the table width it
+/// implies so the AppKit hosts can follow without a SwiftUI round-trip.
+fileprivate struct ColumnWidthPreview: Equatable {
+    let field: LibraryColumnField
+    let width: CGFloat
+    let tableWidth: CGFloat
+}
+
+/// Live column-resize state, deliberately held *off* `LibraryView`'s
+/// `@State`.
+///
+/// A resize drag moves a width at display rate. While the preview was
+/// `@State`, every frame re-evaluated the whole `LibraryView` body and
+/// reassigned both hosting views' `rootView`. That is expensive on its
+/// own — the scroll container documents the row reassignment as "a full
+/// SwiftUI diff over every row" — but the worse problem is that it goes
+/// through `AnyView`, which destroys view identity. The in-flight
+/// `DragGesture` was therefore torn down and rebuilt on every frame of
+/// its own drag, dropping events: that is what made the resize *jump*
+/// rather than merely run slow, and why the handle needed a
+/// global-X anchor to be usable at all.
+///
+/// The header and the rows observe this object instead. A drag is then
+/// an ordinary SwiftUI update inside an already-hosted tree — identity
+/// survives, the gesture survives, and `LibraryView.body` never runs.
+fileprivate final class ColumnResizeModel: ObservableObject {
+    @Published var preview: ColumnWidthPreview?
+
+    /// Installed by `LibraryTableScrollContainer.Coordinator`. The
+    /// representable's `updateNSView` does not run during a drag —
+    /// nothing it reads has changed — so the AppKit host widths are
+    /// driven straight from here.
+    var onLiveTableWidth: ((CGFloat) -> Void)?
+}
+
+/// One column's trailing divider and where it sits, for the resize
+/// handle layer.
+private struct ColumnDivider: Identifiable {
+    let field: LibraryColumnField
+    let x: CGFloat
+    var id: LibraryColumnField { field }
 }
 
 private struct ColumnHeaderFramesKey: PreferenceKey {
@@ -4284,14 +4477,10 @@ private struct LibraryColumnResizeHandle: View {
     let onDragEnded: (_ dragStartGlobalX: CGFloat, _ locationGlobalX: CGFloat) -> Void
 
     var body: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: LibraryColumnLayout.resizeHandleHitPadding)
-            Rectangle()
-                .fill(Color.clear)
-                .frame(width: LibraryColumnLayout.resizeHandleHitWidth)
-        }
-        .frame(maxHeight: .infinity)
-        .contentShape(Rectangle())
+        Color.clear
+            .frame(width: LibraryColumnLayout.resizeHandleHitWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
             .onHover { hovering in
                 if hovering {
                     NSCursor.resizeLeftRight.push()
@@ -4419,6 +4608,11 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
     let columnOrderKey: String
     let headerStateKey: String
     let tracksContentRevision: UInt64
+    /// Live resize state. The coordinator installs `onLiveTableWidth`
+    /// so the AppKit host widths follow a drag directly — SwiftUI never
+    /// re-evaluates this representable while one is in flight, which is
+    /// the whole point (see `ColumnResizeModel`).
+    let columnResize: ColumnResizeModel
     let rowSelection: LibraryRowSelection
     let header: AnyView
     let rows: AnyView
@@ -4540,6 +4734,16 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
             headerLeadingConstraint: leadingConstraint,
             rowSelection: rowSelection
         )
+        // A resize drag never re-enters `updateNSView` — nothing SwiftUI
+        // observes changes while it runs — so the two AppKit widths are
+        // driven straight off the model instead. Both are plain frame /
+        // constraint writes: no view diff, no layout pass through
+        // SwiftUI.
+        let coordinator = context.coordinator
+        columnResize.onLiveTableWidth = { [weak coordinator] width in
+            coordinator?.headerWidthConstraint?.constant = max(width, 1)
+            coordinator?.updateWidths(width)
+        }
         context.coordinator.recordSnapshot(
             tableWidth: tableWidth,
             columnOrderKey: columnOrderKey,
@@ -4576,6 +4780,11 @@ private struct LibraryTableScrollContainer: NSViewRepresentable {
         // diff over every row (AnyView wraps defeat structural
         // diffing). Selection paints via the AppKit layer instead,
         // so clicks land on the next frame.
+        //
+        // A column resize does not reach here at all any more: the
+        // preview lives on `ColumnResizeModel`, which the hosted
+        // subtrees observe directly, so a drag never re-evaluates
+        // `LibraryView.body`. `tableWidth` only moves once, on commit.
         let bodyPresentationChanged = tracksChanged
             || tableWidthChanged
             || columnsChanged
