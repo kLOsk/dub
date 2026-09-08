@@ -405,8 +405,12 @@ enum DubLayout {
     /// whatever it is given — unbounded, the LOOP heading stretched the
     /// section to ~750 pt and pushed SAMPLES to the far edge.
     static let prepLoopSection: CGFloat = 322
+    /// The shelf has no maximum — it takes whatever the other two
+    /// sections leave. There is no fourth Prep section planned (the
+    /// beatgrid editor was ruled out: setting the 1 plus Analyze is
+    /// enough), so reserving trailing width would only recreate the dead
+    /// space this redesign removed.
     static let prepSampleShelfMin: CGFloat = 260
-    static let prepSampleShelfMax: CGFloat = 420
 
     /// Narrowest width at which the Prep grid renders three columns
     /// without clipping. `PerformanceLayoutTests` asserts this stays

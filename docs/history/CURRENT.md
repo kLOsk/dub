@@ -185,6 +185,8 @@ dependency order, not a preference.
    from where it started.
    The FX left Prep entirely (echo, siren, Expert, Quick Scratch, rack),
    and sample *loading* moved in from Preferences.
+   The sample shelf takes the remaining width and lays its bank out in
+   adaptive columns, because no fourth section is coming.
    **Performance is deliberately untouched** — its design is not settled,
    and `CuePadSection` still draws numbered pads there.
    `SirenPadRow` / `SirenExpertPanel` are kept but unmounted, staged for
@@ -232,10 +234,20 @@ dependency order, not a preference.
   carries a transport dimension from day one even while only the keyboard
   lane ships.
 
-**Two gaps the map exposed, both bigger than a step.** Prep has **no
-beatgrid editor** — PRD §3.1 names it as Prep's reason to exist and six FFI
-calls sit behind no surface. And the **vintage FX rack** cannot live
-anywhere until the deck source switch grows an `FX` position (F-38).
+**No beatgrid editor — decided 2026-09-08.** The surface map flagged its
+absence as Prep's biggest gap, on the strength of PRD §3.1 naming a
+beatgrid editor as Prep's reason to exist. Ruled out: **setting the 1 plus
+Analyze is enough.** The deck-header BPM tap re-anchors the grid to the
+visible kick, and Analyze produces the grid in the first place; the six
+FFI calls behind a full editor (`nudge_beat_grid_phase` / `_bpm`,
+`scale_active_beat_grid`, `reset_active_beat_grid_to_auto`,
+`install_beat_grid_from_taps`, `set_bar_phase`) stay unmounted rather than
+becoming a surface nobody asked for. `PrepRack` is three sections and does
+not reserve room for a fourth.
+
+**One gap left that is bigger than a step.** The **vintage FX rack**
+cannot live anywhere until the deck source switch grows its `DUB FX`
+position (F-38).
 
 **Placement rule, for future features.** A capability belongs where the DJ
 is in that state of mind. Prep is couch work with no rig; Performance is a

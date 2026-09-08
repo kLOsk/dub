@@ -35,9 +35,11 @@
 //  are things you do to a record playing in front of people. Prep owns
 //  preparing marks and getting sounds into the bank.
 //
-//  The beatgrid editor belongs here and does not exist yet: PRD §3.1 names
-//  it as Prep's reason to exist and six FFI calls sit behind no surface.
-//  Nothing here assumes three sections forever.
+//  There is **no beatgrid editor**, and there is not going to be one.
+//  Setting the 1 — the deck-header BPM tap, which re-anchors the grid to
+//  the visible kick — plus Analyze covers what a DJ actually does to a
+//  grid. The six FFI calls behind a full editor stay unmounted rather than
+//  becoming a surface nobody asked for. Prep is these three sections.
 //
 //  ## Values in, closures out
 //
@@ -118,16 +120,20 @@ struct PrepRack: View {
                 onExit: callbacks.onLoopExit)
                 .frame(width: DubLayout.prepLoopSection, alignment: .leading)
 
+            // Takes the rest. There is no fourth section coming, so
+            // reserving trailing space would just be the dead area this
+            // redesign exists to remove — and the shelf is the one thing
+            // here that genuinely improves with width, because a filename
+            // is the only string on the surface whose length is not ours
+            // to choose.
             SampleShelf(
                 names: state.sampleNames,
                 onAdd: callbacks.onAddSamples,
                 onRemove: callbacks.onRemoveSample)
                 .frame(
                     minWidth: DubLayout.prepSampleShelfMin,
-                    maxWidth: DubLayout.prepSampleShelfMax,
+                    maxWidth: .infinity,
                     alignment: .leading)
-
-            Spacer(minLength: 0)
         }
     }
 }
@@ -429,8 +435,15 @@ private struct SampleShelf: View {
                         .foregroundStyle(DubColor.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
+                    // Columns, not one long list: at Prep's width a
+                    // single column would be a 700 pt row holding a
+                    // 90 pt filename, and a bank of a dozen samples
+                    // would scroll for no reason.
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 2) {
+                        LazyVGrid(
+                            columns: [GridItem(.adaptive(minimum: 210), spacing: DubSpacing.xs)],
+                            alignment: .leading, spacing: 2
+                        ) {
                             ForEach(Array(names.enumerated()), id: \.offset) { index, name in
                                 sampleRow(index: index, name: name)
                             }
