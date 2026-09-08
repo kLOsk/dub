@@ -284,7 +284,7 @@ extension LibraryColumnValue {
 /// Display + sort identity for a library browser column. Artist
 /// and title are always shown; the trailing set is user-configurable
 /// via header right-click and persisted in `@AppStorage`.
-private enum LibraryColumnField: Hashable, Identifiable {
+enum LibraryColumnField: Hashable, Identifiable {
     /// Manual-order rank column (`#`). Injected as a fixed leading
     /// column only while a Dub crate is selected; never part of the
     /// user-configurable / persisted column set, so it stays out of
@@ -2885,241 +2885,27 @@ rows: AnyView(trackRowsStack(preview: nil)),
         columnWidthsStorage = encoded
     }
 
-    @ViewBuilder
+    /// Delegates to the value-driven `LibraryColumnCell`, which the
+    /// `NSTableView` migration reuses and the snapshot tests cover.
     private func columnCell(for field: LibraryColumnField, track: LibraryTrack) -> some View {
-        switch field {
-        case .crateOrder:
-            Text(track.crateOrdinal.map { String($0 + 1) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textTertiary)
-                .monospacedDigit()
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        case .artist:
-            Text(track.artist ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .title:
-            HStack(spacing: DubSpacing.sm) {
-                Text(displayTitle(track))
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                // M11d-history: Session History rows show which
-                // track this one was mixed in from. The dict is
-                // only populated by that source, so other sources
-                // never pay the extra view.
-                if let from = sessionFromTitles[track.id] {
-                    Text("← from \(from)")
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .layoutPriority(-1)
-                }
-            }
-        case .duration:
-            Text(formatDuration(track.durationMs))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
-        case .bpm:
-            HStack(spacing: 4) {
-                Text(formatBpm(track.bpm))
-                // PRD §8.3 — two sources' grids disagree on the tempo
-                // or the downbeat. Shown ahead of the drift warning:
-                // "Serato says 92, the audio looks like 184" is a
-                // bigger problem than a slow drift, and the per-source
-                // BPM columns are where the DJ goes to resolve it.
-                if track.bpmDisagreement {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(DubColor.stateTentative)
-                        .help(
-                            "Imported and analysed grids disagree · "
-                                + "enable the per-source BPM columns to compare")
-                }
-                if track.gridLocked {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(DubColor.textSecondary)
-                } else if let drift = track.gridDriftQuality, abs(drift) >= 3 {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.orange)
-                        .help(
-                            "May drift over a long mix · right-click → Lock grid to accept")
-                }
-            }
-            .font(DubFont.body)
-            .foregroundStyle(DubColor.textSecondary)
-            .monospacedDigit()
-        case .album:
-            Text(track.album ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .genre:
-            Text(track.genre ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .year:
-            Text(track.year.map { String($0) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
-        case .key:
-            Text(renderKey(track.key))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .help(keyTooltip(track.key))
-        case .comment:
-            Text(track.comment ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(track.comment ?? "")
-        case .versionTokens:
-            Text(track.versionTokens ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .source:
-            Text(track.source)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .composer:
-            Text(track.composer ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        case .trackNumber:
-            Text(track.trackNumber.map { String($0) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
-        case .rating:
-            // Click the Nth star to rate; click the current rating to
-            // clear it. Writes through `model.setTrackRating`.
-            let current = Int(track.rating ?? 0)
-            HStack(spacing: 1) {
-                ForEach(1..<6, id: \.self) { star in
-                    Button {
-                        let newValue: UInt8? = star == current ? nil : UInt8(star)
-                        Task { await model.setTrackRating(trackId: track.id, rating: newValue) }
-                    } label: {
-                        Image(systemName: star <= current ? "star.fill" : "star")
-                            .font(.system(size: 9))
-                            .foregroundStyle(
-                                star <= current
-                                    ? DubColor.stateTentative : DubColor.textTertiary)
+        LibraryColumnCell(
+            field: field,
+            state: LibraryCellState(
+                track: track,
+                sessionFromTitle: sessionFromTitles[track.id],
+                keyNotationMode: keyNotationMode,
+                extraIndexById: extraColumnIndex),
+            actions: LibraryCellActions(
+                onRate: { rating in
+                    Task { @MainActor in
+                        await model.setTrackRating(trackId: track.id, rating: rating)
                     }
-                    .buttonStyle(.plain)
-                }
-            }
-        case .color:
-            colorCell(track)
-        case .extra(let id):
-            extraColumnCell(id: id, track: track)
-        }
-    }
-
-    /// One configurable column's cell (PRD §8.5.3.1). Formatting comes
-    /// from the registry's kind rather than a per-column branch, which
-    /// is what lets the deeper groups ship without a Swift case each.
-    @ViewBuilder
-    private func extraColumnCell(id: String, track: LibraryTrack) -> some View {
-        let info = LibraryColumnCatalog.shared.info(for: id)
-        let cell: LibraryColumnValue = {
-            guard let index = extraColumnIndex[id], track.extras.indices.contains(index) else {
-                return .empty
-            }
-            return track.extras[index]
-        }()
-        let kind = info?.kind ?? .text
-        let text = cell.display(kind: kind)
-        Text(text ?? "—")
-            .font(DubFont.body)
-            .foregroundStyle(text == nil ? DubColor.textTertiary : DubColor.textSecondary)
-            .lineLimit(1)
-            .truncationMode(kind == .text ? .middle : .tail)
-            .monospacedDigit()
-            .frame(
-                maxWidth: .infinity,
-                alignment: kind.isNumeric ? .trailing : .leading
-            )
-            .help(text ?? "")
-    }
-
-    /// Colour-label cell. The swatch box is rendered as **normal cell
-    /// content** (a `Menu` with `.borderlessButton` style drops `Shape`
-    /// label content — only symbols/text survive — which is why the box
-    /// + border were invisible). The palette `Menu` sits on top as a
-    /// clear overlay purely to handle the click, so the swatch renders
-    /// reliably underneath. Set colour also tints the row (see `trackRow`).
-    private func colorCell(_ track: LibraryTrack) -> some View {
-        let swatch = DubColor.trackLabel(track.color)
-        return RoundedRectangle(cornerRadius: 3)
-            .fill(swatch ?? DubColor.surface3)
-            .frame(width: 15, height: 15)
-            .overlay(
-                RoundedRectangle(cornerRadius: 3)
-                    .strokeBorder(
-                        swatch != nil ? Color.white.opacity(0.75) : DubColor.textTertiary,
-                        lineWidth: 1))
-            .overlay {
-                if swatch == nil {
-                    Image(systemName: "plus")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(DubColor.textTertiary)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            // The palette menu is built on click, not on render — see
-            // `LazyMenuClickTarget`. As a SwiftUI `Menu` its ~10 items
-            // were constructed for every row on every rebuild.
-            .overlay {
-                LazyMenuClickTarget { colorMenuEntries(track) }
-            }
-    }
-
-    /// The palette, as menu data rather than as views. Evaluated on
-    /// click by `LazyMenuClickTarget`.
-    ///
-    /// The AppKit menu dispatches on the main thread, so the actions
-    /// hop to `@MainActor` themselves — the `LibraryTableMenu` contract
-    /// note applies here too.
-    private func colorMenuEntries(_ track: LibraryTrack) -> [LazyMenuEntry] {
-        var entries: [LazyMenuEntry] = DubColor.trackLabelPalette.map { entry in
-            .item(
-                title: entry.token.capitalized,
-                symbol: "square.fill",
-                tint: NSColor(entry.color)
-            ) {
-                Task { @MainActor in
-                    await model.setTrackColor(trackId: track.id, color: entry.token)
-                }
-            }
-        }
-        entries.append(.separator)
-        entries.append(
-            .item(title: "None", symbol: "slash.circle", tint: nil) {
-                Task { @MainActor in
-                    await model.setTrackColor(trackId: track.id, color: nil)
-                }
-            })
-        return entries
+                },
+                onColor: { token in
+                    Task { @MainActor in
+                        await model.setTrackColor(trackId: track.id, color: token)
+                    }
+                }))
     }
 
     @ViewBuilder
@@ -4046,24 +3832,6 @@ rows: AnyView(trackRowsStack(preview: nil)),
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func displayTitle(_ track: LibraryTrack) -> String {
-        if let t = track.title, !t.isEmpty { return t }
-        return "Untitled"
-    }
-
-    private func formatBpm(_ bpm: Double?) -> String {
-        guard let b = bpm, b > 0 else { return "—" }
-        return String(format: "%.0f", b)
-    }
-
-    private func formatDuration(_ ms: UInt32) -> String {
-        guard ms > 0 else { return "—" }
-        let totalSecs = Int(ms) / 1000
-        let minutes = totalSecs / 60
-        let seconds = totalSecs % 60
-        return String(format: "%d:%02d", minutes, seconds)
-    }
-
     private func importSummaryLine(_ summary: LibraryImportSummary) -> String {
         // Compact one-line summary; the full per-file `errors`
         // list lands in a v1.x detail sheet.
@@ -4354,52 +4122,8 @@ enum KeyNotationMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// Render a Camelot key as either Camelot (default) or musical
-/// notation (opt-in). Returns `"—"` for `nil` keys; the visual
-/// "we have no key" cue is the em-dash, not an empty cell.
-private extension LibraryView {
+extension LibraryView {
     var keyColumnHeader: String { keyNotationMode.columnLabel }
-
-    func renderKey(_ camelot: String?) -> String {
-        guard let camelot, !camelot.isEmpty else { return "—" }
-        switch keyNotationMode {
-        case .camelot: return camelot
-        case .musical: return musicalFromCamelot(camelot) ?? camelot
-        }
-    }
-
-    /// Tooltip = the *other* notation, so the user always sees
-    /// both at a glance without re-clicking. Empty for nil keys.
-    func keyTooltip(_ camelot: String?) -> String {
-        guard let camelot, !camelot.isEmpty else { return "" }
-        switch keyNotationMode {
-        case .camelot: return musicalFromCamelot(camelot) ?? ""
-        case .musical: return camelot
-        }
-    }
-
-    /// Convert a canonical Camelot string (e.g. `"8B"`) to its
-    /// musical equivalent (e.g. `"C major"`). Returns `nil` for
-    /// malformed inputs; the renderer falls back to the raw
-    /// Camelot string in that case.
-    func musicalFromCamelot(_ camelot: String) -> String? {
-        // Camelot → (pitch class, is_major).
-        // Same wheel layout as `dub-spectral::key::CAMELOT_MAJOR`
-        // and `CAMELOT_MINOR`. Kept here as a static lookup
-        // because pushing this across the FFI for every row
-        // render would be silly — the table is 24 entries.
-        let table: [String: String] = [
-            "8B": "C major", "3B": "C♯ major", "10B": "D major",
-            "5B": "D♯ major", "12B": "E major", "7B": "F major",
-            "2B": "F♯ major", "9B": "G major", "4B": "G♯ major",
-            "11B": "A major", "6B": "A♯ major", "1B": "B major",
-            "5A": "C minor", "12A": "C♯ minor", "7A": "D minor",
-            "2A": "D♯ minor", "9A": "E minor", "4A": "F minor",
-            "11A": "F♯ minor", "6A": "G minor", "1A": "G♯ minor",
-            "8A": "A minor", "3A": "A♯ minor", "10A": "B minor",
-        ]
-        return table[camelot.uppercased()]
-    }
 }
 
 private struct LibraryColumnLayout {
@@ -5606,7 +5330,7 @@ private final class LibraryDocumentWrapper: NSView {
 /// collision was identified. Using a project-scoped name like
 /// `dubMenuPerform:` sidesteps the collision entirely.
 /// One item in a lazily-built menu.
-private enum LazyMenuEntry {
+enum LazyMenuEntry {
     case item(title: String, symbol: String, tint: NSColor?, action: () -> Void)
     case separator
 }
@@ -5623,7 +5347,7 @@ private enum LazyMenuEntry {
 /// AppKit builds a menu when it opens. This is the same reason the row
 /// right-click menu is built in `LibraryDocumentWrapper.menu(for:)`
 /// rather than with SwiftUI's `.contextMenu` — see the note there.
-private struct LazyMenuClickTarget: NSViewRepresentable {
+struct LazyMenuClickTarget: NSViewRepresentable {
     /// Evaluated on click. Cheap to *store*, which is the whole point.
     let entries: () -> [LazyMenuEntry]
 
@@ -5679,7 +5403,7 @@ private struct LazyMenuClickTarget: NSViewRepresentable {
     }
 }
 
-private final class LibraryMenuActionTarget: NSObject {
+final class LibraryMenuActionTarget: NSObject {
     private let work: () -> Void
 
     init(_ work: @escaping () -> Void) {
