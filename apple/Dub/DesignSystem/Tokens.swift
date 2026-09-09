@@ -367,7 +367,7 @@ enum DubLayout {
     /// line: `CueRowBank` drops to a single column and the loop keeps
     /// its own width, so the binding constraint is the wider of the two
     /// plus the column's own padding.
-    static let performanceDeckColumnMinWidth: CGFloat = prepLoopSection + DubSpacing.lg * 2
+    static let performanceDeckColumnMinWidth: CGFloat = prepLoopSection + DubSpacing.md * 2
 
     /// The playing waveform absorbs the width the pad column leaves,
     /// up to this cap; past it the remainder stays as the §9.6.1
@@ -436,7 +436,21 @@ enum DubLayout {
     /// name has nothing left to truncate to. `CueRowBank` uses it as
     /// each column's minimum, which is what lets Performance's deck
     /// column choose its own column count from the width it is given.
-    static let cueRowMinWidth: CGFloat = 186
+    ///
+    /// 164 rather than a rounder 186 for a measured reason. A 1440 pt
+    /// window leaves each deck column 349 pt of inner width, and two
+    /// columns need `2 × this + DubSpacing.sm`. At 186 the commonest
+    /// laptop screen got one tall column of eight and overflowed its
+    /// pane; 164 fits two with room to spare, and the row still holds
+    /// `FIRST VERSE` before it truncates.
+    /// `PerformanceLayoutTests.test_deckColumn_laptopWidthAffordsTwoCueColumns`
+    /// is what holds this number to that claim.
+    static let cueRowMinWidth: CGFloat = 164
+
+    /// Height of a hot-cue row where the bank is not pinned to a
+    /// height. A row sized by its own text lands around 18 pt, which
+    /// reads fine and is a poor mouse target.
+    static let cueRowHeight: CGFloat = 26
 
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`

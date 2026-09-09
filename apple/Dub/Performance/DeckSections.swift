@@ -79,9 +79,16 @@ struct CueRowBank: View {
     let onPreviewUp: () -> Void
     let onRename: (Int) -> Void
     let onColor: (Int, String?) -> Void
-    /// How many columns to split the bank across. Prep fixes this at
-    /// two; Performance's column picks the count its width affords.
-    var columns: Int = 2
+    /// How many columns to split the bank across, or `nil` to pick the
+    /// widest arrangement that fits. Prep fixes it at two so the
+    /// section stays level with its neighbours; Performance's column
+    /// has no neighbour and its width varies with the window.
+    var columns: Int? = 2
+    /// Height of one row, or `nil` to divide `contentHeight` between
+    /// them. Prep divides; Performance sets it, because a row sized by
+    /// its own text lands at about 18 pt — legible, but under any
+    /// reasonable mouse target.
+    var rowHeight: CGFloat?
     /// Pin the bank to a height, or let the rows size themselves.
     /// Prep pins it so the three sections stay level with one another;
     /// Performance's column has no neighbour to match, and a row that
@@ -91,7 +98,7 @@ struct CueRowBank: View {
     private var setCount: Int { slots.filter(\.isSet).count }
 
     /// Rows per column, rounded up so the last column is the short one.
-    private var perColumn: Int {
+    private func perColumn(_ columns: Int) -> Int {
         max(1, Int((Double(slots.count) / Double(max(1, columns))).rounded(.up)))
     }
 
@@ -108,21 +115,41 @@ struct CueRowBank: View {
             SectionHeading(
                 title: "HOTCUE", accent: DubColor.hotCue,
                 trailing: "\(setCount) OF \(slots.count)")
-            // Column-major: 1-4 down the first column, 5-8 down the
-            // second. Reading order follows the number, which is what
-            // the DJ is looking for — the grid is an arrangement, not a
-            // sequence, so row-major would put cue 2 where the eye
-            // expects cue 5.
-            HStack(alignment: .top, spacing: DubSpacing.sm) {
-                ForEach(0..<max(1, columns), id: \.self) { column in
-                    VStack(spacing: 2) {
-                        ForEach(slots.filter { $0.index / perColumn == column }) { row($0) }
-                    }
-                    .frame(minWidth: DubLayout.cueRowMinWidth, alignment: .leading)
+            if let columns {
+                grid(columns: columns)
+            } else {
+                // The heading stays *outside* this — its hairline is a
+                // `Rectangle`, which has an unbounded ideal width, and
+                // `ViewThatFits` compares ideal sizes. With the heading
+                // inside a candidate, every rung reports infinity, none
+                // of them "fits", and the ladder silently falls through
+                // to its last option — one column, however much room
+                // there is. The same greedy `Rectangle` stretched LOOP
+                // across Prep's whole surface once already.
+                ViewThatFits(in: .horizontal) {
+                    grid(columns: 3)
+                    grid(columns: 2)
+                    grid(columns: 1)
                 }
             }
-            .frame(height: contentHeight)
         }
+    }
+
+    /// Column-major: 1-4 down the first column, 5-8 down the second.
+    /// Reading order follows the number, which is what the DJ is
+    /// looking for — the grid is an arrangement, not a sequence, so
+    /// row-major would put cue 2 where the eye expects cue 5.
+    private func grid(columns: Int) -> some View {
+        let rows = perColumn(columns)
+        return HStack(alignment: .top, spacing: DubSpacing.sm) {
+            ForEach(0..<max(1, columns), id: \.self) { column in
+                VStack(spacing: 2) {
+                    ForEach(slots.filter { $0.index / rows == column }) { row($0) }
+                }
+                .frame(minWidth: DubLayout.cueRowMinWidth, alignment: .leading)
+            }
+        }
+        .frame(height: contentHeight)
     }
 
     @ViewBuilder
@@ -157,9 +184,11 @@ struct CueRowBank: View {
                 .fixedSize()
         }
         .padding(.trailing, DubSpacing.sm)
-        // No fixed height: four rows divide `prepSectionContent`, which
-        // is what keeps this section level with the other two.
-        .frame(maxHeight: .infinity)
+        // Either a set height or a share of `contentHeight` — see
+        // `rowHeight`. Prep divides, so its four rows stay level with
+        // the sections beside them.
+        .frame(height: rowHeight)
+        .frame(maxHeight: rowHeight == nil ? .infinity : nil)
         .background(slot.isSet ? DubColor.surface2 : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
         .overlay(

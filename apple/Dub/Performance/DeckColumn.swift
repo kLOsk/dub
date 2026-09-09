@@ -83,6 +83,27 @@ struct DeckColumn<Overview: View>: View {
     @ViewBuilder var overview: () -> Overview
 
     var body: some View {
+        // A narrow window cannot hold eight named rows plus everything
+        // above them: at the column's floor the bank is one column and
+        // the stack wants about 540 pt against a ~280 pt pane. It
+        // scrolls there rather than clipping — the same fallback the
+        // pad column carried, and for the same reason. On any window
+        // wide enough for two cue columns the plain stack fits and no
+        // scroll view is built.
+        ViewThatFits(in: .vertical) {
+            stack
+            ScrollView(.vertical, showsIndicators: false) { stack }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // Opaque, like `playingColumn`. The deck region paints
+        // `DubColor.divider` behind its children so the 1 pt seams
+        // between the panes show through — it is a seam colour, not a
+        // surface. Every child covers it; a child that does not reads
+        // as a grey slab the width of the column.
+        .background(DubColor.surface0)
+    }
+
+    private var stack: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             identityAndReadouts
@@ -97,9 +118,9 @@ struct DeckColumn<Overview: View>: View {
             loopAndEcho
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, DubSpacing.lg)
+        .padding(.horizontal, DubSpacing.md)
         .padding(.vertical, DubSpacing.sm)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     // MARK: - Identity
@@ -178,18 +199,10 @@ struct DeckColumn<Overview: View>: View {
     // MARK: - The two things you play
 
     /// Named rows, as in Prep — a cue is a *named position*, and it has
-    /// to be the same object on both surfaces. The column count follows
-    /// the width: `ViewThatFits` takes the widest arrangement that fits,
-    /// so a wide window gets three columns and the minimum window one.
+    /// to be the same object on both surfaces. `columns: nil` lets the
+    /// bank pick the widest arrangement its width affords: three at a
+    /// full-screen window, one at the column's floor.
     private var cueBank: some View {
-        ViewThatFits(in: .horizontal) {
-            bank(columns: 3)
-            bank(columns: 2)
-            bank(columns: 1)
-        }
-    }
-
-    private func bank(columns: Int) -> some View {
         CueRowBank(
             slots: state.cues,
             hasTrack: state.hasTrack,
@@ -199,7 +212,8 @@ struct DeckColumn<Overview: View>: View {
             onPreviewUp: callbacks.onPreviewUp,
             onRename: callbacks.onRenameCue,
             onColor: callbacks.onColorCue,
-            columns: columns)
+            columns: nil,
+            rowHeight: DubLayout.cueRowHeight)
     }
 
     /// The loop keeps its natural width rather than stretching to the

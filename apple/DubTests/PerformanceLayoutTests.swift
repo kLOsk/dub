@@ -71,13 +71,49 @@ final class PerformanceLayoutTests: XCTestCase {
     /// This is the assertion that would have gone red the day the siren
     /// row landed in M16, instead of the sampler quietly disappearing
     /// under the FX bar a milestone later.
-    func test_deckColumn_fitsThePane_atItsFloor() {
+    /// The width a 1440 × 900 window actually gives each column: the
+    /// pane less the two capped strips and the centre gutter, halved.
+    /// This is the configuration to hold, not the column's floor — the
+    /// floor only happens on a 960 pt window, where the pane is shorter
+    /// too, and asserting a narrow width against a wide window's height
+    /// is a configuration nobody runs.
+    private var columnWidthAt1440: CGFloat {
+        (1440 - DubLayout.performanceWaveformWidthCap * 2
+            - DubLayout.stillpointGutterWidth - 2) / 2
+    }
+
+    func test_deckColumn_fitsThePane_onALaptopScreen() {
+        let size = fittingSize(
+            DeckColumn(state: Self.columnFixture) { Color.clear },
+            width: columnWidthAt1440)
+        XCTAssertLessThanOrEqual(
+            size.height, paneHeight + 0.5,
+            "deck column overflows the 1440×900 pane")
+    }
+
+    /// Two cue columns have to fit that width, because one column of
+    /// eight rows is what makes the stack too tall. If `cueRowMinWidth`
+    /// grows past this the column silently falls to one column and the
+    /// test above goes red — this one says why first.
+    func test_deckColumn_laptopWidthAffordsTwoCueColumns() {
+        let inner = columnWidthAt1440 - DubSpacing.md * 2
+        XCTAssertGreaterThanOrEqual(
+            inner, DubLayout.cueRowMinWidth * 2 + DubSpacing.sm,
+            "a 1440 pt window no longer fits two columns of cue rows")
+    }
+
+    /// The one configuration that does *not* fit, stated deliberately
+    /// rather than left to be discovered: at the column's floor the
+    /// bank is a single column of eight, and the stack is taller than
+    /// the pane a 960 pt window produces. `DeckColumn` scrolls there.
+    /// If this ever fails the column got shorter — delete the scroll
+    /// fallback and fold this case into the test above.
+    func test_deckColumn_atItsFloor_stillNeedsTheScrollFallback() {
         let size = fittingSize(
             DeckColumn(state: Self.columnFixture) { Color.clear },
             width: DubLayout.performanceDeckColumnMinWidth)
-        XCTAssertLessThanOrEqual(
-            size.height, paneHeight + 0.5,
-            "deck column overflows the 1440×900 pane at its narrowest")
+        let smallWindowPane = (DubLayout.mainWindowMinHeight - 128) * 0.6
+        XCTAssertGreaterThan(size.height, smallWindowPane)
     }
 
     /// The column's floor has to hold the loop control, which is the
@@ -87,7 +123,7 @@ final class PerformanceLayoutTests: XCTestCase {
     func test_deckColumn_floorHoldsTheLoopControl() {
         XCTAssertGreaterThanOrEqual(
             DubLayout.performanceDeckColumnMinWidth,
-            DubLayout.prepLoopSection + DubSpacing.lg * 2,
+            DubLayout.prepLoopSection + DubSpacing.md * 2,
             "the column floor no longer fits the loop control")
     }
 
