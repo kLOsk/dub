@@ -323,4 +323,24 @@ final class PerformanceSnapshotTests: XCTestCase {
         .padding()
         snap(deckBg(stack), width: 440, height: 260, named: "source-control-states")
     }
+
+    // MARK: - Waveform zoom control
+
+    /// Every rung of the ladder, so the labels are checked as a set.
+    /// `%.2g` used to format these and rounded to two *significant*
+    /// digits — 1.75x came out "1.8x" and 1.25x came out "1.2x" — which
+    /// is invisible in a test that only renders the 1x default. The
+    /// readout also has a fixed `minWidth`, so a label that outgrows it
+    /// shifts the two buttons apart; rendering all seven catches that
+    /// too.
+    func test_waveformZoom_everyRung() {
+        let stack = VStack(alignment: .leading, spacing: 10) {
+            ForEach(0..<WaveformZoom.steps.count, id: \.self) { i in
+                WaveformZoomControl(index: .constant(i), visible: true)
+            }
+        }
+        .padding()
+        snap(deckBg(stack), width: 200, height: 320, named: "zoom-ladder")
+    }
+
 }
