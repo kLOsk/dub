@@ -439,7 +439,7 @@ pub use rip::{
 ///       `sampler_set_output_deck` / `sampler_clear` drive it. Voices
 ///       sum onto the assigned deck's bus after the FX chain — the
 ///       stab plays *over* the music rather than through its echo.
-pub const FFI_VERSION: u32 = 68;
+pub const FFI_VERSION: u32 = 69;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -5437,7 +5437,7 @@ mod tests {
         // 64→65: instant doubles — `instant_double`.
         // 65→66: sampler — `sampler_load` + trigger / stop / gain /
         // output-deck / clear.
-        assert_eq!(FFI_VERSION, 68);
+        assert_eq!(FFI_VERSION, 69);
     }
 
     #[test]
@@ -8202,6 +8202,21 @@ impl DubLibrary {
     ) -> std::result::Result<(), LibraryFfiError> {
         self.with_library(|lib| {
             lib.set_grid_locked(&track_id, locked)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// The track's musical key as the browser shows it — the active
+    /// `track_keys` row. The deck header uses it on load: a track can
+    /// arrive by drag or double-click, with no browser selection to
+    /// read a row snapshot from, and the header was showing an em-dash
+    /// for a track the list plainly labelled.
+    pub fn track_key(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<String>, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.track_key(&track_id)
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }

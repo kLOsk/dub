@@ -777,6 +777,32 @@ impl Library {
         Ok(analyzed.is_some())
     }
 
+    /// The track's musical key as the browser shows it: the notation
+    /// on the **active** `track_keys` row.
+    ///
+    /// The browser reads this through `TRACK_ROW_COLUMNS`
+    /// (`ak.key_notation` joined on `is_active = 1`) as part of a row
+    /// it already has in hand. The deck does not have that row — a
+    /// track can be loaded by drag, by double-click, or onto the
+    /// non-selected deck — so it needs the same fact by id, and this
+    /// is deliberately the same join so the header and the row can
+    /// never disagree.
+    ///
+    /// `None` for an unknown track and for one with no active key.
+    pub fn track_key(&self, track_id: &str) -> Result<Option<String>> {
+        let key: Option<Option<String>> = self
+            .connection()
+            .query_row(
+                "SELECT key_notation FROM track_keys \
+                 WHERE track_id = ?1 AND is_active = 1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("track_key", e))?;
+        Ok(key.flatten().filter(|k| !k.is_empty()))
+    }
+
     /// M11d.7 — whether the track's beatgrid is frozen against
     /// auto re-analysis.
     pub fn is_grid_locked(&self, track_id: &str) -> Result<bool> {
@@ -1741,6 +1767,35 @@ mod tests {
             .unwrap();
         assert_eq!(fp_rows_after, 1);
         assert!(lib.is_track_analyzed(&track_id).unwrap());
+    }
+
+    /// The deck header reads the key by id, and it has to agree with
+    /// the browser row in every case the browser handles: no key at
+    /// all, a key that was superseded, and an unknown track.
+    #[test]
+    fn track_key_matches_the_active_row_the_browser_shows() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _) = seed_track_without_fingerprint(&lib, &tmp, 120.0, 4.0);
+
+        assert_eq!(lib.track_key(&track_id).unwrap(), None, "no key row yet");
+        assert_eq!(
+            lib.track_key("no-such-track").unwrap(),
+            None,
+            "unknown track is not an error"
+        );
+
+        lib.upsert_auto_key(&track_id, "6A", 0.9, true).unwrap();
+        assert_eq!(lib.track_key(&track_id).unwrap(), Some("6A".to_string()));
+
+        // Deactivated the way an importer supersedes the auto row:
+        // the browser stops showing it, so the header must too.
+        lib.upsert_auto_key(&track_id, "6A", 0.9, false).unwrap();
+        assert_eq!(
+            lib.track_key(&track_id).unwrap(),
+            None,
+            "an inactive key row is not the track's key"
+        );
     }
 
     #[test]

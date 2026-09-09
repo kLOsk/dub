@@ -3098,10 +3098,17 @@ final class WaveformAppModel: ObservableObject {
                 }
                 stamped.hotCues = slots
             }
+            // The key is read by id, not off the browser selection.
+            // A track can arrive by drag, by double-click, or onto the
+            // deck that isn't the selected one, and in every one of
+            // those the snapshot below is nil — so the header showed
+            // an em-dash for a track the browser row plainly labelled
+            // (FFI 69, `DubLibrary.trackKey`). Best-effort: a read
+            // failure leaves the dash, which is what it meant before.
+            stamped.key = (try? library.trackKey(trackId: trackId)) ?? nil
             if librarySelection.selectedLibraryTrackId == trackId,
                let snap = librarySelection.selectedLibraryTrack, snap.id == trackId
             {
-                stamped.key = snap.key
                 stamped.gridLocked = snap.gridLocked
                 stamped.gridDriftQuality = snap.gridDriftQuality
             }
