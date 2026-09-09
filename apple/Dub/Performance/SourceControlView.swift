@@ -47,18 +47,15 @@ struct SourceControlView: View {
     var onRecalibrate: () -> Void = {}
 
     var body: some View {
+        // No status dot and word beside the switch any more. It said
+        // in text what the lit segment already says by position, and in
+        // the two states the switch cannot show — no input, and
+        // calibrating — the signal drawer says it better: that panel
+        // reads live telemetry, where this read back the mode the user
+        // had picked. Two places reporting the same thing from
+        // different sources is one place too many, and the wrong one
+        // was the one that could not see the signal.
         HStack(spacing: DubSpacing.sm) {
-            HStack(spacing: DubSpacing.xs) {
-                Circle()
-                    .fill(dotColor)
-                    .frame(width: 7, height: 7)
-                Text(statusLabel)
-                    .font(DubFont.caps)
-                    .tracking(0.6)
-                    .foregroundStyle(DubColor.textSecondary)
-                    .fixedSize()
-            }
-
             // Three-state switch. INT is the play/pause control: it
             // shows ▶ to start internal playback and ⏸ while playing.
             HStack(spacing: 0) {
@@ -118,25 +115,6 @@ struct SourceControlView: View {
     private var isTimecodeActive: Bool { status == .timecode || status == .calibrating }
     private var isThruActive: Bool { status == .thru }
 
-    private var statusLabel: String {
-        switch status {
-        case .off: return "OFF"
-        case .internalPlay: return "INTERNAL"
-        case .calibrating: return "CALIBRATING…"
-        case .timecode: return "TIMECODE"
-        case .thru: return "THRU"
-        }
-    }
-
-    private var dotColor: Color {
-        switch status {
-        case .off: return DubColor.textPlaceholder
-        case .internalPlay: return DubColor.textSecondary
-        case .calibrating: return DubColor.stateTentative
-        case .timecode: return DubColor.stateLocked
-        case .thru: return DubColor.stateLocked
-        }
-    }
 }
 
 #Preview("Source control — states") {
