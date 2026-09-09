@@ -244,9 +244,18 @@ final class WaveformRenderThread: @unchecked Sendable {
         stopDisplayLink()
         // Drain the queue. Any draw still queued runs but its
         // `drawIfNeeded` will observe `shutdownRequested` and
-        // return without touching the renderer. The blocking
-        // `sync` guarantees no Metal command buffer is in flight
-        // when we return.
+        // return without touching the renderer.
+        //
+        // This does **not** guarantee the GPU is idle. The `sync`
+        // only waits for enqueued *draw calls*; a command buffer
+        // already committed keeps running, and its completion
+        // handler fires afterwards on a Metal-owned thread. Anything
+        // that handler touches must therefore outlive the renderer
+        // on its own — which is why `drawIfPossible` captures the
+        // in-flight semaphore strongly rather than `[weak self]`.
+        // Reading this comment as an idle-GPU guarantee is what put
+        // a `signal()` behind a `self?` and trapped in
+        // `_dispatch_semaphore_dispose`.
         renderQueue.sync {}
     }
 

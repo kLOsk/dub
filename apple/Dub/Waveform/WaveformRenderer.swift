@@ -983,9 +983,23 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         guard inflightSemaphore.wait(timeout: .now()) != .timedOut else {
             return
         }
-        let releaseSemaphore: () -> Void = { [weak self] in
-            self?.inflightSemaphore.signal()
-        }
+        // **Capture the semaphore, not `self`.** This was
+        // `[weak self] in self?.inflightSemaphore.signal()`, which
+        // drops the signal entirely if the renderer is gone by the
+        // time the GPU's completion handler runs — and then the
+        // semaphore is disposed holding fewer counts than it was
+        // created with, which libdispatch traps on
+        // (`_dispatch_semaphore_dispose.cold.1`, SIGILL). Tearing the
+        // view down with a frame in flight is not exotic: it is what
+        // `dismantleNSView` does every time a deck swaps mode or a
+        // track loads and `hasSource` flips.
+        //
+        // `DispatchSemaphore` is a class, so capturing it strongly
+        // keeps *it* alive until the last handler has signalled,
+        // without keeping the renderer alive with it. The balance is
+        // then guaranteed by construction rather than by lifetime.
+        let semaphore = inflightSemaphore
+        let releaseSemaphore: () -> Void = { semaphore.signal() }
         // `pendingRelease` is the one-way "we still own the
         // semaphore" flag. `drawImpl` flips it to `false` once it
         // hands ownership to the command buffer's completion
