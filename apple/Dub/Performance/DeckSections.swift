@@ -87,8 +87,8 @@ struct CueRowBank: View {
     /// eight rows two or three times over on every layout pass. Inside
     /// a column whose own width is negotiated against the waveform,
     /// that measurement never settled and the main thread pinned a core
-    /// with the app idle. Two columns is what the surface wants anyway.
-    var columns: Int = 2
+    /// with the app idle.
+    var columns: Int = 4
     /// Height of one row, or `nil` to divide `contentHeight` between
     /// them. Prep divides; Performance sets it, because a row sized by
     /// its own text lands at about 18 pt — legible, but under any
@@ -102,8 +102,9 @@ struct CueRowBank: View {
 
     private var setCount: Int { slots.filter(\.isSet).count }
 
-    /// Rows per column, rounded up so the last column is the short one.
-    private func perColumn(_ columns: Int) -> Int {
+    /// Rows needed to hold every slot at `columns` per row, rounded up
+    /// so the last row is the short one.
+    private func rowCount(_ columns: Int) -> Int {
         max(1, Int((Double(slots.count) / Double(max(1, columns))).rounded(.up)))
     }
 
@@ -124,18 +125,18 @@ struct CueRowBank: View {
         }
     }
 
-    /// Column-major: 1-4 down the first column, 5-8 down the second.
-    /// Reading order follows the number, which is what the DJ is
-    /// looking for — the grid is an arrangement, not a sequence, so
-    /// row-major would put cue 2 where the eye expects cue 5.
+    /// Row-major: 1-4 across the top, 5-8 across the bottom — the
+    /// same shape as a hardware pad bank, which is the arrangement the
+    /// hand already knows. The bank was four rows of two and read down
+    /// each column; at two rows of four, reading across is what matches
+    /// the numbering, so the fill order flips with the shape.
     private func grid(columns: Int) -> some View {
-        let rows = perColumn(columns)
-        return HStack(alignment: .top, spacing: DubSpacing.sm) {
-            ForEach(0..<max(1, columns), id: \.self) { column in
-                VStack(spacing: 2) {
-                    ForEach(slots.filter { $0.index / rows == column }) { row($0) }
+        let cols = max(1, columns)
+        return VStack(spacing: 2) {
+            ForEach(0..<rowCount(cols), id: \.self) { line in
+                HStack(spacing: DubSpacing.sm) {
+                    ForEach(slots.filter { $0.index / cols == line }) { row($0) }
                 }
-                .frame(minWidth: DubLayout.cueRowMinWidth, alignment: .leading)
             }
         }
         .frame(height: contentHeight)
@@ -164,7 +165,14 @@ struct CueRowBank: View {
                 .foregroundStyle(slot.isSet ? DubColor.textPrimary : DubColor.textPlaceholder)
                 .lineLimit(1)
                 .truncationMode(.tail)
-            Spacer(minLength: DubSpacing.sm)
+                // The name and the spacer are both flexible, and at
+                // four cells to a row the spacer was winning — cue
+                // names truncated to a single character while blank
+                // space sat next to them. The name is the reason the
+                // cell exists, so it takes the slack first and the
+                // spacer gets what is left over.
+                .layoutPriority(1)
+            Spacer(minLength: DubSpacing.xs)
             Text(slot.mark.map { CueTimecode.format($0.positionSecs) } ?? "—")
                 .font(.system(size: 10.5, weight: .regular, design: .monospaced))
                 .foregroundStyle(slot.isSet ? DubColor.textSecondary : DubColor.textPlaceholder)
@@ -173,6 +181,11 @@ struct CueRowBank: View {
                 .fixedSize()
         }
         .padding(.trailing, DubSpacing.sm)
+        // Four to a row now, so a cell takes an equal share of the
+        // width instead of claiming a column minimum. The name is the
+        // part that gives way; number, colour bar and timecode are
+        // fixed and always readable.
+        .frame(minWidth: DubLayout.cueCellMinWidth, maxWidth: .infinity)
         // Either a set height or a share of `contentHeight` — see
         // `rowHeight`. Prep divides, so its four rows stay level with
         // the sections beside them.
@@ -237,7 +250,7 @@ struct CueRowGesture: ViewModifier {
 
 // MARK: - LOOP — a size selector
 
-/// Loop lengths in **beats**, ascending, windowed three at a time.
+/// Loop lengths in **beats**, ascending, windowed four at a time.
 ///
 /// Ascending left-to-right: shorter on the left, longer on the right,
 /// which is the direction `÷2` and `×2` sit and the direction every
@@ -245,7 +258,7 @@ struct CueRowGesture: ViewModifier {
 ///
 /// The two steppers do not move a window — they **resize the running
 /// loop**, keeping its start, so `÷2` gives you the first half of what
-/// is currently looping rather than a new loop somewhere else. The three
+/// is currently looping rather than a new loop somewhere else. The four
 /// visible buttons follow whatever length is engaged, so the neighbours
 /// you would reach next are always the ones on screen.
 ///
@@ -275,17 +288,21 @@ struct LoopEngine: View {
     let onExit: () -> Void
 
     static let sizes: [Double] = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16]
-    static let windowSize = 3
-    /// Where the window sits with nothing engaged: 1 · 2 · 4, the
+    static let windowSize = 4
+    /// Where the window sits with nothing engaged: 1 · 2 · 4 · 8, the
     /// lengths a DJ reaches for first.
     private static let idleStart = 3
 
-    /// Centre the window on the engaged length so both neighbours are
-    /// reachable without a stepper press.
+    /// Sit the window under the engaged length so its neighbours are
+    /// reachable without a stepper press. An even window has no true
+    /// centre: `idx - windowSize / 2` puts the running length third of
+    /// four, which leaves two *shorter* lengths on its left. That is
+    /// the direction loop work actually travels — engage 4, then halve
+    /// into a build — so the asymmetry falls the useful way.
     /// Where the window sits while nothing is engaged. `nil` is the
     /// default position; the browse arrows move it.
     ///
-    /// View state rather than model state on purpose: which three
+    /// View state rather than model state on purpose: which four
     /// lengths you are *looking at* before you commit to one is a
     /// property of looking, not of the deck. Engaging a loop puts the
     /// window back under the running length, so the browse position

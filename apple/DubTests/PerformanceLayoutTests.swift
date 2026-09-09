@@ -220,11 +220,12 @@ final class PerformanceLayoutTests: XCTestCase {
         let size = fittingSize(
             PrepRack(state: PrepRackState(hasTrack: true)),
             width: DubLayout.mainWindowMinWidth - DubSpacing.lg * 2)
+        // Two sections, one gap: Prep dropped the reserved loop
+        // gutter and the cue bank took the width.
         XCTAssertLessThanOrEqual(
-            DubLayout.prepCueColumn + DubLayout.prepLoopSection
-                + DubLayout.prepSampleShelfMin + DubSpacing.xl * 2,
+            DubLayout.prepCueColumn + DubLayout.prepSampleShelfMin + DubSpacing.xl,
             DubLayout.mainWindowMinWidth - DubSpacing.lg * 2,
-            "cue + loop + shelf no longer fit at 960")
+            "cue + shelf no longer fit at 960")
         XCTAssertGreaterThan(size.width, 0)
     }
 

@@ -107,28 +107,10 @@ struct PrepRack: View {
                 onPreviewUp: callbacks.onPreviewUp,
                 onRename: callbacks.onRenameCue,
                 onColor: callbacks.onColorCue,
-                columns: 2,
+                columns: 4,
                 contentHeight: DubLayout.prepSectionContent)
                 .frame(width: DubLayout.prepCueColumn, alignment: .leading)
 
-            // **Loops are off Prep for now.** The control is built and
-            // its column is held at full width — hidden and untappable
-            // rather than removed, so the shelf beside it does not
-            // spread into a gap that is going to be filled again.
-            // `.hidden()` rather than a spacer of some guessed size:
-            // the space stays exactly what will occupy it, and
-            // re-mounting is deleting one modifier. Performance keeps
-            // its own loop pads — this is a Prep decision only.
-            LoopEngine(
-                activeBeats: state.activeLoopBeats,
-                engaged: state.loopEngaged,
-                hasTrack: state.hasTrack,
-                onLoop: callbacks.onLoop,
-                onScale: callbacks.onScaleLoop,
-                onExit: callbacks.onExitLoop)
-                .frame(width: DubLayout.prepLoopSection, alignment: .leading)
-                .hidden()
-                .allowsHitTesting(false)
 
             // Takes the rest. There is no fourth section coming, so
             // reserving trailing space would just be the dead area this

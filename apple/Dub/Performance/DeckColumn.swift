@@ -347,7 +347,7 @@ struct DeckColumn<Overview: View>: View {
             onPreviewUp: callbacks.onPreviewUp,
             onRename: callbacks.onRenameCue,
             onColor: callbacks.onColorCue,
-            columns: 2,
+            columns: 4,
             rowHeight: DubLayout.cueRowHeight)
     }
 

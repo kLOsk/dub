@@ -435,12 +435,12 @@ enum DubLayout {
     /// pane — but it may not shrink past what one column of cue rows and
     /// the loop control need side by side.
     ///
-    /// `cueRowMinWidth` 186 + the loop's 264 do not have to fit on one
-    /// line: `CueRowBank` drops to a single column and the loop keeps
-    /// its own width, so the binding constraint is the wider of the two
-    /// plus the column's own padding.
+    /// The cue bank is four cells wide and does not reflow, so it is
+    /// the binding constraint: four `cueCellMinWidth` plus the three
+    /// gaps between them, plus the column's own padding and the signal
+    /// tab. The loop sits under it on its own line and is narrower.
     static let performanceDeckColumnMinWidth: CGFloat =
-        cueRowMinWidth * 2 + DubSpacing.sm + DubSpacing.md * 2 + deckSignalTabWidth
+        cueCellMinWidth * 4 + DubSpacing.sm * 3 + DubSpacing.md * 2 + deckSignalTabWidth
 
     /// The playing waveform absorbs the width the pad column leaves,
     /// up to this cap; past it the remainder stays as the §9.6.1
@@ -525,6 +525,13 @@ enum DubLayout {
     /// `FIRST VERSE` before it truncates.
     /// `PerformanceLayoutTests.test_deckColumn_laptopWidthAffordsTwoCueColumns`
     /// is what holds this number to that claim.
+    /// Floor for one cue cell in the four-wide bank. Number (10) +
+    /// colour bar (3) + timecode (~36) + the gaps between them come to
+    /// about 90; the rest is the name, which truncates. Below this the
+    /// name has no room at all and the cell stops being worth its
+    /// width.
+    static let cueCellMinWidth: CGFloat = 118
+
     static let cueRowMinWidth: CGFloat = 164
 
     /// Height of a hot-cue row where the bank is not pinned to a
@@ -537,8 +544,20 @@ enum DubLayout {
     /// `test_deckColumn_fitsThePane_onALaptopScreen` is the ceiling.
     static let cueRowHeight: CGFloat = 30
 
-    static let prepCueColumn: CGFloat = 380
-    /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
+    /// Everything the rack has left after the sample shelf's floor,
+    /// derived from the window budget rather than typed.
+    ///
+    /// `test_prepRackFitsTheNarrowestWindow` holds the rack inside a
+    /// 960 pt window. With the loop gutter gone Prep is two sections,
+    /// so the sum is cue + shelf + one `xl` gap; the shelf is the
+    /// flexible one and this takes the rest. That works out to about
+    /// 170 pt per cue cell — enough for "set at playhead" and a short
+    /// name beside the timecode, where the old 380 (two cells at 186,
+    /// from when the bank ran four rows deep) gave four cells 95 and
+    /// truncated them to "set at p...".
+    static let prepCueColumn: CGFloat =
+        mainWindowMinWidth - DubSpacing.lg * 2 - prepSampleShelfMin - DubSpacing.xl
+    /// `÷2` 34 + the size buttons + `×2` 34, plus gaps and `md`
     /// padding each side. Fixed, because a section heading's rule
     /// expands to fill whatever it is given — unbounded, the LOOP
     /// heading stretched the section to ~750 pt and pushed SAMPLES to
