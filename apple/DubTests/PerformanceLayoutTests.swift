@@ -110,6 +110,32 @@ final class PerformanceLayoutTests: XCTestCase {
             "the column floor no longer fits two columns of cue rows")
     }
 
+    /// The overview has to *be* the height the column reserves for it.
+    ///
+    /// It pins its own via `OverviewSizing`, and in SwiftUI the inner
+    /// frame wins — so a caller wrapping it in a shorter frame reserves
+    /// its own height for layout while the view keeps drawing at the
+    /// larger one, overlapping its neighbours with no clipping and no
+    /// warning. That shipped: the overview printed across the artist
+    /// line above it and the times below. The height is a parameter
+    /// now, and this is what stops a wrapper creeping back in.
+    func test_overviewHonoursTheHeightItIsGiven() {
+        let sized = Color.clear.modifier(
+            OverviewSizing(
+                orientation: .horizontal, height: DubLayout.deckColumnOverviewHeight))
+        XCTAssertEqual(
+            fittingSize(sized, width: 400).height,
+            DubLayout.deckColumnOverviewHeight, accuracy: 0.5,
+            "the deck column's overview no longer renders at the height it reserves")
+
+        // And the standalone band still keeps its own.
+        let standalone = Color.clear.modifier(
+            OverviewSizing(orientation: .horizontal, height: nil))
+        XCTAssertEqual(
+            fittingSize(standalone, width: 400).height,
+            DubLayout.deckOverviewHeight, accuracy: 0.5)
+    }
+
     /// The one configuration that does *not* fit, stated deliberately
     /// rather than left to be discovered: at the column's floor the
     /// bank is a single column of eight, and the stack is taller than

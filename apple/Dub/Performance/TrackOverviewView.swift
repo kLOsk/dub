@@ -76,6 +76,18 @@ struct TrackOverviewView: View {
     /// rendering unchanged.
     var orientation: WaveformOrientation = .vertical
 
+    /// Height for the horizontal band, or `nil` for the standalone
+    /// `deckOverviewHeight`.
+    ///
+    /// This exists because a caller cannot impose one from outside:
+    /// `OverviewSizing` pins the view to its own height, and in SwiftUI
+    /// the inner `.frame` wins — wrapping it in a shorter frame reserves
+    /// the caller's height for layout while the view keeps *drawing* at
+    /// its own, silently overlapping whatever sits above and below with
+    /// no clipping and no warning. Performance's deck column did exactly
+    /// that and printed the overview over the artist line.
+    var height: CGFloat?
+
     /// Bucket count for the decimated overview. 480 is enough to
     /// resolve every visible pixel on a typical 600 px-tall strip
     /// at 2× DPR (1200 device pixels) without being so dense that
@@ -226,7 +238,7 @@ struct TrackOverviewView: View {
                             isFinal: true)
                     })
         }
-        .modifier(OverviewSizing(orientation: orientation))
+        .modifier(OverviewSizing(orientation: orientation, height: height))
         .onAppear(perform: reloadIfStale)
         .onChange(of: deckState.sourceURL) { _ in reloadIfStale() }
         .onChange(of: deckState.hasTrack) { _ in reloadIfStale() }
@@ -913,8 +925,12 @@ private extension Float {
 /// Pin the overview to its orientation-appropriate intrinsic
 /// dimension: a fixed width (filling height) in vertical mode, a
 /// fixed height (filling width) in horizontal Prep-mode mode.
-private struct OverviewSizing: ViewModifier {
+/// Internal rather than private so `PerformanceLayoutTests` can assert
+/// the rule directly — the alternative is booting a `WaveformAppModel`
+/// in a layout test, and the rule is what broke, not the drawing.
+struct OverviewSizing: ViewModifier {
     let orientation: WaveformOrientation
+    var height: CGFloat?
     func body(content: Content) -> some View {
         switch orientation {
         case .vertical:
@@ -923,7 +939,7 @@ private struct OverviewSizing: ViewModifier {
                 .frame(maxHeight: .infinity)
         case .horizontal:
             content
-                .frame(height: DubLayout.deckOverviewHeight)
+                .frame(height: height ?? DubLayout.deckOverviewHeight)
                 .frame(maxWidth: .infinity)
         }
     }

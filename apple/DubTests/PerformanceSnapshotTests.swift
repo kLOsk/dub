@@ -132,12 +132,17 @@ final class PerformanceSnapshotTests: XCTestCase {
     private func columnFixture(
         _ state: DeckColumnState
     ) -> some View {
-        // `surface0`, not the column's own `surface1` — the real
-        // overview draws a waveform, and a placeholder that matches the
-        // ground behind it makes the baseline look like the block is
-        // missing.
+        // The placeholder is pinned to the height the real overview
+        // renders at, and `test_overviewHonoursTheHeightItIsGiven`
+        // holds those two together. Before that, the fixture was a bare
+        // `Rectangle` — which accepts any frame — while the real view
+        // pinned its own height and drew 24 pt outside the slot, over
+        // the artist line above and the times below. Every baseline was
+        // green on a component that did not behave like the real one.
         DeckColumn(state: state) {
-            Rectangle().fill(DubColor.surface0)
+            Rectangle()
+                .fill(DubColor.surface0)
+                .frame(height: DubLayout.deckColumnOverviewHeight)
         }
     }
 

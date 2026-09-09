@@ -275,10 +275,15 @@ struct LoopEngine: View {
     /// side by side and heads both from outside so the two hairlines
     /// line up.
     var showsHeading: Bool = true
-    /// Height of the boxed control. Prep gives it `prepSectionContent`
-    /// so the section stays level with its neighbours; Performance's
-    /// column has no neighbour to match and a shorter box buys height
-    /// the cue rows want.
+    /// Outer height of the boxed control, padding included. Prep gives
+    /// it `prepSectionContent` so the section stays level with its
+    /// neighbours; Performance's column has no neighbour to match and a
+    /// shorter box buys height the cue rows want.
+    ///
+    /// The buttons inset from it by `DubSpacing.sm` on each edge. They
+    /// used to be a fixed 64 inside an 88 box, which gave the same air
+    /// by accident; equalising the box to the echo button's height took
+    /// that away and left the stroke sitting on the buttons.
     var contentHeight: CGFloat = DubLayout.prepSectionContent
     let onLoop: (Double) -> Void
     let onScale: (_ double: Bool) -> Void
@@ -319,8 +324,9 @@ struct LoopEngine: View {
                 sizeButtons
                 stepper("×2", double: true)
             }
-            .frame(height: contentHeight)
+            .frame(height: contentHeight - DubSpacing.sm * 2)
             .padding(.horizontal, DubSpacing.md)
+            .padding(.vertical, DubSpacing.sm)
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous)
                     .stroke(DubColor.divider, lineWidth: 1))

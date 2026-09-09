@@ -141,13 +141,17 @@ struct DeckColumn<Overview: View>: View {
     /// under its end — where a DJ reads them off a Serato overview.
     private var overviewAndTimes: some View {
         VStack(alignment: .leading, spacing: 4) {
-            overview()
-                .frame(height: DubLayout.deckColumnOverviewHeight)
             HStack(spacing: 0) {
                 time(.elapsed, colour: DubColor.textSecondary)
                 Spacer(minLength: 0)
                 time(.remaining, colour: DubColor.textPrimary)
             }
+            // No `.frame(height:)` here. The overview pins its own
+            // height and the inner frame wins, so a wrapper only
+            // reserves space the view then draws outside of. It takes
+            // the height as a parameter instead — see
+            // `TrackOverviewView.height`.
+            overview()
         }
     }
 

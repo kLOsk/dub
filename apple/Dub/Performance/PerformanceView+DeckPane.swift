@@ -167,7 +167,8 @@ extension PerformanceView {
             if Self.overviewEnabled {
                 TrackOverviewView(
                     model: model, side: side, deckIdx: deckIdx,
-                    orientation: .horizontal)
+                    orientation: .horizontal,
+                    height: DubLayout.deckColumnOverviewHeight)
             }
         }
         .frame(
