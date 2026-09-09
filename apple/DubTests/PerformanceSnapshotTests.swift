@@ -110,42 +110,115 @@ final class PerformanceSnapshotTests: XCTestCase {
         snap(deckBg(row), width: 1440, height: 108, named: "two-deck-not-mirrored")
     }
 
-    // MARK: - Performance pads
+    // MARK: - The deck column
 
     // Sizes come from the layout tokens, never from a hand-picked
-    // number. The previous baseline rendered at 560 × 360 with the
+    // number. An earlier baseline rendered at 560 × 360 with the
     // struct's *defaults* — where the siren was off — so it was green
     // on a configuration nobody runs, while the real column needed
     // ~478 pt of a ~330 pt pane and spilled behind the FX bar. A
     // snapshot forced to `.frame(width:height:)` cannot catch an
     // overflow anyway; it just renders the smaller thing correctly.
     // `PerformanceLayoutTests` is what actually asserts fit.
+    //
+    // These now cover `DeckColumn`. The pad column they used to cover
+    // is gone: the header band came down into the column and the
+    // numbered cue pads became named rows, so a baseline of
+    // `PerformancePadsView` would be a picture of something the app no
+    // longer draws.
 
-    /// Deck A exactly as the 1440 × 900 surface lays it out: the column
-    /// token wide, and as tall as the 0.60 split leaves the pane.
-    func test_performancePads_deckA_production() {
-        snap(deckBg(PerformancePadsView(side: .a, state: .shippingDefault)),
-             width: DubLayout.performancePadColumnWidth, height: 398,
-             named: "pads-deck-a-production")
+    /// The overview is a Metal view, so the column takes it as a
+    /// closure and tests hand it a placeholder of the right height.
+    private func columnFixture(
+        _ state: DeckColumnState
+    ) -> some View {
+        DeckColumn(state: state) {
+            Rectangle().fill(DubColor.surface1)
+        }
     }
 
-    /// The same column in the shortest pane the window can produce.
-    func test_performancePads_deckA_minimumWindow() {
-        snap(deckBg(PerformancePadsView(side: .a, state: .shippingDefault)),
-             width: DubLayout.performancePadColumnWidth, height: 218,
-             named: "pads-deck-a-minimum")
+    /// The same shape the deck headers use, with the source switch
+    /// present — it is the one control the column inherited from the
+    /// band, so a baseline without it would miss the thing that moved.
+    private static func header(
+        _ title: String?, _ artist: String?, _ bpm: Double?, _ key: String?, _ pitch: Double?
+    ) -> DeckHeaderState {
+        var state = DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: title, trackArtist: artist,
+            bpm: bpm, pitchPercent: pitch, timecodeLockState: 1,
+            key: key,
+            formatChip: "MP3 · 44.1 kHz · stereo",
+            timeRow: .remainingOnly,
+            isMaster: true, isPlaying: title != nil,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil)
+        state.sourceControl = .timecode
+        return state
     }
 
-    /// The dormant FX rack (UI-BACKLOG F-38) flipped on — the tallest
-    /// the column can get, and the case that exercises the scroll
-    /// fallback. Recorded now so the hidden path has a baseline before
-    /// anyone un-hides it.
-    func test_performancePads_deckB_rackEnabled() {
-        var state = PerformancePadsState.shippingDefault
-        state.rackEnabled = true
-        snap(deckBg(PerformancePadsView(side: .b, state: state)),
-             width: DubLayout.performancePadColumnWidth, height: 398,
-             named: "pads-deck-b-rack-on")
+    private static func columnState(
+        side: DeckSide = .a,
+        cues: [CueSlotState]? = nil,
+        loopBeats: Double? = nil,
+        echoEngaged: Bool = false
+    ) -> DeckColumnState {
+        DeckColumnState(
+            side: side,
+            header: header(
+                "Armed & Dangerous", "Oppidan, Cutty Ranks", 133.0, "6A", 0.4),
+            cues: cues ?? (0..<8).map { i in
+                switch i {
+                case 0:
+                    return CueSlotState(
+                        index: 0,
+                        mark: CueMark(positionSecs: 0, name: "INTRO", color: "aqua"))
+                case 1:
+                    return CueSlotState(
+                        index: 1,
+                        mark: CueMark(
+                            positionSecs: 102.3, name: "FIRST VERSE", color: "orange"))
+                case 4:
+                    return CueSlotState(
+                        index: 4,
+                        mark: CueMark(positionSecs: 190, name: "BREAK", color: "green"))
+                default:
+                    return CueSlotState(index: i)
+                }
+            },
+            activeLoopBeats: loopBeats,
+            loopEngaged: loopBeats != nil,
+            echoEnabled: true,
+            echoEngaged: echoEngaged,
+            hasTrack: true,
+            isPlaying: true)
+    }
+
+    /// The column at the width a 1792 pt window actually gives it —
+    /// wide enough for two columns of cue rows.
+    func test_deckColumn_wideWindow() {
+        snap(deckBg(columnFixture(Self.columnState(loopBeats: 2))),
+             width: 540, height: 470, named: "deck-column-wide")
+    }
+
+    /// At its floor the bank drops to one column on its own. This is
+    /// the arrangement a 960 pt window produces.
+    func test_deckColumn_atItsFloor() {
+        snap(deckBg(columnFixture(Self.columnState())),
+             width: DubLayout.performanceDeckColumnMinWidth, height: 470,
+             named: "deck-column-floor")
+    }
+
+    /// Deck B, nothing loaded, echo engaged — the empty state has to
+    /// say what each section needs rather than sitting inert.
+    func test_deckColumn_deckB_noTrack() {
+        var state = Self.columnState(side: .b, echoEngaged: true)
+        state.header = Self.header(nil, nil, nil, nil, nil)
+        state.cues = (0..<8).map { CueSlotState(index: $0) }
+        state.hasTrack = false
+        state.isPlaying = false
+        snap(deckBg(columnFixture(state)),
+             width: 540, height: 470, named: "deck-column-b-no-track")
     }
 
     // MARK: - Global rack bar

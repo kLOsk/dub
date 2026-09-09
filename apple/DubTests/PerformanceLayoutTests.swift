@@ -31,9 +31,37 @@ final class PerformanceLayoutTests: XCTestCase {
 
     // MARK: - The pad column
 
-    /// 1440 × 900 minus 236 pt of fixed chrome, at the 0.60 deck-heavy
-    /// split.
-    private let paneHeight: CGFloat = 398
+    /// 1440 × 900 minus the fixed chrome, at the 0.60 deck-heavy split.
+    ///
+    /// Was 398, against 236 pt of chrome. The deck header band was
+    /// 108 of that and it is gone — its contents moved into
+    /// `DeckColumn` — so the deck region is 108 pt richer and this
+    /// constant had to follow. Leaving it would have asserted the
+    /// column against a pane the app no longer produces.
+    private let paneHeight: CGFloat = 463
+
+    /// A loaded deck with cues set — the tallest the column gets in a
+    /// shipping configuration.
+    private static let columnFixture = DeckColumnState(
+        side: .a,
+        header: DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: "Baddadan (extended mix) (feat. IRah, Flowdan)",
+            trackArtist: "Chase & Status",
+            bpm: 176.0, pitchPercent: -1.2, timecodeLockState: 1,
+            key: "7A", formatChip: "MP3 · 44.1 kHz · stereo",
+            timeRow: .remainingOnly,
+            isMaster: true, isPlaying: true,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil),
+        cues: (0..<8).map {
+            CueSlotState(
+                index: $0,
+                mark: CueMark(positionSecs: Double($0) * 30, name: "MARK", color: "aqua"))
+        },
+        activeLoopBeats: 2, loopEngaged: true,
+        echoEnabled: true, echoEngaged: false,
+        hasTrack: true, isPlaying: true)
 
     /// The regression test for the reported bug. The column's height
     /// now depends on exactly two booleans — the siren left for the
@@ -43,51 +71,35 @@ final class PerformanceLayoutTests: XCTestCase {
     /// This is the assertion that would have gone red the day the siren
     /// row landed in M16, instead of the sampler quietly disappearing
     /// under the FX bar a milestone later.
-    func test_padColumn_fitsThePane_inEveryShippingConfiguration() {
-        for echo in [true, false] {
-            var state = PerformancePadsState.shippingDefault
-            state.echoEnabled = echo
-            let size = fittingSize(
-                PerformancePadsView(side: .a, state: state),
-                width: DubLayout.performancePadColumnWidth)
-            XCTAssertLessThanOrEqual(
-                size.height, paneHeight + 0.5,
-                "pad column overflows the 1440×900 pane (echo: \(echo))")
-        }
-    }
-
-    /// The one configuration that does *not* fit at 1440 × 900, stated
-    /// deliberately rather than left to be discovered.
-    ///
-    /// The dormant per-deck FX rack adds ~173 pt as a fifth row. It is
-    /// off by default and slated to become a dedicated FX *channel*
-    /// that replaces a deck (UI-BACKLOG F-38) rather than stacking onto
-    /// one, so shrinking it now would be work thrown away. Until then
-    /// `ViewThatFits` scrolls it, which is the whole reason that
-    /// fallback is there.
-    ///
-    /// If this assertion ever fails, the rack got shorter or the pane
-    /// got taller — delete the scroll fallback and fold this case back
-    /// into the test above.
-    func test_padColumn_withDormantRack_stillNeedsTheScrollFallback() {
-        var state = PerformancePadsState.shippingDefault
-        state.rackEnabled = true
+    func test_deckColumn_fitsThePane_atItsFloor() {
         let size = fittingSize(
-            PerformancePadsView(side: .a, state: state),
-            width: DubLayout.performancePadColumnWidth)
-        XCTAssertGreaterThan(size.height, paneHeight)
-    }
-
-    /// The column must fit the width token it is framed at, or the
-    /// LOOP row clips its own pads — which the 320 pt baseline did for
-    /// a whole milestone, rendering labels as "UE" and "OOP".
-    func test_padColumn_fitsItsWidthToken() {
-        let size = fittingSize(
-            PerformancePadsView(side: .a, state: .shippingDefault),
-            width: DubLayout.performancePadColumnWidth)
+            DeckColumn(state: Self.columnFixture) { Color.clear },
+            width: DubLayout.performanceDeckColumnMinWidth)
         XCTAssertLessThanOrEqual(
-            size.width, DubLayout.performancePadColumnWidth + 0.5,
-            "pad column is wider than performancePadColumnWidth")
+            size.height, paneHeight + 0.5,
+            "deck column overflows the 1440×900 pane at its narrowest")
+    }
+
+    /// The column's floor has to hold the loop control, which is the
+    /// one section inside it with a fixed width. If the loop grows or
+    /// the floor shrinks, the ×2 stepper clips — which the pad column
+    /// did for a whole milestone, rendering labels as "UE" and "OOP".
+    func test_deckColumn_floorHoldsTheLoopControl() {
+        XCTAssertGreaterThanOrEqual(
+            DubLayout.performanceDeckColumnMinWidth,
+            DubLayout.prepLoopSection + DubSpacing.lg * 2,
+            "the column floor no longer fits the loop control")
+    }
+
+    /// Two columns of cue rows need twice the row minimum plus the
+    /// gap. Below that `CueRowBank` drops to one column on its own —
+    /// this asserts the arithmetic the `ViewThatFits` ladder relies on.
+    func test_cueBank_twoColumnsNeedMoreThanTheFloor() {
+        let twoColumns = DubLayout.cueRowMinWidth * 2 + DubSpacing.sm
+        XCTAssertGreaterThan(
+            twoColumns,
+            DubLayout.performanceDeckColumnMinWidth - DubSpacing.lg * 2,
+            "two cue columns now fit the floor — the ladder has a dead rung")
     }
 
     // MARK: - The global rack bar

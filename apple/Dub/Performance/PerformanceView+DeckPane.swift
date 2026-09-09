@@ -92,35 +92,25 @@ extension PerformanceView {
                 // leaving the two strips marooned far apart in dead
                 // space.
                 // Scratch-Live-style deck pane. Inner→outer:
-                //   waveform (hugs the centre phase clock) · overview ·
-                //   performance pads · air on the outer edge.
-                // Deck A is the window-left half (pads on the left),
-                // deck B the right (pads on the right).
+                //   waveform (hugs the centre phase clock) · deck column
+                //   out to the window edge.
                 //
-                // The pad column is a fixed width and the waveform
-                // takes what is left, up to its cap. It used to be the
-                // other way round — the pads were `maxWidth: .infinity`
-                // and the waveform a hard 200 — so the element PRD §9.2
-                // calls "front and center" was the only one with a cap
-                // while the pads ate ~575 pt per pane at full screen.
+                // There is no outer `Spacer` any more, and the column is
+                // no longer a fixed 224. The waveform is capped at
+                // `performanceWaveformWidthCap`, so on any real window
+                // several hundred points were left over — and a Spacer
+                // held them empty at each outer edge. The column takes
+                // that width instead, and the sections inside it use it:
+                // `CueRowBank` picks its column count from what it is
+                // handed, and the overview finally has room to be a map
+                // rather than a 26 pt sliver.
                 //
-                // `layoutPriority` on the waveform is load-bearing:
-                // without it the HStack splits the slack evenly with
-                // the outer `Spacer` and the strip never reaches its
-                // cap.
+                // `layoutPriority` on the waveform is still load-bearing
+                // — without it the HStack splits the slack evenly and
+                // the strip never reaches its cap.
                 HStack(spacing: 0) {
                     if side == .a {
-                        Spacer(minLength: 0)
-                        PerformancePadsView(
-                            side: side,
-                            state: padsState(side: side, deckState: deckState),
-                            callbacks: padsCallbacks(side: side))
-                            .frame(width: DubLayout.performancePadColumnWidth)
-                        if Self.overviewEnabled {
-                            TrackOverviewView(
-                                model: model, side: side, deckIdx: deckIdx)
-                            Color.clear.frame(width: DubLayout.deckOverviewGap)
-                        }
+                        deckColumn(side: side, deckIdx: deckIdx)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
@@ -130,17 +120,7 @@ extension PerformanceView {
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
                             .layoutPriority(1)
-                        if Self.overviewEnabled {
-                            Color.clear.frame(width: DubLayout.deckOverviewGap)
-                            TrackOverviewView(
-                                model: model, side: side, deckIdx: deckIdx)
-                        }
-                        PerformancePadsView(
-                            side: side,
-                            state: padsState(side: side, deckState: deckState),
-                            callbacks: padsCallbacks(side: side))
-                            .frame(width: DubLayout.performancePadColumnWidth)
-                        Spacer(minLength: 0)
+                        deckColumn(side: side, deckIdx: deckIdx)
                     }
                 }
             case .horizontal:
@@ -167,6 +147,31 @@ extension PerformanceView {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .modifier(DeckDropTarget(model: model, side: side))
+    }
+
+    /// One deck's column: the old header band's contents, the whole-
+    /// track overview turned flat, and the two things you play.
+    ///
+    /// `maxWidth: .infinity` with a floor rather than a fixed width —
+    /// see the layout note in `deckPane`. The floor is what the cue
+    /// rows and the loop need side by side; below it the bank drops to
+    /// one column on its own.
+    @ViewBuilder
+    func deckColumn(side: DeckSide, deckIdx: UInt64) -> some View {
+        DeckColumn(
+            state: deckColumnState(side: side),
+            callbacks: deckColumnCallbacks(side: side)
+        ) {
+            if Self.overviewEnabled {
+                TrackOverviewView(
+                    model: model, side: side, deckIdx: deckIdx,
+                    orientation: .horizontal)
+            }
+        }
+        .frame(
+            minWidth: DubLayout.performanceDeckColumnMinWidth,
+            maxWidth: .infinity,
+            alignment: .leading)
     }
 
     /// The width-capped centre column inside a `deckPane` —

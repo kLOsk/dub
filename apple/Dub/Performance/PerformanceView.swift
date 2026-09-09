@@ -94,6 +94,11 @@ struct PerformanceView: View {
     // waveform column only, which the user reported as "I keep
     // missing the strip — drag should also accept on the header".
 
+    /// **Prep only.** Performance's header band is gone — its contents
+    /// moved into `DeckColumn`, beside each waveform instead of above
+    /// both. That band was 108 pt of the vertical budget spent on two
+    /// blocks of text and six numbers, on the surface where the strip's
+    /// height is the whole point; see `DeckColumn`'s file comment.
     @ViewBuilder
     private var deckHeaders: some View {
         if model.engineMode == .prep {
@@ -107,26 +112,6 @@ struct PerformanceView: View {
                        liveDeckIdx: 0)
                 .background(DubColor.divider)
                 .modifier(DeckDropTarget(model: model, side: .a))
-        } else {
-            HStack(spacing: 1) {
-                DeckHeader(side: .a,
-                           state: headerState(side: .a),
-                           callbacks: headerCallbacks(side: .a),
-                           mirrored: headerMirrored(side: .a),
-                           tapSession: model.tapSession(for: .a),
-                           liveEngine: model.engine,
-                           liveDeckIdx: 0)
-                    .modifier(DeckDropTarget(model: model, side: .a))
-                DeckHeader(side: .b,
-                           state: headerState(side: .b),
-                           callbacks: headerCallbacks(side: .b),
-                           mirrored: headerMirrored(side: .b),
-                           tapSession: model.tapSession(for: .b),
-                           liveEngine: model.engine,
-                           liveDeckIdx: 1)
-                    .modifier(DeckDropTarget(model: model, side: .b))
-            }
-            .background(DubColor.divider)
         }
     }
 
@@ -225,6 +210,54 @@ struct PerformanceView: View {
     /// Snapshot of the model for one deck's pad column, mirroring
     /// `headerState(side:)`. Both deck panes used to spell this out as
     /// a twenty-argument initialiser, written twice.
+    /// The deck column's values. `headerState` is reused verbatim so the
+    /// identity block, the readouts and the source switch cannot drift
+    /// from what the header showed before it moved.
+    func deckColumnState(side: DeckSide) -> DeckColumnState {
+        let deck = (side == .a) ? model.deckA : model.deckB
+        return DeckColumnState(
+            side: side,
+            header: headerState(side: side),
+            cues: (0..<DeckState.hotCueCount).map {
+                CueSlotState(index: $0, mark: deck.hotCues[$0])
+            },
+            activeLoopBeats: deck.activeLoopBeats,
+            loopEngaged: deck.loopActive,
+            echoEnabled: model.echoOutEnabled,
+            echoEngaged: deck.echoDivision != nil,
+            hasTrack: deck.hasTrack,
+            isPlaying: deck.isPlaying)
+    }
+
+    /// Pure forwarders into the model, as with `headerCallbacks`. The
+    /// source-control four are the header's own, so the switch keeps
+    /// behaving exactly as it did in the band.
+    func deckColumnCallbacks(side: DeckSide) -> DeckColumnCallbacks {
+        let header = headerCallbacks(side: side)
+        return DeckColumnCallbacks(
+            onCue: { index, clear in
+                model.handleHotCue(side, index: index, clear: clear)
+            },
+            onPreviewDown: { index in model.beginHotCuePreview(side, index: index) },
+            onPreviewUp: { model.endHotCuePreview(side) },
+            onRenameCue: { index in renameCue(index, side: side) },
+            onColorCue: { index, token in
+                let deck = (side == .a) ? model.deckA : model.deckB
+                model.setHotCueLabel(
+                    side, index: index,
+                    name: deck.hotCues[index]?.name, color: token)
+            },
+            onLoop: { beats in model.handleLoopBeats(side, beats: beats) },
+            onScaleLoop: { double in model.scaleLoop(side, double: double) },
+            onExitLoop: { model.exitLoop(side) },
+            onEchoToggle: { model.toggleEchoOut(side) },
+            onSetInternal: { header.onSetInternal?() },
+            onPause: header.onPause,
+            onSetTimecode: { header.onSetTimecode?() },
+            onSetThru: { header.onSetThru?() },
+            onRecalibrate: { header.onRecalibrate?() })
+    }
+
     func padsState(side: DeckSide, deckState: DeckState) -> PerformancePadsState {
         PerformancePadsState(
             // Performance still draws cues as numbered pads; its own
@@ -339,8 +372,9 @@ struct PerformanceView: View {
     /// Name a cue. A sheet would be heavier than the gesture deserves —
     /// this is a one-field edit on a mark you just dropped — so it is an
     /// `NSAlert` with a text field, the same weight as Finder's rename.
-    private func renameCue(_ index: Int) {
-        guard let mark = model.deckA.hotCues[index] else { return }
+    private func renameCue(_ index: Int, side: DeckSide = .a) {
+        let deck = (side == .a) ? model.deckA : model.deckB
+        guard let mark = deck.hotCues[index] else { return }
         let alert = NSAlert()
         alert.messageText = "Name cue \(index + 1)"
         alert.informativeText = "At \(CueTimecode.format(mark.positionSecs))."
@@ -353,7 +387,7 @@ struct PerformanceView: View {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         model.setHotCueLabel(
-            .a, index: index,
+            side, index: index,
             name: trimmed.isEmpty ? nil : trimmed,
             color: mark.color)
     }

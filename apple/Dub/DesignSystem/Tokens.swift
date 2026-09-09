@@ -358,6 +358,17 @@ enum DubLayout {
     /// waveform did not have nailed down.
     static let performancePadColumnWidth: CGFloat = 224
 
+    /// Floor for Performance's deck column. It takes every point the
+    /// capped waveform leaves — which on a laptop screen is most of the
+    /// pane — but it may not shrink past what one column of cue rows and
+    /// the loop control need side by side.
+    ///
+    /// `cueRowMinWidth` 186 + the loop's 264 do not have to fit on one
+    /// line: `CueRowBank` drops to a single column and the loop keeps
+    /// its own width, so the binding constraint is the wider of the two
+    /// plus the column's own padding.
+    static let performanceDeckColumnMinWidth: CGFloat = prepLoopSection + DubSpacing.lg * 2
+
     /// The playing waveform absorbs the width the pad column leaves,
     /// up to this cap; past it the remainder stays as the §9.6.1
     /// reserved info-chip canvas. PRD §9.6.1 argues a fatter waveform
@@ -420,6 +431,13 @@ enum DubLayout {
     /// end on one baseline and the library starts there.
     static let prepSectionContent: CGFloat = 88
 
+    /// The narrowest a hot-cue row may be laid out at. A row carries a
+    /// colour spine, an index, a name and a timecode; below this the
+    /// name has nothing left to truncate to. `CueRowBank` uses it as
+    /// each column's minimum, which is what lets Performance's deck
+    /// column choose its own column count from the width it is given.
+    static let cueRowMinWidth: CGFloat = 186
+
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
     /// padding each side. Fixed, because a section heading's rule
@@ -474,6 +492,12 @@ enum DubLayout {
     /// Performance mode, so the overview reads as the secondary
     /// chrome it is rather than dominating the strip.
     static let deckOverviewHeight: CGFloat = 60
+
+    /// The overview inside Performance's deck column. Shorter than the
+    /// standalone strip: it is one of six blocks sharing the column's
+    /// height, and a whole-track map earns its keep on the *time* axis,
+    /// which here is the full column width rather than 26 pt of it.
+    static let deckColumnOverviewHeight: CGFloat = 44
 
     /// Width of the per-deck Track Overview strip (M10.5c) — the
     /// thin vertical waveform on each deck's *outside* edge
