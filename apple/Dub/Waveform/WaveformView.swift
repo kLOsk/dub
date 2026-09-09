@@ -215,7 +215,6 @@ struct WaveformView: View {
                 if let handler = scrubHandler {
                     scrubGestureOverlay(in: geo.size, handler: handler)
                 }
-                zeroCrossingOverlay(in: geo.size)
                 if beatGridOverlayEnabled {
                     beatGridOverlay(in: geo.size)
                 }
@@ -223,43 +222,6 @@ struct WaveformView: View {
             }
         }
     }
-
-    /// M10.5e zero-crossing hairline. A 1-px line running along the
-    /// amplitude=0 axis (i.e. *perpendicular* to the playhead,
-    /// parallel to the time axis). Helps the eye read the bar's
-    /// symmetry around silence, anchors the strip visually when
-    /// the waveform is sparse, and — since M10.5t — provides the
-    /// visible "needle is on the platter" baseline in the lead-in /
-    /// lead-out empty-groove regions (PRD §9.6). Before M10.5t it
-    /// used `DubColor.divider.opacity(0.55)`, which against a
-    /// pure-black silent region rendered effectively invisible
-    /// (~0x171A1F vs 0x000000); a Serato comparison made it
-    /// obvious the dark groove needed a properly-visible
-    /// centerline. White at ~20 % opacity matches the Serato
-    /// reference: clearly visible against black, almost entirely
-    /// hidden under the bars (which are centred on this axis), so
-    /// it doesn't read as a separate UI element. Drawn underneath
-    /// the playhead overlay so the deck-tinted playhead always
-    /// wins where they cross.
-    @ViewBuilder
-    private func zeroCrossingOverlay(in size: CGSize) -> some View {
-        let tint = Color.white.opacity(0.22)
-        switch orientation {
-        case .vertical:
-            Rectangle()
-                .fill(tint)
-                .frame(width: 1, height: size.height)
-                .offset(x: size.width * 0.5 - 0.5)
-                .allowsHitTesting(false)
-        case .horizontal:
-            Rectangle()
-                .fill(tint)
-                .frame(width: size.width, height: 1)
-                .offset(y: size.height * 0.5 - 0.5)
-                .allowsHitTesting(false)
-        }
-    }
-
     /// Transparent hit-test layer that drives the M10.5s vinyl-
     /// style scratch. We report the cursor's running offset (in
     /// audio seconds) from the drag's start position; the host

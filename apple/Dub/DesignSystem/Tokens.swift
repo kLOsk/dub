@@ -589,7 +589,7 @@ enum DubLayout {
     /// standalone strip: it is one of six blocks sharing the column's
     /// height, and a whole-track map earns its keep on the *time* axis,
     /// which here is the full column width rather than 26 pt of it.
-    static let deckColumnOverviewHeight: CGFloat = 36
+    static let deckColumnOverviewHeight: CGFloat = 56
 
     /// The echo-out block beside the loop. 96 clipped its own heading
     /// to `E…`; there is room to spare beside the loop, so it takes it.

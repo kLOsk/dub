@@ -518,9 +518,12 @@ struct DeckHeader: View {
                 .foregroundStyle(DubColor.textPlaceholder)
         }
         if let artist = state.trackArtist {
+            // A step below the title, matching `DeckColumn`. At
+            // `textSecondary` the pair sat close enough in weight that
+            // name and artist read as one run of text at a glance.
             Text(artist)
                 .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
+                .foregroundStyle(DubColor.textTertiary)
                 .lineLimit(1)
         }
     }
