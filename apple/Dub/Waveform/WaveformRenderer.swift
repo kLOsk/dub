@@ -317,6 +317,18 @@ struct RendererAppearance {
     var side: DeckSide = .a
     var timeAxisZoom: Double = 1.0
     var beatGridEnabled: Bool = true
+
+    /// The gain the deck loaded this track with, applied to the drawn
+    /// amplitude so the picture matches the sound.
+    ///
+    /// Peaks are decimated from the file's *raw* samples
+    /// (`compute_offline_peaks`), while the deck plays it through
+    /// `auto_gain` from the library's loudness pass. So a track
+    /// mastered with headroom sounded normalised and drew at 80 % of
+    /// the lane — the two were describing different signals. Serato
+    /// folds its Auto Gain into the drawn waveform for the same
+    /// reason.
+    var displayGain: Float = 1.0
 }
 
 /// Lock-protected beat-grid cache (M11d.6 round 5). The
@@ -376,6 +388,20 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// Amplitude scale in NDC. 0.95 leaves a small gutter so peaks
     /// don't kiss the deck-column edge.
     private static let yScale: Float = 0.95
+
+    /// Ceiling on `displayGain`. A very quiet transfer can carry a
+    /// large normalisation gain, and multiplying its noise floor up to
+    /// full lane height would draw a solid block rather than a
+    /// waveform. Four is about 12 dB, past which the source is the
+    /// problem and no drawing fixes it.
+    private static let maxDisplayGain: Float = 4.0
+
+    /// `yScale` with the deck's load gain folded in, clamped so a
+    /// hot master shrinks honestly and a quiet one cannot run away.
+    private static func scaledYScale(_ gain: Float) -> Float {
+        guard gain.isFinite, gain > 0 else { return yScale }
+        return yScale * min(gain, maxDisplayGain)
+    }
 
     /// Fraction of the deck column reserved for the *past* region
     /// (above the playhead per PRD §9.1).
@@ -822,6 +848,10 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     func setTimeAxisZoom(_ value: Double) {
         appearance.withLock { $0.timeAxisZoom = value }
+    }
+
+    func setDisplayGain(_ value: Float) {
+        appearance.withLock { $0.displayGain = value }
     }
 
     func setBeatGridEnabled(_ value: Bool) {
@@ -1442,7 +1472,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             chunkOffset: UInt32(pastFirstRingOffset),
             chunksVisible: UInt32(drawnAbove),
             chunksAbovePlayhead: UInt32(drawnAbove),
-            yScale: WaveformRenderer.yScale,
+            yScale: WaveformRenderer.scaledYScale(appearance.displayGain),
             samplesPerPeakChunk: samplesPerPeakChunk,
             bandChunkOffset: UInt32(pastFirstBandRingOffset),
             samplesPerBandChunk: samplesPerBandChunk,
@@ -1456,7 +1486,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             chunkOffset: UInt32(futureFirstRingOffset),
             chunksVisible: UInt32(drawnBelow),
             chunksAbovePlayhead: 0,
-            yScale: WaveformRenderer.yScale,
+            yScale: WaveformRenderer.scaledYScale(appearance.displayGain),
             samplesPerPeakChunk: samplesPerPeakChunk,
             bandChunkOffset: UInt32(futureFirstBandRingOffset),
             samplesPerBandChunk: samplesPerBandChunk,

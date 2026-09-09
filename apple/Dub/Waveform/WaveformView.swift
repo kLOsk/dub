@@ -149,6 +149,7 @@ struct WaveformView: View {
     /// Time-axis zoom. Prep mode passes `prepModeTimeAxisZoom` (1.2)
     /// so the horizontal strip shows 20 % more audio.
     let timeAxisZoom: Double
+    let displayGain: Float
 
     /// Hot cue positions (track-seconds) for this deck's set CUE
     /// pads, in any order. Pushed into the renderer each
@@ -173,6 +174,7 @@ struct WaveformView: View {
          seekGeneration: UInt64 = 0,
          peaksGeneration: UInt64 = 0,
          timeAxisZoom: Double = 1.0,
+         displayGain: Float = 1.0,
          hotCues: [HotCueMarker] = [],
          loopActive: Bool = false,
          loopInSecs: Double = 0,
@@ -187,6 +189,7 @@ struct WaveformView: View {
         self.seekGeneration = seekGeneration
         self.peaksGeneration = peaksGeneration
         self.timeAxisZoom = timeAxisZoom
+        self.displayGain = displayGain
         self.hotCues = hotCues
         self.loopActive = loopActive
         self.loopInSecs = loopInSecs
@@ -204,6 +207,7 @@ struct WaveformView: View {
                     seekGeneration: seekGeneration,
                     peaksGeneration: peaksGeneration,
                     timeAxisZoom: timeAxisZoom,
+                    displayGain: displayGain,
                     hotCues: hotCues,
                     loopActive: loopActive,
                     loopInSecs: loopInSecs,
@@ -798,6 +802,7 @@ private struct WaveformMetalView: NSViewRepresentable {
     let seekGeneration: UInt64
     let peaksGeneration: UInt64
     let timeAxisZoom: Double
+    let displayGain: Float
     let hotCues: [HotCueMarker]
     let loopActive: Bool
     let loopInSecs: Double
@@ -818,6 +823,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         private var lastOrientation: WaveformOrientation?
         private var lastSide: DeckSide?
         private var lastTimeAxisZoom: Double?
+        private var lastDisplayGain: Float?
         private var lastSeekGeneration: UInt64?
         private var lastPeaksGeneration: UInt64?
         private var lastContinuous: Bool?
@@ -838,6 +844,7 @@ private struct WaveformMetalView: NSViewRepresentable {
             orientation: WaveformOrientation,
             side: DeckSide,
             timeAxisZoom: Double,
+            displayGain: Float,
             seekGeneration: UInt64,
             peaksGeneration: UInt64,
             hotCues: [HotCueMarker],
@@ -850,6 +857,7 @@ private struct WaveformMetalView: NSViewRepresentable {
                 lastOrientation = orientation
                 lastSide = side
                 lastTimeAxisZoom = timeAxisZoom
+                lastDisplayGain = displayGain
                 lastSeekGeneration = seekGeneration
                 lastPeaksGeneration = peaksGeneration
                 lastHotCues = hotCues
@@ -873,6 +881,11 @@ private struct WaveformMetalView: NSViewRepresentable {
             if lastSide != side {
                 renderer.setSide(side)
                 lastSide = side
+                rendererChanged = true
+            }
+            if lastDisplayGain != displayGain {
+                renderer.setDisplayGain(displayGain)
+                lastDisplayGain = displayGain
                 rendererChanged = true
             }
             if lastTimeAxisZoom != timeAxisZoom {
@@ -949,6 +962,7 @@ private struct WaveformMetalView: NSViewRepresentable {
         renderer.setOrientation(orientation)
         renderer.setSide(side)
         renderer.setTimeAxisZoom(timeAxisZoom)
+        renderer.setDisplayGain(displayGain)
         renderer.setBeatGridEnabled(true)
         renderer.setHotCues(hotCues)
         renderer.setLoopRegion(active: loopActive, inSecs: loopInSecs, outSecs: loopOutSecs)
@@ -1001,6 +1015,7 @@ private struct WaveformMetalView: NSViewRepresentable {
             orientation: orientation,
             side: side,
             timeAxisZoom: timeAxisZoom,
+            displayGain: displayGain,
             seekGeneration: seekGeneration,
             peaksGeneration: peaksGeneration,
             hotCues: hotCues,

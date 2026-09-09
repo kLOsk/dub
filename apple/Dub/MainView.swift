@@ -313,6 +313,11 @@ struct DeckState: Equatable {
     /// Internal/Timecode switch. `hasTimecodeInput` gates whether the
     /// switch is shown at all.
     var hasTimecodeInput: Bool = false
+
+    /// The loudness gain this track was loaded with, or `nil` at
+    /// unity. Drives the drawn waveform's amplitude so the picture and
+    /// the sound describe the same signal.
+    var autoGain: Float?
     var controlMode: UInt8 = 0   // 0 internal, 1 timecode
     var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
     var calibrated: Bool = false
@@ -2190,6 +2195,7 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridAnchorSecs = nil
         starting.autoGridCaptured = false
         starting.beatGridLoadSource = "pending_auto"
+        starting.autoGain = nil
         starting.manualGridEditCount = 0
         // Loading a new track drops any engaged echo-out — otherwise the deck
         // stays muted (100 % wet) and the fresh track is silent until the
@@ -2244,6 +2250,11 @@ final class WaveformAppModel: ObservableObject {
         // loads at unity. Resolved here, on the main actor, off the
         // same single-SELECT path as the beat grid; never re-read after.
         let autoGainForLoad = autoGainForPendingLoad(url: url)
+        // Remembered so the waveform can be drawn at the level the deck
+        // is playing it at — see `RendererAppearance.displayGain`.
+        var gained = state(for: side)
+        gained.autoGain = autoGainForLoad
+        setState(gained, for: side)
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
                 try engineRef.loadTrack(

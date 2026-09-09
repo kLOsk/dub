@@ -206,6 +206,7 @@ extension PerformanceView {
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
                         : zoom,
+                    displayGain: deckState.autoGain ?? 1.0,
                     hotCues: deckState.hotCues.compactMap { cue in
                         cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
                     },
