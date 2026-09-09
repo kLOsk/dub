@@ -42,6 +42,12 @@ enum DubColor {
     /// as "stage" rather than "spreadsheet."
     static let surface0 = Color(hex: 0x0B0C0F)
 
+    /// A step *below* `surface0`, for a region that should read as set
+    /// into the app's ground rather than sitting on it. Performance's
+    /// deck columns use it: they flank the playing strips, and a
+    /// recessed ground separates the two without spending a border.
+    static let surfaceRecessed = Color(hex: 0x06070A)
+
     /// Deck header / status strip background.
     static let surface1 = Color(hex: 0x14161B)
 
@@ -450,7 +456,12 @@ enum DubLayout {
     /// Height of a hot-cue row where the bank is not pinned to a
     /// height. A row sized by its own text lands around 18 pt, which
     /// reads fine and is a poor mouse target.
-    static let cueRowHeight: CGFloat = 26
+    ///
+    /// 24 rather than 26: the source switch is now drawn on every deck
+    /// whether or not a timecode input is present, which cost the
+    /// column 32 pt, and four rows at 24 is where that came back from.
+    /// `test_deckColumn_fitsThePane_onALaptopScreen` is the ceiling.
+    static let cueRowHeight: CGFloat = 24
 
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
@@ -511,7 +522,7 @@ enum DubLayout {
     /// standalone strip: it is one of six blocks sharing the column's
     /// height, and a whole-track map earns its keep on the *time* axis,
     /// which here is the full column width rather than 26 pt of it.
-    static let deckColumnOverviewHeight: CGFloat = 44
+    static let deckColumnOverviewHeight: CGFloat = 40
 
     /// Width of the per-deck Track Overview strip (M10.5c) — the
     /// thin vertical waveform on each deck's *outside* edge

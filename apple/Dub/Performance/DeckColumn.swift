@@ -95,12 +95,14 @@ struct DeckColumn<Overview: View>: View {
             ScrollView(.vertical, showsIndicators: false) { stack }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        // Opaque, like `playingColumn`. The deck region paints
-        // `DubColor.divider` behind its children so the 1 pt seams
-        // between the panes show through — it is a seam colour, not a
-        // surface. Every child covers it; a child that does not reads
-        // as a grey slab the width of the column.
-        .background(DubColor.surface0)
+        // Opaque, and a step below the app's ground. The deck region
+        // paints `DubColor.divider` behind its children so the 1 pt
+        // seams between panes show through — a seam colour, not a
+        // surface — so a child that paints nothing reads as a grey slab
+        // the width of the column. This one paints `surfaceRecessed`,
+        // which also gives the column an edge against the waveform
+        // beside it without spending a border on it.
+        .background(DubColor.surfaceRecessed)
     }
 
     private var stack: some View {
@@ -114,6 +116,11 @@ struct DeckColumn<Overview: View>: View {
             // width to be a map.
             overview()
                 .frame(height: DubLayout.deckColumnOverviewHeight)
+                // The map wants air on both sides of it. At the stack's
+                // own spacing it sat hard against the artist line above
+                // and the HOTCUE heading below, and three blocks with
+                // nothing between them read as one crowded block.
+                .padding(.vertical, DubSpacing.sm)
             cueBank
             loopAndEcho
             Spacer(minLength: 0)
@@ -128,20 +135,23 @@ struct DeckColumn<Overview: View>: View {
     /// The source switch is the only part of the old header band that
     /// was a *control* rather than a readout, so it heads the column it
     /// switches. INT is the play control — see `SourceControlView`.
-    @ViewBuilder
     private var sourceRow: some View {
-        if let status = state.header.sourceControl {
-            SourceControlView(
-                status: status,
-                overridden: state.header.sourceControlOverridden,
-                isPlaying: state.isPlaying,
-                side: state.side,
-                onInternal: callbacks.onSetInternal,
-                onPause: callbacks.onPause,
-                onTimecode: callbacks.onSetTimecode,
-                onThru: callbacks.onSetThru,
-                onRecalibrate: callbacks.onRecalibrate)
-        }
+        // Always drawn, even with no timecode input — `.off` is the
+        // status for exactly that, and it renders the switch with no
+        // segment lit. The old header band hid the switch and showed
+        // bare transport glyphs instead, so on a machine with no
+        // interface there was no INT to press; here INT *is* the play
+        // control, so hiding it removes the transport.
+        SourceControlView(
+            status: state.header.sourceControl ?? .off,
+            overridden: state.header.sourceControlOverridden,
+            isPlaying: state.isPlaying,
+            side: state.side,
+            onInternal: callbacks.onSetInternal,
+            onPause: callbacks.onPause,
+            onTimecode: callbacks.onSetTimecode,
+            onThru: callbacks.onSetThru,
+            onRecalibrate: callbacks.onRecalibrate)
     }
 
     /// Identity and readouts share a row. The column is wide — that is
@@ -219,21 +229,37 @@ struct DeckColumn<Overview: View>: View {
     /// The loop keeps its natural width rather than stretching to the
     /// column — it is an instrument with a fixed shape, and a ×2 button
     /// 300 pt from the ÷2 is a worse control, not a bigger one. Echo out
-    /// sits under it: both are fired during a transition, so the hand
-    /// stays in one place for the whole move.
+    /// sits *beside* it: both are fired during a transition, so the hand
+    /// stays in one place for the whole move. On a column too narrow to
+    /// hold both it drops underneath rather than squeezing the loop.
     private var loopAndEcho: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            LoopEngine(
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: DubSpacing.sm) {
+                loop
+                echo
+            }
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                loop
+                echo
+            }
+        }
+    }
+
+    private var loop: some View {
+        LoopEngine(
                 activeBeats: state.activeLoopBeats,
                 engaged: state.loopEngaged,
                 hasTrack: state.hasTrack,
                 onLoop: callbacks.onLoop,
                 onScale: callbacks.onScaleLoop,
-                onExit: callbacks.onExitLoop)
-                .frame(width: DubLayout.prepLoopSection, alignment: .leading)
-            if state.echoEnabled {
-                echoButton
-            }
+            onExit: callbacks.onExitLoop)
+            .frame(width: DubLayout.prepLoopSection, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var echo: some View {
+        if state.echoEnabled {
+            echoButton
         }
     }
 

@@ -126,8 +126,12 @@ struct CueRowBank: View {
                 // to its last option — one column, however much room
                 // there is. The same greedy `Rectangle` stretched LOOP
                 // across Prep's whole surface once already.
+                // Two columns is the widest arrangement, not three.
+                // Eight cues split three ways gives a 3/3/2 grid, and a
+                // ragged last column reads as a mistake; two columns of
+                // four stay a rectangle at any width, and the extra
+                // room goes to the names instead.
                 ViewThatFits(in: .horizontal) {
-                    grid(columns: 3)
                     grid(columns: 2)
                     grid(columns: 1)
                 }
