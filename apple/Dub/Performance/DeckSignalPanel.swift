@@ -61,7 +61,11 @@ struct DeckSignalSlideOut: View {
     /// the tab's position change are the same motion and must share it.
     static let slide = Animation.spring(duration: 0.25)
 
-    @State private var open = false
+    /// `-signalOpen` starts the drawer open, for profiling it without
+    /// a click. The panel is the most expensive thing on the surface
+    /// when it is showing, so being able to measure it repeatably is
+    /// worth one launch argument.
+    @State private var open = ProcessInfo.processInfo.arguments.contains("-signalOpen")
 
     var body: some View {
         HStack(spacing: 0) {
@@ -133,6 +137,30 @@ struct DeckSignalSlideOut: View {
     }
 }
 
+/// The pitch trace's ring buffer.
+///
+/// A class so the timeline closure can append to it without writing
+/// view state — mutating `@State` from inside a `TimelineView` body is
+/// both a side effect during evaluation and, at 20 Hz, an invalidation
+/// storm. `StillpointView` holds its engine the same way.
+@MainActor
+final class PitchTrace {
+    private var samples: [Double] = []
+    private static let maxSamples = 120
+
+    /// Record this tick and return the window to draw. Only a *live*
+    /// timecode pitch is recorded; a paused or input-less deck would
+    /// otherwise smear the trace with -100 % floor samples.
+    func push(_ t: DeckTelemetry) -> [Double] {
+        let live = t.hasTimecodeInput && t.lockState != 0
+        samples.append(live ? t.pitchPercent : .nan)
+        if samples.count > Self.maxSamples {
+            samples.removeFirst(samples.count - Self.maxSamples)
+        }
+        return samples
+    }
+}
+
 /// The panel body: one deck's signal health + calibration controls.
 struct DeckSignalPanel: View {
 
@@ -140,23 +168,40 @@ struct DeckSignalPanel: View {
     let side: DeckSide
     let deckIdx: UInt64
 
-    /// Polled on the same 20 Hz tick that samples the pitch trace, so
-    /// the panel redraws at a fixed cadence rather than whenever the
-    /// app happens to publish something.
-    @State private var telemetry: DeckTelemetry?
-
     /// Rolling pitch-% history for the stability trace (~6 s at 20 Hz).
-    @State private var pitchHistory: [Double] = []
-    private static let maxSamples = 120
-    /// `@State` for the reason `DeckSignalSlideOut.dotTick` explains.
-    /// This one predates that change and had the same fault; it only
-    /// escaped notice because the panel exists solely while the drawer
-    /// is open.
-    @State private var tick =
-        Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
+    ///
+    /// A reference type mutated inside the timeline closure, the same
+    /// shape `StillpointView` uses for its engine. It was `@State` fed
+    /// by a `Timer`, which meant two state writes per tick — one for
+    /// the history, one for the telemetry — and each of those re-ran
+    /// the whole view's body and invalidated layout. An open drawer
+    /// cost 15 % of a core with nothing moving.
+    @State private var trace = PitchTrace()
 
     var body: some View {
-        let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)
+        // **Two cadences.** Only the pitch trace needs 20 Hz — it is a
+        // stability visualiser, and a sample every 50 ms is the point
+        // of it. The readouts around it are numbers a human reads:
+        // five times a second is already faster than that is useful.
+        // Redrawing the whole panel at 20 Hz cost 20 % of a core with
+        // nothing moving, because every tick re-ran the bars, the rows
+        // and the buttons as well as the one Canvas that had changed.
+        TimelineView(.periodic(from: .now, by: 1.0 / 5.0)) { _ in
+            content(engine.deckTelemetry(deckIdx: deckIdx))
+        }
+        .padding(DubSpacing.md)
+        .frame(width: DubLayout.deckSignalPanelWidth)
+        .frame(maxHeight: .infinity)
+        .background(DubColor.surface2.opacity(0.97))
+        .overlay(
+            Rectangle()
+                .fill(DubColor.divider)
+                .frame(width: 1),
+            alignment: side == .a ? .trailing : .leading)
+    }
+
+    @ViewBuilder
+    private func content(_ t: DeckTelemetry) -> some View {
         let lockTint = lockColor(t.lockState, hasInput: t.hasTimecodeInput)
         VStack(alignment: .leading, spacing: DubSpacing.md) {
             HStack(spacing: DubSpacing.sm) {
@@ -196,31 +241,6 @@ struct DeckSignalPanel: View {
 
             Spacer(minLength: 0)
         }
-        .padding(DubSpacing.md)
-        .frame(width: DubLayout.deckSignalPanelWidth)
-        .frame(maxHeight: .infinity)
-        .background(DubColor.surface2.opacity(0.97))
-        .overlay(
-            Rectangle()
-                .fill(DubColor.divider)
-                .frame(width: 1),
-            alignment: side == .a ? .trailing : .leading
-        )
-        .onReceive(tick) { _ in
-            telemetry = engine.deckTelemetry(deckIdx: deckIdx)
-            samplePitch()
-        }
-    }
-
-    private func samplePitch() {
-        let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)
-        // Only record a live timecode pitch; a paused / no-input deck
-        // would otherwise smear the trace with -100 % floor samples.
-        let playing = t.hasTimecodeInput && t.lockState != 0
-        pitchHistory.append(playing ? t.pitchPercent : .nan)
-        if pitchHistory.count > Self.maxSamples {
-            pitchHistory.removeFirst(pitchHistory.count - Self.maxSamples)
-        }
     }
 
     /// Rolling pitch-% trace with a 0 reference line — the calibration
@@ -240,10 +260,17 @@ struct DeckSignalPanel: View {
                     .foregroundStyle(DubColor.textPrimary)
                     .monospacedDigit()
             }
-            Canvas { ctx, size in
-                drawTrace(ctx, size: size,
-                          history: pitchHistory,
-                          tint: lockColor(t.lockState, hasInput: t.hasTimecodeInput))
+            // The one thing here that runs at 20 Hz, and it is its own
+            // `TimelineView` so the rate stays inside this Canvas
+            // rather than dragging the panel around it along.
+            TimelineView(.periodic(from: .now, by: 1.0 / 20.0)) { _ in
+                let live = engine.deckTelemetry(deckIdx: deckIdx)
+                Canvas { ctx, size in
+                    drawTrace(ctx, size: size,
+                              history: trace.push(live),
+                              tint: lockColor(
+                                live.lockState, hasInput: live.hasTimecodeInput))
+                }
             }
             .frame(height: 56)
             .background(DubColor.surface2.opacity(0.5))
