@@ -137,57 +137,37 @@ struct DeckSignalSlideOut: View {
     }
 }
 
-/// The pitch trace's ring buffer.
-///
-/// A class so the timeline closure can append to it without writing
-/// view state — mutating `@State` from inside a `TimelineView` body is
-/// both a side effect during evaluation and, at 20 Hz, an invalidation
-/// storm. `StillpointView` holds its engine the same way.
-@MainActor
-final class PitchTrace {
-    private var samples: [Double] = []
-    private static let maxSamples = 120
-
-    /// Record this tick and return the window to draw. Only a *live*
-    /// timecode pitch is recorded; a paused or input-less deck would
-    /// otherwise smear the trace with -100 % floor samples.
-    func push(_ t: DeckTelemetry) -> [Double] {
-        let live = t.hasTimecodeInput && t.lockState != 0
-        samples.append(live ? t.pitchPercent : .nan)
-        if samples.count > Self.maxSamples {
-            samples.removeFirst(samples.count - Self.maxSamples)
-        }
-        return samples
-    }
-}
-
 /// The panel body: one deck's signal health + calibration controls.
+///
+/// Everything live in here is drawn by `SignalScopeView`, an
+/// `NSView`. That is not a stylistic choice — see its file comment for
+/// the measurements. The short version: this window lays out on every
+/// display cycle whether or not anything changed, and the cost of that
+/// is proportional to how much view exists. Replacing the readouts with
+/// `Color.clear` took the open drawer from 18 % to 4 %, while changing
+/// how *often* they updated did nothing at all. So they are drawn.
 struct DeckSignalPanel: View {
 
     let engine: DubEngine
     let side: DeckSide
     let deckIdx: UInt64
 
-    /// Rolling pitch-% history for the stability trace (~6 s at 20 Hz).
-    ///
-    /// A reference type mutated inside the timeline closure, the same
-    /// shape `StillpointView` uses for its engine. It was `@State` fed
-    /// by a `Timer`, which meant two state writes per tick — one for
-    /// the history, one for the telemetry — and each of those re-ran
-    /// the whole view's body and invalidated layout. An open drawer
-    /// cost 15 % of a core with nothing moving.
-    @State private var trace = PitchTrace()
-
     var body: some View {
-        // **Two cadences.** Only the pitch trace needs 20 Hz — it is a
-        // stability visualiser, and a sample every 50 ms is the point
-        // of it. The readouts around it are numbers a human reads:
-        // five times a second is already faster than that is useful.
-        // Redrawing the whole panel at 20 Hz cost 20 % of a core with
-        // nothing moving, because every tick re-ran the bars, the rows
-        // and the buttons as well as the one Canvas that had changed.
-        TimelineView(.periodic(from: .now, by: 1.0 / 5.0)) { _ in
-            content(engine.deckTelemetry(deckIdx: deckIdx))
+        VStack(alignment: .leading, spacing: DubSpacing.md) {
+            SignalScopeView(engine: engine, deckIdx: deckIdx)
+                .frame(height: SignalScopeView.height)
+
+            // The buttons stay SwiftUI: they are controls with actions,
+            // they change only on click, and hand-rolling `NSButton`
+            // would trade a real affordance for nothing measurable.
+            HStack(spacing: DubSpacing.sm) {
+                Button("Calibrate") { try? engine.calibrateDeck(deckIdx: deckIdx) }
+                Button("Auto") { try? engine.setDeckAutoControl(deckIdx: deckIdx) }
+                Spacer()
+            }
+            .font(DubFont.micro)
+
+            Spacer(minLength: 0)
         }
         .padding(DubSpacing.md)
         .frame(width: DubLayout.deckSignalPanelWidth)
@@ -198,222 +178,6 @@ struct DeckSignalPanel: View {
                 .fill(DubColor.divider)
                 .frame(width: 1),
             alignment: side == .a ? .trailing : .leading)
-    }
-
-    @ViewBuilder
-    private func content(_ t: DeckTelemetry) -> some View {
-        let lockTint = lockColor(t.lockState, hasInput: t.hasTimecodeInput)
-        VStack(alignment: .leading, spacing: DubSpacing.md) {
-            HStack(spacing: DubSpacing.sm) {
-                Circle()
-                    .fill(lockTint)
-                    .frame(width: 7, height: 7)
-                Text(lockLabel(t.lockState, hasInput: t.hasTimecodeInput))
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textSecondary)
-                Spacer()
-            }
-
-            bar(label: "CONFIDENCE",
-                value: Double(t.carrierConfidence), of: 1.0,
-                tint: lockTint,
-                readout: String(format: "%.2f", t.carrierConfidence))
-
-            bar(label: "AMPLITUDE",
-                value: Double(t.carrierAmplitude), of: 0.5,
-                tint: DubColor.deckTint(side),
-                readout: String(format: "%.3f", t.carrierAmplitude))
-
-            pitchTrace(telemetry: t)
-
-            calibrationRow(telemetry: t)
-
-            driftRow(telemetry: t)
-
-            HStack(spacing: DubSpacing.sm) {
-                Button("Calibrate") { try? engine.calibrateDeck(deckIdx: deckIdx) }
-                    .disabled(!t.hasTimecodeInput)
-                Button("Auto") { try? engine.setDeckAutoControl(deckIdx: deckIdx) }
-                    .disabled(!t.controlOverridden)
-                Spacer()
-            }
-            .font(DubFont.micro)
-
-            Spacer(minLength: 0)
-        }
-    }
-
-    /// Rolling pitch-% trace with a 0 reference line — the calibration
-    /// visualizer. A calibrated needle at rest draws a flat line on the
-    /// centre; jitter shows up as vertical wander.
-    private func pitchTrace(telemetry t: DeckTelemetry) -> some View {
-        VStack(alignment: .leading, spacing: DubSpacing.xs) {
-            HStack {
-                Text("PITCH")
-                    .font(DubFont.caps).tracking(0.6)
-                    .foregroundStyle(DubColor.textSecondary)
-                Spacer()
-                Text(t.hasTimecodeInput && t.lockState != 0
-                     ? String(format: "%+.2f %%", t.pitchPercent)
-                     : "—")
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(DubColor.textPrimary)
-                    .monospacedDigit()
-            }
-            // The one thing here that runs at 20 Hz, and it is its own
-            // `TimelineView` so the rate stays inside this Canvas
-            // rather than dragging the panel around it along.
-            TimelineView(.periodic(from: .now, by: 1.0 / 20.0)) { _ in
-                let live = engine.deckTelemetry(deckIdx: deckIdx)
-                Canvas { ctx, size in
-                    drawTrace(ctx, size: size,
-                              history: trace.push(live),
-                              tint: lockColor(
-                                live.lockState, hasInput: live.hasTimecodeInput))
-                }
-            }
-            .frame(height: 56)
-            .background(DubColor.surface2.opacity(0.5))
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
-    }
-
-    private func drawTrace(_ ctx: GraphicsContext, size: CGSize, history: [Double], tint: Color) {
-        let midY = size.height / 2
-        // Centre (0 %) reference.
-        var zero = Path()
-        zero.move(to: CGPoint(x: 0, y: midY)); zero.addLine(to: CGPoint(x: size.width, y: midY))
-        ctx.stroke(zero, with: .color(DubColor.divider), lineWidth: 1)
-
-        let valid = history.filter { !$0.isNaN }
-        guard valid.count > 1 else {
-            var t = ctx.resolve(Text("waiting for lock…").font(DubFont.micro))
-            t.shading = .color(DubColor.textTertiary)
-            ctx.draw(t, at: CGPoint(x: size.width / 2, y: midY + 12))
-            return
-        }
-        // Auto-scale to the spread, floored at ±1 % so a flat trace stays
-        // visibly flat instead of amplifying noise to full height.
-        let peak = max(1.0, valid.map { abs($0) }.max() ?? 1.0)
-        let n = history.count
-        var line = Path()
-        var started = false
-        for (i, v) in history.enumerated() {
-            guard !v.isNaN else { started = false; continue }
-            let x = size.width * CGFloat(i) / CGFloat(max(1, n - 1))
-            let y = midY - CGFloat(v / peak) * (size.height / 2 - 4)
-            if started { line.addLine(to: CGPoint(x: x, y: y)) }
-            else { line.move(to: CGPoint(x: x, y: y)); started = true }
-        }
-        ctx.stroke(line, with: .color(tint), style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
-        // Scale caption.
-        var cap = ctx.resolve(Text(String(format: "±%.1f%%", peak)).font(DubFont.micro))
-        cap.shading = .color(DubColor.textTertiary)
-        ctx.draw(cap, at: CGPoint(x: size.width - 4, y: 9), anchor: .trailing)
-    }
-
-    /// Source classification + control mode + calibration state line.
-    private func calibrationRow(telemetry t: DeckTelemetry) -> some View {
-        HStack(spacing: DubSpacing.sm) {
-            tag(sourceClassLabel(t), DubColor.textSecondary)
-            tag(t.controlMode == 1 ? "Timecode drive" : "Internal",
-                t.controlMode == 1 ? DubColor.stateLocked : DubColor.textTertiary)
-            Spacer()
-            // One story at a time: while the deck is still measuring
-            // (whitening + pitch stabilization — the same condition
-            // that holds playback and draws the header line), showing
-            // a green "Calibrated ✓" next to "Measuring…" read as a
-            // contradiction on-rig. The whitening badge only appears
-            // once the deck is fully ready.
-            if !t.pitchSettled {
-                tag("Measuring…", DubColor.stateTentative)
-            } else {
-                calibrationBadge(t)
-            }
-            if t.controlOverridden {
-                tag("PINNED", DubColor.stateTentative)
-            }
-        }
-    }
-
-    /// Sticker-drift readout: how far the relative-mode playhead has
-    /// slid against the absolute groove position since the engagement
-    /// anchor. Measured live off the LFSR decode while ABS-locked;
-    /// holds the last reading through relative-only gaps. NaN until the
-    /// first locked observation.
-    private func driftRow(telemetry t: DeckTelemetry) -> some View {
-        HStack {
-            Text("STICKER DRIFT")
-                .font(DubFont.caps).tracking(0.6)
-                .foregroundStyle(DubColor.textSecondary)
-            Spacer()
-            if t.stickerDriftMs.isNaN {
-                Text("—")
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(DubColor.textTertiary)
-            } else {
-                Text(String(format: "%+.1f ms", t.stickerDriftMs))
-                    .font(DubFont.numericInline)
-                    .foregroundStyle(abs(t.stickerDriftMs) < 5
-                                     ? DubColor.textPrimary
-                                     : DubColor.stateTentative)
-                    .monospacedDigit()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func calibrationBadge(_ t: DeckTelemetry) -> some View {
-        if t.calibrating {
-            tag("Calibrating…", DubColor.stateTentative)
-        } else if t.calibrated {
-            tag("Calibrated ✓", DubColor.stateLocked)
-        } else {
-            tag("Not calibrated", DubColor.textTertiary)
-        }
-    }
-
-    private func tag(_ text: String, _ color: Color) -> some View {
-        Text(text)
-            .font(DubFont.micro)
-            .foregroundStyle(color)
-    }
-
-    private func sourceClassLabel(_ t: DeckTelemetry) -> String {
-        guard t.hasTimecodeInput else { return "No input" }
-        switch t.sourceClass {
-        case 1:  return "Timecode"
-        case 2:  return "Real record"
-        default: return "Silence"
-        }
-    }
-
-    /// A labelled horizontal meter. `value` is clamped to `[0, of]`.
-    private func bar(label: String, value: Double, of full: Double, tint: Color, readout: String) -> some View {
-        VStack(alignment: .leading, spacing: DubSpacing.xs) {
-            HStack {
-                Text(label)
-                    .font(DubFont.caps)
-                    .tracking(0.6)
-                    .foregroundStyle(DubColor.textSecondary)
-                Spacer()
-                Text(readout)
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-                    .monospacedDigit()
-            }
-            GeometryReader { geo in
-                let frac = max(0, min(1, value / full))
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(DubColor.surface2)
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(tint)
-                        .frame(width: geo.size.width * frac)
-                }
-            }
-            .frame(height: 8)
-        }
     }
 }
 
