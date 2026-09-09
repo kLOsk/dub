@@ -53,7 +53,10 @@ extension PerformanceView {
     /// loads; PRD §6.4: the pane surfaces the 200 ms red flash when
     /// a load fails because the target deck is currently playing.
     @ViewBuilder
-    func deckPane(side: DeckSide, deckIdx: UInt64, enabled: Bool) -> some View {
+    func deckPane(
+        side: DeckSide, deckIdx: UInt64, enabled: Bool,
+        columnWidth: CGFloat? = nil
+    ) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
         let hasSource = enabled && (deckState.hasTrack
                                     || (model.engineMode == .timecode && model.isRunning))
@@ -110,7 +113,7 @@ extension PerformanceView {
                 // the strip never reaches its cap.
                 HStack(spacing: 0) {
                     if side == .a {
-                        deckColumn(side: side, deckIdx: deckIdx)
+                        deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
@@ -120,7 +123,7 @@ extension PerformanceView {
                             side: side, deckIdx: deckIdx,
                             hasSource: hasSource)
                             .layoutPriority(1)
-                        deckColumn(side: side, deckIdx: deckIdx)
+                        deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
                     }
                 }
             case .horizontal:
@@ -157,7 +160,7 @@ extension PerformanceView {
     /// rows and the loop need side by side; below it the bank drops to
     /// one column on its own.
     @ViewBuilder
-    func deckColumn(side: DeckSide, deckIdx: UInt64) -> some View {
+    func deckColumn(side: DeckSide, deckIdx: UInt64, width: CGFloat?) -> some View {
         DeckColumn(
             state: deckColumnState(side: side),
             callbacks: deckColumnCallbacks(side: side),
@@ -172,10 +175,10 @@ extension PerformanceView {
             }
         }
         .equatable()
-        .frame(
-            minWidth: DubLayout.performanceDeckColumnMinWidth,
-            maxWidth: .infinity,
-            alignment: .leading)
+        // A resolved width, handed down from the one `GeometryReader`
+        // over the deck row — see `PerformanceView.perfColumnWidth`.
+        // `nil` only in Prep, which does not draw this column.
+        .frame(width: width ?? DubLayout.performanceDeckColumnMinWidth, alignment: .leading)
     }
 
     /// The width-capped centre column inside a `deckPane` —

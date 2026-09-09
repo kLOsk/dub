@@ -1374,6 +1374,16 @@ final class WaveformAppModel: ObservableObject {
         // exercised without a real interface. When the override is
         // nil, fall through to hardware auto-detect.
         #if DEBUG
+        // `-dubForceMode perf|prep` on the command line, for profiling
+        // and for driving the surface from a script. The Preferences
+        // toggle is a `@Published` that resets every launch, which
+        // makes Performance unreachable without a DJ interface and a
+        // human to click — and Performance is the surface whose render
+        // cost needs measuring.
+        if let arg = UserDefaults.standard.string(forKey: "dubForceMode") {
+            engineMode = arg.lowercased().hasPrefix("perf") ? .timecode : .prep
+            return
+        }
         if let forced = devForcedMode {
             engineMode = forced
             return

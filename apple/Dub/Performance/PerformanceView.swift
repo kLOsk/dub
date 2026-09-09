@@ -456,28 +456,58 @@ struct PerformanceView: View {
             .frame(minHeight: DubLayout.prepRegionMinHeight)
             .background(DubColor.divider)
         } else {
-            HStack(spacing: 1) {
-                deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
-                // Centre gutter: Stillpoint, the round-3 beatmatch aid
-                // (docs/investigations/BEATMATCH-AID-STILLPOINT.md).
-                // One incoming-tinted band on the lock line: drifts =
-                // tempo off, frozen = matched, seated on the line =
-                // in, green line grows per beat held. Replaces the
-                // rejected round-2 candidates (`BeatmatchStackView`,
-                // kept in-tree until the rig verdict).
-                StillpointView(model: model)
-                    .frame(width: DubLayout.stillpointGutterWidth)
-                    .frame(maxHeight: .infinity)
-                deckPane(side: .b, deckIdx: 1, enabled: deckBEnabled)
+            // **One measurement, then fixed frames.** The deck column
+            // used to be `maxWidth: .infinity` and the strip beside it
+            // `layoutPriority(1)` with a cap, so SwiftUI negotiated the
+            // split on every layout pass — and AppKit lays this window
+            // out on every display cycle. With the column's contents
+            // being what they now are, that negotiation cost 25 points
+            // of CPU on an idle surface: measured 46 % flexible against
+            // 19 % with the width pinned. Reading the pane width once
+            // and handing both panes a resolved number makes the pass
+            // arithmetic instead of a search.
+            GeometryReader { geo in
+                perfDeckRow(columnWidth: perfColumnWidth(paneWidth: geo.size.width))
             }
-            // No `minHeight` here. `DeckLibrarySplit` assigns this
-            // region an explicit height and `DeckLibrarySplit` owns the
-            // floor. A `minHeight` inside an explicitly-framed parent
-            // reports and draws its minimum regardless of the frame —
-            // which is precisely how the pad column came to be painted
-            // over by the bar below it.
             .background(DubColor.divider)
         }
+    }
+
+    /// Half of what the strips and the centre gutter do not take, never
+    /// below the column's floor.
+    private func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
+        let claimed = DubLayout.performanceWaveformWidthCap * 2
+            + DubLayout.stillpointGutterWidth + 2
+        return max(
+            DubLayout.performanceDeckColumnMinWidth,
+            ((paneWidth - claimed) / 2).rounded(.down))
+    }
+
+    @ViewBuilder
+    private func perfDeckRow(columnWidth: CGFloat) -> some View {
+        HStack(spacing: 1) {
+            deckPane(
+                side: .a, deckIdx: 0, enabled: deckAEnabled,
+                columnWidth: columnWidth)
+            // Centre gutter: Stillpoint, the round-3 beatmatch aid
+            // (docs/investigations/BEATMATCH-AID-STILLPOINT.md).
+            // One incoming-tinted band on the lock line: drifts =
+            // tempo off, frozen = matched, seated on the line =
+            // in, green line grows per beat held. Replaces the
+            // rejected round-2 candidates (`BeatmatchStackView`,
+            // kept in-tree until the rig verdict).
+            StillpointView(model: model)
+                .frame(width: DubLayout.stillpointGutterWidth)
+                .frame(maxHeight: .infinity)
+            deckPane(
+                side: .b, deckIdx: 1, enabled: deckBEnabled,
+                columnWidth: columnWidth)
+        }
+        // No `minHeight` here. `DeckLibrarySplit` assigns this region
+        // an explicit height and owns the floor. A `minHeight` inside
+        // an explicitly-framed parent reports and draws its minimum
+        // regardless of the frame — which is precisely how the pad
+        // column came to be painted over by the bar below it.
     }
 
     /// Prep-mode horizontal Track-Overview strip stacked above
