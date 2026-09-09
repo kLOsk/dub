@@ -42,6 +42,15 @@ enum DubColor {
     /// as "stage" rather than "spreadsheet."
     static let surface0 = Color(hex: 0x0B0C0F)
 
+    /// The playing waveform's ground, on both decks and whether or not
+    /// a track is loaded.
+    ///
+    /// The Metal lane clears to this; the idle pane painted `surface0`
+    /// instead, so a deck visibly changed shade the moment a track
+    /// landed. Mirrors `WaveformRenderer.laneClearRGB` — change one and
+    /// `WaveformLaneColourTests` fails.
+    static let waveformLane = Color(hex: 0x121214)
+
     /// Deck header / status strip background.
     static let surface1 = Color(hex: 0x14161B)
 
@@ -506,7 +515,7 @@ enum DubLayout {
     /// whether or not a timecode input is present, which cost the
     /// column 32 pt, and four rows at 24 is where that came back from.
     /// `test_deckColumn_fitsThePane_onALaptopScreen` is the ceiling.
-    static let cueRowHeight: CGFloat = 22
+    static let cueRowHeight: CGFloat = 30
 
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`

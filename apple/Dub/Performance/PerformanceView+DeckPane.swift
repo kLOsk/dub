@@ -142,7 +142,7 @@ extension PerformanceView {
             // toggling never reflows the Metal waveform column. Prep
             // mode is file-only — no timecode chrome there.
             if waveformOrientation == .vertical {
-                DeckSignalSlideOut(model: model, side: side, deckIdx: deckIdx)
+                DeckSignalSlideOut(engine: model.engine, side: side, deckIdx: deckIdx)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -206,7 +206,7 @@ extension PerformanceView {
                     loopActive: deckState.loopActive,
                     loopInSecs: deckState.loopInSecs,
                     loopOutSecs: deckState.loopOutSecs)
-                    .background(DubColor.surface0)
+                    .background(DubColor.waveformLane)
             } else {
                 idlePane(side: side)
             }
@@ -319,7 +319,9 @@ extension PerformanceView {
         let orientation = waveformOrientation
         return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                DubColor.surface0
+                // The lane's colour, not the app's ground — an empty
+                // deck and a loaded one are the same surface.
+                DubColor.waveformLane
                 PlayheadMarker(
                     orientation: orientation,
                     size: geo.size,

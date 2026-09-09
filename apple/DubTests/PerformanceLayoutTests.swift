@@ -88,13 +88,35 @@ final class PerformanceLayoutTests: XCTestCase {
             - DubLayout.stillpointGutterWidth - 2) / 2
     }
 
-    func test_deckColumn_fitsThePane_onALaptopScreen() {
+    /// The ceiling is a 1080 pt screen, not a 900 pt one.
+    ///
+    /// It was 900. Eight named cue rows at a size readable from a deck,
+    /// plus the library share Daniel asked for, do not both fit a 900 pt
+    /// window — something has to give and the honest answer is that on
+    /// the shortest supported screen the column scrolls, which is what
+    /// the `ViewThatFits` fallback is for. Above 1080 it never does.
+    func test_deckColumn_fitsThePane_onA1080Screen() {
+        let chrome = DubLayout.rackBarHeight + 1
+        let total = 1080 - DubLayout.statusStripHeight
+        let pane = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .timecode, total: total, deckChrome: chrome,
+            deckMinimum: DubLayout.waveformMinHeight) - chrome
         let size = fittingSize(
             DeckColumn(state: Self.columnFixture) { Color.clear },
             width: columnWidthAt1440)
         XCTAssertLessThanOrEqual(
-            size.height, paneHeight + 0.5,
-            "deck column overflows the 1440×900 pane")
+            size.height, pane + 0.5, "deck column overflows a 1080 pt screen")
+    }
+
+    /// And on a 900 pt one it does not fit, stated deliberately rather
+    /// than left to be discovered. If this starts passing the column got
+    /// shorter — fold it back into the test above and delete the scroll
+    /// fallback.
+    func test_deckColumn_needsTheScrollFallback_at900() {
+        let size = fittingSize(
+            DeckColumn(state: Self.columnFixture) { Color.clear },
+            width: columnWidthAt1440)
+        XCTAssertGreaterThan(size.height, paneHeight)
     }
 
     /// Two cue columns have to fit, at every width from the column's

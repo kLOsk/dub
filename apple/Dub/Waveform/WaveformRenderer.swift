@@ -1242,8 +1242,11 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         }
         let msaaTex = ensureMSAATexture(matching: drawable.texture)
         let passDescriptor = MTLRenderPassDescriptor()
-        passDescriptor.colorAttachments[0].clearColor =
-            MTLClearColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
+        passDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+            red: Double(Self.laneClearRGB.x),
+            green: Double(Self.laneClearRGB.y),
+            blue: Double(Self.laneClearRGB.z),
+            alpha: 1.0)
         passDescriptor.colorAttachments[0].loadAction = .clear
         if let msaaTex {
             passDescriptor.colorAttachments[0].texture = msaaTex
@@ -1883,6 +1886,13 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private static func beatTickRGBA(alpha: Float) -> SIMD4<Float> {
         SIMD4(232.0 / 255.0, 232.0 / 255.0, 232.0 / 255.0, alpha)
     }
+
+    /// The lane's ground. Exposed because the *unloaded* pane is drawn
+    /// in SwiftUI, not Metal, and has to be the same colour — a deck
+    /// that changed shade when a track loaded read as two different
+    /// surfaces. `DubColor.waveformLane` is the SwiftUI side of this
+    /// pair and `WaveformLaneColourTests` holds them together.
+    static let laneClearRGB = SIMD3<Float>(0.07, 0.07, 0.08)
 
     /// Hot cue marker tint — a vivid magenta-pink picked to be hue-
     /// AND luminance-distinct from both deck tints (amber, teal) and

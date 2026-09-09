@@ -316,7 +316,12 @@ struct TrackOverviewView: View {
         // two-tone "shadow" the earlier hull + RMS-core split produced. A
         // crisp top contour line defines the energy shape against the dark
         // strip so it doesn't ghost out.
-        let tint = DubColor.deckTint(side)
+        // One colour for both decks. The overview is a *map*, read to
+        // find a place in the track — deck identity is carried by the
+        // playing strip, the pads and the column around it, and tinting
+        // the map too made deck B's read as a different kind of object
+        // rather than the same one on the other side.
+        let tint = DubColor.deckATint
         let gradient = Gradient(colors: [tint.opacity(0.95), tint.opacity(0.5)])
         let contourColor = tint.opacity(1.0)
 

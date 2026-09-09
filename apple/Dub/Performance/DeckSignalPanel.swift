@@ -28,9 +28,24 @@ import DubCore
 /// out from the window-left edge, deck B from the window-right.
 struct DeckSignalSlideOut: View {
 
-    @ObservedObject var model: WaveformAppModel
+    /// The engine, not the model.
+    ///
+    /// Both views here only ever reached through to `model.engine`, but
+    /// observing the model meant every published change anywhere in the
+    /// app — playhead, deck state, telemetry heartbeat — re-rendered
+    /// the panel *and* made a fresh `deckTelemetry` call across the
+    /// FFI, because that call sat inside `body`. During playback that
+    /// is continuous, and it is why the drawer felt laggy. Telemetry is
+    /// polled on its own timer now and nothing else can trigger a
+    /// redraw.
+    let engine: DubEngine
     let side: DeckSide
     let deckIdx: UInt64
+
+    /// Polled, not read inside `body`. Four times a second is plenty
+    /// for a lock dot, and it holds whether the panel is open or shut.
+    @State private var telemetry: DeckTelemetry?
+    private let dotTick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     @State private var open = false
 
@@ -50,7 +65,7 @@ struct DeckSignalSlideOut: View {
     }
 
     private var panel: some View {
-        DeckSignalPanel(model: model, side: side, deckIdx: deckIdx)
+        DeckSignalPanel(engine: engine, side: side, deckIdx: deckIdx)
             .transition(.move(edge: side == .a ? .leading : .trailing)
                 .combined(with: .opacity))
     }
@@ -58,7 +73,7 @@ struct DeckSignalSlideOut: View {
     /// Slim always-visible toggle: vertical SIGNAL caps + the PRD §5.4
     /// tracking dot, so signal health is glanceable even while closed.
     private var tab: some View {
-        let t = model.engine.deckTelemetry(deckIdx: deckIdx)
+        let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)
         return Button {
             open.toggle()
         } label: {
@@ -80,15 +95,21 @@ struct DeckSignalSlideOut: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Toggle deck \(side.label) signal panel")
+        .onReceive(dotTick) { _ in telemetry = engine.deckTelemetry(deckIdx: deckIdx) }
     }
 }
 
 /// The panel body: one deck's signal health + calibration controls.
 struct DeckSignalPanel: View {
 
-    @ObservedObject var model: WaveformAppModel
+    let engine: DubEngine
     let side: DeckSide
     let deckIdx: UInt64
+
+    /// Polled on the same 20 Hz tick that samples the pitch trace, so
+    /// the panel redraws at a fixed cadence rather than whenever the
+    /// app happens to publish something.
+    @State private var telemetry: DeckTelemetry?
 
     /// Rolling pitch-% history for the stability trace (~6 s at 20 Hz).
     @State private var pitchHistory: [Double] = []
@@ -96,7 +117,7 @@ struct DeckSignalPanel: View {
     private let tick = Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        let t = model.engine.deckTelemetry(deckIdx: deckIdx)
+        let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)
         let lockTint = lockColor(t.lockState, hasInput: t.hasTimecodeInput)
         VStack(alignment: .leading, spacing: DubSpacing.md) {
             HStack(spacing: DubSpacing.sm) {
@@ -126,9 +147,9 @@ struct DeckSignalPanel: View {
             driftRow(telemetry: t)
 
             HStack(spacing: DubSpacing.sm) {
-                Button("Calibrate") { try? model.engine.calibrateDeck(deckIdx: deckIdx) }
+                Button("Calibrate") { try? engine.calibrateDeck(deckIdx: deckIdx) }
                     .disabled(!t.hasTimecodeInput)
-                Button("Auto") { try? model.engine.setDeckAutoControl(deckIdx: deckIdx) }
+                Button("Auto") { try? engine.setDeckAutoControl(deckIdx: deckIdx) }
                     .disabled(!t.controlOverridden)
                 Spacer()
             }
@@ -146,11 +167,14 @@ struct DeckSignalPanel: View {
                 .frame(width: 1),
             alignment: side == .a ? .trailing : .leading
         )
-        .onReceive(tick) { _ in samplePitch() }
+        .onReceive(tick) { _ in
+            telemetry = engine.deckTelemetry(deckIdx: deckIdx)
+            samplePitch()
+        }
     }
 
     private func samplePitch() {
-        let t = model.engine.deckTelemetry(deckIdx: deckIdx)
+        let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)
         // Only record a live timecode pitch; a paused / no-input deck
         // would otherwise smear the trace with -100 % floor samples.
         let playing = t.hasTimecodeInput && t.lockState != 0
@@ -349,5 +373,5 @@ func lockLabel(_ state: UInt8, hasInput: Bool) -> String {
 }
 
 #Preview("Deck signal panel") {
-    DeckSignalPanel(model: WaveformAppModel(), side: .a, deckIdx: 0)
+    DeckSignalPanel(engine: WaveformAppModel().engine, side: .a, deckIdx: 0)
 }

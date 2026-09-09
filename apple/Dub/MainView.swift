@@ -5068,14 +5068,20 @@ final class WaveformAppModel: ObservableObject {
     func toggleEcho(_ side: DeckSide, divisionBeats: Double) {
         guard isRunning, echoOutEnabled else { return }
         var deck = state(for: side)
-        if deck.echoDivision == divisionBeats {
-            releaseEcho(side)
-            deck.echoDivision = nil
-        } else {
-            engageEcho(side, divisionBeats: divisionBeats)
-            deck.echoDivision = divisionBeats
-        }
+        let engaging = deck.echoDivision != divisionBeats
+        // Paint first, then do the engine work — the same optimistic
+        // order the track load uses. `engageEcho` crosses the FFI to
+        // build and arm the echo, and the button was waiting on that
+        // before it lit: the audio changed at the press and the pad a
+        // visible moment later, which reads as an unresponsive control
+        // even though nothing was actually late.
+        deck.echoDivision = engaging ? divisionBeats : nil
         setState(deck, for: side)
+        if engaging {
+            engageEcho(side, divisionBeats: divisionBeats)
+        } else {
+            releaseEcho(side)
+        }
     }
 
     /// Toggle the single 1-beat echo-out on `side` (the one ECHO OUT button).
