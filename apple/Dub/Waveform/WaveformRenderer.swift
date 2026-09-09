@@ -2050,10 +2050,36 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // Retina). Bars (downbeats): visible 3.5 px wide.
         let beatVisibleHalfPx: Float = 0.75
         let barVisibleHalfPx: Float = 1.75
-        let beatVisibleHalfNDC = beatVisibleHalfPx / timeAxisPixels
-        let barVisibleHalfNDC = barVisibleHalfPx / timeAxisPixels
-        let beatQuadHalfNDC = (beatVisibleHalfPx + 1.0) / timeAxisPixels
-        let barQuadHalfNDC = (barVisibleHalfPx + 1.0) / timeAxisPixels
+
+        // **Clip space spans 2 NDC units, not 1.** Every width here is
+        // authored in device pixels, and the conversion divided by
+        // `timeAxisPixels` alone — half the real ratio, since the axis
+        // runs -1...+1 across that many pixels. Every grid line was
+        // drawn at half its intended width: a beat tick 0.75 px
+        // instead of 1.5, a bar 1.75 instead of 3.5.
+        //
+        // That is what made the grid flicker, and why widening or
+        // recolouring the lines never fixed it — those change the
+        // input to a conversion that then halves them again. At
+        // 0.75 px a tick is sub-pixel, and the analytic AA in
+        // `beatGridFragment` degenerates there: it computes
+        // `1 - smoothstep(visibleHalf -/+ 0.5 * fwidth, dist)`, so once
+        // `visibleHalf` (0.375 px) falls below `0.5 * fwidth` (0.5 px)
+        // the lower edge goes negative and the line's peak alpha never
+        // reaches 1. Its brightness then depends on where the centre
+        // lands between fragment centres, which changes every frame as
+        // the strip scrolls. The line's *position* was smooth all
+        // along; its brightness was not.
+        //
+        // The +1 px falloff headroom was halved the same way, leaving
+        // the smoothstep less than the one pixel it needs, so the fade
+        // also clipped on the quad's hard edge — the exact failure the
+        // shader's own comment warns about.
+        let pxToNDC = 2.0 / timeAxisPixels
+        let beatVisibleHalfNDC = beatVisibleHalfPx * pxToNDC
+        let barVisibleHalfNDC = barVisibleHalfPx * pxToNDC
+        let beatQuadHalfNDC = (beatVisibleHalfPx + 1.0) * pxToNDC
+        let barQuadHalfNDC = (barVisibleHalfPx + 1.0) * pxToNDC
 
         beatGridScratchVertices.removeAll(keepingCapacity: true)
 
@@ -2076,7 +2102,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             let low = max(Float(min(inNDC, outNDC)), -1.05)
             let high = min(Float(max(inNDC, outNDC)), 1.05)
             if high > low {
-                let onePx = 1.0 / timeAxisPixels
+                let onePx = pxToNDC
                 Self.appendCrossAxisStrip(
                     vertices: &beatGridScratchVertices,
                     orientation: appearance.orientation,
@@ -2088,8 +2114,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     crossHigh: 1.0)
             }
             // Bright edges at the true in/out, only when on-screen.
-            let loopEdgeVisibleHalfNDC: Float = 1.25 / timeAxisPixels
-            let loopEdgeQuadHalfNDC: Float = (1.25 + 1.0) / timeAxisPixels
+            let loopEdgeVisibleHalfNDC: Float = 1.25 * pxToNDC
+            let loopEdgeQuadHalfNDC: Float = (1.25 + 1.0) * pxToNDC
             for edgeNDC in [Float(inNDC), Float(outNDC)] where edgeNDC >= -1.02 && edgeNDC <= 1.02 {
                 Self.appendBeatLineQuad(
                     vertices: &beatGridScratchVertices,
@@ -2186,8 +2212,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                         vertices: &beatGridScratchVertices,
                         orientation: appearance.orientation,
                         timeNDC: timeNDC,
-                        quadHalfNDC: (halfPx + 1.0) / timeAxisPixels,
-                        visibleHalfNDC: halfPx / timeAxisPixels,
+                        quadHalfNDC: (halfPx + 1.0) * pxToNDC,
+                        visibleHalfNDC: halfPx * pxToNDC,
                         color: tint,
                         isDownbeat: true)
                 }
