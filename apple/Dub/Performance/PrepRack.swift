@@ -233,7 +233,14 @@ private struct CueBank: View {
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .foregroundStyle(slot.isSet ? tint : DubColor.textPlaceholder)
                 .frame(width: 10)
-            Text(slot.mark?.name ?? (hasTrack ? "set at playhead" : "load a track"))
+            // "set at playhead" is an *instruction*, so it belongs only
+            // on an empty slot. A set-but-unnamed cue — the common case,
+            // since most are dropped mid-listen — was reading it back as
+            // if that were its name. It shows its timecode instead, and
+            // the name column stays empty until the DJ types one.
+            Text(slot.isSet
+                ? (slot.mark?.name ?? "")
+                : (hasTrack ? "set at playhead" : "load a track"))
                 .font(.system(size: 12, weight: slot.isSet ? .semibold : .regular))
                 .foregroundStyle(slot.isSet ? DubColor.textPrimary : DubColor.textPlaceholder)
                 .lineLimit(1)
@@ -369,6 +376,12 @@ private struct LoopEngine: View {
                 trailing: engaged ? "● ACTIVE" : "○ IDLE",
                 trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
 
+            // A box, but an empty one. LOOP is the only section that
+            // is a single instrument rather than a set of slots, and it
+            // needs an edge to say so. What it did not need was a
+            // *fill* behind that edge as well: the controls inside are
+            // filled, the box around them is a stroke on the bare
+            // surface, and the section stops reading as a slab.
             HStack(spacing: DubSpacing.sm) {
                 stepper("÷2", double: false)
                 sizeButtons
@@ -376,8 +389,6 @@ private struct LoopEngine: View {
             }
             .frame(height: DubLayout.prepSectionContent)
             .padding(.horizontal, DubSpacing.md)
-            .background(DubColor.surface1)
-            .clipShape(RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous)
                     .stroke(DubColor.divider, lineWidth: 1))
@@ -477,11 +488,23 @@ private struct SampleShelf: View {
                     repeating: GridItem(.flexible(), spacing: DubSpacing.xs), count: 4),
                 spacing: DubSpacing.xs
             ) {
-                ForEach(Array(slots.enumerated()), id: \.offset) { index, name in
-                    slotTile(index: index, name: name)
+                // 5-8 on top, 1-4 underneath. A numbered bank counts
+                // *up* from the row nearest the hand, the way a pad
+                // controller's rows do — reading the grid left-to-right
+                // top-to-bottom put 1 furthest from the fingers.
+                ForEach(Array(Self.slotOrder(count: slots.count)), id: \.self) { index in
+                    slotTile(index: index, name: slots[index])
                 }
             }
         }
+    }
+
+    /// Slot indices in draw order: the second half first, so the
+    /// grid's *bottom* row is 1-4. Derived rather than hard-coded so a
+    /// bank of a different size still splits down the middle.
+    static func slotOrder(count: Int) -> [Int] {
+        let half = count / 2
+        return Array(half..<count) + Array(0..<half)
     }
 
     /// One slot. Empty slots are dashed — the drop-zone convention —
