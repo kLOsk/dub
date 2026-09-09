@@ -375,7 +375,11 @@ struct LoopEngine: View {
         return Text(glyph)
             .font(.system(size: 12, weight: .medium, design: .monospaced))
             .foregroundStyle(enabled ? DubColor.textSecondary : DubColor.textPlaceholder)
-            .frame(width: 34, height: 64)
+            // Fills the box rather than a fixed 64: Performance runs
+            // this control at the echo button's height, and a stepper
+            // taller than its own box hangs out of both ends of it.
+            .frame(width: 34)
+            .frame(maxHeight: .infinity)
             .background(DubColor.surface2)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
             .overlay(

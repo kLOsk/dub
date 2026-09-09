@@ -117,23 +117,15 @@ struct DeckColumn<Overview: View>: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             identityAndReadouts
-            // The map wants air on both sides of it. At the stack's own
-            // spacing it sat hard against the artist line above and the
-            // HOTCUE heading below, and three blocks with nothing
-            // between them read as one crowded block.
-            Spacer(minLength: 0)
             overviewAndTimes
-            Spacer(minLength: 0)
             cueBank
-            Spacer(minLength: 0)
             loopAndEcho
             Spacer(minLength: 0)
         }
-        // Flexible spacers rather than fixed gaps: the pane is much
-        // taller than the column needs on any real window, and the
-        // slack is better spent between the blocks than pooled under
-        // the last one. `minLength` is what the fit tests measure, so a
-        // short pane still collapses to the tight arrangement.
+        // Tight, with the slack at the bottom. Distributing it between
+        // the blocks was tried and read as five things drifting apart
+        // rather than one instrument: a control surface wants its
+        // groups close and the empty space in one place.
         .padding(.leading, state.side == .a ? signalTabInset : DubSpacing.md)
         .padding(.trailing, state.side == .a ? DubSpacing.md : signalTabInset)
         .padding(.vertical, DubSpacing.md)
@@ -180,6 +172,13 @@ struct DeckColumn<Overview: View>: View {
     /// was a *control* rather than a readout, so it heads the column it
     /// switches. INT is the play control — see `SourceControlView`.
     private var sourceRow: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            sourceSwitch
+        }
+    }
+
+    private var sourceSwitch: some View {
         // Always drawn, even with no timecode input — `.off` is the
         // status for exactly that, and it renders the switch with no
         // segment lit. The old header band hid the switch and showed
@@ -324,7 +323,7 @@ struct DeckColumn<Overview: View>: View {
             .foregroundStyle(
                 state.echoEngaged ? DubColor.textPrimary : DubColor.textSecondary)
             .frame(maxWidth: .infinity)
-            .frame(height: 44)
+            .frame(height: DubLayout.deckColumnEchoHeight)
             .background(
                 state.echoEngaged
                     ? DubColor.deckTint(state.side).opacity(0.26) : DubColor.surface2)

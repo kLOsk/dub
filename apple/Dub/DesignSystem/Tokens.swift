@@ -326,7 +326,11 @@ enum DubLayout {
     /// scrolling, which is not something a DJ should meet mid-set. The
     /// library keeps well over `libraryMinHeight` at this fraction;
     /// `PerformanceLayoutTests` holds both ends of that.
-    static let performanceDeckFraction: CGFloat = 0.72
+    ///
+    /// Trimmed 0.72 → 0.68 once the loop box came down to the echo
+    /// button's height: that is about 15 % more library, which is where
+    /// the browsing actually happens between records.
+    static let performanceDeckFraction: CGFloat = 0.68
     /// Fixed height for the deck header (M11d.5 refresh). Sized to
     /// accommodate the 3-row layout (identity / stats / transport-
     /// and-time) at the worst-case font metric inside SwiftUI's
@@ -537,10 +541,14 @@ enum DubLayout {
     /// clears the column's floor.
     static let deckColumnEchoWidth: CGFloat = 96
 
-    /// The loop box inside Performance's column. Shorter than Prep's
-    /// 88: the column stacks six blocks where Prep's rack lays three
-    /// side by side, so height there is scarce and width is not.
-    static let deckColumnLoopHeight: CGFloat = 72
+    /// The loop box inside Performance's column — the same height as
+    /// the echo button beside it, so the pair reads as one row of
+    /// controls rather than two sizes of thing. Prep keeps its own 88;
+    /// there the section has neighbours to stay level with.
+    static let deckColumnLoopHeight: CGFloat = deckColumnEchoHeight
+
+    /// Echo out, and with it the loop box beside it.
+    static let deckColumnEchoHeight: CGFloat = 44
 
     /// The signal slide-out's tab, which sits on each deck's outer edge
     /// *over* the column. The column insets its outer padding by this

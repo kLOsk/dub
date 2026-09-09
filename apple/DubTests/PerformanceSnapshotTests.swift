@@ -132,8 +132,12 @@ final class PerformanceSnapshotTests: XCTestCase {
     private func columnFixture(
         _ state: DeckColumnState
     ) -> some View {
+        // `surface0`, not the column's own `surface1` — the real
+        // overview draws a waveform, and a placeholder that matches the
+        // ground behind it makes the baseline look like the block is
+        // missing.
         DeckColumn(state: state) {
-            Rectangle().fill(DubColor.surface1)
+            Rectangle().fill(DubColor.surface0)
         }
     }
 
