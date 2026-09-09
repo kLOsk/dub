@@ -117,9 +117,16 @@ struct DeckColumn<Overview: View>: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             identityAndReadouts
+            // A little more than the stack's own gap above the three
+            // blocks that start a new thought: the times, the marks and
+            // the loop. Eight points between everything read as one
+            // undifferentiated list.
             overviewAndTimes
+                .padding(.top, DubSpacing.sm)
             cueBank
+                .padding(.top, DubSpacing.sm)
             loopAndEcho
+                .padding(.top, DubSpacing.sm)
             Spacer(minLength: 0)
         }
         // Tight, with the slack at the bottom. Distributing it between
