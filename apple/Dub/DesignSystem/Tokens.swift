@@ -421,7 +421,7 @@ enum DubLayout {
     /// This is the *ideal*: the strip grows toward
     /// `performanceWaveformWidthCap` when the pane allows and shrinks
     /// to `performanceWaveformMinWidth` when it does not.
-    static let performanceWaveformWidth: CGFloat = 200
+    static let performanceWaveformWidth: CGFloat = 133
 
     /// Fixed width of each deck's performance-pad column. The widest
     /// row is CUE / the four LOOP lengths at 4 × 38 + 3 × 8 = 176, plus
@@ -447,8 +447,15 @@ enum DubLayout {
     /// reserved info-chip canvas. PRD §9.6.1 argues a fatter waveform
     /// buys nothing — information density per pixel peaks around 140 —
     /// so this grows the strip without chasing the whole pane.
-    static let performanceWaveformWidthCap: CGFloat = 280
-    static let performanceWaveformMinWidth: CGFloat = 132
+    ///
+    /// The min / ideal / cap triple was cut by a third (132/200/280)
+    /// to hand the width back to the deck columns, which is where the
+    /// cue names and loop controls have to fit. The cap still clears
+    /// the ~140 density knee; the floor is now under it, so a pane
+    /// narrow enough to force the strip down there is trading peak
+    /// detail for the columns on purpose.
+    static let performanceWaveformWidthCap: CGFloat = 187
+    static let performanceWaveformMinWidth: CGFloat = 88
 
     /// The shortest the Prep playing strip is allowed to get before the
     /// pad bar starts giving up height instead.
@@ -568,7 +575,14 @@ enum DubLayout {
     /// Centre gutter for Stillpoint (round 3, the shipping candidate —
     /// docs/investigations/BEATMATCH-AID-STILLPOINT.md). Spec target
     /// is 100–160 px, degradable to 80.
-    static let stillpointGutterWidth: CGFloat = 132
+    ///
+    /// Cut by a third from 132 along with the waveform strips. That
+    /// puts it *below* the spec's target band and into its degraded
+    /// range — deliberate, to widen the deck columns, but it is the
+    /// aid's own sub-spec being spent rather than slack. If drift
+    /// becomes hard to read on the rig, this is the first number to
+    /// put back.
+    static let stillpointGutterWidth: CGFloat = 88
 
     /// Height of the horizontal playing-waveform strip in Prep
     /// mode. ≈ half the vertical-mode `waveformMinHeight`, sized
