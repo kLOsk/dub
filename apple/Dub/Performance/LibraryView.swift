@@ -1692,6 +1692,11 @@ struct LibraryView: View {
     /// thing being imported into actually is.
     @ViewBuilder
     var importMenuItems: some View {
+            // A titled section: a bare list of "Folder… / Serato… /
+            // Traktor…" in a context menu does not say what it will do
+            // with them.
+            Text("Import")
+            Divider()
             Button {
                 presentImportFolderPicker()
             } label: {

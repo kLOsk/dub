@@ -237,10 +237,18 @@ struct DeckColumn<Overview: View>: View {
     /// The source switch is the only part of the old header band that
     /// was a *control* rather than a readout, so it heads the column it
     /// switches. INT is the play control — see `SourceControlView`.
+    /// The switch sits on the column's *inner* edge — toward the
+    /// strip it drives. Deck A's column is left of its waveform so the
+    /// switch is right-aligned; deck B's is right of its waveform so it
+    /// is left-aligned. Mirroring only this: the readouts and the marks
+    /// stay left-aligned on both, because a DJ reads them in the same
+    /// place on either deck (the headers were de-mirrored for exactly
+    /// that reason).
     private var sourceRow: some View {
         HStack(spacing: 0) {
-            Spacer(minLength: DubSpacing.lg)
+            if state.side == .a { Spacer(minLength: DubSpacing.lg) }
             sourceSwitch
+            if state.side == .b { Spacer(minLength: DubSpacing.lg) }
         }
         .padding(.bottom, DubSpacing.xs)
     }

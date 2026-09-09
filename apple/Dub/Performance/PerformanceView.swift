@@ -470,7 +470,6 @@ struct PerformanceView: View {
                 perfDeckRow(columnWidth: perfColumnWidth(paneWidth: geo.size.width))
             }
             .background(DubColor.divider)
-            .onHover { deckRowHovered = $0 }
         }
     }
 
@@ -482,10 +481,11 @@ struct PerformanceView: View {
     /// to find when you open the app in a booth.
     @State private var waveZoomIndex = WaveformZoom.defaultIndex
 
-    /// Drives the zoom control's fade. The whole deck row counts as
-    /// "over the waveform": the control lives between the strips, so a
-    /// pointer travelling to it must not dismiss it on the way.
-    @State private var deckRowHovered = false
+    /// Drives the zoom control's fade. The *strips* and the gutter
+    /// between them count, not the deck columns either side — a
+    /// control that appears while you are reading cue names is
+    /// answering a question nobody asked.
+    @State var waveformHovered = false
 
     private func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
         let claimed = DubLayout.performanceWaveformWidthCap * 2
@@ -512,13 +512,16 @@ struct PerformanceView: View {
             VStack(spacing: 0) {
                 // The zoom control heads the gutter: the one place both
                 // strips can see it, and out of the way of either.
-                WaveformZoomControl(index: $waveZoomIndex, visible: deckRowHovered)
+                WaveformZoomControl(index: $waveZoomIndex, visible: waveformHovered)
                     .padding(.top, DubSpacing.sm)
                 StillpointView(model: model)
                     .frame(maxHeight: .infinity)
             }
             .frame(width: DubLayout.stillpointGutterWidth)
             .frame(maxHeight: .infinity)
+            // The gutter counts as "over the waveform" so the pointer
+            // can travel to the control without dismissing it.
+            .onHover { waveformHovered = $0 }
             deckPane(
                 side: .b, deckIdx: 1, enabled: deckBEnabled,
                 columnWidth: columnWidth,

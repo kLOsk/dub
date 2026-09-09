@@ -31,10 +31,13 @@ import SwiftUI
 /// glance-and-press control on a performance surface — you want the
 /// same view back, not a value you have to re-find.
 enum WaveformZoom {
-    static let steps: [Double] = [0.5, 0.7, 1.0, 1.4, 2.0, 2.8]
+    /// Stops at 2.0 because that is where the renderer's one-pixel
+    /// column floor lands with a 2 px base — a rung past it would
+    /// redraw the same picture and read as a broken button.
+    static let steps: [Double] = [0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0]
 
     /// `1.0` — the shipped Performance scale.
-    static let defaultIndex = 2
+    static let defaultIndex = 4
 
     static func label(_ index: Int) -> String {
         let z = steps[min(max(index, 0), steps.count - 1)]

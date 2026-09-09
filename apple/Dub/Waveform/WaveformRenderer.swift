@@ -422,11 +422,22 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     nonisolated public static let prepModeTimeAxisZoom: Double = 1.2
 
     /// Effective drawable pixels per drawn column for a given
-    /// time-axis zoom. Values > 1.0 zoom out (more seconds visible).
+    /// time-axis zoom. Values above 1.0 show *more* seconds, below 1.0
+    /// fewer.
+    ///
+    /// The lower bound used to be `max(1.0, timeAxisZoom)`, from when
+    /// the only caller was Prep asking for 20 % more audio. That
+    /// silently discarded every zoom-*in* the new control can ask for —
+    /// 0.5 and 0.7 both resolved to 1.0 and drew the same picture.
+    ///
+    /// The floor that remains is real: a drawn column cannot be
+    /// narrower than one drawable pixel, so with a 2 px base the
+    /// furthest out anything can go is 2.0. `WaveformZoom.steps` stops
+    /// there rather than offering rungs that do nothing.
     nonisolated public static func effectivePixelsPerDrawnColumn(
         timeAxisZoom: Double
     ) -> Double {
-        let zoom = max(1.0, timeAxisZoom)
+        let zoom = max(0.05, timeAxisZoom)
         return max(1.0, Double(pixelsPerDrawnColumn) / zoom)
     }
 

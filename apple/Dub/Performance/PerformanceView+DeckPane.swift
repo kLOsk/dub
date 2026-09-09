@@ -217,6 +217,8 @@ extension PerformanceView {
                 idlePane(side: side)
             }
         }
+        let hoverTracked = content
+            .onHover { waveformHovered = $0 }
         switch orientation {
         case .vertical:
             // Fixed, moderate width (Scratch-Live-style): the overview
@@ -224,7 +226,7 @@ extension PerformanceView {
             // space holds the performance pads. Full-bleed was wrong —
             // a vertical scratch waveform wants time-history, not a
             // metre of horizontal peak detail.
-            content
+            hoverTracked
                 .frame(
                     minWidth: DubLayout.performanceWaveformMinWidth,
                     idealWidth: DubLayout.performanceWaveformWidth,
