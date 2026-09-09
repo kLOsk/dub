@@ -293,9 +293,13 @@ struct DeckColumn<Overview: View>: View {
                     state.header.trackTitle == nil
                         ? DubColor.textPlaceholder : DubColor.textPrimary)
                 .lineLimit(2)
+            // A step below the title, not level with it. The two ran
+            // at `textPrimary` and `textSecondary`, which is a small
+            // enough gap that at a glance the pair read as one block of
+            // text rather than as a name and its artist.
             Text(state.header.trackArtist ?? "—")
                 .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
+                .foregroundStyle(DubColor.textTertiary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -366,10 +370,10 @@ struct DeckColumn<Overview: View>: View {
             if state.echoEnabled {
                 VStack(alignment: .leading, spacing: DubSpacing.sm) {
                     SectionHeading(
-                        title: "ECHO", accent: DubColor.deckTint(state.side),
+                        title: "ECHO", accent: DubColor.controlAccent,
                         trailing: state.echoEngaged ? "● ON" : "○ OFF",
                         trailingAccent: state.echoEngaged
-                            ? DubColor.deckTint(state.side) : DubColor.textPlaceholder)
+                            ? DubColor.controlAccent : DubColor.textPlaceholder)
                     echoButton
                 }
                 .frame(width: DubLayout.deckColumnEchoWidth)
@@ -405,13 +409,13 @@ struct DeckColumn<Overview: View>: View {
             .frame(height: DubLayout.deckColumnEchoHeight)
             .background(
                 state.echoEngaged
-                    ? DubColor.deckTint(state.side).opacity(0.26) : DubColor.surface2)
+                    ? DubColor.controlAccent.opacity(0.26) : DubColor.surface2)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
                     .stroke(
                         state.echoEngaged
-                            ? DubColor.deckTint(state.side) : DubColor.divider,
+                            ? DubColor.controlAccent : DubColor.divider,
                         lineWidth: 1))
             .contentShape(Rectangle())
             .onPressDown(enabled: state.hasTrack) { callbacks.onEchoToggle() }

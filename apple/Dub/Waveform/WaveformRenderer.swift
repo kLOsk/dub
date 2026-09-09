@@ -1879,13 +1879,16 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         return Double(1.0 - 0.5 * frac) + Double(pastSubChunkOffsetNDC)
     }
 
-    private static func deckTintRGBA(side: DeckSide, alpha: Float) -> SIMD4<Float> {
-        switch side {
-        case .a:
-            return SIMD4(196.0 / 255.0, 145.0 / 255.0, 87.0 / 255.0, alpha)
-        case .b:
-            return SIMD4(90.0 / 255.0, 128.0 / 255.0, 136.0 / 255.0, alpha)
-        }
+    /// The downbeat's colour. One amber on both decks — mirror of
+    /// `DubColor.controlAccent`.
+    ///
+    /// It used to be the deck's own tint, so the two strips drew their
+    /// bar lines in different colours. A DJ lays the strips side by
+    /// side precisely to compare them, and comparing is harder when the
+    /// two are rendered in different palettes; deck identity is carried
+    /// by the track overview beside each strip instead.
+    private static func downbeatRGBA(alpha: Float) -> SIMD4<Float> {
+        SIMD4(196.0 / 255.0, 145.0 / 255.0, 87.0 / 255.0, alpha)
     }
 
     /// Off-white used for beat ticks. Picked just below pure white
@@ -2078,7 +2081,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                         timeNDC: Float(timeNDC),
                         quadHalfNDC: barQuadHalfNDC,
                         visibleHalfNDC: barVisibleHalfNDC,
-                        color: Self.deckTintRGBA(side: appearance.side, alpha: 1.0),
+                        color: Self.downbeatRGBA(alpha: 1.0),
                         isDownbeat: true)
                 } else {
                     Self.appendMirroredBeatTick(

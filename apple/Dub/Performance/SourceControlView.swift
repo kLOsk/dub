@@ -100,7 +100,7 @@ struct SourceControlView: View {
             .foregroundStyle(playingInternally ? DubColor.surface0 : DubColor.textSecondary)
             .frame(minWidth: 22)
             .padding(.vertical, 4)
-            .background(playingInternally ? DubColor.deckTint(side) : Color.clear)
+            .background(playingInternally ? DubColor.controlAccent : Color.clear)
             .onPressDown { playingInternally ? onPause() : onInternal() }
             .accessibilityAddTraits(.isButton)
             .help(playingInternally ? "Pause" : "Play internally")
@@ -113,7 +113,7 @@ struct SourceControlView: View {
             .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
             .padding(.horizontal, DubSpacing.sm)
             .padding(.vertical, 3)
-            .background(active ? DubColor.deckTint(side) : Color.clear)
+            .background(active ? DubColor.controlAccent : Color.clear)
             .onPressDown(perform: action)
             .accessibilityAddTraits(.isButton)
     }
@@ -173,7 +173,7 @@ struct KeyLockControlView: View {
                     .init(KeyLockSelection.ours, "ON"),
                 ],
                 selection: selection,
-                tint: DubColor.deckTint(side),
+                tint: DubColor.controlAccent,
                 onSelect: { model.setKeyLockSelection(side: side, $0) })
         }
         .onReceive(tick) { _ in
@@ -213,7 +213,7 @@ struct PitchTestView: View {
             DubSegmentedControl(
                 segments: steps.map { .init($0, label($0), width: .minWidth(26)) },
                 selection: current,
-                tint: DubColor.deckTint(side),
+                tint: DubColor.controlAccent,
                 onSelect: { pct in model.setPrepPitch(side: side, percent: pct) })
         }
     }

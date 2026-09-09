@@ -90,6 +90,19 @@ enum DubColor {
     /// Pick a deck's accent by deck index. Asserts in debug for
     /// out-of-range indices so misuse fails loudly instead of
     /// silently falling back to deck A.
+    /// The one accent every *control* uses, on either deck.
+    ///
+    /// Controls used to light in their deck's tint, which made the
+    /// colour answer two questions at once: a lit segment was saying
+    /// both "engaged" and "this is deck B", and at a glance you could
+    /// not tell which. Deck identity lives on the track overview and
+    /// in the deck's own label; a control's colour means one thing —
+    /// this is on.
+    ///
+    /// It is `deckATint`'s amber because that is the colour the
+    /// surface already reads as "active".
+    static let controlAccent = deckATint
+
     static func deckTint(_ deck: DeckSide) -> Color {
         switch deck {
         case .a: return deckATint
