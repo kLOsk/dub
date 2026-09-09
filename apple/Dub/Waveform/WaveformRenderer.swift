@@ -2082,29 +2082,47 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // object; it should not change identity between the two places
         // you look at it.
         if !hotCueMarkers.isEmpty {
-            let cueVisibleHalfPx: Float = 2.0
-            let cueVisibleHalfNDC = cueVisibleHalfPx / timeAxisPixels
-            let cueQuadHalfNDC = (cueVisibleHalfPx + 1.0) / timeAxisPixels
+            // Two passes per cue, in paint order within the one draw
+            // call: a dark halo, then the coloured stem over it.
+            //
+            // The stem alone was 4 px of colour on a waveform that is
+            // itself saturated, and it washed out in a loud passage.
+            // The halo gives it an edge to sit against whatever is
+            // underneath, which is all it needed — a marker head at the
+            // rails was tried and read as chrome bolted onto the lane.
+            //
+            // Each stem carries its own colour, so a cue the DJ
+            // labelled `aqua` is aqua here as well as on the pad. A
+            // mark is one object; it should not change identity between
+            // the two places you look at it.
+            let stemHalfPx: Float = 2.5
+            let haloHalfPx: Float = stemHalfPx + 1.5
             for marker in hotCueMarkers
             where marker.secs.isFinite && marker.secs >= visibleStart
                 && marker.secs <= visibleEnd
             {
-                let timeNDC = Self.beatTimeNDC(
-                    beatSecs: marker.secs,
-                    peakDur: peakDur,
-                    snappedChunkF: snappedChunkF,
-                    drawnAbove: drawnAbove,
-                    drawnBelow: drawnBelow,
-                    pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-                    futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
-                Self.appendBeatLineQuad(
-                    vertices: &beatGridScratchVertices,
-                    orientation: appearance.orientation,
-                    timeNDC: Float(timeNDC),
-                    quadHalfNDC: cueQuadHalfNDC,
-                    visibleHalfNDC: cueVisibleHalfNDC,
-                    color: SIMD4(marker.rgb.x, marker.rgb.y, marker.rgb.z, 0.95),
-                    isDownbeat: true)
+                let timeNDC = Float(
+                    Self.beatTimeNDC(
+                        beatSecs: marker.secs,
+                        peakDur: peakDur,
+                        snappedChunkF: snappedChunkF,
+                        drawnAbove: drawnAbove,
+                        drawnBelow: drawnBelow,
+                        pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                        futureSubChunkOffsetNDC: futureSubChunkOffsetNDC))
+                for (halfPx, tint) in [
+                    (haloHalfPx, SIMD4<Float>(0, 0, 0, 0.6)),
+                    (stemHalfPx, SIMD4(marker.rgb.x, marker.rgb.y, marker.rgb.z, 1.0)),
+                ] {
+                    Self.appendBeatLineQuad(
+                        vertices: &beatGridScratchVertices,
+                        orientation: appearance.orientation,
+                        timeNDC: timeNDC,
+                        quadHalfNDC: (halfPx + 1.0) / timeAxisPixels,
+                        visibleHalfNDC: halfPx / timeAxisPixels,
+                        color: tint,
+                        isDownbeat: true)
+                }
             }
         }
 
