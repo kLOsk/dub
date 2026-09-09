@@ -886,6 +886,12 @@ struct DeckHeader: View {
     private var shouldHideSourcePill: Bool {
         switch state.source {
         case .file, .loading: return true
+        // `OFF` is the absence of a source, and the pane behind it
+        // already says so in full — "NO TRACK LOADED", or "ENGINE
+        // STOPPED" with the reason. A pill restating it is chrome
+        // reporting a nothing, and it is the same argument that took
+        // the status word off the source switch.
+        case .off: return true
         default: return false
         }
     }
@@ -906,7 +912,7 @@ struct DeckHeader: View {
         if state.sourceControl != nil, state.source == .file {
             return false
         }
-        if prepMode, shouldHideSourcePill {
+        if shouldHideSourcePill, prepMode || state.source == .off {
             return false
         }
         return true

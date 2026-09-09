@@ -57,6 +57,10 @@ struct DeckSignalSlideOut: View {
     @State private var dotTick =
         Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
+    /// The one curve the drawer moves on — the panel's transition and
+    /// the tab's position change are the same motion and must share it.
+    static let slide = Animation.spring(duration: 0.25)
+
     @State private var open = false
 
     var body: some View {
@@ -69,7 +73,13 @@ struct DeckSignalSlideOut: View {
                 if open { panel }
             }
         }
-        .animation(.spring(duration: 0.25), value: open)
+        // One animation for the pair. The tab is laid out by this
+        // `HStack`, so when the panel appears the tab's *position*
+        // changes — and the panel arrived on a transition with its own
+        // timing while the tab moved on this one. They ran at different
+        // speeds and a gap opened between them mid-slide. Same curve,
+        // same duration, driven by the same value.
+        .animation(DeckSignalSlideOut.slide, value: open)
         .frame(maxWidth: .infinity, maxHeight: .infinity,
                alignment: side == .a ? .leading : .trailing)
     }

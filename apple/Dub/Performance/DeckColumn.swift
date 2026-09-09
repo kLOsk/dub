@@ -41,7 +41,7 @@ import SwiftUI
 /// Everything the column draws. `header` is the same value the old
 /// header band consumed, so title, tempo, key, pitch and the source
 /// switch keep one source of truth.
-struct DeckColumnState {
+struct DeckColumnState: Equatable {
     var side: DeckSide = .a
     var header: DeckHeaderState
     var cues: [CueSlotState] = (0..<DeckState.hotCueCount).map { CueSlotState(index: $0) }
@@ -70,6 +70,22 @@ struct DeckColumnCallbacks {
     var onSetTimecode: () -> Void = {}
     var onSetThru: () -> Void = {}
     var onRecalibrate: () -> Void = {}
+}
+
+/// Skippable: SwiftUI compares `state` and rebuilds only when it moved.
+///
+/// The model polls the engine ten times a second and republishes when
+/// any field of `DeckState` changes — a pitch reading or a lock byte is
+/// enough. Without this, each of those rebuilt both columns entire:
+/// eight cue rows, the loop, the readouts, the lot. The callbacks and
+/// the overview closure are deliberately not compared; they are rebuilt
+/// every time by their call site and comparing them is impossible, but
+/// they are pure forwarders into the model and carry no state of their
+/// own.
+extension DeckColumn: Equatable {
+    static func == (lhs: DeckColumn, rhs: DeckColumn) -> Bool {
+        lhs.state == rhs.state
+    }
 }
 
 /// One deck's column.

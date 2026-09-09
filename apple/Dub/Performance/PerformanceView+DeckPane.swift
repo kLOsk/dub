@@ -171,6 +171,7 @@ extension PerformanceView {
                     height: DubLayout.deckColumnOverviewHeight)
             }
         }
+        .equatable()
         .frame(
             minWidth: DubLayout.performanceDeckColumnMinWidth,
             maxWidth: .infinity,
