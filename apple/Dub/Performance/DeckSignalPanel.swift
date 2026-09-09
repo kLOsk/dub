@@ -139,7 +139,7 @@ struct DeckSignalPanel: View {
         .padding(DubSpacing.md)
         .frame(width: 236)
         .frame(maxHeight: .infinity)
-        .background(DubColor.surface1.opacity(0.97))
+        .background(DubColor.surface2.opacity(0.97))
         .overlay(
             Rectangle()
                 .fill(DubColor.divider)
