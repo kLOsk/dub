@@ -102,14 +102,15 @@ struct DeckColumn<Overview: View>: View {
             ScrollView(.vertical, showsIndicators: false) { stack }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        // Opaque, and a step below the app's ground. The deck region
-        // paints `DubColor.divider` behind its children so the 1 pt
-        // seams between panes show through — a seam colour, not a
-        // surface — so a child that paints nothing reads as a grey slab
-        // the width of the column. This one paints `surfaceRecessed`,
-        // which also gives the column an edge against the waveform
-        // beside it without spending a border on it.
-        .background(DubColor.surfaceRecessed)
+        // `surface2`, the same ground the rack's groups use below. The
+        // column is a panel of controls flanking the strips and should
+        // read as the same kind of object the sampler and FX panel is.
+        // It has to paint *something* opaque regardless: the deck
+        // region paints `DubColor.divider` behind its children so the
+        // 1 pt seams between panes show through — a seam colour, not a
+        // surface — and a child that paints nothing reads as a grey
+        // slab the width of the column.
+        .background(DubColor.surface2)
     }
 
     private var stack: some View {

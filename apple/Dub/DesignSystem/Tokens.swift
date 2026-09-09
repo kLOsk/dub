@@ -42,12 +42,6 @@ enum DubColor {
     /// as "stage" rather than "spreadsheet."
     static let surface0 = Color(hex: 0x0B0C0F)
 
-    /// A step *below* `surface0`, for a region that should read as set
-    /// into the app's ground rather than sitting on it. Performance's
-    /// deck columns use it: they flank the playing strips, and a
-    /// recessed ground separates the two without spending a border.
-    static let surfaceRecessed = Color(hex: 0x06070A)
-
     /// Deck header / status strip background.
     static let surface1 = Color(hex: 0x14161B)
 
