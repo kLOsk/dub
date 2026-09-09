@@ -43,7 +43,18 @@ import SwiftUI
 /// switch keep one source of truth.
 struct DeckColumnState: Equatable {
     var side: DeckSide = .a
-    var header: DeckHeaderState
+
+    /// Only what the column draws — *not* the whole `DeckHeaderState`.
+    ///
+    /// It used to hold the header wholesale, which meant the column's
+    /// equality check saw fields it never renders. `measureProgress` is
+    /// a continuous 0…1 bar phase and `pitchPercent` moves with the
+    /// platter, so while a deck played the state differed on every
+    /// 10 Hz poll and `.equatable()` bought nothing: eight cue rows,
+    /// the loop and the readouts were rebuilt ten times a second
+    /// through a mix. Narrowing the state to the drawn fields is what
+    /// makes the comparison mean something.
+    var header: DeckColumnHeader
     var cues: [CueSlotState] = (0..<DeckState.hotCueCount).map { CueSlotState(index: $0) }
     var activeLoopBeats: Double?
     var loopEngaged: Bool = false
@@ -51,6 +62,30 @@ struct DeckColumnState: Equatable {
     var echoEngaged: Bool = false
     var hasTrack: Bool = false
     var isPlaying: Bool = false
+}
+
+/// The header's fields that the column actually renders.
+struct DeckColumnHeader: Equatable {
+    var trackTitle: String?
+    var trackArtist: String?
+    var bpm: Double?
+    var key: String?
+    /// Rounded to the tenth the readout prints. The raw value moves
+    /// continuously on a timecode deck, and a difference the DJ cannot
+    /// see is not a reason to rebuild the column.
+    var pitchTenths: Double?
+    var sourceControl: SourceControlStatus?
+    var sourceControlOverridden: Bool
+
+    init(_ state: DeckHeaderState) {
+        trackTitle = state.trackTitle
+        trackArtist = state.trackArtist
+        bpm = state.bpm
+        key = state.key
+        pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
+        sourceControl = state.sourceControl
+        sourceControlOverridden = state.sourceControlOverridden
+    }
 }
 
 /// Every write the column makes, as closures — the same shape as
@@ -264,7 +299,7 @@ struct DeckColumn<Overview: View>: View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
             readout("BPM", state.header.bpm.map { String(format: "%.1f", $0) })
             readout("KEY", state.header.key, tint: DubColor.camelotKey(state.header.key))
-            readout("PITCH", state.header.pitchPercent.map { String(format: "%+.1f", $0) })
+            readout("PITCH", state.header.pitchTenths.map { String(format: "%+.1f", $0) })
         }
         .fixedSize()
     }

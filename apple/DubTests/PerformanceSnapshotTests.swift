@@ -151,7 +151,7 @@ final class PerformanceSnapshotTests: XCTestCase {
     /// band, so a baseline without it would miss the thing that moved.
     private static func header(
         _ title: String?, _ artist: String?, _ bpm: Double?, _ key: String?, _ pitch: Double?
-    ) -> DeckHeaderState {
+    ) -> DeckColumnHeader {
         var state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: title, trackArtist: artist,
@@ -163,7 +163,7 @@ final class PerformanceSnapshotTests: XCTestCase {
             isPanicPlay: false, useTimecodeToggle: false,
             gridLocked: false, gridDriftQuality: nil)
         state.sourceControl = .timecode
-        return state
+        return DeckColumnHeader(state)
     }
 
     private static func columnState(

@@ -217,7 +217,7 @@ struct PerformanceView: View {
         let deck = (side == .a) ? model.deckA : model.deckB
         return DeckColumnState(
             side: side,
-            header: headerState(side: side),
+            header: DeckColumnHeader(headerState(side: side)),
             cues: (0..<DeckState.hotCueCount).map {
                 CueSlotState(index: $0, mark: deck.hotCues[$0])
             },

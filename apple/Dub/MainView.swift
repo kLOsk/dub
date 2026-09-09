@@ -604,7 +604,10 @@ final class WaveformAppModel: ObservableObject {
     /// **Thru** passthrough path instead, to exercise the real-record
     /// live-input rendering against an interface. Never compiled into
     /// Release. Changing it while running restarts the engine.
-    @Published var devForcedSource: PerformanceSource = .timecode {
+    @Published var devForcedSource: PerformanceSource =
+        UserDefaults.standard.string(forKey: "dubForceSource")
+            .flatMap(PerformanceSource.init(rawValue:)) ?? .timecode
+    {
         didSet {
             guard devForcedSource != oldValue else { return }
             if engineMode == .timecode { applyConfig() }

@@ -50,7 +50,7 @@ final class PerformanceLayoutTests: XCTestCase {
     /// shipping configuration.
     private static let columnFixture = DeckColumnState(
         side: .a,
-        header: DeckHeaderState(
+        header: DeckColumnHeader(DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: "Baddadan (extended mix) (feat. IRah, Flowdan)",
             trackArtist: "Chase & Status",
@@ -59,7 +59,7 @@ final class PerformanceLayoutTests: XCTestCase {
             timeRow: .remainingOnly,
             isMaster: true, isPlaying: true,
             isPanicPlay: false, useTimecodeToggle: false,
-            gridLocked: false, gridDriftQuality: nil),
+            gridLocked: false, gridDriftQuality: nil)),
         cues: (0..<8).map {
             CueSlotState(
                 index: $0,
