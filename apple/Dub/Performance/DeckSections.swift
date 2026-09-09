@@ -79,11 +79,16 @@ struct CueRowBank: View {
     let onPreviewUp: () -> Void
     let onRename: (Int) -> Void
     let onColor: (Int, String?) -> Void
-    /// How many columns to split the bank across, or `nil` to pick the
-    /// widest arrangement that fits. Prep fixes it at two so the
-    /// section stays level with its neighbours; Performance's column
-    /// has no neighbour and its width varies with the window.
-    var columns: Int? = 2
+    /// How many columns to split the bank across.
+    ///
+    /// Fixed, not adaptive. This was briefly a `ViewThatFits` ladder
+    /// picking the widest arrangement that fitted — and `ViewThatFits`
+    /// *builds every candidate* to measure it, so the bank rendered its
+    /// eight rows two or three times over on every layout pass. Inside
+    /// a column whose own width is negotiated against the waveform,
+    /// that measurement never settled and the main thread pinned a core
+    /// with the app idle. Two columns is what the surface wants anyway.
+    var columns: Int = 2
     /// Height of one row, or `nil` to divide `contentHeight` between
     /// them. Prep divides; Performance sets it, because a row sized by
     /// its own text lands at about 18 pt — legible, but under any
@@ -115,27 +120,7 @@ struct CueRowBank: View {
             SectionHeading(
                 title: "HOTCUE", accent: DubColor.hotCue,
                 trailing: "\(setCount) OF \(slots.count)")
-            if let columns {
-                grid(columns: columns)
-            } else {
-                // The heading stays *outside* this — its hairline is a
-                // `Rectangle`, which has an unbounded ideal width, and
-                // `ViewThatFits` compares ideal sizes. With the heading
-                // inside a candidate, every rung reports infinity, none
-                // of them "fits", and the ladder silently falls through
-                // to its last option — one column, however much room
-                // there is. The same greedy `Rectangle` stretched LOOP
-                // across Prep's whole surface once already.
-                // Two columns is the widest arrangement, not three.
-                // Eight cues split three ways gives a 3/3/2 grid, and a
-                // ragged last column reads as a mistake; two columns of
-                // four stay a rectangle at any width, and the extra
-                // room goes to the names instead.
-                ViewThatFits(in: .horizontal) {
-                    grid(columns: 2)
-                    grid(columns: 1)
-                }
-            }
+            grid(columns: columns)
         }
     }
 

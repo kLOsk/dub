@@ -350,7 +350,8 @@ struct StatusStripContainer: View {
     /// to a minute at startup) and battery (drift at this cadence is
     /// imperceptible). `Timer.publish` runs on the main run-loop so
     /// updates land on the main actor.
-    private let tick = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+    @State private var tick =
+        Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         StatusStrip(

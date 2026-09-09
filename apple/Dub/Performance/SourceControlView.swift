@@ -149,7 +149,12 @@ struct KeyLockControlView: View {
     /// The engine's published key-lock state (0 off · 1 standby · 2 engaged),
     /// polled at the signal panel's 20 Hz cadence.
     @State private var indicatorState: UInt8 = 0
-    private let tick = Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
+    /// `@State`, not `let` — see `DeckSignalSlideOut.dotTick`. A timer
+    /// stored as a plain property is rebuilt every time SwiftUI
+    /// recreates the struct, scheduling a fresh run-loop timer and
+    /// re-subscribing `onReceive` on every render of the parent.
+    @State private var tick =
+        Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let selection = model.keyLockSelection(side)

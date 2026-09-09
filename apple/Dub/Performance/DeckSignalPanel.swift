@@ -45,7 +45,17 @@ struct DeckSignalSlideOut: View {
     /// Polled, not read inside `body`. Four times a second is plenty
     /// for a lock dot, and it holds whether the panel is open or shut.
     @State private var telemetry: DeckTelemetry?
-    private let dotTick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+
+    /// **`@State`, not `let`.** A timer stored as a plain property is
+    /// rebuilt every time SwiftUI recreates the struct, and this view
+    /// sits inside the deck pane, which re-renders continuously while a
+    /// deck plays. Each rebuild scheduled a fresh run-loop timer and
+    /// re-subscribed `onReceive` to it — dozens per second, per deck,
+    /// on the main thread in `.common` mode, which is why dragging the
+    /// window was where it hurt most. `@State` creates it once and
+    /// keeps it for the view's lifetime.
+    @State private var dotTick =
+        Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     @State private var open = false
 
@@ -114,7 +124,12 @@ struct DeckSignalPanel: View {
     /// Rolling pitch-% history for the stability trace (~6 s at 20 Hz).
     @State private var pitchHistory: [Double] = []
     private static let maxSamples = 120
-    private let tick = Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
+    /// `@State` for the reason `DeckSignalSlideOut.dotTick` explains.
+    /// This one predates that change and had the same fault; it only
+    /// escaped notice because the panel exists solely while the drawer
+    /// is open.
+    @State private var tick =
+        Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let t = telemetry ?? engine.deckTelemetry(deckIdx: deckIdx)

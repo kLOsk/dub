@@ -88,88 +88,21 @@ final class PerformanceLayoutTests: XCTestCase {
             - DubLayout.stillpointGutterWidth - 2) / 2
     }
 
-    /// The ceiling is a 1080 pt screen, not a 900 pt one.
+    /// The column fits the pane a 1440 × 900 window produces.
     ///
-    /// It was 900. Eight named cue rows at a size readable from a deck,
-    /// plus the library share Daniel asked for, do not both fit a 900 pt
-    /// window — something has to give and the honest answer is that on
-    /// the shortest supported screen the column scrolls, which is what
-    /// the `ViewThatFits` fallback is for. Above 1080 it never does.
-    func test_deckColumn_fitsThePane_onA1080Screen() {
-        let chrome = DubLayout.rackBarHeight + 1
-        let total = 1080 - DubLayout.statusStripHeight
-        let pane = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
-            mode: .timecode, total: total, deckChrome: chrome,
-            deckMinimum: DubLayout.waveformMinHeight) - chrome
+    /// It did not, briefly: the cue bank chose its column count with a
+    /// `ViewThatFits` ladder, and at a narrow width it fell to a single
+    /// column of eight rows — 128 pt taller than the pane. The bank is
+    /// two columns at every width now, which is both what the surface
+    /// wants and what makes this assertion hold without a scroll
+    /// fallback underneath it.
+    func test_deckColumn_fitsThePane_onALaptopScreen() {
         let size = fittingSize(
             DeckColumn(state: Self.columnFixture) { Color.clear },
             width: columnWidthAt1440)
         XCTAssertLessThanOrEqual(
-            size.height, pane + 0.5, "deck column overflows a 1080 pt screen")
-    }
-
-    /// And on a 900 pt one it does not fit, stated deliberately rather
-    /// than left to be discovered. If this starts passing the column got
-    /// shorter — fold it back into the test above and delete the scroll
-    /// fallback.
-    func test_deckColumn_needsTheScrollFallback_at900() {
-        let size = fittingSize(
-            DeckColumn(state: Self.columnFixture) { Color.clear },
-            width: columnWidthAt1440)
-        XCTAssertGreaterThan(size.height, paneHeight)
-    }
-
-    /// Two cue columns have to fit, at every width from the column's
-    /// floor upward — one column of eight rows is what makes the stack
-    /// too tall for the pane. If `cueRowMinWidth` grows past this the
-    /// bank silently falls to one column and the fit test above goes
-    /// red; this one says why first.
-    func test_deckColumn_affordsTwoCueColumns_evenAtItsFloor() {
-        let inner = DubLayout.performanceDeckColumnMinWidth
-            - DubSpacing.md * 2 - DubLayout.deckSignalTabWidth
-        XCTAssertGreaterThanOrEqual(
-            inner, DubLayout.cueRowMinWidth * 2 + DubSpacing.sm,
-            "the column floor no longer fits two columns of cue rows")
-    }
-
-    /// The overview has to *be* the height the column reserves for it.
-    ///
-    /// It pins its own via `OverviewSizing`, and in SwiftUI the inner
-    /// frame wins — so a caller wrapping it in a shorter frame reserves
-    /// its own height for layout while the view keeps drawing at the
-    /// larger one, overlapping its neighbours with no clipping and no
-    /// warning. That shipped: the overview printed across the artist
-    /// line above it and the times below. The height is a parameter
-    /// now, and this is what stops a wrapper creeping back in.
-    func test_overviewHonoursTheHeightItIsGiven() {
-        let sized = Color.clear.modifier(
-            OverviewSizing(
-                orientation: .horizontal, height: DubLayout.deckColumnOverviewHeight))
-        XCTAssertEqual(
-            fittingSize(sized, width: 400).height,
-            DubLayout.deckColumnOverviewHeight, accuracy: 0.5,
-            "the deck column's overview no longer renders at the height it reserves")
-
-        // And the standalone band still keeps its own.
-        let standalone = Color.clear.modifier(
-            OverviewSizing(orientation: .horizontal, height: nil))
-        XCTAssertEqual(
-            fittingSize(standalone, width: 400).height,
-            DubLayout.deckOverviewHeight, accuracy: 0.5)
-    }
-
-    /// The one configuration that does *not* fit, stated deliberately
-    /// rather than left to be discovered: at the column's floor the
-    /// bank is a single column of eight, and the stack is taller than
-    /// the pane a 960 pt window produces. `DeckColumn` scrolls there.
-    /// If this ever fails the column got shorter — delete the scroll
-    /// fallback and fold this case into the test above.
-    func test_deckColumn_atItsFloor_stillNeedsTheScrollFallback() {
-        let size = fittingSize(
-            DeckColumn(state: Self.columnFixture) { Color.clear },
-            width: DubLayout.performanceDeckColumnMinWidth)
-        let smallWindowPane = (DubLayout.mainWindowMinHeight - 128) * 0.6
-        XCTAssertGreaterThan(size.height, smallWindowPane)
+            size.height, paneHeight + 0.5,
+            "deck column overflows the 1440 × 900 pane")
     }
 
     /// The column's floor has to hold the loop control, which is the

@@ -90,18 +90,22 @@ struct DeckColumn<Overview: View>: View {
     @ViewBuilder var overview: () -> Overview
 
     var body: some View {
-        // A narrow window cannot hold eight named rows plus everything
-        // above them: at the column's floor the bank is one column and
-        // the stack wants about 540 pt against a ~280 pt pane. It
-        // scrolls there rather than clipping — the same fallback the
-        // pad column carried, and for the same reason. On any window
-        // wide enough for two cue columns the plain stack fits and no
-        // scroll view is built.
-        ViewThatFits(in: .vertical) {
-            stack
-            ScrollView(.vertical, showsIndicators: false) { stack }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // **No `ViewThatFits` here.** It was a scroll fallback for short
+        // panes, and it cost a core. `ViewThatFits` builds *every*
+        // candidate to measure it, so wrapping the stack made two
+        // copies of it — and `CueRowBank` inside has a `ViewThatFits`
+        // of its own, so each copy built the eight cue rows twice
+        // again. Four full builds of the bank per layout pass, per
+        // deck, re-run on every pass: the main thread sat at 100 % with
+        // the app idle, and `CueRowBank.grid` was the top frame in the
+        // sample. One `ViewThatFits` is affordable; nesting them is
+        // not.
+        //
+        // A pane too short for the column now clips rather than
+        // scrolls. That is the honest trade at 900 pt — see
+        // `PerformanceLayoutTests`.
+        stack
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // `surface1` — the signal panel's ground, traded with it: the
         // column is the larger, quieter surface of the two and wants
         // the lower step, while the panel slides *over* the column and
@@ -266,9 +270,10 @@ struct DeckColumn<Overview: View>: View {
     // MARK: - The two things you play
 
     /// Named rows, as in Prep — a cue is a *named position*, and it has
-    /// to be the same object on both surfaces. `columns: nil` lets the
-    /// bank pick the widest arrangement its width affords: three at a
-    /// full-screen window, one at the column's floor.
+    /// to be the same object on both surfaces. Two columns at every
+    /// width: eight split three ways is a ragged 3/3/2, and a bank that
+    /// measures candidates to choose costs more than it is worth (see
+    /// `CueRowBank.columns`).
     private var cueBank: some View {
         CueRowBank(
             slots: state.cues,
@@ -279,7 +284,7 @@ struct DeckColumn<Overview: View>: View {
             onPreviewUp: callbacks.onPreviewUp,
             onRename: callbacks.onRenameCue,
             onColor: callbacks.onColorCue,
-            columns: nil,
+            columns: 2,
             rowHeight: DubLayout.cueRowHeight)
     }
 
