@@ -88,12 +88,19 @@ struct SourceControlView: View {
         // transport / cue / tap controls — INT is the internal
         // Play/Pause, so pressing it starts playback at the press
         // instant rather than on release (see `View.onPressDown`).
+        // Lit only while it is *doing* something. Internal is the
+        // deck's resting state whenever there is no timecode input, so
+        // tinting on the mode alone left the segment permanently
+        // orange and the switch reading as though a stopped deck were
+        // engaged. Grey ▶ at rest, tinted ⏸ while running: the tint
+        // means "this is what the deck is doing", the same as TC and
+        // THRU, rather than "this is the mode it would use".
         return Image(systemName: playingInternally ? "pause.fill" : "play.fill")
             .font(.system(size: 9, weight: .bold))
-            .foregroundStyle(isInternalActive ? DubColor.surface0 : DubColor.textSecondary)
+            .foregroundStyle(playingInternally ? DubColor.surface0 : DubColor.textSecondary)
             .frame(minWidth: 22)
             .padding(.vertical, 4)
-            .background(isInternalActive ? DubColor.deckTint(side) : Color.clear)
+            .background(playingInternally ? DubColor.deckTint(side) : Color.clear)
             .onPressDown { playingInternally ? onPause() : onInternal() }
             .accessibilityAddTraits(.isButton)
             .help(playingInternally ? "Pause" : "Play internally")
@@ -111,7 +118,6 @@ struct SourceControlView: View {
             .accessibilityAddTraits(.isButton)
     }
 
-    private var isInternalActive: Bool { status == .internalPlay }
     private var isTimecodeActive: Bool { status == .timecode || status == .calibrating }
     private var isThruActive: Bool { status == .thru }
 

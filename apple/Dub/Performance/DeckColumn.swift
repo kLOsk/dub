@@ -350,7 +350,7 @@ struct DeckColumn<Overview: View>: View {
             VStack(alignment: .leading, spacing: DubSpacing.sm) {
                 SectionHeading(
                     title: "LOOP", accent: DubColor.loop,
-                    trailing: state.loopEngaged ? "● ACTIVE" : "○ IDLE",
+                    trailing: state.loopEngaged ? "● ON" : "○ OFF",
                     trailingAccent: state.loopEngaged
                         ? DubColor.loop : DubColor.textPlaceholder)
                 loop
@@ -359,8 +359,9 @@ struct DeckColumn<Overview: View>: View {
                 VStack(alignment: .leading, spacing: DubSpacing.sm) {
                     SectionHeading(
                         title: "ECHO", accent: DubColor.deckTint(state.side),
-                        trailing: state.echoEngaged ? "● OUT" : nil,
-                        trailingAccent: DubColor.deckTint(state.side))
+                        trailing: state.echoEngaged ? "● ON" : "○ OFF",
+                        trailingAccent: state.echoEngaged
+                            ? DubColor.deckTint(state.side) : DubColor.textPlaceholder)
                     echoButton
                 }
                 .frame(width: DubLayout.deckColumnEchoWidth)

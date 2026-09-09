@@ -306,7 +306,7 @@ struct LoopEngine: View {
             if showsHeading {
                 SectionHeading(
                     title: "LOOP", accent: DubColor.loop,
-                    trailing: engaged ? "● ACTIVE" : "○ IDLE",
+                    trailing: engaged ? "● ON" : "○ OFF",
                     trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
             }
 

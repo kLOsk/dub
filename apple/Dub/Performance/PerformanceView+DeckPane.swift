@@ -55,7 +55,7 @@ extension PerformanceView {
     @ViewBuilder
     func deckPane(
         side: DeckSide, deckIdx: UInt64, enabled: Bool,
-        columnWidth: CGFloat? = nil
+        columnWidth: CGFloat? = nil, zoom: Double = 1.0
     ) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
         let hasSource = enabled && (deckState.hasTrack
@@ -116,12 +116,12 @@ extension PerformanceView {
                         deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
                         playingColumn(
                             side: side, deckIdx: deckIdx,
-                            hasSource: hasSource)
+                            hasSource: hasSource, zoom: zoom)
                             .layoutPriority(1)
                     } else {
                         playingColumn(
                             side: side, deckIdx: deckIdx,
-                            hasSource: hasSource)
+                            hasSource: hasSource, zoom: zoom)
                             .layoutPriority(1)
                         deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
                     }
@@ -136,7 +136,7 @@ extension PerformanceView {
                 // collapsing the strip.
                 playingColumn(
                     side: side, deckIdx: deckIdx,
-                    hasSource: hasSource)
+                    hasSource: hasSource, zoom: zoom)
             }
             loadErrorOverlay(side: side, deckState: deckState)
             // Timecode signal health, on the deck instead of buried in
@@ -187,7 +187,9 @@ extension PerformanceView {
     /// row-layouts (deck A vs deck B mirror) share the same
     /// rendering.
     @ViewBuilder
-    func playingColumn(side: DeckSide, deckIdx: UInt64, hasSource: Bool) -> some View {
+    func playingColumn(
+        side: DeckSide, deckIdx: UInt64, hasSource: Bool, zoom: Double = 1.0
+    ) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
         let orientation = waveformOrientation
         let content = Group {
@@ -203,7 +205,7 @@ extension PerformanceView {
                     peaksGeneration: deckState.peaksGeneration,
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
-                        : 1.0,
+                        : zoom,
                     hotCues: deckState.hotCues.compactMap { cue in
                         cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
                     },

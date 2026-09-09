@@ -470,11 +470,23 @@ struct PerformanceView: View {
                 perfDeckRow(columnWidth: perfColumnWidth(paneWidth: geo.size.width))
             }
             .background(DubColor.divider)
+            .onHover { deckRowHovered = $0 }
         }
     }
 
     /// Half of what the strips and the centre gutter do not take, never
     /// below the column's floor.
+    /// Zoom is shared: two strips at different scales is a
+    /// beatmatching aid that lies. Session state rather than a stored
+    /// preference — a zoom you left on last week is not what you want
+    /// to find when you open the app in a booth.
+    @State private var waveZoomIndex = WaveformZoom.defaultIndex
+
+    /// Drives the zoom control's fade. The whole deck row counts as
+    /// "over the waveform": the control lives between the strips, so a
+    /// pointer travelling to it must not dismiss it on the way.
+    @State private var deckRowHovered = false
+
     private func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
         let claimed = DubLayout.performanceWaveformWidthCap * 2
             + DubLayout.stillpointGutterWidth + 2
@@ -488,7 +500,8 @@ struct PerformanceView: View {
         HStack(spacing: 1) {
             deckPane(
                 side: .a, deckIdx: 0, enabled: deckAEnabled,
-                columnWidth: columnWidth)
+                columnWidth: columnWidth,
+                zoom: WaveformZoom.steps[waveZoomIndex])
             // Centre gutter: Stillpoint, the round-3 beatmatch aid
             // (docs/investigations/BEATMATCH-AID-STILLPOINT.md).
             // One incoming-tinted band on the lock line: drifts =
@@ -496,12 +509,20 @@ struct PerformanceView: View {
             // in, green line grows per beat held. Replaces the
             // rejected round-2 candidates (`BeatmatchStackView`,
             // kept in-tree until the rig verdict).
-            StillpointView(model: model)
-                .frame(width: DubLayout.stillpointGutterWidth)
-                .frame(maxHeight: .infinity)
+            VStack(spacing: 0) {
+                // The zoom control heads the gutter: the one place both
+                // strips can see it, and out of the way of either.
+                WaveformZoomControl(index: $waveZoomIndex, visible: deckRowHovered)
+                    .padding(.top, DubSpacing.sm)
+                StillpointView(model: model)
+                    .frame(maxHeight: .infinity)
+            }
+            .frame(width: DubLayout.stillpointGutterWidth)
+            .frame(maxHeight: .infinity)
             deckPane(
                 side: .b, deckIdx: 1, enabled: deckBEnabled,
-                columnWidth: columnWidth)
+                columnWidth: columnWidth,
+                zoom: WaveformZoom.steps[waveZoomIndex])
         }
         // No `minHeight` here. `DeckLibrarySplit` assigns this region
         // an explicit height and owns the floor. A `minHeight` inside

@@ -1102,19 +1102,43 @@ struct LibraryView: View {
         }
     }
 
+    /// The sidebar's head is the search field.
+    ///
+    /// It was a `LIBRARY` caption with the track count on the right,
+    /// above a full-width search bar in the pane beside it. Two rows of
+    /// chrome for one field and one number: the count belongs next to
+    /// the thing it counts (the All Tracks row states it), and search
+    /// does not need the width of the window — it needs to be where
+    /// your eye already is when you are looking for a record.
     private var sidebarHeader: some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text("LIBRARY")
-                .font(DubFont.caps)
-                .tracking(1.2)
-                .foregroundStyle(DubColor.textSecondary)
-            Spacer(minLength: 0)
-            Text("\(libraryModel.libraryTrackCount)")
-                .font(DubFont.micro)
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
                 .foregroundStyle(DubColor.textTertiary)
-                .help("Total tracks in library")
+            // Per §8.5.4 a plain substring search, not a typeahead —
+            // `onChange` per keystroke is fast enough on FTS5 to feel
+            // like one in practice.
+            TextField("Search", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(DubFont.body)
+                .focused($searchFocused)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DubColor.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
         }
-        .padding(.horizontal, DubSpacing.lg)
+        .padding(.horizontal, DubSpacing.sm)
+        .padding(.vertical, 5)
+        .background(DubColor.surface1)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .padding(.horizontal, DubSpacing.sm)
         .padding(.vertical, DubSpacing.sm)
         .background(DubColor.surface2)
     }
@@ -1140,6 +1164,7 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func section(heading: String, entries: [LibrarySource]) -> some View {
+        let importable = heading.caseInsensitiveCompare("Library") == .orderedSame
         Text(heading.uppercased())
             .font(DubFont.caps)
             .tracking(1.0)
@@ -1147,8 +1172,16 @@ struct LibraryView: View {
             .padding(.horizontal, DubSpacing.lg)
             .padding(.top, DubSpacing.sm)
             .padding(.bottom, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            // Import lives here now rather than on a toolbar button —
+            // see `importMenuItems`. On the LIBRARY heading and on the
+            // All Tracks row beneath it, which are the two places you
+            // would point at when you mean "the library".
+            .contextMenu { if importable { importMenuItems } }
         ForEach(entries) { entry in
             sidebarRow(entry)
+                .contextMenu { if entry == .allTracks { importMenuItems } }
         }
     }
 
@@ -1447,6 +1480,18 @@ struct LibraryView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 0)
+            // The library's size, on the row that *is* the library.
+            // It used to sit in a `LIBRARY` header above the tree,
+            // where it was a number floating next to a caption; here it
+            // reads as what it is, and matches how every crate row
+            // already states its own count.
+            if entry == .allTracks, libraryModel.libraryTrackCount > 0 {
+                Text("\(libraryModel.libraryTrackCount)")
+                    .font(DubFont.micro)
+                    .monospacedDigit()
+                    .foregroundStyle(DubColor.textTertiary)
+                    .help("Total tracks in library")
+            }
             if !entry.isAvailable {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 9))
@@ -1472,8 +1517,6 @@ struct LibraryView: View {
 
     private var rightPane: some View {
         VStack(spacing: 0) {
-            toolbar
-            Divider().overlay(DubColor.divider)
             if selectedSource == .realRecords {
                 // Past rips are not tracks: they have no fingerprint,
                 // no grid and nothing to load on a deck, so they get
@@ -1640,83 +1683,42 @@ struct LibraryView: View {
         return true
     }
 
-    private var toolbar: some View {
-        HStack(spacing: DubSpacing.sm) {
-            // Search field. Per §8.5.4 it's a plain substring search,
-            // not a typeahead — we wait for the user to commit a
-            // character then re-query. SwiftUI's `TextField`
-            // delivers each keystroke through `onChange`, which is
-            // fast enough on FTS5 to feel typeahead-y in practice.
-            HStack(spacing: 4) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(DubColor.textTertiary)
-                TextField("Search artist, title, album, comment", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(DubFont.body)
-                    .focused($searchFocused)
-                if !searchText.isEmpty {
-                    Button {
-                        searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(DubColor.textTertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear search")
-                }
-            }
-            .padding(.horizontal, DubSpacing.sm)
-            .padding(.vertical, 4)
-            .background(DubColor.surface1)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-
-            Spacer(minLength: 0)
-
-            Menu {
-                Button {
-                    presentImportFolderPicker()
-                } label: {
-                    Label("Folder…", systemImage: "folder")
-                }
-                Divider()
-                Button {
-                    presentImportedSourcePicker(.serato)
-                } label: {
-                    Label("Serato Library…", systemImage: ImportedSourceKind.serato.systemImage)
-                }
-                Button {
-                    presentImportedSourcePicker(.traktor)
-                } label: {
-                    Label("Traktor collection.nml…", systemImage: ImportedSourceKind.traktor.systemImage)
-                }
-                Button {
-                    presentImportedSourcePicker(.rekordbox)
-                } label: {
-                    Label("rekordbox.xml…", systemImage: ImportedSourceKind.rekordbox.systemImage)
-                }
-                Button {
-                    presentImportedSourcePicker(.itunes)
-                } label: {
-                    Label("iTunes Library.xml…", systemImage: ImportedSourceKind.itunes.systemImage)
-                }
+    /// The import actions, as menu content.
+    ///
+    /// They used to be a toolbar button in the track pane's top-right.
+    /// Importing is a thing you do *to* the library, not to whatever
+    /// list happens to be showing, so they live on the right-click of
+    /// the sidebar's Library and All Tracks rows instead — where the
+    /// thing being imported into actually is.
+    @ViewBuilder
+    var importMenuItems: some View {
+            Button {
+                presentImportFolderPicker()
             } label: {
-                Label("Import", systemImage: "tray.and.arrow.down")
+                Label("Folder…", systemImage: "folder")
             }
-            .menuIndicator(.visible)
-            .fixedSize()
-            .controlSize(.small)
-            .disabled(!libraryModel.libraryIsOpen || libraryModel.libraryImportInProgress)
-            .help(
-                libraryModel.libraryImportInProgress
-                    ? "An import is already running."
-                    : "Import a folder, or a Serato / Traktor / iTunes library.")
-        }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.sm)
-        .background(DubColor.surface2)
+            Divider()
+            Button {
+                presentImportedSourcePicker(.serato)
+            } label: {
+                Label("Serato Library…", systemImage: ImportedSourceKind.serato.systemImage)
+            }
+            Button {
+                presentImportedSourcePicker(.traktor)
+            } label: {
+                Label("Traktor collection.nml…", systemImage: ImportedSourceKind.traktor.systemImage)
+            }
+            Button {
+                presentImportedSourcePicker(.rekordbox)
+            } label: {
+                Label("rekordbox.xml…", systemImage: ImportedSourceKind.rekordbox.systemImage)
+            }
+            Button {
+                presentImportedSourcePicker(.itunes)
+            } label: {
+                Label("iTunes Library.xml…", systemImage: ImportedSourceKind.itunes.systemImage)
+            }
     }
-
-    // MARK: - Filter bar view (v8)
 
     private var filterBar: some View {
         VStack(spacing: 0) {
