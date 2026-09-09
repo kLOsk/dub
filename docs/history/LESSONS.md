@@ -346,6 +346,47 @@
   detail most likely to break). Snapshot the production assembly —
   `LibraryTintedRowView` + `LibraryHostingCellView` — not a stand-in.
 
+- **SwiftUI layout cost is about *layout passes*, not expensive views.**
+  Performance idled at 42 % CPU with no track loaded — in Release as well as
+  Debug. Removing any one block of the deck column (cue rows, loop, source
+  switch, identity) each dropped it by roughly what that block contained,
+  which is the signature of a layout being computed over and over rather than
+  of one costly view. The cause: the column was `maxWidth: .infinity` beside a
+  strip with `layoutPriority(1)` and a width cap, so every pass *searched* for
+  the split. Pinning the width took 46 % → 19 %; resolving it once from a
+  single `GeometryReader` over the deck row took it to 2.9 %, which is what
+  Prep costs with the same cue rows in it. **Prep never showed the problem
+  because its rack sits in a fixed-height bar of fixed-width columns — nothing
+  to negotiate.** If a SwiftUI surface is inexplicably hot, look for flexible
+  frames negotiating with priorities before you look at any view.
+- **`ViewThatFits` builds every candidate.** Nesting two — a vertical scroll
+  fallback around the column, a horizontal column-count ladder inside
+  `CueRowBank` — meant four full builds of eight cue rows per layout pass, per
+  deck, and inside a column whose width was itself being negotiated the
+  measurement never settled. The main thread pinned a core with the app idle
+  and `CueRowBank.grid` was the top frame in the sample. One is affordable;
+  nesting them is not.
+- **A `Timer.publish` stored as a `let` on a View is rebuilt on every render.**
+  Four views had one. A stored property is re-created each time SwiftUI
+  recreates the struct, so each render scheduled a fresh run-loop timer and
+  re-subscribed `onReceive` — dozens a second, main thread, `.common` mode.
+  `@State` creates it once per view lifetime.
+- **The window lays out on every display cycle, and the cost scales with view
+  count.** With the signal drawer open, neither the readout rate (5 Hz vs
+  0.25 Hz), the background translucency, nor the trace rate (20 Hz vs 8 Hz)
+  moved the number materially. The profile shows AppKit walking the NSView
+  tree every cycle (`_findAnySubviewNeedingAutoLayoutEngine`) because the
+  window flushes with the display link — whether or not anything changed.
+  Shut, the same passes cost 1.8 %; open, the panel adds enough tree to make
+  them 15 %. The lever for a hot surface is *how much view exists*, not how
+  often it updates.
+- **Profile before theorising.** The 42 % was blamed on stale processes, on
+  timers, and on the Metal renderer in turn — each a plausible story, each
+  wrong. A four-second `sample` named the frame immediately, and the
+  block-by-block bisect (a launch argument per section) turned the rest into
+  arithmetic. `-dubForceMode perf|prep` and `-signalOpen` exist so that
+  measurement does not need a human to click anything.
+
 ## Vinyl rip (M26)
 
 - **The record tap must be wired at Thru-attach time.** The `AudioInput`
