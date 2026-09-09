@@ -48,16 +48,15 @@ enum WaveformZoom {
     /// for rather than the one the rasteriser preferred. MSAA 4x
     /// resolves a half-pixel column into honest coverage.
     ///
-    /// **`0.25x` is currently inert.** `effectivePixelsPerDrawnColumn`
-    /// floors a drawn column at one device pixel, and `0.5x` already
-    /// sits on that floor — so `0.25x` asks for half a pixel per
-    /// column, gets one, and draws the identical picture. Showing
-    /// twice the audio past this point needs each column to *aggregate*
-    /// twice the peak chunks (`chunksPerColumn`, currently pinned at 2)
-    /// rather than occupy fewer pixels. The shader already loops over
-    /// that uniform, so the work is on the Swift side: the snap
-    /// quantum, the drawn-column counts and the grid's time->NDC
-    /// mapping all derive from it.
+    /// **`0.25x` is past the pixel floor**, and works by aggregation
+    /// rather than by narrowing. `effectivePixelsPerDrawnColumn` floors
+    /// a drawn column at one device pixel and `0.5x` already sits on
+    /// that floor, so a narrower column cannot express the difference.
+    /// `WaveformRenderer.columnAggregation` picks up the remainder:
+    /// below the floor each column folds in more peak chunks instead,
+    /// four at `0.25x` against two at `0.5x`. The identity that keeps
+    /// the labels honest — `aggregation / pixelsPerColumn == zoom` — is
+    /// pinned by `testEveryZoomRungScalesSecondsPerPixelWithZoom`.
     static let steps: [Double] = [
         0.5,         // 2x    — 4 px per column
         2.0 / 3.0,   // 1.5x  — 3

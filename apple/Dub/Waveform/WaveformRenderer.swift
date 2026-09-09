@@ -428,6 +428,43 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// Metal pipeline.
     nonisolated public static let chunksPerColumn: UInt32 = 2
 
+    /// Peak chunks folded into one drawn column at a given zoom.
+    ///
+    /// Zooming out normally works by giving each drawn column *fewer*
+    /// pixels — `effectivePixelsPerDrawnColumn` is `2 / zoom`. That
+    /// stops at one device pixel per column: below the floor a column
+    /// cannot get narrower, so asking for a narrower one draws the
+    /// identical picture and the button reads as broken. Past the
+    /// floor the only way to fit more audio on screen is to make each
+    /// column *cover* more of it, which is what this returns.
+    ///
+    /// The two levers multiply, so seconds-per-pixel stays
+    /// proportional to zoom across the whole ladder:
+    ///
+    ///     secsPerPixel = chunksPerColumn * peakDur / pixelsPerColumn
+    ///
+    /// Above the floor `chunksPerColumn` stays at the base 2 and the
+    /// pixel axis carries the zoom. Below it the pixels are pinned at
+    /// 1 and this carries the remainder: at `zoom = 4` (0.25x) that is
+    /// 4 chunks in a 1 px column — twice the audio of 0.5x, which is
+    /// what the rung is asking for.
+    ///
+    /// **Kept even.** The band-colour stabiliser snaps the playhead to
+    /// a multiple of this value so a transient chunk is always paired
+    /// with the same neighbour; an odd aggregation would re-pair them
+    /// frame to frame and bring back the colour flicker that snap
+    /// exists to prevent.
+    nonisolated public static func columnAggregation(
+        timeAxisZoom: Double
+    ) -> UInt32 {
+        let base = Double(chunksPerColumn)
+        let pixels = Double(pixelsPerDrawnColumn) / max(0.05, timeAxisZoom)
+        guard pixels < 1.0 else { return chunksPerColumn }
+        let residual = 1.0 / pixels
+        let agg = (base * residual / 2.0).rounded() * 2.0
+        return UInt32(max(base, agg))
+    }
+
     /// Drawable pixels spanned by one drawn column along the time
     /// axis. M10.5f set this to 2 (the "2× zoom-in") so each
     /// trapezoidal slice covers 2 drawable pixels and the total
@@ -1129,7 +1166,10 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             0, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
         let drawnBelowPixels = max(
             0, Int((Double(futurePixels) / pixelsPerDrawnColumn).rounded(.down)))
-        let agg = Int(WaveformRenderer.chunksPerColumn)
+        // Zoom-dependent: past the one-pixel column floor this
+        // grows so the column covers more audio instead.
+        let agg = Int(
+            Self.columnAggregation(timeAxisZoom: appearance.timeAxisZoom))
 
         // Playhead chunk + chunks past it. In File mode this is
         // computed off the *unclamped* playhead seconds so a hard
@@ -1184,7 +1224,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 // relies on the unchanged floor monotonicity.
                 let chunkFRaw =
                     (pos.playheadSecsUnclamped / peakChunkDurationSecs).rounded(.down)
-                let aggD = Double(WaveformRenderer.chunksPerColumn)
+                let aggD = Double(agg)
                 let chunkFSnapped = (chunkFRaw / aggD).rounded(.down) * aggD
                 playheadChunkSigned = Int64(max(-Double(Int64.max / 2),
                                                 min(Double(Int64.max / 2), chunkFSnapped)))
@@ -1492,7 +1532,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             samplesPerBandChunk: samplesPerBandChunk,
             bandCapacity: UInt32(WaveformRenderer.bandChunkCapacity),
             orientation: appearance.orientation.rawValue,
-            chunksPerColumn: WaveformRenderer.chunksPerColumn,
+            chunksPerColumn: UInt32(agg),
             bandStartPhaseSamples: UInt32(pastBandPhase),
             subChunkOffsetNDC: pastSubChunkOffsetNDC,
             regionFillFrac: pastFillFrac)
@@ -1506,7 +1546,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             samplesPerBandChunk: samplesPerBandChunk,
             bandCapacity: UInt32(WaveformRenderer.bandChunkCapacity),
             orientation: appearance.orientation.rawValue,
-            chunksPerColumn: WaveformRenderer.chunksPerColumn,
+            chunksPerColumn: UInt32(agg),
             bandStartPhaseSamples: UInt32(futureBandPhase),
             subChunkOffsetNDC: futureSubChunkOffsetNDC,
             regionFillFrac: futureFillFrac)
@@ -1900,16 +1940,23 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     private static func beatTimeNDC(
         beatSecs: Double,
         peakDur: Double,
+        chunksPerColumn: Double,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
         pastSubChunkOffsetNDC: Float,
         futureSubChunkOffsetNDC: Float
     ) -> Double {
-        let chunksPerColumn = Double(WaveformRenderer.chunksPerColumn)
         let beatChunkF = beatSecs / peakDur
         let chunksFromSnapped = beatChunkF - snappedChunkF
-        let inFuture = chunksFromSnapped > 1.0
+        // The past region's last column sits at `chunksFromSnapped =
+        // 0` and the future region's first at `= chunksPerColumn`, so
+        // the seam between them is at half a column. This was the
+        // literal `1.0` — correct only while the aggregation was
+        // pinned at 2, and half a column too early at every wider
+        // zoom, which would put beats near the playhead on the wrong
+        // side of the seam.
+        let inFuture = chunksFromSnapped > chunksPerColumn / 2.0
         if inFuture {
             let chunkInWindow = chunksFromSnapped / chunksPerColumn
             let denom = max(Double(drawnBelow - 1), 1.0)
@@ -2005,7 +2052,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let peakDur = peakChunkDurationSecs
         guard peakDur > 0, drawnAbove >= 2, drawnBelow >= 2 else { return }
 
-        let chunksPerColumn = Int(WaveformRenderer.chunksPerColumn)
+        let chunksPerColumn = Int(
+            Self.columnAggregation(timeAxisZoom: appearance.timeAxisZoom))
         let pastFirstChunkSigned =
             Int64(snappedChunkF) + 1 - Int64(drawnAbove * chunksPerColumn)
         let futureLastChunkSigned =
@@ -2090,12 +2138,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // tints the whole strip without a pathologically large quad.
         if let (loopInSecs, loopOutSecs) = loopBounds {
             let inNDC = Self.beatTimeNDC(
-                beatSecs: loopInSecs, peakDur: peakDur, snappedChunkF: snappedChunkF,
+                beatSecs: loopInSecs, peakDur: peakDur,
+                chunksPerColumn: Double(chunksPerColumn), snappedChunkF: snappedChunkF,
                 drawnAbove: drawnAbove, drawnBelow: drawnBelow,
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                 futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
             let outNDC = Self.beatTimeNDC(
-                beatSecs: loopOutSecs, peakDur: peakDur, snappedChunkF: snappedChunkF,
+                beatSecs: loopOutSecs, peakDur: peakDur,
+                chunksPerColumn: Double(chunksPerColumn), snappedChunkF: snappedChunkF,
                 drawnAbove: drawnAbove, drawnBelow: drawnBelow,
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                 futureSubChunkOffsetNDC: futureSubChunkOffsetNDC)
@@ -2136,6 +2186,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 let timeNDC = Self.beatTimeNDC(
                     beatSecs: beat,
                     peakDur: peakDur,
+                    chunksPerColumn: Double(chunksPerColumn),
                     snappedChunkF: snappedChunkF,
                     drawnAbove: drawnAbove,
                     drawnBelow: drawnBelow,
@@ -2199,6 +2250,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     Self.beatTimeNDC(
                         beatSecs: marker.secs,
                         peakDur: peakDur,
+                        chunksPerColumn: Double(chunksPerColumn),
                         snappedChunkF: snappedChunkF,
                         drawnAbove: drawnAbove,
                         drawnBelow: drawnBelow,
