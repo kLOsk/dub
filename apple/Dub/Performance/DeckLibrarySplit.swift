@@ -74,7 +74,7 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
         case .prep:
             wanted = deckMinimum + deckChrome
         case .timecode:
-            wanted = max(deckMinimum + deckChrome, total * 0.60)
+            wanted = max(deckMinimum + deckChrome, total * DubLayout.performanceDeckFraction)
         }
         let ceiling = max(0, total - DubLayout.libraryMinHeight)
         return max(0, min(wanted, ceiling))

@@ -35,6 +35,7 @@
 //  for them.
 //
 
+import DubCore
 import SwiftUI
 
 /// Everything the column draws. `header` is the same value the old
@@ -80,6 +81,12 @@ struct DeckColumnCallbacks {
 struct DeckColumn<Overview: View>: View {
     let state: DeckColumnState
     var callbacks = DeckColumnCallbacks()
+    /// Elapsed and remaining tick once a second off the engine, so they
+    /// come from a `TimelineView` subview rather than through state —
+    /// the same `LiveDeckTimeText` the header band used. Previews and
+    /// snapshots leave these nil and get a placeholder.
+    var liveEngine: DubEngine?
+    var liveDeckIdx: UInt64?
     @ViewBuilder var overview: () -> Overview
 
     var body: some View {
@@ -109,25 +116,61 @@ struct DeckColumn<Overview: View>: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             identityAndReadouts
-            // Full column width. The overview was a 26 pt vertical
-            // sliver on the deck's outer edge — the one orientation
-            // that makes a whole-track map hard to read, and the reason
-            // it was easy to ignore. Across the column it gets the
-            // width to be a map.
-            overview()
-                .frame(height: DubLayout.deckColumnOverviewHeight)
-                // The map wants air on both sides of it. At the stack's
-                // own spacing it sat hard against the artist line above
-                // and the HOTCUE heading below, and three blocks with
-                // nothing between them read as one crowded block.
-                .padding(.vertical, DubSpacing.sm)
+            // The map wants air on both sides of it. At the stack's own
+            // spacing it sat hard against the artist line above and the
+            // HOTCUE heading below, and three blocks with nothing
+            // between them read as one crowded block.
+            Spacer(minLength: 0)
+            overviewAndTimes
+            Spacer(minLength: 0)
             cueBank
+            Spacer(minLength: 0)
             loopAndEcho
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, DubSpacing.md)
-        .padding(.vertical, DubSpacing.sm)
+        // Flexible spacers rather than fixed gaps: the pane is much
+        // taller than the column needs on any real window, and the
+        // slack is better spent between the blocks than pooled under
+        // the last one. `minLength` is what the fit tests measure, so a
+        // short pane still collapses to the tight arrangement.
+        .padding(.leading, state.side == .a ? signalTabInset : DubSpacing.md)
+        .padding(.trailing, state.side == .a ? DubSpacing.md : signalTabInset)
+        .padding(.vertical, DubSpacing.md)
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    /// The signal slide-out's tab sits on the deck's outer edge, over
+    /// the column. Without this it printed straight through the LOOP
+    /// heading.
+    private var signalTabInset: CGFloat { DubLayout.deckSignalTabWidth + DubSpacing.sm }
+
+    /// The whole-track map, with elapsed under its start and remaining
+    /// under its end — where a DJ reads them off a Serato overview.
+    private var overviewAndTimes: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            overview()
+                .frame(height: DubLayout.deckColumnOverviewHeight)
+            HStack(spacing: 0) {
+                time(.elapsed, colour: DubColor.textSecondary)
+                Spacer(minLength: 0)
+                time(.remaining, colour: DubColor.textPrimary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func time(_ slot: LiveDeckTimeText.Slot, colour: Color) -> some View {
+        if let liveEngine, let liveDeckIdx, state.hasTrack {
+            LiveDeckTimeText(engine: liveEngine, deckIdx: liveDeckIdx, slot: slot)
+                .font(DubFont.numericInline)
+                .monospacedDigit()
+                .foregroundStyle(colour)
+        } else {
+            Text(slot == .remaining ? "-00:00" : "00:00")
+                .font(DubFont.numericInline)
+                .monospacedDigit()
+                .foregroundStyle(DubColor.textPlaceholder)
+        }
     }
 
     // MARK: - Identity
@@ -233,34 +276,44 @@ struct DeckColumn<Overview: View>: View {
     /// stays in one place for the whole move. On a column too narrow to
     /// hold both it drops underneath rather than squeezing the loop.
     private var loopAndEcho: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .center, spacing: DubSpacing.sm) {
-                loop
-                echo
-            }
+        HStack(alignment: .top, spacing: DubSpacing.md) {
             VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                SectionHeading(
+                    title: "LOOP", accent: DubColor.loop,
+                    trailing: state.loopEngaged ? "● ACTIVE" : "○ IDLE",
+                    trailingAccent: state.loopEngaged
+                        ? DubColor.loop : DubColor.textPlaceholder)
                 loop
-                echo
+            }
+            if state.echoEnabled {
+                VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                    SectionHeading(
+                        title: "ECHO", accent: DubColor.deckTint(state.side),
+                        trailing: state.echoEngaged ? "● OUT" : nil,
+                        trailingAccent: DubColor.deckTint(state.side))
+                    echoButton
+                }
+                .frame(width: DubLayout.deckColumnEchoWidth)
             }
         }
     }
 
+    /// The loop keeps its own shape rather than stretching to the
+    /// column — a ×2 button 300 pt from the ÷2 is a worse control, not
+    /// a bigger one — but it may *compress*, because echo out sits
+    /// beside it at every width and the pair has to clear the column's
+    /// floor. `LoopEngine`'s size buttons flex between 40 and 52.
     private var loop: some View {
         LoopEngine(
-                activeBeats: state.activeLoopBeats,
-                engaged: state.loopEngaged,
-                hasTrack: state.hasTrack,
-                onLoop: callbacks.onLoop,
-                onScale: callbacks.onScaleLoop,
+            activeBeats: state.activeLoopBeats,
+            engaged: state.loopEngaged,
+            hasTrack: state.hasTrack,
+            showsHeading: false,
+            contentHeight: DubLayout.deckColumnLoopHeight,
+            onLoop: callbacks.onLoop,
+            onScale: callbacks.onScaleLoop,
             onExit: callbacks.onExitLoop)
-            .frame(width: DubLayout.prepLoopSection, alignment: .leading)
-    }
-
-    @ViewBuilder
-    private var echo: some View {
-        if state.echoEnabled {
-            echoButton
-        }
+            .frame(maxWidth: DubLayout.prepLoopSection, alignment: .leading)
     }
 
     private var echoButton: some View {
@@ -269,8 +322,8 @@ struct DeckColumn<Overview: View>: View {
             .tracking(DubFont.capsTracking)
             .foregroundStyle(
                 state.echoEngaged ? DubColor.textPrimary : DubColor.textSecondary)
-            .padding(.horizontal, DubSpacing.md)
-            .frame(height: 28)
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
             .background(
                 state.echoEngaged
                     ? DubColor.deckTint(state.side).opacity(0.26) : DubColor.surface2)

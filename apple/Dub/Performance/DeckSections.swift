@@ -270,6 +270,16 @@ struct LoopEngine: View {
     let activeBeats: Double?
     let engaged: Bool
     let hasTrack: Bool
+    /// Draw the section heading, or leave it to the caller. Prep's
+    /// rack wants the heading inside; Performance pairs LOOP with ECHO
+    /// side by side and heads both from outside so the two hairlines
+    /// line up.
+    var showsHeading: Bool = true
+    /// Height of the boxed control. Prep gives it `prepSectionContent`
+    /// so the section stays level with its neighbours; Performance's
+    /// column has no neighbour to match and a shorter box buys height
+    /// the cue rows want.
+    var contentHeight: CGFloat = DubLayout.prepSectionContent
     let onLoop: (Double) -> Void
     let onScale: (_ double: Bool) -> Void
     let onExit: () -> Void
@@ -291,10 +301,12 @@ struct LoopEngine: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            SectionHeading(
-                title: "LOOP", accent: DubColor.loop,
-                trailing: engaged ? "● ACTIVE" : "○ IDLE",
-                trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
+            if showsHeading {
+                SectionHeading(
+                    title: "LOOP", accent: DubColor.loop,
+                    trailing: engaged ? "● ACTIVE" : "○ IDLE",
+                    trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
+            }
 
             // A box, but an empty one. LOOP is the only section that
             // is a single instrument rather than a set of slots, and it
@@ -307,7 +319,7 @@ struct LoopEngine: View {
                 sizeButtons
                 stepper("×2", double: true)
             }
-            .frame(height: DubLayout.prepSectionContent)
+            .frame(height: contentHeight)
             .padding(.horizontal, DubSpacing.md)
             .overlay(
                 RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous)
@@ -325,7 +337,13 @@ struct LoopEngine: View {
                 Text(Self.label(beats))
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(on ? DubColor.textPrimary : DubColor.textSecondary)
-                    .frame(width: 52, height: 64)
+                    // Flexible, not fixed. Performance keeps echo out
+                    // beside the loop at every width, so the pair has
+                    // to clear the column's floor — the size buttons
+                    // are what gives. Prep hands the control its full
+                    // width and they render at 52 as before.
+                    .frame(minWidth: 40, maxWidth: 52)
+                    .frame(maxHeight: .infinity)
                     .background(on ? DubColor.loop.opacity(0.26) : Color.clear)
                     .overlay(alignment: .trailing) {
                         if offset < Self.windowSize - 1 {

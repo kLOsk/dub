@@ -160,7 +160,9 @@ extension PerformanceView {
     func deckColumn(side: DeckSide, deckIdx: UInt64) -> some View {
         DeckColumn(
             state: deckColumnState(side: side),
-            callbacks: deckColumnCallbacks(side: side)
+            callbacks: deckColumnCallbacks(side: side),
+            liveEngine: model.engine,
+            liveDeckIdx: deckIdx
         ) {
             if Self.overviewEnabled {
                 TrackOverviewView(

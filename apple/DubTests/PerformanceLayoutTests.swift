@@ -31,14 +31,20 @@ final class PerformanceLayoutTests: XCTestCase {
 
     // MARK: - The pad column
 
-    /// 1440 × 900 minus the fixed chrome, at the 0.60 deck-heavy split.
+    /// The deck pane a 1440 × 900 window actually produces, asked of
+    /// the splitter rather than restated as a constant.
     ///
-    /// Was 398, against 236 pt of chrome. The deck header band was
-    /// 108 of that and it is gone — its contents moved into
-    /// `DeckColumn` — so the deck region is 108 pt richer and this
-    /// constant had to follow. Leaving it would have asserted the
-    /// column against a pane the app no longer produces.
-    private let paneHeight: CGFloat = 463
+    /// It used to be a literal 398, derived against 236 pt of chrome —
+    /// 108 of which was the deck header band that no longer exists. A
+    /// constant that has to be re-derived by hand every time the chrome
+    /// moves will be wrong the once it matters, so this computes it.
+    private var paneHeight: CGFloat {
+        let chrome = DubLayout.rackBarHeight + 1
+        let total = 900 - DubLayout.statusStripHeight
+        return DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .timecode, total: total, deckChrome: chrome,
+            deckMinimum: DubLayout.waveformMinHeight) - chrome
+    }
 
     /// A loaded deck with cues set — the tallest the column gets in a
     /// shipping configuration.
@@ -91,15 +97,17 @@ final class PerformanceLayoutTests: XCTestCase {
             "deck column overflows the 1440×900 pane")
     }
 
-    /// Two cue columns have to fit that width, because one column of
-    /// eight rows is what makes the stack too tall. If `cueRowMinWidth`
-    /// grows past this the column silently falls to one column and the
-    /// test above goes red — this one says why first.
-    func test_deckColumn_laptopWidthAffordsTwoCueColumns() {
-        let inner = columnWidthAt1440 - DubSpacing.md * 2
+    /// Two cue columns have to fit, at every width from the column's
+    /// floor upward — one column of eight rows is what makes the stack
+    /// too tall for the pane. If `cueRowMinWidth` grows past this the
+    /// bank silently falls to one column and the fit test above goes
+    /// red; this one says why first.
+    func test_deckColumn_affordsTwoCueColumns_evenAtItsFloor() {
+        let inner = DubLayout.performanceDeckColumnMinWidth
+            - DubSpacing.md * 2 - DubLayout.deckSignalTabWidth
         XCTAssertGreaterThanOrEqual(
             inner, DubLayout.cueRowMinWidth * 2 + DubSpacing.sm,
-            "a 1440 pt window no longer fits two columns of cue rows")
+            "the column floor no longer fits two columns of cue rows")
     }
 
     /// The one configuration that does *not* fit, stated deliberately
@@ -125,17 +133,6 @@ final class PerformanceLayoutTests: XCTestCase {
             DubLayout.performanceDeckColumnMinWidth,
             DubLayout.prepLoopSection + DubSpacing.md * 2,
             "the column floor no longer fits the loop control")
-    }
-
-    /// Two columns of cue rows need twice the row minimum plus the
-    /// gap. Below that `CueRowBank` drops to one column on its own —
-    /// this asserts the arithmetic the `ViewThatFits` ladder relies on.
-    func test_cueBank_twoColumnsNeedMoreThanTheFloor() {
-        let twoColumns = DubLayout.cueRowMinWidth * 2 + DubSpacing.sm
-        XCTAssertGreaterThan(
-            twoColumns,
-            DubLayout.performanceDeckColumnMinWidth - DubSpacing.lg * 2,
-            "two cue columns now fit the floor — the ladder has a dead rung")
     }
 
     // MARK: - The global rack bar

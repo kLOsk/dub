@@ -320,6 +320,19 @@ enum DubRadius {
 /// "natural" heights everything is balanced around.
 enum DubLayout {
     static let statusStripHeight: CGFloat = 28
+
+    /// How much of the window below the status strip Performance gives
+    /// the decks. Was 0.60, set when each deck pane held a pad column
+    /// and the track's identity lived in a band above both.
+    ///
+    /// The band is gone and its contents are in the deck column, along
+    /// with a whole-track overview, named cue rows and the loop — so
+    /// the pane carries roughly 130 pt more than it did. At 0.60 that
+    /// overflowed a 1440 × 900 screen and the column fell back to
+    /// scrolling, which is not something a DJ should meet mid-set. The
+    /// library keeps well over `libraryMinHeight` at this fraction;
+    /// `PerformanceLayoutTests` holds both ends of that.
+    static let performanceDeckFraction: CGFloat = 0.72
     /// Fixed height for the deck header (M11d.5 refresh). Sized to
     /// accommodate the 3-row layout (identity / stats / transport-
     /// and-time) at the worst-case font metric inside SwiftUI's
@@ -373,7 +386,8 @@ enum DubLayout {
     /// line: `CueRowBank` drops to a single column and the loop keeps
     /// its own width, so the binding constraint is the wider of the two
     /// plus the column's own padding.
-    static let performanceDeckColumnMinWidth: CGFloat = prepLoopSection + DubSpacing.md * 2
+    static let performanceDeckColumnMinWidth: CGFloat =
+        cueRowMinWidth * 2 + DubSpacing.sm + DubSpacing.md * 2 + deckSignalTabWidth
 
     /// The playing waveform absorbs the width the pad column leaves,
     /// up to this cap; past it the remainder stays as the §9.6.1
@@ -461,7 +475,7 @@ enum DubLayout {
     /// whether or not a timecode input is present, which cost the
     /// column 32 pt, and four rows at 24 is where that came back from.
     /// `test_deckColumn_fitsThePane_onALaptopScreen` is the ceiling.
-    static let cueRowHeight: CGFloat = 24
+    static let cueRowHeight: CGFloat = 22
 
     static let prepCueColumn: CGFloat = 380
     /// `÷2` 34 + 3 size buttons at 56 + `×2` 34, plus gaps and `md`
@@ -522,7 +536,22 @@ enum DubLayout {
     /// standalone strip: it is one of six blocks sharing the column's
     /// height, and a whole-track map earns its keep on the *time* axis,
     /// which here is the full column width rather than 26 pt of it.
-    static let deckColumnOverviewHeight: CGFloat = 40
+    static let deckColumnOverviewHeight: CGFloat = 36
+
+    /// The echo-out block beside the loop. Wide enough for its own
+    /// section hairline to read as one, narrow enough that the pair
+    /// clears the column's floor.
+    static let deckColumnEchoWidth: CGFloat = 96
+
+    /// The loop box inside Performance's column. Shorter than Prep's
+    /// 88: the column stacks six blocks where Prep's rack lays three
+    /// side by side, so height there is scarce and width is not.
+    static let deckColumnLoopHeight: CGFloat = 72
+
+    /// The signal slide-out's tab, which sits on each deck's outer edge
+    /// *over* the column. The column insets its outer padding by this
+    /// much, or the tab prints straight through the section headings.
+    static let deckSignalTabWidth: CGFloat = 18
 
     /// Width of the per-deck Track Overview strip (M10.5c) — the
     /// thin vertical waveform on each deck's *outside* edge
