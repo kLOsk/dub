@@ -13,7 +13,10 @@ struct LaunchSplashOverlay: View {
 
     var body: some View {
         ZStack {
-            DubColor.surface0
+            // A step up from the app's ground. `surface0` is the
+            // darkest tone we have and behind a splash it read as an
+            // unlit window rather than a screen doing something.
+            DubColor.surface2
                 .ignoresSafeArea()
             Image("AboutSplash")
                 .resizable()
