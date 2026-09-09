@@ -596,6 +596,11 @@ enum DubLayout {
     /// much, or the tab prints straight through the section headings.
     static let deckSignalTabWidth: CGFloat = 18
 
+    /// The signal panel's open width. A token because the drawer
+    /// animates *to* it — the panel's frame and the tab's position are
+    /// the same number, which is what keeps them moving together.
+    static let deckSignalPanelWidth: CGFloat = 236
+
     /// Width of the per-deck Track Overview strip (M10.5c) — the
     /// thin vertical waveform on each deck's *outside* edge
     /// showing the whole track top→bottom with a playhead bracket

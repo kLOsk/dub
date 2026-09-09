@@ -433,7 +433,20 @@ struct WaveformView: View {
         // visual quantum of one drawable pixel = 0.5 logical
         // pixel on Retina, which is below the perceptual
         // threshold.
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { context in
+        // **Paused with the renderer.** This ran unconditionally, so a
+        // mounted waveform redrew this Canvas sixty times a second
+        // whether or not anything moved. In Performance both decks
+        // mount one as soon as the engine runs — a timecode deck shows
+        // its strip before a track is loaded — so two 60 Hz canvases
+        // ran permanently on an idle surface, each invalidating layout
+        // and dragging a full window layout pass behind it. The Metal
+        // side already gated on `continuouslyRendering`; the overlay
+        // drawn on top of it did not. A paused `TimelineView` still
+        // re-renders when its inputs change, so a seek on a stopped
+        // deck still lands.
+        TimelineView(
+            .animation(minimumInterval: 1.0 / 60.0, paused: !continuouslyRendering)
+        ) { context in
             Canvas(opaque: false) { ctx, canvasSize in
                 // **Critical** — referencing `context.date` inside
                 // the Canvas closure is what forces SwiftUI to

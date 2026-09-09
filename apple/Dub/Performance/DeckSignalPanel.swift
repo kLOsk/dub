@@ -66,11 +66,11 @@ struct DeckSignalSlideOut: View {
     var body: some View {
         HStack(spacing: 0) {
             if side == .a {
-                if open { panel }
+                panel
                 tab
             } else {
                 tab
-                if open { panel }
+                panel
             }
         }
         // One animation for the pair. The tab is laid out by this
@@ -84,10 +84,24 @@ struct DeckSignalSlideOut: View {
                alignment: side == .a ? .leading : .trailing)
     }
 
+    /// Always in the tree, its *width* animated between zero and full.
+    ///
+    /// It used to be inserted and removed on a `.move` transition. That
+    /// is a different mechanism from the layout change beside it: the
+    /// `HStack` allocated the panel's full width the instant it
+    /// appeared, so the tab jumped to its final position while the
+    /// panel was still sliding in behind — the gap you could watch open
+    /// and close. Animating the width makes the tab's position and the
+    /// panel's edge the same number, so they cannot disagree.
     private var panel: some View {
-        DeckSignalPanel(engine: engine, side: side, deckIdx: deckIdx)
-            .transition(.move(edge: side == .a ? .leading : .trailing)
-                .combined(with: .opacity))
+        Group {
+            if open {
+                DeckSignalPanel(engine: engine, side: side, deckIdx: deckIdx)
+            }
+        }
+        .frame(width: open ? DubLayout.deckSignalPanelWidth : 0)
+        .clipped()
+        .opacity(open ? 1 : 0)
     }
 
     /// Slim always-visible toggle: vertical SIGNAL caps + the PRD §5.4
@@ -183,7 +197,7 @@ struct DeckSignalPanel: View {
             Spacer(minLength: 0)
         }
         .padding(DubSpacing.md)
-        .frame(width: 236)
+        .frame(width: DubLayout.deckSignalPanelWidth)
         .frame(maxHeight: .infinity)
         .background(DubColor.surface2.opacity(0.97))
         .overlay(
