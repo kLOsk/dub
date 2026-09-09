@@ -4546,6 +4546,40 @@ impl<'t> FullSamples<'t> {
     }
 }
 
+/// Does a cached waveform sidecar actually describe *this* track?
+///
+/// [`dub_peaks::read_sidecar`] only validates a file against itself:
+/// magic bytes, endianness marker, and whether the declared chunk
+/// counts are backed by enough bytes. It has no idea which track the
+/// caller is loading, so a sidecar left behind by an earlier file at
+/// the same fingerprint id deserialises perfectly and is then trusted
+/// whole.
+///
+/// The renderer draws whatever it is handed. Peaks covering 8 s of a
+/// 3½-minute track produce a playing strip with a waveform at the
+/// start and empty lane after it, and a whole-track overview that
+/// stretches those 8 s across the full width as one featureless slab.
+/// Both read as rendering bugs; neither is. Worse, the failure is
+/// silent — the load logs a cache *hit*.
+///
+/// So check coverage before trusting the file. The writer flushes a
+/// trailing partial chunk, so the expected count is
+/// `ceil(frames / samples_per_chunk)`; allow one chunk of slack for
+/// that boundary and require the sample rate to agree exactly. A
+/// mismatch costs one recompute — the same work a cold load does —
+/// which is the cheap side of this trade.
+fn sidecar_matches_track(peaks: &OfflinePeaks, track: &Track) -> bool {
+    if peaks.sample_rate != track.sample_rate() {
+        return false;
+    }
+    let per_chunk = peaks.samples_per_broadband_chunk;
+    if per_chunk == 0 {
+        return false;
+    }
+    let expected = track.frames().div_ceil(per_chunk);
+    peaks.broadband.len().abs_diff(expected) <= 1
+}
+
 fn background_analyze_and_install(
     idx: usize,
     track: Arc<Track>,
@@ -4576,7 +4610,30 @@ fn background_analyze_and_install(
     let t_peaks = std::time::Instant::now();
     let (peaks_result, peaks_from_cache) = match sidecar_path_for_thread.as_deref() {
         Some(path) => match dub_peaks::read_sidecar(std::path::Path::new(path)) {
-            Ok(Some(peaks)) => (Ok(peaks), true),
+            Ok(Some(peaks)) if sidecar_matches_track(&peaks, &track) => (Ok(peaks), true),
+            // Deserialised fine but describes different audio — a
+            // stale file at this fingerprint id. Treat it exactly
+            // like a miss rather than drawing another track's shape.
+            Ok(Some(peaks)) => {
+                eprintln!(
+                    "dub-ffi: waveform sidecar for deck {idx} at {path} covers \
+                     {} chunks x {} samples at {} Hz but the track is {} frames \
+                     at {} Hz; ignoring it and recomputing offline peaks",
+                    peaks.broadband.len(),
+                    peaks.samples_per_broadband_chunk,
+                    peaks.sample_rate,
+                    track.frames(),
+                    track.sample_rate(),
+                );
+                (
+                    compute_offline_peaks(
+                        full_samples.get(),
+                        track.sample_rate(),
+                        track.channels(),
+                    ),
+                    false,
+                )
+            }
             Ok(None) => {
                 eprintln!(
                     "dub-ffi: waveform sidecar miss for deck {idx} at {path}; \
@@ -5267,6 +5324,79 @@ fn filtered_peak_chunks_to_bytes(chunks: &[FilteredPeakChunk]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sidecar that deserialises cleanly can still belong to a
+    /// different track — nothing in the file names the audio it came
+    /// from. These pin the coverage check that keeps such a file from
+    /// being drawn as if it were this track's waveform.
+    mod sidecar_validation {
+        use super::super::sidecar_matches_track;
+        use dub_peaks::compute_offline_peaks;
+
+        fn track_of_secs(secs: f64, sample_rate: u32) -> dub_io::Track {
+            let frames = (secs * f64::from(sample_rate)) as usize;
+            let samples: Vec<f32> = (0..frames)
+                .map(|i| ((i as f32) * 0.01).sin() * 0.5)
+                .collect();
+            dub_io::Track::from_interleaved(samples, sample_rate, 1)
+                .expect("mono track from interleaved samples")
+        }
+
+        #[test]
+        fn peaks_computed_from_the_same_track_match() {
+            let track = track_of_secs(2.0, 44_100);
+            let peaks =
+                compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
+                    .unwrap();
+            assert!(
+                sidecar_matches_track(&peaks, &track),
+                "peaks computed from this very track must be accepted"
+            );
+        }
+
+        #[test]
+        fn a_sidecar_covering_a_fraction_of_the_track_is_rejected() {
+            // The shipped failure: an 8 s sidecar against a long
+            // track. It reads back fine and would otherwise be drawn
+            // as a waveform that stops partway and an overview
+            // stretched across the full width.
+            let short = track_of_secs(2.0, 44_100);
+            let long = track_of_secs(60.0, 44_100);
+            let peaks =
+                compute_offline_peaks(short.samples(), short.sample_rate(), short.channels())
+                    .unwrap();
+            assert!(
+                !sidecar_matches_track(&peaks, &long),
+                "a sidecar covering a fraction of the track must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_sample_rate_mismatch_is_rejected() {
+            let track = track_of_secs(2.0, 44_100);
+            let mut peaks =
+                compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
+                    .unwrap();
+            peaks.sample_rate = 48_000;
+            assert!(
+                !sidecar_matches_track(&peaks, &track),
+                "chunk counts can coincide across rates; the rate must agree too"
+            );
+        }
+
+        #[test]
+        fn one_chunk_of_slack_is_allowed_for_the_trailing_flush() {
+            let track = track_of_secs(2.0, 44_100);
+            let mut peaks =
+                compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
+                    .unwrap();
+            peaks.broadband.pop();
+            assert!(
+                sidecar_matches_track(&peaks, &track),
+                "the writer flushes a trailing partial chunk; one either way is fine"
+            );
+        }
+    }
     use super::*;
 
     #[test]
