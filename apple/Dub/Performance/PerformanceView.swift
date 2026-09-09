@@ -251,7 +251,16 @@ struct PerformanceView: View {
             onScaleLoop: { double in model.scaleLoop(side, double: double) },
             onExitLoop: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
-            onSetInternal: { header.onSetInternal?() },
+            // Select Internal *and* start playing, which is the
+            // contract `SourceControlView` documents for the segment
+            // ("Select Internal and start playing the loaded file").
+            // `setDeckInternal` only sets the control mode, so on its
+            // own the button selected a mode and left the deck sitting
+            // there — indistinguishable from nothing happening.
+            onSetInternal: {
+                header.onSetInternal?()
+                model.play(side: side)
+            },
             onPause: header.onPause,
             onSetTimecode: { header.onSetTimecode?() },
             onSetThru: { header.onSetThru?() },

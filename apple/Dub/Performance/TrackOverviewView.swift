@@ -529,11 +529,12 @@ struct TrackOverviewView: View {
     /// reaches it. Drawn in the static Canvas — cues change only on
     /// set / clear / load, never per playhead tick.
     private func drawHotCues(ctx: GraphicsContext, size: CGSize) {
-        let cues = deckState.hotCues.map { $0?.positionSecs }
+        let cues = deckState.hotCues
         guard cues.contains(where: { $0 != nil }) else { return }
         guard let duration = overviewDurationSecs(), duration > 0 else { return }
         let lineW: CGFloat = 1.5
-        for case let cueSecs? in cues {
+        for case let cue? in cues {
+            let cueSecs = cue.positionSecs
             guard cueSecs.isFinite, cueSecs >= 0, cueSecs <= duration else { continue }
             guard let p = axisPosition(fraction: cueSecs / duration, size: size) else { continue }
             let line: CGRect
@@ -543,7 +544,14 @@ struct TrackOverviewView: View {
             case .horizontal:
                 line = CGRect(x: p - lineW * 0.5, y: 0, width: lineW, height: size.height)
             }
-            ctx.fill(Path(line), with: .color(DubColor.hotCue))
+            // The cue's own colour, as the pad and the playing strip
+            // draw it. This read `positionSecs` only and painted every
+            // line in the accent, so recolouring a cue changed it in
+            // two places out of three — and the overview is the one you
+            // check to find the mark again.
+            ctx.fill(
+                Path(line),
+                with: .color(DubColor.trackLabel(cue.color) ?? DubColor.hotCue))
         }
     }
 

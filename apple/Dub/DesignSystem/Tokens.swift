@@ -183,6 +183,39 @@ enum DubColor {
 
     /// Resolve a stored colour token to its swatch colour, or `nil`
     /// when the track is unlabelled (or carries an unknown token).
+    /// The Camelot wheel, as a colour per key.
+    ///
+    /// Twelve hues around the wheel, so 8A and 8B — the same tonic,
+    /// relative minor and major — share a hue, and neighbours on the
+    /// wheel are neighbours in colour. That is the whole point of the
+    /// notation: keys that mix sit next to each other, and once the
+    /// colour carries it you can see a compatible track in a list
+    /// without reading a single label.
+    ///
+    /// Minor (`A`) is the deeper end of each hue and major (`B`) the
+    /// brighter, which keeps the pair distinguishable at a glance
+    /// without inventing 24 unrelated colours.
+    private static let camelotHues: [Double] = [
+        150, 174, 198, 222, 252, 282, 312, 342, 12, 42, 72, 108,
+    ]
+
+    /// Colour for a Camelot key (`8A`, `12B`). `nil` for anything that
+    /// is not one — an unanalysed track, or a musical-notation string
+    /// the importer wrote verbatim.
+    static func camelotKey(_ notation: String?) -> Color? {
+        guard let notation, !notation.isEmpty else { return nil }
+        let trimmed = notation.trimmingCharacters(in: .whitespaces).uppercased()
+        guard let letter = trimmed.last, letter == "A" || letter == "B",
+              let number = Int(trimmed.dropLast()), (1...12).contains(number)
+        else { return nil }
+        let hue = camelotHues[number - 1] / 360.0
+        let minor = letter == "A"
+        return Color(
+            hue: hue,
+            saturation: minor ? 0.62 : 0.52,
+            brightness: minor ? 0.72 : 0.90)
+    }
+
     static func trackLabel(_ token: String?) -> Color? {
         guard let token else { return nil }
         return trackLabelPalette.first { $0.token == token }?.color
@@ -232,23 +265,23 @@ enum DubFont {
     static let display = Font.system(size: 18, weight: .semibold, design: baseFontDesign)
 
     /// Track titles in the deck header (`Stakes Is High`).
-    static let title = Font.system(size: 16, weight: .semibold, design: baseFontDesign)
+    static let title = Font.system(size: 17, weight: .semibold, design: baseFontDesign)
 
     /// Large numeric stat (BPM, pitch %) — distinct face to avoid
     /// confusion with track text.
-    static let numericLarge = Font.system(size: 18, weight: .medium, design: .monospaced)
+    static let numericLarge = Font.system(size: 20, weight: .medium, design: .monospaced)
 
     /// Inline numeric (key, pitch ±).
-    static let numericInline = Font.system(size: 13, weight: .medium, design: .monospaced)
+    static let numericInline = Font.system(size: 14, weight: .medium, design: .monospaced)
 
     /// Body text — artist, library cells.
-    static let body = Font.system(size: 13, weight: .regular, design: baseFontDesign)
+    static let body = Font.system(size: 14, weight: .regular, design: baseFontDesign)
 
     /// All-caps labels (`PITCH`, `BPM`, `KEY`, `DECK A`).
-    static let caps = Font.system(size: 10, weight: .semibold, design: baseFontDesign)
+    static let caps = Font.system(size: 11, weight: .semibold, design: baseFontDesign)
 
     /// Micro caption (format chips, "fingerprint pending").
-    static let micro = Font.system(size: 10, weight: .regular, design: baseFontDesign)
+    static let micro = Font.system(size: 11, weight: .regular, design: baseFontDesign)
 
     // Letter-spacing for `caps`. Three intentional values, collapsed
     // from six accidental ones (0.5 / 0.6 / 0.8 / 1.0 / 1.2 / 1.5) that
@@ -536,10 +569,9 @@ enum DubLayout {
     /// which here is the full column width rather than 26 pt of it.
     static let deckColumnOverviewHeight: CGFloat = 36
 
-    /// The echo-out block beside the loop. Wide enough for its own
-    /// section hairline to read as one, narrow enough that the pair
-    /// clears the column's floor.
-    static let deckColumnEchoWidth: CGFloat = 96
+    /// The echo-out block beside the loop. 96 clipped its own heading
+    /// to `E…`; there is room to spare beside the loop, so it takes it.
+    static let deckColumnEchoWidth: CGFloat = 150
 
     /// The loop box inside Performance's column — the same height as
     /// the echo button beside it, so the pair reads as one row of

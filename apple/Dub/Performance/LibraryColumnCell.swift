@@ -95,9 +95,14 @@ struct LibraryColumnCell: View {
                 .foregroundStyle(DubColor.textSecondary)
                 .monospacedDigit()
         case .key:
+            // Coloured by the Camelot wheel, so a compatible key can be
+            // spotted down a list without reading it. Falls back to the
+            // plain secondary ink for anything that is not a Camelot
+            // string — an unanalysed track, or an importer's verbatim
+            // musical notation.
             Text(state.keyNotationMode.render(track.key))
                 .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
+                .foregroundStyle(DubColor.camelotKey(track.key) ?? DubColor.textSecondary)
                 .help(state.keyNotationMode.tooltip(track.key))
         case .comment:
             plain(track.comment)

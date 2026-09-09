@@ -297,10 +297,22 @@ struct LoopEngine: View {
 
     /// Centre the window on the engaged length so both neighbours are
     /// reachable without a stepper press.
+    /// Where the window sits while nothing is engaged. `nil` is the
+    /// default position; the browse arrows move it.
+    ///
+    /// View state rather than model state on purpose: which three
+    /// lengths you are *looking at* before you commit to one is a
+    /// property of looking, not of the deck. Engaging a loop puts the
+    /// window back under the running length, so the browse position
+    /// never survives to confuse the next glance.
+    @State private var browseStart: Int?
+
+    private static var lastStart: Int { sizes.count - windowSize }
+
     private var windowStart: Int {
         guard let active = activeBeats,
               let idx = Self.sizes.firstIndex(where: { abs($0 - active) < 1e-9 })
-        else { return Self.idleStart }
+        else { return min(max(browseStart ?? Self.idleStart, 0), Self.lastStart) }
         return min(max(idx - Self.windowSize / 2, 0), Self.sizes.count - Self.windowSize)
     }
 
@@ -350,7 +362,11 @@ struct LoopEngine: View {
                     // width and they render at 52 as before.
                     .frame(minWidth: 40, maxWidth: 52)
                     .frame(maxHeight: .infinity)
-                    .background(on ? DubColor.loop.opacity(0.26) : Color.clear)
+                    // Unlit lengths get a fill of their own — the
+                    // group used to be bare inside the box, so the
+                    // three sizes read as text on the surface while the
+                    // steppers beside them read as buttons.
+                    .background(on ? DubColor.loop.opacity(0.26) : DubColor.surface3)
                     .overlay(alignment: .trailing) {
                         if offset < Self.windowSize - 1 {
                             Rectangle().fill(DubColor.divider).frame(width: 1)
@@ -375,11 +391,24 @@ struct LoopEngine: View {
 
     /// Resizes the *running* loop. Dead without one — there is nothing
     /// to halve — and dead at the ends of the range.
+    /// Two controls in one slot.
+    ///
+    /// **Engaged** it is `÷2` / `×2` — it resizes the running loop,
+    /// keeping its start. **Idle** it is `‹` / `›` — it walks the window
+    /// along the ladder, so you can bring the length you want under
+    /// your finger *before* committing to it. Idle, the halve/double
+    /// pair had nothing to act on and sat dead; this is the same slot
+    /// doing the job the state actually allows.
     private func stepper(_ glyph: String, double: Bool) -> some View {
         let next = activeBeats.map { double ? $0 * 2 : $0 / 2 }
-        let enabled = engaged && next.map { $0 >= 0.125 - 1e-9 && $0 <= 16 + 1e-9 } ?? false
-        return Text(glyph)
-            .font(.system(size: 12, weight: .medium, design: .monospaced))
+        let resizable = engaged && next.map { $0 >= 0.125 - 1e-9 && $0 <= 16 + 1e-9 } ?? false
+        let start = windowStart
+        let browsable = !engaged && (double ? start < Self.lastStart : start > 0)
+        let enabled = resizable || browsable
+        return Text(engaged ? glyph : (double ? "›" : "‹"))
+            .font(.system(
+                size: engaged ? 13 : 15, weight: .medium,
+                design: engaged ? .monospaced : .rounded))
             .foregroundStyle(enabled ? DubColor.textSecondary : DubColor.textPlaceholder)
             // Fills the box rather than a fixed 64: Performance runs
             // this control at the echo button's height, and a stepper
@@ -392,10 +421,18 @@ struct LoopEngine: View {
                 RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
                     .stroke(DubColor.divider, lineWidth: 1))
             .contentShape(Rectangle())
-            .onPressDown(enabled: enabled) { onScale(double) }
-            .help(double
-                ? "Double the running loop"
-                : "Halve the running loop, keeping its start")
+            .onPressDown(enabled: enabled) {
+                if engaged {
+                    onScale(double)
+                } else {
+                    browseStart = min(max(start + (double ? 1 : -1), 0), Self.lastStart)
+                }
+            }
+            .help(engaged
+                ? (double
+                    ? "Double the running loop"
+                    : "Halve the running loop, keeping its start")
+                : (double ? "Longer lengths" : "Shorter lengths"))
     }
 
     /// `1/8` rather than `0.125` — a DJ reads loop sizes as fractions.

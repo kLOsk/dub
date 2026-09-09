@@ -184,20 +184,22 @@ struct DeckColumn<Overview: View>: View {
     /// switches. INT is the play control — see `SourceControlView`.
     private var sourceRow: some View {
         HStack(spacing: 0) {
-            Spacer(minLength: 0)
+            Spacer(minLength: DubSpacing.lg)
             sourceSwitch
         }
+        .padding(.bottom, DubSpacing.xs)
     }
 
     private var sourceSwitch: some View {
-        // Always drawn, even with no timecode input — `.off` is the
-        // status for exactly that, and it renders the switch with no
-        // segment lit. The old header band hid the switch and showed
-        // bare transport glyphs instead, so on a machine with no
-        // interface there was no INT to press; here INT *is* the play
-        // control, so hiding it removes the transport.
+        // Always drawn, and `.internalPlay` — not `.off` — when the
+        // deck has no timecode input. A deck with no input *is* on its
+        // internal clock; `.off` left the INT segment unlit, so it
+        // called `onInternal` forever and never `onPause`. That is why
+        // the play button did nothing and why a deck started by a hot
+        // cue could not be stopped: the one control that pauses it was
+        // permanently in its "start" state.
         SourceControlView(
-            status: state.header.sourceControl ?? .off,
+            status: state.header.sourceControl ?? .internalPlay,
             overridden: state.header.sourceControlOverridden,
             isPlaying: state.isPlaying,
             side: state.side,
@@ -241,13 +243,13 @@ struct DeckColumn<Overview: View>: View {
     private var readouts: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
             readout("BPM", state.header.bpm.map { String(format: "%.1f", $0) })
-            readout("KEY", state.header.key)
+            readout("KEY", state.header.key, tint: DubColor.camelotKey(state.header.key))
             readout("PITCH", state.header.pitchPercent.map { String(format: "%+.1f", $0) })
         }
         .fixedSize()
     }
 
-    private func readout(_ label: String, _ value: String?) -> some View {
+    private func readout(_ label: String, _ value: String?, tint: Color? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
                 .font(DubFont.micro)
@@ -256,7 +258,8 @@ struct DeckColumn<Overview: View>: View {
             Text(value ?? "—")
                 .font(DubFont.numericLarge)
                 .monospacedDigit()
-                .foregroundStyle(value == nil ? DubColor.textPlaceholder : DubColor.textPrimary)
+                .foregroundStyle(
+                    value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
         }
     }
 
