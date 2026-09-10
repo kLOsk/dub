@@ -778,7 +778,7 @@ See §8 for detail.
 
 - **CDJ-style cue / preview button** (set a temp cue point, jump back to audition) → **not built.** A turntablist cues with the needle, not a software cue button — this navigation affordance isn't needed for the target user. *Note: this is distinct from **hot cues** (performance trigger points for beat-juggling / finger-drumming), which **are** a v1 feature — see §6.2.1. Earlier drafts of this PRD conflated the two and wrongly deferred all cues to v2.*
 - **Saved loop slots** (8 numbered, recallable) → **v1.x.** v1 ships ephemeral loops only. M11 includes the empty `track_loops` table so v1.x lands without a schema migration.
-- **Sampler expansion (4 → 6 slots, à la Serato SP-6)** → **v1.x** *if real-world use demands it.* v1 ships 4 slots, symmetric with the 4 Quick Scratch slots.
+- **Sampler expansion beyond 8 slots** → **v1.x** *if real-world use demands it.* v1 ships 8 — the Prep shelf's two rows of four (§7.1); the four-slot rack it started as is gone.
 - **Track Preparation Mode tooling** (beatgrid editor, gain tweak UI) → **v1.x.** M10.8 ships the *mode shell* — load + play + horizontal waveform — but no editing surface. The mode is *visible* in v1; its *tools* arrive in v1.x. (Hot-cue authoring shipped early, in both Performance and Prep — see §6.2.1.)
 - **Stillpoint "numeric-only" variant** (Preferences toggle to hide the band and keep just the Δ BPM / Δ ms readouts) → **v1.x** *if real use suggests it.* v1 ships the single design and learns from how DJs actually use it.
 - **Filesystem browser → full library** transition: v1.0's slim FS browser (M10.5) is intentionally minimal — folder navigation only, no metadata indexing, no crates. M11 lands the SQLite-backed library that replaces it.
@@ -802,18 +802,48 @@ Dub has **three distinct sample/track-throw mechanisms** — each solves a diffe
 
 ### 7.1 Sampler (one-shot, additive)
 
-Classic DJ sampler. v1: **4 slots** (`A S D F`). The PRD considered matching Serato's SP-6 (6 slots), but rejected it: 4 keeps the keymap symmetric with the 4 Quick Scratch slots (`Q W E R`), and 4 has historically been enough for the target user's drop / siren / horn / vocal-stab workflows. Expansion to 6 stays on the table for v1.x if real-world use suggests it.
+Classic DJ sampler. **8 slots**, one bank of pads drawn on both surfaces: Prep's
+SAMPLES shelf is where a sample is loaded (drag from the library or Finder) and
+auditioned; Performance's SAMPLER is the same shelf, firing. A slot loaded in
+the one place is the pad found in the other. The shelf lays them out as two
+rows of four, 5–8 over 1–4, the way a pad controller's rows count up from the
+hand.
 
-- One-shot trigger (key press → sample plays through and ends).
-- Per-slot: gain, output assignment (default: master out / Deck A's output bus, configurable).
-- Loadable via drag-and-drop from finder or library, or right-click "Assign to slot".
-- Output is **additive** — sample plays *over* whatever Deck A/B are currently playing. Mixed into the deck's output bus, post-FX.
+The PRD first specified **4 slots** (`A S D F`), rejecting Serato's SP-6 to
+keep the keymap symmetric with the four Quick Scratch keys. That shipped as a
+separate four-pad binding layer configured in Preferences, distinct from the
+Prep shelf, and the two were collapsed: the shelf *is* the sampler, and eight
+is what the shelf holds.
+
+- One-shot trigger (press → sample plays through and ends). Pressing a
+  sounding slot starts it over; the engine crossfades the retrigger.
+- **Right-click while sounding stops it** — no menu in the way of a hand
+  mid-set. Right-click while quiet offers **Unload**; the destructive gesture
+  only exists when there is nothing to interrupt.
+- **Auto-gain, like a track.** The slot's level is measured at load from the
+  decoded clip (the same −14 LUFS target and −1 dBFS ceiling as §8.4) and
+  applied by the engine. There is no per-slot gain control. A clip shorter than
+  one BS.1770 block — most stabs — is levelled on its whole-clip K-weighted
+  loudness rather than left at unity.
+- **Output follows the master deck**, like the siren: the take sums onto the
+  focused deck's bus, resolved at the press, so a horn lands on the channel the
+  crowd is hearing. A master switch mid-horn does not hop the sound across the
+  mixer; the next press goes to the new master. The `→ A` / `→ B` pill on the
+  SAMPLER header names it.
+- Output is **additive** — the sample plays *over* whatever Deck A/B are
+  currently playing. Mixed into the deck's output bus, post-FX.
+- Samples persist across launches (positional: unloading slot 2 leaves slot 3
+  where it was).
+- Loadable via drag-and-drop from Finder or the library onto either surface.
 - Use case: air horns, vocal stabs, dub-siren one-shots, "rewind!" FX, drops.
 
-**Status: shipped** (FFI 66) — with one deliberate gap: **the `A S D F`
-keys are not bound yet**, so the pads are triggered from the Preferences
-rack (which is also where a DJ auditions one while setting its level).
-The keymap lands with M18's remapping pass, alongside §7.3's.
+**Keys: none, deliberately.** `A S D F` were reserved for the four-slot rack and
+never live. A straight extension to eight collides with `G` (the grid tap), and
+picking a second row nobody has asked for would be a binding to unlearn later;
+the sampler's keys — and its MIDI notes — arrive with map mode (M18), where the
+DJ picks them. Until then the pads are mouse-driven and print no cap.
+
+**Status: shipped** (FFI 70).
 
 Three things the implementation pins down that this section left open:
 
@@ -837,12 +867,9 @@ Three things the implementation pins down that this section left open:
   outgoing take ramps out under the new one (~1.3 ms), as do the head,
   the tail, and an early stop.
 
-**Sample bank.** §7.1 and §7.2 bind from one shared list of files rather
-than a file picker per slot: the same horn is routinely wanted on a pad
-*and* on a Quick Scratch key. The slots still store their own URL, so
-the bank is a convenience over binding rather than a layer they depend
-on, and a binding made before the bank existed is adopted into it on
-load.
+**Quick Scratch binds from the same slots.** §7.2's keys pick from the files
+loaded on the shelf rather than a separate list: the same horn is routinely
+wanted on a pad *and* on a Quick Scratch key.
 
 ### 7.2 Quick Scratch (hotkey-bound fast load)
 
@@ -1361,7 +1388,7 @@ The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-hist
 |---|---|---|---|
 | **Zoomed column, Performance (Timecode) mode** | 200 px ideal, 132 min → 280 cap | `DubLayout.performanceWaveformWidth` / `…MinWidth` / `…WidthCap` | Slim Serato-parity strip after M10.8 waveform dogfooding; keeps kick transients readable while leaving room for overview, centre gutter, and info chips. The strip absorbs the width the pad column doesn't use, up to the cap — past that the remainder stays as the reserved info-chip canvas below, rather than a fatter waveform (see the note beneath this table). |
 | **Performance pad column** | 224 px wide, fixed | `DubLayout.performancePadColumnWidth` | CUE / LOOP / ECHO OUT, per deck. Fixed because it used to be `maxWidth: .infinity` and ate every pixel the waveform did not have nailed down. Sized to the widest row (4 × 38 + 3 × 8 = 176) plus `DubSpacing.lg` each side; LOOP wraps to two rows to fit, unlike Prep's single-row `LoopPadRow`. |
-| **Global rack bar** | 92 px tall, full width | `DubLayout.rackBarHeight` | Siren · Quick Scratch · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. The siren binds to the focused deck (§6.3) — there is one siren keymap and it always fired one deck. |
+| **Global rack bar** | 134 px tall, full width | `DubLayout.rackBarHeight` | Siren · Quick Scratch · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. The siren and the sampler bind to the focused deck (§6.3, §7.1) — there is one siren keymap and it always fired one deck. The height is the sampler's: the same two-row shelf Prep draws, so the bar grew from 92 when the four-pad rack became it. |
 | **Zoomed strip, Prep mode** | ≈ 140 px tall, full-width horizontal | `DubLayout.waveformPrepHeight` | Prep mode is single-deck and uses a horizontal scrolling playing waveform for screenshot/A-B judgement and track prep. |
 | **Overview band, Prep mode** | ≈ 60 px tall, full-width horizontal | `DubLayout.deckOverviewHeight` | Whole-track waveform stacked above the zoomed Prep waveform. Same click-to-jump semantics as the vertical overview. |
 | **Overview column** (M10.5c) | ≈ 36 px wide, full track top→bottom | `DubLayout.deckOverviewWidth` | Thin strip on the deck's outside edge. Shows the whole track at a glance with a playhead-bracket indicator at the current position. Click-to-jump per §6.1. |
@@ -1539,7 +1566,7 @@ remaining work only._
 | **M11d-columns** | **Column data plumbing + per-source disagreement view** — ✅ **shipped** | The remaining §8.5.3.1 column groups exist end-to-end. Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
-| **M17** | **Sampler + Quick Scratch + Instant Doubles** — ✅ **shipped** | All three trigger systems work per §7. The `A S D F` / `Q W E R` / `⌘←→` keymaps are fixed until M18's remapping pass; the sampler rack is driven from Preferences until then. | 4–6 days |
+| **M17** | **Sampler + Quick Scratch + Instant Doubles** — ✅ **shipped** | All three trigger systems work per §7. The `Q W E R` / `⌘←→` keymaps are fixed until M18's remapping pass; the sampler has no keys until map mode (§7.1) and is the Prep shelf firing, eight slots, auto-gained, on the master deck. | 4–6 days |
 | **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases; feature-frozen for v1.0 with hotfix discipline active. | 2–4 weeks, gated by gig time |
 | **M20** | **v1.0 Stable Release** | §2.2.6 SLOs met, DMG published, README/docs/demo ready. | 3–5 days once SLOs pass |

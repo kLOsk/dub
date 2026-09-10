@@ -82,23 +82,21 @@ final class DubKeymapTests: XCTestCase {
             DubKeymap.action(forKeyCode: 999, character: "G", command: false), .tapGrid)
     }
 
-    // MARK: - Reserved bindings
+    // MARK: - The sampler has no bindings
 
-    /// `A S D F` are drawn but not wired (PRD §7.1). They must not
-    /// dispatch, and they must not be swallowed — a reserved key falls
-    /// through to the rest of the app.
-    func testSamplerKeysAreReservedAndDoNotFire() {
+    /// `A S D F` used to be reserved for the sampler. They were dropped
+    /// rather than extended to eight slots — the keys wait for map mode —
+    /// so the letters must fall through to the rest of the app, and no
+    /// binding may claim them.
+    func testSamplerKeysAreNotBoundAndFallThrough() {
         for code in UInt16(0)...UInt16(3) {
             XCTAssertNil(
                 DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                "reserved slot must not consume its key")
+                "an unbound key must not be consumed")
         }
-        for slot in 0..<4 {
-            XCTAssertFalse(DubKeymap.isLive(.samplerSlot(slot)))
-            XCTAssertNotNil(
-                DubKeymap.legend(for: .samplerSlot(slot)),
-                "the cap still renders so the omission is visible")
-        }
+        XCTAssertFalse(
+            DubKeymap.bindings.contains { $0.action.id.hasPrefix("sampler.") },
+            "the sampler's keys come back with map mode, not before")
     }
 
     // MARK: - The invariant the table exists for
@@ -107,7 +105,6 @@ final class DubKeymapTests: XCTestCase {
     func testEveryRenderedLegendComesFromTheTable() {
         XCTAssertEqual(sirenPresetKeys, ["Z", "X", "C", "V", "B", "N", "M", ","])
         XCTAssertEqual(QuickScratchSlots.keyLabels, ["Q", "W", "E", "R"])
-        XCTAssertEqual(SamplerSlots.keyLabels, ["A", "S", "D", "F"])
     }
 
     /// No two live bindings can claim the same key. This is the check that
@@ -130,7 +127,6 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(DubAction.hotCue(2).id, "cue.2")
         XCTAssertEqual(DubAction.sirenPreset(7).id, "siren.preset.7")
         XCTAssertEqual(DubAction.quickScratch(0).id, "quickScratch.0")
-        XCTAssertEqual(DubAction.samplerSlot(3).id, "sampler.3")
         XCTAssertEqual(DubAction.instantDouble(toDeckB: true).id, "deck.instantDouble.b")
         XCTAssertEqual(DubAction.loadSelection.id, "transport.loadSelection")
     }

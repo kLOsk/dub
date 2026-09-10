@@ -52,7 +52,7 @@ struct QuickScratchSlots: Equatable {
         slots.indices.contains(index) ? slots[index] : nil
     }
 
-    /// Every bound URL, for adopting into the shared bank on load.
+    /// Every bound URL, in slot order.
     var boundUrls: [URL] { slots.compactMap { $0?.url } }
 
     mutating func assign(url: URL, deck: DeckSide = .a, to index: Int) {

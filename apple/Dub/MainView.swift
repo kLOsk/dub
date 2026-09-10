@@ -779,29 +779,25 @@ final class WaveformAppModel: ObservableObject {
     private static let kDiscogsAccount = "discogsToken"
     private static let secrets: SecretStore = KeychainSecretStore()
 
-    /// M17 — the shared sample bank both racks bind from (§7.1, §7.2).
+    /// M17 §7.1 — the sampler: eight positional slots, loaded on Prep's
+    /// shelf, fired from either surface, and the list Quick Scratch
+    /// (§7.2) binds from.
     ///
-    /// Persisted under `dub.sampleBank`.
+    /// Persisted under `dub.sampleBank`. Changing a slot re-binds it on
+    /// the engine, which is where the converted buffer lives.
     @Published var sampleBank: SampleBank {
         didSet {
             UserDefaults.standard.set(sampleBank.persisted, forKey: Self.kSampleBank)
+            syncSampler(changedFrom: oldValue)
         }
     }
 
     private static let kSampleBank = "dub.sampleBank"
 
-    /// M17 §7.1 — the four sampler pads (`A S D F`).
-    ///
-    /// Persisted under `dub.samplerSlots`. Changing a slot re-binds it
-    /// on the engine, which is where the converted buffer lives.
-    @Published var samplerSlots: SamplerSlots {
-        didSet {
-            UserDefaults.standard.set(samplerSlots.persisted, forKey: Self.kSamplerSlots)
-            syncSamplerSlots(changedFrom: oldValue)
-        }
-    }
-
-    private static let kSamplerSlots = "dub.samplerSlots"
+    /// What every sampler slot is doing — sounding, and how far through.
+    /// Refreshed by the 30 Hz poll; only republished when something
+    /// changed, so an idle rack costs the view nothing.
+    @Published private(set) var samplerVoices: [SamplerSlotTelemetry] = []
 
     /// M17 §7.2 — the four Quick Scratch slots (`Q W E R`).
     ///
@@ -1234,21 +1230,10 @@ final class WaveformAppModel: ObservableObject {
         // in the preferences plist across on the way.
         // Decoded into locals first: `self` cannot be read here until
         // every stored property is initialised.
-        let quickScratchSlots = QuickScratchSlots(
+        self.quickScratch = QuickScratchSlots(
             persisted: UserDefaults.standard.string(forKey: Self.kQuickScratch) ?? "")
-        let samplerRack = SamplerSlots(
-            persisted: UserDefaults.standard.string(forKey: Self.kSamplerSlots) ?? "")
-        // Adopt whatever the racks already point at, so a binding made
-        // before the bank existed still shows up in the list instead of
-        // being audibly bound and invisible.
-        var bank = SampleBank(
+        self.sampleBank = SampleBank(
             persisted: UserDefaults.standard.string(forKey: Self.kSampleBank) ?? "")
-        for url in samplerRack.boundUrls + quickScratchSlots.boundUrls {
-            bank.adopt(url)
-        }
-        self.quickScratch = quickScratchSlots
-        self.samplerSlots = samplerRack
-        self.sampleBank = bank
         self.discogsToken = SecretMigration.migrateFromDefaults(
             account: Self.kDiscogsAccount,
             defaultsKey: Self.kDiscogsToken,
@@ -1696,7 +1681,7 @@ final class WaveformAppModel: ObservableObject {
             if isRunning { startPolling() }
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
-            syncSamplerSlots()
+            syncSampler()
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -1735,7 +1720,7 @@ final class WaveformAppModel: ObservableObject {
             if isRunning { startPolling() }
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
-            syncSamplerSlots()
+            syncSampler()
             // M26b — offer any rip that never finished. Reads WAV
             // headers only, so it stays off the critical path even
             // with a season's worth of sessions on disk.
@@ -1768,7 +1753,7 @@ final class WaveformAppModel: ObservableObject {
             if isRunning { startPolling() }
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
-            syncSamplerSlots()
+            syncSampler()
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -1825,7 +1810,19 @@ final class WaveformAppModel: ObservableObject {
         if newA != deckA { deckA = newA }
         if newB != deckB { deckB = newB }
         recomputeMaster()
+        pollSampler()
         logSignalDiagnostics()
+    }
+
+    /// The pad lamps and their sweeps (M17 §7.1). Lock-free reads; the
+    /// publish is skipped while nothing is sounding and nothing was, so
+    /// the common case — an idle rack — never invalidates the bar.
+    private func pollSampler() {
+        let voices = engine.samplerTelemetry()
+        let wasIdle = samplerVoices.allSatisfy { !$0.playing }
+        let isIdle = voices.allSatisfy { !$0.playing }
+        if wasIdle && isIdle && samplerVoices.count == voices.count { return }
+        samplerVoices = voices
     }
 
     /// M11d-history: report play-state edges to the library's
@@ -4634,79 +4631,63 @@ final class WaveformAppModel: ObservableObject {
         setState(destination, for: to)
     }
 
-    /// Fire a sampler pad (M17, PRD §7.1).
+    /// Fire a sampler slot (M17, PRD §7.1) onto the focused deck — the
+    /// master, so the horn lands on the channel the crowd is hearing.
+    /// The deck is resolved here, at the press, and the take keeps it;
+    /// a master switch mid-horn does not hop the sound across the mixer.
     ///
-    /// The keys (`A S D F`) are **not bound yet** — the keymap lands
-    /// with M18's remapping pass — so today this is driven from the
-    /// Preferences rack, which is also how a DJ auditions a pad while
-    /// setting levels.
+    /// Mouse-driven today: the sampler's keys were reserved and never
+    /// live, and were dropped rather than extended to eight — they come
+    /// back with map mode. A MIDI note or a key is just another caller
+    /// of this.
     func triggerSampler(_ index: Int) {
-        guard isRunning, samplerSlots.slot(index) != nil else { return }
+        guard isRunning, sampleBank.slot(index) != nil else { return }
         do {
-            try engine.samplerTrigger(slot: UInt64(index))
+            try engine.samplerTrigger(
+                slot: UInt64(index), deckIdx: focusedDeckForGridNudge.ffiDeckIdx)
         } catch {
-            surfaceError("Sampler \(Self.samplerKeyLabel(index)): \(error.localizedDescription)")
+            surfaceError("Sampler \(index + 1): \(error.localizedDescription)")
         }
     }
 
-    /// Stop a sounding pad early, ramping out.
+    /// Stop a sounding slot early, ramping out.
     func stopSampler(_ index: Int) {
         guard isRunning else { return }
         try? engine.samplerStop(slot: UInt64(index))
     }
 
-    static func samplerKeyLabel(_ index: Int) -> String {
-        SamplerSlots.keyLabels.indices.contains(index)
-            ? SamplerSlots.keyLabels[index] : "\(index + 1)"
-    }
-
-    /// Push the sampler rack to the engine (M17 §7.1).
+    /// Push the sampler to the engine (M17 §7.1).
     ///
     /// The engine owns the decoded, rate-converted buffers, so they do
     /// not survive an engine restart — this runs on every start as well
     /// as on every edit. `changedFrom` limits the work to slots that
-    /// actually moved: `sampler_load` decodes and resamples a file, so
-    /// re-binding all four on a gain tweak would be absurd.
-    func syncSamplerSlots(changedFrom previous: SamplerSlots? = nil) {
+    /// actually moved: `sampler_load` decodes, resamples and measures
+    /// a file, so re-binding all eight because one changed would be
+    /// absurd. The level is the engine's to set: it measures the clip's
+    /// loudness at load and applies the same auto-gain a track gets.
+    func syncSampler(changedFrom previous: SampleBank? = nil) {
         guard isRunning else { return }
         let engine = self.engine
-        let slots = samplerSlots
+        let bank = sampleBank
 
-        for index in 0..<SamplerSlots.count {
-            let slot = slots.slot(index)
-            let old = previous?.slot(index)
+        for index in 0..<SampleBank.count {
+            let url = bank.slot(index)
+            guard previous == nil || url != previous?.slot(index) else { continue }
             let ffiSlot = UInt64(index)
-
-            if slot?.url != old?.url {
-                guard let slot else {
-                    try? engine.samplerClear(slot: ffiSlot)
-                    continue
-                }
-                let url = slot.url
-                // Decode + resample, so off the main queue.
-                Task.detached(priority: .userInitiated) {
-                    do {
-                        try engine.samplerLoad(slot: ffiSlot, path: url.path)
-                        try engine.samplerSetGain(slot: ffiSlot, gain: Float(slot.gain))
-                        try engine.samplerSetOutputDeck(
-                            slot: ffiSlot, deckIdx: slot.deck.ffiDeckIdx)
-                    } catch {
-                        let message = error.localizedDescription
-                        await MainActor.run {
-                            self.surfaceError(
-                                "Sampler \(Self.samplerKeyLabel(index)): \(message)")
-                        }
-                    }
-                }
+            guard let url else {
+                try? engine.samplerClear(slot: ffiSlot)
                 continue
             }
-
-            guard let slot else { continue }
-            if slot.gain != old?.gain {
-                try? engine.samplerSetGain(slot: ffiSlot, gain: Float(slot.gain))
-            }
-            if slot.deck != old?.deck {
-                try? engine.samplerSetOutputDeck(slot: ffiSlot, deckIdx: slot.deck.ffiDeckIdx)
+            // Decode + resample + measure, so off the main queue.
+            Task.detached(priority: .userInitiated) {
+                do {
+                    try engine.samplerLoad(slot: ffiSlot, path: url.path)
+                } catch {
+                    let message = error.localizedDescription
+                    await MainActor.run {
+                        self.surfaceError("Sampler \(index + 1): \(message)")
+                    }
+                }
             }
         }
     }
@@ -4843,32 +4824,16 @@ final class WaveformAppModel: ObservableObject {
         return nearest
     }
 
-    /// Best-effort persistence of one hot cue slot (set when
-    /// `position != nil`, else delete). The in-memory cue already
-    /// works this session regardless of the DB write.
-    /// Put `url` in sample slot `index`, replacing whatever was there.
-    ///
-    /// Slots are positional: the bank is a list, so filling slot 5 while
-    /// 3 and 4 are empty pads the gaps rather than sliding the file
-    /// left. A pad bound to slot 5 must keep pointing at slot 5.
+    /// Put `url` in sampler slot `index`, replacing whatever was there.
+    /// Slots are positional — see `SampleBank`.
     func setSampleSlot(_ index: Int, url: URL) {
-        guard index >= 0, index < 8 else { return }
-        var urls = sampleBank.all
-        while urls.count <= index { urls.append(Self.emptySampleSlotURL) }
-        urls[index] = url
-        sampleBank = SampleBank(urls: urls.filter { $0 != Self.emptySampleSlotURL })
+        sampleBank.load(url, into: index)
     }
 
-    /// Empty a sample slot.
+    /// Empty a sampler slot.
     func clearSampleSlot(_ index: Int) {
-        let all = sampleBank.all
-        guard all.indices.contains(index) else { return }
-        sampleBank.remove(all[index])
+        sampleBank.unload(index)
     }
-
-    /// Placeholder for a gap while re-indexing the bank. Never persisted
-    /// — `setSampleSlot` filters it out before storing.
-    private static let emptySampleSlotURL = URL(fileURLWithPath: "/dev/null")
 
     /// Name and/or colour an existing cue on `side`.
     ///
@@ -4894,6 +4859,9 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Best-effort persistence of one hot cue slot (set when
+    /// `position != nil`, else delete). The in-memory cue already
+    /// works this session regardless of the DB write.
     private func persistHotCue(deck: DeckState, index: Int, position: Double?) {
         guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
         let library = self.library
@@ -6180,12 +6148,6 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onInstantDouble(toDeckB) { return nil }
                 case .loadSelection:
                     if onSpace() { return nil }
-                case .samplerSlot:
-                    // Reserved — `DubKeymap.action` filters these out, so
-                    // this is unreachable. Listed rather than defaulted so
-                    // wiring it at M18 is a compiler error here, not an
-                    // omission nobody notices.
-                    break
                 case .openPreferences:
                     // Handled above, before the text-field guard, because
                     // ⌘, must win even while typing.

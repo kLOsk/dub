@@ -329,18 +329,32 @@ struct PerformanceView: View {
                     sampleName: slot.map { SampleBank.label(for: $0.url) },
                     deck: slot?.deck)
             },
-            sampler: (0..<SamplerSlots.count).map { index in
-                let slot = model.samplerSlots.slot(index)
-                return TriggerPadState(
+            sampler: sampleShelfState(focusedDeck: focus))
+    }
+
+    /// The sampler as drawn on either surface: the bank's names over
+    /// the engine's lamps. `focusedDeck` names the deck the pads fire on;
+    /// Prep passes `nil` — one deck, no pill.
+    private func sampleShelfState(focusedDeck: DeckSide?) -> SampleShelfState {
+        let voices = model.samplerVoices
+        return SampleShelfState(
+            slots: (0..<SampleBank.count).map { index in
+                let voice = voices.indices.contains(index) ? voices[index] : nil
+                return SampleSlotState(
                     index: index,
-                    key: SamplerSlots.keyLabels[index],
-                    sampleName: slot.map { SampleBank.label(for: $0.url) },
-                    deck: slot?.deck,
-                    // PRD §7.1 — reserved until M18 wires them. Read from
-                    // the keymap rather than asserted here, so the day the
-                    // binding goes live the cap follows with no edit.
-                    keyBound: DubKeymap.isLive(.samplerSlot(index)))
-            })
+                    name: model.sampleBank.slot(index).map { SampleBank.label(for: $0) },
+                    playing: voice?.playing ?? false,
+                    progress: Double(voice?.progress ?? 0))
+            },
+            focusedDeck: focusedDeck)
+    }
+
+    private var sampleShelfCallbacks: SampleShelfCallbacks {
+        SampleShelfCallbacks(
+            onTrigger: { index in model.triggerSampler(index) },
+            onStop: { index in model.stopSampler(index) },
+            onDrop: { index, url in model.setSampleSlot(index, url: url) },
+            onUnload: { index in model.clearSampleSlot(index) })
     }
 
     /// Prep's surface, as values. Read fresh each render; nothing here
@@ -352,10 +366,7 @@ struct PerformanceView: View {
             },
             activeLoopBeats: model.deckA.activeLoopBeats,
             loopEngaged: model.deckA.loopActive,
-            sampleSlots: (0..<8).map { index in
-                let all = model.sampleBank.all
-                return all.indices.contains(index) ? SampleBank.label(for: all[index]) : nil
-            },
+            samples: sampleShelfState(focusedDeck: nil),
             hasTrack: model.deckA.hasTrack,
             isPlaying: model.deckA.isPlaying)
     }
@@ -374,8 +385,7 @@ struct PerformanceView: View {
             onLoop: { beats in model.handleLoopBeats(.a, beats: beats) },
             onScaleLoop: { double in model.scaleLoop(.a, double: double) },
             onExitLoop: { model.exitLoop(.a) },
-            onDropSample: { index, url in model.setSampleSlot(index, url: url) },
-            onUnloadSample: { index in model.clearSampleSlot(index) })
+            samples: sampleShelfCallbacks)
     }
 
     /// Name a cue. A sheet would be heavier than the gesture deserves —
@@ -418,8 +428,7 @@ struct PerformanceView: View {
                 model.setSirenDub(model.focusedDeckForGridNudge, value)
             },
             onQuickScratch: { idx in model.triggerQuickScratch(idx) },
-            onSampler: { idx in model.triggerSampler(idx) },
-            onSamplerStop: { idx in model.stopSampler(idx) })
+            sampler: sampleShelfCallbacks)
     }
 
     // MARK: - Waveform region

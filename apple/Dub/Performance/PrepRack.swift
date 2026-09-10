@@ -20,10 +20,11 @@
 //  * **LOOP** is an *instrument*. Boxed, recessed, panel-like, built
 //    around a numeral in a well. It is the only thing here that looks like
 //    a unit, because it is the only thing here that behaves like one.
-//  * **SAMPLES** is a *drop target over a list*. Its border is dashed when
-//    empty because that is what a drop zone looks like, and solid once it
-//    holds something. Neither of the other two has a state where its own
-//    outline changes.
+//  * **SAMPLES** is a *drop target over a pad bank*. Its border is dashed
+//    when empty because that is what a drop zone looks like, and solid
+//    once it holds something. Neither of the other two has a state where
+//    its own outline changes. It is `SampleShelf`, the same view
+//    Performance fires from — Prep is where it gets loaded and tried.
 //
 //  Cover the labels: a list, a panel, and a drop zone are still three
 //  recognisable objects. That is the test this file has to keep passing.
@@ -59,9 +60,9 @@ struct PrepRackState: Equatable {
     /// Beats of the loop currently running; `nil` when none is.
     var activeLoopBeats: Double?
     var loopEngaged: Bool = false
-    /// Eight sample slots; `nil` is empty. Fixed slots rather than a
-    /// growing list, because a slot is what a pad binds to.
-    var sampleSlots: [String?] = Array(repeating: nil, count: 8)
+    /// The sampler. Fixed slots rather than a growing list, because a
+    /// slot is what a pad is.
+    var samples: SampleShelfState = .empty
     /// Cue and loop controls do nothing without a deck loaded, and should
     /// say so rather than fail quietly.
     var hasTrack: Bool = false
@@ -84,10 +85,8 @@ struct PrepRackCallbacks {
     var onScaleLoop: (_ double: Bool) -> Void = { _ in }
     /// Pressing the lit length again leaves the loop.
     var onExitLoop: () -> Void = {}
-    /// A file dropped onto slot `index` — from the library or Finder.
-    /// Dropping onto a filled slot replaces it.
-    var onDropSample: (_ index: Int, _ url: URL) -> Void = { _, _ in }
-    var onUnloadSample: (_ index: Int) -> Void = { _ in }
+    /// The sampler's gestures — fire, stop, drop, unload.
+    var samples = SampleShelfCallbacks()
 }
 
 // MARK: - The surface
@@ -118,10 +117,7 @@ struct PrepRack: View {
             // here that genuinely improves with width, because a filename
             // is the only string on the surface whose length is not ours
             // to choose.
-            SampleShelf(
-                slots: state.sampleSlots,
-                onDrop: callbacks.onDropSample,
-                onUnload: callbacks.onUnloadSample)
+            SampleShelf(state: state.samples, callbacks: callbacks.samples)
                 .frame(
                     minWidth: DubLayout.prepSampleShelfMin,
                     maxWidth: .infinity,
@@ -143,104 +139,5 @@ enum CueTimecode {
         let whole = Int(tenthsTotal / 10)
         let tenths = Int(tenthsTotal) % 10
         return String(format: "%d:%02d.%d", whole / 60, whole % 60, tenths)
-    }
-}
-
-// MARK: - SAMPLES — a drop target over a list
-
-/// Prep owns getting sounds *into* the bank; Performance fires them.
-///
-/// Its outline is the state: dashed while the bank is empty, because that
-/// is what a drop zone looks like, and solid once it holds something.
-/// Neither of the other two sections changes its own border, which is what
-/// keeps this one identifiable.
-///
-/// The sampler and Quick Scratch racks both bind from this one list, so a
-/// horn added here is available to a sampler pad and a Quick Scratch key
-/// at once. It lived only in Preferences, which is the wrong home for work
-/// done while auditioning.
-private struct SampleShelf: View {
-    let slots: [String?]
-    let onDrop: (Int, URL) -> Void
-    let onUnload: (Int) -> Void
-
-    private var filled: Int { slots.compactMap { $0 }.count }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            SectionHeading(
-                title: "SAMPLES", accent: DubColor.deckATint,
-                trailing: "\(filled) OF \(slots.count)")
-
-            LazyVGrid(
-                columns: Array(
-                    repeating: GridItem(.flexible(), spacing: DubSpacing.xs), count: 4),
-                spacing: DubSpacing.xs
-            ) {
-                // 5-8 on top, 1-4 underneath. A numbered bank counts
-                // *up* from the row nearest the hand, the way a pad
-                // controller's rows do — reading the grid left-to-right
-                // top-to-bottom put 1 furthest from the fingers.
-                ForEach(Array(Self.slotOrder(count: slots.count)), id: \.self) { index in
-                    slotTile(index: index, name: slots[index])
-                }
-            }
-        }
-    }
-
-    /// Slot indices in draw order: the second half first, so the
-    /// grid's *bottom* row is 1-4. Derived rather than hard-coded so a
-    /// bank of a different size still splits down the middle.
-    static func slotOrder(count: Int) -> [Int] {
-        let half = count / 2
-        return Array(half..<count) + Array(0..<half)
-    }
-
-    /// One slot. Empty slots are dashed — the drop-zone convention —
-    /// and there is no Add button: a sample arrives by being dragged
-    /// from the track list, which is where the DJ is already looking
-    /// when they decide something should be a stab.
-    private func slotTile(index: Int, name: String?) -> some View {
-        let isEmpty = name == nil
-        // An empty slot shows its number, the way an empty cue row
-        // shows its own. Eight tiles each reading "drop" was the
-        // instruction printed eight times; the dashed border already
-        // says the slot takes something.
-        return VStack(spacing: 2) {
-            Text(name ?? "\(index + 1)")
-                .font(.system(
-                    size: isEmpty ? 13 : 11,
-                    weight: isEmpty ? .medium : .semibold,
-                    design: isEmpty ? .monospaced : .default))
-                .foregroundStyle(isEmpty ? DubColor.textPlaceholder : DubColor.textPrimary)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .minimumScaleFactor(0.85)
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 42)
-        .padding(.horizontal, DubSpacing.xs)
-        .background(isEmpty ? Color.clear : DubColor.surface2)
-        .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                .strokeBorder(
-                    DubColor.divider,
-                    style: StrokeStyle(lineWidth: 1, dash: isEmpty ? [3, 3] : [])))
-        // Replacing is the same gesture as filling: dropping onto a
-        // full slot overwrites it, so there is no "clear it first".
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            onDrop(index, url)
-            return true
-        }
-        .contextMenu {
-            if !isEmpty {
-                Button("Unload") { onUnload(index) }
-            }
-        }
-        .help(isEmpty
-            ? "Slot \(index + 1) — drag a track here from the library"
-            : "\(name ?? "") — drop another to replace, right-click to unload")
     }
 }

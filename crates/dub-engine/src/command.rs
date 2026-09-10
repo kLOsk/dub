@@ -321,19 +321,17 @@ pub enum Command {
     /// off the audio thread.
     SamplerClear { slot: u8 },
 
-    /// Fire sampler slot `slot`'s one-shot (§7.1). Retriggering a
-    /// sounding voice crossfades rather than cutting.
-    SamplerTrigger { slot: u8 },
+    /// Fire sampler slot `slot`'s one-shot (§7.1) onto deck `deck`'s
+    /// output bus — the master deck, chosen by the shell at the press.
+    /// Retriggering a sounding voice crossfades rather than cutting.
+    SamplerTrigger { slot: u8, deck: u8 },
 
     /// Stop sampler slot `slot` before its sample ends, ramping out.
     SamplerStop { slot: u8 },
 
-    /// Per-slot linear gain (§7.1).
+    /// Slot `slot`'s linear gain — the auto-gain the shell measured at
+    /// bind time (§7.1).
     SamplerSetGain { slot: u8, gain: f32 },
-
-    /// Which deck's output bus slot `slot` sums onto (§7.1 "output
-    /// assignment"; default deck A).
-    SamplerSetOutputDeck { slot: u8, deck: u8 },
 
     /// Instant Doubles (M17, PRD §7.3): put the track loaded on deck
     /// `from` onto deck `to` at `from`'s current playhead, for
@@ -418,9 +416,10 @@ impl std::fmt::Debug for Command {
             Self::SamplerClear { slot } => {
                 f.debug_struct("SamplerClear").field("slot", slot).finish()
             }
-            Self::SamplerTrigger { slot } => f
+            Self::SamplerTrigger { slot, deck } => f
                 .debug_struct("SamplerTrigger")
                 .field("slot", slot)
+                .field("deck", deck)
                 .finish(),
             Self::SamplerStop { slot } => {
                 f.debug_struct("SamplerStop").field("slot", slot).finish()
@@ -429,11 +428,6 @@ impl std::fmt::Debug for Command {
                 .debug_struct("SamplerSetGain")
                 .field("slot", slot)
                 .field("gain", gain)
-                .finish(),
-            Self::SamplerSetOutputDeck { slot, deck } => f
-                .debug_struct("SamplerSetOutputDeck")
-                .field("slot", slot)
-                .field("deck", deck)
                 .finish(),
             Self::DeckInstantDouble { from, to } => f
                 .debug_struct("DeckInstantDouble")

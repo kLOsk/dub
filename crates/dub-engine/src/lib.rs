@@ -318,6 +318,9 @@ pub struct Engine {
     /// per-deck: a voice chooses which deck bus it sums onto, so the
     /// same rack serves both.
     samplers: [crate::sampler::SamplerVoice; crate::sampler::SAMPLER_SLOTS],
+    /// Where the voices publish playing / progress for the UI poll,
+    /// once per block after they render.
+    sampler_shared: std::sync::Arc<crate::sampler::SamplerSharedState>,
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -449,6 +452,7 @@ impl Engine {
             siren_volume: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
+            sampler_shared: std::sync::Arc::default(),
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -527,6 +531,7 @@ impl Engine {
             siren_volume: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
+            sampler_shared: side.sampler_shared,
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -929,6 +934,7 @@ impl Engine {
                 }
             }
         }
+        self.sampler_shared.publish(&self.samplers);
 
         // Master gain (M4 / M5.5): single multiplicative scale across the
         // entire summed N-channel bus. Applied after deck mixing so
@@ -1942,9 +1948,9 @@ impl Engine {
                     }
                 }
             }
-            Command::SamplerTrigger { slot } => {
+            Command::SamplerTrigger { slot, deck } => {
                 if let Some(voice) = self.samplers.get_mut(slot as usize) {
-                    voice.trigger();
+                    voice.trigger(deck);
                 }
             }
             Command::SamplerStop { slot } => {
@@ -1955,11 +1961,6 @@ impl Engine {
             Command::SamplerSetGain { slot, gain } => {
                 if let Some(voice) = self.samplers.get_mut(slot as usize) {
                     voice.set_gain(gain);
-                }
-            }
-            Command::SamplerSetOutputDeck { slot, deck } => {
-                if let Some(voice) = self.samplers.get_mut(slot as usize) {
-                    voice.set_output_deck(deck);
                 }
             }
             Command::DeckInstantDouble { from, to } => {
@@ -6151,7 +6152,7 @@ mod tests {
             source: sample,
         });
         engine.apply_command(Command::SamplerSetGain { slot: 0, gain: 1.0 });
-        engine.apply_command(Command::SamplerTrigger { slot: 0 });
+        engine.apply_command(Command::SamplerTrigger { slot: 0, deck: 0 });
 
         let mut buf = vec![0.0f32; 512 * 2];
         let mut rt = RealtimeContext::new();
@@ -6175,8 +6176,7 @@ mod tests {
             source: sample,
         });
         engine.apply_command(Command::SamplerSetGain { slot: 1, gain: 1.0 });
-        engine.apply_command(Command::SamplerSetOutputDeck { slot: 1, deck: 1 });
-        engine.apply_command(Command::SamplerTrigger { slot: 1 });
+        engine.apply_command(Command::SamplerTrigger { slot: 1, deck: 1 });
 
         // Four channels, external-mixer routing: deck A on 0+1, deck B
         // on 2+3.
@@ -6253,9 +6253,9 @@ mod tests {
         engine.render(&mut rt, &mut buf);
 
         assert_no_alloc::assert_no_alloc(|| {
-            engine.apply_command(Command::SamplerTrigger { slot: 0 });
+            engine.apply_command(Command::SamplerTrigger { slot: 0, deck: 0 });
             engine.render(&mut rt, &mut buf);
-            engine.apply_command(Command::SamplerTrigger { slot: 0 });
+            engine.apply_command(Command::SamplerTrigger { slot: 0, deck: 0 });
             engine.render(&mut rt, &mut buf);
             engine.apply_command(Command::SamplerStop { slot: 0 });
             engine.render(&mut rt, &mut buf);
@@ -6274,7 +6274,45 @@ mod tests {
             .expect_err("slot 9 does not exist");
         assert!(matches!(err, CommandError::InvalidDeck { .. }));
         assert!(Arc::ptr_eq(&returned, &sample), "the sample comes back");
-        assert!(handle.sampler_trigger(9).is_err());
+        assert!(handle.sampler_trigger(9, 0).is_err());
+        assert!(
+            handle.sampler_trigger(0, 9).is_err(),
+            "and a deck that does not exist"
+        );
         assert!(handle.sampler_set_gain(9, 1.0).is_err());
+    }
+
+    /// The pad lights and its sweep moves off what the render loop
+    /// publishes — the same atomics the handle reads.
+    #[test]
+    fn the_handle_sees_a_sounding_voice_and_its_progress() {
+        let (mut engine, handle) = Engine::new_with_handle(48_000.0, 64);
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 1024 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 3,
+            source: sample,
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 3, gain: 1.0 });
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut rt = RealtimeContext::new();
+
+        engine.render(&mut rt, &mut buf);
+        assert!(
+            !handle.sampler_shared().is_playing(3),
+            "idle until triggered"
+        );
+
+        engine.apply_command(Command::SamplerTrigger { slot: 3, deck: 0 });
+        engine.render(&mut rt, &mut buf);
+        assert!(handle.sampler_shared().is_playing(3));
+        let progress = handle.sampler_shared().progress(3);
+        assert!(
+            (progress - 0.5).abs() < 1e-2,
+            "half way through, got {progress}"
+        );
+
+        engine.render(&mut rt, &mut buf);
+        assert!(!handle.sampler_shared().is_playing(3), "the one-shot ended");
+        assert!(handle.sampler_shared().progress(3).abs() < f32::EPSILON);
     }
 }

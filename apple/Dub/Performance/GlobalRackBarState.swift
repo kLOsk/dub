@@ -7,11 +7,11 @@
 //
 //  These three are grouped because they are the racks that are *not*
 //  per-deck, however they used to be drawn. There is one siren keymap
-//  (`Z X C V B N M ,`) and it fires the focused deck; Quick Scratch and
-//  the sampler are four-slot tables where each slot carries its own
-//  target deck, so an index-keyed press has never needed a deck
-//  argument. Drawing them once, in one bar, is what the model has
-//  always said.
+//  (`Z X C V B N M ,`) and it fires the focused deck; the sampler's
+//  eight slots fire the focused deck too; Quick Scratch is a four-slot
+//  table where each slot carries its own target deck, so an index-keyed
+//  press has never needed a deck argument. Drawing them once, in one
+//  bar, is what the model has always said.
 //
 
 import DubCore
@@ -29,7 +29,7 @@ struct SirenRackState: Equatable {
     var dubMacro: Double = 0
 }
 
-/// One Quick Scratch or sampler pad.
+/// One Quick Scratch pad.
 struct TriggerPadState: Equatable, Identifiable {
     var index: Int
     /// The key cap printed under the name.
@@ -38,11 +38,6 @@ struct TriggerPadState: Equatable, Identifiable {
     var sampleName: String?
     /// Which deck bus the slot lands on; `nil` when unbound.
     var deck: DeckSide?
-    /// Whether `key` actually fires this pad today. The sampler's
-    /// `A S D F` are not bound yet (PRD §7.1 hands the keymap to M18's
-    /// remapping pass), so its caps render dimmed rather than
-    /// advertising a binding that does not exist.
-    var keyBound: Bool = true
 
     var id: Int { index }
 }
@@ -54,7 +49,8 @@ struct GlobalRackBarState: Equatable {
     /// their own column and a second copy would be duplicate chrome.
     var siren: SirenRackState?
     var quickScratch: [TriggerPadState] = []
-    var sampler: [TriggerPadState] = []
+    /// The sampler — the same shelf Prep loads, firing here.
+    var sampler: SampleShelfState = .empty
 }
 
 /// What the bar fires. Separate from the state so the state stays
@@ -64,6 +60,5 @@ struct GlobalRackBarCallbacks {
     var onSirenUnit: (_ unit: SirenUnit) -> Void = { _ in }
     var onSirenDubMacro: (_ value: Double) -> Void = { _ in }
     var onQuickScratch: (_ index: Int) -> Void = { _ in }
-    var onSampler: (_ index: Int) -> Void = { _ in }
-    var onSamplerStop: (_ index: Int) -> Void = { _ in }
+    var sampler = SampleShelfCallbacks()
 }

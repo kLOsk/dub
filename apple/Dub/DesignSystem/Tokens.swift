@@ -403,11 +403,26 @@ enum DubLayout {
     static let splitterThickness: CGFloat = 6
 
     /// The global rack bar (siren · Quick Scratch · sampler), which
-    /// replaces the old placeholder FX bar. 12 top padding + a 20 pt
-    /// header row (the label, the deck pill, a `.mini` segmented
-    /// picker) + 8 + a 36 pt pad row + 12 bottom = 88, with 4 pt of
-    /// slack so a font-metric change doesn't clip the pads.
-    static let rackBarHeight: CGFloat = 92
+    /// replaces the old placeholder FX bar. Sized by its tallest block,
+    /// the sampler, which is the same two-row shelf Prep draws: 12 top
+    /// padding + the 14 pt heading + 8 + `prepSectionContent` (two 42 pt
+    /// rows and a 4 pt gap) + 12 bottom = 134. Derived rather than typed
+    /// so it moves with the shelf; `test_rackBar_fitsItsHeightToken`
+    /// holds it. The siren and Quick Scratch rows sit at the top of the
+    /// extra height, which is where the eye already reads them.
+    ///
+    /// Was 92, sized for a single 36 pt pad row, when the sampler was
+    /// four `TriggerPadGroup` pads bound in Preferences.
+    static let rackBarHeight: CGFloat =
+        DubSpacing.md + 14 + DubSpacing.sm + prepSectionContent + DubSpacing.md
+
+    /// The sampler's floor in the rack bar: four tiles as wide as a
+    /// siren preset pad, plus the three gaps between them — the same
+    /// width as the Quick Scratch row beside it, so the two trigger
+    /// blocks read as a pair. The shelf's grid declares no width of its
+    /// own (a `LazyVGrid` of flexible columns), and with the siren
+    /// holding layout priority it was laid out at ~60 pt without this.
+    static let rackSamplerMinWidth: CGFloat = 64 * 4 + DubSpacing.xs * 3
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
 

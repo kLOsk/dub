@@ -2,7 +2,8 @@
 //  TriggerPadGroup.swift
 //  Dub
 //
-//  A row of momentary trigger pads — Quick Scratch or the sampler.
+//  A row of momentary trigger pads — Quick Scratch. (The sampler drew
+//  here too until it became `SampleShelf`, the Prep drop shelf firing.)
 //
 //  These pads used to be static chrome: `lit: false`, no callbacks, and
 //  a hardcoded `Q W` / `E R` split across the two decks that
@@ -22,11 +23,6 @@ struct TriggerPadGroup: View {
     let title: String
     let pads: [TriggerPadState]
     let onTrigger: (_ index: Int) -> Void
-    /// Right-click action, when the rack has one (the sampler stops a
-    /// running voice). `nil` omits the context menu.
-    var onSecondary: ((_ index: Int) -> Void)?
-    /// Shown on a right-click menu item, when `onSecondary` is set.
-    var secondaryTitle: String = "Stop"
 
     var body: some View {
         DubSectionPanel(title) {
@@ -51,17 +47,12 @@ struct TriggerPadGroup: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                DubKeycap(key: pad.key, bound: pad.keyBound, lit: bound)
+                DubKeycap(key: pad.key, lit: bound)
             }
         }
         .onPressDown(enabled: bound) { onTrigger(pad.index) }
         .opacity(bound ? 1.0 : 0.55)
         .help(helpText(pad))
-        .contextMenu {
-            if bound, let onSecondary {
-                Button(secondaryTitle) { onSecondary(pad.index) }
-            }
-        }
     }
 
     private func helpText(_ pad: TriggerPadState) -> String {
@@ -69,9 +60,6 @@ struct TriggerPadGroup: View {
             return "Empty slot — bind a sample in Preferences (⌘,)."
         }
         let deck = (pad.deck ?? .a) == .a ? "A" : "B"
-        return pad.keyBound
-            ? "\(name) → deck \(deck) (\(pad.key))"
-            : "\(name) → deck \(deck). Click to fire; the \(pad.key) key "
-                + "arrives with the key-remapping pass."
+        return "\(name) → deck \(deck) (\(pad.key))"
     }
 }

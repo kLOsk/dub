@@ -79,7 +79,8 @@ final class PrepPadSnapshotTests: XCTestCase {
             },
             activeLoopBeats: 4,
             loopEngaged: true,
-            sampleSlots: ["Air Horn", "Reload", nil, "Siren Up", nil, nil, nil, nil],
+            samples: SampleShelfState(
+                names: ["Air Horn", "Reload", nil, "Siren Up", nil, nil, nil, nil]),
             hasTrack: true)
         snap(
             PrepRack(state: state),
@@ -126,15 +127,29 @@ final class PrepPadSnapshotTests: XCTestCase {
     /// not ours to choose.
     func test_prepRack_longSampleNames() {
         let state = PrepRackState(
-            sampleSlots: [
+            samples: SampleShelfState(names: [
                 "Amen Break Full Length Reference Bounce 24bit",
                 "Horn", nil, "Reload Siren (Benidub DS01E, long tail)",
                 nil, nil, nil, nil,
-            ],
+            ]),
             hasTrack: true)
         snap(
             PrepRack(state: state),
             width: Self.surfaceWidth, height: 230, named: "rack-long-sample-names")
+    }
+
+    /// A slot mid-take: the tile lights in the deck tint and the sweep
+    /// has crossed most of it. Prep auditions samples the same way
+    /// Performance fires them, so the lit state is baselined here too.
+    func test_prepRack_sampleSounding() {
+        var samples = SampleShelfState(
+            names: ["Air Horn", "Reload", nil, "Siren Up", nil, nil, nil, nil])
+        samples.slots[0].playing = true
+        samples.slots[0].progress = 0.7
+        let state = PrepRackState(samples: samples, hasTrack: true)
+        snap(
+            PrepRack(state: state),
+            width: Self.surfaceWidth, height: 230, named: "rack-sample-sounding")
     }
 
     // MARK: - Formatting

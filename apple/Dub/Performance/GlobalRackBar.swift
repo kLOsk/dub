@@ -3,7 +3,8 @@
 //  Dub
 //
 //  The horizontal bar under the deck panes: siren · Quick Scratch ·
-//  sampler.
+//  sampler. The sampler is `SampleShelf` — the same eight tiles Prep
+//  loads, so a slot learned in one place is the slot found in the other.
 //
 //  It occupies the slot `FXBarPlaceholder` used to fill with
 //  "ECHO-OUT — Coming soon" and "DUB SIREN — Coming soon" cards,
@@ -21,6 +22,15 @@
 import SwiftUI
 
 /// Siren · Quick Scratch · sampler, one of each, full width.
+///
+/// **Where the slack goes.** The siren is eight fixed pads and gains
+/// nothing from width, so it sits at its own size with first claim on
+/// it; Quick Scratch and the sampler split whatever is left. The
+/// sampler is the one block here that genuinely improves with width —
+/// a filename is the only string on the bar whose length is not ours
+/// to choose — and the shelf's grid, unlike the fixed pads it replaced,
+/// declares no width of its own, so without a floor the siren's
+/// priority starved it to nothing.
 struct GlobalRackBar: View {
     let state: GlobalRackBarState
     var callbacks = GlobalRackBarCallbacks()
@@ -28,7 +38,7 @@ struct GlobalRackBar: View {
     var body: some View {
         HStack(spacing: 1) {
             if let siren = state.siren {
-                group {
+                group(flexible: false) {
                     SirenRackGroup(
                         state: siren,
                         onPreset: callbacks.onSirenPreset,
@@ -44,23 +54,25 @@ struct GlobalRackBar: View {
                     onTrigger: callbacks.onQuickScratch)
             }
             group {
-                TriggerPadGroup(
-                    title: "SAMPLER",
-                    pads: state.sampler,
-                    onTrigger: callbacks.onSampler,
-                    onSecondary: callbacks.onSamplerStop)
+                SampleShelf(state: state.sampler, callbacks: callbacks.sampler)
+                    .frame(minWidth: DubLayout.rackSamplerMinWidth)
             }
         }
         .frame(height: DubLayout.rackBarHeight)
         .background(DubColor.divider)
     }
 
+    /// One block. `flexible` blocks share the bar's slack; a fixed one
+    /// takes its content's width and no more.
     @ViewBuilder
-    private func group<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    private func group<Content: View>(
+        flexible: Bool = true,
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
         content()
             .padding(.horizontal, DubSpacing.lg)
             .padding(.vertical, DubSpacing.md)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: flexible ? .infinity : nil, maxHeight: .infinity, alignment: .topLeading)
             .background(DubColor.surface2)
     }
 }

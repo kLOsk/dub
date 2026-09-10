@@ -7,9 +7,18 @@
 //  Before this there were four copies of the same knowledge and nothing
 //  holding them together: three `[UInt16: Int]` dictionaries inline in
 //  `KeyEventMonitorHost`'s event closure, and three hand-typed legend
-//  arrays (`sirenPresetKeys`, `QuickScratchSlots.keyLabels`,
-//  `SamplerSlots.keyLabels`) in the views. A pad's printed cap and the
-//  key that actually fires it were separate facts maintained by hand.
+//  arrays (`sirenPresetKeys`, `QuickScratchSlots.keyLabels`, the old
+//  sampler's) in the views. A pad's printed cap and the key that
+//  actually fires it were separate facts maintained by hand.
+//
+//  ## The sampler has no bindings here
+//
+//  It had `A S D F` reserved — drawn, never live. The sampler is eight
+//  slots now and a straight extension collides with `G` (the grid tap),
+//  so rather than pick a second row nobody has asked for, the sampler's
+//  keys wait for map mode, where the DJ picks them. Until then it is
+//  mouse-driven, and the pads print no cap at all rather than a dimmed
+//  promise.
 //
 //  `SirenRackGroup`'s own doc comment records what that costs: it shipped
 //  two siren racks advertising the same eight keys when only the focused
@@ -46,7 +55,6 @@ enum DubAction: Hashable {
     case hotCue(Int)
     case sirenPreset(Int)
     case quickScratch(Int)
-    case samplerSlot(Int)
     /// `true` duplicates deck A onto B; `false` is the reverse.
     case instantDouble(toDeckB: Bool)
 
@@ -58,7 +66,6 @@ enum DubAction: Hashable {
         case .hotCue(let i): return "cue.\(i)"
         case .sirenPreset(let i): return "siren.preset.\(i)"
         case .quickScratch(let i): return "quickScratch.\(i)"
-        case .samplerSlot(let i): return "sampler.\(i)"
         case .instantDouble(let b): return "deck.instantDouble.\(b ? "b" : "a")"
         }
     }
@@ -96,7 +103,8 @@ struct DubBinding: Hashable {
     let legend: String
     /// `false` for a slot that is reserved but does not fire yet. The pad
     /// still renders, so the omission is visible rather than silent, but
-    /// it must not advertise a key that would do nothing.
+    /// it must not advertise a key that would do nothing. Nothing is
+    /// reserved today; the flag stays for map mode.
     var isLive: Bool = true
 }
 
@@ -114,9 +122,6 @@ enum DubKeymap {
     /// `Q W E R`.
     private static let quickScratchCodes: [UInt16] = [12, 13, 14, 15]
     private static let quickScratchLegends = ["Q", "W", "E", "R"]
-    /// `A S D F` — reserved, not live. PRD §7.1 hands these to M18.
-    private static let samplerCodes: [UInt16] = [0, 1, 2, 3]
-    private static let samplerLegends = ["A", "S", "D", "F"]
 
     static let bindings: [DubBinding] = {
         var all: [DubBinding] = [
@@ -152,12 +157,6 @@ enum DubKeymap {
                 DubBinding(
                     action: .quickScratch(i), match: .code(code),
                     legend: quickScratchLegends[i]))
-        }
-        for (i, code) in samplerCodes.enumerated() {
-            all.append(
-                DubBinding(
-                    action: .samplerSlot(i), match: .code(code),
-                    legend: samplerLegends[i], isLive: false))
         }
         return all
     }()

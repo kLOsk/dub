@@ -1,7 +1,7 @@
 //! One-shot sampler voices (M17, PRD §7.1).
 //!
-//! Four slots (`A S D F`), each holding a pre-decoded sample. A press
-//! plays the sample through and ends: air horns, vocal stabs, dub-siren
+//! Eight slots, each holding a pre-decoded sample. A press plays the
+//! sample through and ends: air horns, vocal stabs, dub-siren
 //! one-shots, "rewind!" FX, drops.
 //!
 //! **Additive.** §7.1 is explicit that the sampler plays *over* the
@@ -14,16 +14,24 @@
 //! an add with no rate conversion in it. That is the whole reason for
 //! the bind-time conversion: a trigger has to sound on the frame the
 //! key goes down, so the expensive part cannot happen here.
+//!
+//! **The deck is chosen at the press.** A voice sums onto whichever
+//! deck bus the trigger names — the shell passes the master deck, so a
+//! horn lands on the channel the crowd is hearing — and keeps that bus
+//! for the life of the take. A master switch mid-horn does not hop the
+//! sound across the mixer; the next press goes to the new master.
 
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use dub_io::Track;
 
-/// Slots in the rack. §7.1 chose four over Serato's six so the keymap
-/// stays symmetric with Quick Scratch's four (`Q W E R`), and because
-/// four has covered the target user's drop / siren / horn / vocal-stab
-/// workflow. Widening stays on the table for v1.x.
-pub const SAMPLER_SLOTS: usize = 4;
+/// Slots in the rack. Eight: the Prep sample shelf is a two-row pad
+/// bank of four, laid out like a controller's (5–8 over 1–4), and the
+/// shelf *is* the sampler — a slot loaded there is the pad fired on the
+/// Performance surface. §7.1 shipped with four and a separate binding
+/// layer in Preferences; the two collapsed into this one table.
+pub const SAMPLER_SLOTS: usize = 8;
 
 /// Frames of linear ramp applied at the start and end of a voice, and
 /// across a retrigger. ~1.3 ms at 48 kHz — long enough to kill the edge
@@ -42,9 +50,10 @@ pub struct SamplerVoice {
     /// engine rate.
     frame: usize,
     playing: bool,
-    /// Linear gain, §7.1 per-slot.
+    /// Linear gain. Set at bind time from the clip's measured loudness
+    /// (auto-gain, the same −14 LUFS target as a track), not by hand.
     gain: f32,
-    /// Deck bus this voice sums onto (§7.1 "output assignment").
+    /// Deck bus this take sums onto, recorded at the trigger.
     output_deck: u8,
     /// Ramp position at the head of a trigger, counted up to
     /// [`RAMP_FRAMES`].
@@ -97,29 +106,38 @@ impl SamplerVoice {
         self.gain
     }
 
-    /// Set the per-slot gain. Clamped to `[0, 4]`: a negative value
+    /// Set the slot's gain. Clamped to `[0, 4]`: a negative value
     /// would invert the phase against the deck it sums into, and the
-    /// ceiling keeps a mis-dragged slider off the DJ's ears.
+    /// ceiling bounds what auto-gain may ask of a near-silent clip.
     pub fn set_gain(&mut self, gain: f32) {
         self.gain = gain.clamp(0.0, 4.0);
     }
 
-    /// Deck output bus this voice sums onto.
+    /// Deck output bus the current take sums onto.
     #[must_use]
     pub fn output_deck(&self) -> u8 {
         self.output_deck
     }
 
-    /// Choose the deck bus this voice sums onto (§7.1 "output
-    /// assignment"; default deck A).
-    pub fn set_output_deck(&mut self, deck: u8) {
-        self.output_deck = deck;
+    /// How far through the sample the take is, `0.0..=1.0`. `0.0` when
+    /// idle, so the UI's progress sweep rests at the left edge.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn progress(&self) -> f32 {
+        match self.source.as_ref() {
+            Some(source) if self.playing && source.frames() > 0 => {
+                (self.frame as f32 / source.frames() as f32).min(1.0)
+            }
+            _ => 0.0,
+        }
     }
 
-    /// Fire the one-shot from the top. Retriggering a sounding voice
-    /// hands the current take to the tail so it ramps out under the new
-    /// one instead of cutting.
-    pub fn trigger(&mut self) {
+    /// Fire the one-shot from the top onto `output_deck`'s bus.
+    /// Retriggering a sounding voice hands the current take to the tail
+    /// so it ramps out under the new one instead of cutting. The tail
+    /// follows the new take's bus: a horn that hops decks across a
+    /// retrigger is one press, not two sounds.
+    pub fn trigger(&mut self, output_deck: u8) {
         if self.source.is_none() {
             return;
         }
@@ -127,6 +145,7 @@ impl SamplerVoice {
             self.tail_frame = Some(self.frame);
             self.tail_remaining = RAMP_FRAMES;
         }
+        self.output_deck = output_deck;
         self.frame = 0;
         self.attack = 0;
         self.playing = true;
@@ -222,6 +241,75 @@ impl SamplerVoice {
     }
 }
 
+/// What the UI can see of the rack: per slot, whether the take is
+/// sounding and how far through it is.
+///
+/// Written by the audio thread once per block, read by the shell's
+/// poll — the same shape as the deck's `siren_state`. Relaxed atomics:
+/// the pad lights and the sweep moves; nothing sequences on them.
+#[derive(Debug)]
+pub struct SamplerSharedState {
+    playing: [AtomicBool; SAMPLER_SLOTS],
+    /// Progress in 1/[`PROGRESS_SCALE`]ths, so the whole rack fits in a
+    /// cache line and the reader needs no float atomics.
+    progress: [AtomicU16; SAMPLER_SLOTS],
+}
+
+/// Resolution of the published progress. 10 000 steps is finer than any
+/// pad sweep will draw and still fits a `u16`.
+const PROGRESS_SCALE: f32 = 10_000.0;
+
+impl Default for SamplerSharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SamplerSharedState {
+    /// Every slot idle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            playing: std::array::from_fn(|_| AtomicBool::new(false)),
+            progress: std::array::from_fn(|_| AtomicU16::new(0)),
+        }
+    }
+
+    /// Publish every voice's state. Audio thread; stores only.
+    pub(crate) fn publish(&self, voices: &[SamplerVoice; SAMPLER_SLOTS]) {
+        for (i, voice) in voices.iter().enumerate() {
+            self.playing[i].store(voice.is_playing(), Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let permyriad = (voice.progress() * PROGRESS_SCALE) as u16;
+            self.progress[i].store(permyriad, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether slot `slot` is sounding. Out of range reads idle.
+    #[must_use]
+    pub fn is_playing(&self, slot: usize) -> bool {
+        self.playing
+            .get(slot)
+            .is_some_and(|p| p.load(Ordering::Relaxed))
+    }
+
+    /// Slot `slot`'s progress, `0.0..=1.0`. Out of range reads `0.0`.
+    #[must_use]
+    pub fn progress(&self, slot: usize) -> f32 {
+        self.progress.get(slot).map_or(0.0, |p| {
+            f32::from(p.load(Ordering::Relaxed)) / PROGRESS_SCALE
+        })
+    }
+
+    /// Back to idle — a fresh engine starts with an empty rack.
+    pub fn reset(&self) {
+        for i in 0..SAMPLER_SLOTS {
+            self.playing[i].store(false, Ordering::Relaxed);
+            self.progress[i].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Linear fade-in over [`RAMP_FRAMES`].
 #[allow(clippy::cast_precision_loss)]
 fn ramp_in(attack: usize) -> f32 {
@@ -259,7 +347,7 @@ mod tests {
     #[test]
     fn an_unloaded_voice_is_silent() {
         let mut voice = SamplerVoice::default();
-        voice.trigger();
+        voice.trigger(0);
         assert!(!voice.is_playing(), "nothing to trigger");
         assert!(render(&mut voice, 32).iter().all(|s| *s == 0.0));
     }
@@ -269,7 +357,7 @@ mod tests {
         let mut voice = SamplerVoice::default();
         assert!(voice.set_source(track(0.5, 128)).is_none());
         voice.set_gain(1.0);
-        voice.trigger();
+        voice.trigger(0);
         assert!(voice.is_playing());
 
         let out = render(&mut voice, 128);
@@ -287,7 +375,7 @@ mod tests {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(0.25, 256));
         voice.set_gain(1.0);
-        voice.trigger();
+        voice.trigger(0);
 
         let mut out = vec![0.4f32; 64 * 2];
         voice.render_add(&mut out, 2, 0);
@@ -302,7 +390,7 @@ mod tests {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(0.5, 512));
         voice.set_gain(0.5);
-        voice.trigger();
+        voice.trigger(0);
         // Skip the attack ramp before measuring.
         let _ = render(&mut voice, RAMP_FRAMES);
         let out = render(&mut voice, 16);
@@ -325,10 +413,10 @@ mod tests {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(0.5, 4096));
         voice.set_gain(1.0);
-        voice.trigger();
+        voice.trigger(0);
         let _ = render(&mut voice, 512); // well past the attack
 
-        voice.trigger();
+        voice.trigger(0);
         let out = render(&mut voice, RAMP_FRAMES);
         // Across the retrigger the envelope is the outgoing tail
         // ramping down plus the new take ramping up — never a jump to
@@ -346,7 +434,7 @@ mod tests {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(1.0, RAMP_FRAMES * 4));
         voice.set_gain(1.0);
-        voice.trigger();
+        voice.trigger(0);
 
         let out = render(&mut voice, RAMP_FRAMES * 4);
         assert!(out[0].abs() < 0.05, "starts from silence, got {}", out[0]);
@@ -380,7 +468,7 @@ mod tests {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(0.8, 4096));
         voice.set_gain(1.0);
-        voice.trigger();
+        voice.trigger(0);
         let _ = render(&mut voice, 256);
 
         voice.stop();
@@ -391,14 +479,73 @@ mod tests {
         assert!(last.abs() < 0.05, "and lands on silence, got {last}");
     }
 
+    /// The pad's sweep: idle rests at 0, a take walks to 1 and the
+    /// end of the sample puts it back at 0 rather than parking at 1.
+    #[test]
+    fn progress_walks_the_take_and_rests_at_zero() {
+        let mut voice = SamplerVoice::default();
+        let _ = voice.set_source(track(0.5, 1024));
+        voice.set_gain(1.0);
+        assert!(voice.progress().abs() < f32::EPSILON);
+        voice.trigger(0);
+        let _ = render(&mut voice, 512);
+        assert!(
+            (voice.progress() - 0.5).abs() < 1e-3,
+            "{}",
+            voice.progress()
+        );
+        let _ = render(&mut voice, 512);
+        assert!(!voice.is_playing());
+        assert!(
+            voice.progress().abs() < f32::EPSILON,
+            "a finished take is idle, not 100 %"
+        );
+    }
+
+    /// The master switching decks mid-horn must not hop the sound
+    /// across the mixer; the deck is fixed at the press.
+    #[test]
+    fn a_take_keeps_its_deck_until_retriggered() {
+        let mut voice = SamplerVoice::default();
+        let _ = voice.set_source(track(0.5, 4096));
+        voice.trigger(0);
+        assert_eq!(voice.output_deck(), 0);
+        voice.trigger(1);
+        assert_eq!(voice.output_deck(), 1);
+    }
+
+    #[test]
+    fn shared_state_publishes_every_voice_and_resets() {
+        let mut voices: [SamplerVoice; SAMPLER_SLOTS] = Default::default();
+        let _ = voices[2].set_source(track(0.5, 1024));
+        voices[2].set_gain(1.0);
+        voices[2].trigger(0);
+        let _ = render(&mut voices[2], 256);
+
+        let shared = SamplerSharedState::new();
+        shared.publish(&voices);
+        assert!(shared.is_playing(2));
+        assert!(
+            (shared.progress(2) - 0.25).abs() < 1e-3,
+            "{}",
+            shared.progress(2)
+        );
+        assert!(!shared.is_playing(0));
+        assert!(shared.progress(0).abs() < f32::EPSILON);
+        assert!(!shared.is_playing(SAMPLER_SLOTS), "out of range reads idle");
+
+        shared.reset();
+        assert!(!shared.is_playing(2));
+        assert!(shared.progress(2).abs() < f32::EPSILON);
+    }
+
     #[test]
     fn a_voice_renders_into_its_assigned_channel_pair_only() {
         let mut voice = SamplerVoice::default();
         let _ = voice.set_source(track(0.5, 256));
         voice.set_gain(1.0);
-        voice.set_output_deck(1);
+        voice.trigger(1);
         assert_eq!(voice.output_deck(), 1);
-        voice.trigger();
 
         // Four channels, deck B's pair at offset 2.
         let mut out = vec![0.0f32; 64 * 4];

@@ -182,23 +182,7 @@ pub fn measure_integrated_loudness(
         };
     }
 
-    // K-weight every channel into a contiguous per-channel buffer.
-    // `weighted[c][i]` holds the K-weighted sample for channel `c`,
-    // frame `i`. One allocation per channel — offline only.
-    let (shelf0, hpf0) = k_weighting_filters(fs);
-    let mut weighted: Vec<Vec<f64>> = Vec::with_capacity(ch);
-    for c in 0..ch {
-        let mut shelf = shelf0;
-        let mut hpf = hpf0;
-        shelf.reset();
-        hpf.reset();
-        let mut col = vec![0.0_f64; frames];
-        for (i, slot) in col.iter_mut().enumerate() {
-            let x = f64::from(samples[i * ch + c]);
-            *slot = hpf.process(shelf.process(x));
-        }
-        weighted.push(col);
-    }
+    let weighted = k_weighted(samples, fs, ch);
 
     // Block-energy z_j = Σ_c (mean square of K-weighted channel c).
     // Channel weights G_c are 1.0 for L/R (and we extend that to all
@@ -207,27 +191,8 @@ pub fn measure_integrated_loudness(
     let mut block_energy: Vec<f64> = Vec::with_capacity(n_blocks);
     for b in 0..n_blocks {
         let start = b * hop_frames;
-        let end = start + block_frames;
-        let mut z = 0.0;
-        for col in &weighted {
-            let mut sum_sq = 0.0;
-            for &s in &col[start..end] {
-                sum_sq += s * s;
-            }
-            z += sum_sq / block_frames as f64;
-        }
-        block_energy.push(z);
+        block_energy.push(block_energy_of(&weighted, start, start + block_frames));
     }
-
-    // Loudness of a block from its energy. The `-0.691` offset is the
-    // BS.1770 K-weighting calibration constant.
-    let loudness = |z: f64| -> f64 {
-        if z > 0.0 {
-            -0.691 + 10.0 * z.log10()
-        } else {
-            f64::NEG_INFINITY
-        }
-    };
 
     // Absolute gate at -70 LUFS.
     let abs_gated: Vec<f64> = block_energy
@@ -263,6 +228,85 @@ pub fn measure_integrated_loudness(
     LoudnessMeasurement {
         lufs_i: lufs_i.is_finite().then_some(lufs_i),
         sample_peak_dbfs,
+    }
+}
+
+/// Loudness of a one-shot clip — the sampler's auto-gain (PRD §7.1).
+///
+/// A track is measured with [`measure_integrated_loudness`]; a sampler
+/// hit often is not measurable that way, because a horn stab or a
+/// vocal "rewind!" can be shorter than BS.1770's one 400 ms block, and
+/// the integrated measure then returns `None`. Silence would be the
+/// wrong answer for a clip that is plainly loud, so this falls back to
+/// the K-weighted mean square of the *whole* clip, ungated: a clip too
+/// short to gate is a single event, and its loudness is its loudness.
+///
+/// Anything long enough for the integrated measure gets the integrated
+/// measure, so a ten-second drop is normalised exactly like a track.
+#[must_use]
+pub fn measure_clip_loudness(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> LoudnessMeasurement {
+    let integrated = measure_integrated_loudness(samples, sample_rate, channels);
+    if integrated.lufs_i.is_some() {
+        return integrated;
+    }
+    let ch = channels.max(1) as usize;
+    let frames = samples.len() / ch;
+    if frames == 0 {
+        return integrated;
+    }
+    let weighted = k_weighted(samples, f64::from(sample_rate.max(1)), ch);
+    let lufs = loudness(block_energy_of(&weighted, 0, frames));
+    LoudnessMeasurement {
+        // The absolute gate still applies: a clip that is digital
+        // silence has no loudness and gets unity gain, not +24 dB.
+        lufs_i: (lufs.is_finite() && lufs >= -70.0).then_some(lufs),
+        sample_peak_dbfs: integrated.sample_peak_dbfs,
+    }
+}
+
+/// K-weight every channel into a contiguous per-channel buffer.
+/// `weighted[c][i]` holds the K-weighted sample for channel `c`,
+/// frame `i`. One allocation per channel — offline only.
+fn k_weighted(samples: &[f32], fs: f64, ch: usize) -> Vec<Vec<f64>> {
+    let frames = samples.len() / ch;
+    let (shelf0, hpf0) = k_weighting_filters(fs);
+    let mut weighted: Vec<Vec<f64>> = Vec::with_capacity(ch);
+    for c in 0..ch {
+        let mut shelf = shelf0;
+        let mut hpf = hpf0;
+        shelf.reset();
+        hpf.reset();
+        let mut col = vec![0.0_f64; frames];
+        for (i, slot) in col.iter_mut().enumerate() {
+            let x = f64::from(samples[i * ch + c]);
+            *slot = hpf.process(shelf.process(x));
+        }
+        weighted.push(col);
+    }
+    weighted
+}
+
+/// Block energy z = Σ_c (mean square of K-weighted channel c) over
+/// frames `start..end`.
+fn block_energy_of(weighted: &[Vec<f64>], start: usize, end: usize) -> f64 {
+    let len = (end - start).max(1) as f64;
+    weighted
+        .iter()
+        .map(|col| col[start..end].iter().map(|s| s * s).sum::<f64>() / len)
+        .sum()
+}
+
+/// Loudness of a block from its energy. The `-0.691` offset is the
+/// BS.1770 K-weighting calibration constant.
+fn loudness(z: f64) -> f64 {
+    if z > 0.0 {
+        -0.691 + 10.0 * z.log10()
+    } else {
+        f64::NEG_INFINITY
     }
 }
 
@@ -336,6 +380,42 @@ mod tests {
         let (buf, fs, ch) = sine(1000.0, 0.5, 0.1);
         let m = measure_integrated_loudness(&buf, fs, ch);
         assert!(m.lufs_i.is_none());
+    }
+
+    /// A 100 ms stab is under one BS.1770 block, so the integrated
+    /// measure has nothing to say about it — but the sampler still
+    /// has to level it, and "no loudness" would mean unity gain on a
+    /// full-scale horn over a −14 LUFS record.
+    #[test]
+    fn a_clip_shorter_than_one_block_still_measures() {
+        let (buf, fs, ch) = sine(1000.0, 0.5, 0.1);
+        assert!(measure_integrated_loudness(&buf, fs, ch).lufs_i.is_none());
+        let m = measure_clip_loudness(&buf, fs, ch);
+        let lufs = m.lufs_i.expect("a short clip gets the whole-clip measure");
+        // Same tone, same calibration: ≈ −6 LUFS, like the 4 s version.
+        assert!(
+            (-7.0..-5.0).contains(&lufs),
+            "short 1 kHz −6 dBFS tone should read ≈ −6 LUFS, got {lufs}"
+        );
+        assert!((m.sample_peak_dbfs - (-6.02)).abs() < 0.1);
+    }
+
+    /// Long enough for the integrated measure, the clip path *is* the
+    /// integrated measure — a ten-second drop is normalised like a track.
+    #[test]
+    fn a_long_clip_uses_the_integrated_measure() {
+        let (buf, fs, ch) = sine(1000.0, 0.5, 4.0);
+        assert_eq!(
+            measure_clip_loudness(&buf, fs, ch),
+            measure_integrated_loudness(&buf, fs, ch)
+        );
+    }
+
+    #[test]
+    fn a_silent_or_empty_clip_has_no_loudness() {
+        assert!(measure_clip_loudness(&[], 48_000, 2).lufs_i.is_none());
+        let silence = vec![0.0_f32; 4_800 * 2];
+        assert!(measure_clip_loudness(&silence, 48_000, 2).lufs_i.is_none());
     }
 
     #[test]

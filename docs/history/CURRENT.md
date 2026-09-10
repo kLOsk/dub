@@ -5,7 +5,7 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-09-08.
+> Last updated: 2026-09-10.
 
 ## Where the branch is
 
@@ -68,9 +68,10 @@ what remains before trusted-DJ hands is polish, and it carries real
 deferred work rather than only cosmetics:
 
 - **Key remapping** — and with it the M17 keymaps. `⌘←→` (instant doubles)
-  and `Q W E R` (Quick Scratch) are bound but fixed; the sampler's
-  `A S D F` are **not bound at all** and its rack is driven from
-  Preferences until they are.
+  and `Q W E R` (Quick Scratch) are bound but fixed; the sampler has
+  **no keys and no MIDI** until map mode — its reserved `A S D F` were
+  removed rather than extended to eight (see below), so it is
+  mouse-driven for now.
 - **The deferred M16 fine-tuning**: siren sound polish (GS1 shots / DS01E
   tones / SN76477 bank) and the deck-B siren Expert panel
   (`UI-BACKLOG.md` §5 F-36 / F-37). Note F-37's Performance half is moot:
@@ -195,8 +196,23 @@ dependency order, not a preference.
    deck/library drag handle is gone — Prep sizes the deck to its content
    and hands the rest to the library, Performance keeps the decks
    dominant. `prepPadBarMinHeight` re-measured 280 → 192.
-   **Performance is deliberately untouched** — its design is not settled,
-   and `CuePadSection` still draws numbered pads there.
+   **Performance's CUE / LOOP are deliberately untouched** — that design
+   is not settled, and `CuePadSection` still draws numbered pads there.
+   **The sampler did land on Performance (2026-09-10, FFI 70):** the
+   global rack bar's four `TriggerPadGroup` pads are gone and the same
+   `SampleShelf` Prep loads now fires there — eight slots, one table
+   (`SampleBank` is positional now; the list-backed bank slid pads left
+   on every unload), the Preferences "Samples" / "Sampler" sections
+   deleted. Press fires on the **master deck** like the siren (`→ A` pill;
+   the deck is resolved at the press, so a master switch mid-horn does
+   not hop the sound); press again restarts; **right-click stops while
+   sounding and offers Unload when quiet** (`onSecondaryClick`, an AppKit
+   catcher — `.contextMenu` cannot decide at click time). **Auto-gain at
+   load**, the track's −14 LUFS target, with a whole-clip fallback for
+   stabs under one BS.1770 block (`measure_clip_loudness`). The tile
+   lights and sweeps off `sampler_telemetry`, polled at 30 Hz only while
+   something sounds. The rack bar grew 92 → 134 to hold the two-row
+   shelf; `rackBarHeight` is derived from it now.
    `SirenPadRow` / `SirenExpertPanel` are kept but unmounted, staged for
    F-37's move to Performance; the file says so rather than letting them
    rot.
@@ -274,10 +290,12 @@ surfaces differ almost entirely in the deck.
   the other at a sample-accurate playhead — done *on the audio thread* off
   the loaded `Arc<Track>`, which is what makes it sample-accurate and
   instant. **Quick Scratch** loads a bound sample through the library's own
-  load path. **The sampler** is four additive one-shot voices summed onto
-  the assigned deck bus after the FX, reading rate-converted buffers with
-  an integer cursor because the conversion happens at bind time off-RT.
-  Both racks bind from one shared sample bank. FFI 66.
+  load path. **The sampler** is additive one-shot voices summed onto the
+  deck bus after the FX, reading rate-converted buffers with an integer
+  cursor because the conversion happens at bind time off-RT. Shipped as
+  four voices bound in Preferences (FFI 66); now eight, the Prep shelf
+  itself, auto-gained, on the master deck (FFI 70 — see the Prep overhaul
+  step 5 above). Quick Scratch binds from the same slots.
 
 - **M26c — rip recognition. Complete.** AcoustID naming (no MusicBrainz on
   the common path), opt-in pressing identification, Discogs enrichment

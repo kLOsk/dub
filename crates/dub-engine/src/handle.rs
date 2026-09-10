@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::command::Command;
 use crate::deck::DeckSharedState;
+use crate::sampler::SamplerSharedState;
 use crate::thru::{ThruAttachError, ThruInputConfig, ThruSource};
 use crate::timecode::{AttachError as TimecodeAttachError, TimecodeInput, TimecodeInputConfig};
 use crate::DECK_COUNT;
@@ -225,6 +226,10 @@ pub struct EngineHandle {
     /// [`Self::thru_trash_overflow_count`].
     thru_trash_overflow: Arc<AtomicU64>,
     deck_shared: [Arc<DeckSharedState>; DECK_COUNT],
+    /// The sampler rack's playing / progress atomics (M17 §7.1),
+    /// written by the audio thread once per block. Engine-wide like
+    /// the voices themselves.
+    sampler_shared: Arc<SamplerSharedState>,
     /// Cached engine sample rate. Used by [`Self::attach_timecode_input`]
     /// and [`Self::attach_thru_source`] to validate the input config
     /// without forcing the caller to re-supply what's already an
@@ -243,6 +248,7 @@ pub(crate) struct EngineSide {
     pub(crate) overflow_counter: Arc<AtomicU64>,
     pub(crate) timecode_trash_overflow: Arc<AtomicU64>,
     pub(crate) thru_trash_overflow: Arc<AtomicU64>,
+    pub(crate) sampler_shared: Arc<SamplerSharedState>,
 }
 
 impl EngineHandle {
@@ -266,6 +272,7 @@ impl EngineHandle {
         let overflow_counter = Arc::new(AtomicU64::new(0));
         let timecode_trash_overflow = Arc::new(AtomicU64::new(0));
         let thru_trash_overflow = Arc::new(AtomicU64::new(0));
+        let sampler_shared = Arc::new(SamplerSharedState::new());
         let handle = Self {
             tx: cmd_tx,
             trash_rx: trash_consumer,
@@ -275,6 +282,7 @@ impl EngineHandle {
             timecode_trash_overflow: timecode_trash_overflow.clone(),
             thru_trash_overflow: thru_trash_overflow.clone(),
             deck_shared,
+            sampler_shared: sampler_shared.clone(),
             engine_sample_rate,
         };
         let engine_side = EngineSide {
@@ -285,8 +293,16 @@ impl EngineHandle {
             overflow_counter,
             timecode_trash_overflow,
             thru_trash_overflow,
+            sampler_shared,
         };
         (handle, engine_side)
+    }
+
+    /// The sampler rack's published state — which slots are sounding
+    /// and how far through their take they are. Cheap (atomic loads).
+    #[must_use]
+    pub fn sampler_shared(&self) -> &SamplerSharedState {
+        &self.sampler_shared
     }
 
     /// Get an ergonomic command builder for the given deck.
@@ -425,13 +441,15 @@ impl EngineHandle {
         self.send(Command::SamplerClear { slot })
     }
 
-    /// Fire sampler slot `slot`'s one-shot.
+    /// Fire sampler slot `slot`'s one-shot onto deck `deck`'s bus —
+    /// the master deck, resolved by the caller at the press.
     ///
     /// # Errors
     /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
-    pub fn sampler_trigger(&mut self, slot: usize) -> Result<(), CommandError> {
+    pub fn sampler_trigger(&mut self, slot: usize, deck: usize) -> Result<(), CommandError> {
         let slot = Self::check_sampler_slot(slot)?;
-        self.send(Command::SamplerTrigger { slot })
+        let deck = self.check_deck(deck)?;
+        self.send(Command::SamplerTrigger { slot, deck })
     }
 
     /// Stop sampler slot `slot` early, ramping out.
@@ -443,27 +461,14 @@ impl EngineHandle {
         self.send(Command::SamplerStop { slot })
     }
 
-    /// Set sampler slot `slot`'s linear gain.
+    /// Set sampler slot `slot`'s linear gain — the auto-gain measured
+    /// from the clip at bind time.
     ///
     /// # Errors
     /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
     pub fn sampler_set_gain(&mut self, slot: usize, gain: f32) -> Result<(), CommandError> {
         let slot = Self::check_sampler_slot(slot)?;
         self.send(Command::SamplerSetGain { slot, gain })
-    }
-
-    /// Choose the deck bus sampler slot `slot` sums onto.
-    ///
-    /// # Errors
-    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
-    pub fn sampler_set_output_deck(
-        &mut self,
-        slot: usize,
-        deck: usize,
-    ) -> Result<(), CommandError> {
-        let slot = Self::check_sampler_slot(slot)?;
-        let deck = self.check_deck(deck)?;
-        self.send(Command::SamplerSetOutputDeck { slot, deck })
     }
 
     /// Validate a sampler slot index. Reuses [`CommandError::InvalidDeck`]

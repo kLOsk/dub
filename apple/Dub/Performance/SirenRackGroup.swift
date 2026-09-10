@@ -60,21 +60,10 @@ struct SirenRackGroup: View {
         }
     }
 
-    /// Names the deck the pads and keys land on. Not clickable: focus
-    /// follows the master deck, and a second way to set it would be a
-    /// competing notion of the same thing. To fire the siren on the
-    /// other deck, make that deck master — same as with hot cues.
+    /// Names the deck the pads and keys land on — see `DubDeckPill` for
+    /// why it is not clickable.
     private var focusPill: some View {
-        Text(state.focusedDeck == .a ? "→ A" : "→ B")
-            .font(DubFont.caps)
-            .tracking(DubFont.capsTracking)
-            .foregroundStyle(tint)
-            .padding(.horizontal, DubSpacing.xs)
-            .padding(.vertical, 1)
-            .overlay(
-                RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
-                    .stroke(tint.opacity(0.6), lineWidth: 1))
-            .animation(.easeOut(duration: 0.12), value: state.focusedDeck)
+        DubDeckPill(deck: state.focusedDeck)
             .help("The siren fires on the focused deck — the master, or deck A "
                 + "when neither is. \(sirenPresetKeys.prefix(4).joined(separator: " ")) … "
                 + "fire the same pads.")

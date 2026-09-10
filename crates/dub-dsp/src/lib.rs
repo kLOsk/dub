@@ -30,8 +30,8 @@ pub use hk628::{
     Hk628State, HK623_PROGRAM_COUNT, HK628_PROGRAM_COUNT,
 };
 pub use loudness::{
-    db_to_linear, measure_integrated_loudness, normalization_gain_db, LoudnessMeasurement,
-    CEILING_DBFS, DEFAULT_TARGET_LUFS,
+    db_to_linear, measure_clip_loudness, measure_integrated_loudness, normalization_gain_db,
+    LoudnessMeasurement, CEILING_DBFS, DEFAULT_TARGET_LUFS,
 };
 pub use phaser::Phaser;
 pub use pt2399::Pt2399;

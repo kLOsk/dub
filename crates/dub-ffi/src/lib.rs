@@ -439,7 +439,19 @@ pub use rip::{
 ///       `sampler_set_output_deck` / `sampler_clear` drive it. Voices
 ///       sum onto the assigned deck's bus after the FX chain — the
 ///       stab plays *over* the music rather than through its echo.
-pub const FFI_VERSION: u32 = 69;
+///   67. **Cue names + colours.** `HotCue` carries `name` / `color`;
+///       [`DubLibrary::set_hot_cue_label`] writes them without touching
+///       the position.
+///   70. **One sampler, eight slots.** The Prep sample shelf *is* the
+///       sampler: `sampler_slot_count` is 8, the Preferences binding
+///       layer is gone. `sampler_load` measures the clip's loudness and
+///       sets the slot's gain itself (auto-gain, the track's −14 LUFS
+///       target), so `sampler_set_gain` is no longer exported;
+///       [`DubEngine::sampler_trigger`] takes the deck to sound on (the
+///       shell passes the master), replacing `sampler_set_output_deck`;
+///       [`DubEngine::sampler_telemetry`] reports each slot's playing /
+///       progress for the pad lamp and sweep.
+pub const FFI_VERSION: u32 = 70;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -2454,6 +2466,15 @@ impl DubEngine {
     /// and it should not be converting rates per frame either. The
     /// voice then reads the buffer with an integer cursor.
     ///
+    /// **Auto-gain.** The clip's loudness is measured from the decoded
+    /// buffer right here and the slot's gain set from it — the same
+    /// −14 LUFS target and −1 dBFS ceiling a track gets at load, so a
+    /// horn lands at the level of the record it plays over. There is
+    /// no library round-trip: a sample is not a library track, and the
+    /// whole clip is already in hand. A clip too short for the
+    /// integrated measure is levelled on its whole-clip loudness
+    /// (`dub_dsp::measure_clip_loudness`); a silent one gets unity.
+    ///
     /// Blocking — the Apple shell calls it off the main queue like the
     /// other load paths. The sample file is left untouched: Quick
     /// Scratch (§7.2) loads the same file from disk through the deck,
@@ -2470,6 +2491,7 @@ impl DubEngine {
 
         let decoded = dub_io::Track::load_from_path(std::path::Path::new(&path))
             .map_err(|e| EngineError::TrackDecodeFailed(e.to_string()))?;
+        let gain = sampler_auto_gain(&decoded);
         // `RunningState::sample_rate` is already the engine rate in Hz.
         let target_sr = engine_sr;
         let converted = dub_io::resample_track(&decoded, target_sr).ok_or_else(|| {
@@ -2486,7 +2508,11 @@ impl DubEngine {
         running
             .handle
             .sampler_load(slot, std::sync::Arc::new(converted))
-            .map_err(|(e, _arc)| map_command_error(e))
+            .map_err(|(e, _arc)| map_command_error(e))?;
+        running
+            .handle
+            .sampler_set_gain(slot, gain)
+            .map_err(map_command_error)
     }
 
     /// Unbind sampler slot `slot`.
@@ -2500,14 +2526,18 @@ impl DubEngine {
         })
     }
 
-    /// Fire sampler slot `slot`'s one-shot (§7.1). Retriggering a
+    /// Fire sampler slot `slot`'s one-shot (§7.1) onto deck `deck_idx`'s
+    /// output bus. The shell passes the master deck, so the sample
+    /// sounds on the channel the crowd is hearing; the take keeps that
+    /// bus even if the master changes under it. Retriggering a
     /// sounding voice crossfades rather than cutting.
-    pub fn sampler_trigger(&self, slot: u64) -> Result<(), EngineError> {
+    pub fn sampler_trigger(&self, slot: u64, deck_idx: u64) -> Result<(), EngineError> {
         let slot = sampler_slot_to_usize(slot)?;
+        let deck = deck_idx_to_usize(deck_idx)?;
         self.with_running(|running| {
             running
                 .handle
-                .sampler_trigger(slot)
+                .sampler_trigger(slot, deck)
                 .map_err(map_command_error)
         })
     }
@@ -2518,33 +2548,30 @@ impl DubEngine {
         self.with_running(|running| running.handle.sampler_stop(slot).map_err(map_command_error))
     }
 
-    /// Set sampler slot `slot`'s linear gain (§7.1 per-slot gain).
-    pub fn sampler_set_gain(&self, slot: u64, gain: f32) -> Result<(), EngineError> {
-        let slot = sampler_slot_to_usize(slot)?;
-        self.with_running(|running| {
-            running
-                .handle
-                .sampler_set_gain(slot, gain)
-                .map_err(map_command_error)
-        })
+    /// What every sampler slot is doing right now — sounding or not,
+    /// and how far through its take. One row per slot, in slot order,
+    /// so the shell's pads light and sweep off it at poll rate.
+    /// Lock-free (atomic loads); all idle when the engine is stopped.
+    #[must_use]
+    pub fn sampler_telemetry(&self) -> Vec<SamplerSlotTelemetry> {
+        let state = lock_state(&self.state);
+        let EngineState::Running(running) = &*state else {
+            return (0..dub_engine::sampler::SAMPLER_SLOTS)
+                .map(|_| SamplerSlotTelemetry::default())
+                .collect();
+        };
+        let shared = running.handle.sampler_shared();
+        (0..dub_engine::sampler::SAMPLER_SLOTS)
+            .map(|slot| SamplerSlotTelemetry {
+                playing: shared.is_playing(slot),
+                progress: shared.progress(slot),
+            })
+            .collect()
     }
 
-    /// Choose which deck's output bus sampler slot `slot` sums onto
-    /// (§7.1 "output assignment"; default deck A).
-    pub fn sampler_set_output_deck(&self, slot: u64, deck_idx: u64) -> Result<(), EngineError> {
-        let slot = sampler_slot_to_usize(slot)?;
-        let deck = deck_idx_to_usize(deck_idx)?;
-        self.with_running(|running| {
-            running
-                .handle
-                .sampler_set_output_deck(slot, deck)
-                .map_err(map_command_error)
-        })
-    }
-
-    /// Number of sampler slots (§7.1: four, `A S D F`). Exposed so the
-    /// shell builds its rack from the engine's count rather than its
-    /// own copy of it.
+    /// Number of sampler slots (eight — the Prep shelf's two rows of
+    /// four). Exposed so the shell builds its rack from the engine's
+    /// count rather than its own copy of it.
     #[must_use]
     pub fn sampler_slot_count(&self) -> u64 {
         dub_engine::sampler::SAMPLER_SLOTS as u64
@@ -3862,6 +3889,16 @@ impl PositionInfo {
     };
 }
 
+/// One sampler slot's live state (M17 §7.1), as
+/// [`DubEngine::sampler_telemetry`] reports it.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct SamplerSlotTelemetry {
+    /// `true` while the slot's one-shot is sounding.
+    pub playing: bool,
+    /// How far through the take, `0.0..=1.0`; `0.0` when idle.
+    pub progress: f32,
+}
+
 /// Per-deck live telemetry for the Performance deck header: pitch
 /// (deck rate) and timecode signal health. Read lock-free from the
 /// deck's shared state; returned by [`DubEngine::deck_telemetry`].
@@ -4901,6 +4938,27 @@ fn track_still_loaded(running: &RunningState, idx: usize, track: &Arc<Track>) ->
     )
 }
 
+/// The sampler's auto-gain for a decoded clip (M17 §7.1): the same
+/// loudness normalisation a track gets at load, measured here from the
+/// buffer rather than read from the library. Unity for a clip with no
+/// measurable loudness (silence, or nothing decoded).
+fn sampler_auto_gain(clip: &dub_io::Track) -> f32 {
+    let measurement = dub_dsp::measure_clip_loudness(
+        clip.samples(),
+        clip.sample_rate(),
+        u16::from(clip.channels()),
+    );
+    match measurement.lufs_i {
+        Some(lufs) => dub_dsp::db_to_linear(dub_dsp::normalization_gain_db(
+            lufs,
+            measurement.sample_peak_dbfs,
+            dub_dsp::DEFAULT_TARGET_LUFS,
+            dub_dsp::CEILING_DBFS,
+        )),
+        None => 1.0,
+    }
+}
+
 /// Validate a sampler slot index coming across the FFI (M17 §7.1).
 /// Reuses [`EngineError::InvalidDeckIndex`] rather than minting a
 /// parallel variant — the caller's recovery is identical, and one
@@ -5567,7 +5625,13 @@ mod tests {
         // 64→65: instant doubles — `instant_double`.
         // 65→66: sampler — `sampler_load` + trigger / stop / gain /
         // output-deck / clear.
-        assert_eq!(FFI_VERSION, 69);
+        // 66→67: cue names + colours — `HotCue.name` / `.color`,
+        // `set_hot_cue_label`.
+        // 69→70: one eight-slot sampler — `sampler_trigger` takes the
+        // deck, `sampler_set_gain` / `sampler_set_output_deck` gone
+        // (auto-gain at load, master-deck at trigger), `sampler_telemetry`
+        // + `SamplerSlotTelemetry`.
+        assert_eq!(FFI_VERSION, 70);
     }
 
     #[test]
@@ -5621,15 +5685,16 @@ mod tests {
     fn sampler_calls_on_a_stopped_engine_return_not_running() {
         let engine = DubEngine::new();
         for f in [
-            engine.sampler_trigger(0),
+            engine.sampler_trigger(0, 0),
             engine.sampler_stop(0),
             engine.sampler_clear(0),
-            engine.sampler_set_gain(0, 1.0),
-            engine.sampler_set_output_deck(0, 1),
             engine.sampler_load(0, "/nonexistent.wav".to_string()),
         ] {
             assert!(matches!(f.unwrap_err(), EngineError::NotRunning));
         }
+        let idle = engine.sampler_telemetry();
+        assert_eq!(idle.len(), dub_engine::sampler::SAMPLER_SLOTS);
+        assert!(idle.iter().all(|s| !s.playing && s.progress == 0.0));
     }
 
     #[test]
@@ -5638,12 +5703,44 @@ mod tests {
         // Checked before the running guard, so the error names the
         // real problem rather than "engine not running".
         for f in [
-            engine.sampler_trigger(9),
-            engine.sampler_set_gain(9, 1.0),
+            engine.sampler_trigger(9, 0),
             engine.sampler_load(9, "/nonexistent.wav".to_string()),
         ] {
             assert!(matches!(f.unwrap_err(), EngineError::InvalidDeckIndex(9)));
         }
+        assert!(matches!(
+            engine.sampler_trigger(0, 9).unwrap_err(),
+            EngineError::InvalidDeckIndex(9)
+        ));
+    }
+
+    /// The level a pad lands at is measured, not dialled: a hot clip
+    /// comes down, a quiet one comes up, silence is left alone.
+    #[test]
+    fn sampler_auto_gain_levels_a_clip_like_a_track() {
+        let tone = |amplitude: f32, secs: f64| {
+            let frames = (secs * 48_000.0) as usize;
+            let samples: Vec<f32> = (0..frames)
+                .flat_map(|i| {
+                    let t = i as f64 / 48_000.0;
+                    let v = amplitude * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+                    [v, v]
+                })
+                .collect();
+            dub_io::Track::from_interleaved(samples, 48_000, 2).unwrap()
+        };
+        // ≈ −6 LUFS dual-mono tone: 8 dB over target, attenuated.
+        let hot = sampler_auto_gain(&tone(0.5, 2.0));
+        assert!(hot < 0.5, "a hot clip is brought down, got {hot}");
+        // ≈ −26 LUFS: wants +12 dB, ceiling-limited by its −20 dBFS peak
+        // to +19 dB, so it comes up.
+        let quiet = sampler_auto_gain(&tone(0.05, 2.0));
+        assert!(quiet > 2.0, "a quiet clip is brought up, got {quiet}");
+        // A 100 ms stab is under one BS.1770 block and still levelled.
+        let stab = sampler_auto_gain(&tone(0.5, 0.1));
+        assert!((stab - hot).abs() < 0.05, "short clip {stab} vs long {hot}");
+        let silence = dub_io::Track::from_interleaved(vec![0.0; 9600], 48_000, 2).unwrap();
+        assert_eq!(sampler_auto_gain(&silence), 1.0);
     }
 
     #[test]

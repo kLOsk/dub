@@ -36,7 +36,7 @@ extension PerformancePadsState {
 
 extension GlobalRackBarState {
     /// A populated bar: the GS1 siren, two Quick Scratch slots bound to
-    /// different decks, one sampler slot bound.
+    /// different decks, three sampler slots loaded with one sounding.
     static func fixture(focus: DeckSide) -> GlobalRackBarState {
         GlobalRackBarState(
             siren: SirenRackState(
@@ -54,12 +54,17 @@ extension GlobalRackBarState {
                 TriggerPadState(index: 2, key: "E"),
                 TriggerPadState(index: 3, key: "R"),
             ],
-            sampler: [
-                TriggerPadState(index: 0, key: "A", sampleName: "Horn", deck: .a,
-                                keyBound: false),
-                TriggerPadState(index: 1, key: "S", keyBound: false),
-                TriggerPadState(index: 2, key: "D", keyBound: false),
-                TriggerPadState(index: 3, key: "F", keyBound: false),
-            ])
+            sampler: SampleShelfState(
+                slots: [
+                    SampleSlotState(index: 0, name: "Horn", playing: true, progress: 0.4),
+                    SampleSlotState(index: 1, name: "Reload"),
+                    SampleSlotState(index: 2),
+                    SampleSlotState(index: 3),
+                    SampleSlotState(index: 4, name: "Siren Up"),
+                    SampleSlotState(index: 5),
+                    SampleSlotState(index: 6),
+                    SampleSlotState(index: 7),
+                ],
+                focusedDeck: focus))
     }
 }

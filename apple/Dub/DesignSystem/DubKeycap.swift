@@ -29,10 +29,11 @@ struct DubKeycap: View {
     /// The glyph as the DJ reads it on their keyboard — `Z`, `,`, `⇧1`.
     let key: String
 
-    /// `false` when the action has no key wired to it yet (the sampler's
-    /// `A S D F` until the M18 remap pass). The cap still renders, so the
-    /// slot is visibly reserved rather than silently missing, but it does
-    /// not advertise a key that would do nothing.
+    /// `false` when the action has no key wired to it yet — a slot the
+    /// keymap reserves ahead of the M18 remap pass. The cap still
+    /// renders, so the slot is visibly reserved rather than silently
+    /// missing, but it does not advertise a key that would do nothing.
+    /// Nothing is reserved today; the state stays for map mode.
     var bound: Bool = true
 
     /// Lifts the glyph to `textPrimary` while the pad it sits on is lit,

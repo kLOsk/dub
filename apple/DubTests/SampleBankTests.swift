@@ -2,136 +2,114 @@ import XCTest
 
 @testable import Dub
 
-/// M17: the shared bank both racks bind from, and the sampler's own
-/// slot table. Same concern as `QuickScratchTests` — the persisted
-/// form is read while building a sheet or handling a press, so a bad
-/// value has to mean "nothing bound", never a throw.
+/// M17: the sampler's eight positional slots. Same concern as
+/// `QuickScratchTests` — the persisted form is read while building a
+/// view or handling a press, so a bad value has to mean "nothing
+/// loaded", never a throw.
 final class SampleBankTests: XCTestCase {
 
     private let horn = URL(fileURLWithPath: "/Music/fx/horn.wav")
     private let stab = URL(fileURLWithPath: "/Music/fx/stab.aiff")
+    private let rewind = URL(fileURLWithPath: "/Music/fx/rewind.mp3")
 
-    // MARK: - Bank
-
-    func testAddsInOrderAndIgnoresDuplicates() {
-        var bank = SampleBank()
+    func testStartsEmptyWithEightSlots() {
+        let bank = SampleBank()
         XCTAssertTrue(bank.isEmpty)
-        bank.add(horn)
-        bank.add(stab)
-        bank.add(horn)
-
-        XCTAssertEqual(bank.all, [horn, stab], "the same horn twice is one entry")
+        XCTAssertEqual(bank.all.count, SampleBank.count)
+        XCTAssertEqual(SampleBank.count, 8)
+        XCTAssertTrue(bank.all.allSatisfy { $0 == nil })
     }
 
-    func testRemoveDropsOnlyThatEntry() {
-        var bank = SampleBank(urls: [horn, stab])
-        bank.remove(horn)
-        XCTAssertEqual(bank.all, [stab])
+    /// A pad is a place the hand learns. Unloading slot 2 must leave
+    /// slot 3 where it was — the list-backed bank this replaced slid
+    /// everything left, against its own doc comment.
+    func testSlotsArePositional() {
+        var bank = SampleBank()
+        bank.load(horn, into: 1)
+        bank.load(stab, into: 2)
+        bank.load(rewind, into: 5)
+
+        bank.unload(1)
+        XCTAssertNil(bank.slot(1))
+        XCTAssertEqual(bank.slot(2), stab, "slot 3 stays put")
+        XCTAssertEqual(bank.slot(5), rewind)
+        XCTAssertEqual(bank.loaded, [stab, rewind], "loaded files come back in slot order")
     }
 
-    /// A binding older than the bank — or hand-edited — must appear in
-    /// the list rather than being audibly bound but invisible.
-    func testAdoptBringsInAnExistingBindingWithoutReordering() {
-        var bank = SampleBank(urls: [stab])
-        bank.adopt(horn)
-        bank.adopt(stab)
-        XCTAssertEqual(bank.all, [stab, horn])
+    /// Dropping onto a full slot is the same gesture as filling an
+    /// empty one.
+    func testLoadingOntoAFullSlotReplacesIt() {
+        var bank = SampleBank()
+        bank.load(horn, into: 0)
+        bank.load(stab, into: 0)
+        XCTAssertEqual(bank.slot(0), stab)
+        XCTAssertEqual(bank.loaded, [stab])
     }
 
-    func testBankRoundTripsThroughItsPersistedForm() {
-        let bank = SampleBank(urls: [horn, stab])
-        XCTAssertEqual(SampleBank(persisted: bank.persisted), bank)
+    func testOutOfRangeIndicesAreIgnored() {
+        var bank = SampleBank()
+        bank.load(horn, into: 9)
+        bank.load(horn, into: -1)
+        bank.unload(9)
+        XCTAssertNil(bank.slot(9))
+        XCTAssertNil(bank.slot(-1))
+        XCTAssertTrue(bank.isEmpty)
+    }
+
+    func testRoundTripsThroughItsPersistedFormWithGaps() {
+        var bank = SampleBank()
+        bank.load(horn, into: 0)
+        bank.load(stab, into: 6)
+        let restored = SampleBank(persisted: bank.persisted)
+        XCTAssertEqual(restored, bank)
+        XCTAssertNil(restored.slot(1))
+        XCTAssertEqual(restored.slot(6), stab)
+    }
+
+    /// The bank used to be a plain list. That JSON is a gap-free slot
+    /// table, so an upgrade keeps everyone's samples in the order they
+    /// had them.
+    func testLegacyListFormLandsInSlotOrder() {
+        let legacy = "[\"\(horn.absoluteString)\",\"\(stab.absoluteString)\"]"
+        let bank = SampleBank(persisted: legacy)
+        XCTAssertEqual(bank.slot(0), horn)
+        XCTAssertEqual(bank.slot(1), stab)
+        XCTAssertNil(bank.slot(2))
     }
 
     func testMalformedBankDegradesToEmpty() {
         for junk in ["", "not json", "{}", "[1, 2]"] {
-            XCTAssertTrue(SampleBank(persisted: junk).isEmpty, "junk: \(junk)")
+            let bank = SampleBank(persisted: junk)
+            XCTAssertTrue(bank.isEmpty, "junk: \(junk)")
+            XCTAssertEqual(bank.all.count, SampleBank.count, "junk: \(junk)")
         }
+    }
+
+    func testUrlsInitialiserFillsFromSlotZero() {
+        let bank = SampleBank(urls: [horn, stab])
+        XCTAssertEqual(bank.slot(0), horn)
+        XCTAssertEqual(bank.slot(1), stab)
+        XCTAssertEqual(bank.loaded, [horn, stab])
     }
 
     func testLabelIsTheFilename() {
         XCTAssertEqual(SampleBank.label(for: horn), "horn.wav")
     }
 
-    // MARK: - Sampler slots
+    // MARK: - The shelf's draw order
 
-    func testSamplerStartsEmptyWithFourSlots() {
-        let slots = SamplerSlots()
-        XCTAssertEqual(slots.all.count, SamplerSlots.count)
-        XCTAssertTrue(slots.all.allSatisfy { $0 == nil })
-        XCTAssertEqual(SamplerSlots.keyLabels.count, SamplerSlots.count)
+    /// 5–8 over 1–4, the way a pad controller's rows count up from the
+    /// hand.
+    func testShelfDrawsTheTopHalfFirst() {
+        XCTAssertEqual(SampleShelf.slotOrder(count: 8), [4, 5, 6, 7, 0, 1, 2, 3])
+        XCTAssertEqual(SampleShelf.slotOrder(count: 4), [2, 3, 0, 1])
     }
 
-    func testSamplerSlotDefaultsToUnityGainOnDeckA() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 0)
-        XCTAssertEqual(slots.slot(0)?.gain, 1.0)
-        XCTAssertEqual(slots.slot(0)?.deck, .a)
-    }
-
-    /// Gain and output belong to the *pad*, not the file: re-pointing a
-    /// pad at a different sample keeps the level the DJ dialled in.
-    func testRebindingASlotKeepsItsGainAndOutput() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 1)
-        slots.setGain(0.4, for: 1)
-        slots.setDeck(.b, for: 1)
-
-        slots.assign(url: stab, to: 1)
-        XCTAssertEqual(slots.slot(1)?.url, stab)
-        XCTAssertEqual(slots.slot(1)?.gain, 0.4)
-        XCTAssertEqual(slots.slot(1)?.deck, .b)
-    }
-
-    func testGainIsClampedToTheEnginesRange() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 0)
-        slots.setGain(-3, for: 0)
-        XCTAssertEqual(slots.slot(0)?.gain, 0.0, "no phase inversion against the deck")
-        slots.setGain(99, for: 0)
-        XCTAssertEqual(slots.slot(0)?.gain, 4.0)
-    }
-
-    func testSamplerOutOfRangeIndicesAreIgnored() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 9)
-        slots.setGain(2, for: 9)
-        slots.setDeck(.b, for: 9)
-        slots.clear(9)
-        XCTAssertNil(slots.slot(9))
-        XCTAssertTrue(slots.all.allSatisfy { $0 == nil })
-    }
-
-    func testSamplerRoundTripsThroughItsPersistedForm() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 0)
-        slots.setGain(0.75, for: 0)
-        slots.setDeck(.b, for: 0)
-        slots.assign(url: stab, to: 3)
-
-        let restored = SamplerSlots(persisted: slots.persisted)
-        XCTAssertEqual(restored, slots)
-        XCTAssertEqual(restored.slot(0)?.gain, 0.75)
-        XCTAssertEqual(restored.slot(0)?.deck, .b)
-        XCTAssertNil(restored.slot(1))
-    }
-
-    func testMalformedSamplerTableDegradesToEmpty() {
-        for junk in ["", "not json", "[]", "[{\"url\":1}]"] {
-            let slots = SamplerSlots(persisted: junk)
-            XCTAssertEqual(slots.all.count, SamplerSlots.count, "junk: \(junk)")
-            XCTAssertTrue(slots.all.allSatisfy { $0 == nil }, "junk: \(junk)")
-        }
-    }
-
-    func testBoundUrlsAreWhatTheBankAdopts() {
-        var slots = SamplerSlots()
-        slots.assign(url: horn, to: 0)
-        slots.assign(url: stab, to: 2)
-        XCTAssertEqual(slots.boundUrls, [horn, stab])
-
-        var quick = QuickScratchSlots()
-        quick.assign(url: horn, to: 3)
-        XCTAssertEqual(quick.boundUrls, [horn])
+    func testShelfStateFromNamesIsIdle() {
+        let state = SampleShelfState(names: ["Horn", nil, "Stab"])
+        XCTAssertEqual(state.slots.map(\.name), ["Horn", nil, "Stab"])
+        XCTAssertTrue(state.slots.allSatisfy { !$0.playing && $0.progress == 0 })
+        XCTAssertNil(state.focusedDeck)
+        XCTAssertEqual(SampleShelfState.empty.slots.count, SampleBank.count)
     }
 }
