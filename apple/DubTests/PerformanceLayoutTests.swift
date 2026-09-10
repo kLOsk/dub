@@ -105,15 +105,71 @@ final class PerformanceLayoutTests: XCTestCase {
             "deck column overflows the 1440 × 900 pane")
     }
 
-    /// The column's floor has to hold the loop control, which is the
-    /// one section inside it with a fixed width. If the loop grows or
-    /// the floor shrinks, the ×2 stepper clips — which the pad column
-    /// did for a whole milestone, rendering labels as "UE" and "OOP".
-    func test_deckColumn_floorHoldsTheLoopControl() {
+    /// The column's floor has to hold the loop row at its narrowest
+    /// beside the echo button, because the pair never wraps. If the
+    /// loop's floor grows, the echo widens or the column's floor
+    /// shrinks, the ×2 stepper clips — which the pad column did for a
+    /// whole milestone, rendering labels as "UE" and "OOP".
+    func test_deckColumn_floorHoldsTheLoopAndEcho() {
+        // The column's own padding at its widest: the signal tab's
+        // inset on the outer edge, `md` on the inner.
+        let padding = DubLayout.deckSignalTabWidth + DubSpacing.sm + DubSpacing.md
         XCTAssertGreaterThanOrEqual(
-            DubLayout.performanceDeckColumnMinWidth,
-            DubLayout.prepLoopSection + DubSpacing.md * 2,
-            "the column floor no longer fits the loop control")
+            DubLayout.performanceDeckColumnMinWidth - padding,
+            LoopEngine.minWidth + DubSpacing.md + DubLayout.deckColumnEchoWidth,
+            "the column floor no longer fits the loop row beside the echo")
+    }
+
+    /// The readouts are read while beatmatching, so a digit arriving
+    /// in one slot must not move its neighbours. Every value the row
+    /// can print — the dashes of an empty deck, a two-digit BPM, a
+    /// pitch that gained a sign and a digit, a scratch's runaway rate
+    /// — has to lay out at exactly the same width.
+    func test_readouts_holdTheirWidth_acrossEveryValue() {
+        func width(bpm: Double?, key: String?, pitch: Double?, trailing: Bool) -> CGFloat {
+            let state = DeckHeaderState(
+                isLive: true, source: .file,
+                trackTitle: nil, trackArtist: nil,
+                bpm: bpm, pitchPercent: pitch,
+                key: key, formatChip: nil, timeRow: nil,
+                isMaster: false, isPlaying: pitch != nil,
+                isPanicPlay: false, useTimecodeToggle: false,
+                gridLocked: false, gridDriftQuality: nil)
+            let host = NSHostingView(
+                rootView: DeckReadouts(header: DeckColumnHeader(state), trailing: trailing))
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.width
+        }
+        let cases: [(Double?, String?, Double?)] = [
+            (92.5, "7A", 0.4),
+            (133.0, "12B", -12.3),
+            (176.0, "1A", 8.0),
+            (261.0, "6A", -250.7),
+        ]
+        // Both decks: A hangs the slots from the right, B from the left.
+        for trailing in [false, true] {
+            let empty = width(bpm: nil, key: nil, pitch: nil, trailing: trailing)
+            for (bpm, key, pitch) in cases {
+                XCTAssertEqual(
+                    width(bpm: bpm, key: key, pitch: pitch, trailing: trailing), empty,
+                    accuracy: 0.5,
+                    "\(String(describing: bpm)) · \(String(describing: key)) · "
+                        + "\(String(describing: pitch)) trailing=\(trailing)")
+            }
+        }
+    }
+
+    /// A row of loop controls as tall as the echo beside it — the pair
+    /// has to read as one row, which is the point of the shared token.
+    /// `NSHostingView` sizes the row itself, so this holds the drawn
+    /// height and not just the parameter.
+    func test_loopRow_standsAsTallAsTheEcho() {
+        let size = fittingSize(
+            LoopEngine(
+                activeBeats: 2, engaged: true, hasTrack: true,
+                onLoop: { _ in }, onScale: { _ in }, onExit: {}),
+            width: 400)
+        XCTAssertEqual(size.height, DubLayout.deckColumnEchoHeight, accuracy: 0.5)
     }
 
     // MARK: - The global rack bar

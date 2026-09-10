@@ -218,6 +218,14 @@ final class PerformanceSnapshotTests: XCTestCase {
              named: "deck-column-floor")
     }
 
+    /// Deck B with a track: the readouts on the left, the title and
+    /// artist right-aligned out to the window's edge — the mirror of
+    /// deck A, so the numbers sit beside the strip on both.
+    func test_deckColumn_deckB_wideWindow() {
+        snap(deckBg(columnFixture(Self.columnState(side: .b, loopBeats: 2))),
+             width: 540, height: 470, named: "deck-column-b-wide")
+    }
+
     /// Deck B, nothing loaded, echo engaged — the empty state has to
     /// say what each section needs rather than sitting inert.
     func test_deckColumn_deckB_noTrack() {

@@ -268,27 +268,30 @@ struct LoopEngine: View {
     let activeBeats: Double?
     let engaged: Bool
     let hasTrack: Bool
-    /// Draw the section heading, or leave it to the caller. Prep's
-    /// rack wants the heading inside; Performance pairs LOOP with ECHO
-    /// side by side and heads both from outside so the two hairlines
-    /// line up.
-    var showsHeading: Bool = true
-    /// Outer height of the boxed control, padding included. Prep gives
-    /// it `prepSectionContent` so the section stays level with its
-    /// neighbours; Performance's column has no neighbour to match and a
-    /// shorter box buys height the cue rows want.
-    ///
-    /// The buttons inset from it by `DubSpacing.sm` on each edge. They
-    /// used to be a fixed 64 inside an 88 box, which gave the same air
-    /// by accident; equalising the box to the echo button's height took
-    /// that away and left the stroke sitting on the buttons.
-    var contentHeight: CGFloat = DubLayout.prepSectionContent
+    /// Height of the row. The steppers and the size buttons fill it
+    /// edge to edge — there is no box around them any more. There
+    /// was: a stroked frame with the buttons inset 8 pt inside it,
+    /// which put a 28 pt control beside the 44 pt echo button and
+    /// read as two sizes of thing however exactly the frames matched.
+    /// The buttons are their own container now, at the echo's height.
+    var height: CGFloat = DubLayout.deckColumnLoopHeight
     let onLoop: (Double) -> Void
     let onScale: (_ double: Bool) -> Void
     let onExit: () -> Void
 
     static let sizes: [Double] = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16]
     static let windowSize = 4
+
+    private static let stepperWidth: CGFloat = 34
+    private static let sizeButtonMinWidth: CGFloat = 40
+
+    /// The narrowest the row lays out at: both steppers, the four size
+    /// buttons at their floor, and the gaps between. The size buttons
+    /// have no ceiling — the row takes whatever width the column hands
+    /// it, up to the echo button beside it — so this is the only
+    /// number the column's floor has to clear.
+    static let minWidth: CGFloat =
+        stepperWidth * 2 + sizeButtonMinWidth * CGFloat(windowSize) + DubSpacing.sm * 2
     /// Where the window sits with nothing engaged: 1 · 2 · 4 · 8, the
     /// lengths a DJ reaches for first.
     private static let idleStart = 3
@@ -319,32 +322,12 @@ struct LoopEngine: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            if showsHeading {
-                SectionHeading(
-                    title: "LOOP", accent: DubColor.loop,
-                    trailing: engaged ? "● ON" : "○ OFF",
-                    trailingAccent: engaged ? DubColor.loop : DubColor.textPlaceholder)
-            }
-
-            // A box, but an empty one. LOOP is the only section that
-            // is a single instrument rather than a set of slots, and it
-            // needs an edge to say so. What it did not need was a
-            // *fill* behind that edge as well: the controls inside are
-            // filled, the box around them is a stroke on the bare
-            // surface, and the section stops reading as a slab.
-            HStack(spacing: DubSpacing.sm) {
-                stepper("÷2", double: false)
-                sizeButtons
-                stepper("×2", double: true)
-            }
-            .frame(height: contentHeight - DubSpacing.sm * 2)
-            .padding(.horizontal, DubSpacing.md)
-            .padding(.vertical, DubSpacing.sm)
-            .overlay(
-                RoundedRectangle(cornerRadius: DubRadius.card, style: .continuous)
-                    .stroke(DubColor.divider, lineWidth: 1))
+        HStack(spacing: DubSpacing.sm) {
+            stepper("÷2", double: false)
+            sizeButtons
+            stepper("×2", double: true)
         }
+        .frame(height: height)
     }
 
     private var sizeButtons: some View {
@@ -357,12 +340,12 @@ struct LoopEngine: View {
                 Text(Self.label(beats))
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(on ? DubColor.textPrimary : DubColor.textSecondary)
-                    // Flexible, not fixed. Performance keeps echo out
-                    // beside the loop at every width, so the pair has
-                    // to clear the column's floor — the size buttons
-                    // are what gives. Prep hands the control its full
-                    // width and they render at 52 as before.
-                    .frame(minWidth: 40, maxWidth: 52)
+                    // Flexible both ways. Echo out sits beside the loop
+                    // at every width, so the pair has to clear the
+                    // column's floor and the size buttons are what
+                    // gives; above it the row runs the whole way to the
+                    // echo and the four lengths share the width.
+                    .frame(minWidth: Self.sizeButtonMinWidth, maxWidth: .infinity)
                     .frame(maxHeight: .infinity)
                     // Unlit lengths get a fill of their own — the
                     // group used to be bare inside the box, so the
@@ -412,10 +395,10 @@ struct LoopEngine: View {
                 size: engaged ? 13 : 15, weight: .medium,
                 design: engaged ? .monospaced : .rounded))
             .foregroundStyle(enabled ? DubColor.textSecondary : DubColor.textPlaceholder)
-            // Fills the box rather than a fixed 64: Performance runs
-            // this control at the echo button's height, and a stepper
-            // taller than its own box hangs out of both ends of it.
-            .frame(width: 34)
+            // Fills the row rather than a fixed 64: the row runs at
+            // the echo button's height, and a stepper taller than it
+            // hangs out of both ends.
+            .frame(width: Self.stepperWidth)
             .frame(maxHeight: .infinity)
             .background(DubColor.surface2)
             .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))

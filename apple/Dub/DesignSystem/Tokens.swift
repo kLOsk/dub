@@ -558,11 +558,12 @@ enum DubLayout {
     /// height. A row sized by its own text lands around 18 pt, which
     /// reads fine and is a poor mouse target.
     ///
-    /// 24 rather than 26: the source switch is now drawn on every deck
-    /// whether or not a timecode input is present, which cost the
-    /// column 32 pt, and four rows at 24 is where that came back from.
+    /// 38 is the DJ's ask — a quarter taller than the 30 it was — for
+    /// a pad hit mid-set with the eyes elsewhere. The bank is two rows
+    /// now, so the column has the height to spend that the earlier
+    /// four-row layout did not.
     /// `test_deckColumn_fitsThePane_onALaptopScreen` is the ceiling.
-    static let cueRowHeight: CGFloat = 30
+    static let cueRowHeight: CGFloat = 38
 
     /// Everything the rack has left after the sample shelf's floor,
     /// derived from the window budget rather than typed.
@@ -577,12 +578,6 @@ enum DubLayout {
     /// truncated them to "set at p...".
     static let prepCueColumn: CGFloat =
         mainWindowMinWidth - DubSpacing.lg * 2 - prepSampleShelfMin - DubSpacing.xl
-    /// `÷2` 34 + the size buttons + `×2` 34, plus gaps and `md`
-    /// padding each side. Fixed, because a section heading's rule
-    /// expands to fill whatever it is given — unbounded, the LOOP
-    /// heading stretched the section to ~750 pt and pushed SAMPLES to
-    /// the far edge.
-    static let prepLoopSection: CGFloat = 268
     /// The shelf has no maximum — it takes whatever the other two
     /// sections leave. There is no fourth Prep section planned (the
     /// beatgrid editor was ruled out: setting the 1 plus Analyze is
@@ -648,10 +643,10 @@ enum DubLayout {
     /// to `E…`; there is room to spare beside the loop, so it takes it.
     static let deckColumnEchoWidth: CGFloat = 150
 
-    /// The loop box inside Performance's column — the same height as
+    /// The loop row inside Performance's column — the same height as
     /// the echo button beside it, so the pair reads as one row of
-    /// controls rather than two sizes of thing. Prep keeps its own 88;
-    /// there the section has neighbours to stay level with.
+    /// controls rather than two sizes of thing. The buttons themselves
+    /// stand this tall; there is no box around them to inset from.
     static let deckColumnLoopHeight: CGFloat = deckColumnEchoHeight
 
     /// Echo out, and with it the loop box beside it.

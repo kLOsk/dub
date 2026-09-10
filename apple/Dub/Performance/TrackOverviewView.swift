@@ -157,6 +157,16 @@ struct TrackOverviewView: View {
 
     private static let overviewSeekMinInterval: TimeInterval = 1.0 / 30.0
 
+    /// Closest two minute markers may sit before the ladder steps up
+    /// an interval. A `10m` label is ~24 pt wide at the label size;
+    /// this leaves it clear air on both sides.
+    private static let minMarkerSpacing: CGFloat = 40
+
+    /// Where the horizontal band's labels sit down from the top edge.
+    /// The envelope tops out at `energyHeadroom` of the height, so the
+    /// labels ride the loudest peaks rather than the dark margin.
+    private static let minuteLabelInset: CGFloat = 8
+
     private var deckState: DeckState {
         switch side {
         case .a: return model.deckA
@@ -454,7 +464,7 @@ struct TrackOverviewView: View {
         let pad = OverviewLayout.endPadding
         let tickColor = Color.white.opacity(0.28)
         let majorTickColor = Color.white.opacity(0.42)
-        let intervalSecs = duration >= 120 ? 60.0 : 30.0
+        let intervalSecs = markerIntervalSecs(duration: duration, size: size)
         var marker = intervalSecs
         while marker < duration {
             let fraction = marker / duration
@@ -563,23 +573,50 @@ struct TrackOverviewView: View {
     @ViewBuilder
     private func minuteMarkerLabels(in size: CGSize) -> some View {
         if let duration = overviewDurationSecs(), duration > 0 {
-            let intervalSecs = duration >= 120 ? 60.0 : 30.0
+            let intervalSecs = markerIntervalSecs(duration: duration, size: size)
             let labels = minuteLabelPoints(duration: duration, intervalSecs: intervalSecs)
             ForEach(labels, id: \.self) { point in
-                switch orientation {
-                case .vertical:
-                    Text(point.label)
-                        .font(.system(size: 7, weight: .semibold, design: .rounded))
-                        .foregroundColor(Color.white.opacity(0.72))
-                        .position(x: size.width - 6, y: axisPosition(fraction: point.fraction, size: size) ?? 0)
-                case .horizontal:
-                    Text(point.label)
-                        .font(.system(size: 7, weight: .semibold, design: .rounded))
-                        .foregroundColor(Color.white.opacity(0.72))
-                        .position(x: axisPosition(fraction: point.fraction, size: size) ?? 0, y: 7)
-                }
+                let along = axisPosition(fraction: point.fraction, size: size) ?? 0
+                minuteLabel(point.label)
+                    .position(
+                        orientation == .vertical
+                            ? CGPoint(x: size.width * 0.5, y: along)
+                            : CGPoint(x: along, y: Self.minuteLabelInset))
             }
         }
+    }
+
+    /// Read at glance distance, so sized like the rest of the app's
+    /// smallest text — 11 pt is the type ramp's floor and these were
+    /// the one thing on the surface under it, at 7. They sit on the
+    /// envelope's peaks rather than beside them, so a tight dark halo
+    /// keeps them legible over the deck tint.
+    private func minuteLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.85))
+            .shadow(color: Color.black.opacity(0.75), radius: 1.5)
+    }
+
+    /// Marker spacing for a track of `duration` on this strip. Half
+    /// minutes under two minutes, minutes above — and coarser again
+    /// when minutes would land closer than a label is wide: a 60-minute
+    /// mix file on a 450 pt band puts a minute every 7 pt. Ticks and
+    /// labels both draw from this, so the two never disagree.
+    private func markerIntervalSecs(duration: Double, size: CGSize) -> Double {
+        let ladder: [Double] = [30, 60, 120, 300, 600, 1200]
+        let axisLength: CGFloat
+        switch orientation {
+        case .vertical: axisLength = max(0, size.height - 2 * OverviewLayout.endPadding)
+        case .horizontal: axisLength = max(0, size.width - 2 * OverviewLayout.endPadding)
+        }
+        let first = duration >= 120 ? 1 : 0
+        for secs in ladder[first...] {
+            if axisLength * CGFloat(secs / duration) >= Self.minMarkerSpacing {
+                return secs
+            }
+        }
+        return ladder[ladder.count - 1]
     }
 
     private struct MinuteLabelPoint: Hashable {

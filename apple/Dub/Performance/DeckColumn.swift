@@ -217,16 +217,20 @@ struct DeckColumn<Overview: View>: View {
         }
     }
 
+    /// The large face, the same as BPM: remaining time is the "thirty
+    /// seconds to mix" cue and is read at the same distance, with the
+    /// same urgency. Elapsed matches it so the two ends of the overview
+    /// read as one pair.
     @ViewBuilder
     private func time(_ slot: LiveDeckTimeText.Slot, colour: Color) -> some View {
         if let liveEngine, let liveDeckIdx, state.hasTrack {
             LiveDeckTimeText(engine: liveEngine, deckIdx: liveDeckIdx, slot: slot)
-                .font(DubFont.numericInline)
+                .font(DubFont.numericLarge)
                 .monospacedDigit()
                 .foregroundStyle(colour)
         } else {
             Text(slot == .remaining ? "-00:00" : "00:00")
-                .font(DubFont.numericInline)
+                .font(DubFont.numericLarge)
                 .monospacedDigit()
                 .foregroundStyle(DubColor.textPlaceholder)
         }
@@ -240,10 +244,8 @@ struct DeckColumn<Overview: View>: View {
     /// The switch sits on the column's *inner* edge — toward the
     /// strip it drives. Deck A's column is left of its waveform so the
     /// switch is right-aligned; deck B's is right of its waveform so it
-    /// is left-aligned. Mirroring only this: the readouts and the marks
-    /// stay left-aligned on both, because a DJ reads them in the same
-    /// place on either deck (the headers were de-mirrored for exactly
-    /// that reason).
+    /// is left-aligned. The readouts under it mirror the same way (see
+    /// `identityAndReadouts`); the marks and the loop do not.
     private var sourceRow: some View {
         HStack(spacing: 0) {
             if state.side == .a { Spacer(minLength: DubSpacing.lg) }
@@ -278,21 +280,34 @@ struct DeckColumn<Overview: View>: View {
     /// strip under a 40 pt title block spends height the strip beside it
     /// wants. The old header band put them side by side for the same
     /// reason.
+    ///
+    /// The readouts take the column's *inner* edge on both decks —
+    /// right on deck A, left on deck B — so the numbers sit beside the
+    /// strip they describe and the title runs out to the window's edge.
+    /// Mirrored like the source switch above them; the order inside
+    /// stays BPM · KEY · PITCH on both, one reading order to learn.
     private var identityAndReadouts: some View {
         HStack(alignment: .top, spacing: DubSpacing.lg) {
-            identity
-            readouts
+            if state.side == .a {
+                identity
+                readouts
+            } else {
+                readouts
+                identity
+            }
         }
     }
 
     private var identity: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let outward = state.side == .a
+        return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
             Text(state.header.trackTitle ?? "No track loaded")
                 .font(DubFont.title)
                 .foregroundStyle(
                     state.header.trackTitle == nil
                         ? DubColor.textPlaceholder : DubColor.textPrimary)
                 .lineLimit(2)
+                .multilineTextAlignment(outward ? .leading : .trailing)
             // A step below the title, not level with it. The two ran
             // at `textPrimary` and `textSecondary`, which is a small
             // enough gap that at a glance the pair read as one block of
@@ -302,32 +317,11 @@ struct DeckColumn<Overview: View>: View {
                 .foregroundStyle(DubColor.textTertiary)
                 .lineLimit(1)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: outward ? .leading : .trailing)
     }
 
-    /// Tempo, key and pitch. Pitch tracks the platter in Performance, so
-    /// it stays — unlike Prep, where it can only ever read `+0.0 %`.
     private var readouts: some View {
-        HStack(alignment: .top, spacing: DubSpacing.md) {
-            readout("BPM", state.header.bpm.map { String(format: "%.1f", $0) })
-            readout("KEY", state.header.key, tint: DubColor.camelotKey(state.header.key))
-            readout("PITCH", state.header.pitchTenths.map { String(format: "%+.1f", $0) })
-        }
-        .fixedSize()
-    }
-
-    private func readout(_ label: String, _ value: String?, tint: Color? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(DubFont.micro)
-                .tracking(DubFont.capsTracking)
-                .foregroundStyle(DubColor.textTertiary)
-            Text(value ?? "—")
-                .font(DubFont.numericLarge)
-                .monospacedDigit()
-                .foregroundStyle(
-                    value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
-        }
+        DeckReadouts(header: state.header, trailing: state.side == .a)
     }
 
     // MARK: - The two things you play
@@ -351,12 +345,18 @@ struct DeckColumn<Overview: View>: View {
             rowHeight: DubLayout.cueRowHeight)
     }
 
-    /// The loop keeps its natural width rather than stretching to the
-    /// column — it is an instrument with a fixed shape, and a ×2 button
-    /// 300 pt from the ÷2 is a worse control, not a bigger one. Echo out
-    /// sits *beside* it: both are fired during a transition, so the hand
-    /// stays in one place for the whole move. On a column too narrow to
-    /// hold both it drops underneath rather than squeezing the loop.
+    /// One row, two controls at one height: the loop runs from the
+    /// column's edge to the echo, and the echo keeps its fixed width.
+    /// Both are fired during a transition, so the hand stays in one
+    /// place for the whole move.
+    ///
+    /// The loop used to keep a natural width of its own, on the
+    /// argument that a ×2 button far from the ÷2 is a worse control.
+    /// What that left was a stroked box 268 pt wide with the column's
+    /// slack sitting empty between it and the echo — the DJ asked for
+    /// the loop to fill that gap and to stand as tall as the echo, and
+    /// the steppers stay at the row's two ends where the hand already
+    /// finds them.
     private var loopAndEcho: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
             VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -381,22 +381,20 @@ struct DeckColumn<Overview: View>: View {
         }
     }
 
-    /// The loop keeps its own shape rather than stretching to the
-    /// column — a ×2 button 300 pt from the ÷2 is a worse control, not
-    /// a bigger one — but it may *compress*, because echo out sits
-    /// beside it at every width and the pair has to clear the column's
-    /// floor. `LoopEngine`'s size buttons flex between 40 and 52.
+    /// Takes every point between the column's edge and the echo. It may
+    /// also *compress*, because echo out sits beside it at every width
+    /// and the pair has to clear the column's floor —
+    /// `LoopEngine.minWidth` is what the floor has to hold.
     private var loop: some View {
         LoopEngine(
             activeBeats: state.activeLoopBeats,
             engaged: state.loopEngaged,
             hasTrack: state.hasTrack,
-            showsHeading: false,
-            contentHeight: DubLayout.deckColumnLoopHeight,
+            height: DubLayout.deckColumnLoopHeight,
             onLoop: callbacks.onLoop,
             onScale: callbacks.onScaleLoop,
             onExit: callbacks.onExitLoop)
-            .frame(maxWidth: DubLayout.prepLoopSection, alignment: .leading)
+            .frame(maxWidth: .infinity)
     }
 
     private var echoButton: some View {
@@ -420,5 +418,71 @@ struct DeckColumn<Overview: View>: View {
             .contentShape(Rectangle())
             .onPressDown(enabled: state.hasTrack) { callbacks.onEchoToggle() }
             .help("Echo out — cut the dry signal and hand the deck to the echo")
+    }
+}
+
+/// Tempo, key and pitch. Pitch tracks the platter in Performance, so
+/// it stays — unlike Prep, where it can only ever read `+0.0 %`.
+///
+/// Each value reserves the width of the widest string it can print,
+/// so a neighbour never moves when a digit arrives: pitch going from
+/// `+0.4` to `+10.4` used to shove BPM and KEY sideways, on a row the
+/// DJ reads while beatmatching. BPM is the number that matters and
+/// keeps the large face; key and pitch step down to the inline size,
+/// which is what the type ramp names them for.
+///
+/// Its own view so `PerformanceLayoutTests` can hold the width steady
+/// across values without reaching into the column.
+struct DeckReadouts: View {
+    let header: DeckColumnHeader
+    /// Hang each slot's label and value from its trailing edge rather
+    /// than its leading one. The slots are wider than most values —
+    /// pitch holds six places for a `+0.4` — so the values should hug
+    /// the edge the row sits against: trailing on deck A, where the
+    /// readouts end at the column's inner edge, leading on deck B.
+    var trailing: Bool = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: DubSpacing.md) {
+            readout(
+                "BPM", header.bpm.map { String(format: "%.1f", $0) },
+                font: DubFont.numericLarge, widest: "888.8")
+            readout(
+                "KEY", header.key,
+                font: DubFont.numericInline, widest: "12B",
+                tint: DubColor.camelotKey(header.key))
+            // Six places: the sign, three digits, the point and a tenth.
+            // A scratch drives the smoothed rate well past ±100 %, and
+            // the slot has to hold that too or the row jumps mid-cut.
+            readout(
+                "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
+                font: DubFont.numericInline, widest: "-888.8")
+        }
+        .fixedSize()
+    }
+
+    /// `widest` is drawn hidden underneath the value and sets the
+    /// slot's width — measured, so the reservation follows the font
+    /// rather than a hand-typed point count.
+    private func readout(
+        _ label: String, _ value: String?, font: Font, widest: String, tint: Color? = nil
+    ) -> some View {
+        VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
+            Text(label)
+                .font(DubFont.micro)
+                .tracking(DubFont.capsTracking)
+                .foregroundStyle(DubColor.textTertiary)
+            ZStack(alignment: trailing ? .trailing : .leading) {
+                Text(widest)
+                    .font(font)
+                    .monospacedDigit()
+                    .hidden()
+                Text(value ?? "—")
+                    .font(font)
+                    .monospacedDigit()
+                    .foregroundStyle(
+                        value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
+            }
+        }
     }
 }
