@@ -331,6 +331,20 @@ the network, and an upstream publication would turn an unrelated push red.
   unaffected.
 - The tests that sleep waiting on worker threads are now the slowest thing in
   the suite. `drain_then_stop` fixed the six that raced; others still sleep.
+- **Waveform renderer, second-order CPU (noted 2026-09-10, not visible today).**
+  A read-through after the library-sidebar drag work found the big items all
+  done (off-main `CVDisplayLink` thread, vsync-extrapolated playhead, grid +
+  cues + loop in one draw call, paused deck at zero cost) and three leftovers:
+  (1) while playing, every frame re-ingests the whole 8 192-chunk window
+  around the playhead — ~350 KB per deck across the FFI, three copies deep —
+  when only ~12 chunks are new; a delta ingest (full window only on seek /
+  generation bump) would cut it ~99 %. (2) Two array literals in
+  `drawBeatGrid` (loop-edge pair, per-cue halo/stem pair) allocate on the
+  render thread per frame. (3) `NSEvent.pressedMouseButtons` is read twice
+  per frame from the render thread. Measure first — `make trace-grid` with
+  two decks playing — and do (1) only if it shows; (2) is free.
+  This MacBook Pro is Intel, and the renderer's comments benchmark against
+  Apple Silicon, so the trace is worth taking here.
 
 ## Keeping this file honest
 
