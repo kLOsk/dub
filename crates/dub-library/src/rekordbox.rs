@@ -104,8 +104,9 @@ pub struct ParsedTrack {
     /// Tempo, BPM — `AverageBpm`, falling back to the first `TEMPO`'s `Bpm`.
     pub bpm: Option<f64>,
     /// Musical key, verbatim from `Tonality` (rekordbox's own notation —
-    /// Camelot `8B`, Open-Key `5d`, or classical `Abm`; the schema stores it
-    /// as-is, see `track_keys`). Empty dropped.
+    /// Camelot `8B`, Open-Key `5d`, or classical `Abm`; the importer
+    /// converts it to Camelot for `track_keys` and keeps this string as
+    /// `original_notation`). Empty dropped.
     pub key: Option<String>,
     /// Grid anchor, seconds — the first `<TEMPO>`'s `Inizio`.
     pub grid_anchor_secs: Option<f64>,

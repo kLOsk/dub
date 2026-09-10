@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::db::Library;
 use crate::error::{LibraryError, Result};
 use crate::importer::{detect_codec_from_extension, ImportError, ImportSummary};
+use crate::key_notation;
 use crate::serato::{autotags, beatgrid, database, geob, markers2};
 use crate::volumes::{discover_for_path, DiscoveredVolume};
 
@@ -184,12 +185,12 @@ fn write_metadata(
     }
 
     // Key → Camelot (Serato stores musical notation, e.g. "Em"); preserve
-    // the original.
+    // the original. Anything the converter does not recognise is not
+    // written: `key_notation` is Camelot by contract, and a verbatim
+    // string there breaks the ⚠ cross-check and the deck readout.
     if let Some(raw) = entry.key.as_deref() {
-        if let Some(camelot) = musical_key_to_camelot(raw) {
+        if let Some(camelot) = key_notation::to_camelot(raw) {
             library.upsert_imported_key(track_id, SERATO, &camelot, Some(raw))?;
-        } else {
-            library.upsert_imported_key(track_id, SERATO, raw, Some(raw))?;
         }
     }
 
@@ -291,72 +292,9 @@ fn ensure_crate_chain(
     Ok(parent.expect("components is non-empty"))
 }
 
-/// Convert a musical key notation (Serato's `Em`, `Ab`, `F#m`, `Ebm`, …) to
-/// Camelot. `None` for anything unrecognised. Enharmonic spellings collapse
-/// (`Ebm` == `D#m`).
-fn musical_key_to_camelot(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    // Minor keys end in a lowercase 'm' (e.g. "Em"); strip it for the root.
-    let (root, minor) = if let Some(stripped) = s.strip_suffix('m') {
-        (stripped, true)
-    } else {
-        (s, false)
-    };
-    // Pitch class 0..11 from the root spelling.
-    let pc = pitch_class(root)?;
-    // Camelot number per pitch class, separately for major (B) / minor (A).
-    // Major: C=8B,G=9B,D=10B,A=11B,E=12B,B=1B,F#=2B,C#=3B,G#=4B,D#=5B,A#=6B,F=7B.
-    const MAJOR: [u8; 12] = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1]; // index = pitch class C..B
-                                                                     // Minor: Am=8A,Em=9A,Bm=10A,F#m=11A,C#m=12A,G#m=1A,D#m=2A,A#m=3A,Fm=4A,Cm=5A,Gm=6A,Dm=7A.
-    const MINOR: [u8; 12] = [5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10]; // index = pitch class C..B
-    let number = if minor {
-        MINOR[pc as usize]
-    } else {
-        MAJOR[pc as usize]
-    };
-    let side = if minor { 'A' } else { 'B' };
-    Some(format!("{number}{side}"))
-}
-
-/// Map a note-name root to a pitch class 0..11 (C=0 … B=11), handling sharps
-/// and flats.
-fn pitch_class(root: &str) -> Option<u8> {
-    let mut chars = root.chars();
-    let letter = chars.next()?;
-    let base: i32 = match letter.to_ascii_uppercase() {
-        'C' => 0,
-        'D' => 2,
-        'E' => 4,
-        'F' => 5,
-        'G' => 7,
-        'A' => 9,
-        'B' => 11,
-        _ => return None,
-    };
-    let accidental = match chars.next() {
-        Some('#') | Some('s') => 1,
-        Some('b') | Some('♭') => -1,
-        None => 0,
-        _ => return None,
-    };
-    Some(((base + accidental).rem_euclid(12)) as u8)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn key_conversion_minor_and_major() {
-        assert_eq!(musical_key_to_camelot("Em").as_deref(), Some("9A"));
-        assert_eq!(musical_key_to_camelot("Bm").as_deref(), Some("10A"));
-        assert_eq!(musical_key_to_camelot("Ebm").as_deref(), Some("2A")); // D#m
-        assert_eq!(musical_key_to_camelot("Am").as_deref(), Some("8A"));
-        assert_eq!(musical_key_to_camelot("C").as_deref(), Some("8B"));
-        assert_eq!(musical_key_to_camelot("F#").as_deref(), Some("2B"));
-        assert_eq!(musical_key_to_camelot("Db").as_deref(), Some("3B")); // C#
-        assert_eq!(musical_key_to_camelot("xyz"), None);
-    }
 
     /// Opt-in end-to-end import against a real `_Serato_` folder, into a
     /// throwaway temp library (never the developer's real DB).

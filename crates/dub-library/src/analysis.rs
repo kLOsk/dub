@@ -1475,15 +1475,22 @@ impl Library {
     /// first. Mirrors [`Self::grid_source_rank`]; `mixedinkey` (a dedicated
     /// key-detection authority DJs trust) and a `user` override rank above
     /// the library imports. Preferences-configurable later (§8.3).
+    ///
+    /// The file's own tag ranks above `auto`, not level with it: a
+    /// `TKEY` was written by whatever keyed the DJ's collection, and
+    /// §8.3 puts every import ahead of Dub's estimate. Level ranks
+    /// would have made the active key depend on whether the folder
+    /// was imported before or after the track was analysed.
     fn key_source_rank(source: &str) -> u8 {
         match source {
-            "user" => 6,
-            "mixedinkey" => 5,
-            "serato" => 4,
-            "rekordbox" => 3,
-            "traktor" => 2,
-            "itunes" => 1,
-            _ => 0, // "id3" / "auto" / unknown
+            "user" => 7,
+            "mixedinkey" => 6,
+            "serato" => 5,
+            "rekordbox" => 4,
+            "traktor" => 3,
+            "itunes" => 2,
+            "id3" => 1,
+            _ => 0, // "auto" / unknown
         }
     }
 

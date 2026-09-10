@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::db::Library;
 use crate::error::{LibraryError, Result};
 use crate::importer::{detect_codec_from_extension, ImportError, ImportSummary};
+use crate::key_notation;
 use crate::rekordbox::{self, ParsedPlaylist, ParsedTrack};
 use crate::volumes::discover_for_path;
 
@@ -197,8 +198,14 @@ fn write_rekordbox_metadata(library: &Library, track_id: &str, track: &ParsedTra
         library.upsert_imported_beatgrid(track_id, REKORDBOX, anchor, bpm, track.grid_bar_phase)?;
     }
 
+    // `Tonality` is whatever notation the user picked in rekordbox —
+    // Camelot, Open Key or musical — and `key_notation` is Camelot by
+    // contract, so it is converted here rather than stored verbatim.
+    // The verbatim string survives as `original_notation`.
     if let Some(key) = track.key.as_deref() {
-        library.upsert_imported_key(track_id, REKORDBOX, key, Some(key))?;
+        if let Some(camelot) = key_notation::to_camelot(key) {
+            library.upsert_imported_key(track_id, REKORDBOX, &camelot, Some(key))?;
+        }
     }
 
     write_cues(library, track_id, track)?;
@@ -439,7 +446,8 @@ mod tests {
             2
         );
 
-        // Key 8A stored verbatim (Camelot, rekordbox's own notation).
+        // Key 8A is already Camelot, so it lands unchanged; a musical
+        // `Tonality` would be converted (see `key_notation`).
         let key: String = lib
             .connection()
             .query_row(

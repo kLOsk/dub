@@ -270,12 +270,7 @@ impl KeyEstimate {
         if self.confidence <= 0.0 {
             return "";
         }
-        let pc = (self.tonic_pc % 12) as usize;
-        if self.is_major {
-            CAMELOT_MAJOR[pc]
-        } else {
-            CAMELOT_MINOR[pc]
-        }
+        camelot_notation(self.tonic_pc, self.is_major)
     }
 
     /// Musical-notation rendering, e.g. `"C major"` / `"A minor"`.
@@ -291,6 +286,20 @@ impl KeyEstimate {
         let pc = (self.tonic_pc % 12) as usize;
         let mode = if self.is_major { "major" } else { "minor" };
         format!("{} {}", PC_NAMES[pc], mode)
+    }
+}
+
+/// Canonical Camelot for a pitch class (`0 = C` … `11 = B`, taken
+/// modulo 12) and mode — the same wheel [`KeyEstimate::camelot`]
+/// reads, exposed so `dub-library` can convert the musical notation
+/// in imported tags without a second copy of the tables.
+#[must_use]
+pub fn camelot_notation(tonic_pc: u8, is_major: bool) -> &'static str {
+    let pc = (tonic_pc % 12) as usize;
+    if is_major {
+        CAMELOT_MAJOR[pc]
+    } else {
+        CAMELOT_MINOR[pc]
     }
 }
 

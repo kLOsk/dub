@@ -75,6 +75,7 @@ use uuid::Uuid;
 use crate::db::Library;
 use crate::error::{LibraryError, Result};
 use crate::filename_parser::{self, ParsedFilename};
+use crate::key_notation;
 use crate::version_tokens::VersionToken;
 use crate::volumes::discover_for_path;
 
@@ -368,6 +369,7 @@ fn write_metadata_rows(
             id3_token.as_deref(),
         )
         .map_err(|e| format!("write id3 row: {e}"))?;
+    promote_tag_key(library, track_uuid, meta.key.as_deref())?;
 
     library
         .upsert_metadata_source(
@@ -390,6 +392,34 @@ fn write_metadata_rows(
         .map_err(|e| format!("write filename row: {e}"))?;
 
     Ok(())
+}
+
+/// Promote the file's own key tag (`TKEY` / `INITIALKEY`) into
+/// `track_keys`, where the browser's KEY column and the deck header
+/// read from. The verbatim tag goes into `track_metadata_source.key`
+/// regardless (the per-source "ID3 Key" column); this is the row that
+/// makes it *the* key. Before this the tag never got past the
+/// per-source row, so a file keyed by Mixed In Key, rekordbox or
+/// Traktor showed a blank KEY until Dub's own analyser ran.
+///
+/// Converted to Camelot on the way in — `key_notation` is Camelot by
+/// contract — and skipped when the tag is not a key the converter
+/// recognises (ID3's `o` "off key", junk). `upsert_imported_key`'s
+/// source ranking decides whether it takes the active slot: it does
+/// over Dub's `auto` estimate, and yields to a Serato / Traktor /
+/// rekordbox import (PRD §8.3).
+fn promote_tag_key(
+    library: &Library,
+    track_uuid: &str,
+    raw: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(raw) = raw else { return Ok(()) };
+    let Some(camelot) = key_notation::to_camelot(raw) else {
+        return Ok(());
+    };
+    library
+        .upsert_imported_key(track_uuid, "id3", &camelot, Some(raw))
+        .map_err(|e| format!("promote id3 key: {e}"))
 }
 
 /// Refresh just the metadata rows on a known `(volume, path)`. We
@@ -442,6 +472,7 @@ fn refresh_metadata_for_known_track(
             id3_token.as_deref(),
         )
         .map_err(|e| format!("refresh id3 row: {e}"))?;
+    promote_tag_key(library, track_uuid, meta.key.as_deref())?;
 
     let filename_token = format_token_for_storage(&parsed_filename.version_tokens);
     library
@@ -852,6 +883,145 @@ mod tests {
             )
             .unwrap();
         assert_eq!(id3_count, 1);
+    }
+
+    /// A WAV behind a minimal `ID3v2.3` tag carrying `TKEY`. Symphonia's
+    /// probe reads a leading `ID3v2` block before any container, which
+    /// is how a tagged file reaches the importer without an MP3
+    /// fixture in the repo.
+    fn write_wav_with_id3_key(path: &Path, key: &str) {
+        let payload = [&[0u8][..], key.as_bytes()].concat();
+        let payload_len = u32::try_from(payload.len()).unwrap();
+        let mut frame = b"TKEY".to_vec();
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&payload);
+        let size = u32::try_from(frame.len()).unwrap();
+        let mut bytes = b"ID3\x03\x00\x00".to_vec();
+        bytes.extend_from_slice(&[
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]);
+        bytes.extend_from_slice(&frame);
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            for _ in 0..4_410 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        bytes.extend_from_slice(&cursor.into_inner());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn active_key(lib: &Library) -> Option<(String, String, Option<String>)> {
+        lib.connection()
+            .query_row(
+                "SELECT source, key_notation, original_notation \
+                 FROM track_keys WHERE is_active = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+    }
+
+    /// The bug: a file tagged with a key by Mixed In Key / rekordbox /
+    /// Traktor showed nothing in the KEY column until Dub's analyser
+    /// ran, because the tag only ever reached `track_metadata_source`
+    /// — the optional "ID3 Key" column — and never `track_keys`, which
+    /// is what the KEY column reads. The tag is now promoted, in
+    /// Camelot, with the tagger's own spelling kept alongside.
+    #[test]
+    fn id3_key_tag_becomes_the_active_key() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        write_wav_with_id3_key(&music.join("Cutty Ranks - Limb By Limb.wav"), "Ebm");
+
+        let mut lib = open_lib(tmp.path());
+        import_folder(&mut lib, &music).expect("import");
+
+        assert_eq!(
+            active_key(&lib),
+            Some(("id3".to_string(), "2A".to_string(), Some("Ebm".to_string())))
+        );
+        // The browser's KEY column reads the same row.
+        let listed = lib.list_tracks(10, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key.as_deref(), Some("2A"));
+
+        // Re-import refreshes in place rather than minting a second row.
+        import_folder(&mut lib, &music).expect("re-import");
+        assert_eq!(row_count(&lib, "track_keys"), 1);
+    }
+
+    /// PRD §8.3: an import outranks Dub's own estimate whichever
+    /// arrived first. A track analysed before its folder was
+    /// (re-)imported has an active `auto` key; the tag takes the slot
+    /// from it and the estimate stays as the inactive cross-check.
+    #[test]
+    fn id3_key_tag_takes_the_active_slot_from_auto() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        write_wav_with_id3_key(&music.join("Cutty Ranks - Limb By Limb.wav"), "Ebm");
+
+        let mut lib = open_lib(tmp.path());
+        import_folder(&mut lib, &music).expect("import");
+
+        // The state an analyse-then-import order leaves behind.
+        lib.connection()
+            .execute_batch(
+                "UPDATE track_keys SET is_active = 0; \
+                 INSERT INTO track_keys \
+                 (track_id, source, key_notation, original_notation, confidence, is_active, captured_at) \
+                 SELECT id, 'auto', '5A', '5A', 0.8, 1, 0 FROM tracks;",
+            )
+            .unwrap();
+
+        import_folder(&mut lib, &music).expect("re-import");
+
+        assert_eq!(
+            active_key(&lib),
+            Some(("id3".to_string(), "2A".to_string(), Some("Ebm".to_string())))
+        );
+        assert_eq!(row_count(&lib, "track_keys"), 2);
+    }
+
+    /// A tag the converter cannot read stays out of `track_keys`: the
+    /// column is Camelot by contract, and ID3's `o` ("off key") or a
+    /// tagger's junk must not be displayed as one.
+    #[test]
+    fn unreadable_id3_key_tag_is_not_promoted() {
+        let tmp = tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        write_wav_with_id3_key(&music.join("Untitled.wav"), "o");
+
+        let mut lib = open_lib(tmp.path());
+        import_folder(&mut lib, &music).expect("import");
+
+        assert_eq!(row_count(&lib, "track_keys"), 0);
+        // …but the verbatim tag is still there for the per-source column.
+        let raw: Option<String> = lib
+            .connection()
+            .query_row(
+                "SELECT key FROM track_metadata_source WHERE source = 'id3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some("o"));
     }
 
     /// Cross-check: the hand-rolled `write_wav_with_inam_title`

@@ -330,14 +330,30 @@ fn merge_metadata(out: &mut TrackMetadata, revision: &MetadataRevision) {
     }
 }
 
+/// Whether a raw tag name is the file's musical-key field. Symphonia
+/// 0.5.5 has no `StandardTagKey` for it, so the ID3 `TKEY` frame
+/// (v2.2 `TKE` arrives already mapped), the Vorbis `INITIALKEY`
+/// comment and the iTunes freeform `com.apple.iTunes:initialkey`
+/// atom all come through with `std_key == None` and are matched by
+/// name. `KEY` is what a few Vorbis taggers write instead.
+fn is_initial_key_tag(raw_key: &str) -> bool {
+    let upper = raw_key.to_ascii_uppercase();
+    upper == "TKEY" || upper == "INITIALKEY" || upper == "KEY" || upper.ends_with(":INITIALKEY")
+}
+
 fn copy_tag(out: &mut TrackMetadata, tag: &Tag) {
-    let Some(key) = tag.std_key else { return };
     let value = tag.value.to_string();
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return;
     }
     let owned = trimmed.to_string();
+    let Some(key) = tag.std_key else {
+        if out.key.is_none() && is_initial_key_tag(&tag.key) {
+            out.key = Some(owned);
+        }
+        return;
+    };
     match key {
         StandardTagKey::TrackTitle if out.title.is_none() => out.title = Some(owned),
         // `Artist` (TPE1 / TPE2-when-only-TPE2 is present in some
@@ -375,15 +391,8 @@ fn copy_tag(out: &mut TrackMetadata, tag: &Tag) {
                 }
             }
         }
-        // Note: symphonia 0.5.5's `StandardTagKey` does not expose a
-        // musical-key variant; native ID3 `TKEY` / Vorbis `INITIALKEY`
-        // reading would require matching on the format-specific
-        // `tag.key` string. PRD §8.4 defers key detection to v1.x,
-        // and Mixed In Key (the source the v1 importer cares about)
-        // writes its key data into the `Comment` field which we read
-        // above. The dedicated `key` column on TrackMetadata stays
-        // `None` from container-tag reading; M11e Serato importer
-        // populates it from Serato's `Autotags` GEOB frame.
+        // The musical key has no `StandardTagKey`; see
+        // `is_initial_key_tag`, which catches it before this match.
         StandardTagKey::ReplayGainTrackGain if out.gain_db.is_none() => {
             // ReplayGain frames carry strings like "-7.20 dB". Strip
             // the unit suffix before parsing.
@@ -1296,6 +1305,83 @@ mod tests {
         let track = Track::load_from_path(&path).expect("load WAV");
         assert!(track.title().is_none());
         assert!(track.artist().is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A minimal `ID3v2.3` tag: header plus one text frame per entry
+    /// (ISO-8859-1). Symphonia's probe reads a leading `ID3v2` block
+    /// before any container, so prepending this to a WAV is enough
+    /// to exercise the tag path without shipping an MP3 fixture.
+    fn id3v2_tag(frames: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, text) in frames {
+            let payload_len = u32::try_from(1 + text.len()).unwrap();
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&payload_len.to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.push(0);
+            body.extend_from_slice(text.as_bytes());
+        }
+        let size = u32::try_from(body.len()).unwrap();
+        let syncsafe = [
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ];
+        let mut tag = b"ID3\x03\x00\x00".to_vec();
+        tag.extend_from_slice(&syncsafe);
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    fn silent_wav_bytes() -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            for _ in 0..480 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// `TKEY` has no `StandardTagKey` in symphonia 0.5, so it reached
+    /// the browser as nothing at all — a Mixed In Key / rekordbox /
+    /// Traktor tag sat in the file while the KEY column stayed blank
+    /// until Dub's own analyser ran. The tag is matched by name.
+    #[test]
+    fn read_metadata_reads_the_id3_initial_key() {
+        let path = std::env::temp_dir().join("dub-io-test-tkey.wav");
+        let mut bytes = id3v2_tag(&[(b"TKEY", "Ebm"), (b"TBPM", "174")]);
+        bytes.extend_from_slice(&silent_wav_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let metadata = super::read_metadata(&path).expect("metadata probe");
+        assert_eq!(metadata.key.as_deref(), Some("Ebm"));
+        assert_eq!(metadata.bpm, Some(174.0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The ID3 "off key" marker and a blank frame are not keys.
+    #[test]
+    fn read_metadata_ignores_a_blank_initial_key() {
+        let path = std::env::temp_dir().join("dub-io-test-tkey-blank.wav");
+        let mut bytes = id3v2_tag(&[(b"TKEY", "  ")]);
+        bytes.extend_from_slice(&silent_wav_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let metadata = super::read_metadata(&path).expect("metadata probe");
+        assert!(metadata.key.is_none());
 
         std::fs::remove_file(&path).ok();
     }

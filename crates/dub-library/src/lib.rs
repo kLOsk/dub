@@ -42,6 +42,9 @@ mod importer;
 /// target and the import adapter can consume `parse_library`.
 pub mod itunes;
 mod itunes_import;
+/// Camelot / Open Key / musical notation → canonical Camelot, for every
+/// importer that reads a key someone else wrote.
+pub mod key_notation;
 pub mod m3u;
 mod paths;
 /// rekordbox `rekordbox.xml` (`DJ_PLAYLISTS`) parser (M12d). Public so the
