@@ -924,13 +924,10 @@ struct LibraryView: View {
     private static let listingLimit: UInt32 = 5_000
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .frame(width: 200)
-                .background(DubColor.surface1)
-            Rectangle().fill(DubColor.divider).frame(width: 1)
-            rightPane
-        }
+        // The sidebar's width is the split's own state, not this
+        // view's: a drag would otherwise re-run this body — and the
+        // table update behind it — on every frame. See `LibrarySplit`.
+        LibrarySplit(sidebar: sidebar, content: rightPane)
         // No `minHeight`: `DeckLibrarySplit` frames this explicitly and
         // `DeckLibrarySplit` owns the floor (`DubLayout.libraryMinHeight`).
         // A minimum here would be reported and drawn even inside a

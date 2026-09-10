@@ -236,7 +236,90 @@ final class PerformanceLayoutTests: XCTestCase {
             "Prep's three columns overflow the minimum window")
     }
 
+    // MARK: - The library sidebar
+
+    /// The one pane boundary the DJ places. It opens at the default
+    /// until dragged, and only a real width counts as having been.
+    func test_librarySidebar_opensAtItsDefaultUntilDragged() {
+        let suite = "PerformanceLayoutTests.librarySidebar"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            return XCTFail("no defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suite)
+
+        XCTAssertEqual(
+            LibrarySidebarDivider.storedWidth(from: defaults),
+            DubLayout.librarySidebarDefaultWidth)
+
+        LibrarySidebarDivider.store(312, to: defaults)
+        XCTAssertEqual(LibrarySidebarDivider.storedWidth(from: defaults), 312)
+
+        for junk in [CGFloat(0), -40, .nan, .infinity] {
+            LibrarySidebarDivider.store(junk, to: defaults)
+            XCTAssertEqual(
+                LibrarySidebarDivider.storedWidth(from: defaults), 312,
+                "\(junk) should not have been written")
+        }
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    /// Wherever the handle is dragged at the narrowest supported
+    /// window, the sidebar stays inside its tokens and the track list
+    /// keeps its floor.
+    func test_librarySidebar_clampsToItsTokens_atTheMinimumWindow() {
+        let total = DubLayout.mainWindowMinWidth
+        for wanted in stride(from: CGFloat(-200), through: 2_000, by: 20) {
+            let width = LibrarySidebarDivider.width(wanted: wanted, total: total)
+            XCTAssertGreaterThanOrEqual(
+                width, DubLayout.librarySidebarMinWidth, "at \(wanted)")
+            XCTAssertLessThanOrEqual(
+                width, DubLayout.librarySidebarMaxWidth, "at \(wanted)")
+            XCTAssertGreaterThanOrEqual(
+                total - 1 - width, DubLayout.libraryTrackPaneMinWidth,
+                "track list lost its floor at \(wanted)")
+        }
+        // Inside the band the request is honoured, or the handle would
+        // not follow the pointer — to the point, so the pane edge sits
+        // on a pixel.
+        XCTAssertEqual(LibrarySidebarDivider.width(wanted: 250, total: total), 250)
+        XCTAssertEqual(LibrarySidebarDivider.width(wanted: 250.4, total: total), 250)
+        XCTAssertEqual(LibrarySidebarDivider.width(wanted: 250.6, total: total), 251)
+    }
+
+    /// The property that keeps the panes from overlapping: the sidebar
+    /// never asks for more than there is, whatever it is offered.
+    func test_librarySidebar_neverExceedsTheSpace() {
+        for total in [CGFloat(0), 40, 300, 700, 960, 1_440, 5_000] {
+            for wanted in [CGFloat(-1), 0, 200, 420, 10_000, .nan] {
+                let width = LibrarySidebarDivider.width(wanted: wanted, total: total)
+                XCTAssertGreaterThanOrEqual(width, 0, "\(total)/\(wanted)")
+                XCTAssertLessThanOrEqual(width, total, "\(total)/\(wanted)")
+            }
+        }
+        // A non-finite offer is not a layout; fall back rather than
+        // propagate the NaN into a frame.
+        for total in [CGFloat.nan, .infinity] {
+            XCTAssertEqual(
+                LibrarySidebarDivider.width(wanted: 200, total: total),
+                DubLayout.librarySidebarDefaultWidth)
+        }
+    }
+
     // MARK: - Token coupling
+
+    /// The sidebar's ceiling, its divider and the track list's floor
+    /// have to fit the minimum window together, or the clamp starts
+    /// trading one floor against the other on a supported screen.
+    func test_librarySidebar_tokensFitTheMinimumWindow() {
+        XCTAssertLessThanOrEqual(
+            DubLayout.librarySidebarMaxWidth + 1 + DubLayout.libraryTrackPaneMinWidth,
+            DubLayout.mainWindowMinWidth,
+            "sidebar ceiling plus track-list floor exceed the minimum window")
+        XCTAssertGreaterThanOrEqual(
+            DubLayout.librarySidebarDefaultWidth, DubLayout.librarySidebarMinWidth)
+        XCTAssertLessThanOrEqual(
+            DubLayout.librarySidebarDefaultWidth, DubLayout.librarySidebarMaxWidth)
+    }
 
     /// The deck pane has to hold the pad column, the overview, its gap
     /// and a waveform no narrower than the floor. If a token grows past

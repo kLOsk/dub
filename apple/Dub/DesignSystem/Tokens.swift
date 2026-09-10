@@ -398,7 +398,8 @@ enum DubLayout {
     /// invariant and lets the un-loaded deck reserve the same
     /// vertical slot with an empty `Color.clear` placeholder.
     static let deckHeaderHeight: CGFloat = 108
-    /// The draggable deck / library divider.
+    /// Grab zone of the library's sidebar divider. The line itself stays
+    /// 1 pt; this is how wide the pointer's target is around it.
     static let splitterThickness: CGFloat = 6
 
     /// The global rack bar (siren · Quick Scratch · sampler), which
@@ -409,6 +410,25 @@ enum DubLayout {
     static let rackBarHeight: CGFloat = 92
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
+
+    /// The library's source tree, before the DJ has dragged it. Unlike
+    /// the deck / library boundary this has no correct answer the app
+    /// can compute — the width a crate column wants is the length of
+    /// the names in it, which is per library, not per mode — so it is
+    /// resizable and remembered (`LibrarySidebarDivider`).
+    static let librarySidebarDefaultWidth: CGFloat = 300
+    /// Narrow enough to be out of the way, wide enough that the stock
+    /// rows still read: at 14 pt body, "Recently Played" needs ~104 pt
+    /// beside its glyph and the row's padding.
+    static let librarySidebarMinWidth: CGFloat = 160
+    /// Room for a deep rekordbox or iTunes tree with long names; past
+    /// this the space is better spent on the track list.
+    static let librarySidebarMaxWidth: CGFloat = 420
+    /// What the track list keeps whatever the sidebar asks for — the
+    /// favourites strip and enough columns to identify a record. Only
+    /// binds below the minimum window; `PerformanceLayoutTests` holds
+    /// that the sidebar's ceiling fits inside it at 960 pt.
+    static let libraryTrackPaneMinWidth: CGFloat = 480
 
     /// Ideal width of each deck's playing waveform in Performance
     /// (Timecode) mode — the strip's *width* is the equivalent of
