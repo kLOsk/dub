@@ -509,19 +509,31 @@ struct PerformanceView: View {
             // in, green line grows per beat held. Replaces the
             // rejected round-2 candidates (`BeatmatchStackView`,
             // kept in-tree until the rig verdict).
-            VStack(spacing: 0) {
-                // The zoom control heads the gutter: the one place both
-                // strips can see it, and out of the way of either.
-                WaveformZoomControl(index: $waveZoomIndex, visible: waveformHovered)
-                    .padding(.top, DubSpacing.sm)
-                StillpointView(model: model)
-                    .frame(maxHeight: .infinity)
-            }
-            .frame(width: DubLayout.stillpointGutterWidth)
-            .frame(maxHeight: .infinity)
-            // The gutter counts as "over the waveform" so the pointer
-            // can travel to the control without dismissing it.
-            .onHover { waveformHovered = $0 }
+            //
+            // Stillpoint takes the gutter's full height and the zoom
+            // control floats over its top edge. It used to *head* the
+            // gutter as a row above the canvas, which cost three things
+            // at once: the 32 pt slot let the region's seam colour show
+            // through as a grey box; the control is wider than the
+            // gutter, so deck B — drawn after it — covered its right
+            // half; and the canvas measured its "25 % from the top" lock
+            // line from 32 pt down, which put it 24 pt under the strips'
+            // playheads that the sub-spec says it must be collinear with.
+            StillpointView(model: model)
+                .frame(width: DubLayout.stillpointGutterWidth)
+                .frame(maxHeight: .infinity)
+                .overlay(alignment: .top) {
+                    // The one place both strips can see it, and out of
+                    // the way of either.
+                    WaveformZoomControl(index: $waveZoomIndex, visible: waveformHovered)
+                        .padding(.top, DubSpacing.sm)
+                }
+                // Above both panes, so the overhang is not clipped by
+                // whichever sibling the stack draws later.
+                .zIndex(1)
+                // The gutter counts as "over the waveform" so the pointer
+                // can travel to the control without dismissing it.
+                .onHover { waveformHovered = $0 }
             deckPane(
                 side: .b, deckIdx: 1, enabled: deckBEnabled,
                 columnWidth: columnWidth,
