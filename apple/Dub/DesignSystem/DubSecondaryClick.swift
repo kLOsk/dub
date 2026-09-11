@@ -37,11 +37,22 @@ enum SecondaryClickResponse {
 /// One item of a click-time menu.
 struct SecondaryMenuItem {
     let title: String
+    /// Draws the check mark — the current choice in a set of options.
+    var checked: Bool = false
     let action: () -> Void
+    /// A separator line; `title` and `action` are ignored.
+    var isSeparator: Bool = false
 
-    init(_ title: String, action: @escaping () -> Void) {
+    init(_ title: String, checked: Bool = false, action: @escaping () -> Void) {
         self.title = title
+        self.checked = checked
         self.action = action
+    }
+
+    static var separator: SecondaryMenuItem {
+        var item = SecondaryMenuItem("") {}
+        item.isSeparator = true
+        return item
     }
 }
 
@@ -109,11 +120,16 @@ final class SecondaryClickView: NSView {
         switch respond?() {
         case .menu(let items):
             let menu = NSMenu()
-            menuActions = items.map { item in
+            menuActions = items.compactMap { item in
+                if item.isSeparator {
+                    menu.addItem(.separator())
+                    return nil
+                }
                 let holder = MenuAction(item.action)
                 let entry = NSMenuItem(
                     title: item.title, action: #selector(MenuAction.fire), keyEquivalent: "")
                 entry.target = holder
+                entry.state = item.checked ? .on : .off
                 menu.addItem(entry)
                 return holder
             }

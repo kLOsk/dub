@@ -7,18 +7,20 @@
 //  Before this there were four copies of the same knowledge and nothing
 //  holding them together: three `[UInt16: Int]` dictionaries inline in
 //  `KeyEventMonitorHost`'s event closure, and three hand-typed legend
-//  arrays (`sirenPresetKeys`, `QuickScratchSlots.keyLabels`, the old
-//  sampler's) in the views. A pad's printed cap and the key that
-//  actually fires it were separate facts maintained by hand.
+//  arrays (`sirenPresetKeys` and the old Quick Scratch and sampler
+//  tables') in the views. A pad's printed cap and the key that actually
+//  fires it were separate facts maintained by hand.
 //
-//  ## The sampler has no bindings here
+//  ## The sampler and Quick Scratch have no bindings here
 //
-//  It had `A S D F` reserved — drawn, never live. The sampler is eight
-//  slots now and a straight extension collides with `G` (the grid tap),
-//  so rather than pick a second row nobody has asked for, the sampler's
-//  keys wait for map mode, where the DJ picks them. Until then it is
-//  mouse-driven, and the pads print no cap at all rather than a dimmed
-//  promise.
+//  The sampler had `A S D F` reserved — drawn, never live — and Quick
+//  Scratch had `Q W E R` live, each key bound to a slot with its own
+//  target deck. The sampler is eight slots now and a straight extension
+//  collides with `G` (the grid tap); Quick Scratch is a per-deck row of
+//  four, so its keys need a deck dimension the old four did not have.
+//  Rather than pick rows nobody has asked for, both wait for map mode,
+//  where the DJ picks them. Until then they are mouse-driven, and the
+//  pads print no cap at all rather than a dimmed promise.
 //
 //  `SirenRackGroup`'s own doc comment records what that costs: it shipped
 //  two siren racks advertising the same eight keys when only the focused
@@ -54,7 +56,6 @@ enum DubAction: Hashable {
     case tapGrid
     case hotCue(Int)
     case sirenPreset(Int)
-    case quickScratch(Int)
     /// `true` duplicates deck A onto B; `false` is the reverse.
     case instantDouble(toDeckB: Bool)
 
@@ -65,7 +66,6 @@ enum DubAction: Hashable {
         case .tapGrid: return "grid.tap"
         case .hotCue(let i): return "cue.\(i)"
         case .sirenPreset(let i): return "siren.preset.\(i)"
-        case .quickScratch(let i): return "quickScratch.\(i)"
         case .instantDouble(let b): return "deck.instantDouble.\(b ? "b" : "a")"
         }
     }
@@ -119,9 +119,6 @@ enum DubKeymap {
     /// Bottom letter row, in fire order. Layout-independent keyCodes.
     private static let sirenCodes: [UInt16] = [6, 7, 8, 9, 11, 45, 46, 43]
     private static let sirenLegends = ["Z", "X", "C", "V", "B", "N", "M", ","]
-    /// `Q W E R`.
-    private static let quickScratchCodes: [UInt16] = [12, 13, 14, 15]
-    private static let quickScratchLegends = ["Q", "W", "E", "R"]
 
     static let bindings: [DubBinding] = {
         var all: [DubBinding] = [
@@ -151,12 +148,6 @@ enum DubKeymap {
                 DubBinding(
                     action: .sirenPreset(i), match: .code(code),
                     legend: sirenLegends[i]))
-        }
-        for (i, code) in quickScratchCodes.enumerated() {
-            all.append(
-                DubBinding(
-                    action: .quickScratch(i), match: .code(code),
-                    legend: quickScratchLegends[i]))
         }
         return all
     }()

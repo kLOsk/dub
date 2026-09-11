@@ -2,9 +2,12 @@
 //  GlobalRackBar.swift
 //  Dub
 //
-//  The horizontal bar under the deck panes: siren · Quick Scratch ·
-//  sampler. The sampler is `SampleShelf` — the same eight tiles Prep
-//  loads, so a slot learned in one place is the slot found in the other.
+//  The horizontal bar under the deck panes: siren · sampler. The
+//  sampler is `SampleShelf` — the same eight tiles Prep loads, so a slot
+//  learned in one place is the slot found in the other. Quick Scratch
+//  drew here as a third block of four pads until PRD §7.2 got its way
+//  back: it is a tag on a sampler tile now, fired from a row in each
+//  deck column, and the bar's width went to the shelf.
 //
 //  It occupies the slot `FXBarPlaceholder` used to fill with
 //  "ECHO-OUT — Coming soon" and "DUB SIREN — Coming soon" cards,
@@ -21,16 +24,15 @@
 
 import SwiftUI
 
-/// Siren · Quick Scratch · sampler, one of each, full width.
+/// Siren · sampler, one of each, full width.
 ///
 /// **Where the slack goes.** The siren is eight fixed pads and gains
 /// nothing from width, so it sits at its own size with first claim on
-/// it; Quick Scratch and the sampler split whatever is left. The
-/// sampler is the one block here that genuinely improves with width —
-/// a filename is the only string on the bar whose length is not ours
-/// to choose — and the shelf's grid, unlike the fixed pads it replaced,
-/// declares no width of its own, so without a floor the siren's
-/// priority starved it to nothing.
+/// it; the sampler takes whatever is left. It is the one block here
+/// that genuinely improves with width — a filename is the only string
+/// on the bar whose length is not ours to choose — and the shelf's
+/// grid, unlike the fixed pads it replaced, declares no width of its
+/// own, so without a floor the siren's priority starved it to nothing.
 struct GlobalRackBar: View {
     let state: GlobalRackBarState
     var callbacks = GlobalRackBarCallbacks()
@@ -43,15 +45,10 @@ struct GlobalRackBar: View {
                         state: siren,
                         onPreset: callbacks.onSirenPreset,
                         onUnit: callbacks.onSirenUnit,
-                        onDubMacro: callbacks.onSirenDubMacro)
+                        onDubMacro: callbacks.onSirenDubMacro,
+                        onOutput: callbacks.onSirenOutput)
                 }
                 .layoutPriority(1)
-            }
-            group {
-                TriggerPadGroup(
-                    title: "QUICK SCRATCH",
-                    pads: state.quickScratch,
-                    onTrigger: callbacks.onQuickScratch)
             }
             group {
                 SampleShelf(state: state.sampler, callbacks: callbacks.sampler)
@@ -62,7 +59,7 @@ struct GlobalRackBar: View {
         .background(DubColor.divider)
     }
 
-    /// One block. `flexible` blocks share the bar's slack; a fixed one
+    /// One block. A `flexible` block takes the bar's slack; a fixed one
     /// takes its content's width and no more.
     @ViewBuilder
     private func group<Content: View>(

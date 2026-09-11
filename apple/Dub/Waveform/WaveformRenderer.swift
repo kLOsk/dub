@@ -318,8 +318,8 @@ struct RendererAppearance {
     var timeAxisZoom: Double = 1.0
     var beatGridEnabled: Bool = true
 
-    /// The gain the deck loaded this track with, applied to the drawn
-    /// amplitude so the picture matches the sound.
+    /// A gain folded into the drawn amplitude — the deck's load gain,
+    /// so the picture matches the sound.
     ///
     /// Peaks are decimated from the file's *raw* samples
     /// (`compute_offline_peaks`), while the deck plays it through
@@ -328,6 +328,10 @@ struct RendererAppearance {
     /// the lane — the two were describing different signals. Serato
     /// folds its Auto Gain into the drawn waveform for the same
     /// reason.
+    ///
+    /// **Currently unity.** The deck pane stopped feeding the load gain
+    /// at the DJ's request (2026-09-11); the lane draws the file as
+    /// decoded. The plumbing stays so it is one line to turn back on.
     var displayGain: Float = 1.0
 }
 

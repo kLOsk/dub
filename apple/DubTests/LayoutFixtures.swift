@@ -35,12 +35,12 @@ extension PerformancePadsState {
 }
 
 extension GlobalRackBarState {
-    /// A populated bar: the GS1 siren, two Quick Scratch slots bound to
-    /// different decks, three sampler slots loaded with one sounding.
+    /// A populated bar: the GS1 siren and three sampler slots loaded —
+    /// one sounding, one tagged for Quick Scratch.
     static func fixture(focus: DeckSide) -> GlobalRackBarState {
         GlobalRackBarState(
             siren: SirenRackState(
-                focusedDeck: focus,
+                output: RackOutputState(focused: focus),
                 presetNames: [
                     "Wail", "Alarm", "Laser", "Bomb",
                     "Riser", "Zap", "Siren", "Horn",
@@ -48,16 +48,10 @@ extension GlobalRackBarState {
                 sounding: false,
                 unit: .gs1,
                 dubMacro: 0.35),
-            quickScratch: [
-                TriggerPadState(index: 0, key: "Q", sampleName: "Ahh", deck: .a),
-                TriggerPadState(index: 1, key: "W", sampleName: "Fresh", deck: .b),
-                TriggerPadState(index: 2, key: "E"),
-                TriggerPadState(index: 3, key: "R"),
-            ],
             sampler: SampleShelfState(
                 slots: [
                     SampleSlotState(index: 0, name: "Horn", playing: true, progress: 0.4),
-                    SampleSlotState(index: 1, name: "Reload"),
+                    SampleSlotState(index: 1, name: "Reload", quickScratch: 0),
                     SampleSlotState(index: 2),
                     SampleSlotState(index: 3),
                     SampleSlotState(index: 4, name: "Siren Up"),
@@ -65,6 +59,6 @@ extension GlobalRackBarState {
                     SampleSlotState(index: 6),
                     SampleSlotState(index: 7),
                 ],
-                focusedDeck: focus))
+                output: RackOutputState(focused: focus)))
     }
 }

@@ -28,8 +28,21 @@ struct SirenRackGroup: View {
     var onPreset: (_ index: Int) -> Void = { _ in }
     var onUnit: (_ unit: SirenUnit) -> Void = { _ in }
     var onDubMacro: (_ value: Double) -> Void = { _ in }
+    var onOutput: ((_ output: RackOutput) -> Void)?
 
-    private var tint: Color { DubColor.deckTint(state.focusedDeck) }
+    private var tint: Color {
+        state.output.tintDeck.map(DubColor.deckTint) ?? DubColor.controlAccent
+    }
+
+    /// The block's width: the eight preset pads and the gaps between
+    /// them. Pinned, because the heading's rule is flexible and would
+    /// otherwise make the block's ideal width unbounded — the bar then
+    /// hands the siren every spare point and squeezes the shelf to its
+    /// floor, which is exactly what the shelf's own floor was added to
+    /// stop. The rule fills what the pill, the unit switch and the knob
+    /// leave, to the pads' edge and no further.
+    static let width: CGFloat =
+        (DubPadCell<Text>.Size.preset.width ?? 64) * 8 + DubSpacing.sm * 7
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -40,11 +53,18 @@ struct SirenRackGroup: View {
                 }
             }
         }
+        .frame(width: Self.width, alignment: .leading)
     }
 
+    /// The same heading the shelf and the deck sections use — title,
+    /// rule, state — so the bar's two blocks read as one family. The
+    /// rule takes what the pill, the unit switch and the knob leave.
     private var header: some View {
         HStack(spacing: DubSpacing.sm) {
-            DubSectionLabel("SIREN", dot: state.sounding ? DubColor.siren : DubColor.divider)
+            SectionHeading(
+                title: "DUB SIREN", accent: DubColor.siren,
+                trailing: state.sounding ? "● ON" : "○ OFF",
+                trailingAccent: state.sounding ? DubColor.siren : DubColor.textPlaceholder)
             focusPill
             DubSegmentedControl(
                 segments: [
@@ -60,13 +80,13 @@ struct SirenRackGroup: View {
         }
     }
 
-    /// Names the deck the pads and keys land on — see `DubDeckPill` for
-    /// why it is not clickable.
+    /// Names the deck(s) the pads and keys land on, and takes the
+    /// override — see `DubDeckPill`.
     private var focusPill: some View {
-        DubDeckPill(deck: state.focusedDeck)
-            .help("The siren fires on the focused deck — the master, or deck A "
-                + "when neither is. \(sirenPresetKeys.prefix(4).joined(separator: " ")) … "
-                + "fire the same pads.")
+        DubDeckPill(state: state.output, onSelect: onOutput)
+            .help("Where the siren fires — the master deck by default. "
+                + "Right-click to pin it to A, B or both. "
+                + "\(sirenPresetKeys.prefix(4).joined(separator: " ")) … fire the same pads.")
     }
 
     private var dubKnob: some View {

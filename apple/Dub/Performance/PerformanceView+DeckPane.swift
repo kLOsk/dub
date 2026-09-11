@@ -206,7 +206,10 @@ extension PerformanceView {
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
                         : zoom,
-                    displayGain: deckState.autoGain ?? 1.0,
+                    // Drawn as decoded, not at the deck's auto-gain. The
+                    // renderer can fold the load gain into the picture
+                    // (`RendererAppearance.displayGain`); it is off at
+                    // the DJ's request, so the lane shows the file.
                     hotCues: deckState.hotCues.compactMap { cue in
                         cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
                     },

@@ -311,6 +311,13 @@ impl EngineHandle {
         DeckCommand { handle: self, idx }
     }
 
+    /// The deck's shared atomics — what the FFI's telemetry reads
+    /// (Quick Scratch state lives here beside the siren's).
+    #[must_use]
+    pub fn deck_shared(&self, idx: usize) -> Option<&DeckSharedState> {
+        self.deck_shared.get(idx).map(Arc::as_ref)
+    }
+
     /// Read-only snapshot of the given deck. Cheap (atomic load).
     #[must_use]
     pub fn deck_state(&self, idx: usize) -> Option<DeckSnapshot> {
@@ -452,6 +459,19 @@ impl EngineHandle {
         self.send(Command::SamplerTrigger { slot, deck })
     }
 
+    /// Fire sampler slot `slot`'s one-shot onto **both** deck buses —
+    /// the rack's `A+B` output.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn sampler_trigger_both(&mut self, slot: usize) -> Result<(), CommandError> {
+        let slot = Self::check_sampler_slot(slot)?;
+        self.send(Command::SamplerTrigger {
+            slot,
+            deck: crate::sampler::SAMPLER_OUTPUT_BOTH,
+        })
+    }
+
     /// Stop sampler slot `slot` early, ramping out.
     ///
     /// # Errors
@@ -484,6 +504,40 @@ impl EngineHandle {
             idx: 0,
             count: crate::sampler::SAMPLER_SLOTS as u8,
         })
+    }
+
+    /// Quick Scratch (PRD §7.2): put sampler slot `slot` on deck `deck`
+    /// and park its track — doubling the track onto `double_to` first
+    /// when given, so it keeps playing there.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn quick_scratch_engage(
+        &mut self,
+        deck: usize,
+        slot: usize,
+        double_to: Option<usize>,
+    ) -> Result<(), CommandError> {
+        let deck = self.check_deck(deck)?;
+        let slot = Self::check_sampler_slot(slot)?;
+        let double_to = match double_to {
+            Some(d) => Some(self.check_deck(d)?),
+            None => None,
+        };
+        self.send(Command::DeckQuickScratchEngage {
+            deck,
+            slot,
+            double_to,
+        })
+    }
+
+    /// Quick Scratch release: the parked track comes back.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] / [`CommandError::InvalidDeck`].
+    pub fn quick_scratch_release(&mut self, deck: usize) -> Result<(), CommandError> {
+        let deck = self.check_deck(deck)?;
+        self.send(Command::DeckQuickScratchRelease { deck })
     }
 
     /// Instant Doubles (M17, PRD §7.3): put deck `from`'s track onto

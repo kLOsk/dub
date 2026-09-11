@@ -43,10 +43,16 @@ struct SectionHeading: View {
 
     var body: some View {
         HStack(spacing: DubSpacing.sm) {
+            // `fixedSize` on both texts: an `HStack` offers a `Text`
+            // less than it wants before it squeezes the rule, because a
+            // `Text` can truncate and a line cannot — so at the echo's
+            // 96 pt the heading read "E… ○…" over a full-length rule.
+            // The words are the heading; the rule takes what is left.
             Text(title)
                 .font(DubFont.caps)
                 .tracking(DubFont.capsTracking)
                 .foregroundStyle(accent)
+                .fixedSize()
             Rectangle()
                 .fill(DubColor.divider)
                 .frame(height: 1)
@@ -55,6 +61,7 @@ struct SectionHeading: View {
                     .font(DubFont.micro)
                     .tracking(DubFont.capsTracking)
                     .foregroundStyle(trailingAccent ?? DubColor.textTertiary)
+                    .fixedSize()
             }
         }
         .frame(height: 14)
@@ -282,8 +289,12 @@ struct LoopEngine: View {
     static let sizes: [Double] = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16]
     static let windowSize = 4
 
-    private static let stepperWidth: CGFloat = 34
-    private static let sizeButtonMinWidth: CGFloat = 40
+    /// Compact: the loop shares its row with the SCRATCH pads and the
+    /// echo, and the three have to clear the column's floor together
+    /// (`test_deckColumn_floorHoldsTheTriggerRow`). 34 / 40 were the
+    /// sizes when the loop had the row to itself.
+    private static let stepperWidth: CGFloat = 28
+    private static let sizeButtonMinWidth: CGFloat = 32
 
     /// The narrowest the row lays out at: both steppers, the four size
     /// buttons at their floor, and the gaps between. The size buttons

@@ -18,7 +18,6 @@
 //  Opened via `⌘,` or the status-strip gear icon. Esc / Close dismiss.
 //
 
-import AppKit
 import SwiftUI
 import DubCore
 
@@ -46,7 +45,6 @@ struct PreferencesSheet: View {
                     cueSection
                     recordingSection
                     fxSection
-                    quickScratchSection
                     librariesSection
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -258,88 +256,6 @@ struct PreferencesSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-        }
-    }
-
-    // MARK: - Quick Scratch
-
-    /// Menu of the sampler's loaded files for one Quick Scratch slot,
-    /// plus a way to unbind. Samples are loaded on Prep's SAMPLES shelf
-    /// — a drop from the library or Finder — so an empty sampler says
-    /// where to go rather than offering an unhelpful empty menu.
-    @ViewBuilder
-    private func sampleBindingMenu(
-        current: URL?,
-        onPick: @escaping (URL) -> Void,
-        onClear: @escaping () -> Void
-    ) -> some View {
-        if model.sampleBank.isEmpty {
-            Text("No samples — drop files onto the SAMPLES shelf in Prep.")
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textTertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Menu(current.map(SampleBank.label(for:)) ?? "—") {
-                ForEach(model.sampleBank.loaded, id: \.self) { url in
-                    Button(SampleBank.label(for: url)) { onPick(url) }
-                }
-                Divider()
-                Button("None") { onClear() }
-            }
-            .menuStyle(.borderlessButton)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .help(current?.path ?? "Nothing bound")
-        }
-    }
-
-    /// Quick Scratch slots (M17, PRD §7.2). Binding a slot is prep,
-    /// not performance — the no-mouse rule governs the *set*, and this
-    /// is the config surface for it. Drag-and-drop assignment onto the
-    /// performance pads is the nicer affordance §7.2 also asks for and
-    /// is not wired yet.
-    private var quickScratchSection: some View {
-        section(title: "Quick Scratch") {
-            VStack(alignment: .leading, spacing: DubSpacing.xs) {
-                Text("Press a key to load its sample onto a deck instantly — it lands at the start, under your needle, ready to scratch. Loading works exactly like dragging the file from the library.")
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                ForEach(Array(QuickScratchSlots.keyLabels.enumerated()), id: \.offset) {
-                    index, key in
-                    quickScratchRow(index: index, key: key)
-                }
-            }
-        }
-    }
-
-    private func quickScratchRow(index: Int, key: String) -> some View {
-        let slot = model.quickScratch.slot(index)
-        return HStack(spacing: DubSpacing.sm) {
-            Text(key)
-                .font(DubFont.caps)
-                .frame(width: 18)
-                .foregroundStyle(DubColor.textSecondary)
-
-            sampleBindingMenu(
-                current: slot?.url,
-                onPick: { model.quickScratch.assign(url: $0, deck: slot?.deck ?? .a, to: index) },
-                onClear: { model.quickScratch.clear(index) })
-
-            Picker(
-                "",
-                selection: Binding(
-                    get: { slot?.deck ?? .a },
-                    set: { model.quickScratch.setDeck($0, for: index) })
-            ) {
-                Text("A").tag(DeckSide.a)
-                Text("B").tag(DeckSide.b)
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 72)
-            .disabled(slot == nil)
-
         }
     }
 

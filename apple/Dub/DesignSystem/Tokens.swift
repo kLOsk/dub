@@ -249,9 +249,10 @@ enum DubColor {
 /// Tiny enum to keep deck identity type-safe in call sites that
 /// don't need the full `UInt64` deck index.
 ///
-/// `Codable` because M17's Quick Scratch slots persist a target deck
-/// per slot; a case-less enum encodes as its case name, which is
-/// stable across reordering.
+/// `Codable` from when M17's Quick Scratch slots persisted a target
+/// deck per slot; kept so a saved keymap profile can name a deck. A
+/// case-less enum encodes as its case name, which is stable across
+/// reordering.
 enum DeckSide: Hashable, Codable {
     case a
     case b
@@ -402,14 +403,14 @@ enum DubLayout {
     /// 1 pt; this is how wide the pointer's target is around it.
     static let splitterThickness: CGFloat = 6
 
-    /// The global rack bar (siren · Quick Scratch · sampler), which
-    /// replaces the old placeholder FX bar. Sized by its tallest block,
+    /// The global rack bar (siren · sampler), which replaces the old
+    /// placeholder FX bar. Sized by its tallest block,
     /// the sampler, which is the same two-row shelf Prep draws: 12 top
     /// padding + the 14 pt heading + 8 + `prepSectionContent` (two 42 pt
     /// rows and a 4 pt gap) + 12 bottom = 134. Derived rather than typed
     /// so it moves with the shelf; `test_rackBar_fitsItsHeightToken`
-    /// holds it. The siren and Quick Scratch rows sit at the top of the
-    /// extra height, which is where the eye already reads them.
+    /// holds it. The siren row sits at the top of the extra height,
+    /// which is where the eye already reads it.
     ///
     /// Was 92, sized for a single 36 pt pad row, when the sampler was
     /// four `TriggerPadGroup` pads bound in Preferences.
@@ -417,11 +418,10 @@ enum DubLayout {
         DubSpacing.md + 14 + DubSpacing.sm + prepSectionContent + DubSpacing.md
 
     /// The sampler's floor in the rack bar: four tiles as wide as a
-    /// siren preset pad, plus the three gaps between them — the same
-    /// width as the Quick Scratch row beside it, so the two trigger
-    /// blocks read as a pair. The shelf's grid declares no width of its
-    /// own (a `LazyVGrid` of flexible columns), and with the siren
-    /// holding layout priority it was laid out at ~60 pt without this.
+    /// siren preset pad, plus the three gaps between them. The shelf's
+    /// grid declares no width of its own (a `LazyVGrid` of flexible
+    /// columns), and with the siren holding layout priority it was laid
+    /// out at ~60 pt without this.
     static let rackSamplerMinWidth: CGFloat = 64 * 4 + DubSpacing.xs * 3
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
@@ -656,7 +656,20 @@ enum DubLayout {
 
     /// The echo-out block beside the loop. 96 clipped its own heading
     /// to `E…`; there is room to spare beside the loop, so it takes it.
-    static let deckColumnEchoWidth: CGFloat = 150
+    /// Was 150 when the echo shared its row with the loop alone; the
+    /// SCRATCH pads joined the row (PRD §7.2) and the three have to
+    /// clear the column's floor together. "ECHO OUT" at the caps size
+    /// is ~72 pt; 96 leaves it air on both sides.
+    static let deckColumnEchoWidth: CGFloat = 96
+    /// Floor for one Quick Scratch pad in the deck column's trigger
+    /// row; the four pads share the row's slack above it, while the
+    /// loop and the echo keep their widths. A name at the floor is five
+    /// or six characters before it scales down; the tooltip has the
+    /// rest.
+    static let deckColumnScratchPadMinWidth: CGFloat = 42
+    /// The SCRATCH block's floor: four pads and three `xs` gaps.
+    static let deckColumnScratchRowMinWidth: CGFloat =
+        deckColumnScratchPadMinWidth * 4 + DubSpacing.xs * 3
 
     /// The loop row inside Performance's column — the same height as
     /// the echo button beside it, so the pair reads as one row of

@@ -18,8 +18,10 @@
 //    sounding slot starts it over (the engine crossfades the retrigger).
 //  * **Right-click while sounding stops it.** No menu — a hand mid-set
 //    wants the horn gone, not a list to read.
-//  * **Right-click while quiet offers Unload.** The destructive gesture
-//    only exists when there is nothing to interrupt.
+//  * **Right-click while quiet offers the Quick Scratch tag and Unload.**
+//    The destructive gesture only exists when there is nothing to
+//    interrupt; the tag is prep work and lives on the tile because the
+//    tile is where the sample is.
 //  * **Drop** loads, onto empty and full alike. There is no Add button:
 //    a sample arrives by being dragged from the track list or Finder,
 //    which is where the DJ is already looking when they decide something
@@ -43,6 +45,9 @@ struct SampleSlotState: Equatable, Identifiable {
     var playing: Bool = false
     /// How far through the take, `0...1`. `0` when idle.
     var progress: Double = 0
+    /// The Quick Scratch pad this slot answers to (0-based), printed
+    /// on the tile as `QS 1`; `nil` when it is a plain sampler slot.
+    var quickScratch: Int?
 
     var id: Int { index }
 }
@@ -50,20 +55,21 @@ struct SampleSlotState: Equatable, Identifiable {
 /// Everything the shelf draws.
 struct SampleShelfState: Equatable {
     var slots: [SampleSlotState]
-    /// The deck the pads fire on — the master. `nil` hides the pill:
-    /// Prep is one deck, and a `→ A` there would be noise.
-    var focusedDeck: DeckSide?
+    /// Where the pads fire — the master by default, or the deck(s) the
+    /// DJ pinned the rack to. `nil` hides the pill: Prep is one deck,
+    /// and a `→ A` there would be noise.
+    var output: RackOutputState?
 
-    init(slots: [SampleSlotState], focusedDeck: DeckSide? = nil) {
+    init(slots: [SampleSlotState], output: RackOutputState? = nil) {
         self.slots = slots
-        self.focusedDeck = focusedDeck
+        self.output = output
     }
 
     /// Eight idle slots from their names — fixtures and snapshots.
-    init(names: [String?], focusedDeck: DeckSide? = nil) {
+    init(names: [String?], output: RackOutputState? = nil) {
         self.init(
             slots: names.enumerated().map { SampleSlotState(index: $0.offset, name: $0.element) },
-            focusedDeck: focusedDeck)
+            output: output)
     }
 
     static let empty = SampleShelfState(names: Array(repeating: nil, count: SampleBank.count))
@@ -77,6 +83,12 @@ struct SampleShelfCallbacks {
     /// Dropping onto a filled slot replaces it.
     var onDrop: (_ index: Int, _ url: URL) -> Void = { _, _ in }
     var onUnload: (_ index: Int) -> Void = { _ in }
+    /// Tag slot `index` with Quick Scratch pad `pad` (0-based), or
+    /// `nil` to clear the tag.
+    var onQuickScratch: (_ index: Int, _ pad: Int?) -> Void = { _, _ in }
+    /// The pill's right-click: pin the rack's output or let it follow
+    /// the master again.
+    var onOutput: (_ output: RackOutput) -> Void = { _ in }
 }
 
 // MARK: - The shelf
@@ -97,7 +109,10 @@ struct SampleShelf: View {
     static let tileHeight: CGFloat = 42
 
     private var filled: Int { state.slots.filter { $0.name != nil }.count }
-    private var tint: Color { DubColor.deckTint(state.focusedDeck ?? .a) }
+    private var tint: Color {
+        guard let output = state.output else { return DubColor.deckATint }
+        return output.tintDeck.map(DubColor.deckTint) ?? DubColor.controlAccent
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -108,10 +123,9 @@ struct SampleShelf: View {
                     repeating: GridItem(.flexible(), spacing: DubSpacing.xs), count: 4),
                 spacing: DubSpacing.xs
             ) {
-                // 5-8 on top, 1-4 underneath. A numbered bank counts
-                // *up* from the row nearest the hand, the way a pad
-                // controller's rows do — reading the grid left-to-right
-                // top-to-bottom put 1 furthest from the fingers.
+                // 1-4 on top, 5-8 underneath — reading order. A pad
+                // controller's bottom-up numbering was tried and read
+                // wrong against the numbered empties on screen.
                 ForEach(Self.slotOrder(count: state.slots.count), id: \.self) { index in
                     tile(state.slots[index])
                 }
@@ -124,20 +138,19 @@ struct SampleShelf: View {
             SectionHeading(
                 title: "SAMPLES", accent: tint,
                 trailing: "\(filled) OF \(state.slots.count)")
-            if let deck = state.focusedDeck {
-                DubDeckPill(deck: deck)
-                    .help("Samples sound on the focused deck — the master, or deck A "
-                        + "when neither is.")
+            if let output = state.output {
+                DubDeckPill(state: output, onSelect: callbacks.onOutput)
+                    .help("Where samples sound — the master deck by default. "
+                        + "Right-click to pin them to A, B or both.")
             }
         }
     }
 
-    /// Slot indices in draw order: the second half first, so the
-    /// grid's *bottom* row is 1-4. Derived rather than hard-coded so a
-    /// bank of a different size still splits down the middle.
+    /// Slot indices in draw order: reading order, 1–4 over 5–8. A
+    /// function rather than a range at the call site so the decision
+    /// has one home and a test.
     static func slotOrder(count: Int) -> [Int] {
-        let half = count / 2
-        return Array(half..<count) + Array(0..<half)
+        Array(0..<count)
     }
 
     /// One slot. Empty slots are dashed — the drop-zone convention.
@@ -185,6 +198,18 @@ struct SampleShelf: View {
                 .strokeBorder(
                     lit ? tint : DubColor.divider,
                     style: StrokeStyle(lineWidth: 1, dash: isEmpty ? [3, 3] : [])))
+        .overlay(alignment: .topTrailing) {
+            if let pad = slot.quickScratch {
+                Text("QS\(pad + 1)")
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(lit ? DubColor.textPrimary : tint)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(DubColor.surface0.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                    .padding(3)
+            }
+        }
         .contentShape(Rectangle())
         .onPressDown(enabled: !isEmpty) { callbacks.onTrigger(slot.index) }
         .onSecondaryClick {
@@ -193,7 +218,7 @@ struct SampleShelf: View {
                 callbacks.onStop(slot.index)
                 return .handled
             }
-            return .menu([SecondaryMenuItem("Unload") { callbacks.onUnload(slot.index) }])
+            return .menu(quietMenu(slot))
         }
         // Replacing is the same gesture as filling: dropping onto a
         // full slot overwrites it, so there is no "clear it first".
@@ -205,12 +230,28 @@ struct SampleShelf: View {
         .help(help(slot))
     }
 
+    /// The stopped-state menu: which Quick Scratch pad this sample sits
+    /// on, and the way out. Flat rather than a submenu — five lines,
+    /// read once.
+    private func quietMenu(_ slot: SampleSlotState) -> [SecondaryMenuItem] {
+        var items = (0..<SampleBank.quickScratchCount).map { pad in
+            SecondaryMenuItem("Quick Scratch \(pad + 1)", checked: slot.quickScratch == pad) {
+                callbacks.onQuickScratch(slot.index, slot.quickScratch == pad ? nil : pad)
+            }
+        }
+        items.append(.separator)
+        items.append(SecondaryMenuItem("Unload") { callbacks.onUnload(slot.index) })
+        return items
+    }
+
     private func help(_ slot: SampleSlotState) -> String {
         guard let name = slot.name else {
             return "Slot \(slot.index + 1) — drag a track here from the library or Finder"
         }
+        let tag = slot.quickScratch.map { " · Quick Scratch \($0 + 1)" } ?? ""
         return slot.playing
             ? "\(name) — click to start over, right-click to stop"
-            : "\(name) — click to play, right-click to unload, drop another to replace"
+            : "\(name)\(tag) — click to play, right-click for Quick Scratch / unload, "
+                + "drop another to replace"
     }
 }

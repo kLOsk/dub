@@ -62,6 +62,22 @@ struct DeckColumnState: Equatable {
     var echoEngaged: Bool = false
     var hasTrack: Bool = false
     var isPlaying: Bool = false
+    /// The four Quick Scratch pads (PRD §7.2), in pad order. An untagged
+    /// pad is drawn dark and dead so the hand's positions never move.
+    var scratch: [ScratchPadState] = (0..<SampleBank.quickScratchCount).map {
+        ScratchPadState(pad: $0)
+    }
+}
+
+/// One Quick Scratch pad as the column draws it.
+struct ScratchPadState: Equatable, Identifiable {
+    var pad: Int
+    /// The tagged sample's name; `nil` when no sample answers to the pad.
+    var name: String?
+    /// `true` while this pad's sample is on the deck.
+    var engaged: Bool = false
+
+    var id: Int { pad }
 }
 
 /// The header's fields that the column actually renders.
@@ -76,8 +92,14 @@ struct DeckColumnHeader: Equatable {
     var pitchTenths: Double?
     var sourceControl: SourceControlStatus?
     var sourceControlOverridden: Bool
+    /// Set while Quick Scratch has a sample on the deck: what is parked
+    /// underneath and where it is. The identity block then shouts.
+    var scratch: ScratchBadge?
+    /// The master deck (PRD §6.4) — the one the crowd is hearing, the
+    /// one the siren and sampler land on, the one Space-load avoids.
+    var isMaster: Bool
 
-    init(_ state: DeckHeaderState) {
+    init(_ state: DeckHeaderState, scratch: ScratchBadge? = nil) {
         trackTitle = state.trackTitle
         trackArtist = state.trackArtist
         bpm = state.bpm
@@ -85,7 +107,22 @@ struct DeckColumnHeader: Equatable {
         pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
+        self.scratch = scratch
+        isMaster = state.isMaster
     }
+}
+
+/// What the header says about a quick scratch in progress.
+struct ScratchBadge: Equatable {
+    /// The parked tune's title, or `nil` when the deck was empty.
+    var parkedTitle: String?
+    /// Where the parked tune is, whole seconds — it moves under slip,
+    /// and whole seconds is what the `m:ss` readout can show, so the
+    /// column is not rebuilt for a change it cannot draw.
+    var parkedSecs: Int
+    /// The deck the tune is playing on meanwhile, when it was doubled
+    /// across; `nil` when it is parked silently underneath.
+    var playingOn: DeckSide? = nil
 }
 
 /// Every write the column makes, as closures — the same shape as
@@ -100,6 +137,9 @@ struct DeckColumnCallbacks {
     var onScaleLoop: (_ double: Bool) -> Void = { _ in }
     var onExitLoop: () -> Void = {}
     var onEchoToggle: () -> Void = {}
+    /// Quick Scratch pad `pad` pressed: engage its sample, swap to it,
+    /// or — if it is the one on the deck — release.
+    var onScratch: (_ pad: Int) -> Void = { _ in }
     var onSetInternal: () -> Void = {}
     var onPause: () -> Void = {}
     var onSetTimecode: () -> Void = {}
@@ -180,7 +220,7 @@ struct DeckColumn<Overview: View>: View {
                 .padding(.top, DubSpacing.sm)
             cueBank
                 .padding(.top, DubSpacing.sm)
-            loopAndEcho
+            triggerRow
                 .padding(.top, DubSpacing.sm)
             Spacer(minLength: 0)
         }
@@ -246,13 +286,43 @@ struct DeckColumn<Overview: View>: View {
     /// switch is right-aligned; deck B's is right of its waveform so it
     /// is left-aligned. The readouts under it mirror the same way (see
     /// `identityAndReadouts`); the marks and the loop do not.
+    /// The source switch on the inner end, and the MASTER chip on the
+    /// outer — the deck's top corner, where it reads from across the
+    /// booth and moves nothing else. The chip is the one the header
+    /// band carried before the column replaced it; it went missing in
+    /// the move, and with the siren and the sampler both landing on the
+    /// master deck it is the thing that says which deck that is.
     private var sourceRow: some View {
         HStack(spacing: 0) {
-            if state.side == .a { Spacer(minLength: DubSpacing.lg) }
-            sourceSwitch
-            if state.side == .b { Spacer(minLength: DubSpacing.lg) }
+            if state.side == .a {
+                masterChip
+                Spacer(minLength: DubSpacing.lg)
+                sourceSwitch
+            } else {
+                sourceSwitch
+                Spacer(minLength: DubSpacing.lg)
+                masterChip
+            }
         }
         .padding(.bottom, DubSpacing.xs)
+    }
+
+    /// Drawn only on the master deck; the other deck's corner stays
+    /// empty rather than printing a dimmed "not master".
+    @ViewBuilder
+    private var masterChip: some View {
+        if state.header.isMaster {
+            let tint = DubColor.deckTint(state.side)
+            Text("MASTER")
+                .font(DubFont.caps)
+                .tracking(0.8)
+                .foregroundStyle(tint)
+                .padding(.horizontal, DubSpacing.sm)
+                .padding(.vertical, 2)
+                .overlay(Capsule(style: .continuous).stroke(tint, lineWidth: 1))
+                .help("The master deck — the one the siren and samples land on, "
+                    + "and the one Space-load avoids.")
+        }
     }
 
     private var sourceSwitch: some View {
@@ -298,26 +368,70 @@ struct DeckColumn<Overview: View>: View {
         }
     }
 
+    /// Two title lines are reserved whether the title needs one or two,
+    /// so the block is the same height with "No track loaded", a short
+    /// name and a long one — the times, the overview and every row
+    /// below used to shift by a line on load. The SCRATCH badge sits on
+    /// the title's baseline for the same reason: a third line while a
+    /// scratch is on would move the column under the DJ's hand.
     private var identity: some View {
         let outward = state.side == .a
+        let tint = DubColor.deckTint(state.side)
+        let scratching = state.header.scratch != nil
         return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
-            Text(state.header.trackTitle ?? "No track loaded")
-                .font(DubFont.title)
-                .foregroundStyle(
-                    state.header.trackTitle == nil
-                        ? DubColor.textPlaceholder : DubColor.textPrimary)
-                .lineLimit(2)
-                .multilineTextAlignment(outward ? .leading : .trailing)
+            HStack(alignment: .firstTextBaseline, spacing: DubSpacing.sm) {
+                // A quick scratch in progress is a latched state on
+                // stage, so the identity block says so in the deck's own
+                // colour rather than quietly showing a sample's name as
+                // a title. Outer side on both decks, like the title.
+                if scratching && outward { scratchBadge(tint) }
+                Text(state.header.trackTitle ?? "No track loaded")
+                    .font(DubFont.title)
+                    .foregroundStyle(
+                        state.header.trackTitle == nil
+                            ? DubColor.textPlaceholder
+                            : scratching ? tint : DubColor.textPrimary)
+                    .lineLimit(2, reservesSpace: true)
+                    .multilineTextAlignment(outward ? .leading : .trailing)
+                if scratching && !outward { scratchBadge(tint) }
+            }
             // A step below the title, not level with it. The two ran
             // at `textPrimary` and `textSecondary`, which is a small
             // enough gap that at a glance the pair read as one block of
-            // text rather than as a name and its artist.
-            Text(state.header.trackArtist ?? "—")
+            // text rather than as a name and its artist. Under a
+            // scratch this line is the parked tune and where it is,
+            // so the DJ can see it is still there.
+            Text(subtitle)
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textTertiary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: outward ? .leading : .trailing)
+    }
+
+    private func scratchBadge(_ tint: Color) -> some View {
+        Text("SCRATCH")
+            .font(DubFont.caps)
+            .tracking(DubFont.capsTracking)
+            .foregroundStyle(tint)
+            .padding(.horizontal, DubSpacing.xs)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                    .stroke(tint.opacity(0.6), lineWidth: 1))
+    }
+
+    private var subtitle: String {
+        guard let scratch = state.header.scratch else {
+            return state.header.trackArtist ?? "—"
+        }
+        guard let parked = scratch.parkedTitle else { return "← empty deck" }
+        let secs = scratch.parkedSecs
+        let time = "\(secs / 60):\(String(format: "%02d", secs % 60))"
+        if let on = scratch.playingOn {
+            return "← \(parked) · playing on \(on == .a ? "A" : "B") · \(time)"
+        }
+        return "← \(parked) · \(time)"
     }
 
     private var readouts: some View {
@@ -345,20 +459,29 @@ struct DeckColumn<Overview: View>: View {
             rowHeight: DubLayout.cueRowHeight)
     }
 
-    /// One row, two controls at one height: the loop runs from the
-    /// column's edge to the echo, and the echo keeps its fixed width.
-    /// Both are fired during a transition, so the hand stays in one
-    /// place for the whole move.
+    /// One row, three controls at one height: SCRATCH · LOOP · ECHO. All
+    /// three are fired during a transition, so the hand stays on one
+    /// line for the whole move. The scratch pads take every point the
+    /// other two leave — a sample's name is the one string on the row
+    /// whose length is not ours to choose — while the loop and the echo
+    /// sit at their own widths; the three floors together clear the
+    /// column's floor exactly (`test_deckColumn_floorHoldsTheTriggerRow`).
     ///
-    /// The loop used to keep a natural width of its own, on the
-    /// argument that a ×2 button far from the ÷2 is a worse control.
-    /// What that left was a stroked box 268 pt wide with the column's
-    /// slack sitting empty between it and the echo — the DJ asked for
-    /// the loop to fill that gap and to stand as tall as the echo, and
-    /// the steppers stay at the row's two ends where the hand already
-    /// finds them.
-    private var loopAndEcho: some View {
+    /// The loop had the row to itself with the echo, at 34 pt steppers
+    /// and 40 pt lengths and every point of slack; the DJ asked for it
+    /// smaller again so the scratch pads could join the row, and then
+    /// for the pads to have the slack instead.
+    private var triggerRow: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                SectionHeading(
+                    title: "SCRATCH", accent: DubColor.deckTint(state.side),
+                    trailing: scratchEngaged ? "● ON DECK" : "○ OFF",
+                    trailingAccent: scratchEngaged
+                        ? DubColor.deckTint(state.side) : DubColor.textPlaceholder)
+                scratchPads
+            }
+            .frame(maxWidth: .infinity)
             VStack(alignment: .leading, spacing: DubSpacing.sm) {
                 SectionHeading(
                     title: "LOOP", accent: DubColor.loop,
@@ -367,6 +490,7 @@ struct DeckColumn<Overview: View>: View {
                         ? DubColor.loop : DubColor.textPlaceholder)
                 loop
             }
+            .frame(width: LoopEngine.minWidth)
             if state.echoEnabled {
                 VStack(alignment: .leading, spacing: DubSpacing.sm) {
                     SectionHeading(
@@ -381,10 +505,10 @@ struct DeckColumn<Overview: View>: View {
         }
     }
 
-    /// Takes every point between the column's edge and the echo. It may
-    /// also *compress*, because echo out sits beside it at every width
-    /// and the pair has to clear the column's floor —
-    /// `LoopEngine.minWidth` is what the floor has to hold.
+    private var scratchEngaged: Bool { state.scratch.contains { $0.engaged } }
+
+    /// Pinned to `LoopEngine.minWidth`: the compact ladder the DJ asked
+    /// for, at every width. The slack on the row is the scratch pads'.
     private var loop: some View {
         LoopEngine(
             activeBeats: state.activeLoopBeats,
@@ -394,7 +518,93 @@ struct DeckColumn<Overview: View>: View {
             onLoop: callbacks.onLoop,
             onScale: callbacks.onScaleLoop,
             onExit: callbacks.onExitLoop)
-            .frame(maxWidth: .infinity)
+    }
+
+    /// PRD §7.2: four Quick Scratch pads, drawn as what they are — four
+    /// records. Press one and it is on the deck, under the needle; press
+    /// it again and the tune comes back; press another while engaged and
+    /// the record swaps, the park untouched. Unboxed on purpose: every
+    /// neighbour on this row is a rounded rectangle, and the eye finds
+    /// the records by silhouette alone. The one on the deck is a third
+    /// bigger, its label in the deck's tint, and its sticker turns with
+    /// the platter (`DubRecordGlyph`). Empty pads are a dashed outline
+    /// where a record goes — the shelf's own empty convention.
+    private var scratchPads: some View {
+        HStack(spacing: DubSpacing.xs) {
+            ForEach(state.scratch) { pad in
+                scratchPad(pad)
+            }
+        }
+    }
+
+    /// Idle and on-deck record sizes. The slot they sit in is fixed so
+    /// the name beneath does not move when one grows. (`DeckColumn` is
+    /// generic over its overview, so these are computed, not stored.)
+    private var recordIdle: CGFloat { 24 }
+    private var recordOnDeck: CGFloat { 32 }
+    private var recordSlot: CGFloat { 30 }
+
+    @ViewBuilder
+    private func scratchPad(_ pad: ScratchPadState) -> some View {
+        let tint = DubColor.deckTint(state.side)
+        let bound = pad.name != nil
+        let look: DubRecordGlyph.Look = pad.engaged ? .onDeck : bound ? .shelved : .empty
+        VStack(spacing: 3) {
+            record(look: look, tint: tint)
+                .frame(width: pad.engaged ? recordOnDeck : recordIdle,
+                       height: pad.engaged ? recordOnDeck : recordIdle)
+                .animation(.spring(response: 0.18, dampingFraction: 0.6), value: pad.engaged)
+                .frame(height: recordSlot)
+            Text(pad.name ?? "QS\(pad.pad + 1)")
+                .font(bound
+                    ? .system(size: 10, weight: .semibold, design: .rounded)
+                    : .system(size: 9, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .foregroundStyle(
+                    pad.engaged ? DubColor.textPrimary
+                        : bound ? DubColor.textSecondary : DubColor.textPlaceholder)
+        }
+        .padding(.horizontal, 2)
+        // Flexible from the floor up: the four pads share the row's
+        // slack equally, and at the column's floor they sit at
+        // `deckColumnScratchPadMinWidth` so the three blocks sum to the
+        // inner width exactly.
+        .frame(minWidth: DubLayout.deckColumnScratchPadMinWidth, maxWidth: .infinity)
+        .frame(height: DubLayout.deckColumnEchoHeight)
+        .contentShape(Rectangle())
+        .onPressDown(enabled: bound) { callbacks.onScratch(pad.pad) }
+        .help(scratchHelp(pad))
+    }
+
+    /// The record, turning with the platter while it is on the deck.
+    /// The angle is read off the engine's lock-free position snapshot
+    /// every frame — the same source the playhead uses — so it follows a
+    /// scratch back and forth and stands still on a paused deck. Without
+    /// an engine (snapshots, previews) it sits at twelve o'clock.
+    @ViewBuilder
+    private func record(look: DubRecordGlyph.Look, tint: Color) -> some View {
+        if look == .onDeck, let liveEngine, let liveDeckIdx {
+            TimelineView(.animation) { _ in
+                DubRecordGlyph(
+                    look: look, tint: tint,
+                    angle: DubRecordGlyph.angle(
+                        forElapsedSecs: liveEngine.positionSnapshot(deckIdx: liveDeckIdx).elapsedSecs))
+            }
+        } else {
+            DubRecordGlyph(look: look, tint: tint)
+        }
+    }
+
+    private func scratchHelp(_ pad: ScratchPadState) -> String {
+        guard let name = pad.name else {
+            return "Quick Scratch \(pad.pad + 1) — tag a sample with it: right-click a "
+                + "SAMPLES tile"
+        }
+        return pad.engaged
+            ? "\(name) is on the deck — press to bring the tune back"
+            : "Put \(name) on the deck under the needle; the tune parks and comes back "
+                + "when you press again"
     }
 
     private var echoButton: some View {

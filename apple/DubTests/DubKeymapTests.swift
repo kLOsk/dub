@@ -41,17 +41,20 @@ final class DubKeymapTests: XCTestCase {
         }
     }
 
-    /// `Q W E R`, unmodified only — `⌘Q` has to stay Quit.
-    func testQuickScratchKeepsQWER() {
-        let codes: [UInt16] = [12, 13, 14, 15]
-        for (slot, code) in codes.enumerated() {
-            XCTAssertEqual(
+    /// `Q W E R` used to fire Quick Scratch. Its pads are per deck now
+    /// (PRD §7.2), which the old four keys could not address, so they
+    /// wait for map mode too — and `⌘Q` has to stay Quit regardless.
+    func testQuickScratchKeysAreNotBoundAndFallThrough() {
+        for code: UInt16 in [12, 13, 14, 15] {
+            XCTAssertNil(
                 DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                .quickScratch(slot))
+                "an unbound key must not be consumed")
         }
         XCTAssertNil(
             DubKeymap.action(forKeyCode: 12, character: "q", command: true),
             "⌘Q must fall through to Quit")
+        XCTAssertFalse(
+            DubKeymap.bindings.contains { $0.action.id.hasPrefix("quickScratch.") })
     }
 
     func testSpaceLoadsTheSelection() {
@@ -104,7 +107,6 @@ final class DubKeymapTests: XCTestCase {
     /// A rendered cap and the key that fires it are the same fact.
     func testEveryRenderedLegendComesFromTheTable() {
         XCTAssertEqual(sirenPresetKeys, ["Z", "X", "C", "V", "B", "N", "M", ","])
-        XCTAssertEqual(QuickScratchSlots.keyLabels, ["Q", "W", "E", "R"])
     }
 
     /// No two live bindings can claim the same key. This is the check that
@@ -126,7 +128,6 @@ final class DubKeymapTests: XCTestCase {
     func testActionIdsAreStable() {
         XCTAssertEqual(DubAction.hotCue(2).id, "cue.2")
         XCTAssertEqual(DubAction.sirenPreset(7).id, "siren.preset.7")
-        XCTAssertEqual(DubAction.quickScratch(0).id, "quickScratch.0")
         XCTAssertEqual(DubAction.instantDouble(toDeckB: true).id, "deck.instantDouble.b")
         XCTAssertEqual(DubAction.loadSelection.id, "transport.loadSelection")
     }

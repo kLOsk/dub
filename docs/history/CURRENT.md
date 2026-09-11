@@ -5,7 +5,7 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-09-10.
+> Last updated: 2026-09-11.
 
 ## Where the branch is
 
@@ -295,7 +295,8 @@ surfaces differ almost entirely in the deck.
   cursor because the conversion happens at bind time off-RT. Shipped as
   four voices bound in Preferences (FFI 66); now eight, the Prep shelf
   itself, auto-gained, on the master deck (FFI 70 — see the Prep overhaul
-  step 5 above). Quick Scratch binds from the same slots.
+  step 5 above). **Quick Scratch** was a hotkey fast-load with no way
+  back; it parks and returns now (FFI 71, same place).
 
 - **M26c — rip recognition. Complete.** AcoustID naming (no MusicBrainz on
   the common path), opt-in pressing identification, Discogs enrichment

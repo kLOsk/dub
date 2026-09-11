@@ -200,7 +200,40 @@ final class PerformanceSnapshotTests: XCTestCase {
             echoEnabled: true,
             echoEngaged: echoEngaged,
             hasTrack: true,
-            isPlaying: true)
+            isPlaying: true,
+            scratch: [
+                ScratchPadState(pad: 0, name: "Horn"),
+                ScratchPadState(pad: 1, name: "Rewind!"),
+                ScratchPadState(pad: 2),
+                ScratchPadState(pad: 3),
+            ])
+    }
+
+    /// A quick scratch in progress: pad 2 lit, the identity block in
+    /// the deck tint with SCRATCH beside the sample's name, and the
+    /// parked tune — playing on deck B meanwhile — with its position
+    /// underneath. This is the latched state a DJ has to be able to see
+    /// from across the booth.
+    func test_deckColumn_quickScratchEngaged() {
+        var state = Self.columnState(loopBeats: nil)
+        var header = DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: "Rewind!", trackArtist: nil,
+            bpm: nil, pitchPercent: 0.4, timecodeLockState: 1,
+            key: nil, formatChip: "SAMPLE",
+            timeRow: .remainingOnly,
+            isMaster: true, isPlaying: true,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil)
+        header.sourceControl = .timecode
+        state.header = DeckColumnHeader(
+            header,
+            scratch: ScratchBadge(
+                parkedTitle: "Armed & Dangerous", parkedSecs: 102, playingOn: .b))
+        state.cues = (0..<8).map { CueSlotState(index: $0) }
+        state.scratch[1].engaged = true
+        snap(deckBg(columnFixture(state)),
+             width: 540, height: 470, named: "deck-column-quick-scratch")
     }
 
     /// The column at the width a 1792 pt window actually gives it —
@@ -261,8 +294,19 @@ final class PerformanceSnapshotTests: XCTestCase {
              named: "rack-bar-narrow")
     }
 
-    /// Prep, where the siren has its own column and the bar carries
-    /// only the two trigger racks.
+    /// Both racks pinned: the siren to `A+B`, the sampler to deck B
+    /// while the master is A. A pinned pill draws filled so "set" and
+    /// "following" read as different states across the booth.
+    func test_globalRackBar_pinnedOutputs() {
+        var state = GlobalRackBarState.fixture(focus: .a)
+        state.siren?.output = RackOutputState(.both, focused: .a)
+        state.sampler.output = RackOutputState(.b, focused: .a)
+        snap(deckBg(GlobalRackBar(state: state)),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-pinned-outputs")
+    }
+
+    /// The siren gate off: the bar carries the sampler alone.
     func test_globalRackBar_noSiren() {
         var state = GlobalRackBarState.fixture(focus: .a)
         state.siren = nil

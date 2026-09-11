@@ -16,8 +16,9 @@
 //! key goes down, so the expensive part cannot happen here.
 //!
 //! **The deck is chosen at the press.** A voice sums onto whichever
-//! deck bus the trigger names — the shell passes the master deck, so a
-//! horn lands on the channel the crowd is hearing — and keeps that bus
+//! deck bus the trigger names — the shell passes the master deck by
+//! default, so a horn lands on the channel the crowd is hearing, or a
+//! deck the DJ pinned, or [`SAMPLER_OUTPUT_BOTH`] — and keeps that bus
 //! for the life of the take. A master switch mid-horn does not hop the
 //! sound across the mixer; the next press goes to the new master.
 
@@ -26,11 +27,16 @@ use std::sync::Arc;
 
 use dub_io::Track;
 
+/// `output_deck` value meaning "both deck buses": the voice sums onto
+/// A's pair and B's pair alike. Deck indices are `0..DECK_COUNT`, so
+/// this cannot collide with one.
+pub const SAMPLER_OUTPUT_BOTH: u8 = u8::MAX;
+
 /// Slots in the rack. Eight: the Prep sample shelf is a two-row pad
-/// bank of four, laid out like a controller's (5–8 over 1–4), and the
-/// shelf *is* the sampler — a slot loaded there is the pad fired on the
-/// Performance surface. §7.1 shipped with four and a separate binding
-/// layer in Preferences; the two collapsed into this one table.
+/// bank of four (1–4 over 5–8), and the shelf *is* the sampler — a slot
+/// loaded there is the pad fired on the Performance surface. §7.1
+/// shipped with four and a separate binding layer in Preferences; the
+/// two collapsed into this one table.
 pub const SAMPLER_SLOTS: usize = 8;
 
 /// Frames of linear ramp applied at the start and end of a voice, and
@@ -94,6 +100,12 @@ impl SamplerVoice {
         self.source.is_some()
     }
 
+    /// The bound sample — what Quick Scratch puts on a deck.
+    #[must_use]
+    pub fn source(&self) -> Option<&Arc<Track>> {
+        self.source.as_ref()
+    }
+
     /// `true` while the one-shot is sounding.
     #[must_use]
     pub fn is_playing(&self) -> bool {
@@ -113,10 +125,17 @@ impl SamplerVoice {
         self.gain = gain.clamp(0.0, 4.0);
     }
 
-    /// Deck output bus the current take sums onto.
+    /// Deck output bus the current take sums onto, or
+    /// [`SAMPLER_OUTPUT_BOTH`].
     #[must_use]
     pub fn output_deck(&self) -> u8 {
         self.output_deck
+    }
+
+    /// Whether this take sums onto deck `deck`'s bus.
+    #[must_use]
+    pub fn sounds_on(&self, deck: u8) -> bool {
+        self.output_deck == deck || self.output_deck == SAMPLER_OUTPUT_BOTH
     }
 
     /// How far through the sample the take is, `0.0..=1.0`. `0.0` when
@@ -510,8 +529,14 @@ mod tests {
         let _ = voice.set_source(track(0.5, 4096));
         voice.trigger(0);
         assert_eq!(voice.output_deck(), 0);
+        assert!(voice.sounds_on(0) && !voice.sounds_on(1));
         voice.trigger(1);
         assert_eq!(voice.output_deck(), 1);
+        voice.trigger(SAMPLER_OUTPUT_BOTH);
+        assert!(
+            voice.sounds_on(0) && voice.sounds_on(1),
+            "A+B lands on both buses"
+        );
     }
 
     #[test]

@@ -806,8 +806,8 @@ Classic DJ sampler. **8 slots**, one bank of pads drawn on both surfaces: Prep's
 SAMPLES shelf is where a sample is loaded (drag from the library or Finder) and
 auditioned; Performance's SAMPLER is the same shelf, firing. A slot loaded in
 the one place is the pad found in the other. The shelf lays them out as two
-rows of four, 5–8 over 1–4, the way a pad controller's rows count up from the
-hand.
+rows of four in reading order, 1–4 over 5–8 (a controller's bottom-up
+numbering was tried and read wrong against the numbered empties).
 
 The PRD first specified **4 slots** (`A S D F`), rejecting Serato's SP-6 to
 keep the keymap symmetric with the four Quick Scratch keys. That shipped as a
@@ -825,11 +825,15 @@ is what the shelf holds.
   applied by the engine. There is no per-slot gain control. A clip shorter than
   one BS.1770 block — most stabs — is levelled on its whole-clip K-weighted
   loudness rather than left at unity.
-- **Output follows the master deck**, like the siren: the take sums onto the
-  focused deck's bus, resolved at the press, so a horn lands on the channel the
-  crowd is hearing. A master switch mid-horn does not hop the sound across the
-  mixer; the next press goes to the new master. The `→ A` / `→ B` pill on the
-  SAMPLER header names it.
+- **Output follows the master deck** by default, like the siren: the take
+  sums onto the focused deck's bus, resolved at the press, so a horn lands on
+  the channel the crowd is hearing. A master switch mid-horn does not hop the
+  sound across the mixer; the next press goes to the new master. The `→ A` /
+  `→ B` pill on the SAMPLES header names it — and **right-click on the pill
+  overrides it**: *Auto* (default) · *A* · *B* · *A+B*, remembered per rack. A
+  pinned pill draws filled. `A+B` sums the take onto both deck buses. The
+  DUB SIREN block has the same pill and the same menu; `A+B` fires the preset
+  on both decks' sirens and its unit switch / DUB knob write to both.
 - Output is **additive** — the sample plays *over* whatever Deck A/B are
   currently playing. Mixed into the deck's output bus, post-FX.
 - Samples persist across launches (positional: unloading slot 2 leaves slot 3
@@ -867,23 +871,90 @@ Three things the implementation pins down that this section left open:
   outgoing take ramps out under the new one (~1.3 ms), as do the head,
   the tail, and an early stop.
 
-**Quick Scratch binds from the same slots.** §7.2's keys pick from the files
-loaded on the shelf rather than a separate list: the same horn is routinely
-wanted on a pad *and* on a Quick Scratch key.
+**Quick Scratch is a tag on these slots** (§7.2) rather than a separate
+list: the same horn is routinely wanted on a pad *and* on a deck.
 
-### 7.2 Quick Scratch (hotkey-bound fast load)
+### 7.2 Quick Scratch (a sample on the deck, and the way back)
 
-Hotkey-triggered fast load of a sample to a deck. Semantically identical to dragging a track from the library — just instant.
+A sampler slot on the deck, under the needle, with the tune parked and
+waiting — the M-Audio Torq feature. The DJ scratches the sample with the
+turntable, exactly as a loaded track, and when they let go the tune is
+back where it belongs. The **return** is the whole feature; an earlier
+draft of this section dropped it as "more complicated than valuable" and
+shipped a fast load — which was the wrong call for a scratch DJ, for whom
+this is the reason to have samples on a deck at all.
 
-- **4 slots** in v1 (`Q W E R` by default).
-- Each slot is bound to a sample file (drag-and-drop to assign, or right-click).
-- Each slot has a **target deck** (default: Deck A; configurable per slot).
-- **Behavior**: pressing the hotkey **loads the sample to the target deck** as if the user had loaded it from the library. The deck reset to position 0 of the new sample, plays from the start, fully under timecode control. The user can scratch the sample using their needle.
-- **Returning to a track**: the user loads a track normally afterward (drag, search, or another hotkey). There is no automatic "restore previous track" feature — that proved more complicated than valuable.
-- **Workflow**:
-  > Deck B plays. User wants to scratch a sample over Deck B. User presses `Q`. Deck A now has the assigned sample loaded at position 0; user scratches it with their needle. When done, user drags the next track to Deck A (or presses another Quick Scratch hotkey).
+**Assignment is a tag on a sampler tile.** Right-click a SAMPLES tile →
+*Quick Scratch 1 … 4*. A pad names one slot, so the tag moves; the tile
+shows `QS2`. That is prep work, so it lives where the samples do, on both
+surfaces, and there is no separate slot table or Preferences section any
+more.
 
-This is exactly the same load operation as the library's "load to deck", just keyboard-instant. Internally it shares the same code path as a library drag-and-drop. Quick Scratch slots are persisted across sessions per user.
+**One gesture, not two.** Each deck column has a **SCRATCH row** of four
+pads (one per tag). Press qs2 → qs2's sample is on the deck, from 0, the
+tune parked. Press qs2 again → the tune is back. Press qs1 while qs2 is on
+→ the sample swaps, the park untouched. Selecting first and activating
+second was two steps per use, on stage.
+
+**Where the tune goes — decided by deck state, not by a setting.**
+
+- Deck **playing, other deck idle** → the tune is **doubled onto the other
+  deck** (Instant Doubles, §7.3) and keeps playing there, out of the other
+  mixer channel, while the sample is scratched and cut against it on this
+  one — the M-Audio Torq move done the way an external mixer needs it. This
+  is the case a scratch DJ actually wants: the crowd keeps hearing the tune,
+  and the scratch deck is cut in and out against it. Release doubles it
+  back — this deck takes the tune at the other deck's *live* position, in
+  sync — and **the other deck reverts to what it had**: its own record at
+  its cue, paused as it was, in its own control mode. (The alternative —
+  the host playing on to cover the crossfade back — was tried on the rig
+  and the revert preferred.) **The host plays the tune on its internal
+  clock at the originating deck's pitch** (the smoothed value the PITCH
+  readout shows): no record has to be spinning there, the host's turntable
+  stays free, and the beat does not move when the tune crosses and comes
+  back. If the DJ flips the host's switch during the scratch, that choice
+  stands. A deck on THRU / FX is a real record or a live send on air and
+  never hosts. The other channel's fader is best up *before* the press.
+- Deck **playing, other deck also playing** → doubling would kill the other
+  tune mid-mix, so the tune runs on silently underneath at the rate it had
+  and comes back **in time** (a ghost clock). The mix continues on the other
+  deck anyway.
+- Deck **paused / cued** on engage → the tune comes back to the **exact
+  frame**. The idle deck holding the next record cued up gets its cue back.
+- The ghost clock runs under a doubled park too: if the other deck gets
+  loaded over during the scratch, release falls back to it, so "back in
+  time" holds regardless.
+
+**Output follows the deck.** The sample sounds on the deck it is on — the
+DJ chose the deck by pressing that deck's pad — so an external mixer treats
+it like the record it replaced.
+
+**Mechanics.** The sampler already holds every sample decoded and
+rate-converted in the engine, so engaging is the Instant Doubles trick:
+the deck's `Arc<Track>` is swapped for the slot's on the audio thread —
+no decode, no file read, sample-accurate and instant. The parked track is
+its own `Arc` + a playhead (+ the ghost clock under slip); the FFI parks
+the deck's waveform and grid alongside, and an analysis still running on
+the parked track lands in the park rather than being lost. The sample's
+waveform was decimated when the slot loaded, so the deck draws it at the
+press; it carries no beat grid. The sample plays at its auto-gain (§7.1).
+
+**Guard rails.** The identity block shouts while engaged — `SCRATCH` in the
+deck tint beside the sample's name, the parked tune and its position
+underneath (`← Armed & Dangerous · playing on B · 1:42`). The pads are drawn
+as four 12" records: the one on the deck grows, its label takes the deck's
+tint, and its sticker turns with the platter (the playhead at 33⅓ rpm), so a
+scratch reads as the sticker running back and forth. Loading any track normally onto
+an engaged deck, switching the deck to Thru / FX, or doubling onto it drops
+the park rather than the load, so a deck can never be stranded behind a
+sample. A loop set on the tune does not survive the park.
+
+**Keys: none, deliberately.** `Q W E R` used to fire four global slots with
+a target deck each; the pads are per deck now, which the old keys could
+not address, and per-deck keys — and MIDI notes — arrive with map mode
+(M18), the same as the sampler's.
+
+**Status: shipped** (FFI 73).
 
 ### 7.3 Instant Doubles
 
@@ -1388,7 +1459,7 @@ The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-hist
 |---|---|---|---|
 | **Zoomed column, Performance (Timecode) mode** | 200 px ideal, 132 min → 280 cap | `DubLayout.performanceWaveformWidth` / `…MinWidth` / `…WidthCap` | Slim Serato-parity strip after M10.8 waveform dogfooding; keeps kick transients readable while leaving room for overview, centre gutter, and info chips. The strip absorbs the width the pad column doesn't use, up to the cap — past that the remainder stays as the reserved info-chip canvas below, rather than a fatter waveform (see the note beneath this table). |
 | **Performance pad column** | 224 px wide, fixed | `DubLayout.performancePadColumnWidth` | CUE / LOOP / ECHO OUT, per deck. Fixed because it used to be `maxWidth: .infinity` and ate every pixel the waveform did not have nailed down. Sized to the widest row (4 × 38 + 3 × 8 = 176) plus `DubSpacing.lg` each side; LOOP wraps to two rows to fit, unlike Prep's single-row `LoopPadRow`. |
-| **Global rack bar** | 134 px tall, full width | `DubLayout.rackBarHeight` | Siren · Quick Scratch · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. The siren and the sampler bind to the focused deck (§6.3, §7.1) — there is one siren keymap and it always fired one deck. The height is the sampler's: the same two-row shelf Prep draws, so the bar grew from 92 when the four-pad rack became it. |
+| **Global rack bar** | 134 px tall, full width | `DubLayout.rackBarHeight` | Siren · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. Both bind to the focused deck (§6.3, §7.1) — there is one siren keymap and it always fired one deck. The height is the sampler's: the same two-row shelf Prep draws, so the bar grew from 92 when the four-pad rack became it. Quick Scratch left the bar for a per-deck row (§7.2). |
 | **Zoomed strip, Prep mode** | ≈ 140 px tall, full-width horizontal | `DubLayout.waveformPrepHeight` | Prep mode is single-deck and uses a horizontal scrolling playing waveform for screenshot/A-B judgement and track prep. |
 | **Overview band, Prep mode** | ≈ 60 px tall, full-width horizontal | `DubLayout.deckOverviewHeight` | Whole-track waveform stacked above the zoomed Prep waveform. Same click-to-jump semantics as the vertical overview. |
 | **Overview column** (M10.5c) | ≈ 36 px wide, full track top→bottom | `DubLayout.deckOverviewWidth` | Thin strip on the deck's outside edge. Shows the whole track at a glance with a playhead-bracket indicator at the current position. Click-to-jump per §6.1. |
@@ -1566,7 +1637,7 @@ remaining work only._
 | **M11d-columns** | **Column data plumbing + per-source disagreement view** — ✅ **shipped** | The remaining §8.5.3.1 column groups exist end-to-end. Demo: enable `serato_bpm` next to `bpm_auto`, sort by the disagreement, fix outliers in bulk. | 2–3 days |
 | **M11f** | **Export: rekordbox XML + M3U / M3U8** — ✅ **shipped** | Export a Dub crate and round-trip it through a fresh import with canonical identity, cues, loops, and grids intact. | 3 days |
 | **M12-lexicon** | **Lexicon path documented** | No code: document Lexicon → Serato / rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`. | 0.5 day |
-| **M17** | **Sampler + Quick Scratch + Instant Doubles** — ✅ **shipped** | All three trigger systems work per §7. The `Q W E R` / `⌘←→` keymaps are fixed until M18's remapping pass; the sampler has no keys until map mode (§7.1) and is the Prep shelf firing, eight slots, auto-gained, on the master deck. | 4–6 days |
+| **M17** | **Sampler + Quick Scratch + Instant Doubles** — ✅ **shipped** | All three trigger systems work per §7. `⌘←→` is fixed until M18's remapping pass; the sampler and Quick Scratch have no keys until map mode. The sampler is the Prep shelf firing, eight slots, auto-gained, on the master deck (§7.1); Quick Scratch is a tag on a tile and a per-deck row of pads, with the tune parked and returned — in time or to the frame (§7.2). | 4–6 days |
 | **M18** | **Polish + Alpha** | Calibration UX, preferences, key remapping, dark-mode polish, and manual rig checklist are ready for 3–5 trusted DJs. Includes the deferred M16 fine-tuning: siren sound polish (GS1 shots / DS01E tones / SN76477 bank) and the Performance-surface + deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). | 2–3 weeks |
 | **M19** | **Beta** | Public opt-in beta on GitHub Releases; feature-frozen for v1.0 with hotfix discipline active. | 2–4 weeks, gated by gig time |
 | **M20** | **v1.0 Stable Release** | §2.2.6 SLOs met, DMG published, README/docs/demo ready. | 3–5 days once SLOs pass |
@@ -1647,7 +1718,7 @@ Dub v1.0 ships when **all** of the following hold on a DMG installed on a clean 
 7. User can import their existing Serato / Traktor / rekordbox / iTunes / Lexicon library and play tracks with imported beatgrids. Auto-detect grids fall back when source has none.
 8. Looping (reverse-loop with beat-length select + halve/double, plus manual in/out, per §6.2) works correctly under timecode. ✅ **met** — M13.
 9. **Key Lock works on both decks; engages and disengages automatically based on playback rate per §6.1.1; user hears no glitches during scratching with Key Lock on.** ✅ **met** — M14, and M13 for the loop case. Key Lock holds through a loop — the wrap happens in the stretcher's feed, so a looped deck at a pitched platter does not shift pitch while an unlooped one holds.
-10. Echo-Out, Dub Siren, Sampler (4 slots), Quick Scratch (4 slots, hotkey fast-load), Instant Doubles all work per §6 / §7.
+10. Echo-Out, Dub Siren, Sampler (8 slots), Quick Scratch (4 per-deck pads, parked-and-returned), Instant Doubles all work per §6 / §7.
 11. UI is keyboard-navigable end-to-end. **No performance gesture** (pitch / scratch / crossfade / EQ / gain / cue) requires the mouse — per §1's refined mouse rule. Mouse-driven *transport* (Panic Play, Casual Play, position navigation per §6.1) is in v1 and *not* in conflict with the philosophy.
 12. **Panic Play (§6.1.2)** recovers from a needle dirt event without audible interruption: keystroke transitions the deck from timecode-driven to last-known-velocity playback, audience hears no glitch, automatic resume on clean LFSR return verified in a manual rig test.
 13. **Stillpoint (§9.4)** renders in the centre gutter at 60 Hz with ≤ 1 frame of stutter, drifts when tempos differ and freezes / seats the band on the line when matched, and certifies lock honestly (no false green). Verified against its Swift test suite (`apple/DubTests/`).

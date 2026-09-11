@@ -122,6 +122,21 @@ struct CueMark: Equatable {
     var color: String?
 }
 
+/// A Quick Scratch as the model tracks it (PRD §7.2).
+struct QuickScratchState: Equatable {
+    /// The pad pressed, 0-based.
+    var pad: Int
+    /// The sampler slot on the deck.
+    var slot: Int
+    /// The parked tune's title, for the header. `nil` when the deck was
+    /// empty when the scratch went on.
+    var parkedTitle: String?
+    /// The deck the tune was doubled onto and keeps playing on, when it
+    /// was on air and the other deck idle. `nil` for the ghost / freeze
+    /// paths.
+    var doubledTo: DeckSide?
+}
+
 struct DeckState: Equatable {
     /// True once `load_track` has succeeded on this deck. Cleared
     /// when the engine stops or a load fails.
@@ -259,6 +274,17 @@ struct DeckState: Equatable {
     /// SIREN panel while the engine says a preset is making sound.
     var sirenState: UInt8 = 0
 
+    /// PRD §7.2 Quick Scratch in progress on this deck: which pad, and
+    /// what it parked. `nil` while the deck plays its own track. The
+    /// engine confirms it each poll (`deckTelemetry.quickScratchSlot`);
+    /// when the engine says the scratch is gone — a load over it, a
+    /// source switch — the model drops its park to match.
+    var quickScratch: QuickScratchState? = nil
+
+    /// Where the parked tune is, track seconds, from the poll. Moves
+    /// under slip, still under freeze; `0` when nothing is parked.
+    var quickScratchParkedSecs: Double = 0
+
     /// Advanced siren "dub" super-knob (0..1): one knob fans across the siren's
     /// Speed + Delay + Feedback + onboard-echo Mix. 0 = dry siren, 1 = slow,
     /// long, self-feeding dub. UI-local (the siren is a self-contained
@@ -314,10 +340,6 @@ struct DeckState: Equatable {
     /// switch is shown at all.
     var hasTimecodeInput: Bool = false
 
-    /// The loudness gain this track was loaded with, or `nil` at
-    /// unity. Drives the drawn waveform's amplitude so the picture and
-    /// the sound describe the same signal.
-    var autoGain: Float?
     var controlMode: UInt8 = 0   // 0 internal, 1 timecode
     var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
     var calibrated: Bool = false
@@ -794,23 +816,46 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kSampleBank = "dub.sampleBank"
 
+    /// Where the sampler lands — the master deck by default, or a deck
+    /// the DJ pinned it to, or both. Persisted under `dub.samplerOutput`.
+    @Published var samplerOutput: RackOutput {
+        didSet { UserDefaults.standard.set(samplerOutput.rawValue, forKey: Self.kSamplerOutput) }
+    }
+    /// Same for the siren. Persisted under `dub.sirenOutput`.
+    @Published var sirenOutput: RackOutput {
+        didSet { UserDefaults.standard.set(sirenOutput.rawValue, forKey: Self.kSirenOutput) }
+    }
+
+    private static let kSamplerOutput = "dub.samplerOutput"
+    private static let kSirenOutput = "dub.sirenOutput"
+
+    /// The sampler's output rule resolved against the current master.
+    var samplerOutputState: RackOutputState {
+        RackOutputState(samplerOutput, focused: focusedDeckForGridNudge)
+    }
+
+    /// The siren's output rule resolved against the current master.
+    var sirenOutputState: RackOutputState {
+        RackOutputState(sirenOutput, focused: focusedDeckForGridNudge)
+    }
+
     /// What every sampler slot is doing — sounding, and how far through.
     /// Refreshed by the 30 Hz poll; only republished when something
     /// changed, so an idle rack costs the view nothing.
     @Published private(set) var samplerVoices: [SamplerSlotTelemetry] = []
 
-    /// M17 §7.2 — the four Quick Scratch slots (`Q W E R`).
-    ///
-    /// Persisted under `dub.quickScratchSlots` as the table's own
-    /// encoded form, so an unreadable value resolves to empty slots
-    /// rather than throwing on the keypress that reads it.
-    @Published var quickScratch: QuickScratchSlots {
-        didSet {
-            UserDefaults.standard.set(quickScratch.persisted, forKey: Self.kQuickScratch)
-        }
-    }
-
-    private static let kQuickScratch = "dub.quickScratchSlots"
+    /// What each deck was showing before Quick Scratch took it — the
+    /// whole `DeckState`, restored with `adoptLoadedTrack` on release.
+    /// The engine parks the audio; this parks the metadata.
+    private var quickScratchParked: [DeckSide: DeckState] = [:]
+    /// The same for a deck *hosting* a doubled tune: what it showed
+    /// before the tune landed, given back when the tune leaves.
+    private var doubleHostParked: [DeckSide: DeckState] = [:]
+    /// When each deck's scratch went on. The poll treats the engine as
+    /// the authority on whether a scratch is still engaged, but the
+    /// engage command lands on the next audio block, and a poll tick in
+    /// that window would read "nothing engaged" and undo the press.
+    private var quickScratchEngagedAt: [DeckSide: Date] = [:]
 
     /// M26a manual Prep ↔ Performance override, persisted so the
     /// choice survives a relaunch. `nil` = follow hardware
@@ -1230,10 +1275,12 @@ final class WaveformAppModel: ObservableObject {
         // in the preferences plist across on the way.
         // Decoded into locals first: `self` cannot be read here until
         // every stored property is initialised.
-        self.quickScratch = QuickScratchSlots(
-            persisted: UserDefaults.standard.string(forKey: Self.kQuickScratch) ?? "")
         self.sampleBank = SampleBank(
             persisted: UserDefaults.standard.string(forKey: Self.kSampleBank) ?? "")
+        self.samplerOutput = UserDefaults.standard.string(forKey: Self.kSamplerOutput)
+            .flatMap(RackOutput.init(rawValue:)) ?? .auto
+        self.sirenOutput = UserDefaults.standard.string(forKey: Self.kSirenOutput)
+            .flatMap(RackOutput.init(rawValue:)) ?? .auto
         self.discogsToken = SecretMigration.migrateFromDefaults(
             account: Self.kDiscogsAccount,
             defaultsKey: Self.kDiscogsToken,
@@ -1974,6 +2021,18 @@ final class WaveformAppModel: ObservableObject {
         // branch — the siren is additive, so a stuck-sounding deck is never
         // stranded in silence the way a muted echo deck would be.
         next.sirenState = tele.sirenState
+        // PRD §7.2: the engine is the authority on whether a scratch is
+        // still on. A load over it, a source switch or an engine restart
+        // drops the park engine-side; the model follows, and the deck's
+        // metadata is whatever that path installed.
+        next.quickScratchParkedSecs = tele.quickScratchParkedSecs
+        if tele.quickScratchSlot == nil, next.quickScratch != nil,
+            Date().timeIntervalSince(quickScratchEngagedAt[side] ?? .distantPast) > 0.25
+        {
+            next.quickScratch = nil
+            quickScratchParked[side] = nil
+            doubleHostParked[side == .a ? .b : .a] = nil
+        }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
         next.sourceClass = tele.sourceClass
@@ -2192,7 +2251,6 @@ final class WaveformAppModel: ObservableObject {
         starting.autoGridAnchorSecs = nil
         starting.autoGridCaptured = false
         starting.beatGridLoadSource = "pending_auto"
-        starting.autoGain = nil
         starting.manualGridEditCount = 0
         // Loading a new track drops any engaged echo-out — otherwise the deck
         // stays muted (100 % wet) and the fresh track is silent until the
@@ -2247,11 +2305,6 @@ final class WaveformAppModel: ObservableObject {
         // loads at unity. Resolved here, on the main actor, off the
         // same single-SELECT path as the beat grid; never re-read after.
         let autoGainForLoad = autoGainForPendingLoad(url: url)
-        // Remembered so the waveform can be drawn at the level the deck
-        // is playing it at — see `RendererAppearance.displayGain`.
-        var gained = state(for: side)
-        gained.autoGain = autoGainForLoad
-        setState(gained, for: side)
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
                 try engineRef.loadTrack(
@@ -4631,10 +4684,11 @@ final class WaveformAppModel: ObservableObject {
         setState(destination, for: to)
     }
 
-    /// Fire a sampler slot (M17, PRD §7.1) onto the focused deck — the
-    /// master, so the horn lands on the channel the crowd is hearing.
-    /// The deck is resolved here, at the press, and the take keeps it;
-    /// a master switch mid-horn does not hop the sound across the mixer.
+    /// Fire a sampler slot (M17, PRD §7.1) onto the rack's output — the
+    /// master deck by default, so the horn lands on the channel the
+    /// crowd is hearing, or the deck(s) the DJ pinned the rack to. The
+    /// output is resolved here, at the press, and the take keeps it; a
+    /// master switch mid-horn does not hop the sound across the mixer.
     ///
     /// Mouse-driven today: the sampler's keys were reserved and never
     /// live, and were dropped rather than extended to eight — they come
@@ -4642,9 +4696,14 @@ final class WaveformAppModel: ObservableObject {
     /// of this.
     func triggerSampler(_ index: Int) {
         guard isRunning, sampleBank.slot(index) != nil else { return }
+        let output: SamplerOutput
+        switch samplerOutputState.decks {
+        case [.a]: output = .deckA
+        case [.b]: output = .deckB
+        default: output = .both
+        }
         do {
-            try engine.samplerTrigger(
-                slot: UInt64(index), deckIdx: focusedDeckForGridNudge.ffiDeckIdx)
+            try engine.samplerTrigger(slot: UInt64(index), output: output)
         } catch {
             surfaceError("Sampler \(index + 1): \(error.localizedDescription)")
         }
@@ -4678,10 +4737,13 @@ final class WaveformAppModel: ObservableObject {
                 try? engine.samplerClear(slot: ffiSlot)
                 continue
             }
-            // Decode + resample + measure, so off the main queue.
+            // Decode + resample + measure, so off the main queue. The
+            // gain it reports is applied engine-side; the waveform
+            // draws the file as decoded (see the deck pane's note on
+            // display gain), so nothing here keeps it.
             Task.detached(priority: .userInitiated) {
                 do {
-                    try engine.samplerLoad(slot: ffiSlot, path: url.path)
+                    _ = try engine.samplerLoad(slot: ffiSlot, path: url.path)
                 } catch {
                     let message = error.localizedDescription
                     await MainActor.run {
@@ -4692,29 +4754,114 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    /// Quick Scratch (M17, PRD §7.2): `Q W E R` load a bound sample
-    /// onto its target deck.
+    // MARK: Quick Scratch (PRD §7.2)
+
+    /// Quick Scratch pad `pad` pressed on `side`: one gesture, three
+    /// outcomes. Nothing engaged → put the pad's sample on the deck and
+    /// park the tune — and if the tune was on air with the other deck
+    /// idle, double it onto the other deck first, where it keeps
+    /// playing out of the other mixer channel. This pad already on →
+    /// release, the tune comes back (doubled back in sync, in time from
+    /// the ghost, or to the frame if it was paused — the engine and the
+    /// FFI decide from the decks' own state). Another pad on → swap the
+    /// sample; the park stays.
     ///
-    /// Deliberately the *same* call the library's drag-and-drop and
-    /// Space-load use — §7.2 is explicit that this is a fast load, not
-    /// a second playback mechanism, so the sample arrives at position
-    /// 0 fully under timecode control and the DJ scratches it with
-    /// their needle. There is no "restore the previous track": §7.2
-    /// dropped it as more complicated than valuable.
-    ///
-    /// An unbound slot does nothing. A bound file that has since moved
-    /// says so once, because silence would look like a dead key.
-    func triggerQuickScratch(_ index: Int) {
-        guard isRunning, let slot = quickScratch.slot(index) else { return }
-        guard FileManager.default.fileExists(atPath: slot.url.path) else {
-            let key = QuickScratchSlots.keyLabels.indices.contains(index)
-                ? QuickScratchSlots.keyLabels[index] : "\(index + 1)"
-            surfaceError("Quick Scratch \(key): \(slot.url.lastPathComponent) has moved.")
+    /// The audio side is one command; this side parks the deck's
+    /// metadata — title, cues, grid — the same way Instant Doubles
+    /// carries it, mirrors it onto the other deck when the tune went
+    /// there, and restores it on release.
+    func toggleQuickScratch(_ side: DeckSide, pad: Int) {
+        guard isRunning, let slot = sampleBank.quickScratchSlot(pad: pad) else { return }
+        var deck = state(for: side)
+        if let current = deck.quickScratch, current.pad == pad {
+            releaseQuickScratch(side)
             return
         }
-        Task { @MainActor in
-            _ = await loadTrack(side: slot.deck, url: slot.url)
+        let parkedTitle: String?
+        if let current = deck.quickScratch {
+            parkedTitle = current.parkedTitle
+        } else {
+            parkedTitle = deck.hasTrack ? (deck.trackTitle ?? deck.displayName) : nil
         }
+        let doubledTo: DeckSide?
+        do {
+            doubledTo = try engine.quickScratchEngage(deckIdx: side.ffiDeckIdx, slot: UInt64(slot))
+                .map { $0 == 0 ? DeckSide.a : .b }
+        } catch {
+            surfaceError("Quick Scratch \(pad + 1): \(error.localizedDescription)")
+            return
+        }
+        if let other = doubledTo {
+            // The tune is on the other deck now: same track, same cues
+            // and grid, at the same playhead — what `instantDouble` does.
+            // What the host showed is parked, to come back at release.
+            var destination = state(for: other)
+            doubleHostParked[other] = destination
+            destination.adoptLoadedTrack(from: deck)
+            destination.quickScratch = nil
+            destination.seekGeneration &+= 1
+            setState(destination, for: other)
+            quickScratchParked[other] = nil
+        }
+        if deck.quickScratch == nil {
+            quickScratchParked[side] = deck
+        }
+        quickScratchEngagedAt[side] = Date()
+        var sample = DeckState()
+        sample.hasTrack = true
+        sample.displayName = sampleBank.slot(slot).map { SampleBank.label(for: $0) }
+        sample.trackTitle = sample.displayName
+        sample.sourceURL = sampleBank.slot(slot)
+        sample.formatChip = "SAMPLE"
+        deck.adoptLoadedTrack(from: sample)
+        deck.quickScratch = QuickScratchState(
+            pad: pad, slot: slot, parkedTitle: parkedTitle,
+            doubledTo: doubledTo ?? deck.quickScratch?.doubledTo)
+        deck.atEnd = false
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
+    }
+
+    /// The file parked behind a quick scratch on `side`, if any.
+    func quickScratchParkedSourceURL(_ side: DeckSide) -> URL? {
+        quickScratchParked[side]?.sourceURL
+    }
+
+    /// The tune comes back. No-op when nothing is engaged.
+    func releaseQuickScratch(_ side: DeckSide) {
+        guard isRunning, state(for: side).quickScratch != nil else { return }
+        let doubledBackFrom: DeckSide?
+        do {
+            doubledBackFrom = try engine.quickScratchRelease(deckIdx: side.ffiDeckIdx)
+                .map { $0 == 0 ? DeckSide.a : .b }
+        } catch {
+            surfaceError("Quick Scratch release: \(error.localizedDescription)")
+            return
+        }
+        var deck = state(for: side)
+        let parked = quickScratchParked.removeValue(forKey: side)
+        if let other = doubledBackFrom {
+            // Back from the other deck, which has been playing the tune
+            // — its cues and grid may have moved on; take its copy. The
+            // host then reverts to what it showed before.
+            deck.adoptLoadedTrack(from: state(for: other))
+            var host = state(for: other)
+            host.adoptLoadedTrack(from: doubleHostParked.removeValue(forKey: other) ?? DeckState())
+            host.seekGeneration &+= 1
+            setState(host, for: other)
+        } else {
+            doubleHostParked[side == .a ? .b : .a] = nil
+            if let parked {
+                deck.adoptLoadedTrack(from: parked)
+            } else {
+                deck.adoptLoadedTrack(from: DeckState())
+            }
+        }
+        deck.quickScratch = nil
+        deck.quickScratchParkedSecs = 0
+        deck.atEnd = false
+        deck.seekGeneration &+= 1
+        setState(deck, for: side)
     }
 
     func handleHotCue(_ side: DeckSide, index: Int, clear: Bool) {
@@ -5172,6 +5319,31 @@ final class WaveformAppModel: ObservableObject {
             presetId: UInt32(index),
             syncBeats: syncBeats,
             bpm: effectiveBpm)
+    }
+
+    /// Fire preset `index` on the rack's output — the master deck by
+    /// default, or the deck(s) the DJ pinned it to. The keyboard and
+    /// the bar's pads both come through here so the pill is never a
+    /// lie about where a key lands.
+    func fireSirenPresetOnRack(index: Int) {
+        for side in sirenOutputState.decks {
+            fireSirenPreset(side, index: index)
+        }
+    }
+
+    /// The rack's unit switch writes to every deck it lands on, so
+    /// `A+B` does not leave the two decks on different sirens.
+    func setSirenUnitOnRack(_ unit: SirenUnit) {
+        for side in sirenOutputState.decks {
+            setSirenUnit(side, unit)
+        }
+    }
+
+    /// Same for the DUB knob.
+    func setSirenDubOnRack(_ value: Double) {
+        for side in sirenOutputState.decks {
+            setSirenDub(side, value)
+        }
     }
 
     /// Stop any sounding siren on `side` (oscillator fades out, tail rings on).
@@ -6066,19 +6238,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onSirenPreset: { index in
                 Task { @MainActor in
                     guard model.sirenEnabled else { return }
-                    model.fireSirenPreset(model.focusedDeckForGridNudge, index: index)
+                    model.fireSirenPresetOnRack(index: index)
                 }
                 return true
             },
             onInstantDouble: { toDeckB in
                 Task { @MainActor in
                     model.instantDouble(toDeckB: toDeckB)
-                }
-                return true
-            },
-            onQuickScratch: { index in
-                Task { @MainActor in
-                    model.triggerQuickScratch(index)
                 }
                 return true
             })
@@ -6105,8 +6271,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
             onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
-            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool,
-            onQuickScratch: @escaping (_ index: Int) -> Bool
+            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -6142,8 +6307,6 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onHotCue(index, flags.contains(.shift)) { return nil }
                 case .sirenPreset(let index):
                     if onSirenPreset(index) { return nil }
-                case .quickScratch(let slot):
-                    if onQuickScratch(slot) { return nil }
                 case .instantDouble(let toDeckB):
                     if onInstantDouble(toDeckB) { return nil }
                 case .loadSelection:

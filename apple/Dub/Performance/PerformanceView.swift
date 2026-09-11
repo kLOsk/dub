@@ -217,7 +217,21 @@ struct PerformanceView: View {
         let deck = (side == .a) ? model.deckA : model.deckB
         return DeckColumnState(
             side: side,
-            header: DeckColumnHeader(headerState(side: side)),
+            header: DeckColumnHeader(
+                headerState(side: side),
+                scratch: deck.quickScratch.map { scratch in
+                    ScratchBadge(
+                        parkedTitle: scratch.parkedTitle,
+                        parkedSecs: Int(deck.quickScratchParkedSecs.rounded(.down)),
+                        // Only while the other deck still has the tune —
+                        // a load over it there makes the ghost the truth.
+                        playingOn: scratch.doubledTo.flatMap { other in
+                            let theirs = (other == .a) ? model.deckA : model.deckB
+                            return theirs.sourceURL != nil
+                                && theirs.sourceURL == quickScratchParkedURL(side)
+                                ? other : nil
+                        })
+                }),
             cues: (0..<DeckState.hotCueCount).map {
                 CueSlotState(index: $0, mark: deck.hotCues[$0])
             },
@@ -226,7 +240,20 @@ struct PerformanceView: View {
             echoEnabled: model.echoOutEnabled,
             echoEngaged: deck.echoDivision != nil,
             hasTrack: deck.hasTrack,
-            isPlaying: deck.isPlaying)
+            isPlaying: deck.isPlaying,
+            scratch: (0..<SampleBank.quickScratchCount).map { pad in
+                let slot = model.sampleBank.quickScratchSlot(pad: pad)
+                return ScratchPadState(
+                    pad: pad,
+                    name: slot.flatMap { model.sampleBank.slot($0) }.map { SampleBank.label(for: $0) },
+                    engaged: deck.quickScratch?.pad == pad)
+            })
+    }
+
+    /// The file the deck parked for a quick scratch, so the header can
+    /// tell whether the other deck is still playing it.
+    private func quickScratchParkedURL(_ side: DeckSide) -> URL? {
+        model.quickScratchParkedSourceURL(side)
     }
 
     /// Pure forwarders into the model, as with `headerCallbacks`. The
@@ -251,6 +278,7 @@ struct PerformanceView: View {
             onScaleLoop: { double in model.scaleLoop(side, double: double) },
             onExitLoop: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
+            onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
             // Select Internal *and* start playing, which is the
             // contract `SourceControlView` documents for the segment
             // ("Select Internal and start playing the loaded file").
@@ -310,32 +338,27 @@ struct PerformanceView: View {
     /// Snapshot for the bar. The siren block is omitted in Prep, where
     /// the siren and its Expert panel already have their own column.
     private var rackBarState: GlobalRackBarState {
-        let focus = model.focusedDeckForGridNudge
-        let deck = (focus == .a) ? model.deckA : model.deckB
+        let siren = model.sirenOutputState
+        let deck = (siren.primary == .a) ? model.deckA : model.deckB
+        let sounding = siren.decks.contains {
+            (($0 == .a) ? model.deckA : model.deckB).sirenState == 1
+        }
         return GlobalRackBarState(
             siren: (model.sirenEnabled && model.engineMode != .prep)
                 ? SirenRackState(
-                    focusedDeck: focus,
-                    presetNames: model.sirenLabels(for: focus),
-                    sounding: deck.sirenState == 1,
+                    output: siren,
+                    presetNames: model.sirenLabels(for: siren.primary),
+                    sounding: sounding,
                     unit: deck.sirenUnit,
                     dubMacro: deck.sirenDubMacro)
                 : nil,
-            quickScratch: (0..<QuickScratchSlots.count).map { index in
-                let slot = model.quickScratch.slot(index)
-                return TriggerPadState(
-                    index: index,
-                    key: QuickScratchSlots.keyLabels[index],
-                    sampleName: slot.map { SampleBank.label(for: $0.url) },
-                    deck: slot?.deck)
-            },
-            sampler: sampleShelfState(focusedDeck: focus))
+            sampler: sampleShelfState(output: model.samplerOutputState))
     }
 
     /// The sampler as drawn on either surface: the bank's names over
-    /// the engine's lamps. `focusedDeck` names the deck the pads fire on;
-    /// Prep passes `nil` — one deck, no pill.
-    private func sampleShelfState(focusedDeck: DeckSide?) -> SampleShelfState {
+    /// the engine's lamps. `output` is where the pads fire; Prep passes
+    /// `nil` — one deck, no pill.
+    private func sampleShelfState(output: RackOutputState?) -> SampleShelfState {
         let voices = model.samplerVoices
         return SampleShelfState(
             slots: (0..<SampleBank.count).map { index in
@@ -344,9 +367,10 @@ struct PerformanceView: View {
                     index: index,
                     name: model.sampleBank.slot(index).map { SampleBank.label(for: $0) },
                     playing: voice?.playing ?? false,
-                    progress: Double(voice?.progress ?? 0))
+                    progress: Double(voice?.progress ?? 0),
+                    quickScratch: model.sampleBank.quickScratchTag(index))
             },
-            focusedDeck: focusedDeck)
+            output: output)
     }
 
     private var sampleShelfCallbacks: SampleShelfCallbacks {
@@ -354,7 +378,9 @@ struct PerformanceView: View {
             onTrigger: { index in model.triggerSampler(index) },
             onStop: { index in model.stopSampler(index) },
             onDrop: { index, url in model.setSampleSlot(index, url: url) },
-            onUnload: { index in model.clearSampleSlot(index) })
+            onUnload: { index in model.clearSampleSlot(index) },
+            onQuickScratch: { index, pad in model.sampleBank.setQuickScratch(pad, for: index) },
+            onOutput: { output in model.samplerOutput = output })
     }
 
     /// Prep's surface, as values. Read fresh each render; nothing here
@@ -366,7 +392,7 @@ struct PerformanceView: View {
             },
             activeLoopBeats: model.deckA.activeLoopBeats,
             loopEngaged: model.deckA.loopActive,
-            samples: sampleShelfState(focusedDeck: nil),
+            samples: sampleShelfState(output: nil),
             hasTrack: model.deckA.hasTrack,
             isPlaying: model.deckA.isPlaying)
     }
@@ -412,22 +438,16 @@ struct PerformanceView: View {
     }
 
 
-    /// The siren's focused deck is re-read inside each closure rather
-    /// than captured, so a master switch between render and click
-    /// routes the press to the deck that has focus *now* — the same
-    /// discipline `KeyEventMonitorHost` uses.
+    /// The siren's output is resolved inside the model at the press
+    /// rather than captured here, so a master switch between render and
+    /// click routes the press to the deck that has focus *now* — the
+    /// same discipline `KeyEventMonitorHost` uses.
     private var rackBarCallbacks: GlobalRackBarCallbacks {
         GlobalRackBarCallbacks(
-            onSirenPreset: { idx in
-                model.fireSirenPreset(model.focusedDeckForGridNudge, index: idx)
-            },
-            onSirenUnit: { unit in
-                model.setSirenUnit(model.focusedDeckForGridNudge, unit)
-            },
-            onSirenDubMacro: { value in
-                model.setSirenDub(model.focusedDeckForGridNudge, value)
-            },
-            onQuickScratch: { idx in model.triggerQuickScratch(idx) },
+            onSirenPreset: { idx in model.fireSirenPresetOnRack(index: idx) },
+            onSirenUnit: { unit in model.setSirenUnitOnRack(unit) },
+            onSirenDubMacro: { value in model.setSirenDubOnRack(value) },
+            onSirenOutput: { output in model.sirenOutput = output },
             sampler: sampleShelfCallbacks)
     }
 

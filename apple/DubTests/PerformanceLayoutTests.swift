@@ -105,19 +105,20 @@ final class PerformanceLayoutTests: XCTestCase {
             "deck column overflows the 1440 × 900 pane")
     }
 
-    /// The column's floor has to hold the loop row at its narrowest
-    /// beside the echo button, because the pair never wraps. If the
-    /// loop's floor grows, the echo widens or the column's floor
-    /// shrinks, the ×2 stepper clips — which the pad column did for a
-    /// whole milestone, rendering labels as "UE" and "OOP".
-    func test_deckColumn_floorHoldsTheLoopAndEcho() {
+    /// The column's floor has to hold the trigger row — the scratch
+    /// pads, the loop at its narrowest and the echo — because the three
+    /// never wrap. If any floor grows or the column's shrinks, the ×2
+    /// stepper clips — which the pad column did for a whole milestone,
+    /// rendering labels as "UE" and "OOP".
+    func test_deckColumn_floorHoldsTheTriggerRow() {
         // The column's own padding at its widest: the signal tab's
         // inset on the outer edge, `md` on the inner.
         let padding = DubLayout.deckSignalTabWidth + DubSpacing.sm + DubSpacing.md
         XCTAssertGreaterThanOrEqual(
             DubLayout.performanceDeckColumnMinWidth - padding,
-            LoopEngine.minWidth + DubSpacing.md + DubLayout.deckColumnEchoWidth,
-            "the column floor no longer fits the loop row beside the echo")
+            DubLayout.deckColumnScratchRowMinWidth + DubSpacing.md
+                + LoopEngine.minWidth + DubSpacing.md + DubLayout.deckColumnEchoWidth,
+            "the column floor no longer fits scratch · loop · echo on one row")
     }
 
     /// The readouts are read while beatmatching, so a digit arriving

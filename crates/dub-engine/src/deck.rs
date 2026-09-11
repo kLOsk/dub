@@ -204,6 +204,14 @@ pub struct DeckSharedState {
     /// echo there is nothing to strand). PRD §6.3. Plain relaxed atomic —
     /// a one-block tear is invisible.
     siren_state: AtomicU8,
+    /// Quick Scratch (PRD §7.2): the sampler slot on the deck in place
+    /// of its track, or [`crate::quick_scratch::QUICK_SCRATCH_NONE`].
+    /// Lights the deck's SCRATCH pad.
+    quick_scratch_slot: AtomicU8,
+    /// Where the parked track is, in track seconds — moving under slip,
+    /// still under freeze. `f64` bits. The header prints it beside the
+    /// parked title so the DJ can see the tune is still there.
+    quick_scratch_parked_secs_bits: AtomicU64,
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -350,6 +358,8 @@ impl DeckSharedState {
             key_lock_state: AtomicU8::new(0),
             echo_state: AtomicU8::new(0),
             siren_state: AtomicU8::new(0),
+            quick_scratch_slot: AtomicU8::new(crate::quick_scratch::QUICK_SCRATCH_NONE),
+            quick_scratch_parked_secs_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -381,6 +391,10 @@ impl DeckSharedState {
         self.key_lock_state.store(0, Ordering::Relaxed);
         self.echo_state.store(0, Ordering::Relaxed);
         self.siren_state.store(0, Ordering::Relaxed);
+        self.quick_scratch_slot
+            .store(crate::quick_scratch::QUICK_SCRATCH_NONE, Ordering::Relaxed);
+        self.quick_scratch_parked_secs_bits
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
         self.tc_abs_locked.store(false, Ordering::Relaxed);
         self.tc_abs_position_secs_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
@@ -491,6 +505,29 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_siren_state(&self) -> u8 {
         self.siren_state.load(Ordering::Relaxed)
+    }
+
+    /// Publish the Quick Scratch state (audio thread): the slot on the
+    /// deck, or `QUICK_SCRATCH_NONE`, and where the parked track is.
+    /// Two relaxed stores; RT-safe.
+    pub(crate) fn store_quick_scratch(&self, slot: u8, parked_secs: f64) {
+        self.quick_scratch_slot.store(slot, Ordering::Relaxed);
+        self.quick_scratch_parked_secs_bits
+            .store(parked_secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the sampler slot Quick Scratch has on the deck,
+    /// `None` when the deck is playing its own track.
+    #[must_use]
+    pub fn load_quick_scratch_slot(&self) -> Option<u8> {
+        let slot = self.quick_scratch_slot.load(Ordering::Relaxed);
+        (slot != crate::quick_scratch::QUICK_SCRATCH_NONE).then_some(slot)
+    }
+
+    /// Lock-free read of the parked track's position, track seconds.
+    #[must_use]
+    pub fn load_quick_scratch_parked_secs(&self) -> f64 {
+        f64::from_bits(self.quick_scratch_parked_secs_bits.load(Ordering::Relaxed))
     }
 
     /// Publish the installed whitening matrix + calibration counter
@@ -1571,6 +1608,18 @@ impl Deck {
     #[cfg(test)]
     pub(crate) fn load_siren_state(&self) -> u8 {
         self.shared.load_siren_state()
+    }
+
+    /// Publish this deck's Quick Scratch state (engine, on engage /
+    /// release and each block while parked). RT-safe.
+    pub(crate) fn store_quick_scratch(&self, slot: u8, parked_secs: f64) {
+        self.shared.store_quick_scratch(slot, parked_secs);
+    }
+
+    /// The sampler slot Quick Scratch has on this deck, if any.
+    #[must_use]
+    pub fn quick_scratch_slot(&self) -> Option<u8> {
+        self.shared.load_quick_scratch_slot()
     }
 
     /// `true` when the deck is currently contributing audio.

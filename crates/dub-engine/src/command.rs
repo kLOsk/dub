@@ -322,8 +322,9 @@ pub enum Command {
     SamplerClear { slot: u8 },
 
     /// Fire sampler slot `slot`'s one-shot (§7.1) onto deck `deck`'s
-    /// output bus — the master deck, chosen by the shell at the press.
-    /// Retriggering a sounding voice crossfades rather than cutting.
+    /// output bus — the master deck, chosen by the shell at the press,
+    /// or [`crate::sampler::SAMPLER_OUTPUT_BOTH`] for both. Retriggering
+    /// a sounding voice crossfades rather than cutting.
     SamplerTrigger { slot: u8, deck: u8 },
 
     /// Stop sampler slot `slot` before its sample ends, ramping out.
@@ -332,6 +333,23 @@ pub enum Command {
     /// Slot `slot`'s linear gain — the auto-gain the shell measured at
     /// bind time (§7.1).
     SamplerSetGain { slot: u8, gain: f32 },
+
+    /// Quick Scratch (PRD §7.2): put sampler slot `slot`'s sample on
+    /// deck `deck` at 0 and park what the deck was playing — doubling
+    /// it onto `double_to` first, when the shell asks (the tune was on
+    /// air and the other deck idle), so it keeps playing there. Engaging
+    /// on a deck already engaged swaps the sample and leaves the park
+    /// alone. A slot with nothing loaded does nothing.
+    DeckQuickScratchEngage {
+        deck: u8,
+        slot: u8,
+        double_to: Option<u8>,
+    },
+
+    /// Quick Scratch release: put the parked track back — in time if
+    /// the deck was playing when it was parked, at the parked frame if
+    /// it was not. No-op when nothing is engaged.
+    DeckQuickScratchRelease { deck: u8 },
 
     /// Instant Doubles (M17, PRD §7.3): put the track loaded on deck
     /// `from` onto deck `to` at `from`'s current playhead, for
@@ -428,6 +446,20 @@ impl std::fmt::Debug for Command {
                 .debug_struct("SamplerSetGain")
                 .field("slot", slot)
                 .field("gain", gain)
+                .finish(),
+            Self::DeckQuickScratchEngage {
+                deck,
+                slot,
+                double_to,
+            } => f
+                .debug_struct("DeckQuickScratchEngage")
+                .field("deck", deck)
+                .field("slot", slot)
+                .field("double_to", double_to)
+                .finish(),
+            Self::DeckQuickScratchRelease { deck } => f
+                .debug_struct("DeckQuickScratchRelease")
+                .field("deck", deck)
                 .finish(),
             Self::DeckInstantDouble { from, to } => f
                 .debug_struct("DeckInstantDouble")

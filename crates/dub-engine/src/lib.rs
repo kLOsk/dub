@@ -32,6 +32,8 @@ mod display_rate;
 mod drift;
 mod handle;
 mod looping;
+/// PRD §7.2 Quick Scratch: a sampler slot on the deck, and the way back.
+pub mod quick_scratch;
 #[cfg(test)]
 mod real_vinyl_tests;
 pub mod realtime;
@@ -321,6 +323,18 @@ pub struct Engine {
     /// Where the voices publish playing / progress for the UI poll,
     /// once per block after they render.
     sampler_shared: std::sync::Arc<crate::sampler::SamplerSharedState>,
+    /// PRD §7.2 Quick Scratch: per deck, the track parked while a
+    /// sampler slot is on the deck. `None` when the deck plays its own.
+    quick_scratch: [Option<crate::quick_scratch::ParkedTrack>; DECK_COUNT],
+    /// PRD §7.2: a deck hosting a doubled tune was put on its internal
+    /// clock so the tune keeps the originating platter's pitch and needs
+    /// no record spinning. This is the mode it had before, given back on
+    /// its next load — not on release, when the crossfader is still on
+    /// it. A switch the DJ flips themselves clears it: their choice wins.
+    double_host_prior_mode: [Option<ControlMode>; DECK_COUNT],
+    /// Staging for a host's park while the engage arm holds a borrow of
+    /// the tune it is doubling; moved into the `ParkedTrack` right after.
+    pending_host_park: Option<crate::quick_scratch::HostPark>,
 }
 
 /// Per-deck Panic-Play state machine (M10.6b, PRD §6.1.2). Owned
@@ -453,6 +467,9 @@ impl Engine {
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
             sampler_shared: std::sync::Arc::default(),
+            quick_scratch: std::array::from_fn(|_| None),
+            double_host_prior_mode: [None; DECK_COUNT],
+            pending_host_park: None,
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -532,6 +549,9 @@ impl Engine {
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
             sampler_shared: side.sampler_shared,
+            quick_scratch: std::array::from_fn(|_| None),
+            double_host_prior_mode: [None; DECK_COUNT],
+            pending_host_park: None,
             siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
@@ -804,6 +824,8 @@ impl Engine {
         // in effect for this block's output.
         self.drive_timecode_inputs();
 
+        self.advance_quick_scratch(out.len() / num_channels);
+
         for sample in out.iter_mut() {
             *sample = 0.0;
         }
@@ -929,7 +951,7 @@ impl Engine {
             #[allow(clippy::cast_possible_truncation)]
             let deck_id = idx as u8;
             for voice in &mut self.samplers {
-                if voice.output_deck() == deck_id {
+                if voice.sounds_on(deck_id) {
                     voice.render_add(out, num_channels, first_us);
                 }
             }
@@ -1585,6 +1607,8 @@ impl Engine {
         if idx >= DECK_COUNT {
             return;
         }
+        // The DJ chose; a mode a double was going to give back is moot.
+        self.double_host_prior_mode[idx] = None;
         let prev = self.control_mode[idx];
         match mode {
             ControlMode::Internal => {
@@ -1611,6 +1635,7 @@ impl Engine {
                 // show a ghost of the old track). For FX the per-deck rack
                 // processes the passthrough in `render_routed`.
                 self.cancel_panic_play(idx);
+                self.abandon_quick_scratch(idx);
                 self.decks[idx].clear_source();
             }
         }
@@ -1901,6 +1926,19 @@ impl Engine {
                 }
             }
             Command::DeckLoad { idx, source, gain } => {
+                // A real load over a quick scratch is the way out that
+                // can never strand a deck: the park goes, not the load.
+                self.abandon_quick_scratch(idx as usize);
+                // A deck that hosted a doubled tune on its internal clock
+                // gets its own mode back with the next record: the double
+                // is over, and the DJ expects the platter to drive again.
+                if let Some(mode) = self
+                    .double_host_prior_mode
+                    .get_mut(idx as usize)
+                    .and_then(Option::take)
+                {
+                    self.set_deck_control_mode(idx as usize, mode);
+                }
                 let Some(d) = self.decks.get_mut(idx as usize) else {
                     // Bad idx: bounce the new Arc back through the trash
                     // channel rather than drop here. Symmetric with the
@@ -1963,11 +2001,22 @@ impl Engine {
                     voice.set_gain(gain);
                 }
             }
+            Command::DeckQuickScratchEngage {
+                deck,
+                slot,
+                double_to,
+            } => {
+                self.quick_scratch_engage(deck as usize, slot, double_to.map(usize::from));
+            }
+            Command::DeckQuickScratchRelease { deck } => {
+                self.quick_scratch_release(deck as usize);
+            }
             Command::DeckInstantDouble { from, to } => {
                 if from == to {
                     return;
                 }
                 let (from_idx, to_idx) = (from as usize, to as usize);
+                self.abandon_quick_scratch(to_idx);
                 // Read everything off the source deck first: the
                 // borrow checker will not let both decks be borrowed
                 // mutably, and an `Arc::clone` here is a refcount bump,
@@ -2055,6 +2104,258 @@ impl Engine {
     /// changes — and route them through the trash channel. Cheap
     /// (mostly two `Option::take()` checks) and called from the
     /// engine's command-application and post-render sweeps.
+    /// PRD §7.2: a parked tune keeps running underneath a quick scratch
+    /// (slip), so its clock ticks here, once per block, and the header
+    /// sees where it has got to.
+    fn advance_quick_scratch(&mut self, block_frames: usize) {
+        for idx in 0..DECK_COUNT {
+            let Some(parked) = self.quick_scratch[idx].as_mut() else {
+                continue;
+            };
+            parked.advance(block_frames, f64::from(self.sample_rate));
+            // A doubled tune is *playing* on the other deck; that is
+            // where it is, not where the ghost thinks. The ghost keeps
+            // counting underneath in case the double goes away.
+            let live = parked.doubled_to.and_then(|other| {
+                let other = usize::from(other);
+                let held = self.decks.get(other)?.source()?;
+                let tune = parked.track.as_ref()?;
+                std::sync::Arc::ptr_eq(held, tune).then(|| self.decks[other].position_secs())
+            });
+            self.decks[idx]
+                .store_quick_scratch(parked.slot, live.unwrap_or_else(|| parked.position_secs()));
+        }
+    }
+
+    /// PRD §7.2: put sampler slot `slot` on deck `idx`, parking its
+    /// track — or, if a scratch is already engaged there, swap the
+    /// sample and keep the park. See [`quick_scratch`] for the return
+    /// rule. Everything here is a refcount bump or a field write.
+    fn quick_scratch_engage(&mut self, idx: usize, slot: u8, double_to: Option<usize>) {
+        let Some(sample) = self
+            .samplers
+            .get(slot as usize)
+            .and_then(|v| v.source().map(std::sync::Arc::clone))
+        else {
+            // An empty slot is a mis-press, not a reason to empty a deck.
+            return;
+        };
+        let sample_gain = self.samplers[slot as usize].gain();
+        if idx >= DECK_COUNT {
+            return;
+        }
+
+        if let Some(parked) = self.quick_scratch[idx].as_mut() {
+            parked.slot = slot;
+        } else {
+            let deck = &self.decks[idx];
+            let track = deck.source().map(std::sync::Arc::clone);
+            let (position, playing, rate, gain) = (
+                deck.position_frames(),
+                deck.is_playing(),
+                deck.rate(),
+                deck.gain(),
+            );
+            // The pitch the tune crosses at: under timecode the smoothed
+            // value the PITCH readout shows, not the instantaneous platter
+            // rate — the press itself can be a jitter. Internal decks
+            // already run at a steady rate.
+            let carry_rate = if self.control_mode[idx] == ControlMode::Timecode {
+                self.tc_display_value[idx]
+            } else {
+                rate
+            };
+            // The tune keeps playing on the other deck, out of the other
+            // mixer channel, while the sample is cut against it here.
+            // Only with a tune to double and a different deck to take it.
+            let doubled = match (double_to, track.as_ref()) {
+                (Some(other), Some(tune)) if other != idx && other < DECK_COUNT => {
+                    self.abandon_quick_scratch(other);
+                    // Park what the host has, to give back at release.
+                    let host = {
+                        let h = &self.decks[other];
+                        crate::quick_scratch::HostPark {
+                            track: h.source().map(std::sync::Arc::clone),
+                            position_frames: h.position_frames(),
+                            playing: h.is_playing(),
+                            rate: h.rate(),
+                            gain: h.gain(),
+                        }
+                    };
+                    self.pending_host_park = Some(host);
+                    // The host plays the tune on its internal clock at the
+                    // originating platter's pitch: no record has to be
+                    // spinning there, and the beat does not move when the
+                    // tune crosses and comes back. Its own mode comes back
+                    // at release, or with its next load.
+                    if self.control_mode[other] != ControlMode::Internal {
+                        if self.double_host_prior_mode[other].is_none() {
+                            self.double_host_prior_mode[other] = Some(self.control_mode[other]);
+                        }
+                        self.cancel_panic_play(other);
+                        self.control_mode[other] = ControlMode::Internal;
+                    }
+                    let dst = &mut self.decks[other];
+                    dst.set_rate(if carry_rate.is_finite() && carry_rate > 0.0 {
+                        carry_rate
+                    } else {
+                        1.0
+                    });
+                    dst.set_playing(playing);
+                    dst.swap_source(std::sync::Arc::clone(tune));
+                    dst.set_position_frames(position);
+                    dst.set_gain(gain);
+                    if let Some(m) = self.tc_drift.get_mut(other) {
+                        m.note_remap();
+                    }
+                    self.sweep_deck_disposal(other);
+                    #[allow(clippy::cast_possible_truncation)]
+                    Some(other as u8)
+                }
+                _ => None,
+            };
+            let host = self.pending_host_park.take();
+            self.quick_scratch[idx] = Some(crate::quick_scratch::ParkedTrack {
+                track,
+                position_frames: position,
+                // Slip only makes sense forward: a deck being pulled
+                // back or held still on engage has nowhere to run to.
+                ghost_rate: (playing && rate > 0.0).then_some(rate),
+                was_playing: playing,
+                gain,
+                slot,
+                doubled_to: doubled,
+                host,
+            });
+        }
+
+        let deck = &mut self.decks[idx];
+        deck.swap_source(sample);
+        deck.set_position_frames(0.0);
+        deck.set_gain(sample_gain);
+        if let Some(m) = self.tc_drift.get_mut(idx) {
+            m.note_remap();
+        }
+        let parked_secs = self.quick_scratch[idx]
+            .as_ref()
+            .map_or(0.0, crate::quick_scratch::ParkedTrack::position_secs);
+        self.decks[idx].store_quick_scratch(slot, parked_secs);
+        self.sweep_deck_disposal(idx);
+    }
+
+    /// PRD §7.2: the parked track comes back. The sample's `Arc` leaves
+    /// through the deck's de-click state like any displaced source;
+    /// the sampler slot still holds its own.
+    fn quick_scratch_release(&mut self, idx: usize) {
+        let Some(mut parked) = self.quick_scratch.get_mut(idx).and_then(Option::take) else {
+            return;
+        };
+        if idx >= DECK_COUNT {
+            return;
+        }
+        // Doubled, and the other deck still has the tune: come back at
+        // its *live* position, in sync, and give the other deck back
+        // what it had.
+        let live = parked.doubled_to.map(usize::from).and_then(|other| {
+            let held = self.decks.get(other)?.source()?;
+            let tune = parked.track.as_ref()?;
+            std::sync::Arc::ptr_eq(held, tune).then(|| {
+                let d = &self.decks[other];
+                (other, d.position_frames(), d.is_playing(), d.rate())
+            })
+        });
+        let host = parked.host.take();
+        match (live, host) {
+            (Some((other, ..)), Some(host)) => self.revert_double_host(other, host),
+            // The double is gone (the host was loaded over): its park is
+            // moot, and its `Arc` leaves through the trash.
+            (_, Some(host)) => {
+                if let Some(track) = host.track {
+                    self.send_to_trash(track);
+                }
+            }
+            _ => {}
+        }
+        let live = live.map(|(_, position, playing, rate)| (position, playing, rate));
+        let deck = &mut self.decks[idx];
+        // Transport first, so the de-click fades the sample out rather
+        // than the returning tune — same ordering as Instant Doubles.
+        // Also the reason the empty arm sets it: `clear_source` leaves
+        // the flag alone, and an empty deck the platter had running the
+        // sample would come back empty *and playing*.
+        let (position, playing) = match live {
+            Some((position, playing, rate)) => {
+                deck.set_rate(rate);
+                (position, playing)
+            }
+            None => (parked.position_frames, parked.was_playing),
+        };
+        deck.set_playing(playing);
+        if let Some(track) = parked.track {
+            deck.swap_source(track);
+            deck.set_position_frames(position);
+            deck.set_gain(parked.gain);
+        } else {
+            deck.clear_source();
+        }
+        if let Some(m) = self.tc_drift.get_mut(idx) {
+            m.note_remap();
+        }
+        self.decks[idx].store_quick_scratch(crate::quick_scratch::QUICK_SCRATCH_NONE, 0.0);
+        self.sweep_deck_disposal(idx);
+    }
+
+    /// Give a host deck back what it had before a tune was doubled onto
+    /// it: its track at its position, its transport, and its control
+    /// mode — unless the DJ flipped the mode themselves meanwhile, which
+    /// cleared the pending restore and stands.
+    fn revert_double_host(&mut self, other: usize, host: crate::quick_scratch::HostPark) {
+        if other >= DECK_COUNT {
+            return;
+        }
+        if let Some(mode) = self.double_host_prior_mode[other].take() {
+            self.cancel_panic_play(other);
+            self.control_mode[other] = mode;
+        }
+        let deck = &mut self.decks[other];
+        // Transport first, in both arms: `clear_source` leaves the
+        // playing flag alone, and a host that was empty would otherwise
+        // stay "playing" nothing — which the next press reads as busy
+        // and refuses to double onto.
+        deck.set_rate(host.rate);
+        deck.set_playing(host.playing);
+        match host.track {
+            Some(track) => {
+                deck.swap_source(track);
+                deck.set_position_frames(host.position_frames);
+                deck.set_gain(host.gain);
+            }
+            None => deck.clear_source(),
+        }
+        if let Some(m) = self.tc_drift.get_mut(other) {
+            m.note_remap();
+        }
+        self.sweep_deck_disposal(other);
+    }
+
+    /// Drop a park without restoring it — the deck is being loaded
+    /// over. The parked `Arc` goes through the trash channel; the
+    /// audio thread never drops one.
+    fn abandon_quick_scratch(&mut self, idx: usize) {
+        let Some(parked) = self.quick_scratch.get_mut(idx).and_then(Option::take) else {
+            return;
+        };
+        if let Some(track) = parked.track {
+            self.send_to_trash(track);
+        }
+        if let Some(track) = parked.host.and_then(|h| h.track) {
+            self.send_to_trash(track);
+        }
+        if let Some(deck) = self.decks.get(idx) {
+            deck.store_quick_scratch(crate::quick_scratch::QUICK_SCRATCH_NONE, 0.0);
+        }
+    }
+
     fn sweep_deck_disposal(&mut self, idx: usize) {
         // Two-step take: borrow `decks` only as long as we're popping
         // each Option, then release before calling `send_to_trash`
@@ -6194,6 +6495,33 @@ mod tests {
         );
     }
 
+    /// A+B: one press, both mixer channels.
+    #[test]
+    fn a_sampler_voice_can_land_on_both_deck_buses() {
+        let mut engine = Engine::new(48_000.0, 64);
+        let sample = Arc::new(Track::from_interleaved(vec![0.5; 8192], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 0,
+            source: sample,
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 0, gain: 1.0 });
+        engine.apply_command(Command::SamplerTrigger {
+            slot: 0,
+            deck: crate::sampler::SAMPLER_OUTPUT_BOTH,
+        });
+        let mut buf = vec![0.0f32; 256 * 4];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut buf, 4, &[Some(0), Some(2)]);
+        assert!(
+            buf.chunks_exact(4).any(|f| f[0] > 0.0),
+            "deck A's pair carries it"
+        );
+        assert!(
+            buf.chunks_exact(4).any(|f| f[2] > 0.0),
+            "and so does deck B's"
+        );
+    }
+
     #[test]
     fn loading_a_sampler_slot_returns_the_displaced_sample_through_the_trash() {
         let first = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
@@ -6314,5 +6642,712 @@ mod tests {
         engine.render(&mut rt, &mut buf);
         assert!(!handle.sampler_shared().is_playing(3), "the one-shot ended");
         assert!(handle.sampler_shared().progress(3).abs() < f32::EPSILON);
+    }
+
+    // ---- PRD §7.2: Quick Scratch ----
+
+    fn quick_scratch_rig() -> (Engine, EngineHandle, Arc<Track>, Arc<Track>) {
+        let (mut engine, handle) = Engine::new_with_handle(48_000.0, 64);
+        let tune = Arc::new(Track::from_interleaved(vec![0.3; 96_000 * 2], 48_000, 2).unwrap());
+        let horn = Arc::new(Track::from_interleaved(vec![0.6; 4_800 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: Arc::clone(&tune),
+            gain: 0.5,
+        });
+        engine.apply_command(Command::SamplerLoad {
+            slot: 2,
+            source: Arc::clone(&horn),
+        });
+        engine.apply_command(Command::SamplerSetGain { slot: 2, gain: 0.8 });
+        (engine, handle, tune, horn)
+    }
+
+    /// The on-air case: the tune keeps running underneath and comes
+    /// back in time, not to where the scratch began.
+    #[test]
+    fn a_playing_deck_slips_and_returns_in_time() {
+        let (mut engine, _handle, tune, horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(10_000.0);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        assert!(
+            Arc::ptr_eq(engine.deck(0).source().unwrap(), &horn),
+            "the sample is on the deck"
+        );
+        assert!(
+            engine.deck(0).position_frames().abs() < 1e-9,
+            "under the needle, from the top"
+        );
+        assert!(
+            (engine.deck(0).gain() - 0.8).abs() < 1e-6,
+            "with the sample's auto-gain"
+        );
+        assert_eq!(engine.deck(0).quick_scratch_slot(), Some(2));
+        assert!(engine.deck(0).is_playing());
+
+        // Ten blocks of 64 frames pass while the horn is scratched.
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+        for _ in 0..10 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+        assert!(
+            (engine.deck(0).position_frames() - 10_640.0).abs() < 1e-6,
+            "back in time — 640 frames on, got {}",
+            engine.deck(0).position_frames()
+        );
+        assert!(
+            (engine.deck(0).gain() - 0.5).abs() < 1e-6,
+            "its own gain back"
+        );
+        assert!(engine.deck(0).is_playing());
+        assert_eq!(engine.deck(0).quick_scratch_slot(), None);
+    }
+
+    /// The idle-deck case: a cued record gets its cue back exactly.
+    #[test]
+    fn a_paused_deck_freezes_and_returns_to_the_frame() {
+        let (mut engine, _handle, tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(4_242.0);
+        engine.deck_mut(0).set_playing(false);
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+        for _ in 0..10 {
+            engine.render(&mut rt, &mut buf);
+        }
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+        assert!((engine.deck(0).position_frames() - 4_242.0).abs() < 1e-9);
+        assert!(!engine.deck(0).is_playing());
+    }
+
+    #[test]
+    fn an_empty_deck_engages_and_releases_to_empty_and_idle() {
+        let (mut engine, handle, _tune, horn) = quick_scratch_rig();
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 1,
+            slot: 2,
+            double_to: None,
+        });
+        assert!(Arc::ptr_eq(engine.deck(1).source().unwrap(), &horn));
+        // The platter runs the sample.
+        engine.deck_mut(1).set_playing(true);
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 1 });
+        assert!(
+            engine.deck(1).source().is_none(),
+            "nothing was parked, nothing comes back"
+        );
+        assert!(
+            !engine.deck(1).is_playing(),
+            "and it is idle, not playing nothing"
+        );
+        assert!(!handle.deck_state(1).unwrap().is_playing);
+        assert_eq!(engine.deck(1).quick_scratch_slot(), None);
+    }
+
+    /// The rig case that bit: B empty, A on air. The double lands on B,
+    /// plays; release must leave B empty *and idle* — the next press has
+    /// to see it as free and double again.
+    #[test]
+    fn an_empty_host_is_idle_again_after_release_so_the_next_press_doubles() {
+        let (mut engine, handle, tune, horn) = quick_scratch_rig();
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        engine.deck_mut(0).set_playing(true);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+
+        for round in 0..2 {
+            engine.apply_command(Command::DeckQuickScratchEngage {
+                deck: 0,
+                slot: 2,
+                double_to: Some(1),
+            });
+            assert!(
+                Arc::ptr_eq(engine.deck(1).source().unwrap(), &tune),
+                "round {round}: the tune is on B"
+            );
+            assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &horn));
+            for _ in 0..8 {
+                engine.render(&mut rt, &mut buf);
+            }
+            engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+            for _ in 0..8 {
+                engine.render(&mut rt, &mut buf);
+            }
+            assert!(
+                engine.deck(1).source().is_none(),
+                "round {round}: B is empty again"
+            );
+            assert!(!engine.deck(1).is_playing(), "round {round}: and idle");
+            assert!(
+                !handle.deck_state(1).unwrap().is_playing,
+                "round {round}: the shell sees it idle"
+            );
+            assert_eq!(engine.control_mode[1], ControlMode::Timecode);
+            assert!(
+                engine.deck(0).is_playing(),
+                "round {round}: A has the tune, playing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_slot_or_a_release_with_nothing_engaged_does_nothing() {
+        let (mut engine, _handle, tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(777.0);
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 5,
+            double_to: None,
+        });
+        assert!(
+            Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune),
+            "a mis-press must not empty the deck"
+        );
+        assert_eq!(engine.deck(0).quick_scratch_slot(), None);
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!((engine.deck(0).position_frames() - 777.0).abs() < 1e-9);
+    }
+
+    /// Pressing qs1 while qs2 is engaged swaps the sample; the park is
+    /// untouched, so the tune still comes back to where it was.
+    #[test]
+    fn engaging_another_slot_swaps_the_sample_and_keeps_the_park() {
+        let (mut engine, _handle, tune, _horn) = quick_scratch_rig();
+        let stab = Arc::new(Track::from_interleaved(vec![0.2; 2_400 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::SamplerLoad {
+            slot: 0,
+            source: Arc::clone(&stab),
+        });
+        engine.deck_mut(0).set_position_frames(5_000.0);
+        engine.deck_mut(0).set_playing(false);
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 0,
+            double_to: None,
+        });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &stab));
+        assert_eq!(engine.deck(0).quick_scratch_slot(), Some(0));
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+        assert!((engine.deck(0).position_frames() - 5_000.0).abs() < 1e-9);
+    }
+
+    /// A real load over a scratch is the way out that can never strand
+    /// the deck: the park is dropped through the trash channel and the
+    /// new track simply lands.
+    #[test]
+    fn loading_over_a_scratch_abandons_the_park_through_the_trash() {
+        let (mut engine, mut handle, tune, _horn) = quick_scratch_rig();
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        let next = Arc::new(Track::from_interleaved(vec![0.1; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: Arc::clone(&next),
+            gain: 1.0,
+        });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &next));
+        assert_eq!(engine.deck(0).quick_scratch_slot(), None);
+        // The parked tune's Arc came back to the main thread.
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 4_096 * 2];
+        engine.render(&mut rt, &mut buf);
+        engine.render(&mut rt, &mut buf);
+        assert!(handle.reclaim() >= 1);
+        drop(engine);
+        assert_eq!(
+            Arc::strong_count(&tune),
+            1,
+            "nothing still holds the parked tune"
+        );
+    }
+
+    #[test]
+    fn quick_scratch_is_alloc_free_on_the_audio_thread() {
+        let (mut engine, _handle, _tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_playing(true);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 128];
+        engine.render(&mut rt, &mut buf);
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::DeckQuickScratchEngage {
+                deck: 0,
+                slot: 2,
+                double_to: None,
+            });
+            engine.render(&mut rt, &mut buf);
+            engine.apply_command(Command::DeckQuickScratchEngage {
+                deck: 0,
+                slot: 2,
+                double_to: None,
+            });
+            engine.render(&mut rt, &mut buf);
+            engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+            engine.render(&mut rt, &mut buf);
+        });
+    }
+
+    /// The on-air case, other deck idle: the tune is doubled onto the
+    /// other deck and keeps playing there; release doubles it back at
+    /// the other deck's live position and leaves it playing.
+    #[test]
+    fn a_playing_deck_doubles_the_tune_to_the_idle_deck_and_takes_it_back_live() {
+        let (mut engine, handle, tune, horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(10_000.0);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        assert!(
+            Arc::ptr_eq(engine.deck(0).source().unwrap(), &horn),
+            "the sample is on deck A"
+        );
+        assert!(
+            Arc::ptr_eq(engine.deck(1).source().unwrap(), &tune),
+            "the tune is on deck B"
+        );
+        assert!(
+            (engine.deck(1).position_frames() - 10_000.0).abs() < 1e-9,
+            "at the frame it left A"
+        );
+        assert!(engine.deck(1).is_playing(), "and playing there");
+        assert!(
+            (engine.deck(1).gain() - 0.5).abs() < 1e-6,
+            "with the tune's own gain"
+        );
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.deck_mut(1).quiesce_declick_for_test();
+        for _ in 0..10 {
+            engine.render(&mut rt, &mut buf);
+        }
+        let live = engine.deck(1).position_frames();
+        assert!(live > 10_000.0, "B has been playing the tune: {live}");
+        // Published at the top of the block, so it trails the deck's
+        // block-end position by one block.
+        let shared = handle.deck_shared(0).unwrap();
+        let published = shared.load_quick_scratch_parked_secs();
+        assert!(
+            (published - live / 48_000.0).abs() < 2.0 * 64.0 / 48_000.0,
+            "the header shows where B has the tune: {published} vs {}",
+            live / 48_000.0
+        );
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+        assert!(
+            (engine.deck(0).position_frames() - live).abs() < 1e-9,
+            "A took the tune at B's live frame: {} vs {live}",
+            engine.deck(0).position_frames()
+        );
+        assert!(engine.deck(0).is_playing());
+        assert!(
+            engine.deck(1).source().is_none(),
+            "B reverts to what it had — nothing, so it is empty again"
+        );
+        assert_eq!(engine.deck(0).quick_scratch_slot(), None);
+    }
+
+    /// The host had a record cued: it gets it back at its cue, paused,
+    /// in its own mode, the moment the tune leaves.
+    #[test]
+    fn the_host_gets_its_cued_record_back_at_release() {
+        let (mut engine, mut handle, tune, _horn) = quick_scratch_rig();
+        let cued = Arc::new(Track::from_interleaved(vec![0.2; 96_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&cued),
+            gain: 0.7,
+        });
+        engine.deck_mut(1).set_position_frames(3_000.0);
+        engine.deck_mut(1).set_playing(false);
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        engine.deck_mut(0).set_playing(true);
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        assert!(Arc::ptr_eq(engine.deck(1).source().unwrap(), &tune));
+        assert_eq!(engine.control_mode[1], ControlMode::Internal);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+        for _ in 0..10 {
+            engine.render(&mut rt, &mut buf);
+        }
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(
+            Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune),
+            "the tune is back on A"
+        );
+        assert!(
+            Arc::ptr_eq(engine.deck(1).source().unwrap(), &cued),
+            "B has its record back"
+        );
+        assert!(
+            (engine.deck(1).position_frames() - 3_000.0).abs() < 1e-9,
+            "at its cue"
+        );
+        assert!(!engine.deck(1).is_playing(), "paused, as it was");
+        assert!((engine.deck(1).gain() - 0.7).abs() < 1e-6);
+        assert_eq!(
+            engine.control_mode[1],
+            ControlMode::Timecode,
+            "in its own mode"
+        );
+        // Nothing leaked: the tune's Arc on B went through the trash.
+        engine.render(&mut rt, &mut buf);
+        engine.render(&mut rt, &mut buf);
+        assert!(handle.reclaim() >= 1);
+    }
+
+    /// The host plays the tune on its internal clock at the originating
+    /// deck's pitch — no record spinning needed there, and the beat does
+    /// not move when the tune crosses. Its own mode comes back at
+    /// release.
+    #[test]
+    fn the_host_runs_the_double_internally_at_the_carried_pitch_until_its_next_load() {
+        let (mut engine, _handle, tune, _horn) = quick_scratch_rig();
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        // Deck A is under timecode: the platter's instantaneous rate is
+        // whatever the last block saw, the smoothed pitch is what the
+        // readout shows — and what crosses.
+        engine.deck_mut(0).set_rate(1.11);
+        engine.tc_display_value[0] = 1.03;
+        engine.deck_mut(0).set_playing(true);
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        assert_eq!(
+            engine.control_mode[1],
+            ControlMode::Internal,
+            "the host is on its own clock"
+        );
+        assert!(
+            (engine.deck(1).rate() - 1.03).abs() < 1e-9,
+            "at A's smoothed pitch, got {}",
+            engine.deck(1).rate()
+        );
+        assert!(engine.deck(1).is_playing());
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert_eq!(
+            engine.control_mode[1],
+            ControlMode::Timecode,
+            "its own mode is back the moment the tune leaves"
+        );
+        assert!(
+            engine.deck(1).source().is_none(),
+            "and it is empty again, as it was"
+        );
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+    }
+
+    /// The host was loaded over mid-scratch: the double is gone, so
+    /// release leaves the host with its new record — but its mode still
+    /// comes back with that load, since the hosting is over.
+    #[test]
+    fn a_host_loaded_over_keeps_the_new_record_and_gets_its_mode_back() {
+        let (mut engine, _handle, _tune, _horn) = quick_scratch_rig();
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        engine.deck_mut(0).set_playing(true);
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        assert_eq!(engine.control_mode[1], ControlMode::Internal);
+        let next = Arc::new(Track::from_interleaved(vec![0.1; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&next),
+            gain: 1.0,
+        });
+        assert_eq!(engine.control_mode[1], ControlMode::Timecode);
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(Arc::ptr_eq(engine.deck(1).source().unwrap(), &next));
+    }
+
+    /// The rig case: B on timecode with a silent carrier (needle up),
+    /// paused at its cue; A on internal play. Double across, run a few
+    /// blocks, release, run a few more — B must be back at its cue,
+    /// paused, on timecode, and idle enough for the next press to
+    /// double again.
+    #[test]
+    fn a_timecode_host_with_a_silent_carrier_is_paused_again_after_release() {
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, handle) = Engine::new_with_handle(sr, block);
+        // Silent timecode input on deck B: attached, nothing pushed.
+        let rb = HeapRb::<f32>::new(block * 4);
+        let (_tx, rx) = rb.split();
+        engine
+            .attach_timecode_input(1, rx, TimecodeInputConfig::default())
+            .unwrap();
+        let tune = Arc::new(Track::from_interleaved(vec![0.3; 96_000 * 2], 48_000, 2).unwrap());
+        let cued = Arc::new(Track::from_interleaved(vec![0.2; 96_000 * 2], 48_000, 2).unwrap());
+        let horn = Arc::new(Track::from_interleaved(vec![0.6; 4_800 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 0,
+            source: Arc::clone(&tune),
+            gain: 1.0,
+        });
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&cued),
+            gain: 1.0,
+        });
+        engine.apply_command(Command::SamplerLoad {
+            slot: 0,
+            source: horn,
+        });
+        engine.set_deck_control_mode(0, ControlMode::Internal);
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        engine.deck_mut(1).set_position_frames(3_000.0);
+        engine.deck_mut(1).set_playing(false);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; block * 2];
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut buf);
+        }
+        assert!(engine.deck(0).is_playing());
+        assert!(
+            !engine.deck(1).is_playing(),
+            "B idle under a silent carrier"
+        );
+
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 0,
+            double_to: Some(1),
+        });
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut buf);
+        }
+        assert_eq!(engine.control_mode[1], ControlMode::Internal);
+        assert!(engine.deck(1).is_playing(), "B hosts the tune, playing");
+
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut buf);
+        }
+        assert_eq!(engine.control_mode[1], ControlMode::Timecode);
+        assert!(Arc::ptr_eq(engine.deck(1).source().unwrap(), &cued));
+        assert!(
+            !engine.deck(1).is_playing(),
+            "B is paused again — not running on its own clock"
+        );
+        assert!(
+            (engine.deck(1).position_frames() - 3_000.0).abs() < 1e-9,
+            "at its cue, got {}",
+            engine.deck(1).position_frames()
+        );
+        assert!(
+            !handle.deck_state(1).unwrap().is_playing,
+            "and the shell would see it idle, so the next press doubles again"
+        );
+    }
+
+    /// The DJ flipping the host's switch themselves wins over the
+    /// pending restore.
+    #[test]
+    fn the_hosts_own_switch_cancels_the_pending_mode_restore() {
+        let (mut engine, _handle, _tune, _horn) = quick_scratch_rig();
+        engine.set_deck_control_mode(1, ControlMode::Timecode);
+        engine.deck_mut(0).set_playing(true);
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        engine.set_deck_control_mode(1, ControlMode::Internal);
+        assert!(engine.double_host_prior_mode[1].is_none());
+        let next = Arc::new(Track::from_interleaved(vec![0.1; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: next,
+            gain: 1.0,
+        });
+        assert_eq!(
+            engine.control_mode[1],
+            ControlMode::Internal,
+            "the DJ's choice stands"
+        );
+    }
+
+    /// The other deck was loaded over during the scratch: the double is
+    /// gone, so release falls back to the ghost clock — still in time.
+    #[test]
+    fn a_double_that_was_loaded_over_falls_back_to_the_ghost() {
+        let (mut engine, _handle, tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(10_000.0);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        let next = Arc::new(Track::from_interleaved(vec![0.1; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&next),
+            gain: 1.0,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 64 * 2];
+        for _ in 0..10 {
+            engine.render(&mut rt, &mut buf);
+        }
+        engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+        assert!(Arc::ptr_eq(engine.deck(0).source().unwrap(), &tune));
+        assert!(
+            (engine.deck(0).position_frames() - 10_640.0).abs() < 1e-6,
+            "ghost: 640 frames on, got {}",
+            engine.deck(0).position_frames()
+        );
+        assert!(
+            Arc::ptr_eq(engine.deck(1).source().unwrap(), &next),
+            "B keeps its new track"
+        );
+    }
+
+    /// No double when the shell does not ask for one (the other deck
+    /// was playing) — the tune ghosts underneath as before.
+    #[test]
+    fn without_a_double_the_other_deck_is_untouched() {
+        let (mut engine, _handle, _tune, _horn) = quick_scratch_rig();
+        let other = Arc::new(Track::from_interleaved(vec![0.2; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&other),
+            gain: 1.0,
+        });
+        engine.deck_mut(0).set_playing(true);
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        assert!(Arc::ptr_eq(engine.deck(1).source().unwrap(), &other));
+    }
+
+    /// Doubling onto a deck that is itself mid-scratch drops that park
+    /// (through the trash), the same as a load over it would.
+    #[test]
+    fn doubling_onto_a_scratching_deck_abandons_its_park() {
+        let (mut engine, mut handle, _tune, _horn) = quick_scratch_rig();
+        let b_tune = Arc::new(Track::from_interleaved(vec![0.2; 48_000 * 2], 48_000, 2).unwrap());
+        engine.apply_command(Command::DeckLoad {
+            idx: 1,
+            source: Arc::clone(&b_tune),
+            gain: 1.0,
+        });
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 1,
+            slot: 2,
+            double_to: None,
+        });
+        assert_eq!(engine.deck(1).quick_scratch_slot(), Some(2));
+
+        engine.deck_mut(0).set_playing(true);
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: Some(1),
+        });
+        assert_eq!(
+            engine.deck(1).quick_scratch_slot(),
+            None,
+            "B's park is gone"
+        );
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 4_096 * 2];
+        engine.render(&mut rt, &mut buf);
+        engine.render(&mut rt, &mut buf);
+        assert!(
+            handle.reclaim() >= 1,
+            "B's parked tune came back through the trash"
+        );
+    }
+
+    #[test]
+    fn a_doubled_quick_scratch_is_alloc_free() {
+        let (mut engine, _handle, _tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_playing(true);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 128];
+        engine.render(&mut rt, &mut buf);
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.apply_command(Command::DeckQuickScratchEngage {
+                deck: 0,
+                slot: 2,
+                double_to: Some(1),
+            });
+            engine.render(&mut rt, &mut buf);
+            engine.apply_command(Command::DeckQuickScratchRelease { deck: 0 });
+            engine.render(&mut rt, &mut buf);
+        });
+    }
+
+    /// The header prints where the parked tune is; under slip it moves.
+    #[test]
+    fn the_parked_position_is_published_and_moves_under_slip() {
+        let (mut engine, handle, _tune, _horn) = quick_scratch_rig();
+        engine.deck_mut(0).set_position_frames(48_000.0);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.apply_command(Command::DeckQuickScratchEngage {
+            deck: 0,
+            slot: 2,
+            double_to: None,
+        });
+        let shared = handle.deck_shared(0).unwrap();
+        assert_eq!(shared.load_quick_scratch_slot(), Some(2));
+        assert!((shared.load_quick_scratch_parked_secs() - 1.0).abs() < 1e-9);
+
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        engine.render(&mut rt, &mut buf);
+        assert!((shared.load_quick_scratch_parked_secs() - 1.1).abs() < 1e-9);
     }
 }

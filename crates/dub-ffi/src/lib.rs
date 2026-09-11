@@ -451,7 +451,24 @@ pub use rip::{
 ///       shell passes the master), replacing `sampler_set_output_deck`;
 ///       [`DubEngine::sampler_telemetry`] reports each slot's playing /
 ///       progress for the pad lamp and sweep.
-pub const FFI_VERSION: u32 = 70;
+///   71. **Quick Scratch with a way back (§7.2).**
+///       [`DubEngine::quick_scratch_engage`] puts a sampler slot on a
+///       deck and parks its track; [`DubEngine::quick_scratch_release`]
+///       brings the track back — in time if the deck was playing (slip),
+///       to the frame if it was paused. `DeckTelemetry` grows
+///       `quick_scratch_slot` + `quick_scratch_parked_secs`;
+///       `sampler_load` returns the gain it applied.
+///   72. **Rack output override.** [`DubEngine::sampler_trigger`] takes
+///       a [`SamplerOutput`] (deck A · deck B · both) instead of a deck
+///       index, so the rack bar's `→ A` pill can be pinned to a deck or
+///       to `A+B` rather than always following the master.
+///   73. **Quick Scratch doubles the tune across.** A tune that was on
+///       air when the sample landed is doubled onto the idle deck and
+///       keeps playing there; release doubles it back at the live
+///       position. [`DubEngine::quick_scratch_engage`] and
+///       [`DubEngine::quick_scratch_release`] return the deck involved
+///       (`None` for the ghost / freeze paths) so the shell mirrors it.
+pub const FFI_VERSION: u32 = 73;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -654,6 +671,14 @@ enum PeakSource {
     /// Pre-computed File-mode peaks. The whole track's broadband +
     /// band peaks were decimated once during `load_track`.
     File(FilePeaks),
+}
+
+/// The FFI-side half of a Quick Scratch park (PRD §7.2): the deck's
+/// UI-facing track and waveform while a sampler slot stands in for
+/// them. The engine parks the audio; this parks what the shell reads.
+struct ParkedDeckView {
+    file_track: Option<Arc<Track>>,
+    peaks: Option<PeakSource>,
 }
 
 /// Offline-decoded peak buffer for a File-mode deck.
@@ -890,6 +915,19 @@ struct RunningState {
     /// clone of this `Arc<Track>` — the audio thread reads samples
     /// through its own reference.
     file_tracks: [Option<Arc<Track>>; 2],
+    /// Per sampler slot, the converted sample and its waveform (M17
+    /// §7.1). Kept so Quick Scratch (§7.2) can put the slot on a deck
+    /// with the same `Arc` the voice reads and a waveform ready to
+    /// draw — no decode, no compute, at the press.
+    sampler_tracks: [Option<Arc<Track>>; dub_engine::sampler::SAMPLER_SLOTS],
+    sampler_peaks: [Option<FilePeaks>; dub_engine::sampler::SAMPLER_SLOTS],
+    /// Per deck, what the UI-side state was before Quick Scratch took
+    /// the deck: the track `track_info` describes and the peaks the
+    /// waveform draws. Put back on release, exactly as they were.
+    quick_scratch_parked: [Option<ParkedDeckView>; 2],
+    /// Per deck, the same for a deck *hosting* a doubled tune: what it
+    /// showed before the tune landed, put back when the tune leaves.
+    double_host_view: [Option<ParkedDeckView>; 2],
     /// Live engine command channel. Held purely so its `Drop` runs
     /// at the right point in the shutdown sequence.
     handle: EngineHandle,
@@ -1688,6 +1726,11 @@ impl DubEngine {
                     }
                 })?;
 
+            // A real load over a quick scratch drops the park — the
+            // engine does the same on its side — so the deck is never
+            // stranded behind a sample. Same for a deck hosting a double.
+            running.quick_scratch_parked[idx] = None;
+            running.double_host_view[idx] = None;
             running.file_tracks[idx] = Some(track.clone());
             running.peaks[idx] = None;
             if let Some(a) = self.peak_generation_seq.get(idx) {
@@ -2479,7 +2522,15 @@ impl DubEngine {
     /// other load paths. The sample file is left untouched: Quick
     /// Scratch (§7.2) loads the same file from disk through the deck,
     /// and the two must not fight over it.
-    pub fn sampler_load(&self, slot: u64, path: String) -> Result<(), EngineError> {
+    ///
+    /// Returns the linear gain applied, so the shell can draw the
+    /// sample's waveform at the level it will sound when Quick Scratch
+    /// puts it on a deck.
+    ///
+    /// The converted sample's waveform is decimated here as well and
+    /// kept beside it (`sampler_peaks`), so a Quick Scratch press has a
+    /// waveform to draw the instant the sample lands on the deck.
+    pub fn sampler_load(&self, slot: u64, path: String) -> Result<f32, EngineError> {
         let slot = sampler_slot_to_usize(slot)?;
         let engine_sr = {
             let state = lock_state(&self.state);
@@ -2500,6 +2551,20 @@ impl DubEngine {
                  or shorter than one output frame"
             ))
         })?;
+        let peaks = match compute_offline_peaks(
+            converted.samples(),
+            converted.sample_rate(),
+            converted.channels(),
+        ) {
+            Ok(p) => Some(file_peaks_without_grid(p)),
+            Err(e) => {
+                // The voice still fires; only a quick scratch of it
+                // draws the empty groove.
+                eprintln!("dub-ffi: sampler slot {slot} peaks failed for {path}: {e}");
+                None
+            }
+        };
+        let converted = std::sync::Arc::new(converted);
 
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
@@ -2507,38 +2572,190 @@ impl DubEngine {
         };
         running
             .handle
-            .sampler_load(slot, std::sync::Arc::new(converted))
+            .sampler_load(slot, Arc::clone(&converted))
             .map_err(|(e, _arc)| map_command_error(e))?;
         running
             .handle
             .sampler_set_gain(slot, gain)
-            .map_err(map_command_error)
+            .map_err(map_command_error)?;
+        running.sampler_tracks[slot] = Some(converted);
+        running.sampler_peaks[slot] = peaks;
+        Ok(gain)
     }
 
-    /// Unbind sampler slot `slot`.
+    /// Unbind sampler slot `slot`. A deck quick-scratching the slot
+    /// keeps playing it — it holds its own `Arc` — until released.
     pub fn sampler_clear(&self, slot: u64) -> Result<(), EngineError> {
         let slot = sampler_slot_to_usize(slot)?;
         self.with_running(|running| {
             running
                 .handle
                 .sampler_clear(slot)
-                .map_err(map_command_error)
+                .map_err(map_command_error)?;
+            running.sampler_tracks[slot] = None;
+            running.sampler_peaks[slot] = None;
+            Ok(())
         })
     }
 
-    /// Fire sampler slot `slot`'s one-shot (§7.1) onto deck `deck_idx`'s
-    /// output bus. The shell passes the master deck, so the sample
-    /// sounds on the channel the crowd is hearing; the take keeps that
-    /// bus even if the master changes under it. Retriggering a
-    /// sounding voice crossfades rather than cutting.
-    pub fn sampler_trigger(&self, slot: u64, deck_idx: u64) -> Result<(), EngineError> {
+    /// Quick Scratch (PRD §7.2): put sampler slot `slot` on deck
+    /// `deck_idx` at 0, under the needle, and park what the deck was
+    /// playing. Pressing a different slot while engaged swaps the
+    /// sample and keeps the park. An empty slot does nothing.
+    ///
+    /// **Where the tune goes** is decided here, from the decks' live
+    /// state, and returned: a tune that was *playing* while the other
+    /// deck sat idle (a file deck, not on Thru) is **doubled onto the
+    /// other deck** and keeps playing there, out of the other mixer
+    /// channel, on that deck's internal clock at this deck's pitch — the
+    /// return value names that deck. Otherwise `None`: the tune ghosts
+    /// underneath (other deck busy) or freezes (this deck paused), see
+    /// `dub_engine::quick_scratch`.
+    ///
+    /// The audio swap is the Instant Doubles trick — the sample is
+    /// already decoded at the engine rate in the sampler, so this is a
+    /// refcount bump on the audio thread, not a load. The deck's
+    /// waveform is the sample's, decimated when the slot was loaded; a
+    /// doubled tune takes its waveform and grid along, cloned.
+    pub fn quick_scratch_engage(
+        &self,
+        deck_idx: u64,
+        slot: u64,
+    ) -> Result<Option<u8>, EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
         let slot = sampler_slot_to_usize(slot)?;
-        let deck = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        let Some(sample) = running.sampler_tracks[slot].clone() else {
+            return Ok(None);
+        };
+        let other = 1 - idx;
+        let fresh = running.quick_scratch_parked[idx].is_none();
+        let this_playing = running.handle.deck_state(idx).is_some_and(|d| d.is_playing);
+        let other_playing = running
+            .handle
+            .deck_state(other)
+            .is_some_and(|d| d.is_playing);
+        let double_to =
+            (fresh && this_playing && !other_playing && running.file_tracks[idx].is_some())
+                .then_some(other);
+
+        running
+            .handle
+            .quick_scratch_engage(idx, slot, double_to)
+            .map_err(map_command_error)?;
+
+        if let Some(other) = double_to {
+            // Park what the host showed, to give back when the tune
+            // leaves; then mirror what the UI reads off the FFI onto it,
+            // exactly as `instant_double` does: same track, same
+            // waveform and grid, cloned rather than recomputed.
+            running.quick_scratch_parked[other] = None;
+            running.double_host_view[other] = Some(ParkedDeckView {
+                file_track: running.file_tracks[other].take(),
+                peaks: running.peaks[other].take(),
+            });
+            running.file_tracks[other] = running.file_tracks[idx].clone();
+            running.peaks[other] = match running.peaks[idx].as_ref() {
+                Some(PeakSource::File(fp)) => Some(PeakSource::File(fp.clone())),
+                _ => None,
+            };
+        }
+        if fresh {
+            running.quick_scratch_parked[idx] = Some(ParkedDeckView {
+                file_track: running.file_tracks[idx].take(),
+                peaks: running.peaks[idx].take(),
+            });
+        }
+        running.file_tracks[idx] = Some(sample);
+        running.peaks[idx] = running.sampler_peaks[slot].clone().map(PeakSource::File);
+        drop(state);
+        self.bump_peak_generation(idx);
+        self.bump_beat_grid_generation(idx);
+        if let Some(other) = double_to {
+            self.bump_peak_generation(other);
+            self.bump_beat_grid_generation(other);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(double_to.map(|d| d as u8))
+    }
+
+    /// Quick Scratch release: the parked track comes back. Doubled and
+    /// still on the other deck → back at that deck's *live* position, in
+    /// sync, and the other deck reverts to what it showed before; the
+    /// return value names that deck so the shell restores its metadata
+    /// too. Otherwise `None`: in time from the ghost clock if the deck
+    /// was playing when it was parked, at the parked frame if it was not
+    /// (see `dub_engine::quick_scratch`). No-op when nothing is engaged.
+    pub fn quick_scratch_release(&self, deck_idx: u64) -> Result<Option<u8>, EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        let Some(parked) = running.quick_scratch_parked[idx].take() else {
+            return Ok(None);
+        };
+        running
+            .handle
+            .quick_scratch_release(idx)
+            .map_err(map_command_error)?;
+        // The same test the engine applies: the other deck still holds
+        // the very track that was parked here.
+        let other = 1 - idx;
+        let doubled_back = match (
+            parked.file_track.as_ref(),
+            running.file_tracks[other].as_ref(),
+        ) {
+            (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+            _ => false,
+        };
+        if doubled_back {
+            // The tune's waveform and grid come back from the host, which
+            // may have finished analysing them; the host gets its own
+            // view back.
+            running.file_tracks[idx] = running.file_tracks[other].take();
+            running.peaks[idx] = match running.peaks[other].take() {
+                Some(PeakSource::File(fp)) => Some(PeakSource::File(fp)),
+                _ => parked.peaks,
+            };
+            if let Some(host) = running.double_host_view[other].take() {
+                running.file_tracks[other] = host.file_track;
+                running.peaks[other] = host.peaks;
+            }
+        } else {
+            running.double_host_view[other] = None;
+            running.file_tracks[idx] = parked.file_track;
+            running.peaks[idx] = parked.peaks;
+        }
+        drop(state);
+        self.bump_peak_generation(idx);
+        self.bump_beat_grid_generation(idx);
+        if doubled_back {
+            self.bump_peak_generation(other);
+            self.bump_beat_grid_generation(other);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(doubled_back.then_some(other as u8))
+    }
+
+    /// Fire sampler slot `slot`'s one-shot (§7.1) onto `output`. The
+    /// shell passes the master deck by default, so the sample sounds on
+    /// the channel the crowd is hearing, or the deck the DJ pinned the
+    /// rack to, or both; the take keeps that bus even if the master
+    /// changes under it. Retriggering a sounding voice crossfades
+    /// rather than cutting.
+    pub fn sampler_trigger(&self, slot: u64, output: SamplerOutput) -> Result<(), EngineError> {
+        let slot = sampler_slot_to_usize(slot)?;
         self.with_running(|running| {
-            running
-                .handle
-                .sampler_trigger(slot, deck)
-                .map_err(map_command_error)
+            match output {
+                SamplerOutput::DeckA => running.handle.sampler_trigger(slot, 0),
+                SamplerOutput::DeckB => running.handle.sampler_trigger(slot, 1),
+                SamplerOutput::Both => running.handle.sampler_trigger_both(slot),
+            }
+            .map_err(map_command_error)
         })
     }
 
@@ -2615,6 +2832,8 @@ impl DubEngine {
         // `load_track` maintains. Unlike a load there is no decode to
         // wait for, so the destination's waveform and grid are simply
         // the source's — cloned rather than recomputed.
+        running.quick_scratch_parked[to] = None;
+        running.double_host_view[to] = None;
         running.file_tracks[to] = Some(track);
         running.peaks[to] = match running.peaks[from].as_ref() {
             Some(PeakSource::File(fp)) => Some(PeakSource::File(fp.clone())),
@@ -2839,6 +3058,8 @@ impl DubEngine {
             key_lock_state: shared.load_key_lock_state(),
             echo_state: shared.load_echo_state(),
             siren_state: shared.load_siren_state(),
+            quick_scratch_slot: shared.load_quick_scratch_slot(),
+            quick_scratch_parked_secs: shared.load_quick_scratch_parked_secs(),
         }
     }
 
@@ -2872,6 +3093,8 @@ impl DubEngine {
             // track too so the waveform doesn't keep painting the ghost of the
             // unloaded file.
             if matches!(mode, ControlMode::Thru | ControlMode::Fx) {
+                running.quick_scratch_parked[idx] = None;
+                running.double_host_view[idx] = None;
                 running.file_tracks[idx] = None;
             }
         }
@@ -3889,6 +4112,18 @@ impl PositionInfo {
     };
 }
 
+/// Where a sampler one-shot lands (§7.1): the rack's `→ A` / `→ B` /
+/// `→ A+B` output, resolved by the shell at the press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SamplerOutput {
+    /// Deck A's output bus.
+    DeckA,
+    /// Deck B's output bus.
+    DeckB,
+    /// Both buses — one press, both mixer channels.
+    Both,
+}
+
 /// One sampler slot's live state (M17 §7.1), as
 /// [`DubEngine::sampler_telemetry`] reports it.
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -3986,6 +4221,13 @@ pub struct DeckTelemetry {
     /// slap-back tail still ringing). Drives the deck's siren pad glow. No
     /// auto-off (the siren is additive). PRD §6.3.
     pub siren_state: u8,
+    /// Quick Scratch (PRD §7.2): the sampler slot on the deck in place
+    /// of its track, or `None` when the deck plays its own. Lights the
+    /// deck's SCRATCH pad and the header badge.
+    pub quick_scratch_slot: Option<u8>,
+    /// Where the parked track is, in track seconds — moving under slip,
+    /// still under freeze. `0` when nothing is parked.
+    pub quick_scratch_parked_secs: f64,
 }
 
 impl DeckTelemetry {
@@ -4011,6 +4253,8 @@ impl DeckTelemetry {
             key_lock_state: 0,
             echo_state: 0,
             siren_state: 0,
+            quick_scratch_slot: None,
+            quick_scratch_parked_secs: 0.0,
         }
     }
 }
@@ -4730,10 +4974,10 @@ fn background_analyze_and_install(
         let EngineState::Running(running) = &mut *guard else {
             return;
         };
-        if !track_still_loaded(running, idx, &track) {
+        let Some(target) = analysis_target(running, idx, &track) else {
             return;
-        }
-        running.peaks[idx] = Some(PeakSource::File(FilePeaks {
+        };
+        let peaks = PeakSource::File(FilePeaks {
             broadband,
             bands,
             onset,
@@ -4750,9 +4994,17 @@ fn background_analyze_and_install(
                 .as_ref()
                 .map(|g| g.grid_locked)
                 .unwrap_or(false),
-        }));
-        if let Some(a) = peak_generation_seq.get(idx) {
-            a.fetch_add(1, Ordering::Release);
+        });
+        match target {
+            AnalysisTarget::Live(slot) => {
+                *slot = Some(peaks);
+                if let Some(a) = peak_generation_seq.get(idx) {
+                    a.fetch_add(1, Ordering::Release);
+                }
+            }
+            // The deck is showing a quick scratch; the waveform waits
+            // in the park and comes back with the track.
+            AnalysisTarget::Parked(slot) => *slot = Some(peaks),
         }
     }
     let peaks_source_label = if peaks_from_cache {
@@ -4843,11 +5095,18 @@ fn background_analyze_and_install(
         let EngineState::Running(running) = &mut *guard else {
             return;
         };
-        if !track_still_loaded(running, idx, &track) {
+        let Some(target) = analysis_target(running, idx, &track) else {
             return;
-        }
-        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+        };
+        let (slot, live) = match target {
+            AnalysisTarget::Live(slot) => (slot, true),
+            AnalysisTarget::Parked(slot) => (slot, false),
+        };
+        if let Some(PeakSource::File(fp)) = slot.as_mut() {
             fp.beat_grid = grid;
+        }
+        if !live {
+            return;
         }
     }
     if let Some(a) = beat_grid_generation_seq.get(idx) {
@@ -4936,6 +5195,59 @@ fn track_still_loaded(running: &RunningState, idx: usize, track: &Arc<Track>) ->
         running.file_tracks.get(idx).and_then(|t| t.as_ref()),
         Some(current) if Arc::ptr_eq(current, track)
     )
+}
+
+/// Where a finished analysis of `track` on deck `idx` should land.
+///
+/// The deck's live slot when the track is still what the deck shows;
+/// the Quick Scratch park when the track is parked behind a sample —
+/// a scratch pressed right after a load must not cost the tune its
+/// waveform and grid for the rest of the night. `None` when the track
+/// has left the deck altogether.
+enum AnalysisTarget<'a> {
+    Live(&'a mut Option<PeakSource>),
+    Parked(&'a mut Option<PeakSource>),
+}
+
+fn analysis_target<'a>(
+    running: &'a mut RunningState,
+    idx: usize,
+    track: &Arc<Track>,
+) -> Option<AnalysisTarget<'a>> {
+    if track_still_loaded(running, idx, track) {
+        return running.peaks.get_mut(idx).map(AnalysisTarget::Live);
+    }
+    match running.quick_scratch_parked.get_mut(idx) {
+        Some(Some(parked))
+            if parked
+                .file_track
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, track)) =>
+        {
+            Some(AnalysisTarget::Parked(&mut parked.peaks))
+        }
+        _ => None,
+    }
+}
+
+/// A sample's waveform as a deck draws it: the decimated peaks with no
+/// beat grid — a stab has no tempo worth a grid, and the deck's grid
+/// lines belong to the parked tune.
+fn file_peaks_without_grid(p: OfflinePeaks) -> FilePeaks {
+    FilePeaks {
+        broadband: p.broadband,
+        bands: p.bands,
+        onset: p.onset,
+        filtered: p.filtered,
+        sample_rate: p.sample_rate,
+        samples_per_broadband_chunk: u32::try_from(p.samples_per_broadband_chunk)
+            .unwrap_or(u32::MAX),
+        samples_per_band_chunk: u32::try_from(p.samples_per_band_chunk).unwrap_or(u32::MAX),
+        samples_per_onset_chunk: u32::try_from(p.samples_per_onset_chunk).unwrap_or(u32::MAX),
+        samples_per_filtered_chunk: u32::try_from(p.samples_per_filtered_chunk).unwrap_or(u32::MAX),
+        beat_grid: BeatGrid::empty(),
+        grid_locked: false,
+    }
 }
 
 /// The sampler's auto-gain for a decoded clip (M17 §7.1): the same
@@ -5219,6 +5531,10 @@ fn start_thru_inner(
     Ok(RunningState {
         peaks,
         file_tracks: [None, None],
+        sampler_tracks: std::array::from_fn(|_| None),
+        sampler_peaks: std::array::from_fn(|_| None),
+        quick_scratch_parked: [None, None],
+        double_host_view: [None, None],
         handle,
         output,
         input: Some(input),
@@ -5286,6 +5602,10 @@ fn start_engine_inner(
     Ok(RunningState {
         peaks: [None, None],
         file_tracks: [None, None],
+        sampler_tracks: std::array::from_fn(|_| None),
+        sampler_peaks: std::array::from_fn(|_| None),
+        quick_scratch_parked: [None, None],
+        double_host_view: [None, None],
         handle,
         output,
         input: None,
@@ -5631,7 +5951,13 @@ mod tests {
         // deck, `sampler_set_gain` / `sampler_set_output_deck` gone
         // (auto-gain at load, master-deck at trigger), `sampler_telemetry`
         // + `SamplerSlotTelemetry`.
-        assert_eq!(FFI_VERSION, 70);
+        // 70→71: Quick Scratch — `quick_scratch_engage` / `_release`,
+        // `DeckTelemetry.quick_scratch_slot` / `_parked_secs`,
+        // `sampler_load` returns its gain.
+        // 71→72: `sampler_trigger(slot, SamplerOutput)` — A · B · both.
+        // 72→73: Quick Scratch doubles across — `quick_scratch_engage` /
+        // `_release` return the other deck when they did.
+        assert_eq!(FFI_VERSION, 73);
     }
 
     #[test]
@@ -5685,10 +6011,14 @@ mod tests {
     fn sampler_calls_on_a_stopped_engine_return_not_running() {
         let engine = DubEngine::new();
         for f in [
-            engine.sampler_trigger(0, 0),
+            engine.sampler_trigger(0, SamplerOutput::DeckA),
             engine.sampler_stop(0),
             engine.sampler_clear(0),
-            engine.sampler_load(0, "/nonexistent.wav".to_string()),
+            engine
+                .sampler_load(0, "/nonexistent.wav".to_string())
+                .map(|_| ()),
+            engine.quick_scratch_engage(0, 0).map(|_| ()),
+            engine.quick_scratch_release(0).map(|_| ()),
         ] {
             assert!(matches!(f.unwrap_err(), EngineError::NotRunning));
         }
@@ -5703,15 +6033,16 @@ mod tests {
         // Checked before the running guard, so the error names the
         // real problem rather than "engine not running".
         for f in [
-            engine.sampler_trigger(9, 0),
-            engine.sampler_load(9, "/nonexistent.wav".to_string()),
+            engine.sampler_trigger(9, SamplerOutput::Both),
+            engine
+                .sampler_load(9, "/nonexistent.wav".to_string())
+                .map(|_| ()),
+            engine.quick_scratch_engage(0, 9).map(|_| ()),
+            engine.quick_scratch_engage(9, 0).map(|_| ()),
+            engine.quick_scratch_release(9).map(|_| ()),
         ] {
             assert!(matches!(f.unwrap_err(), EngineError::InvalidDeckIndex(9)));
         }
-        assert!(matches!(
-            engine.sampler_trigger(0, 9).unwrap_err(),
-            EngineError::InvalidDeckIndex(9)
-        ));
     }
 
     /// The level a pad lands at is measured, not dialled: a hot clip
