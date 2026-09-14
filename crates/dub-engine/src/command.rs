@@ -52,21 +52,6 @@ pub enum FxSlot {
     Phaser = 3,
 }
 
-/// Which siren *unit* a deck's siren plays (PRD §6.3). The DJ picks one; firing
-/// a preset routes to that unit's voice. `repr(u8)` so the FFI maps 1:1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SirenUnit {
-    /// **GS1** — the Rigsmith-GS1-style toy-chip bank (rifle / alarm / bombs /
-    /// guns), produced by our HK628 chip recreation (`dub_dsp::Hk628`).
-    Gs1 = 0,
-    /// Benidub DS01E — the analog oscillator siren (Sine 1/2 · Test Tone · Square).
-    Ds01e = 1,
-    /// **SN76477** — the TI complex-sound-generator chip (MAME-modeled), its
-    /// own gun / laser / bomb / explosion preset bank (`dub_dsp::Sn76477`).
-    Sn76477 = 2,
-}
-
 /// One mutation request to the engine. Variants name the deck index where
 /// applicable; engine-wide commands use no index.
 ///
@@ -204,13 +189,14 @@ pub enum Command {
         lp_coeff: f32,
     },
 
-    /// Fire M16 dub-siren preset `preset_id` on deck `idx` (Simple mode,
-    /// PRD §6.3). The siren is a *generator* summed onto the deck's output bus
-    /// (additive — it sounds with or without a track loaded, and survives the
-    /// deck's echo-out dry-mute). The preset bank (siren / alarm / laser / bomb
-    /// / gun …) is **precomputed off-RT** at engine construction, so this only
-    /// carries the index; the audio thread copies the resolved patch and
-    /// re-triggers the voice as a tap one-shot. Out-of-range ids are ignored.
+    /// Fire dub-siren shot `preset_id` on deck `idx` (PRD §6.3). The siren
+    /// is a *generator* summed onto the deck's output bus (additive — it
+    /// sounds with or without a track loaded, and survives the deck's
+    /// echo-out dry-mute). The bank ([`crate::SIREN_BANK`]) names which chip
+    /// each shot plays on; every patch is **precomputed off-RT** at engine
+    /// construction, so this only carries the index and the audio thread
+    /// copies the resolved patch and re-triggers that voice as a tap
+    /// one-shot. Out-of-range ids are ignored.
     ///
     /// `delay_frames_override` (`0` = use the preset's own slap-back time)
     /// replaces the echo length when the user has beat-matched the siren echo;
@@ -258,11 +244,6 @@ pub enum Command {
         filter: f32,
         echo_cut: bool,
     },
-
-    /// Pick which siren **unit** deck `idx` plays (PRD §6.3): HK628 digital
-    /// shots or the Benidub DS01E analog siren. Firing a preset/MODE routes to
-    /// this unit's voice.
-    DeckSetSirenUnit { idx: u8, unit: SirenUnit },
 
     /// Set the Benidub DS01E voice controls on deck `idx`: `pitch_factor`
     /// (PITCH selector — multiplies the MODE's base frequency), `rate_hz` (RATE
@@ -585,11 +566,6 @@ impl std::fmt::Debug for Command {
                 .field("volume", volume)
                 .field("filter", filter)
                 .field("echo_cut", echo_cut)
-                .finish(),
-            Self::DeckSetSirenUnit { idx, unit } => f
-                .debug_struct("DeckSetSirenUnit")
-                .field("idx", idx)
-                .field("unit", unit)
                 .finish(),
             Self::DeckSetSirenVoice {
                 idx,

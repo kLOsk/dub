@@ -31,14 +31,18 @@ final class DubKeymapTests: XCTestCase {
         }
     }
 
-    /// `Z X C V B N M ,` — the bottom letter row, in fire order.
-    func testSirenPresetsKeepTheBottomRow() {
-        let codes: [UInt16] = [6, 7, 8, 9, 11, 45, 46, 43]
-        for (index, code) in codes.enumerated() {
-            XCTAssertEqual(
+    /// The siren's bottom row `Z X C V B N M ,` is unbound until map
+    /// mode: every one of those keys must fall through, and no binding
+    /// may claim the action.
+    func testSirenKeysAreNotBoundAndFallThrough() {
+        for code: UInt16 in [6, 7, 8, 9, 11, 45, 46, 43] {
+            XCTAssertNil(
                 DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                .sirenPreset(index))
+                "an unbound key must not be consumed")
         }
+        XCTAssertFalse(
+            DubKeymap.bindings.contains { $0.action.id.hasPrefix("siren.") },
+            "the siren's keys come back with map mode, not before")
     }
 
     /// `Q W E R` used to fire Quick Scratch. Its pads are per deck now
@@ -104,9 +108,10 @@ final class DubKeymapTests: XCTestCase {
 
     // MARK: - The invariant the table exists for
 
-    /// A rendered cap and the key that fires it are the same fact.
+    /// A rendered cap and the key that fires it are the same fact — and
+    /// with nothing bound, the siren's caps print nothing.
     func testEveryRenderedLegendComesFromTheTable() {
-        XCTAssertEqual(sirenPresetKeys, ["Z", "X", "C", "V", "B", "N", "M", ","])
+        XCTAssertEqual(sirenPresetKeys, ["", "", "", "", ""])
     }
 
     /// No two live bindings can claim the same key. This is the check that
@@ -127,7 +132,7 @@ final class DubKeymapTests: XCTestCase {
     /// silent rebind for anyone who already had one.
     func testActionIdsAreStable() {
         XCTAssertEqual(DubAction.hotCue(2).id, "cue.2")
-        XCTAssertEqual(DubAction.sirenPreset(7).id, "siren.preset.7")
+        XCTAssertEqual(DubAction.sirenPreset(4).id, "siren.preset.4")
         XCTAssertEqual(DubAction.instantDouble(toDeckB: true).id, "deck.instantDouble.b")
         XCTAssertEqual(DubAction.loadSelection.id, "transport.loadSelection")
     }

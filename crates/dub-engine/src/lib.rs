@@ -39,10 +39,12 @@ mod real_vinyl_tests;
 pub mod realtime;
 /// M17 §7.1 one-shot sampler voices.
 pub mod sampler;
+/// The dub siren's five-shot bank (PRD §6.3).
+pub mod siren_bank;
 pub mod thru;
 pub mod timecode;
 
-pub use command::{Command, FxSlot, SirenUnit};
+pub use command::{Command, FxSlot};
 pub use deck::{Deck, DeckSharedState, LoopState, PublishState};
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
@@ -51,6 +53,9 @@ pub use handle::{
 };
 pub use looping::{reverse_loop_region, wrap_into};
 pub use realtime::{RealtimeContext, RtError};
+pub use siren_bank::{
+    siren_shot, siren_shot_name, SirenShot, SirenVoiceId, SIREN_BANK, SIREN_BANK_COUNT,
+};
 pub use thru::{ThruAttachError, ThruInputConfig, ThruSource};
 pub use timecode::{
     AttachError as TimecodeAttachError, LiftIntent, LiftPolicy, TimecodeInput, TimecodeInputConfig,
@@ -265,16 +270,16 @@ pub struct Engine {
     /// track and is never swallowed by echo-out's dry-mute. Each holds its
     /// pre-allocated wavetables + slap-back ring (sized at construction) —
     /// RT-safe every block. Engaged via the command channel.
-    /// Per-deck generic [`dub_dsp::SirenVoice`] — now the **Benidub DS01E**
-    /// analog voice (fired from `benidub_patches` when the unit is DS01E).
+    /// Per-deck generic [`dub_dsp::SirenVoice`] — the **Benidub DS01E**
+    /// analog voice (fired from `benidub_patches` for the bank's Sine shot).
     siren: [dub_dsp::SirenVoice; DECK_COUNT],
-    /// Per-deck faithful SN76477 chip voice (M16) — the SN76477 siren unit.
+    /// Per-deck faithful SN76477 chip voice (M16) — Laser and Siren.
     sn76477: [dub_dsp::Sn76477; DECK_COUNT],
-    /// SN76477 chip preset bank (gun / laser / bomb / explosion …), resolved
-    /// off-RT at construction; `DeckFireSirenPreset` copies one by index.
+    /// SN76477 chip preset bank, resolved off-RT at construction;
+    /// `DeckFireSirenPreset` copies the one the shot names.
     sn76477_presets: [dub_dsp::Sn76477Patch; dub_dsp::SN76477_PRESET_COUNT],
-    /// Per-deck faithful HK628 chip voice (M16) — the digital toy-IC sounds
-    /// (rifle / alarm / dual-tone / bombs / electric guns), the HK628 unit.
+    /// Per-deck faithful HK628 chip voice (M16) — the digital toy-IC
+    /// sounds; Rifle Gun and Alarm in the bank.
     hk628: [dub_dsp::Hk628; DECK_COUNT],
     /// Per-deck vintage-FX rack (the King Tubby / Lee Perry processing chain):
     /// spring reverb + RE-201 tape echo (additive sends) and the Big Knob HPF +
@@ -299,13 +304,10 @@ pub struct Engine {
     siren_echo_active: [bool; DECK_COUNT],
     /// Per-deck siren output level (the GS1 "Volume" knob), default unity.
     siren_volume: [f32; DECK_COUNT],
-    /// Which siren unit each deck plays — HK628 digital shots or the Benidub
-    /// DS01E analog siren. Firing a preset/MODE routes to this unit's voice.
-    siren_unit: [SirenUnit; DECK_COUNT],
-    /// Benidub DS01E MODE patches (Sine 1/2 · Test Tone · Square), resolved
-    /// off-RT at construction (the resolve calls `exp`/`powf`). Firing a DS01E
-    /// MODE copies one of these, applies the deck's PITCH/RATE/TRIGGER, and
-    /// engages the generic [`dub_dsp::SirenVoice`] (`self.siren`).
+    /// Benidub DS01E MODE patches, resolved off-RT at construction (the
+    /// resolve calls `exp`/`powf`). Firing the bank's Sine shot copies one,
+    /// applies the deck's PITCH/RATE/TRIGGER, and engages the generic
+    /// [`dub_dsp::SirenVoice`] (`self.siren`).
     benidub_patches: [dub_dsp::SirenPatch; dub_dsp::BENIDUB_PRESET_COUNT],
     /// Per-deck DS01E PITCH (base-freq multiplier), RATE (LFO Hz) and TRIGGER
     /// (continuous = latched sustain). Applied to the MODE patch at fire time.
@@ -470,7 +472,6 @@ impl Engine {
             quick_scratch: std::array::from_fn(|_| None),
             double_host_prior_mode: [None; DECK_COUNT],
             pending_host_park: None,
-            siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
             ds01e_rate: [0.0; DECK_COUNT],
@@ -552,7 +553,6 @@ impl Engine {
             quick_scratch: std::array::from_fn(|_| None),
             double_host_prior_mode: [None; DECK_COUNT],
             pending_host_park: None,
-            siren_unit: [SirenUnit::Gs1; DECK_COUNT],
             benidub_patches: std::array::from_fn(|i| dub_dsp::benidub_preset_patch(i, sample_rate)),
             ds01e_pitch: [1.0; DECK_COUNT],
             ds01e_rate: [0.0; DECK_COUNT],
@@ -1794,21 +1794,17 @@ impl Engine {
                 preset_id,
                 delay_frames_override,
             } => {
-                // Route the preset/MODE to the deck's selected siren unit: the
-                // GS1 toy-chip shots (HK628), the Benidub DS01E analog voice, or
-                // the SN76477 chip.
+                // The shot names its chip; an id past the bank is ignored.
                 let i = idx as usize;
-                if i < DECK_COUNT {
-                    match self.siren_unit[i] {
-                        SirenUnit::Gs1 => {
-                            self.hk628[i].trigger(dub_dsp::hk628_program(preset_id as usize));
+                if let Some(shot) = siren_shot(preset_id as usize).filter(|_| i < DECK_COUNT) {
+                    match shot.voice {
+                        SirenVoiceId::Hk628(program) => {
+                            self.hk628[i].trigger(dub_dsp::hk628_program(program));
                         }
-                        SirenUnit::Ds01e => {
+                        SirenVoiceId::Ds01e(mode) => {
                             // Copy the precomputed MODE patch, apply the deck's
                             // PITCH / RATE / TRIGGER, and engage the analog voice.
-                            if let Some(mut patch) =
-                                self.benidub_patches.get(preset_id as usize).copied()
-                            {
+                            if let Some(mut patch) = self.benidub_patches.get(mode).copied() {
                                 patch.base_freq *= self.ds01e_pitch[i];
                                 if self.ds01e_rate[i] > 0.0 {
                                     patch.lfo_rate = self.ds01e_rate[i];
@@ -1822,10 +1818,8 @@ impl Engine {
                                 self.siren[i].engage(&patch);
                             }
                         }
-                        SirenUnit::Sn76477 => {
-                            if let Some(patch) =
-                                self.sn76477_presets.get(preset_id as usize).copied()
-                            {
+                        SirenVoiceId::Sn76477(preset) => {
+                            if let Some(patch) = self.sn76477_presets.get(preset).copied() {
                                 self.sn76477[i].trigger(&patch);
                             }
                         }
@@ -1886,11 +1880,6 @@ impl Engine {
                     // keeps recirculating under a cut and returns on release).
                     self.siren_echo_active[i] = mix > 1.0e-3 || echo_cut;
                     self.siren_volume[i] = volume.clamp(0.0, 2.0);
-                }
-            }
-            Command::DeckSetSirenUnit { idx, unit } => {
-                if let Some(u) = self.siren_unit.get_mut(idx as usize) {
-                    *u = unit;
                 }
             }
             Command::DeckSetSirenVoice {
@@ -2965,25 +2954,35 @@ mod tests {
     }
 
     #[test]
-    fn siren_unit_routes_fire_to_the_selected_voice() {
-        // Default unit (HK628): firing triggers the digital chip, not the analog
-        // voice.
-        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+    fn siren_bank_routes_each_shot_to_its_chip() {
+        // One flat bank, three chips: firing a shot wakes exactly the voice
+        // it names and leaves the other two idle. An id past the bank does
+        // nothing.
         let mut rt = RealtimeContext::new();
         let mut out = vec![0.0_f32; 256 * 2];
-        handle.deck(0).fire_siren_preset(0, 0).unwrap();
-        engine.render(&mut rt, &mut out);
-        assert_eq!(engine.hk628[0].state(), dub_dsp::Hk628State::Sounding);
-        assert_eq!(engine.siren[0].state(), dub_dsp::SirenState::Idle);
+        for (id, shot) in SIREN_BANK.iter().enumerate() {
+            let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+            let id = u8::try_from(id).unwrap();
+            handle.deck(0).fire_siren_preset(id, 0).unwrap();
+            engine.render(&mut rt, &mut out);
+            let hk = engine.hk628[0].state() == dub_dsp::Hk628State::Sounding;
+            let ds = engine.siren[0].state() == dub_dsp::SirenState::Sounding;
+            let sn = engine.sn76477[0].state_code() != 0;
+            let expected = match shot.voice {
+                SirenVoiceId::Hk628(_) => (true, false, false),
+                SirenVoiceId::Ds01e(_) => (false, true, false),
+                SirenVoiceId::Sn76477(_) => (false, false, true),
+            };
+            assert_eq!((hk, ds, sn), expected, "{} woke the wrong chip", shot.name);
+        }
 
-        // Switch the unit to DS01E: firing a MODE triggers the analog SirenVoice
-        // instead (and the HK628 stays idle).
         let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
-        handle.deck(0).set_siren_unit(SirenUnit::Ds01e).unwrap();
-        handle.deck(0).fire_siren_preset(0, 0).unwrap();
+        handle
+            .deck(0)
+            .fire_siren_preset(u8::try_from(SIREN_BANK_COUNT).unwrap(), 0)
+            .unwrap();
         engine.render(&mut rt, &mut out);
-        assert_eq!(engine.siren[0].state(), dub_dsp::SirenState::Sounding);
-        assert_eq!(engine.hk628[0].state(), dub_dsp::Hk628State::Idle);
+        assert_eq!(engine.deck(0).load_siren_state(), 0);
     }
 
     #[test]
@@ -2997,8 +2996,8 @@ mod tests {
         engine.render(&mut rt, &mut out);
         assert_eq!(engine.deck(0).load_siren_state(), 0);
 
-        // Bomb 2 (preset 5) is a one-pass HK628 program.
-        handle.deck(0).fire_siren_preset(5, 0).unwrap();
+        // Alarm (shot 1) is an HK628 program bounded by its `total_ms`.
+        handle.deck(0).fire_siren_preset(1, 0).unwrap();
         engine.render(&mut rt, &mut out);
         assert_eq!(engine.hk628[0].state(), dub_dsp::Hk628State::Sounding);
         assert_eq!(engine.deck(0).load_siren_state(), 1);
@@ -7349,5 +7348,96 @@ mod tests {
         let mut buf = vec![0.0f32; 4_800 * 2];
         engine.render(&mut rt, &mut buf);
         assert!((shared.load_quick_scratch_parked_secs() - 1.1).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod siren_bank_tests {
+    //! What the five shots sound like through the deck bus, as a fence:
+    //! their level and how promptly they report idle. Both were wrong
+    //! once — Laser and Siren sat ten dB over the chip shots, and the
+    //! Sine voice reported "sounding" for two silent seconds after its
+    //! release, which the meter faithfully drew as a needle that would
+    //! not fall.
+
+    use super::*;
+    use crate::realtime::RealtimeContext;
+
+    /// The bank's common level: the −14 LUFS track target the sampler's
+    /// auto-gain and the HK628's output trim both aim at.
+    const TARGET_LUFS: f64 = -14.0;
+
+    struct Rendered {
+        lufs: f64,
+        /// Seconds until the output last exceeded −60 dBFS.
+        audible_until: f32,
+        /// Seconds until `siren_state` returned to 0.
+        idle_at: f32,
+    }
+
+    fn render_shot(id: usize) -> Rendered {
+        const SR: u32 = 48_000;
+        #[allow(clippy::cast_precision_loss)]
+        let sr = SR as f32;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 256 * 2];
+        handle
+            .deck(0)
+            .fire_siren_preset(u8::try_from(id).unwrap(), 0)
+            .unwrap();
+        let mut all: Vec<f32> = Vec::new();
+        let mut idle_block: Option<usize> = None;
+        let blocks = SR as usize * 8 / 256;
+        for b in 0..blocks {
+            out.fill(0.0);
+            engine.render(&mut rt, &mut out);
+            all.extend_from_slice(&out);
+            if idle_block.is_none() && b > 2 && engine.deck(0).load_siren_state() == 0 {
+                idle_block = Some(b);
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let audible_until = all
+            .iter()
+            .rposition(|s| s.abs() > 0.001)
+            .map_or(0.0, |i| i as f32 / 2.0 / sr);
+        #[allow(clippy::cast_precision_loss)]
+        let idle_at = idle_block.map_or(f32::INFINITY, |b| b as f32 * 256.0 / sr);
+        let lufs = dub_dsp::measure_clip_loudness(&all, SR, 2)
+            .lufs_i
+            .expect("a shot is loud enough to measure");
+        Rendered {
+            lufs,
+            audible_until,
+            idle_at,
+        }
+    }
+
+    #[test]
+    fn siren_bank_shots_are_level_matched() {
+        for (id, shot) in SIREN_BANK.iter().enumerate() {
+            let r = render_shot(id);
+            assert!(
+                (r.lufs - TARGET_LUFS).abs() <= 1.0,
+                "{} measures {:.1} LUFS, target {TARGET_LUFS} ± 1",
+                shot.name,
+                r.lufs
+            );
+        }
+    }
+
+    #[test]
+    fn siren_bank_shots_report_idle_as_soon_as_they_are_quiet() {
+        for (id, shot) in SIREN_BANK.iter().enumerate() {
+            let r = render_shot(id);
+            assert!(r.idle_at.is_finite(), "{} never reported idle", shot.name);
+            let lag = r.idle_at - r.audible_until;
+            assert!(
+                lag <= 0.3,
+                "{} stayed 'sounding' {lag:.2} s after it went quiet",
+                shot.name
+            );
+        }
     }
 }

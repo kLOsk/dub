@@ -33,6 +33,12 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
     /// Fixed chrome that rides with the deck side — the rack bar and
     /// its divider in Performance, nothing in Prep.
     let deckChrome: CGFloat
+    /// The chrome `performanceDeckFraction` was tuned against — the rack
+    /// bar open. When the actual `deckChrome` is smaller (the bar
+    /// folded) the difference is handed to the library rather than to
+    /// the waveform, which is the point of folding it. Defaults to
+    /// `deckChrome`, i.e. no difference.
+    var deckChromeBudget: CGFloat? = nil
     /// Floor for the deck side's *content*, excluding `deckChrome`.
     let deckMinimum: CGFloat
     /// Called with the height available to the deck content.
@@ -44,7 +50,8 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
             let total = max(0, geo.size.height - 1)
             let deckHeight = Self.deckHeight(
                 mode: mode, total: total,
-                deckChrome: deckChrome, deckMinimum: deckMinimum)
+                deckChrome: deckChrome, deckChromeBudget: deckChromeBudget ?? deckChrome,
+                deckMinimum: deckMinimum)
             VStack(spacing: 0) {
                 deck(max(0, deckHeight - deckChrome))
                     .frame(height: deckHeight)
@@ -67,6 +74,7 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
         mode: EngineMode,
         total: CGFloat,
         deckChrome: CGFloat,
+        deckChromeBudget: CGFloat? = nil,
         deckMinimum: CGFloat
     ) -> CGFloat {
         let wanted: CGFloat
@@ -74,7 +82,13 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
         case .prep:
             wanted = deckMinimum + deckChrome
         case .timecode:
-            wanted = max(deckMinimum + deckChrome, total * DubLayout.performanceDeckFraction)
+            // The fraction includes the budgeted chrome; chrome that is
+            // not there (the rack folded) comes off the deck side, so
+            // the waveform region stays exactly where it was.
+            let missing = max(0, (deckChromeBudget ?? deckChrome) - deckChrome)
+            wanted = max(
+                deckMinimum + deckChrome,
+                total * DubLayout.performanceDeckFraction - missing)
         }
         let ceiling = max(0, total - DubLayout.libraryMinHeight)
         return max(0, min(wanted, ceiling))

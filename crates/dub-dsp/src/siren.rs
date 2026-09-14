@@ -588,9 +588,17 @@ impl SirenVoice {
             self.lfo_phase = wrap(self.lfo_phase + lfo_inc, len);
             self.trem_phase = wrap(self.trem_phase + trem_inc, len);
 
-            // Self-terminate once released, the envelope is silent and the tail
-            // has decayed for the dwell window (turns the UI pad off).
-            if !self.gate_active && self.env <= ENV_FLOOR && wet.abs() <= WET_FLOOR {
+            // Self-terminate once released, the envelope is silent and the
+            // *heard* tail has decayed for the dwell window (turns the UI pad
+            // off). The tail is judged after the mix: a dry patch (the DS01E
+            // modes, echoed externally) still recirculates its slap-back at
+            // `delay_feedback`, and gating on the raw ring kept the voice
+            // "sounding" two silent seconds past its release — a meter that
+            // would not fall.
+            if !self.gate_active
+                && self.env <= ENV_FLOOR
+                && (wet * self.delay_mix).abs() <= WET_FLOOR
+            {
                 self.quiet_frames = self.quiet_frames.saturating_add(1);
                 if self.quiet_frames >= self.ready_frames {
                     self.state = SirenState::Idle;
@@ -799,7 +807,9 @@ const BENIDUB_PRESETS: [SirenPresetSpec; 4] = [
         source_lpf_hz: OPEN_LPF_HZ, source_lpf_end_hz: OPEN_LPF_HZ, source_lp_sweep_ms: 0.0,
         attack_ms: 6.0, release_ms: 160.0,
         delay_ms: 250.0, delay_feedback: 0.3, delay_mix: 0.0, delay_lpf_hz: 6_000.0,
-        volume: 0.5, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
+        // Level-matched to the bank's −14 LUFS through the deck bus
+        // (`dub-engine` `siren_bank_shots_are_level_matched`).
+        volume: 0.22, crush_rate_hz: 0.0, crush_bits: 0.0, gate_ms: 2_500.0,
     },
     // MODE 2 — Sine 2: raw + mean, thinner with more bite (higher, faster).
     SirenPresetSpec {
@@ -1503,6 +1513,39 @@ mod tests {
         assert!(
             dark * 2 < bright,
             "low-pass did not darken noise: bright {bright} dark {dark}"
+        );
+    }
+
+    #[test]
+    fn dry_patch_goes_idle_without_waiting_for_its_silent_tail() {
+        // A patch with `delay_mix` 0 still recirculates its slap-back; that
+        // ring is never heard, so it must not hold the voice in `Sounding`.
+        let sr = 48_000.0;
+        let mut voice = SirenVoice::new(sr);
+        let mut patch = benidub_preset_patch(0, sr);
+        patch.gate_frames = (sr * 0.05) as u32;
+        assert_eq!(patch.delay_mix, 0.0, "the DS01E modes are dry");
+        assert!(
+            patch.delay_feedback > 0.0,
+            "the ring must be live for the test to mean anything"
+        );
+        voice.engage(&patch);
+        let mut buf = vec![0.0_f32; 256 * 2];
+        let mut idle_at_frames = None;
+        for b in 0..2_000 {
+            buf.iter_mut().for_each(|s| *s = 0.0);
+            voice.process_block(&mut buf, 2, 0);
+            if voice.state() == SirenState::Idle {
+                idle_at_frames = Some(b * 256);
+                break;
+            }
+        }
+        // Gate 50 ms + release 160 ms + the 50 ms dwell — well under 0.6 s.
+        let idle = idle_at_frames.expect("the voice never went idle");
+        assert!(
+            (idle as f32) < sr * 0.6,
+            "idle only after {:.2} s — the silent ring was gating the state",
+            idle as f32 / sr
         );
     }
 

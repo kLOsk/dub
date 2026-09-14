@@ -525,7 +525,8 @@ const SN76477_PRESETS: [Sn76477Spec; 7] = [
         gate_ms: 280.0,
         retrigger_from_slf: false,
         explode_after_sweep: false,
-        volume: 0.7,
+        // Level-matched to the bank's −14 LUFS (was 0.7, ten dB hot).
+        volume: 0.22,
     },
     // 1 — Explosion: filtered noise, slow decay, no tone.
     Sn76477Spec {
@@ -602,7 +603,8 @@ const SN76477_PRESETS: [Sn76477Spec; 7] = [
         gate_ms: 1_600.0,
         retrigger_from_slf: false,
         explode_after_sweep: false,
-        volume: 0.55,
+        // Level-matched to the bank's −14 LUFS (was 0.55, twelve dB hot).
+        volume: 0.14,
     },
     // 5 — UFO: a fast VCO wobble under the SLF.
     Sn76477Spec {

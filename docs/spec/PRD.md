@@ -763,9 +763,11 @@ Hot cues persist per track (`track_cues`, `source='user'`; see [`LIBRARY-SCHEMA.
 - One-button workflow: tap and hold → echo-out engages; release → tail decays naturally; deck's actual playback continues where it would have been (slip-aware).
 
 **Dub Siren**
-- Classic dub-siren synth: oscillator (sine/saw/square), envelope, slap-back delay, optional spring reverb modeling
-- Trigger via keyboard or on-screen button
-- Pitch-bend mod wheel via mouse drag or trackpad
+- A self-contained instrument, drawn as the box a dub DJ owns: a black faceplate on the rack bar with a **display window**, **five keys** and **one knob**. No software mixer, no rack effect — its own voice, its own PT2399 echo, its own volume.
+- **Five shots, one flat bank**, fired by a click on the key (keyboard and MIDI come with map mode, as for the sampler): Rifle Gun · Alarm (the HK628 toy-chip recreation), Sine (the Benidub DS01E voice), Laser · Siren (the SN76477). Each shot names its chip in the engine (`dub-engine::SIREN_BANK`); there is no unit selector — a switch that relabels and relocates the pads was cut with the bank.
+- **DUB knob** (Advanced): one dial — the black fluted phenolic knob with the spun-aluminium cap off every 70s pedal and amp, its scale ticked on the plate — DRY → DUB, that slows and deepens the chip shots (the HK628 clock, pitch and timing coupled) and adds the box's echo — longer, louder, more self-feeding and darker as it turns. Its readout states the delay and feedback the engine is using; the value persists across launches. The live performance knob is MIDI once map mode lands.
+- **Meter**: the window is a 70s moving-coil VU — the last shot printed on the cream dial, the echo line under it, a needle that throws into the red on a press and falls back through the repeats. Eye candy by decision: the siren has no level tap, so the needle is drawn from the press, `siren_state` and the knob's delay/feedback, never measured. The keys sink and light while their shot sounds. All five shots are level-matched to −14 LUFS through the deck bus, fenced by `siren_bank_shots_are_level_matched`.
+- Expert: the individual echo controls (TIME / FEEDBACK / ECHO / FILTER / VOLUME / ECHO CUT) plus SPEED (chip shots) and PITCH / RATE / HOLD (Sine) — the panel exists, unmounted until F-37.
 - Routed to a configurable output (default: Deck A output, but should support a dedicated "FX bus" output for users with mixer aux returns — **decision deferred to v1.1** unless trivial)
 
 ### 6.4 Sampler / Quick Scratch (see §7 for detail)
@@ -832,8 +834,9 @@ is what the shelf holds.
   `→ B` pill on the SAMPLES header names it — and **right-click on the pill
   overrides it**: *Auto* (default) · *A* · *B* · *A+B*, remembered per rack. A
   pinned pill draws filled. `A+B` sums the take onto both deck buses. The
-  DUB SIREN block has the same pill and the same menu; `A+B` fires the preset
-  on both decks' sirens and its unit switch / DUB knob write to both.
+  DUB SIREN box has the same pill and the same menu; `A+B` fires the shot
+  on both decks' sirens. Its DUB knob writes to both decks regardless, so
+  re-pinning never lands on a deck with a different echo.
 - Output is **additive** — the sample plays *over* whatever Deck A/B are
   currently playing. Mixed into the deck's output bus, post-FX.
 - Samples persist across launches (positional: unloading slot 2 leaves slot 3
@@ -1459,7 +1462,7 @@ The zoomed column is **deliberately slim**. Scratch DJs need vertical *time-hist
 |---|---|---|---|
 | **Zoomed column, Performance (Timecode) mode** | 200 px ideal, 132 min → 280 cap | `DubLayout.performanceWaveformWidth` / `…MinWidth` / `…WidthCap` | Slim Serato-parity strip after M10.8 waveform dogfooding; keeps kick transients readable while leaving room for overview, centre gutter, and info chips. The strip absorbs the width the pad column doesn't use, up to the cap — past that the remainder stays as the reserved info-chip canvas below, rather than a fatter waveform (see the note beneath this table). |
 | **Performance pad column** | 224 px wide, fixed | `DubLayout.performancePadColumnWidth` | CUE / LOOP / ECHO OUT, per deck. Fixed because it used to be `maxWidth: .infinity` and ate every pixel the waveform did not have nailed down. Sized to the widest row (4 × 38 + 3 × 8 = 176) plus `DubSpacing.lg` each side; LOOP wraps to two rows to fit, unlike Prep's single-row `LoopPadRow`. |
-| **Global rack bar** | 134 px tall, full width | `DubLayout.rackBarHeight` | Siren · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. Both bind to the focused deck (§6.3, §7.1) — there is one siren keymap and it always fired one deck. The height is the sampler's: the same two-row shelf Prep draws, so the bar grew from 92 when the four-pad rack became it. Quick Scratch left the bar for a per-deck row (§7.2). |
+| **Global rack bar** | 134 px tall, full width; folds to a 22 px strip | `DubLayout.rackBarHeight` / `rackBarFoldedHeight` | Siren · sampler, one of each, below the deck panes. Replaces the M10.3 placeholder FX bar. Both bind to the focused deck (§6.3, §7.1). The height is the sampler's: the same two-row shelf Prep draws. Quick Scratch left the bar for a per-deck row (§7.2). **Folds** by the chevron at its leading edge (the library's `› FILTER` gesture) to a one-line strip naming the blocks; the height it gives up goes to the **library**, not the waveform — the split budgets the open bar as deck chrome, so the decks do not move. Remembered across launches. |
 | **Zoomed strip, Prep mode** | ≈ 140 px tall, full-width horizontal | `DubLayout.waveformPrepHeight` | Prep mode is single-deck and uses a horizontal scrolling playing waveform for screenshot/A-B judgement and track prep. |
 | **Overview band, Prep mode** | ≈ 60 px tall, full-width horizontal | `DubLayout.deckOverviewHeight` | Whole-track waveform stacked above the zoomed Prep waveform. Same click-to-jump semantics as the vertical overview. |
 | **Overview column** (M10.5c) | ≈ 36 px wide, full track top→bottom | `DubLayout.deckOverviewWidth` | Thin strip on the deck's outside edge. Shows the whole track at a glance with a playhead-bracket indicator at the current position. Click-to-jump per §6.1. |

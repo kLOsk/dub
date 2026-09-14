@@ -5,26 +5,34 @@
 //  State for the global rack bar — the siren and the sampler.
 //
 //  These two are grouped because they are the racks that are *not*
-//  per-deck, however they used to be drawn. There is one siren keymap
-//  (`Z X C V B N M ,`) and it fires the focused deck; the sampler's
+//  per-deck, however they used to be drawn. There is one siren, firing
+//  the focused deck (its keys wait for map mode); the sampler's
 //  eight slots fire the focused deck too. Drawing them once, in one
 //  bar, is what the model has always said. Quick Scratch left the bar
 //  when it became a per-deck row (PRD §7.2) — a scratch is done *on* a
 //  deck, so its pads belong in that deck's column.
 //
 
-import DubCore
 import SwiftUI
 
-/// The siren block. State is genuinely per-deck in the engine, so this
-/// is a snapshot of the deck the rack's output resolves to.
+/// The siren box. Sounding is per deck in the engine, so that half is a
+/// snapshot of the deck(s) the rack's output resolves to; the shot names,
+/// the last shot and the knob are the box's own.
 struct SirenRackState: Equatable {
-    /// Where the pads fire — the master by default, or the deck(s) the
+    /// Where the keys fire — the master by default, or the deck(s) the
     /// DJ pinned the rack to.
     var output: RackOutputState
+    /// The five shots, in fire order.
     var presetNames: [String]
     var sounding: Bool
-    var unit: SirenUnit = .gs1
+    /// The shot last fired, as an index into `presetNames`. The display
+    /// keeps its name after the tail; the key it lit sinks only while
+    /// `sounding`. `nil` before the first press.
+    var lastShot: Int? = nil
+    /// Counts presses. A re-hit of the shot already sounding changes
+    /// nothing else in this state, and the meter still has to kick.
+    var fireCount: Int = 0
+    /// The DUB knob, 0…1.
     var dubMacro: Double = 0
 }
 
@@ -42,7 +50,6 @@ struct GlobalRackBarState: Equatable {
 /// `Equatable`.
 struct GlobalRackBarCallbacks {
     var onSirenPreset: (_ index: Int) -> Void = { _ in }
-    var onSirenUnit: (_ unit: SirenUnit) -> Void = { _ in }
     var onSirenDubMacro: (_ value: Double) -> Void = { _ in }
     /// The siren pill's right-click: pin the rack's output or let it
     /// follow the master again.

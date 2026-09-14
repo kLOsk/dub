@@ -1348,15 +1348,6 @@ impl DeckCommand<'_> {
         })
     }
 
-    /// Pick which siren unit this deck plays (HK628 shots or the DS01E).
-    ///
-    /// # Errors
-    /// See impl-level docs.
-    pub fn set_siren_unit(self, unit: crate::SirenUnit) -> Result<(), CommandError> {
-        let idx = self.handle.check_deck(self.idx)?;
-        self.handle.send(Command::DeckSetSirenUnit { idx, unit })
-    }
-
     /// Set the Benidub DS01E voice controls on this deck: `pitch_factor` (PITCH),
     /// `rate_hz` (RATE) and `continuous` (TRIGGER latch). Applied to the MODE
     /// patch at fire time.

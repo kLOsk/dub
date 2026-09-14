@@ -272,6 +272,14 @@
   "Square" preset needed its volume dropped to ~0.22 to sit with the sine tones,
   and every siren/FX output is trimmed to the −14 LUFS track target
   (`hk628::OUTPUT_GAIN`).
+- **Cut the bank at the product layer, not in the chip tables.** When the
+  siren went from nineteen sounds on three switchable units to five shots,
+  the temptation was to delete programs from `hk628.rs` / `siren.rs` /
+  `sn76477.rs`. Those tables are the chip recreations (the HK623 twin indexes
+  into the HK628's by position), so the cut lives in `dub-engine`'s
+  `SIREN_BANK` — five entries that each name a chip and an index — and the
+  UI never sees a unit. Swapping a shot is a one-line bank edit; the DSP
+  tests and `dump_wavs` keep covering every program.
 - **Emulate the real unit's control surface, don't invent knobs.** Expert mode
   mirrors the physical box (DS01E = MODE / PITCH / RATE / TRIGGER + PT2399
   TIME / FEEDBACK / ECHO VOLUME / FILTER / ECHO CUT). Confirm the real layout

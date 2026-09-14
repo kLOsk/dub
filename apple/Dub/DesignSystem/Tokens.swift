@@ -63,6 +63,39 @@ enum DubColor {
     /// Hairline divider on a `surface0` background.
     static let divider = Color(hex: 0x2B2F38)
 
+    /// The edge of a hardware faceplate (the siren box) and of a key on
+    /// it — one step brighter than `divider`, so the stroke still reads
+    /// against the key faces and the plate's `surface1` ground.
+    static let plateEdge = Color(hex: 0x363A44)
+
+    /// A recessed display window on a faceplate — darker than `surface0`
+    /// so the glass reads as sunk into the plate rather than printed on it.
+    static let displayWell = Color(hex: 0x06070A)
+
+    /// The lip under a key cap — the shadow that makes it a cap and not a
+    /// tile; it shortens when the key is pressed.
+    static let keyLip = Color(hex: 0x07080A)
+
+    // ----- The siren box's meter --------------------------------------
+    // A Sifam / Ernest Turner moving-coil VU as it sat on every British
+    // desk and tape machine in 1975: an aged-cream face, black scale, a red
+    // +3 zone. The one light object on the surface, deliberately — it is
+    // the siren's only readout and eye candy by decision (Daniel,
+    // 2026-09-12), so it may pull the eye.
+
+    /// The dial face — cream gone slightly yellow under a lamp.
+    static let meterFace = Color(hex: 0xE6D9BC)
+    /// The face's bezel line.
+    static let meterBezel = Color(hex: 0xB9AB8C)
+    /// Scale, ticks and the shot's name printed on the face.
+    static let meterInk = Color(hex: 0x3A2E22)
+    /// The small print — the echo line under the name.
+    static let meterInkSoft = Color(hex: 0x6E5C45)
+    /// The +1 … +3 zone.
+    static let meterRed = Color(hex: 0xC8352B)
+    /// The needle and its pivot.
+    static let meterNeedle = Color(hex: 0x1B1613)
+
     // ----- Text -----------------------------------------------------
 
     /// Track titles, numeric BPM, primary buttons.
@@ -416,6 +449,30 @@ enum DubLayout {
     /// four `TriggerPadGroup` pads bound in Preferences.
     static let rackBarHeight: CGFloat =
         DubSpacing.md + 14 + DubSpacing.sm + prepSectionContent + DubSpacing.md
+
+    /// The rack bar folded away: one line — a chevron and the blocks'
+    /// names — so it can be found and opened again. The 113 pt it gives
+    /// up go to the library (`DeckLibrarySplit`), not the waveform:
+    /// folding is "I am browsing now", and the decks do not move.
+    static let rackBarFoldedHeight: CGFloat = 22
+    /// The fold control's column at the bar's leading edge when open.
+    static let rackBarFoldColumnWidth: CGFloat = 18
+
+    /// The siren box's faceplate: exactly the shelf's two rows, so the
+    /// bar's two blocks share a bottom edge and the siren no longer
+    /// leaves half its height empty under one row of pads.
+    static let sirenPlateHeight: CGFloat = prepSectionContent
+    /// The five keys on the plate — wide enough for RIFLE GUN on two
+    /// lines at the cap's 10 pt, tall enough to read as a key and not a
+    /// tile. `SirenRackGroup.width` sums the plate from these.
+    static let sirenKeyWidth: CGFloat = 66
+    static let sirenKeyHeight: CGFloat = 48
+    /// The display window: three lines of 9–12 pt mono with the plate's
+    /// padding, and wide enough for `ECHO 420 ms` plus the repeat lamps.
+    static let sirenDisplayWidth: CGFloat = 110
+    static let sirenDisplayHeight: CGFloat = 66
+    /// The DUB knob's cell — the 60 pt dial with air either side.
+    static let sirenKnobCellWidth: CGFloat = 80
 
     /// The sampler's floor in the rack bar: four tiles as wide as a
     /// siren preset pad, plus the three gaps between them. The shelf's

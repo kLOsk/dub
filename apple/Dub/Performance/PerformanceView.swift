@@ -61,6 +61,7 @@ struct PerformanceView: View {
             DeckLibrarySplit(
                 mode: model.engineMode,
                 deckChrome: deckChromeHeight,
+                deckChromeBudget: model.engineMode == .prep ? 0 : DubLayout.rackBarHeight + 1,
                 deckMinimum: model.engineMode == .prep
                     ? DubLayout.prepRegionMinHeight + prepRipLaneHeight
                     : DubLayout.waveformMinHeight
@@ -75,7 +76,8 @@ struct PerformanceView: View {
                     if model.engineMode != .prep {
                         Rectangle().fill(DubColor.divider).frame(height: 1)
                         GlobalRackBar(
-                            state: rackBarState, callbacks: rackBarCallbacks)
+                            state: rackBarState, callbacks: rackBarCallbacks,
+                            folded: rackFolded, onFold: { rackFolded.toggle() })
                     }
                 }
             } library: {
@@ -328,9 +330,14 @@ struct PerformanceView: View {
             onRackMacro: { idx, value in model.setRackMacro(side, idx, value) })
     }
 
+    /// The rack bar folded to its one-line strip — "I am browsing now".
+    /// Remembered across launches, like the library's filter bar.
+    @AppStorage("dub.rackFolded") private var rackFolded: Bool = false
+
     /// Fixed chrome carried on the deck side of the divider.
     private var deckChromeHeight: CGFloat {
-        model.engineMode == .prep ? 0 : DubLayout.rackBarHeight + 1
+        guard model.engineMode != .prep else { return 0 }
+        return (rackFolded ? DubLayout.rackBarFoldedHeight : DubLayout.rackBarHeight) + 1
     }
 
     // MARK: - Global rack bar
@@ -339,7 +346,6 @@ struct PerformanceView: View {
     /// the siren and its Expert panel already have their own column.
     private var rackBarState: GlobalRackBarState {
         let siren = model.sirenOutputState
-        let deck = (siren.primary == .a) ? model.deckA : model.deckB
         let sounding = siren.decks.contains {
             (($0 == .a) ? model.deckA : model.deckB).sirenState == 1
         }
@@ -347,10 +353,11 @@ struct PerformanceView: View {
             siren: (model.sirenEnabled && model.engineMode != .prep)
                 ? SirenRackState(
                     output: siren,
-                    presetNames: model.sirenLabels(for: siren.primary),
+                    presetNames: model.sirenPresetLabels,
                     sounding: sounding,
-                    unit: deck.sirenUnit,
-                    dubMacro: deck.sirenDubMacro)
+                    lastShot: model.lastSirenShot,
+                    fireCount: model.sirenFireCount,
+                    dubMacro: model.sirenDub)
                 : nil,
             sampler: sampleShelfState(output: model.samplerOutputState))
     }
@@ -445,7 +452,6 @@ struct PerformanceView: View {
     private var rackBarCallbacks: GlobalRackBarCallbacks {
         GlobalRackBarCallbacks(
             onSirenPreset: { idx in model.fireSirenPresetOnRack(index: idx) },
-            onSirenUnit: { unit in model.setSirenUnitOnRack(unit) },
             onSirenDubMacro: { value in model.setSirenDubOnRack(value) },
             onSirenOutput: { output in model.sirenOutput = output },
             sampler: sampleShelfCallbacks)
@@ -870,41 +876,93 @@ struct PerformanceView: View {
 
 }
 
-/// Per-deck drop modifier. M11d.5: applied to each deck's
-/// vertical column (header + waveform + FX strip) so dragging
-/// onto any part of the deck lands the load. Pre-fix the drop
-/// modifier was scoped to the 80 px waveform strip only, which
-/// the user reported as "I keep missing the strip; the header
-/// should also accept drops". Behaviour: macOS 13+ Transferable
-/// API, auto-play on a successful load **in Prep mode only**
-/// (the drag-to-play idiom from M10.5d), and a `true` return
-/// value so SwiftUI knows the drop was consumed. In Performance
-/// mode the drop loads but does not start the deck — playback is
-/// driven by the control vinyl (or an explicit Play press).
+/// Drops onto a deck. Applied to the deck pane as a whole — header,
+/// waveform and column — so dragging onto any part of the deck lands
+/// the load; pre-fix it was scoped to the 80 px waveform strip only,
+/// which the user reported as "I keep missing the strip; the header
+/// should also accept drops".
+///
+/// Two payloads:
+///
+/// * A **file URL** (Finder, or a library row) loads the track. In Prep
+///   it auto-plays — the drag-to-play idiom from M10.5d. In Performance
+///   the drop loads but does not start the deck: playback is driven by
+///   the control vinyl (or an explicit Play press), and auto-playing
+///   here engaged *user-initiated* Panic-Play, which ignored timecode
+///   until the deck was paused — "load auto-starts internal play and
+///   the record does nothing".
+/// * The **other deck's identity** (`DeckDoubleDrag`) is an instant
+///   double: this deck takes the other's tune at its playhead, the
+///   same thing `⌘←` / `⌘→` do. Dragging the title onto the deck it is
+///   already on does nothing.
+///
+/// `onDrop(of:)` rather than `dropDestination(for: URL.self)` because
+/// one target has to take both payloads, and the deck drag is an
+/// in-process string, not a `Transferable`.
 struct DeckDropTarget: ViewModifier {
     let model: WaveformAppModel
     let side: DeckSide
 
     func body(content: Content) -> some View {
-        content.dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            Task { @MainActor in
-                if await model.loadTrack(side: side, url: url) {
-                    // Drag-to-play idiom (M10.5d) applies in Prep mode
-                    // only. In Performance mode the loaded track must
-                    // wait for the control vinyl (or an explicit Play
-                    // press). Auto-playing here calls `play(side:)`,
-                    // which in Timecode mode engages *user-initiated*
-                    // Panic-Play — internal playback that ignores
-                    // timecode until the deck is paused. That was the
-                    // "load auto-starts internal play and the record
-                    // does nothing" bug.
-                    if model.engineMode == .prep {
+        content.onDrop(of: [.fileURL, .plainText], isTargeted: nil) { providers in
+            let files = providers.filter {
+                $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            }
+            if files.isEmpty,
+               let text = providers.first(where: {
+                   $0.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+               })
+            {
+                // Item loads complete off the main thread; the double is
+                // dispatched back once the sentinel is read.
+                text.loadObject(ofClass: NSString.self) { object, _ in
+                    guard let from = DeckDoubleDrag.side(in: object as? String ?? ""),
+                          from != side
+                    else { return }
+                    Task { @MainActor in model.instantDouble(toDeckB: side == .b) }
+                }
+                return true
+            }
+            guard let provider = files.first else { return false }
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let direct = item as? URL {
+                    url = direct
+                } else if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = nil
+                }
+                guard let url else { return }
+                Task { @MainActor in
+                    if await model.loadTrack(side: side, url: url), model.engineMode == .prep {
                         model.play(side: side)
                     }
                 }
             }
             return true
+        }
+    }
+}
+
+/// The in-process drag a deck's identity block starts: `dubdeck:a` /
+/// `dubdeck:b` as plain text, the way crates drag as `dubcrate:<id>`.
+/// The other deck's drop target reads the side off it and doubles.
+enum DeckDoubleDrag {
+    private static let prefix = "dubdeck:"
+
+    static func provider(for side: DeckSide) -> NSItemProvider {
+        NSItemProvider(object: "\(prefix)\(side == .a ? "a" : "b")" as NSString)
+    }
+
+    /// The dragged deck, if `text` is the sentinel; `nil` for any other
+    /// text that happens to land on a deck.
+    static func side(in text: String) -> DeckSide? {
+        guard text.hasPrefix(prefix) else { return nil }
+        switch text.dropFirst(prefix.count) {
+        case "a": return .a
+        case "b": return .b
+        default: return nil
         }
     }
 }

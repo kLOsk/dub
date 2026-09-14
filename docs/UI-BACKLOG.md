@@ -320,8 +320,9 @@ render-path code must stay allocation/lock/syscall free
 ## 5. FX / Dub siren (deferred)
 
 _Added 2026-07-02 when M16 (dub siren + vintage-chip FX DSP) merged. The
-instrument, its three units (GS1 / DS01E / SN76477), the shared PT2399 echo,
-and the Prep-surface Expert panel shipped; the vintage-FX DSP chain
+instrument, three chip recreations (HK628 / DS01E / SN76477), the shared PT2399
+echo, and the Prep-surface Expert panel shipped — since 2026-09-12 as one
+five-shot bank on the siren box, no unit switch; the vintage-FX DSP chain
 (spring / RE-201 / Big Knob / phaser) is in-tree but parked behind the deck-role
 FX channel below. These are the pieces explicitly held back so they're not lost._
 
@@ -351,24 +352,26 @@ rather than fixed is that the visible error is normally sub-frame.
 
 ### F-36. Siren-sound fine-tuning (polish phase)
 
-The three units are voiced and level-matched (−14 LUFS), but the sounds
-themselves are a first cut, not final. GS1's 8 shots (bomb / MG / lickshot were
-flagged as the roughest), the DS01E 4 MODE tones, and the SN76477 preset bank
-all want an ear-tuning pass against reference recordings.
+The chips are voiced and level-matched (−14 LUFS), but the five shots the
+bank keeps — Rifle Gun · Alarm (HK628), Sine (DS01E), Laser · Siren
+(SN76477) — are a first cut, not final, and want an ear-tuning pass against
+reference recordings.
 
-**Fix**: during the polish phase, render fresh WAVs per unit (the `#[ignore]`
+**Fix**: during the polish phase, render fresh WAVs per chip (the `#[ignore]`
 `dump_*_wavs` tests in `dub-dsp`), audition, and tune the preset specs +
-per-unit output trims. No architectural change — data / coefficients only.
+per-chip output trims. No architectural change — data / coefficients only.
+The bank (`crates/dub-engine/src/siren_bank.rs`) is where a shot is swapped
+for a different program without touching the chip tables.
 
 **Location**: `crates/dub-dsp/src/{hk628,siren,sn76477}.rs`.
 
 ### F-37. Expert panel on the Performance surface + deck B
 
-The siren Expert panel (`SirenExpertPanel`) currently lives only on the **Prep**
-surface for **deck A** — Prep is the mouse-config home, so it's the right first
-home, but the panel isn't yet mirrored onto the Performance surface or deck B.
-Doing so needs the `WaveformAppModel` threaded into `PerformancePadsView` at
-both call sites and the panel bound to the correct `DeckSide`.
+The siren Expert panel (`SirenExpertPanel`) is unmounted — it left Prep with
+the siren, and the box on the Performance rack bar carries only the DUB knob.
+It is one flat panel now (echo section + SPEED for the chip shots + PITCH /
+RATE / HOLD for Sine); mounting it needs a home on the box (a fold, or a
+second row) and the model threaded in for both decks.
 
 **Fix (later — "expert mode in the deck")**: thread the model + side into the
 Performance pad bar and render `SirenExpertPanel` there for both decks. The

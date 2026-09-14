@@ -11,22 +11,24 @@
 //  tables') in the views. A pad's printed cap and the key that actually
 //  fires it were separate facts maintained by hand.
 //
-//  ## The sampler and Quick Scratch have no bindings here
+//  ## The sampler, Quick Scratch and the siren have no bindings here
 //
 //  The sampler had `A S D F` reserved — drawn, never live — and Quick
 //  Scratch had `Q W E R` live, each key bound to a slot with its own
 //  target deck. The sampler is eight slots now and a straight extension
 //  collides with `G` (the grid tap); Quick Scratch is a per-deck row of
 //  four, so its keys need a deck dimension the old four did not have.
-//  Rather than pick rows nobody has asked for, both wait for map mode,
-//  where the DJ picks them. Until then they are mouse-driven, and the
-//  pads print no cap at all rather than a dimmed promise.
+//  The siren had `Z X C V B` until 2026-09-12, when Daniel asked for
+//  them to go too. Rather than pick rows nobody has asked for, all three
+//  wait for map mode, where the DJ picks them. Until then they are
+//  mouse-driven, and the pads print no cap at all rather than a dimmed
+//  promise. `DubAction.sirenPreset` stays so a profile can bind it.
 //
-//  `SirenRackGroup`'s own doc comment records what that costs: it shipped
-//  two siren racks advertising the same eight keys when only the focused
-//  deck's ever fired — "the non-focused copy was advertising keys that did
-//  nothing to it". With one table feeding both the dispatcher and the cap,
-//  that class of bug is no longer writable.
+//  `SirenRackGroup`'s own doc comment records what a hand-typed legend
+//  costs: it shipped two siren racks advertising the same keys when only
+//  the focused deck's ever fired — "the non-focused copy was advertising
+//  keys that did nothing to it". With one table feeding both the
+//  dispatcher and the cap, that class of bug is no longer writable.
 //
 //  ## Why a transport lives on a binding that only ever uses one
 //
@@ -116,10 +118,6 @@ struct DubBinding: Hashable {
 /// profile — no call site has to change for that.
 enum DubKeymap {
 
-    /// Bottom letter row, in fire order. Layout-independent keyCodes.
-    private static let sirenCodes: [UInt16] = [6, 7, 8, 9, 11, 45, 46, 43]
-    private static let sirenLegends = ["Z", "X", "C", "V", "B", "N", "M", ","]
-
     static let bindings: [DubBinding] = {
         var all: [DubBinding] = [
             DubBinding(action: .loadSelection, match: .code(49), legend: "SPACE"),
@@ -142,12 +140,6 @@ enum DubKeymap {
         for (i, code) in cueCodes.enumerated() {
             all.append(
                 DubBinding(action: .hotCue(i), match: .code(code), legend: "\(i + 1)"))
-        }
-        for (i, code) in sirenCodes.enumerated() {
-            all.append(
-                DubBinding(
-                    action: .sirenPreset(i), match: .code(code),
-                    legend: sirenLegends[i]))
         }
         return all
     }()

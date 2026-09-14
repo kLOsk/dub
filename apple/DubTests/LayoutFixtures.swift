@@ -35,18 +35,16 @@ extension PerformancePadsState {
 }
 
 extension GlobalRackBarState {
-    /// A populated bar: the GS1 siren and three sampler slots loaded —
-    /// one sounding, one tagged for Quick Scratch.
+    /// A populated bar: the siren box after one shot, its knob part
+    /// way up, and three sampler slots loaded — one sounding, one tagged
+    /// for Quick Scratch.
     static func fixture(focus: DeckSide) -> GlobalRackBarState {
         GlobalRackBarState(
             siren: SirenRackState(
                 output: RackOutputState(focused: focus),
-                presetNames: [
-                    "Wail", "Alarm", "Laser", "Bomb",
-                    "Riser", "Zap", "Siren", "Horn",
-                ],
+                presetNames: ["Rifle Gun", "Alarm", "Sine", "Laser", "Siren"],
                 sounding: false,
-                unit: .gs1,
+                lastShot: 3,
                 dubMacro: 0.35),
             sampler: SampleShelfState(
                 slots: [

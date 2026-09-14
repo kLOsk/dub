@@ -483,7 +483,9 @@ const HK628_PROGRAMS: [Hk628Program; 8] = [
         repeat: true,
         total_ms: 1486.0,
         echo: false,
-        volume: 0.9,
+        // Level-matched to the bank's −14 LUFS with Alarm, Sine, Laser and
+        // Siren (`dub-engine` `siren_bank_shots_are_level_matched`).
+        volume: 0.77,
     },
     Hk628Program {
         name: "Rifle Echo",
@@ -499,7 +501,7 @@ const HK628_PROGRAMS: [Hk628Program; 8] = [
         repeat: true,
         total_ms: 1520.0,
         echo: false,
-        volume: 0.7,
+        volume: 0.95,
     },
     Hk628Program {
         name: "Dual Tone",

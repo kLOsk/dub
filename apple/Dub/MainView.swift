@@ -287,8 +287,9 @@ struct DeckState: Equatable {
 
     /// Advanced siren "dub" super-knob (0..1): one knob fans across the siren's
     /// Speed + Delay + Feedback + onboard-echo Mix. 0 = dry siren, 1 = slow,
-    /// long, self-feeding dub. UI-local (the siren is a self-contained
-    /// instrument; its echo isn't polled).
+    /// long, self-feeding dub. The engine holds it per deck; the box's one
+    /// knob (`WaveformAppModel.sirenDub`) writes both decks and is what
+    /// persists. UI-local (the siren's echo isn't polled).
     var sirenDubMacro: Double = 0.0
 
     /// Siren output level (GS1 "Volume"), default unity. Held for the dub-macro
@@ -303,11 +304,6 @@ struct DeckState: Equatable {
     /// old rate. Not a performance control (PRD §6.1.3: no pitch
     /// fader); a discrete test affordance.
     var prepPitchPercent: Double = 0
-
-    /// Which siren unit this deck plays — GS1 toy-chip shots, the Benidub
-    /// DS01E analog siren, or the SN76477 chip. Drives the pad labels and which
-    /// voice fires.
-    var sirenUnit: SirenUnit = .gs1
 
     // ── Expert siren controls (the individual knobs; the DUB macro is the
     //    Advanced one-knob shortcut over the same engine state). ────────────
@@ -826,8 +822,25 @@ final class WaveformAppModel: ObservableObject {
         didSet { UserDefaults.standard.set(sirenOutput.rawValue, forKey: Self.kSirenOutput) }
     }
 
+    /// The siren box's DUB knob, 0…1 — one knob for the one box, written
+    /// to both decks (`setSirenDubOnRack`) so re-pinning the output never
+    /// lands on a deck with a different echo. Persisted under
+    /// `dub.sirenDub`: it used to start dry at every launch, and 0 is
+    /// not "a little echo", it is no echo rendered at all.
+    @Published var sirenDub: Double {
+        didSet { UserDefaults.standard.set(sirenDub, forKey: Self.kSirenDub) }
+    }
+
+    /// The shot the box last fired, as a bank index — the display keeps
+    /// its name after the tail has gone; `nil` until the first press.
+    @Published var lastSirenShot: Int?
+    /// Presses so far — the meter kicks on every one, including a re-hit
+    /// of the shot that is already sounding.
+    @Published var sirenFireCount: Int = 0
+
     private static let kSamplerOutput = "dub.samplerOutput"
     private static let kSirenOutput = "dub.sirenOutput"
+    private static let kSirenDub = "dub.sirenDub"
 
     /// The sampler's output rule resolved against the current master.
     var samplerOutputState: RackOutputState {
@@ -1281,6 +1294,7 @@ final class WaveformAppModel: ObservableObject {
             .flatMap(RackOutput.init(rawValue:)) ?? .auto
         self.sirenOutput = UserDefaults.standard.string(forKey: Self.kSirenOutput)
             .flatMap(RackOutput.init(rawValue:)) ?? .auto
+        self.sirenDub = min(max(UserDefaults.standard.double(forKey: Self.kSirenDub), 0), 1)
         self.discogsToken = SecretMigration.migrateFromDefaults(
             account: Self.kDiscogsAccount,
             defaultsKey: Self.kDiscogsToken,
@@ -1729,6 +1743,7 @@ final class WaveformAppModel: ObservableObject {
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
             syncSampler()
+            syncSirenDub()
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -1768,6 +1783,7 @@ final class WaveformAppModel: ObservableObject {
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
             syncSampler()
+            syncSirenDub()
             // M26b — offer any rip that never finished. Reads WAV
             // headers only, so it stays off the critical path even
             // with a season's worth of sessions on disk.
@@ -1801,6 +1817,7 @@ final class WaveformAppModel: ObservableObject {
             // The engine holds the sampler's converted buffers, so a
             // fresh engine has an empty rack (M17 §7.1).
             syncSampler()
+            syncSirenDub()
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
@@ -1849,6 +1866,10 @@ final class WaveformAppModel: ObservableObject {
 
     private func pollDecks() {
         guard isRunning else { return }
+        stallTimed("pollDecks", threshold: 0.03) { pollDecksTimed() }
+    }
+
+    private func pollDecksTimed() {
         let newA = readDeckState(side: .a, prev: deckA)
         let newB = readDeckState(side: .b, prev: deckB)
         recordTransportHistory(
@@ -1883,6 +1904,12 @@ final class WaveformAppModel: ObservableObject {
     /// the DJ.
     private func recordTransportHistory(aWas: Bool, aNow: Bool, bWas: Bool, bNow: Bool) {
         guard libraryModel.libraryIsOpen, (aWas != aNow) || (bWas != bNow) else { return }
+        stallTimed("recordTransportHistory") {
+            recordTransportHistoryTimed(aWas: aWas, aNow: aNow, bWas: bWas, bNow: bNow)
+        }
+    }
+
+    private func recordTransportHistoryTimed(aWas: Bool, aNow: Bool, bWas: Bool, bNow: Bool) {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let edges: [(deck: UInt32, was: Bool, now: Bool)] = [(0, aWas, aNow), (1, bWas, bNow)]
         do {
@@ -4771,6 +4798,10 @@ final class WaveformAppModel: ObservableObject {
     /// carries it, mirrors it onto the other deck when the tune went
     /// there, and restores it on release.
     func toggleQuickScratch(_ side: DeckSide, pad: Int) {
+        stallTimed("toggleQuickScratch") { toggleQuickScratchTimed(side, pad: pad) }
+    }
+
+    private func toggleQuickScratchTimed(_ side: DeckSide, pad: Int) {
         guard isRunning, let slot = sampleBank.quickScratchSlot(pad: pad) else { return }
         var deck = state(for: side)
         if let current = deck.quickScratch, current.pad == pad {
@@ -4785,8 +4816,10 @@ final class WaveformAppModel: ObservableObject {
         }
         let doubledTo: DeckSide?
         do {
-            doubledTo = try engine.quickScratchEngage(deckIdx: side.ffiDeckIdx, slot: UInt64(slot))
-                .map { $0 == 0 ? DeckSide.a : .b }
+            doubledTo = try stallTimed("quickScratchEngage (FFI)") {
+                try engine.quickScratchEngage(deckIdx: side.ffiDeckIdx, slot: UInt64(slot))
+                    .map { $0 == 0 ? DeckSide.a : .b }
+            }
         } catch {
             surfaceError("Quick Scratch \(pad + 1): \(error.localizedDescription)")
             return
@@ -5273,41 +5306,17 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: - M16 dub siren (Simple mode, PRD §6.3)
 
-    /// Display names of the built-in siren presets (siren / alarm / laser /
-    /// bomb / gun …), in fire order. Fetched once from the engine bank; the
-    /// index drives both the pad grid and `fireSirenPreset`.
-    @Published var sirenPresetLabels: [String] = sirenUnitPresetNames(unit: .gs1)
-
-    /// DS01E MODE names (Sine 1 / Sine 2 / Test Tone / Square), fetched once.
-    let sirenDs01eLabels: [String] = sirenUnitPresetNames(unit: .ds01e)
-
-    /// SN76477 preset names (gun / laser / bomb / explosion …), fetched once.
-    let sirenSn76477Labels: [String] = sirenUnitPresetNames(unit: .sn76477)
-
-    /// Pad labels for `side`'s currently-selected siren unit.
-    func sirenLabels(for side: DeckSide) -> [String] {
-        switch state(for: side).sirenUnit {
-        case .ds01e: return sirenDs01eLabels
-        case .sn76477: return sirenSn76477Labels
-        default: return sirenPresetLabels // .gs1
-        }
-    }
-
-    /// Switch the siren unit (HK628 shots ↔ Benidub DS01E) on `side`.
-    func setSirenUnit(_ side: DeckSide, _ unit: SirenUnit) {
-        var deck = state(for: side)
-        deck.sirenUnit = unit
-        setState(deck, for: side)
-        guard isRunning else { return }
-        try? engine.setSirenUnit(deckIdx: side.ffiDeckIdx, unit: unit)
-    }
+    /// Display names of the siren's five shots (Rifle Gun · Alarm · Sine ·
+    /// Laser · Siren), in fire order. Fetched once from the engine bank;
+    /// the index drives both the keys and `fireSirenPreset`.
+    let sirenPresetLabels: [String] = sirenPresetNames()
 
     /// Fire dub-siren preset `index` on `side` as a tap one-shot. The preset
     /// bank lives in the engine; the siren is a generator, so it sounds with or
     /// without a track and is unaffected by echo-out.
     func fireSirenPreset(_ side: DeckSide, index: Int) {
         guard isRunning, sirenEnabled else { return }
-        guard index >= 0, index < sirenLabels(for: side).count else { return }
+        guard index >= 0, index < sirenPresetLabels.count else { return }
         // Beat-match (optional): one beat at the deck's effective tempo, else 0
         // = use the preset's own slap-back. Falls back to 120 with no track.
         let deck = state(for: side)
@@ -5326,23 +5335,29 @@ final class WaveformAppModel: ObservableObject {
     /// the bar's pads both come through here so the pill is never a
     /// lie about where a key lands.
     func fireSirenPresetOnRack(index: Int) {
+        guard index >= 0, index < sirenPresetLabels.count else { return }
+        lastSirenShot = index
+        sirenFireCount &+= 1
         for side in sirenOutputState.decks {
             fireSirenPreset(side, index: index)
         }
     }
 
-    /// The rack's unit switch writes to every deck it lands on, so
-    /// `A+B` does not leave the two decks on different sirens.
-    func setSirenUnitOnRack(_ unit: SirenUnit) {
-        for side in sirenOutputState.decks {
-            setSirenUnit(side, unit)
+    /// The box's DUB knob: one value, both decks — see `sirenDub`.
+    func setSirenDubOnRack(_ value: Double) {
+        sirenDub = min(max(value, 0), 1)
+        for side in [DeckSide.a, .b] {
+            setSirenDub(side, sirenDub)
         }
     }
 
-    /// Same for the DUB knob.
-    func setSirenDubOnRack(_ value: Double) {
-        for side in sirenOutputState.decks {
-            setSirenDub(side, value)
+    /// Push the persisted DUB knob into a freshly started engine, whose
+    /// sirens come up dry. Called wherever the sampler is re-synced for
+    /// the same reason.
+    private func syncSirenDub() {
+        guard sirenDub > 0 else { return }
+        for side in [DeckSide.a, .b] {
+            setSirenDub(side, sirenDub)
         }
     }
 

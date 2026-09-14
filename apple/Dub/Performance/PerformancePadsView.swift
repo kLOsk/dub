@@ -96,131 +96,23 @@ struct PerformancePadsView: View {
 
 }
 
-// `sirenPresetKeys` lives in SirenRackGroup.swift — one keymap, shared
-// by the Prep siren row and the global rack bar.
-
-/// One siren preset pad: its name plus the keyboard hint. Fires the one-shot on
-/// mouse-down (a momentary trigger, within the §1 mouse rule).
-@ViewBuilder
-private func sirenPresetPad(_ label: String, key: String, onPress: @escaping () -> Void)
-    -> some View
-{
-    DubPadCell(size: .preset) {
-        VStack(spacing: 1) {
-            Text(label.uppercased())
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-            DubKeycap(key: key)
-        }
-    }
-    .onPressDown(perform: onPress)
-    .help("Fire the \(label) siren (\(key))")
-}
-
-/// Simple-mode dub-siren panel (M16, PRD §6.3): a grid of preset one-shot pads
-/// (siren / alarm / laser / bomb / gun …), laid out four per row. Tap a pad (or
-/// its Z X C V B N M , key) to fire the classic sound; it plays through the
-/// built-in slap-back echo and stops itself. Value-driven (names come from the
-/// engine bank); a header dot lights while the deck's siren is sounding.
-/// (Advanced / Expert modes — live tweaking — arrive later.)
-struct SirenPadRow: View {
-    /// Preset display names, in fire order (index = preset id).
-    let names: [String]
-    /// Whether the engine reports the deck's siren sounding (lights the dot).
-    let sounding: Bool
-    /// Fire preset `index` on this deck.
-    let onPreset: (_ index: Int) -> Void
-    /// Advanced "dub" super-knob position (0..1).
-    var dubMacro: Double = 0.0
-    /// Set the dub super-knob.
-    var onDubMacro: (_ value: Double) -> Void = { _ in }
-    /// The selected siren unit (GS1 shots · Benidub DS01E · SN76477).
-    var unit: SirenUnit = .gs1
-    /// Switch the siren unit.
-    var onUnit: (_ unit: SirenUnit) -> Void = { _ in }
-
-    private var rows: [[Int]] {
-        let idx = Array(names.indices)
-        return stride(from: 0, to: idx.count, by: 4).map { Array(idx[$0..<min($0 + 4, idx.count)]) }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            HStack(spacing: DubSpacing.xs) {
-                Circle()
-                    .fill(sounding ? DubColor.siren : DubColor.divider)
-                    .frame(width: 7, height: 7)
-                Text("SIREN")
-                    .font(DubFont.caps)
-                    .tracking(0.8)
-                    .foregroundStyle(DubColor.textSecondary)
-                // A fixed gap, deliberately not a `Spacer`. A `Spacer` has
-                // infinite maximum width, which made this header the only
-                // greedy child of an otherwise rigid row — so the whole
-                // SirenPadRow inflated to whatever width it was proposed and
-                // the unit picker rode the far window edge, ~1200 pt from
-                // this label, on the Prep surface.
-                Spacer().frame(width: DubSpacing.md)
-                // Unit selector: GS1 toy-chip shots · Benidub DS01E · SN76477.
-                Picker(
-                    "Siren unit",
-                    selection: Binding(get: { unit }, set: { onUnit($0) })
-                ) {
-                    Text("GS1").tag(SirenUnit.gs1)
-                    Text("DS01E").tag(SirenUnit.ds01e)
-                    Text("SN76477").tag(SirenUnit.sn76477)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.mini)
-                .frame(width: 210)
-                .help("Siren unit — GS1 (toy-chip shots) · Benidub DS01E (analog) · SN76477 chip")
-            }
-            ForEach(rows, id: \.self) { row in
-                HStack(spacing: DubSpacing.sm) {
-                    ForEach(row, id: \.self) { idx in
-                        sirenPresetPad(
-                            names[idx],
-                            key: idx < sirenPresetKeys.count ? sirenPresetKeys[idx] : "",
-                            onPress: { onPreset(idx) })
-                    }
-                }
-            }
-            // Advanced: one "DUB" super-knob driving the siren's onboard echo
-            // (Speed + Delay + Feedback + Mix). 0 = dry. The siren's own echo,
-            // separate from the FX rack.
-            HStack(spacing: DubSpacing.sm) {
-                Text("DUB")
-                    .font(DubFont.micro)
-                    .foregroundStyle(dubMacro > 0 ? DubColor.siren : DubColor.textTertiary)
-                    .frame(width: 28, alignment: .leading)
-                Slider(
-                    value: Binding(get: { dubMacro }, set: { onDubMacro($0) }),
-                    in: 0...1)
-                    .controlSize(.mini)
-                    .tint(DubColor.siren)
-                    .frame(maxWidth: 180)
-                    .help("Dub super-knob — one knob adds the siren's own echo (delay + feedback). 0 = dry.")
-            }
-        }
-    }
-}
-
 /// **Currently unmounted.** The siren left Prep — it is a thing you play
 /// over a record, not something you prepare — and `PrepRack` does not
-/// draw it. This and `SirenPadRow` are kept rather than deleted because
-/// F-37 mounts the Expert panel on *Performance* for both decks, and the
-/// engine/FFI surface behind it is already complete. Delete them if that
-/// plan changes; do not let them rot unnoticed.
+/// draw it. Kept rather than deleted because F-37 mounts the Expert
+/// panel on *Performance* for both decks, and the engine/FFI surface
+/// behind it is already complete. Delete it if that plan changes; do not
+/// let it rot unnoticed. (`SirenPadRow`, once kept beside it, is gone:
+/// the box in `SirenRackGroup` is the siren now.)
 ///
-/// The **Expert** siren panel (PRD §6.3): the individual knobs/buttons, matching
-/// the real units' control surfaces. The echo section (TIME / FEEDBACK / ECHO /
-/// FILTER / VOLUME + ECHO CUT) is shared by every unit; below it are the
-/// unit-specific controls — GS1: SPEED · DS01E: PITCH / RATE / TRIGGER ·
-/// SN76477: none. Reads the deck's stored state; writes through model methods
-/// (each pushes the full `set_siren_controls` / `set_siren_voice`). An
-/// expandable section so it stays out of the way until needed.
+/// The **Expert** siren panel (PRD §6.3): the individual knobs/buttons,
+/// matching the real units' control surfaces. The echo section (TIME /
+/// FEEDBACK / ECHO / FILTER / VOLUME + ECHO CUT) is the box's PT2399 and
+/// colours every shot; below it, the controls that belong to one chip —
+/// SPEED is the HK628 clock under Rifle Gun and Alarm, PITCH / RATE /
+/// HOLD are the DS01E voice under Sine. Laser and Siren are fixed
+/// SN76477 patches. Reads the deck's stored state; writes through model
+/// methods (each pushes the full `set_siren_controls` / `set_siren_voice`).
+/// An expandable section so it stays out of the way until needed.
 struct SirenExpertPanel: View {
     /// Every write this panel makes, as closures.
     ///
@@ -272,48 +164,41 @@ struct SirenExpertPanel: View {
                         onUp: { callbacks.onEchoCut(false) })
                     .help("Echo cut — hold to mute the echo (the loop keeps running underneath)")
 
-                // Unit-specific controls.
-                switch deck.sirenUnit {
-                case .gs1:
-                    knob("SPEED", deck.sirenSpeed, 0.25...4.0) { callbacks.onSpeed($0) }
-                case .ds01e:
-                    HStack(spacing: DubSpacing.sm) {
-                        Text("PITCH")
-                            .font(DubFont.micro)
-                            .foregroundStyle(DubColor.textTertiary)
-                            .frame(width: 70, alignment: .leading)
-                        Picker(
-                            "Pitch",
-                            selection: Binding(
-                                get: { deck.sirenPitchIndex },
-                                set: { callbacks.onPitch($0) })
-                        ) {
-                            Text("Lo").tag(0)
-                            Text("Mid").tag(1)
-                            Text("Hi").tag(2)
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .controlSize(.mini)
-                        .frame(width: 150)
-                    }
-                    knob("RATE", deck.sirenRate, 0...12.0) { callbacks.onRate($0) }
-                    Toggle(
-                        isOn: Binding(
-                            get: { deck.sirenContinuous },
-                            set: { callbacks.onContinuous($0) })
+                // The chip shots' clock (Rifle Gun · Alarm).
+                knob("SPEED", deck.sirenSpeed, 0.25...4.0) { callbacks.onSpeed($0) }
+                // The DS01E voice under Sine: PITCH / RATE / TRIGGER.
+                HStack(spacing: DubSpacing.sm) {
+                    Text("PITCH")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .frame(width: 70, alignment: .leading)
+                    Picker(
+                        "Pitch",
+                        selection: Binding(
+                            get: { deck.sirenPitchIndex },
+                            set: { callbacks.onPitch($0) })
                     ) {
-                        Text("HOLD (continuous)")
-                            .font(DubFont.micro)
-                            .foregroundStyle(DubColor.textTertiary)
+                        Text("Lo").tag(0)
+                        Text("Mid").tag(1)
+                        Text("Hi").tag(2)
                     }
-                    .toggleStyle(.switch)
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
                     .controlSize(.mini)
-                case .sn76477:
-                    EmptyView() // the SN76477 plays fixed preset patches
-                @unknown default:
-                    EmptyView()
+                    .frame(width: 150)
                 }
+                knob("RATE", deck.sirenRate, 0...12.0) { callbacks.onRate($0) }
+                Toggle(
+                    isOn: Binding(
+                        get: { deck.sirenContinuous },
+                        set: { callbacks.onContinuous($0) })
+                ) {
+                    Text("HOLD (continuous)")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
             }
         }
     }

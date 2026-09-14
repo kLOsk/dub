@@ -950,14 +950,22 @@ struct TrackOverviewView: View {
             lastSeenGeneration = currentGen
             return
         }
-        // Pull the entire broadband peak array. `maxChunks: 0` keeps
-        // the unbounded "to the end" behaviour (the scrolling renderer
-        // passes a bounded budget instead); start_idx = 0 returns every
-        // chunk produced so far — for File-mode sources the whole track
-        // (computed offline at load time per M10.5a). One-shot per track
-        // load (gated on `peaksGeneration`), so the full pull is fine.
-        let data = model.engine.peaksExtend(deckIdx: deckIdx, startIdx: 0, maxChunks: 0)
-        buckets = OverviewDecimator.decimate(data: data, bucketCount: Self.bucketCount)
+        // Decimated in Rust (`peaks_overview`): `bucketCount` (peak, rms)
+        // pairs, 4 KB. This used to pull the whole track's chunks across
+        // the FFI and reduce them here — ~300 ms per deck on the main
+        // thread in a Debug build, and a Quick Scratch reloads two or
+        // three decks' overviews in one gesture. That was the second the
+        // doubled tune sat frozen on the other deck: its render link is
+        // started by a view update that could not run until this had.
+        // `stallTimed` stays as the fence; the watchdog log is where a
+        // regression shows.
+        stallTimed("overview reloadIfStale") {
+            let flat = model.engine.peaksOverview(
+                deckIdx: deckIdx, bucketCount: UInt32(Self.bucketCount))
+            buckets = stride(from: 0, to: flat.count - 1, by: 2).map {
+                OverviewBucket(peak: flat[$0], rms: flat[$0 + 1])
+            }
+        }
         lastSeenGeneration = currentGen
     }
 }

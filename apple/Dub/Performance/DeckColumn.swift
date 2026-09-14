@@ -345,27 +345,55 @@ struct DeckColumn<Overview: View>: View {
             onRecalibrate: callbacks.onRecalibrate)
     }
 
-    /// Identity and readouts share a row. The column is wide — that is
-    /// the point of it taking the slack — and stacking a 46 pt readout
-    /// strip under a 40 pt title block spends height the strip beside it
-    /// wants. The old header band put them side by side for the same
-    /// reason.
+    /// The artist shares a row with the readouts; the title has the next
+    /// row to itself. The column is wide — that is the point of it
+    /// taking the slack — and the title is the one string here whose
+    /// length is not ours to choose, so it gets the full width to run
+    /// out to the window's edge, while the artist, a step smaller, sits
+    /// beside BPM · KEY · PITCH on the numbers' baseline. The two rows
+    /// were the other way round until 2026-09-14 (title beside the
+    /// readouts, artist under it): a long title wrapped at the numbers
+    /// while the artist line ran under them with room to spare.
     ///
     /// The readouts take the column's *inner* edge on both decks —
     /// right on deck A, left on deck B — so the numbers sit beside the
-    /// strip they describe and the title runs out to the window's edge.
-    /// Mirrored like the source switch above them; the order inside
-    /// stays BPM · KEY · PITCH on both, one reading order to learn.
+    /// strip they describe. Mirrored like the source switch above them;
+    /// the order inside stays BPM · KEY · PITCH on both, one reading
+    /// order to learn.
     private var identityAndReadouts: some View {
-        HStack(alignment: .top, spacing: DubSpacing.lg) {
-            if state.side == .a {
-                identity
-                readouts
-            } else {
-                readouts
-                identity
+        let outward = state.side == .a
+        return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
+            HStack(alignment: .lastTextBaseline, spacing: DubSpacing.lg) {
+                if outward {
+                    subtitleLine
+                    readouts
+                } else {
+                    readouts
+                    subtitleLine
+                }
             }
+            titleLine
         }
+        // Drag the tune to the other deck for an instant double — the
+        // same thing ⌘← / ⌘→ do, as a gesture. Only the identity block
+        // drags, and only while it names a track; the readouts, the
+        // marks and the strip stay put under the pointer.
+        .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
+        .help(state.hasTrack ? "Drag onto the other deck for an instant double" : "")
+    }
+
+    /// A step below the title, not level with it. The two ran at
+    /// `textPrimary` and `textSecondary`, which is a small enough gap
+    /// that at a glance the pair read as one block of text rather than
+    /// as a name and its artist. Under a scratch this line is the parked
+    /// tune and where it is, so the DJ can see it is still there.
+    private var subtitleLine: some View {
+        let outward = state.side == .a
+        return Text(subtitle)
+            .font(DubFont.body)
+            .foregroundStyle(DubColor.textTertiary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: outward ? .leading : .trailing)
     }
 
     /// Two title lines are reserved whether the title needs one or two,
@@ -374,37 +402,25 @@ struct DeckColumn<Overview: View>: View {
     /// below used to shift by a line on load. The SCRATCH badge sits on
     /// the title's baseline for the same reason: a third line while a
     /// scratch is on would move the column under the DJ's hand.
-    private var identity: some View {
+    private var titleLine: some View {
         let outward = state.side == .a
         let tint = DubColor.deckTint(state.side)
         let scratching = state.header.scratch != nil
-        return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: DubSpacing.sm) {
-                // A quick scratch in progress is a latched state on
-                // stage, so the identity block says so in the deck's own
-                // colour rather than quietly showing a sample's name as
-                // a title. Outer side on both decks, like the title.
-                if scratching && outward { scratchBadge(tint) }
-                Text(state.header.trackTitle ?? "No track loaded")
-                    .font(DubFont.title)
-                    .foregroundStyle(
-                        state.header.trackTitle == nil
-                            ? DubColor.textPlaceholder
-                            : scratching ? tint : DubColor.textPrimary)
-                    .lineLimit(2, reservesSpace: true)
-                    .multilineTextAlignment(outward ? .leading : .trailing)
-                if scratching && !outward { scratchBadge(tint) }
-            }
-            // A step below the title, not level with it. The two ran
-            // at `textPrimary` and `textSecondary`, which is a small
-            // enough gap that at a glance the pair read as one block of
-            // text rather than as a name and its artist. Under a
-            // scratch this line is the parked tune and where it is,
-            // so the DJ can see it is still there.
-            Text(subtitle)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textTertiary)
-                .lineLimit(1)
+        return HStack(alignment: .firstTextBaseline, spacing: DubSpacing.sm) {
+            // A quick scratch in progress is a latched state on stage,
+            // so the identity block says so in the deck's own colour
+            // rather than quietly showing a sample's name as a title.
+            // Outer side on both decks, like the title.
+            if scratching && outward { scratchBadge(tint) }
+            Text(state.header.trackTitle ?? "No track loaded")
+                .font(DubFont.title)
+                .foregroundStyle(
+                    state.header.trackTitle == nil
+                        ? DubColor.textPlaceholder
+                        : scratching ? tint : DubColor.textPrimary)
+                .lineLimit(2, reservesSpace: true)
+                .multilineTextAlignment(outward ? .leading : .trailing)
+            if scratching && !outward { scratchBadge(tint) }
         }
         .frame(maxWidth: .infinity, alignment: outward ? .leading : .trailing)
     }
@@ -693,6 +709,20 @@ struct DeckReadouts: View {
                     .foregroundStyle(
                         value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
             }
+        }
+    }
+}
+
+extension View {
+    /// `onDrag` that can be switched off: an empty deck has nothing to
+    /// double, and a modifier that returns an empty provider still
+    /// starts a drag image of the block.
+    @ViewBuilder
+    func onDrag(if enabled: Bool, _ data: @escaping () -> NSItemProvider) -> some View {
+        if enabled {
+            onDrag(data)
+        } else {
+            self
         }
     }
 }

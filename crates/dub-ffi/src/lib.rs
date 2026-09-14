@@ -468,7 +468,17 @@ pub use rip::{
 ///       position. [`DubEngine::quick_scratch_engage`] and
 ///       [`DubEngine::quick_scratch_release`] return the deck involved
 ///       (`None` for the ghost / freeze paths) so the shell mirrors it.
-pub const FFI_VERSION: u32 = 73;
+///   74. **One siren bank, five shots.** The unit selector is gone:
+///       `SirenUnit`, `set_siren_unit` and `siren_unit_preset_names` are
+///       removed, and [`siren_preset_names`] / [`siren_preset_count`]
+///       describe the one flat bank (Rifle Gun · Alarm · Sine · Laser ·
+///       Siren), each shot routed to its chip by the engine.
+///       [`siren_dub_macro_controls`] exposes the DUB knob's curve so the
+///       box's readout shows the delay and feedback the engine is using.
+///       Also [`DubEngine::peaks_overview`]: the whole-track overview
+///       decimated in Rust, so the shell stops pulling the entire track
+///       across the FFI on every load and double.
+pub const FFI_VERSION: u32 = 74;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -2199,11 +2209,11 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
-    /// Fire M16 dub-siren preset `preset_id` on `deck_idx` (Simple mode,
-    /// PRD §6.3) as a tap one-shot. The preset bank (siren / alarm / laser /
-    /// bomb / gun …, see [`siren_preset_names`]) is precomputed off the audio
-    /// thread at engine startup; this only sends the index. Out-of-range ids
-    /// are ignored. The siren is a generator summed onto the deck's output bus,
+    /// Fire dub-siren shot `preset_id` on `deck_idx` (PRD §6.3) as a tap
+    /// one-shot. The bank (see [`siren_preset_names`]) names which chip each
+    /// shot plays on; every patch is precomputed off the audio thread at
+    /// engine startup, so this only sends the index. Out-of-range ids are
+    /// ignored. The siren is a generator summed onto the deck's output bus,
     /// so it sounds with or without a track and survives echo-out's dry-mute.
     ///
     /// When the user has beat-matched the siren echo, pass `sync_beats > 0` and
@@ -2351,25 +2361,6 @@ impl DubEngine {
             .handle
             .deck(idx)
             .set_siren_controls(speed, delay_ms, feedback, mix, volume, filter, false)
-            .map_err(map_command_error)
-    }
-
-    /// Pick which siren **unit** `deck_idx` plays: HK628 digital shots or the
-    /// Benidub DS01E analog siren. Firing a preset/MODE routes to this unit.
-    ///
-    /// # Errors
-    /// [`EngineError::NotRunning`] if the engine isn't running;
-    /// [`EngineError::InvalidDeck`] on a bad index.
-    pub fn set_siren_unit(&self, deck_idx: u64, unit: SirenUnit) -> Result<(), EngineError> {
-        let idx = deck_idx_to_usize(deck_idx)?;
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::NotRunning);
-        };
-        running
-            .handle
-            .deck(idx)
-            .set_siren_unit(unit.into())
             .map_err(map_command_error)
     }
 
@@ -3801,6 +3792,40 @@ impl DubEngine {
         peak_chunks_to_bytes(&chunks)
     }
 
+    /// The whole-track overview strip, already decimated: `bucket_count`
+    /// `(peak, rms)` pairs, flattened. `peak` is `max(|min|, |max|)` over
+    /// the bucket's chunks and `rms` the RMS-of-RMS, the same reduction
+    /// the shell's `OverviewDecimator` does.
+    ///
+    /// Here rather than in Swift because the overview used to pull the
+    /// entire track's chunks — two to three megabytes — across the FFI
+    /// and reduce them in unoptimised Swift on the main thread, ~300 ms
+    /// per deck, two or three decks' worth per Quick Scratch. That was the
+    /// second the doubled tune sat frozen on the other deck: the view
+    /// update that starts its render link could not run until the
+    /// reloads were done. This returns 4 KB and takes a millisecond.
+    ///
+    /// Empty when the engine is stopped, the deck has no peaks source, or
+    /// `bucket_count == 0`.
+    #[must_use]
+    pub fn peaks_overview(&self, deck_idx: u64, bucket_count: u32) -> Vec<f32> {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return Vec::new();
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return Vec::new();
+        };
+        match source {
+            PeakSource::File(f) => overview_buckets(&f.broadband, bucket_count as usize),
+            PeakSource::Live { .. } => {
+                let mut chunks: Vec<PeakChunk> = Vec::new();
+                source.extend_broadband_from(0, 0, &mut chunks);
+                overview_buckets(&chunks, bucket_count as usize)
+            }
+        }
+    }
+
     /// Number of [`BandPeakChunk`]s captured so far on `deck_idx`.
     /// Returns `0` if band capture is disabled or the engine is
     /// stopped.
@@ -4331,65 +4356,57 @@ impl From<RackFx> for dub_engine::FxSlot {
     }
 }
 
-/// Which siren unit a deck plays (PRD §6.3) — passed to `set_siren_unit`.
-#[derive(Debug, Clone, Copy, uniffi::Enum)]
-pub enum SirenUnit {
-    /// GS1 — the Rigsmith-GS1-style toy-chip bank (our HK628 recreation):
-    /// rifle / alarm / bombs / guns.
-    Gs1,
-    /// Benidub DS01E analog oscillator siren (Sine 1/2 · Test Tone · Square).
-    Ds01e,
-    /// SN76477 — the TI complex-sound-generator chip (gun / laser / bomb …).
-    Sn76477,
-}
-
-impl From<SirenUnit> for dub_engine::SirenUnit {
-    fn from(u: SirenUnit) -> Self {
-        match u {
-            SirenUnit::Gs1 => dub_engine::SirenUnit::Gs1,
-            SirenUnit::Ds01e => dub_engine::SirenUnit::Ds01e,
-            SirenUnit::Sn76477 => dub_engine::SirenUnit::Sn76477,
-        }
-    }
-}
-
-/// The display names of the built-in M16 dub-siren presets (Simple mode),
-/// in fire order — the index is what [`DubEngine::fire_siren_preset`] takes.
-/// A free function (no engine instance needed) so the UI can lay out its pad
-/// grid before / regardless of engine state.
+/// The display names of the dub siren's shots, in fire order — the index is
+/// what [`DubEngine::fire_siren_preset`] takes and the key's position on the
+/// box, left to right. One flat bank across the three chip recreations
+/// (`dub_engine::SIREN_BANK`); there is no unit to select. A free function
+/// (no engine instance needed) so the UI can lay out its keys before /
+/// regardless of engine state.
 #[uniffi::export]
 #[must_use]
 pub fn siren_preset_names() -> Vec<String> {
-    // Simple mode is the Honsitak HK628's eight sounds.
-    (0..dub_dsp::HK628_PROGRAM_COUNT)
-        .map(|i| dub_dsp::hk628_program_name(i).to_string())
+    dub_engine::SIREN_BANK
+        .iter()
+        .map(|shot| shot.name.to_string())
         .collect()
 }
 
-/// The number of built-in dub-siren presets (Simple mode, M16).
+/// The number of shots in the dub siren's bank.
 #[uniffi::export]
 #[must_use]
 pub fn siren_preset_count() -> u32 {
-    dub_dsp::HK628_PROGRAM_COUNT as u32
+    dub_engine::SIREN_BANK_COUNT as u32
 }
 
-/// The display names of a siren unit's preset/MODE pads, in fire order — the
-/// index is what [`DubEngine::fire_siren_preset`] takes. HK628 = 8 shots; the
-/// DS01E = its 4 MODE tones (Sine 1 / Sine 2 / Test Tone / Square). A free
-/// function so the UI can relabel its pad grid when the unit selector changes.
+/// What the DUB knob has set, at one position — the same curve
+/// [`DubEngine::set_siren_dub_macro`] applies, so the box's readout and the
+/// engine cannot disagree about what "0.6" means.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct SirenDubControls {
+    /// HK628 chip-clock multiplier (1 = the chip's own; lower = slower + deeper).
+    pub speed: f32,
+    /// Onboard echo TIME, ms.
+    pub delay_ms: f32,
+    /// Echo feedback, 0..1.
+    pub feedback: f32,
+    /// Echo level, 0..1 — at 0 the echo is not rendered at all.
+    pub mix: f32,
+    /// Echo tone, 0 dark low-pass · 0.5 open · 1 thin high-pass.
+    pub filter: f32,
+}
+
+/// Resolve the DUB knob at `macro_value` (0..1) to the controls it sets —
+/// for the UI's readout. A free function; nothing is sent to the engine.
 #[uniffi::export]
 #[must_use]
-pub fn siren_unit_preset_names(unit: SirenUnit) -> Vec<String> {
-    match unit {
-        SirenUnit::Gs1 => (0..dub_dsp::HK628_PROGRAM_COUNT)
-            .map(|i| dub_dsp::hk628_program_name(i).to_string())
-            .collect(),
-        SirenUnit::Ds01e => (0..dub_dsp::BENIDUB_PRESET_COUNT)
-            .map(|i| dub_dsp::benidub_preset_name(i).to_string())
-            .collect(),
-        SirenUnit::Sn76477 => (0..dub_dsp::SN76477_PRESET_COUNT)
-            .map(|i| dub_dsp::sn76477_preset_name(i).to_string())
-            .collect(),
+pub fn siren_dub_macro_controls(macro_value: f32) -> SirenDubControls {
+    let (speed, delay_ms, feedback, mix, filter) = siren_dub_macro(macro_value);
+    SirenDubControls {
+        speed,
+        delay_ms,
+        feedback,
+        mix,
+        filter,
     }
 }
 
@@ -5649,6 +5666,33 @@ fn map_command_error(e: dub_engine::CommandError) -> EngineError {
 /// Swift reads this as `Data` and reinterprets via
 /// `withUnsafeBytes(_:)` into `[PeakChunk]`. Native-endian works
 /// because both ARM64 and x86_64 macOS are little-endian.
+/// Reduce `chunks` to `bucket_count` `(peak, rms)` pairs, flattened.
+/// Buckets split the chunk range evenly; a bucket always covers at least
+/// one chunk, so a track shorter than the bucket count repeats chunks
+/// rather than leaving gaps.
+fn overview_buckets(chunks: &[PeakChunk], bucket_count: usize) -> Vec<f32> {
+    if chunks.is_empty() || bucket_count == 0 {
+        return Vec::new();
+    }
+    let n = chunks.len();
+    let mut out = Vec::with_capacity(bucket_count * 2);
+    for b in 0..bucket_count {
+        let start = (b * n) / bucket_count;
+        let end = (((b + 1) * n) / bucket_count).max(start + 1).min(n);
+        let mut peak: f32 = 0.0;
+        let mut rms_sq_sum: f32 = 0.0;
+        for c in &chunks[start..end] {
+            peak = peak.max(c.min.abs().max(c.max.abs()));
+            rms_sq_sum += c.rms * c.rms;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let rms = (rms_sq_sum / (end - start) as f32).sqrt();
+        out.push(peak.clamp(0.0, 1.0));
+        out.push(rms.clamp(0.0, 1.0));
+    }
+    out
+}
+
 fn peak_chunks_to_bytes(chunks: &[PeakChunk]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(chunks));
     for c in chunks {
@@ -5957,7 +6001,9 @@ mod tests {
         // 71→72: `sampler_trigger(slot, SamplerOutput)` — A · B · both.
         // 72→73: Quick Scratch doubles across — `quick_scratch_engage` /
         // `_release` return the other deck when they did.
-        assert_eq!(FFI_VERSION, 73);
+        // 73→74: one siren bank — `SirenUnit` / `set_siren_unit` /
+        // `siren_unit_preset_names` gone, `siren_dub_macro_controls` added.
+        assert_eq!(FFI_VERSION, 74);
     }
 
     #[test]
@@ -6115,11 +6161,33 @@ mod tests {
     fn siren_preset_names_are_exposed_for_the_ui() {
         let names = siren_preset_names();
         assert_eq!(names.len() as u32, siren_preset_count());
-        assert!(names.len() >= 8, "expected the classic preset bank");
-        assert!(names.iter().all(|n| !n.is_empty()), "a preset is unnamed");
-        // The fire-order index the UI sends must line up with these names
-        // (Simple mode = the HK628's eight sounds).
-        assert_eq!(names[0], "Rifle Gun");
+        // The fire-order index the UI sends is the key's position on the
+        // box, left to right — five keys, five shots.
+        assert_eq!(names, ["Rifle Gun", "Alarm", "Sine", "Laser", "Siren"]);
+    }
+
+    #[test]
+    fn siren_dub_macro_controls_match_the_curve_the_engine_gets() {
+        // The readout and `set_siren_dub_macro` resolve the same table, at
+        // the ends and in the middle; 0 is the dry siren (no echo rendered).
+        let dry = siren_dub_macro_controls(0.0);
+        assert_eq!(dry.mix, 0.0);
+        assert_eq!(dry.speed, 1.0);
+        let full = siren_dub_macro_controls(1.0);
+        let (speed, delay_ms, feedback, mix, filter) = siren_dub_macro(1.0);
+        assert_eq!(
+            (
+                full.speed,
+                full.delay_ms,
+                full.feedback,
+                full.mix,
+                full.filter
+            ),
+            (speed, delay_ms, feedback, mix, filter)
+        );
+        assert!(full.delay_ms > dry.delay_ms && full.feedback > dry.feedback);
+        // Out-of-range input clamps rather than extrapolating.
+        assert_eq!(siren_dub_macro_controls(3.0), full);
     }
 
     #[test]
@@ -6574,6 +6642,38 @@ mod tests {
             .start_thru("MacBook Pro Microphone".to_string(), vec![0, 1], None)
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidChannels(_)));
+    }
+
+    #[test]
+    fn overview_buckets_reduce_like_the_shell_did() {
+        let c = |min: f32, max: f32, rms: f32| PeakChunk { min, max, rms };
+        // Six chunks into three buckets: two per bucket.
+        let chunks = [
+            c(-0.2, 0.5, 0.3),
+            c(-0.6, 0.1, 0.4),
+            c(-0.1, 0.1, 0.1),
+            c(-0.1, 0.9, 0.1),
+            c(0.0, 0.0, 0.0),
+            c(0.0, 0.0, 0.0),
+        ];
+        let out = overview_buckets(&chunks, 3);
+        assert_eq!(out.len(), 6);
+        assert!(
+            (out[0] - 0.6).abs() < 1e-6,
+            "peak = max |min|,|max| across the bucket"
+        );
+        assert!(
+            (out[1] - (0.125_f32).sqrt()).abs() < 1e-6,
+            "rms = sqrt(mean(rms²))"
+        );
+        assert!((out[2] - 0.9).abs() < 1e-6);
+        assert_eq!(out[4], 0.0);
+        // Shorter than the bucket count: every bucket still covers a chunk.
+        let few = overview_buckets(&chunks[..2], 5);
+        assert_eq!(few.len(), 10);
+        assert!(few.iter().all(|v| v.is_finite()));
+        assert!(overview_buckets(&[], 4).is_empty());
+        assert!(overview_buckets(&chunks, 0).is_empty());
     }
 
     #[test]

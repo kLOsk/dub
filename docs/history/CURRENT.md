@@ -72,10 +72,11 @@ deferred work rather than only cosmetics:
   **no keys and no MIDI** until map mode — its reserved `A S D F` were
   removed rather than extended to eight (see below), so it is
   mouse-driven for now.
-- **The deferred M16 fine-tuning**: siren sound polish (GS1 shots / DS01E
-  tones / SN76477 bank) and the deck-B siren Expert panel
-  (`UI-BACKLOG.md` §5 F-36 / F-37). Note F-37's Performance half is moot:
-  the siren is one rack in the global bar now, bound to the focused deck.
+- **The deferred M16 fine-tuning**: siren sound polish (the five shots
+  that survived the cut — Rifle Gun · Alarm · Sine · Laser · Siren) and
+  the deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). Note
+  F-37's Performance half is moot: the siren is one box in the global bar
+  now, bound to the focused deck.
 - Calibration UX, preferences, dark-mode polish, and the manual rig
   checklist.
 
@@ -107,6 +108,133 @@ What changed:
   get explicit heights that sum to the space available, so nothing can
   overflow its slot and be drawn over. That meant deleting the
   `minHeight` on the waveform region *and* on `LibraryView`.
+
+### The siren box — shipped (2026-09-12, FFI 74)
+
+The bank was cut from nineteen sounds across three switchable units to
+**five shots in one flat bank** — Rifle Gun · Alarm (HK628), Sine (DS01E),
+Laser · Siren (SN76477) — each naming its chip in
+`dub-engine::siren_bank`, so the unit selector and everything that hung
+off it (`SirenUnit`, `set_siren_unit`, `siren_unit_preset_names`, the
+per-deck unit) is gone — and so, later the same day at Daniel's request,
+are the siren's key bindings altogether: `Z X C V B` fall through, the
+caps print no legend, and the siren waits for map mode like the sampler
+(`DubAction.sirenPreset` stays for the profile to bind). The DSP chip tables stay whole:
+they are the chip recreations, and the cut is a product decision, so it
+lives in the engine's bank rather than in `dub-dsp`.
+
+The block was rebuilt as the box a dub DJ owns (study: the *Dub Siren
+Faceplate* artifact): a framed faceplate the height of the shelf's two
+rows on the deck's `surface1`, with a window, five `DubKey` caps that
+sink when pressed, and a `DubKnob` dial DRY → DUB whose readout states
+the delay and feedback (`siren_dub_macro_controls` exposes the engine's
+own curve). It is the only framed, only metered, only dialled thing on
+the surface — the differentiation the pad-surface studies asked for.
+The DUB value persists (`dub.sirenDub`) and is pushed into every
+freshly started engine; it used to start dry every launch, and 0 is no
+echo at all.
+
+The window is a **Sifam-style VU meter** (`SirenDisplay` +
+`SirenMeterFace`, a `Canvas`): cream face, red +3 zone, the last shot
+printed on the dial, the echo line under it, and a needle that rests on
+its stop, throws into the red on a press and falls back through the
+repeats. **Eye candy by decision** — Daniel picked it from *The Siren
+Window* study over the honest jewel lamp ("this is just eye candy so its
+fine"). The siren bus has no level tap; the ballistics are synthesised
+from `siren_state`, the press count and the knob's delay/feedback, and
+the file says so. The `TimelineView` ticks at 30 Hz only while a shot or
+its tail is live. The DUB knob is the one from the photo Daniel sent
+after rejecting all four of *The Siren Knob* study: the MXR / Davies-1900
+pattern — black phenolic body with eight flutes that turn with the value,
+a spun-aluminium diamond-cut cap whose sheen stays with the light, a white
+index line down the lobe under the pointer, the scale ticked on the plate
+(`DubKnob`, a `Canvas`). No readout under it — the echo line on the meter
+and the tooltip carry the numbers.
+
+**Instant double by drag (2026-09-14).** The deck column's identity
+block (artist + title) drags as `dubdeck:a` / `dubdeck:b` — the crate
+drag's in-process string pattern — and the other deck's `DeckDropTarget`
+doubles onto itself (`instantDouble`, the same path as `⌘←` / `⌘→`).
+The target moved from `dropDestination(for: URL.self)` to `onDrop(of:
+[.fileURL, .plainText])` so one target takes both a file and a deck;
+a drop on the deck the tune is already on is ignored. Verified on the
+internal mixer: B's tune doubled onto A at the same playhead, cues and
+grid along.
+
+**Quick Scratch double — the doubled deck's waveform sat frozen ~1 s
+(found and fixed, 2026-09-14).** Daniel's rig log, with the Debug
+`MainThreadWatchdog` in: `overview reloadIfStale took 333 ms`, `took
+300 ms`, then `main thread stalled 862 ms` on the press; three reloads
+and an 1142 ms stall on the release. `TrackOverviewView.reloadIfStale`
+pulled the *entire* track's peak chunks across the FFI (2–3 MB) and
+reduced them in unoptimised Swift on the main thread, once per deck
+whose overview changed — and a Quick Scratch changes two or three. The
+render link for the doubled deck is started by a view update, so it
+waited behind those reloads; the audio and render threads never need
+the main thread, which is why deck A kept scrolling and the sound was
+fine. Fix: `DubEngine::peaks_overview(deck, bucket_count)` decimates in
+Rust (release-built) and returns 480 `(peak, rms)` pairs — 4 KB, about
+a millisecond — and the shell reads that. `OverviewDecimator` stays for
+the rip's live overview, which reduces a growing buffer it already
+holds. The `stallTimed` fence around the reload and the watchdog stay
+in Debug builds so a regression prints itself:
+`/usr/bin/log show --predicate 'subsystem == "com.dub.app" AND category == "stall"' --last 5m --style compact`.
+
+**Then the watchdog grew a stack capture** (in-process: suspend the
+main thread, walk its frame pointers, resume, symbolicate —
+`/usr/bin/sample` was tried first and always attached after the stall
+had ended). Full stacks in `~/Library/Logs/Dub/stall-<ms>.txt`, the
+top frames in the log. It named two more things straight away:
+
+- **The GPU mux (fixed).** The 2.6 s stall at engine start and the 8.6 s
+  one at a cold launch were `CAMetalLayer.setDevice` →
+  `layer_private_mux_acquire` → `IOServiceOpen`: this MacBook Pro has an
+  Intel UHD 630 and a Radeon Pro 5500M, `MTLCreateSystemDefaultDevice()`
+  hands over the Radeon, and the first layer bound to it makes macOS
+  switch GPUs, once per waveform view. `NSSupportsAutomaticGraphicsSwitching`
+  is in Info.plist now and `WaveformMetalView` takes the low-power device
+  (`MTLCopyAllDevices().first { $0.isLowPower }`), shared across views.
+  Measured on the internal mixer: 2571 ms → no stall.
+- **The Quick Scratch press is ~200–270 ms now** (was ~1 s): what remains
+  is SwiftUI / AppKit relaying out the window on a deck-state change —
+  `_NSViewUpdateConstraints` under the attribute graph, nothing of ours in
+  the stack — at Debug-build speed. The lever is narrowing what a
+  `deckA` / `deckB` publish invalidates (`PerformanceView` observes the
+  whole model, so both panes, the bar and the library host re-evaluate);
+  an architectural pass, not done here. A Release build would show the
+  real-world number first.
+- **Library load on the main thread (open).** At launch:
+  `LibraryView.recomputeSortedTracks` ~1.0 s (`KeyPathComparator` copying
+  a full `LibraryTrack` per comparison, Debug), `refreshVolumeReachability`
+  ~0.55 s (the same copy per row), then the table's row views. Not
+  touched; it is the next thing the watchdog points at.
+
+**Deck column header, rows swapped (2026-09-14).** The artist now
+shares the row with BPM · KEY · PITCH, on the numbers' baseline, and the
+title has the next row to itself at the column's full width — it is the
+one string in the header whose length is not ours to choose, and beside
+the readouts it wrapped at the numbers while the artist ran under them
+with room to spare. Two title lines stay reserved; five deck-column
+baselines re-recorded; the 1440 × 900 fit test still holds.
+
+**The rack folds (2026-09-14).** A chevron column at the bar's leading
+edge — the library's `› FILTER` gesture — folds the whole bar to a
+22 pt strip (`▸ DUB SIREN · SAMPLES`), and the 112 pt it gives up go to
+the library: `DeckLibrarySplit` now takes a `deckChromeBudget` (the open
+bar) and subtracts what is missing from the deck side, so the waveform
+region keeps its height and nothing above the fold moves
+(`test_foldingTheRackGivesTheLibraryTheSpace`). Persisted as
+`dub.rackFolded`.
+
+**Levels and idle, fenced.** Laser and Siren measured −3.9 / −2.1 LUFS
+through the deck bus against the chip shots' −12.6 / −16.6; all five are
+trimmed to **−14.0 LUFS** now (`siren_bank_shots_are_level_matched`, ±1).
+And the Sine voice reported "sounding" for two silent seconds after its
+release — its dry DS01E patch still recirculated an unheard slap-back and
+the idle check waited for it — which the meter drew as a needle that
+would not fall. The voice now judges the *heard* tail
+(`wet * delay_mix`); `siren_bank_shots_report_idle_as_soon_as_they_are_quiet`
+holds every shot to ≤ 0.3 s.
 
 **Gap this closed in the test suite.** `pads-deck-a` rendered at a
 hand-picked 560 × 360 with `sirenEnabled` defaulting to *false* — green
@@ -144,10 +272,11 @@ that matter here:
   `PrepPadGrid` renders two (648). `prepTuningColumn` (248) is referenced by
   nothing else, and `PerformanceLayoutTests` asserts against the inflated
   figure.
-- The siren unit switch changes the pad row's length (GS1 has 8 presets,
-  DS01E 4), so every mouse target and key-addressed pad relocates.
-- `SirenPadRow` still uses a raw AppKit `Picker(.segmented)` rather than
-  the house `DubSegmentedControl`.
+- ~~The siren unit switch changes the pad row's length, so every mouse
+  target and key-addressed pad relocates~~ — gone with the switch: the
+  bank is five shots and the keys never move (the siren box, below).
+- ~~`SirenPadRow` still uses a raw AppKit `Picker(.segmented)`~~ —
+  `SirenPadRow` is deleted.
 
 **The sequence.** Each step is safe to land alone, and the order is a
 dependency order, not a preference.

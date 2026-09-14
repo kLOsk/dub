@@ -281,7 +281,7 @@ struct PreferencesSheet: View {
                         .foregroundStyle(DubColor.textPrimary)
                 }
                 .toggleStyle(.switch)
-                Text("Adds a grid of classic dub-siren sounds to each deck — siren, alarm, laser, bomb, machine gun and more. Tap a pad (or its Z X C V B N M , key) to fire one. Pure synthesis: an oscillator swept by an LFO, through a built-in slap-back echo. When off, the pads are hidden.")
+                Text("Puts the siren box on the rack bar — five shots (Rifle Gun, Alarm, Sine, Laser, Siren) with a DUB knob for the box's own echo. Pure synthesis: three vintage chips recreated, through a PT2399 echo. Keys come with map mode. When off, the box is hidden.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

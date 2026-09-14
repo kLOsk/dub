@@ -37,6 +37,9 @@ final class DubAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        MainThreadWatchdog.start()
+        #endif
         NSApp.setActivationPolicy(.regular)
         installMainMenu()
 

@@ -183,6 +183,37 @@ final class PerformanceLayoutTests: XCTestCase {
             "rack bar content is taller than rackBarHeight")
     }
 
+    /// Folded, the bar is its one-line strip and no taller.
+    func test_rackBar_foldedFitsItsHeightToken() {
+        let size = fittingSize(
+            GlobalRackBar(state: .fixture(focus: .a), folded: true), width: 1440)
+        XCTAssertLessThanOrEqual(
+            size.height, DubLayout.rackBarFoldedHeight + 0.5,
+            "folded rack strip is taller than rackBarFoldedHeight")
+    }
+
+    /// Folding the rack hands its height to the library and to nothing
+    /// else: the deck side shrinks by exactly the bar's difference, so
+    /// the waveform region keeps its height and nothing above the fold
+    /// moves.
+    func test_foldingTheRackGivesTheLibraryTheSpace() {
+        let total: CGFloat = 900 - DubLayout.statusStripHeight
+        let budget = DubLayout.rackBarHeight + 1
+        let open = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .timecode, total: total,
+            deckChrome: budget, deckChromeBudget: budget,
+            deckMinimum: DubLayout.waveformMinHeight)
+        let folded = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
+            mode: .timecode, total: total,
+            deckChrome: DubLayout.rackBarFoldedHeight + 1, deckChromeBudget: budget,
+            deckMinimum: DubLayout.waveformMinHeight)
+        let freed = DubLayout.rackBarHeight - DubLayout.rackBarFoldedHeight
+        XCTAssertEqual(open - folded, freed, accuracy: 0.5,
+                       "the library should gain exactly what the bar gave up")
+        XCTAssertEqual(open - budget, folded - (DubLayout.rackBarFoldedHeight + 1), accuracy: 0.5,
+                       "the waveform region must not move when the rack folds")
+    }
+
     func test_rackBar_fitsTheNarrowestSupportedWindow() {
         let size = fittingSize(
             GlobalRackBar(state: .fixture(focus: .a)),

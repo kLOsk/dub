@@ -306,6 +306,35 @@ final class PerformanceSnapshotTests: XCTestCase {
              named: "rack-bar-pinned-outputs")
     }
 
+    /// LASER down: the key sinks and lights, the display names it and
+    /// says SOUNDING, the heading trailing names it too.
+    func test_globalRackBar_sirenSounding() {
+        var state = GlobalRackBarState.fixture(focus: .a)
+        state.siren?.sounding = true
+        snap(deckBg(GlobalRackBar(state: state)),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-siren-sounding")
+    }
+
+    /// Fresh launch, knob at DRY: no shot yet, no echo rendered, and the
+    /// display says so rather than pretending.
+    func test_globalRackBar_sirenDry() {
+        var state = GlobalRackBarState.fixture(focus: .a)
+        state.siren?.lastShot = nil
+        state.siren?.dubMacro = 0
+        snap(deckBg(GlobalRackBar(state: state)),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-siren-dry")
+    }
+
+    /// Folded: one line, chevron and the blocks' names, the library
+    /// has the rest.
+    func test_globalRackBar_folded() {
+        snap(deckBg(GlobalRackBar(state: .fixture(focus: .a), folded: true)),
+             width: 1440, height: DubLayout.rackBarFoldedHeight,
+             named: "rack-bar-folded")
+    }
+
     /// The siren gate off: the bar carries the sampler alone.
     func test_globalRackBar_noSiren() {
         var state = GlobalRackBarState.fixture(focus: .a)

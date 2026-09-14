@@ -896,12 +896,31 @@ private struct WaveformMetalView: NSViewRepresentable {
         Coordinator()
     }
 
+    /// One device for every waveform view, resolved once: the low-power
+    /// GPU when the machine has one, else the default. A device is
+    /// shared safely across layers, and resolving it per view would
+    /// enumerate the GPUs on every deck build.
+    private static let sharedDevice: MTLDevice? = {
+        let all = MTLCopyAllDevices()
+        return all.first(where: { $0.isLowPower && !$0.isRemovable })
+            ?? MTLCreateSystemDefaultDevice()
+    }()
+
+    static func preferredDevice() -> MTLDevice? { sharedDevice }
+
     func makeNSView(context: Context) -> WaveformMetalHostView {
         let hostView = WaveformMetalHostView(frame: .zero)
         context.coordinator.hostView = hostView
 
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            NSLog("WaveformView: MTLCreateSystemDefaultDevice() returned nil")
+        // The integrated GPU where there is a choice. On a dual-GPU
+        // MacBook Pro the system default is the discrete one, and the
+        // first layer bound to it makes macOS switch GPUs — 2.6 s on
+        // the main thread at engine start here, 8.6 s at a cold launch
+        // on Daniel's — for a renderer that is a handful of draw calls.
+        // `NSSupportsAutomaticGraphicsSwitching` in Info.plist is the
+        // other half: without it the OS switches anyway.
+        guard let device = Self.preferredDevice() else {
+            NSLog("WaveformView: no Metal device")
             return hostView
         }
         hostView.metalLayer.device = device
