@@ -48,9 +48,12 @@ enum MainThreadWatchdog {
     /// Send times of pings the main thread has not answered yet.
     /// Touched on `queue` only.
     private static var pending: [TimeInterval] = []
-    /// The stall the last capture belonged to, so one stall yields one
-    /// stack however long it runs.
+    /// The stall the last capture belonged to, and when it was last
+    /// sampled: a long stall is sampled every `resampleEvery` so the
+    /// file shows where the time went, not one instant of it.
     private static var capturedStall: TimeInterval = -1
+    private static var lastCaptureUptime: TimeInterval = 0
+    private static let resampleEvery: TimeInterval = 0.1
     /// When the last stall was reported. Every ping queued during one
     /// stall runs the moment the main thread frees, each with a smaller
     /// lag than the one before; only the first — the longest — is the
@@ -67,9 +70,13 @@ enum MainThreadWatchdog {
         t.setEventHandler {
             let sent = ProcessInfo.processInfo.systemUptime
             pending.append(sent)
-            if let oldest = pending.first, sent - oldest > captureAfter, capturedStall != oldest {
+            if let oldest = pending.first, sent - oldest > captureAfter,
+               capturedStall != oldest || sent - lastCaptureUptime >= resampleEvery
+            {
+                let first = capturedStall != oldest
                 capturedStall = oldest
-                captureMainThread(stalledSince: oldest)
+                lastCaptureUptime = sent
+                captureMainThread(stalledSince: oldest, first: first)
             }
             DispatchQueue.main.async {
                 let now = ProcessInfo.processInfo.systemUptime
@@ -85,7 +92,7 @@ enum MainThreadWatchdog {
         timer = t
     }
 
-    private static func captureMainThread(stalledSince: TimeInterval) {
+    private static func captureMainThread(stalledSince: TimeInterval, first: Bool) {
         guard let main = mainThread else { return }
         let pcs = main.backtrace()
         guard !pcs.isEmpty else {
@@ -97,9 +104,17 @@ enum MainThreadWatchdog {
             .appendingPathComponent("Library/Logs/Dub", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("stall-\(Int(stalledSince * 1000)).txt")
-        let report = "main thread, \(Int((ProcessInfo.processInfo.systemUptime - stalledSince) * 1000)) ms into a stall\n"
+        let into = Int((ProcessInfo.processInfo.systemUptime - stalledSince) * 1000)
+        let report = "--- main thread, \(into) ms into the stall\n"
             + frames.enumerated().map { "\($0.offset)  \($0.element)" }.joined(separator: "\n") + "\n"
-        try? report.write(to: file, atomically: true, encoding: .utf8)
+        if first {
+            try? report.write(to: file, atomically: true, encoding: .utf8)
+        } else if let handle = try? FileHandle(forWritingTo: file) {
+            handle.seekToEndOfFile()
+            handle.write(Data(report.utf8))
+            try? handle.close()
+        }
+        guard first else { return }
         // The interesting frames are the app's own, which sit under the
         // run loop; the log gets the top of the stack, the file all of it.
         let top = frames.prefix(14).joined(separator: " ← ")

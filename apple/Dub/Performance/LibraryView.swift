@@ -525,7 +525,7 @@ private struct BpmBucket: Hashable {
 /// The DJ's active selections in the filter bar. Within a box the
 /// selected values are OR'd; across boxes they're AND'd. Transient —
 /// reset whenever the source view changes.
-private struct LibraryFilterState {
+private struct LibraryFilterState: Equatable {
     /// Selected categorical values per dimension (`nil` = "(none)").
     var categorical: [LibraryFilterField: Set<String?>] = [:]
     /// Selected BPM buckets.
@@ -2638,16 +2638,32 @@ struct LibraryView: View {
     /// idiom. The cost is one sort + one map per real change,
     /// down from three sorts + two maps per body re-eval pre-fix.
     private func recomputeSortedTracks() {
-        // v8: sort the FILTERED subset. `tracks` stays the full current
-        // view (so the filter boxes can list its distinct values); every
-        // render path reads `sortedTracks` / `sortedTrackIds`, so the
-        // whole table inherits filtering from this one choke point.
-        let base = filteredTracks
-        let sorted = sortOrder.isEmpty ? base : base.sorted(using: sortOrder)
+        let sorted = Self.sortedRows(tracks, filter: filterState, order: sortOrder)
         if sorted != sortedTracks {
             sortedTracks = sorted
             sortedTrackIds = sorted.map(\.id)
         }
+    }
+
+    /// v8: sort the FILTERED subset. `tracks` stays the full current
+    /// view (so the filter boxes can list its distinct values); every
+    /// render path reads `sortedTracks` / `sortedTrackIds`, so the
+    /// whole table inherits filtering from this one choke point.
+    ///
+    /// Pure and static so `refreshTracks` can run it off the main
+    /// thread: with a `KeyPathComparator` over `String` this is an ICU
+    /// collation per comparison, and it sat inside a one-second
+    /// main-thread stall at launch (`MainThreadWatchdog`, 2026-09-14).
+    /// `nonisolated` is load-bearing, not decoration: `View` is a
+    /// `@MainActor` protocol in the current SDK, so a static on a view
+    /// is main-actor-isolated by inference and a call from a detached
+    /// task silently hops back to the main thread — the watchdog caught
+    /// exactly that the first time round.
+    nonisolated private static func sortedRows(
+        _ rows: [LibraryTrack], filter: LibraryFilterState, order: [LibraryRowComparator]
+    ) -> [LibraryTrack] {
+        let base = filter.isActive ? rows.filter { filter.passes($0) } : rows
+        return order.isEmpty ? base : base.sorted(using: order)
     }
 
     // MARK: - Filter bar (v8)
@@ -2676,16 +2692,25 @@ struct LibraryView: View {
     /// filters (self-excluded → cascading counts). BPM bucket boundaries
     /// come from the full view's span (stable); their counts cascade.
     private func recomputeFacets() {
-        guard libraryModel.libraryIsOpen, !tracks.isEmpty else {
-            facets = [:]
-            bpmBucketFacet = []
-            return
-        }
-        let fields = enabledFilterFields
+        let computed = Self.computedFacets(
+            tracks, open: libraryModel.libraryIsOpen,
+            fields: enabledFilterFields, filter: filterState)
+        facets = computed.facets
+        bpmBucketFacet = computed.bpm
+    }
+
+    /// The facet lists for the filter boxes. Pure and static for the
+    /// same reason as `sortedRows`: it walks every row once per enabled
+    /// box, and `refreshTracks` runs it off the main thread.
+    nonisolated private static func computedFacets(
+        _ tracks: [LibraryTrack], open: Bool,
+        fields: [LibraryFilterField], filter: LibraryFilterState
+    ) -> (facets: [LibraryFilterField: [LibraryFacetValue]], bpm: [LibraryBpmBucketCount]) {
+        guard open, !tracks.isEmpty else { return ([:], []) }
         var out: [LibraryFilterField: [LibraryFacetValue]] = [:]
         for field in fields where field.kind == .categorical {
             var counts: [String?: Int] = [:]
-            for t in tracks where filterState.passes(t, excluding: field) {
+            for t in tracks where filter.passes(t, excluding: field) {
                 for v in field.categoricalValues(of: t) {
                     counts[v, default: 0] += 1
                 }
@@ -2699,25 +2724,24 @@ struct LibraryView: View {
                     return (lhs.value ?? "") < (rhs.value ?? "")
                 }
         }
-        facets = out
 
+        var bpm: [LibraryBpmBucketCount] = []
         if fields.contains(.bpm) {
             let buckets = Self.bpmBuckets(for: tracks)
-            bpmBucketFacet = buckets.compactMap { bucket in
+            bpm = buckets.compactMap { bucket in
                 let count = tracks.filter {
-                    filterState.passes($0, excluding: .bpm)
+                    filter.passes($0, excluding: .bpm)
                         && ($0.bpm.map(bucket.contains) ?? false)
                 }.count
                 return count > 0 ? LibraryBpmBucketCount(bucket: bucket, count: count) : nil
             }
-        } else {
-            bpmBucketFacet = []
         }
+        return (out, bpm)
     }
 
     /// Auto tempo buckets covering the view's BPM span, with a nice-
     /// rounded width targeting ~10 buckets so the ranges read cleanly.
-    private static func bpmBuckets(for tracks: [LibraryTrack]) -> [BpmBucket] {
+    nonisolated private static func bpmBuckets(for tracks: [LibraryTrack]) -> [BpmBucket] {
         let bpms = tracks.compactMap(\.bpm)
         guard let lo = bpms.min(), let hi = bpms.max(), hi > lo else {
             // All one tempo (or none analysed): a single tight bucket.
@@ -3342,6 +3366,15 @@ struct LibraryView: View {
         let limit = Self.listingLimit
         let library = model.library
         let since = model.appLaunchUnixSeconds
+        // What the sort and the facets depend on, taken now so the
+        // background pass sees one consistent view. If either moves
+        // while the fetch is in flight, the landing recomputes on the
+        // main thread as before.
+        let sortSnapshot = sortOrder
+        let filterSnapshot = filterState
+        let fieldsSnapshot = enabledFilterFields
+        let libraryOpen = libraryModel.libraryIsOpen
+        let reachabilityBefore = libraryModel.volumeReachability
 
         isLoading = true
         Task.detached(priority: .userInitiated) {
@@ -3394,11 +3427,32 @@ struct LibraryView: View {
             // Immutable snapshot — the @Sendable MainActor closure
             // can't capture the mutated local `var` directly.
             let resolvedFromTitles = fromTitles
+            // The heavy, pure part — the sort, the facet tallies and the
+            // volume probes — still off the main thread. The landing
+            // below is then assignments and one table reload; it used
+            // to be a second of main thread at launch, with the
+            // waveform links and every deck update queued behind it.
+            let sorted = Self.sortedRows(rows, filter: filterSnapshot, order: sortSnapshot)
+            let sortedIds = sorted.map(\.id)
+            let facetsPrepared = Self.computedFacets(
+                rows, open: libraryOpen, fields: fieldsSnapshot, filter: filterSnapshot)
+            let reachability = WaveformAppModel.probeVolumeReachability(
+                for: rows, previous: reachabilityBefore)
             await MainActor.run {
                 self.tracks = rows
                 self.sessionFromTitles = resolvedFromTitles
-                self.recomputeSortedTracks()
-                self.recomputeFacets()
+                if self.sortOrder == sortSnapshot, self.filterState == filterSnapshot {
+                    if sorted != self.sortedTracks {
+                        self.sortedTracks = sorted
+                        self.sortedTrackIds = sortedIds
+                    }
+                    self.facets = facetsPrepared.facets
+                    self.bpmBucketFacet = facetsPrepared.bpm
+                } else {
+                    self.recomputeSortedTracks()
+                    self.recomputeFacets()
+                }
+                self.model.applyVolumeReachability(reachability)
                 self.tracksContentRevision &+= 1
                 self.isLoading = false
                 // M11d-history: a reveal staged across this refresh
@@ -3429,24 +3483,6 @@ struct LibraryView: View {
                     }
                     self.syncModelPrimarySelection()
                 }
-            }
-            // Volume reachability has to run on the main thread
-            // (it mutates `libraryModel.volumeReachability`), but
-            // it's an O(rows) scan + per-mount-point `stat(2)`
-            // that has no business piggy-backing on the same
-            // runloop tick that ships the new rows into the
-            // table. Pre-fix it shared the `MainActor.run` block
-            // above, so the visible row body re-eval + AppKit
-            // selection-layer redraw + NSHostingView LazyVStack
-            // rebuild + `stat` syscalls all serialised onto the
-            // same vsync window — the largest single source of
-            // residual main-thread block on a sidebar swap. The
-            // reachability map drives the per-row missing-file
-            // glyph ONLY, so a one-runloop-tick delay is
-            // invisible to the user (the glyph just paints on
-            // the next CVDisplayLink frame instead of this one).
-            await MainActor.run {
-                self.model.refreshVolumeReachability(for: rows)
             }
         }
     }

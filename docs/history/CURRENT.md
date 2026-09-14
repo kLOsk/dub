@@ -203,11 +203,22 @@ top frames in the log. It named two more things straight away:
   whole model, so both panes, the bar and the library host re-evaluate);
   an architectural pass, not done here. A Release build would show the
   real-world number first.
-- **Library load on the main thread (open).** At launch:
-  `LibraryView.recomputeSortedTracks` ~1.0 s (`KeyPathComparator` copying
-  a full `LibraryTrack` per comparison, Debug), `refreshVolumeReachability`
-  ~0.55 s (the same copy per row), then the table's row views. Not
-  touched; it is the next thing the watchdog points at.
+- **Library load on the main thread (fixed).** At launch the rows'
+  landing did the sort (~1.0 s — an ICU collation per comparison through
+  `KeyPathComparator`), the facet tallies and the volume `stat`s on the
+  main thread, in the same hop that shipped the rows to the table.
+  `refreshTracks` now does all three on its fetch task — `sortedRows`,
+  `computedFacets`, `WaveformAppModel.probeVolumeReachability` — and the
+  main-thread landing is assignments plus one reload; if the sort order
+  or filter moved during the fetch it recomputes on main as before.
+  **The trap, caught by the watchdog on the first attempt:** `View` is a
+  `@MainActor` protocol in the current SDK, so a `static func` on a
+  SwiftUI view is main-actor-isolated by inference and a call from
+  `Task.detached` hops straight back to the main thread; the helpers are
+  `nonisolated` for that reason. Launch stalls went 994 / 1072 ms →
+  233 ms (CoreAudio `AudioDeviceCreateIOProcID` starting the device) and
+  ~630 ms of SwiftUI's first window layout — no app code in either
+  sample; the latter is the Debug-build cost of the view tree.
 
 **Deck column header, rows swapped (2026-09-14).** The artist now
 shares the row with BPM · KEY · PITCH, on the numbers' baseline, and the

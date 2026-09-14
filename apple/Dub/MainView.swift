@@ -2621,35 +2621,46 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    /// Recompute the per-volume reachability cache for the set of
-    /// mount points present in the supplied track list. Each
-    /// unique non-nil mount point hits the filesystem exactly
-    /// once via `FileManager.fileExists(atPath:isDirectory:)`.
-    /// `nil` mount points (volumes the library has on record but
-    /// can't currently locate) implicitly map to unreachable
-    /// without a syscall.
+    /// The per-volume reachability cache for the set of mount points
+    /// present in a track list. Each unique non-nil mount point hits the
+    /// filesystem exactly once via `FileManager.fileExists(atPath:
+    /// isDirectory:)`; `nil` mount points (volumes the library has on
+    /// record but can't currently locate) implicitly map to unreachable
+    /// without a syscall. Recomputed by `LibraryView.refreshTracks`
+    /// whenever the displayed track set changes (source switch, search,
+    /// post-import refresh) — never per frame; an SSD staying plugged
+    /// in is the common case and we don't want to syscall every scroll
+    /// tick.
     ///
-    /// Called by the LibraryView whenever the displayed track
-    /// set changes (source switch, search, post-import refresh).
-    /// Per-frame polling is intentionally avoided — an SSD
-    /// staying plugged in is the common case and we don't want
-    /// to syscall every scroll tick.
-    func refreshVolumeReachability(for tracks: [LibraryTrack]) {
+    /// The probe half: pure over its
+    /// inputs and free of the model, so `LibraryView.refreshTracks`
+    /// runs it on its fetch task. A `stat(2)` per mount point is
+    /// nothing for an internal SSD and anything at all for a network
+    /// volume that has gone away — which is not a thing to find out on
+    /// the main thread.
+    nonisolated static func probeVolumeReachability(
+        for tracks: [LibraryTrack], previous: [String: Bool]
+    ) -> [String: Bool] {
         var mountPoints = Set<String>()
         for t in tracks {
             if let m = t.primaryVolumeMountPoint, !m.isEmpty {
                 mountPoints.insert(m)
             }
         }
-        var next = libraryModel.volumeReachability
         // Drop entries for mount points no longer in view so the
         // cache stays bounded.
-        next = next.filter { mountPoints.contains($0.key) }
+        var next = previous.filter { mountPoints.contains($0.key) }
         for m in mountPoints {
             var isDir: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: m, isDirectory: &isDir)
             next[m] = exists && isDir.boolValue
         }
+        return next
+    }
+
+    /// The publish half: only writes when something changed, so the
+    /// common case — an SSD that stayed plugged in — invalidates nothing.
+    func applyVolumeReachability(_ next: [String: Bool]) {
         if next != libraryModel.volumeReachability {
             libraryModel.volumeReachability = next
         }
