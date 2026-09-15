@@ -232,6 +232,7 @@ struct CueRowBank: View {
                 Button("Clear") { onCue(slot.index, true) }
             }
         }
+        .mappable(.hotCue(slot.index))
     }
 
 }

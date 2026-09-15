@@ -40,10 +40,15 @@ struct RackOutputState: Equatable {
     var output: RackOutput
     /// The master deck, which `.auto` resolves to.
     var focused: DeckSide
+    /// The deck that is the DUB FX channel, if one is (F-38). A rack
+    /// landing there goes *through* the rack — the siren through the
+    /// Space Echo — and the pill says so: `→ FX`.
+    var fxDeck: DeckSide? = nil
 
-    init(_ output: RackOutput = .auto, focused: DeckSide) {
+    init(_ output: RackOutput = .auto, focused: DeckSide, fxDeck: DeckSide? = nil) {
         self.output = output
         self.focused = focused
+        self.fxDeck = fxDeck
     }
 
     /// The decks the rack lands on, in order. One for a single deck,
@@ -67,9 +72,24 @@ struct RackOutputState: Equatable {
     /// What the pill prints.
     var label: String {
         switch decks {
-        case [.a]: return "→ A"
-        case [.b]: return "→ B"
+        case [.a]: return fxDeck == .a ? "→ FX" : "→ A"
+        case [.b]: return fxDeck == .b ? "→ FX" : "→ B"
         default: return "→ A+B"
+        }
+    }
+
+    /// Whether the rack lands on the FX channel — fires into the rack.
+    var intoFx: Bool {
+        decks.count == 1 && decks[0] == fxDeck
+    }
+
+    /// The menu's title for an option, naming the FX channel where a
+    /// deck letter would otherwise mislead.
+    func menuTitle(_ option: RackOutput) -> String {
+        switch option {
+        case .a where fxDeck == .a: return "Deck A — the FX channel"
+        case .b where fxDeck == .b: return "Deck B — the FX channel"
+        default: return option.menuTitle
         }
     }
 

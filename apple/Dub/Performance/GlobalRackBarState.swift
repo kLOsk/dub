@@ -34,6 +34,9 @@ struct SirenRackState: Equatable {
     var fireCount: Int = 0
     /// The DUB knob, 0…1.
     var dubMacro: Double = 0
+    /// The caps on the five keys, from the map — `""` for an unbound
+    /// shot. State rather than a global so a rebind re-renders.
+    var legends: [String] = ["", "", "", "", ""]
 }
 
 /// Everything the bar draws.
@@ -44,6 +47,12 @@ struct GlobalRackBarState: Equatable {
     var siren: SirenRackState?
     /// The sampler — the same shelf Prep loads, firing here.
     var sampler: SampleShelfState = .empty
+    /// The deck that is the DUB FX channel, if one is (F-38). The bar is
+    /// not taken over by the channel — the siren and the samples are what
+    /// the DJ plays *with* the rack — but it re-orders so the siren box
+    /// sits under the rack: samples left and siren right when deck B is
+    /// the channel, the usual order otherwise.
+    var fxSide: DeckSide? = nil
 }
 
 /// What the bar fires. Separate from the state so the state stays

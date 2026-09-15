@@ -48,6 +48,9 @@ struct SampleSlotState: Equatable, Identifiable {
     /// The Quick Scratch pad this slot answers to (0-based), printed
     /// on the tile as `QS 1`; `nil` when it is a plain sampler slot.
     var quickScratch: Int?
+    /// The key that fires the slot, from the map; `nil` until the DJ
+    /// binds one in map mode.
+    var legend: String?
 
     var id: Int { index }
 }
@@ -113,6 +116,9 @@ struct SampleShelf: View {
         guard let output = state.output else { return DubColor.deckATint }
         return output.tintDeck.map(DubColor.deckTint) ?? DubColor.controlAccent
     }
+
+    /// Map mode draws its own cap on every tile; the tile's steps aside.
+    @Environment(\.dubMapping) private var mapping
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -210,6 +216,13 @@ struct SampleShelf: View {
                     .padding(3)
             }
         }
+        .overlay(alignment: .bottomLeading) {
+            // The key that fires it, once map mode bound one.
+            if let legend = slot.legend, !isEmpty, mapping == nil {
+                DubKeycap(key: legend, lit: lit)
+                    .padding(3)
+            }
+        }
         .contentShape(Rectangle())
         .onPressDown(enabled: !isEmpty) { callbacks.onTrigger(slot.index) }
         .onSecondaryClick {
@@ -228,6 +241,7 @@ struct SampleShelf: View {
             return true
         }
         .help(help(slot))
+        .mappable(.sampler(slot.index))
     }
 
     /// The stopped-state menu: which Quick Scratch pad this sample sits

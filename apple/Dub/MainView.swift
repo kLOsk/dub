@@ -328,6 +328,21 @@ struct DeckState: Equatable {
     /// rack effects never self-terminate, so there's no engine telemetry to
     /// poll — the toggle is the truth). Lights each slot's button.
     var rackActive: [Bool] = [false, false, false, false]
+    /// The DUB FX channel's Expert controls — each unit's own knobs (F-38).
+    /// UI-local like `rackActive`: the rack publishes no state, so what the
+    /// knob was set to is what the engine has.
+    var fxRack: FxRackControls = FxRackControls()
+    /// The channel's INPUT rocker — what is patched into the pair: the mixer's
+    /// send, or a mic straight in. A label the engine does not yet read
+    /// (F-38 stage 3 is the routing); the VU and the path line print it.
+    var fxInput: FxInputKind = .send
+    /// The channel's TRIM, in dB — the deck gain while the deck is the FX
+    /// channel. A track load sets the gain back to the track's own.
+    var fxTrimDb: Double = 0
+    /// The decoder's RMS reading of the deck's input this poll — the FX
+    /// channel's VU. The one measured meter on the pane; the unit lamps are
+    /// drawn from the knobs.
+    var inputAmplitude: Float = 0
     /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
     var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
 
@@ -336,7 +351,10 @@ struct DeckState: Equatable {
     /// switch is shown at all.
     var hasTimecodeInput: Bool = false
 
-    var controlMode: UInt8 = 0   // 0 internal, 1 timecode
+    var controlMode: UInt8 = 0   // 0 internal · 1 timecode · 2 thru · 3 dub fx
+    /// The deck is the DUB FX channel — the rack on the mixer's send, not a
+    /// turntable (F-38). The pane, the bar and the pills all key off this.
+    var isDubFx: Bool { controlMode == 3 }
     var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
     var calibrated: Bool = false
     var calibrating: Bool = false
@@ -844,12 +862,12 @@ final class WaveformAppModel: ObservableObject {
 
     /// The sampler's output rule resolved against the current master.
     var samplerOutputState: RackOutputState {
-        RackOutputState(samplerOutput, focused: focusedDeckForGridNudge)
+        RackOutputState(samplerOutput, focused: focusedDeckForGridNudge, fxDeck: dubFxDeck)
     }
 
     /// The siren's output rule resolved against the current master.
     var sirenOutputState: RackOutputState {
-        RackOutputState(sirenOutput, focused: focusedDeckForGridNudge)
+        RackOutputState(sirenOutput, focused: focusedDeckForGridNudge, fxDeck: dubFxDeck)
     }
 
     /// What every sampler slot is doing — sounding, and how far through.
@@ -953,6 +971,82 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private static let kRackFxEnabled = "dub.rackFxEnabled"
+
+    /// The DUB FX channel (Preferences ▸ FX, F-38). When on, each deck's
+    /// source switch grows a fourth position, `DUB FX`: the deck stops being a
+    /// turntable and becomes the outboard rack on the mixer's send. Default
+    /// off — it is the dub DJ's feature, and a fourth segment on the switch
+    /// is chrome a scratch set never uses. Turning it off puts any FX deck
+    /// back on its internal clock. Persisted under `dub.dubFxEnabled`.
+    @Published var dubFxEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(dubFxEnabled, forKey: Self.kDubFxEnabled)
+            if !dubFxEnabled { leaveDubFxEverywhere() }
+        }
+    }
+
+    private static let kDubFxEnabled = "dub.dubFxEnabled"
+
+    /// The deck that is the DUB FX channel right now, if one is.
+    var dubFxDeck: DeckSide? {
+        if deckA.isDubFx { return .a }
+        if deckB.isDubFx { return .b }
+        return nil
+    }
+
+    // MARK: Map mode (M18)
+
+    /// MAP on the status strip: every bindable control draws its cap and
+    /// a ring, and a click arms it for the next key. Off, the armed
+    /// control is dropped too — nothing waits for a key behind a mode
+    /// that is no longer showing.
+    @Published var mapMode: Bool = false {
+        didSet { if !mapMode { mapArmed = nil } }
+    }
+
+    /// The control waiting for a key, while map mode is on.
+    @Published var mapArmed: DubAction? = nil
+
+    /// A control was clicked in map mode: arm it, or disarm it if it was
+    /// the one already waiting.
+    func armForMapping(_ action: DubAction) {
+        guard mapMode, action.isRemappable else { return }
+        mapArmed = (mapArmed == action) ? nil : action
+    }
+
+    /// A key arrived while a control was armed: bind it. The chord takes
+    /// the key from whatever else held it (`DubKeymapStore.bind`).
+    func bindArmedControl(code: UInt16, characters: String?, command: Bool) {
+        guard let action = mapArmed else { return }
+        let chord = DubKeyChord(
+            code: code, command: command,
+            legend: DubKeyChord.legend(code: code, characters: characters, command: command))
+        DubKeymapStore.shared.bind(action, to: chord)
+        mapArmed = nil
+    }
+
+    /// ⌫ on an armed control: leave it with no key.
+    func unbindArmedControl() {
+        guard let action = mapArmed else { return }
+        DubKeymapStore.shared.clear(action)
+        mapArmed = nil
+    }
+
+    /// Escape: stop waiting, keep whatever the control had.
+    func cancelMapping() {
+        mapArmed = nil
+    }
+
+    /// The FX rack's key bindings fire on whichever deck is the channel.
+    func fxToggleFromKey(_ unitIndex: Int) {
+        guard let side = dubFxDeck, let unit = FxRackUnit(rawValue: unitIndex) else { return }
+        toggleFxRackSlot(side, unit.slot)
+    }
+
+    func fxKickFromKey() {
+        guard let side = dubFxDeck else { return }
+        kickFxSpring(side)
+    }
 
     /// Per-source library-import enables (Preferences ▸ Libraries). When a
     /// source is on, Dub scans its default folder (`~/Music/_Serato_`,
@@ -1314,6 +1408,8 @@ final class WaveformAppModel: ObservableObject {
         // code remain in-tree, dormant, for the post-release rebuild.
         self.rackFxEnabled =
             UserDefaults.standard.object(forKey: Self.kRackFxEnabled) as? Bool ?? false
+        self.dubFxEnabled =
+            UserDefaults.standard.object(forKey: Self.kDubFxEnabled) as? Bool ?? false
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)
@@ -2062,6 +2158,7 @@ final class WaveformAppModel: ObservableObject {
         }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
+        next.inputAmplitude = tele.carrierAmplitude
         next.sourceClass = tele.sourceClass
         next.calibrated = tele.calibrated
         next.calibrating = tele.calibrating
@@ -3263,9 +3360,14 @@ final class WaveformAppModel: ObservableObject {
     /// `loadedLibraryTrackId` and fire lazy analysis.
     private func resolveLibraryTrackId(for url: URL) -> String? {
         let normalized = url.standardizedFileURL
+        // The selection already resolved this id's path once, into
+        // `browserSelection` (C-27: this used to be a second
+        // `trackPath` SELECT for the same click-then-Space). A volume
+        // that unmounted in between fails in `loadTrack` first, so the
+        // cached URL is as good as a fresh lookup here.
         if let selected = librarySelection.selectedLibraryTrackId,
-           let path = try? library.trackPath(trackId: selected),
-           URL(fileURLWithPath: path).standardizedFileURL == normalized
+           let cached = librarySelection.browserSelection,
+           cached.standardizedFileURL == normalized
         {
             return selected
         }
@@ -4440,6 +4542,48 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Select DUB FX — the deck becomes the outboard rack on the mixer's
+    /// send (the deck-header switch, F-38). Like Thru, the live input is the
+    /// source, so the loaded file is unloaded and the model forgets it. The
+    /// rack's Expert controls and the trim are pushed so the engine has
+    /// what the faces show, and the channel starts with every unit bypassed
+    /// (a send with four effects already in it is not a starting point).
+    func setDeckDubFx(side: DeckSide) {
+        guard dubFxEnabled else { return }
+        try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .fx)
+        disengageEchoIfEngaged(side)
+        var s = state(for: side)
+        let hadLibraryTrack = s.loadedLibraryTrackId != nil
+        s.clearLoadedTrack()
+        s.rackActive = [false, false, false, false]
+        setState(s, for: side)
+        if hadLibraryTrack {
+            let deck: UInt32 = (side == .a) ? 0 : 1
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            try? library.historyDeckUnloaded(deck: deck, timestampMs: nowMs)
+        }
+        pushFxRack(side)
+        try? engine.setFxInputTrim(deckIdx: side.ffiDeckIdx, db: Float(s.fxTrimDb))
+    }
+
+    /// The feature was switched off: any FX deck goes back to its internal
+    /// clock, the rack bypassed, so nothing keeps processing a send the
+    /// switch can no longer show.
+    private func leaveDubFxEverywhere() {
+        for side in [DeckSide.a, DeckSide.b] where state(for: side).isDubFx {
+            var s = state(for: side)
+            s.rackActive = [false, false, false, false]
+            setState(s, for: side)
+            guard isRunning else { continue }
+            for index in 0..<4 {
+                if let fx = rackFx(index) {
+                    try? engine.setRackFxActive(deckIdx: side.ffiDeckIdx, fx: fx, active: false)
+                }
+            }
+            try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .internalPlay)
+        }
+    }
+
     /// Manually (re)calibrate a deck's timecode needle (the ↻ button).
     func recalibrateDeck(side: DeckSide) {
         try? engine.calibrateDeck(deckIdx: side.ffiDeckIdx)
@@ -5529,6 +5673,69 @@ final class WaveformAppModel: ObservableObject {
             macroValue: Float(value))
     }
 
+    // MARK: DUB FX channel — the Expert rack (F-38)
+
+    /// The IN/OUT toggle on a unit's face: engage or bypass slot `index`
+    /// without touching its controls (`set_rack_fx` would re-apply the macro).
+    func toggleFxRackSlot(_ side: DeckSide, _ index: Int) {
+        guard isRunning, let fx = rackFx(index) else { return }
+        var deck = state(for: side)
+        guard index < deck.rackActive.count else { return }
+        deck.rackActive[index].toggle()
+        let active = deck.rackActive[index]
+        setState(deck, for: side)
+        try? engine.setRackFxActive(deckIdx: side.ffiDeckIdx, fx: fx, active: active)
+    }
+
+    /// Set the channel's Expert controls in one go — the faces hand back a
+    /// whole `FxRackControls` with the one knob changed.
+    func setFxRack(_ side: DeckSide, _ controls: FxRackControls) {
+        var deck = state(for: side)
+        deck.fxRack = controls
+        setState(deck, for: side)
+        pushFxRack(side)
+    }
+
+    /// KICK — Tubby's thunder into the spring tank. Momentary.
+    func kickFxSpring(_ side: DeckSide) {
+        guard isRunning else { return }
+        try? engine.kickRackSpring(deckIdx: side.ffiDeckIdx)
+    }
+
+    /// The channel's TRIM knob, in dB.
+    func setFxInputTrim(_ side: DeckSide, db: Double) {
+        var deck = state(for: side)
+        deck.fxTrimDb = db
+        setState(deck, for: side)
+        guard isRunning else { return }
+        try? engine.setFxInputTrim(deckIdx: side.ffiDeckIdx, db: Float(db))
+    }
+
+    /// The INPUT rocker: SEND or MIC. A label until F-38 stage 3 routes it.
+    func setFxInput(_ side: DeckSide, _ kind: FxInputKind) {
+        var deck = state(for: side)
+        deck.fxInput = kind
+        setState(deck, for: side)
+    }
+
+    /// Push every unit's Expert controls to the engine.
+    private func pushFxRack(_ side: DeckSide) {
+        guard isRunning else { return }
+        let c = state(for: side).fxRack
+        let idx = side.ffiDeckIdx
+        try? engine.setRackBigKnob(deckIdx: idx, step: UInt8(c.bigKnobStep), q: Float(c.bigKnobQ))
+        try? engine.setRackPhaser(
+            deckIdx: idx, rateHz: Float(c.phaserRateHz), depth: Float(c.phaserDepth),
+            feedback: Float(c.phaserFeedback), mix: Float(c.phaserMix))
+        try? engine.setRackSpaceEcho(
+            deckIdx: idx, mode: c.spaceEchoMode, repeatMs: Float(c.spaceEchoRepeatMs),
+            intensity: Float(c.spaceEchoIntensity), echoVolume: Float(c.spaceEchoVolume),
+            reverb: Float(c.spaceEchoReverb), wowFlutter: Float(c.spaceEchoWowFlutter))
+        try? engine.setRackSpring(
+            deckIdx: idx, decay: Float(c.springDecay), tone: Float(c.springTone),
+            wet: Float(c.springWet))
+    }
+
     /// Bypass every rack slot on both decks and clear the UI flags (called when
     /// the feature is switched off in Preferences).
     private func disengageAllRackFx() {
@@ -6273,6 +6480,51 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     model.instantDouble(toDeckB: toDeckB)
                 }
                 return true
+            },
+            onSampler: { slot in
+                Task { @MainActor in
+                    model.triggerSampler(slot)
+                }
+                return true
+            },
+            onQuickScratch: { side, pad in
+                Task { @MainActor in
+                    model.toggleQuickScratch(side, pad: pad)
+                }
+                return true
+            },
+            onFxToggle: { unit in
+                Task { @MainActor in
+                    model.fxToggleFromKey(unit)
+                }
+                return true
+            },
+            onFxKick: {
+                Task { @MainActor in
+                    model.fxKickFromKey()
+                }
+                return true
+            },
+            onEchoOut: { side in
+                Task { @MainActor in
+                    model.toggleEchoOut(side)
+                }
+                return true
+            },
+            // Map mode: while a control is armed, the next key is its
+            // binding — Escape backs out, ⌫ unbinds. Checked on the main
+            // actor synchronously so the key never also fires the action
+            // it was about to be bound to.
+            mapCapture: { code, characters, command in
+                guard model.mapArmed != nil else { return false }
+                switch code {
+                case 53: model.cancelMapping()
+                case 51, 117: model.unbindArmedControl()
+                // Modifier keys alone are not a chord.
+                case 54, 55, 56, 57, 58, 59, 60, 61, 62, 63: return true
+                default: model.bindArmedControl(code: code, characters: characters, command: command)
+                }
+                return true
             })
         return view
     }
@@ -6297,7 +6549,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
             onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
-            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool
+            onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool,
+            onSampler: @escaping (_ slot: Int) -> Bool,
+            onQuickScratch: @escaping (_ side: DeckSide, _ pad: Int) -> Bool,
+            onFxToggle: @escaping (_ unit: Int) -> Bool,
+            onFxKick: @escaping () -> Bool,
+            onEchoOut: @escaping (_ side: DeckSide) -> Bool,
+            mapCapture: @escaping (_ code: UInt16, _ characters: String?, _ command: Bool) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -6313,6 +6571,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 // shortcut so it always wins.
                 if self.isTextFirstResponder() {
                     return event
+                }
+                // A control armed in map mode takes the key, whatever it
+                // is — before the table, so a key already bound elsewhere
+                // moves rather than fires.
+                if mapCapture(event.keyCode, event.charactersIgnoringModifiers, isCmd) {
+                    return nil
                 }
                 // Every binding below resolves through `DubKeymap` —
                 // one table shared with the caps the pads print, so a
@@ -6341,6 +6605,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     // Handled above, before the text-field guard, because
                     // ⌘, must win even while typing.
                     break
+                case .sampler(let slot):
+                    if onSampler(slot) { return nil }
+                case .quickScratch(let side, let pad):
+                    if onQuickScratch(side, pad) { return nil }
+                case .fxToggle(let unit):
+                    if onFxToggle(unit) { return nil }
+                case .fxKick:
+                    if onFxKick() { return nil }
+                case .echoOut(let side):
+                    if onEchoOut(side) { return nil }
                 }
                 return event
             }

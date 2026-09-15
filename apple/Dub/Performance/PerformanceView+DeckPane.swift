@@ -58,85 +58,107 @@ extension PerformanceView {
         columnWidth: CGFloat? = nil, zoom: Double = 1.0
     ) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
+        // R-41: while a rip captures, deck A is a Thru deck with the
+        // live peaks stream attached (`start_thru_for_rip`), so the
+        // strip draws the record building up instead of the idle
+        // placeholder it sat on before.
+        let ripCapturing = side == .a && model.ripPhase == .capture
         let hasSource = enabled && (deckState.hasTrack
-                                    || (model.engineMode == .timecode && model.isRunning))
+                                    || (model.engineMode == .timecode && model.isRunning)
+                                    || ripCapturing)
         ZStack {
-            switch waveformOrientation {
-            case .vertical:
-                // Per-deck vertical-mode row layout (PRD §9.2 /
-                // §9.6.1):
-                //   Deck A: [overview] [gap] [filler] [playing] [filler]
-                //   Deck B: [filler] [playing] [filler] [gap] [overview]
-                // The overview sits on each deck's **outer** edge —
-                // window-left for deck A, window-right for deck B —
-                // matching Serato Scratch Live, Traktor Scratch, and
-                // rekordbox DVS. Pre-fix, both overviews were pinned
-                // against the centre divider, which crowded the
-                // beatmatch surface and read as "deck B is mirrored
-                // wrong" at glance distance. Filler regions remain
-                // reserved for forthcoming info chips (RPM toggle,
-                // key-lock, beatgrid offset) and the M10.7 centre-
-                // gutter Phase-Drift Trail.
-                // M11d.5: the overview always renders, even with
-                // no track loaded — its empty-state path draws a
-                // faint dashed midline so the strip reads as
-                // chrome the user can drop a track onto rather
-                // than as "where did my overview go?". Pre-fix
-                // the overview was conditional on
-                // `deckState.hasTrack`, which left the strip
-                // invisible at cold launch and made the deck
-                // pane look bare in screenshots.
-                // Redesign: a single outer `Spacer` pulls each deck's
-                // waveform toward the **centre** so the two decks form
-                // one tight cluster with the phase clock between them
-                // (where the eyes converge during a mix), and the
-                // overview sits on the deck's outer edge. Pre-redesign
-                // two Spacers centred each waveform in its own half,
-                // leaving the two strips marooned far apart in dead
-                // space.
-                // Scratch-Live-style deck pane. Inner→outer:
-                //   waveform (hugs the centre phase clock) · deck column
-                //   out to the window edge.
-                //
-                // There is no outer `Spacer` any more, and the column is
-                // no longer a fixed 224. The waveform is capped at
-                // `performanceWaveformWidthCap`, so on any real window
-                // several hundred points were left over — and a Spacer
-                // held them empty at each outer edge. The column takes
-                // that width instead, and the sections inside it use it:
-                // `CueRowBank` picks its column count from what it is
-                // handed, and the overview finally has room to be a map
-                // rather than a 26 pt sliver.
-                //
-                // `layoutPriority` on the waveform is still load-bearing
-                // — without it the HStack splits the slack evenly and
-                // the strip never reaches its cap.
-                HStack(spacing: 0) {
-                    if side == .a {
-                        deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
-                        playingColumn(
-                            side: side, deckIdx: deckIdx,
-                            hasSource: hasSource, zoom: zoom)
-                            .layoutPriority(1)
-                    } else {
-                        playingColumn(
-                            side: side, deckIdx: deckIdx,
-                            hasSource: hasSource, zoom: zoom)
-                            .layoutPriority(1)
-                        deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
-                    }
+            if deckState.isDubFx, waveformOrientation == .vertical {
+                // The deck is the DUB FX channel (F-38): the rack in the
+                // column's place, the live input in the strip's. The
+                // strip is the same Metal lane a Thru deck scrolls — an
+                // Fx deck captures its input the same way.
+                FxChannelPane(
+                    state: fxChannelState(side: side),
+                    callbacks: fxChannelCallbacks(side: side),
+                    columnWidth: columnWidth
+                ) {
+                    playingColumn(
+                        side: side, deckIdx: deckIdx,
+                        hasSource: hasSource, zoom: zoom)
                 }
-            case .horizontal:
-                // Prep-mode horizontal strip — playing waveform
-                // fills the full pane width, no side spacers, no
-                // overview (the Track Overview lives on a separate
-                // surface in Prep mode). Stops the SwiftUI
-                // `Spacer(minLength: 0)` siblings from competing
-                // with `playingColumn`'s `maxWidth: .infinity` and
-                // collapsing the strip.
-                playingColumn(
-                    side: side, deckIdx: deckIdx,
-                    hasSource: hasSource, zoom: zoom)
+            } else {
+                switch waveformOrientation {
+                case .vertical:
+                    // Per-deck vertical-mode row layout (PRD §9.2 /
+                    // §9.6.1):
+                    //   Deck A: [overview] [gap] [filler] [playing] [filler]
+                    //   Deck B: [filler] [playing] [filler] [gap] [overview]
+                    // The overview sits on each deck's **outer** edge —
+                    // window-left for deck A, window-right for deck B —
+                    // matching Serato Scratch Live, Traktor Scratch, and
+                    // rekordbox DVS. Pre-fix, both overviews were pinned
+                    // against the centre divider, which crowded the
+                    // beatmatch surface and read as "deck B is mirrored
+                    // wrong" at glance distance. Filler regions remain
+                    // reserved for forthcoming info chips (RPM toggle,
+                    // key-lock, beatgrid offset) and the M10.7 centre-
+                    // gutter Phase-Drift Trail.
+                    // M11d.5: the overview always renders, even with
+                    // no track loaded — its empty-state path draws a
+                    // faint dashed midline so the strip reads as
+                    // chrome the user can drop a track onto rather
+                    // than as "where did my overview go?". Pre-fix
+                    // the overview was conditional on
+                    // `deckState.hasTrack`, which left the strip
+                    // invisible at cold launch and made the deck
+                    // pane look bare in screenshots.
+                    // Redesign: a single outer `Spacer` pulls each deck's
+                    // waveform toward the **centre** so the two decks form
+                    // one tight cluster with the phase clock between them
+                    // (where the eyes converge during a mix), and the
+                    // overview sits on the deck's outer edge. Pre-redesign
+                    // two Spacers centred each waveform in its own half,
+                    // leaving the two strips marooned far apart in dead
+                    // space.
+                    // Scratch-Live-style deck pane. Inner→outer:
+                    //   waveform (hugs the centre phase clock) · deck column
+                    //   out to the window edge.
+                    //
+                    // There is no outer `Spacer` any more, and the column is
+                    // no longer a fixed 224. The waveform is capped at
+                    // `performanceWaveformWidthCap`, so on any real window
+                    // several hundred points were left over — and a Spacer
+                    // held them empty at each outer edge. The column takes
+                    // that width instead, and the sections inside it use it:
+                    // `CueRowBank` picks its column count from what it is
+                    // handed, and the overview finally has room to be a map
+                    // rather than a 26 pt sliver.
+                    //
+                    // `layoutPriority` on the waveform is still load-bearing
+                    // — without it the HStack splits the slack evenly and
+                    // the strip never reaches its cap.
+                    HStack(spacing: 0) {
+                        if side == .a {
+                            deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
+                            playingColumn(
+                                side: side, deckIdx: deckIdx,
+                                hasSource: hasSource, zoom: zoom)
+                                .layoutPriority(1)
+                        } else {
+                            playingColumn(
+                                side: side, deckIdx: deckIdx,
+                                hasSource: hasSource, zoom: zoom)
+                                .layoutPriority(1)
+                            deckColumn(side: side, deckIdx: deckIdx, width: columnWidth)
+                        }
+                    }
+                case .horizontal:
+                    // Prep-mode horizontal strip — playing waveform
+                    // fills the full pane width, no side spacers, no
+                    // overview (the Track Overview lives on a separate
+                    // surface in Prep mode). Stops the SwiftUI
+                    // `Spacer(minLength: 0)` siblings from competing
+                    // with `playingColumn`'s `maxWidth: .infinity` and
+                    // collapsing the strip.
+                    playingColumn(
+                        side: side, deckIdx: deckIdx,
+                        hasSource: hasSource, zoom: zoom)
+                }
             }
             loadErrorOverlay(side: side, deckState: deckState)
             // Timecode signal health, on the deck instead of buried in
@@ -200,7 +222,8 @@ extension PerformanceView {
                     orientation: orientation,
                     scrubHandler: scrubHandler(side: side),
                     continuouslyRendering:
-                        deckState.isPlaying || model.scratchingDeck == side,
+                        deckState.isPlaying || model.scratchingDeck == side
+                        || (side == .a && model.ripPhase == .capture),
                     seekGeneration: deckState.seekGeneration,
                     peaksGeneration: deckState.peaksGeneration,
                     timeAxisZoom: model.engineMode == .prep

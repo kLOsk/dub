@@ -9,6 +9,8 @@
 //  - INT  — play the loaded file on its own clock (Play button starts it).
 //  - TC   — the control vinyl drives the loaded file.
 //  - THRU — pass the live record on the platter straight through.
+//  - DUB FX — the deck is the outboard rack on the mixer's send (F-38);
+//    only drawn once the channel is enabled in Preferences.
 //
 //  The small ↻ (shown on TC) recalibrates the needle.
 //
@@ -25,6 +27,7 @@ enum SourceControlStatus: Equatable {
     case calibrating  // Timecode selected, capturing the whitening
     case timecode     // driven by the control vinyl
     case thru         // live record passthrough
+    case fx           // the DUB FX channel: the rack on the mixer's send
 }
 
 struct SourceControlView: View {
@@ -44,6 +47,10 @@ struct SourceControlView: View {
     var onPause: () -> Void = {}
     var onTimecode: () -> Void = {}
     var onThru: () -> Void = {}
+    /// Whether the fourth position is drawn at all — the DUB FX channel is
+    /// a Preferences opt-in, and a scratch set never wants the segment.
+    var showFx: Bool = false
+    var onFx: () -> Void = {}
     var onRecalibrate: () -> Void = {}
 
     var body: some View {
@@ -62,6 +69,9 @@ struct SourceControlView: View {
                 intSegment
                 segment("TC", active: isTimecodeActive, action: onTimecode)
                 segment("THRU", active: isThruActive, action: onThru)
+                if showFx {
+                    segment("DUB FX", active: status == .fx, action: onFx)
+                }
             }
             .background(DubColor.surface2)
             .clipShape(Capsule())

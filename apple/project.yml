@@ -86,6 +86,15 @@ targets:
         CFBundleShortVersionString: "0.0.1"
         CFBundleVersion: "1"
         LSMinimumSystemVersion: "13.0"
+        # Dual-GPU MacBook Pros: without this the first Metal layer makes
+        # macOS switch to the discrete GPU — seconds on the main thread at
+        # engine start and launch (`layer_private_mux_acquire`). The
+        # waveform is a few draw calls; the integrated GPU is enough and
+        # kinder to the battery on stage. `WaveformMetalView` asks for the
+        # low-power device as well. Lives here, not only in the plist:
+        # `xcodegen generate` rewrites Info.plist from these properties
+        # and silently dropped the hand-added key (2026-09-15).
+        NSSupportsAutomaticGraphicsSwitching: true
         NSHighResolutionCapable: true
         NSPrincipalClass: NSApplication
         # M0.5 doesn't talk to the microphone or any audio input yet,

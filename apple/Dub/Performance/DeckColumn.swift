@@ -67,6 +67,11 @@ struct DeckColumnState: Equatable {
     var scratch: [ScratchPadState] = (0..<SampleBank.quickScratchCount).map {
         ScratchPadState(pad: $0)
     }
+    /// Whether the source switch grows its `DUB FX` position — the FX
+    /// channel is a Preferences opt-in (F-38).
+    var fxAvailable: Bool = false
+    /// The key on ECHO OUT, from the map; `nil` until bound.
+    var echoLegend: String?
 }
 
 /// One Quick Scratch pad as the column draws it.
@@ -76,6 +81,8 @@ struct ScratchPadState: Equatable, Identifiable {
     var name: String?
     /// `true` while this pad's sample is on the deck.
     var engaged: Bool = false
+    /// The key that fires the pad, from the map; `nil` until bound.
+    var legend: String?
 
     var id: Int { pad }
 }
@@ -144,6 +151,7 @@ struct DeckColumnCallbacks {
     var onPause: () -> Void = {}
     var onSetTimecode: () -> Void = {}
     var onSetThru: () -> Void = {}
+    var onSetFx: () -> Void = {}
     var onRecalibrate: () -> Void = {}
 }
 
@@ -171,6 +179,8 @@ extension DeckColumn: Equatable {
 /// placeholder of the same height.
 struct DeckColumn<Overview: View>: View {
     let state: DeckColumnState
+    /// Map mode draws its own cap on every pad; the pads' step aside.
+    @Environment(\.dubMapping) private var mapping
     var callbacks = DeckColumnCallbacks()
     /// Elapsed and remaining tick once a second off the engine, so they
     /// come from a `TimelineView` subview rather than through state —
@@ -342,6 +352,8 @@ struct DeckColumn<Overview: View>: View {
             onPause: callbacks.onPause,
             onTimecode: callbacks.onSetTimecode,
             onThru: callbacks.onSetThru,
+            showFx: state.fxAvailable,
+            onFx: callbacks.onSetFx,
             onRecalibrate: callbacks.onRecalibrate)
     }
 
@@ -588,9 +600,15 @@ struct DeckColumn<Overview: View>: View {
         // inner width exactly.
         .frame(minWidth: DubLayout.deckColumnScratchPadMinWidth, maxWidth: .infinity)
         .frame(height: DubLayout.deckColumnEchoHeight)
+        .overlay(alignment: .topTrailing) {
+            if let legend = pad.legend, bound, mapping == nil {
+                DubKeycap(key: legend, lit: pad.engaged)
+            }
+        }
         .contentShape(Rectangle())
         .onPressDown(enabled: bound) { callbacks.onScratch(pad.pad) }
         .help(scratchHelp(pad))
+        .mappable(.quickScratch(state.side, pad.pad))
     }
 
     /// The record, turning with the platter while it is on the deck.
@@ -641,9 +659,16 @@ struct DeckColumn<Overview: View>: View {
                         state.echoEngaged
                             ? DubColor.controlAccent : DubColor.divider,
                         lineWidth: 1))
+            .overlay(alignment: .topTrailing) {
+                if let legend = state.echoLegend, mapping == nil {
+                    DubKeycap(key: legend, lit: state.echoEngaged)
+                        .padding(3)
+                }
+            }
             .contentShape(Rectangle())
             .onPressDown(enabled: state.hasTrack) { callbacks.onEchoToggle() }
             .help("Echo out — cut the dry signal and hand the deck to the echo")
+            .mappable(.echoOut(state.side))
     }
 }
 

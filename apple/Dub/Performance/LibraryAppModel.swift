@@ -183,12 +183,14 @@ final class LibraryAppModel: ObservableObject {
 
     /// M11c.1 — count of analyses currently in flight, batch or
     /// not. Drives the spinner-vs-quiescent decision on the
-    /// LibraryView footer ("any work happening at all?"). NOT
+    /// LibraryView footer ("any work happening at all?") and, with
+    /// no batch running, U-14's quiet "Analyzing 1 track…" line. NOT
     /// the right value for "N of M" progress — analyses inside
     /// `analyzeTracks` run serially, so this counter is at most 1
     /// for the duration of a batch even when 200 tracks are
     /// queued. Use `analysisBatchCompleted` for the visible "N of
-    /// M" line.
+    /// M" line. It is a count and not a flag on purpose (C-28): two
+    /// deck loads, or a deck load during a batch, overlap.
     @Published var analysisInFlightCount: UInt32 = 0
 
     /// Committed rip sessions for the "Real Records" node (M26b,

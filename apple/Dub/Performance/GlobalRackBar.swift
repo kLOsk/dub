@@ -65,20 +65,36 @@ struct GlobalRackBar: View {
     private var openBar: some View {
         HStack(spacing: 1) {
             foldColumn
-            if let siren = state.siren {
-                group(flexible: false) {
-                    SirenRackGroup(
-                        state: siren,
-                        onPreset: callbacks.onSirenPreset,
-                        onDubMacro: callbacks.onSirenDubMacro,
-                        onOutput: callbacks.onSirenOutput)
-                }
-                .layoutPriority(1)
+            // The siren sits under the rack when a deck is the DUB FX
+            // channel: on the right for deck B, so the two swap.
+            if state.fxSide == .b {
+                samplerGroup
+                sirenGroup
+            } else {
+                sirenGroup
+                samplerGroup
             }
-            group {
-                SampleShelf(state: state.sampler, callbacks: callbacks.sampler)
-                    .frame(minWidth: DubLayout.rackSamplerMinWidth)
+        }
+    }
+
+    @ViewBuilder
+    private var sirenGroup: some View {
+        if let siren = state.siren {
+            group(flexible: false) {
+                SirenRackGroup(
+                    state: siren,
+                    onPreset: callbacks.onSirenPreset,
+                    onDubMacro: callbacks.onSirenDubMacro,
+                    onOutput: callbacks.onSirenOutput)
             }
+            .layoutPriority(1)
+        }
+    }
+
+    private var samplerGroup: some View {
+        group {
+            SampleShelf(state: state.sampler, callbacks: callbacks.sampler)
+                .frame(minWidth: DubLayout.rackSamplerMinWidth)
         }
     }
 

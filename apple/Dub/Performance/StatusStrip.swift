@@ -43,6 +43,10 @@ struct StatusStripState: Equatable {
     /// connected.
     var modeSwitch: ModeSwitchState? = nil
 
+    /// M18 map mode: MAP lit while it is on. Always drawn — mapping is a
+    /// mode over the live interface on both surfaces.
+    var mapMode: Bool = false
+
     /// Sample rate formatted as "48.0 kHz" or `nil` if `0` (engine
     /// not running yet).
     var sampleRateText: String? {
@@ -128,6 +132,8 @@ struct StatusStrip: View {
     /// M26a — mode-switch tap target. `nil` renders the switch
     /// inert (previews / snapshot tests).
     var onSelectMode: ((EngineMode) -> Void)? = nil
+    /// M18 — MAP tap target. `nil` renders the button inert.
+    var onToggleMap: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
@@ -143,6 +149,7 @@ struct StatusStrip: View {
             if let modeSwitch = state.modeSwitch {
                 modeSwitchView(modeSwitch)
             }
+            mapButton
             clockView
             batteryView
             if let openPreferences {
@@ -209,6 +216,29 @@ struct StatusStrip: View {
         .padding(.vertical, 2)
         .background(DubColor.stateError.opacity(0.15))
         .clipShape(Capsule())
+    }
+
+    /// MAP — Serato's mechanism: turn it on, click a control, press the
+    /// key. Lit in the control accent while on, the same way an engaged
+    /// pad lights, because that is what it is: a mode you are in.
+    private var mapButton: some View {
+        Button(action: { onToggleMap?() }) {
+            Text("MAP")
+                .font(DubFont.caps)
+                .tracking(DubFont.capsTracking)
+                .foregroundStyle(state.mapMode ? DubColor.surface0 : DubColor.textSecondary)
+                .padding(.horizontal, DubSpacing.sm)
+                .padding(.vertical, 2)
+                .background(state.mapMode ? DubColor.controlAccent : Color.clear)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(
+                    state.mapMode ? DubColor.controlAccent : DubColor.divider, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(state.mapMode
+              ? "Map mode is on — click a control, then press its key. Click MAP to leave."
+              : "Map mode: click a control, then press the key you want it on")
+        .accessibilityLabel(state.mapMode ? "Leave map mode" : "Map mode")
     }
 
     private func gearButton(action: @escaping () -> Void) -> some View {
@@ -339,6 +369,8 @@ struct StatusStripContainer: View {
     /// M26a — see `ModeSwitchState`; `nil` hides the switch.
     var modeSwitch: ModeSwitchState? = nil
     var onSelectMode: ((EngineMode) -> Void)? = nil
+    var mapMode: Bool = false
+    var onToggleMap: (() -> Void)? = nil
     let openPreferences: () -> Void
     let openAbout: () -> Void
 
@@ -362,10 +394,12 @@ struct StatusStripContainer: View {
                 clockText: clockText,
                 power: power,
                 lastError: lastError,
-                modeSwitch: modeSwitch),
+                modeSwitch: modeSwitch,
+                mapMode: mapMode),
             openPreferences: openPreferences,
             openAbout: openAbout,
-            onSelectMode: onSelectMode)
+            onSelectMode: onSelectMode,
+            onToggleMap: onToggleMap)
             .onAppear(perform: refresh)
             .onReceive(tick) { _ in refresh() }
     }

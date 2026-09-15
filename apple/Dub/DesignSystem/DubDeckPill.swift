@@ -45,7 +45,7 @@ struct DubDeckPill: View {
             .onSecondaryClick {
                 guard let onSelect else { return .handled }
                 return .menu(RackOutput.allCases.map { option in
-                    SecondaryMenuItem(option.menuTitle, checked: state.output == option) {
+                    SecondaryMenuItem(state.menuTitle(option), checked: state.output == option) {
                         onSelect(option)
                     }
                 })

@@ -24,19 +24,13 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<!-- Dual-GPU MacBook Pros: without this the first Metal layer makes
-	     macOS switch to the discrete GPU — seconds on the main thread
-	     at engine start and launch (`layer_private_mux_acquire`). The
-	     waveform is a few draw calls; the integrated GPU is enough and
-	     kinder to the battery on stage. `WaveformMetalView` asks for the
-	     low-power device as well. -->
-	<key>NSSupportsAutomaticGraphicsSwitching</key>
-	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Dub needs access to your audio input to capture timecode and audio for waveform analysis.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>

@@ -173,6 +173,26 @@ final class SampleBankTests: XCTestCase {
         XCTAssertNil(both.tintDeck, "no one deck's colour")
     }
 
+    /// With a deck on DUB FX (F-38) a rack landing there fires into the
+    /// rack, and the pill and its menu say so — but only for that deck,
+    /// and never for `A+B`, which is not one place.
+    func testRackOutputNamesTheFxChannel() {
+        let intoFx = RackOutputState(.auto, focused: .b, fxDeck: .b)
+        XCTAssertEqual(intoFx.label, "→ FX")
+        XCTAssertTrue(intoFx.intoFx)
+        XCTAssertEqual(intoFx.tintDeck, .b, "still deck B's colour")
+        XCTAssertEqual(intoFx.menuTitle(.b), "Deck B — the FX channel")
+        XCTAssertEqual(intoFx.menuTitle(.a), "Deck A")
+
+        let onA = RackOutputState(.a, focused: .b, fxDeck: .b)
+        XCTAssertEqual(onA.label, "→ A")
+        XCTAssertFalse(onA.intoFx)
+
+        let both = RackOutputState(.both, focused: .b, fxDeck: .b)
+        XCTAssertEqual(both.label, "→ A+B")
+        XCTAssertFalse(both.intoFx)
+    }
+
     func testRackOutputRoundTripsItsRawValue() {
         for output in RackOutput.allCases {
             XCTAssertEqual(RackOutput(rawValue: output.rawValue), output)

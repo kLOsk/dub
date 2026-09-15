@@ -16,19 +16,48 @@ import XCTest
 /// bug — pads advertising keys that did nothing.
 final class DubKeymapTests: XCTestCase {
 
-    // MARK: - The bindings that existed before, unchanged
+    /// Every test runs against an empty, throwaway map — the suite is
+    /// hosted in the app, where the shared store reads the DJ's real one.
+    private var savedStore: DubKeymapStore?
+    private var suite: UserDefaults?
 
-    /// Number row, layout-independent. `⇧` clears rather than selecting a
-    /// different action, so it must not change the match.
-    func testHotCuesKeepTheNumberRow() {
+    override func setUp() {
+        super.setUp()
+        savedStore = DubKeymapStore.shared
+        let name = "dub.tests.keymap.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)
+        defaults?.removePersistentDomain(forName: name)
+        suite = defaults
+        DubKeymapStore.shared = DubKeymapStore(defaults: defaults ?? .standard)
+    }
+
+    override func tearDown() {
+        if let saved = savedStore { DubKeymapStore.shared = saved }
+        super.tearDown()
+    }
+
+    // MARK: - Nothing you play has a default key
+
+    /// The number row used to fire the hot cues. It falls through now —
+    /// a DJ maps their own keys (2026-09-15) — and `⇧` on a mapped cue
+    /// still clears rather than selecting a different action.
+    func testHotCuesHaveNoDefaultKey() {
         // 1-8. Not contiguous past 4 on macOS: 5 and 6 are 23 and 22.
         let codes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28]
         for (i, code) in codes.enumerated() {
-            XCTAssertEqual(
+            XCTAssertNil(
                 DubKeymap.action(forKeyCode: code, character: "\(i + 1)", command: false),
-                .hotCue(i),
-                "cue \(i + 1)")
+                "cue \(i + 1) must not be pre-assigned")
         }
+        DubKeymapStore.shared.bind(.hotCue(0), to: DubKeyChord(code: 18, legend: "1"))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 18, character: "1", command: false), .hotCue(0))
+    }
+
+    /// Only the two app conventions ship bound.
+    func testOnlySpaceAndPreferencesAreDefaults() {
+        XCTAssertEqual(
+            Set(DubKeymap.defaults.map(\.action)), [.loadSelection, .openPreferences])
     }
 
     /// The siren's bottom row `Z X C V B N M ,` is unbound until map
@@ -67,26 +96,19 @@ final class DubKeymapTests: XCTestCase {
             .loadSelection)
     }
 
-    /// `⌘→` duplicates onto B, `⌘←` the reverse. Unmodified arrows are not
-    /// ours — they move a caret and a table selection.
-    func testInstantDoublesNeedCommand() {
+    /// `⌘→` / `⌘←` used to be instant doubles and `G` the grid tap. Both
+    /// wait for the DJ now, and the arrows and the letter fall through.
+    func testInstantDoublesAndGridTapHaveNoDefaultKey() {
+        XCTAssertNil(DubKeymap.action(forKeyCode: 124, character: nil, command: true))
+        XCTAssertNil(DubKeymap.action(forKeyCode: 123, character: nil, command: true))
+        XCTAssertNil(DubKeymap.action(forKeyCode: 5, character: "g", command: false))
+        DubKeymapStore.shared.bind(.instantDouble(toDeckB: true), to: DubKeyChord(code: 124, command: true, legend: "⌘→"))
         XCTAssertEqual(
             DubKeymap.action(forKeyCode: 124, character: nil, command: true),
             .instantDouble(toDeckB: true))
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 123, character: nil, command: true),
-            .instantDouble(toDeckB: false))
-        XCTAssertNil(DubKeymap.action(forKeyCode: 124, character: nil, command: false))
-    }
-
-    /// The grid tap is matched by printed character, not position — the
-    /// mnemonic is the `G` of "grid", so a non-QWERTY layout should follow
-    /// the letter rather than the key.
-    func testGridTapMatchesTheLetterNotThePosition() {
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 999, character: "g", command: false), .tapGrid)
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 999, character: "G", command: false), .tapGrid)
+        XCTAssertNil(
+            DubKeymap.action(forKeyCode: 124, character: nil, command: false),
+            "a ⌘ chord does not fire on the bare key")
     }
 
     // MARK: - The sampler has no bindings
@@ -135,6 +157,112 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(DubAction.sirenPreset(4).id, "siren.preset.4")
         XCTAssertEqual(DubAction.instantDouble(toDeckB: true).id, "deck.instantDouble.b")
         XCTAssertEqual(DubAction.loadSelection.id, "transport.loadSelection")
+        XCTAssertEqual(DubAction.sampler(7).id, "sampler.7")
+        XCTAssertEqual(DubAction.quickScratch(.b, 3).id, "scratch.b.3")
+        XCTAssertEqual(DubAction.fxToggle(2).id, "fx.unit.2")
+        XCTAssertEqual(DubAction.fxKick.id, "fx.kick")
+        XCTAssertEqual(DubAction.echoOut(.a).id, "echo.a")
+    }
+
+    /// Every id round-trips through the parser a stored profile uses,
+    /// and an id no version issued is refused rather than guessed.
+    func testActionIdsRoundTrip() {
+        let all: [DubAction] = [
+            .loadSelection, .openPreferences, .tapGrid, .hotCue(5), .sirenPreset(0),
+            .instantDouble(toDeckB: false), .instantDouble(toDeckB: true), .sampler(3),
+            .quickScratch(.a, 0), .quickScratch(.b, 3), .fxToggle(3), .fxKick, .echoOut(.b),
+        ]
+        for action in all {
+            XCTAssertEqual(DubAction(id: action.id), action, action.id)
+        }
+        XCTAssertNil(DubAction(id: "siren.preset.x"))
+        XCTAssertNil(DubAction(id: "midi.cc.7"))
+        XCTAssertNil(DubAction(id: ""))
+    }
+
+    // MARK: - Map mode (M18)
+
+    private func chord(_ code: UInt16, _ legend: String, command: Bool = false) -> DubKeyChord {
+        DubKeyChord(code: code, command: command, legend: legend)
+    }
+
+    /// Turn MAP on, click the siren's LASER key, press Z: Z fires LASER
+    /// and the key prints Z. Nothing else moved.
+    func testBindingASirenShotMakesItsKeyFireAndPrint() {
+        DubKeymapStore.shared.bind(.sirenPreset(3), to: chord(6, "Z"))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 6, character: "z", command: false), .sirenPreset(3))
+        XCTAssertEqual(DubKeymap.legend(for: .sirenPreset(3)), "Z")
+        XCTAssertEqual(sirenPresetKeys, ["", "", "", "Z", ""])
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 49, character: " ", command: false), .loadSelection,
+            "the defaults are still there")
+    }
+
+    /// One key, one action: binding a sampler slot to `1` takes `1` from
+    /// the hot cue that had it, which is then unbound — its cap prints
+    /// nothing rather than a key that fires something else. Space, a
+    /// default, is stolen the same way.
+    func testBindingStealsTheKeyFromItsPreviousAction() {
+        DubKeymapStore.shared.bind(.hotCue(0), to: chord(18, "1"))
+        DubKeymapStore.shared.bind(.sampler(0), to: chord(18, "1"))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 18, character: "1", command: false), .sampler(0))
+        XCTAssertNil(DubKeymap.legend(for: .hotCue(0)))
+        XCTAssertTrue(DubKeymapStore.shared.isOverridden(.hotCue(0)))
+        // Rebinding the cue elsewhere gives it a key back; the slot keeps 1.
+        DubKeymapStore.shared.bind(.hotCue(0), to: chord(12, "Q"))
+        XCTAssertEqual(DubKeymap.legend(for: .hotCue(0)), "Q")
+        XCTAssertEqual(DubKeymap.legend(for: .sampler(0)), "1")
+
+        DubKeymapStore.shared.bind(.echoOut(.a), to: chord(49, "SPACE"))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 49, character: " ", command: false), .echoOut(.a))
+        XCTAssertNil(DubKeymap.legend(for: .loadSelection), "Space moved off the loader")
+    }
+
+    /// `⌘,` is the way back to everything: it cannot be taken or rebound.
+    func testPreferencesCannotBeRebound() {
+        DubKeymapStore.shared.bind(.openPreferences, to: chord(6, "Z"))
+        XCTAssertNil(DubKeymap.legend(for: .sirenPreset(0)))
+        XCTAssertEqual(DubKeymap.legend(for: .openPreferences), "⌘,")
+        DubKeymapStore.shared.bind(.sampler(1), to: chord(43, "⌘,", command: true))
+        XCTAssertEqual(DubKeymap.legend(for: .openPreferences), "⌘,", "not stolen either")
+    }
+
+    /// ⌫ on an armed control leaves it unbound; reset brings every
+    /// default back and forgets every override.
+    func testClearAndReset() {
+        DubKeymapStore.shared.clear(.loadSelection)
+        XCTAssertNil(DubKeymap.legend(for: .loadSelection))
+        XCTAssertNil(DubKeymap.action(forKeyCode: 49, character: " ", command: false))
+        DubKeymapStore.shared.bind(.sampler(4), to: chord(0, "A"))
+        DubKeymapStore.shared.reset()
+        XCTAssertEqual(DubKeymap.legend(for: .loadSelection), "SPACE")
+        XCTAssertNil(DubKeymap.legend(for: .sampler(4)))
+        XCTAssertFalse(DubKeymapStore.shared.isOverridden(.loadSelection))
+    }
+
+    /// The map survives a relaunch: a second store over the same suite
+    /// resolves the same table.
+    func testOverridesPersist() {
+        DubKeymapStore.shared.bind(.quickScratch(.b, 2), to: chord(14, "E"))
+        DubKeymapStore.shared.clear(.hotCue(7))
+        let reopened = DubKeymapStore(defaults: suite ?? .standard)
+        XCTAssertEqual(reopened.resolvedByAction[.quickScratch(.b, 2)]?.legend, "E")
+        XCTAssertNil(reopened.resolvedByAction[.hotCue(7)])
+        XCTAssertEqual(reopened.resolved.count, DubKeymapStore.shared.resolved.count)
+    }
+
+    /// The cap prints what the DJ's keyboard says: letters upper-case,
+    /// the unprintable keys by their macOS symbols, a ⌘ chord with its glyph.
+    func testChordLegends() {
+        XCTAssertEqual(DubKeyChord.legend(code: 6, characters: "z", command: false), "Z")
+        XCTAssertEqual(DubKeyChord.legend(code: 49, characters: " ", command: false), "SPACE")
+        XCTAssertEqual(DubKeyChord.legend(code: 124, characters: "\u{F703}", command: false), "→")
+        XCTAssertEqual(DubKeyChord.legend(code: 122, characters: "\u{F704}", command: false), "F1")
+        XCTAssertEqual(DubKeyChord.legend(code: 12, characters: "q", command: true), "⌘Q")
+        XCTAssertEqual(DubKeyChord.legend(code: 999, characters: nil, command: false), "#999")
     }
 
     /// Every binding ships on the key transport today. MIDI and HID exist

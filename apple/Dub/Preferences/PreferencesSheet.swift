@@ -298,10 +298,16 @@ struct PreferencesSheet: View {
                     .foregroundStyle(DubColor.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                // The vintage FX rack is deferred to post-release (being reworked
-                // into a deck-role FX channel), so its Preferences toggle is
-                // removed and the per-deck rack UI stays hidden. The view + DSP
-                // + engine code remain in-tree, dormant.
+                Toggle(isOn: $model.dubFxEnabled) {
+                    Text("Dub FX channel")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("Adds a DUB FX position to each deck's source switch. Flip a deck to it and the deck stops being a turntable: the record is replaced by the vintage rack — Big Knob, phaser, Space Echo, spring — on the mixer's aux send, patched into the pair that deck's needle used, returning on its output pair. Every knob is the unit's own; ride them from a controller. When off, the position is hidden and any FX deck goes back to its internal clock.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

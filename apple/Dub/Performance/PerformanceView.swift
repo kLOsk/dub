@@ -45,6 +45,8 @@ import DubCore
 struct PerformanceView: View {
 
     @ObservedObject var model: WaveformAppModel
+    /// The map — observed so a rebind re-reads every printed cap.
+    @ObservedObject private var keymap = DubKeymapStore.shared
     /// Callback the status-strip gear button hits to open the
     /// Preferences sheet — owned by `MainView`, passed down so
     /// `PerformanceView` itself stays free of sheet bindings.
@@ -53,7 +55,27 @@ struct PerformanceView: View {
     /// sheet — also owned by `MainView`.
     let openAbout: () -> Void
 
+    init(model: WaveformAppModel, openPreferences: @escaping () -> Void, openAbout: @escaping () -> Void) {
+        self.model = model
+        self.openPreferences = openPreferences
+        self.openAbout = openAbout
+    }
+
+    /// Map mode in the view tree (M18): `nil` when it is off, so every
+    /// `.mappable` control is exactly what it was.
+    private var mapping: DubMapping? {
+        guard model.mapMode else { return nil }
+        return DubMapping(
+            armed: model.mapArmed, revision: keymap.revision,
+            arm: { model.armForMapping($0) })
+    }
+
     var body: some View {
+        surface
+            .environment(\.dubMapping, mapping)
+    }
+
+    private var surface: some View {
         VStack(spacing: 0) {
             statusStrip
             deckHeaders
@@ -129,6 +151,8 @@ struct PerformanceView: View {
             onSelectMode: { mode in
                 model.setModeOverride(mode)
             },
+            mapMode: model.mapMode,
+            onToggleMap: { model.mapMode.toggle() },
             openPreferences: openPreferences,
             openAbout: openAbout)
     }
@@ -248,8 +272,11 @@ struct PerformanceView: View {
                 return ScratchPadState(
                     pad: pad,
                     name: slot.flatMap { model.sampleBank.slot($0) }.map { SampleBank.label(for: $0) },
-                    engaged: deck.quickScratch?.pad == pad)
-            })
+                    engaged: deck.quickScratch?.pad == pad,
+                    legend: DubKeymap.legend(for: .quickScratch(side, pad)))
+            },
+            fxAvailable: model.dubFxEnabled,
+            echoLegend: DubKeymap.legend(for: .echoOut(side)))
     }
 
     /// The file the deck parked for a quick scratch, so the header can
@@ -294,7 +321,50 @@ struct PerformanceView: View {
             onPause: header.onPause,
             onSetTimecode: { header.onSetTimecode?() },
             onSetThru: { header.onSetThru?() },
+            onSetFx: { model.setDeckDubFx(side: side) },
             onRecalibrate: { header.onRecalibrate?() })
+    }
+
+    // MARK: - DUB FX channel
+
+    /// Snapshot of the model for the FX channel pane (F-38), as
+    /// `deckColumnState` is for the column.
+    func fxChannelState(side: DeckSide) -> FxChannelState {
+        let deck = (side == .a) ? model.deckA : model.deckB
+        let pair = (side == .a ? model.channelsAText : model.channelsBText)
+            .replacingOccurrences(of: ",", with: "–")
+        return FxChannelState(
+            side: side,
+            isPlaying: deck.isPlaying,
+            sourceOverridden: deck.controlOverridden,
+            input: deck.fxInput,
+            inputPair: pair,
+            trimDb: deck.fxTrimDb,
+            inputAmplitude: deck.inputAmplitude,
+            active: deck.rackActive,
+            controls: deck.fxRack,
+            toggleLegends: FxRackUnit.allCases.map { DubKeymap.legend(for: .fxToggle($0.rawValue)) },
+            kickLegend: DubKeymap.legend(for: .fxKick))
+    }
+
+    /// Pure forwarders into the model. The source-control four are the
+    /// header's own, so the switch keeps behaving as it does on a deck.
+    func fxChannelCallbacks(side: DeckSide) -> FxChannelCallbacks {
+        let header = headerCallbacks(side: side)
+        return FxChannelCallbacks(
+            onSetInternal: {
+                header.onSetInternal?()
+                model.play(side: side)
+            },
+            onPause: header.onPause,
+            onSetTimecode: { header.onSetTimecode?() },
+            onSetThru: { header.onSetThru?() },
+            onRecalibrate: { header.onRecalibrate?() },
+            onInput: { kind in model.setFxInput(side, kind) },
+            onTrim: { db in model.setFxInputTrim(side, db: db) },
+            onToggle: { unit in model.toggleFxRackSlot(side, unit.slot) },
+            onControls: { controls in model.setFxRack(side, controls) },
+            onKick: { model.kickFxSpring(side) })
     }
 
     func padsState(side: DeckSide, deckState: DeckState) -> PerformancePadsState {
@@ -357,9 +427,11 @@ struct PerformanceView: View {
                     sounding: sounding,
                     lastShot: model.lastSirenShot,
                     fireCount: model.sirenFireCount,
-                    dubMacro: model.sirenDub)
+                    dubMacro: model.sirenDub,
+                    legends: sirenPresetKeys)
                 : nil,
-            sampler: sampleShelfState(output: model.samplerOutputState))
+            sampler: sampleShelfState(output: model.samplerOutputState),
+            fxSide: model.dubFxDeck)
     }
 
     /// The sampler as drawn on either surface: the bank's names over
@@ -375,7 +447,8 @@ struct PerformanceView: View {
                     name: model.sampleBank.slot(index).map { SampleBank.label(for: $0) },
                     playing: voice?.playing ?? false,
                     progress: Double(voice?.progress ?? 0),
-                    quickScratch: model.sampleBank.quickScratchTag(index))
+                    quickScratch: model.sampleBank.quickScratchTag(index),
+                    legend: DubKeymap.legend(for: .sampler(index)))
             },
             output: output)
     }

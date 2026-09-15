@@ -1233,11 +1233,12 @@ extension DeckHeaderState {
     static func sourceControl(from d: DeckState) -> SourceControlStatus? {
         guard d.hasTimecodeInput else { return nil }
         // Reflect the user-selected mode directly (0 internal · 1
-        // timecode · 2 thru). Calibration is a transient sub-state of
+        // timecode · 2 thru · 3 dub fx). Calibration is a transient sub-state of
         // Timecode. No auto-detection / `detecting` state any more.
         switch d.controlMode {
         case 0: return .internalPlay
         case 2: return .thru
+        case 3: return .fx
         default: return d.calibrating ? .calibrating : .timecode
         }
     }

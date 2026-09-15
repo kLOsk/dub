@@ -23,11 +23,13 @@
 import DubCore
 import SwiftUI
 
-/// Keyboard legends for the siren shots, in fire order — all empty until
-/// map mode binds them; the caps then print whatever the DJ picked. One
-/// row because there is one keymap — the handler resolves the deck at
-/// press time, not the key.
-let sirenPresetKeys = DubKeymap.legends({ .sirenPreset($0) }, count: 5)
+/// Keyboard legends for the siren shots, in fire order — empty until map
+/// mode binds them; the caps then print whatever the DJ picked. Read at
+/// draw time (a global `let` froze the launch-time map) and carried on
+/// `SirenRackState.legends` so a rebind re-renders the box. One row
+/// because there is one keymap — the handler resolves the deck at press
+/// time, not the key.
+var sirenPresetKeys: [String] { DubKeymap.legends({ .sirenPreset($0) }, count: 5) }
 
 /// The siren box: display · keys · DUB knob on a faceplate, under the
 /// bar's shared heading.
@@ -110,12 +112,13 @@ struct SirenRackGroup: View {
 
     @ViewBuilder
     private func key(index: Int, name: String) -> some View {
-        let legend = index < sirenPresetKeys.count ? sirenPresetKeys[index] : ""
+        let legend = index < state.legends.count ? state.legends[index] : ""
         DubKey(
             title: name, legend: legend,
             down: state.sounding && state.lastShot == index)
             .onPressDown { onPreset(index) }
             .help(legend.isEmpty ? "Fire \(name)" : "Fire \(name) (\(legend))")
+            .mappable(.sirenPreset(index))
     }
 
     /// The DUB knob. The delay and feedback it has set are on the meter's

@@ -3164,6 +3164,22 @@ struct LibraryView: View {
                         .font(DubFont.micro)
                         .foregroundStyle(DubColor.textSecondary)
                 }
+            } else if libraryModel.analysisInFlightCount > 0 {
+                // U-14: a single deck-load analysis (`ensureTrackAnalyzed`)
+                // used to run with no trace — the BPM column read "—" until
+                // the worker finished and the number appeared. The same
+                // spinner, quieter copy, so the DJ can tell "in flight" from
+                // "stuck".
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                    Text(libraryModel.analysisInFlightCount == 1
+                         ? "Analyzing 1 track…"
+                         : "Analyzing \(libraryModel.analysisInFlightCount) tracks…")
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                }
             }
             if libraryModel.missingTrackCount > 0 {
                 Button(action: { showRelocateSheet = true }) {

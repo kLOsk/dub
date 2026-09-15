@@ -25,6 +25,11 @@
 import SwiftUI
 
 /// One dial, 0…1 over a 270° arc, `low` and `high` printed at its ends.
+///
+/// The siren's DUB knob at its native 60 pt; the DUB FX channel's faces
+/// draw it smaller (`size`) and, for the Big Knob, with `detents` — the
+/// value snaps to the Altec's eleven stops and the drag clicks through
+/// them.
 struct DubKnob: View {
     /// 0…1.
     let value: Double
@@ -32,11 +37,19 @@ struct DubKnob: View {
     var low: String = ""
     var high: String = ""
     var tint: Color = DubColor.siren
+    /// The dial's outer size in points; everything scales with it.
+    var size: CGFloat = 60
+    /// Stepped positions (≥ 2) — the value snaps to `i / (detents − 1)`
+    /// and the printed scale has one tick per stop. `nil` = continuous.
+    var detents: Int? = nil
+    /// The scale's ink; a face can print it brighter than the plate.
+    var ink: Color = DubColor.textPlaceholder
     var onChange: (_ value: Double) -> Void = { _ in }
 
     /// Points of vertical drag for the full turn.
     private static let travel: CGFloat = 150
-    private static let size: CGFloat = 60
+    /// Everything below was drawn at 60 pt; scale by this.
+    private var k: CGFloat { size / 60 }
     /// The arc runs from 135° (bottom-left) clockwise through the top to
     /// 45° (bottom-right): 270° of the circle, the gap at the bottom.
     private static let startDegrees: Double = 135
@@ -52,7 +65,7 @@ struct DubKnob: View {
             drawScale(ctx, c)
             drawKnob(ctx, c, phase: pointerAngle.radians)
         }
-        .frame(width: Self.size, height: Self.size)
+        .frame(width: size, height: size)
         .overlay(alignment: .bottom) {
             HStack {
                 scaleLabel(low)
@@ -68,22 +81,30 @@ struct DubKnob: View {
         .accessibilityLabel("\(low) to \(high)")
         .accessibilityValue("\(Int((clamped * 100).rounded())) percent")
         .accessibilityAdjustableAction { direction in
+            let step = detents.map { 1.0 / Double($0 - 1) } ?? 0.05
             switch direction {
-            case .increment: onChange(min(clamped + 0.05, 1))
-            case .decrement: onChange(max(clamped - 0.05, 0))
+            case .increment: onChange(min(clamped + step, 1))
+            case .decrement: onChange(max(clamped - step, 0))
             @unknown default: break
             }
         }
     }
 
     private var pointerAngle: Angle {
-        .degrees(Self.startDegrees + Self.sweepDegrees * clamped)
+        .degrees(Self.startDegrees + Self.sweepDegrees * snapped)
+    }
+
+    /// The value the pointer sits on: the nearest stop when there are
+    /// detents, the value itself otherwise.
+    private var snapped: Double {
+        guard let n = detents, n >= 2 else { return clamped }
+        return (clamped * Double(n - 1)).rounded() / Double(n - 1)
     }
 
     // MARK: - Drawing
 
     /// Outer edge of the fluted body at a lobe's crest, and the depth of
-    /// the flute between lobes.
+    /// the flute between lobes — at 60 pt; scaled by `k`.
     private static let lobeRadius: CGFloat = 23
     private static let fluteDepth: CGFloat = 2.6
     private static let lobes = 8
@@ -91,23 +112,30 @@ struct DubKnob: View {
     private static let capRadius: CGFloat = 13.5
     private static let bevelRadius: CGFloat = 16
 
-    /// The panel print: eleven ticks over the arc, the ends a touch
-    /// longer, in the plate's ink. The words come from the overlay.
+    private var lobeRadius: CGFloat { Self.lobeRadius * k }
+    private var fluteDepth: CGFloat { Self.fluteDepth * k }
+    private var capRadius: CGFloat { Self.capRadius * k }
+    private var bevelRadius: CGFloat { Self.bevelRadius * k }
+
+    /// The panel print: one tick per stop (eleven when continuous), the
+    /// ends and the middle a touch longer, in the plate's ink. The words
+    /// come from the overlay.
     private func drawScale(_ ctx: GraphicsContext, _ c: CGPoint) {
-        for i in 0...10 {
-            let a = Angle.degrees(Self.startDegrees + Self.sweepDegrees * Double(i) / 10).radians
-            let long = i == 0 || i == 10 || i == 5
+        let stops = max(detents ?? 11, 2)
+        for i in 0..<stops {
+            let a = Angle.degrees(Self.startDegrees + Self.sweepDegrees * Double(i) / Double(stops - 1)).radians
+            let long = i == 0 || i == stops - 1 || (stops % 2 == 1 && i == stops / 2)
             var tick = Path()
-            tick.move(to: polar(c, Self.lobeRadius + 3, a))
-            tick.addLine(to: polar(c, Self.lobeRadius + (long ? 6.5 : 5), a))
-            ctx.stroke(tick, with: .color(DubColor.textPlaceholder),
-                       style: StrokeStyle(lineWidth: 1, lineCap: .round))
+            tick.move(to: polar(c, lobeRadius + 3 * k, a))
+            tick.addLine(to: polar(c, lobeRadius + (long ? 6.5 : 5) * k, a))
+            ctx.stroke(tick, with: .color(ink),
+                       style: StrokeStyle(lineWidth: max(1 * k, 0.8), lineCap: .round))
         }
     }
 
     private func drawKnob(_ ctx: GraphicsContext, _ c: CGPoint, phase: Double) {
         // The skirt: the flange under the body, a shade off the plate.
-        let skirt = Path(ellipseIn: square(c, Self.lobeRadius + 2))
+        let skirt = Path(ellipseIn: square(c, lobeRadius + 2 * k))
         ctx.fill(skirt, with: .color(Color(hex: 0x0E0F12)))
         ctx.stroke(skirt, with: .color(DubColor.plateEdge.opacity(0.6)), lineWidth: 0.8)
 
@@ -116,7 +144,7 @@ struct DubKnob: View {
         let body = lobedPath(c, phase: phase)
         ctx.fill(body, with: .radialGradient(
             Gradient(colors: [Color(hex: 0x3C3D42), Color(hex: 0x15161A), Color(hex: 0x050506)]),
-            center: CGPoint(x: c.x - 7, y: c.y - 8), startRadius: 0, endRadius: Self.lobeRadius * 1.6))
+            center: CGPoint(x: c.x - 7 * k, y: c.y - 8 * k), startRadius: 0, endRadius: lobeRadius * 1.6))
         var flank: [Gradient.Stop] = []
         for i in 0..<Self.lobes {
             let base = Double(i) / Double(Self.lobes)
@@ -131,14 +159,14 @@ struct DubKnob: View {
         ctx.stroke(body, with: .color(.black.opacity(0.9)), lineWidth: 0.7)
 
         // The bevel ring between the flutes and the cap.
-        let bevel = Path(ellipseIn: square(c, Self.bevelRadius))
+        let bevel = Path(ellipseIn: square(c, bevelRadius))
         ctx.fill(bevel, with: .radialGradient(
             Gradient(colors: [Color(hex: 0x0A0B0D), Color(hex: 0x1C1D22)]),
-            center: c, startRadius: Self.capRadius, endRadius: Self.bevelRadius))
+            center: c, startRadius: capRadius, endRadius: bevelRadius))
 
         // The spun-aluminium cap: an anisotropic sheen fixed to the light,
         // then the diamond-cut rings as hairlines.
-        let cap = Path(ellipseIn: square(c, Self.capRadius))
+        let cap = Path(ellipseIn: square(c, capRadius))
         let sheen = Gradient(stops: [
             .init(color: Color(hex: 0xA9AEB4), location: 0.00),
             .init(color: Color(hex: 0xEDF0F2), location: 0.10),
@@ -150,12 +178,12 @@ struct DubKnob: View {
             .init(color: Color(hex: 0xA9AEB4), location: 1.00),
         ])
         ctx.fill(cap, with: .conicGradient(sheen, center: c, angle: .degrees(-60)))
-        var r: CGFloat = 2
+        var r: CGFloat = 2 * k
         var dark = true
-        while r < Self.capRadius - 0.5 {
+        while r < capRadius - 0.5 {
             let ring = Path(ellipseIn: square(c, r))
             ctx.stroke(ring, with: .color(dark ? .black.opacity(0.18) : .white.opacity(0.22)), lineWidth: 0.35)
-            r += 0.9
+            r += 0.9 * k
             dark.toggle()
         }
         ctx.stroke(cap, with: .color(.black.opacity(0.7)), lineWidth: 0.6)
@@ -163,10 +191,10 @@ struct DubKnob: View {
         // The index line: white paint from the cap's edge down the lobe
         // that sits under the pointer.
         var index = Path()
-        index.move(to: polar(c, Self.bevelRadius + 0.5, phase))
-        index.addLine(to: polar(c, Self.lobeRadius - 0.6, phase))
+        index.move(to: polar(c, bevelRadius + 0.5, phase))
+        index.addLine(to: polar(c, lobeRadius - 0.6, phase))
         ctx.stroke(index, with: .color(Color(hex: 0xF4F5F7)),
-                   style: StrokeStyle(lineWidth: 1.7, lineCap: .round))
+                   style: StrokeStyle(lineWidth: max(1.7 * k, 1.2), lineCap: .round))
     }
 
     /// Eight rounded lobes with a flute between each pair, a crest under
@@ -177,7 +205,7 @@ struct DubKnob: View {
         for i in 0...steps {
             let a = phase + Double(i) / Double(steps) * 2 * .pi
             let wave = (1 + cos(Double(Self.lobes) * (a - phase))) / 2   // 1 at a crest, 0 in a flute
-            let r = Self.lobeRadius - Self.fluteDepth * (1 - pow(wave, 0.7))
+            let r = lobeRadius - fluteDepth * (1 - pow(wave, 0.7))
             let pt = polar(c, r, a)
             if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
         }
@@ -206,8 +234,15 @@ struct DubKnob: View {
                 let origin = dragOrigin ?? clamped
                 if dragOrigin == nil { dragOrigin = origin }
                 // Up is more: screen y grows downward.
-                let next = origin - Double(g.translation.height / Self.travel)
-                onChange(min(max(next, 0), 1))
+                let raw = min(max(origin - Double(g.translation.height / Self.travel), 0), 1)
+                // A stepped dial hands back the stop, so the model never
+                // holds a value between two detents.
+                if let n = detents, n >= 2 {
+                    let stop = (raw * Double(n - 1)).rounded() / Double(n - 1)
+                    if stop != snapped { onChange(stop) }
+                } else {
+                    onChange(raw)
+                }
             }
             .onEnded { _ in dragOrigin = nil }
     }
