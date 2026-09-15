@@ -225,6 +225,57 @@ pub enum Command {
         macro_value: f32,
     },
 
+    /// Engage or bypass rack slot `slot` on deck `idx` *without* touching its
+    /// controls — the DUB FX channel's IN/OUT toggle. [`Self::DeckSetRackFx`]
+    /// re-applies the Advanced macro on every call, which would stomp the
+    /// Expert knobs; this one is the switch alone.
+    DeckSetRackSlotActive { idx: u8, slot: FxSlot, active: bool },
+
+    /// Expert Big Knob on deck `idx` (the DUB FX channel, PRD §6.3): snap the
+    /// cutoff to detent `step` (0..=10 over [`dub_dsp::BIG_KNOB_STEPS`]) and set
+    /// the resonance `q` (0.5..8). Both pure on the audio thread — the detent
+    /// coefficients are a table built at construction.
+    DeckSetRackBigKnob { idx: u8, step: u8, q: f32 },
+
+    /// Expert phaser on deck `idx`: LFO `rate_hz`, sweep `depth`, resonance
+    /// `feedback` and dry/wet `mix` (all 0..1 except the rate). Pure setters.
+    DeckSetRackPhaser {
+        idx: u8,
+        rate_hz: f32,
+        depth: f32,
+        feedback: f32,
+        mix: f32,
+    },
+
+    /// Expert Space Echo on deck `idx`: the `mode` selector position (dial
+    /// index into [`dub_dsp::Re201Mode::ALL`]), the longest head's
+    /// `repeat_ms`, `intensity` (feedback; > ~1 self-oscillates),
+    /// `echo_volume`, the onboard `reverb` wet and `wow_flutter` (tape age).
+    /// All pure on the audio thread — ms→samples is a multiply and the
+    /// reverb's coefficients are fixed at construction.
+    DeckSetRackSpaceEcho {
+        idx: u8,
+        mode: u8,
+        repeat_ms: f32,
+        intensity: f32,
+        echo_volume: f32,
+        reverb: f32,
+        wow_flutter: f32,
+    },
+
+    /// Expert spring on deck `idx`: `decay` (tail feedback), `tone` (0 dark →
+    /// 1 bright, from the tank's tone table) and `wet`. Pure setters.
+    DeckSetRackSpring {
+        idx: u8,
+        decay: f32,
+        tone: f32,
+        wet: f32,
+    },
+
+    /// Kick the spring tank on deck `idx` — Tubby's thunder: a short impulse
+    /// into the springs at `level` (0..1). Pure (arms a sample counter).
+    DeckKickSpring { idx: u8, level: f32 },
+
     /// Set the dub-siren's live controls on deck `idx` (PRD §6.3). The siren is
     /// a self-contained instrument: `speed` is the HK628 chip-clock (pitch +
     /// timing); the rest drive its onboard PT2399 echo — `delay_ms`/`feedback`/
@@ -546,6 +597,67 @@ impl std::fmt::Debug for Command {
                 .field("slot", slot)
                 .field("active", active)
                 .field("macro_value", macro_value)
+                .finish(),
+            Self::DeckSetRackSlotActive { idx, slot, active } => f
+                .debug_struct("DeckSetRackSlotActive")
+                .field("idx", idx)
+                .field("slot", slot)
+                .field("active", active)
+                .finish(),
+            Self::DeckSetRackBigKnob { idx, step, q } => f
+                .debug_struct("DeckSetRackBigKnob")
+                .field("idx", idx)
+                .field("step", step)
+                .field("q", q)
+                .finish(),
+            Self::DeckSetRackPhaser {
+                idx,
+                rate_hz,
+                depth,
+                feedback,
+                mix,
+            } => f
+                .debug_struct("DeckSetRackPhaser")
+                .field("idx", idx)
+                .field("rate_hz", rate_hz)
+                .field("depth", depth)
+                .field("feedback", feedback)
+                .field("mix", mix)
+                .finish(),
+            Self::DeckSetRackSpaceEcho {
+                idx,
+                mode,
+                repeat_ms,
+                intensity,
+                echo_volume,
+                reverb,
+                wow_flutter,
+            } => f
+                .debug_struct("DeckSetRackSpaceEcho")
+                .field("idx", idx)
+                .field("mode", mode)
+                .field("repeat_ms", repeat_ms)
+                .field("intensity", intensity)
+                .field("echo_volume", echo_volume)
+                .field("reverb", reverb)
+                .field("wow_flutter", wow_flutter)
+                .finish(),
+            Self::DeckSetRackSpring {
+                idx,
+                decay,
+                tone,
+                wet,
+            } => f
+                .debug_struct("DeckSetRackSpring")
+                .field("idx", idx)
+                .field("decay", decay)
+                .field("tone", tone)
+                .field("wet", wet)
+                .finish(),
+            Self::DeckKickSpring { idx, level } => f
+                .debug_struct("DeckKickSpring")
+                .field("idx", idx)
+                .field("level", level)
                 .finish(),
             Self::DeckSetSirenControls {
                 idx,

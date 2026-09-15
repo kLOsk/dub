@@ -45,7 +45,9 @@ const HEAD_RATIOS: [f32; 3] = [0.337, 0.668, 1.0];
 
 /// RE-201 mode: which playback heads are live and whether the spring reverb is
 /// in circuit. A representative subset of the unit's 12-position selector.
+/// `repr(u8)` in selector order so the FFI can map a Swift enum onto it 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Re201Mode {
     /// Reverb only — no tape echo.
     Reverb,
@@ -64,6 +66,23 @@ pub enum Re201Mode {
 }
 
 impl Re201Mode {
+    /// Every position of the selector, in dial order.
+    pub const ALL: [Self; 7] = [
+        Self::Reverb,
+        Self::Short,
+        Self::Long,
+        Self::Triple,
+        Self::ShortReverb,
+        Self::LongReverb,
+        Self::TripleReverb,
+    ];
+
+    /// The selector position for a dial index (clamped to the last stop).
+    #[must_use]
+    pub fn from_index(index: u8) -> Self {
+        Self::ALL[usize::from(index).min(Self::ALL.len() - 1)]
+    }
+
     /// `(head1, head2, head3, reverb)` for this mode.
     fn config(self) -> ([bool; 3], bool) {
         match self {

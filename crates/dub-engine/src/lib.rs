@@ -884,10 +884,26 @@ impl Engine {
             self.echo[idx].process_block(out, num_channels, first_us);
             self.decks[idx].store_echo_state(self.echo[idx].state_code());
 
-            // Vintage-FX rack (PRD §6.3) — the dub processing chain on the
-            // MUSIC. Each engaged slot processes the deck's output bus in turn:
-            // the inserts (Big Knob HPF, phaser) rewrite in place, then the
-            // sends (RE-201 tape echo, spring reverb) add their wet on top. A
+            // The instruments — the siren and the sampler — and the rack
+            // compose in one of two orders. On a music deck the rack is the
+            // dub processing chain on the MUSIC and the instruments render
+            // after it, untouched (a siren through the Big Knob would lose
+            // its bottom). On the DUB FX channel the deck IS the rack, and
+            // the instruments are routed into it on purpose — the siren
+            // through the Space Echo is the sound-system sound, and a horn
+            // stab into the tape is the point of the `→ FX` pill — so there
+            // they render first and the rack processes them along with the
+            // send. F-38.
+            let instruments_first = matches!(self.control_mode[idx], ControlMode::Fx);
+            if instruments_first {
+                self.render_siren_into(idx, out, num_channels, first_us);
+                self.render_samplers_into(idx, out, num_channels, first_us);
+            }
+
+            // Vintage-FX rack (PRD §6.3) — the dub processing chain. Each
+            // engaged slot processes the deck's output bus in turn: the
+            // inserts (Big Knob HPF, phaser) rewrite in place, then the sends
+            // (RE-201 tape echo, spring reverb) add their wet on top. A
             // disengaged slot is skipped entirely. No state is published — the
             // UI toggle is the source of truth (these never self-terminate).
             let active = &self.rack_active[idx];
@@ -904,56 +920,9 @@ impl Engine {
                 self.spring[idx].process_block(out, num_channels, first_us);
             }
 
-            // M16 dub-siren (PRD §6.3): a self-contained INSTRUMENT, rendered
-            // LAST so the music FX above never touch it. The voices render into
-            // a scratch pair, pass through the siren's OWN onboard echo (PT2399,
-            // the GS1/Benidub chip), get the siren volume, then sum onto the
-            // deck bus. So the siren sounds with or without a track and is
-            // independent of echo-out + the rack. Sliced into SIREN_CHUNK frames
-            // so any block size stays allocation-free.
-            let frames = out.len() / num_channels;
-            let mut done = 0;
-            while done < frames {
-                let n = (frames - done).min(SIREN_CHUNK);
-                let scratch = &mut self.siren_scratch[..n * 2];
-                scratch.fill(0.0);
-                self.siren[idx].process_block(scratch, 2, 0);
-                self.sn76477[idx].process_block(scratch, 2, 0);
-                self.hk628[idx].process_block(scratch, 2, 0);
-                if self.siren_echo_active[idx] {
-                    self.siren_echo[idx].process_block(scratch, 2, 0);
-                }
-                let vol = self.siren_volume[idx];
-                for f in 0..n {
-                    let s = scratch[f * 2] * vol;
-                    let o = (done + f) * num_channels + first_us;
-                    out[o] += s;
-                    out[o + 1] += s;
-                }
-                done += n;
-            }
-            let siren_code = self.siren[idx]
-                .state_code()
-                .max(self.sn76477[idx].state_code())
-                .max(self.hk628[idx].state_code());
-            self.decks[idx].store_siren_state(siren_code);
-
-            // M17 §7.1 sampler one-shots, summed onto whichever deck
-            // bus each slot is assigned to. Last, for the same reason
-            // the siren is late: a horn stab is not the music, so the
-            // deck's echo-out and vintage rack have no business
-            // processing it. Additive by construction — the voice adds
-            // and never writes, so the deck keeps playing underneath.
-            //
-            // A voice assigned to a deck with no routing is silent for
-            // this block; the deck's channels are where its output
-            // physically goes, and there is nowhere else to put it.
-            #[allow(clippy::cast_possible_truncation)]
-            let deck_id = idx as u8;
-            for voice in &mut self.samplers {
-                if voice.sounds_on(deck_id) {
-                    voice.render_add(out, num_channels, first_us);
-                }
+            if !instruments_first {
+                self.render_siren_into(idx, out, num_channels, first_us);
+                self.render_samplers_into(idx, out, num_channels, first_us);
             }
         }
         self.sampler_shared.publish(&self.samplers);
@@ -982,6 +951,83 @@ impl Engine {
         }
     }
 
+    /// M16 dub-siren (PRD §6.3): a self-contained INSTRUMENT. The voices
+    /// render into a scratch pair, pass through the siren's OWN onboard echo
+    /// (PT2399, the GS1/Benidub chip), get the siren volume, then sum onto
+    /// the deck bus — so the siren sounds with or without a track and is
+    /// independent of echo-out. On a music deck this runs after the rack so
+    /// the music FX never touch it; on the DUB FX channel it runs before,
+    /// deliberately (see `render_routed`). Sliced into `SIREN_CHUNK` frames
+    /// so any block size stays allocation-free. RT-safe.
+    fn render_siren_into(
+        &mut self,
+        idx: usize,
+        out: &mut [f32],
+        num_channels: usize,
+        first_us: usize,
+    ) {
+        let frames = out.len() / num_channels;
+        let mut done = 0;
+        while done < frames {
+            let n = (frames - done).min(SIREN_CHUNK);
+            let scratch = &mut self.siren_scratch[..n * 2];
+            scratch.fill(0.0);
+            self.siren[idx].process_block(scratch, 2, 0);
+            self.sn76477[idx].process_block(scratch, 2, 0);
+            self.hk628[idx].process_block(scratch, 2, 0);
+            if self.siren_echo_active[idx] {
+                self.siren_echo[idx].process_block(scratch, 2, 0);
+            }
+            let vol = self.siren_volume[idx];
+            for f in 0..n {
+                let s = scratch[f * 2] * vol;
+                let o = (done + f) * num_channels + first_us;
+                out[o] += s;
+                out[o + 1] += s;
+            }
+            done += n;
+        }
+        let siren_code = self.siren[idx]
+            .state_code()
+            .max(self.sn76477[idx].state_code())
+            .max(self.hk628[idx].state_code());
+        self.decks[idx].store_siren_state(siren_code);
+    }
+
+    /// M17 §7.1 sampler one-shots, summed onto whichever deck bus each slot
+    /// is assigned to. Additive by construction — the voice adds and never
+    /// writes, so the deck keeps playing underneath. A voice assigned to a
+    /// deck with no routing is silent for this block; the deck's channels are
+    /// where its output physically goes, and there is nowhere else to put it.
+    /// After the rack on a music deck (a horn stab is not the music), before
+    /// it on the DUB FX channel. RT-safe.
+    fn render_samplers_into(
+        &mut self,
+        idx: usize,
+        out: &mut [f32],
+        num_channels: usize,
+        first_us: usize,
+    ) {
+        #[allow(clippy::cast_possible_truncation)]
+        let deck_id = idx as u8;
+        for voice in &mut self.samplers {
+            if voice.sounds_on(deck_id) {
+                voice.render_add(out, num_channels, first_us);
+            }
+        }
+    }
+
+    /// The control mode as the telemetry publishes it: 0 Internal ·
+    /// 1 Timecode · 2 Thru · 3 Fx — the FFI's `DeckTelemetry.control_mode`.
+    const fn mode_code(mode: ControlMode) -> u8 {
+        match mode {
+            ControlMode::Internal => 0,
+            ControlMode::Timecode => 1,
+            ControlMode::Thru => 2,
+            ControlMode::Fx => 3,
+        }
+    }
+
     /// For each deck with a timecode input attached, drain whatever
     /// audio has arrived since last block, decode it, and translate
     /// the decoder's `(rate, confidence)` into deck transport. This is
@@ -1005,9 +1051,21 @@ impl Engine {
             // The flag itself is a tiny `Copy` bool; we mutate it
             // below only when we transition out of panic mode.
             let panic_engaged = self.panic_play_states[idx].engaged;
-            let intent = match self.timecode_inputs[idx].as_mut() {
-                Some(input) => input.drive(),
-                None => continue,
+            let Some(intent) = self.timecode_inputs[idx].as_mut().map(TimecodeInput::drive) else {
+                // Nothing to decode, but the switch still has to see the
+                // mode it selected. The mode code used to be published
+                // only from the decode path below, so a deck with no
+                // input — every deck in the DEV internal mixer — never
+                // reported the `DUB FX` (or `THRU`) it was switched to,
+                // and its pane stayed a turntable.
+                self.decks[idx].publish_source_state(
+                    Self::mode_code(self.control_mode[idx]),
+                    0,
+                    false,
+                    false,
+                    self.control_override[idx],
+                );
+                continue;
             };
             // Block-end groove position (+ block duration, for the
             // heal's slew bound) staged for the drift observation in
@@ -1213,12 +1271,7 @@ impl Engine {
                 SourceClass::Timecode => 1,
                 SourceClass::Record => 2,
             };
-            let mode_code = match self.control_mode[idx] {
-                ControlMode::Internal => 0,
-                ControlMode::Timecode => 1,
-                ControlMode::Thru => 2,
-                ControlMode::Fx => 3,
-            };
+            let mode_code = Self::mode_code(self.control_mode[idx]);
             let (now_calibrated, now_calibrating) = {
                 let input = self.timecode_inputs[idx].as_ref();
                 (
@@ -1854,6 +1907,70 @@ impl Engine {
                         FxSlot::Phaser => self.phaser[i].set_macro(macro_value),
                     }
                     self.rack_active[i][slot as usize] = active;
+                }
+            }
+            // Expert rack (the DUB FX channel): each unit's own controls. Every
+            // setter below is pure on the audio thread — the two that need a
+            // transcendental (the Big Knob detents, the spring's tone) read
+            // tables built at construction.
+            Command::DeckSetRackSlotActive { idx, slot, active } => {
+                if let Some(deck) = self.rack_active.get_mut(idx as usize) {
+                    deck[slot as usize] = active;
+                }
+            }
+            Command::DeckSetRackBigKnob { idx, step, q } => {
+                if let Some(f) = self.bigknob.get_mut(idx as usize) {
+                    f.set_step(usize::from(step));
+                    f.set_resonance(q);
+                }
+            }
+            Command::DeckSetRackPhaser {
+                idx,
+                rate_hz,
+                depth,
+                feedback,
+                mix,
+            } => {
+                if let Some(p) = self.phaser.get_mut(idx as usize) {
+                    p.set_rate(rate_hz);
+                    p.set_depth(depth);
+                    p.set_feedback(feedback);
+                    p.set_mix(mix);
+                }
+            }
+            Command::DeckSetRackSpaceEcho {
+                idx,
+                mode,
+                repeat_ms,
+                intensity,
+                echo_volume,
+                reverb,
+                wow_flutter,
+            } => {
+                if let Some(re) = self.re201.get_mut(idx as usize) {
+                    re.set_mode(dub_dsp::Re201Mode::from_index(mode));
+                    re.set_repeat_rate(repeat_ms);
+                    re.set_intensity(intensity);
+                    re.set_echo_volume(echo_volume);
+                    re.set_reverb_wet(reverb);
+                    re.set_wow_flutter(wow_flutter);
+                }
+            }
+            Command::DeckSetRackSpring {
+                idx,
+                decay,
+                tone,
+                wet,
+            } => {
+                if let Some(sp) = self.spring.get_mut(idx as usize) {
+                    sp.set_decay(decay);
+                    sp.set_tone(tone);
+                    sp.set_wet(wet);
+                }
+            }
+            Command::DeckKickSpring { idx, level } => {
+                if let Some(sp) = self.spring.get_mut(idx as usize) {
+                    sp.kick(level);
                 }
             }
             Command::DeckSetSirenControls {
@@ -3206,6 +3323,247 @@ mod tests {
         assert!(
             last.abs() < 0.05,
             "rack did not process the FX input (DC not high-passed): {last}"
+        );
+    }
+
+    #[test]
+    fn expert_rack_commands_render_is_alloc_free() {
+        // The DUB FX channel's Expert controls — the unit's own knobs, not
+        // the macro — are applied on the audio thread. Every setter must be
+        // pure: the Big Knob detents and the spring's tone read tables built
+        // at construction, the rest are assignments and multiplies.
+        let mut engine = engine_with_two_decks(0.3, 0.5);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            for slot in [
+                FxSlot::BigKnob,
+                FxSlot::Phaser,
+                FxSlot::SpaceEcho,
+                FxSlot::Spring,
+            ] {
+                engine.apply_command(Command::DeckSetRackFx {
+                    idx: 0,
+                    slot,
+                    active: true,
+                    macro_value: 0.5,
+                });
+            }
+            for n in 0..300_u32 {
+                if n % 6 == 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let t = (n % 60) as f32 / 60.0;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let step = (n % 11) as u8;
+                    engine.apply_command(Command::DeckSetRackBigKnob {
+                        idx: 0,
+                        step,
+                        q: 0.5 + t * 4.0,
+                    });
+                    engine.apply_command(Command::DeckSetRackPhaser {
+                        idx: 0,
+                        rate_hz: 0.05 + t * 5.0,
+                        depth: t,
+                        feedback: t * 0.9,
+                        mix: t,
+                    });
+                    engine.apply_command(Command::DeckSetRackSpaceEcho {
+                        idx: 0,
+                        mode: (n % 7) as u8,
+                        repeat_ms: 50.0 + t * 700.0,
+                        intensity: t * 1.2,
+                        echo_volume: t,
+                        reverb: t,
+                        wow_flutter: t,
+                    });
+                    engine.apply_command(Command::DeckSetRackSpring {
+                        idx: 0,
+                        decay: t,
+                        tone: t,
+                        wet: t,
+                    });
+                    engine.apply_command(Command::DeckKickSpring { idx: 0, level: 0.8 });
+                }
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            }
+            assert!(out.iter().all(|s| s.is_finite()));
+        });
+    }
+
+    #[test]
+    fn rack_slot_switch_leaves_the_expert_controls_alone() {
+        // The IN/OUT toggle must not re-apply the macro: park the Big Knob on
+        // its top detent, throw the slot in with the switch, and the DC input
+        // must still be killed the way the 7.5 kHz detent kills it — not the
+        // macro's default (0.5 ≈ 400 Hz, which also kills DC, so check the
+        // opposite direction too: the bottom detent passes it).
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let settle = |engine: &mut Engine, tx: &mut ringbuf::HeapProd<f32>, blocks: usize| {
+            let mut rt = RealtimeContext::new();
+            let mut out = vec![0.0_f32; block * 2];
+            let blk_in = vec![0.3_f32; block * 2];
+            for _ in 0..blocks {
+                tx.push_slice(&blk_in);
+                engine.render(&mut rt, &mut out);
+            }
+            out[0]
+        };
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Fx,
+        });
+        // Bottom detent (70 Hz) — a steady DC input still leaks through a
+        // gentle first-order-ish slope over a short window, but the top
+        // detent kills it outright; use the two to tell "macro re-applied"
+        // (≈ 400 Hz: a fast kill) from "Expert kept" (70 Hz: slow).
+        engine.apply_command(Command::DeckSetRackBigKnob {
+            idx: 0,
+            step: 0,
+            q: 0.7,
+        });
+        engine.apply_command(Command::DeckSetRackSlotActive {
+            idx: 0,
+            slot: FxSlot::BigKnob,
+            active: true,
+        });
+        let kept = settle(&mut engine, &mut tx, 6);
+        engine.apply_command(Command::DeckSetRackFx {
+            idx: 0,
+            slot: FxSlot::BigKnob,
+            active: true,
+            macro_value: 0.5,
+        });
+        let macro_applied = settle(&mut engine, &mut tx, 6);
+        assert!(
+            kept.abs() > macro_applied.abs() * 2.0,
+            "the switch re-applied the macro: kept {kept} vs macro {macro_applied}"
+        );
+    }
+
+    #[test]
+    fn control_mode_is_published_for_a_deck_with_no_input() {
+        // The DEV internal mixer attaches no inputs, and the mode code was
+        // only ever published from the decode path — so a deck switched to
+        // DUB FX there reported Internal forever and its pane never
+        // changed. The mode must come back whether or not there is a
+        // needle to decode.
+        let (mut engine, _handle) = Engine::new_with_handle(48_000.0, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 64 * 2];
+        engine.render(&mut rt, &mut out);
+        assert_ne!(
+            engine
+                .deck(0)
+                .shared()
+                .load_timecode_telemetry()
+                .control_mode,
+            3
+        );
+
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Fx,
+        });
+        engine.render(&mut rt, &mut out);
+        let t = engine.deck(0).shared().load_timecode_telemetry();
+        assert_eq!(t.control_mode, 3, "DUB FX not reported without an input");
+        assert!(t.overridden, "the switch pinned the mode");
+
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        engine.render(&mut rt, &mut out);
+        assert_eq!(
+            engine
+                .deck(0)
+                .shared()
+                .load_timecode_telemetry()
+                .control_mode,
+            2
+        );
+    }
+
+    #[test]
+    fn kick_rings_the_spring_tank() {
+        // Tubby's thunder: with the spring engaged and nothing else sounding,
+        // a kick alone must put energy on the bus, and it must die away.
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 64 * 2];
+        handle
+            .deck(0)
+            .set_rack_fx(FxSlot::Spring, true, 0.7)
+            .unwrap();
+        engine.render(&mut rt, &mut out);
+        let quiet: f32 = out.iter().map(|s| s * s).sum();
+        assert!(quiet < 1e-9, "the tank rang before it was kicked: {quiet}");
+
+        // The burst goes into the springs and comes out a spring-length
+        // later (33–41 ms), so listen for ~85 ms.
+        handle.deck(0).kick_spring(1.0).unwrap();
+        let mut early = 0.0_f32;
+        for _ in 0..64 {
+            engine.render(&mut rt, &mut out);
+            early += out.iter().map(|s| s * s).sum::<f32>();
+        }
+        assert!(early > 1e-4, "the kick made no sound: {early}");
+
+        let mut late = 0.0_f32;
+        for _ in 0..3_000 {
+            engine.render(&mut rt, &mut out);
+        }
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut out);
+            late += out.iter().map(|s| s * s).sum::<f32>();
+        }
+        assert!(
+            late < early * 0.1,
+            "the thunder did not decay: {early} → {late}"
+        );
+    }
+
+    #[test]
+    fn fx_deck_renders_the_siren_through_the_rack() {
+        // On a music deck the siren renders AFTER the rack, untouched — a
+        // siren through the Big Knob would lose its bottom. On the DUB FX
+        // channel the deck IS the rack and the siren is routed into it on
+        // purpose (the `→ FX` pill): fire the Sine shot with the Big Knob at
+        // its top detent and the FX deck's output must be the high-passed
+        // remainder, well below the music deck's untouched siren.
+        let energy = |mode: ControlMode| {
+            let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+            let mut rt = RealtimeContext::new();
+            let mut out = vec![0.0_f32; 64 * 2];
+            engine.apply_command(Command::DeckSetControlMode { idx: 0, mode });
+            handle
+                .deck(0)
+                .set_rack_fx(FxSlot::BigKnob, true, 1.0)
+                .unwrap();
+            handle.deck(0).set_rack_big_knob(10, 0.7).unwrap();
+            // Let the cutoff ramp settle before the shot.
+            for _ in 0..40 {
+                engine.render(&mut rt, &mut out);
+            }
+            handle.deck(0).fire_siren_preset(2, 0).unwrap();
+            let mut sum = 0.0_f64;
+            for _ in 0..120 {
+                engine.render(&mut rt, &mut out);
+                sum += out.iter().map(|&s| f64::from(s * s)).sum::<f64>();
+            }
+            sum
+        };
+        let music = energy(ControlMode::Internal);
+        let fx = energy(ControlMode::Fx);
+        assert!(
+            music > 1e-3,
+            "the siren did not sound on the music deck: {music}"
+        );
+        assert!(
+            fx < music * 0.25,
+            "the FX deck's siren was not high-passed by its rack: music {music} vs fx {fx}"
         );
     }
 

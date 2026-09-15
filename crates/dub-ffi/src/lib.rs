@@ -478,7 +478,19 @@ pub use rip::{
 ///       Also [`DubEngine::peaks_overview`]: the whole-track overview
 ///       decimated in Rust, so the shell stops pulling the entire track
 ///       across the FFI on every load and double.
-pub const FFI_VERSION: u32 = 74;
+///   75. **The DUB FX channel's Expert rack (F-38 stage 2).** Each unit's
+///       own controls, beside the one-macro `set_rack_fx`:
+///       [`DubEngine::set_rack_fx_active`] (the IN/OUT switch alone),
+///       [`DubEngine::set_rack_big_knob`] (detent + Q),
+///       [`DubEngine::set_rack_phaser`], [`DubEngine::set_rack_space_echo`]
+///       (with the [`SpaceEchoMode`] selector), [`DubEngine::set_rack_spring`]
+///       and [`DubEngine::kick_rack_spring`] — Tubby's thunder.
+///       [`DubEngine::set_fx_input_trim`] is the channel's TRIM (the deck
+///       gain, in dB). [`big_knob_step_hz`] / [`spring_tone_hz`] give the
+///       faces their numbers. On an `Fx` deck the siren and the sampler now
+///       render *before* the rack, so `→ B` on a DUB FX deck B is the
+///       siren through the Space Echo.
+pub const FFI_VERSION: u32 = 75;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -2304,6 +2316,194 @@ impl DubEngine {
             .handle
             .deck(idx)
             .set_rack_fx(fx.into(), active, macro_value.clamp(0.0, 1.0))
+            .map_err(map_command_error)
+    }
+
+    /// Engage or bypass rack slot `fx` on `deck_idx` without touching its
+    /// controls — the DUB FX channel's IN/OUT toggle. `set_rack_fx` re-applies
+    /// the Advanced macro on every call, which would stomp the Expert knobs.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_rack_fx_active(
+        &self,
+        deck_idx: u64,
+        fx: RackFx,
+        active: bool,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_slot_active(fx.into(), active)
+            .map_err(map_command_error)
+    }
+
+    /// Expert Big Knob on `deck_idx` (the DUB FX channel, F-38): snap the
+    /// cutoff to detent `step` (0..=10, the Altec's eleven stops — see
+    /// [`big_knob_step_hz`]) at resonance `q` (0.5..8, ~0.7 is the passive
+    /// unit). Independent of the slot's engaged flag, so the dial can be
+    /// pre-set and then thrown in.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_rack_big_knob(&self, deck_idx: u64, step: u8, q: f32) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_big_knob(step.min(10), q.clamp(0.5, 8.0))
+            .map_err(map_command_error)
+    }
+
+    /// Expert phaser on `deck_idx`: LFO `rate_hz` (0.01..10), sweep `depth`,
+    /// resonance `feedback` (0..0.95) and dry/wet `mix`, all 0..1 unless
+    /// noted.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_rack_phaser(
+        &self,
+        deck_idx: u64,
+        rate_hz: f32,
+        depth: f32,
+        feedback: f32,
+        mix: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_phaser(
+                rate_hz.clamp(0.01, 10.0),
+                depth.clamp(0.0, 1.0),
+                feedback.clamp(0.0, 0.95),
+                mix.clamp(0.0, 1.0),
+            )
+            .map_err(map_command_error)
+    }
+
+    /// Expert Space Echo on `deck_idx`: the `mode` selector, the longest
+    /// head's `repeat_ms` (heads 1 and 2 follow at 0.337 / 0.668 of it; up to
+    /// 750 ms), `intensity` (feedback, 0..1.2 — past ~1 the tape
+    /// self-oscillates), `echo_volume`, the onboard spring's `reverb` wet and
+    /// `wow_flutter` (tape age, 0..2).
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rack_space_echo(
+        &self,
+        deck_idx: u64,
+        mode: SpaceEchoMode,
+        repeat_ms: f32,
+        intensity: f32,
+        echo_volume: f32,
+        reverb: f32,
+        wow_flutter: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_space_echo(
+                mode as u8,
+                repeat_ms.clamp(1.0, 750.0),
+                intensity.clamp(0.0, 1.2),
+                echo_volume.clamp(0.0, 1.0),
+                reverb.clamp(0.0, 1.0),
+                wow_flutter.clamp(0.0, 2.0),
+            )
+            .map_err(map_command_error)
+    }
+
+    /// Expert spring on `deck_idx`: `decay` (tail length, 0..1), `tone` (0
+    /// dark → 1 bright; see [`spring_tone_hz`]) and `wet` (0..1).
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_rack_spring(
+        &self,
+        deck_idx: u64,
+        decay: f32,
+        tone: f32,
+        wet: f32,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_rack_spring(
+                decay.clamp(0.0, 1.0),
+                tone.clamp(0.0, 1.0),
+                wet.clamp(0.0, 1.0),
+            )
+            .map_err(map_command_error)
+    }
+
+    /// Kick the spring tank on `deck_idx` — Tubby's thunder, a short impulse
+    /// into the springs. Momentary: one press, one crash; it rings with the
+    /// tank's decay.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn kick_rack_spring(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .kick_spring(1.0)
+            .map_err(map_command_error)
+    }
+
+    /// The DUB FX channel's TRIM: the input gain on `deck_idx`, in dB
+    /// (−24..+24). It is the deck's own gain — a track load sets that back to
+    /// the track's normalisation, so the trim never leaks onto a record.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_fx_input_trim(&self, deck_idx: u64, db: f32) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        let gain = 10.0_f32.powf(db.clamp(-24.0, 24.0) / 20.0);
+        running
+            .handle
+            .deck(idx)
+            .set_gain(gain)
             .map_err(map_command_error)
     }
 
@@ -4360,6 +4560,47 @@ impl From<RackFx> for dub_engine::FxSlot {
     }
 }
 
+/// The Space Echo's mode selector, in dial order: which playback heads are
+/// live and whether the onboard spring is in circuit. Passed to
+/// [`DubEngine::set_rack_space_echo`]; the discriminants are the dial index
+/// the engine takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[repr(u8)]
+pub enum SpaceEchoMode {
+    /// Reverb only — no tape echo.
+    Reverb = 0,
+    /// Head 1 (the shortest).
+    Short = 1,
+    /// Heads 2 + 3.
+    Long = 2,
+    /// All three heads.
+    Triple = 3,
+    /// Head 1 + reverb.
+    ShortReverb = 4,
+    /// Heads 2 + 3 + reverb.
+    LongReverb = 5,
+    /// All three heads + reverb.
+    TripleReverb = 6,
+}
+
+/// The cut-off frequency of Big Knob detent `step` (0..=10, clamped), in Hz
+/// — the Altec's eleven stops, for the face's readout. A free function;
+/// nothing is sent to the engine.
+#[uniffi::export]
+#[must_use]
+pub fn big_knob_step_hz(step: u8) -> f32 {
+    dub_dsp::BIG_KNOB_STEPS[usize::from(step).min(dub_dsp::BIG_KNOB_STEP_COUNT - 1)]
+}
+
+/// The spring's damping cut-off at TONE knob position `tone` (0..1), in Hz
+/// — the same curve the engine's table is built from, for the face's
+/// readout. A free function; nothing is sent to the engine.
+#[uniffi::export]
+#[must_use]
+pub fn spring_tone_hz(tone: f32) -> f32 {
+    dub_dsp::spring_tone_hz(tone)
+}
+
 /// The display names of the dub siren's shots, in fire order — the index is
 /// what [`DubEngine::fire_siren_preset`] takes and the key's position on the
 /// box, left to right. One flat bank across the three chip recreations
@@ -6007,7 +6248,12 @@ mod tests {
         // `_release` return the other deck when they did.
         // 73→74: one siren bank — `SirenUnit` / `set_siren_unit` /
         // `siren_unit_preset_names` gone, `siren_dub_macro_controls` added.
-        assert_eq!(FFI_VERSION, 74);
+        // 74→75: the DUB FX channel's Expert rack — `set_rack_fx_active`,
+        // `set_rack_big_knob` /
+        // `_phaser` / `_space_echo` / `_spring`, `kick_rack_spring`,
+        // `set_fx_input_trim`, `SpaceEchoMode`, `big_knob_step_hz`,
+        // `spring_tone_hz`.
+        assert_eq!(FFI_VERSION, 75);
     }
 
     #[test]
@@ -6153,6 +6399,63 @@ mod tests {
             engine.release_siren(0).unwrap_err(),
             EngineError::NotRunning
         ));
+    }
+
+    #[test]
+    fn expert_rack_commands_on_stopped_engine_return_not_running() {
+        let engine = DubEngine::new();
+        assert!(matches!(
+            engine
+                .set_rack_fx_active(0, RackFx::Spring, true)
+                .unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine.set_rack_big_knob(0, 3, 0.7).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine.set_rack_phaser(0, 0.4, 0.7, 0.45, 0.5).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine
+                .set_rack_space_echo(0, SpaceEchoMode::TripleReverb, 420.0, 0.62, 0.6, 0.3, 0.3)
+                .unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine.set_rack_spring(0, 0.6, 0.5, 0.35).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine.kick_rack_spring(0).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert!(matches!(
+            engine.set_fx_input_trim(0, 6.0).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        // A bad deck index is caught before the running check.
+        assert!(matches!(
+            engine.set_rack_big_knob(7, 3, 0.7).unwrap_err(),
+            EngineError::InvalidDeckIndex(7)
+        ));
+    }
+
+    #[test]
+    fn rack_readout_helpers_report_the_engine_curves() {
+        // The faces print these; they must be the tables the engine plays.
+        assert_eq!(big_knob_step_hz(0), 70.0);
+        assert_eq!(big_knob_step_hz(3), 240.0);
+        assert_eq!(big_knob_step_hz(10), 7_500.0);
+        assert_eq!(big_knob_step_hz(200), 7_500.0, "clamps to the top detent");
+        assert!((spring_tone_hz(0.0) - dub_dsp::TONE_HZ_MIN).abs() < 1e-3);
+        assert!((spring_tone_hz(1.0) - dub_dsp::TONE_HZ_MAX).abs() < 1e-2);
+        assert!(spring_tone_hz(0.5) > spring_tone_hz(0.25));
+        // The selector's discriminants are the dial index the engine takes.
+        assert_eq!(SpaceEchoMode::Reverb as u8, 0);
+        assert_eq!(SpaceEchoMode::TripleReverb as u8, 6);
     }
 
     #[test]

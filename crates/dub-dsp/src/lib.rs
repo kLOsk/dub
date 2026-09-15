@@ -44,7 +44,7 @@ pub use siren::{
 pub use sn76477::{
     sn76477_preset, sn76477_preset_name, Sn76477, Sn76477Patch, Sn76477State, SN76477_PRESET_COUNT,
 };
-pub use spring::SpringReverb;
+pub use spring::{tone_hz as spring_tone_hz, SpringReverb, TONE_HZ_MAX, TONE_HZ_MIN};
 pub use um3561::{um3561_program, um3561_program_name, UM3561_PROGRAM_COUNT};
 
 /// Library version reported by the crate.

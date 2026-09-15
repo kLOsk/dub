@@ -140,6 +140,25 @@ pub struct SpringReverb {
     /// Precomputed damping coefficient across the macro range [0,1] — so
     /// `set_macro` is a pure table lookup, RT-safe to call from the engine.
     macro_damp: [f32; MACRO_LUT_LEN],
+    /// Precomputed damping coefficient across the Expert TONE range
+    /// ([`TONE_HZ_MIN`]..[`TONE_HZ_MAX`], log-spaced) — the macro's table
+    /// only spans the curated 2.2–4 kHz, and a tone knob wants the whole
+    /// dark-to-bright travel of a real tank's damping.
+    tone_damp: [f32; MACRO_LUT_LEN],
+}
+
+/// The dark end of the Expert TONE knob: the loop low-pass of a dark,
+/// dripping tank. The knob is log-spaced from here to [`TONE_HZ_MAX`].
+pub const TONE_HZ_MIN: f32 = 800.0;
+/// The bright end of the Expert TONE knob: a bright, splashy tank.
+pub const TONE_HZ_MAX: f32 = 8_000.0;
+
+/// The damping cutoff a TONE knob position (0..1) selects, in Hz — the same
+/// curve the table is built from, for the UI's readout.
+#[must_use]
+pub fn tone_hz(norm: f32) -> f32 {
+    let n = norm.clamp(0.0, 1.0);
+    TONE_HZ_MIN * (TONE_HZ_MAX / TONE_HZ_MIN).powf(n)
 }
 
 impl SpringReverb {
@@ -155,10 +174,12 @@ impl SpringReverb {
             Spring::new(sample_rate, 41.0, &[5.3, 6.9, 8.7, 10.1, 12.9], 0.84, damp),
         ];
         let mut macro_damp = [0.0f32; MACRO_LUT_LEN];
-        for (i, slot) in macro_damp.iter_mut().enumerate() {
+        let mut tone_damp = [0.0f32; MACRO_LUT_LEN];
+        for (i, (m_slot, t_slot)) in macro_damp.iter_mut().zip(tone_damp.iter_mut()).enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let m = i as f32 / (MACRO_LUT_LEN - 1) as f32;
-            *slot = one_pole_coeff(4_000.0 - m * 1_800.0, sample_rate);
+            *m_slot = one_pole_coeff(4_000.0 - m * 1_800.0, sample_rate);
+            *t_slot = one_pole_coeff(tone_hz(m), sample_rate);
         }
         Self {
             springs,
@@ -167,6 +188,7 @@ impl SpringReverb {
             kick_level: 0.0,
             noise: 0x9e37_79b9,
             macro_damp,
+            tone_damp,
         }
     }
 
@@ -185,6 +207,37 @@ impl SpringReverb {
     /// Set only the wet mix (0..1). Pure assignment, RT-safe.
     pub fn set_wet(&mut self, wet: f32) {
         self.wet = wet.clamp(0.0, 1.0);
+    }
+
+    /// Expert DECAY: the tank's feedback (0..1 → tail length). Pure
+    /// assignment, RT-safe; the damping is left where TONE put it.
+    pub fn set_decay(&mut self, decay: f32) {
+        let fb = decay.clamp(0.0, 0.97);
+        for s in &mut self.springs {
+            let damp = s.damp_coeff;
+            s.set(fb, damp);
+        }
+    }
+
+    /// Expert TONE (0..1, dark → bright): the loop low-pass, from the
+    /// `tone_damp` table so no `exp` runs on the audio thread. RT-safe.
+    pub fn set_tone(&mut self, norm: f32) {
+        let n = norm.clamp(0.0, 1.0);
+        #[allow(clippy::cast_precision_loss)]
+        let fi = n * (MACRO_LUT_LEN - 1) as f32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = fi as usize;
+        #[allow(clippy::cast_precision_loss)]
+        let frac = fi - i as f32;
+        let damp = if i + 1 < MACRO_LUT_LEN {
+            self.tone_damp[i] * (1.0 - frac) + self.tone_damp[i + 1] * frac
+        } else {
+            self.tone_damp[MACRO_LUT_LEN - 1]
+        };
+        for s in &mut self.springs {
+            let fb = s.feedback;
+            s.set(fb, damp);
+        }
     }
 
     /// Apply already-resolved tank parameters. Pure assignment, RT-safe — the
@@ -269,6 +322,45 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn tone_table_matches_the_off_rt_coefficient() {
+        // The Expert TONE knob reads a table on the audio thread; it must land
+        // where `set_params` (the off-RT `exp` path) would for the same Hz.
+        let mut a = SpringReverb::new(SR);
+        let mut b = SpringReverb::new(SR);
+        for i in 0..=8 {
+            let n = i as f32 / 8.0;
+            a.set_tone(n);
+            b.set_params(0.6, tone_hz(n), 0.5, SR);
+            assert!(
+                (a.springs[0].damp_coeff - b.springs[0].damp_coeff).abs() < 1e-6,
+                "tone {n}: table {} vs exp {}",
+                a.springs[0].damp_coeff,
+                b.springs[0].damp_coeff
+            );
+        }
+        assert!((tone_hz(0.0) - TONE_HZ_MIN).abs() < 1e-3);
+        assert!((tone_hz(1.0) - TONE_HZ_MAX).abs() < 1e-2);
+    }
+
+    #[test]
+    fn decay_and_tone_are_independent() {
+        // DECAY leaves the damping where TONE put it, and TONE leaves the
+        // feedback where DECAY put it — two knobs, two parameters.
+        let mut s = SpringReverb::new(SR);
+        s.set_tone(0.25);
+        let damp = s.springs[0].damp_coeff;
+        s.set_decay(0.9);
+        assert!((s.springs[0].damp_coeff - damp).abs() < 1e-9);
+        assert!((s.springs[0].feedback - 0.9).abs() < 1e-6);
+        s.set_tone(0.75);
+        assert!((s.springs[0].feedback - 0.9).abs() < 1e-6);
+        assert!(
+            s.springs[0].damp_coeff > damp,
+            "brighter tone = larger coefficient"
+        );
+    }
 
     fn rms(a: &[f32]) -> f32 {
         if a.is_empty() {

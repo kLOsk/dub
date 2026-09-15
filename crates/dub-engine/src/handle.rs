@@ -1316,6 +1316,103 @@ impl DeckCommand<'_> {
         })
     }
 
+    /// Engage or bypass a rack slot without touching its controls — the DUB
+    /// FX channel's IN/OUT toggle.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_rack_slot_active(
+        self,
+        slot: crate::FxSlot,
+        active: bool,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle
+            .send(Command::DeckSetRackSlotActive { idx, slot, active })
+    }
+
+    /// Expert Big Knob (the DUB FX channel): detent `step` (0..=10) and
+    /// resonance `q`.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_rack_big_knob(self, step: u8, q: f32) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle
+            .send(Command::DeckSetRackBigKnob { idx, step, q })
+    }
+
+    /// Expert phaser: `rate_hz`, `depth`, `feedback`, `mix`.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_rack_phaser(
+        self,
+        rate_hz: f32,
+        depth: f32,
+        feedback: f32,
+        mix: f32,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetRackPhaser {
+            idx,
+            rate_hz,
+            depth,
+            feedback,
+            mix,
+        })
+    }
+
+    /// Expert Space Echo: selector `mode` (dial index), `repeat_ms`,
+    /// `intensity`, `echo_volume`, onboard `reverb` wet, `wow_flutter`.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rack_space_echo(
+        self,
+        mode: u8,
+        repeat_ms: f32,
+        intensity: f32,
+        echo_volume: f32,
+        reverb: f32,
+        wow_flutter: f32,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetRackSpaceEcho {
+            idx,
+            mode,
+            repeat_ms,
+            intensity,
+            echo_volume,
+            reverb,
+            wow_flutter,
+        })
+    }
+
+    /// Expert spring: `decay`, `tone` (0 dark → 1 bright), `wet`.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_rack_spring(self, decay: f32, tone: f32, wet: f32) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetRackSpring {
+            idx,
+            decay,
+            tone,
+            wet,
+        })
+    }
+
+    /// Kick the spring tank — a thunder impulse at `level` (0..1).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn kick_spring(self, level: f32) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckKickSpring { idx, level })
+    }
+
     /// Set the dub-siren's live controls on this deck: `speed` (HK628 chip
     /// clock), `delay_ms`/`feedback`/`mix`/`filter`/`echo_cut` (onboard PT2399
     /// echo), and `volume` (output). All applied with pure RT-safe setters; the

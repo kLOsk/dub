@@ -59,6 +59,10 @@ pub struct BigKnobHpf {
     /// Precomputed prewarped cutoff `g` across the macro range [0,1] — so
     /// `set_macro` is a pure table lookup, RT-safe to call from the engine.
     macro_g: [f32; MACRO_LUT_LEN],
+    /// Precomputed prewarped cutoff `g` for each of the Altec's detents, so
+    /// the Expert `set_step` is a table lookup too and the DUB FX channel can
+    /// click through the steps from the audio thread.
+    step_g: [f32; BIG_KNOB_STEP_COUNT],
 }
 
 impl BigKnobHpf {
@@ -73,6 +77,11 @@ impl BigKnobHpf {
             let hz = (20.0 * 400.0_f32.powf(m)).clamp(10.0, sample_rate * 0.45);
             *slot = (std::f32::consts::PI * hz / sample_rate).tan();
         }
+        let mut step_g = [0.0f32; BIG_KNOB_STEP_COUNT];
+        for (slot, &hz) in step_g.iter_mut().zip(BIG_KNOB_STEPS.iter()) {
+            let fc = hz.clamp(10.0, sample_rate * 0.45);
+            *slot = (std::f32::consts::PI * fc / sample_rate).tan();
+        }
         let mut f = Self {
             sample_rate,
             g: 0.0,
@@ -82,6 +91,7 @@ impl BigKnobHpf {
             ic1: [0.0; 2],
             ic2: [0.0; 2],
             macro_g,
+            step_g,
         };
         f.set_cutoff_hz(BIG_KNOB_STEPS[0]);
         f.g = f.g_target; // snap, don't ramp from 0 at startup
@@ -104,9 +114,12 @@ impl BigKnobHpf {
     }
 
     /// Snap to one of the Altec's [`BIG_KNOB_STEPS`] detents (clamped).
+    /// RT-safe: the coefficient comes from the `step_g` table built at
+    /// construction, so the engine can click through the detents from the
+    /// audio thread.
     pub fn set_step(&mut self, step: usize) {
         let i = step.min(BIG_KNOB_STEP_COUNT - 1);
-        self.set_cutoff_hz(BIG_KNOB_STEPS[i]);
+        self.g_target = self.step_g[i];
     }
 
     /// Resonance (Q): 0.5 (gentle, passive-like) up to ~8 (sharp). Off-RT.
@@ -178,6 +191,27 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn step_table_matches_the_continuous_cutoff() {
+        // The Expert detents are a table so the audio thread can click through
+        // them; the table must land exactly where the off-RT `tan` path does.
+        let mut a = BigKnobHpf::new(SR);
+        let mut b = BigKnobHpf::new(SR);
+        for (i, &hz) in BIG_KNOB_STEPS.iter().enumerate() {
+            a.set_step(i);
+            b.set_cutoff_hz(hz);
+            assert!(
+                (a.g_target - b.g_target).abs() < 1e-7,
+                "step {i} ({hz} Hz): table {} vs tan {}",
+                a.g_target,
+                b.g_target
+            );
+        }
+        // Out of range clamps to the top detent rather than indexing past it.
+        a.set_step(99);
+        assert!((a.g_target - b.g_target).abs() < 1e-7);
+    }
 
     fn rms(a: &[f32]) -> f32 {
         if a.is_empty() {
