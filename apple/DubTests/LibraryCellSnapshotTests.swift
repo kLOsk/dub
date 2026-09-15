@@ -400,7 +400,7 @@ final class LibraryHeaderSnapshotTests: XCTestCase {
                 LibraryHeaderState(title: "Artist"),
                 LibraryHeaderState(title: "Title", isActive: true, ascending: true),
                 LibraryHeaderState(title: "BPM", isActive: true, ascending: false),
-                LibraryHeaderState(title: "Key (♪)"),
+                LibraryHeaderState(title: "Key · Musical"),
             ],
             width: 480, named: "header-sort-states")
     }

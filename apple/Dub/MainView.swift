@@ -3010,9 +3010,9 @@ final class WaveformAppModel: ObservableObject {
                 + summary.siblingVersions
             if changed == 0 {
                 if let first = summary.errors.first {
-                    surfaceError("Import skipped \(summary.skipped) file(s): \(first)")
+                    surfaceNotice("Import skipped \(summary.skipped) file(s): \(first)")
                 } else {
-                    surfaceError("Import found no supported audio files.")
+                    surfaceNotice("Import found no supported audio files.")
                 }
             }
         case .failure(let err):
@@ -3117,10 +3117,10 @@ final class WaveformAppModel: ObservableObject {
                 librarySelection.browserSelection = nil
                 librarySelection.selectedLibraryTrackId = nil
                 librarySelection.selectedLibraryTrack = nil
-                surfaceError("Track is unreachable — the source volume may be unmounted.")
+                surfaceNotice("Track is unreachable — the source volume may be unmounted.")
             }
         } catch {
-            surfaceError("Failed to resolve track: \(error.localizedDescription)")
+            surfaceNotice("Failed to resolve track: \(error.localizedDescription)")
         }
     }
 
@@ -3340,7 +3340,7 @@ final class WaveformAppModel: ObservableObject {
             // transition) and writes the 'load' row.
             try library.historyDeckLoaded(trackId: trackId, deck: deck, timestampMs: nowMs)
         } catch {
-            surfaceError("Failed to record play history: \(error.localizedDescription)")
+            surfaceNotice("Failed to record play history: \(error.localizedDescription)")
         }
         // PRD-BEATS §4.5: lazy analyse fires regardless of whether
         // `recordLoad` succeeded. A transient `play_history` write
@@ -3503,7 +3503,7 @@ final class WaveformAppModel: ObservableObject {
                     if case LibraryFfiError.GridLocked = err {
                         return
                     }
-                    self.surfaceError(
+                    self.surfaceNotice(
                         "Analysis failed for track: \(err.localizedDescription)")
                 }
             }
@@ -3754,7 +3754,7 @@ final class WaveformAppModel: ObservableObject {
                 if case LibraryFfiError.GridLocked = err {
                     continue
                 }
-                surfaceError("Analysis failed for track: \(err.localizedDescription)")
+                surfaceNotice("Analysis failed for track: \(err.localizedDescription)")
             }
         }
     }
@@ -4666,6 +4666,28 @@ final class WaveformAppModel: ObservableObject {
         }
         lastErrorClearTask = task
     }
+
+    /// The quiet channel (U-15): something the DJ may want to know but
+    /// nothing they have to act on now — an analysis that failed on a
+    /// five-second track, a row whose file has gone, files an import
+    /// skipped. It goes to the log and to the library footer's notice
+    /// line, never to the banner across the top of the window, which is
+    /// reserved for what stops the set: an engine that will not start, a
+    /// library that will not open, a load that failed.
+    func surfaceNotice(_ message: String) {
+        dubLog.notice("\(message, privacy: .public)")
+        libraryModel.lastNotice = message
+        libraryNoticeClearTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.noticeVisibilitySecs)
+            guard let self, !Task.isCancelled else { return }
+            self.libraryModel.lastNotice = nil
+        }
+        libraryNoticeClearTask = task
+    }
+
+    private var libraryNoticeClearTask: Task<Void, Never>?
+    private static let noticeVisibilitySecs: UInt64 = 8_000_000_000
 
     private func flashLoadError(side: DeckSide) {
         // 200 ms red flash per PRD §5.5: "deck is playing — lift the

@@ -132,6 +132,12 @@ final class LibraryAppModel: ObservableObject {
     /// `nil` while no import has run this session.
     @Published var lastImportSummary: LibraryImportSummary? = nil
 
+    /// U-15's quiet channel: the last informational notice — an analysis
+    /// that failed, a row whose file has gone, files an import skipped —
+    /// shown as a line in the footer for a few seconds and never as the
+    /// banner. `nil` when nothing is being said.
+    @Published var lastNotice: String? = nil
+
     /// `true` while an import is in progress. Drives the
     /// browser's progress indicator and disables the
     /// "Import Folder…" button to prevent overlapping runs (the

@@ -81,6 +81,33 @@ extension LibraryTrack: @retroactive Identifiable {}
 /// while preserving the §8.5.3 "missing fields look empty, not
 /// magically valuable" semantic.
 extension LibraryTrack {
+    /// U-18: whether a built-in column has nothing to sort by — the FFI's
+    /// contract is empty cells *last in both directions*, and the folded
+    /// sort keys below cannot express that on their own (`""` sorts first
+    /// ascending, a `max` sentinel first descending). The comparator
+    /// consults this before the key.
+    func isEmpty(for field: LibraryColumnField) -> Bool {
+        switch field {
+        case .title: return (title ?? "").isEmpty
+        case .artist: return (artist ?? "").isEmpty
+        case .album: return (album ?? "").isEmpty
+        case .genre: return (genre ?? "").isEmpty
+        case .source: return source.isEmpty
+        case .bpm: return bpm == nil
+        case .duration: return durationMs == 0
+        case .year: return year == nil
+        case .key: return (key ?? "").isEmpty
+        case .comment: return (comment ?? "").isEmpty
+        case .versionTokens: return (versionTokens ?? "").isEmpty
+        case .composer: return (composer ?? "").isEmpty
+        case .trackNumber: return trackNumber == nil
+        case .rating: return rating == nil
+        case .color: return color == nil
+        case .crateOrder: return crateOrdinal == nil
+        case .extra: return true
+        }
+    }
+
     var titleSortKey:    String { title ?? "" }
     var artistSortKey:   String { artist ?? "" }
     var albumSortKey:    String { album ?? "" }
@@ -171,15 +198,18 @@ extension LibraryColumnKind {
 /// untagged rows doesn't bury the tagged ones on a reverse click.
 private struct LibraryRowComparator: SortComparator {
     enum Basis: Hashable {
-        case field(KeyPathComparator<LibraryTrack>)
+        /// A built-in column: its comparator, and the column so empty
+        /// cells can be held last in both directions (U-18) — the same
+        /// contract the configurable columns and the SQL sorts keep.
+        case field(KeyPathComparator<LibraryTrack>, column: LibraryColumnField?)
         case extra(index: Int, numeric: Bool)
     }
 
     var basis: Basis
     var order: SortOrder
 
-    init(field comparator: KeyPathComparator<LibraryTrack>, order: SortOrder) {
-        self.basis = .field(comparator)
+    init(field comparator: KeyPathComparator<LibraryTrack>, column: LibraryColumnField? = nil, order: SortOrder) {
+        self.basis = .field(comparator, column: column)
         self.order = order
     }
 
@@ -190,7 +220,15 @@ private struct LibraryRowComparator: SortComparator {
 
     func compare(_ lhs: LibraryTrack, _ rhs: LibraryTrack) -> ComparisonResult {
         switch basis {
-        case .field(let comparator):
+        case .field(let comparator, let column):
+            if let column {
+                let leftEmpty = lhs.isEmpty(for: column)
+                let rightEmpty = rhs.isEmpty(for: column)
+                if leftEmpty || rightEmpty {
+                    if leftEmpty && rightEmpty { return .orderedSame }
+                    return leftEmpty ? .orderedDescending : .orderedAscending
+                }
+            }
             var comparator = comparator
             comparator.order = order
             return comparator.compare(lhs, rhs)
@@ -2343,82 +2381,82 @@ struct LibraryView: View {
         case .crateOrder:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.crateOrderSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.crateOrderSortKey, order: order), column: .crateOrder, order: order)
             ]
         case .artist:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.artistSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.artistSortKey, order: order), column: .artist, order: order)
             ]
         case .title:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.titleSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.titleSortKey, order: order), column: .title, order: order)
             ]
         case .duration:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.durationSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.durationSortKey, order: order), column: .duration, order: order)
             ]
         case .bpm:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.bpmSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.bpmSortKey, order: order), column: .bpm, order: order)
             ]
         case .album:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.albumSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.albumSortKey, order: order), column: .album, order: order)
             ]
         case .genre:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.genreSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.genreSortKey, order: order), column: .genre, order: order)
             ]
         case .year:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.yearSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.yearSortKey, order: order), column: .year, order: order)
             ]
         case .key:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.keySortKey, order: order), order: order)
+                    field: KeyPathComparator(\.keySortKey, order: order), column: .key, order: order)
             ]
         case .comment:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.commentSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.commentSortKey, order: order), column: .comment, order: order)
             ]
         case .versionTokens:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.versionTokensSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.versionTokensSortKey, order: order), column: .versionTokens, order: order)
             ]
         case .source:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.sourceSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.sourceSortKey, order: order), column: .source, order: order)
             ]
         case .composer:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.composerSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.composerSortKey, order: order), column: .composer, order: order)
             ]
         case .trackNumber:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.trackNumberSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.trackNumberSortKey, order: order), column: .trackNumber, order: order)
             ]
         case .rating:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.ratingSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.ratingSortKey, order: order), column: .rating, order: order)
             ]
         case .color:
             sortOrder = [
                 LibraryRowComparator(
-                    field: KeyPathComparator(\.colorSortKey, order: order), order: order)
+                    field: KeyPathComparator(\.colorSortKey, order: order), column: .color, order: order)
             ]
         }
     }
@@ -2431,7 +2469,9 @@ struct LibraryView: View {
         case .duration: return 52
         case .bpm: return 56
         case .year: return 48
-        case .key: return 56
+        // Wide enough for "KEY · CAMELOT" — the header names the notation
+        // (U-17).
+        case .key: return 104
         case .comment, .album, .genre, .versionTokens, .source: return 140
         case .composer: return 120
         case .trackNumber: return 52
@@ -3139,7 +3179,16 @@ struct LibraryView: View {
 
     private var footer: some View {
         HStack(spacing: DubSpacing.md) {
-            if let summary = libraryModel.lastImportSummary {
+            if let notice = libraryModel.lastNotice {
+                // U-15: the quiet channel. Informational, so it takes the
+                // import summary's slot for a few seconds rather than a
+                // banner across the window.
+                Text(notice)
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } else if let summary = libraryModel.lastImportSummary {
                 Text(importSummaryLine(summary))
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
@@ -3581,11 +3630,14 @@ enum KeyNotationMode: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Display name for the column header.
+    /// Display name for the column header. Both modes name themselves
+    /// (U-17): a bare "Key" said nothing about which notation the cells
+    /// were in, and the toggle behind the header's right-click was
+    /// undiscoverable.
     var columnLabel: String {
         switch self {
-        case .camelot: return "Key"
-        case .musical: return "Key (♪)"
+        case .camelot: return "Key · Camelot"
+        case .musical: return "Key · Musical"
         }
     }
 
