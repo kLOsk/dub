@@ -22,7 +22,11 @@ re-discovering the issue.
 
 ## 2. UX polish (works, but feels rough)
 
-### U-14. No feedback while a single-deck-load analysis is running
+### U-14. No feedback while a single-deck-load analysis is running — **done**
+
+Shipped 2026-09-15: the footer renders "Analyzing 1 track…" (or "N tracks…")
+with the batch spinner whenever `analysisInFlightCount > 0` and no batch is
+running, in the tertiary tone so it reads as quieter than the batch line.
 
 `ensureTrackAnalyzed` fires when a track loads but doesn't surface
 its progress anywhere — the BPM column shows "—" until the worker
@@ -107,7 +111,11 @@ state only.
 
 ## 3. Code health (no visible symptom yet, but architectural debt)
 
-### C-27. `selectLibraryTrack` calls `trackPath` twice
+### C-27. `selectLibraryTrack` calls `trackPath` twice — **done**
+
+Shipped 2026-09-15: `resolveLibraryTrackId` compares the load URL against the
+selection's cached `browserSelection` instead of re-querying `trackPath`; an
+unmount between click and Space fails in `loadTrack` first, as predicted.
 
 The selection path:
 
@@ -132,7 +140,12 @@ gets caught by the `loadTrack` engine error.
 
 ---
 
-### C-28. `analysisInFlightCount` naming is now misleading
+### C-28. `analysisInFlightCount` naming is now misleading — **closed**
+
+Closed 2026-09-15: the doc comment is accurate now (it is the "any work at
+all?" counter, `analysisBatchCompleted` is the progress value) and U-14 reads
+it. It stays a count rather than the `Bool` proposed below: two deck loads,
+or a deck load during a batch, genuinely overlap.
 
 Post-fix for B-3/B-4 the counter represents "any analysis in
 flight, batch or not" but the documentation comment also says
@@ -163,7 +176,14 @@ want a baseline so regressions are visible.
 
 ---
 
-### C-31. Swift-UI snapshot tests are PRD-mandated but don't exist yet
+### C-31. Swift-UI snapshot tests are PRD-mandated but don't exist yet — **done**
+
+Closed 2026-09-15: `apple/DubTests/` carries 201 tests across nine
+suites — `PerformanceSnapshotTests`, `PrepPadSnapshotTests`,
+`StillpointSnapshotTests`, `LibraryCellSnapshotTests`, `RipSnapshotTests`,
+`FxChannelSnapshotTests` and the unit suites — over the views named below
+and well beyond them, run by the pre-push hook (`make snapshot`). The
+original scope, kept for the record:
 
 PRD §2.2.4 says "every PR that changes a view must include
 updated snapshots" via `swift-snapshot-testing`. We have zero
@@ -290,9 +310,15 @@ state. Pairs with the Phase 4 UI-truthfulness work in P-35.
 
 ---
 
-### P-35. Automatic per-deck source detection (Thru ↔ Timecode)
+### P-35. Automatic per-deck source detection (Thru ↔ Timecode) — **closed, superseded**
 
-PRD §5.1.1 calls for each deck to auto-detect whether the input is
+Closed 2026-09-15: PRD §5.1.1 was rewritten to an **explicit** per-deck
+INT · TC · THRU (· DUB FX) switch — the DJ selects the source, there is no
+auto-detection, and the `detecting` state was removed from the shell. The
+plan below is kept as the record of what was *not* built and why; picking it
+up again is a PRD decision first.
+
+PRD §5.1.1 used to call for each deck to auto-detect whether the input is
 control vinyl (drive a loaded file) or a real record (Thru passthrough)
 and switch transparently. The timecode-playback wiring shipped via the
 engine's existing tested path; the auto-detection half (Phases 2 to 5
@@ -336,7 +362,13 @@ by a test that measures the rendered fundamental: 480 Hz into a 12 000-frame
 loop (exactly 120 periods, so the wrap is phase-seamless in the source) reads
 480 Hz engaged, and read 509.8 Hz — the resampler shift — before the fix.
 
-### P-40. The position extrapolator does not know about loops
+### P-40. The position extrapolator does not know about loops — **done**
+
+Shipped 2026-09-15: `LoopState::wrap` folds the loop-blind extrapolation
+into `[loop_in, loop_out)` — modular, both directions — and
+`position_snapshot` applies it, so the UI playhead and the reverse-loop
+press (which reads the same snapshot) never see a value past the loop's
+end. Pinned by `loop_state_wraps_an_extrapolated_playhead_both_ways`.
 
 **Symptom**: `PublishState::extrapolated_secs` is `position_secs + elapsed ×
 rate` with no loop wrap, so between publishes the UI playhead reads past
@@ -365,18 +397,22 @@ for a different program without touching the chip tables.
 
 **Location**: `crates/dub-dsp/src/{hk628,siren,sn76477}.rs`.
 
-### F-37. Expert panel on the Performance surface + deck B
+### F-37. Siren Expert panel needs a home on the box
+
+_Narrowed 2026-09-15: the "deck B" half is moot — the siren is one box on the
+global bar, firing the deck its `→` pill names, so there is no per-deck panel
+to mount. What remains is the Expert panel itself._
 
 The siren Expert panel (`SirenExpertPanel`) is unmounted — it left Prep with
 the siren, and the box on the Performance rack bar carries only the DUB knob.
 It is one flat panel now (echo section + SPEED for the chip shots + PITCH /
 RATE / HOLD for Sine); mounting it needs a home on the box (a fold, or a
-second row) and the model threaded in for both decks.
+second row).
 
-**Fix (later — "expert mode in the deck")**: thread the model + side into the
-Performance pad bar and render `SirenExpertPanel` there for both decks. The
-engine/FFI surface is already complete (per-deck `set_siren_*`), so this is
-Swift-only.
+**Fix (later)**: give the panel a fold on the box and thread the pill's
+resolved deck through. The engine/FFI surface is already complete (per-deck
+`set_siren_*`), so this is Swift-only. The DUB FX rack's faces
+(`FxRackUnits.swift`) are the idiom to match if it becomes a second row.
 
 **Location**: `apple/Dub/Performance/PerformancePadsView.swift`,
 `apple/Dub/Performance/PerformanceView.swift`.
@@ -395,11 +431,54 @@ passthrough + rack processing hook), the four FX blocks + `rack_active` state
 live in the engine, and the per-deck rack UI is hidden (`rackFxEnabled` defaults
 false; the Preferences toggle was removed). Remaining:
 
-* **Stage 2 (Swift)** — surface an `FX` position on the deck source switch; move
-  the rack controls into the FX-deck pane; relabel the deck as an FX channel.
-* **Stage 3 (routing)** — input monitoring for the mic / aux-send into the FX
-  deck, and the optional "send siren → rack" bridge (off by default) for the
-  lush "siren through the Space Echo" sound.
+* **Stage 2 (Swift) — shipped 2026-09-15, FFI 75.** Preferences ▸ FX ▸ "Dub
+  FX channel" grows the source switch's `DUB FX` position; flipping a deck
+  to it mounts `FxChannelPane` (`apple/Dub/Performance/FxChannel*.swift`,
+  `FxRackUnits.swift`, `FxHardware.swift`) in the deck pane's place: the
+  input lane on the inner edge (SEND · MIC rocker, TRIM = the deck gain,
+  the siren box's cream VU off the decoder's RMS, the Thru live lane as the
+  scope), the rack column on the outer. Engine: `set_rack_fx_active` (the
+  IN/OUT switch alone — `set_rack_fx` re-applies the macro, which stomped
+  the Expert knobs), `set_rack_big_knob` / `_phaser` / `_space_echo` /
+  `_spring`, `kick_rack_spring`, `set_fx_input_trim`, and on an `Fx` deck
+  the siren + sampler render *before* the rack, so the pills' `→ FX` is
+  the siren through the Space Echo. The Big Knob's detents and the
+  spring's TONE got construction-time tables so the audio thread never
+  runs a `tan` / `exp` for them.
+* **Stage 3 (routing)** — the SEND · MIC rocker is a label the engine does
+  not yet read (both are "the pair"); real send / mic input monitoring,
+  and the direct-mic case's own preamp, are what is left.
+
+**Design settled 2026-09-15** (canvas: *Dub FX Channel*,
+`claude.ai/code/artifact/1d073ff2-77b3-42fc-bfb9-4197823913f7`). The pane
+keeps the deck's grammar: the source switch stays at the top of the column,
+the narrow inner strip still scrolls bottom→top — the *input* signal now, not
+the groove, under a SEND · MIC rocker, a trim and the siren box's cream VU —
+and the wide column becomes a 19″ rack, the four units stacked in the
+engine's order with the unit's own controls (Expert has no macro): the Big
+Knob as one stepped dial with the 11 detents printed on the arc, the phaser's
+rate / depth / feedback / mix with L·R sweep lamps, the Space Echo's mode
+selector + tape window (heads lit per `Re201Mode`) + repeat / intensity /
+echo / reverb, the spring's decay / tone / wet + KICK. Bat-handle IN/OUT
+toggles and Dymo strips on all four; the faces are skeuomorphic by the same
+decision as the siren box, and every readout is the engine's number.
+
+**Routing — the mixer does it.** The FX deck's input is the interface pair
+its needle used (deck B → in 3–4), and the DJ patches the **mixer's aux send
+or FX loop** into it; the return goes out 3–4 into a mixer channel. Deck A,
+the MC's mic and the siren are all inputs *by the mixer's send knob* — no
+internal send bus, which would be a software-mixer function (PRD §5.3). MIC
+direct remains for a battle mixer with no send. The "siren → rack" key is
+**dropped**: the siren box's existing output pill grows a `→ FX` position
+instead (engine: render the siren *before* the rack on an `Fx` deck rather
+than after it), and the samples pill gets the same — a horn stab straight
+into the tape. The global rack bar is **not** taken over: siren and samples
+are what the DJ plays *with* the rack, so the bar re-orders (samples left,
+siren right) to put the siren directly under the rack. The rack publishes no
+state, so the tape / lamps / coils animate from the UI's own knob values,
+like the siren's needle; only the input VU is measured. Naming is open:
+SPACE ECHO / BIG KNOB / PHASER are other people's marks or nicknames; a
+generic TAPE ECHO is the safe swap at release.
 
 **Location**: engine `crates/dub-engine/src/lib.rs` (`ControlMode::Fx`, dormant);
 `crates/dub-ffi/src/lib.rs`; `apple/Dub/Performance/`,
@@ -518,7 +597,11 @@ per baseline, the eight split into two causes:
   the edge, so the baseline had been clipping its own content — labels reading
   "UE" and "OOP", the exit pad off-screen.
 
-### R-41. Deck pane shows the idle placeholder during capture
+### R-41. Deck pane shows the idle placeholder during capture — **done**
+
+Shipped 2026-09-15: the Prep strip treats deck A as sourced while
+`ripPhase == .capture` and renders continuously, so the live Thru peaks
+`start_thru_for_rip` already attaches draw the record building up.
 
 **Symptom**: while recording, only the overview band renders the live signal;
 the main deck pane sits on its placeholder (the deck has no loaded track in

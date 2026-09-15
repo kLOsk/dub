@@ -63,6 +63,16 @@
 
 ## Timecode / control vinyl (validate on real hardware)
 
+- **A deck's telemetry must not live only inside the decode loop.**
+  `drive_timecode_inputs` `continue`d past a deck with no input before
+  publishing anything, so the control mode a deck was switched to came back
+  only when a needle was attached. Every deck in the DEV internal mixer has
+  no input, and DUB FX (and THRU) there switched the engine and left the UI
+  drawing a turntable — a bug you cannot see on the rig, where every deck
+  has an input, and cannot miss on the couch. The mode code is published on
+  the no-input path too now; `control_mode_is_published_for_a_deck_with_no_input`
+  pins it. When a published value is *about the deck* rather than about the
+  signal, publish it where the deck is, not where the signal is.
 - **Lift detection took three SL3 iterations.** A single-threshold gate
   chatters on lift; confidence-only hysteresis reads a lift as a "lukewarm
   scratch transient" and burst-plays the track with the needle up. The working
@@ -280,6 +290,19 @@
   `SIREN_BANK` — five entries that each name a chip and an index — and the
   UI never sees a unit. Swapping a shot is a one-line bank edit; the DSP
   tests and `dump_wavs` keep covering every program.
+- **A slot's IN/OUT switch must not re-apply the macro.** `DeckSetRackFx`
+  carries `(active, macro_value)` and applies the macro on every call — right
+  for the Advanced one-knob, wrong for the DUB FX channel, where throwing a
+  unit in stomped every Expert knob back to the macro's curve. The switch
+  alone is its own command (`DeckSetRackSlotActive`); the Expert setters are
+  their own commands; nothing shares a payload with the macro. Pinned by
+  `rack_slot_switch_leaves_the_expert_controls_alone`.
+- **On the DUB FX channel the instruments render BEFORE the rack.** The
+  siren-last rule above is for a music deck, where the rack is the chain on
+  the music and the siren must survive it. On an `Fx` deck the deck *is* the
+  rack, and routing the siren and the sampler into it is the point of the
+  `→ FX` pill — so the render order flips per deck on `control_mode`, not
+  globally. `fx_deck_renders_the_siren_through_the_rack` holds both ends.
 - **Emulate the real unit's control surface, don't invent knobs.** Expert mode
   mirrors the physical box (DS01E = MODE / PITCH / RATE / TRIGGER + PT2399
   TIME / FEEDBACK / ECHO VOLUME / FILTER / ECHO CUT). Confirm the real layout

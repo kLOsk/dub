@@ -67,11 +67,15 @@ confirmed on hardware, and neither has been.
 what remains before trusted-DJ hands is polish, and it carries real
 deferred work rather than only cosmetics:
 
-- **Key remapping** — and with it the M17 keymaps. `⌘←→` (instant doubles)
-  and `Q W E R` (Quick Scratch) are bound but fixed; the sampler has
-  **no keys and no MIDI** until map mode — its reserved `A S D F` were
-  removed rather than extended to eight (see below), so it is
-  mouse-driven for now.
+- ~~**Key remapping**~~ — **the keyboard lane shipped 2026-09-15** (step 6
+  below): `MAP` on the status strip, click a control, press the key. The
+  sampler, Quick Scratch, the siren, ECHO OUT, the hot cues and the DUB FX
+  rack's toggles + KICK are all bindable; the map persists
+  (`dub.keymap.v1`) as overrides over the defaults — and **there is no
+  default keymap for anything played** (Daniel, 2026-09-15): the number
+  row, `G` and `⌘←→` went; only Space (load) and `⌘,` ship bound. **No
+  MIDI yet** — the MIDI lane is the same mechanism pointed at
+  `dub-controller` once that crate is real.
 - **The deferred M16 fine-tuning**: siren sound polish (the five shots
   that survived the cut — Rifle Gun · Alarm · Sine · Laser · Siren) and
   the deck-B siren Expert panel (`UI-BACKLOG.md` §5 F-36 / F-37). Note
@@ -356,16 +360,21 @@ dependency order, not a preference.
    `SirenPadRow` / `SirenExpertPanel` are kept but unmounted, staged for
    F-37's move to Performance; the file says so rather than letting them
    rot.
-6. **Map mode.** Serato's mechanism: turn on MAP, click a control, press
-   the key or move the knob. Not a Preferences screen — a mode over the
-   live interface, so it is on both surfaces by construction. Keyboard lane
-   at M18; the MIDI lane is the same mechanism pointed at
-   `dub-controller` once that crate is real, and it is the missing half of
-   Expert FX ("a real MIDI controller used instead of a second turntable").
-   Shape is settled below: two lanes per control, latch-vs-momentary owned
-   by the control, LED output in from the start, one shared map, and a
-   binding that carries a transport (key / MIDI / HID) so profiles are
-   possible later without a migration.
+6. **Map mode — keyboard lane shipped 2026-09-15.** Serato's mechanism:
+   turn on MAP, click a control, press the key. Not a Preferences screen —
+   a mode over the live interface, so it is on both surfaces by
+   construction. Built as an environment value (`DubMapping`) that
+   `.mappable(action)` controls read: off, nothing changes; on, the
+   control's own press becomes "arm me", it draws its cap and a dashed
+   ring, the armed one pulses and says PRESS A KEY, and
+   `KeyEventMonitorHost` hands the next key to `DubKeymapStore` (Escape
+   cancels, ⌫ unbinds). One key, one action — binding steals the key from
+   whatever held it, default or not; `⌘,` can be neither taken nor
+   rebound. The store holds overrides only, so the default map stays what
+   a profile is diffed against. The MIDI lane is the same mechanism
+   pointed at `dub-controller` once that crate is real — the missing half
+   of Expert FX ("a real MIDI controller used instead of a second
+   turntable"); a binding already carries its transport.
 
 **Decisions — settled 2026-09-08.**
 
@@ -387,7 +396,13 @@ dependency order, not a preference.
 - **The vintage FX rack gets a real home.** A Preferences toggle enables
   it; once enabled the deck source switch grows a fourth position named
   **`DUB FX`** (INT · TC · THRU · DUB FX). That settles F-38 stage 2: the
-  rack is a deck role, and the switch is how you select it.
+  rack is a deck role, and the switch is how you select it. **The pane's
+  design and its routing were settled 2026-09-15 and stage 2 shipped the
+  same day (FFI 75)** — the mixer's send is the input, the siren reaches
+  the rack through its own `→ FX` output pill, the bar re-orders rather
+  than being taken over; the full description, what shipped and the design
+  canvas are on F-38 in `UI-BACKLOG.md`. Stage 3 (real send / mic input
+  monitoring) is what is left.
 - **Map mode, all five.** Two binding lanes per control (key **and** MIDI,
   so the laptop keymap and the controller can coexist). Momentary-vs-
   latching is a property of the **control**, not the binding — fewer ways
@@ -409,9 +424,8 @@ FFI calls behind a full editor (`nudge_beat_grid_phase` / `_bpm`,
 becoming a surface nobody asked for. `PrepRack` is three sections and does
 not reserve room for a fourth.
 
-**One gap left that is bigger than a step.** The **vintage FX rack**
-cannot live anywhere until the deck source switch grows its `DUB FX`
-position (F-38).
+**The vintage FX rack has its home** — the `DUB FX` deck role, F-38 stage
+2, shipped 2026-09-15. Off by default (Preferences ▸ FX).
 
 **Placement rule, for future features.** A capability belongs where the DJ
 is in that state of mind. Prep is couch work with no rig; Performance is a
