@@ -53,7 +53,8 @@ final class FxChannelSnapshotTests: XCTestCase {
         s.input = .send
         s.inputPair = side == .a ? "1–2" : "3–4"
         s.trimDb = 6
-        s.inputAmplitude = 0.08
+        s.inputRms = 0.08
+        s.inputPeak = 0.2
         s.active = [true, true, true, false]
         // Still: the tape, the lamps and the coils hold one phase.
         s.motion = false
@@ -85,7 +86,8 @@ final class FxChannelSnapshotTests: XCTestCase {
         s.active = [false, false, false, false]
         s.input = .mic
         s.trimDb = 0
-        s.inputAmplitude = 0.01
+        s.inputRms = 0.01
+        s.inputPeak = 0.02
         snap(pane(s),
              width: Self.paneWidth, height: Self.paneHeight, named: "bypassed-mic")
     }
@@ -98,7 +100,8 @@ final class FxChannelSnapshotTests: XCTestCase {
         s.controls.spaceEchoIntensity = 1.15
         s.controls.spaceEchoMode = .short
         s.controls.bigKnobStep = 10
-        s.inputAmplitude = 0.5
+        s.inputRms = 0.5
+        s.inputPeak = 0.98
         snap(pane(s),
              width: Self.paneWidth, height: Self.paneHeight, named: "runaway-hot")
     }

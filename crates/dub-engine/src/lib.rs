@@ -100,7 +100,7 @@ pub enum ControlMode {
     /// to its output (PRD §1: real records are first-class). The loaded
     /// file, if any, does not advance. Backed by the always-attached
     /// timecode input's raw samples (see
-    /// [`crate::TimecodeInput::render_passthrough_into`]).
+    /// [`crate::TimecodeInput::render_passthrough_mono_into`]).
     Thru,
     /// The deck slot is an **FX channel** (the dub processing rack), not a
     /// turntable (PRD §6.3). Its attached interface input — a mic, or the
@@ -149,6 +149,57 @@ pub type OutputRouting = [Option<u32>; DECK_COUNT];
 /// Internal-mixer routing: both decks summed into channels 0+1 of a
 /// 2-channel buffer. This is what [`Engine::render`] produces.
 pub const INTERNAL_MIXER_ROUTING: OutputRouting = [Some(0), Some(0)];
+
+/// The FX channel's input meter (F-38 stage 3), one per deck.
+///
+/// A moving-coil VU: the RMS integrates over ~300 ms, so a needle drawn
+/// from it moves the way a real one does; the peak jumps to any new
+/// maximum and falls back at ~20 dB/s, so a clip shows for long enough
+/// to be seen. Everything here is a multiply-add per block — RT-safe —
+/// and the published values are linear, post-trim.
+#[derive(Debug, Clone, Copy, Default)]
+struct InputMeter {
+    mean_sq: f32,
+    peak: f32,
+}
+
+impl InputMeter {
+    /// The VU integration time.
+    const RMS_SECS: f32 = 0.3;
+    /// Peak fall, in dB per second.
+    const PEAK_FALL_DB_PER_SEC: f32 = 20.0;
+
+    /// Fold one block in. `level.frames` is how much input there was —
+    /// zero on an underrun, which decays the meter rather than freezing it.
+    fn feed(
+        &mut self,
+        level: crate::timecode::PassthroughLevel,
+        block_frames: usize,
+        sample_rate: f32,
+    ) {
+        #[allow(clippy::cast_precision_loss)]
+        let dt = block_frames as f32 / sample_rate;
+        let block_mean_sq = if level.frames > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let n = level.frames as f32;
+            level.sum_sq / n
+        } else {
+            0.0
+        };
+        let a = (dt / Self::RMS_SECS).min(1.0);
+        self.mean_sq += (block_mean_sq - self.mean_sq) * a;
+        // 10^(-dB/20) per block, as a linear-per-second fall applied once.
+        let fall = 1.0 - Self::PEAK_FALL_DB_PER_SEC / 8.686 * dt;
+        self.peak = level.peak.max(self.peak * fall.max(0.0));
+        if self.peak < 1e-6 {
+            self.peak = 0.0;
+        }
+    }
+
+    fn rms(self) -> f32 {
+        self.mean_sq.max(0.0).sqrt()
+    }
+}
 
 /// Top-level engine. Sits between the platform audio I/O and the audio graph.
 ///
@@ -295,6 +346,14 @@ pub struct Engine {
     /// (`[Spring, SpaceEcho, BigKnob, Phaser]`). A disengaged slot is skipped
     /// entirely (true bypass).
     rack_active: [[bool; 4]; DECK_COUNT],
+    /// F-38 stage 3: the DUB FX channel's MIC input — sum the pair to both
+    /// channels, so a mic on one side of the pair is heard on both.
+    /// `false` is SEND: the pair passes as it comes.
+    fx_input_mono: [bool; DECK_COUNT],
+    /// Per-deck input meter state for a Thru / FX deck: a VU-ballistic
+    /// mean square (300 ms) and a peak that holds and falls. Pure
+    /// arithmetic per block; published through the deck's atomics.
+    input_meter: [InputMeter; DECK_COUNT],
     /// Per-deck dub-siren **onboard echo** (PT2399, the GS1/Benidub chip). The
     /// siren is a self-contained instrument: its voices render into a scratch,
     /// pass through this echo, get the siren volume, and sum onto the bus
@@ -463,6 +522,8 @@ impl Engine {
             bigknob: std::array::from_fn(|_| dub_dsp::BigKnobHpf::new(sample_rate)),
             phaser: std::array::from_fn(|_| dub_dsp::Phaser::new(sample_rate)),
             rack_active: [[false; 4]; DECK_COUNT],
+            fx_input_mono: [false; DECK_COUNT],
+            input_meter: [InputMeter::default(); DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -544,6 +605,8 @@ impl Engine {
             bigknob: std::array::from_fn(|_| dub_dsp::BigKnobHpf::new(sample_rate)),
             phaser: std::array::from_fn(|_| dub_dsp::Phaser::new(sample_rate)),
             rack_active: [[false; 4]; DECK_COUNT],
+            fx_input_mono: [false; DECK_COUNT],
+            input_meter: [InputMeter::default(); DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -865,11 +928,30 @@ impl Engine {
                 // Thru = a live record; FX = a mic / mixer aux send that the
                 // per-deck rack (below) then processes.
                 let gain = self.decks[idx].gain();
-                if let Some(input) = self.timecode_inputs[idx].as_ref() {
-                    input.render_passthrough_into(out, gain, num_channels, first_us);
-                }
+                let level = self.timecode_inputs[idx].as_ref().map_or_else(
+                    crate::timecode::PassthroughLevel::default,
+                    |input| {
+                        input.render_passthrough_mono_into(
+                            out,
+                            gain,
+                            num_channels,
+                            first_us,
+                            self.fx_input_mono[idx],
+                        )
+                    },
+                );
+                // The channel's meter (F-38 stage 3): post-trim, the way a
+                // desk's VU reads after the gain pot.
+                let frames = out.len() / num_channels;
+                self.input_meter[idx].feed(level, frames, sr);
+                let meter = self.input_meter[idx];
+                self.decks[idx].store_input_level(meter.rms(), meter.peak);
             } else {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
+                if self.input_meter[idx].peak > 0.0 || self.input_meter[idx].mean_sq > 0.0 {
+                    self.input_meter[idx] = InputMeter::default();
+                    self.decks[idx].store_input_level(0.0, 0.0);
+                }
             }
 
             // M15 echo-out (PRD §6.3): the FX sits on the per-deck output
@@ -1913,6 +1995,11 @@ impl Engine {
             // setter below is pure on the audio thread — the two that need a
             // transcendental (the Big Knob detents, the spring's tone) read
             // tables built at construction.
+            Command::DeckSetFxInputMono { idx, mono } => {
+                if let Some(m) = self.fx_input_mono.get_mut(idx as usize) {
+                    *m = mono;
+                }
+            }
             Command::DeckSetRackSlotActive { idx, slot, active } => {
                 if let Some(deck) = self.rack_active.get_mut(idx as usize) {
                     deck[slot as usize] = active;
@@ -3484,6 +3571,94 @@ mod tests {
                 .control_mode,
             2
         );
+    }
+
+    #[test]
+    fn fx_mic_input_sums_the_pair_to_both_channels() {
+        // A mic on the left side of the pair (F-38 stage 3): SEND passes
+        // it hard left, MIC sums the pair and puts it on both channels at
+        // the mic's own level.
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Fx,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+
+        push_thru_input(&mut tx, block * 30, 0.4, 0.0);
+        for _ in 0..12 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert!((out[0] - 0.4).abs() < 1e-3, "SEND left: {}", out[0]);
+        assert!(
+            out[1].abs() < 1e-3,
+            "SEND right should be silent: {}",
+            out[1]
+        );
+
+        engine.apply_command(Command::DeckSetFxInputMono { idx: 0, mono: true });
+        push_thru_input(&mut tx, block * 30, 0.4, 0.0);
+        for _ in 0..12 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert!((out[0] - 0.4).abs() < 1e-3, "MIC left: {}", out[0]);
+        assert!((out[1] - 0.4).abs() < 1e-3, "MIC right: {}", out[1]);
+    }
+
+    #[test]
+    fn fx_deck_publishes_its_input_level() {
+        // The channel's VU reads a measured RMS and a held peak, post-trim.
+        // A steady 0.3 on both sides settles the RMS at 0.3 and pins the
+        // peak there; silence afterwards lets the RMS fall while the peak
+        // holds longer; a file deck publishes nothing.
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Fx,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+        let blk_in = vec![0.3_f32; block * 2];
+
+        // ~1.3 s of signal: well past the 300 ms integration.
+        for _ in 0..1_000 {
+            tx.push_slice(&blk_in);
+            engine.render(&mut rt, &mut out);
+        }
+        let (rms, peak) = engine.deck(0).shared().load_input_level();
+        assert!(
+            (rms - 0.3).abs() < 0.01,
+            "rms settled at {rms}, expected 0.3"
+        );
+        assert!((peak - 0.3).abs() < 1e-3, "peak {peak}, expected 0.3");
+
+        // Silence for 200 ms: the RMS falls by about half a time constant
+        // while the peak, falling 20 dB/s, is still most of the way up.
+        for _ in 0..150 {
+            engine.render(&mut rt, &mut out);
+        }
+        let (rms_after, peak_after) = engine.deck(0).shared().load_input_level();
+        assert!(
+            rms_after < rms * 0.8,
+            "rms did not fall: {rms} → {rms_after}"
+        );
+        assert!(
+            peak_after > 0.15 && peak_after < peak,
+            "peak should be falling: {peak} → {peak_after}"
+        );
+
+        // Back on a file: the meter reads nothing.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Internal,
+        });
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.deck(0).shared().load_input_level(), (0.0, 0.0));
     }
 
     #[test]

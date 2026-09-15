@@ -89,8 +89,8 @@ struct FxInputLane<Scope: View>: View {
                 .frame(maxWidth: .infinity)
             SectionHeading(
                 title: "LIVE", accent: DubColor.deckTint(state.side),
-                trailing: state.vuLevel >= 0.84 ? "● HOT" : "● ",
-                trailingAccent: state.vuLevel >= 0.84 ? DubColor.stateError : DubColor.stateLocked)
+                trailing: state.isHot ? "● HOT" : "● ",
+                trailingAccent: state.isHot ? DubColor.stateError : DubColor.stateLocked)
             scope()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 3))

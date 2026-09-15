@@ -212,6 +212,12 @@ pub struct DeckSharedState {
     /// still under freeze. `f64` bits. The header prints it beside the
     /// parked title so the DJ can see the tune is still there.
     quick_scratch_parked_secs_bits: AtomicU64,
+    /// The live input's level on a Thru / DUB FX deck, post-trim (F-38
+    /// stage 3): a VU-ballistic RMS (300 ms) and a held peak, linear,
+    /// `f32` bits. The channel's meter — the one measured thing on the
+    /// FX pane. Zero on a deck playing a file.
+    input_rms_bits: AtomicU32,
+    input_peak_bits: AtomicU32,
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -386,6 +392,8 @@ impl DeckSharedState {
             siren_state: AtomicU8::new(0),
             quick_scratch_slot: AtomicU8::new(crate::quick_scratch::QUICK_SCRATCH_NONE),
             quick_scratch_parked_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            input_rms_bits: AtomicU32::new(0.0f32.to_bits()),
+            input_peak_bits: AtomicU32::new(0.0f32.to_bits()),
         }
     }
 
@@ -531,6 +539,24 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_siren_state(&self) -> u8 {
         self.siren_state.load(Ordering::Relaxed)
+    }
+
+    /// Publish the live input's level (audio thread): VU-ballistic RMS and
+    /// held peak, linear, post-trim. Two relaxed stores; RT-safe.
+    pub(crate) fn store_input_level(&self, rms: f32, peak: f32) {
+        self.input_rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+        self.input_peak_bits
+            .store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the live input's `(rms, peak)`, for the FFI
+    /// telemetry that drives the FX channel's VU.
+    #[must_use]
+    pub fn load_input_level(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.input_rms_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.input_peak_bits.load(Ordering::Relaxed)),
+        )
     }
 
     /// Publish the Quick Scratch state (audio thread): the slot on the
@@ -1627,6 +1653,11 @@ impl Deck {
     /// the deck's output-bus siren voice. One relaxed store; RT-safe.
     pub(crate) fn store_siren_state(&self, state: u8) {
         self.shared.store_siren_state(state);
+    }
+
+    /// Publish this deck's live input level (F-38 stage 3). RT-safe.
+    pub(crate) fn store_input_level(&self, rms: f32, peak: f32) {
+        self.shared.store_input_level(rms, peak);
     }
 
     /// Read back this deck's published dub-siren indicator state. Used by the

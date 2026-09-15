@@ -141,6 +141,19 @@ const ZERO_ANCHOR_GUARD: f64 = 0.004;
 /// flags 0.01 as the empirical lift threshold.
 pub const DEFAULT_AMPLITUDE_THRESHOLD: f32 = 0.01;
 
+/// What one block of passthrough carried, post-gain, for the input meter:
+/// the absolute peak, the sum of per-frame mean squares, and how many
+/// frames there were (fewer than the block when the input underran).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PassthroughLevel {
+    /// The block's absolute peak across both channels.
+    pub peak: f32,
+    /// Σ over frames of the per-frame mean square.
+    pub sum_sq: f32,
+    /// Frames actually carried; less than the block on an underrun.
+    pub frames: usize,
+}
+
 /// Off-RT configuration for [`TimecodeInput`]. All fields are validated
 /// at attach time, so the audio thread sees only checked values.
 #[derive(Debug, Clone, Copy)]
@@ -569,7 +582,7 @@ pub struct TimecodeInput {
 
     /// Number of interleaved samples actually popped into `scratch` by
     /// the most recent [`Self::drive`] call (always even — whole stereo
-    /// frames). Read by [`Self::render_passthrough_into`] so Thru mode
+    /// frames). Read by [`Self::render_passthrough_mono_into`] so Thru mode
     /// can pass the live record straight to the output using the *same*
     /// samples the decoder just consumed — one input consumer, no second
     /// ring. Reset to `0` on a block with no new input so a stale block
@@ -996,20 +1009,41 @@ impl TimecodeInput {
     /// behaviour of the dedicated [`crate::thru::ThruSource`] path.
     ///
     /// **RT-safety**: no allocation, no locks — a bounded additive copy.
-    pub(crate) fn render_passthrough_into(
+    /// `mono` is the MIC option (F-38 stage 3): it sums the pair and
+    /// writes the sum to both channels, so a mic on one side of the pair
+    /// comes out of both speakers at its own level instead of hard left.
+    /// Returns the block's level, post-gain, for the channel's meter.
+    /// RT-safe: arithmetic over the scratch.
+    pub(crate) fn render_passthrough_mono_into(
         &self,
         out: &mut [f32],
         gain: f32,
         num_channels: usize,
         first: usize,
-    ) {
+        mono: bool,
+    ) -> PassthroughLevel {
         let frames = out.len() / num_channels;
         let avail_frames = self.last_popped / 2;
         let n = frames.min(avail_frames);
+        let mut peak = 0.0f32;
+        let mut sum_sq = 0.0f32;
         for i in 0..n {
             let base = i * num_channels + first;
-            out[base] += self.scratch[2 * i] * gain;
-            out[base + 1] += self.scratch[2 * i + 1] * gain;
+            let (l, r) = if mono {
+                let m = (self.scratch[2 * i] + self.scratch[2 * i + 1]) * gain;
+                (m, m)
+            } else {
+                (self.scratch[2 * i] * gain, self.scratch[2 * i + 1] * gain)
+            };
+            out[base] += l;
+            out[base + 1] += r;
+            peak = peak.max(l.abs()).max(r.abs());
+            sum_sq += 0.5 * (l * l + r * r);
+        }
+        PassthroughLevel {
+            peak,
+            sum_sq,
+            frames: n,
         }
     }
 

@@ -225,6 +225,11 @@ pub enum Command {
         macro_value: f32,
     },
 
+    /// The DUB FX channel's input kind on deck `idx` (F-38 stage 3):
+    /// `mono` sums the input pair to both channels (a MIC on one side of
+    /// the pair), `false` passes the pair as it comes (the mixer's SEND).
+    DeckSetFxInputMono { idx: u8, mono: bool },
+
     /// Engage or bypass rack slot `slot` on deck `idx` *without* touching its
     /// controls — the DUB FX channel's IN/OUT toggle. [`Self::DeckSetRackFx`]
     /// re-applies the Advanced macro on every call, which would stomp the
@@ -597,6 +602,11 @@ impl std::fmt::Debug for Command {
                 .field("slot", slot)
                 .field("active", active)
                 .field("macro_value", macro_value)
+                .finish(),
+            Self::DeckSetFxInputMono { idx, mono } => f
+                .debug_struct("DeckSetFxInputMono")
+                .field("idx", idx)
+                .field("mono", mono)
                 .finish(),
             Self::DeckSetRackSlotActive { idx, slot, active } => f
                 .debug_struct("DeckSetRackSlotActive")

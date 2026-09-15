@@ -339,10 +339,12 @@ struct DeckState: Equatable {
     /// The channel's TRIM, in dB — the deck gain while the deck is the FX
     /// channel. A track load sets the gain back to the track's own.
     var fxTrimDb: Double = 0
-    /// The decoder's RMS reading of the deck's input this poll — the FX
-    /// channel's VU. The one measured meter on the pane; the unit lamps are
-    /// drawn from the knobs.
-    var inputAmplitude: Float = 0
+    /// The live input's level this poll (F-38 stage 3): a VU-ballistic RMS
+    /// and a held peak, post-trim, linear, measured on the passthrough —
+    /// the FX channel's VU and its HOT lamp. The one measured meter on the
+    /// pane; the unit lamps are drawn from the knobs.
+    var inputRms: Float = 0
+    var inputPeak: Float = 0
     /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
     var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
 
@@ -2158,7 +2160,8 @@ final class WaveformAppModel: ObservableObject {
         }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
-        next.inputAmplitude = tele.carrierAmplitude
+        next.inputRms = tele.inputRms
+        next.inputPeak = tele.inputPeak
         next.sourceClass = tele.sourceClass
         next.calibrated = tele.calibrated
         next.calibrating = tele.calibrating
@@ -4564,6 +4567,7 @@ final class WaveformAppModel: ObservableObject {
         }
         pushFxRack(side)
         try? engine.setFxInputTrim(deckIdx: side.ffiDeckIdx, db: Float(s.fxTrimDb))
+        try? engine.setFxInputMono(deckIdx: side.ffiDeckIdx, mono: s.fxInput == .mic)
     }
 
     /// The feature was switched off: any FX deck goes back to its internal
@@ -5733,11 +5737,15 @@ final class WaveformAppModel: ObservableObject {
         try? engine.setFxInputTrim(deckIdx: side.ffiDeckIdx, db: Float(db))
     }
 
-    /// The INPUT rocker: SEND or MIC. A label until F-38 stage 3 routes it.
+    /// The INPUT rocker: SEND passes the pair as it comes; MIC sums it to
+    /// both channels so a mic on one side of the pair is not hard left
+    /// (F-38 stage 3).
     func setFxInput(_ side: DeckSide, _ kind: FxInputKind) {
         var deck = state(for: side)
         deck.fxInput = kind
         setState(deck, for: side)
+        guard isRunning else { return }
+        try? engine.setFxInputMono(deckIdx: side.ffiDeckIdx, mono: kind == .mic)
     }
 
     /// Push every unit's Expert controls to the engine.

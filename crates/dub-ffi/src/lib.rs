@@ -490,7 +490,13 @@ pub use rip::{
 ///       faces their numbers. On an `Fx` deck the siren and the sampler now
 ///       render *before* the rack, so `→ B` on a DUB FX deck B is the
 ///       siren through the Space Echo.
-pub const FFI_VERSION: u32 = 75;
+///   76. **F-38 stage 3 — the FX channel's input.**
+///       [`DubEngine::set_fx_input_mono`] (MIC sums the pair to both
+///       channels; SEND passes it), and `DeckTelemetry.input_rms` /
+///       `input_peak` — a measured, VU-ballistic level on any Thru / FX
+///       deck, post-trim, so the channel's meter reads the send rather than
+///       the timecode decoder's idea of it.
+pub const FFI_VERSION: u32 = 76;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -2486,6 +2492,27 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// The DUB FX channel's INPUT rocker (F-38 stage 3): `mono` is MIC —
+    /// the pair is summed and heard on both channels, so a mic on one side
+    /// of the pair is not hard left; `false` is SEND — the mixer's send
+    /// passes as it comes.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_fx_input_mono(&self, deck_idx: u64, mono: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_fx_input_mono(mono)
+            .map_err(map_command_error)
+    }
+
     /// The DUB FX channel's TRIM: the input gain on `deck_idx`, in dB
     /// (−24..+24). It is the deck's own gain — a track load sets that back to
     /// the track's normalisation, so the trim never leaks onto a record.
@@ -3255,6 +3282,8 @@ impl DubEngine {
             siren_state: shared.load_siren_state(),
             quick_scratch_slot: shared.load_quick_scratch_slot(),
             quick_scratch_parked_secs: shared.load_quick_scratch_parked_secs(),
+            input_rms: shared.load_input_level().0,
+            input_peak: shared.load_input_level().1,
         }
     }
 
@@ -4457,6 +4486,13 @@ pub struct DeckTelemetry {
     /// Where the parked track is, in track seconds — moving under slip,
     /// still under freeze. `0` when nothing is parked.
     pub quick_scratch_parked_secs: f64,
+    /// F-38 stage 3: the live input's RMS on a Thru / DUB FX deck,
+    /// post-trim, linear, VU-ballistic (300 ms) — draw the needle from
+    /// it. `0` on a deck playing a file.
+    pub input_rms: f32,
+    /// The live input's peak, post-trim, linear: holds and falls at
+    /// 20 dB/s — light HOT from it. `0` on a deck playing a file.
+    pub input_peak: f32,
 }
 
 impl DeckTelemetry {
@@ -4484,6 +4520,8 @@ impl DeckTelemetry {
             siren_state: 0,
             quick_scratch_slot: None,
             quick_scratch_parked_secs: 0.0,
+            input_rms: 0.0,
+            input_peak: 0.0,
         }
     }
 }
@@ -6253,7 +6291,9 @@ mod tests {
         // `_phaser` / `_space_echo` / `_spring`, `kick_rack_spring`,
         // `set_fx_input_trim`, `SpaceEchoMode`, `big_knob_step_hz`,
         // `spring_tone_hz`.
-        assert_eq!(FFI_VERSION, 75);
+        // 75→76: F-38 stage 3 — `set_fx_input_mono`,
+        // `DeckTelemetry.input_rms` / `input_peak`.
+        assert_eq!(FFI_VERSION, 76);
     }
 
     #[test]
@@ -6436,6 +6476,12 @@ mod tests {
             engine.set_fx_input_trim(0, 6.0).unwrap_err(),
             EngineError::NotRunning
         ));
+        assert!(matches!(
+            engine.set_fx_input_mono(0, true).unwrap_err(),
+            EngineError::NotRunning
+        ));
+        assert_eq!(engine.deck_telemetry(0).input_rms, 0.0);
+        assert_eq!(engine.deck_telemetry(0).input_peak, 0.0);
         // A bad deck index is caught before the running check.
         assert!(matches!(
             engine.set_rack_big_knob(7, 3, 0.7).unwrap_err(),

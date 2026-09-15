@@ -121,9 +121,11 @@ struct FxChannelState: Equatable {
     /// The interface input pair the channel takes, as printed: `3–4`.
     var inputPair: String = ""
     var trimDb: Double = 0
-    /// The decoder's RMS of the input this poll — the VU's needle. The
-    /// one measured meter on the pane.
-    var inputAmplitude: Float = 0
+    /// The live input's VU-ballistic RMS and held peak this poll, post-trim,
+    /// linear — the needle and the HOT lamp. The one measured meter on the
+    /// pane.
+    var inputRms: Float = 0
+    var inputPeak: Float = 0
     /// Engaged flags in `RackFx` order, as `DeckState.rackActive`.
     var active: [Bool] = [false, false, false, false]
     var controls: FxRackControls = FxRackControls()
@@ -147,10 +149,14 @@ struct FxChannelState: Equatable {
     /// The VU's needle, 0…1 along the siren meter's scale: 0 VU at
     /// −18 dBFS RMS, the scale −20…+3 VU, the red from +1.
     var vuLevel: Double {
-        let amp = Double(max(inputAmplitude, 1e-5))
+        let amp = Double(max(inputRms, 1e-5))
         let vu = 20 * log10(amp) + 18
         return min(max((vu + 20) / 23, 0), 1)
     }
+
+    /// HOT: the input peaked within 1 dB of full scale — the trim is too
+    /// high for what the mixer is sending.
+    var isHot: Bool { inputPeak >= 0.89 }
 
     /// The trim as the readout prints it.
     var trimText: String {

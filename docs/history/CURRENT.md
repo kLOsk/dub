@@ -401,8 +401,8 @@ dependency order, not a preference.
   same day (FFI 75)** — the mixer's send is the input, the siren reaches
   the rack through its own `→ FX` output pill, the bar re-orders rather
   than being taken over; the full description, what shipped and the design
-  canvas are on F-38 in `UI-BACKLOG.md`. Stage 3 (real send / mic input
-  monitoring) is what is left.
+  canvas are on F-38 in `UI-BACKLOG.md`. Stage 3 — the MIC sum and a
+  measured input meter — shipped the same day (FFI 76).
 - **Map mode, all five.** Two binding lanes per control (key **and** MIDI,
   so the laptop keymap and the controller can coexist). Momentary-vs-
   latching is a property of the **control**, not the binding — fewer ways

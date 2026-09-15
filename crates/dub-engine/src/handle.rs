@@ -1316,6 +1316,16 @@ impl DeckCommand<'_> {
         })
     }
 
+    /// The DUB FX channel's input kind: `mono` sums the pair to both
+    /// channels (MIC), `false` passes it as it comes (SEND).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_fx_input_mono(self, mono: bool) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetFxInputMono { idx, mono })
+    }
+
     /// Engage or bypass a rack slot without touching its controls — the DUB
     /// FX channel's IN/OUT toggle.
     ///

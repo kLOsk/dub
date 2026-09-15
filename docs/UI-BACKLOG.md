@@ -41,7 +41,13 @@ so users can tell the modes apart; same spinner.
 
 ---
 
-### U-15. Error toasts are too aggressive
+### U-15. Error toasts are too aggressive — **done**
+
+Shipped 2026-09-15: `surfaceNotice` is the quiet channel — the unified log
+plus a line in the library footer for eight seconds, never the banner. On
+it now: a failed analysis, an unreachable or unresolvable row, files an
+import skipped, a play-history write that failed. The banner keeps what
+stops a set: the engine, the library, a load.
 
 `surfaceError` writes to `lastError` which renders as a banner
 across the top of the window. Any FFI hiccup (transient unmounted
@@ -58,7 +64,11 @@ modal errors go to the banner.
 
 ---
 
-### U-17. The notation-toggle affordance is invisible
+### U-17. The notation-toggle affordance is invisible — **done**
+
+Shipped 2026-09-15: the header reads `KEY · CAMELOT` / `KEY · MUSICAL` (the
+column's default width grew to fit), so the notation the cells are in is on
+the surface and the right-click toggle has something to be found from.
 
 The Key column is currently not part of the default performance
 browser. When it returns via customizable columns, the header must
@@ -71,7 +81,12 @@ chrome doesn't.
 
 ---
 
-### U-18. Sort semantics differ between FFI and client sort
+### U-18. Sort semantics differ between FFI and client sort — **done**
+
+Shipped 2026-09-15: `LibraryRowComparator` carries the built-in column
+beside its `KeyPathComparator` and holds empty cells (`LibraryTrack.isEmpty
+(for:)`) last in both directions before the key is consulted — the
+configurable columns' and the FFI's contract, now on every column.
 
 The FFI's `list_tracks_sorted` puts NULLs last in both directions
 ("missing tag rows don't jump to the top when you click Artist").
@@ -95,7 +110,11 @@ comparator to copy already exists.
 
 ---
 
-### U-21. StatusStrip mixes engine + library state
+### U-21. StatusStrip mixes engine + library state — **done**
+
+Closed 2026-09-15: already the case — `StatusStripState` carries engine
+state only (rate, running, clock, power, the error, the mode switch, MAP)
+and the counts live in the library footer ("107 shown · 107 total").
 
 The status strip currently shows engine-running, master-deck, and
 library-imported counts in a single horizontal row. Engine state
@@ -445,9 +464,17 @@ false; the Preferences toggle was removed). Remaining:
   the siren through the Space Echo. The Big Knob's detents and the
   spring's TONE got construction-time tables so the audio thread never
   runs a `tan` / `exp` for them.
-* **Stage 3 (routing)** — the SEND · MIC rocker is a label the engine does
-  not yet read (both are "the pair"); real send / mic input monitoring,
-  and the direct-mic case's own preamp, are what is left.
+* **Stage 3 (routing) — shipped 2026-09-15, FFI 76.** The SEND · MIC
+  rocker is real: MIC sums the pair to both channels (`set_fx_input_mono`),
+  so a mic on one side of the pair is not hard left; SEND passes the
+  mixer's send as it comes. The channel's VU reads a *measured* level —
+  `DeckTelemetry.input_rms` (VU-ballistic, 300 ms) and `input_peak` (held,
+  falling 20 dB/s), post-trim, computed on the passthrough for any Thru /
+  FX deck — instead of the timecode decoder's carrier amplitude; HOT lights
+  from the peak within 1 dB of full scale. Left for later: a mic-level
+  preamp (the trim is ±24 dB; a mic into a line input wants the
+  interface's own preamp) and skipping the wasted timecode decode on an
+  Fx deck.
 
 **Design settled 2026-09-15** (canvas: *Dub FX Channel*,
 `claude.ai/code/artifact/1d073ff2-77b3-42fc-bfb9-4197823913f7`). The pane
