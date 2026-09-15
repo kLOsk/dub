@@ -1064,11 +1064,15 @@ impl DubEngine {
         // intrinsically stable here and we don't need an
         // explicit branch for it.
         let publish = shared.load_publish_state();
-        let playhead_secs_unclamped = publish.extrapolated_secs(now_ns);
+        let loop_state = shared.load_loop();
+        // Fold the loop-blind extrapolation into the running loop, as the
+        // audio thread folds the real playhead (P-40). The reverse-loop
+        // press reads this same value, so it can no longer re-grip off a
+        // reading past the loop's end.
+        let playhead_secs_unclamped = loop_state.wrap(publish.extrapolated_secs(now_ns));
         let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
         let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
         let debug_elapsed_ns = now_ns.saturating_sub(publish.host_time_ns);
-        let loop_state = shared.load_loop();
         PositionInfo {
             elapsed_secs,
             playhead_secs_unclamped,

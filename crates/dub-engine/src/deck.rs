@@ -226,6 +226,32 @@ pub struct LoopState {
     pub out_secs: f64,
 }
 
+impl LoopState {
+    /// Fold an extrapolated playhead back into `[in_secs, out_secs)` while
+    /// the loop runs, the way the audio thread wraps the real one.
+    ///
+    /// [`PublishState::extrapolated_secs`] is `position + elapsed × rate`
+    /// and knows nothing about loops, so between publishes the UI playhead
+    /// read past `out_secs` — by about a block normally, more at a scratched
+    /// platter rate, up to the 100 ms clamp if the audio thread stalled —
+    /// and the reverse-loop press, which captures the same reading, could
+    /// re-grip a loop off a position past its own end (UI-BACKLOG P-40).
+    /// Modular in both directions, so a reversed platter folds past
+    /// `in_secs` as well. A degenerate or inactive loop passes `secs`
+    /// through.
+    #[must_use]
+    pub fn wrap(&self, secs: f64) -> f64 {
+        let len = self.out_secs - self.in_secs;
+        if !self.active || len <= 0.0 || !len.is_finite() || !secs.is_finite() {
+            return secs;
+        }
+        if secs >= self.in_secs && secs < self.out_secs {
+            return secs;
+        }
+        self.in_secs + (secs - self.in_secs).rem_euclid(len)
+    }
+}
+
 /// Lock-free snapshot of a deck's timecode signal health. Returned by
 /// [`DeckSharedState::load_timecode_telemetry`].
 ///
@@ -3607,6 +3633,47 @@ mod tests {
     /// recovers on the next vsync. This test therefore asserts
     /// only the within-field invariant, which is what
     /// `AtomicU64` provides.
+    #[test]
+    fn loop_state_wraps_an_extrapolated_playhead_both_ways() {
+        // P-40: the extrapolation is loop-blind; the fold is what the UI
+        // and the reverse-loop press read.
+        let lp = LoopState {
+            active: true,
+            in_secs: 10.0,
+            out_secs: 12.0,
+        };
+        assert_eq!(lp.wrap(11.5), 11.5, "inside: untouched");
+        assert_eq!(lp.wrap(10.0), 10.0, "in is inclusive");
+        assert!(
+            (lp.wrap(12.0) - 10.0).abs() < 1e-12,
+            "out is the wrap point"
+        );
+        assert!(
+            (lp.wrap(12.3) - 10.3).abs() < 1e-12,
+            "a block past out folds to the start"
+        );
+        assert!(
+            (lp.wrap(9.7) - 11.7).abs() < 1e-12,
+            "reverse: a block before in folds to the end"
+        );
+        assert!(
+            (lp.wrap(14.5) - 10.5).abs() < 1e-12,
+            "a stall's worth folds modulo the length"
+        );
+
+        let off = LoopState {
+            active: false,
+            ..lp
+        };
+        assert_eq!(off.wrap(12.3), 12.3, "no loop, no fold");
+        let degenerate = LoopState {
+            active: true,
+            in_secs: 5.0,
+            out_secs: 5.0,
+        };
+        assert_eq!(degenerate.wrap(7.0), 7.0, "zero-length loop passes through");
+    }
+
     #[test]
     fn shared_state_concurrent_reads_are_within_field_coherent() {
         use std::sync::Arc as StdArc;
