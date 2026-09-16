@@ -437,6 +437,13 @@ button; crates, imports, analysis and keymap remapping are reachable from
 not. That group is the surprise — Prep is not "the library mode". The two
 surfaces differ almost entirely in the deck.
 
+**Post-1.0, on the roadmap (2026-09-16): M27 — UI themes.** Light for
+daytime DJing and Kingston (greenish olive military tones), beside the
+dark default, chosen in Preferences. PRD §12.2. Nothing to do before
+v1.0 except keep every colour in `DubColor` — the FX rack's faces are
+the one place hex literals live in a view, and they are the hardware's
+own paint, not the theme's.
+
 ## Recently shipped (detail in `SHIPPED.md`)
 
 - **M17 — Sampler, Quick Scratch & Instant Doubles.** All three of §7's
