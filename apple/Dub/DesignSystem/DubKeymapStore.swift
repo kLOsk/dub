@@ -107,6 +107,9 @@ final class DubKeymapStore: ObservableObject {
         overrides[action.id] != nil
     }
 
+    /// Whether anything differs from the defaults — what a reset would undo.
+    var hasOverrides: Bool { !overrides.isEmpty }
+
     // MARK: - Resolution
 
     private func rebuild() {

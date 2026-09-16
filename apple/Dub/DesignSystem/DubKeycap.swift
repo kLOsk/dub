@@ -40,20 +40,40 @@ struct DubKeycap: View {
     /// so a firing pad's binding stays legible against the tint wash.
     var lit: Bool = false
 
+    /// Where the cap sits. On a pad it is a corner mark and stays small;
+    /// in a list (the Preferences Keys tab) it is the row's value and
+    /// gets a real cap's proportions — `SPACE` with air around it.
+    enum Size {
+        case pad
+        case list
+    }
+    var size: Size = .pad
+
     private var glyphColor: Color {
         guard bound else { return DubColor.textPlaceholder }
         return lit ? DubColor.textPrimary : DubColor.textSecondary
     }
 
+    private var pointSize: CGFloat { size == .pad ? 9 : 11 }
+    private var minWidth: CGFloat {
+        switch size {
+        case .pad: return key.count > 1 ? 22 : 16
+        case .list: return 26
+        }
+    }
+    private var minHeight: CGFloat { size == .pad ? 14 : 22 }
+    private var inset: CGFloat { size == .pad ? 0 : 8 }
+
     var body: some View {
         Text(bound ? key : "—")
-            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .font(.system(size: pointSize, weight: .bold, design: .monospaced))
             .foregroundStyle(glyphColor)
-            .frame(minWidth: key.count > 1 ? 22 : 16, minHeight: 14)
+            .padding(.horizontal, inset)
+            .frame(minWidth: minWidth, minHeight: minHeight)
             .background(DubColor.surface0)
-            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: size == .pad ? 3 : 4, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                RoundedRectangle(cornerRadius: size == .pad ? 3 : 4, style: .continuous)
                     .stroke(
                         bound ? DubColor.divider : DubColor.divider.opacity(0.5),
                         lineWidth: 1))
