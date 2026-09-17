@@ -13,8 +13,10 @@ Cargo.lock.bak
 *.swo
 .DS_Store
 
-# Apple build outputs
+# Apple build outputs (`build-asan/` is the sanitizer variant:
+# `xcodebuild … -derivedDataPath apple/build-asan -enableAddressSanitizer YES`)
 apple/build/
+apple/build-*/
 apple/DerivedData/
 apple/*.xcodeproj/
 apple/*.xcworkspace/

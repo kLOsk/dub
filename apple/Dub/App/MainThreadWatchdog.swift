@@ -171,10 +171,31 @@ private struct MainThreadHandle {
     /// Program counters, innermost first. Suspends the thread only for
     /// the register read and the frame walk; both are a few
     /// microseconds. Empty if the thread state could not be read.
+    ///
+    /// **Nothing may allocate while the thread is suspended.** It is
+    /// stopped wherever it happens to be, and one time in a few that
+    /// is inside `malloc` holding the zone lock. This used to `append`
+    /// to an empty array right after `thread_suspend`; when the
+    /// suspend landed inside malloc, that append waited for a lock the
+    /// frozen thread could never release, the `thread_resume` never
+    /// ran, and every other thread queued up behind the same lock —
+    /// the whole app stuck at 0 % CPU (2026-09-16, a 2 s `sample`
+    /// showed the main thread parked in `tiny_free_list_add_ptr` and
+    /// the watchdog in `swift_slowAlloc`). So the buffer is allocated
+    /// first, the walk writes into it by index, and the slice that is
+    /// returned is built only after the resume.
     func backtrace(maxFrames: Int = 96) -> [UInt] {
-        guard thread_suspend(port) == KERN_SUCCESS else { return [] }
+        var pcs = [UInt](repeating: 0, count: maxFrames)
+        let n = pcs.withUnsafeMutableBufferPointer { walk(into: $0) }
+        return Array(pcs.prefix(n))
+    }
+
+    /// The suspended section: a syscall for the registers, then raw
+    /// reads of the stack. Returns the number of frames written.
+    private func walk(into pcs: UnsafeMutableBufferPointer<UInt>) -> Int {
+        guard thread_suspend(port) == KERN_SUCCESS else { return 0 }
         defer { thread_resume(port) }
-        var pcs: [UInt] = []
+        var n = 0
         #if arch(x86_64)
         var state = x86_thread_state64_t()
         var count = mach_msg_type_number_t(MemoryLayout<x86_thread_state64_t>.size / MemoryLayout<natural_t>.size)
@@ -183,8 +204,9 @@ private struct MainThreadHandle {
                 thread_get_state(port, thread_state_flavor_t(x86_THREAD_STATE64), $0, &count)
             }
         }
-        guard kr == KERN_SUCCESS else { return [] }
-        pcs.append(UInt(state.__rip))
+        guard kr == KERN_SUCCESS else { return 0 }
+        pcs[n] = UInt(state.__rip)
+        n += 1
         var fp = UInt(state.__rbp)
         #elseif arch(arm64)
         var state = arm_thread_state64_t()
@@ -194,25 +216,30 @@ private struct MainThreadHandle {
                 thread_get_state(port, thread_state_flavor_t(ARM_THREAD_STATE64), $0, &count)
             }
         }
-        guard kr == KERN_SUCCESS else { return [] }
-        pcs.append(UInt(state.__pc))
-        pcs.append(UInt(state.__lr))
+        guard kr == KERN_SUCCESS else { return 0 }
+        pcs[n] = UInt(state.__pc)
+        n += 1
+        if n < pcs.count {
+            pcs[n] = UInt(state.__lr)
+            n += 1
+        }
         var fp = UInt(state.__fp)
         #else
-        return []
+        return 0
         #endif
         // Frame-pointer walk: [fp] is the caller's fp, [fp + 8] its
         // return address. Bounded to the main thread's own stack so a
         // frameless leaf cannot send this reading garbage.
-        while pcs.count < maxFrames, fp >= stackBottom, fp + 16 <= stackTop, fp % 8 == 0 {
+        while n < pcs.count, fp >= stackBottom, fp + 16 <= stackTop, fp % 8 == 0 {
             let next = UnsafePointer<UInt>(bitPattern: fp)?.pointee ?? 0
             let ret = UnsafePointer<UInt>(bitPattern: fp + 8)?.pointee ?? 0
             guard ret != 0 else { break }
-            pcs.append(ret)
+            pcs[n] = ret
+            n += 1
             guard next > fp else { break }
             fp = next
         }
-        return pcs
+        return n
     }
 }
 

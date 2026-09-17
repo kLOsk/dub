@@ -129,11 +129,13 @@ require_match "PRD auto-stop (secs at dB)" \
 echo ""
 echo "Doc cross-links:"
 BROKEN_LINKS=0
-# Ours only — vendored SPM checkouts under apple/build carry their own
-# broken links and are none of our business.
+# Ours only — vendored SPM checkouts under apple/build (and the
+# sanitizer variant, apple/build-asan) carry their own broken links and
+# are none of our business.
 for md in $(find . -name '*.md' \
         -not -path './target/*' -not -path './.git/*' \
-        -not -path './apple/build/*' -not -path './apple/DerivedData/*' | sort); do
+        -not -path './apple/build/*' -not -path './apple/build-*/*' \
+        -not -path './apple/DerivedData/*' | sort); do
     dir="$(dirname "$md")"
     targets="$(grep -Eo '\]\([^)#]+\.md' "$md" 2>/dev/null | sed -E 's/^\]\(//' || true)"
     for target in $targets; do

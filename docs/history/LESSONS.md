@@ -627,6 +627,23 @@
   0.15 %, verified by injecting ±0.3 %. **When a bug is only findable on the
   rig, the fix is a captured fixture, not a better generator.**
 
+- **Nothing may allocate while a thread you suspended is suspended.** The
+  debug watchdog stops the main thread to walk its stack; it then `append`ed
+  the first program counter to an empty array. One time in a few the suspend
+  landed inside `malloc` with the zone lock held, the append waited for that
+  lock, the `thread_resume` in a `defer` never ran, and every thread in the
+  process queued up behind the same lock — an app frozen at 0 % CPU with no
+  crash report (2026-09-16, after a long idle following a DUB FX session).
+  The first read of the `sample` was "heap corruption, malloc spinning in
+  `tiny_free_list_add_ptr`", which the CPU figure disproved: a spinning
+  thread pins a core, a suspended one shows the same stack at 0 %. The ASan
+  build that followed could not reproduce it because it is a timing race, not
+  a memory bug. Between `thread_suspend` and `thread_resume` there may be a
+  syscall and raw reads, nothing else; the buffer is allocated before, the
+  slice built after (`MainThreadHandle.backtrace`). **When a hang shows one
+  thread "running" inside a non-blocking function at 0 % CPU, ask who
+  suspended it before asking who corrupted the heap.**
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **The beatmatch aid is Traktor's phase meter, and the strips do the

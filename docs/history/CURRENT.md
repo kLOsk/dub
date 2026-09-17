@@ -451,6 +451,18 @@ and the rack bar reads sampler · siren everywhere, the order the FX
 channel on deck B already used (`GlobalRackBar.sirenLeads` — only an FX
 channel on deck A swaps them back).
 
+**The debug watchdog could freeze the app (fixed 2026-09-16).** Its stall
+capture suspended the main thread and then allocated; when the suspend
+landed inside `malloc` the whole process deadlocked on the zone lock at
+0 % CPU — the "not responding" after a DUB FX session, five minutes into
+idle. `MainThreadHandle.backtrace` now allocates before the suspend and
+builds its result after the resume; the rule is in LESSONS (build +
+test hygiene). Debug builds only — the watchdog is `#if DEBUG`. An
+Address-Sanitizer variant of the app builds into `apple/build-asan`
+(gitignored) with `xcodebuild … -derivedDataPath apple/build-asan
+-enableAddressSanitizer YES`; it was the wrong tool for this one but
+is the right one for a real double free.
+
 **Post-1.0, on the roadmap (2026-09-16): M27 — UI themes.** Light for
 daytime DJing and Kingston (greenish olive military tones), beside the
 dark default, chosen in Preferences. PRD §12.2. Nothing to do before
