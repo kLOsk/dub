@@ -50,8 +50,8 @@ struct GlobalRackBarState: Equatable {
     /// The deck that is the DUB FX channel, if one is (F-38). The bar is
     /// not taken over by the channel — the siren and the samples are what
     /// the DJ plays *with* the rack — but it re-orders so the siren box
-    /// sits under the rack: samples left and siren right when deck B is
-    /// the channel, the usual order otherwise.
+    /// sits under the rack: the usual samples-left, siren-right when deck
+    /// B is the channel or none is, the two swapped when deck A is.
     var fxSide: DeckSide? = nil
 }
 

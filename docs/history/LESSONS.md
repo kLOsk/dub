@@ -629,6 +629,17 @@
 
 ## Product invariants (don't relitigate without sign-off)
 
+- **The beatmatch aid is Traktor's phase meter, and the strips do the
+  tempo.** Four rounds: a dot trail, then Stillpoint — role inference, a
+  workflow FSM, honesty gates, a growing green lock line, a pitch coach —
+  and Daniel's verdict was "to be honest it sucks … Traktor's phase meter
+  is simply the easiest." Cleverer than the standard lost to the standard
+  every time it was tried; the one thing that survived all six of
+  Stillpoint's rounds is the axis (late = above the line), because it
+  was settled on the rig. Do not add motion-nulling, coaching or
+  role-inference back into the gutter. `PhaseMeter.swift`; the Stillpoint
+  sub-spec stays in `docs/investigations/` as history.
+
 - **No software mixer / EQ / crossfader, ever** (v1 & v2). The hardware mixer is
   the product; Dub routes per-deck audio + FX only.
 - **No device / channel picker.** Audio mode is hardware-derived (interface →
@@ -661,7 +672,7 @@
   machine, the MK2 mis-routing, the octave cases, the SR-drift — each is a named
   test that would catch the specific class again.
 - **Snapshot tests exist now — keep new views value-struct-driven.** The
-  `snap(_:width:height:named:)` harness (`StillpointSnapshotTests`,
+  `snap(_:width:height:named:)` harness (`PhaseMeterTests`,
   `PerformanceSnapshotTests`, `RipSnapshotTests`) closed the old "they
   don't exist" gap (UI-BACKLOG C-31): views that take plain state structs
   (no FFI) snapshot for free. The UI regressions each round (footer pill,

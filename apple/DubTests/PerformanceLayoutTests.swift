@@ -85,7 +85,7 @@ final class PerformanceLayoutTests: XCTestCase {
     /// is a configuration nobody runs.
     private var columnWidthAt1440: CGFloat {
         (1440 - DubLayout.performanceWaveformWidthCap * 2
-            - DubLayout.stillpointGutterWidth - 2) / 2
+            - DubLayout.phaseMeterGutterWidth - 2) / 2
     }
 
     /// The column fits the pane a 1440 × 900 window produces.
@@ -414,7 +414,7 @@ final class PerformanceLayoutTests: XCTestCase {
     /// that, this fails before anyone sees a clipped pane.
     func test_deckPane_tokensFitTheMinimumWindow() {
         let pane = (DubLayout.mainWindowMinWidth
-            - DubLayout.stillpointGutterWidth - 2) / 2
+            - DubLayout.phaseMeterGutterWidth - 2) / 2
         let fixed = DubLayout.performancePadColumnWidth
             + DubLayout.deckOverviewWidth
             + DubLayout.deckOverviewGap

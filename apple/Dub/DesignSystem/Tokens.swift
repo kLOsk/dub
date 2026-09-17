@@ -507,13 +507,13 @@ enum DubLayout {
     /// Serato Scratch Live's playing-waveform height, translated into
     /// our bottom→top vertical orientation. The two waveforms read as
     /// prominent "records" pulled into a centred cluster, favouring
-    /// vertical time-history over horizontal peak-detail; Stillpoint
-    /// sits between them, overviews on the outer edges.
+    /// vertical time-history over horizontal peak-detail; the phase
+    /// meter sits between them, overviews on the outer edges.
     ///
     /// This is the *ideal*: the strip grows toward
     /// `performanceWaveformWidthCap` when the pane allows and shrinks
     /// to `performanceWaveformMinWidth` when it does not.
-    static let performanceWaveformWidth: CGFloat = 133
+    static let performanceWaveformWidth: CGFloat = 106
 
     /// Fixed width of each deck's performance-pad column. The widest
     /// row is CUE / the four LOOP lengths at 4 × 38 + 3 × 8 = 176, plus
@@ -540,14 +540,16 @@ enum DubLayout {
     /// buys nothing — information density per pixel peaks around 140 —
     /// so this grows the strip without chasing the whole pane.
     ///
-    /// The min / ideal / cap triple was cut by a third (132/200/280)
-    /// to hand the width back to the deck columns, which is where the
-    /// cue names and loop controls have to fit. The cap still clears
-    /// the ~140 density knee; the floor is now under it, so a pane
-    /// narrow enough to force the strip down there is trading peak
-    /// detail for the columns on purpose.
-    static let performanceWaveformWidthCap: CGFloat = 187
-    static let performanceWaveformMinWidth: CGFloat = 88
+    /// The min / ideal / cap triple was cut by a third (132/200/280 →
+    /// 88/133/187) to hand the width back to the deck columns, which is
+    /// where the cue names and loop controls have to fit, and by a
+    /// further fifth (2026-09-16, the DJ's ask, alongside the gutter's
+    /// cut) for the same reason. The cap now sits just past the ~140
+    /// density knee; the floor is well under it, so a pane narrow
+    /// enough to force the strip down there is trading peak detail for
+    /// the columns on purpose.
+    static let performanceWaveformWidthCap: CGFloat = 150
+    static let performanceWaveformMinWidth: CGFloat = 70
 
     /// The shortest the Prep playing strip is allowed to get before the
     /// pad bar starts giving up height instead.
@@ -673,22 +675,16 @@ enum DubLayout {
     static let mainWindowMinWidth: CGFloat = 960
     static let mainWindowMinHeight: CGFloat = 600
 
-    /// The centre-gutter beatmatch phase clock (PhaseClockView). The
-    /// ring diameter and the gutter column it lives in.
-    static let phaseClockDiameter: CGFloat = 132
-    static let phaseClockWidth: CGFloat = 160
-
-    /// Centre gutter for Stillpoint (round 3, the shipping candidate —
-    /// docs/investigations/BEATMATCH-AID-STILLPOINT.md). Spec target
-    /// is 100–160 px, degradable to 80.
-    ///
-    /// Cut by a third from 132 along with the waveform strips. That
-    /// puts it *below* the spec's target band and into its degraded
-    /// range — deliberate, to widen the deck columns, but it is the
-    /// aid's own sub-spec being spent rather than slack. If drift
-    /// becomes hard to read on the rig, this is the first number to
-    /// put back.
-    static let stillpointGutterWidth: CGFloat = 88
+    /// Centre gutter for the phase meter (`PhaseMeterCanvas`, round 4 —
+    /// Traktor's one-beat meter, standing between the strips). The meter
+    /// is a 10 pt track with 4 pt ticks either side and a 24 pt marker,
+    /// so the gutter is the marker plus 6 pt of air each side — the
+    /// meter's own width and no more, at the DJ's ask (2026-09-16); the
+    /// width it gave up went to the deck columns. It was 132 for
+    /// Stillpoint's three faces and 88 for the meter's first cut. The
+    /// zoom control stands vertical in it (`WaveformZoomControl`), 32 pt
+    /// at its widest — anything wider here overhangs the strips.
+    static let phaseMeterGutterWidth: CGFloat = 36
 
     /// Height of the horizontal playing-waveform strip in Prep
     /// mode. ≈ half the vertical-mode `waveformMinHeight`, sized

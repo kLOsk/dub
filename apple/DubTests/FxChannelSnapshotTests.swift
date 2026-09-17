@@ -40,8 +40,8 @@ final class FxChannelSnapshotTests: XCTestCase {
     }
 
     /// The pane at the 1440 × 900 deck row: a 486 pt column beside the
-    /// 187 pt strip.
-    private static let paneWidth: CGFloat = 486 + 187
+    /// strip at its cap.
+    private static let paneWidth: CGFloat = 486 + DubLayout.performanceWaveformWidthCap
     private static let paneHeight: CGFloat = 560
 
     /// Deck B on DUB FX with the send patched in: the Big Knob, the Space
@@ -117,5 +117,17 @@ final class FxChannelSnapshotTests: XCTestCase {
         snap(GlobalRackBar(state: state).background(DubColor.surface0),
              width: 1440, height: DubLayout.rackBarHeight,
              named: "rack-bar-fx-corner")
+    }
+
+    /// Deck A as the channel: the one case the blocks swap, the siren
+    /// box leading so it stays under the rack on the left.
+    func test_globalRackBar_fxCornerLeft() {
+        var state = GlobalRackBarState.fixture(focus: .a)
+        state.fxSide = .a
+        state.siren?.output = RackOutputState(.a, focused: .a, fxDeck: .a)
+        state.sampler.output = RackOutputState(.b, focused: .a, fxDeck: .a)
+        snap(GlobalRackBar(state: state).background(DubColor.surface0),
+             width: 1440, height: DubLayout.rackBarHeight,
+             named: "rack-bar-fx-corner-left")
     }
 }

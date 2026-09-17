@@ -412,16 +412,17 @@ final class PerformanceSnapshotTests: XCTestCase {
     /// digits — 1.75x came out "1.8x" and 1.25x came out "1.2x" — which
     /// is invisible in a test that only renders the 1x default. The
     /// readout also has a fixed `minWidth`, so a label that outgrows it
-    /// shifts the two buttons apart; rendering all seven catches that
-    /// too.
+    /// widens the column past the gutter; rendering all seven catches
+    /// that too. A row of columns: each control is one stacked pill
+    /// sized to the 36 pt gutter.
     func test_waveformZoom_everyRung() {
-        let stack = VStack(alignment: .leading, spacing: 10) {
+        let row = HStack(alignment: .top, spacing: 10) {
             ForEach(0..<WaveformZoom.steps.count, id: \.self) { i in
                 WaveformZoomControl(index: .constant(i), visible: true)
             }
         }
         .padding()
-        snap(deckBg(stack), width: 200, height: 320, named: "zoom-ladder")
+        snap(deckBg(row), width: 340, height: 90, named: "zoom-ladder")
     }
 
 }

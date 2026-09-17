@@ -234,7 +234,7 @@ baselines re-recorded; the 1440 × 900 fit test still holds.
 
 **The rack folds (2026-09-14).** A chevron column at the bar's leading
 edge — the library's `› FILTER` gesture — folds the whole bar to a
-22 pt strip (`▸ DUB SIREN · SAMPLES`), and the 112 pt it gives up go to
+22 pt strip (`▸ SAMPLES · DUB SIREN` since the 2026-09-16 swap), and the 112 pt it gives up go to
 the library: `DeckLibrarySplit` now takes a `deckChromeBudget` (the open
 bar) and subtracts what is missing from the deck side, so the waveform
 region keeps its height and nothing above the fold moves
@@ -436,6 +436,20 @@ button; crates, imports, analysis and keymap remapping are reachable from
 **both**; and sample *loading* is Prep work even though sample *firing* is
 not. That group is the surprise — Prep is not "the library mode". The two
 surfaces differ almost entirely in the deck.
+
+**The beatmatch aid is the phase meter now (2026-09-16).** Stillpoint
+(round 3) and the dead round-2 candidates (`PhaseClockView`,
+`BeatmatchViz`) are deleted; `PhaseMeter.swift` is Traktor's one-beat
+meter standing in the gutter, late above the line, the incoming deck's
+beat against the master's. PRD §9.4 rewritten; the Stillpoint sub-spec
+stays in `docs/investigations/` as history. `PerformanceLayoutTests`
+follow the renamed `phaseMeterGutterWidth`. Same day, on the DJ's ask:
+the gutter is the meter's own width now (88 → 36 pt; the zoom control
+stands vertical in it), each playing strip is a fifth narrower
+(70/106/150 for min/ideal/cap) and both cuts went to the deck columns;
+and the rack bar reads sampler · siren everywhere, the order the FX
+channel on deck B already used (`GlobalRackBar.sirenLeads` — only an FX
+channel on deck A swaps them back).
 
 **Post-1.0, on the roadmap (2026-09-16): M27 — UI themes.** Light for
 daytime DJing and Kingston (greenish olive military tones), beside the

@@ -19,7 +19,7 @@
 //      │                              │                          │
 //      │   playhead at 25 % from top, deck-tinted hairline       │
 //      │                                                         │
-//      ├─ global rack bar: siren → A · quick scratch · sampler ──┤
+//      ├─ global rack bar: sampler · siren → A ──────────────────┤
 //      ╞═ draggable divider ═════════════════════════════════════╡
 //      ├─ library / FS browser (M10.5b) ─────────────────────────┤
 //      └─────────────────────────────────────────────────────────┘
@@ -598,7 +598,7 @@ struct PerformanceView: View {
 
     private func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
         let claimed = DubLayout.performanceWaveformWidthCap * 2
-            + DubLayout.stillpointGutterWidth + 2
+            + DubLayout.phaseMeterGutterWidth + 2
         return max(
             DubLayout.performanceDeckColumnMinWidth,
             ((paneWidth - claimed) / 2).rounded(.down))
@@ -611,25 +611,21 @@ struct PerformanceView: View {
                 side: .a, deckIdx: 0, enabled: deckAEnabled,
                 columnWidth: columnWidth,
                 zoom: WaveformZoom.steps[waveZoomIndex])
-            // Centre gutter: Stillpoint, the round-3 beatmatch aid
-            // (docs/investigations/BEATMATCH-AID-STILLPOINT.md).
-            // One incoming-tinted band on the lock line: drifts =
-            // tempo off, frozen = matched, seated on the line =
-            // in, green line grows per beat held. Replaces the
-            // rejected round-2 candidates (`BeatmatchStackView`,
-            // kept in-tree until the rig verdict).
+            // Centre gutter: the phase meter (round 4, `PhaseMeter.swift`)
+            // — Traktor's one-beat meter standing between the strips, the
+            // incoming deck's beat against the master's, late above the
+            // line. Tempo is matched by the header numbers and by the two
+            // strips scrolling at one speed; this is for the last few
+            // milliseconds. It replaced Stillpoint (round 3, kept in
+            // docs/investigations/BEATMATCH-AID-STILLPOINT.md as history).
             //
-            // Stillpoint takes the gutter's full height and the zoom
-            // control floats over its top edge. It used to *head* the
-            // gutter as a row above the canvas, which cost three things
-            // at once: the 32 pt slot let the region's seam colour show
-            // through as a grey box; the control is wider than the
-            // gutter, so deck B — drawn after it — covered its right
-            // half; and the canvas measured its "25 % from the top" lock
-            // line from 32 pt down, which put it 24 pt under the strips'
-            // playheads that the sub-spec says it must be collinear with.
-            StillpointView(model: model)
-                .frame(width: DubLayout.stillpointGutterWidth)
+            // The meter takes the gutter's full height and the zoom
+            // control stands over its top end — a row above the canvas
+            // would push the meter's line off the strips' playheads it
+            // has to be collinear with. The gutter is the meter's own
+            // width (36 pt), so the control is a column, not a row.
+            PhaseMeterView(model: model)
+                .frame(width: DubLayout.phaseMeterGutterWidth)
                 .frame(maxHeight: .infinity)
                 .overlay(alignment: .top) {
                     // The one place both strips can see it, and out of

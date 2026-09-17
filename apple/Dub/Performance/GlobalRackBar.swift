@@ -2,12 +2,14 @@
 //  GlobalRackBar.swift
 //  Dub
 //
-//  The horizontal bar under the deck panes: siren · sampler. The
+//  The horizontal bar under the deck panes: sampler · siren. The
 //  sampler is `SampleShelf` — the same eight tiles Prep loads, so a slot
 //  learned in one place is the slot found in the other. Quick Scratch
 //  drew here as a third block of four pads until PRD §7.2 got its way
 //  back: it is a tag on a sampler tile now, fired from a row in each
-//  deck column, and the bar's width went to the shelf.
+//  deck column, and the bar's width went to the shelf. The siren led
+//  the bar until 2026-09-16; the DJ preferred the FX channel's order
+//  (samples first, the siren box at the right) everywhere.
 //
 //  The bar folds (2026-09-14) to a one-line strip, and the height it
 //  gives up goes to the library — `DeckLibrarySplit` takes the open
@@ -30,7 +32,7 @@
 
 import SwiftUI
 
-/// Siren · sampler, one of each, full width.
+/// Sampler · siren, one of each, full width.
 ///
 /// **Where the slack goes.** The siren is a fixed-width box and gains
 /// nothing from width, so it sits at its own size with first claim on
@@ -65,17 +67,22 @@ struct GlobalRackBar: View {
     private var openBar: some View {
         HStack(spacing: 1) {
             foldColumn
-            // The siren sits under the rack when a deck is the DUB FX
-            // channel: on the right for deck B, so the two swap.
-            if state.fxSide == .b {
-                samplerGroup
+            if sirenLeads {
                 sirenGroup
+                samplerGroup
             } else {
-                sirenGroup
                 samplerGroup
+                sirenGroup
             }
         }
     }
+
+    /// Samples, then the siren — the order the DJ asked for on the
+    /// regular surface (2026-09-16), which is also the order the FX
+    /// channel on deck B had already put them in. The siren still sits
+    /// under the rack when a deck is the DUB FX channel, so with the
+    /// rack on the left (deck A) the two swap back.
+    private var sirenLeads: Bool { state.fxSide == .a }
 
     @ViewBuilder
     private var sirenGroup: some View {
@@ -99,7 +106,7 @@ struct GlobalRackBar: View {
     }
 
     /// A slim column with the chevron at the height of the headings, so
-    /// it reads as `▾ DUB SIREN` beside the first block.
+    /// it reads as `▾ SAMPLES` beside the first block.
     private var foldColumn: some View {
         Button(action: onFold) {
             VStack {
@@ -121,20 +128,22 @@ struct GlobalRackBar: View {
     }
 
     /// The whole strip is the button: chevron and the names of what is
-    /// folded, in their own tints.
+    /// folded, in their own tints and in the open bar's order.
     private var foldedStrip: some View {
         Button(action: onFold) {
             HStack(spacing: DubSpacing.sm) {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(DubColor.textSecondary)
-                if state.siren != nil {
+                if state.siren != nil, sirenLeads {
                     stripTitle("DUB SIREN", DubColor.siren)
-                    Text("·")
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textPlaceholder)
+                    stripDot
                 }
                 stripTitle("SAMPLES", samplerTint)
+                if state.siren != nil, !sirenLeads {
+                    stripDot
+                    stripTitle("DUB SIREN", DubColor.siren)
+                }
                 Spacer()
             }
             .padding(.horizontal, DubSpacing.lg)
@@ -150,6 +159,12 @@ struct GlobalRackBar: View {
     /// The shelf's own heading tint — the deck it fires on.
     private var samplerTint: Color {
         state.sampler.output?.tintDeck.map(DubColor.deckTint) ?? DubColor.controlAccent
+    }
+
+    private var stripDot: some View {
+        Text("·")
+            .font(DubFont.micro)
+            .foregroundStyle(DubColor.textPlaceholder)
     }
 
     private func stripTitle(_ title: String, _ tint: Color) -> some View {

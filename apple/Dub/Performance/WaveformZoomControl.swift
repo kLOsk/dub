@@ -13,12 +13,12 @@
 //
 //  ## Why the beatmatch aid does not zoom with them
 //
-//  Stillpoint has no time axis to zoom. It shows drift as a band's
-//  *position*, not as seconds of audio, so a "zoom" would either do
-//  nothing or change what the position means — a scale change on an
-//  instrument whose whole job is to be read the same way every time.
-//  The control sits above it because that is where both strips can see
-//  it, not because it applies to it.
+//  The phase meter has no time axis to zoom. It is one beat long by
+//  definition, whatever the strips show, so a "zoom" would either do
+//  nothing or change what the marker's position means — a scale change
+//  on an instrument whose whole job is to be read the same way every
+//  time. The control sits above it because that is where both strips
+//  can see it, not because it applies to it.
 //
 
 import SwiftUI
@@ -83,28 +83,37 @@ enum WaveformZoom {
     }
 }
 
-/// `−` and `+`, shown while the pointer is over the deck row.
+/// `+` over `−`, shown while the pointer is over the deck row.
+///
+/// Stacked, not side by side: the gutter it stands in is the phase
+/// meter's width (`DubLayout.phaseMeterGutterWidth`, 36 pt), and a row
+/// of `− 1.25× +` is three times that — it would straddle both strips.
+/// A column fits, `+` on top the way every map control reads.
 struct WaveformZoomControl: View {
     @Binding var index: Int
     /// Fades rather than appears: a control that pops in under the
     /// pointer reads as a misclick waiting to happen.
     let visible: Bool
 
+    /// The readout's floor: "1.25×" at the caption size, so the buttons
+    /// do not shift when the label gains or loses a digit.
+    private static let labelWidth: CGFloat = 26
+
     var body: some View {
-        HStack(spacing: DubSpacing.xs) {
-            button("minus", enabled: index < WaveformZoom.steps.count - 1) {
-                index = min(index + 1, WaveformZoom.steps.count - 1)
-            }
-            Text(WaveformZoom.label(index))
-                .font(DubFont.micro)
-                .monospacedDigit()
-                .foregroundStyle(DubColor.textSecondary)
-                .frame(minWidth: 46)
+        VStack(spacing: 2) {
             button("plus", enabled: index > 0) {
                 index = max(index - 1, 0)
             }
+            Text(WaveformZoom.label(index))
+                .font(.system(size: 9, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(DubColor.textSecondary)
+                .frame(minWidth: Self.labelWidth)
+            button("minus", enabled: index < WaveformZoom.steps.count - 1) {
+                index = min(index + 1, WaveformZoom.steps.count - 1)
+            }
         }
-        .padding(.horizontal, DubSpacing.sm)
+        .padding(.horizontal, 3)
         .padding(.vertical, 4)
         .background(DubColor.surface2)
         .clipShape(Capsule())

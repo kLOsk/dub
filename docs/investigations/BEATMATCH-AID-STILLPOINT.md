@@ -1,3 +1,9 @@
+> **Superseded 2026-09-16.** Stillpoint was replaced by a plain Traktor-style
+> phase meter (`apple/Dub/Performance/PhaseMeter.swift`, PRD §9.4 round 4)
+> after the rig verdict that the standard is simply easier. This document is
+> kept as the record of what was tried and why; only its axis convention
+> (late = above the line) carried over.
+
 # Stillpoint — beatmatch aid, round 3 (design proposal)
 
 Status: **adopted and shipped.** This is the binding sub-spec for PRD §9.4 —

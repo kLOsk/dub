@@ -500,8 +500,10 @@ direct remains for a battle mixer with no send. The "siren → rack" key is
 instead (engine: render the siren *before* the rack on an `Fx` deck rather
 than after it), and the samples pill gets the same — a horn stab straight
 into the tape. The global rack bar is **not** taken over: siren and samples
-are what the DJ plays *with* the rack, so the bar re-orders (samples left,
-siren right) to put the siren directly under the rack. The rack publishes no
+are what the DJ plays *with* the rack, so the bar re-orders to put the siren
+directly under the rack (samples left, siren right is the regular order
+too since 2026-09-16 — the DJ preferred it — so only an FX channel on deck
+A swaps them). The rack publishes no
 state, so the tape / lamps / coils animate from the UI's own knob values,
 like the siren's needle; only the input VU is measured. Naming is open:
 SPACE ECHO / BIG KNOB / PHASER are other people's marks or nicknames; a
