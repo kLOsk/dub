@@ -201,13 +201,16 @@ struct TrackOverviewView: View {
         //     change, i.e. on track load. Steady-state cost: zero
         //     per-tick CPU.
         //   * The per-tick `TimelineView` Canvas redraws just the
-        //     ~6 shapes of `drawPlayhead`. ~120× cheaper than the
+        //     ~6 shapes of the playhead. ~120× cheaper than the
         //     unsplit version.
         //
-        // 4 Hz remains the right cadence (bracket motion is ≤ 0.4
-        // pixel / tick on a 4-min track, well below perceptual
-        // motion threshold), but the *cost per tick* now actually
-        // matches that budget.
+        // **Round 2 (2026-09-23): the tick is gone too.** Cheap as the
+        // redraw was, every `TimelineView` tick still cost an AppKit
+        // layout pass of the *whole window* — and in rip review that
+        // window is the biggest it gets, so the same nextDrawable
+        // contention came back as a jumping strip. The playhead is a
+        // Core Animation layer now (`PlayheadLayer`), moved by its own
+        // 4 Hz timer and never laid out; see `LayerTickers.swift`.
         GeometryReader { geo in
             ZStack {
                 Canvas { ctx, size in
@@ -222,13 +225,17 @@ struct TrackOverviewView: View {
                     }
                 }
                 if let buckets, !buckets.isEmpty {
-                    TimelineView(.periodic(from: .now, by: 0.25)) { context in
-                        Canvas { ctx, size in
-                            _ = context.date
-                            drawPlayhead(ctx: ctx, size: size)
-                        }
-                    }
-                    .allowsHitTesting(false)
+                    // Moved, never laid out — see `LayerTickers.swift`.
+                    // This was a 4 Hz `TimelineView` whose every tick
+                    // cost a whole-window layout pass, and on the i9
+                    // each pass made the Metal strip drop a frame.
+                    PlayheadLayer(
+                        orientation: orientation,
+                        fraction: { [engine = model.engine, deckIdx] in
+                            Self.enginePlayheadFraction(engine: engine, deckIdx: deckIdx)
+                        },
+                        dragFraction: dragPlayheadFraction)
+                        .allowsHitTesting(false)
                     minuteMarkerLabels(in: geo.size)
                 }
             }
@@ -685,64 +692,6 @@ struct TrackOverviewView: View {
         return nil
     }
 
-    private func drawPlayhead(ctx: GraphicsContext, size: CGSize) {
-        guard let fraction = playheadFraction() else { return }
-        let chevronSize = DubLayout.playheadChevronSize
-        let coreW = DubLayout.playheadCoreWidth
-        let haloW = DubLayout.playheadHaloWidth
-        let accent = DubColor.playheadAccent
-        let haloColor = Color.black.opacity(0.55)
-        let pad = OverviewLayout.endPadding
-        switch orientation {
-        case .vertical:
-            let axisLength = max(0, size.height - 2 * pad)
-            let y = pad + axisLength * CGFloat(fraction)
-            let halo = CGRect(x: 0, y: y - haloW * 0.5,
-                              width: size.width, height: haloW)
-            ctx.fill(Path(halo), with: .color(haloColor))
-            let line = CGRect(x: 0, y: y - coreW * 0.5,
-                              width: size.width, height: coreW)
-            ctx.fill(Path(line), with: .color(accent))
-            let leftChevron = Path { p in
-                p.move(to: CGPoint(x: 0, y: y - chevronSize))
-                p.addLine(to: CGPoint(x: chevronSize, y: y))
-                p.addLine(to: CGPoint(x: 0, y: y + chevronSize))
-                p.closeSubpath()
-            }
-            let rightChevron = Path { p in
-                p.move(to: CGPoint(x: size.width, y: y - chevronSize))
-                p.addLine(to: CGPoint(x: size.width - chevronSize, y: y))
-                p.addLine(to: CGPoint(x: size.width, y: y + chevronSize))
-                p.closeSubpath()
-            }
-            ctx.fill(leftChevron, with: .color(accent))
-            ctx.fill(rightChevron, with: .color(accent))
-        case .horizontal:
-            let axisLength = max(0, size.width - 2 * pad)
-            let x = pad + axisLength * CGFloat(fraction)
-            let halo = CGRect(x: x - haloW * 0.5, y: 0,
-                              width: haloW, height: size.height)
-            ctx.fill(Path(halo), with: .color(haloColor))
-            let line = CGRect(x: x - coreW * 0.5, y: 0,
-                              width: coreW, height: size.height)
-            ctx.fill(Path(line), with: .color(accent))
-            let topChevron = Path { p in
-                p.move(to: CGPoint(x: x - chevronSize, y: 0))
-                p.addLine(to: CGPoint(x: x, y: chevronSize))
-                p.addLine(to: CGPoint(x: x + chevronSize, y: 0))
-                p.closeSubpath()
-            }
-            let bottomChevron = Path { p in
-                p.move(to: CGPoint(x: x - chevronSize, y: size.height))
-                p.addLine(to: CGPoint(x: x, y: size.height - chevronSize))
-                p.addLine(to: CGPoint(x: x + chevronSize, y: size.height))
-                p.closeSubpath()
-            }
-            ctx.fill(topChevron, with: .color(accent))
-            ctx.fill(bottomChevron, with: .color(accent))
-        }
-    }
-
     /// Compute the playhead's fractional position **on the same
     /// chunk grid the bars are laid out on**. This is the M10.5t
     /// fix for the "overview drifts towards the end of the song"
@@ -779,15 +728,15 @@ struct TrackOverviewView: View {
     /// reads `pos.durationSecs` instead of `deckState.durationSecs`
     /// for the same reason — keeps the fraction calculation in
     /// sync with the engine on the same tick.
-    private func playheadFraction() -> Double? {
-        if let dragPlayheadFraction {
-            return max(0, min(1, dragPlayheadFraction))
-        }
+    /// Static, so the playhead layer's clock can call it without
+    /// holding the view struct, whose `@State` it would read frozen. A
+    /// scrub's own fraction is handed to the layer separately.
+    static func enginePlayheadFraction(engine: DubEngine, deckIdx: UInt64) -> Double? {
         // M11d.6 round 5 — lock-free FFI snapshot.
-        let pos = model.engine.positionSnapshot(deckIdx: deckIdx)
+        let pos = engine.positionSnapshot(deckIdx: deckIdx)
         let elapsed = pos.elapsedSecs
-        let peaksLen = model.engine.peaksLen(deckIdx: deckIdx)
-        let chunkDur = model.engine.peaksChunkDurationSecs(deckIdx: deckIdx)
+        let peaksLen = engine.peaksLen(deckIdx: deckIdx)
+        let chunkDur = engine.peaksChunkDurationSecs(deckIdx: deckIdx)
         if peaksLen > 0 && chunkDur > 0 {
             let totalSecs = Double(peaksLen) * chunkDur
             guard totalSecs > 0 else { return nil }

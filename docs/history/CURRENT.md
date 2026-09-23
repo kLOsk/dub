@@ -178,6 +178,71 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     tap is not feeding deck 0's stream or the mount is being starved — and the
     starvation theory is worth retesting first, because the overview fix above
     removed a large main-thread load that was running the whole time.
+- **The second rip pass (2026-09-23)** — the review screen, used in anger:
+  - **A segment can be dropped.** Placing a split creates track 2 and there
+    was no way to discard track 1; a `dropped` flag on the manifest entry
+    (serde-default, so the schema does not move) makes the commit skip it. The
+    audio stays in `side.flac` and the indices do not shift, so nothing moves
+    under the DJ and a re-split brings it back. Dropping and removing a
+    boundary are different edits — the second *merges* — and both exist now.
+  - **Space is play/pause in review**, where there is no browser selection to
+    load and the hands are on the transport while placing splits.
+  - **Split markers carry their track's name** in the overview, and are
+    **mirrored into the playing strip** (they ride the cue-marker pass — to
+    the renderer a split is the same thing, a full-height line at a track
+    position). Judging a split against the overview band alone was the
+    complaint.
+  - **One transport per card**, and it is that track's. `▶ IN` / `▶ OUT`
+    played six seconds of the head and the tail; the DJ reads the first as
+    "play this track", so it plays the whole track and the glyph flips to
+    pause while the playhead is inside it — at most one card shows pause, and
+    Space does the same thing to whichever track the playhead is in. The
+    panel-level Play added the day before is gone: a second Play only raised
+    the question of what it played that the card's did not. The card's SAMPLES
+    lookup went with the OUT button (`SampleLineage` still serves the library
+    row menu).
+  - **DROP is a bin**, and un-drop is an undo arrow. A glyph that needs no
+    reading beats a word that does.
+  - **The preview strip jumped — the main thread, not the renderer.** Two
+    `TimelineView` clocks (the overview playhead, 4 Hz; the elapsed/remaining
+    digits, 2 Hz) each forced a ~15 ms whole-window layout pass, and the strip
+    dropped a frame waiting on `nextDrawable` every time. Both are Core
+    Animation layers now (`LayerTickers.swift`); in review, window layout went
+    574 → 9 samples in 8 s and the `nextDrawable` wait 1072 → 8. It lifts the
+    same load off the Performance deck columns, which use the same two views.
+    The per-frame colour-band re-copy that was left went the same day (delta
+    ingest, under Known gaps): across the two changes the render thread's busy
+    time in review fell 1 663 → 20 samples in 8 s.
+  - **It came back on the external display** — two bugs that only exist
+    there, on the DJ's LG DualUp above the MacBook. (1) The strip renders on
+    the integrated GPU (the launch-freeze fix), but a MacBook Pro 16's external
+    ports are wired to the discrete one, so every frame was copied across GPUs
+    before it could be shown: 3 424 of 3 494 busy samples in `nextDrawable`.
+    The coordinator now rebuilds the renderer on the GPU currently driving the
+    window's display (`CGDirectDisplayCopyCurrentMetalDevice`) — free, since
+    that display has already switched the discrete GPU on — and follows a GPU
+    switch or a move between screens. (2) The `CVDisplayLink` was created fresh
+    on every Play targeting the *main* display, and `setCurrentDisplay` was
+    dropped while the link was stopped — i.e. whenever the deck was paused,
+    which is when windows get moved. The render thread now remembers the
+    display and applies it to every link it creates. On the LG afterwards: the
+    strip on the AMD GPU, render thread busy 3 494 → 1 521, the cross-GPU
+    presentation queue 294 → 0, completed frames roughly doubled.
+  - **No BPM or key while ripping** (decided 2026-09-23). Tapping a tempo in
+    review set a grid on the *spill* — the whole side on deck A, a temporary
+    track that encode throws away — and ½ / 2× did nothing because the side is
+    not in the library. Each segment gets its own BPM and key at **commit**
+    (`commit_segment` analyses that segment's own PCM and writes its grid, key,
+    `BPM` and `INITIALKEY`), so a number on the side described nothing a DJ
+    keeps. `DeckHeader.hidesTempoAndKey` hides both columns in place during
+    capture and review — the header keeps its fixed height, and hidden views
+    take no clicks, so the tap and its ½ / 2× menu go with them — and
+    `handleTapForGrid` / `applyTapToGrid` refuse during a rip so a bound tap
+    key cannot reach the side either. The lever that matters before encoding
+    is the card's **Genre**: it is written into the file and the analyser reads
+    it to choose the octave (hip-hop 75–105, drum & bass 160–185, reggae/dub
+    the one-drop range). A correction made after import lives in the library;
+    nothing writes it back into the FLAC's `BPM` tag yet.
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output
@@ -659,20 +724,20 @@ the network, and an upstream publication would turn an unrelated push red.
   unaffected.
 - The tests that sleep waiting on worker threads are now the slowest thing in
   the suite. `drain_then_stop` fixed the six that raced; others still sleep.
-- **Waveform renderer, second-order CPU (noted 2026-09-10, not visible today).**
-  A read-through after the library-sidebar drag work found the big items all
-  done (off-main `CVDisplayLink` thread, vsync-extrapolated playhead, grid +
-  cues + loop in one draw call, paused deck at zero cost) and three leftovers:
-  (1) while playing, every frame re-ingests the whole 8 192-chunk window
-  around the playhead — ~350 KB per deck across the FFI, three copies deep —
-  when only ~12 chunks are new; a delta ingest (full window only on seek /
-  generation bump) would cut it ~99 %. (2) Two array literals in
-  `drawBeatGrid` (loop-edge pair, per-cue halo/stem pair) allocate on the
-  render thread per frame. (3) `NSEvent.pressedMouseButtons` is read twice
-  per frame from the render thread. Measure first — `make trace-grid` with
-  two decks playing — and do (1) only if it shows; (2) is free.
-  This MacBook Pro is Intel, and the renderer's comments benchmark against
-  Apple Silicon, so the trace is worth taking here.
+- **Waveform renderer, second-order CPU** (noted 2026-09-10). Two of the
+  three leftovers are done (2026-09-23), measured on this Intel MacBook Pro
+  in rip review with the side playing, 8 s per build:
+  - ~~(1) every frame re-ingests the whole 8 192-chunk window~~ — **done**.
+    Each GPU buffer tracks which chunks it holds (`PeakRingCoverage`) and a
+    frame fetches only what is missing: a sliver in steady play, the window
+    once after a seek, nothing on a rewind. Render thread busy
+    805 → **20** samples; the colour-band copy, 79 % of what was left,
+    639 → **0**. Frames committed and presented at the same rate throughout.
+  - ~~(3) `NSEvent.pressedMouseButtons` read per frame~~ — **gone** with the
+    old dedupe gate it belonged to; exact coverage makes it unnecessary.
+  - (2) Two array literals in `drawBeatGrid` (loop-edge pair, per-cue
+    halo/stem pair) still allocate on the render thread per frame. Free to
+    fix, not measurable any more.
 
 ## Keeping this file honest
 

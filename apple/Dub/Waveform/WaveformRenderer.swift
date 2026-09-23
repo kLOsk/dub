@@ -288,6 +288,59 @@ private struct BandPeakChunkLayout {
     var b4: Float; var b5: Float; var b6: Float; var b7: Float
 }
 
+/// Which global chunk indices one GPU ring buffer holds valid data
+/// for, and what to fetch to cover a window. Pure, so it tests.
+///
+/// **Why this exists.** Every frame the renderer keeps a window of
+/// `maxChunksIngestPerFrame` chunks around the playhead in the ring.
+/// It used to re-copy the *whole* window — across the FFI, into a
+/// `Data`, into the `MTLBuffer` — whenever the playhead crossed a
+/// chunk. A colour-band chunk is 512 samples, ~11 ms, so that was
+/// ~87 s of band data re-fetched nearly every frame to gain one new
+/// chunk, and profiled in rip review it was 79 % of what the render
+/// thread did (2026-09-23). A chunk's data never changes within one
+/// source — a new source bumps the peaks generation, which clears
+/// every coverage — so the only chunks worth fetching are the ones
+/// the buffer has not got: a sliver at the leading edge in steady
+/// play, the whole window after a seek.
+///
+/// **Why a buffer can hold more than the window.** The ring is far
+/// larger than the window, so the chunks behind the playhead stay
+/// valid after it moves on. Coverage grows as the union of what was
+/// fetched, which makes a rewind or a scratch-back free as well. It
+/// never exceeds the ring's capacity: past that, a slot would be
+/// holding a different chunk than the one it is credited with, so
+/// the plan falls back to fetching the window whole.
+struct PeakRingCoverage: Equatable {
+    /// Half-open `[lo, hi)`. Empty when `hi <= lo`.
+    var lo: UInt64 = 0
+    var hi: UInt64 = 0
+
+    var isEmpty: Bool { hi <= lo }
+
+    /// The ranges to fetch so `window` is covered, and the coverage
+    /// once they have been. At most two ranges — the window can only
+    /// stick out past either end of what is held.
+    func plan(
+        window: Range<UInt64>, capacity: UInt64
+    ) -> (fetch: [Range<UInt64>], after: PeakRingCoverage) {
+        guard !window.isEmpty else { return ([], self) }
+        let whole = ([window], PeakRingCoverage(lo: window.lowerBound, hi: window.upperBound))
+        // Nothing held, or the window is elsewhere: a seek.
+        if isEmpty || window.upperBound < lo || window.lowerBound > hi {
+            return whole
+        }
+        let union = PeakRingCoverage(lo: min(lo, window.lowerBound), hi: max(hi, window.upperBound))
+        // Past the ring's capacity a slot would be credited with a
+        // chunk it no longer holds.
+        if union.hi - union.lo > capacity { return whole }
+        var fetch: [Range<UInt64>] = []
+        if window.lowerBound < lo { fetch.append(window.lowerBound..<lo) }
+        if window.upperBound > hi { fetch.append(hi..<window.upperBound) }
+        return (fetch, union)
+    }
+}
+
 /// CPU-side mirror of `Shaders.metal`'s `BeatGridVertex`.
 /// Includes the analytic-AA fields (`signedTimeAxisDistNDC`,
 /// `visibleHalfNDC`); field order + types must match the Metal
@@ -779,15 +832,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// queued behind tick vertex generation.
     private var framesSinceSourceSwap: Int = 0
 
-    /// Skip redundant FFI + `memcpy` when the playhead hasn't
-    /// crossed a chunk boundary since the last ingest **into this
-    /// specific GPU buffer**. Per-buffer because the chunks/band
-    /// rings are triple-buffered; a freshness hit on buffer 0
-    /// says nothing about buffers 1 / 2.
-    private var lastBroadbandIngestPhChunkPerBuffer: [UInt64]
-    private var lastBandIngestPhChunkPerBuffer: [UInt64]
-    private var lastSeenPeaksLenPerBuffer: [UInt64]
-    private var lastSeenBandPeaksLenPerBuffer: [UInt64]
+    /// Which chunks each GPU buffer already holds, for this source.
+    /// Per buffer because the rings are triple-buffered: what buffer 0
+    /// holds says nothing about buffers 1 and 2. See
+    /// `PeakRingCoverage` for why this replaced re-copying the window.
+    private var broadbandCoverage: [PeakRingCoverage]
+    private var bandCoverage: [PeakRingCoverage]
 
     // MARK: Init
 
@@ -908,14 +958,10 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         }
         self.bandChunksBuffers = bandChunksList
 
-        self.lastBroadbandIngestPhChunkPerBuffer = Array(
-            repeating: UInt64.max, count: WaveformRenderer.maxFramesInFlight)
-        self.lastBandIngestPhChunkPerBuffer = Array(
-            repeating: UInt64.max, count: WaveformRenderer.maxFramesInFlight)
-        self.lastSeenPeaksLenPerBuffer = Array(
-            repeating: 0, count: WaveformRenderer.maxFramesInFlight)
-        self.lastSeenBandPeaksLenPerBuffer = Array(
-            repeating: 0, count: WaveformRenderer.maxFramesInFlight)
+        self.broadbandCoverage = Array(
+            repeating: PeakRingCoverage(), count: WaveformRenderer.maxFramesInFlight)
+        self.bandCoverage = Array(
+            repeating: PeakRingCoverage(), count: WaveformRenderer.maxFramesInFlight)
         self.beatGridVertexBuffers = Array(
             repeating: nil, count: WaveformRenderer.maxFramesInFlight)
         self.beatGridVertexCapacities = Array(
@@ -1015,11 +1061,10 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             state.beatGridGeneration = 0
         }
         framesSinceSourceSwap = 0
+        // A new source: nothing any buffer holds is valid for it.
         for idx in 0..<WaveformRenderer.maxFramesInFlight {
-            lastBroadbandIngestPhChunkPerBuffer[idx] = UInt64.max
-            lastBandIngestPhChunkPerBuffer[idx] = UInt64.max
-            lastSeenPeaksLenPerBuffer[idx] = 0
-            lastSeenBandPeaksLenPerBuffer[idx] = 0
+            broadbandCoverage[idx] = PeakRingCoverage()
+            bandCoverage[idx] = PeakRingCoverage()
         }
     }
 
@@ -1782,10 +1827,11 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// Writes to the triple-buffered slot the caller will bind to
     /// the GPU this frame; the in-flight semaphore guarantees the
     /// slot is not concurrently read.
+    @discardableResult
     private func ingestBroadbandRange(
         startIdx: UInt64, count: UInt64, bufferIndex: Int
-    ) {
-        guard count > 0 else { return }
+    ) -> Int {
+        guard count > 0 else { return 0 }
         // `maxChunks: count` bounds the engine to the `[startIdx,
         // startIdx + count)` window instead of `[startIdx, peaksLen)`.
         // Without it a 90-minute track re-serialises + marshals its
@@ -1794,12 +1840,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // exceeds `chunkCapacity`.
         let data = engine.peaksExtend(
             deckIdx: deckIdx, startIdx: startIdx, maxChunks: count)
-        if data.isEmpty { return }
+        if data.isEmpty { return 0 }
 
         let chunkStride = MemoryLayout<PeakChunkLayout>.stride
-        guard data.count % chunkStride == 0 else { return }
+        guard data.count % chunkStride == 0 else { return 0 }
         let newChunkCount = min(data.count / chunkStride, Int(count))
-        guard newChunkCount > 0 else { return }
+        guard newChunkCount > 0 else { return 0 }
 
         let ringBytes = WaveformRenderer.chunkCapacity * chunkStride
         let dstBase = chunksBuffers[bufferIndex].contents()
@@ -1821,19 +1867,18 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     bytesToWrite - bytesBeforeWrap)
             }
         }
+        return newChunkCount
     }
 
-    /// Pull a playhead-centred window of broadband peaks into the
-    /// ring. Bounded to [`maxChunksIngestPerFrame`] so load / seek /
-    /// scrub stays responsive while the column scrolls. The dedupe
-    /// gate is per-buffer so the first frame on a freshly-rotated
-    /// triple-buffer slot always performs a real write instead of
-    /// binding zero-initialised memory.
+    /// Keep a playhead-centred window of broadband peaks in the ring.
+    /// Bounded to [`maxChunksIngestPerFrame`] so load / seek / scrub
+    /// stays responsive while the column scrolls. Fetches only what
+    /// this buffer does not already hold — see `PeakRingCoverage`.
     private func ingestNewChunks(playheadSecs: Double, bufferIndex: Int) {
         let currentLen = engine.peaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenPeaksLen = 0
-            lastSeenPeaksLenPerBuffer[bufferIndex] = 0
+            broadbandCoverage[bufferIndex] = PeakRingCoverage()
             return
         }
         if lastSeenPeaksLen == 0 {
@@ -1850,36 +1895,62 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let half = budget / 2
         let start = phChunk > half ? phChunk - half : 0
         let end = min(currentLen, start + budget)
-        if phChunk == lastBroadbandIngestPhChunkPerBuffer[bufferIndex],
-           lastSeenPeaksLenPerBuffer[bufferIndex] == currentLen,
-           NSEvent.pressedMouseButtons == 0
-        {
-            return
+        broadbandCoverage[bufferIndex] = Self.ingestDelta(
+            held: broadbandCoverage[bufferIndex],
+            window: start..<max(start, end),
+            peaksLen: currentLen,
+            capacity: UInt64(WaveformRenderer.chunkCapacity)
+        ) { range in
+            self.ingestBroadbandRange(
+                startIdx: range.lowerBound, count: UInt64(range.count),
+                bufferIndex: bufferIndex)
         }
-        lastBroadbandIngestPhChunkPerBuffer[bufferIndex] = phChunk
-        ingestBroadbandRange(
-            startIdx: start, count: end &- start, bufferIndex: bufferIndex)
         lastSeenPeaksLen = currentLen
-        lastSeenPeaksLenPerBuffer[bufferIndex] = currentLen
+    }
+
+    /// Bring one buffer's coverage up to `window`, fetching only the
+    /// chunks it does not already hold. Returns the new coverage.
+    ///
+    /// A short fetch — the engine returned fewer chunks than asked,
+    /// which a length racing a reload can do — drops the coverage to
+    /// nothing rather than recording chunks that were never written;
+    /// the next frame then fetches the window whole. So a wrong claim
+    /// costs one full copy, never a stale picture.
+    private static func ingestDelta(
+        held: PeakRingCoverage,
+        window: Range<UInt64>,
+        peaksLen: UInt64,
+        capacity: UInt64,
+        fetch: (Range<UInt64>) -> Int
+    ) -> PeakRingCoverage {
+        // The source shrank under us without a generation bump (an
+        // unload racing the poll): nothing held can be trusted.
+        let start = held.hi > peaksLen ? PeakRingCoverage() : held
+        let plan = start.plan(window: window, capacity: capacity)
+        for range in plan.fetch where !range.isEmpty {
+            if fetch(range) != range.count { return PeakRingCoverage() }
+        }
+        return plan.after
     }
 
     /// Copy `[startIdx, startIdx + count)` band peak chunks into
     /// the GPU ring at `bandChunksBuffers[bufferIndex]`. Triple-
     /// buffered, same rationale as [`ingestBroadbandRange`].
+    @discardableResult
     private func ingestBandRange(
         startIdx: UInt64, count: UInt64, bufferIndex: Int
-    ) {
-        guard count > 0 else { return }
+    ) -> Int {
+        guard count > 0 else { return 0 }
         // Bound to the `[startIdx, startIdx + count)` window; see
         // `ingestBroadbandRange` for why the unbounded form jitters.
         let data = engine.bandPeaksExtend(
             deckIdx: deckIdx, startIdx: startIdx, maxChunks: count)
-        if data.isEmpty { return }
+        if data.isEmpty { return 0 }
 
         let chunkStride = MemoryLayout<BandPeakChunkLayout>.stride
-        guard data.count % chunkStride == 0 else { return }
+        guard data.count % chunkStride == 0 else { return 0 }
         let newChunkCount = min(data.count / chunkStride, Int(count))
-        guard newChunkCount > 0 else { return }
+        guard newChunkCount > 0 else { return 0 }
 
         let ringBytes = WaveformRenderer.bandChunkCapacity * chunkStride
         let dstBase = bandChunksBuffers[bufferIndex].contents()
@@ -1901,6 +1972,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     bytesToWrite - bytesBeforeWrap)
             }
         }
+        return newChunkCount
     }
 
     /// Playhead-centred band peak ingest; mirrors [`ingestNewChunks`].
@@ -1909,7 +1981,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let currentLen = engine.bandPeaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenBandPeaksLen = 0
-            lastSeenBandPeaksLenPerBuffer[bufferIndex] = 0
+            bandCoverage[bufferIndex] = PeakRingCoverage()
             return
         }
 
@@ -1924,17 +1996,17 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let half = budget / 2
         let start = phChunk > half ? phChunk - half : 0
         let end = min(currentLen, start + budget)
-        if phChunk == lastBandIngestPhChunkPerBuffer[bufferIndex],
-           lastSeenBandPeaksLenPerBuffer[bufferIndex] == currentLen,
-           NSEvent.pressedMouseButtons == 0
-        {
-            return
+        bandCoverage[bufferIndex] = Self.ingestDelta(
+            held: bandCoverage[bufferIndex],
+            window: start..<max(start, end),
+            peaksLen: currentLen,
+            capacity: UInt64(WaveformRenderer.bandChunkCapacity)
+        ) { range in
+            self.ingestBandRange(
+                startIdx: range.lowerBound, count: UInt64(range.count),
+                bufferIndex: bufferIndex)
         }
-        lastBandIngestPhChunkPerBuffer[bufferIndex] = phChunk
-        ingestBandRange(
-            startIdx: start, count: end &- start, bufferIndex: bufferIndex)
         lastSeenBandPeaksLen = currentLen
-        lastSeenBandPeaksLenPerBuffer[bufferIndex] = currentLen
     }
 
     /// Snapshot the engine's reported broadband + band chunk cadences

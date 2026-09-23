@@ -195,12 +195,23 @@ final class WaveformMetalHostView: NSView {
     private func installWindowObservers() {
         NotificationCenter.default.removeObserver(
             self, name: NSWindow.didChangeScreenNotification, object: nil)
+        NotificationCenter.default.removeObserver(
+            self, name: NSApplication.didChangeScreenParametersNotification, object: nil)
         guard let window else { return }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(windowDidChangeScreen(_:)),
             name: NSWindow.didChangeScreenNotification,
             object: window)
+        // A GPU switch, a display plugged in or out, a resolution
+        // change: the window has not moved, but the GPU driving its
+        // display may have, and the strip has to follow it or pay a
+        // cross-GPU copy on every frame.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidChangeScreen(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil)
     }
 
     @objc

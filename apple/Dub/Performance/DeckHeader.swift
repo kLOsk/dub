@@ -782,9 +782,9 @@ struct DeckHeader: View {
         textColor: Color
     ) -> some View {
         if let engine = liveEngine, let deckIdx = liveDeckIdx {
-            LiveDeckTimeText(engine: engine, deckIdx: deckIdx, slot: slot)
-                .font(DubFont.numericInline)
-                .foregroundStyle(textColor)
+            LiveDeckTimeText(
+                engine: engine, deckIdx: deckIdx, slot: slot,
+                size: DubFont.numericInlineSize, color: textColor)
         } else {
             Text(slot == .remaining ? "-00:00" : "00:00")
                 .font(DubFont.numericInline)
@@ -1230,22 +1230,27 @@ struct LiveDeckTimeText: View {
     let engine: DubEngine
     let deckIdx: UInt64
     let slot: Slot
+    /// Point size of the monospaced digits — `DubFont.numericInlineSize`
+    /// or `numericLargeSize`. Explicit because the text is drawn on a
+    /// layer, which cannot take a SwiftUI `.font(...)`.
+    let size: CGFloat
+    let color: Color
 
     var body: some View {
-        // 2 Hz timeline is enough — the integer-second-floor of the
-        // position only changes once a second, and a 0.5 s tick keeps
-        // the M:SS rollover visually fresh without paying the cost of
-        // a per-display-refresh closure body re-eval. The Apple shell
-        // never asks for sub-second precision on this surface (per the
-        // M11d.5 round 3 user sign-off: "nothing is relevant sub
-        // seconds" on the deck-header time display).
-        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            let pos = engine.positionSnapshot(deckIdx: deckIdx)
-            Text(formattedText(for: pos))
-        }
+        // Still 2 Hz, but no longer a `TimelineView`: its every tick
+        // cost a whole-window layout pass, which on the i9 made the
+        // Metal strips drop frames (2026-09-23). The claim this comment
+        // used to make — that the swap "does not propagate up" — was
+        // true of SwiftUI's graph and not of AppKit's window layout,
+        // which is where the time went. See `LayerTickers.swift`.
+        LayerClockText(
+            engine: engine, deckIdx: deckIdx, slot: slot, size: size, color: color)
+            .fixedSize()
     }
 
-    private func formattedText(for pos: PositionInfo) -> String {
+    /// The string for one slot. Static so the layer's own clock can
+    /// build it from a fresh position without holding this struct.
+    static func text(for pos: PositionInfo, slot: Slot) -> String {
         // Defensive against unloaded / cold-launch decks where
         // `has_track` is false: the engine reports zero for both
         // fields, which renders as "00:00" / "-00:00". Same

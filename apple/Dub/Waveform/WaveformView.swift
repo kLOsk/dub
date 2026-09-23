@@ -789,6 +789,96 @@ private struct WaveformMetalView: NSViewRepresentable {
         var renderer: WaveformRenderer?
         var renderThread: WaveformRenderThread?
         weak var hostView: WaveformMetalHostView?
+        /// What a rebuild needs that the stamps do not carry.
+        var engine: DubEngine?
+        var deckIdx: UInt64 = 0
+        /// The display the host view is on, once it is in a window.
+        private var displayID: CGDirectDisplayID?
+
+        /// Build the renderer and its thread on `device`, stamped with
+        /// the last values `stampRenderer` recorded. Used at creation
+        /// and again whenever the strip has to move GPUs.
+        func build(device: MTLDevice) {
+            guard let hostView, let engine else { return }
+            hostView.metalLayer.device = device
+            // Drawable size is owned by the host view's `layout` hook;
+            // this just keeps the first frame off a 1×1 drawable.
+            hostView.metalLayer.drawableSize = hostView.currentDrawableSize
+            let renderer: WaveformRenderer
+            do {
+                renderer = try WaveformRenderer(device: device, engine: engine, deckIdx: deckIdx)
+            } catch {
+                NSLog("WaveformView: renderer init failed: \(error.localizedDescription)")
+                return
+            }
+            if let lastPalette { renderer.setPalette(lastPalette) }
+            if let lastOrientation { renderer.setOrientation(lastOrientation) }
+            if let lastSide { renderer.setSide(lastSide) }
+            if let lastTimeAxisZoom { renderer.setTimeAxisZoom(lastTimeAxisZoom) }
+            if let lastPlatterRate { renderer.setPlatterRate(lastPlatterRate) }
+            if let lastDisplayGain { renderer.setDisplayGain(lastDisplayGain) }
+            renderer.setBeatGridEnabled(true)
+            if let lastHotCues { renderer.setHotCues(lastHotCues) }
+            renderer.setLoopRegion(
+                active: lastLoopActive ?? false,
+                inSecs: lastLoopInSecs ?? 0, outSecs: lastLoopOutSecs ?? 0)
+            self.renderer = renderer
+
+            // M11d.6 round 11 — capture the mach_absolute_time ↔
+            // engine-host-time-ns offset once per renderer so the
+            // CVDisplayLink callback can translate vsync display times
+            // into the FFI's host_time_ns domain. See
+            // `EngineHostTimeMapping` for the clock-domain rationale.
+            let thread = WaveformRenderThread(
+                metalLayer: hostView.metalLayer,
+                renderer: renderer,
+                hostTimeMapping: EngineHostTimeMapping(engine: engine),
+                label: "dub.waveform.render.\(deckIdx)")
+            // Paused-deck repaint hook: when the async beat-grid fetch
+            // commits a fresh grid, ask the render thread for one more
+            // draw so "set the 1" / re-analyze shows on a stopped deck.
+            // Weak, so the renderer → thread reference does not retain
+            // the thread.
+            renderer.setRedrawRequest { [weak thread] in
+                thread?.requestOneShot()
+            }
+            if let displayID { thread.setCurrentDisplay(displayID) }
+            if lastContinuous == true { thread.setContinuous(true) }
+            renderThread = thread
+            thread.requestOneShot()
+        }
+
+        /// The host view is on a new display, or its display's GPU
+        /// changed. Pace the frame clock to it, and move the renderer
+        /// to the GPU that drives it.
+        ///
+        /// **Render on the GPU the display is on.** The strip starts
+        /// on the low-power GPU (`WaveformView.preferredDevice`), which
+        /// is what keeps macOS from switching GPUs at launch — 2.6 s
+        /// on the main thread at engine start, 8.6 s cold. But on a
+        /// MacBook Pro 16 an external display is wired to the discrete
+        /// GPU, so a strip rendered on the integrated one had every
+        /// frame copied across before it could be shown, and sat in
+        /// `nextDrawable` waiting for the copy: 3 424 of 3 494 busy
+        /// samples in eight seconds on an LG DualUp, and the strip
+        /// jumped (2026-09-23). Plugging in that display has already
+        /// switched the discrete GPU on, so rendering there costs no
+        /// switch — `CGDirectDisplayCopyCurrentMetalDevice` returns
+        /// the GPU *currently* driving the display, and so can never
+        /// be the one that triggers a switch.
+        func displayChanged(_ id: CGDirectDisplayID) {
+            displayID = id
+            renderThread?.setCurrentDisplay(id)
+            guard let current = renderer?.device,
+                  let wanted = CGDirectDisplayCopyCurrentMetalDevice(id),
+                  wanted.registryID != current.registryID
+            else { return }
+            NSLog("WaveformView: deck \(deckIdx) moves to \(wanted.name) — the GPU driving its display")
+            renderThread?.shutdown()
+            renderThread = nil
+            renderer = nil
+            build(device: wanted)
+        }
 
         // Last-stamped prop snapshot for the idempotent
         // `updateNSView` path. SwiftUI fires `updateNSView` on
@@ -935,83 +1025,49 @@ private struct WaveformMetalView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WaveformMetalHostView {
         let hostView = WaveformMetalHostView(frame: .zero)
-        context.coordinator.hostView = hostView
+        let coordinator = context.coordinator
+        coordinator.hostView = hostView
+        coordinator.engine = engine
+        coordinator.deckIdx = deckIdx
 
-        // The integrated GPU where there is a choice. On a dual-GPU
-        // MacBook Pro the system default is the discrete one, and the
-        // first layer bound to it makes macOS switch GPUs — 2.6 s on
-        // the main thread at engine start here, 8.6 s at a cold launch
-        // on Daniel's — for a renderer that is a handful of draw calls.
-        // `NSSupportsAutomaticGraphicsSwitching` in Info.plist is the
-        // other half: without it the OS switches anyway.
+        // Record the initial values without a renderer to stamp, so
+        // `build` — here and on every later rebuild — applies them.
+        _ = coordinator.stampRenderer(
+            palette: palette,
+            orientation: orientation,
+            side: side,
+            timeAxisZoom: timeAxisZoom,
+            platterRate: platterRate,
+            displayGain: displayGain,
+            seekGeneration: seekGeneration,
+            peaksGeneration: peaksGeneration,
+            hotCues: hotCues,
+            loopActive: loopActive,
+            loopInSecs: loopInSecs,
+            loopOutSecs: loopOutSecs)
+
+        // The integrated GPU to start with, where there is a choice. On
+        // a dual-GPU MacBook Pro the system default is the discrete
+        // one, and the first layer bound to it makes macOS switch GPUs
+        // — 2.6 s on the main thread at engine start here, 8.6 s at a
+        // cold launch on Daniel's — for a renderer that is a handful of
+        // draw calls. `NSSupportsAutomaticGraphicsSwitching` in
+        // Info.plist is the other half: without it the OS switches
+        // anyway. Once the view knows its display, `displayChanged`
+        // moves the strip to whichever GPU drives it.
         guard let device = Self.preferredDevice() else {
             NSLog("WaveformView: no Metal device")
             return hostView
         }
-        hostView.metalLayer.device = device
-        // Drawable size is owned by the host view's `layout`
-        // hook; here we just make sure the layer has a sensible
-        // value before the first vsync (otherwise the first
-        // frame draws into a 1×1 drawable until layout fires).
-        let initialSize = hostView.currentDrawableSize
-        hostView.metalLayer.drawableSize = initialSize
+        coordinator.build(device: device)
 
-        let renderer: WaveformRenderer
-        do {
-            renderer = try WaveformRenderer(
-                device: device, engine: engine, deckIdx: deckIdx)
-        } catch {
-            NSLog("WaveformView: renderer init failed: \(error.localizedDescription)")
-            return hostView
+        // Display migration drives both the frame clock and the GPU.
+        // Fires on `viewDidMoveToWindow`, on
+        // `NSWindow.didChangeScreenNotification`, and on screen
+        // parameter changes (which is how a GPU switch arrives).
+        hostView.onDisplayChange = { [weak coordinator] displayID in
+            coordinator?.displayChanged(displayID)
         }
-        renderer.setPalette(palette)
-        renderer.setOrientation(orientation)
-        renderer.setSide(side)
-        renderer.setTimeAxisZoom(timeAxisZoom)
-        renderer.setDisplayGain(displayGain)
-        renderer.setBeatGridEnabled(true)
-        renderer.setHotCues(hotCues)
-        renderer.setLoopRegion(active: loopActive, inSecs: loopInSecs, outSecs: loopOutSecs)
-        context.coordinator.renderer = renderer
-
-        // M11d.6 round 11 — capture the mach_absolute_time ↔
-        // engine-host-time-ns offset once per renderer so the
-        // CVDisplayLink callback can translate vsync display
-        // times into the FFI's host_time_ns domain. See
-        // `EngineHostTimeMapping` for the clock-domain rationale.
-        let hostTimeMapping = EngineHostTimeMapping(engine: engine)
-
-        let label = "dub.waveform.render.\(deckIdx)"
-        let renderThread = WaveformRenderThread(
-            metalLayer: hostView.metalLayer,
-            renderer: renderer,
-            hostTimeMapping: hostTimeMapping,
-            label: label)
-        context.coordinator.renderThread = renderThread
-
-        // Paused-deck repaint hook: when the async beat-grid fetch
-        // commits a fresh grid, ask the render thread for one more
-        // draw so "set the 1" / re-analyze shows on a stopped deck
-        // without waiting for the next Play frame. Weak capture
-        // keeps the renderer → thread reference from retaining the
-        // thread.
-        renderer.setRedrawRequest { [weak renderThread] in
-            renderThread?.requestOneShot()
-        }
-
-        // Wire host-view display migration straight into the
-        // render thread's CVDisplayLink. Fires on
-        // `viewDidMoveToWindow` and on
-        // `NSWindow.didChangeScreenNotification`.
-        hostView.onDisplayChange = { [weak renderThread] displayID in
-            renderThread?.setCurrentDisplay(displayID)
-        }
-
-        // Kick a single draw so the layer has content before the
-        // first vsync; if `continuouslyRendering` is true the
-        // immediate `setContinuous` call in `updateNSView`
-        // will keep the link running.
-        renderThread.requestOneShot()
         return hostView
     }
 

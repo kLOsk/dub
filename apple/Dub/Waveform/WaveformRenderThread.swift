@@ -107,6 +107,9 @@ final class WaveformRenderThread: @unchecked Sendable {
     /// `CVDisplayLink` instance. `nil` while continuous mode is
     /// off (so a paused deck pays zero recurring cost).
     private var displayLink: CVDisplayLink?
+    /// The display the host view is on, applied to every link this
+    /// thread creates. Main-thread only, like the link's lifecycle.
+    private var preferredDisplayID: CGDirectDisplayID?
     /// `Unmanaged` retain balancing the unowned pointer we pass
     /// into the `CVDisplayLink` C callback. Cleared on `stop()`
     /// alongside the actual link teardown.
@@ -228,6 +231,13 @@ final class WaveformRenderThread: @unchecked Sendable {
     /// `NSWindow.didChangeScreenNotification`). No-op if the
     /// link is not currently running.
     func setCurrentDisplay(_ displayID: CGDirectDisplayID) {
+        // Remembered even while the link is stopped. It used to be
+        // dropped then — and the link is stopped whenever the deck is
+        // paused, which is exactly when a window gets moved — so the
+        // next Play created a fresh link on the *main* display and
+        // paced a strip on an external screen to the built-in one's
+        // vsync (2026-09-23, on an LG DualUp above the MacBook).
+        preferredDisplayID = displayID
         guard let link = displayLink else { return }
         CVDisplayLinkSetCurrentCGDisplay(link, displayID)
     }
@@ -336,6 +346,11 @@ final class WaveformRenderThread: @unchecked Sendable {
                 "WaveformRenderThread: CVDisplayLinkCreateWithActiveCGDisplays "
                 + "failed (\(create))")
             return
+        }
+        // A new link targets the main display; pace it to the one the
+        // strip is actually on.
+        if let preferredDisplayID {
+            CVDisplayLinkSetCurrentCGDisplay(link, preferredDisplayID)
         }
         let retain = Unmanaged.passRetained(self)
         let ptr = retain.toOpaque()

@@ -663,6 +663,51 @@
     need not be, so rounding them independently left the zoomed-out rungs 6 %
     off — pick the integer, divide for the float, and the product is exact.
 
+- **A `TimelineView` tick is a whole-window layout pass.** Two small clocks —
+  the overview's playhead at 4 Hz and the elapsed / remaining digits at 2 Hz —
+  each re-evaluated a tiny subtree, and each tick still made AppKit run
+  `NSWindow.layoutIfNeeded → _layoutViewTree` over the entire SwiftUI graph:
+  ~15 ms on the i9, six times a second, and the only Dub code in 630 samples of
+  it was the two tickers. The Metal strips render off-main, but they wait in
+  `CAMetalLayer.nextDrawable()` for the compositor, and a late main-thread
+  commit makes the compositor late — so the layout passes surfaced as dropped
+  frames in the strip, worst in rip review where the window is biggest
+  (2026-09-23). Both are Core Animation layers now (`LayerTickers.swift`),
+  moved by their own timers and never laid out. Measured in review, same
+  preview, 8 s: window layout 574 → 9 samples, `nextDrawable` wait
+  1072 → 8, render thread busy halved. `LiveDeckTimeText`'s old comment
+  claimed its swap "does not propagate up" — true of SwiftUI's graph, false of
+  AppKit's window layout, which is where the time went. **Anything that
+  changes on a clock rather than on an event does not belong in the SwiftUI
+  graph of a window that also hosts a Metal view**; and profile the main
+  thread when a Metal view stutters, not the render thread.
+
+- **On a dual-GPU Mac, render on the GPU that drives the display.** The
+  waveform pins the integrated GPU so macOS never switches GPUs at launch (a
+  2.6–8.6 s main-thread freeze). Right for the built-in screen, wrong for any
+  external one on a MacBook Pro 16, whose external ports are wired to the
+  discrete GPU: every frame was copied across GPUs and the strip spent 98 % of
+  its time in `nextDrawable`. The rule that keeps both: start on the low-power
+  GPU, then follow `CGDirectDisplayCopyCurrentMetalDevice` for the window's
+  display, which returns the GPU *already* driving it and so can never be the
+  one that triggers a switch. And a `CVDisplayLink` created with
+  `CreateWithActiveCGDisplays` targets the main display: a link recreated on
+  every Play must be told the window's display every time, not only on the
+  screen-change notification, which usually arrives while it is stopped
+  (2026-09-23).
+
+- **Copy what changed, not what is visible.** The waveform re-fetched its
+  whole 8 192-chunk window across the FFI whenever the playhead crossed a
+  chunk; for the colour bands that was ~87 s of data a frame to gain one new
+  chunk, and it was 79 % of the render thread. A chunk never changes within
+  one source (a new source bumps the generation), so a buffer only needs what
+  it does not hold: `PeakRingCoverage` tracks it per triple-buffer slot and the
+  render thread went from 805 samples busy to 20. The trap in a delta scheme
+  is never speed — it is a slot credited with a chunk it no longer holds,
+  which draws stale waveform and raises nothing. So coverage is capped at the
+  ring's capacity, dropped on any short fetch, and pinned by a frame-by-frame
+  play-through test.
+
 - **Two views drawing "the deck header" is one view too many.** The live BPM
   (grid × pitch) was computed on `DeckHeader` — which only **Prep** renders.
   Performance draws `DeckColumn`, whose `DeckColumnHeader.init` copied the raw

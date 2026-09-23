@@ -325,10 +325,15 @@ enum DubFont {
 
     /// Large numeric stat (BPM, pitch %) — distinct face to avoid
     /// confusion with track text.
-    static let numericLarge = Font.system(size: 20, weight: .medium, design: .monospaced)
+    static let numericLarge = Font.system(size: numericLargeSize, weight: .medium, design: .monospaced)
+    /// Its point size, for the clock drawn on a `CATextLayer`
+    /// (`LayerClockText`), which cannot read a SwiftUI `Font`.
+    static let numericLargeSize: CGFloat = 20
 
     /// Inline numeric (key, pitch ±).
-    static let numericInline = Font.system(size: 14, weight: .medium, design: .monospaced)
+    static let numericInline = Font.system(size: numericInlineSize, weight: .medium, design: .monospaced)
+    /// See `numericLargeSize`.
+    static let numericInlineSize: CGFloat = 14
 
     /// Body text — artist, library cells.
     static let body = Font.system(size: 14, weight: .regular, design: baseFontDesign)

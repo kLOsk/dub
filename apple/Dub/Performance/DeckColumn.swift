@@ -287,10 +287,9 @@ struct DeckColumn<Overview: View>: View {
     @ViewBuilder
     private func time(_ slot: LiveDeckTimeText.Slot, colour: Color) -> some View {
         if let liveEngine, let liveDeckIdx, state.hasTrack {
-            LiveDeckTimeText(engine: liveEngine, deckIdx: liveDeckIdx, slot: slot)
-                .font(DubFont.numericLarge)
-                .monospacedDigit()
-                .foregroundStyle(colour)
+            LiveDeckTimeText(
+                engine: liveEngine, deckIdx: liveDeckIdx, slot: slot,
+                size: DubFont.numericLargeSize, color: colour)
         } else {
             Text(slot == .remaining ? "-00:00" : "00:00")
                 .font(DubFont.numericLarge)
