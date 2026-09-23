@@ -91,8 +91,16 @@ struct ScratchPadState: Equatable, Identifiable {
 struct DeckColumnHeader: Equatable {
     var trackTitle: String?
     var trackArtist: String?
+    /// The tempo the record is **playing at** — `DeckHeaderState.liveBpm`,
+    /// the grid BPM scaled by the platter's pitch. This used to be the
+    /// raw grid BPM, so pitching a deck moved PITCH and left BPM
+    /// standing (found on the rig, 2026-09-22).
     var bpm: Double?
     var key: String?
+    /// M14 key lock: what the DJ set, and what the engine is doing with
+    /// it (0 off · 1 standby · 2 engaged).
+    var keyLockOn: Bool = false
+    var keyLockState: UInt8 = 0
     /// Rounded to the tenth the readout prints. The raw value moves
     /// continuously on a timecode deck, and a difference the DJ cannot
     /// see is not a reason to rebuild the column.
@@ -109,8 +117,10 @@ struct DeckColumnHeader: Equatable {
     init(_ state: DeckHeaderState, scratch: ScratchBadge? = nil) {
         trackTitle = state.trackTitle
         trackArtist = state.trackArtist
-        bpm = state.bpm
+        bpm = state.liveBpm
         key = state.key
+        keyLockOn = state.keyLockOn
+        keyLockState = state.keyLockState
         pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
@@ -153,6 +163,9 @@ struct DeckColumnCallbacks {
     var onSetThru: () -> Void = {}
     var onSetFx: () -> Void = {}
     var onRecalibrate: () -> Void = {}
+    /// M14 key lock on / off. `nil` hides the button — Prep has no
+    /// platter to hold a pitch against.
+    var onToggleKeyLock: (() -> Void)? = nil
 }
 
 /// Skippable: SwiftUI compares `state` and rebuilds only when it moved.
@@ -377,21 +390,29 @@ struct DeckColumn<Overview: View>: View {
         return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
             HStack(alignment: .lastTextBaseline, spacing: DubSpacing.lg) {
                 if outward {
-                    subtitleLine
+                    draggableSubtitle
                     readouts
                 } else {
                     readouts
-                    subtitleLine
+                    draggableSubtitle
                 }
             }
             titleLine
+                .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
+                .help(dragHelp)
         }
-        // Drag the tune to the other deck for an instant double — the
-        // same thing ⌘← / ⌘→ do, as a gesture. Only the identity block
-        // drags, and only while it names a track; the readouts, the
-        // marks and the strip stay put under the pointer.
-        .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
-        .help(state.hasTrack ? "Drag onto the other deck for an instant double" : "")
+    }
+
+    /// Drag the tune to the other deck for an instant double — the same
+    /// thing ⌘← / ⌘→ do, as a gesture. **On the text, not the block.**
+    /// It was on the whole identity VStack, which put the readouts
+    /// inside the drag source: a drag source takes the press before any
+    /// child gesture sees it, so the LOCK button in that row was inert
+    /// and there was nothing wrong with the button (2026-09-22). This
+    /// is what the block's comment always claimed — "the readouts stay
+    /// put under the pointer" — now actually the case.
+    private var dragHelp: String {
+        state.hasTrack ? "Drag onto the other deck for an instant double" : ""
     }
 
     /// A step below the title, not level with it. The two ran at
@@ -399,6 +420,14 @@ struct DeckColumn<Overview: View>: View {
     /// that at a glance the pair read as one block of text rather than
     /// as a name and its artist. Under a scratch this line is the parked
     /// tune and where it is, so the DJ can see it is still there.
+    /// The artist half of the drag handle. The readouts share this row
+    /// but must not drag — see `dragHelp`.
+    private var draggableSubtitle: some View {
+        subtitleLine
+            .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
+            .help(dragHelp)
+    }
+
     private var subtitleLine: some View {
         let outward = state.side == .a
         return Text(subtitle)
@@ -463,7 +492,11 @@ struct DeckColumn<Overview: View>: View {
     }
 
     private var readouts: some View {
-        DeckReadouts(header: state.header, trailing: state.side == .a)
+        DeckReadouts(
+            header: state.header,
+            trailing: state.side == .a,
+            side: state.side,
+            onToggleKeyLock: callbacks.onToggleKeyLock)
     }
 
     // MARK: - The two things you play
@@ -692,6 +725,11 @@ struct DeckReadouts: View {
     /// the edge the row sits against: trailing on deck A, where the
     /// readouts end at the column's inner edge, leading on deck B.
     var trailing: Bool = false
+    /// Tints the LOCK button. Defaults to A so the layout tests, which
+    /// render the row on its own, keep their one-argument call.
+    var side: DeckSide = .a
+    /// M14 key lock. `nil` leaves the button out entirely.
+    var onToggleKeyLock: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
@@ -708,8 +746,56 @@ struct DeckReadouts: View {
             readout(
                 "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
                 font: DubFont.numericInline, widest: "-888.8")
+            keyLockButton
         }
         .fixedSize()
+    }
+
+    /// M14 key lock, at the end of the row the pitch it holds is on —
+    /// where Traktor puts it, next to the pitch fader.
+    ///
+    /// **Two states, not one.** The button lights from `keyLockOn` (the
+    /// DJ's switch, immediate on tap); the dot reports what the engine
+    /// is actually doing — dim while the platter sits at unity or a
+    /// loop has it bypassed, solid once the stretcher is holding a
+    /// pitch. A single lit state would claim work that isn't happening
+    /// at +0.0 %.
+    @ViewBuilder
+    private var keyLockButton: some View {
+        if let toggle = onToggleKeyLock {
+            let on = header.keyLockOn
+            let tint = DubColor.deckTint(side)
+            VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
+                Text("LOCK")
+                    .font(DubFont.micro)
+                    .tracking(DubFont.capsTracking)
+                    .foregroundStyle(DubColor.textTertiary)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(on ? tint.opacity(header.keyLockState == 2 ? 1.0 : 0.35)
+                                 : DubColor.textPlaceholder)
+                        .frame(width: 5, height: 5)
+                    Text(on ? "ON" : "OFF")
+                        .font(DubFont.numericInline)
+                        .foregroundStyle(on ? tint : DubColor.textPlaceholder)
+                }
+                .padding(.horizontal, DubSpacing.sm)
+                .padding(.vertical, 3)
+                .background(on ? tint.opacity(0.16) : DubColor.surface2)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
+                .contentShape(Rectangle())
+                .onPressDown(perform: toggle)
+            }
+            .help(on
+                  ? "Key lock on — the pitch holds while the platter moves the tempo"
+                  : "Key lock off — pitch rides the platter, like a record")
+            .accessibilityLabel("Key lock")
+            .accessibilityValue(on ? "on" : "off")
+            .mappable(.keyLock(side))
+        }
     }
 
     /// `widest` is drawn hidden underneath the value and sets the

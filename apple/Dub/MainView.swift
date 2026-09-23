@@ -269,6 +269,34 @@ struct DeckState: Equatable {
     /// whether the next tap engages or disengages.
     var echoDivision: Double? = nil
 
+    /// The pitch the **tempo** readout may use: the platter's pitch
+    /// while it is a pitch and not a scratch.
+    ///
+    /// `pitchPercent` is the truth and the PITCH column prints it, spikes
+    /// and all — the smoothed rate runs past ±100 % under the hand, and
+    /// that slot reserves six places for exactly that. A BPM cannot
+    /// follow it there: 92.9 at −250 % reads "−393.3", which is both
+    /// nonsense and wider than the BPM slot, so the row would jump on
+    /// every cut. This holds the last believable value instead, which is
+    /// what a DJ means by "the tempo it is playing at" — it changes when
+    /// you move the fader, not when you touch the record.
+    var tempoPitchPercent: Double? = nil
+
+    /// M14 key-lock state from `engine.deckTelemetry`: 0 off · 1 standby
+    /// (armed, auto-bypassed at unity or inside a loop) · 2 engaged (the
+    /// stretcher is holding the pitch). Engine truth, for the header's
+    /// LOCK dot; the button itself lights from `keyLockOn` so the tap is
+    /// immediate — the same split the echo pad uses.
+    var keyLockState: UInt8 = 0
+
+    /// Whether the DJ asked for key lock on this deck. The engine's own
+    /// state lags it (standby until the platter actually leaves unity),
+    /// so this is what the button reads.
+    var keyLockOn: Bool = false
+
+    /// The widest pitch that reads as a fader rather than a hand.
+    static let tempoPitchLimit: Double = 50
+
     /// M16 dub-siren state from `engine.deckTelemetry`: 0 idle · 1 sounding
     /// (gated, releasing, or the slap-back tail still ringing). Lights the
     /// SIREN panel while the engine says a preset is making sound.
@@ -762,6 +790,14 @@ final class WaveformAppModel: ObservableObject {
                 vinylRecordingEnabled, forKey: Self.kVinylRecording)
         }
     }
+
+    /// How far the platter may wander and still count as the same
+    /// pitch. Wider than the decoder's residual wobble, far narrower
+    /// than a fader nudge.
+    private static let tempoPitchStillness: Double = 0.2
+    /// Polls it has to stay inside that band before the tempo readouts
+    /// adopt it — ~⅓ s at the 30 Hz poll.
+    private static let tempoPitchSteadyPolls: Int = 10
 
     private static let kVinylRecording = "dub.vinylRecordingEnabled"
 
@@ -1339,6 +1375,13 @@ final class WaveformAppModel: ObservableObject {
     /// thread work that occasionally stacked with a Metal draw and
     /// delayed transport clicks.
     private var bpmPollTick: [DeckSide: UInt] = [.a: 0, .b: 0]
+
+    /// Candidate platter pitch and how many polls it has held still —
+    /// the gate in front of `DeckState.tempoPitchPercent`. Model state
+    /// rather than deck state: it changes on most polls and `DeckState`
+    /// is published, so putting it there would republish the deck at
+    /// 30 Hz for a value no view reads.
+    private var tempoPitchSteady: [DeckSide: (candidate: Double, polls: Int)] = [:]
 
     /// Pending auto-clear task for `lastError`. Cancelled if a new
     /// error supersedes the previous one within the visibility
@@ -2126,9 +2169,37 @@ final class WaveformAppModel: ObservableObject {
         // just gate it on playback so a paused deck reads "—".
         let tele = engine.deckTelemetry(deckIdx: side.ffiDeckIdx)
         next.pitchPercent = nowPlaying ? tele.pitchPercent : nil
+        // A turntable's fader is ±8 / ±16 / ±50; anything past that is a
+        // hand on the record, not a tempo. Outside the band `next` keeps
+        // what `prev` had, so the BPM holds rather than flickering.
+        //
+        // **And it has to sit still first.** The band alone is not
+        // enough: a platter spinning up after STOP, or settling after a
+        // scratch, sweeps *through* the band on its way to the fader's
+        // value, and everything downstream followed it — the BPM
+        // counted up and the waveform, whose axis is scaled by this
+        // (`WaveformRenderer.effectiveTimeAxisZoom`), zoomed through
+        // every intermediate rate. That is the "weird zoom jumping
+        // thingie" on restart and after a cut. A real fader move
+        // settles inside a third of a second; a spin-up does not.
+        if nowPlaying, abs(tele.pitchPercent) <= DeckState.tempoPitchLimit {
+            let seen = tempoPitchSteady[side]
+            if let seen, abs(tele.pitchPercent - seen.candidate) <= Self.tempoPitchStillness {
+                let polls = seen.polls + 1
+                tempoPitchSteady[side] = (seen.candidate, polls)
+                if polls >= Self.tempoPitchSteadyPolls {
+                    next.tempoPitchPercent = seen.candidate
+                }
+            } else {
+                tempoPitchSteady[side] = (tele.pitchPercent, 0)
+            }
+        } else {
+            tempoPitchSteady[side] = nil
+        }
         next.pitchSettled = tele.pitchSettled
         next.measureProgress = Double(tele.measureProgress)
         next.timecodeLockState = tele.lockState
+        next.keyLockState = tele.keyLockState
         next.echoState = tele.echoState
         // M15 auto-off: the engine reports echo_state == 2 once the muted
         // input AND the wet tail have both been silent for a moment — e.g. a
@@ -4614,6 +4685,9 @@ final class WaveformAppModel: ObservableObject {
         } else {
             keyLockSelectionB = selection
         }
+        var deck = state(for: side)
+        deck.keyLockOn = selection != .resampler
+        setState(deck, for: side)
         switch selection {
         case .resampler:
             try? engine.setDeckStretchBackend(deckIdx: side.ffiDeckIdx, backend: .resamplerOnly)
@@ -4622,6 +4696,14 @@ final class WaveformAppModel: ObservableObject {
             try? engine.setDeckStretchBackend(deckIdx: side.ffiDeckIdx, backend: .dubOwn)
             try? engine.setDeckKeyLock(deckIdx: side.ffiDeckIdx, on: true)
         }
+    }
+
+    /// The deck header's LOCK button (M14 on the performance surface).
+    /// One tap, because a DJ picking a stretch *backend* mid-set is not a
+    /// thing — the A/B selector was a bench control. On is `.ours`.
+    func toggleKeyLock(side: DeckSide) {
+        setKeyLockSelection(
+            side: side, keyLockSelection(side) == .resampler ? .ours : .resampler)
     }
 
     /// **Testing only** (M14): set the prep deck's playback rate from the pitch
@@ -6541,6 +6623,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
+            onKeyLock: { side in
+                Task { @MainActor in
+                    model.toggleKeyLock(side: side)
+                }
+                return true
+            },
             // Map mode: while a control is armed, the next key is its
             // binding — Escape backs out, ⌫ unbinds. Checked on the main
             // actor synchronously so the key never also fires the action
@@ -6585,6 +6673,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onFxToggle: @escaping (_ unit: Int) -> Bool,
             onFxKick: @escaping () -> Bool,
             onEchoOut: @escaping (_ side: DeckSide) -> Bool,
+            onKeyLock: @escaping (_ side: DeckSide) -> Bool,
             mapCapture: @escaping (_ code: UInt16, _ characters: String?, _ command: Bool) -> Bool
         ) {
             uninstall()
@@ -6645,6 +6734,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onFxKick() { return nil }
                 case .echoOut(let side):
                     if onEchoOut(side) { return nil }
+                case .keyLock(let side):
+                    if onKeyLock(side) { return nil }
                 }
                 return event
             }

@@ -65,6 +65,10 @@ struct DeckHeaderState: Equatable {
     /// plays immediately; only the *numbers* are still measuring.
     var pitchSettled: Bool = true
 
+    /// The pitch the BPM is scaled by — the platter's fader position,
+    /// held through a scratch. See `DeckState.tempoPitchPercent`.
+    var tempoPitchPercent: Double? = nil
+
     /// Calibration / measurement progress [0, 1] from the engine
     /// (whitening capture + pitch stabilization, time-weighted). While
     /// `pitchSettled == false`, row 2 draws a progress line filling
@@ -99,6 +103,38 @@ struct DeckHeaderState: Equatable {
     /// surface for the musical-notation preference, not the deck
     /// header which DJs read at glance distance during a mix.
     let key: String?
+
+    /// The **live** tempo: the analyzed grid BPM scaled by the deck's
+    /// current pitch, so a readout says the BPM the record is *actually
+    /// playing at*. Slow the platter and it drops with it; this is the
+    /// number you beatmatch against, and the one §9.4 means when it
+    /// says tempo is matched by the header numbers. Falls back to the
+    /// nominal BPM when the deck isn't being driven (`pitchPercent ==
+    /// nil`).
+    ///
+    /// **On the state, not on a view.** It lived on `DeckHeader` — the
+    /// header Prep renders — while Performance draws `DeckColumn`,
+    /// which copied `bpm` straight across. So the surface with the
+    /// turntables on it was the one showing the unpitched number, and
+    /// it took a rig session to notice (2026-09-22). One computed
+    /// property, both consumers.
+    var liveBpm: Double? {
+        guard let base = bpm, base > 0 else { return nil }
+        // `tempoPitchPercent`, never `pitchPercent`: the latter follows a
+        // scratch past ±100 % and the BPM must not.
+        guard let pitch = tempoPitchPercent else { return base }
+        return base * (1.0 + pitch / 100.0)
+    }
+
+
+    /// M14 key lock, as the DJ set it. Lights the LOCK button in row 2.
+    var keyLockOn: Bool = false
+
+    /// M14 key lock as the *engine* has it: 0 off · 1 standby · 2
+    /// engaged. Standby is the honest state at unity pitch or inside a
+    /// loop — armed, nothing to hold yet — and the button's dot says so
+    /// rather than claiming the stretcher is working.
+    var keyLockState: UInt8 = 0
 
     /// Format / SR caption ("MP3 · 44.1 kHz · stereo"). `nil` for
     /// Thru / off decks.
@@ -604,21 +640,9 @@ struct DeckHeader: View {
     /// has emitted a rolling preview, render that preview value
     /// instead of the committed BPM so the user can see the
     /// running estimate converge in real time.
-    /// The **live** tempo: the track's analyzed BPM scaled by the
-    /// deck's current pitch, so the column reads the BPM the record is
-    /// *actually playing at*. When the platter slows the BPM drops with
-    /// it; this is the number you beatmatch against. Falls back to the
-    /// nominal BPM when the deck isn't being driven (`pitchPercent ==
-    /// nil`).
-    private var liveBpm: Double? {
-        guard let base = state.bpm, base > 0 else { return nil }
-        guard let pitch = state.pitchPercent else { return base }
-        return base * (1.0 + pitch / 100.0)
-    }
-
     private var formattedBPM: String {
         // Tap-tempo preview wins while a tap session is rolling.
-        let value = tapSession.rollingBpm ?? liveBpm
+        let value = tapSession.rollingBpm ?? state.liveBpm
         guard let bpm = value, bpm > 0 else { return "—" }
         if prepMode {
             return String(format: "%.2f", bpm)
@@ -1084,7 +1108,6 @@ struct DeckHeader: View {
             + "Right-click for 2× / ½ / Reset / Lock."
     }
 
-    @ViewBuilder
     private func statColumn(label: String, value: String) -> some View {
         HStack(spacing: DubSpacing.sm) {
             Text(label)
@@ -1318,11 +1341,14 @@ extension DeckHeaderState {
                 bpm: deckState.bpm,
                 pitchPercent: deckState.pitchPercent,
                 pitchSettled: deckState.pitchSettled,
+                tempoPitchPercent: deckState.tempoPitchPercent,
                 measureProgress: deckState.measureProgress,
                 timecodeLockState: deckState.timecodeLockState,
                 sourceControl: Self.sourceControl(from: deckState),
                 sourceControlOverridden: deckState.controlOverridden,
                 key: deckState.key,
+                keyLockOn: deckState.keyLockOn,
+                keyLockState: deckState.keyLockState,
                 formatChip: deckState.formatChip,
                 timeRow: time,
                 isMaster: isMaster,

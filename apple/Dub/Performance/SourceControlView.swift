@@ -157,49 +157,6 @@ enum KeyLockSelection: Equatable {
 /// Per-deck Key Lock control (PRD §6.1.1): a two-way RESAMP / OURS toggle plus a
 /// status dot showing the engine's *actual* state (full green = engaged / pitch
 /// held, dim green = standby / auto-bypassed during a scratch, grey = off). A
-/// Prep / dev surface; clickable (the no-mouse rule is Performance-only).
-struct KeyLockControlView: View {
-    @ObservedObject var model: WaveformAppModel
-    let side: DeckSide
-
-    /// The engine's published key-lock state (0 off · 1 standby · 2 engaged),
-    /// polled at the signal panel's 20 Hz cadence.
-    @State private var indicatorState: UInt8 = 0
-    /// `@State`, not `let` — see `DeckSignalSlideOut.dotTick`. A timer
-    /// stored as a plain property is rebuilt every time SwiftUI
-    /// recreates the struct, scheduling a fresh run-loop timer and
-    /// re-subscribing `onReceive` on every render of the parent.
-    @State private var tick =
-        Timer.publish(every: 1.0 / 20.0, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        let selection = model.keyLockSelection(side)
-        HStack(spacing: DubSpacing.sm) {
-            DubSectionLabel("KEY LOCK", dot: dotColor)
-                .fixedSize()
-            DubSegmentedControl(
-                segments: [
-                    .init(KeyLockSelection.resampler, "OFF"),
-                    .init(KeyLockSelection.ours, "ON"),
-                ],
-                selection: selection,
-                tint: DubColor.controlAccent,
-                onSelect: { model.setKeyLockSelection(side: side, $0) })
-        }
-        .onReceive(tick) { _ in
-            indicatorState = model.engine.deckTelemetry(deckIdx: side.ffiDeckIdx).keyLockState
-        }
-    }
-
-    private var dotColor: Color {
-        switch indicatorState {
-        case 2: return DubColor.stateLocked // engaged — pitch held
-        case 1: return DubColor.stateLocked.opacity(0.4) // standby — auto-bypassed
-        default: return DubColor.textPlaceholder // off
-        }
-    }
-}
-
 /// Rudimentary prep-mode pitch control for **testing** key lock without a
 /// turntable (M14): tap a percent to set the deck's playback rate, then A/B the
 /// key-lock engines above to hear pitch held (Ours / Rubber Band) vs shifted

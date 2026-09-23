@@ -316,6 +316,10 @@ struct RendererAppearance {
     var orientation: WaveformOrientation = .vertical
     var side: DeckSide = .a
     var timeAxisZoom: Double = 1.0
+    /// The platter's steady rate (1.0 = unity), from the deck's held
+    /// pitch. Scales the time axis into *room* seconds — see
+    /// `WaveformRenderer.effectiveTimeAxisZoom`.
+    var platterRate: Double = 1.0
     var beatGridEnabled: Bool = true
 
     /// A gain folded into the drawn amplitude — the deck's load gain,
@@ -458,15 +462,28 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// with the same neighbour; an odd aggregation would re-pair them
     /// frame to frame and bring back the colour flicker that snap
     /// exists to prevent.
+    /// **The pixels follow from this, not the other way round.** A
+    /// column has to be a whole (even) number of chunks — the shader
+    /// takes a per-band max over them — but its *width* is a Double
+    /// and can absorb whatever is left over. So this picks the
+    /// aggregation and `effectivePixelsPerDrawnColumn` divides, which
+    /// makes seconds-per-pixel exactly `zoom × referenceSecsPerPixel`
+    /// at every rung and every platter rate. The two used to be
+    /// computed independently from the zoom and rounded separately;
+    /// with the integer rungs that was exact, but once the rate folded
+    /// into the zoom (2026-09-22) the rounding left the zoomed-out
+    /// rungs up to 6 % off — which is the beat-spacing mismatch this
+    /// whole change exists to remove, reappearing at 0.5× and 0.25×.
+    /// Every canonical rung resolves to the same pair it always did.
     nonisolated public static func columnAggregation(
         timeAxisZoom: Double
     ) -> UInt32 {
-        let base = Double(chunksPerColumn)
-        let pixels = Double(pixelsPerDrawnColumn) / max(0.05, timeAxisZoom)
-        guard pixels < 1.0 else { return chunksPerColumn }
-        let residual = 1.0 / pixels
-        let agg = (base * residual / 2.0).rounded() * 2.0
-        return UInt32(max(base, agg))
+        let zoom = max(0.05, timeAxisZoom)
+        // A column is at least the base pair, and never narrower than
+        // one drawable pixel — past that it takes more audio instead.
+        let needed = max(Double(chunksPerColumn), zoom)
+        let even = (needed / 2.0).rounded(.up) * 2.0
+        return UInt32(max(Double(chunksPerColumn), min(even, 4096)))
     }
 
     /// Drawable pixels spanned by one drawn column along the time
@@ -498,14 +515,15 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// 0.5 and 0.7 both resolved to 1.0 and drew the same picture.
     ///
     /// The floor that remains is real: a drawn column cannot be
-    /// narrower than one drawable pixel, so with a 2 px base the
-    /// furthest out anything can go is 2.0. `WaveformZoom.steps` stops
-    /// there rather than offering rungs that do nothing.
+    /// narrower than one drawable pixel. `columnAggregation` is what
+    /// enforces it — it widens the column in *chunks* once the pixels
+    /// would go under one — and this just divides, so the product of
+    /// the two is always the requested scale.
     nonisolated public static func effectivePixelsPerDrawnColumn(
         timeAxisZoom: Double
     ) -> Double {
         let zoom = max(0.05, timeAxisZoom)
-        return max(1.0, Double(pixelsPerDrawnColumn) / zoom)
+        return Double(columnAggregation(timeAxisZoom: zoom)) / zoom
     }
 
     /// Default broadband samples-per-chunk emitted by `dub-peaks`'s
@@ -531,6 +549,58 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     ) -> Double {
         let sr = max(1.0, Double(sampleRate))
         return chunksPerPixel * Double(samplesPerPeakChunk) / sr
+    }
+
+    /// Room-seconds per drawable pixel at `timeAxisZoom == 1` — the
+    /// axis both decks share. It is the cadence the renderer has
+    /// always drawn a 44.1 kHz track at unity pitch with (one 64-sample
+    /// chunk per pixel), kept as the anchor so that configuration looks
+    /// exactly as it did.
+    nonisolated public static let referenceSecsPerPixel: Double =
+        Double(defaultSamplesPerPeakChunk) / 44_100.0
+
+    /// The zoom the geometry is actually built at: the DJ's zoom,
+    /// scaled so a pixel is a fixed slice of the **room's** time rather
+    /// than the track's.
+    ///
+    /// **Why this exists.** The axis used to be laid out in chunks, and
+    /// a chunk is 64 samples *of the track*. Two things fall out of
+    /// that, and both were found on the rig (2026-09-22):
+    ///
+    /// 1. **Pitch was ignored.** Beats were drawn `60 / gridBpm` track
+    ///    seconds apart whatever the platter was doing, so an 88 BPM
+    ///    record pitched up to 92 still drew its beats 92/88 = 4.5 %
+    ///    further apart than a 92 BPM record beside it — aligned at the
+    ///    playhead, diverging away from it, which is exactly what the
+    ///    DJ reported. The two strips did not scroll at the same pixel
+    ///    speed when beatmatched either, which is the premise PRD §9.4
+    ///    rests the phase meter on.
+    /// 2. **Sample rate leaked into the picture.** A 64-sample chunk is
+    ///    1.45 ms at 44.1 kHz and 1.33 ms at 48 kHz, both drawn one
+    ///    pixel wide, so a 48 kHz file drew 8.8 % wider than a 44.1 kHz
+    ///    one at the same BPM with no pitch at all.
+    ///
+    /// Both are the same error — a track-time axis where a room-time
+    /// one belongs — and both cancel here. A pixel is
+    /// `referenceSecsPerPixel × zoom` of the room; equal effective
+    /// tempo ⇒ equal beat spacing, and equal scroll speed, on both
+    /// decks.
+    ///
+    /// **`rate` is the fader, not the hand.** It comes from the deck's
+    /// held pitch (`DeckState.tempoPitchPercent`), never the
+    /// instantaneous rate: the smoothed rate swings past ±100 % under a
+    /// scratch and goes negative on a pull-back, and feeding that in
+    /// would zoom the picture in and out on every cut. Clamped anyway,
+    /// so a bad value degrades to a slightly wrong scale rather than a
+    /// collapsed or exploded one.
+    nonisolated public static func effectiveTimeAxisZoom(
+        timeAxisZoom: Double,
+        platterRate: Double,
+        peakDurSecs: Double
+    ) -> Double {
+        guard peakDurSecs > 0, peakDurSecs.isFinite else { return timeAxisZoom }
+        let rate = min(max(platterRate.isFinite ? platterRate : 1.0, 0.25), 4.0)
+        return timeAxisZoom * rate * (referenceSecsPerPixel / peakDurSecs)
     }
 
     /// Byte stride between the past-region and future-region
@@ -887,6 +957,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         appearance.withLock { $0.side = value }
     }
 
+    /// The platter's held pitch as a rate. Pushed from
+    /// `WaveformView.updateNSView`, like the zoom.
+    func setPlatterRate(_ value: Double) {
+        appearance.withLock { $0.platterRate = value }
+    }
+
     func setTimeAxisZoom(_ value: Double) {
         appearance.withLock { $0.timeAxisZoom = value }
     }
@@ -1164,16 +1240,22 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // drawable pixels along the time axis. Performance mode uses
         // the base `pixelsPerDrawnColumn` (= 2); prep mode divides
         // by `timeAxisZoom` (1.2) so ~20 % more audio is visible.
+        // The axis is in room-seconds, so the deck's pitch and the
+        // track's sample rate both fold into the zoom here — see
+        // `effectiveTimeAxisZoom`.
+        let axisZoom = Self.effectiveTimeAxisZoom(
+            timeAxisZoom: appearance.timeAxisZoom,
+            platterRate: appearance.platterRate,
+            peakDurSecs: peakChunkDurationSecs)
         let pixelsPerDrawnColumn =
-            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: appearance.timeAxisZoom)
+            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: axisZoom)
         let drawnAbovePixels = max(
             0, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
         let drawnBelowPixels = max(
             0, Int((Double(futurePixels) / pixelsPerDrawnColumn).rounded(.down)))
         // Zoom-dependent: past the one-pixel column floor this
         // grows so the column covers more audio instead.
-        let agg = Int(
-            Self.columnAggregation(timeAxisZoom: appearance.timeAxisZoom))
+        let agg = Int(Self.columnAggregation(timeAxisZoom: axisZoom))
 
         // Playhead chunk + chunks past it. In File mode this is
         // computed off the *unclamped* playhead seconds so a hard

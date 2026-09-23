@@ -322,7 +322,8 @@ struct PerformanceView: View {
             onSetTimecode: { header.onSetTimecode?() },
             onSetThru: { header.onSetThru?() },
             onSetFx: { model.setDeckDubFx(side: side) },
-            onRecalibrate: { header.onRecalibrate?() })
+            onRecalibrate: { header.onRecalibrate?() },
+            onToggleKeyLock: { model.toggleKeyLock(side: side) })
     }
 
     // MARK: - DUB FX channel

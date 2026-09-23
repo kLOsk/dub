@@ -64,7 +64,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         let state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: "Bow Down", trackArtist: "Westside Connection",
-            bpm: 92.9, pitchPercent: -2.3, timecodeLockState: 1,
+            bpm: 92.9, pitchPercent: -2.3, tempoPitchPercent: -2.3,
+            timecodeLockState: 1,
             key: "7A",
             formatChip: "MP3 · 44.1 kHz · stereo",
             timeRow: .remainingOnly,
@@ -95,7 +96,8 @@ final class PerformanceSnapshotTests: XCTestCase {
             DeckHeaderState(
                 isLive: true, source: .file,
                 trackTitle: title, trackArtist: artist,
-                bpm: bpm, pitchPercent: pitch, timecodeLockState: 1,
+                bpm: bpm, pitchPercent: pitch, tempoPitchPercent: pitch,
+                timecodeLockState: 1,
                 key: key,
                 formatChip: "MP3 · 44.1 kHz · stereo",
                 timeRow: .remainingOnly,
@@ -155,7 +157,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         var state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: title, trackArtist: artist,
-            bpm: bpm, pitchPercent: pitch, timecodeLockState: 1,
+            bpm: bpm, pitchPercent: pitch, tempoPitchPercent: pitch,
+            timecodeLockState: 1,
             key: key,
             formatChip: "MP3 · 44.1 kHz · stereo",
             timeRow: .remainingOnly,
@@ -344,6 +347,29 @@ final class PerformanceSnapshotTests: XCTestCase {
              named: "rack-bar-no-siren")
     }
 
+    /// M14 key lock on the performance surface (2026-09-22). Three
+    /// states side by side, because the dot is the whole point: off,
+    /// on-but-standby (armed at unity pitch — nothing to hold yet) and
+    /// on-and-engaged. It renders in `DeckReadouts`, the row the deck
+    /// column draws; the button only appears when a toggle callback is
+    /// wired, which is how Prep keeps it hidden.
+    func test_deckReadouts_keyLock() {
+        func row(_ on: Bool, _ engineState: UInt8, pitch: Double?) -> some View {
+            var header = Self.header("Bow Down", "Westside Connection", 92.9, "7A", pitch)
+            header.keyLockOn = on
+            header.keyLockState = engineState
+            return DeckReadouts(
+                header: header, trailing: false, side: .a, onToggleKeyLock: {})
+        }
+        let stack = VStack(alignment: .leading, spacing: 12) {
+            row(false, 0, pitch: 0)
+            row(true, 1, pitch: 0)
+            row(true, 2, pitch: -3.4)
+        }
+        .padding()
+        snap(deckBg(stack), width: 460, height: 200, named: "key-lock-states")
+    }
+
     func test_deckHeader_withSourceControl() {
         // Auto-selected TIMECODE: the row-3 switch carries the source +
         // tracking dot, so the row-1 FILE pill is suppressed (no
@@ -351,7 +377,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         let state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: "Bow Down", trackArtist: "Westside Connection",
-            bpm: 92.9, pitchPercent: -2.3, timecodeLockState: 1,
+            bpm: 92.9, pitchPercent: -2.3, tempoPitchPercent: -2.3,
+            timecodeLockState: 1,
             sourceControl: .timecode,
             key: "7A",
             formatChip: "MP3 · 44.1 kHz · stereo",
@@ -373,7 +400,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         let state = DeckHeaderState(
             isLive: true, source: .file,
             trackTitle: "Bow Down", trackArtist: "Westside Connection",
-            bpm: 92.9, pitchPercent: -2.3, timecodeLockState: 1,
+            bpm: 92.9, pitchPercent: -2.3, tempoPitchPercent: -2.3,
+            timecodeLockState: 1,
             sourceControl: .thru,
             sourceControlOverridden: false,
             key: "7A",

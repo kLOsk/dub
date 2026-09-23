@@ -644,6 +644,43 @@
   thread "running" inside a non-blocking function at 0 % CPU, ask who
   suspended it before asking who corrupted the heap.**
 
+- **A waveform's axis is the room's clock, not the track's.** The renderer
+  laid columns out in peak chunks — 64 samples *of the track* — so the picture
+  silently carried two scale errors: the platter's pitch never entered it (an
+  88 BPM record pitched to 92 drew its beats 4.5 % wider than a 92 BPM record
+  beside it, aligned at the playhead and diverging away from it), and the
+  file's sample rate did (48 kHz drew 8.8 % wider than 44.1 kHz at the same
+  BPM). Neither is visible on one deck, which is why both survived to the rig:
+  they are only wrong *relative to the other strip*, and the whole beatmatching
+  story — two strips moving as one, PRD §9.4 — depends on that relation. When a
+  view exists to be compared against another view, test the comparison, not the
+  view.
+  - Two corollaries. **Scale by the settled pitch, never the live rate**: the
+    smoothed rate runs past ±100 % under a hand, so the picture would zoom on
+    every scratch (the BPM readout has the same rule, for the same reason).
+    And **when an integer and a float both carry a scale, derive one from the
+    other**: chunks-per-column must be a whole number and pixels-per-column
+    need not be, so rounding them independently left the zoomed-out rungs 6 %
+    off — pick the integer, divide for the float, and the product is exact.
+
+- **Two views drawing "the deck header" is one view too many.** The live BPM
+  (grid × pitch) was computed on `DeckHeader` — which only **Prep** renders.
+  Performance draws `DeckColumn`, whose `DeckColumnHeader.init` copied the raw
+  grid BPM across. So the surface with the turntables on it showed the
+  unpitched number, on a readout PRD §9.4 tells the DJ to beatmatch by, and it
+  took a rig session to notice (2026-09-22). Derivations belong on the *state*
+  (`DeckHeaderState.liveBpm`), not on whichever view happened to need them
+  first. The same session added a control to `DeckHeader` and watched it not
+  appear on the rig, for the same reason.
+
+- **An unmounted view is worse than a missing feature.** `KeyLockControlView`
+  existed, looked finished, and was referenced by nothing, so M14 key lock had
+  no way to reach it — while the engine side, the FFI and the telemetry all
+  worked. Nothing failed: not the build, not the tests, not a review. It was
+  found by a DJ asking "we don't have a key lock button :)". **Grep for a new
+  view's own name before calling it shipped**, and when a control is deleted or
+  replaced, delete it rather than leaving it for later.
+
 ## Product invariants (don't relitigate without sign-off)
 
 - **The beatmatch aid is Traktor's phase meter, and the strips do the

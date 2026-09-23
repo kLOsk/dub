@@ -72,6 +72,8 @@ enum DubAction: Hashable {
     case fxKick
     /// A deck's ECHO OUT (tap-toggle).
     case echoOut(DeckSide)
+    /// A deck's key lock (M14). Per deck, like the platter it holds.
+    case keyLock(DeckSide)
 
     var id: String {
         switch self {
@@ -86,6 +88,7 @@ enum DubAction: Hashable {
         case .fxToggle(let i): return "fx.unit.\(i)"
         case .fxKick: return "fx.kick"
         case .echoOut(let side): return "echo.\(side == .a ? "a" : "b")"
+        case .keyLock(let side): return "keylock.\(side == .a ? "a" : "b")"
         }
     }
 
@@ -120,6 +123,9 @@ enum DubAction: Hashable {
         case (2, "echo"):
             guard let d = side(parts[1]) else { return nil }
             self = .echoOut(d)
+        case (2, "keylock"):
+            guard let d = side(parts[1]) else { return nil }
+            self = .keyLock(d)
         default: return nil
         }
     }
