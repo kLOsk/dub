@@ -76,6 +76,26 @@ final class PerformanceSnapshotTests: XCTestCase {
              width: 720, height: 108, named: "file-timecode-playing")
     }
 
+    /// Prep while a rip is in review: the side on deck A is one
+    /// temporary track, so its BPM and key say nothing a DJ keeps and
+    /// the tap would set a grid encode throws away. Both columns are
+    /// hidden in place — the header keeps its height, so entering or
+    /// leaving a rip does not move anything under it.
+    func test_deckHeader_prepWhileRipping() {
+        let state = DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: "rip-2026-09-23", trackArtist: nil,
+            bpm: 92.9, key: "7A",
+            formatChip: "WAV · 48 kHz · stereo",
+            timeRow: .elapsedAndRemaining,
+            isMaster: true, isPlaying: false,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil)
+        snap(deckBg(DeckHeader(side: .a, state: state, prepMode: true,
+                               hidesTempoAndKey: true)),
+             width: 720, height: 108, named: "prep-while-ripping")
+    }
+
     func test_deckHeader_loading() {
         let state = DeckHeaderState(
             isLive: true, source: .loading,

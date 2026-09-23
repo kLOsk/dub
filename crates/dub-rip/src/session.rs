@@ -669,6 +669,31 @@ impl RipSession {
         Ok(())
     }
 
+    /// Drop a segment from the commit, or put it back.
+    ///
+    /// A dropped segment keeps its place in the plan — indices do not
+    /// shift under the DJ mid-review — and keeps its audio in the side
+    /// archive, so a re-split recovers it. It is simply not encoded
+    /// and not imported. This is the other half of editing a side:
+    /// removing a *boundary* merges two segments, dropping one
+    /// discards it, and before 2026-09-23 only the first was possible.
+    ///
+    /// # Errors
+    /// [`RipError::TrackIndexOutOfRange`] for an index past the plan,
+    /// and the usual "not while recording" guard.
+    pub fn set_segment_dropped(&mut self, index: usize, dropped: bool) -> Result<(), RipError> {
+        self.require_stopped("drop a segment")?;
+        let count = self.manifest.tracks.len();
+        let entry = self
+            .manifest
+            .tracks
+            .get_mut(index)
+            .ok_or(RipError::TrackIndexOutOfRange { index, count })?;
+        entry.dropped = dropped;
+        manifest::save(&self.cfg.session_dir, &self.manifest)?;
+        Ok(())
+    }
+
     /// Encode + tag + import every segment, write the side archive,
     /// and delete the spill once everything succeeded. Idempotent:
     /// segments that already carry a `library_uuid` are skipped, so

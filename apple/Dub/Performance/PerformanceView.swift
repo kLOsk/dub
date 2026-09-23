@@ -131,6 +131,7 @@ struct PerformanceView: View {
                        callbacks: headerCallbacks(side: .a),
                        mirrored: false,
                        prepMode: true,
+                       hidesTempoAndKey: model.ripPhase != .none,
                        tapSession: model.tapSession(for: .a),
                        liveEngine: model.engine,
                        liveDeckIdx: 0)
@@ -677,7 +678,9 @@ struct PerformanceView: View {
                 if model.ripPhase == .review {
                     RipSplitMarkerOverlay(
                         markers: model.ripSplits.map {
-                            RipMarkerUi(id: $0.id, secs: $0.secs)
+                            RipMarkerUi(
+                                id: $0.id, secs: $0.secs,
+                                label: ripTrackNameStarting(atSecs: $0.secs))
                         },
                         durationSecs: ripSideDurationSecs,
                         trim: ripTrim,
@@ -699,6 +702,20 @@ struct PerformanceView: View {
             }
             .frame(height: DubLayout.deckOverviewHeight)
         }
+    }
+
+    /// The name of the segment that starts at a marker, for the
+    /// overview's label. Matched on the boundary rather than by index
+    /// so a marker dragged past its neighbour still names the track it
+    /// actually opens.
+    private func ripTrackNameStarting(atSecs secs: Double) -> String {
+        guard let seg = model.ripSegments.min(by: {
+            abs($0.startSecs - secs) < abs($1.startSecs - secs)
+        }), abs(seg.startSecs - secs) < 0.5 else { return "" }
+        let title = seg.title ?? ""
+        let artist = seg.artist ?? ""
+        if title.isEmpty { return artist }
+        return artist.isEmpty ? title : "\(artist) — \(title)"
     }
 
     /// Duration for the marker overlay: the **whole capture**, not the
@@ -875,6 +892,7 @@ struct PerformanceView: View {
                 index: seg.index,
                 startSecs: seg.startSecs,
                 endSecs: seg.endSecs,
+                dropped: seg.dropped,
                 title: seg.title ?? "",
                 artist: seg.artist ?? "",
                 album: seg.album ?? "",
@@ -924,7 +942,7 @@ struct PerformanceView: View {
             jobDots: dots,
             overallStatus: status,
             recognition: model.ripRecognition,
-            isPlaying: model.deckA.isPlaying)
+            playingIndex: model.ripPlayingSegment)
     }
 
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
@@ -932,7 +950,10 @@ struct PerformanceView: View {
             addSplitAtPlayhead: { model.addRipSplitAtPlayhead() },
             autoSplit: { model.autoSplitRip() },
             audition: { secs in model.ripAudition(fromSecs: secs) },
-            togglePlay: { model.ripTogglePlay() },
+            setDropped: { index, dropped in
+                model.setRipSegmentDropped(index: index, dropped: dropped)
+            },
+            togglePlay: { index in model.ripTogglePlaySegment(index: index) },
             setMetadata: { index, meta in
                 model.setRipSegmentMetadata(
                     index: index,

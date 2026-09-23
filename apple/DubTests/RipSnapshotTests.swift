@@ -125,10 +125,13 @@ final class RipSnapshotTests: XCTestCase {
     }
 
     func test_ripReviewPanel_threeSegments() {
+        // Track 2 is the one rolling: exactly one card shows a pause
+        // glyph, and which one is the playhead's business.
         let state = RipReviewPanelState(
             mode: .review,
             sideDurationSecs: 1361,
-            segments: threeSegments)
+            segments: threeSegments,
+            playingIndex: 1)
         snap(deckBg(RipReviewPanel(state: state)),
              width: 900, height: 260, named: "review-3-segments")
     }
@@ -182,6 +185,20 @@ final class RipSnapshotTests: XCTestCase {
             genre: "Dub", year: "1976")
         snap(deckBg(RipSegmentCard(segment: segment)),
              width: 280, height: 220, named: "filled")
+    }
+
+    /// Dropped: the card dims and outlines, DROP turns into UNDO, and
+    /// the fields stay legible — the DJ may be dropping it *because*
+    /// of what they say.
+    func test_ripSegmentCard_dropped() {
+        let segment = RipSegmentUi(
+            index: 1, startSecs: 452, endSecs: 878,
+            dropped: true,
+            title: "Run-out groove",
+            artist: "", album: "King Tubbys Meets Rockers Uptown",
+            genre: "Dub", year: "1976")
+        snap(deckBg(RipSegmentCard(segment: segment)),
+             width: 280, height: 220, named: "dropped")
     }
 
     // MARK: - Split-marker overlay

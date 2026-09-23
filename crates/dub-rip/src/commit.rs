@@ -154,6 +154,17 @@ pub(crate) fn commit_session(
             .unwrap_or_else(|| segment_file_name(index, &entry.meta, manifest.split_generation));
         let file = session_dir.join(&file_name);
 
+        if entry.dropped {
+            // The DJ dropped this one in review. Its audio stays in
+            // the side archive — a re-split can bring it back — but it
+            // is not encoded and never reaches the library.
+            progress(CommitProgress::Finished {
+                index,
+                imported: false,
+            });
+            continue;
+        }
+
         if entry.library_uuid.is_some() {
             // Already imported by an earlier pass — idempotent skip.
             progress(CommitProgress::Finished {

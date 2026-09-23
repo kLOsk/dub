@@ -1140,6 +1140,13 @@ final class WaveformAppModel: ObservableObject {
     /// RipSplitMarkerOverlay / RipReviewPanel are mounted.
     @Published var ripPhase: RipUiPhase = .none
 
+    /// Which track of the side is rolling in review — the one card
+    /// that shows a pause glyph. Republished from the rip poll, and
+    /// only when it actually changes (a boundary crossing or a
+    /// transport flip), because the review cards carry live text
+    /// fields and must not rebuild at the poll's rate.
+    @Published var ripPlayingSegment: UInt32? = nil
+
     /// 10 Hz value snapshot of `ripSession.status()` (phase, elapsed,
     /// level, stop reason, error). `nil` while no session exists.
     @Published var ripStatus: RipUiStatus? = nil
@@ -1248,6 +1255,10 @@ final class WaveformAppModel: ObservableObject {
     /// the UI layer where the deck state is authoritative.
     func handleTapForGrid(_ side: DeckSide) {
         guard isRunning else { return }
+        // During a rip deck A is the whole side, a temporary track that
+        // encode throws away; each track gets its own grid when it
+        // encodes. The header hides the control; this closes the key.
+        guard ripPhase == .none else { return }
         let deck = state(for: side)
         guard deck.hasTrack, deck.bpm != nil else { return }
         if deck.gridLocked {
@@ -4837,6 +4848,8 @@ final class WaveformAppModel: ObservableObject {
     /// holds a library track.
     func applyTapToGrid(halve: Bool, double: Bool) {
         guard isRunning else { return }
+        // Same rule as `handleTapForGrid`: no grid on a rip's side.
+        guard ripPhase == .none else { return }
         let side = masterDeck ?? stickyMaster
         var deck = state(for: side)
         guard deck.hasTrack else { return }
@@ -6558,7 +6571,15 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         context.coordinator.install(
             onSpace: {
                 Task { @MainActor in
-                    await model.loadBrowserSelectionIntoTargetDeck()
+                    // In rip review the side is the only thing on a
+                    // deck and there is no browser selection to load:
+                    // Space is play / pause, which is what the hands
+                    // reach for while placing splits (2026-09-23).
+                    if model.ripPhase == .review {
+                        model.ripTogglePlay()
+                    } else {
+                        await model.loadBrowserSelectionIntoTargetDeck()
+                    }
                 }
                 return true
             },

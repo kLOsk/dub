@@ -347,6 +347,9 @@ extension WaveformAppModel {
             if ripRecognition != next { ripRecognition = next }
         }
 
+        let playing = ripPlayingSegmentIndex()
+        if ripPlayingSegment != playing { ripPlayingSegment = playing }
+
         let gen = session.generation()
         if gen != ripLastGeneration {
             ripLastGeneration = gen
@@ -702,6 +705,19 @@ extension WaveformAppModel {
         }
     }
 
+    /// Drop a segment from the commit, or put it back. The audio stays
+    /// in the side archive either way — this is the plan, not the tape.
+    func setRipSegmentDropped(index: UInt32, dropped: Bool) {
+        guard let session = ripSession else { return }
+        do {
+            try session.setSegmentDropped(index: index, dropped: dropped)
+            ripSegments = session.segments()
+            ripLastGeneration = session.generation()
+        } catch {
+            surfaceError("Could not change the track: \(Self.describeRip(error))")
+        }
+    }
+
     /// Play / pause the captured side in review.
     ///
     /// It cancels the audition's auto-pause first: an audition is a
@@ -716,6 +732,45 @@ extension WaveformAppModel {
         } else {
             play(side: .a)
         }
+    }
+
+    /// Play one track of the side, or pause it if it is the one
+    /// running. **The whole track**, not a six-second listen — the
+    /// button on a card is that track's transport.
+    ///
+    /// Playing a track the playhead is already inside resumes from
+    /// where it sits rather than jumping to the top: in review the
+    /// playhead is usually where the DJ just put it, checking a split.
+    func ripTogglePlaySegment(index: UInt32) {
+        guard engineMode == .prep, deckA.hasTrack,
+              let seg = ripSegments.first(where: { $0.index == index })
+        else { return }
+        ripAuditionTask?.cancel()
+        ripAuditionTask = nil
+        let inside = ripPlayheadIsInside(seg)
+        if deckA.isPlaying, inside {
+            pause(side: .a)
+            return
+        }
+        if !inside { seekDeck(side: .a, absoluteSecs: max(0, seg.startSecs)) }
+        if !deckA.isPlaying { play(side: .a) }
+    }
+
+    private func ripPlayheadIsInside(_ seg: RipSegment) -> Bool {
+        let at = ripPlayheadSecs()
+        return at >= seg.startSecs - 0.05 && at < seg.endSecs
+    }
+
+    private func ripPlayheadSecs() -> Double {
+        max(0, engine.positionSnapshot(deckIdx: 0).playheadSecsUnclamped)
+    }
+
+    /// The segment the playhead is inside while the side rolls — the
+    /// one card that shows a pause glyph. `nil` when paused.
+    func ripPlayingSegmentIndex() -> UInt32? {
+        guard ripPhase == .review, deckA.isPlaying else { return nil }
+        let at = ripPlayheadSecs()
+        return ripSegments.first { at >= $0.startSecs - 0.05 && at < $0.endSecs }?.index
     }
 
     // MARK: Error text

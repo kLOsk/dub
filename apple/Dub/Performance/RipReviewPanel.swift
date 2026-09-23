@@ -6,7 +6,7 @@
 //  bar while a recorded side is being split, tagged, and imported.
 //  Header: side summary + "+ Split at playhead". Body: horizontally
 //  scrolling per-segment cards (duration chip, editable metadata
-//  debounced into the session, audition buttons). Footer: destructive
+//  debounced into the session, play + drop). Footer: destructive
 //  two-step Discard + the filled "Encode & Import ▸" action, which
 //  becomes per-segment progress dots + status (+ "Retry failed")
 //  once the commit worker runs.
@@ -24,6 +24,9 @@ struct RipSegmentUi: Equatable, Identifiable {
     let index: UInt32
     var startSecs: Double
     var endSecs: Double
+    /// Left out of the commit — the card dims and the overview marker
+    /// greys, but the audio stays in the side archive.
+    var dropped: Bool = false
     var title: String = ""
     var artist: String = ""
     var album: String = ""
@@ -83,9 +86,15 @@ struct RipReviewPanelState: Equatable {
     var overallStatus: String? = nil
     /// M26c recognition: `nil` until a pass has been asked for.
     var recognition: RipRecognitionUi? = nil
-    /// Whether deck A — which holds the captured side in review — is
-    /// playing. Drives the transport pill.
-    var isPlaying: Bool = false
+    /// The segment the side's playhead is inside, while it rolls.
+    /// `nil` when paused or outside every segment. One card shows a
+    /// pause glyph; the rest show play.
+    ///
+    /// An index rather than a playhead in seconds: the cards carry
+    /// live `TextField`s, and republishing a moving playhead at the
+    /// poll's 10 Hz would rebuild them all for a value none of them
+    /// prints.
+    var playingIndex: UInt32? = nil
 
     var hasFailedSegment: Bool { jobDots.contains(.failed) }
 
@@ -135,8 +144,10 @@ struct RipReviewPanelCallbacks {
     var autoSplit: () -> Void = {}
     /// Audition from an absolute side position (seconds).
     var audition: (Double) -> Void = { _ in }
-    /// Play / pause the side from wherever the playhead is.
-    var togglePlay: () -> Void = {}
+    /// Drop a segment from the commit, or put it back.
+    var setDropped: (UInt32, Bool) -> Void = { _, _ in }
+    /// Play a track, or pause it if it is the one running.
+    var togglePlay: (UInt32) -> Void = { _ in }
     var setMetadata: (UInt32, RipSegmentMetadata) -> Void = { _, _ in }
     var cancel: () -> Void = {}
     /// Ask AcoustID what these tracks are (M26c).
@@ -176,18 +187,11 @@ struct RipReviewPanel: View {
                 .foregroundStyle(DubColor.textSecondary)
             Spacer(minLength: 0)
             if state.mode == .review {
-                // Listening to the side is the first thing you do in
-                // review, and until 2026-09-22 there was no way to: the
-                // segment rows could audition six seconds at a time and
-                // that was the whole transport. The side is on deck A —
-                // this plays it.
-                Button(action: callbacks.togglePlay) {
-                    pillLabel(state.isPlaying ? "❙❙ Pause" : "▶ Play")
-                }
-                .buttonStyle(.plain)
-                .help(state.isPlaying
-                      ? "Pause the side"
-                      : "Play the side from the playhead")
+                // No panel-level transport: every card has one, and a
+                // second Play at the top only raised the question of
+                // what it played that the card's did not (2026-09-23).
+                // Space is the keyboard path, and it toggles whichever
+                // track the playhead is inside.
                 Button(action: callbacks.autoSplit) {
                     pillLabel("Auto-split")
                 }
@@ -257,11 +261,12 @@ struct RipReviewPanel: View {
                         onMetadata: { meta in
                             callbacks.setMetadata(segment.index, meta)
                         },
-                        onAuditionInto: {
-                            callbacks.audition(segment.startSecs)
+                        onTogglePlay: {
+                            callbacks.togglePlay(segment.index)
                         },
-                        onAuditionOutOf: {
-                            callbacks.audition(max(segment.startSecs, segment.endSecs - 6))
+                        isPlaying: state.playingIndex == segment.index,
+                        onToggleDropped: {
+                            callbacks.setDropped(segment.index, !segment.dropped)
                         })
                 }
             }
@@ -403,8 +408,7 @@ struct RipReviewPanel: View {
 // MARK: - Segment card
 
 /// One track-to-be: index + duration chip, editable metadata
-/// (debounced 300 ms into `onMetadata`), audition into / out-of
-/// buttons. Local `@State` mirrors the fields so typing never
+/// (debounced 300 ms into `onMetadata`), a play button and DROP. Local `@State` mirrors the fields so typing never
 /// round-trips through the 10 Hz session poll; the card re-seeds
 /// only when its segment boundaries change (a split edit re-sliced
 /// the side).
@@ -414,8 +418,12 @@ struct RipSegmentCard: View {
     var editable: Bool = true
     var jobDot: RipJobDot? = nil
     var onMetadata: (RipSegmentMetadata) -> Void = { _ in }
-    var onAuditionInto: () -> Void = {}
-    var onAuditionOutOf: () -> Void = {}
+    /// Play this track, or pause it if it is the one running.
+    var onTogglePlay: () -> Void = {}
+    /// Whether the side's playhead is inside this track *and* rolling.
+    var isPlaying: Bool = false
+    /// Drop this segment from the commit, or put it back.
+    var onToggleDropped: () -> Void = {}
 
     @State private var title: String
     @State private var artist: String
@@ -424,20 +432,24 @@ struct RipSegmentCard: View {
     @State private var year: String
     @State private var debounce: Task<Void, Never>? = nil
 
+    private var dropped: Bool { segment.dropped }
+
     init(
         segment: RipSegmentUi,
         editable: Bool = true,
         jobDot: RipJobDot? = nil,
         onMetadata: @escaping (RipSegmentMetadata) -> Void = { _ in },
-        onAuditionInto: @escaping () -> Void = {},
-        onAuditionOutOf: @escaping () -> Void = {}
+        onTogglePlay: @escaping () -> Void = {},
+        isPlaying: Bool = false,
+        onToggleDropped: @escaping () -> Void = {}
     ) {
         self.segment = segment
         self.editable = editable
         self.jobDot = jobDot
         self.onMetadata = onMetadata
-        self.onAuditionInto = onAuditionInto
-        self.onAuditionOutOf = onAuditionOutOf
+        self.onTogglePlay = onTogglePlay
+        self.isPlaying = isPlaying
+        self.onToggleDropped = onToggleDropped
         _title = State(initialValue: segment.title)
         _artist = State(initialValue: segment.artist)
         _album = State(initialValue: segment.album)
@@ -475,26 +487,35 @@ struct RipSegmentCard: View {
                     .frame(width: 56)
             }
             HStack(spacing: DubSpacing.xs) {
-                auditionButton("▶ IN", help: "Audition into this track",
-                               action: onAuditionInto)
-                auditionButton("▶ OUT", help: "Audition out of this track",
-                               action: onAuditionOutOf)
+                // The transport for *this* track. It was `▶ IN` beside
+                // a `▶ OUT` that played six seconds of the head and the
+                // tail; a DJ reads the first as "play this track", so
+                // that is what it now is — the whole track, and the
+                // glyph says whether it is running (2026-09-23).
+                iconButton(
+                    isPlaying ? "pause.fill" : "play.fill",
+                    help: isPlaying ? "Pause" : "Play this track",
+                    action: onTogglePlay)
                 Spacer(minLength: 0)
-                // R-49 — the question this audience asks straight after
-                // "what is it": what does it sample. Disabled until the
-                // card carries a name, which is what Identify fills in.
-                auditionButton(
-                    "SAMPLES", help: SampleLineage.helpText,
-                    action: { SampleLineage.lookUp(artist: artist, title: title) }
-                )
-                .disabled(sampleLookupUnavailable)
-                .opacity(sampleLookupUnavailable ? 0.4 : 1.0)
+                iconButton(
+                    dropped ? "arrow.uturn.backward" : "trash",
+                    help: dropped
+                        ? "Keep this one after all"
+                        : "Leave this one out — the audio stays in the side archive",
+                    tint: dropped ? DubColor.textSecondary : DubColor.stateError,
+                    action: onToggleDropped)
             }
         }
         .padding(DubSpacing.sm)
         .frame(width: 230)
         .background(DubColor.surface1)
         .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel))
+        // Dropped reads at a glance, and the fields stay legible — the
+        // DJ may be dropping it *because* of what they say.
+        .opacity(dropped ? 0.45 : 1.0)
+        .overlay(
+            RoundedRectangle(cornerRadius: DubRadius.panel)
+                .stroke(dropped ? DubColor.stateError.opacity(0.6) : .clear, lineWidth: 1))
         .onChange(of: title) { _ in metadataEdited() }
         .onChange(of: artist) { _ in metadataEdited() }
         .onChange(of: album) { _ in metadataEdited() }
@@ -531,13 +552,6 @@ struct RipSegmentCard: View {
         }
     }
 
-    /// R-49: the live field values, not `segment`'s, so a name the DJ
-    /// has just typed (or applied from Identify) is searchable without
-    /// waiting for the debounce to land it back on the plan.
-    private var sampleLookupUnavailable: Bool {
-        SampleLineage.whoSampledSearchURL(artist: artist, title: title) == nil
-    }
-
     private func field(_ placeholder: String, text: Binding<String>) -> some View {
         TextField(placeholder, text: text)
             .textFieldStyle(.plain)
@@ -551,15 +565,18 @@ struct RipSegmentCard: View {
             .opacity(editable ? 1.0 : 0.6)
     }
 
-    private func auditionButton(
-        _ label: String, help: String, action: @escaping () -> Void
+    /// A glyph, not a word. `DROP` needed reading; a bin does not.
+    private func iconButton(
+        _ symbol: String,
+        help: String,
+        tint: Color = DubColor.textSecondary,
+        action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            Text(label)
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textSecondary)
-                .padding(.horizontal, DubSpacing.sm)
-                .padding(.vertical, 2)
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 20, height: 16)
                 .background(DubColor.surface2)
                 .clipShape(Capsule())
         }

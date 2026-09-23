@@ -351,6 +351,16 @@ struct DeckHeader: View {
     var mirrored: Bool = false
     /// Prep mode shows BPM to two decimals; Performance mode one.
     var prepMode: Bool = false
+    /// A rip is capturing or in review: deck A holds the *whole side*
+    /// as one temporary track, so its BPM and key describe nothing a
+    /// DJ keeps — every track is measured on its own audio when it
+    /// encodes. The tap was worse than meaningless: it set a grid on
+    /// that temporary track, which encode throws away, and ½ / 2× did
+    /// nothing because it is not in the library (2026-09-23, from the
+    /// rig). Hidden in place rather than removed, so the header keeps
+    /// its fixed height and nothing jumps on the way in or out of a
+    /// rip; hidden views take no clicks, so the tap goes with them.
+    var hidesTempoAndKey: Bool = false
     /// Per-deck published surface for the open tap-tempo session.
     /// Drives the parenthesised count chip and the italic
     /// rolling-BPM preview in the BPM column. Deliberately
@@ -606,9 +616,10 @@ struct DeckHeader: View {
                     statColumn(label: "PITCH", value: formattedPitch)
                         .opacity(state.pitchSettled ? 1.0 : 0.45)
                 }
-                bpmStatColumn
-                    .opacity(state.pitchSettled ? 1.0 : 0.45)
-                statColumn(label: "KEY", value: formattedKey)
+                unlessRipping(
+                    bpmStatColumn
+                        .opacity(state.pitchSettled ? 1.0 : 0.45))
+                unlessRipping(statColumn(label: "KEY", value: formattedKey))
             } else {
                 // No platter in Prep, so pitch can only ever read
                 // `+0.0 %` — a readout with one possible value is noise.
@@ -616,14 +627,26 @@ struct DeckHeader: View {
                     statColumn(label: "PITCH", value: formattedPitch)
                         .opacity(state.pitchSettled ? 1.0 : 0.45)
                 }
-                bpmStatColumn
-                    .opacity(state.pitchSettled ? 1.0 : 0.45)
-                statColumn(label: "KEY", value: formattedKey)
+                unlessRipping(
+                    bpmStatColumn
+                        .opacity(state.pitchSettled ? 1.0 : 0.45))
+                unlessRipping(statColumn(label: "KEY", value: formattedKey))
                 Spacer(minLength: 0)
             }
         }
         .frame(maxWidth: .infinity,
                alignment: mirrored ? .trailing : .leading)
+    }
+
+    /// See `hidesTempoAndKey`: the slot keeps its size, the content
+    /// and its gestures go.
+    @ViewBuilder
+    private func unlessRipping<V: View>(_ view: V) -> some View {
+        if hidesTempoAndKey {
+            view.hidden()
+        } else {
+            view
+        }
     }
 
     /// Render the BPM column. The Stage-1 estimator delivers two

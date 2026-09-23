@@ -926,3 +926,71 @@ fn resplit_from_archive_replaces_the_earlier_tracks() {
     // The archive survives, so the side can be split again.
     assert!(session_dir.join("side.flac").exists());
 }
+
+/// A dropped segment does not reach the library — and everything
+/// around it still does.
+///
+/// A side is not all keepers: the lead-in chatter, a run-out the
+/// detector took for music, a track the DJ does not want. Before this
+/// the only recourse was to re-split the whole side (2026-09-23, from
+/// the rig). The audio stays in `side.flac`, so the decision is
+/// reversible by re-splitting; only the plan changes.
+#[test]
+fn a_dropped_segment_is_not_encoded_or_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("rip-session");
+    let mut cfg = RipConfig::new(SR, session_dir.clone());
+    cfg.poll_interval = Duration::from_millis(1);
+    let mut session = RipSession::new(cfg).unwrap();
+
+    let ring = HeapRb::<f32>::new(1 << 20);
+    let (mut tx, rx) = ring.split();
+    session.arm(rx).unwrap();
+    session.start().unwrap();
+    let side = synthetic_side();
+    let mut pushed = 0;
+    while pushed < side.len() {
+        pushed += tx.push_slice(&side[pushed..]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drain_then_stop(&mut session, 3 * seg_frames());
+    session.wait_stopped(Duration::from_secs(10)).unwrap();
+
+    session
+        .set_splits(vec![seg_frames(), 2 * seg_frames()])
+        .unwrap();
+    // Drop the middle one, which is the case a trim cannot express.
+    session.set_segment_dropped(1, true).unwrap();
+
+    // The flag is in the manifest, not in memory, so a crash mid-review
+    // cannot resurrect a dropped take. (Checked before the commit: a
+    // committed session has no spill left to reopen.)
+    {
+        let reloaded = RipSession::from_session_dir(session_dir.clone()).unwrap();
+        assert!(reloaded.manifest().tracks[1].dropped);
+        assert!(!reloaded.manifest().tracks[0].dropped);
+    }
+
+    let mut library = dub_library::Library::open_at(&dir.path().join("library.sqlite")).unwrap();
+    let outcome = session.commit(&mut library).unwrap();
+
+    let imported: Vec<usize> = outcome
+        .segments
+        .iter()
+        .filter(|s| s.library_uuid.is_some())
+        .map(|s| s.index)
+        .collect();
+    assert_eq!(
+        imported,
+        vec![0, 2],
+        "the dropped segment must not import, and its neighbours must"
+    );
+    assert!(
+        !outcome.segments.iter().any(|s| s.index == 1),
+        "a dropped segment reports no outcome at all"
+    );
+
+    // Its audio is still in the archive: dropping edits the plan, not
+    // the tape, so a re-split can bring it back.
+    assert!(session_dir.join("side.flac").exists());
+}

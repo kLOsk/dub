@@ -29,6 +29,22 @@ pub struct TrackEntry {
     /// Canonical library track UUID once imported. Presence makes
     /// the commit retry skip this segment.
     pub library_uuid: Option<String>,
+    /// Dropped by the DJ in review: the audio stays in the side
+    /// archive, but this segment is not encoded and not imported.
+    ///
+    /// A side is not all keepers. The lead-in chatter before the first
+    /// track, a run-out the detector took for music, a track you do
+    /// not want in the library — before this there was no way to say
+    /// so, and the only recourse was to re-split the whole side
+    /// (2026-09-23, from the rig). Dropping is not the same as
+    /// removing the split that made it: removing a boundary *merges*
+    /// two segments, which is the other thing the DJ wants some of the
+    /// time, and both are now expressible.
+    ///
+    /// `serde(default)` — manifests written before this simply keep
+    /// every segment, so the schema version does not move.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// The `rip.json` payload.
@@ -194,6 +210,7 @@ mod tests {
                 },
                 encoded_file: Some("01 Sound Dimension - Real Rock.flac".into()),
                 library_uuid: Some("abc-123".into()),
+                dropped: false,
             },
             TrackEntry::default(),
         ];

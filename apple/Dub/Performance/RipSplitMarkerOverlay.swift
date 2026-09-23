@@ -37,6 +37,11 @@ import SwiftUI
 struct RipMarkerUi: Equatable, Identifiable {
     let id: UInt32
     var secs: Double
+    /// The name of the track that *starts* here, once the DJ has typed
+    /// one into its card. A marker is otherwise an anonymous tick, and
+    /// on a side with six of them the only way to tell which is which
+    /// was to count (2026-09-23, from the rig).
+    var label: String = ""
 }
 
 /// Where the side begins and ends inside the capture. The lead-in
@@ -163,6 +168,9 @@ struct RipSplitMarkerOverlay: View {
                         selected: selection == .split(marker.id),
                         height: geo.size.height)
                         .position(x: x, y: geo.size.height * 0.5)
+                        .overlay(alignment: .topLeading) {
+                            markerLabel(marker, x: x, width: geo.size.width)
+                        }
                         .contextMenu {
                             Button("Remove Split", role: .destructive) {
                                 callbacks.removeSplit(marker.id)
@@ -201,6 +209,29 @@ struct RipSplitMarkerOverlay: View {
                     .onEnded { value in
                         handleDragEnded(value, size: geo.size)
                     })
+        }
+    }
+
+    /// The track name beside its marker, riding the line's top edge.
+    ///
+    /// It hangs to the *right* of the marker because a marker is where
+    /// that track begins, and it is clipped to what is left of the
+    /// band so a long name near the run-out cannot run off the end.
+    @ViewBuilder
+    private func markerLabel(_ marker: RipMarkerUi, x: CGFloat, width: CGFloat) -> some View {
+        if !marker.label.isEmpty {
+            Text(marker.label)
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 3)
+                .background(DubColor.surface0.opacity(0.75))
+                .clipShape(RoundedRectangle(cornerRadius: 2))
+                .frame(maxWidth: max(24, width - x - 6), alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .offset(x: x + 4, y: 2)
+                .allowsHitTesting(false)
         }
     }
 

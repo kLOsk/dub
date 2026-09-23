@@ -502,7 +502,13 @@ pub use rip::{
 ///       the raw peak of whichever block was last. The old field read a
 ///       different transient every poll — "super jumpy and often clipped"
 ///       on the rig — and a clip that lasts one poll is one nobody sees.
-pub const FFI_VERSION: u32 = 77;
+///   78. **A rip segment can be dropped.**
+///       `DubRipSession::set_segment_dropped` and `RipSegment.dropped`: a
+///       dropped segment keeps its place in the plan and its audio in the
+///       side archive, but is not encoded or imported. Removing a split
+///       *merges* two segments; this discards one — both edits a DJ needs
+///       once a side is split (2026-09-23).
+pub const FFI_VERSION: u32 = 78;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -6301,7 +6307,8 @@ mod tests {
         // `DeckTelemetry.input_rms` / `input_peak`.
         // 76→77: rip capture meter ballistics —
         // `RipSessionStatus.level_rms` / `clipped_secs_ago`.
-        assert_eq!(FFI_VERSION, 77);
+        // 77→78: `set_segment_dropped`, `RipSegment.dropped`.
+        assert_eq!(FFI_VERSION, 78);
     }
 
     #[test]

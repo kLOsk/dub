@@ -258,6 +258,9 @@ pub struct RipSegment {
     pub genre: Option<String>,
     /// Release year, if set.
     pub year: Option<i32>,
+    /// Dropped in review: stays in the plan and in the side archive,
+    /// but is not encoded and not imported.
+    pub dropped: bool,
 }
 
 /// Commit progress for one segment. M26a reports coarse progress —
@@ -1512,13 +1515,11 @@ impl DubRipSession {
             .iter()
             .enumerate()
             .map(|(i, range)| {
-                let meta = manifest
-                    .tracks
-                    .get(i)
-                    .map(|t| t.meta.clone())
-                    .unwrap_or_default();
+                let entry = manifest.tracks.get(i);
+                let meta = entry.map(|t| t.meta.clone()).unwrap_or_default();
                 RipSegment {
                     index: u32::try_from(i).unwrap_or(u32::MAX),
+                    dropped: entry.is_some_and(|t| t.dropped),
                     start_secs: frames_to_secs(range.start, self.sample_rate),
                     end_secs: frames_to_secs(range.end, self.sample_rate),
                     title: meta.title,
@@ -1529,6 +1530,38 @@ impl DubRipSession {
                 }
             })
             .collect()
+    }
+
+    /// Drop a segment from the commit, or put it back.
+    ///
+    /// The lead-in chatter, a run-out the detector took for music, a
+    /// track you do not want in the library: the audio stays in the
+    /// side archive and the indices do not shift, so nothing moves
+    /// under the DJ and a re-split brings it back. Removing the
+    /// *boundary* instead merges two segments — a different edit, and
+    /// both are needed.
+    ///
+    /// # Errors
+    ///
+    /// [`RipFfiError::InvalidSegment`] for an out-of-range index;
+    /// [`RipFfiError::InvalidState`] while recording / after commit.
+    pub fn set_segment_dropped(&self, index: u32, dropped: bool) -> Result<(), RipFfiError> {
+        self.guard_mutable()?;
+        self.sync_if_terminal();
+        {
+            let mut session = lock_mutex(&self.session);
+            // Same materialisation as `set_segment_metadata`: an
+            // unsplit side has no track entries until the first
+            // `set_splits`.
+            if session.manifest().tracks.is_empty() {
+                session.set_splits(Vec::new()).map_err(map_rip_error)?;
+            }
+            session
+                .set_segment_dropped(usize_from_u64(u64::from(index)), dropped)
+                .map_err(map_rip_error)?;
+        }
+        self.bump_generation();
+        Ok(())
     }
 
     /// Set one segment's metadata (tagged into the encoded FLAC and

@@ -214,6 +214,9 @@ extension PerformanceView {
     ) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
         let orientation = waveformOrientation
+        // Deck A holds the captured side during review, and the strip
+        // shows its splits rather than the spill's (absent) hot cues.
+        let ripReviewing = side == .a && model.ripPhase == .review
         let content = Group {
             if hasSource {
                 WaveformView(
@@ -239,9 +242,19 @@ extension PerformanceView {
                     // renderer can fold the load gain into the picture
                     // (`RendererAppearance.displayGain`); it is off at
                     // the DJ's request, so the lane shows the file.
-                    hotCues: deckState.hotCues.compactMap { cue in
-                        cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
-                    },
+                    // Split markers ride the cue-marker pass during rip
+                    // review: they are the same thing to the renderer —
+                    // a full-height line at a track position — and the
+                    // DJ was placing splits against an overview band
+                    // while the strip beside it, the one with the
+                    // detail, showed nothing (2026-09-23).
+                    hotCues: ripReviewing
+                        ? model.ripSplits.map {
+                            HotCueMarker(secs: $0.secs, colorToken: "aqua")
+                        }
+                        : deckState.hotCues.compactMap { cue in
+                            cue.map { HotCueMarker(secs: $0.positionSecs, colorToken: $0.color) }
+                        },
                     loopActive: deckState.loopActive,
                     loopInSecs: deckState.loopInSecs,
                     loopOutSecs: deckState.loopOutSecs)
