@@ -502,6 +502,27 @@ enum DubLayout {
     /// that the sidebar's ceiling fits inside it at 960 pt.
     static let libraryTrackPaneMinWidth: CGFloat = 480
 
+    /// A filter box in the library's FILTER bar. The boxes used to be a
+    /// flat 168 pt each, which is two different wrongs at once: GENRE
+    /// and COMMENT truncate every row, while COLOUR and RATING sit
+    /// half empty. They size to their content now
+    /// (`LibraryFilterBoxWidth.width`) and clamp here.
+    ///
+    /// The ceiling was doubled after the first rig look (2026-09-22):
+    /// measuring the content alone left the wide boxes no room to grow
+    /// past the flat 168 they replaced, which read as a regression.
+    /// The floor came back down the same evening — with a high ceiling
+    /// the boxes that need width have it, and holding KEY and RATING at
+    /// a wide floor just spends the bar on white space.
+    ///
+    /// The ceiling is the point past which one box starts costing a
+    /// whole other box on screen — the bar scrolls horizontally, so a
+    /// runaway value would otherwise push everything after it out of
+    /// reach.
+    static let libraryFilterBoxMinWidth: CGFloat = 120
+    static let libraryFilterBoxMaxWidth: CGFloat = 520
+    static let libraryFilterBoxHeight: CGFloat = 150
+
     /// Ideal width of each deck's playing waveform in Performance
     /// (Timecode) mode — the strip's *width* is the equivalent of
     /// Serato Scratch Live's playing-waveform height, translated into

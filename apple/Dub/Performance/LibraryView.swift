@@ -614,6 +614,61 @@ private struct LibraryFacetValue: Identifiable {
     var id: String { value ?? "\u{0000}none" }
 }
 
+/// How wide a filter box has to be to show its own rows.
+///
+/// A flat width is two wrongs at once: GENRE and COMMENT truncate every
+/// row while COLOUR and RATING sit half empty. The box asks its content
+/// instead — the widest of the header and its rows — and clamps to
+/// `DubLayout.libraryFilterBox{Min,Max}Width`.
+///
+/// Measured with `NSString.size(withAttributes:)` rather than left to
+/// SwiftUI's ideal-width negotiation: the bar is a horizontal
+/// `ScrollView`, which offers its content unbounded width, and a
+/// greedy row inside an unbounded proposal has no width to be ideal
+/// about. Measuring is also what makes this testable without a host
+/// view. Same idiom as `LibraryTable`'s drag-image sizing.
+enum LibraryFilterBoxWidth {
+
+    /// Row furniture: the checkbox, the gap after it, the gap before
+    /// the count, and the row's own horizontal padding.
+    private static let rowChrome: CGFloat = 9 + DubSpacing.xs + DubSpacing.xs + DubSpacing.sm * 2
+    /// The colour box's swatch and its gap — only `.color` draws one.
+    private static let swatch: CGFloat = 9 + DubSpacing.xs
+    /// The header's own padding, plus the clear button that appears
+    /// there once the box has a selection. Reserved always: a box must
+    /// not change width when you tick a row in it.
+    private static let headerChrome: CGFloat = DubSpacing.sm * 2 + DubSpacing.xs + 9
+
+    private static let rowFont = NSFont.systemFont(ofSize: 11, weight: .regular)
+    private static let headerFont = NSFont.systemFont(ofSize: 11, weight: .regular)
+
+    private static func width(_ text: String, _ font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    /// `labels` are the row texts, `counts` their counts (same order, or
+    /// empty for a box whose rows carry none). `header` is the box's
+    /// title. The result is already clamped.
+    static func width(
+        header: String,
+        labels: [String],
+        counts: [Int],
+        hasSwatch: Bool
+    ) -> CGFloat {
+        var widest = width(header.uppercased(), headerFont) + headerChrome
+        for (i, label) in labels.enumerated() {
+            let count = i < counts.count ? counts[i] : 0
+            var w = width(label, rowFont) + rowChrome
+            w += width("\(count)", rowFont)
+            if hasSwatch { w += swatch }
+            widest = max(widest, w)
+        }
+        return min(
+            max(widest.rounded(.up), DubLayout.libraryFilterBoxMinWidth),
+            DubLayout.libraryFilterBoxMaxWidth)
+    }
+}
+
 /// One BPM bucket row: the bucket and its cascaded count.
 private struct LibraryBpmBucketCount: Identifiable {
     let bucket: BpmBucket
@@ -1830,9 +1885,37 @@ struct LibraryView: View {
             Divider().overlay(DubColor.divider)
             filterBoxBody(field)
         }
-        .frame(width: 168, height: 150, alignment: .top)
+        .frame(
+            width: filterBoxWidth(field),
+            height: DubLayout.libraryFilterBoxHeight,
+            alignment: .top)
         .background(RoundedRectangle(cornerRadius: 4).fill(DubColor.surface2))
         .overlay(RoundedRectangle(cornerRadius: 4).stroke(DubColor.divider, lineWidth: 1))
+    }
+
+    /// The box's width, from what is actually in it. Recomputed when the
+    /// facets change — the values cascade as other boxes are ticked, so
+    /// a box narrows once its list does.
+    private func filterBoxWidth(_ field: LibraryFilterField) -> CGFloat {
+        switch field.kind {
+        case .categorical:
+            let values = facets[field] ?? []
+            return LibraryFilterBoxWidth.width(
+                header: field.headerLabel,
+                labels: values.map { $0.value ?? "(none)" },
+                counts: values.map(\.count),
+                hasSwatch: field == .color)
+        case .bpmBuckets:
+            return LibraryFilterBoxWidth.width(
+                header: field.headerLabel,
+                labels: bpmBucketFacet.map(\.bucket.label),
+                counts: bpmBucketFacet.map(\.count),
+                hasSwatch: false)
+        case .ratingThreshold:
+            // Five stars and "Any rating" — no list to measure, and the
+            // floor already clears both.
+            return DubLayout.libraryFilterBoxMinWidth
+        }
     }
 
     @ViewBuilder
