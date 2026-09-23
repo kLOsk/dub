@@ -168,9 +168,16 @@ pub struct RipSessionStatus {
     pub elapsed_secs: f64,
     /// Frames written to the spill so far.
     pub recorded_frames: u64,
-    /// Absolute peak of the most recent capture window — the level
-    /// meter while recording. `0.0` once capture ends.
+    /// Peak-hold level with a 20 dB/s fall, `[0, 1]` — the level
+    /// meter's marker while recording. `0.0` once capture ends.
     pub level_peak: f32,
+    /// Smoothed (300 ms) RMS, `[0, 1]` — the level meter's bar.
+    /// Peak answers "did it clip"; this answers "how loud is it".
+    pub level_rms: f32,
+    /// Seconds since the take last hit full scale, or `None` if it
+    /// never has. The UI latches its clip warning off this instead of
+    /// off one poll's peak, which flickers.
+    pub clipped_secs_ago: Option<f64>,
     /// Failure message when `phase == Failed`.
     pub error: Option<String>,
     /// Where the side starts, in seconds. The lead-in groove before
@@ -1195,6 +1202,8 @@ impl DubRipSession {
                 elapsed_secs: 0.0,
                 recorded_frames: 0,
                 level_peak: 0.0,
+                level_rms: 0.0,
+                clipped_secs_ago: None,
                 error: None,
                 side_start_secs: 0.0,
                 side_end_secs: 0.0,
@@ -1230,6 +1239,8 @@ impl DubRipSession {
                 elapsed_secs,
                 recorded_frames,
                 level_peak: 0.0,
+                level_rms: 0.0,
+                clipped_secs_ago: None,
                 error,
                 side_start_secs,
                 side_end_secs,
@@ -1251,6 +1262,10 @@ impl DubRipSession {
             elapsed_secs: s.elapsed_secs,
             recorded_frames: s.recorded_frames,
             level_peak: s.window_peak,
+            level_rms: s.window_rms,
+            clipped_secs_ago: s
+                .clipped_frames_ago
+                .map(|f| frames_to_secs(f, self.sample_rate)),
             error: s.failure,
             side_start_secs,
             side_end_secs,

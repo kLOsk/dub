@@ -61,9 +61,26 @@ pub(crate) struct CaptureShared {
     pub(crate) state: AtomicU8,
     pub(crate) command: AtomicU8,
     pub(crate) recorded_frames: AtomicU64,
-    /// |peak| of the most recent poll window while recording
-    /// (f32 bits). Drives the UI level meter.
+    /// Peak-hold level with a decay, `[0, 1]` (f32 bits). Drives the
+    /// UI meter's peak marker.
+    ///
+    /// **This used to be the raw peak of whatever block happened to be
+    /// last**, overwritten every drain and sampled by the UI at 10 Hz,
+    /// which is a meter reading a different transient every poll: on
+    /// the rig it "was super jumpy and often clipped" (2026-09-22). A
+    /// meter needs ballistics — the peak rises instantly and falls at
+    /// a fixed rate, the way every hardware meter has since the VU.
     pub(crate) window_peak_bits: AtomicU32,
+    /// Smoothed RMS, `[0, 1]` (f32 bits) — the meter's *bar*. Peak
+    /// says "did it clip", RMS says "how loud is it", and a bar driven
+    /// by peak alone is unreadable on music.
+    pub(crate) window_rms_bits: AtomicU32,
+    /// Frames recorded at the last sample at or over full scale, or
+    /// `u64::MAX` for "never". The UI latches its clip warning for a
+    /// couple of seconds off this: a clip is a fact about the take
+    /// that outlives the block it happened in, and a flash that lasts
+    /// one poll is one a DJ watching the record will miss.
+    pub(crate) clipped_at_frames: AtomicU64,
     pub(crate) stop_reason: AtomicU8,
     pub(crate) envelope: Mutex<Vec<PeakChunk>>,
     pub(crate) failure: Mutex<Option<String>>,
@@ -76,6 +93,8 @@ impl CaptureShared {
             command: AtomicU8::new(CMD_NONE),
             recorded_frames: AtomicU64::new(0),
             window_peak_bits: AtomicU32::new(0),
+            window_rms_bits: AtomicU32::new(0),
+            clipped_at_frames: AtomicU64::new(u64::MAX),
             stop_reason: AtomicU8::new(REASON_NONE),
             envelope: Mutex::new(Vec::new()),
             failure: Mutex::new(None),
@@ -335,9 +354,14 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
                     // sized for exactly that), so feed it in blocks.
                     for part in [older, newer] {
                         for block in part.chunks(SCRATCH_SAMPLES) {
-                            if let Err(e) =
-                                append(shared, &mut writer, &mut decimator, &mut mono, block)
-                            {
+                            if let Err(e) = append(
+                                shared,
+                                &mut writer,
+                                &mut decimator,
+                                &mut mono,
+                                block,
+                                cfg.sample_rate,
+                            ) {
                                 shared.fail(e);
                                 let _ = writer.finalize();
                                 return;
@@ -355,6 +379,7 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
                 &mut decimator,
                 &mut mono,
                 &scratch[..n],
+                cfg.sample_rate,
             ) {
                 shared.fail(e);
                 let _ = writer.finalize();
@@ -400,6 +425,7 @@ fn run(rx: &mut HeapCons<f32>, shared: &CaptureShared, cfg: &CaptureConfig) {
                 &mut decimator,
                 &mut mono,
                 &scratch[..n],
+                cfg.sample_rate,
             ) {
                 shared.fail(e);
                 let _ = writer.finalize();
@@ -425,6 +451,7 @@ fn append(
     decimator: &mut Decimator,
     mono: &mut [f32],
     block: &[f32],
+    sample_rate: u32,
 ) -> Result<(), String> {
     // `block` must fit the caller's mono scratch — at most
     // `SCRATCH_SAMPLES`. The pre-roll flush chunks for this reason.
@@ -451,13 +478,72 @@ fn append(
         decimator.feed(&mono[..frames], |chunk| envelope.push(chunk));
     }
 
-    shared
+    let recorded = shared
         .recorded_frames
-        .fetch_add(frames as u64, Ordering::AcqRel);
+        .fetch_add(frames as u64, Ordering::AcqRel)
+        + frames as u64;
+
+    publish_meter(
+        shared,
+        peak,
+        block_rms(&block[..samples]),
+        frames,
+        sample_rate,
+        recorded,
+    );
+    Ok(())
+}
+
+/// Clip threshold. A sample at or past this is at full scale — the
+/// converter had nowhere left to go.
+const CLIP_LEVEL: f32 = 0.999;
+
+/// How fast the peak marker falls, in dB per second. The IEC/VU
+/// convention is 20 dB in 1.7 s for a PPM's return; 20 dB/s is the
+/// faster end of that and is what the deck's own input meter uses
+/// (`dub-engine`'s `InputMeter`), so the two read alike.
+const PEAK_FALL_DB_PER_SEC: f32 = 20.0;
+
+/// RMS averaging time. 300 ms is the VU integration the deck meter
+/// uses; on music it gives a bar that moves with the tune rather than
+/// with every snare.
+const RMS_TAU_SECS: f32 = 0.3;
+
+/// Fold one block into the meter the UI reads: peak-hold with decay,
+/// smoothed RMS, and a latched clip position.
+///
+/// Both ballistics are computed from the block's *duration*, not per
+/// block, because a block is whatever the ring handed over — the
+/// meter must fall at the same rate whether it arrives in 64-frame
+/// or 4096-frame lumps.
+fn publish_meter(
+    shared: &CaptureShared,
+    peak: f32,
+    rms: f32,
+    frames: usize,
+    sample_rate: u32,
+    recorded_frames: u64,
+) {
+    #[allow(clippy::cast_precision_loss)]
+    let dt = frames as f32 / sample_rate.max(1) as f32;
+
+    let held = f32::from_bits(shared.window_peak_bits.load(Ordering::Acquire));
+    let decayed = held * 10.0_f32.powf(-PEAK_FALL_DB_PER_SEC * dt / 20.0);
     shared
         .window_peak_bits
-        .store(peak.to_bits(), Ordering::Release);
-    Ok(())
+        .store(peak.max(decayed).to_bits(), Ordering::Release);
+
+    let prev = f32::from_bits(shared.window_rms_bits.load(Ordering::Acquire));
+    let alpha = 1.0 - (-dt / RMS_TAU_SECS).exp();
+    shared
+        .window_rms_bits
+        .store((prev + alpha * (rms - prev)).to_bits(), Ordering::Release);
+
+    if peak >= CLIP_LEVEL {
+        shared
+            .clipped_at_frames
+            .store(recorded_frames, Ordering::Release);
+    }
 }
 
 /// Absolute peak of one drained block. The right statistic for the
@@ -550,6 +636,93 @@ mod tests {
     use crate::AutoCapture;
 
     const SR: u32 = 44_100;
+
+    /// The meter has ballistics: the peak jumps to a transient and
+    /// then *falls at a fixed rate*, so the UI is reading a level
+    /// rather than whichever block it happened to sample. Before this
+    /// the field was the raw peak of the last block, which on the rig
+    /// read "super jumpy and often clipped".
+    #[test]
+    fn the_peak_holds_then_falls_at_twenty_db_per_second() {
+        let shared = CaptureShared::new();
+        // One loud block, then silence for a second.
+        publish_meter(&shared, 1.0, 0.5, 1024, SR, 1024);
+        let after_hit = f32::from_bits(shared.window_peak_bits.load(Ordering::Acquire));
+        assert!(
+            (after_hit - 1.0).abs() < 1e-6,
+            "peak did not take the transient"
+        );
+
+        let block = SR as usize / 10; // 100 ms
+        for _ in 0..10 {
+            publish_meter(&shared, 0.0, 0.0, block, SR, 0);
+        }
+        let after_a_second = f32::from_bits(shared.window_peak_bits.load(Ordering::Acquire));
+        // 20 dB down is a factor of 10.
+        assert!(
+            (after_a_second - 0.1).abs() < 0.01,
+            "peak fell to {after_a_second}, expected ~0.1 after 1 s at 20 dB/s"
+        );
+    }
+
+    /// The fall rate is per *second*, not per block — the ring hands
+    /// over whatever it has, and a meter that decayed per call would
+    /// fall at the mercy of the block size.
+    #[test]
+    fn the_fall_does_not_depend_on_the_block_size() {
+        let coarse = CaptureShared::new();
+        publish_meter(&coarse, 1.0, 0.0, 1, SR, 0);
+        publish_meter(&coarse, 0.0, 0.0, SR as usize / 2, SR, 0);
+
+        let fine = CaptureShared::new();
+        publish_meter(&fine, 1.0, 0.0, 1, SR, 0);
+        for _ in 0..50 {
+            publish_meter(&fine, 0.0, 0.0, SR as usize / 100, SR, 0);
+        }
+        let a = f32::from_bits(coarse.window_peak_bits.load(Ordering::Acquire));
+        let b = f32::from_bits(fine.window_peak_bits.load(Ordering::Acquire));
+        assert!(
+            (a - b).abs() < 0.01,
+            "half a second fell to {a} in one block and {b} in fifty"
+        );
+    }
+
+    /// The RMS bar smooths; it does not chase the block.
+    #[test]
+    fn the_rms_bar_settles_rather_than_jumping() {
+        let shared = CaptureShared::new();
+        let block = SR as usize / 100; // 10 ms
+        publish_meter(&shared, 0.9, 0.5, block, SR, 0);
+        let first = f32::from_bits(shared.window_rms_bits.load(Ordering::Acquire));
+        assert!(
+            first < 0.1,
+            "one 10 ms block moved the bar to {first} of a 0.5 signal"
+        );
+        for _ in 0..200 {
+            publish_meter(&shared, 0.9, 0.5, block, SR, 0);
+        }
+        let settled = f32::from_bits(shared.window_rms_bits.load(Ordering::Acquire));
+        assert!(
+            (settled - 0.5).abs() < 0.02,
+            "bar settled at {settled}, expected ~0.5"
+        );
+    }
+
+    /// A clip is a fact about the take, and the UI latches off *when*
+    /// it happened rather than off one poll's peak.
+    #[test]
+    fn a_clip_is_remembered_with_its_position() {
+        let shared = CaptureShared::new();
+        assert_eq!(shared.clipped_at_frames.load(Ordering::Acquire), u64::MAX);
+        publish_meter(&shared, 0.98, 0.4, 512, SR, 10_000);
+        assert_eq!(
+            shared.clipped_at_frames.load(Ordering::Acquire),
+            u64::MAX,
+            "0.98 is hot, not clipped"
+        );
+        publish_meter(&shared, 1.0, 0.4, 512, SR, 20_000);
+        assert_eq!(shared.clipped_at_frames.load(Ordering::Acquire), 20_000);
+    }
 
     fn push(out: &mut Vec<f32>, secs: f64, amp: f32) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

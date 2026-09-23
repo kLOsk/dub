@@ -62,21 +62,24 @@ final class RipSnapshotTests: XCTestCase {
     /// M26b: armed and waiting for the needle. The meter is live so a
     /// silent input is visibly silent before the trigger ever fires.
     func test_prepRipBar_armed() {
-        let state = PrepRipBarState(phase: .armed, levelPeak: 0.02)
+        let state = PrepRipBarState(phase: .armed, levelPeak: 0.02, levelRms: 0.01)
         snap(deckBg(PrepRipBar(state: state)),
              width: 720, height: 64, named: "armed")
     }
 
     func test_prepRipBar_recording() {
         let state = PrepRipBarState(
-            phase: .recording, elapsedSecs: 754, levelPeak: 0.72)
+            phase: .recording, elapsedSecs: 754, levelPeak: 0.72, levelRms: 0.41)
         snap(deckBg(PrepRipBar(state: state)),
              width: 720, height: 64, named: "recording")
     }
 
     func test_prepRipBar_recording_clipping() {
+        // Clipping is latched off "when did it last hit full scale",
+        // not off this poll's peak.
         let state = PrepRipBarState(
-            phase: .recording, elapsedSecs: 61, levelPeak: 0.995)
+            phase: .recording, elapsedSecs: 61, levelPeak: 0.995, levelRms: 0.78,
+            clippedSecsAgo: 0.4)
         snap(deckBg(PrepRipBar(state: state)),
              width: 720, height: 64, named: "recording-clip")
     }

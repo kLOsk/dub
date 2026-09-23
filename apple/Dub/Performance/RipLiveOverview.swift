@@ -6,8 +6,17 @@
 //  slot while a rip records. A horizontal Canvas fed by incremental
 //  `DubRipSession.envelopeExtend(startIdx:)` pulls on a ~1 Hz
 //  TimelineView: the packed 12-byte (min, max, rms) chunks are the
-//  same wire format as `peaksExtend`, so the accumulated buffer is
-//  re-decimated to 480 buckets with the shared `OverviewDecimator`.
+//  same wire format as `peaksExtend`.
+//
+//  **The accumulation is tiled, not kept raw.** It used to hold every
+//  chunk and re-decimate the whole buffer on every tick, on the main
+//  thread. A chunk is 64 samples, so a side arrives at 750 of them a
+//  second: ten minutes in, each tick walked 450 000 chunks and a ~5 MB
+//  `Data` grew under it, and the cost rose for as long as the record
+//  played. That is the recording session where "the UI was very laggy
+//  and the overview updated every 2 seconds" (2026-09-22). Incoming
+//  chunks are folded into fixed-length tiles once, and only the tiles
+//  — a few thousand for a whole side — are re-bucketed per tick.
 //
 //  Split into a live driver (`RipLiveOverview`, owns the fetch +
 //  accumulation) and a pure Canvas (`RipLiveOverviewCanvas`) so the
@@ -121,6 +130,106 @@ struct RipLiveOverviewCanvas: View {
 
 /// Live driver: accumulates the packed envelope chunks and
 /// re-decimates on a ~1 Hz cadence while mounted.
+/// Folds the capture's packed peak chunks into fixed-length tiles as
+/// they arrive, and hands out a bucket list on demand.
+///
+/// **Why tiles.** The bucket boundaries move as the side grows — 480
+/// buckets over ten minutes is not 480 buckets over twenty — so the
+/// bucket pass cannot be incremental. The *tiles* can: a tile is a
+/// fixed number of chunks, so a chunk lands in exactly one tile and
+/// never moves. Per tick the work is then the new chunks (a second's
+/// worth) plus a walk over the tiles, instead of a walk over every
+/// chunk since the needle dropped.
+///
+/// `tileChunks` is the whole trade-off. At 64 samples a chunk and
+/// 48 kHz, 128 chunks is ~0.17 s — finer than a bucket stays until a
+/// side runs past ~80 minutes, which is longer than any side and
+/// longer than the session cap. Coarser tiles would start visibly
+/// flattening transients in the live shape.
+struct RipEnvelopeTiler {
+
+    /// Chunks per tile. See the note above before changing it.
+    static let tileChunks = 128
+    /// The packed wire stride: `(min, max, rms)` as three `Float`s.
+    static let chunkStride = MemoryLayout<Float>.size * 3
+
+    private(set) var tiles: [OverviewBucket] = []
+    /// Chunks consumed so far — what `envelopeExtend` wants as its
+    /// start index.
+    private(set) var chunksFetched: UInt64 = 0
+    /// The tile still filling: its running peak, its summed squares
+    /// and how many chunks are in it.
+    private var partialPeak: Float = 0
+    private var partialRmsSq: Float = 0
+    private var partialCount = 0
+
+    /// Fold a fresh `envelopeExtend` payload in. Whole tiles are
+    /// published; the remainder stays pending until the chunks that
+    /// complete it arrive, so a tile is never published twice.
+    mutating func feed(_ data: Data) {
+        let count = data.count / Self.chunkStride
+        guard count > 0 else { return }
+        chunksFetched &+= UInt64(count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            for i in 0..<count {
+                let p = base.advanced(by: i * Self.chunkStride)
+                    .assumingMemoryBound(to: Float.self)
+                let amp = max(abs(p[0]), abs(p[1]))
+                let rms = p[2]
+                if amp > partialPeak { partialPeak = amp }
+                partialRmsSq += rms * rms
+                partialCount += 1
+                if partialCount == Self.tileChunks { closeTile() }
+            }
+        }
+    }
+
+    private mutating func closeTile() {
+        guard partialCount > 0 else { return }
+        tiles.append(
+            OverviewBucket(
+                peak: partialPeak,
+                rms: (partialRmsSq / Float(partialCount)).squareRoot()))
+        partialPeak = 0
+        partialRmsSq = 0
+        partialCount = 0
+    }
+
+    /// The live shape: the closed tiles plus whatever is in the tile
+    /// still filling, reduced to `count` buckets. Including the
+    /// partial one is what keeps the leading edge moving between tile
+    /// boundaries instead of stepping a tile at a time.
+    func buckets(count: Int) -> [OverviewBucket] {
+        guard count > 0 else { return [] }
+        var src = tiles
+        if partialCount > 0 {
+            src.append(
+                OverviewBucket(
+                    peak: partialPeak,
+                    rms: (partialRmsSq / Float(partialCount)).squareRoot()))
+        }
+        guard !src.isEmpty else { return [] }
+        guard src.count > count else { return src }
+        var out = [OverviewBucket](repeating: OverviewBucket(peak: 0, rms: 0), count: count)
+        for b in 0..<count {
+            let start = (b * src.count) / count
+            let end = max(start + 1, ((b + 1) * src.count) / count)
+            var peak: Float = 0
+            var rmsSq: Float = 0
+            var n = 0
+            for i in start..<min(end, src.count) {
+                if src[i].peak > peak { peak = src[i].peak }
+                rmsSq += src[i].rms * src[i].rms
+                n += 1
+            }
+            out[b] = OverviewBucket(
+                peak: peak, rms: n > 0 ? (rmsSq / Float(n)).squareRoot() : 0)
+        }
+        return out
+    }
+}
+
 struct RipLiveOverview: View {
 
     /// `envelopeExtend(startIdx:)` — takes the number of chunks
@@ -130,7 +239,7 @@ struct RipLiveOverview: View {
     /// Bucket cap, matching `TrackOverviewView`'s overview.
     private static let bucketCount = 480
 
-    @State private var raw = Data()
+    @State private var tiler = RipEnvelopeTiler()
     @State private var buckets: [OverviewBucket] = []
 
     var body: some View {
@@ -144,12 +253,10 @@ struct RipLiveOverview: View {
     }
 
     private func fetchMore() {
-        let stride = MemoryLayout<Float>.size * 3
-        let fetched = UInt64(raw.count / stride)
-        let more = fetchEnvelope(fetched)
+        let more = fetchEnvelope(tiler.chunksFetched)
         guard !more.isEmpty || buckets.isEmpty else { return }
-        raw.append(more)
-        buckets = OverviewDecimator.decimate(data: raw, bucketCount: Self.bucketCount)
+        tiler.feed(more)
+        buckets = tiler.buckets(count: Self.bucketCount)
     }
 }
 

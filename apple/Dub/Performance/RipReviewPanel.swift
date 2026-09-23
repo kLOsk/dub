@@ -83,6 +83,9 @@ struct RipReviewPanelState: Equatable {
     var overallStatus: String? = nil
     /// M26c recognition: `nil` until a pass has been asked for.
     var recognition: RipRecognitionUi? = nil
+    /// Whether deck A — which holds the captured side in review — is
+    /// playing. Drives the transport pill.
+    var isPlaying: Bool = false
 
     var hasFailedSegment: Bool { jobDots.contains(.failed) }
 
@@ -132,6 +135,8 @@ struct RipReviewPanelCallbacks {
     var autoSplit: () -> Void = {}
     /// Audition from an absolute side position (seconds).
     var audition: (Double) -> Void = { _ in }
+    /// Play / pause the side from wherever the playhead is.
+    var togglePlay: () -> Void = {}
     var setMetadata: (UInt32, RipSegmentMetadata) -> Void = { _, _ in }
     var cancel: () -> Void = {}
     /// Ask AcoustID what these tracks are (M26c).
@@ -171,6 +176,18 @@ struct RipReviewPanel: View {
                 .foregroundStyle(DubColor.textSecondary)
             Spacer(minLength: 0)
             if state.mode == .review {
+                // Listening to the side is the first thing you do in
+                // review, and until 2026-09-22 there was no way to: the
+                // segment rows could audition six seconds at a time and
+                // that was the whole transport. The side is on deck A —
+                // this plays it.
+                Button(action: callbacks.togglePlay) {
+                    pillLabel(state.isPlaying ? "❙❙ Pause" : "▶ Play")
+                }
+                .buttonStyle(.plain)
+                .help(state.isPlaying
+                      ? "Pause the side"
+                      : "Play the side from the playhead")
                 Button(action: callbacks.autoSplit) {
                     pillLabel("Auto-split")
                 }

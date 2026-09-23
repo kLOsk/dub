@@ -34,15 +34,27 @@ struct PrepRipBarState: Equatable {
     var phase: Phase
     /// Recorded duration (recording / review states).
     var elapsedSecs: Double = 0
-    /// Absolute peak of the most recent capture window, `[0, 1]`.
+    /// Peak-hold with a 20 dB/s fall, `[0, 1]` — the meter's marker.
     var levelPeak: Float = 0
+    /// Smoothed (300 ms) RMS, `[0, 1]` — the meter's bar. The bar was
+    /// driven by `levelPeak` and read "super jumpy" on the rig: peak
+    /// answers "did it clip", not "how loud is it".
+    var levelRms: Float = 0
+    /// Seconds since the take last hit full scale, `nil` if never.
+    var clippedSecsAgo: Double? = nil
     /// Secondary status text (done summary, stop-reason note).
     var statusText: String? = nil
     /// Failure message (failed state).
     var errorMessage: String? = nil
 
-    /// Clip indicator — flashes the meter red.
-    var isClipping: Bool { levelPeak >= 0.99 }
+    /// Clip indicator — holds the meter red for a moment after the
+    /// take hits full scale. **Latched**, because it used to compare
+    /// the instantaneous peak against 0.99: a clip that lasts one
+    /// 10 Hz poll is one the DJ, who is watching the record rather
+    /// than the screen, never sees, and a needle tick flashed it red
+    /// for a single frame either way.
+    var isClipping: Bool { (clippedSecsAgo ?? .infinity) <= Self.clipHoldSecs }
+    private static let clipHoldSecs: Double = 2.0
 
     /// `mm:ss` elapsed clock.
     var elapsedText: String { RipDuration.running(elapsedSecs) }
@@ -122,7 +134,7 @@ struct PrepRipBar: View {
             Text("drop the needle")
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
-            RipLevelMeter(level: state.levelPeak, clipping: false)
+            RipLevelMeter(level: state.levelRms, peak: state.levelPeak, clipping: false)
                 .frame(width: 140, height: 8)
             Spacer(minLength: 0)
             Button(action: callbacks.onStop) {
@@ -155,7 +167,9 @@ struct PrepRipBar: View {
                 .font(DubFont.numericLarge)
                 .monospacedDigit()
                 .foregroundStyle(DubColor.textPrimary)
-            RipLevelMeter(level: state.levelPeak, clipping: state.isClipping)
+            RipLevelMeter(
+                level: state.levelRms, peak: state.levelPeak,
+                clipping: state.isClipping)
                 .frame(width: 140, height: 8)
             if state.isClipping {
                 Text("CLIP")
@@ -238,31 +252,48 @@ struct PrepRipBar: View {
     }
 }
 
-/// Horizontal peak meter for the recording row. Value-driven; the
-/// clip state paints the whole bar red so a hot cartridge is
-/// unmissable at arm's length.
+/// Horizontal level meter for the recording row: an RMS bar with the
+/// peak riding above it, the way a recorder's meter reads. Value-
+/// driven; the clip state paints the whole bar red so a hot cartridge
+/// is unmissable at arm's length.
+///
+/// **Two numbers, because one cannot answer both questions.** The bar
+/// is the smoothed RMS — is the level right — and the marker is the
+/// peak hold — did it clip. A bar driven by raw peak jumps a bar's
+/// width per poll on music and tells you neither.
 struct RipLevelMeter: View {
-    /// `[0, 1]` peak of the last capture window.
+    /// `[0, 1]` smoothed RMS — the bar.
     let level: Float
+    /// `[0, 1]` peak hold — the marker. Never below the bar.
+    var peak: Float = 0
     let clipping: Bool
 
     var body: some View {
         GeometryReader { geo in
-            let fraction = CGFloat(max(0, min(1, level)))
+            let bar = CGFloat(max(0, min(1, level)))
+            let hold = CGFloat(max(0, min(1, max(peak, level))))
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(DubColor.surface2)
                 Capsule()
                     .fill(fillColor)
-                    .frame(width: max(2, geo.size.width * fraction))
+                    .frame(width: max(2, geo.size.width * bar))
+                Capsule()
+                    .fill(peakColor)
+                    .frame(width: 2)
+                    .offset(x: max(0, geo.size.width * hold - 2))
             }
         }
     }
 
     private var fillColor: Color {
         if clipping { return DubColor.stateError }
-        if level >= 0.85 { return DubColor.stateTentative }
+        if peak >= 0.85 { return DubColor.stateTentative }
         return DubColor.stateLocked
+    }
+
+    private var peakColor: Color {
+        clipping ? DubColor.textPrimary : DubColor.textSecondary
     }
 }
 

@@ -496,7 +496,13 @@ pub use rip::{
 ///       `input_peak` — a measured, VU-ballistic level on any Thru / FX
 ///       deck, post-trim, so the channel's meter reads the send rather than
 ///       the timecode decoder's idea of it.
-pub const FFI_VERSION: u32 = 76;
+///   77. **The rip capture meter gets ballistics.** `RipSessionStatus`
+///       grows `level_rms` (300 ms VU) and `clipped_secs_ago`, and
+///       `level_peak` is now a peak *hold* falling at 20 dB/s rather than
+///       the raw peak of whichever block was last. The old field read a
+///       different transient every poll — "super jumpy and often clipped"
+///       on the rig — and a clip that lasts one poll is one nobody sees.
+pub const FFI_VERSION: u32 = 77;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -6293,7 +6299,9 @@ mod tests {
         // `spring_tone_hz`.
         // 75→76: F-38 stage 3 — `set_fx_input_mono`,
         // `DeckTelemetry.input_rms` / `input_peak`.
-        assert_eq!(FFI_VERSION, 76);
+        // 76→77: rip capture meter ballistics —
+        // `RipSessionStatus.level_rms` / `clipped_secs_ago`.
+        assert_eq!(FFI_VERSION, 77);
     }
 
     #[test]

@@ -841,7 +841,9 @@ struct PerformanceView: View {
             return PrepRipBarState(
                 phase: model.ripStatus?.phase == .armed ? .armed : .recording,
                 elapsedSecs: model.ripStatus?.elapsedSecs ?? 0,
-                levelPeak: model.ripStatus?.levelPeak ?? 0)
+                levelPeak: model.ripStatus?.levelPeak ?? 0,
+                levelRms: model.ripStatus?.levelRms ?? 0,
+                clippedSecsAgo: model.ripStatus?.clippedSecsAgo)
         case .failed:
             return PrepRipBarState(
                 phase: .failed,
@@ -921,7 +923,8 @@ struct PerformanceView: View {
             segments: segments,
             jobDots: dots,
             overallStatus: status,
-            recognition: model.ripRecognition)
+            recognition: model.ripRecognition,
+            isPlaying: model.deckA.isPlaying)
     }
 
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
@@ -929,6 +932,7 @@ struct PerformanceView: View {
             addSplitAtPlayhead: { model.addRipSplitAtPlayhead() },
             autoSplit: { model.autoSplitRip() },
             audition: { secs in model.ripAudition(fromSecs: secs) },
+            togglePlay: { model.ripTogglePlay() },
             setMetadata: { index, meta in
                 model.setRipSegmentMetadata(
                     index: index,

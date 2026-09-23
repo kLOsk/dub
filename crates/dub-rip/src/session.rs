@@ -135,8 +135,14 @@ pub struct RipStatus {
     pub recorded_frames: u64,
     /// Recorded duration in seconds.
     pub elapsed_secs: f64,
-    /// |peak| of the most recent capture window (level meter).
+    /// Peak-hold level with decay, `[0, 1]` — the meter's marker.
     pub window_peak: f32,
+    /// Smoothed RMS, `[0, 1]` — the meter's bar.
+    pub window_rms: f32,
+    /// Whether the take has clipped, and how long ago in frames. The
+    /// UI latches its warning off this rather than off an
+    /// instantaneous sample; `None` means it never has.
+    pub clipped_frames_ago: Option<u64>,
     /// Failure message when `state == Failed`.
     pub failure: Option<String>,
 }
@@ -476,6 +482,11 @@ impl RipSession {
             recorded_frames,
             elapsed_secs: recorded_frames as f64 / f64::from(self.cfg.sample_rate),
             window_peak: f32::from_bits(self.shared.window_peak_bits.load(Ordering::Acquire)),
+            window_rms: f32::from_bits(self.shared.window_rms_bits.load(Ordering::Acquire)),
+            clipped_frames_ago: match self.shared.clipped_at_frames.load(Ordering::Acquire) {
+                u64::MAX => None,
+                at => Some(recorded_frames.saturating_sub(at)),
+            },
             failure: self.shared.failure_guard().clone(),
         }
     }

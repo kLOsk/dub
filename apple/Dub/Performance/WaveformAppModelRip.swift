@@ -61,7 +61,12 @@ struct RipUiStatus: Equatable {
     var phase: RipPhase
     var stopReason: RipStopReason
     var elapsedSecs: Double
+    /// Peak-hold with a 20 dB/s fall — the meter's marker.
     var levelPeak: Float
+    /// Smoothed RMS — the meter's bar.
+    var levelRms: Float
+    /// Seconds since the take last hit full scale, `nil` if never.
+    var clippedSecsAgo: Double?
     var error: String?
     /// Where the side begins and ends inside the capture. Carried on
     /// the polled snapshot — and therefore in the `Equatable` the poll
@@ -74,6 +79,8 @@ struct RipUiStatus: Equatable {
         stopReason = status.stopReason
         elapsedSecs = status.elapsedSecs
         levelPeak = status.levelPeak
+        levelRms = status.levelRms
+        clippedSecsAgo = status.clippedSecsAgo
         error = status.error
         sideStartSecs = status.sideStartSecs
         sideEndSecs = status.sideEndSecs
@@ -692,6 +699,22 @@ extension WaveformAppModel {
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard let self, !Task.isCancelled else { return }
             self.pause(side: .a)
+        }
+    }
+
+    /// Play / pause the captured side in review.
+    ///
+    /// It cancels the audition's auto-pause first: an audition is a
+    /// six-second listen that stops itself, and pressing Play inside
+    /// that window used to go quiet again a moment later.
+    func ripTogglePlay() {
+        guard engineMode == .prep, deckA.hasTrack else { return }
+        ripAuditionTask?.cancel()
+        ripAuditionTask = nil
+        if deckA.isPlaying {
+            pause(side: .a)
+        } else {
+            play(side: .a)
         }
     }
 

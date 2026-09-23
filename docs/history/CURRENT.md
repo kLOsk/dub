@@ -54,12 +54,134 @@ confirmed on hardware, and neither has been.
    there: a stalled platter, a mid-play lift, pitch extremes, and *both*
    Traktor formats. See that README.
 1. **Loops under a real needle.** Acceptance §14 #8 is met on a synthetic
-   Serato CV02 carrier. Not tried: scratching inside a loop, lifting the needle
-   mid-loop, re-locking after a lift, key lock at a pitched platter.
+   Serato CV02 carrier. **First rig session 2026-09-22: loops, scratching and
+   pitching all behave** ("loops work awesome"). Still not tried: lifting the
+   needle mid-loop, re-locking after a lift, and key lock at a pitched platter
+   — the last of which was untestable until that session, because the key-lock
+   control was mounted nowhere (below).
 2. **A rip end to end through the app.** Every gate is fitted against the three
    captures in `testdata/rip-baselines/` and replayed offline with
    `dub rip-tune`. The trim brackets, the Real Records node and re-split have
    never been driven on the rig with a record on the platter.
+
+## From the first rig session (2026-09-22)
+
+The SL 3 on the real rig, both decks on timecode. What it turned up:
+
+- **Key lock had no UI at all.** `KeyLockControlView` — an OFF/ON segmented
+  control with the engine's state dot — existed in `SourceControlView.swift`
+  and was referenced by nothing, so key lock sat at its default (off) with no
+  way to reach it. The engine side was fine the whole time (FFI 40). It is a
+  `LOCK` button in `DeckReadouts` now — the row the deck column draws, beside
+  the pitch it holds — bindable in map mode (`keylock.a` / `keylock.b`). The
+  old unmounted view is deleted. **It took two goes**: the button first went
+  into `DeckHeader`, which only Prep renders, so it did not appear on the rig
+  either — the same dead-UI trap, twice in one session. `PitchTestView` is
+  still unmounted; it is the bench pitch rig for key-lock A/B and stays that
+  way.
+- **Three follow-ups the same evening, all found by using it:**
+  - **The LOCK button was inert** — and not because of the button.
+    `identityAndReadouts` carries the instant-double `.onDrag`, and the
+    readouts row lives inside it; a drag source takes the press before any
+    child gesture sees it. The drag is on the title and artist text now, which
+    is what that block's own comment always claimed ("the readouts stay put
+    under the pointer"). **A drag source is a hit-testing decision for
+    everything under it** — check for one before suspecting a control.
+  - **The waveform zoomed through the spin-up.** The ±50 % band alone did not
+    gate `tempoPitchPercent`: a platter coming back after STOP, or settling
+    after a cut, sweeps *through* the band on the way to the fader's value, and
+    the axis followed every intermediate rate. The pitch now has to hold still
+    (±0.2 % for ~⅓ s) before anything adopts it — a fader move qualifies, a
+    spin-up does not.
+  - **The filter floor came back down** to 120 pt. With the ceiling at 520 the
+    boxes that need width have it; holding KEY and RATING at a wide floor just
+    spent the bar on white space.
+- **The filter boxes are content-sized** (the DJ's ask): from the widest of
+  the header and the value rows, replacing a flat 168 that truncated every
+  Genre row while Colour sat half empty. Pure function, unit-tested
+  (`LibraryFilterBoxWidthTests`). The clamps were **doubled to 240 … 520**
+  after the first look: measuring the content alone put most boxes *under* the
+  168 they replaced, which reads as a regression — this bar is scanned at
+  arm's length, and a box sized to exactly its longest genre is technically
+  right and too tight.
+- **The waveform's time axis is in track seconds, not room seconds — fixed.**
+  Two decks beatmatched at different grid BPMs draw their beats at different
+  spacings (92/88 = 4.5 % on the rig), diverging away from the playhead, and
+  the two strips do not scroll at the same pixel speed when matched — which is
+  the premise PRD §9.4 rests the phase meter on. Second, independent one:
+  `peaks_chunk_duration_secs` uses the *track's* sample rate, so a 48 kHz file
+  draws 8.8 % wider than a 44.1 kHz one at the same BPM with no pitch at all.
+  Both fell out of the same fix: `WaveformRenderer.effectiveTimeAxisZoom` folds
+  the platter's rate *and* the chunk's own duration into the zoom, so a pixel
+  is `referenceSecsPerPixel × zoom` of the **room** on every deck. It scales by
+  the held pitch, not the instantaneous rate, or the picture would pump on
+  every cut. 44.1 kHz at unity is the anchor and resolves to exactly what the
+  renderer drew before, so nothing moves in the common case.
+  - It needed a second change to be exact. `columnAggregation` and
+    `effectivePixelsPerDrawnColumn` were independent functions of the zoom,
+    each rounding on its own — fine for the integer rungs, but with a
+    continuous rate folded in, the zoomed-out rungs (0.5× / 0.25×, where the
+    column is pinned at one pixel and the aggregation carries the scale) came
+    out up to 6 % off, which is the same mismatch reappearing where it is
+    hardest to see. The aggregation is chosen first now and the pixel width
+    divides, so the product is the requested scale at every rung and rate.
+    `WaveformTimeAxisTests` pins the DJ-facing property directly: two decks at
+    the same audible tempo, same beat spacing and same scroll speed, whatever
+    their grids, pitches and sample rates.
+- **BPM did not follow the pitch — fixed.** The scaling existed
+  (`liveBpm`) on `DeckHeader`, the header **Prep** renders; Performance draws
+  `DeckColumn`, which copied the raw grid BPM across. So the surface with the
+  turntables on it was the one showing the unpitched number, and two header
+  implementations had quietly drifted. `liveBpm` is on `DeckHeaderState` now —
+  one computed property, both consumers.
+  - It scales by `tempoPitchPercent`, **not** the live pitch: the smoothed rate
+    runs past ±100 % under a hand, where 92.9 would read "−393.3" — nonsense,
+    and wider than the BPM slot, so the row jumped on every cut. The model
+    holds the last pitch inside ±50 % (a fader's range), so the BPM follows the
+    fader and sits still through a scratch. PITCH still prints the truth,
+    spikes and all; its slot reserves six places for exactly that.
+- **`DubTests` crashed the GPU driver, twice.** Not the app: the test host
+  segfaults inside `AppleIntelKBLGraphicsMTLDriver` during
+  swift-snapshot-testing's *perceptual* image compare, which runs the diff
+  through CoreImage → MPS on the integrated GPU (this is an Intel MacBook Pro;
+  `perceptualPrecision: 0.98` is on every snapshot here). It is a flake, not a
+  regression — the same suite passes on a re-run — but it means the pre-push
+  hook can fail for reasons that have nothing to do with the change. If it
+  becomes routine, the fix is to drop `perceptualPrecision` for exact
+  comparison plus a small `precision`, which keeps the anti-aliasing tolerance
+  without the GPU path.
+- **The first rip on the rig turned up four things** (2026-09-22). Three fixed:
+  - **The live overview was O(the whole recording), every second, on the main
+    thread.** It kept every peak chunk and re-decimated the lot each tick; a
+    chunk is 64 samples, so a side arrives at ~750 a second and ten minutes in
+    each tick walked 450 000 of them. That is the laggy UI and the overview
+    that "updated every 2 seconds". `RipEnvelopeTiler` folds incoming chunks
+    into fixed 128-chunk tiles once, and only the tiles — a few thousand for a
+    whole side — are re-bucketed per tick.
+  - **The capture meter had no ballistics.** `level_peak` was the raw peak of
+    whichever block was drained last, sampled at 10 Hz: a different transient
+    every poll ("super jumpy"), and a clip flash that lasted one poll, which a
+    DJ watching the record never sees. The worker now publishes a peak *hold*
+    falling at 20 dB/s, a 300 ms RMS for the bar, and the frame position of the
+    last full-scale sample so the UI can latch its clip warning (2 s). The bar
+    is the RMS with the peak riding it, the way a recorder's meter reads.
+    FFI 77.
+  - **Review had no transport.** The segment rows could audition six seconds
+    at a time and that was all; there was no way to simply listen to the side.
+    A Play / Pause pill sits in the review header now (`ripTogglePlay`, which
+    also cancels the audition's auto-pause so pressing Play inside one does not
+    go quiet a moment later).
+  - **Still open: no waveform while recording.** R-41 was closed on 2026-09-15
+    by treating deck A as sourced during capture, and the condition is still
+    there and correct (`hasSource` includes `ripCapturing`, `deckAEnabled` is
+    just `isRunning`), so the strip should mount. Either the Thru-for-rip peaks
+    tap is not feeding deck 0's stream or the mount is being starved — and the
+    starvation theory is worth retesting first, because the overview fix above
+    removed a large main-thread load that was running the whole time.
+- **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
+  section's, and it genuinely does not apply in Performance (the master always
+  returns on the interface). The real gap is that the Audio tab has *no* output
+  row at all, so nothing tells the DJ where the master is going.
 
 ## Next milestone
 
