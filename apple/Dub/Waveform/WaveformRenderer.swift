@@ -364,15 +364,98 @@ private struct BeatGridVertexLayout {
 /// the per-field setters at `updateNSView` time; the render
 /// thread snapshots the whole struct once per draw with a single
 /// lock acquisition.
+/// The pitch the time axis is drawn at — the platter's, followed
+/// while the fader moves, held exactly through everything else.
+///
+/// The axis used to take the deck's *held* pitch, which only moved
+/// once the platter had been still for a third of a second: a −8 → +8
+/// sweep scrolled faster at the old scale and then jumped into the
+/// new one at the end (rig, 2026-09-23). Serato stretches the picture
+/// with the fader, and so does this.
+///
+/// **A fader is slow; nothing else is.** A hand on the pitch fader
+/// moves it at tens of percent a second; STOP brakes the platter by
+/// hundreds, START spins it up as fast, and a scratch — even a slow
+/// drag that never leaves the fader's band — faster still. So the
+/// follower measures the rate of change over `slewWindowSecs`, and any
+/// motion above `maxFaderSlew`, or any reading outside the band or
+/// with the deck stopped, counts as not-a-tempo. The axis then keeps
+/// *exactly* the zoom it had: it follows the pitch as it was `lagSecs`
+/// ago, which is longer than a scratch or a brake takes to show its
+/// speed, so their first frames never reach it. It rejoins once the
+/// platter has been calm for `rejoinSecs` — after STOP/START or a
+/// scratch that is the same fader position, so the picture never moves.
+struct PlatterAxisFollower {
+    /// A turntable fader's widest range; past it is a hand on the record.
+    static let band: Double = 50
+    /// Faster than this (pitch-% a second) is not a fader.
+    static let maxFaderSlew: Double = 40
+    static let slewWindowSecs: Double = 0.1
+    /// Longer than a brake or a scratch takes to exceed `maxFaderSlew`.
+    static let lagSecs: Double = 0.08
+    static let rejoinSecs: Double = 0.35
+    /// Takes the edge off per-frame jitter without trailing the hand.
+    static let smoothingSecs: Double = 0.05
+    /// The fastest the picture rescales on its way back after a hold.
+    static let maxSlewPerSec: Double = 60
+
+    private(set) var axisPitch: Double = 0
+    private var now: Double = 0
+    private var calmSince: Double = 0
+    /// Recent readings, newest last; `nil` = not a tempo (stopped or
+    /// out of band). A fixed ring — this runs on the render thread.
+    private var times = [Double](repeating: -.infinity, count: 48)
+    private var values = [Double?](repeating: nil, count: 48)
+    private var head = 0
+
+    /// The newest reading at or before `t`.
+    private func reading(at t: Double) -> Double?? {
+        var k = head
+        for _ in 0..<times.count {
+            k = (k - 1 + times.count) % times.count
+            if times[k] <= t { return .some(values[k]) }
+        }
+        return .none
+    }
+
+    mutating func step(livePitch: Double?, dt: Double) -> Double {
+        let dt = min(max(dt.isFinite ? dt : 0, 0), 0.1)
+        now += dt
+        let live = livePitch.flatMap { $0.isFinite && abs($0) <= Self.band ? $0 : nil }
+        times[head] = now
+        values[head] = live
+        head = (head + 1) % times.count
+
+        var calm = live != nil
+        if let live, case .some(let earlier) = reading(at: now - Self.slewWindowSecs) {
+            if let earlier {
+                calm = abs(live - earlier) <= Self.maxFaderSlew * Self.slewWindowSecs
+            } else {
+                calm = false
+            }
+        }
+        if !calm { calmSince = now }
+        guard now - calmSince >= Self.rejoinSecs,
+              case .some(.some(let target)) = reading(at: now - Self.lagSecs)
+        else { return axisPitch }
+
+        let eased = (target - axisPitch) * (1 - exp(-dt / Self.smoothingSecs))
+        let cap = Self.maxSlewPerSec * dt
+        axisPitch += min(max(eased, -cap), cap)
+        return axisPitch
+    }
+}
+
 struct RendererAppearance {
     var palette: WaveformPalette = .serato
     var orientation: WaveformOrientation = .vertical
     var side: DeckSide = .a
     var timeAxisZoom: Double = 1.0
-    /// The platter's steady rate (1.0 = unity), from the deck's held
-    /// pitch. Scales the time axis into *room* seconds — see
-    /// `WaveformRenderer.effectiveTimeAxisZoom`.
-    var platterRate: Double = 1.0
+    /// The rate the time axis is scaled by (1.0 = unity), putting it in
+    /// *room* seconds — see `WaveformRenderer.effectiveTimeAxisZoom`.
+    /// `nil` follows the platter live (`PlatterAxisFollower`), which is
+    /// what Performance does; Prep has no platter and passes 1.0.
+    var platterRate: Double? = 1.0
     var beatGridEnabled: Bool = true
 
     /// A gain folded into the drawn amplitude — the deck's load gain,
@@ -1003,10 +1086,46 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         appearance.withLock { $0.side = value }
     }
 
-    /// The platter's held pitch as a rate. Pushed from
+    /// A fixed axis rate, or `nil` to follow the platter. Pushed from
     /// `WaveformView.updateNSView`, like the zoom.
-    func setPlatterRate(_ value: Double) {
+    func setPlatterRate(_ value: Double?) {
         appearance.withLock { $0.platterRate = value }
+    }
+
+    /// Render-thread state for following the platter.
+    private var axisFollower = PlatterAxisFollower()
+    private var axisFollowedAtNs: UInt64?
+
+    /// The axis rate each deck's strip last drew with, for the mouse
+    /// scrub: a pixel dragged has to be the same slice of track as the
+    /// pixel drawn under it, and with a followed axis only the
+    /// renderer knows that rate.
+    private static let drawnAxisRates = OSAllocatedUnfairLock(
+        initialState: [Double](repeating: 1.0, count: 8))
+
+    nonisolated static func drawnAxisRate(deckIdx: UInt64) -> Double {
+        drawnAxisRates.withLock { deckIdx < $0.count ? $0[Int(deckIdx)] : 1.0 }
+    }
+
+    /// The axis rate for this frame: the fixed one, or the platter's
+    /// followed pitch.
+    private func axisRate(fixed: Double?, pos: PositionInfo, targetNs: UInt64?) -> Double {
+        let rate: Double
+        if let fixed {
+            rate = fixed
+        } else {
+            var dt = 1.0 / 60.0
+            if let targetNs, let last = axisFollowedAtNs, targetNs > last {
+                dt = Double(targetNs - last) / 1e9
+            }
+            axisFollowedAtNs = targetNs
+            let live = pos.isPlaying && pos.debugAdvanceRate.isFinite
+                ? (pos.debugAdvanceRate - 1) * 100 : nil
+            rate = 1 + axisFollower.step(livePitch: live, dt: dt) / 100
+        }
+        let idx = deckIdx
+        Self.drawnAxisRates.withLock { if idx < $0.count { $0[Int(idx)] = rate } }
+        return rate
     }
 
     func setTimeAxisZoom(_ value: Double) {
@@ -1290,7 +1409,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // `effectiveTimeAxisZoom`.
         let axisZoom = Self.effectiveTimeAxisZoom(
             timeAxisZoom: appearance.timeAxisZoom,
-            platterRate: appearance.platterRate,
+            platterRate: axisRate(
+                fixed: appearance.platterRate, pos: pos, targetNs: targetEngineHostTimeNs),
             peakDurSecs: peakChunkDurationSecs)
         let pixelsPerDrawnColumn =
             Self.effectivePixelsPerDrawnColumn(timeAxisZoom: axisZoom)

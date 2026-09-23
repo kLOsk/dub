@@ -232,12 +232,13 @@ extension PerformanceView {
                     timeAxisZoom: model.engineMode == .prep
                         ? WaveformRenderer.prepModeTimeAxisZoom
                         : zoom,
-                    // Room-time axis: the held pitch, so two beatmatched
-                    // decks scroll at one speed whatever their grids and
-                    // sample rates are. Prep has no platter.
-                    platterRate: model.engineMode == .prep
-                        ? 1.0
-                        : 1.0 + (deckState.tempoPitchPercent ?? 0) / 100.0,
+                    // Room-time axis, so two beatmatched decks scroll at
+                    // one speed whatever their grids and sample rates are.
+                    // `nil` = the renderer follows the platter itself,
+                    // stretching with the fader — through the model it
+                    // would rebuild the window on every frame of a move.
+                    // Prep has no platter.
+                    platterRate: model.engineMode == .prep ? 1.0 : nil,
                     // Drawn as decoded, not at the deck's auto-gain. The
                     // renderer can fold the load gain into the picture
                     // (`RendererAppearance.displayGain`); it is off at

@@ -333,3 +333,271 @@ final class LayerClockView: NSView {
         if reshaped { invalidateIntrinsicContentSize() }
     }
 }
+
+// MARK: - Readout
+
+/// A number that moves while a record plays — PITCH, the live BPM —
+/// on a `CATextLayer`, read ten times a second.
+///
+/// As `Text` these rebuilt the column every time the platter's pitch
+/// moved a tenth, and fed the model's thirty-a-second republish that
+/// cost the strips their frames (`DeckPublishRateTests`). Here the
+/// string changes and nothing is laid out: the slot's width is set by
+/// SwiftUI from the widest value, the view has no size of its own, and
+/// the text hangs from whichever edge the row sits against.
+struct LayerReadout: NSViewRepresentable {
+    /// `nil` draws the em-dash in the placeholder colour.
+    let read: () -> String?
+    let size: CGFloat
+    let color: Color
+    let placeholder: Color
+    var trailing: Bool = false
+
+    func makeNSView(context: Context) -> LayerReadoutView {
+        let v = LayerReadoutView()
+        configure(v)
+        return v
+    }
+
+    func updateNSView(_ v: LayerReadoutView, context: Context) {
+        configure(v)
+    }
+
+    private func configure(_ v: LayerReadoutView) {
+        v.read = read
+        v.setStyle(
+            font: NSFont.monospacedSystemFont(ofSize: size, weight: .medium),
+            color: NSColor(color), placeholder: NSColor(placeholder), trailing: trailing)
+    }
+}
+
+final class LayerReadoutView: NSView {
+    var read: () -> String? = { nil }
+
+    /// Ten a second: a fader move reads as following the hand, and a
+    /// string that has not changed costs a comparison.
+    private static let interval: TimeInterval = 0.1
+
+    private let text = CATextLayer()
+    private var shown: String?? = .none
+    private var color = NSColor.white
+    private var placeholder = NSColor.gray
+    private var timer: Timer?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        text.actions = [
+            "contents": NSNull(), "string": NSNull(), "bounds": NSNull(),
+            "position": NSNull(), "foregroundColor": NSNull(),
+        ]
+        text.truncationMode = .none
+        layer?.addSublayer(text)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unused") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
+    func setStyle(font: NSFont, color: NSColor, placeholder: NSColor, trailing: Bool) {
+        self.color = color
+        self.placeholder = placeholder
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        text.font = font
+        text.fontSize = font.pointSize
+        text.alignmentMode = trailing ? .right : .left
+        CATransaction.commit()
+        shown = .none
+        refresh()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        text.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate()
+        timer = nil
+        guard window != nil else { return }
+        text.contentsScale = window?.backingScaleFactor ?? 2
+        let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        refresh()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        text.frame = bounds
+        CATransaction.commit()
+    }
+
+    private func refresh() {
+        let next = read()
+        if case .some(let was) = shown, was == next { return }
+        shown = .some(next)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        text.string = next ?? "—"
+        text.foregroundColor = (next == nil ? placeholder : color).cgColor
+        CATransaction.commit()
+    }
+}
+
+// MARK: - Calibration
+
+/// A deck's session-start measurement, drawn over its overview until
+/// it is done: a thick bar filling in the deck's colour and what the
+/// engine is doing.
+///
+/// Until 2026-09-23 the only way to follow it on the performance
+/// surface was to open the SIGNAL panel, and the deck is *held* until
+/// it finishes — the engine does not start the track until the
+/// whitening capture and the pitch settle are done — so a DJ at the
+/// rig was waiting on something they could not see. The overview is
+/// the canvas because it is the biggest thing in the column that means
+/// nothing yet: the track has not started.
+///
+/// On a layer, not in SwiftUI, for the reason in the file comment: the
+/// fill moves several times a second while the *other* deck may be
+/// playing, and a SwiftUI-driven bar would re-lay-out the window on
+/// every step and bring the strip's dropped frames back. Only its
+/// appearance and disappearance go through SwiftUI — twice a session.
+struct CalibrationBar: NSViewRepresentable {
+    let engine: DubEngine
+    let deckIdx: UInt64
+    let tint: Color
+
+    func makeNSView(context: Context) -> CalibrationBarView {
+        let v = CalibrationBarView()
+        configure(v)
+        return v
+    }
+
+    func updateNSView(_ v: CalibrationBarView, context: Context) {
+        configure(v)
+    }
+
+    private func configure(_ v: CalibrationBarView) {
+        v.read = { [engine, deckIdx] in
+            let t = engine.deckTelemetry(deckIdx: deckIdx)
+            return (Double(t.measureProgress), t.calibrating)
+        }
+        v.tint = NSColor(tint)
+    }
+}
+
+final class CalibrationBarView: NSView {
+    /// `(progress 0…1, still capturing the whitening window?)`.
+    var read: () -> (Double, Bool) = { (0, true) }
+    var tint: NSColor = .white {
+        didSet { fill.backgroundColor = tint.cgColor }
+    }
+
+    /// Ten steps a second: the measurement runs for a few seconds and
+    /// a coarser bar reads as stuck.
+    private static let interval: TimeInterval = 0.1
+
+    private let shade = CALayer()
+    private let track = CALayer()
+    private let fill = CALayer()
+    private let label = CATextLayer()
+    private let percent = CATextLayer()
+    private var timer: Timer?
+    private var progress: Double = 0
+    private var capturing = true
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        let none: [String: CAAction] = [
+            "bounds": NSNull(), "position": NSNull(), "frame": NSNull(),
+            "contents": NSNull(), "string": NSNull(),
+        ]
+        shade.backgroundColor = NSColor(DubColor.surface0).withAlphaComponent(0.88).cgColor
+        track.backgroundColor = NSColor(DubColor.surface3).cgColor
+        track.cornerRadius = 3
+        fill.cornerRadius = 3
+        for text in [label, percent] {
+            text.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            text.fontSize = 11
+            text.foregroundColor = NSColor(DubColor.textPrimary).cgColor
+        }
+        percent.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        percent.alignmentMode = .right
+        for l in [shade, track, fill, label, percent] {
+            l.actions = none
+            layer?.addSublayer(l)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unused") }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate()
+        timer = nil
+        guard window != nil else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        label.contentsScale = scale
+        percent.contentsScale = scale
+        let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        refresh()
+    }
+
+    override func layout() {
+        super.layout()
+        place()
+    }
+
+    private func refresh() {
+        let (p, c) = read()
+        progress = max(0, min(1, p))
+        capturing = c
+        place()
+    }
+
+    /// Geometry and text only — no layout pass.
+    private func place() {
+        let b = bounds
+        let inset: CGFloat = 12
+        let barH: CGFloat = 8
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        shade.frame = b
+        let barY = b.midY + 2
+        track.frame = CGRect(x: inset, y: barY, width: max(0, b.width - inset * 2), height: barH)
+        fill.frame = CGRect(
+            x: inset, y: barY,
+            width: max(barH, (b.width - inset * 2) * CGFloat(progress)), height: barH)
+        let textY = barY - 18
+        // "Calibrating" is the whitening capture; after it the decoder
+        // is fitting the platter's wobble so the pitch reads true. Both
+        // hold the deck, and the DJ needs to know it is still working.
+        label.string = capturing ? "CALIBRATING" : "SETTLING PITCH"
+        label.frame = CGRect(x: inset, y: textY, width: b.width / 2, height: 15)
+        percent.string = "\(Int((progress * 100).rounded())) %"
+        percent.frame = CGRect(x: b.width / 2, y: textY, width: b.width / 2 - inset, height: 15)
+        CATransaction.commit()
+    }
+}

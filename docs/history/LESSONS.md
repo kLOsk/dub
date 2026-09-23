@@ -328,6 +328,20 @@
 
 ## Library / SwiftUI
 
+- **A number that moves while a record plays must never be `@Published`.**
+  `deckA` / `deckB` publish on any change, and a live pitch or input level
+  changes on every poll — so every view observing the model (overview,
+  library, column) rebuilt 30×/s and the window re-laid out each time: 30 %
+  of the main thread, and a late pass costs the Metal strips a frame (they
+  wait in `nextDrawable` for the compositor). Store only what a reader can
+  see (`heldPitch`: 0.1 % steps) and draw the moving digits on a layer
+  (`LayerReadout`). Same for per-frame drawing: a `Canvas` in a 60 Hz
+  `TimelineView` re-renders its whole frame into a RenderBox surface every
+  tick — the full-height phase meter alone had the main thread 57 % asleep
+  in `wait_for_allocations`. Draw the still part once; move a layer.
+  Measure with `sample` while *both* decks play — a probe that fires on
+  loading measures the library, not the set.
+
 - **Be optimistic about reachability — don't cry wolf.** `isTrackReachable`
   flags a row only when a volume probe *positively* returned `false`. The
   reachability cache is populated one runloop tick *after* rows render, so a
@@ -578,6 +592,16 @@
   blend is symmetric in time, so the seam is continuous in both directions —
   which a ramp probe showed immediately (both directions read identically). The
   fix would have been real code solving nothing.
+- **A lit button is not an engaged effect — and a mode the engine refuses must
+  say so.** Key lock shipped at M14 for internal playback only: the engine
+  declined to engage whenever the timecode advance drove the deck, which is
+  every deck on a turntable. The pill lit, the engine state sat at bypass, and
+  the voices rode the fader — found on the rig, months later. Any condition in
+  an engage decision that excludes a whole source (timecode, thru) is a
+  product decision; put it in the PRD next to the feature, not only in a
+  `&&`. And a drift test must fail without the fix: the first one here passed
+  with the correction deleted, because a symmetric wobble averages out and the
+  tolerance sat just above the drift. Bias the input the way the rig does.
 
 ## Build + test hygiene
 

@@ -96,6 +96,29 @@ final class PerformanceLayoutTests: XCTestCase {
     /// two columns at every width now, which is both what the surface
     /// wants and what makes this assertion hold without a scroll
     /// fallback underneath it.
+    /// Rig, 2026-09-23: timecode on, needle down, no track yet — the
+    /// deck was calibrating and the column said nothing. That is the
+    /// first thing a DJ does at a gig, so the bar has to show there.
+    func test_anEmptyTimecodeDeck_showsItsCalibration() {
+        var deck = DeckState()
+        deck.hasTimecodeInput = true
+        deck.controlMode = 1
+        deck.pitchSettled = false
+        deck.measureProgress = 0.3
+        let header = DeckHeaderState.from(
+            side: .a, deckState: deck, engineRunning: true,
+            deckEnabled: true, thruMode: true, isMaster: false,
+            prepMode: false)
+        XCTAssertTrue(DeckColumnHeader(header).calibrating)
+
+        deck.pitchSettled = true
+        let settled = DeckHeaderState.from(
+            side: .a, deckState: deck, engineRunning: true,
+            deckEnabled: true, thruMode: true, isMaster: false,
+            prepMode: false)
+        XCTAssertFalse(DeckColumnHeader(settled).calibrating)
+    }
+
     func test_deckColumn_fitsThePane_onALaptopScreen() {
         let size = fittingSize(
             DeckColumn(state: Self.columnFixture) { Color.clear },

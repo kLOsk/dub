@@ -243,6 +243,81 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     it to choose the octave (hip-hop 75–105, drum & bass 160–185, reggae/dub
     the one-drop range). A correction made after import lives in the library;
     nothing writes it back into the FLAC's `BPM` tag yet.
+- **Second rig session, same day — three more, all fixed:**
+  - **Key lock never engaged on a timecode deck.** Not the button: the engine
+    required `!has_m6_advance`, and every timecode deck has one, so LOCK lit
+    and the voices rode the fader. PRD §6.1.1 always specified it for
+    timecode; M14 built it for internal play and refused the rest, because
+    the stretcher reads through its own cursor and the M6 re-pin moved the
+    playhead without it. The re-pin now moves the cursor by the same
+    correction (bypass on anything > 256 frames). The first drift test passed
+    with the fix deleted — a sine wobble averages out, and the tolerance sat
+    just above the drift — so it now runs the rig's measured 0.3 % bias and a
+    one-feed-hop tolerance, and fails without the correction.
+  - **BPM snapped instead of following the fader.** The stillness gate added
+    to stop the waveform zooming through a spin-up had been applied to the BPM
+    readout too. The BPM follows the live pitch now, exactly like PITCH,
+    holding its last value only past ±50 % (a hand on the record); the gate
+    stays on the waveform axis alone. Rounded to the printed tenth in the
+    column, or a raw per-poll value would rebuild the column and bring the
+    window-layout jank back.
+  - **Calibration was only visible in the SIGNAL panel**, and the deck is held
+    until it finishes. `CalibrationBar` lays a bar and CALIBRATING / SETTLING
+    PITCH over each deck's overview until it is done — on a layer, so its
+    ten-a-second fill cannot re-lay-out the window while the other deck plays.
+  - **An empty timecode deck showed no calibration.** The armed-but-empty
+    header state never carried `pitchSettled` / `measureProgress`, so the bar
+    only appeared once a track was loaded — after the calibration most DJs do
+    first.
+  - **"A little front and back jump every once in a while", both strips.**
+    The engine playhead never went backwards (`make trace-grid-last`): a draw
+    read the playhead for its vsync, then waited ~25 ms in `nextDrawable()`,
+    so the frame lit up a vsync late — the step back — and the next one a
+    double step forward. The cause was the main thread, not the strip:
+    `sample` with both decks playing put **30 %** of it in whole-window layout
+    (`_layoutViewTree`, 3 278 samples / 15 s), because `deckA` / `deckB`
+    republished on every 30 Hz poll — the live pitch wobbles in its last
+    digits and the input levels never sit still — and every observer of the
+    model rebuilt (the overview re-drawing 480 bars alone was 365 samples).
+    Fixed: PITCH and BPM are `LayerReadout`s reading the engine at 10 Hz; the
+    stored pitch moves only on a 0.1 % step (`DeckState.heldPitch`); input
+    levels are carried only on a DUB FX deck; phase meter / echo / siren read
+    the exact pitch off the engine. That freed the main thread into the next
+    wall: **57 %** asleep in RenderBox `wait_for_allocations`, from the phase
+    meter's full-height `Canvas` in a 60 Hz `TimelineView` (≈ 72 × 2 400 px a
+    frame on the Intel UHD 630). Now the gutter is drawn once and the marker
+    is a layer (`PhaseMeterMarker`). After: main thread 88 % idle, layout 400
+    samples, no RenderBox waits, **0 of 2 330 draws stalled** (was 192), frames
+    skipped 0.5–1 % (display-link scheduling — no late frame, so no step back).
+    Tried and reverted: re-targeting a late frame to a later vsync
+    (`PresentTarget`) — in steady state every drawable arrived ~9 ms "late",
+    right on the half-period threshold, and frames flip-flopped (272 repeats).
+    Treat the pipeline stall, not the symptom.
+    **Then still jumpy while the pitch moved** (fine once settled): the held
+    0.1 % pitch still republished the model on every step of a fader move,
+    each a ~90 ms whole-window freeze (watchdog: ~20 in 90 s). The model no
+    longer carries the live pitch at all; every reader takes it off the
+    engine, and the settled tempo moves in 0.1 % steps.
+  - **The strip stretched late: "at the very end it jumps into a new zoom".**
+    The time axis followed the settled pitch, which moves only once the
+    platter is still. It now follows the platter every frame inside the
+    fader's ±50 % band (`PlatterAxisFollower`, in the renderer — through the
+    model it would rebuild the window per frame), holds outside it, and
+    after a stop / spin-up / scratch waits 0.35 s in the band before gliding
+    back, so a spin-up still does not zoom the picture. Serato's behaviour.
+    First cut still zoomed on STOP and on scratches: a brake and a slow drag
+    both pass *through* the band. The follower now also gates on speed — a
+    fader moves at tens of %/s, a brake / start / scratch at hundreds, so
+    anything over 40 %/s (measured over 100 ms) holds — and follows the
+    pitch as it was 80 ms ago, longer than any of those takes to show its
+    speed, so their first frames never reach the axis: the zoom is held
+    *exactly*.
+  - **Agreed next (Daniel, 2026-09-23): split the model.** Deck A, deck B,
+    the rack and the library as separate observable objects, so a deck's
+    change rebuilds that deck's views and not the window; plus a debug guard
+    that logs a deck publishing more than a few times a second in steady
+    play. Not a move off SwiftUI — static controls cost nothing; what cost
+    was one model everyone observes, and per-frame drawing in SwiftUI.
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output

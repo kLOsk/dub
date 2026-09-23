@@ -88,6 +88,17 @@ final class PhaseMeterTests: XCTestCase {
         XCTAssertFalse(paused.locked)
     }
 
+    /// The live marker is a layer over a canvas drawn once, so the two
+    /// must agree on where the track is: in phase sits on the line, half
+    /// a beat either way at an end of the track.
+    func test_markerGeometry_sitsOnTheDrawnTrack() {
+        let g = PhaseMeterCanvas.geometry(CGSize(width: DubLayout.phaseMeterGutterWidth, height: 560))
+        XCTAssertEqual(g.markerRect(phi: 0).midY, g.lineY, accuracy: 1e-9)
+        XCTAssertEqual(g.markerRect(phi: -0.5).midY, g.track.minY, accuracy: 1e-9)
+        XCTAssertEqual(g.markerRect(phi: 0.5).midY, g.track.maxY, accuracy: 1e-9)
+        XCTAssertEqual(g.markerRect(phi: 0).midX, g.track.midX, accuracy: 1e-9)
+    }
+
     // MARK: - Canvas
 
     private func snap(_ frame: PhaseMeterFrame, named name: String,

@@ -132,4 +132,135 @@ final class WaveformTimeAxisTests: XCTestCase {
                 timeAxisZoom: 0.8, platterRate: 1.2, peakDurSecs: 0),
             0.8, accuracy: 1e-12)
     }
+
+    // MARK: - Following the platter (rig, 2026-09-23)
+    //
+    // "When I pitch from −8 to +8 the waveform speeds up and at the
+    // very end it jumps into a new zoom." The axis followed the *held*
+    // pitch, which only moves once the platter is still. Serato
+    // stretches the picture with the fader. These pin a follower that
+    // does — and still does not zoom through a spin-up or a scratch,
+    // which is why the hold was there.
+
+    private let frame = 1.0 / 60.0
+
+    private func run(_ f: inout PlatterAxisFollower, _ pitch: Double?, secs: Double) -> Double {
+        var out = f.axisPitch
+        for _ in 0..<Int((secs / frame).rounded()) { out = f.step(livePitch: pitch, dt: frame) }
+        return out
+    }
+
+    /// A fader move is followed while it happens, not after: every
+    /// frame of a −8 → +8 sweep moves the axis, and it ends where the
+    /// fader ends with no step left to take.
+    func testAFaderSweepIsFollowedContinuously() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, -8, secs: 1)
+        XCTAssertEqual(f.axisPitch, -8, accuracy: 0.05)
+        var last = f.axisPitch
+        var biggestStep = 0.0
+        let frames = 60
+        for i in 1...frames {
+            let live = -8 + 16 * Double(i) / Double(frames)
+            let now = f.step(livePitch: live, dt: frame)
+            // 1e-3: the last hundred-thousandths of settling onto −8 are
+            // still arriving as the sweep starts — that is not a reversal.
+            XCTAssertGreaterThanOrEqual(now, last - 1e-3, "the axis went backwards mid-sweep")
+            biggestStep = max(biggestStep, now - last)
+            last = now
+        }
+        XCTAssertGreaterThan(f.axisPitch, 5, "the axis waited for the fader to stop")
+        XCTAssertLessThan(biggestStep, 1.0, "the axis jumped rather than stretched")
+        let settled = run(&f, 8, secs: 0.5)
+        XCTAssertEqual(settled, 8, accuracy: 0.05)
+    }
+
+    /// Platter wobble is not a tempo: sub-percent jitter barely moves
+    /// the picture.
+    func testWobbleBarelyMovesTheAxis() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 2, secs: 1)
+        var lo = Double.infinity, hi = -Double.infinity
+        for i in 0..<240 {
+            let live = 2 + 0.2 * sin(Double(i) * frame * 2 * .pi / 1.8)
+            let a = f.step(livePitch: live, dt: frame)
+            lo = min(lo, a); hi = max(hi, a)
+        }
+        XCTAssertLessThan(hi - lo, 0.45)
+    }
+
+    /// STOP and start again: the platter sweeps −100 % → the fader's
+    /// value, crossing the band on the way. The axis holds through it —
+    /// the "weird zoom jumping thingie" the hold was added for.
+    func testASpinUpDoesNotZoomThePicture() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 3, secs: 1)
+        _ = run(&f, nil, secs: 1)
+        var worst = 0.0
+        for i in 0..<30 {
+            let live = -100 + 103 * Double(i) / 29
+            worst = max(worst, abs(f.step(livePitch: live, dt: frame) - 3))
+        }
+        worst = max(worst, abs(run(&f, 3, secs: 1) - 3))
+        XCTAssertLessThan(worst, 0.05, "the axis zoomed through the spin-up")
+    }
+
+    /// A scratch leaves the band on every pull-back; the axis holds,
+    /// then glides — not jumps — to a new fader position.
+    func testAfterAScratchTheAxisGlidesToTheFader() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 0, secs: 1)
+        for i in 0..<60 {
+            let live = i % 10 < 5 ? -250.0 : 180.0
+            XCTAssertEqual(f.step(livePitch: live, dt: frame), 0, accuracy: 1e-9)
+        }
+        var last = f.axisPitch
+        var biggestStep = 0.0
+        for _ in 0..<90 {
+            let now = f.step(livePitch: 6, dt: frame)
+            biggestStep = max(biggestStep, abs(now - last))
+            last = now
+        }
+        XCTAssertEqual(f.axisPitch, 6, accuracy: 0.05)
+        XCTAssertLessThan(biggestStep, 1.5)
+    }
+
+    /// STOP: the motor brakes the platter from the fader's pitch to a
+    /// standstill, and the first half of that is inside the band. The
+    /// picture keeps exactly the zoom it had (rig, 2026-09-23: "when I
+    /// scratch the waveform zooms… same with start stop").
+    func testABrakeKeepsTheZoomExactly() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 4, secs: 1.5)
+        let before = f.axisPitch
+        for i in 0..<30 {
+            let live = 4 - 104 * Double(i) / 29
+            XCTAssertEqual(f.step(livePitch: live, dt: frame), before, accuracy: 0.01)
+        }
+        XCTAssertEqual(run(&f, nil, secs: 1), before, accuracy: 0.01)
+        for i in 0..<40 {
+            let live = -100 + 104 * Double(i) / 39
+            XCTAssertEqual(f.step(livePitch: live, dt: frame), before, accuracy: 0.01)
+        }
+        XCTAssertEqual(run(&f, 4, secs: 1.5), before, accuracy: 0.01)
+    }
+
+    /// A scratch that never leaves the band — a slow drag back and
+    /// forth around the playing speed — is still a scratch, not a tempo.
+    func testAnInBandScratchKeepsTheZoomExactly() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 0, secs: 1.5)
+        for i in 0..<180 {
+            let live = -30 * (0.5 - 0.5 * cos(Double(i) * frame * 2 * .pi * 2))
+            XCTAssertEqual(f.step(livePitch: live, dt: frame), 0, accuracy: 0.01)
+        }
+        XCTAssertEqual(run(&f, 0, secs: 1), 0, accuracy: 0.01)
+    }
+
+    /// A stopped deck keeps its picture.
+    func testAPausedDeckHolds() {
+        var f = PlatterAxisFollower()
+        _ = run(&f, 5, secs: 1)
+        XCTAssertEqual(run(&f, nil, secs: 3), 5, accuracy: 0.05)
+    }
 }

@@ -101,10 +101,21 @@ struct DeckColumnHeader: Equatable {
     /// it (0 off · 1 standby · 2 engaged).
     var keyLockOn: Bool = false
     var keyLockState: UInt8 = 0
+    /// The deck is still in its session-start measurement (whitening
+    /// capture, then the pitch settle) and the engine is holding the
+    /// track. A flag, not the progress: the progress is continuous and
+    /// is drawn by `CalibrationBar` on a layer, so this flips twice a
+    /// session and the column is not rebuilt in between.
+    var calibrating: Bool = false
     /// Rounded to the tenth the readout prints. The raw value moves
     /// continuously on a timecode deck, and a difference the DJ cannot
     /// see is not a reason to rebuild the column.
     var pitchTenths: Double?
+    /// What the live BPM readout multiplies — the grid's tempo and the
+    /// settled pitch it falls back to past the fader's band. Both move
+    /// rarely; the live pitch itself is read by the layer.
+    var baseBpm: Double?
+    var tempoPitchPercent: Double?
     var sourceControl: SourceControlStatus?
     var sourceControlOverridden: Bool
     /// Set while Quick Scratch has a sample on the deck: what is parked
@@ -117,11 +128,18 @@ struct DeckColumnHeader: Equatable {
     init(_ state: DeckHeaderState, scratch: ScratchBadge? = nil) {
         trackTitle = state.trackTitle
         trackArtist = state.trackArtist
-        bpm = state.liveBpm
+        // Rounded to the tenth the readout prints, like `pitchTenths`:
+        // it follows the live pitch now, and a raw value that moves on
+        // every poll would rebuild the column — and re-lay-out the
+        // window — for a difference nobody can see.
+        bpm = state.liveBpm.map { ($0 * 10).rounded() / 10 }
         key = state.key
+        calibrating = !state.pitchSettled
         keyLockOn = state.keyLockOn
         keyLockState = state.keyLockState
         pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
+        baseBpm = state.bpm
+        tempoPitchPercent = state.tempoPitchPercent
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
         self.scratch = scratch
@@ -277,6 +295,14 @@ struct DeckColumn<Overview: View>: View {
             // the height as a parameter instead — see
             // `TrackOverviewView.height`.
             overview()
+                .overlay {
+                    if state.header.calibrating, let liveEngine, let liveDeckIdx {
+                        CalibrationBar(
+                            engine: liveEngine, deckIdx: liveDeckIdx,
+                            tint: DubColor.deckTint(state.side))
+                            .allowsHitTesting(false)
+                    }
+                }
         }
     }
 
@@ -495,6 +521,9 @@ struct DeckColumn<Overview: View>: View {
             header: state.header,
             trailing: state.side == .a,
             side: state.side,
+            live: liveEngine.flatMap { engine in
+                liveDeckIdx.map { DeckReadouts.Live(engine: engine, deckIdx: $0) }
+            },
             onToggleKeyLock: callbacks.onToggleKeyLock)
     }
 
@@ -727,14 +756,38 @@ struct DeckReadouts: View {
     /// Tints the LOCK button. Defaults to A so the layout tests, which
     /// render the row on its own, keep their one-argument call.
     var side: DeckSide = .a
+    /// The engine, when there is one: BPM and PITCH are then read off
+    /// it on layers (`LayerReadout`) rather than rebuilt as `Text` on
+    /// every tenth the platter moves. Previews and snapshots have none
+    /// and draw the header's values.
+    var live: Live? = nil
     /// M14 key lock. `nil` leaves the button out entirely.
     var onToggleKeyLock: (() -> Void)? = nil
+
+    struct Live {
+        let engine: DubEngine
+        let deckIdx: UInt64
+
+        /// `nil` unless the deck is playing — a paused deck publishes
+        /// rate 0, which is not a pitch.
+        func pitch() -> Double? {
+            guard engine.positionSnapshot(deckIdx: deckIdx).isPlaying else { return nil }
+            return engine.deckTelemetry(deckIdx: deckIdx).pitchPercent
+        }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
             readout(
                 "BPM", header.bpm.map { String(format: "%.1f", $0) },
-                font: DubFont.numericLarge, widest: "888.8")
+                font: DubFont.numericLarge, widest: "888.8",
+                live: live.map { l in
+                    { [base = header.baseBpm, tempo = header.tempoPitchPercent] in
+                        DeckHeaderState.liveBpm(base: base, pitch: l.pitch(), tempoPitch: tempo)
+                            .map { String(format: "%.1f", $0) }
+                    }
+                },
+                size: DubFont.numericLargeSize)
             readout(
                 "KEY", header.key,
                 font: DubFont.numericInline, widest: "12B",
@@ -744,7 +797,9 @@ struct DeckReadouts: View {
             // the slot has to hold that too or the row jumps mid-cut.
             readout(
                 "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
-                font: DubFont.numericInline, widest: "-888.8")
+                font: DubFont.numericInline, widest: "-888.8",
+                live: live.map { l in { l.pitch().map { String(format: "%+.1f", $0) } } },
+                size: DubFont.numericInlineSize)
             keyLockButton
         }
         .fixedSize()
@@ -801,24 +856,43 @@ struct DeckReadouts: View {
     /// slot's width — measured, so the reservation follows the font
     /// rather than a hand-typed point count.
     private func readout(
-        _ label: String, _ value: String?, font: Font, widest: String, tint: Color? = nil
+        _ label: String, _ value: String?, font: Font, widest: String, tint: Color? = nil,
+        live: (() -> String?)? = nil, size: CGFloat = 0
     ) -> some View {
         VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
             Text(label)
                 .font(DubFont.micro)
                 .tracking(DubFont.capsTracking)
                 .foregroundStyle(DubColor.textTertiary)
-            ZStack(alignment: trailing ? .trailing : .leading) {
+            if let live {
                 Text(widest)
                     .font(font)
                     .monospacedDigit()
                     .hidden()
-                Text(value ?? "—")
-                    .font(font)
-                    .monospacedDigit()
-                    .foregroundStyle(
-                        value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
+                    .overlay {
+                        LayerReadout(
+                            read: live, size: size,
+                            color: tint ?? DubColor.textPrimary,
+                            placeholder: DubColor.textPlaceholder,
+                            trailing: trailing)
+                    }
+            } else {
+                staticValue(value, font: font, widest: widest, tint: tint)
             }
+        }
+    }
+
+    private func staticValue(_ value: String?, font: Font, widest: String, tint: Color?) -> some View {
+        ZStack(alignment: trailing ? .trailing : .leading) {
+            Text(widest)
+                .font(font)
+                .monospacedDigit()
+                .hidden()
+            Text(value ?? "—")
+                .font(font)
+                .monospacedDigit()
+                .foregroundStyle(
+                    value == nil ? DubColor.textPlaceholder : (tint ?? DubColor.textPrimary))
         }
     }
 }

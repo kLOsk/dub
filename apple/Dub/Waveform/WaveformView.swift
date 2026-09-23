@@ -149,12 +149,12 @@ struct WaveformView: View {
     /// Time-axis zoom. Prep mode passes `prepModeTimeAxisZoom` (1.2)
     /// so the horizontal strip shows 20 % more audio.
     let timeAxisZoom: Double
-    /// The platter's **held** pitch as a rate (1.0 = unity) — the
-    /// deck's `tempoPitchPercent`, not its live pitch. Puts the time
-    /// axis in room-seconds so two beatmatched decks scroll at one
-    /// speed and draw their beats at one spacing; see
-    /// `WaveformRenderer.effectiveTimeAxisZoom`.
-    let platterRate: Double
+    /// The rate the time axis is scaled by (1.0 = unity), putting it in
+    /// room-seconds so two beatmatched decks scroll at one speed and
+    /// draw their beats at one spacing; see
+    /// `WaveformRenderer.effectiveTimeAxisZoom`. `nil` follows the
+    /// platter live, stretching with the fader (`PlatterAxisFollower`).
+    let platterRate: Double?
     let displayGain: Float
 
     /// Hot cue positions (track-seconds) for this deck's set CUE
@@ -180,7 +180,7 @@ struct WaveformView: View {
          seekGeneration: UInt64 = 0,
          peaksGeneration: UInt64 = 0,
          timeAxisZoom: Double = 1.0,
-         platterRate: Double = 1.0,
+         platterRate: Double? = 1.0,
          displayGain: Float = 1.0,
          hotCues: [HotCueMarker] = [],
          loopActive: Bool = false,
@@ -259,7 +259,7 @@ struct WaveformView: View {
         // Without the rate here a mouse scratch would move the stylus
         // a different distance than the waveform under it.
         let secsPerPixel = Double(WaveformRenderer.secsPerPixel(
-            sampleRate: engine.sampleRate())) * timeAxisZoom * platterRate
+            sampleRate: engine.sampleRate())) * timeAxisZoom
         Color.clear
             .contentShape(Rectangle())
             .gesture(
@@ -287,6 +287,7 @@ struct WaveformView: View {
                             deltaPx = value.startLocation.x - value.location.x
                         }
                         let offsetSecs = Double(deltaPx) * secsPerPixel
+                            * (platterRate ?? WaveformRenderer.drawnAxisRate(deckIdx: deckIdx))
                         // `onBegan` is idempotent on the host side
                         // (the model's `scratchBegin` ignores
                         // repeats), so we don't need to dedupe
@@ -777,7 +778,7 @@ private struct WaveformMetalView: NSViewRepresentable {
     let seekGeneration: UInt64
     let peaksGeneration: UInt64
     let timeAxisZoom: Double
-    let platterRate: Double
+    let platterRate: Double?
     let displayGain: Float
     let hotCues: [HotCueMarker]
     let loopActive: Bool
@@ -815,7 +816,7 @@ private struct WaveformMetalView: NSViewRepresentable {
             if let lastOrientation { renderer.setOrientation(lastOrientation) }
             if let lastSide { renderer.setSide(lastSide) }
             if let lastTimeAxisZoom { renderer.setTimeAxisZoom(lastTimeAxisZoom) }
-            if let lastPlatterRate { renderer.setPlatterRate(lastPlatterRate) }
+            if case .some(let rate) = lastPlatterRate { renderer.setPlatterRate(rate) }
             if let lastDisplayGain { renderer.setDisplayGain(lastDisplayGain) }
             renderer.setBeatGridEnabled(true)
             if let lastHotCues { renderer.setHotCues(lastHotCues) }
@@ -889,7 +890,9 @@ private struct WaveformMetalView: NSViewRepresentable {
         private var lastOrientation: WaveformOrientation?
         private var lastSide: DeckSide?
         private var lastTimeAxisZoom: Double?
-        private var lastPlatterRate: Double?
+        /// Doubly optional: `.none` is "not stamped yet", `.some(nil)`
+        /// is "follow the platter".
+        private var lastPlatterRate: Double?? = .none
         private var lastDisplayGain: Float?
         private var lastSeekGeneration: UInt64?
         private var lastPeaksGeneration: UInt64?
@@ -911,7 +914,7 @@ private struct WaveformMetalView: NSViewRepresentable {
             orientation: WaveformOrientation,
             side: DeckSide,
             timeAxisZoom: Double,
-            platterRate: Double,
+            platterRate: Double?,
             displayGain: Float,
             seekGeneration: UInt64,
             peaksGeneration: UInt64,
@@ -963,8 +966,9 @@ private struct WaveformMetalView: NSViewRepresentable {
                 lastTimeAxisZoom = timeAxisZoom
                 rendererChanged = true
             }
-            // Only a fader move gets here: `tempoPitchPercent` holds
-            // through a scratch, so this is not a per-frame change.
+            // Fixed (Prep) or `nil` (follow the platter): this changes
+            // with the mode, never per frame — the following is the
+            // renderer's own.
             if lastPlatterRate != platterRate {
                 renderer.setPlatterRate(platterRate)
                 lastPlatterRate = platterRate

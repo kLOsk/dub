@@ -297,6 +297,16 @@ struct DeckState: Equatable {
     /// The widest pitch that reads as a fader rather than a hand.
     static let tempoPitchLimit: Double = 50
 
+    /// The settled tempo moves only when the platter has moved a
+    /// readout step (0.1 %) from it. `deckA` / `deckB` publish on any
+    /// change and a publish rebuilds every view observing the model, so
+    /// a slow fader drift must not re-settle it at every hundredth. The
+    /// live pitch is not stored at all — see `readDeckState`.
+    static func heldPitch(_ live: Double, prev: Double?) -> Double {
+        guard let prev, abs(live - prev) < 0.1 else { return live }
+        return prev
+    }
+
     /// M16 dub-siren state from `engine.deckTelemetry`: 0 idle · 1 sounding
     /// (gated, releasing, or the slap-back tail still ringing). Lights the
     /// SIREN panel while the engine says a preset is making sound.
@@ -2179,7 +2189,13 @@ final class WaveformAppModel: ObservableObject {
         // block, before the UI samples it), so no extra UI filtering —
         // just gate it on playback so a paused deck reads "—".
         let tele = engine.deckTelemetry(deckIdx: side.ffiDeckIdx)
-        next.pitchPercent = nowPlaying ? tele.pitchPercent : nil
+        // The live pitch is **not** stored. Everything that shows or
+        // uses it reads the engine itself — the column's PITCH / BPM
+        // layers, the phase meter, echo and siren timing — because a
+        // model change here rebuilt the whole window, ~90 ms a time on
+        // the rig, and a fader move crosses a step many times a second:
+        // the strips jumped for exactly as long as the pitch moved.
+        next.pitchPercent = nil
         // A turntable's fader is ±8 / ±16 / ±50; anything past that is a
         // hand on the record, not a tempo. Outside the band `next` keeps
         // what `prev` had, so the BPM holds rather than flickering.
@@ -2199,7 +2215,8 @@ final class WaveformAppModel: ObservableObject {
                 let polls = seen.polls + 1
                 tempoPitchSteady[side] = (seen.candidate, polls)
                 if polls >= Self.tempoPitchSteadyPolls {
-                    next.tempoPitchPercent = seen.candidate
+                    next.tempoPitchPercent = DeckState.heldPitch(
+                        seen.candidate, prev: next.tempoPitchPercent)
                 }
             } else {
                 tempoPitchSteady[side] = (tele.pitchPercent, 0)
@@ -2242,8 +2259,11 @@ final class WaveformAppModel: ObservableObject {
         }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
-        next.inputRms = tele.inputRms
-        next.inputPeak = tele.inputPeak
+        // Only the DUB FX channel shows its input level, and a live level
+        // never sits still — carried on a turntable deck it republished
+        // the model every poll for a meter nobody was looking at.
+        next.inputRms = next.isDubFx ? tele.inputRms : 0
+        next.inputPeak = next.isDubFx ? tele.inputPeak : 0
         next.sourceClass = tele.sourceClass
         next.calibrated = tele.calibrated
         next.calibrating = tele.calibrating
@@ -5563,7 +5583,7 @@ final class WaveformAppModel: ObservableObject {
         // in absolute time rather than beat-locked) — better than a silent
         // no-op on an un-analysed track.
         let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
-        let effectiveBpm = base * (1.0 + (deck.pitchPercent ?? 0) / 100.0)
+        let effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
         guard effectiveBpm > 0 else { return }
         try? engine.engageEchoOut(
             deckIdx: side.ffiDeckIdx,
@@ -5590,6 +5610,14 @@ final class WaveformAppModel: ObservableObject {
     /// Fire dub-siren preset `index` on `side` as a tap one-shot. The preset
     /// bank lives in the engine; the siren is a generator, so it sounds with or
     /// without a track and is unaffected by echo-out.
+    /// The platter's pitch right now, for a tempo that has to be exact
+    /// at the moment of a press. The model does not carry it (see
+    /// `readDeckState`).
+    func livePitchPercent(_ side: DeckSide) -> Double? {
+        guard state(for: side).isPlaying else { return nil }
+        return engine.deckTelemetry(deckIdx: side.ffiDeckIdx).pitchPercent
+    }
+
     func fireSirenPreset(_ side: DeckSide, index: Int) {
         guard isRunning, sirenEnabled else { return }
         guard index >= 0, index < sirenPresetLabels.count else { return }
@@ -5597,7 +5625,7 @@ final class WaveformAppModel: ObservableObject {
         // = use the preset's own slap-back. Falls back to 120 with no track.
         let deck = state(for: side)
         let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
-        let effectiveBpm = base * (1.0 + (deck.pitchPercent ?? 0) / 100.0)
+        let effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
         let syncBeats = sirenDelaySync ? 1.0 : 0.0
         try? engine.fireSirenPreset(
             deckIdx: side.ffiDeckIdx,

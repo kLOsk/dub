@@ -118,11 +118,33 @@ struct DeckHeaderState: Equatable {
     /// turntables on it was the one showing the unpitched number, and
     /// it took a rig session to notice (2026-09-22). One computed
     /// property, both consumers.
+    ///
+    /// **Live, like PITCH beside it** (2026-09-23): it follows the fader
+    /// as the fader moves, because that is how a DJ beatmatches by the
+    /// numbers — ride the pitch until the two BPMs agree. For a day it
+    /// followed `tempoPitchPercent`, which only adopts a pitch once it
+    /// has held still for a third of a second; right for the waveform's
+    /// axis, which must not zoom through a spin-up, and useless here —
+    /// the number snapped to the new tempo after the hand had stopped.
+    /// The one thing it refuses is a hand on the record: past
+    /// `DeckState.tempoPitchLimit` the smoothed rate is a scratch, not
+    /// a tempo (92.9 at −250 % would read "−393.3" and jump the row),
+    /// so it holds the last settled value instead.
     var liveBpm: Double? {
-        guard let base = bpm, base > 0 else { return nil }
-        // `tempoPitchPercent`, never `pitchPercent`: the latter follows a
-        // scratch past ±100 % and the BPM must not.
-        guard let pitch = tempoPitchPercent else { return base }
+        Self.liveBpm(base: bpm, pitch: pitchPercent, tempoPitch: tempoPitchPercent)
+    }
+
+    /// The rule, apart from the state: the column's layer readout runs
+    /// it on the engine's live pitch ten times a second.
+    static func liveBpm(base: Double?, pitch live: Double?, tempoPitch: Double?) -> Double? {
+        guard let base, base > 0 else { return nil }
+        let pitch: Double?
+        if let live, abs(live) <= DeckState.tempoPitchLimit {
+            pitch = live
+        } else {
+            pitch = tempoPitch
+        }
+        guard let pitch else { return base }
         return base * (1.0 + pitch / 100.0)
     }
 
@@ -1405,6 +1427,11 @@ extension DeckHeaderState {
                 trackTitle: nil,
                 trackArtist: nil,
                 bpm: nil,
+                // Calibration runs on the needle, not the track: an
+                // armed deck with nothing loaded is where it usually
+                // happens, and the column's bar reads this.
+                pitchSettled: deckState.pitchSettled,
+                measureProgress: deckState.measureProgress,
                 timecodeLockState: deckState.timecodeLockState,
                 sourceControl: Self.sourceControl(from: deckState),
                 sourceControlOverridden: deckState.controlOverridden,
