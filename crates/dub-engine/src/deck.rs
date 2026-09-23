@@ -1063,6 +1063,12 @@ const KL_SLEW_DISENGAGE: f64 = 0.35;
 /// lulls of a scratch — which was audible as repeated re-engage clicks.
 const KL_SETTLE_FRAMES: u32 = 2_400;
 
+/// Largest per-block M6 re-pin correction the engaged key-lock path absorbs
+/// by nudging the stretcher's read cursor (~5 ms at 48 kHz). A platter's
+/// block-to-block wobble is a small fraction of a frame; anything this big is
+/// a discontinuity (needle drop, a stuck decoder recovering) and re-primes.
+const KL_MAX_REPIN_FRAMES: f64 = 256.0;
+
 /// Per-deck resident key-lock stretcher (WSOLA), preallocated off-RT.
 struct DeckStretchers {
     wsola: dub_stretch::WsolaStretcher,
@@ -1461,15 +1467,25 @@ impl Deck {
 
     /// Key-lock engage decision for the current block: `(can_engage,
     /// must_bypass)`, with slew hysteresis so engage/disengage can't flap at the
-    /// threshold. Key lock only engages in forward, settled, moderate-rate,
-    /// internal playback (M6 absolute advance ⇒ timecode ⇒ bypass).
+    /// threshold. Key lock engages in forward, settled, moderate-rate playback —
+    /// **including a timecode deck** (PRD §6.1.1).
+    ///
+    /// It used to require `!has_m6_advance`, i.e. refuse whenever the M6
+    /// absolute advance was driving the deck — which is every timecode deck,
+    /// so on the rig the LOCK button lit and the pitch rode the fader
+    /// regardless (2026-09-23). The reason was real: the engaged path reads
+    /// through its own `read_cursor`, and the M6 re-pin moved the playhead
+    /// without it, so the stretched audio would have drifted off the groove.
+    /// The re-pin now carries its correction into the cursor (see the end of
+    /// `render_into`), which is what makes engaging safe. A scratch still
+    /// bypasses through the slew rule, as the PRD's decision logic asks.
     ///
     /// A loop no longer forces bypass: the wrap and its seam crossfade
     /// live in the stretcher's *feed* (`kl_refill`), so the engaged
     /// path sees a continuous stream. Without that, a looped deck at a
     /// pitched platter shifted pitch while an unlooped one did not —
     /// the one thing key lock exists to prevent (§14 #9).
-    fn key_lock_engage_decision(&self, has_m6_advance: bool, declick_active: bool) -> (bool, bool) {
+    fn key_lock_engage_decision(&self, declick_active: bool) -> (bool, bool) {
         let backend_ok = match self.stretch_backend {
             dub_stretch::StretchBackend::ResamplerOnly => false,
             dub_stretch::StretchBackend::DubOwn => true,
@@ -1480,7 +1496,6 @@ impl Deck {
             && self.rate.is_finite()
             && self.rate > KL_MIN_RATE
             && self.rate < KL_MAX_RATE
-            && !has_m6_advance
             && !declick_active;
         let slew = (self.rate - self.prev_rate).abs();
         let can_engage = base_ok && slew < KL_SLEW_ENGAGE;
@@ -1903,8 +1918,7 @@ impl Deck {
 
                 // --- M14 key-lock state machine (per block). ---
                 let declick_active = frames_consumed_in_fade > 0;
-                let (eligible, must_bypass) =
-                    self.key_lock_engage_decision(advance.is_some(), declick_active);
+                let (eligible, must_bypass) = self.key_lock_engage_decision(declick_active);
                 // Settle timer: engage only after the deck has been continuously
                 // eligible for KL_SETTLE_FRAMES, so a scratch's brief lulls don't
                 // re-engage (which clicked). Any ineligible block resets it.
@@ -2024,7 +2038,24 @@ impl Deck {
         // timecode), but the guard makes the precedence explicit.
         if self.playing && self.source.is_some() && loop_region.is_none() {
             if let Some(delta) = advance {
-                pos = block_start + delta;
+                let pinned = block_start + delta;
+                let correction = pinned - pos;
+                pos = pinned;
+                // Key lock engaged: the stretcher reads through its own
+                // cursor, which the integrator above advanced alongside
+                // `pos`. Move it by the same correction, or the audio
+                // walks off the groove a fraction of a frame per block and
+                // never comes back. A correction too big to be a platter's
+                // wobble is a discontinuity — drop to bypass and let the
+                // settle timer re-prime cleanly at the new position.
+                if !matches!(self.lock_state, KeyLockState::Bypassed) {
+                    if correction.abs() <= KL_MAX_REPIN_FRAMES {
+                        self.read_cursor += correction;
+                    } else {
+                        self.lock_state = KeyLockState::Bypassed;
+                        self.settle_frames = 0;
+                    }
+                }
             }
         }
 
@@ -2912,6 +2943,159 @@ mod tests {
         assert!(
             f_off > 455.0,
             "resampler-only should shift to ~466 Hz, got {f_off}"
+        );
+    }
+
+    /// Drive a deck the way the timecode path does: every block, the
+    /// decoder's rate *and* the groove's exact advance, with the small
+    /// block-to-block wobble a real platter has, so the M6 re-pin has a
+    /// correction to make. Returns the rendered stereo.
+    fn tc_render(deck: &mut Deck, blocks: usize, rate: f64) -> Vec<f32> {
+        let mut rt = RealtimeContext::new();
+        let block = 256usize;
+        let mut out = vec![0.0f32; block * 2];
+        let mut all = Vec::with_capacity(blocks * block * 2);
+        for b in 0..blocks {
+            // ±0.2 % wobble in the reported rate, and the groove's own
+            // advance a hair off the integrated one — what the decoder
+            // hands the deck on a real record.
+            let wobble = 0.002 * ((b as f64) * 0.7).sin();
+            deck.set_rate(rate * (1.0 + wobble));
+            // The groove also runs a steady 0.3 % off the reported rate:
+            // a real decoder's integrated rate and the groove never agree
+            // exactly — this rig once measured −0.31 % at a true 0 — and a
+            // wobble alone averages out, which is how the first version of
+            // `timecode_key_lock_stays_with_the_groove` passed with the
+            // cursor correction deleted.
+            deck.advance_position_frames(block as f64 * rate * (1.003 + 0.5 * wobble));
+            out.fill(0.0);
+            deck.render(&mut rt, &mut out, 48_000.0);
+            all.extend_from_slice(&out);
+        }
+        all
+    }
+
+    /// Key lock on a *timecode* deck (PRD §6.1.1). The engine used to
+    /// refuse outright whenever the M6 absolute advance was driving
+    /// the deck, so on the rig the LOCK button lit and the voices still
+    /// went up and down with the fader (2026-09-23).
+    #[test]
+    fn key_lock_holds_pitch_on_a_timecode_deck() {
+        let track = kl_sine_track(440.0, 120_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.quiesce_declick_for_test();
+        let out = tc_render(&mut deck, 200, 1.06);
+        let f = kl_fundamental(&out, 6_000);
+        assert!(
+            (f - 440.0).abs() < 12.0,
+            "key lock on a timecode deck should hold ~440 Hz, got {f} (466 = bypassed)"
+        );
+        assert_eq!(
+            deck.shared.load_key_lock_state(),
+            2,
+            "key lock should be engaged"
+        );
+    }
+
+    /// The stretched audio has to stay with the record. The engaged path
+    /// reads through its own cursor and the timecode path re-pins the
+    /// playhead to the groove every block; if the correction is not
+    /// carried into the cursor, the audio drifts away from the needle
+    /// a little every block and never comes back.
+    #[test]
+    fn timecode_key_lock_stays_with_the_groove() {
+        let track = kl_sine_track(440.0, 700_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.quiesce_declick_for_test();
+        let _ = tc_render(&mut deck, 100, 1.06);
+        assert_eq!(
+            deck.shared.load_key_lock_state(),
+            2,
+            "engaged before measuring"
+        );
+        let lead_early = deck.read_cursor - deck.position_frames();
+        // ~10 s more of a wobbling platter.
+        let _ = tc_render(&mut deck, 1_900, 1.06);
+        let lead_late = deck.read_cursor - deck.position_frames();
+        // The cursor moves in feed hops while the playhead moves every
+        // frame, so the lead legitimately swings by up to one hop at the
+        // platter's rate. Without the correction it drifts ~0.8 frames a
+        // block here — ~1 500 frames over the run, far outside that.
+        #[allow(clippy::cast_precision_loss)]
+        let hop = KL_FEED_HOP as f64 * 1.06;
+        assert!(
+            (lead_late - lead_early).abs() <= hop + 1.0,
+            "the stretcher's read cursor drifted {} frames from the groove \
+             in ten seconds (lead {lead_early} → {lead_late}); one feed hop is {hop}",
+            lead_late - lead_early
+        );
+    }
+
+    /// A scratch still bypasses: the slew rule has to keep working now
+    /// that timecode decks are allowed to engage at all.
+    #[test]
+    fn a_scratch_bypasses_timecode_key_lock() {
+        let track = kl_sine_track(440.0, 200_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_position_frames(100_000.0);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.quiesce_declick_for_test();
+        let _ = tc_render(&mut deck, 100, 1.0);
+        assert_eq!(deck.shared.load_key_lock_state(), 2);
+        // Back and forth under the hand.
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        for b in 0..40 {
+            let r = if b % 2 == 0 { 1.8 } else { -1.2 };
+            deck.set_rate(r);
+            deck.advance_position_frames(256.0 * r);
+            out.fill(0.0);
+            deck.render(&mut rt, &mut out, 48_000.0);
+        }
+        assert_eq!(
+            deck.shared.load_key_lock_state(),
+            1,
+            "a scratch must put key lock in standby"
+        );
+    }
+
+    /// The timecode-driven key-locked path runs on the audio thread:
+    /// engage, prime, the per-block re-pin and its cursor correction.
+    #[test]
+    fn timecode_key_locked_render_is_alloc_free() {
+        let track = kl_sine_track(440.0, 200_000);
+        let mut deck = test_deck();
+        deck.set_source(track);
+        deck.set_playing(true);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..150 {
+                let wobble = 0.002 * ((b as f64) * 0.7).sin();
+                deck.set_rate(1.06 * (1.0 + wobble));
+                deck.advance_position_frames(256.0 * 1.06 * (1.003 + 0.5 * wobble));
+                out.fill(0.0);
+                deck.render(&mut rt, &mut out, 48_000.0);
+            }
+        });
+        assert_eq!(
+            deck.shared.load_key_lock_state(),
+            2,
+            "the path under test is the engaged one"
         );
     }
 
