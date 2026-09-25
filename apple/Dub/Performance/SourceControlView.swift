@@ -162,15 +162,22 @@ enum KeyLockSelection: Equatable {
 /// key-lock engines above to hear pitch held (Ours / Rubber Band) vs shifted
 /// (Resampler). `0` returns to unity. Not a performance control.
 struct PitchTestView: View {
-    @ObservedObject var model: WaveformAppModel
+    let model: WaveformAppModel
     let side: DeckSide
+    /// The deck's own store, observed: deck state is not published
+    /// through the model (`ModelStores.swift`).
+    @ObservedObject private var deck: DeckStore
+
+    init(model: WaveformAppModel, side: DeckSide) {
+        self.model = model
+        self.side = side
+        self._deck = ObservedObject(wrappedValue: model.deckStore(side))
+    }
 
     private let steps: [Double] = [-10, -5, -2, 0, 2, 5, 10]
 
     /// On the model, not `@State` — see `DeckState.prepPitchPercent`.
-    private var current: Double {
-        (side == .a ? model.deckA : model.deckB).prepPitchPercent
-    }
+    private var current: Double { deck.state.prepPitchPercent }
 
     var body: some View {
         HStack(spacing: DubSpacing.sm) {

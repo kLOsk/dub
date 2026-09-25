@@ -341,6 +341,13 @@
   in `wait_for_allocations`. Draw the still part once; move a layer.
   Measure with `sample` while *both* decks play — a probe that fires on
   loading measures the library, not the set.
+- **Deck state is not on the model's `objectWillChange` any more.** It lives
+  on `DeckStore`s (`App/ModelStores.swift`). A view that reads `model.deckA`
+  must sit in a `DeckScope` or observe the store itself, or it shows the
+  deck as it was at its last unrelated rebuild — and SwiftUI skips a child
+  whose inputs look unchanged, so being *inside* a rebuilt parent is not
+  enough (the overview had to observe its own store). The library's on-deck
+  markers had only ever refreshed by accident, riding every deck publish.
 
 - **Be optimistic about reachability — don't cry wolf.** `isTrackReachable`
   flags a row only when a volume probe *positively* returned `false`. The

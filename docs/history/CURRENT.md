@@ -312,12 +312,93 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     pitch as it was 80 ms ago, longer than any of those takes to show its
     speed, so their first frames never reach the axis: the zoom is held
     *exactly*.
-  - **Agreed next (Daniel, 2026-09-23): split the model.** Deck A, deck B,
-    the rack and the library as separate observable objects, so a deck's
-    change rebuilds that deck's views and not the window; plus a debug guard
-    that logs a deck publishing more than a few times a second in steady
-    play. Not a move off SwiftUI — static controls cost nothing; what cost
-    was one model everyone observes, and per-frame drawing in SwiftUI.
+  - **The model split (agreed with Daniel, 2026-09-23) — built, awaiting the
+    rig.** Deck A, deck B and the sampler's voices live on their own
+    `ObservableObject`s (`App/ModelStores.swift`); the model keeps `deckA` /
+    `deckB` / `samplerVoices` as accessors onto them, so its code is
+    unchanged but its `objectWillChange` no longer fires for them. Views that
+    show them observe the store: `DeckScope` wraps the performance surface's
+    deck regions (waveform region, Prep header, rack bar — both decks + the
+    sampler, since they read across decks); the overview and the Prep pitch
+    test observe their deck directly (SwiftUI skips a child whose inputs look
+    unchanged). The library needs only which rows are loaded — a published
+    `deckTrackIds`, which now also bumps the table's revision (the on-deck
+    markers had been refreshing only because every deck change rebuilt the
+    library). Found on the way: `samplerVoices` republished the whole model
+    every poll while a sample sounded. DEBUG builds warn (`com.dub.app` /
+    `publish`) when a store publishes > 4/s for 2 s while playing, naming the
+    fields that moved. Not a move off SwiftUI — static controls cost nothing.
+  - **Plugging in the SL3 froze the app for 10–13 s — built, awaiting the
+    rig.** Watchdog dumps at every connect (19:36, 20:27, 21:10): the device
+    hot-plug handler ran `listOutputDevices` / `hasExternalAudioInterface`
+    on the main thread while the SL3's driver came up (each CoreAudio
+    question waits for it), then `startPerformanceTwoDeck` (~1 s: AudioUnit
+    start with retries, channel map), then two `WaveformRenderer.init`s
+    (~0.5 s each, a hand zero-fill of the peak rings). Now: the probe and the
+    timecode start run on a serial `deviceQueue` and commit on the main
+    thread through `EngineStartGate` (a stop or a newer start overtakes an
+    in-flight one; `applyConfig` treats "starting" as running; `stop()`
+    cancels and `stopEngine` waits on the engine lock for the start it
+    stops); the status strip reads CONNECTING SL3… meanwhile; the rings rely
+    on `makeBuffer` zero-filling (`MetalBufferZeroFillTests`). Prep start,
+    the rip flow and cold boot stay synchronous — not the slow part, and the
+    rip code relies on it. (The 6 s "freezes" also in the log were the Swift
+    test host, which shares the `com.dub.app` subsystem.)
+- **Rip review, rig 2026-09-24 — built, awaiting the rig.**
+  - **A library track loaded onto deck A mid-review** and played under the
+    recording's trims and split markers. `loadTrack` now refuses while any
+    rip phase is open (`WaveformAppModel.loadRefusal`, the rip's own spill /
+    re-split loads pass `ripOwned: true`), and so do Instant Double and
+    Quick Scratch — every route onto the deck. The refusal names the way
+    out (STOP / Encode & Import / Discard / Done).
+  - **"How do I finish a review? There's no button."** There was — Encode &
+    Import in the panel's footer — but the Prep region reserved only the pad
+    bar's 128 pt for the panel that replaces it, which needs 243, so the
+    footer was drawn under the library. The region now asks for it
+    (`ripReviewExtraHeight`, pinned by `test_ripReviewPanel_fitsThePrepRegion`)
+    and the action row sits under the header, above the cards, where a
+    short window cuts the cards first. Review baselines re-recorded.
+- **Rig 2026-09-25 — built, awaiting the rig.**
+  - **Refused-load flash lasted 0.2 s and always said "deck is playing".**
+    It now carries its reason (`DeckState.errorFlashMessage`: playing deck,
+    still loading, or the recording's way out via `loadRefusalBadge`) and
+    stays 3 s — a half-second red wash, then the words, then a fade.
+  - **The drag chip flew in from outside the window** (months-old KNOWN
+    ISSUE in `LibraryTable`). Every attempt set the image in
+    `draggingSession(_:willBeginAt:)`, after AppKit had begun the session
+    from the table's own row images — and it animates an item from the
+    frame it began with. `LibraryNSTableView` overrides
+    `beginDraggingSession(with:event:source:)`, which the table calls to
+    start its drag, and places the chip under the pointer *before* the
+    session exists. A `com.dub.app`/`drag` log line confirms the override
+    runs. Unverified by eye until Daniel drags.
+  - **Rip review as a sleeve tracklist** (design in the "Rip Review
+    Redesign" artifact, approved): toolbar with SIDE A|B, the side summary,
+    split/identify as one tool group, Discard side… and "Import N tracks ▸";
+    a track map (each track as long as it is, click to play); rows numbered
+    A1… counting only what imports; a left-out piece is a hatched line; a
+    piece < 20 s is *suggested* as lead-in / run-out; Identify's names show
+    per row in amber until Use (`RipRecognitionUi.suggestions`, from the
+    FFI's per-track result — no FFI change); during the commit the rows
+    report waiting / encoding / in library / failed. The Prep region asks
+    `RipReviewPanel.preferredHeight(rows:)` (up to 5 rows, then it scrolls).
+    Open: the side letter is display-only — writing "A1" into the tags
+    (TRACKNUMBER is numeric) is Daniel's call.
+  - **Rig 2026-09-25, second pass.** Drag confirmed fixed. Then:
+    typing a tag made the field **blink** — the row re-seeded whenever the
+    session's copy differed from its own, and a letter typed between the
+    300 ms send and the 10 Hz echo was reset, which counted as an edit and
+    went round again; rows now re-seed only on a re-cut or
+    `ripMetadataRevision` (Use all). **Year** left the row ("who puts in
+    year?" — Identify's year still reaches the tags via Use). **Genre**
+    completes from the collection: `Library::distinct_genres` (same source
+    priority as the browser, most-used first, case-merged; FFI 79) into an
+    `NSComboBox` — inline completion, drop-down, new values allowed.
+    **PREP · REC · PERF** replaces PREP/PERF where MAP sat (MAP hidden in
+    REC; the RIP VINYL pill is gone): REC arms; PREP from REC cancels an
+    armed take, *parks* a reviewed one (session dir kept, recovery banner
+    offers it back — `parkRip`), closes an imported one, and is refused
+    mid-take or mid-import (`StudioSurfaceRules`).
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output

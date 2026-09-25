@@ -292,6 +292,70 @@ extension WaveformAppModel {
         clearRipState()
     }
 
+    // MARK: PREP · REC · PERF
+
+    var studioSurface: StudioSurface {
+        StudioSurfaceRules.current(ripPhase: ripPhase, engineMode: engineMode)
+    }
+
+    /// Recording is live but waiting for the needle — nothing captured.
+    var ripArmed: Bool { ripPhase == .capture && ripStatus?.phase == .armed }
+
+    /// Vinyl recording is on and there is an input to record from,
+    /// whichever surface the app is on now.
+    var canRecordVinyl: Bool {
+        vinylRecordingEnabled && (!performanceDevices.isEmpty || ripDevOverrideEngaged)
+    }
+
+    var surfaceDisabled: [StudioSurface: String] {
+        StudioSurfaceRules.disabled(ripPhase: ripPhase, armed: ripArmed, canRecord: canRecordVinyl)
+    }
+
+    /// The status strip's surface switch. Each move says what it does to
+    /// a recording in flight — see `StudioSurfaceRules.leave`.
+    func selectSurface(_ target: StudioSurface) {
+        guard target != studioSurface, surfaceDisabled[target] == nil else { return }
+        switch target {
+        case .prep:
+            if ripPhase != .none { leaveRecording() }
+            if engineMode != .prep { setModeOverride(.prep) }
+        case .record:
+            if engineMode != .prep { setModeOverride(.prep) }
+            startRipCapture()
+        case .perf:
+            setModeOverride(.timecode)
+        }
+    }
+
+    private func leaveRecording() {
+        switch StudioSurfaceRules.leave(
+            ripPhase: ripPhase, armed: ripArmed, hasSegments: !ripSegments.isEmpty)
+        {
+        case .cancel: cancelRip()
+        case .park: parkRip()
+        case .dismiss: dismissRip()
+        case .refuse: break
+        }
+    }
+
+    /// Close the review and keep the take: the session directory stays
+    /// on disk (dropping the session only stops its worker), deck A lets
+    /// go of the spill, and the recovery banner offers it back — the way
+    /// back to Prep that does not throw a side away.
+    func parkRip() {
+        guard let session = ripSession else { return }
+        ripAuditionTask?.cancel()
+        let deckHoldsSpill = deckA.sourceURL?.path.hasPrefix(session.sessionDir()) ?? false
+        clearRipState()
+        ripRecognition = nil
+        if deckHoldsSpill {
+            stop()
+            startPrep()
+        } else {
+            refreshRecoverableRips()
+        }
+    }
+
     private func clearRipState() {
         stopRipPolling()
         ripDoneClearTask?.cancel()
@@ -403,7 +467,7 @@ extension WaveformAppModel {
         let spill = URL(fileURLWithPath: session.sessionDir())
             .appendingPathComponent("side.raw.wav")
         Task { @MainActor [weak self] in
-            _ = await self?.loadTrack(side: .a, url: spill)
+            _ = await self?.loadTrack(side: .a, url: spill, ripOwned: true)
         }
     }
 
@@ -498,7 +562,7 @@ extension WaveformAppModel {
             // after a live capture.
             let side = Self.ripSideAudioURL(sessionDir: session.sessionDir())
             Task { @MainActor [weak self] in
-                _ = await self?.loadTrack(side: .a, url: side)
+                _ = await self?.loadTrack(side: .a, url: side, ripOwned: true)
             }
         } catch {
             surfaceError("Couldn't reopen that rip: \(Self.describeRip(error))")
@@ -529,7 +593,7 @@ extension WaveformAppModel {
             startRipPolling()
             let side = Self.ripSideAudioURL(sessionDir: session.sessionDir())
             Task { @MainActor [weak self] in
-                _ = await self?.loadTrack(side: .a, url: side)
+                _ = await self?.loadTrack(side: .a, url: side, ripOwned: true)
             }
         } catch {
             surfaceError("Couldn't reopen that rip: \(Self.describeRip(error))")
@@ -812,6 +876,17 @@ extension RipRecognitionUi {
         } else {
             release = nil
         }
+        var suggestions: [UInt32: RipSegmentMetadata] = [:]
+        for track in status.tracks {
+            guard let title = track.title, !title.isEmpty else { continue }
+            suggestions[track.index] = RipSegmentMetadata(
+                title: title,
+                artist: track.artist ?? status.albumArtist ?? "",
+                album: status.album ?? "",
+                genre: status.style ?? "",
+                year: status.year.map(String.init) ?? "")
+        }
+        self.suggestions = suggestions
     }
 }
 
@@ -858,6 +933,7 @@ extension WaveformAppModel {
             ripSegments = session.segments()
             ripSplits = session.splitMarkers()
             ripLastGeneration = session.generation()
+            noteRipMetadataReplaced()
         } catch {
             ripRecognition?.error = "\(error)"
         }

@@ -133,7 +133,7 @@ final class RipSnapshotTests: XCTestCase {
             segments: threeSegments,
             playingIndex: 1)
         snap(deckBg(RipReviewPanel(state: state)),
-             width: 900, height: 260, named: "review-3-segments")
+             width: 1200, height: 300, named: "review-3-segments")
     }
 
     func test_ripReviewPanel_encodingOneFailed() {
@@ -144,7 +144,7 @@ final class RipSnapshotTests: XCTestCase {
             jobDots: [.done, .failed, .done],
             overallStatus: "Track 2 failed: encoder error.")
         snap(deckBg(RipReviewPanel(state: state)),
-             width: 900, height: 260, named: "encoding-one-failed")
+             width: 1200, height: 300, named: "encoding-one-failed")
     }
 
     func test_ripReviewPanel_encodingRunning() {
@@ -155,7 +155,7 @@ final class RipSnapshotTests: XCTestCase {
             jobDots: [.running, .running, .running],
             overallStatus: "Encoding 3 tracks…")
         snap(deckBg(RipReviewPanel(state: state)),
-             width: 900, height: 260, named: "encoding-running")
+             width: 1200, height: 300, named: "encoding-running")
     }
 
     func test_ripReviewPanel_done() {
@@ -165,40 +165,54 @@ final class RipSnapshotTests: XCTestCase {
             segments: threeSegments,
             jobDots: [.done, .done, .done])
         snap(deckBg(RipReviewPanel(state: state)),
-             width: 900, height: 260, named: "done")
+             width: 1200, height: 300, named: "done")
     }
 
-    // MARK: - RipSegmentCard
+    // MARK: - Tracklist rows
 
-    func test_ripSegmentCard_empty() {
+    func test_ripTrackRow_empty() {
         let segment = RipSegmentUi(index: 1, startSecs: 452, endSecs: 878)
-        snap(deckBg(RipSegmentCard(segment: segment)),
-             width: 280, height: 220, named: "empty")
+        snap(deckBg(RipTrackRow(segment: segment, position: "A2")),
+             width: 1100, height: 70, named: "empty")
     }
 
-    func test_ripSegmentCard_filled() {
+    func test_ripTrackRow_filledPlaying() {
         let segment = RipSegmentUi(
             index: 0, startSecs: 0, endSecs: 452,
             title: "King Tubby Meets Rockers Uptown",
             artist: "Augustus Pablo",
             album: "King Tubbys Meets Rockers Uptown",
             genre: "Dub", year: "1976")
-        snap(deckBg(RipSegmentCard(segment: segment)),
-             width: 280, height: 220, named: "filled")
+        snap(deckBg(RipTrackRow(segment: segment, position: "A1", isPlaying: true)),
+             width: 1100, height: 70, named: "filled-playing")
     }
 
-    /// Dropped: the card dims and outlines, DROP turns into UNDO, and
-    /// the fields stay legible — the DJ may be dropping it *because*
-    /// of what they say.
-    func test_ripSegmentCard_dropped() {
-        let segment = RipSegmentUi(
-            index: 1, startSecs: 452, endSecs: 878,
-            dropped: true,
-            title: "Run-out groove",
-            artist: "", album: "King Tubbys Meets Rockers Uptown",
-            genre: "Dub", year: "1976")
-        snap(deckBg(RipSegmentCard(segment: segment)),
-             width: 280, height: 220, named: "dropped")
+    /// Identify came back: the names sit in amber where the placeholders
+    /// were, with Use in the title field — nothing is the track's name
+    /// until it is taken.
+    func test_ripTrackRow_suggested() {
+        let segment = RipSegmentUi(index: 3, startSecs: 887, endSecs: 1370)
+        let suggestion = RipSegmentMetadata(
+            title: "Skanking Easy", artist: "Augustus Pablo",
+            album: "King Tubbys Meets Rockers Uptown", genre: "Dub", year: "1976")
+        snap(deckBg(RipTrackRow(segment: segment, position: "A3", suggestion: suggestion)),
+             width: 1100, height: 70, named: "suggested")
+    }
+
+    /// A nine-second piece at the head of the side: the length reads
+    /// amber and the row asks — it never decides.
+    func test_ripTrackRow_shortPiece() {
+        let segment = RipSegmentUi(index: 0, startSecs: 0, endSecs: 9)
+        snap(deckBg(RipTrackRow(
+                segment: segment, position: "A1", shortReason: "probably the lead-in")),
+             width: 1100, height: 70, named: "short-piece")
+    }
+
+    /// Left out: a thin hatched line, not a full row.
+    func test_ripDroppedRow() {
+        let segment = RipSegmentUi(index: 0, startSecs: 0, endSecs: 9, dropped: true)
+        snap(deckBg(RipDroppedRow(segment: segment, reason: "probably the lead-in")),
+             width: 1100, height: 70, named: "dropped")
     }
 
     // MARK: - Split-marker overlay
@@ -306,7 +320,7 @@ final class RipSnapshotTests: XCTestCase {
             trimmedSecs: 143,
             segments: threeSegments)
         snap(deckBg(RipReviewPanel(state: state)),
-             width: 900, height: 260, named: "trimmed")
+             width: 1200, height: 300, named: "trimmed")
     }
 
 }

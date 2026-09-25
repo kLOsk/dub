@@ -321,27 +321,18 @@ extension PerformanceView {
             })
     }
 
-    /// Red flash overlay surfaced for ~200 ms when a load is
-    /// rejected because the deck is currently playing. The exact
-    /// expiry timestamp lives on `DeckState.errorFlashUntil`; we
-    /// rely on the 30 Hz poll inside the model to clear the field
-    /// (which republishes and removes the overlay).
+    /// A refused load: a red hit on the strip and the reason, readable
+    /// for `WaveformAppModel.loadFlashSecs`. Expiry lives on
+    /// `DeckState.errorFlashUntil`; the model's poll clears it.
     @ViewBuilder
     func loadErrorOverlay(side: DeckSide, deckState: DeckState) -> some View {
         if let until = deckState.errorFlashUntil, until > Date() {
-            ZStack {
-                DubColor.stateError.opacity(0.55)
-                Text("DECK IS PLAYING — LIFT THE NEEDLE")
-                    .font(DubFont.caps)
-                    .tracking(1.5)
-                    .foregroundStyle(.white)
-                    .padding(DubSpacing.lg)
-                    .background(DubColor.stateError.opacity(0.95))
-                    .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel))
-            }
-            .allowsHitTesting(false)
-            .transition(.opacity)
-            .animation(.easeOut(duration: 0.15), value: until)
+            LoadRefusedFlash(
+                message: deckState.errorFlashMessage ?? "DECK IS PLAYING — LIFT THE NEEDLE",
+                until: until)
+                .id(until)
+                .allowsHitTesting(false)
+                .transition(.opacity.animation(.easeOut(duration: 0.4)))
         }
     }
 
@@ -456,6 +447,32 @@ extension PerformanceView {
             case .prep:
                 return "Prep mode shows a single deck. Switch to Performance in Preferences for two decks."
             }
+        }
+    }
+}
+
+/// The red wash hits and clears within half a second — a playing deck's
+/// strip is not covered for long — while the reason stays up to be read.
+private struct LoadRefusedFlash: View {
+    let message: String
+    let until: Date
+    @State private var washed = true
+
+    var body: some View {
+        ZStack {
+            DubColor.stateError.opacity(washed ? 0.5 : 0)
+            Text(message)
+                .font(DubFont.caps)
+                .tracking(1.5)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white)
+                .padding(DubSpacing.lg)
+                .background(DubColor.stateError.opacity(0.95))
+                .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel))
+                .padding(DubSpacing.md)
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.5).delay(0.2)) { washed = false }
         }
     }
 }

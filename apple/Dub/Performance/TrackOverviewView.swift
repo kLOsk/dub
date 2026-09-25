@@ -65,7 +65,11 @@ enum OverviewLayout {
 
 struct TrackOverviewView: View {
 
-    @ObservedObject var model: WaveformAppModel
+    /// Not observed: the overview draws its deck, which it observes on
+    /// the deck's own store, and a model publish — a rack knob, a rip
+    /// status — would otherwise redraw all 480 bars.
+    let model: WaveformAppModel
+    @ObservedObject private var deck: DeckStore
     let side: DeckSide
     let deckIdx: UInt64
     /// Time-axis orientation. `.vertical` is the canonical
@@ -167,11 +171,18 @@ struct TrackOverviewView: View {
     /// labels ride the loudest peaks rather than the dark margin.
     private static let minuteLabelInset: CGFloat = 8
 
-    private var deckState: DeckState {
-        switch side {
-        case .a: return model.deckA
-        case .b: return model.deckB
-        }
+    private var deckState: DeckState { deck.state }
+
+    init(
+        model: WaveformAppModel, side: DeckSide, deckIdx: UInt64,
+        orientation: WaveformOrientation = .vertical, height: CGFloat? = nil
+    ) {
+        self.model = model
+        self._deck = ObservedObject(wrappedValue: model.deckStore(side))
+        self.side = side
+        self.deckIdx = deckIdx
+        self.orientation = orientation
+        self.height = height
     }
 
     var body: some View {

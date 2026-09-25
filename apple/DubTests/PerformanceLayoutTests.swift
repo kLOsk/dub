@@ -96,6 +96,29 @@ final class PerformanceLayoutTests: XCTestCase {
     /// two columns at every width now, which is both what the surface
     /// wants and what makes this assertion hold without a scroll
     /// fallback underneath it.
+    /// Rig, 2026-09-24: "I don't understand how to finish a review —
+    /// there's no button." There was: Encode & Import sat in the
+    /// review panel's footer, and the Prep region reserved only the pad
+    /// bar's height for the panel that replaces the pads, so the footer
+    /// was drawn under the library. The region has to ask for what the
+    /// panel needs.
+    func test_ripReviewPanel_fitsThePrepRegion() {
+        for count in 1...8 {
+            let segments = (0..<count).map {
+                RipSegmentUi(
+                    index: UInt32($0), startSecs: Double($0) * 300, endSecs: Double($0 + 1) * 300,
+                    title: "A title long enough to crowd the row", artist: "An artist",
+                    album: "An album", genre: "Dub", year: "1976")
+            }
+            let state = RipReviewPanelState(
+                mode: .review, sideDurationSecs: Double(count) * 300, segments: segments)
+            let needed = fittingSize(RipReviewPanel(state: state), width: 1100).height
+            XCTAssertLessThanOrEqual(
+                needed, RipReviewPanel.preferredHeight(rows: count) + 0.5,
+                "\(count) tracks: the review panel needs \(needed) pt")
+        }
+    }
+
     /// Rig, 2026-09-23: timecode on, needle down, no track yet — the
     /// deck was calibrating and the column said nothing. That is the
     /// first thing a DJ does at a gig, so the bar has to show there.

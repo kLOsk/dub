@@ -89,7 +89,7 @@ struct PerformanceView: View {
                     : DubLayout.waveformMinHeight
             ) { _ in
                 VStack(spacing: 0) {
-                    waveformRegion
+                    deckScope { waveformRegion }
                     // Prep gets no rack bar. Its vertical budget is the
                     // tightest on either surface, its siren has its own
                     // column, and the 100 pt this slot used to cost it
@@ -97,9 +97,11 @@ struct PerformanceView: View {
                     // had already shipped.
                     if model.engineMode != .prep {
                         Rectangle().fill(DubColor.divider).frame(height: 1)
-                        GlobalRackBar(
-                            state: rackBarState, callbacks: rackBarCallbacks,
-                            folded: rackFolded, onFold: { rackFolded.toggle() })
+                        deckScope {
+                            GlobalRackBar(
+                                state: rackBarState, callbacks: rackBarCallbacks,
+                                folded: rackFolded, onFold: { rackFolded.toggle() })
+                        }
                     }
                 }
             } library: {
@@ -123,8 +125,21 @@ struct PerformanceView: View {
     /// both. That band was 108 pt of the vertical budget spent on two
     /// blocks of text and six numbers, on the surface where the strip's
     /// height is the whole point; see `DeckColumn`'s file comment.
-    @ViewBuilder
+    /// A region that reads deck or sampler state. This view observes
+    /// the model, not the stores (`ModelStores.swift`), so anything here
+    /// that shows a deck has to sit in one of these or go stale.
+    private func deckScope<C: View>(@ViewBuilder _ content: @escaping () -> C) -> some View {
+        DeckScope(
+            a: model.deckStoreA, b: model.deckStoreB, sampler: model.samplerStore,
+            content: content)
+    }
+
     private var deckHeaders: some View {
+        deckScope { prepDeckHeader }
+    }
+
+    @ViewBuilder
+    private var prepDeckHeader: some View {
         if model.engineMode == .prep {
             DeckHeader(side: .a,
                        state: headerState(side: .a),
@@ -149,27 +164,28 @@ struct PerformanceView: View {
             isRunning: model.isRunning,
             lastError: model.lastError,
             modeSwitch: modeSwitchState,
-            onSelectMode: { mode in
-                model.setModeOverride(mode)
+            onSelectMode: { surface in
+                model.selectSurface(surface)
             },
             mapMode: model.mapMode,
             onToggleMap: { model.mapMode.toggle() },
+            connecting: model.engineStarts.connecting,
+            showsMap: model.ripPhase == .none,
             openPreferences: openPreferences,
             openAbout: openAbout)
     }
 
-    /// M26a — the manual PREP / PERF switch appears only while the
-    /// vinyl-recording feature is on and a DJ interface is present
-    /// (auto-detect rules everything else). Disabled while a rip
-    /// flow is live so a stray click can't tear the capture down —
-    /// finish or discard the rip first.
+    /// PREP · REC · PERF, whenever vinyl recording is on. Gated on an
+    /// input to record from, it vanished on a laptop with no interface —
+    /// taking the way out of a recovered review with it (rig,
+    /// 2026-09-25); REC now greys with the reason instead. Which moves
+    /// are allowed mid-recording is `StudioSurfaceRules`.
     private var modeSwitchState: ModeSwitchState? {
-        guard model.vinylRecordingEnabled,
-              !model.performanceDevices.isEmpty
-        else { return nil }
+        guard model.vinylRecordingEnabled else { return nil }
         return ModeSwitchState(
-            mode: model.engineMode,
-            isEnabled: model.ripPhase == .none)
+            current: model.studioSurface,
+            showsPerf: !model.performanceDevices.isEmpty,
+            disabled: model.surfaceDisabled)
     }
 
     // MARK: - Deck header derivation
@@ -773,6 +789,7 @@ struct PerformanceView: View {
                 RipReviewPanel(
                     state: ripReviewPanelState,
                     callbacks: ripReviewPanelCallbacks)
+                    .onAppear { model.refreshRipGenres() }
             } else {
                 prepPadRows
             }
@@ -793,6 +810,13 @@ struct PerformanceView: View {
         var extra: CGFloat = 0
         if model.ripRecoverable.first != nil { extra += 56 }
         if ripBarState != nil { extra += 56 }
+        // The review panel replaces the pad rows and needs ~115 pt more
+        // than they do; unasked for, its bottom was drawn under the
+        // library (`test_ripReviewPanel_fitsThePrepRegion`).
+        if showsRipReviewPanel {
+            extra += max(0, RipReviewPanel.preferredHeight(rows: model.ripSegments.count)
+                + 2 * DubSpacing.sm - DubLayout.prepPadBarMinHeight)
+        }
         return extra
     }
 
@@ -849,8 +873,9 @@ struct PerformanceView: View {
     private var ripBarState: PrepRipBarState? {
         switch model.ripPhase {
         case .none:
-            guard model.canStartRipCapture else { return nil }
-            return PrepRipBarState(phase: .idle)
+            // REC in the status strip is the way in; the lane's own
+            // RIP VINYL pill would be a second one.
+            return nil
         case .capture:
             // Armed vs recording comes straight from the FFI phase:
             // with auto-start the worker, not the button, decides when
@@ -942,7 +967,10 @@ struct PerformanceView: View {
             jobDots: dots,
             overallStatus: status,
             recognition: model.ripRecognition,
-            playingIndex: model.ripPlayingSegment)
+            playingIndex: model.ripPlayingSegment,
+            sideLetter: model.ripSideLetter,
+            genres: model.ripGenres,
+            metadataRevision: model.ripMetadataRevision)
     }
 
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {
@@ -963,6 +991,7 @@ struct PerformanceView: View {
                     genre: meta.genre.isEmpty ? nil : meta.genre,
                     year: Int32(meta.year.trimmingCharacters(in: .whitespaces)))
             },
+            setSideLetter: { model.ripSideLetter = $0 },
             cancel: { model.cancelRip() },
             identify: { model.identifyRip() },
             applyRecognition: { model.applyRipRecognition() },

@@ -1034,6 +1034,9 @@ struct LibraryView: View {
         // moves. Without this the header relabelled to "KEY (♪)" and
         // every row underneath kept showing Camelot.
         .onChange(of: keyNotationMode) { _ in tracksContentRevision &+= 1 }
+        // The on-deck markers. A load changes no row id, so the table
+        // would keep the old gutter without a revision.
+        .onChange(of: model.deckTrackIds) { _ in tracksContentRevision &+= 1 }
         .onAppear {
             applyExtraColumns()
         }
@@ -3128,8 +3131,8 @@ struct LibraryView: View {
                 sessionFromTitle: sessionFromTitles[track.id],
                 keyNotationMode: keyNotationMode,
                 extraIndexById: extraColumnIndex),
-            isOnDeckA: model.deckA.loadedLibraryTrackId == track.id,
-            isOnDeckB: model.deckB.loadedLibraryTrackId == track.id,
+            isOnDeckA: model.deckTrackIds.a == track.id,
+            isOnDeckB: model.deckTrackIds.b == track.id,
             showsUnreachableWarning: libraryModel.libraryIsOpen
                 && !model.isTrackReachable(track),
             unreachableTooltip: missingFileTooltip(for: track))

@@ -47,6 +47,14 @@ struct StatusStripState: Equatable {
     /// mode over the live interface on both surfaces.
     var mapMode: Bool = false
 
+    /// MAP has nothing to map while a side is being recorded.
+    var showsMap: Bool = true
+
+    /// The interface the engine is opening in the background, while it
+    /// does — a hot-plugged SL3 takes seconds while its driver comes up,
+    /// and the strip says so rather than reading IDLE.
+    var connecting: String? = nil
+
     /// Sample rate formatted as "48.0 kHz" or `nil` if `0` (engine
     /// not running yet).
     var sampleRateText: String? {
@@ -63,12 +71,12 @@ struct StatusStripState: Equatable {
 /// unplugging the interface (PRD §3 auto-detect still rules every
 /// other case).
 struct ModeSwitchState: Equatable {
-    /// The engine mode currently in effect (highlights the segment).
-    let mode: EngineMode
-    /// `false` greys the switch out (e.g. while a rip capture or
-    /// encode is in flight — tearing the engine down mid-rip is
-    /// handled by the fail-safes, not by a stray click).
-    let isEnabled: Bool
+    /// The surface in effect (highlights the segment).
+    let current: StudioSurface
+    /// PERF only when a DJ interface is connected.
+    var showsPerf: Bool = true
+    /// Surfaces that cannot be chosen now, and why — shown on hover.
+    var disabled: [StudioSurface: String] = [:]
 }
 
 /// Lightweight power-source snapshot. Built from
@@ -131,7 +139,7 @@ struct StatusStrip: View {
     let openAbout: (() -> Void)?
     /// M26a — mode-switch tap target. `nil` renders the switch
     /// inert (previews / snapshot tests).
-    var onSelectMode: ((EngineMode) -> Void)? = nil
+    var onSelectMode: ((StudioSurface) -> Void)? = nil
     /// M18 — MAP tap target. `nil` renders the button inert.
     var onToggleMap: (() -> Void)? = nil
 
@@ -149,7 +157,9 @@ struct StatusStrip: View {
             if let modeSwitch = state.modeSwitch {
                 modeSwitchView(modeSwitch)
             }
-            mapButton
+            if state.showsMap {
+                mapButton
+            }
             clockView
             batteryView
             if let openPreferences {
@@ -161,41 +171,54 @@ struct StatusStrip: View {
         .background(DubColor.surface1)
     }
 
-    /// M26a PREP / PERF segmented switch. Compact two-segment pill,
-    /// deliberately quiet chrome — it exists for the rip workflow,
-    /// not as a general mode picker (auto-detect still rules; the
-    /// override clears itself when the interface unplugs).
+    /// PREP · REC · PERF. Quiet chrome — auto-detect still picks PREP or
+    /// PERF from the hardware; the switch is for the rip workflow, and
+    /// REC is the only way into it (StudioSurface.swift).
     private func modeSwitchView(_ modeSwitch: ModeSwitchState) -> some View {
         HStack(spacing: 2) {
-            modeSegment("PREP", mode: .prep, current: modeSwitch.mode)
-            modeSegment("PERF", mode: .timecode, current: modeSwitch.mode)
+            modeSegment("PREP", surface: .prep, state: modeSwitch,
+                        help: "Track preparation")
+            modeSegment("REC", surface: .record, state: modeSwitch,
+                        help: "Record a side of vinyl")
+            if modeSwitch.showsPerf {
+                modeSegment("PERF", surface: .perf, state: modeSwitch,
+                            help: "Performance")
+            }
         }
         .padding(2)
         .background(DubColor.surface2)
         .clipShape(Capsule())
-        .opacity(modeSwitch.isEnabled ? 1.0 : 0.4)
-        .disabled(!modeSwitch.isEnabled)
-        .help("Switch between Track Preparation and Performance (vinyl recording)")
     }
 
     private func modeSegment(
-        _ label: String, mode: EngineMode, current: EngineMode
+        _ label: String, surface: StudioSurface, state: ModeSwitchState, help: String
     ) -> some View {
-        let isActive = mode == current
+        let isActive = surface == state.current
+        let reason = state.disabled[surface]
+        let recording = surface == .record && isActive
         return Button {
-            onSelectMode?(mode)
+            onSelectMode?(surface)
         } label: {
-            Text(label)
-                .font(DubFont.caps)
-                .tracking(0.8)
-                .foregroundStyle(
-                    isActive ? DubColor.textPrimary : DubColor.textTertiary)
-                .padding(.horizontal, DubSpacing.sm)
-                .padding(.vertical, 2)
-                .background(isActive ? DubColor.surface3 : Color.clear)
-                .clipShape(Capsule())
+            HStack(spacing: 4) {
+                if surface == .record {
+                    Circle()
+                        .fill(recording ? DubColor.stateError : DubColor.stateError.opacity(0.6))
+                        .frame(width: 6, height: 6)
+                }
+                Text(label)
+                    .font(DubFont.caps)
+                    .tracking(0.8)
+            }
+            .foregroundStyle(isActive ? DubColor.textPrimary : DubColor.textTertiary)
+            .padding(.horizontal, DubSpacing.sm)
+            .padding(.vertical, 2)
+            .background(isActive ? DubColor.surface3 : Color.clear)
+            .clipShape(Capsule())
+            .opacity(reason == nil || isActive ? 1 : 0.4)
         }
         .buttonStyle(.plain)
+        .disabled(reason != nil)
+        .help(reason ?? help)
     }
 
     /// Inline error pill — same colour palette as the deck-pane
@@ -272,7 +295,17 @@ struct StatusStrip: View {
 
     @ViewBuilder
     private var statusText: some View {
-        if state.isRunning {
+        if let device = state.connecting {
+            HStack(spacing: DubSpacing.sm) {
+                Circle()
+                    .fill(DubColor.stateTentative)
+                    .frame(width: 6, height: 6)
+                Text("CONNECTING \(device.uppercased())…")
+                    .font(DubFont.caps)
+                    .tracking(0.6)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+        } else if state.isRunning {
             HStack(spacing: DubSpacing.sm) {
                 Circle()
                     .fill(DubColor.stateLocked)
@@ -368,9 +401,11 @@ struct StatusStripContainer: View {
     let lastError: String?
     /// M26a — see `ModeSwitchState`; `nil` hides the switch.
     var modeSwitch: ModeSwitchState? = nil
-    var onSelectMode: ((EngineMode) -> Void)? = nil
+    var onSelectMode: ((StudioSurface) -> Void)? = nil
     var mapMode: Bool = false
     var onToggleMap: (() -> Void)? = nil
+    var connecting: String? = nil
+    var showsMap: Bool = true
     let openPreferences: () -> Void
     let openAbout: () -> Void
 
@@ -395,7 +430,9 @@ struct StatusStripContainer: View {
                 power: power,
                 lastError: lastError,
                 modeSwitch: modeSwitch,
-                mapMode: mapMode),
+                mapMode: mapMode,
+                showsMap: showsMap,
+                connecting: connecting),
             openPreferences: openPreferences,
             openAbout: openAbout,
             onSelectMode: onSelectMode,

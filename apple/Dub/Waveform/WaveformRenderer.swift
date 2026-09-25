@@ -998,6 +998,11 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         self.beatGridPipeline = try device.makeRenderPipelineState(
             descriptor: beatGridDescriptor)
 
+        // No explicit zero fill on these rings: `makeBuffer(length:options:)`
+        // returns a zero-filled buffer (pinned by
+        // `MetalBufferZeroFillTests`), and filling it by hand forced every
+        // page of tens of megabytes in at once — ~0.5 s per strip on the
+        // main thread, paid again at every SL3 connect (rig, 2026-09-23).
         let chunkBytes = WaveformRenderer.chunkCapacity * MemoryLayout<PeakChunkLayout>.stride
         var chunksList: [MTLBuffer] = []
         chunksList.reserveCapacity(WaveformRenderer.maxFramesInFlight)
@@ -1013,8 +1018,6 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     ])
             }
             buf.label = "dub.waveform.chunks[\(idx)]"
-            buf.contents().initializeMemory(
-                as: UInt8.self, repeating: 0, count: chunkBytes)
             chunksList.append(buf)
         }
         self.chunksBuffers = chunksList
@@ -1035,8 +1038,6 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     ])
             }
             buf.label = "dub.waveform.bandChunks[\(idx)]"
-            buf.contents().initializeMemory(
-                as: UInt8.self, repeating: 0, count: bandChunkBytes)
             bandChunksList.append(buf)
         }
         self.bandChunksBuffers = bandChunksList

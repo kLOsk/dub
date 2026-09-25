@@ -419,6 +419,8 @@ struct DeckState: Equatable {
     /// caused by attempting to load into a playing deck (PRD §5.5
     /// + §6.4).
     var errorFlashUntil: Date? = nil
+    /// What the flash says — the reason this load was refused.
+    var errorFlashMessage: String? = nil
 
     /// Cached source URL for the loaded file. Used by drag-drop
     /// targeting + the FS browser to highlight which file is
@@ -920,8 +922,14 @@ final class WaveformAppModel: ObservableObject {
 
     /// What every sampler slot is doing — sounding, and how far through.
     /// Refreshed by the 30 Hz poll; only republished when something
-    /// changed, so an idle rack costs the view nothing.
-    @Published private(set) var samplerVoices: [SamplerSlotTelemetry] = []
+    /// changed, so an idle rack costs the view nothing. Lives on
+    /// `samplerStore`, not here: while a sample sounds it changes every
+    /// poll, and on the model that rebuilt the library with it.
+    let samplerStore = SamplerStore()
+    private(set) var samplerVoices: [SamplerSlotTelemetry] {
+        get { samplerStore.voices }
+        set { samplerStore.voices = newValue }
+    }
 
     /// What each deck was showing before Quick Scratch took it — the
     /// whole `DeckState`, restored with `adoptLoadedTrack` on release.
@@ -1132,8 +1140,46 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: Per-deck state (M10.5b)
 
-    @Published private(set) var deckA: DeckState = .empty
-    @Published private(set) var deckB: DeckState = .empty
+    /// Each deck's state lives on its own store (`ModelStores.swift`), so
+    /// a deck's change rebuilds the views that show decks — `DeckScope`
+    /// regions and views observing the store — and not the library, the
+    /// status strip or the root. These read and write through.
+    let deckStoreA = DeckStore(label: "deck A")
+    let deckStoreB = DeckStore(label: "deck B")
+    private(set) var deckA: DeckState {
+        get { deckStoreA.state }
+        set {
+            deckStoreA.state = newValue
+            noteDeckTrackIds()
+        }
+    }
+    private(set) var deckB: DeckState {
+        get { deckStoreB.state }
+        set {
+            deckStoreB.state = newValue
+            noteDeckTrackIds()
+        }
+    }
+
+    func deckStore(_ side: DeckSide) -> DeckStore {
+        side == .a ? deckStoreA : deckStoreB
+    }
+
+    /// The library rows loaded on each deck — all the library needs of
+    /// the decks, published only when a load changes it. The library's
+    /// on-deck markers used to refresh only because every deck change
+    /// rebuilt the library.
+    struct DeckTrackIds: Equatable {
+        var a: String?
+        var b: String?
+    }
+    @Published private(set) var deckTrackIds = DeckTrackIds()
+
+    private func noteDeckTrackIds() {
+        let ids = DeckTrackIds(
+            a: deckStoreA.state.loadedLibraryTrackId, b: deckStoreB.state.loadedLibraryTrackId)
+        if ids != deckTrackIds { deckTrackIds = ids }
+    }
 
     /// Master deck per PRD §6.4 (sticky single-master). `nil` only
     /// while the engine is stopped.
@@ -1173,6 +1219,25 @@ final class WaveformAppModel: ObservableObject {
     /// M26c — recognition summary, polled while the worker runs. `nil`
     /// until a pass has been asked for.
     @Published var ripRecognition: RipRecognitionUi? = nil
+    /// Which side of the record the review is numbering — A1… or B1….
+    @Published var ripSideLetter: String = "A"
+    /// The collection's genres, most-used first, for the review's genre
+    /// field. Loaded when the review opens.
+    @Published private(set) var ripGenres: [String] = []
+    /// Bumped when names arrive in the plan from outside a row (Use all),
+    /// so the rows re-seed their fields from the session. A row's own
+    /// edits coming back through the poll must not re-seed it — that
+    /// reset the field mid-typing and it blinked (rig, 2026-09-25).
+    @Published private(set) var ripMetadataRevision: Int = 0
+
+    func refreshRipGenres() {
+        guard libraryModel.libraryIsOpen else { return }
+        ripGenres = (try? library.distinctGenres(limit: 500)) ?? []
+    }
+
+    func noteRipMetadataReplaced() {
+        ripMetadataRevision &+= 1
+    }
 
     /// M26b — unfinished rips found on disk, offered above the rip bar
     /// on Prep entry. Empty once dismissed or resumed.
@@ -1538,7 +1603,21 @@ final class WaveformAppModel: ObservableObject {
     /// channel layout does not come from here; it comes from the
     /// registry via `engine.performanceRoutingFor(_:)`.
     func refreshDevices() {
-        let all = engine.listOutputDevices()
+        applyDeviceList(engine.listOutputDevices())
+    }
+
+    /// The CoreAudio work that can block for seconds — a device list
+    /// and the interface check, while a USB interface's driver comes up
+    /// — runs here, never on the main thread. Engine starts that talk to
+    /// the interface go through it too, so they queue behind a probe
+    /// rather than race it. See `EngineStartGate`.
+    private let deviceQueue = DispatchQueue(label: "com.dub.devices", qos: .userInitiated)
+
+    /// Background engine starts, and which one may commit. Published for
+    /// the status strip's CONNECTING state.
+    @Published private(set) var engineStarts = EngineStartGate()
+
+    private func applyDeviceList(_ all: [AudioDeviceInfo]) {
         performanceDevices = all.filter { $0.category == .performanceInterface }
         // Output picker pool (DEV builds only): built-in speakers +
         // every Performance interface. A DJ might listen through the
@@ -1613,8 +1692,8 @@ final class WaveformAppModel: ObservableObject {
     /// interface is actually present *and* the vinyl-recording
     /// feature is on; in every other case the hardware decides,
     /// exactly as before.
-    private func detectEngineMode() -> EngineMode {
-        let hasInterface = engine.hasExternalAudioInterface()
+    private func detectEngineMode(hasInterface probed: Bool? = nil) -> EngineMode {
+        let hasInterface = probed ?? engine.hasExternalAudioInterface()
         if hasInterface, vinylRecordingEnabled, let override = modeOverride {
             return override
         }
@@ -1639,8 +1718,9 @@ final class WaveformAppModel: ObservableObject {
         if performanceDevices.isEmpty && outputDevices.isEmpty {
             refreshDevices()
         }
-        let wasRunning = isRunning
-        if wasRunning {
+        // A start still in flight counts as running: without the stop,
+        // this start would land on an engine the first one opened.
+        if isRunning || engineStarts.inFlight {
             stop()
         }
         start()
@@ -1660,6 +1740,10 @@ final class WaveformAppModel: ObservableObject {
 
     func stop() {
         stopPolling()
+        // Any background start must not commit after this. If one is
+        // still opening the interface, `stopEngine` waits for it on the
+        // engine's lock and then stops what it opened.
+        engineStarts.cancel()
         engine.stopEngine()
         isRunning = false
         twoDeckMode = false
@@ -1773,10 +1857,28 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// Probe off the main thread, then apply. A USB interface that has
+    /// just appeared answers CoreAudio only once its driver is up, which
+    /// took 10–13 s for the SL3 — all of it a frozen UI while this ran on
+    /// the main thread (rig, 2026-09-23).
     private func reevaluateModeForDeviceChange() {
+        let token = deviceChangeToken
+        let engine = self.engine
+        deviceQueue.async {
+            let all = engine.listOutputDevices()
+            let hasInterface = engine.hasExternalAudioInterface()
+            Task { @MainActor [weak self] in
+                // A newer change is pending: its own probe applies.
+                guard let self, token == self.deviceChangeToken else { return }
+                self.applyDeviceChange(all: all, hasInterface: hasInterface)
+            }
+        }
+    }
+
+    private func applyDeviceChange(all: [AudioDeviceInfo], hasInterface: Bool) {
         // Always re-probe the (TCC-safe) device lists so the picker and
         // first-interface default reflect what's now attached.
-        refreshDevices()
+        applyDeviceList(all)
 
         // In DEBUG, a forced mode pins us regardless of hardware — the
         // whole point of the dev override. Still refresh lists above so
@@ -1791,11 +1893,11 @@ final class WaveformAppModel: ObservableObject {
         // auto-detect (Prep). Any live rip capture is handled by
         // the Rust side (the record tap stops with `inputLost`)
         // and the rip poll's stopped-phase transition.
-        if !engine.hasExternalAudioInterface(), modeOverride != nil {
+        if !hasInterface, modeOverride != nil {
             modeOverride = nil
         }
 
-        let desired = detectEngineMode()
+        let desired = detectEngineMode(hasInterface: hasInterface)
         guard desired != engineMode else { return }
         engineMode = desired
         applyConfig()
@@ -1863,36 +1965,56 @@ final class WaveformAppModel: ObservableObject {
         #if DEBUG
         useThru = (devForcedSource == .thru)
         #endif
-        do {
-            if routing.twoDeck {
-                if useThru {
-                    try engine.startThruTwoDeck(
-                        deviceName: inputDevice.name,
-                        channelsA: routing.deckAInput,
-                        channelsB: routing.deckBInput,
-                        outputDeviceUid: outputUID)
+        // Opening the interface's AudioUnits waits on its driver — about
+        // a second on a warm SL3, far longer while it is still coming up
+        // after a hot-plug — so it runs on `deviceQueue` and commits
+        // here, unless a stop or a newer start overtook it meanwhile
+        // (`EngineStartGate`). The status strip shows CONNECTING until
+        // then.
+        let ticket = engineStarts.begin(device: inputDevice.name)
+        let engine = self.engine
+        deviceQueue.async {
+            let result = Result<Void, Error> {
+                if routing.twoDeck {
+                    if useThru {
+                        try engine.startThruTwoDeck(
+                            deviceName: inputDevice.name,
+                            channelsA: routing.deckAInput,
+                            channelsB: routing.deckBInput,
+                            outputDeviceUid: outputUID)
+                    } else {
+                        try engine.startPerformanceTwoDeck(
+                            deviceName: inputDevice.name,
+                            channelsA: routing.deckAInput,
+                            channelsB: routing.deckBInput,
+                            outputDeviceUid: outputUID)
+                    }
                 } else {
-                    try engine.startPerformanceTwoDeck(
-                        deviceName: inputDevice.name,
-                        channelsA: routing.deckAInput,
-                        channelsB: routing.deckBInput,
-                        outputDeviceUid: outputUID)
+                    if useThru {
+                        try engine.startThru(
+                            deviceName: inputDevice.name,
+                            channels: routing.deckAInput,
+                            outputDeviceUid: outputUID)
+                    } else {
+                        try engine.startPerformance(
+                            deviceName: inputDevice.name,
+                            channels: routing.deckAInput,
+                            outputDeviceUid: outputUID)
+                    }
                 }
-                twoDeckMode = true
-            } else {
-                if useThru {
-                    try engine.startThru(
-                        deviceName: inputDevice.name,
-                        channels: routing.deckAInput,
-                        outputDeviceUid: outputUID)
-                } else {
-                    try engine.startPerformance(
-                        deviceName: inputDevice.name,
-                        channels: routing.deckAInput,
-                        outputDeviceUid: outputUID)
-                }
-                twoDeckMode = false
             }
+            Task { @MainActor [weak self] in
+                guard let self, self.engineStarts.finish(ticket) else { return }
+                self.commitTimecodeStart(result, routing: routing)
+            }
+        }
+    }
+
+    /// The main-thread half of `openTimecodeCapture`.
+    private func commitTimecodeStart(_ result: Result<Void, Error>, routing: PerformanceRouting) {
+        switch result {
+        case .success:
+            twoDeckMode = routing.twoDeck
             // Mirror the resolved channels into the text fields so the
             // DEV Preferences surface shows what the registry picked.
             channelsAText = routing.deckAInput.map(String.init).joined(separator: ",")
@@ -1906,9 +2028,9 @@ final class WaveformAppModel: ObservableObject {
             // fresh engine has an empty rack (M17 §7.1).
             syncSampler()
             syncSirenDub()
-        } catch let error as EngineError {
+        case .failure(let error as EngineError):
             surfaceError(describe(error))
-        } catch {
+        case .failure(let error):
             surfaceError("Unexpected error: \(error.localizedDescription)")
         }
     }
@@ -2273,6 +2395,7 @@ final class WaveformAppModel: ObservableObject {
         // `Date() > errorFlashUntil`.
         if let until = next.errorFlashUntil, Date() >= until {
             next.errorFlashUntil = nil
+            next.errorFlashMessage = nil
         }
         // M10.5v — `load_track` no longer blocks on
         // `analyze_beat_grid`; the engine spawns the BPM compute
@@ -2439,7 +2562,35 @@ final class WaveformAppModel: ObservableObject {
     /// "—" until the detached BPM thread finishes, then populates
     /// via the 30 Hz position poll.
     @discardableResult
-    func loadTrack(side: DeckSide, url: URL) async -> Bool {
+    /// Why a load must not happen now, or `nil`. While a recording is
+    /// open, deck A holds its side: the rip's trims, split markers and
+    /// audition all apply to whatever is on it, so a library track
+    /// dropped there played under the recording's trims (rig,
+    /// 2026-09-24). The refusal names what ends the recording.
+    nonisolated static func loadRefusal(ripPhase: RipUiPhase, ripOwned: Bool) -> String? {
+        guard !ripOwned else { return nil }
+        switch ripPhase {
+        case .none:
+            return nil
+        case .capture:
+            return "Recording in progress — press STOP, then finish the review before loading a track."
+        case .review, .failed:
+            return "Deck A holds the recording — Encode & Import it or Discard it before loading a track."
+        case .encoding:
+            return "The recording is being imported — wait for it to finish before loading a track."
+        case .done:
+            return "Press Done to leave the recording before loading a track."
+        }
+    }
+
+    /// `ripOwned` is the recording's own loads — the spill for audition,
+    /// a re-split side — which are exactly what its phase is for.
+    func loadTrack(side: DeckSide, url: URL, ripOwned: Bool = false) async -> Bool {
+        if let refusal = Self.loadRefusal(ripPhase: ripPhase, ripOwned: ripOwned) {
+            flashLoadError(side: side, message: Self.loadRefusalBadge(ripPhase: ripPhase))
+            surfaceError(refusal)
+            return false
+        }
         guard isRunning else {
             surfaceError("Engine not running. Open Preferences (⌘,) and Start.")
             return false
@@ -2450,7 +2601,7 @@ final class WaveformAppModel: ObservableObject {
             return false
         }
         if target.isLoading {
-            flashLoadError(side: side)
+            flashLoadError(side: side, message: "DECK \(side.label) IS STILL LOADING")
             surfaceError("Deck \(side.label) is already loading a track. Wait or load onto the other deck.")
             return false
         }
@@ -2476,6 +2627,7 @@ final class WaveformAppModel: ObservableObject {
         starting.bpmConfidence = 0
         starting.key = nil
         starting.errorFlashUntil = nil
+        starting.errorFlashMessage = nil
         starting.autoGridBpm = nil
         starting.autoGridAnchorSecs = nil
         starting.autoGridCaptured = false
@@ -4806,13 +4958,29 @@ final class WaveformAppModel: ObservableObject {
     private var libraryNoticeClearTask: Task<Void, Never>?
     private static let noticeVisibilitySecs: UInt64 = 8_000_000_000
 
-    private func flashLoadError(side: DeckSide) {
-        // 200 ms red flash per PRD §5.5: "deck is playing — lift the
-        // needle". Long enough to register, short enough not to
-        // intrude on the next attempt.
+    /// A red hit on the strip plus the reason, per PRD §5.5. The hit is
+    /// brief; the words stay long enough to read — at 200 ms the DJ saw
+    /// a red blink and nothing else (rig, 2026-09-25), and every refusal
+    /// said "deck is playing" whatever the reason was.
+    private func flashLoadError(
+        side: DeckSide, message: String = "DECK IS PLAYING — LIFT THE NEEDLE"
+    ) {
         var s = state(for: side)
-        s.errorFlashUntil = Date().addingTimeInterval(0.2)
+        s.errorFlashUntil = Date().addingTimeInterval(Self.loadFlashSecs)
+        s.errorFlashMessage = message
         setState(s, for: side)
+    }
+
+    static let loadFlashSecs: TimeInterval = 3
+
+    /// The strip's short form of `loadRefusal`, for the flash.
+    nonisolated static func loadRefusalBadge(ripPhase: RipUiPhase) -> String {
+        switch ripPhase {
+        case .capture: return "RECORDING — PRESS STOP FIRST"
+        case .review, .failed: return "FINISH OR DISCARD THE RECORDING FIRST"
+        case .encoding: return "IMPORTING THE RECORDING — WAIT"
+        case .done, .none: return "PRESS DONE TO LEAVE THE RECORDING"
+        }
     }
 
     private func state(for side: DeckSide) -> DeckState {
@@ -4988,6 +5156,11 @@ final class WaveformAppModel: ObservableObject {
     /// than throw a banner across the window.
     func instantDouble(toDeckB: Bool) {
         guard isRunning else { return }
+        // A double onto a deck is a load, and a recording owns deck A.
+        if let refusal = Self.loadRefusal(ripPhase: ripPhase, ripOwned: false) {
+            surfaceError(refusal)
+            return
+        }
         let from: DeckSide = toDeckB ? .a : .b
         let to: DeckSide = toDeckB ? .b : .a
         let source = state(for: from)
@@ -5094,6 +5267,13 @@ final class WaveformAppModel: ObservableObject {
     /// carries it, mirrors it onto the other deck when the tune went
     /// there, and restores it on release.
     func toggleQuickScratch(_ side: DeckSide, pad: Int) {
+        // Quick Scratch parks the deck's tune and puts a sample on it —
+        // a load, and a recording owns deck A. The shelf is hidden
+        // while recording, but a mapped key is not.
+        if let refusal = Self.loadRefusal(ripPhase: ripPhase, ripOwned: false) {
+            surfaceError(refusal)
+            return
+        }
         stallTimed("toggleQuickScratch") { toggleQuickScratchTimed(side, pad: pad) }
     }
 
