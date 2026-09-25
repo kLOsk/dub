@@ -508,7 +508,7 @@ pub use rip::{
 ///       side archive, but is not encoded or imported. Removing a split
 ///       *merges* two segments; this discards one — both edits a DJ needs
 ///       once a side is split (2026-09-23).
-pub const FFI_VERSION: u32 = 78;
+pub const FFI_VERSION: u32 = 79;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -6308,7 +6308,7 @@ mod tests {
         // 76→77: rip capture meter ballistics —
         // `RipSessionStatus.level_rms` / `clipped_secs_ago`.
         // 77→78: `set_segment_dropped`, `RipSegment.dropped`.
-        assert_eq!(FFI_VERSION, 78);
+        assert_eq!(FFI_VERSION, 79);
     }
 
     #[test]
@@ -8108,6 +8108,17 @@ impl DubLibrary {
                 .map(|c| c.as_str())
                 .collect())
         })
+    }
+
+    /// The collection's genres, most-used first (FFI 79). Feeds the rip
+    /// review's genre field, so a DJ typing "hi" is offered the library's
+    /// own "Hip-Hop" rather than inventing a fourth spelling of it.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryFfiError`] when the library is closed or the query fails.
+    pub fn distinct_genres(&self, limit: u32) -> std::result::Result<Vec<String>, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.distinct_genres(limit)?))
     }
 
     /// "All Tracks" listing for the M11d browser. `limit` /

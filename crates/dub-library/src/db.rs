@@ -1759,6 +1759,38 @@ impl Library {
         collect_track_rows(rows, "list_tracks_sorted")
     }
 
+    /// The collection's genres, most-used first — what the rip review's
+    /// genre field offers while the DJ types. Resolved by the same
+    /// source priority as [`TRACK_ROW_COLUMNS`], so a genre reads as the
+    /// browser shows it; spellings differing only in case count as one;
+    /// empty and whitespace-only values are skipped.
+    pub fn distinct_genres(&self, limit: u32) -> Result<Vec<String>> {
+        let sql = "SELECT MIN(g) AS genre, COUNT(*) AS n FROM ( \
+                SELECT TRIM(COALESCE(NULLIF(TRIM(sr.genre), ''), NULLIF(TRIM(rb.genre), ''), \
+                                     NULLIF(TRIM(tr.genre), ''), NULLIF(TRIM(it.genre), ''), \
+                                     NULLIF(TRIM(i3.genre), ''))) AS g \
+                FROM tracks t \
+                LEFT JOIN track_metadata_source i3 ON i3.track_id = t.id AND i3.source = 'id3' \
+                LEFT JOIN track_metadata_source sr ON sr.track_id = t.id AND sr.source = 'serato' \
+                LEFT JOIN track_metadata_source rb ON rb.track_id = t.id AND rb.source = 'rekordbox' \
+                LEFT JOIN track_metadata_source tr ON tr.track_id = t.id AND tr.source = 'traktor' \
+                LEFT JOIN track_metadata_source it ON it.track_id = t.id AND it.source = 'itunes' \
+                WHERE t.in_collection = 1) \
+             WHERE g IS NOT NULL AND g <> '' \
+             GROUP BY g COLLATE NOCASE \
+             ORDER BY n DESC, genre COLLATE NOCASE ASC \
+             LIMIT ?1";
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| LibraryError::sqlite("prepare_distinct_genres", e))?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |r| r.get::<_, String>(0))
+            .map_err(|e| LibraryError::sqlite("query_distinct_genres", e))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LibraryError::sqlite("row_distinct_genres", e))
+    }
+
     /// Tracks that carry a metadata row for `source` (e.g. `serato`,
     /// `traktor`, `itunes`), for the sidebar's per-source "all tracks from
     /// this source" node. The rows are the **unified** [`TrackRow`] — display
@@ -2953,6 +2985,39 @@ mod tests {
     /// fingerprint, track_file row, both metadata rows). Returns the
     /// minted UUIDs in insertion order so tests can assert on them.
     /// Used by every M11d.1 browser-query test below.
+    #[allow(clippy::too_many_arguments)]
+    fn set_genre(lib: &Library, id: &str, source: &str, genre: Option<&str>) {
+        lib.upsert_metadata_source(
+            id, source, None, None, None, genre, None, None, None, None, None, None, None, None,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// The rip review's genre field suggests the collection's own
+    /// genres (rig, 2026-09-25): resolved by the same source priority
+    /// the browser shows, most-used first, one entry per spelling
+    /// regardless of case, blanks left out.
+    #[test]
+    fn distinct_genres_follow_the_collection() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["a", "b", "c", "d", "e"]);
+        // Seeded id3 genre is "Test Genre" on every track.
+        set_genre(&lib, &ids[0], "serato", Some("Hip-Hop"));
+        set_genre(&lib, &ids[1], "serato", Some("hip-hop"));
+        set_genre(&lib, &ids[2], "serato", Some("Hip-Hop"));
+        set_genre(&lib, &ids[3], "serato", Some("Dub"));
+        set_genre(&lib, &ids[4], "serato", Some("  "));
+
+        let genres = lib.distinct_genres(50).unwrap();
+        assert_eq!(genres.len(), 3, "{genres:?}");
+        assert!(genres[0].eq_ignore_ascii_case("hip-hop"), "{genres:?}");
+        assert!(genres.contains(&"Dub".to_string()), "{genres:?}");
+        // The blank Serato genre falls through to the id3 row.
+        assert!(genres.contains(&"Test Genre".to_string()), "{genres:?}");
+        assert_eq!(lib.distinct_genres(1).unwrap().len(), 1);
+    }
+
     fn seed_tracks(lib: &Library, titles: &[&str]) -> Vec<String> {
         // Register a synthetic volume so the (volume_uuid, relative_path)
         // FK on track_files holds.
