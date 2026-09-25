@@ -47,6 +47,7 @@
 //
 
 import AppKit
+import os
 import DubCore
 import SwiftUI
 
@@ -129,7 +130,10 @@ struct LibraryTable: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let table = NSTableView()
+        let table = LibraryNSTableView()
+        table.dragChip = { [weak coordinator = context.coordinator] rows in
+            MainActor.assumeIsolated { coordinator?.dragChip(rows: rows) }
+        }
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = false
         table.backgroundColor = NSColor(DubColor.surface0)
@@ -397,99 +401,27 @@ struct LibraryTable: NSViewRepresentable {
             return item
         }
 
-        /// The drag picture: a compact `♪ Artist — Title` chip.
-        ///
-        /// **KNOWN ISSUE — the image animates in from off-screen.** The
-        /// chip's content and drop behaviour are correct; only its
-        /// entrance is wrong. Ruled out by measurement, so do not
-        /// re-try these:
-        ///
-        ///   * `draggingFrame` is applied and correct. Logged set vs.
-        ///     read-back: identical, centred on the pointer in screen
-        ///     coordinates, e.g. set (618,1791,293,24) with the pointer
-        ///     at (775,1803).
-        ///   * Coordinate space is not the cause. Table-space with
-        ///     `for: tableView`, and screen-space with `for: nil`, both
-        ///     fly. The start position tracked the *display* the window
-        ///     was on, which is what identified the space.
-        ///   * `setDraggingFrame(_:contents:)` is ignored outright;
-        ///     only the `draggingFrame` property takes.
-        ///   * `draggingFormation = .none` and
-        ///     `animatesToStartingPositionsOnCancelOrFail = false` do
-        ///     not stop it.
-        ///   * Overriding `draggingImageComponents` on `NSTableCellView`
-        ///     yields no components at all (drag shows only the drop
-        ///     badge); `NSTableRowView` has no such property.
-        ///   * There is no competing SwiftUI drag — the old
-        ///     `LazyVStack` rows and their `.onDrag` are gone.
-        ///
-        /// Next thing to try is an isolated sample project, not another
-        /// substitution in here.
-        ///
-        /// Two things matter here, both learned the hard way.
-        ///
-        /// `imageComponentsProvider` rather than an override of
-        /// `NSTableCellView.draggingImageComponents` — that override
-        /// was never collected and the drag showed only the drop badge.
-        /// AppKit calls this closure itself, when it needs the image.
-        ///
-        /// And the frame is in **screen coordinates**, centred on the
-        /// pointer. `enumerateDraggingItems(for:)` is documented to
-        /// re-base frames into the given view's space, but it does not
-        /// here: passing the table and a table-space point put the chip
-        /// at that point on the *desktop*, which showed up as the image
-        /// flying in from a different screen edge depending on which
-        /// display the window was on. Passing `nil` asks for screen
-        /// coordinates explicitly, and `screenPoint` is already in them.
-        ///
-        /// AppKit animates the image from whatever frame the item
-        /// carries to the cursor, so any other position visibly flies.
-        /// Note it only takes via the `draggingFrame` property;
-        /// `setDraggingFrame(_:contents:)` was ignored outright.
+        /// The drag picture: a compact `♪ Artist — Title` chip, placed by
+        /// `LibraryNSTableView.beginDraggingSession` before the session
+        /// starts. Setting it here, once the session had begun, is what
+        /// made it fly in from off-screen: AppKit animates each item from
+        /// the frame it began with to whatever it is given later — see
+        /// `LibraryNSTableView`.
+        @MainActor
+        func dragChip(rows: [Int]) -> NSImage? {
+            guard let first = rows.first, parent.tracks.indices.contains(first) else { return nil }
+            return LibraryDragChip.image(for: parent.tracks[first], extraCount: rows.count - 1)
+        }
+
         func tableView(
             _ tableView: NSTableView,
             draggingSession session: NSDraggingSession,
             willBeginAt screenPoint: NSPoint,
             forRowIndexes rowIndexes: IndexSet
         ) {
-            let rows = Array(rowIndexes)
-            let tracks = MainActor.assumeIsolated { self.parent.tracks }
-            guard let first = rows.first, tracks.indices.contains(first) else { return }
-            let chip = LibraryDragChip.image(
-                for: tracks[first], extraCount: rows.count - 1)
-            let centre = screenPoint
-
-            // `.none` is load-bearing. The default formation *gathers*
-            // the items toward the cursor, and that gather is the
-            // animation — it runs off the frames AppKit had before this
-            // method ran, so setting a correct frame here did nothing.
-            // Verified: the frame reads back exactly as set, centred on
-            // the pointer, and the image still flew in until this line.
+            // One chip, where it was put; no gathering the rows into it.
             session.draggingFormation = .none
             session.animatesToStartingPositionsOnCancelOrFail = false
-            session.enumerateDraggingItems(
-                options: [], for: nil, classes: [NSPasteboardItem.self],
-                searchOptions: [:]
-            ) { item, index, _ in
-                guard index == 0 else {
-                    // One chip for the whole drag; the rest collapse
-                    // into it rather than stacking N images.
-                    item.imageComponentsProvider = nil
-                    item.draggingFrame = NSRect(origin: centre, size: .zero)
-                    return
-                }
-                item.draggingFrame = NSRect(
-                    x: centre.x - chip.size.width / 2,
-                    y: centre.y - chip.size.height / 2,
-                    width: chip.size.width,
-                    height: chip.size.height)
-                item.imageComponentsProvider = {
-                    let component = NSDraggingImageComponent(key: .icon)
-                    component.contents = chip
-                    component.frame = NSRect(origin: .zero, size: chip.size)
-                    return [component]
-                }
-            }
         }
 
         /// The dragged ids in visual order. A multi-row selection moves
@@ -839,4 +771,54 @@ enum LibraryDragChip {
         image.unlockFocus()
         return image
     }
+}
+
+/// The library's table, for one reason: to place the drag image *before*
+/// the drag session begins.
+///
+/// The chip flew in from off-screen for months. Every attempt set it in
+/// `draggingSession(_:willBeginAt:)`, and every one of those frames read
+/// back correct — but by then AppKit had started the session with the
+/// table's own row images at their row positions, and it animates an
+/// item from the frame it began with to any it is given later. The table
+/// begins its drag through this view's own
+/// `beginDraggingSession(with:event:source:)`, so the items can be given
+/// their final frame and image here, and there is nothing to animate
+/// from: the chip is under the pointer where the row was grabbed, from
+/// the first frame, the way Finder's is (rig, 2026-09-25).
+final class LibraryNSTableView: NSTableView {
+    /// The chip for the rows being dragged, in drag order.
+    var dragChip: ([Int]) -> NSImage? = { _ in nil }
+
+    override func beginDraggingSession(
+        with items: [NSDraggingItem], event: NSEvent, source: NSDraggingSource
+    ) -> NSDraggingSession {
+        let point = convert(event.locationInWindow, from: nil)
+        let grabbed = row(at: point)
+        let rows: [Int]
+        if grabbed >= 0, selectedRowIndexes.contains(grabbed) {
+            rows = [grabbed] + selectedRowIndexes.filter { $0 != grabbed }
+        } else {
+            rows = grabbed >= 0 ? [grabbed] : Array(selectedRowIndexes)
+        }
+        if let chip = dragChip(rows) {
+            for (index, item) in items.enumerated() {
+                if index == 0 {
+                    // The pointer sits on the chip's note, as it sits on a
+                    // file's icon in a Finder drag.
+                    let frame = NSRect(
+                        x: point.x - 14, y: point.y - chip.size.height / 2,
+                        width: chip.size.width, height: chip.size.height)
+                    item.setDraggingFrame(frame, contents: chip)
+                } else {
+                    // One chip for the whole drag; the chip says how many.
+                    item.setDraggingFrame(NSRect(origin: point, size: .zero), contents: nil)
+                }
+            }
+        }
+        Self.log.notice("drag begins with \(items.count, privacy: .public) item(s), chip placed before the session")
+        return super.beginDraggingSession(with: items, event: event, source: source)
+    }
+
+    private static let log = Logger(subsystem: "com.dub.app", category: "drag")
 }
