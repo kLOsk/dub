@@ -760,7 +760,7 @@ Hot cues persist per track (`track_cues`, `source='user'`; see [`LIBRARY-SCHEMA.
 
 **Echo-Out**
 - Hold-to-engage button (or keyboard tap with sustain)
-- Captures the last N beats of the deck's output into a delay line, freezes the deck's main signal, plays the captured loop with feedback decay.
+- On the press the deck plays **the next beat** as normal while it is captured into a delay line; then the deck's main signal is muted and that beat repeats with feedback decay. The beat after the press, not the one before it (Daniel, 2026-09-25): the DJ hits the button on the beat they want to throw away, and hears it go. Pressing again inside that beat cancels with nothing muted.
 - Parameters: divisions (1/4, 1/2, 1, 2, 4 beats), feedback (default 60 %), filter (low-pass, default 8 kHz)
 - One-button workflow: tap and hold → echo-out engages; release → tail decays naturally; deck's actual playback continues where it would have been (slip-aware).
 

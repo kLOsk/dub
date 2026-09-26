@@ -2978,6 +2978,12 @@ mod tests {
 
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
         handle.deck(0).engage_echo(480, 0.5, lp).unwrap();
+        // The press lights the pad at once; the deck plays the next beat
+        // dry while it is captured (256 of 480 frames rendered)…
+        engine.render(&mut rt, &mut out);
+        assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Capturing);
+        assert_eq!(engine.deck(0).load_echo_state(), 1);
+        // …then that beat echoes.
         engine.render(&mut rt, &mut out);
         assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Engaged);
         assert_eq!(engine.deck(0).load_echo_state(), 1);
@@ -3323,8 +3329,9 @@ mod tests {
             out[0]
         );
 
-        // Engage; delay long enough that the rendered window stays inside the
-        // first (full-level) lap, so the wet is the captured 0.2.
+        // Engage. The next 480 frames play dry while they are captured; the
+        // rendered window then ends inside the first (full-level) lap of the
+        // echo, so the wet is the captured 0.2.
         let lp = dub_dsp::one_pole_coeff(8_000.0, sr);
         engine.apply_command(Command::DeckEngageEcho {
             idx: 0,
@@ -3333,7 +3340,7 @@ mod tests {
             lp_coeff: lp,
         });
         let mut last = 0.0_f32;
-        for _ in 0..6 {
+        for _ in 0..12 {
             engine.render(&mut rt, &mut out);
             last = out[0];
         }

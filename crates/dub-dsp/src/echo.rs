@@ -3,11 +3,15 @@
 //! ## What it is
 //!
 //! The classic dub / Pioneer-DJM "echo out", run **100 % wet**: the DJ taps
-//! the button on, the last *N* beats of the deck's output are captured, the
-//! deck's dry signal is **muted**, and the captured loop repeats with a
+//! the button on, the deck plays **the next beat** as normal while it is
+//! captured, then its dry signal is **muted** and that beat repeats with a
 //! feedback decay — the phrase echoes away to silence while the operator
 //! brings in the next record. Tapping off un-mutes the deck, which has kept
 //! playing underneath (slip-aware) and resumes at its advanced position.
+//!
+//! The beat *after* the press, not the one before it (Daniel, 2026-09-25):
+//! the DJ hits the button on the beat they want to throw away, and hears it
+//! go.
 //!
 //! It is a **toggle**, not a hold: on → mute + echo; off → dry back.
 //!
@@ -18,7 +22,10 @@
 //! capture"). The read head trails the write head by exactly `delay_frames`,
 //! so `ring[w − D]` is the audio from one echo-length ago.
 //!
-//! On **engage** we stop writing live input and instead recirculate:
+//! On **engage** the echo first *captures*: live input keeps going into the
+//! ring and out dry for one echo length, so when that beat is in, the read
+//! head (`w − D`) sits on its first sample. Then it stops writing live input
+//! and recirculates:
 //!
 //! ```text
 //! echo    = ring[w − D]                 // what we play this sample (wet)
@@ -101,6 +108,8 @@ const AUTO_OFF_MS: f32 = 300.0;
 pub enum EchoState {
     /// Off: transparent passthrough, ring warm-captures the dry.
     Idle,
+    /// Pressed: the deck plays the next beat dry while it is recorded.
+    Capturing,
     /// On: dry muted (internal deck) and the captured loop repeating + decaying.
     Engaged,
 }
@@ -111,7 +120,7 @@ impl EchoState {
     pub fn code(self) -> u8 {
         match self {
             EchoState::Idle => 0,
-            EchoState::Engaged => 1,
+            EchoState::Capturing | EchoState::Engaged => 1,
         }
     }
 }
@@ -153,6 +162,8 @@ pub struct EchoOut {
     quiet_frames: usize,
     /// `quiet_frames` threshold (= `AUTO_OFF_MS` at the engine sample rate).
     ready_frames: usize,
+    /// Frames of the capture beat still to record while `Capturing`.
+    capture_left: usize,
 }
 
 impl EchoOut {
@@ -180,23 +191,28 @@ impl EchoOut {
             quiet_frames: 0,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             ready_frames: (sample_rate * AUTO_OFF_MS / 1000.0).max(1.0) as usize,
+            capture_left: 0,
         }
     }
 
     /// Engage (toggle on) the echo. `delay_frames`, `feedback` and `lp_coeff`
     /// are fully resolved off-RT (delay from the deck's BPM × division;
-    /// coefficient from the cutoff). The captured loop is whatever the ring
-    /// has warm-captured up to now — no buffer reset, so an echo of the last
-    /// N beats is audible immediately. Re-engaging swaps the length live.
+    /// coefficient from the cutoff). From off, the deck plays the next
+    /// `delay_frames` dry while they are captured, and the echo of exactly
+    /// that beat begins as it ends. Re-engaging while echoing swaps the
+    /// length live.
     pub fn engage(&mut self, delay_frames: usize, feedback: f32, lp_coeff: f32) {
         self.delay_frames = delay_frames.clamp(1, self.capacity());
         self.feedback = feedback.clamp(0.0, MAX_FEEDBACK);
         self.lp_coeff = lp_coeff.clamp(0.0, 1.0);
+        self.quiet_frames = 0;
+        if self.state == EchoState::Engaged {
+            return;
+        }
         self.lp_l = 0.0;
         self.lp_r = 0.0;
-        self.state = EchoState::Engaged;
-        self.wet_target = 1.0;
-        self.quiet_frames = 0;
+        self.state = EchoState::Capturing;
+        self.capture_left = self.delay_frames;
     }
 
     /// Disengage (toggle off): the dry signal comes back (the deck has kept
@@ -232,6 +248,7 @@ impl EchoOut {
     pub fn state_code(&self) -> u8 {
         match self.state {
             EchoState::Idle => 0,
+            EchoState::Capturing => 1,
             EchoState::Engaged if self.quiet_frames >= self.ready_frames => 2,
             EchoState::Engaged => 1,
         }
@@ -250,21 +267,23 @@ impl EchoOut {
     pub fn process_block(&mut self, out: &mut [f32], stride: usize, offset: usize) {
         debug_assert!(stride >= 2 && offset + 2 <= stride);
 
-        // Mute the dry while engaged; idle passes it through.
-        let dry_target = if self.state == EchoState::Engaged {
-            0.0
-        } else {
-            1.0
-        };
-
         // Anything to do to the output? When fully off (idle, wet gone, dry
         // restored) the call is a transparent no-op that just keeps the ring
         // warm.
-        let active = self.state == EchoState::Engaged || self.wet_gain > 0.0 || self.dry_gain < 1.0;
+        let active = self.state != EchoState::Idle || self.wet_gain > 0.0 || self.dry_gain < 1.0;
 
         for frame in out.chunks_exact_mut(stride) {
             let in_l = frame[offset];
             let in_r = frame[offset + 1];
+            // A frame's gains follow the state it *started* in: the last
+            // sample of the capture beat is still dry, and the echo begins
+            // on the sample after it. Idle and capturing pass the dry.
+            let dry_target = if self.state == EchoState::Engaged {
+                0.0
+            } else {
+                1.0
+            };
+            let wet_target = self.wet_target;
 
             let read = (self.write.wrapping_sub(self.delay_frames)) & self.mask;
             let echo_l = self.ring_l[read];
@@ -275,6 +294,18 @@ impl EchoOut {
                     // Warm capture: store the live dry, no recirculation.
                     self.ring_l[self.write] = in_l;
                     self.ring_r[self.write] = in_r;
+                }
+                EchoState::Capturing => {
+                    // The beat after the press: record it, play it dry.
+                    self.ring_l[self.write] = in_l;
+                    self.ring_r[self.write] = in_r;
+                    self.capture_left = self.capture_left.saturating_sub(1);
+                    if self.capture_left == 0 {
+                        // It is in: from the next sample the read head sits
+                        // on its first frame. Mute the dry, bring the wet.
+                        self.state = EchoState::Engaged;
+                        self.wet_target = 1.0;
+                    }
                 }
                 EchoState::Engaged => {
                     // Recirculate the captured loop through the one-pole
@@ -300,7 +331,7 @@ impl EchoOut {
             }
             self.write = (self.write + 1) & self.mask;
 
-            self.wet_gain = ramp(self.wet_gain, self.wet_target, self.ramp_inc);
+            self.wet_gain = ramp(self.wet_gain, wet_target, self.ramp_inc);
             self.dry_gain = ramp(self.dry_gain, dry_target, self.ramp_inc);
 
             if active {
@@ -381,30 +412,84 @@ mod tests {
         assert_eq!(echo.state(), EchoState::Idle);
     }
 
+    /// Rig, 2026-09-25: the echo is of the beat *after* the press, not
+    /// the one before it. The deck plays that beat dry — nothing muted,
+    /// no wet — then goes 100 % wet on exactly that beat.
+    #[test]
+    fn engage_plays_the_next_beat_dry_then_echoes_it() {
+        let mut echo = EchoOut::new(SR);
+        let delay = 1_000usize;
+        // The beat before the press: loud. It must never be heard as echo.
+        for _ in 0..delay {
+            let _ = step(&mut echo, 0.9);
+        }
+        echo.engage(delay, 0.5, 1.0);
+        assert_eq!(echo.state(), EchoState::Capturing);
+        assert_eq!(echo.state_code(), 1, "the pad lights on the press");
+        // The beat after the press passes dry, untouched.
+        let beat: Vec<f32> = (0..delay)
+            .map(|i| (i as f32 / delay as f32) * 0.4)
+            .collect();
+        for (i, &x) in beat.iter().enumerate() {
+            let y = step(&mut echo, x);
+            assert!(
+                (y - x).abs() < 1e-6,
+                "capture beat sample {i} not dry: {x} -> {y}"
+            );
+        }
+        assert_eq!(echo.state(), EchoState::Engaged);
+        // Then the dry mutes and that beat repeats (past the 3 ms
+        // cross-fade), not the 0.9 before the press.
+        let ramp = (SR * RAMP_MS / 1000.0) as usize + 2;
+        for (i, &x) in beat.iter().enumerate() {
+            let y = step(&mut echo, 0.77);
+            if i > ramp {
+                assert!(
+                    (y - x).abs() < 1e-3,
+                    "echo sample {i}: {y}, want the captured {x}"
+                );
+            }
+        }
+    }
+
+    /// Pressed again inside the capture beat: nothing was muted, nothing
+    /// echoes — the deck just carries on.
+    #[test]
+    fn release_while_capturing_never_echoes() {
+        let mut echo = EchoOut::new(SR);
+        echo.engage(1_000, 0.6, 1.0);
+        for _ in 0..300 {
+            let _ = step(&mut echo, 0.5);
+        }
+        echo.release();
+        assert_eq!(echo.state(), EchoState::Idle);
+        for i in 0..3_000 {
+            let y = step(&mut echo, 0.25);
+            assert!((y - 0.25).abs() < 1e-6, "sample {i} carried an echo: {y}");
+        }
+    }
+
     #[test]
     fn engaged_repeats_captured_loop_with_decay() {
         let mut echo = EchoOut::new(SR);
         let delay = 2_000usize;
         let fb = 0.5f32;
 
-        // Warm capture: a unit impulse at sample 0, then silence to 1000.
-        let _ = step(&mut echo, 1.0);
-        for _ in 1..1_000 {
-            let _ = step(&mut echo, 0.0);
-        }
-
         // Engage, low-pass bypassed (coeff = 1 → identity) so only feedback
-        // shapes the tail. Feed silence; the wet is the only output.
+        // shapes the tail. The captured beat is the one after the press: a
+        // unit impulse inside it — clear of the 3 ms cross-fade at the seam
+        // where the echo takes over — and silence around it.
         echo.engage(delay, fb, 1.0);
-        let mut out = Vec::with_capacity(7_000);
-        for _ in 0..7_000 {
-            out.push(step(&mut echo, 0.0));
+        let mut out = Vec::with_capacity(7_500);
+        for i in 0..7_500 {
+            out.push(step(&mut echo, if i == 500 { 1.0 } else { 0.0 }));
         }
 
-        let peak_at = |abs_sample: usize| out[abs_sample - 1_000];
-        let e1 = peak_at(2_000);
-        let e2 = peak_at(4_000);
-        let e3 = peak_at(6_000);
+        // The impulse played dry at 500; it comes back one beat later, and
+        // once a beat after that, decaying.
+        let e1 = out[2_500];
+        let e2 = out[4_500];
+        let e3 = out[6_500];
 
         assert!((e1 - 1.0).abs() < 1e-3, "1st echo {e1} != 1.0");
         assert!((e2 - fb).abs() < 1e-3, "2nd echo {e2} != {fb}");
