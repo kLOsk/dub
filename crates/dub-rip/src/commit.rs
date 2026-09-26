@@ -136,8 +136,24 @@ pub(crate) fn commit_session(
             .tracks
             .resize_with(ranges.len(), crate::manifest::TrackEntry::default);
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let track_total = ranges.len() as u32;
+    let file_names = plan_file_names_skipping(
+        &manifest
+            .tracks
+            .iter()
+            .map(|t| t.meta.clone())
+            .collect::<Vec<_>>(),
+        &manifest
+            .tracks
+            .iter()
+            .map(|t| t.encoded_file.clone())
+            .collect::<Vec<_>>(),
+        &manifest
+            .tracks
+            .iter()
+            .map(|t| t.dropped)
+            .collect::<Vec<_>>(),
+        manifest.split_generation,
+    );
 
     let mut outcome = RipOutcome {
         segments: Vec::with_capacity(ranges.len()),
@@ -148,10 +164,7 @@ pub(crate) fn commit_session(
 
     for (index, range) in ranges.iter().enumerate() {
         let entry = &manifest.tracks[index];
-        let file_name = entry
-            .encoded_file
-            .clone()
-            .unwrap_or_else(|| segment_file_name(index, &entry.meta, manifest.split_generation));
+        let file_name = file_names[index].clone();
         let file = session_dir.join(&file_name);
 
         if entry.dropped {
@@ -185,7 +198,7 @@ pub(crate) fn commit_session(
         let end = usize::try_from(range.end * 2).unwrap_or(usize::MAX);
         let pcm = &samples[start..end];
         #[allow(clippy::cast_possible_truncation)]
-        let tags = tags_for(&entry.meta, index as u32 + 1, track_total);
+        let tags = tags_for(&entry.meta);
 
         let result = commit_segment(library, pcm, sample_rate, &file, &tags);
         let (library_uuid, error) = match result {
@@ -378,21 +391,72 @@ fn analyze_segment(
         .map_err(|e| format!("analysis commit failed: {e}"))
 }
 
-fn tags_for(meta: &crate::plan::TrackMeta, track_number: u32, track_total: u32) -> TrackTags {
+/// What goes into a ripped file's tags: what the track is called and
+/// where it came from — not its position on the side. A DJ rips the
+/// songs they want, not the album, and "3 of 7" on a rip of two means
+/// nothing to their library (rig, 2026-09-25).
+fn tags_for(meta: &crate::plan::TrackMeta) -> TrackTags {
     TrackTags {
         title: meta.title.clone(),
         artist: meta.artist.clone(),
         album: meta.album.clone(),
         year: meta.year,
         genre: meta.genre.clone(),
-        track_number: Some(track_number),
-        track_total: Some(track_total),
         ..TrackTags::default()
     }
 }
 
-/// `NN Artist - Title.flac`, falling back to `NN Track.flac` for
-/// untagged segments. Sanitized for the filesystem; the library
+/// Every segment's file name for a commit. A name an earlier pass wrote
+/// stays; new names steer around the ones taken, gaining ` (2)`, ` (3)`…
+/// — without the side position in front, two tracks called "Version"
+/// would otherwise write one file over the other. Compared ignoring
+/// case, as the Mac's file system does.
+#[cfg(test)]
+fn plan_file_names(
+    tracks: &[crate::plan::TrackMeta],
+    written: &[Option<String>],
+    generation: u32,
+) -> Vec<String> {
+    plan_file_names_skipping(tracks, written, &vec![false; tracks.len()], generation)
+}
+
+/// [`plan_file_names`], where a `dropped` segment is never encoded and so
+/// takes no name from a kept one.
+fn plan_file_names_skipping(
+    tracks: &[crate::plan::TrackMeta],
+    written: &[Option<String>],
+    dropped: &[bool],
+    generation: u32,
+) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> =
+        written.iter().flatten().map(|n| n.to_lowercase()).collect();
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(index, meta)| {
+            if let Some(Some(name)) = written.get(index) {
+                return name.clone();
+            }
+            let base = segment_file_name(index, meta, generation);
+            if dropped.get(index).copied().unwrap_or(false) {
+                return base;
+            }
+            let (stem, ext) = base.rsplit_once('.').unwrap_or((base.as_str(), "flac"));
+            let mut name = base.clone();
+            let mut count = 2;
+            while taken.contains(&name.to_lowercase()) {
+                name = format!("{stem} ({count}).{ext}");
+                count += 1;
+            }
+            taken.insert(name.to_lowercase());
+            name
+        })
+        .collect()
+}
+
+/// `Artist - Title.flac`, falling back to `Track N.flac` for untagged
+/// segments — the side position is only ever a name when there is no
+/// other; see [`plan_file_names`] for same-named tracks. Sanitized for the filesystem; the library
 /// derives `filename`-source metadata from this, so keep it human.
 fn segment_file_name(index: usize, meta: &crate::plan::TrackMeta, generation: u32) -> String {
     let n = index + 1;
@@ -407,9 +471,9 @@ fn segment_file_name(index: usize, meta: &crate::plan::TrackMeta, generation: u3
     // identity is (volume, relative path), so the same path would hand
     // the new audio the old track's row, cues and history included.
     if generation > 1 {
-        format!("{n:02} {stem} (v{generation}).flac")
+        format!("{stem} (v{generation}).flac")
     } else {
-        format!("{n:02} {stem}.flac")
+        format!("{stem}.flac")
     }
 }
 
@@ -467,32 +531,89 @@ mod tests {
     use super::*;
     use crate::plan::TrackMeta;
 
+    fn meta(artist: Option<&str>, title: Option<&str>) -> TrackMeta {
+        TrackMeta {
+            artist: artist.map(Into::into),
+            title: title.map(Into::into),
+            ..TrackMeta::default()
+        }
+    }
+
+    /// A DJ rips the songs they want, not the album, and cares about the
+    /// name (rig, 2026-09-25): no side position in front of it.
     #[test]
     fn file_name_uses_artist_and_title_when_present() {
-        let meta = TrackMeta {
-            artist: Some("Sound Dimension".into()),
-            title: Some("Real Rock".into()),
-            ..TrackMeta::default()
-        };
         assert_eq!(
-            segment_file_name(0, &meta, 1),
-            "01 Sound Dimension - Real Rock.flac"
+            segment_file_name(0, &meta(Some("Sound Dimension"), Some("Real Rock")), 1),
+            "Sound Dimension - Real Rock.flac"
         );
     }
 
+    /// An untitled track keeps its place on the side as its name — the
+    /// only thing that tells two of them apart.
     #[test]
     fn file_name_falls_back_per_missing_field() {
         assert_eq!(
             segment_file_name(2, &TrackMeta::default(), 1),
-            "03 Track 3.flac"
+            "Track 3.flac"
         );
-        let title_only = TrackMeta {
-            title: Some("Version".into()),
-            ..TrackMeta::default()
-        };
-        assert_eq!(segment_file_name(9, &title_only, 1), "10 Version.flac");
+        assert_eq!(
+            segment_file_name(9, &meta(None, Some("Version")), 1),
+            "Version.flac"
+        );
+        assert_eq!(
+            segment_file_name(4, &meta(Some("King Tubby"), None), 1),
+            "King Tubby - Track 5.flac"
+        );
         // A re-split writes beside the previous split, never over it.
-        assert_eq!(segment_file_name(9, &title_only, 2), "10 Version (v2).flac");
+        assert_eq!(
+            segment_file_name(9, &meta(None, Some("Version")), 2),
+            "Version (v2).flac"
+        );
+    }
+
+    /// Without the number in front, two tracks called "Version" on one
+    /// side — common on a dub record — would write one file over the
+    /// other. The second gets a count; case does not make them different,
+    /// because the Mac's file system does not.
+    #[test]
+    fn same_named_tracks_on_a_side_get_distinct_files() {
+        let tracks = [
+            meta(None, Some("Version")),
+            meta(Some("Augustus Pablo"), Some("East of the River Nile")),
+            meta(None, Some("version")),
+            meta(None, Some("Version")),
+        ];
+        let names = plan_file_names(&tracks, &[None, None, None, None], 1);
+        assert_eq!(
+            names,
+            [
+                "Version.flac",
+                "Augustus Pablo - East of the River Nile.flac",
+                "version (2).flac",
+                "Version (3).flac",
+            ]
+        );
+    }
+
+    /// A name already written by an earlier pass stays, and new names
+    /// steer around it.
+    #[test]
+    fn names_already_written_are_kept_and_avoided() {
+        let tracks = [meta(None, Some("Version")), meta(None, Some("Version"))];
+        let written = [None, Some("Version.flac".to_string())];
+        let names = plan_file_names(&tracks, &written, 1);
+        assert_eq!(names, ["Version (2).flac", "Version.flac"]);
+    }
+
+    /// Track number and total are not written: on a rip of two songs
+    /// from a side, "3 of 7" means nothing to a DJ's library.
+    #[test]
+    fn tags_carry_no_side_position() {
+        let tags = tags_for(&meta(Some("Augustus Pablo"), Some("Java")));
+        assert_eq!(tags.title.as_deref(), Some("Java"));
+        assert_eq!(tags.track_number, None);
+        assert_eq!(tags.track_total, None);
     }
 
     #[test]

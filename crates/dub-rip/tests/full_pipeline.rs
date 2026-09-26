@@ -194,7 +194,7 @@ fn record_split_commit_full_pipeline() {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .starts_with("01 Sound Dimension - Real Rock"));
+        .starts_with("Sound Dimension - Real Rock"));
 
     // The encoded segment decodes to exactly the segment length.
     let track = dub_io::Track::load_from_path(&outcome.segments[0].file).expect("segment decodes");
