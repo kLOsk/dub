@@ -312,6 +312,9 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     pitch as it was 80 ms ago, longer than any of those takes to show its
     speed, so their first frames never reach the axis: the zoom is held
     *exactly*.
+    A fader flick faster than 40 %/s (a full ±8 in under ~0.4 s) reads as a
+    scratch — the picture holds, then glides after 0.35 s. Daniel confirmed
+    that is fine (2026-09-25); the threshold stays.
   - **The model split (agreed with Daniel, 2026-09-23) — built, awaiting the
     rig.** Deck A, deck B and the sampler's voices live on their own
     `ObservableObject`s (`App/ModelStores.swift`); the model keeps `deckA` /
@@ -382,8 +385,13 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     FFI's per-track result — no FFI change); during the commit the rows
     report waiting / encoding / in library / failed. The Prep region asks
     `RipReviewPanel.preferredHeight(rows:)` (up to 5 rows, then it scrolls).
-    Open: the side letter is display-only — writing "A1" into the tags
-    (TRACKNUMBER is numeric) is Daniel's call.
+    **Resolved 2026-09-25/26: no side letter at all.** Daniel: DJs care
+    about the name, and rip the songs they want, not the album. The A|B
+    switch is gone; rows number 1, 2, 3 by place on the side (left-out
+    ones included) — only to match a map block to a row; TRACKNUMBER /
+    TRACKTOTAL are no longer written; files are `Artist - Title.flac`
+    (untitled keep `Track N`), and same-named tracks on a side get ` (2)`
+    (`plan_file_names`, case-insensitive like the Mac's file system).
   - **Rig 2026-09-25, second pass.** Drag confirmed fixed. Then:
     typing a tag made the field **blink** — the row re-seeded whenever the
     session's copy differed from its own, and a letter typed between the
@@ -399,6 +407,18 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
     armed take, *parks* a reviewed one (session dir kept, recovery banner
     offers it back — `parkRip`), closes an imported one, and is refused
     mid-take or mid-import (`StudioSurfaceRules`).
+- **DUB FX / "UI takes seconds to react", rig 2026-09-26 — fixed, confirmed.**
+  Profiled with rotating `sample` slices + Intel GPU utilisation from
+  `ioreg`: main thread ~78 % idle, audio render healthy, GPU ≤ 16 % — the
+  surface simply was not redrawing. `PerformanceView` observes the deck and
+  sampler stores again (library/root still isolated). Also fixed on the way:
+  the DUB FX input level rode the deck state every poll (the VU needle and
+  HOT lamp now read the engine on layers — `MeterNeedle`, `LayerReadout`).
+  The FX lane's `clipShape` was taken off as a suspect for its render thread
+  starving in `nextDrawable`, did not fix it, and is back (Daniel wants the
+  rounded corners); the starvation went with the redraw fix.
+  **Open:** find which region under `DeckScope` went stale — its own test
+  (`DeckScopeTests`) passes.
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output

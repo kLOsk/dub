@@ -377,12 +377,6 @@ struct DeckState: Equatable {
     /// The channel's TRIM, in dB — the deck gain while the deck is the FX
     /// channel. A track load sets the gain back to the track's own.
     var fxTrimDb: Double = 0
-    /// The live input's level this poll (F-38 stage 3): a VU-ballistic RMS
-    /// and a held peak, post-trim, linear, measured on the passthrough —
-    /// the FX channel's VU and its HOT lamp. The one measured meter on the
-    /// pane; the unit lamps are drawn from the knobs.
-    var inputRms: Float = 0
-    var inputPeak: Float = 0
     /// Vintage-FX rack macro (super-knob) positions 0..1, same order.
     var rackMacro: [Double] = [0.5, 0.5, 0.5, 0.5]
 
@@ -663,7 +657,11 @@ final class WaveformAppModel: ObservableObject {
     /// DEBUG builds, by the dev override below. There is no
     /// user-facing mode switch in a shipping build — the hardware
     /// decides (PRD §3).
-    @Published var engineMode: EngineMode = .timecode
+    @Published var engineMode: EngineMode = .timecode {
+        // MAP lives on Performance only; leaving it must not strand map
+        // mode on with no button to turn it off.
+        didSet { if engineMode != .timecode, mapMode { mapMode = false } }
+    }
 
     #if DEBUG
     /// DEV-only manual mode override. `nil` means "follow hardware
@@ -1219,8 +1217,6 @@ final class WaveformAppModel: ObservableObject {
     /// M26c — recognition summary, polled while the worker runs. `nil`
     /// until a pass has been asked for.
     @Published var ripRecognition: RipRecognitionUi? = nil
-    /// Which side of the record the review is numbering — A1… or B1….
-    @Published var ripSideLetter: String = "A"
     /// The collection's genres, most-used first, for the review's genre
     /// field. Loaded when the review opens.
     @Published private(set) var ripGenres: [String] = []
@@ -2381,11 +2377,11 @@ final class WaveformAppModel: ObservableObject {
         }
         next.hasTimecodeInput = tele.hasTimecodeInput
         next.controlMode = tele.controlMode
-        // Only the DUB FX channel shows its input level, and a live level
-        // never sits still — carried on a turntable deck it republished
-        // the model every poll for a meter nobody was looking at.
-        next.inputRms = next.isDubFx ? tele.inputRms : 0
-        next.inputPeak = next.isDubFx ? tele.inputPeak : 0
+        // The input level is not stored: it never sits still, and carried
+        // here it republished the deck every poll — on a turntable deck
+        // for a meter nobody was looking at, on the DUB FX channel for
+        // one that rebuilt the whole rack 30×/s (rig, 2026-09-26). The FX
+        // pane's meter reads the engine on its own layers.
         next.sourceClass = tele.sourceClass
         next.calibrated = tele.calibrated
         next.calibrating = tele.calibrating

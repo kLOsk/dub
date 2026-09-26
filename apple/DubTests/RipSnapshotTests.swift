@@ -172,7 +172,7 @@ final class RipSnapshotTests: XCTestCase {
 
     func test_ripTrackRow_empty() {
         let segment = RipSegmentUi(index: 1, startSecs: 452, endSecs: 878)
-        snap(deckBg(RipTrackRow(segment: segment, position: "A2")),
+        snap(deckBg(RipTrackRow(segment: segment, position: "2")),
              width: 1100, height: 70, named: "empty")
     }
 
@@ -183,7 +183,7 @@ final class RipSnapshotTests: XCTestCase {
             artist: "Augustus Pablo",
             album: "King Tubbys Meets Rockers Uptown",
             genre: "Dub", year: "1976")
-        snap(deckBg(RipTrackRow(segment: segment, position: "A1", isPlaying: true)),
+        snap(deckBg(RipTrackRow(segment: segment, position: "1", isPlaying: true)),
              width: 1100, height: 70, named: "filled-playing")
     }
 
@@ -195,7 +195,7 @@ final class RipSnapshotTests: XCTestCase {
         let suggestion = RipSegmentMetadata(
             title: "Skanking Easy", artist: "Augustus Pablo",
             album: "King Tubbys Meets Rockers Uptown", genre: "Dub", year: "1976")
-        snap(deckBg(RipTrackRow(segment: segment, position: "A3", suggestion: suggestion)),
+        snap(deckBg(RipTrackRow(segment: segment, position: "4", suggestion: suggestion)),
              width: 1100, height: 70, named: "suggested")
     }
 
@@ -204,14 +204,14 @@ final class RipSnapshotTests: XCTestCase {
     func test_ripTrackRow_shortPiece() {
         let segment = RipSegmentUi(index: 0, startSecs: 0, endSecs: 9)
         snap(deckBg(RipTrackRow(
-                segment: segment, position: "A1", shortReason: "probably the lead-in")),
+                segment: segment, position: "1", shortReason: "probably the lead-in")),
              width: 1100, height: 70, named: "short-piece")
     }
 
     /// Left out: a thin hatched line, not a full row.
     func test_ripDroppedRow() {
         let segment = RipSegmentUi(index: 0, startSecs: 0, endSecs: 9, dropped: true)
-        snap(deckBg(RipDroppedRow(segment: segment, reason: "probably the lead-in")),
+        snap(deckBg(RipDroppedRow(segment: segment, position: "1", reason: "probably the lead-in")),
              width: 1100, height: 70, named: "dropped")
     }
 

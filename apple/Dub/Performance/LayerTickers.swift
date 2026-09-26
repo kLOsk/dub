@@ -352,6 +352,8 @@ struct LayerReadout: NSViewRepresentable {
     let color: Color
     let placeholder: Color
     var trailing: Bool = false
+    /// What `nil` reads as, in the placeholder colour.
+    var nilText: String = "—"
 
     func makeNSView(context: Context) -> LayerReadoutView {
         let v = LayerReadoutView()
@@ -365,6 +367,7 @@ struct LayerReadout: NSViewRepresentable {
 
     private func configure(_ v: LayerReadoutView) {
         v.read = read
+        v.nilText = nilText
         v.setStyle(
             font: NSFont.monospacedSystemFont(ofSize: size, weight: .medium),
             color: NSColor(color), placeholder: NSColor(placeholder), trailing: trailing)
@@ -373,6 +376,7 @@ struct LayerReadout: NSViewRepresentable {
 
 final class LayerReadoutView: NSView {
     var read: () -> String? = { nil }
+    var nilText = "—"
 
     /// Ten a second: a fader move reads as following the hand, and a
     /// string that has not changed costs a comparison.
@@ -450,7 +454,7 @@ final class LayerReadoutView: NSView {
         shown = .some(next)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        text.string = next ?? "—"
+        text.string = next ?? nilText
         text.foregroundColor = (next == nil ? placeholder : color).cgColor
         CATransaction.commit()
     }

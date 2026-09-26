@@ -148,15 +148,19 @@ struct FxChannelState: Equatable {
 
     /// The VU's needle, 0…1 along the siren meter's scale: 0 VU at
     /// −18 dBFS RMS, the scale −20…+3 VU, the red from +1.
-    var vuLevel: Double {
-        let amp = Double(max(inputRms, 1e-5))
+    var vuLevel: Double { Self.vuLevel(rms: inputRms) }
+
+    static func vuLevel(rms: Float) -> Double {
+        let amp = Double(max(rms, 1e-5))
         let vu = 20 * log10(amp) + 18
         return min(max((vu + 20) / 23, 0), 1)
     }
 
     /// HOT: the input peaked within 1 dB of full scale — the trim is too
     /// high for what the mixer is sending.
-    var isHot: Bool { inputPeak >= 0.89 }
+    var isHot: Bool { Self.isHot(peak: inputPeak) }
+
+    static func isHot(peak: Float) -> Bool { peak >= 0.89 }
 
     /// The trim as the readout prints it.
     var trimText: String {

@@ -6,6 +6,7 @@
 //  drives the needle and why it is drawn rather than measured.
 //
 
+import AppKit
 import SwiftUI
 
 /// The dial: a static drawing of the face plus a needle at `level`.
@@ -16,6 +17,10 @@ struct SirenMeterFace: View {
     let echoLine: String
     /// 0…1 along the scale.
     let level: Double
+    /// Off when the needle is drawn live on a layer over the face
+    /// (`MeterNeedle`) — a level through SwiftUI redraws the face, and a
+    /// live one redrew the DUB FX pane thirty times a second.
+    var drawsNeedle: Bool = true
 
     /// The face sits inset in the window; the scale is an arc about a
     /// pivot just below the face, its sweep from the left stop to the
@@ -32,7 +37,7 @@ struct SirenMeterFace: View {
             let face = CGRect(x: Self.inset, y: Self.inset,
                               width: size.width - Self.inset * 2,
                               height: size.height - Self.inset * 2)
-            let pivot = CGPoint(x: face.midX, y: face.maxY - 6)
+            let pivot = Self.pivot(in: size)
             let faceShape = Path(roundedRect: face, cornerRadius: 3)
             ctx.fill(faceShape, with: .color(DubColor.meterFace))
             ctx.stroke(faceShape, with: .color(DubColor.meterBezel), lineWidth: 1)
@@ -70,10 +75,11 @@ struct SirenMeterFace: View {
                     .foregroundColor(DubColor.meterInkSoft),
                 at: CGPoint(x: face.midX, y: face.maxY - 5), anchor: .center)
 
+            guard drawsNeedle else { return }
             // The needle and its pivot.
             var needle = Path()
             needle.move(to: pivot)
-            needle.addLine(to: point(pivot, at: min(max(level, 0), 1), radius: Self.radius - 2))
+            needle.addLine(to: Self.needleTip(pivot, level: level))
             ctx.stroke(needle, with: .color(DubColor.meterNeedle),
                        style: StrokeStyle(lineWidth: 1.3, lineCap: .round))
             ctx.fill(
@@ -82,13 +88,29 @@ struct SirenMeterFace: View {
         }
     }
 
-    private func angle(at level: Double) -> Double {
-        (Self.startDeg + Self.sweepDeg * level) * .pi / 180
+    /// Where the needle turns, for a face of `size` — shared with the
+    /// live needle layer so it lands on the face drawn here.
+    static func pivot(in size: CGSize) -> CGPoint {
+        CGPoint(x: size.width / 2, y: size.height - inset - 6)
     }
 
-    private func point(_ pivot: CGPoint, at level: Double, radius: CGFloat) -> CGPoint {
+    static func needleTip(_ pivot: CGPoint, level: Double) -> CGPoint {
+        point(pivot, at: min(max(level, 0), 1), radius: radius - 2)
+    }
+
+    private static func angle(at level: Double) -> Double {
+        (startDeg + sweepDeg * level) * .pi / 180
+    }
+
+    private static func point(_ pivot: CGPoint, at level: Double, radius: CGFloat) -> CGPoint {
         let a = angle(at: level)
         return CGPoint(x: pivot.x + radius * cos(a), y: pivot.y + radius * sin(a))
+    }
+
+    private func angle(at level: Double) -> Double { Self.angle(at: level) }
+
+    private func point(_ pivot: CGPoint, at level: Double, radius: CGFloat) -> CGPoint {
+        Self.point(pivot, at: level, radius: radius)
     }
 
     private func arc(_ pivot: CGPoint, from: Double, to: Double) -> Path {
@@ -98,5 +120,95 @@ struct SirenMeterFace: View {
             startAngle: .radians(angle(at: from)), endAngle: .radians(angle(at: to)),
             clockwise: false)
         return p
+    }
+}
+
+/// A VU needle on a Core Animation layer over a `SirenMeterFace` drawn
+/// with `drawsNeedle: false`, moved thirty times a second from `read`.
+/// No SwiftUI update, no redraw of the face: the level is a property
+/// the compositor applies (the DUB FX pane's input meter, 2026-09-26).
+struct MeterNeedle: NSViewRepresentable {
+    /// 0…1 along the scale.
+    let read: () -> Double
+
+    func makeNSView(context: Context) -> MeterNeedleView {
+        let v = MeterNeedleView()
+        v.read = read
+        return v
+    }
+
+    func updateNSView(_ v: MeterNeedleView, context: Context) {
+        v.read = read
+    }
+}
+
+final class MeterNeedleView: NSView {
+    var read: () -> Double = { 0 }
+
+    private static let interval: TimeInterval = 1.0 / 30.0
+    private let needle = CAShapeLayer()
+    private let hub = CAShapeLayer()
+    private var shown: Double = -1
+    private var shownSize: CGSize = .zero
+    private var timer: Timer?
+
+    override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        let none: [String: CAAction] = ["path": NSNull(), "position": NSNull(), "bounds": NSNull()]
+        needle.actions = none
+        hub.actions = none
+        needle.strokeColor = NSColor(DubColor.meterNeedle).cgColor
+        needle.fillColor = nil
+        needle.lineWidth = 1.3
+        needle.lineCap = .round
+        hub.fillColor = NSColor(DubColor.meterNeedle).cgColor
+        layer?.addSublayer(needle)
+        layer?.addSublayer(hub)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unused") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate()
+        timer = nil
+        guard window != nil else { return }
+        let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        refresh()
+    }
+
+    override func layout() {
+        super.layout()
+        shown = -1
+        refresh()
+    }
+
+    private func refresh() {
+        let level = read()
+        let size = bounds.size
+        guard abs(level - shown) > 0.002 || size != shownSize else { return }
+        shown = level
+        shownSize = size
+        let pivot = SirenMeterFace.pivot(in: size)
+        let path = CGMutablePath()
+        path.move(to: pivot)
+        path.addLine(to: SirenMeterFace.needleTip(pivot, level: level))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        needle.path = path
+        hub.path = CGPath(
+            ellipseIn: CGRect(x: pivot.x - 2.4, y: pivot.y - 2.4, width: 4.8, height: 4.8),
+            transform: nil)
+        CATransaction.commit()
     }
 }

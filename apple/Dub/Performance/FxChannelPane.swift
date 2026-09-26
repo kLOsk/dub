@@ -26,6 +26,9 @@ import SwiftUI
 struct FxChannelPane<Scope: View>: View {
     let state: FxChannelState
     var callbacks = FxChannelCallbacks()
+    /// The live input level, read off the engine by the meter's own
+    /// layers. `nil` (snapshots, previews) draws `state`'s values.
+    var meter: FxInputMeterSource? = nil
     /// Width of the rack column — the same resolved width the deck column
     /// gets, handed down from the deck row's `GeometryReader`.
     var columnWidth: CGFloat?
@@ -44,7 +47,7 @@ struct FxChannelPane<Scope: View>: View {
     }
 
     private var lane: some View {
-        FxInputLane(state: state, callbacks: callbacks, scope: scope)
+        FxInputLane(state: state, callbacks: callbacks, meter: meter, scope: scope)
             .frame(
                 minWidth: DubLayout.performanceWaveformMinWidth,
                 idealWidth: DubLayout.performanceWaveformWidth,
@@ -65,6 +68,7 @@ struct FxChannelPane<Scope: View>: View {
 struct FxInputLane<Scope: View>: View {
     let state: FxChannelState
     var callbacks = FxChannelCallbacks()
+    var meter: FxInputMeterSource? = nil
     @ViewBuilder var scope: () -> Scope
 
     var body: some View {
@@ -83,14 +87,17 @@ struct FxInputLane<Scope: View>: View {
             SirenMeterFace(
                 title: state.input.title,
                 echoLine: "\(state.inputPair) · \(state.trimText)",
-                level: state.vuLevel)
+                level: state.vuLevel,
+                drawsNeedle: meter == nil)
+                .overlay {
+                    if let meter {
+                        MeterNeedle(read: { FxChannelState.vuLevel(rms: meter.read().rms) })
+                    }
+                }
                 .frame(width: DubLayout.sirenDisplayWidth, height: DubLayout.sirenDisplayHeight)
                 .background(RoundedRectangle(cornerRadius: 3).fill(DubColor.displayWell))
                 .frame(maxWidth: .infinity)
-            SectionHeading(
-                title: "LIVE", accent: DubColor.deckTint(state.side),
-                trailing: state.isHot ? "● HOT" : "● ",
-                trailingAccent: state.isHot ? DubColor.stateError : DubColor.stateLocked)
+            liveHeading
             scope()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
@@ -103,6 +110,34 @@ struct FxInputLane<Scope: View>: View {
     }
 
     /// Two keys, one lit: what is patched in.
+    /// LIVE, with the HOT lamp. Live, the lamp is a layer reading the
+    /// engine; the heading reserves its width so nothing moves.
+    @ViewBuilder
+    private var liveHeading: some View {
+        if let meter {
+            SectionHeading(
+                title: "LIVE", accent: DubColor.deckTint(state.side),
+                trailing: "● HOT", trailingAccent: .clear)
+                .overlay(alignment: .trailing) {
+                    Text("● HOT")
+                        .font(DubFont.caps)
+                        .tracking(DubFont.capsTracking)
+                        .hidden()
+                        .overlay {
+                            LayerReadout(
+                                read: { FxChannelState.isHot(peak: meter.read().peak) ? "● HOT" : nil },
+                                size: 11, color: DubColor.stateError,
+                                placeholder: DubColor.stateLocked, trailing: true, nilText: "●")
+                        }
+                }
+        } else {
+            SectionHeading(
+                title: "LIVE", accent: DubColor.deckTint(state.side),
+                trailing: state.isHot ? "● HOT" : "● ",
+                trailingAccent: state.isHot ? DubColor.stateError : DubColor.stateLocked)
+        }
+    }
+
     private var rocker: some View {
         HStack(spacing: DubSpacing.xs) {
             ForEach(FxInputKind.allCases, id: \.self) { kind in
@@ -272,4 +307,12 @@ struct FxPathLine: View {
             .foregroundStyle(color)
             .fixedSize()
     }
+}
+
+/// Where the DUB FX pane's meter reads the live input: the engine, on
+/// the meter's own layers, never through the model — a level carried on
+/// the deck state republished it every poll and rebuilt the whole rack
+/// thirty times a second (rig, 2026-09-26).
+struct FxInputMeterSource {
+    let read: () -> (rms: Float, peak: Float)
 }

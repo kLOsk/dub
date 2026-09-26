@@ -26,9 +26,9 @@ final class ModelStoresTests: XCTestCase {
         var a = DeckState.empty
         var b = a
         b.isPlaying = true
-        b.inputRms = 0.3
+        b.pitchSettled = false
         XCTAssertEqual(
-            Set(PublishRateGuard<DeckState>.changedFields(a, b)), ["isPlaying", "inputRms"])
+            Set(PublishRateGuard<DeckState>.changedFields(a, b)), ["isPlaying", "pitchSettled"])
         a = b
         XCTAssertEqual(PublishRateGuard<DeckState>.changedFields(a, b), [])
     }

@@ -343,11 +343,20 @@
   loading measures the library, not the set.
 - **Deck state is not on the model's `objectWillChange` any more.** It lives
   on `DeckStore`s (`App/ModelStores.swift`). A view that reads `model.deckA`
-  must sit in a `DeckScope` or observe the store itself, or it shows the
-  deck as it was at its last unrelated rebuild — and SwiftUI skips a child
-  whose inputs look unchanged, so being *inside* a rebuilt parent is not
-  enough (the overview had to observe its own store). The library's on-deck
-  markers had only ever refreshed by accident, riding every deck publish.
+  must observe the store, or it shows the deck as it was at its last
+  unrelated rebuild — and SwiftUI skips a child whose inputs look unchanged,
+  so being *inside* a rebuilt parent is not enough (the overview observes its
+  own store). The library's on-deck markers had only ever refreshed by
+  accident, riding every deck publish.
+- **Region-level observation went stale on the rig (2026-09-26).** Wrapping
+  the surface's deck regions in `DeckScope` passed its own test, yet on the
+  rig the surface stopped updating: a DUB FX switch appeared seconds late,
+  rack knobs did nothing visible, play/pause looked stuck — with the main
+  thread idle, the audio thread healthy and the GPU at 16 %. The engine got
+  every click; the screen was not told. `PerformanceView` now observes the
+  three stores itself (the library and root still do not). Lesson: when "the
+  UI is slow" comes with an idle main thread, suspect a view that is not
+  observing what it shows, before suspecting cost.
 
 - **Be optimistic about reachability — don't cry wolf.** `isTrackReachable`
   flags a row only when a volume probe *positively* returned `false`. The

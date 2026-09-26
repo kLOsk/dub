@@ -75,6 +75,10 @@ extension PerformanceView {
                 FxChannelPane(
                     state: fxChannelState(side: side),
                     callbacks: fxChannelCallbacks(side: side),
+                    meter: FxInputMeterSource(read: { [engine = model.engine] in
+                        let t = engine.deckTelemetry(deckIdx: deckIdx)
+                        return (t.inputRms, t.inputPeak)
+                    }),
                     columnWidth: columnWidth
                 ) {
                     playingColumn(

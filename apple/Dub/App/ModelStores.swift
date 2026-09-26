@@ -30,7 +30,9 @@ final class DeckStore: ObservableObject {
     @Published var state: DeckState = .empty {
         didSet {
             #if DEBUG
-            rateGuard.note(old: oldValue, new: state, playing: state.isPlaying)
+            // A DUB FX deck is live without "playing" — and that is where
+            // a per-poll input level rebuilt the whole rack unnoticed.
+            rateGuard.note(old: oldValue, new: state, playing: state.isPlaying || state.isDubFx)
             #endif
         }
     }

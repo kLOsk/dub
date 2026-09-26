@@ -7,9 +7,9 @@
 //
 //  Laid out as the back of a sleeve (rig, 2026-09-25): a toolbar that
 //  says what the side is and what Import will do; a track map — the
-//  side cut into its tracks, each as long as it is; and a tracklist
-//  numbered the way a DJ reads a record, A1 A2 A3, one row per track,
-//  filling the width. The cards it replaced sat in a corner of a panel
+//  side cut into its tracks, each as long as it is; and a tracklist,
+//  one row per track numbered by where it sits on the side, filling the
+//  width. The cards it replaced sat in a corner of a panel
 //  two thirds empty, and a nine-second lead-in got a card as big as a
 //  seven-minute track.
 //
@@ -101,8 +101,6 @@ struct RipReviewPanelState: Equatable {
 
     var hasFailedSegment: Bool { jobDots.contains(.failed) }
 
-    /// The record's side, for the numbering: A1, A2… or B1, B2….
-    var sideLetter: String = "A"
     /// The collection's genres, for the genre field's completion.
     var genres: [String] = []
     /// Changes when names land in the plan from outside the rows (Use
@@ -115,13 +113,14 @@ struct RipReviewPanelState: Equatable {
 
     var keptCount: Int { segments.filter { !$0.dropped }.count }
 
-    /// `A1`, `A2`…, counting only the tracks that will import — a left-
-    /// out lead-in does not take A1 from the first real track. `nil`
-    /// for a left-out segment.
-    func position(of segment: RipSegmentUi) -> String? {
-        guard !segment.dropped else { return nil }
-        let n = segments.filter { !$0.dropped && $0.index <= segment.index }.count
-        return "\(sideLetter)\(n)"
+    /// Where the piece sits on the side: 1, 2, 3…, left-out ones
+    /// included. Only a way to tell which block on the map is which row
+    /// while splitting — it goes nowhere. A DJ rips the songs they want,
+    /// not the album, so a sleeve position (A1, B2) and a count of the
+    /// kept tracks were both wrong on a partial rip; neither is written
+    /// into the files either (rig, 2026-09-25).
+    func position(of segment: RipSegmentUi) -> String {
+        "\(segment.index + 1)"
     }
 
     /// Why a piece looks like it is not a track, or `nil`.
@@ -204,8 +203,6 @@ struct RipReviewPanelCallbacks {
     /// Play a track, or pause it if it is the one running.
     var togglePlay: (UInt32) -> Void = { _ in }
     var setMetadata: (UInt32, RipSegmentMetadata) -> Void = { _, _ in }
-    /// Which side of the record this is — the A / B of the numbering.
-    var setSideLetter: (String) -> Void = { _ in }
     var cancel: () -> Void = {}
     /// Ask AcoustID what these tracks are (M26c).
     var identify: () -> Void = {}
@@ -276,7 +273,6 @@ struct RipReviewPanel: View {
                     .font(DubFont.caps)
                     .tracking(DubFont.capsTracking)
                     .foregroundStyle(DubColor.textSecondary)
-                sideSwitch
                 Text(state.summaryText)
                     .font(DubFont.numericInline)
                     .foregroundStyle(DubColor.textSecondary)
@@ -312,31 +308,6 @@ struct RipReviewPanel: View {
             trailingAction
         }
         .frame(height: Self.toolbarHeight)
-    }
-
-    /// A / B: which side of the record, so the tracks number A1… or B1….
-    private var sideSwitch: some View {
-        HStack(spacing: 0) {
-            ForEach(["A", "B"], id: \.self) { letter in
-                let on = state.sideLetter == letter
-                Button { callbacks.setSideLetter(letter) } label: {
-                    Text(letter)
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(on ? DubColor.surface0 : DubColor.textSecondary)
-                        .frame(width: 24, height: 20)
-                        .background(on ? DubColor.deckATint : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .buttonStyle(.plain)
-                .disabled(showsProgress)
-                .accessibilityLabel("Side \(letter)")
-                .accessibilityAddTraits(on ? .isSelected : [])
-            }
-        }
-        .padding(2)
-        .background(DubColor.surface2)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .help("Which side of the record — the tracks number A1… or B1…")
     }
 
     /// Splitting and naming, as one group: they are one job.
@@ -496,12 +467,13 @@ struct RipReviewPanel: View {
                 } else if segment.dropped {
                     RipDroppedRow(
                         segment: segment,
+                        position: state.position(of: segment),
                         reason: state.shortPieceReason(segment),
                         onPutBack: { callbacks.setDropped(segment.index, false) })
                 } else {
                     RipTrackRow(
                         segment: segment,
-                        position: state.position(of: segment) ?? "",
+                        position: state.position(of: segment),
                         isPlaying: state.playingIndex == segment.index,
                         shortReason: state.shortPieceReason(segment),
                         suggestion: state.suggestion(for: segment),
@@ -563,7 +535,7 @@ struct RipTrackMap: View {
                 }
                 if width > 56 {
                     HStack(spacing: 6) {
-                        Text(position ?? "–")
+                        Text(position)
                             .font(.system(size: 11, weight: .semibold, design: .monospaced))
                             .foregroundStyle(playing ? DubColor.deckATint : DubColor.textSecondary)
                         Text(segment.title.isEmpty ? "Untitled" : segment.title)
@@ -584,7 +556,7 @@ struct RipTrackMap: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(segment.dropped ? "Left out" : "Play \(position ?? "")")
+        .help(segment.dropped ? "Left out" : "Play \(position)")
     }
 
     private func progressColor(_ segment: RipSegmentUi) -> Color? {
@@ -860,15 +832,17 @@ struct RipField: View {
 /// track.
 struct RipDroppedRow: View {
     let segment: RipSegmentUi
+    var position: String = ""
     var reason: String? = nil
     var onPutBack: () -> Void = {}
 
     var body: some View {
         HStack(spacing: RipTrackRow.spacing) {
             Color.clear.frame(width: RipTrackRow.playWidth)
-            Text("–")
+            Text(position)
                 .font(.system(size: 15, weight: .semibold, design: .monospaced))
                 .foregroundStyle(DubColor.textPlaceholder)
+                .strikethrough(true, color: DubColor.textPlaceholder)
                 .frame(width: RipTrackRow.positionWidth, alignment: .leading)
             Text("Left out · \(segment.durationText)\(reason.map { " · \($0)" } ?? "")")
                 .font(DubFont.body)
@@ -902,13 +876,13 @@ struct RipDroppedRow: View {
 /// called, and how far it got.
 struct RipProgressRow: View {
     let segment: RipSegmentUi
-    let position: String?
+    let position: String
     let dot: RipJobDot?
 
     var body: some View {
         HStack(spacing: RipTrackRow.spacing) {
             statusGlyph.frame(width: RipTrackRow.playWidth)
-            Text(position ?? "–")
+            Text(position)
                 .font(.system(size: 15, weight: .semibold, design: .monospaced))
                 .foregroundStyle(DubColor.textSecondary)
                 .frame(width: RipTrackRow.positionWidth, alignment: .leading)

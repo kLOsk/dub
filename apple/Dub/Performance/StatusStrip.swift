@@ -43,8 +43,8 @@ struct StatusStripState: Equatable {
     /// connected.
     var modeSwitch: ModeSwitchState? = nil
 
-    /// M18 map mode: MAP lit while it is on. Always drawn — mapping is a
-    /// mode over the live interface on both surfaces.
+    /// M18 map mode: MAP lit while it is on. Drawn on Performance only
+    /// (`showsMap`) — Prep and recording have nothing to map.
     var mapMode: Bool = false
 
     /// MAP has nothing to map while a side is being recorded.

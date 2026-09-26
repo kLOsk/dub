@@ -55,10 +55,24 @@ struct PerformanceView: View {
     /// sheet — also owned by `MainView`.
     let openAbout: () -> Void
 
+    /// The decks and the sampler, observed by the whole surface. The
+    /// split (ModelStores.swift) had only `DeckScope` regions watch them,
+    /// and on the rig the surface stopped updating — a mode switch shown
+    /// seconds late, the rack's knobs doing nothing visible (2026-09-26).
+    /// Until the region that went stale is found, the surface watches them
+    /// as it watched the model before; the library and the root still do
+    /// not, which is what the split was for.
+    @ObservedObject private var deckStoreA: DeckStore
+    @ObservedObject private var deckStoreB: DeckStore
+    @ObservedObject private var samplerStore: SamplerStore
+
     init(model: WaveformAppModel, openPreferences: @escaping () -> Void, openAbout: @escaping () -> Void) {
         self.model = model
         self.openPreferences = openPreferences
         self.openAbout = openAbout
+        _deckStoreA = ObservedObject(wrappedValue: model.deckStoreA)
+        _deckStoreB = ObservedObject(wrappedValue: model.deckStoreB)
+        _samplerStore = ObservedObject(wrappedValue: model.samplerStore)
     }
 
     /// Map mode in the view tree (M18): `nil` when it is off, so every
@@ -170,7 +184,9 @@ struct PerformanceView: View {
             mapMode: model.mapMode,
             onToggleMap: { model.mapMode.toggle() },
             connecting: model.engineStarts.connecting,
-            showsMap: model.ripPhase == .none,
+            // Performance only: Prep is prepared with the mouse and has
+            // nothing to map, and recording less so (rig, 2026-09-26).
+            showsMap: model.engineMode == .timecode && model.ripPhase == .none,
             openPreferences: openPreferences,
             openAbout: openAbout)
     }
@@ -358,8 +374,6 @@ struct PerformanceView: View {
             input: deck.fxInput,
             inputPair: pair,
             trimDb: deck.fxTrimDb,
-            inputRms: deck.inputRms,
-            inputPeak: deck.inputPeak,
             active: deck.rackActive,
             controls: deck.fxRack,
             toggleLegends: FxRackUnit.allCases.map { DubKeymap.legend(for: .fxToggle($0.rawValue)) },
@@ -968,7 +982,6 @@ struct PerformanceView: View {
             overallStatus: status,
             recognition: model.ripRecognition,
             playingIndex: model.ripPlayingSegment,
-            sideLetter: model.ripSideLetter,
             genres: model.ripGenres,
             metadataRevision: model.ripMetadataRevision)
     }
@@ -991,7 +1004,6 @@ struct PerformanceView: View {
                     genre: meta.genre.isEmpty ? nil : meta.genre,
                     year: Int32(meta.year.trimmingCharacters(in: .whitespaces)))
             },
-            setSideLetter: { model.ripSideLetter = $0 },
             cancel: { model.cancelRip() },
             identify: { model.identifyRip() },
             applyRecognition: { model.applyRipRecognition() },
