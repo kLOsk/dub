@@ -268,12 +268,15 @@ struct WaveformView: View {
                         let deltaPx: CGFloat
                         switch orientation {
                         case .vertical:
-                            // Time runs top → bottom under the
-                            // stylus in the Metal renderer, so a
-                            // downward drag = forward in time =
-                            // positive offset. Matches "drag the
-                            // record forward".
-                            deltaPx = value.location.y - value.startLocation.y
+                            // Forward play scrolls the strip upward —
+                            // the future rises from below through the
+                            // playhead — so pushing the waveform *up*
+                            // moves the music the way it already moves:
+                            // up = forward, the hand with the content,
+                            // as the horizontal strip does. It was down
+                            // = forward, which the DJ found backwards
+                            // (rig, 2026-09-25).
+                            deltaPx = value.startLocation.y - value.location.y
                         case .horizontal:
                             // Past = left, future = right, and forward
                             // playback scrolls the waveform leftward
