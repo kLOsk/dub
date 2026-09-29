@@ -417,8 +417,14 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
   The FX lane's `clipShape` was taken off as a suspect for its render thread
   starving in `nextDrawable`, did not fix it, and is back (Daniel wants the
   rounded corners); the starvation went with the redraw fix.
-  **Open:** find which region under `DeckScope` went stale — its own test
-  (`DeckScopeTests`) passes.
+  **Found (same day):** folding the rack bar was slow and jumpy too —
+  `rackFolded` is PerformanceView state, and the rack bar sat in a
+  `DeckScope`. A scope holds a content closure that captured PerformanceView
+  *as it was when the scope was built*: a deck change re-ran it with old
+  values, and a change to the view's own state never reached it (SwiftUI
+  cannot compare a closure, so it took the scope as unchanged). The test
+  passed because it had no parent state. `DeckScope` is gone; the surface
+  observes the stores directly.
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output

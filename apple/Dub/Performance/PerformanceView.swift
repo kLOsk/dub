@@ -55,13 +55,17 @@ struct PerformanceView: View {
     /// sheet — also owned by `MainView`.
     let openAbout: () -> Void
 
-    /// The decks and the sampler, observed by the whole surface. The
-    /// split (ModelStores.swift) had only `DeckScope` regions watch them,
-    /// and on the rig the surface stopped updating — a mode switch shown
-    /// seconds late, the rack's knobs doing nothing visible (2026-09-26).
-    /// Until the region that went stale is found, the surface watches them
-    /// as it watched the model before; the library and the root still do
-    /// not, which is what the split was for.
+    /// The decks and the sampler, observed by the whole surface; the
+    /// library and the root do not, which is what the split
+    /// (ModelStores.swift) was for.
+    ///
+    /// It was `DeckScope` regions at first, and on the rig the surface
+    /// went stale — a mode switch seconds late, knobs doing nothing
+    /// visible, the rack bar's fold jumping and slow (2026-09-26). A scope
+    /// holds a closure that captured *this view as it was when the scope
+    /// was built*: a deck change re-ran it with old values, and a change
+    /// to this view's own state (`rackFolded`) never reached it, because
+    /// SwiftUI cannot compare a closure and took the scope as unchanged.
     @ObservedObject private var deckStoreA: DeckStore
     @ObservedObject private var deckStoreB: DeckStore
     @ObservedObject private var samplerStore: SamplerStore
@@ -103,7 +107,7 @@ struct PerformanceView: View {
                     : DubLayout.waveformMinHeight
             ) { _ in
                 VStack(spacing: 0) {
-                    deckScope { waveformRegion }
+                    waveformRegion
                     // Prep gets no rack bar. Its vertical budget is the
                     // tightest on either surface, its siren has its own
                     // column, and the 100 pt this slot used to cost it
@@ -111,11 +115,9 @@ struct PerformanceView: View {
                     // had already shipped.
                     if model.engineMode != .prep {
                         Rectangle().fill(DubColor.divider).frame(height: 1)
-                        deckScope {
-                            GlobalRackBar(
-                                state: rackBarState, callbacks: rackBarCallbacks,
-                                folded: rackFolded, onFold: { rackFolded.toggle() })
-                        }
+                        GlobalRackBar(
+                            state: rackBarState, callbacks: rackBarCallbacks,
+                            folded: rackFolded, onFold: { rackFolded.toggle() })
                     }
                 }
             } library: {
@@ -139,21 +141,8 @@ struct PerformanceView: View {
     /// both. That band was 108 pt of the vertical budget spent on two
     /// blocks of text and six numbers, on the surface where the strip's
     /// height is the whole point; see `DeckColumn`'s file comment.
-    /// A region that reads deck or sampler state. This view observes
-    /// the model, not the stores (`ModelStores.swift`), so anything here
-    /// that shows a deck has to sit in one of these or go stale.
-    private func deckScope<C: View>(@ViewBuilder _ content: @escaping () -> C) -> some View {
-        DeckScope(
-            a: model.deckStoreA, b: model.deckStoreB, sampler: model.samplerStore,
-            content: content)
-    }
-
-    private var deckHeaders: some View {
-        deckScope { prepDeckHeader }
-    }
-
     @ViewBuilder
-    private var prepDeckHeader: some View {
+    private var deckHeaders: some View {
         if model.engineMode == .prep {
             DeckHeader(side: .a,
                        state: headerState(side: .a),

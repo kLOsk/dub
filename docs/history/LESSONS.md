@@ -357,6 +357,13 @@
   three stores itself (the library and root still do not). Lesson: when "the
   UI is slow" comes with an idle main thread, suspect a view that is not
   observing what it shows, before suspecting cost.
+  The cause, found the same day: `DeckScope` held a `content` closure
+  that captured the parent view *as it was when the scope was built*. A
+  deck change re-ran that closure with the parent's old values, and the
+  parent's own `@State` (the rack bar's fold) never reached the scope —
+  SwiftUI cannot compare a closure and treated the scope as unchanged.
+  **Never observe through a wrapper view holding a content closure;**
+  observe in the view whose body reads the state.
 
 - **Be optimistic about reachability — don't cry wolf.** `isTrackReachable`
   flags a row only when a volume probe *positively* returned `false`. The

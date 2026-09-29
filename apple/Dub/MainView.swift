@@ -1139,9 +1139,9 @@ final class WaveformAppModel: ObservableObject {
     // MARK: Per-deck state (M10.5b)
 
     /// Each deck's state lives on its own store (`ModelStores.swift`), so
-    /// a deck's change rebuilds the views that show decks — `DeckScope`
-    /// regions and views observing the store — and not the library, the
-    /// status strip or the root. These read and write through.
+    /// a deck's change rebuilds the views that observe it — the performance
+    /// surface, the overview — and not the library, the status strip or
+    /// the root. These read and write through.
     let deckStoreA = DeckStore(label: "deck A")
     let deckStoreB = DeckStore(label: "deck B")
     private(set) var deckA: DeckState {

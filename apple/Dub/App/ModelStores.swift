@@ -16,8 +16,11 @@
 //  before but no longer fires its own `objectWillChange` for them.
 //
 //  A view that reads deck or sampler state has to observe the store it
-//  reads — `DeckScope` for a region, or the store itself for a view
-//  SwiftUI may skip (its inputs look unchanged when the deck changes).
+//  reads. `PerformanceView` observes all three; the overview and the
+//  Prep pitch test observe their own deck, because SwiftUI skips a child
+//  whose inputs look unchanged. Not a scope view holding a content
+//  closure: that closure keeps the parent as it was when it was built,
+//  and went stale on the rig (see PerformanceView).
 //
 
 import Combine
@@ -52,25 +55,6 @@ final class DeckStore: ObservableObject {
 /// sample sounds, which is exactly why it is not on the model.
 final class SamplerStore: ObservableObject {
     @Published var voices: [SamplerSlotTelemetry] = []
-}
-
-/// Rebuilds `content` when either deck or the sampler changes, and
-/// only then. A region of the performance surface that reads deck state
-/// sits in one; the surface itself does not observe the stores, so the
-/// library, the status strip and the root are left alone.
-///
-/// Both decks, not one: the regions read across them (the Quick Scratch
-/// badge checks the other deck's tune, the rack bar both decks' sirens),
-/// and a region watching one deck would go stale on the other's change.
-/// The deck columns are `.equatable()`, so the deck that did not change
-/// is not rebuilt anyway.
-struct DeckScope<Content: View>: View {
-    @ObservedObject var a: DeckStore
-    @ObservedObject var b: DeckStore
-    @ObservedObject var sampler: SamplerStore
-    @ViewBuilder var content: () -> Content
-
-    var body: some View { content() }
 }
 
 #if DEBUG
