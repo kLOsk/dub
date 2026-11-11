@@ -1978,6 +1978,34 @@ mod tests {
         (DubRipSession::from_parts(session, SR), tx)
     }
 
+    /// Before `stop()`: wait until the worker has read everything pushed
+    /// and the recorded count has stopped growing — or the session ended
+    /// itself (run-out auto-stop). The worker does not drain the ring on
+    /// stop, so a fixed sleep truncated the take on a loaded machine; the
+    /// same race `drain_then_stop` fixed in the pipeline tests.
+    fn drain(ffi: &DubRipSession, tx: &ringbuf::HeapProd<f32>) {
+        use ringbuf::traits::Observer;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = u64::MAX;
+        let mut settled = 0;
+        while Instant::now() < deadline {
+            let st = ffi.status();
+            if st.phase != RipPhase::Recording {
+                return;
+            }
+            if tx.is_empty() && st.recorded_frames == last {
+                settled += 1;
+                if settled >= 5 {
+                    return;
+                }
+            } else {
+                settled = 0;
+                last = st.recorded_frames;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Record `secs` seconds of a stereo tone and stop.
     /// A pass that has not run yet has nothing to accept. Applying is
     /// deliberately a second call — a wrong match written into the
@@ -2058,7 +2086,7 @@ mod tests {
             pushed += tx.push_slice(&samples[pushed..]);
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        drain(&ffi, &tx);
         ffi.stop().unwrap();
         ffi
     }
@@ -2109,7 +2137,7 @@ mod tests {
             pushed += tx.push_slice(&side[pushed..]);
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        drain(&ffi, &tx);
         ffi.stop().unwrap();
 
         let before = ffi.generation();
@@ -2187,7 +2215,7 @@ mod tests {
             pushed += tx.push_slice(&side[pushed..]);
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        drain(&ffi, &tx);
         ffi.stop().unwrap();
 
         assert_eq!(ffi.auto_split().unwrap(), 1, "expected the one gap");

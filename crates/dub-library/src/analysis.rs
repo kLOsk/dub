@@ -2058,10 +2058,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let first_mtime = std::fs::metadata(&first_path).unwrap().modified().unwrap();
-        // Sleep a hair so mtime can advance even on filesystems
-        // with second-resolution timestamps.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Backdate the sidecar an hour rather than sleeping past a
+        // second-resolution clock: the re-analyze then has to move the
+        // mtime *forward* to pass, which is the refresh being tested.
+        let first_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&first_path)
+            .unwrap()
+            .set_modified(first_mtime)
+            .unwrap();
         lib.analyze_track(&track_id).unwrap();
         let second_path: String = lib
             .connection()
@@ -2077,9 +2083,9 @@ mod tests {
         );
         let second_mtime = std::fs::metadata(&second_path).unwrap().modified().unwrap();
         assert!(
-            second_mtime >= first_mtime,
-            "re-analyze must refresh the sidecar (mtime moved backwards: \
-             first {first_mtime:?}, second {second_mtime:?})"
+            second_mtime > first_mtime,
+            "re-analyze must rewrite the sidecar (mtime did not move: \
+             backdated {first_mtime:?}, after {second_mtime:?})"
         );
     }
 

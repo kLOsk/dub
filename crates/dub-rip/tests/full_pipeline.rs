@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use ringbuf::traits::{Producer, Split};
+use ringbuf::traits::{Observer, Producer, Split};
 use ringbuf::HeapRb;
 
 use dub_rip::{RipConfig, RipSession, RipState, StopReason, TrackMeta};
@@ -95,6 +95,39 @@ fn drain_then_stop(session: &mut RipSession, at_least: u64) {
     session.stop().unwrap();
 }
 
+/// Start, and wait for the worker to take it. It picks the command up on
+/// its next poll; anything pushed while it is still Armed is discarded as
+/// backlog beyond the pre-roll, so on a loaded machine a test that pushed
+/// straight away lost the head of its side and failed for a reason that
+/// had nothing to do with what it tests.
+fn start_recording(session: &mut RipSession) {
+    session.start().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while session.status().state != RipState::Recording {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never started recording"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Wait until the worker has read everything pushed into `tx`, then
+/// for a few of its 1 ms polls so the last block it took is processed.
+/// For checks that something did *not* happen: a fixed sleep there
+/// passes without looking if the worker is behind.
+fn wait_until_read(tx: &impl Observer) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !tx.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never drained the ring"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(5));
+}
+
 #[test]
 fn record_split_commit_full_pipeline() {
     let dir = tempfile::tempdir().unwrap();
@@ -107,7 +140,7 @@ fn record_split_commit_full_pipeline() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
 
     let side = synthetic_side();
     let mut pushed = 0;
@@ -240,7 +273,7 @@ fn a_committed_track_carries_its_bpm_and_key_in_the_file() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
 
     const SECS: u64 = 10;
     let side = click_side(120.0, SECS);
@@ -289,7 +322,7 @@ fn producer_drop_fail_safe_stops_with_captured_audio() {
     let ring = HeapRb::<f32>::new(1 << 16);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
 
     let tone: Vec<f32> = vec![0.5; 44_100 * 2];
     let mut pushed = 0;
@@ -315,7 +348,7 @@ fn splits_rejected_while_recording_and_when_invalid() {
     let ring = HeapRb::<f32>::new(1 << 16);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     assert!(
         session.set_splits(vec![1_000]).is_err(),
         "splits must be rejected while recording"
@@ -354,7 +387,7 @@ fn auto_split_finds_the_gaps_in_a_side() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     assert!(
         session.auto_split(&GapConfig::default()).is_err(),
         "auto split must be rejected while recording"
@@ -454,7 +487,7 @@ fn the_run_out_is_trimmed_off_the_last_track() {
     let ring = HeapRb::<f32>::new(1 << 21);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
 
     let mut side: Vec<f32> = Vec::new();
     let push_tone = |side: &mut Vec<f32>| {
@@ -559,7 +592,7 @@ fn auto_start_fires_on_the_needle_drop_and_keeps_the_pre_roll() {
         pushed += tx.push_slice(&quiet[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(20));
+    wait_until_read(&tx);
     assert_eq!(
         session.status().state,
         RipState::Armed,
@@ -624,7 +657,7 @@ fn silence_auto_stop_fires_in_the_run_out_but_not_between_tracks() {
     let ring = HeapRb::<f32>::new(1 << 22);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
 
     let tone = |secs: f64| -> Vec<f32> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -658,7 +691,23 @@ fn silence_auto_stop_fires_in_the_run_out_but_not_between_tracks() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(20));
+    // The whole side on disk — or the session stopped early, which is
+    // the failure this checks for. A fixed sleep could look before the
+    // gap had been seen.
+    let side_frames = (side.len() / 2) as u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = session.status();
+        let ended = matches!(st.state, RipState::Stopped(_) | RipState::Failed);
+        if ended || st.recorded_frames >= side_frames {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never caught up"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(
         session.status().state,
         RipState::Recording,
@@ -694,15 +743,14 @@ fn interrupted_session_recovers_from_disk_and_commits() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     let side = synthetic_side();
     let mut pushed = 0;
     while pushed < side.len() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(10));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, 3 * seg_frames());
     session.wait_stopped(Duration::from_secs(10)).unwrap();
     let recorded = session.manifest().recorded_frames;
     drop(session);
@@ -776,15 +824,14 @@ fn commit_reports_progress_per_segment() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     let side = synthetic_side();
     let mut pushed = 0;
     while pushed < side.len() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(10));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, 3 * seg_frames());
     session.wait_stopped(Duration::from_secs(10)).unwrap();
     session
         .set_splits(vec![seg_frames(), 2 * seg_frames()])
@@ -841,15 +888,14 @@ fn resplit_from_archive_replaces_the_earlier_tracks() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     let side = synthetic_side();
     let mut pushed = 0;
     while pushed < side.len() {
         pushed += tx.push_slice(&side[pushed..]);
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(10));
-    session.stop().unwrap();
+    drain_then_stop(&mut session, 3 * seg_frames());
     session.wait_stopped(Duration::from_secs(10)).unwrap();
 
     // First split: three tracks.
@@ -946,7 +992,7 @@ fn a_dropped_segment_is_not_encoded_or_imported() {
     let ring = HeapRb::<f32>::new(1 << 20);
     let (mut tx, rx) = ring.split();
     session.arm(rx).unwrap();
-    session.start().unwrap();
+    start_recording(&mut session);
     let side = synthetic_side();
     let mut pushed = 0;
     while pushed < side.len() {

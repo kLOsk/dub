@@ -368,7 +368,18 @@ mod tests {
                 }
             }
         }
-        thread::sleep(Duration::from_millis(200));
+        // Until the worker has read every sample, then two of its polls
+        // for the last hop to be analysed — a fixed 200 ms could pass
+        // before the silence was looked at, on a loaded machine.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tx.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never drained the ring"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(POLL_INTERVAL * 2);
 
         let mut transitions = Vec::new();
         while let Some(ev) = stream.try_recv() {
