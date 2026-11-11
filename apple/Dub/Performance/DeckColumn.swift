@@ -123,6 +123,9 @@ struct DeckColumnHeader: Equatable {
     /// rarely; the live pitch itself is read by the layer.
     var baseBpm: Double?
     var tempoPitchPercent: Double?
+    /// A THRU deck's tempo — the record's, tracked or tapped. Replaces the
+    /// track BPM in the readout.
+    var thruTempo: ThruTempoReadout?
     var sourceControl: SourceControlStatus?
     var sourceControlOverridden: Bool
     /// Set while Quick Scratch has a sample on the deck: what is parked
@@ -147,6 +150,7 @@ struct DeckColumnHeader: Equatable {
         pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
         baseBpm = state.bpm
         tempoPitchPercent = state.tempoPitchPercent
+        thruTempo = state.thruTempo
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
         self.scratch = scratch
@@ -180,6 +184,8 @@ struct DeckColumnCallbacks {
     var onExitLoop: () -> Void = {}
     var onEchoToggle: () -> Void = {}
     var onEchoHold: () -> Void = {}
+    /// A tap on a THRU deck's BPM: one beat of the record's tempo.
+    var onTapTempo: () -> Void = {}
     /// Quick Scratch pad `pad` pressed: engage its sample, swap to it,
     /// or — if it is the one on the deck — release.
     var onScratch: (_ pad: Int) -> Void = { _ in }
@@ -532,7 +538,8 @@ struct DeckColumn<Overview: View>: View {
             live: liveEngine.flatMap { engine in
                 liveDeckIdx.map { DeckReadouts.Live(engine: engine, deckIdx: $0) }
             },
-            onToggleKeyLock: callbacks.onToggleKeyLock)
+            onToggleKeyLock: callbacks.onToggleKeyLock,
+            onTapTempo: state.header.thruTempo == nil ? nil : callbacks.onTapTempo)
     }
 
     // MARK: - The two things you play
@@ -816,6 +823,8 @@ struct DeckReadouts: View {
     var live: Live? = nil
     /// M14 key lock. `nil` leaves the button out entirely.
     var onToggleKeyLock: (() -> Void)? = nil
+    /// Tap tempo on a THRU deck's BPM. Only with `header.thruTempo`.
+    var onTapTempo: (() -> Void)? = nil
 
     struct Live {
         let engine: DubEngine
@@ -831,16 +840,20 @@ struct DeckReadouts: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
-            readout(
-                "BPM", header.bpm.map { String(format: "%.1f", $0) },
-                font: DubFont.numericLarge, widest: "888.8",
-                live: live.map { l in
-                    { [base = header.baseBpm, tempo = header.tempoPitchPercent] in
-                        DeckHeaderState.liveBpm(base: base, pitch: l.pitch(), tempoPitch: tempo)
-                            .map { String(format: "%.1f", $0) }
-                    }
-                },
-                size: DubFont.numericLargeSize)
+            if let thru = header.thruTempo {
+                thruBpm(thru)
+            } else {
+                readout(
+                    "BPM", header.bpm.map { String(format: "%.1f", $0) },
+                    font: DubFont.numericLarge, widest: "888.8",
+                    live: live.map { l in
+                        { [base = header.baseBpm, tempo = header.tempoPitchPercent] in
+                            DeckHeaderState.liveBpm(base: base, pitch: l.pitch(), tempoPitch: tempo)
+                                .map { String(format: "%.1f", $0) }
+                        }
+                    },
+                    size: DubFont.numericLargeSize)
+            }
             readout(
                 "KEY", header.key,
                 font: DubFont.numericInline, widest: "12B",
@@ -856,6 +869,30 @@ struct DeckReadouts: View {
             keyLockButton
         }
         .fixedSize()
+    }
+
+    /// A THRU deck's BPM: the record's tempo as the tracker hears it —
+    /// dim while tentative, solid once locked — or as the DJ tapped it,
+    /// marked TAP. The readout is its own tap pad: the number being set
+    /// is the thing under the finger. No pitch scaling: the record is
+    /// measured at the speed it plays.
+    private func thruBpm(_ t: ThruTempoReadout) -> some View {
+        VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
+            Text(t.tapped ? "BPM · TAP" : "BPM")
+                .font(DubFont.micro)
+                .tracking(DubFont.capsTracking)
+                .foregroundStyle(t.tapped ? DubColor.deckTint(side) : DubColor.textTertiary)
+            staticValue(
+                t.bpm.map { String(format: "%.1f", $0) },
+                font: DubFont.numericLarge, widest: "888.8",
+                tint: t.tapped || t.locked ? nil : DubColor.textSecondary)
+        }
+        .contentShape(Rectangle())
+        .onPressDown(enabled: onTapTempo != nil) { onTapTempo?() }
+        .help("The record's tempo, heard live. Tap the beat here to set it — it holds until the needle comes up.")
+        .accessibilityLabel("Tempo")
+        .accessibilityValue(t.bpm.map { String(format: "%.1f BPM", $0) } ?? "listening")
+        .mappable(.tapTempo(side))
     }
 
     /// M14 key lock, at the end of the row the pitch it holds is on —

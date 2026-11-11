@@ -399,6 +399,36 @@ struct DeckState: Equatable {
     var isDubFx: Bool { controlMode == 3 }
     /// A live record through the engine — no track, but sound to throw.
     var isThru: Bool { controlMode == 2 }
+
+    /// A THRU deck's tempo as its tracker has it (FFI 82), in tenths so a
+    /// tentative estimate wandering in the hundredths does not republish.
+    /// `nil` while searching or off THRU.
+    var thruBpm: Double? = nil
+    var thruLocked: Bool = false
+    /// Counts records on the THRU deck: bumps when sound returns after
+    /// the needle was up.
+    var thruRecordSeq: UInt32 = 0
+    var thruNeedleUp: Bool = false
+    /// A tempo the DJ tapped, and the record it belongs to.
+    var thruTap: ThruTap? = nil
+
+    struct ThruTap: Equatable {
+        var bpm: Double
+        var recordSeq: UInt32
+    }
+
+    /// What a THRU deck's BPM readout shows, `nil` off THRU. A tap wins
+    /// for the record it was tapped on and gives way to the tracker when
+    /// the needle comes up and the next one goes down (Daniel,
+    /// 2026-11-11) — tapping is how a half- or double-tempo read is put
+    /// right, and the next record is a different tune.
+    var thruReadout: ThruTempoReadout? {
+        guard isThru else { return nil }
+        if let tap = thruTap, tap.recordSeq == thruRecordSeq {
+            return ThruTempoReadout(bpm: tap.bpm, tapped: true, locked: true)
+        }
+        return ThruTempoReadout(bpm: thruBpm, tapped: false, locked: thruLocked)
+    }
     var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
     var calibrated: Bool = false
     var calibrating: Bool = false
@@ -2285,6 +2315,62 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// A THRU deck's tempo off its tracker (FFI 82). Fields are only
+    /// written when they change, so a steady tracker never republishes the
+    /// deck. A new record (the needle up, then down) retires the tap.
+    /// Off THRU everything clears — the next THRU session's tracker starts
+    /// its record count again, and an old tap must not come back with it.
+    private func readThruTempo(side: DeckSide, into next: inout DeckState) {
+        guard next.isThru else {
+            if next.thruBpm != nil || next.thruTap != nil || next.thruRecordSeq != 0
+                || next.thruLocked || next.thruNeedleUp
+            {
+                next.thruBpm = nil
+                next.thruLocked = false
+                next.thruRecordSeq = 0
+                next.thruNeedleUp = false
+                next.thruTap = nil
+                thruTaps[side] = nil
+            }
+            return
+        }
+        let t = engine.thruTempo(deckIdx: side.ffiDeckIdx)
+        let bpm = t.active && t.bpm > 0 ? (t.bpm * 10).rounded() / 10 : nil
+        if next.thruBpm != bpm { next.thruBpm = bpm }
+        if next.thruLocked != t.locked { next.thruLocked = t.locked }
+        if next.thruNeedleUp != t.needleUp { next.thruNeedleUp = t.needleUp }
+        if next.thruRecordSeq != t.recordSeq {
+            next.thruRecordSeq = t.recordSeq
+            if let tap = next.thruTap, tap.recordSeq != t.recordSeq {
+                next.thruTap = nil
+                thruTaps[side] = nil
+            }
+        }
+    }
+
+    /// Tap the record's tempo on a THRU deck. Four taps make a tempo; it
+    /// holds for this record — the tracker's reading gives way to it — and
+    /// retires when the needle comes up and the next record goes down.
+    /// Tapped while the needle is up, it is for the record about to go
+    /// down.
+    func tapThruTempo(_ side: DeckSide) {
+        var deck = state(for: side)
+        guard isRunning, deck.isThru else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        var taps = thruTaps[side] ?? []
+        taps.append(now)
+        taps.removeAll { now - $0 > 8 }
+        thruTaps[side] = taps
+        guard let bpm = FxRackControls.tappedBpm(taps) else { return }
+        let record = deck.thruNeedleUp ? deck.thruRecordSeq &+ 1 : deck.thruRecordSeq
+        deck.thruTap = DeckState.ThruTap(bpm: (bpm * 10).rounded() / 10, recordSeq: record)
+        setState(deck, for: side)
+        syncFxEcho()
+    }
+
+    /// Tap times per THRU deck, seconds of uptime. Not state anything draws.
+    private var thruTaps: [DeckSide: [TimeInterval]] = [:]
+
     private func readDeckState(side: DeckSide, prev: DeckState) -> DeckState {
         // M11d.6 round 5 — lock-free FFI snapshot. The position
         // read no longer contends with library / load-track work
@@ -2414,6 +2500,7 @@ final class WaveformAppModel: ObservableObject {
         next.calibrated = tele.calibrated
         next.calibrating = tele.calibrating
         next.controlOverridden = tele.controlOverridden
+        readThruTempo(side: side, into: &next)
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -5836,12 +5923,15 @@ final class WaveformAppModel: ObservableObject {
         // Tempo-lock to the deck's analysed BPM when known; otherwise fall
         // back to a neutral 120 so the echo still fires (the division is then
         // in absolute time rather than beat-locked) — better than a silent
-        // no-op on an un-analysed track. A THRU record has no analysed
-        // tempo; the Space Echo's TAP is the one the DJ gave for it, at the
-        // platter's real speed already.
+        // no-op on an un-analysed track. A THRU record's tempo is the
+        // deck's live one — tracked, or tapped on the deck — and failing
+        // that the Space Echo's TAP; both are at the platter's real speed
+        // already.
         let effectiveBpm: Double
         if !deck.isThru, let bpm = deck.bpm, bpm > 0 {
             effectiveBpm = bpm * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        } else if let thru = deck.thruReadout?.tempo {
+            effectiveBpm = thru
         } else if let fx = dubFxDeck, let tapped = state(for: fx).fxRack.spaceEchoTapBpm {
             effectiveBpm = tapped
         } else {
@@ -6134,12 +6224,15 @@ final class WaveformAppModel: ObservableObject {
     /// TAP's presses, seconds of uptime. Not state anything draws.
     private var fxEchoTaps: [TimeInterval] = []
 
-    /// The tempo SYNC follows: the music deck's live BPM — its analysed
-    /// tempo at the platter's pitch — when it has one, else the tapped
-    /// tempo.
+    /// The tempo SYNC follows: the music deck's — a THRU record's live
+    /// tempo (tracked, or tapped on the deck), or a track's analysed tempo
+    /// at the platter's pitch — else the tempo tapped on the unit.
     private func fxEchoTempo(fxSide: DeckSide) -> FxEchoTempo? {
         let music: DeckSide = fxSide == .a ? .b : .a
         let deck = state(for: music)
+        if let thru = deck.thruReadout?.tempo {
+            return FxEchoTempo(source: .deck(music), bpm: thru)
+        }
         if deck.hasTrack, !deck.isThru, let base = deck.bpm, base > 0 {
             let live = base * (1 + (livePitchPercent(music) ?? 0) / 100)
             return FxEchoTempo(source: .deck(music), bpm: live)
@@ -7032,6 +7125,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
+            onTapTempo: { side in
+                Task { @MainActor in
+                    model.tapThruTempo(side)
+                }
+                return true
+            },
             // Map mode: while a control is armed, the next key is its
             // binding — Escape backs out, ⌫ unbinds. Checked on the main
             // actor synchronously so the key never also fires the action
@@ -7080,6 +7179,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onFxHold: @escaping () -> Bool,
             onFxTap: @escaping () -> Bool,
             onKeyLock: @escaping (_ side: DeckSide) -> Bool,
+            onTapTempo: @escaping (_ side: DeckSide) -> Bool,
             mapCapture: @escaping (_ code: UInt16, _ characters: String?, _ command: Bool) -> Bool
         ) {
             uninstall()
@@ -7148,6 +7248,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onFxTap() { return nil }
                 case .keyLock(let side):
                     if onKeyLock(side) { return nil }
+                case .tapTempo(let side):
+                    if onTapTempo(side) { return nil }
                 }
                 return event
             }

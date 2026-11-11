@@ -77,7 +77,7 @@ pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
 pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
 pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};
-pub use stream::BpmStream;
+pub use stream::{BpmStream, LiveStreamConfig, StreamSnapshot};
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
 
 // M9.5a: the FFT pipeline + log-band layout + magnitude compression that

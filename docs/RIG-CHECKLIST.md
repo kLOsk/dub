@@ -52,9 +52,10 @@ Clear these first; they are the open items in `history/CURRENT.md`.
       with an analysed track. The line under REPEAT reads `♩ A · <bpm>`;
       the repeats sit on the beat. Ride the pitch fader −8 → +8 % → the
       echoes stay in time, bend smoothly, never click.
-- [ ] **TAP on a real record.** Deck A in THRU (no BPM): SYNC reads
-      `NO TEMPO · TAP` in red. Tap four beats → `TAP · <bpm>`, echoes on
-      the beat.
+- [ ] **TAP on a real record.** Deck A in THRU: the deck's BPM shows the
+      record's tempo once it is heard, and SYNC reads `♩ A · <bpm>`. Tap the
+      deck's BPM four times → `BPM · TAP`, echoes on your beat. (The
+      Space Echo's own TAP is the fallback while nothing is heard yet.)
 - [ ] **Deck HOLD only with DUB FX.** Preferences: DUB FX off → the echo is
       the single ECHO OUT, no HOLD. On → OUT · HOLD.
 - [ ] **FX rack responsiveness.** Switch a deck to DUB FX and back five
@@ -155,11 +156,14 @@ Clear these first; they are the open items in `history/CURRENT.md`.
 ## 8. Thru — real records
 
 - [ ] THRU on a deck, drop a record → it passes through the engine with no
-      audible latency; the waveform builds live.
-- [ ] **Known gap:** PRD §2.2.10 asks for auto-BPM on THRU (lock within
-      15 s on hip-hop, reggae, dnb). The engine can track it, but only the
-      CLI wires it up — the app shows no BPM on THRU. Record FAIL until it
-      is wired; TAP on the Space Echo is the stopgap.
+      audible latency; the waveform builds live, scrolling in from the right.
+- [ ] Auto-BPM: a reggae, a hip-hop and a dnb record in THRU → the deck's BPM
+      shows a dim number, then a solid one within 15 s, on the right tempo.
+      **Known:** dnb reads two-thirds of its tempo (~116 for ~175) — note it.
+- [ ] Tap override: tap the deck's BPM four times on the beat → it reads
+      `BPM · TAP` with your tempo; the Space Echo's SYNC follows it. Lift the
+      needle, put the next record down → the tap is gone and the deck listens
+      again.
 
 ## 9. Robustness
 

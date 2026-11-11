@@ -50,8 +50,8 @@
 //! the engine. Keeping the type public and standalone avoids a maze of
 //! `#[cfg(test)]` shims and lets each layer be tested independently.
 
-use ringbuf::traits::{Consumer, Observer};
-use ringbuf::HeapCons;
+use ringbuf::traits::{Consumer, Observer, Producer};
+use ringbuf::{HeapCons, HeapProd};
 
 use dub_timecode::{whitening_from_covariance, DecodeOutput, Decoder, Format, RateSmoother};
 
@@ -693,6 +693,20 @@ pub struct TimecodeInput {
     /// `drive` can convert popped frames into the real block duration
     /// for the policy's hold-decay clock.
     input_sample_rate: f32,
+
+    /// THRU's analysis taps — see [`Self::with_live_taps`]. Fed by
+    /// [`Self::push_live_taps`] only while the deck plays a record.
+    live_taps: Option<LiveTaps>,
+}
+
+/// The mono feeds a THRU deck's tempo tracker and live waveform read,
+/// with the scratch the audio thread downmixes into. Built off-RT and
+/// kept for the input's whole life, so nothing here is ever freed on
+/// the audio thread.
+struct LiveTaps {
+    bpm: HeapProd<f32>,
+    peaks: HeapProd<f32>,
+    mono: Vec<f32>,
 }
 
 /// Running covariance of the raw `(ch1, ch0)` input during a
@@ -762,7 +776,37 @@ impl TimecodeInput {
             last_display_rate: 1.0,
             hold_until_calibrated: config.hold_until_calibrated,
             input_sample_rate: config.input_sample_rate,
+            live_taps: None,
         }
+    }
+
+    /// Give this input THRU's analysis taps: while the deck is on THRU,
+    /// every block of the record is downmixed (pre-gain) into `bpm` for
+    /// the tempo tracker and `peaks` for the live waveform. Off-RT —
+    /// sizes the downmix scratch for `max_block_frames`.
+    #[must_use]
+    pub fn with_live_taps(mut self, bpm: HeapProd<f32>, peaks: HeapProd<f32>) -> Self {
+        let mono = vec![0.0; self.scratch.len() / 2];
+        self.live_taps = Some(LiveTaps { bpm, peaks, mono });
+        self
+    }
+
+    /// Push this block's input, downmixed to mono, into the THRU taps.
+    /// A full ring drops the block — analysis telemetry, never audio.
+    /// RT-safe: no allocation, two lock-free pushes.
+    pub(crate) fn push_live_taps(&mut self) {
+        let Some(taps) = self.live_taps.as_mut() else {
+            return;
+        };
+        let frames = (self.last_popped / 2).min(taps.mono.len());
+        for (m, frame) in taps.mono[..frames]
+            .iter_mut()
+            .zip(self.scratch[..frames * 2].chunks_exact(2))
+        {
+            *m = 0.5 * (frame[0] + frame[1]);
+        }
+        let _ = taps.bpm.push_slice(&taps.mono[..frames]);
+        let _ = taps.peaks.push_slice(&taps.mono[..frames]);
     }
 
     /// Whether this input holds deck auto-start until calibration and

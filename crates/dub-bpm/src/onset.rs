@@ -145,6 +145,20 @@ impl OnsetDetector {
         &self.odf
     }
 
+    /// Keep only the newest `n` samples of both ODFs. A live input never
+    /// ends, so a search over all of it would cost more every second and
+    /// let a record that finished minutes ago outvote the one playing.
+    pub(crate) fn keep_last(&mut self, n: usize) {
+        if self.odf.len() > n {
+            let cut = self.odf.len() - n;
+            self.odf.drain(..cut);
+        }
+        if self.kick_odf.len() > n {
+            let cut = self.kick_odf.len() - n;
+            self.kick_odf.drain(..cut);
+        }
+    }
+
     /// Consume the detector and return broadband + kick ODFs.
     pub(crate) fn into_odfs(self) -> (Vec<f32>, Vec<f32>) {
         (self.odf, self.kick_odf)

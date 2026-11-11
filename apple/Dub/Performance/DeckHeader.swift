@@ -29,6 +29,20 @@ import DubCore
 /// (engine status + DeckState + master-deck flag) — the view does no
 /// derivation of its own, which keeps it trivially snapshot-testable
 /// in M18.
+/// What a THRU deck's BPM readout shows: the record's tempo, measured
+/// live (FFI 82) or tapped by the DJ.
+struct ThruTempoReadout: Equatable {
+    /// `nil` while the tracker is still searching and nothing is tapped.
+    var bpm: Double?
+    /// The DJ tapped it; it holds until the needle comes up.
+    var tapped: Bool = false
+    /// The tracker confirmed it. A tentative tempo reads dim.
+    var locked: Bool = false
+
+    /// The tempo to sync to, when there is one.
+    var tempo: Double? { bpm }
+}
+
 struct DeckHeaderState: Equatable {
 
     /// Whether the engine has an active source on this deck (Thru
@@ -218,6 +232,10 @@ struct DeckHeaderState: Equatable {
     /// occupied by elapsed + remaining. `var` with a default so
     /// existing `from(...)` call sites keep compiling.
     var historyHint: String? = nil
+
+    /// Set on a THRU deck: the record's tempo, for the BPM readout. `var`
+    /// with a default so the `from(...)` call sites keep compiling.
+    var thruTempo: ThruTempoReadout? = nil
 
     enum Source: Equatable {
         case off
@@ -1442,7 +1460,8 @@ extension DeckHeaderState {
                 isPlaying: false,
                 isPanicPlay: false,
                 useTimecodeToggle: false,
-                gridLocked: false, gridDriftQuality: nil)
+                gridLocked: false, gridDriftQuality: nil,
+                thruTempo: deckState.thruReadout)
         }
 
         return DeckHeaderState(

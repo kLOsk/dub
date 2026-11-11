@@ -487,6 +487,21 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
   CARTRIDGE / CABLE` (`DeckTelemetry.weak_channel`; the deck holds, Panic
   Play and INT still work), and a capture that cannot collect a second of
   turning carrier within 10 s is dropped instead of sitting at CALIBRATING.
+  **THRU tempo + waveform, FFI 82 (2026-11-11, not yet on the rig).** Each
+  deck's timecode input carries two mono taps (tempo, peaks) built off-RT
+  at attach; the engine feeds them only on THRU. Entering THRU spawns a
+  live `BpmStream` (60 s onset window; a second of silence = needle up:
+  the tracker starts over and the next sound is a new record) and a
+  `PeakStream` whose waveform the deck draws live; leaving hands the
+  consumers back (`into_audio_rx`), so nothing is ever freed on the audio
+  thread. The deck's BPM shows the record's tempo (dim tentative, solid
+  locked); four taps on it override until the needle comes up — Daniel's
+  call — and SYNC / ECHO OUT follow it. Real records: reggae 133.4 and
+  soul 112.9 locked at 5 s; **dnb reads 116.6 (⅔ of ~175)**, live and
+  offline — the next tempo-detector job. Also from the rig: the Space
+  Echo's knobs walked sideways with their values (readouts and the line
+  under REPEAT changed width, and a synced repeat re-laid out the window
+  30×/s); every readout now keeps a fixed width.
   Still open: Space Echo HOLD / SYNC / TAP —
   the aux send is patched into 5/6 (deck B's pair) but nothing arrives
   there; looks like the mixer side.

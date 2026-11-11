@@ -47,9 +47,10 @@ pub mod timecode;
 pub use command::{Command, FxSlot};
 pub use deck::{Deck, DeckSharedState, LoopState, PublishState};
 pub use handle::{
-    CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
-    ThruAttachWithPeaksError, ThruAttachWithTelemetryError, ThruTapHandles, ThruTaps,
-    BPM_TEE_RING_CAPACITY_SECS, PEAKS_TAP_RING_CAPACITY_SECS, RECORD_TAP_RING_CAPACITY_SECS,
+    CommandError, DeckCommand, DeckSnapshot, EngineHandle, LiveTapConsumers,
+    ThruAttachWithBpmError, ThruAttachWithPeaksError, ThruAttachWithTelemetryError, ThruTapHandles,
+    ThruTaps, BPM_TEE_RING_CAPACITY_SECS, PEAKS_TAP_RING_CAPACITY_SECS,
+    RECORD_TAP_RING_CAPACITY_SECS,
 };
 pub use looping::{reverse_loop_region, wrap_into};
 pub use realtime::{RealtimeContext, RtError};
@@ -946,6 +947,13 @@ impl Engine {
                 self.input_meter[idx].feed(level, frames, sr);
                 let meter = self.input_meter[idx];
                 self.decks[idx].store_input_level(meter.rms(), meter.peak);
+                // A record on THRU feeds its tempo tracker and live
+                // waveform. Not DUB FX: that input is a send, not a tune.
+                if self.control_mode[idx] == ControlMode::Thru {
+                    if let Some(input) = self.timecode_inputs[idx].as_mut() {
+                        input.push_live_taps();
+                    }
+                }
             } else {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
                 if self.input_meter[idx].peak > 0.0 || self.input_meter[idx].mean_sq > 0.0 {
@@ -3395,6 +3403,66 @@ mod tests {
             "thru dry was not muted (100% wet): {last}"
         );
         assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Engaged);
+    }
+
+    /// A record on THRU feeds its tempo tracker and live waveform: the
+    /// input, downmixed to mono, lands in both taps — allocation-free —
+    /// and only on THRU. On TC the input is a control record, on DUB FX
+    /// a mixer send; neither is a tune to analyse.
+    #[test]
+    fn thru_feeds_the_live_taps_and_nothing_else_does() {
+        use ringbuf::traits::{Observer, Split};
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let mut engine = Engine::new(sr, block);
+        let (mut tx, rx) = HeapRb::<f32>::new(48_000 * 2).split();
+        let (bpm_tx, bpm_rx) = HeapRb::<f32>::new(48_000).split();
+        let (peaks_tx, peaks_rx) = HeapRb::<f32>::new(48_000).split();
+        let cfg = TimecodeInputConfig {
+            input_sample_rate: sr,
+            max_block_frames: block,
+            ..TimecodeInputConfig::default()
+        };
+        engine.apply_command(Command::AttachTimecodeInput {
+            idx: 0,
+            input: Box::new(TimecodeInput::new(rx, cfg).with_live_taps(bpm_tx, peaks_tx)),
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+        let mut run = |engine: &mut Engine, mode: ControlMode, blocks: usize| {
+            engine.apply_command(Command::DeckSetControlMode { idx: 0, mode });
+            for _ in 0..blocks {
+                push_thru_input(&mut tx, block, 0.4, 0.2);
+                assert_no_alloc::assert_no_alloc(|| engine.render(&mut rt, &mut out));
+            }
+        };
+        run(&mut engine, ControlMode::Timecode, 8);
+        run(&mut engine, ControlMode::Fx, 8);
+        assert_eq!(bpm_rx.occupied_len(), 0, "TC or DUB FX fed the tempo tap");
+        assert_eq!(
+            peaks_rx.occupied_len(),
+            0,
+            "TC or DUB FX fed the waveform tap"
+        );
+        run(&mut engine, ControlMode::Thru, 8);
+        assert_eq!(
+            bpm_rx.occupied_len(),
+            8 * block,
+            "THRU did not feed the tempo tap"
+        );
+        assert_eq!(
+            peaks_rx.occupied_len(),
+            8 * block,
+            "THRU did not feed the waveform tap"
+        );
+        let mut first = [0.0_f32; 1];
+        let mut bpm_rx = bpm_rx;
+        let _ = ringbuf::traits::Consumer::pop_slice(&mut bpm_rx, &mut first);
+        assert!(
+            (first[0] - 0.3).abs() < 1e-6,
+            "not the mono downmix: {}",
+            first[0]
+        );
     }
 
     #[test]

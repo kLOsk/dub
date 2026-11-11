@@ -38,12 +38,12 @@ use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
 use dub_bpm::{
     analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_from_taps,
     analyze_beat_grid_with_profile, bar_phase_from_tap, octave_profile_from_genre,
-    relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid as CoreBeatGrid,
-    GridQuality as CoreGridQuality, OctaveProfile,
+    relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid as CoreBeatGrid, BpmRange, BpmStream,
+    GridQuality as CoreGridQuality, LiveStreamConfig, OctaveProfile, TrackerConfig, TrackerState,
 };
 use dub_engine::{
-    reverse_loop_region, DeckSharedState, Engine, EngineHandle, ThruInputConfig, ThruTaps,
-    TimecodeInputConfig, INTERNAL_MIXER_ROUTING,
+    reverse_loop_region, DeckSharedState, Engine, EngineHandle, LiveTapConsumers, ThruInputConfig,
+    ThruTaps, TimecodeInputConfig, INTERNAL_MIXER_ROUTING,
 };
 use dub_io::{
     read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
@@ -512,7 +512,12 @@ pub use rip::{
 ///       `DeckTelemetry.weak_channel`: the deck's last calibration was
 ///       refused because one channel of the pair is far quieter than the
 ///       other (a cartridge / headshell / cable fault), and which one.
-pub const FFI_VERSION: u32 = 81;
+///   82. **THRU has a tempo and a waveform.** [`DubEngine::thru_tempo`]
+///       and [`ThruTempo`]: a deck on THRU tracks its record's tempo live,
+///       starting over when the needle comes up, and draws the record as
+///       a live waveform through the deck's ordinary peaks. A deck sent to
+///       THRU or DUB FX no longer keeps the unloaded track's peaks.
+pub const FFI_VERSION: u32 = 82;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -954,6 +959,9 @@ impl PeakSource {
 /// 4. `input` is dropped last (when present) → no more samples flow.
 struct RunningState {
     peaks: [Option<PeakSource>; 2],
+    /// Per deck, THRU's tempo tracker and the idle ends of its analysis
+    /// taps — see [`LiveDeckTaps`].
+    live_taps: [LiveDeckTaps; 2],
     /// Per-deck loaded track (File mode). Held so [`DubEngine::track_info`]
     /// can read metadata after load. The engine's deck also holds a
     /// clone of this `Arc<Track>` — the audio thread reads samples
@@ -999,6 +1007,90 @@ struct RunningState {
     /// (PRD §4.4). File-mode peaks carry their own SR so the
     /// renderer's time-axis math is correct per-deck.
     sample_rate: u32,
+}
+
+/// A deck's THRU analysis: the consumer ends of the taps its timecode
+/// input feeds while on THRU
+/// (`EngineHandle::attach_timecode_input_with_live_taps`), and the tempo
+/// stream reading one of them during a THRU session. The live waveform's stream sits in `RunningState::peaks` as
+/// [`PeakSource::Live`]. Each session spawns fresh threads on the same
+/// rings and hands the consumers back when it ends, so a session starts
+/// clean and nothing is ever freed on the audio thread.
+#[derive(Default)]
+struct LiveDeckTaps {
+    bpm_rx: Option<ringbuf::HeapCons<f32>>,
+    peaks_rx: Option<ringbuf::HeapCons<f32>>,
+    bpm: Option<BpmStream>,
+}
+
+impl LiveDeckTaps {
+    fn from_consumers(c: LiveTapConsumers) -> Self {
+        Self {
+            bpm_rx: Some(c.bpm),
+            peaks_rx: Some(c.peaks),
+            bpm: None,
+        }
+    }
+}
+
+/// Drop whatever a ring still holds from before — the last session's
+/// tail would otherwise open the new one.
+fn drain_stale(rx: &mut ringbuf::HeapCons<f32>) {
+    use ringbuf::traits::{Consumer, Observer};
+    let stale = rx.occupied_len();
+    rx.skip(stale);
+}
+
+impl RunningState {
+    /// A deck went to THRU: spawn its tempo tracker and live waveform on
+    /// the deck's taps. Already running (THRU pressed twice) keeps them.
+    fn start_live_analysis(&mut self, idx: usize) {
+        let sr = self.sample_rate;
+        let taps = &mut self.live_taps[idx];
+        if taps.bpm.is_none() {
+            if let Some(mut rx) = taps.bpm_rx.take() {
+                drain_stale(&mut rx);
+                let cfg = TrackerConfig {
+                    sample_rate: sr,
+                    channels: 1,
+                    analysis_period_samples: sr.max(1),
+                    bpm_range: BpmRange::DEFAULT,
+                };
+                // Spawn only fails on a zero sample rate, which a running
+                // engine cannot have; the consumer is lost with it then.
+                taps.bpm = BpmStream::spawn_live(rx, cfg, LiveStreamConfig::default()).ok();
+            }
+        }
+        if !matches!(self.peaks[idx], Some(PeakSource::Live { .. })) {
+            if let Some(mut rx) = taps.peaks_rx.take() {
+                drain_stale(&mut rx);
+                self.peaks[idx] =
+                    PeakStream::spawn(rx, PeakStreamConfig::at(sr))
+                        .ok()
+                        .map(|stream| PeakSource::Live {
+                            stream,
+                            sample_rate: sr,
+                        });
+            }
+        }
+    }
+
+    /// A deck left THRU: stop its analysis and keep the consumers for the
+    /// next session. The waveform goes with it; returns whether there was
+    /// one, so the caller knows the deck's peaks changed.
+    fn stop_live_analysis(&mut self, idx: usize) -> bool {
+        let taps = &mut self.live_taps[idx];
+        if let Some(stream) = taps.bpm.take() {
+            taps.bpm_rx = stream.into_audio_rx();
+        }
+        if matches!(self.peaks[idx], Some(PeakSource::Live { .. })) {
+            if let Some(PeakSource::Live { stream, .. }) = self.peaks[idx].take() {
+                taps.peaks_rx = stream.into_audio_rx();
+            }
+            return true;
+        }
+        false
+    }
 }
 
 impl DubEngine {
@@ -3296,6 +3388,38 @@ impl DubEngine {
         self.position_snapshot_at_host_time_inner(deck_idx, host_time_ns)
     }
 
+    /// A THRU deck's tempo, as its tracker has it now (PRD §5.2.3): the
+    /// record on the platter, analysed live. Searching until a tempo
+    /// shows, tentative while it is confirmed, locked after. Not on THRU
+    /// (or no input): `active` is false and the rest is empty. Takes the
+    /// engine lock briefly; poll at UI cadence.
+    #[must_use]
+    pub fn thru_tempo(&self, deck_idx: u64) -> ThruTempo {
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return ThruTempo::INACTIVE;
+        };
+        let state = lock_state(&self.state);
+        let EngineState::Running(running) = &*state else {
+            return ThruTempo::INACTIVE;
+        };
+        let Some(stream) = running.live_taps[idx].bpm.as_ref() else {
+            return ThruTempo::INACTIVE;
+        };
+        let snap = stream.snapshot();
+        let (bpm, locked) = match snap.state {
+            TrackerState::Searching => (0.0, false),
+            TrackerState::Tentative { bpm } => (bpm, false),
+            TrackerState::Locked { bpm } => (bpm, true),
+        };
+        ThruTempo {
+            active: true,
+            bpm,
+            locked,
+            record_seq: snap.record_seq,
+            needle_up: snap.needle_up,
+        }
+    }
+
     /// Per-deck live telemetry (pitch + timecode signal health) for the
     /// Performance deck header, tracking dot, and signal-quality panel.
     /// Lock-free read of the deck's shared state — the same hot path as
@@ -3358,6 +3482,7 @@ impl DubEngine {
         mode: ControlMode,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
+        let peaks_changed;
         {
             let mut state = lock_state(&self.state);
             let EngineState::Running(running) = &mut *state else {
@@ -3378,8 +3503,29 @@ impl DubEngine {
                 running.double_host_view[idx] = None;
                 running.file_tracks[idx] = None;
             }
+            // A record on THRU gets its tempo tracker and a live
+            // waveform; every other mode stops them. The unloaded file's
+            // peaks go too — they used to stay, and a deck switched to
+            // THRU or DUB FX painted the old track's tail.
+            peaks_changed = match mode {
+                ControlMode::Thru => {
+                    if matches!(running.peaks[idx], Some(PeakSource::File(_))) {
+                        running.peaks[idx] = None;
+                    }
+                    running.start_live_analysis(idx);
+                    true
+                }
+                ControlMode::Fx => {
+                    running.stop_live_analysis(idx);
+                    running.peaks[idx] = None;
+                    true
+                }
+                ControlMode::InternalPlay | ControlMode::Timecode => {
+                    running.stop_live_analysis(idx)
+                }
+            };
         }
-        if matches!(mode, ControlMode::Thru | ControlMode::Fx) {
+        if peaks_changed {
             self.bump_peak_generation(idx);
         }
         Ok(())
@@ -4447,6 +4593,33 @@ pub struct SamplerSlotTelemetry {
     pub playing: bool,
     /// How far through the take, `0.0..=1.0`; `0.0` when idle.
     pub progress: f32,
+}
+
+/// A THRU deck's live tempo — see [`DubEngine::thru_tempo`].
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ThruTempo {
+    /// A tracker is running: the deck is on THRU with an input.
+    pub active: bool,
+    /// The tempo, `0.0` while searching.
+    pub bpm: f64,
+    /// Confirmed (solid) rather than tentative.
+    pub locked: bool,
+    /// Bumps each time sound returns after the needle was up — a new
+    /// record. A tempo the DJ tapped belongs to the count it was tapped
+    /// in, and gives way when it moves.
+    pub record_seq: u32,
+    /// The input has been silent long enough to count as the needle up.
+    pub needle_up: bool,
+}
+
+impl ThruTempo {
+    const INACTIVE: Self = Self {
+        active: false,
+        bpm: 0.0,
+        locked: false,
+        record_seq: 0,
+        needle_up: false,
+    };
 }
 
 /// Per-deck live telemetry for the Performance deck header: pitch
@@ -5801,6 +5974,7 @@ fn start_thru_inner(
     // attached because the waveform follows the loaded track's file
     // peaks (installed by `load_track`).
     let mut peaks: [Option<PeakSource>; 2] = [None, None];
+    let mut live_taps: [LiveDeckTaps; 2] = Default::default();
     let mut record_taps: [Option<ringbuf::HeapCons<f32>>; 2] = [None, None];
 
     match source_mode {
@@ -5876,23 +6050,26 @@ fn start_thru_inner(
                 max_block_frames: THRU_MAX_BLOCK_FRAMES,
                 ..TimecodeInputConfig::default()
             };
-            handle
-                .attach_timecode_input(0, consumer_a, tc_cfg)
+            let taps_a = handle
+                .attach_timecode_input_with_live_taps(0, consumer_a, tc_cfg)
                 .map_err(|e| {
                     EngineError::AudioStartFailed(format!("attaching timecode on deck 0: {e}"))
                 })?;
+            live_taps[0] = LiveDeckTaps::from_consumers(taps_a);
             if let Some(consumer_b) = consumer_b {
-                handle
-                    .attach_timecode_input(1, consumer_b, tc_cfg)
+                let taps_b = handle
+                    .attach_timecode_input_with_live_taps(1, consumer_b, tc_cfg)
                     .map_err(|e| {
                         EngineError::AudioStartFailed(format!("attaching timecode on deck 1: {e}"))
                     })?;
+                live_taps[1] = LiveDeckTaps::from_consumers(taps_b);
             }
         }
     }
 
     Ok(RunningState {
         peaks,
+        live_taps,
         file_tracks: [None, None],
         sampler_tracks: std::array::from_fn(|_| None),
         sampler_peaks: std::array::from_fn(|_| None),
@@ -5964,6 +6141,7 @@ fn start_engine_inner(
 
     Ok(RunningState {
         peaks: [None, None],
+        live_taps: Default::default(),
         file_tracks: [None, None],
         sampler_tracks: std::array::from_fn(|_| None),
         sampler_peaks: std::array::from_fn(|_| None),
@@ -6360,7 +6538,8 @@ mod tests {
         // `RipSessionStatus.level_rms` / `clipped_secs_ago`.
         // 77→78: `set_segment_dropped`, `RipSegment.dropped`.
         // 80→81: `DeckTelemetry.weak_channel`.
-        assert_eq!(FFI_VERSION, 81);
+        // 81→82: `thru_tempo`, `ThruTempo`.
+        assert_eq!(FFI_VERSION, 82);
     }
 
     #[test]

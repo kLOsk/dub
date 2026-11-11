@@ -333,6 +333,7 @@ struct PerformanceView: View {
             onExitLoop: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
             onEchoHold: { model.toggleEchoHold(side) },
+            onTapTempo: { model.tapThruTempo(side) },
             onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
             // Select Internal *and* start playing, which is the
             // contract `SourceControlView` documents for the segment

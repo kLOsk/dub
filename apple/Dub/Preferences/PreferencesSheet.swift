@@ -467,6 +467,7 @@ struct PreferencesSheet: View {
         case .fxHold: return "FX · Space Echo hold"
         case .fxTap: return "FX · Space Echo tap tempo"
         case .keyLock(let side): return "Key lock \(side.label)"
+        case .tapTempo(let side): return "Tap tempo \(side.label) (THRU)"
         }
     }
 

@@ -163,6 +163,12 @@ impl BpmTracker {
         self.estimator.current()
     }
 
+    /// Search only the newest `secs` of onsets — see
+    /// [`BpmEstimator::set_window_secs`]. For a live input.
+    pub fn set_odf_window_secs(&mut self, secs: Option<f32>) {
+        self.estimator.set_window_secs(secs);
+    }
+
     /// Wipe to fresh state. Equivalent to constructing a new tracker
     /// with the same config but cheaper (no FFT re-plan).
     pub fn reset(&mut self) {

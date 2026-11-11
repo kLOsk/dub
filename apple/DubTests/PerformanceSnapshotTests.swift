@@ -234,6 +234,24 @@ final class PerformanceSnapshotTests: XCTestCase {
             ])
     }
 
+    private static func thruColumnState(_ tempo: ThruTempoReadout) -> DeckColumnState {
+        var header = DeckHeaderState(
+            isLive: true, source: .timecode,
+            trackTitle: nil, trackArtist: nil,
+            bpm: nil, key: nil, formatChip: nil, timeRow: nil,
+            isMaster: true, isPlaying: false,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil)
+        header.sourceControl = .thru
+        header.thruTempo = tempo
+        var state = columnState()
+        state.header = DeckColumnHeader(header)
+        state.hasTrack = false
+        state.isThru = true
+        state.isPlaying = false
+        return state
+    }
+
     /// A quick scratch in progress: pad 2 lit, the identity block in
     /// the deck tint with SCRATCH beside the sample's name, and the
     /// parked tune — playing on deck B meanwhile — with its position
@@ -272,6 +290,21 @@ final class PerformanceSnapshotTests: XCTestCase {
         state.fxAvailable = true
         snap(deckBg(columnFixture(state)),
              width: 540, height: 470, named: "deck-column-echo-held")
+    }
+
+    /// A THRU deck: no track, the record's tempo in the BPM slot. Heard
+    /// and not yet confirmed, it reads dim.
+    func test_deckColumn_thruTentative() {
+        snap(deckBg(columnFixture(Self.thruColumnState(ThruTempoReadout(bpm: 133.4)))),
+             width: 540, height: 470, named: "deck-column-thru-tentative")
+    }
+
+    /// Tapped: solid, and the label says TAP in the deck's colour — the
+    /// number is the DJ's until the needle comes up.
+    func test_deckColumn_thruTapped() {
+        snap(deckBg(columnFixture(Self.thruColumnState(
+            ThruTempoReadout(bpm: 66.7, tapped: true, locked: true)))),
+             width: 540, height: 470, named: "deck-column-thru-tapped")
     }
 
     func test_deckColumn_wideWindow() {

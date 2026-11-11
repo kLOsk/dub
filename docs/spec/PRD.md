@@ -241,7 +241,7 @@ Every release runs through this on real hardware. All must pass. The runnable fo
 7. Engage Echo-Out 50 times in a row → no degradation, tail decays cleanly each time.
 8. Switch a deck to Thru, drop a real record → audio passes through the engine (~2.7 ms one-way), waveform builds live, auto-BPM locks.
 9. On the same Thru deck, engage Echo-Out → the record mutes and the echo plays out (§6.3 — 100 % wet); disengage → the record is back at its slipped position.
-10. Auto-BPM on Thru locks within 15 s on a 4/4 hip-hop record, a reggae record, and a dnb record. *(Open: the engine tracks it, but only the CLI wires it up; the app shows no BPM on Thru yet.)*
+10. Auto-BPM on Thru locks within 15 s on a 4/4 hip-hop record, a reggae record, and a dnb record. *(Wired in the app, FFI 82: the deck's BPM shows the record's tempo — dim while tentative — and a tap on it overrides until the needle comes up. On the rip baselines the reggae 12″ and the soul sampler lock in 5 s (`dub-bpm/tests/thru_real_records.rs`); **the dnb side does not** — it reads ~116.6, two-thirds of its ~175, live and offline alike. Open: the 3:2 dnb read, and a hip-hop record to test against.)*
 11. Unplug the audio interface mid-playback → engine stops cleanly, UI shows "interface lost", reconnect → playback resumes.
 12. Run 60 minutes continuous use (any combination of features), close the app cleanly → no crash, no orphan processes.
 13. Open the macOS sleep/wake cycle while Dub is running → audio resumes without artifacts on wake.

@@ -80,6 +80,9 @@ enum DubAction: Hashable {
     case fxTap
     /// A deck's key lock (M14). Per deck, like the platter it holds.
     case keyLock(DeckSide)
+    /// Tap a THRU deck's tempo — the record's, overriding the tracker
+    /// until the needle comes up.
+    case tapTempo(DeckSide)
 
     var id: String {
         switch self {
@@ -98,6 +101,7 @@ enum DubAction: Hashable {
         case .fxHold: return "fx.hold"
         case .fxTap: return "fx.tap"
         case .keyLock(let side): return "keylock.\(side == .a ? "a" : "b")"
+        case .tapTempo(let side): return "tempo.tap.\(side == .a ? "a" : "b")"
         }
     }
 
@@ -140,6 +144,9 @@ enum DubAction: Hashable {
         case (2, "keylock"):
             guard let d = side(parts[1]) else { return nil }
             self = .keyLock(d)
+        case (3, "tempo") where parts[1] == "tap":
+            guard let d = side(parts[2]) else { return nil }
+            self = .tapTempo(d)
         default: return nil
         }
     }

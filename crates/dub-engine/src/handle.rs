@@ -133,6 +133,22 @@ pub enum ThruAttachWithTelemetryError {
     PeaksSampleRateMismatch { peaks_sr: u32, engine_sr: u32 },
 }
 
+/// The consumer ends of a deck's THRU analysis taps — see
+/// [`EngineHandle::attach_timecode_input_with_live_taps`]. Mono, pre-gain,
+/// at the engine rate.
+pub struct LiveTapConsumers {
+    /// For a `dub_bpm::BpmStream`.
+    pub bpm: ringbuf::HeapCons<f32>,
+    /// For a `dub_peaks::PeakStream`.
+    pub peaks: ringbuf::HeapCons<f32>,
+}
+
+impl std::fmt::Debug for LiveTapConsumers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveTapConsumers").finish_non_exhaustive()
+    }
+}
+
 /// Which taps [`EngineHandle::attach_thru_source_with_taps`] wires
 /// onto the [`ThruSource`] (M26). The M8/M9 convenience variants
 /// cover the common telemetry combinations; this struct exists so
@@ -625,6 +641,49 @@ impl EngineHandle {
         self.tx
             .try_push(Command::AttachTimecodeInput { idx: idx_u8, input })
             .map_err(|_cmd| TimecodeAttachError::ChannelFull)
+    }
+
+    /// [`Self::attach_timecode_input`] with THRU's analysis taps: while
+    /// the deck is switched to THRU, its input feeds a tempo tracker and
+    /// a live waveform through the rings whose consumers come back here.
+    /// The rings live as long as the input, so the producers never leave
+    /// the audio thread; the caller spawns (and respawns) the analysis
+    /// threads on the consumers — `dub_bpm::BpmStream::into_audio_rx` and
+    /// `dub_peaks::PeakStream::into_audio_rx` hand them back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attach_timecode_input`].
+    pub fn attach_timecode_input_with_live_taps(
+        &mut self,
+        idx: usize,
+        rx: ringbuf::HeapCons<f32>,
+        config: TimecodeInputConfig,
+    ) -> Result<LiveTapConsumers, TimecodeAttachError> {
+        if idx >= DECK_COUNT {
+            return Err(TimecodeAttachError::InvalidDeck {
+                idx,
+                count: DECK_COUNT,
+            });
+        }
+        config.validate(self.engine_sample_rate)?;
+        self.reclaim();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let sr = self.engine_sample_rate as usize;
+        let ring = || {
+            ringbuf::traits::Split::split(ringbuf::HeapRb::<f32>::new(
+                sr.saturating_mul(BPM_TEE_RING_CAPACITY_SECS).max(1024),
+            ))
+        };
+        let (bpm_tx, bpm) = ring();
+        let (peaks_tx, peaks) = ring();
+        #[allow(clippy::cast_possible_truncation)]
+        let idx_u8 = idx as u8;
+        let input = Box::new(TimecodeInput::new(rx, config).with_live_taps(bpm_tx, peaks_tx));
+        self.tx
+            .try_push(Command::AttachTimecodeInput { idx: idx_u8, input })
+            .map_err(|_cmd| TimecodeAttachError::ChannelFull)?;
+        Ok(LiveTapConsumers { bpm, peaks })
     }
 
     /// Attach a [`ThruSource`] to deck `idx` mid-stream (M7).

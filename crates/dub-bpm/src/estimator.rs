@@ -39,6 +39,9 @@ pub struct BpmEstimator {
     odf_sample_rate: f64,
     last_estimate: Option<BpmEstimate>,
     bpm_range: BpmRange,
+    /// ODF samples the tempo search sees — the newest ones; `None` for
+    /// all of it (a file: the whole track is the evidence).
+    odf_window: Option<usize>,
 }
 
 impl BpmEstimator {
@@ -69,7 +72,17 @@ impl BpmEstimator {
             odf_sample_rate: f64::from(sample_rate) / HOP_SIZE as f64,
             last_estimate: None,
             bpm_range,
+            odf_window: None,
         })
+    }
+
+    /// Search only the newest `secs` of onsets — for a live input, where
+    /// the history only grows. `None` searches everything fed since the
+    /// last [`reset`](Self::reset).
+    pub fn set_window_secs(&mut self, secs: Option<f32>) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let window = secs.map(|s| (f64::from(s.max(1.0)) * self.odf_sample_rate) as usize);
+        self.odf_window = window;
     }
 
     /// Feed a block of mono audio and refresh the cached estimate.
@@ -98,6 +111,20 @@ impl BpmEstimator {
     /// [`recompute`]: Self::recompute
     pub fn feed(&mut self, mono_block: &[f32]) {
         self.detector.process(mono_block);
+        // Trim in steps of a quarter window, not every hop: the drain
+        // moves the whole buffer, so this keeps it to one move per
+        // quarter window of audio.
+        if let Some(window) = self.odf_window {
+            if self.detector.odf().len() > window + window / 4 {
+                self.detector.keep_last(window);
+            }
+        }
+    }
+
+    /// ODF samples currently held for the tempo search.
+    #[must_use]
+    pub fn odf_len(&self) -> usize {
+        self.detector.odf().len()
     }
 
     /// Run the tempo-search step against the current ODF and update
@@ -172,6 +199,29 @@ mod tests {
         assert!(e.current().is_some());
         e.reset();
         assert!(e.current().is_none());
+    }
+
+    /// A live input is analysed over a window, not its whole history: an
+    /// hour of THRU must cost what a minute costs.
+    #[test]
+    fn a_window_bounds_the_onset_history() {
+        let mut e = BpmEstimator::new(48_000).unwrap();
+        e.set_window_secs(Some(10.0));
+        let audio = synthetic::click_track(120.0, 40.0, 48_000);
+        for chunk in audio.chunks(4096) {
+            e.feed(chunk);
+        }
+        let window = (10.0 * 48_000.0 / HOP_SIZE as f64) as usize;
+        assert!(
+            e.odf_len() <= window + window / 4,
+            "history grew to {} ODF samples, window {window}",
+            e.odf_len()
+        );
+        e.recompute();
+        let est = e
+            .current()
+            .expect("a windowed search still finds the tempo");
+        assert!((est.bpm - 120.0).abs() < 1.0, "got {}", est.bpm);
     }
 
     #[test]

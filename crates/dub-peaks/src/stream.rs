@@ -186,7 +186,9 @@ pub struct PeakStream {
     /// every consumer.
     samples_per_onset_chunk: Option<usize>,
     shutdown: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    /// The thread hands its audio consumer back when it exits — see
+    /// [`PeakStream::into_audio_rx`].
+    join: Option<JoinHandle<HeapCons<f32>>>,
 }
 
 impl std::fmt::Debug for PeakStream {
@@ -281,7 +283,7 @@ impl PeakStream {
                     bands_enabled,
                     onset_enabled,
                     shutdown_for_thread,
-                );
+                )
             })
             .expect("OS refused to spawn decimator thread — fatal");
 
@@ -374,6 +376,16 @@ impl PeakStream {
             let _ = handle.join();
         }
     }
+
+    /// Stop the thread and take back the audio consumer it was reading,
+    /// so a fresh stream — a fresh waveform — can be spawned on the same
+    /// ring while its producer stays on the audio thread for good.
+    /// `None` only if the thread panicked.
+    #[must_use]
+    pub fn into_audio_rx(mut self) -> Option<HeapCons<f32>> {
+        self.shutdown.store(true, Ordering::Release);
+        self.join.take().and_then(|handle| handle.join().ok())
+    }
 }
 
 impl Drop for PeakStream {
@@ -396,7 +408,7 @@ fn analysis_loop(
     bands_enabled: bool,
     onset_enabled: bool,
     shutdown: Arc<AtomicBool>,
-) {
+) -> HeapCons<f32> {
     let mut block = vec![0.0f32; DRAIN_BLOCK_SAMPLES];
     let mut decimator = Decimator::new(samples_per_chunk);
     let mut band_decimator = bands_enabled.then(|| BandDecimator::new(sample_rate));
@@ -452,12 +464,39 @@ fn analysis_loop(
             thread::sleep(POLL_INTERVAL);
         }
     }
+    audio_rx
 }
 
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    /// A fresh stream on the same ring starts an empty waveform: a THRU
+    /// session shows its own record, not the last session's tail.
+    #[test]
+    fn into_audio_rx_hands_the_ring_back_for_a_fresh_waveform() {
+        let (mut tx, rx) = HeapRb::<f32>::new(8_192).split();
+        let first = PeakStream::spawn(rx, PeakStreamConfig::at(48_000)).expect("spawn");
+        assert_eq!(tx.push_slice(&[0.5; 4_096]), 4_096);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while first.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!first.is_empty(), "the first stream drew nothing");
+        let rx = first.into_audio_rx().expect("the consumer comes back");
+        let second = PeakStream::spawn(rx, PeakStreamConfig::at(48_000)).expect("respawn");
+        assert!(second.is_empty(), "a fresh stream starts empty");
+        assert_eq!(tx.push_slice(&[0.5; 4_096]), 4_096);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while second.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !second.is_empty(),
+            "the second stream is not reading the ring"
+        );
+    }
     use ringbuf::traits::{Producer, Split};
     use ringbuf::{HeapProd, HeapRb};
 
