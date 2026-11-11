@@ -6,8 +6,15 @@ import XCTest
 /// The FX rack's animations run on Core Animation (FxLayerAnimations).
 /// As `TimelineView`s they cost the main thread a third of a core while
 /// the units were in — 1 003 ms of CPU over 3 s on the Intel MacBook
-/// Pro, against 21 ms after (2026-10-03). The ceiling here is fifteen
-/// times the measured cost; the old code fails it by three.
+/// Pro, against 21 ms after (2026-10-03).
+///
+/// The test host is the whole app, and its own launch work — the library
+/// refresh, a seven-second stall at worst — lands on the same main thread
+/// whenever it likes: one 3 s window read 22, 206 and 328 ms on three runs
+/// of unchanged code (2026-11-11). So the cost is the quietest of three
+/// one-second windows. Launch work is bursty and cannot cover all three;
+/// a rack that animates on the main thread costs every second and fails
+/// the 100 ms ceiling by three, as the old one would.
 final class FxRackAnimationCostTests: XCTestCase {
 
     /// Main-thread CPU spent while the rack sits on screen with every unit
@@ -27,11 +34,16 @@ final class FxRackAnimationCostTests: XCTestCase {
         window.contentView = host
         window.orderFront(nil)
         RunLoop.main.run(until: Date().addingTimeInterval(1))
-        let before = Self.mainThreadCPU()
-        RunLoop.main.run(until: Date().addingTimeInterval(3))
-        let used = Self.mainThreadCPU() - before
+        var quietest = Double.infinity
+        for _ in 0..<3 {
+            let before = Self.mainThreadCPU()
+            RunLoop.main.run(until: Date().addingTimeInterval(1))
+            quietest = min(quietest, Self.mainThreadCPU() - before)
+        }
         window.orderOut(nil)
-        XCTAssertLessThan(used, 0.3, "the rack's animations cost \(Int(used * 1000)) ms of main thread in 3 s")
+        XCTAssertLessThan(
+            quietest, 0.1,
+            "the rack's animations cost \(Int(quietest * 1000)) ms of main thread in its quietest second")
     }
 
     private static func mainThreadCPU() -> Double {
