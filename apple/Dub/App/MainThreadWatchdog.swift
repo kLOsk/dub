@@ -17,9 +17,13 @@
 //          category == "stall"' --last 5m --style compact
 //
 
+// Foundation outside the `#if`: the release branch of `stallTimed`
+// below names `TimeInterval` too, and without it a Release build did not
+// compile — unnoticed while every build was Debug (2026-10-03).
+import Foundation
+
 #if DEBUG
 import Darwin
-import Foundation
 import os
 
 let dubStallLog = Logger(subsystem: "com.dub.app", category: "stall")
