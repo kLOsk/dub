@@ -9,6 +9,8 @@ avoid loading the whole `docs/` folder when one anchored section is enough.
 docs/
   README.md            this routing guide
   UI-BACKLOG.md        open UI/UX work (+ a closed archive)
+  RIG-CHECKLIST.md     the manual rig checklist — the hardware release gate
+                       (PRD §2.2.10), runnable, with a sign-off sheet
   spec/                binding spec + reference (source of truth)
     PRD.md  PRD-BEATS.md  ARCHITECTURE.md
     LIBRARY-SCHEMA.md  LIBRARY-FORMATS.md  LICENSE-DEPENDENCIES.md
