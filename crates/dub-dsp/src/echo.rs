@@ -22,10 +22,11 @@
 //! capture"). The read head trails the write head by exactly `delay_frames`,
 //! so `ring[w − D]` is the audio from one echo-length ago.
 //!
-//! On **engage** the echo first *captures*: live input keeps going into the
-//! ring and out dry for one echo length, so when that beat is in, the read
-//! head (`w − D`) sits on its first sample. Then it stops writing live input
-//! and recirculates:
+//! On **engage** the echo first *captures*: live input goes out dry for one
+//! echo length and into the ring scaled by `feedback`, so when that beat is
+//! in, the read head (`w − D`) sits on its first sample and the first repeat
+//! is already one step down (beat · fb, then · fb², …). Then it stops
+//! writing live input and recirculates:
 //!
 //! ```text
 //! echo    = ring[w − D]                 // what we play this sample (wet)
@@ -74,6 +75,11 @@ pub const MAX_FEEDBACK: f32 = 0.95;
 
 /// Default feedback (PRD §6.3: 60 %).
 pub const DEFAULT_FEEDBACK: f32 = 0.6;
+/// Feedback while HOLD is on: just under endless. Over a 20 s record swap
+/// at ~90 BPM (~30 laps) the loop loses about 1 dB and darkens a little
+/// through the feedback low-pass — it carries the room across the gap, and
+/// it can never grow.
+pub const HOLD_FEEDBACK: f32 = 0.995;
 
 /// Default feedback low-pass cutoff (PRD §6.3: 8 kHz).
 pub const DEFAULT_LPF_HZ: f32 = 8_000.0;
@@ -164,6 +170,8 @@ pub struct EchoOut {
     ready_frames: usize,
     /// Frames of the capture beat still to record while `Capturing`.
     capture_left: usize,
+    /// HOLD: recirculate at [`HOLD_FEEDBACK`] instead of `feedback`.
+    hold: bool,
 }
 
 impl EchoOut {
@@ -192,6 +200,7 @@ impl EchoOut {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             ready_frames: (sample_rate * AUTO_OFF_MS / 1000.0).max(1.0) as usize,
             capture_left: 0,
+            hold: false,
         }
     }
 
@@ -221,6 +230,24 @@ impl EchoOut {
     pub fn release(&mut self) {
         self.state = EchoState::Idle;
         self.wet_target = 0.0;
+        // The next throw starts as a throw, not still held.
+        self.hold = false;
+    }
+
+    /// HOLD (toggle): keep the captured beat repeating at just-under-endless
+    /// feedback, for the record swap of traditional one-turntable dub —
+    /// throw the last phrase, hold it while the needle is lifted and the
+    /// next record goes down, release (or turn the echo off) to let it go.
+    /// Off returns to the set feedback, so a released hold decays the
+    /// normal way. Cleared by [`EchoOut::release`].
+    pub fn set_hold(&mut self, on: bool) {
+        self.hold = on;
+    }
+
+    /// Whether HOLD is on.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.hold
     }
 
     /// Live-update feedback and low-pass while engaged or idle (UI sliders).
@@ -296,9 +323,19 @@ impl EchoOut {
                     self.ring_r[self.write] = in_r;
                 }
                 EchoState::Capturing => {
-                    // The beat after the press: record it, play it dry.
-                    self.ring_l[self.write] = in_l;
-                    self.ring_r[self.write] = in_r;
+                    // The beat after the press: play it dry, and record it
+                    // already one feedback step down. Recorded at unity, the
+                    // first lap replayed the beat at full level — the same
+                    // beat twice, a stutter — before the decay began (rig,
+                    // 2026-11-11). A delay's first repeat is the first
+                    // step of the decay.
+                    let feedback = if self.hold {
+                        HOLD_FEEDBACK
+                    } else {
+                        self.feedback
+                    };
+                    self.ring_l[self.write] = in_l * feedback;
+                    self.ring_r[self.write] = in_r * feedback;
                     self.capture_left = self.capture_left.saturating_sub(1);
                     if self.capture_left == 0 {
                         // It is in: from the next sample the read head sits
@@ -314,8 +351,13 @@ impl EchoOut {
                     let fr = self.lp_r + self.lp_coeff * (echo_r - self.lp_r);
                     self.lp_l = flush(fl);
                     self.lp_r = flush(fr);
-                    self.ring_l[self.write] = flush(fl * self.feedback);
-                    self.ring_r[self.write] = flush(fr * self.feedback);
+                    let feedback = if self.hold {
+                        HOLD_FEEDBACK
+                    } else {
+                        self.feedback
+                    };
+                    self.ring_l[self.write] = flush(fl * feedback);
+                    self.ring_r[self.write] = flush(fr * feedback);
 
                     // Auto-off watch: the muted input (`in_*`) AND the wet
                     // tail (`echo_*`) must both be silent. Accumulate while
@@ -439,17 +481,97 @@ mod tests {
         }
         assert_eq!(echo.state(), EchoState::Engaged);
         // Then the dry mutes and that beat repeats (past the 3 ms
-        // cross-fade), not the 0.9 before the press.
+        // cross-fade), not the 0.9 before the press — one feedback step
+        // down already.
         let ramp = (SR * RAMP_MS / 1000.0) as usize + 2;
         for (i, &x) in beat.iter().enumerate() {
             let y = step(&mut echo, 0.77);
             if i > ramp {
                 assert!(
-                    (y - x).abs() < 1e-3,
-                    "echo sample {i}: {y}, want the captured {x}"
+                    (y - 0.5 * x).abs() < 1e-3,
+                    "echo sample {i}: {y}, want the captured {x} at feedback 0.5"
                 );
             }
         }
+    }
+
+    fn rms(xs: &[f32]) -> f32 {
+        (xs.iter().map(|x| x * x).sum::<f32>() / xs.len().max(1) as f32).sqrt()
+    }
+
+    /// Engage at ~90 BPM, capture one beat of a 200 Hz tone, then feed the
+    /// silence of a lifted needle for `secs`. Returns the output.
+    fn throw_and_swap(hold: bool, secs: f32) -> Vec<f32> {
+        let mut echo = EchoOut::new(SR);
+        let beat = (SR * 60.0 / 90.0) as usize;
+        echo.engage(beat, DEFAULT_FEEDBACK, one_pole_coeff(DEFAULT_LPF_HZ, SR));
+        for i in 0..beat {
+            let _ = step(&mut echo, 0.5 * (i as f32 * 2.0 * PI * 200.0 / SR).sin());
+        }
+        echo.set_hold(hold);
+        (0..(SR * secs) as usize)
+            .map(|_| step(&mut echo, 0.0))
+            .collect()
+    }
+
+    /// Traditional one-turntable dub (Daniel, 2026-10-06): throw the last
+    /// phrase into the echo, HOLD it while the record is swapped — 10 to
+    /// 20 s — then drop the needle on the next tune. Held, the echo is
+    /// still there at the end of a 20 s swap, within 3 dB, and never louder
+    /// than it started.
+    #[test]
+    fn hold_keeps_the_echo_alive_through_a_record_swap() {
+        let out = throw_and_swap(true, 20.0);
+        let sr = SR as usize;
+        let early = rms(&out[sr..2 * sr]);
+        let late = rms(&out[19 * sr..20 * sr]);
+        assert!(early > 0.05, "nothing captured: {early}");
+        assert!(late > early * 0.7, "held echo faded: {early} → {late}");
+        assert!(late <= early * 1.01, "held echo grew: {early} → {late}");
+    }
+
+    /// The contrast: at the default feedback it is gone long before the
+    /// next record is down — the reason HOLD exists.
+    #[test]
+    fn without_hold_the_echo_is_gone_before_the_swap_ends() {
+        let out = throw_and_swap(false, 20.0);
+        let sr = SR as usize;
+        let early = rms(&out[sr..2 * sr]);
+        let late = rms(&out[10 * sr..11 * sr]);
+        assert!(
+            late < early * 0.01,
+            "echo outlived the swap: {early} → {late}"
+        );
+    }
+
+    /// HOLD off: the held loop decays the normal way.
+    #[test]
+    fn releasing_hold_lets_the_echo_decay() {
+        let mut echo = EchoOut::new(SR);
+        let beat = (SR * 60.0 / 90.0) as usize;
+        echo.engage(beat, DEFAULT_FEEDBACK, one_pole_coeff(DEFAULT_LPF_HZ, SR));
+        for i in 0..beat {
+            let _ = step(&mut echo, 0.5 * (i as f32 * 2.0 * PI * 200.0 / SR).sin());
+        }
+        echo.set_hold(true);
+        let held: Vec<f32> = (0..SR as usize * 3).map(|_| step(&mut echo, 0.0)).collect();
+        echo.set_hold(false);
+        let after: Vec<f32> = (0..SR as usize * 10)
+            .map(|_| step(&mut echo, 0.0))
+            .collect();
+        let sr = SR as usize;
+        assert!(rms(&after[9 * sr..]) < rms(&held[2 * sr..]) * 0.01);
+    }
+
+    /// Turning the echo off clears HOLD, so the next throw decays as
+    /// normal instead of hanging on forever.
+    #[test]
+    fn turning_the_echo_off_clears_hold() {
+        let mut echo = EchoOut::new(SR);
+        echo.engage(1_000, DEFAULT_FEEDBACK, 1.0);
+        echo.set_hold(true);
+        echo.release();
+        assert!(!echo.is_held());
     }
 
     /// Pressed again inside the capture beat: nothing was muted, nothing
@@ -487,13 +609,42 @@ mod tests {
 
         // The impulse played dry at 500; it comes back one beat later, and
         // once a beat after that, decaying.
+        let e0 = out[500];
         let e1 = out[2_500];
         let e2 = out[4_500];
         let e3 = out[6_500];
 
-        assert!((e1 - 1.0).abs() < 1e-3, "1st echo {e1} != 1.0");
-        assert!((e2 - fb).abs() < 1e-3, "2nd echo {e2} != {fb}");
-        assert!((e3 - fb * fb).abs() < 1e-3, "3rd echo {e3} != {}", fb * fb);
+        assert!((e0 - 1.0).abs() < 1e-6, "the throw itself {e0} != 1.0");
+        assert!((e1 - fb).abs() < 1e-3, "1st echo {e1} != {fb}");
+        assert!((e2 - fb * fb).abs() < 1e-3, "2nd echo {e2} != {}", fb * fb);
+        assert!(
+            (e3 - fb * fb * fb).abs() < 1e-3,
+            "3rd echo {e3} != {}",
+            fb * fb * fb
+        );
+    }
+
+    /// Rig, 2026-11-11: the first repeat came back at full level — the
+    /// thrown beat twice at the same volume, a stutter — and only then
+    /// decayed. Every repeat, the first included, is quieter than the
+    /// throw.
+    #[test]
+    fn the_first_repeat_is_already_quieter_than_the_throw() {
+        let mut echo = EchoOut::new(SR);
+        let beat = 4_800usize;
+        echo.engage(beat, DEFAULT_FEEDBACK, one_pole_coeff(DEFAULT_LPF_HZ, SR));
+        let tone = |i: usize| 0.5 * (i as f32 * 2.0 * PI * 200.0 / SR).sin();
+        let thrown: Vec<f32> = (0..beat).map(|i| step(&mut echo, tone(i))).collect();
+        let first: Vec<f32> = (0..beat).map(|_| step(&mut echo, 0.0)).collect();
+        let ratio = rms(&first) / rms(&thrown);
+        assert!(
+            ratio < 0.7,
+            "first repeat at {ratio:.2} of the throw — want about {DEFAULT_FEEDBACK}"
+        );
+        assert!(
+            ratio > DEFAULT_FEEDBACK * 0.85,
+            "first repeat at {ratio:.2} of the throw — dropped too far"
+        );
     }
 
     #[test]

@@ -60,7 +60,12 @@ struct DeckColumnState: Equatable {
     var loopEngaged: Bool = false
     var echoEnabled: Bool = false
     var echoEngaged: Bool = false
+    /// HOLD on the echo: the thrown beat sustains through a record swap.
+    var echoHeld: Bool = false
     var hasTrack: Bool = false
+    /// THRU: a live record with no track loaded. Echo out is the
+    /// one-turntable throw, so it answers here too.
+    var isThru: Bool = false
     var isPlaying: Bool = false
     /// The four Quick Scratch pads (PRD §7.2), in pad order. An untagged
     /// pad is drawn dark and dead so the hand's positions never move.
@@ -72,6 +77,8 @@ struct DeckColumnState: Equatable {
     var fxAvailable: Bool = false
     /// The key on ECHO OUT, from the map; `nil` until bound.
     var echoLegend: String?
+    /// The key on HOLD, from the map; `nil` until bound.
+    var echoHoldLegend: String?
 }
 
 /// One Quick Scratch pad as the column draws it.
@@ -172,6 +179,7 @@ struct DeckColumnCallbacks {
     var onScaleLoop: (_ double: Bool) -> Void = { _ in }
     var onExitLoop: () -> Void = {}
     var onEchoToggle: () -> Void = {}
+    var onEchoHold: () -> Void = {}
     /// Quick Scratch pad `pad` pressed: engage its sample, swap to it,
     /// or — if it is the one on the deck — release.
     var onScratch: (_ pad: Int) -> Void = { _ in }
@@ -584,10 +592,21 @@ struct DeckColumn<Overview: View>: View {
                 VStack(alignment: .leading, spacing: DubSpacing.sm) {
                     SectionHeading(
                         title: "ECHO", accent: DubColor.controlAccent,
-                        trailing: state.echoEngaged ? "● ON" : "○ OFF",
-                        trailingAccent: state.echoEngaged
-                            ? DubColor.controlAccent : DubColor.textPlaceholder)
-                    echoButton
+                        trailing: state.echoHeld ? "● HOLD" : state.echoEngaged ? "● ON" : "○ OFF",
+                        trailingAccent: state.echoHeld
+                            ? DubColor.echo
+                            : state.echoEngaged ? DubColor.controlAccent : DubColor.textPlaceholder)
+                    // HOLD belongs to the one-turntable dub set the DUB FX
+                    // channel is for; without that opt-in the echo is the
+                    // one ECHO OUT it always was (Daniel, 2026-10-06).
+                    if state.fxAvailable {
+                        HStack(spacing: DubSpacing.xs) {
+                            echoButton
+                            holdButton
+                        }
+                    } else {
+                        echoButton
+                    }
                 }
                 .frame(width: DubLayout.deckColumnEchoWidth)
             }
@@ -703,7 +722,7 @@ struct DeckColumn<Overview: View>: View {
     }
 
     private var echoButton: some View {
-        Text("ECHO OUT")
+        Text(state.fxAvailable ? "OUT" : "ECHO OUT")
             .font(DubFont.caps)
             .tracking(DubFont.capsTracking)
             .foregroundStyle(
@@ -727,9 +746,43 @@ struct DeckColumn<Overview: View>: View {
                 }
             }
             .contentShape(Rectangle())
-            .onPressDown(enabled: state.hasTrack) { callbacks.onEchoToggle() }
+            .onPressDown(enabled: state.hasTrack || state.isThru) { callbacks.onEchoToggle() }
             .help("Echo out — cut the dry signal and hand the deck to the echo")
             .mappable(.echoOut(state.side))
+    }
+
+    /// HOLD — a toggle, live only while the echo is on. The thrown beat
+    /// sustains just under endless, so it carries the room while the
+    /// needle comes up and the next record goes down; HOLD again lets it
+    /// decay, OUT cuts it. Violet, the echo's own colour, not the amber
+    /// every "on" on the surface wears: a different state of the same
+    /// sound, and the one you must not forget is on.
+    private var holdButton: some View {
+        let live = state.echoEngaged
+        return Text("HOLD")
+            .font(DubFont.caps)
+            .tracking(DubFont.capsTracking)
+            .foregroundStyle(
+                state.echoHeld ? DubColor.textPrimary
+                    : live ? DubColor.textSecondary : DubColor.textPlaceholder)
+            .frame(maxWidth: .infinity)
+            .frame(height: DubLayout.deckColumnEchoHeight)
+            .background(
+                state.echoHeld ? DubColor.echo.opacity(0.26) : DubColor.surface2)
+            .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
+                    .stroke(state.echoHeld ? DubColor.echo : DubColor.divider, lineWidth: 1))
+            .overlay(alignment: .topTrailing) {
+                if let legend = state.echoHoldLegend, mapping == nil {
+                    DubKeycap(key: legend, lit: state.echoHeld)
+                        .padding(3)
+                }
+            }
+            .contentShape(Rectangle())
+            .onPressDown(enabled: live) { callbacks.onEchoHold() }
+            .help("Hold the echo through a record swap — tap again to let it go")
+            .mappable(.echoHold(state.side))
     }
 }
 

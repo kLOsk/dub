@@ -106,6 +106,35 @@ final class FxChannelSnapshotTests: XCTestCase {
              width: Self.paneWidth, height: Self.paneHeight, named: "runaway-hot")
     }
 
+    /// HOLD on through a record swap: the lamp lit violet, the button
+    /// down, `Held` under it.
+    func test_fxChannel_spaceEchoHeld() {
+        var s = Self.fixture()
+        s.controls.spaceEchoHold = true
+        snap(pane(s),
+             width: Self.paneWidth, height: Self.paneHeight, named: "space-echo-held")
+    }
+
+    /// SYNC following deck A at ¾ of a beat: the ¾ key and SYNC lit, the
+    /// repeat readout in the tape's amber, the tempo's source under it.
+    func test_fxChannel_spaceEchoSynced() {
+        var s = Self.fixture()
+        s.controls.spaceEchoSync = true
+        s.controls.spaceEchoRepeatMs = 486.5
+        s.echoTempo = FxEchoTempo(source: .deck(.a), bpm: 92.5)
+        snap(pane(s),
+             width: Self.paneWidth, height: Self.paneHeight, named: "space-echo-synced")
+    }
+
+    /// SYNC on with nothing to follow — a real record and no taps yet:
+    /// the line under the repeat says so in red.
+    func test_fxChannel_spaceEchoSyncNoTempo() {
+        var s = Self.fixture()
+        s.controls.spaceEchoSync = true
+        snap(pane(s),
+             width: Self.paneWidth, height: Self.paneHeight, named: "space-echo-sync-no-tempo")
+    }
+
     /// The bar with deck B as the channel: samples left, the siren box
     /// right under the rack, its pill reading `→ FX` because the siren
     /// fires into the rack.

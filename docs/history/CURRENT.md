@@ -425,6 +425,71 @@ The SL 3 on the real rig, both decks on timecode. What it turned up:
   cannot compare a closure, so it took the scope as unchanged). The test
   passed because it had no parent state. `DeckScope` is gone; the surface
   observes the stores directly.
+- **DUB FX speed, 2026-10-03.** Measured in tests, piece by piece: building
+  the pane costs ~120 ms (rack column ~110, each unit 17–34 ms — forty-odd
+  small views, not one heavy one; Release ≈ Debug, so it is SwiftUI's own
+  cost). The 1–1.4 s freezes on the rig were the stale-redraw bug, not the
+  build. The units' animations (tape dashes, spring ripple, phaser lamps,
+  RUNAWAY) were 60 Hz `TimelineView`s: **1 003 ms of main-thread CPU over
+  3 s** with every unit in; on Core Animation layers (`FxLayerAnimations`)
+  **21 ms**. Guarded by `FxRackAnimationCostTests` (ceiling 300 ms). If the
+  ~120 ms switch still bites, the next step is keeping the built rack alive
+  when switching back. Found on the way: **the Release build did not
+  compile** (`MainThreadWatchdog`'s Foundation import sat inside `#if
+  DEBUG`) — every build so far had been Debug.
+- **HOLD, 2026-10-06 (FFI 80) — needs the rig.** What the DUB FX channel is
+  for, per Daniel: *traditional* dub — one turntable, and the transition is
+  an effect held while the record is swapped. Compared against Klementz's
+  NanoPreamp / Dub Mixer (their isolator, crossover outs and compressors are
+  the mixer's job, not ours); what we lacked was a hold. Echo-out had 60 %
+  feedback (gone in ~4 s at 90 BPM; a swap takes 10–20 s), and the Space
+  Echo could only sustain by running away. Now **HOLD** (a toggle, Daniel's
+  call) on both: echo-out recirculates at 0.995 (~1 dB down over 20 s,
+  cleared by OUT); the Space Echo records nothing new — the needle lift and
+  the drop stay off the tape — and loops at 0.995 without the low-end
+  thinning (with it the bass died in seconds whatever the gain). Deck
+  column ECHO is **OUT · HOLD** — HOLD only with DUB FX enabled (Daniel:
+  without it the echo stays the one ECHO OUT). Both mappable
+  (`echo.hold.a/b`, `fx.hold`).
+  **SYNC + TAP, same day:** the Space Echo's repeat follows the *other*
+  deck's live BPM (analysed tempo × platter pitch) at ½ · ¾ · 1 beat (¾ puts
+  all three heads on sixteenths; longer than the 750 ms tape → halved, still
+  on the grid). The app has **no BPM for a THRU record** — the engine's
+  `attach_thru_source_with_bpm_tracking` is only wired in the CLI — so TAP
+  (`fx.tap`) supplies the tempo there. The poll updates state only past a
+  0.3 % move; the engine's heads now **glide** to a new repeat (80 ms, the
+  RE-201's motor) instead of jumping — a jump clicked, on every knob turn
+  too. The unit's top row is the key strip HOLD · SYNC · ½ ¾ 1 · TAP (the
+  caption went; HOLD in the knob row had pushed the rack past its column).
+  Next: a low-pass side on the Big Knob; maybe THRU tempo tracking in-app.
+  **Rig, 2026-11-11 (Release, SL 3):** connect, HOLD-only-with-DUB-FX, rack
+  switching and the strip drag pass; deck HOLD carries on a TC deck. Three
+  fixes, unrebuilt on the rig yet: **ECHO OUT was dead on THRU** — the button
+  wanted a loaded track, so the one-turntable throw could not start (it now
+  answers on THRU, and takes TAP's tempo there); **the first repeat came back
+  at full level** — the thrown beat twice, then the decay — now recorded one
+  feedback step down; **auto-calibration measured a stopped stylus** — hum
+  and DC decode as a confident rate 0, one second of it installed a
+  [5.0 / 0.71] whitening and the deck played robotic until Recalibrate — now
+  only chunks turning at 0.5–2× count. Rebuilt 17:38 — ECHO OUT on THRU and
+  the quieter first repeat confirmed ("perfect"); THRU is stereo again.
+  But a **THRU record started a capture too** (music decodes as timecode
+  often enough): [3.0 −2.5 / −2.5 3.4], and back on TC the deck stuck at
+  SETTLING PITCH 47 % until Recalibrate. Now no auto-calibration on THRU or
+  DUB FX at all, and leaving for them drops a capture under way. A sampler
+  pad whose file is gone is a one-time quiet notice now, not the red banner
+  on every launch and plug-in. Then deck A calibrated four times in a row
+  to [≈24 / 0.71] — its second channel ~33× down, the same signature as the
+  17:06 [5.0 / 0.71] and the "right channel missing" on THRU: an
+  intermittent cartridge / headshell / cable fault, which the whitening
+  amplified, noise and all. **FFI 81:** a calibration whose channels differ
+  by more than 3× is refused and the bar says `RIGHT CHANNEL WEAK — CHECK
+  CARTRIDGE / CABLE` (`DeckTelemetry.weak_channel`; the deck holds, Panic
+  Play and INT still work), and a capture that cannot collect a second of
+  turning carrier within 10 s is dropped instead of sitting at CALIBRATING.
+  Still open: Space Echo HOLD / SYNC / TAP —
+  the aux send is patched into 5/6 (deck B's pair) but nothing arrives
+  there; looks like the mixer side.
 - **Prefs "output"**: a false alarm — the greyed picker is the DEBUG dev
   section's, and it genuinely does not apply in Performance (the master always
   returns on the interface). The real gap is that the Audio tab has *no* output
@@ -904,8 +969,15 @@ the network, and an upstream publication would turn an unrelated push red.
   script-coherence heuristic could, and that is a research task, not a
   milestone. Only bites `--album` / "identify the pressing"; naming is
   unaffected.
-- The tests that sleep waiting on worker threads are now the slowest thing in
-  the suite. `drain_then_stop` fixed the six that raced; others still sleep.
+- ~~Tests that sleep waiting on worker threads~~ — **done** (2026-10-17).
+  The fixed sleeps that *hoped* a worker had caught up are gone: the rip
+  pipeline starts through `start_recording` (waits for Recording — pushing
+  into a still-Armed session lost the side's head as backlog, which is how
+  the gap test failed under load) and stops through `drain_then_stop`; the
+  FFI rip tests `drain`; the negative checks wait for the ring to be read;
+  the sidecar test backdates the file instead of sleeping 1.1 s (and now
+  asserts the mtime *moved*). 10/10 runs with every core loaded. What still
+  sleeps is polling with a deadline, or real code (CLI pacing, HTTP back-off).
 - **Waveform renderer, second-order CPU** (noted 2026-09-10). Two of the
   three leftovers are done (2026-09-23), measured on this Intel MacBook Pro
   in rip review with the side playing, 8 s per build:
@@ -917,9 +989,9 @@ the network, and an upstream publication would turn an unrelated push red.
     639 → **0**. Frames committed and presented at the same rate throughout.
   - ~~(3) `NSEvent.pressedMouseButtons` read per frame~~ — **gone** with the
     old dedupe gate it belonged to; exact coverage makes it unnecessary.
-  - (2) Two array literals in `drawBeatGrid` (loop-edge pair, per-cue
-    halo/stem pair) still allocate on the render thread per frame. Free to
-    fix, not measurable any more.
+  - ~~(2) Two array literals in `drawBeatGrid`~~ — **done** (2026-10-17):
+    the loop-edge pair and each cue's halo/stem pair are plain calls now,
+    no per-frame allocation on the render thread.
 
 ## Keeping this file honest
 

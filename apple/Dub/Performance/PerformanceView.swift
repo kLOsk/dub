@@ -287,7 +287,9 @@ struct PerformanceView: View {
             loopEngaged: deck.loopActive,
             echoEnabled: model.echoOutEnabled,
             echoEngaged: deck.echoDivision != nil,
+            echoHeld: deck.echoHeld,
             hasTrack: deck.hasTrack,
+            isThru: deck.isThru,
             isPlaying: deck.isPlaying,
             scratch: (0..<SampleBank.quickScratchCount).map { pad in
                 let slot = model.sampleBank.quickScratchSlot(pad: pad)
@@ -298,7 +300,8 @@ struct PerformanceView: View {
                     legend: DubKeymap.legend(for: .quickScratch(side, pad)))
             },
             fxAvailable: model.dubFxEnabled,
-            echoLegend: DubKeymap.legend(for: .echoOut(side)))
+            echoLegend: DubKeymap.legend(for: .echoOut(side)),
+            echoHoldLegend: DubKeymap.legend(for: .echoHold(side)))
     }
 
     /// The file the deck parked for a quick scratch, so the header can
@@ -329,6 +332,7 @@ struct PerformanceView: View {
             onScaleLoop: { double in model.scaleLoop(side, double: double) },
             onExitLoop: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
+            onEchoHold: { model.toggleEchoHold(side) },
             onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
             // Select Internal *and* start playing, which is the
             // contract `SourceControlView` documents for the segment
@@ -366,7 +370,10 @@ struct PerformanceView: View {
             active: deck.rackActive,
             controls: deck.fxRack,
             toggleLegends: FxRackUnit.allCases.map { DubKeymap.legend(for: .fxToggle($0.rawValue)) },
-            kickLegend: DubKeymap.legend(for: .fxKick))
+            kickLegend: DubKeymap.legend(for: .fxKick),
+            holdLegend: DubKeymap.legend(for: .fxHold),
+            tapLegend: DubKeymap.legend(for: .fxTap),
+            echoTempo: deck.fxEchoTempo)
     }
 
     /// Pure forwarders into the model. The source-control four are the
@@ -386,7 +393,8 @@ struct PerformanceView: View {
             onTrim: { db in model.setFxInputTrim(side, db: db) },
             onToggle: { unit in model.toggleFxRackSlot(side, unit.slot) },
             onControls: { controls in model.setFxRack(side, controls) },
-            onKick: { model.kickFxSpring(side) })
+            onKick: { model.kickFxSpring(side) },
+            onTap: { model.tapFxEcho(side) })
     }
 
     func padsState(side: DeckSide, deckState: DeckState) -> PerformancePadsState {

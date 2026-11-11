@@ -1248,6 +1248,24 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckReleaseEcho { idx })
     }
 
+    /// Echo-out HOLD (toggle) — see [`Command::DeckSetEchoHold`].
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_echo_hold(self, on: bool) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetEchoHold { idx, on })
+    }
+
+    /// Space Echo HOLD (toggle) — see [`Command::DeckSetSpaceEchoHold`].
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn set_space_echo_hold(self, on: bool) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckSetSpaceEchoHold { idx, on })
+    }
+
     /// Live-update echo-out `feedback` and feedback low-pass (`lp_coeff`,
     /// resolved off-RT from the cutoff) while held or idle. The echo length
     /// changes only on a fresh [`Self::engage_echo`].

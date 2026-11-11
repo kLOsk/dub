@@ -19,6 +19,7 @@ final class ModelStoresTests: XCTestCase {
         sub.cancel()
     }
 
+    #if DEBUG
     /// The guard's report names what moved — the whole point of it: the
     /// churn it exists to catch (a live pitch, an input level) was
     /// invisible until a profile found it.
@@ -32,4 +33,5 @@ final class ModelStoresTests: XCTestCase {
         a = b
         XCTAssertEqual(PublishRateGuard<DeckState>.changedFields(a, b), [])
     }
+    #endif
 }

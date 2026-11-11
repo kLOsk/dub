@@ -463,6 +463,9 @@ struct PreferencesSheet: View {
             return "FX · " + (FxRackUnit(rawValue: i)?.title.capitalized ?? "unit \(i + 1)") + " in/out"
         case .fxKick: return "FX · Kick the spring"
         case .echoOut(let side): return "Echo out \(side.label)"
+        case .echoHold(let side): return "Echo hold \(side.label)"
+        case .fxHold: return "FX · Space Echo hold"
+        case .fxTap: return "FX · Space Echo tap tempo"
         case .keyLock(let side): return "Key lock \(side.label)"
         }
     }

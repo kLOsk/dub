@@ -341,6 +341,15 @@
   in `wait_for_allocations`. Draw the still part once; move a layer.
   Measure with `sample` while *both* decks play — a probe that fires on
   loading measures the library, not the set.
+- **A looping decoration is Core Animation's job, not a `TimelineView`'s.**
+  A dash phase, an opacity, a rotation on a loop is one `CABasicAnimation`
+  the render server runs with zero app work. The FX rack's four were 60 Hz
+  `TimelineView`s costing a third of a core while units were in (1 003 ms
+  of main thread per 3 s → 21 ms). Keep a static (`motion: false`) path for
+  snapshots so the baselines still hold the look.
+- **Build Release now and then.** It did not compile for weeks — an import
+  inside `#if DEBUG` that only the release branch needed — and nothing
+  noticed, because every build was Debug.
 - **Deck state is not on the model's `objectWillChange` any more.** It lives
   on `DeckStore`s (`App/ModelStores.swift`). A view that reads `model.deckA`
   must observe the store, or it shows the deck as it was at its last

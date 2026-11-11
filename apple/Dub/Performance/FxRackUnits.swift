@@ -193,9 +193,14 @@ struct FxPhaserUnit: View {
     private var sweepLamps: some View {
         VStack(spacing: 5) {
             FxEngraved(text: "Sweep", dim: true)
-            TimelineView(.animation(paused: !(on && motion))) { tl in
-                let t = motion ? tl.date.timeIntervalSinceReferenceDate : 0
-                let phase = on ? sin(2 * .pi * controls.phaserRateHz * t + 0.5) : -1
+            if motion {
+                // The breathing is Core Animation's (FxLayerAnimations).
+                HStack(spacing: 6) {
+                    liveLamp(inverted: false)
+                    liveLamp(inverted: true)
+                }
+            } else {
+                let phase = on ? sin(0.5) : -1
                 HStack(spacing: 6) {
                     lamp(0.5 + 0.5 * phase)
                     lamp(0.5 - 0.5 * phase)
@@ -203,6 +208,16 @@ struct FxPhaserUnit: View {
             }
             FxEngraved(text: "L · R", dim: true)
         }
+    }
+
+    private func liveLamp(inverted: Bool) -> some View {
+        Circle()
+            .fill(DubColor.phaser.opacity(0.12))
+            .overlay(PulsingLamp(
+                color: DubColor.phaser, rateHz: controls.phaserRateHz,
+                inverted: inverted, on: on))
+            .overlay(Circle().stroke(Color.black, lineWidth: 1))
+            .frame(width: 12, height: 12)
     }
 
     private func lamp(_ level: Double) -> some View {
@@ -227,8 +242,14 @@ struct FxSpaceEchoUnit: View {
     var toggleLegend: String? = nil
     /// Off: the tape and RUNAWAY hold one phase (a snapshot).
     var motion: Bool = true
+    /// The keys on HOLD and TAP, from the map.
+    var holdLegend: String? = nil
+    var tapLegend: String? = nil
+    /// Where SYNC's tempo comes from; `nil` when off or none.
+    var tempo: FxEchoTempo? = nil
     var onToggle: () -> Void = {}
     var onControls: (FxRackControls) -> Void = { _ in }
+    var onTap: () -> Void = {}
 
     static let height: CGFloat = 138
     private static let repeatMin = 20.0
@@ -241,7 +262,7 @@ struct FxSpaceEchoUnit: View {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 10) {
                         FxDymoLabel(text: "Space Echo", tilt: -0.3)
-                        FxEngraved(text: "Tape echo · 3 heads + spring")
+                        performanceKeys
                         Spacer(minLength: 0)
                         wowFlutter
                     }
@@ -276,6 +297,56 @@ struct FxSpaceEchoUnit: View {
             .background(LinearGradient(
                 colors: [Color(hex: 0x1A2F24), Color(hex: 0x142419)],
                 startPoint: .top, endPoint: .bottom))
+        }
+    }
+
+    /// The one-turntable keys, along the top: HOLD the tape through a
+    /// record swap; SYNC the repeat to the music, at ½ · ¾ · 1 beat; TAP
+    /// the tempo when the record has none. Small panel keys, not knobs —
+    /// they are switched, not ridden, and the knob row has no room left.
+    private var performanceKeys: some View {
+        HStack(spacing: 6) {
+            FxPanelKey(
+                title: "Hold", lit: controls.spaceEchoHold, color: DubColor.echo,
+                legend: holdLegend,
+                help: controls.spaceEchoHold
+                    ? "Held — tap to let the tape fade"
+                    : "Hold the tape through a record swap: nothing new goes on, the loop sustains"
+            ) {
+                var c = controls
+                c.spaceEchoHold.toggle()
+                onControls(c)
+            }
+            .mappable(.fxHold)
+            FxPanelKey(
+                title: "Sync", lit: controls.spaceEchoSync, color: DubColor.spaceEcho,
+                help: "Repeat in time with the other deck's tempo, or the tempo tapped in"
+            ) {
+                var c = controls
+                c.spaceEchoSync.toggle()
+                onControls(c)
+            }
+            HStack(spacing: 2) {
+                ForEach(FxRackControls.spaceEchoDivisions, id: \.beats) { division in
+                    let chosen = controls.spaceEchoDivision == division.beats
+                    FxPanelKey(
+                        title: division.label, lit: chosen && controls.spaceEchoSync,
+                        dimLit: chosen, color: DubColor.spaceEcho, width: 16,
+                        help: "The longest head at \(division.label) of a beat"
+                    ) {
+                        var c = controls
+                        c.spaceEchoDivision = division.beats
+                        c.spaceEchoSync = true
+                        onControls(c)
+                    }
+                }
+            }
+            FxPanelKey(
+                title: "Tap", lit: tempo?.source == .tap, color: DubColor.spaceEcho,
+                legend: tapLegend,
+                help: "Tap the beat — the tempo for SYNC when the record has none (THRU)",
+                action: onTap)
+            .mappable(.fxTap)
         }
     }
 
@@ -327,22 +398,33 @@ struct FxSpaceEchoUnit: View {
         }
     }
 
-    /// Repeat rate: the longest head, with all three head times under it.
+    /// Repeat rate: the longest head, with all three head times under it
+    /// — or, synced, where the tempo comes from. Turning the knob takes
+    /// the repeat back by hand.
     private var repeatCell: some View {
         let ms = controls.spaceEchoRepeatMs
         return VStack(spacing: 2) {
             FxKnobCell(
                 name: "Repeat",
                 value: (ms - Self.repeatMin) / (Self.repeatMax - Self.repeatMin),
-                readout: "\(Int(ms.rounded())) ms"
+                readout: "\(Int(ms.rounded())) ms",
+                readoutColor: controls.spaceEchoSync && tempo != nil
+                    ? DubColor.spaceEcho : DubColor.textPrimary
             ) { v in
                 var c = controls
                 c.spaceEchoRepeatMs = Self.repeatMin + v * (Self.repeatMax - Self.repeatMin)
+                c.spaceEchoSync = false
                 onControls(c)
             }
-            FxEngraved(
-                text: "\(Int((ms * 0.337).rounded())) · \(Int((ms * 0.668).rounded())) · \(Int(ms.rounded()))",
-                dim: true)
+            if controls.spaceEchoSync {
+                FxEngraved(
+                    text: tempo.map { "♩ \($0.text)" } ?? "No tempo · tap",
+                    color: tempo == nil ? DubColor.stateError : DubColor.spaceEcho)
+            } else {
+                FxEngraved(
+                    text: "\(Int((ms * 0.337).rounded())) · \(Int((ms * 0.668).rounded())) · \(Int(ms.rounded()))",
+                    dim: true)
+            }
         }
     }
 
@@ -361,10 +443,10 @@ struct FxSpaceEchoUnit: View {
                 onControls(c)
             }
             if runaway {
-                TimelineView(.animation(paused: !(on && motion))) { tl in
-                    let t = motion ? tl.date.timeIntervalSinceReferenceDate : 0
-                    let blink = on && Int(t * 4) % 2 == 0
-                    FxEngraved(text: "Runaway", color: DubColor.stateError.opacity(blink ? 1 : 0.35))
+                if motion {
+                    BlinkingEngraved(text: "Runaway", color: DubColor.stateError, on: on)
+                } else {
+                    FxEngraved(text: "Runaway", color: DubColor.stateError.opacity(on ? 1 : 0.35))
                 }
             } else {
                 FxEngraved(text: "Osc > 1.0", dim: true)
@@ -383,49 +465,60 @@ struct FxTapeWindow: View {
     let runaway: Bool
     var motion: Bool = true
 
+    private static let tapeColor = Color(hex: 0xB58A4A)
+
+    /// The tape loop, past the record head and around both reels.
+    private static let loop: Path = Path { p in
+        p.move(to: CGPoint(x: 18, y: 24))
+        p.addLine(to: CGPoint(x: 70, y: 24))
+        p.addArc(center: CGPoint(x: 70, y: 44), radius: 20,
+                 startAngle: .degrees(-90), endAngle: .degrees(90), clockwise: false)
+        p.addLine(to: CGPoint(x: 18, y: 64))
+        p.addArc(center: CGPoint(x: 18, y: 44), radius: 20,
+                 startAngle: .degrees(90), endAngle: .degrees(270), clockwise: false)
+        p.closeSubpath()
+    }
+
     var body: some View {
-        TimelineView(.animation(paused: !(running && motion))) { tl in
-            Canvas { ctx, size in
-                let t = motion ? tl.date.timeIntervalSinceReferenceDate : 0
-                let loop = Path { p in
-                    p.move(to: CGPoint(x: 18, y: 24))
-                    p.addLine(to: CGPoint(x: 70, y: 24))
-                    p.addArc(center: CGPoint(x: 70, y: 44), radius: 20,
-                             startAngle: .degrees(-90), endAngle: .degrees(90), clockwise: false)
-                    p.addLine(to: CGPoint(x: 18, y: 64))
-                    p.addArc(center: CGPoint(x: 18, y: 44), radius: 20,
-                             startAngle: .degrees(90), endAngle: .degrees(270), clockwise: false)
-                    p.closeSubpath()
-                }
-                ctx.stroke(loop, with: .color(Color(hex: 0x2A221A)), lineWidth: 6)
-                let speed = runaway ? 34.0 : 17.0
-                let phase = running ? -CGFloat((t * speed).truncatingRemainder(dividingBy: 9)) : 0
-                ctx.stroke(loop, with: .color(Color(hex: 0xB58A4A)),
-                           style: StrokeStyle(lineWidth: 2.5, dash: [5, 4], dashPhase: phase))
-                for x in [18.0, 70.0] {
-                    let hub = Path(ellipseIn: CGRect(x: x - 8, y: 36, width: 16, height: 16))
-                    ctx.fill(hub, with: .color(Color(hex: 0x15171A)))
-                    ctx.stroke(hub, with: .color(Color(hex: 0x3A3E45)), lineWidth: 1.5)
-                    ctx.fill(Path(ellipseIn: CGRect(x: x - 2.5, y: 41.5, width: 5, height: 5)),
-                             with: .color(Color(hex: 0x3A3E45)))
-                }
-                let heads = Self.heads(mode)
-                head(ctx, x: 30, label: "R", live: true, color: Color(hex: 0x9AA0A8))
-                head(ctx, x: 43, label: "1", live: heads.0, color: DubColor.spaceEcho)
-                head(ctx, x: 56, label: "2", live: heads.1, color: DubColor.spaceEcho)
-                head(ctx, x: 69, label: "3", live: heads.2, color: DubColor.spaceEcho)
-                let reverb = Self.reverbOn(mode)
-                let box = Path(roundedRect: CGRect(x: 31, y: 51, width: 26, height: 12), cornerRadius: 2)
-                ctx.fill(box, with: .color(reverb ? Color(hex: 0x12261C) : Color(hex: 0x1A1C20)))
-                ctx.stroke(box, with: .color(reverb ? DubColor.springFx : Color(hex: 0x3A3E45)), lineWidth: 1)
-                ctx.draw(
-                    Text("RVB").font(.system(size: 6, weight: .bold))
-                        .foregroundColor(reverb ? DubColor.springFx : Color(hex: 0x5A5F68)),
-                    at: CGPoint(x: 44, y: 57))
-                ctx.draw(
-                    Text("TAPE LOOP").font(.system(size: 5.5, weight: .semibold))
-                        .foregroundColor(DubColor.textTertiary),
-                    at: CGPoint(x: 24, y: 71))
+        Canvas { ctx, size in
+            let loop = Self.loop
+            ctx.stroke(loop, with: .color(Color(hex: 0x2A221A)), lineWidth: 6)
+            if !motion {
+                ctx.stroke(loop, with: .color(Self.tapeColor),
+                           style: StrokeStyle(lineWidth: 2.5, dash: [5, 4], dashPhase: 0))
+            }
+            for x in [18.0, 70.0] {
+                let hub = Path(ellipseIn: CGRect(x: x - 8, y: 36, width: 16, height: 16))
+                ctx.fill(hub, with: .color(Color(hex: 0x15171A)))
+                ctx.stroke(hub, with: .color(Color(hex: 0x3A3E45)), lineWidth: 1.5)
+                ctx.fill(Path(ellipseIn: CGRect(x: x - 2.5, y: 41.5, width: 5, height: 5)),
+                         with: .color(Color(hex: 0x3A3E45)))
+            }
+            let heads = Self.heads(mode)
+            head(ctx, x: 30, label: "R", live: true, color: Color(hex: 0x9AA0A8))
+            head(ctx, x: 43, label: "1", live: heads.0, color: DubColor.spaceEcho)
+            head(ctx, x: 56, label: "2", live: heads.1, color: DubColor.spaceEcho)
+            head(ctx, x: 69, label: "3", live: heads.2, color: DubColor.spaceEcho)
+            let reverb = Self.reverbOn(mode)
+            let box = Path(roundedRect: CGRect(x: 31, y: 51, width: 26, height: 12), cornerRadius: 2)
+            ctx.fill(box, with: .color(reverb ? Color(hex: 0x12261C) : Color(hex: 0x1A1C20)))
+            ctx.stroke(box, with: .color(reverb ? DubColor.springFx : Color(hex: 0x3A3E45)), lineWidth: 1)
+            ctx.draw(
+                Text("RVB").font(.system(size: 6, weight: .bold))
+                    .foregroundColor(reverb ? DubColor.springFx : Color(hex: 0x5A5F68)),
+                at: CGPoint(x: 44, y: 57))
+            ctx.draw(
+                Text("TAPE LOOP").font(.system(size: 5.5, weight: .semibold))
+                    .foregroundColor(DubColor.textTertiary),
+                at: CGPoint(x: 24, y: 71))
+        }
+        .overlay {
+            // The tape runs on Core Animation (FxLayerAnimations): racing
+            // when it feeds back on itself.
+            if motion {
+                TravellingDashes(
+                    path: Self.loop.cgPath, color: Self.tapeColor, lineWidth: 2.5,
+                    dash: [5, 4], speed: runaway ? 34 : 17, running: running)
             }
         }
         .frame(width: 88, height: 76)
@@ -604,10 +697,20 @@ struct FxSpringTank: View {
     let kickedAt: Date?
     var motion: Bool = true
 
+    private static let rippleColor = DubColor.springFx.opacity(0.9)
+
+    /// The highlight's run along each coil.
+    private static let ripple: [(y: CGFloat, len: CGFloat)] = [(20, 82), (46, 62)]
+
+    /// Redraw at a kick and once more as its flash ends — not every frame.
+    private var kickMoments: [Date] {
+        kickedAt.map { [$0, $0.addingTimeInterval(0.3)] } ?? []
+    }
+
     var body: some View {
-        TimelineView(.animation(paused: !(ringing && motion))) { tl in
+        TimelineView(.explicit(kickMoments)) { tl in
             Canvas { ctx, size in
-                let t = motion ? tl.date.timeIntervalSinceReferenceDate : 0
+                let t: Double = 0
                 let flash = kickedAt.map { tl.date.timeIntervalSince($0) < 0.3 } ?? false
                 for (x, y) in [(5.0, 20.0), (94.0, 20.0), (5.0, 46.0), (74.0, 46.0)] {
                     let tab = Path(roundedRect: CGRect(x: x, y: y - 8, width: 5, height: 16), cornerRadius: 1)
@@ -616,9 +719,9 @@ struct FxSpringTank: View {
                 }
                 coil(ctx, x0: 13, y: 20, turns: 17, color: flash ? DubColor.springFx : Color(hex: 0x8B9096))
                 coil(ctx, x0: 13, y: 46, turns: 13, color: flash ? DubColor.springFx : Color(hex: 0x7D838A))
-                if ringing {
+                if ringing, !motion {
                     let phase = -CGFloat((t * 9).truncatingRemainder(dividingBy: 12))
-                    for (y, len) in [(20.0, 82.0), (46.0, 62.0)] {
+                    for (y, len) in Self.ripple {
                         var line = Path()
                         line.move(to: CGPoint(x: 11, y: y))
                         line.addLine(to: CGPoint(x: 13 + len, y: y))
@@ -632,10 +735,27 @@ struct FxSpringTank: View {
                     at: CGPoint(x: 84, y: 61))
             }
         }
+        .overlay {
+            // The highlight runs on Core Animation (FxLayerAnimations).
+            if motion, ringing {
+                TravellingDashes(
+                    path: Self.ripplePath, color: Self.rippleColor, lineWidth: 2,
+                    dash: [3, 9], speed: 9, lineCap: .round, running: true)
+            }
+        }
         .frame(width: 104, height: 66)
         .background(LinearGradient(
             colors: [Color(hex: 0x17191C), Color(hex: 0x0D0E10)],
             startPoint: .top, endPoint: .bottom))
+    }
+
+    private static var ripplePath: CGPath {
+        let p = CGMutablePath()
+        for (y, len) in ripple {
+            p.move(to: CGPoint(x: 11, y: y))
+            p.addLine(to: CGPoint(x: 13 + len, y: y))
+        }
+        return p
     }
 
     private func coil(_ ctx: GraphicsContext, x0: CGFloat, y: CGFloat, turns: Int, color: Color) {

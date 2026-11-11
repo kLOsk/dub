@@ -160,6 +160,9 @@ pub struct DeckSharedState {
     /// result means the cartridge ellipse went uncorrected.
     whitening_bits: [AtomicU32; 4],
     calibration_seq: AtomicU32,
+    /// The last calibration was refused because one channel of the pair
+    /// is far quieter than the other: 0 none · 1 first · 2 second.
+    weak_channel: AtomicU8,
     /// M6 absolute-position diagnostics: whether the LFSR bitstream
     /// tracker is locked, and the decoded groove position in seconds
     /// of record time (input frames / input SR). Display/log only —
@@ -296,6 +299,10 @@ pub struct TimecodeTelemetry {
     pub whitening: [f32; 4],
     /// Diagnostic: count of calibrations installed since attach.
     pub calibration_seq: u32,
+    /// The last calibration was refused because one channel of the pair
+    /// is far quieter than the other — a cartridge, headshell or cable
+    /// fault: 0 none · 1 first channel · 2 second channel.
+    pub weak_channel: u8,
     /// M6: whether the absolute LFSR position tracker is locked on the
     /// bitstream (bit-exact velocity + drift-free playhead active).
     pub abs_locked: bool,
@@ -379,6 +386,7 @@ impl DeckSharedState {
                 AtomicU32::new(1.0f32.to_bits()),
             ],
             calibration_seq: AtomicU32::new(0),
+            weak_channel: AtomicU8::new(0),
             tc_abs_locked: AtomicBool::new(false),
             tc_sticker_drift_ms_bits: AtomicU64::new(f64::NAN.to_bits()),
             tc_pitch_settled: AtomicBool::new(true),
@@ -436,7 +444,7 @@ impl DeckSharedState {
             .store(f64::NAN.to_bits(), Ordering::Relaxed);
         self.tc_pitch_settled.store(true, Ordering::Relaxed);
         self.store_loop(false, 0.0, 0.0);
-        self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0);
+        self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0, 0);
         // Bring the seqlock-protected publish triple back to a
         // clean baseline (zero playhead, zero rate, host time at
         // "now" so no extrapolation kicks in if the snapshot
@@ -583,9 +591,9 @@ impl DeckSharedState {
     }
 
     /// Publish the installed whitening matrix + calibration counter
-    /// (audio thread). Diagnostic only. Four relaxed stores + one for the
-    /// seq; RT-safe.
-    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32) {
+    /// (audio thread), and which channel a refused calibration found too
+    /// weak (0 none). A handful of relaxed stores; RT-safe.
+    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32, weak_channel: u8) {
         #[allow(clippy::cast_possible_truncation)]
         let flat = [
             whitening[0][0] as f32,
@@ -597,6 +605,7 @@ impl DeckSharedState {
             slot.store(v.to_bits(), Ordering::Relaxed);
         }
         self.calibration_seq.store(seq, Ordering::Relaxed);
+        self.weak_channel.store(weak_channel, Ordering::Relaxed);
     }
 
     /// Lock-free read of the deck's timecode signal health + source state.
@@ -620,6 +629,7 @@ impl DeckSharedState {
                 f32::from_bits(self.whitening_bits[3].load(Ordering::Relaxed)),
             ],
             calibration_seq: self.calibration_seq.load(Ordering::Relaxed),
+            weak_channel: self.weak_channel.load(Ordering::Relaxed),
             abs_locked: self.tc_abs_locked.load(Ordering::Relaxed),
             abs_position_secs: f64::from_bits(
                 self.tc_abs_position_secs_bits.load(Ordering::Relaxed),
@@ -1232,8 +1242,9 @@ impl Deck {
 
     /// Forward the installed whitening matrix + calibration counter to
     /// the deck's shared state (RT-safe; diagnostic).
-    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32) {
-        self.shared.publish_calibration(whitening, seq);
+    pub(crate) fn publish_calibration(&self, whitening: [[f64; 2]; 2], seq: u32, weak_channel: u8) {
+        self.shared
+            .publish_calibration(whitening, seq, weak_channel);
     }
 
     /// Audio-thread hook: pin the `host_time_ns` the next

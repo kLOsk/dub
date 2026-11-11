@@ -222,3 +222,50 @@ struct FxKnobCell: View {
         .fixedSize()
     }
 }
+
+/// A small rectangular panel key with a lit window — the latching
+/// switches along a unit's top edge (the Space Echo's HOLD · SYNC · TAP).
+/// `lit` glows in `color`; `dimLit` marks a chosen position whose switch
+/// is off (a division while SYNC is out). The mapped key rides in the
+/// tooltip: a keycap does not fit on a key this small, and map mode
+/// draws its own.
+struct FxPanelKey: View {
+    let title: String
+    let lit: Bool
+    var dimLit: Bool = false
+    let color: Color
+    var width: CGFloat? = nil
+    var legend: String? = nil
+    let help: String
+    let action: () -> Void
+
+    private var ink: Color { lit ? color : Color.white.opacity(dimLit ? 0.8 : 0.5) }
+    private var fill: Color { lit ? color.opacity(0.2) : Color.black.opacity(0.35) }
+    private var rim: Color { lit ? color.opacity(0.85) : Color.white.opacity(dimLit ? 0.35 : 0.12) }
+    private var glow: Color { lit ? color.opacity(0.6) : .clear }
+
+    private var face: some View {
+        let shape = RoundedRectangle(cornerRadius: 2.5)
+        return Text(title.uppercased())
+            .font(.system(size: 7, weight: .bold))
+            .tracking(width == nil ? 1.0 : 0)
+            .foregroundStyle(ink)
+            .padding(.horizontal, width == nil ? 6 : 0)
+            .frame(width: width, height: 16)
+            .background(shape.fill(fill))
+            .overlay(shape.stroke(rim, lineWidth: 1))
+            .shadow(color: glow, radius: lit ? 3 : 0)
+    }
+
+    var body: some View {
+        face
+            .fixedSize()
+            .contentShape(Rectangle())
+            .onPressDown(perform: action)
+            .help(legend.map { "\(help) — key \($0)" } ?? help)
+            .accessibilityElement()
+            .accessibilityLabel(title)
+            .accessibilityValue(lit ? "On" : "Off")
+            .accessibilityAddTraits(.isButton)
+    }
+}

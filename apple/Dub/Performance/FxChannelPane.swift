@@ -215,8 +215,12 @@ struct FxRackColumn: View, Equatable {
                 FxSpaceEchoUnit(
                     on: state.isOn(.spaceEcho), controls: state.controls,
                     toggleLegend: state.toggleLegend(.spaceEcho), motion: state.motion,
+                    holdLegend: state.holdLegend,
+                    tapLegend: state.tapLegend,
+                    tempo: state.echoTempo,
                     onToggle: { callbacks.onToggle(.spaceEcho) },
-                    onControls: callbacks.onControls)
+                    onControls: callbacks.onControls,
+                    onTap: callbacks.onTap)
                 FxSpringUnit(
                     on: state.isOn(.spring), controls: state.controls,
                     toggleLegend: state.toggleLegend(.spring), motion: state.motion,

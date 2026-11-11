@@ -269,6 +269,11 @@ struct DeckState: Equatable {
     /// whether the next tap engages or disengages.
     var echoDivision: Double? = nil
 
+    /// Echo-out HOLD (toggle): the thrown beat repeats just under endless,
+    /// to carry the room through a one-turntable record swap. Only while
+    /// the echo is on; turning the echo off clears it.
+    var echoHeld: Bool = false
+
     /// The pitch the **tempo** readout may use: the platter's pitch
     /// while it is a pitch and not a scratch.
     ///
@@ -370,6 +375,9 @@ struct DeckState: Equatable {
     /// UI-local like `rackActive`: the rack publishes no state, so what the
     /// knob was set to is what the engine has.
     var fxRack: FxRackControls = FxRackControls()
+    /// Where the synced Space Echo's tempo is coming from right now, as
+    /// the unit prints it; `nil` when SYNC is off or there is no tempo.
+    var fxEchoTempo: FxEchoTempo?
     /// The channel's INPUT rocker — what is patched into the pair: the mixer's
     /// send, or a mic straight in. A label the engine does not yet read
     /// (F-38 stage 3 is the routing); the VU and the path line print it.
@@ -389,6 +397,8 @@ struct DeckState: Equatable {
     /// The deck is the DUB FX channel — the rack on the mixer's send, not a
     /// turntable (F-38). The pane, the bar and the pills all key off this.
     var isDubFx: Bool { controlMode == 3 }
+    /// A live record through the engine — no track, but sound to throw.
+    var isThru: Bool { controlMode == 2 }
     var sourceClass: UInt8 = 0   // 0 silence, 1 timecode, 2 record
     var calibrated: Bool = false
     var calibrating: Bool = false
@@ -878,6 +888,11 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kSampleBank = "dub.sampleBank"
 
+    /// Pads whose file was gone at the last push, by pad, with the file's
+    /// name: a press says why it is silent, and a reconnect does not
+    /// repeat the notice.
+    private var missingSamples: [Int: String] = [:]
+
     /// Where the sampler lands — the master deck by default, or a deck
     /// the DJ pinned it to, or both. Persisted under `dub.samplerOutput`.
     @Published var samplerOutput: RackOutput {
@@ -1100,6 +1115,16 @@ final class WaveformAppModel: ObservableObject {
     func fxKickFromKey() {
         guard let side = dubFxDeck else { return }
         kickFxSpring(side)
+    }
+
+    func fxHoldFromKey() {
+        guard let side = dubFxDeck else { return }
+        toggleFxSpaceEchoHold(side)
+    }
+
+    func fxTapFromKey() {
+        guard let side = dubFxDeck else { return }
+        tapFxEcho(side)
     }
 
     /// Per-source library-import enables (Preferences ▸ Libraries). When a
@@ -2157,6 +2182,7 @@ final class WaveformAppModel: ObservableObject {
             bWas: deckB.isPlaying, bNow: newB.isPlaying)
         if newA != deckA { deckA = newA }
         if newB != deckB { deckB = newB }
+        syncFxEcho()
         recomputeMaster()
         pollSampler()
         logSignalDiagnostics()
@@ -2252,6 +2278,7 @@ final class WaveformAppModel: ObservableObject {
                 settled=\(t.pitchSettled, privacy: .public) \
                 cls=\(t.sourceClass, privacy: .public) \
                 calibrated=\(t.calibrated, privacy: .public) calibrating=\(t.calibrating, privacy: .public) \
+                weak=\(t.weakChannel, privacy: .public) \
                 cal#\(t.calibrationSeq, privacy: .public) whitening=\(wStr, privacy: .public)
                 """)
             lastDiag[idx] = (t.lockState, t.calibrationSeq, t.absLocked)
@@ -2358,6 +2385,7 @@ final class WaveformAppModel: ObservableObject {
         if next.echoDivision != nil, tele.echoState == 2 {
             releaseEcho(side)
             next.echoDivision = nil
+            next.echoHeld = false
         }
         // M16 siren: the engine publishes 0 idle / 1 sounding. No auto-off
         // branch — the siren is additive, so a stuck-sounding deck is never
@@ -2636,6 +2664,7 @@ final class WaveformAppModel: ObservableObject {
             releaseEcho(side)
         }
         starting.echoDivision = nil
+        starting.echoHeld = false
         tapToGrid(for: side).cancel()
         setState(starting, for: side)
 
@@ -4809,6 +4838,9 @@ final class WaveformAppModel: ObservableObject {
         let hadLibraryTrack = s.loadedLibraryTrackId != nil
         s.clearLoadedTrack()
         s.rackActive = [false, false, false, false]
+        // A hold left on from the last time would sustain whatever reaches
+        // the tape first.
+        s.fxRack.spaceEchoHold = false
         setState(s, for: side)
         if hadLibraryTrack {
             let deck: UInt32 = (side == .a) ? 0 : 1
@@ -4824,6 +4856,14 @@ final class WaveformAppModel: ObservableObject {
     /// clock, the rack bypassed, so nothing keeps processing a send the
     /// switch can no longer show.
     private func leaveDubFxEverywhere() {
+        // HOLD is part of the DUB FX set; with the feature off its button
+        // is gone, so nothing may be left held behind it.
+        for side in [DeckSide.a, DeckSide.b] where state(for: side).echoHeld {
+            var s = state(for: side)
+            s.echoHeld = false
+            setState(s, for: side)
+            try? engine.setEchoHold(deckIdx: side.ffiDeckIdx, on: false)
+        }
         for side in [DeckSide.a, DeckSide.b] where state(for: side).isDubFx {
             var s = state(for: side)
             s.rackActive = [false, false, false, false]
@@ -5188,6 +5228,10 @@ final class WaveformAppModel: ObservableObject {
     /// of this.
     func triggerSampler(_ index: Int) {
         guard isRunning, sampleBank.slot(index) != nil else { return }
+        if let name = missingSamples[index] {
+            surfaceNotice("Sampler pad \(index + 1): \(name) is gone. Drop a sample on the pad.")
+            return
+        }
         let output: SamplerOutput
         switch samplerOutputState.decks {
         case [.a]: output = .deckA
@@ -5226,9 +5270,25 @@ final class WaveformAppModel: ObservableObject {
             guard previous == nil || url != previous?.slot(index) else { continue }
             let ffiSlot = UInt64(index)
             guard let url else {
+                missingSamples[index] = nil
                 try? engine.samplerClear(slot: ffiSlot)
                 continue
             }
+            // A file moved or deleted since it was put on the pad. Not
+            // something that stops the set, so not the red banner — and
+            // not again on every reconnect (rig, 2026-11-11: it greeted
+            // every launch and every SL 3 plug-in).
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                try? engine.samplerClear(slot: ffiSlot)
+                if missingSamples[index] != url.lastPathComponent {
+                    missingSamples[index] = url.lastPathComponent
+                    surfaceNotice(
+                        "Sampler pad \(index + 1): \(url.lastPathComponent) is gone. "
+                            + "Drop a sample on the pad.")
+                }
+                continue
+            }
+            missingSamples[index] = nil
             // Decode + resample + measure, so off the main queue. The
             // gain it reports is applied engine-side; the waveform
             // draws the file as decoded (see the deck pane's note on
@@ -5237,9 +5297,13 @@ final class WaveformAppModel: ObservableObject {
                 do {
                     _ = try engine.samplerLoad(slot: ffiSlot, path: url.path)
                 } catch {
-                    let message = error.localizedDescription
+                    let name = url.lastPathComponent
+                    let detail = error.localizedDescription
+                    dubLog.error("Sampler \(index + 1): \(detail, privacy: .public)")
                     await MainActor.run {
-                        self.surfaceError("Sampler \(index + 1): \(message)")
+                        self.surfaceNotice(
+                            "Sampler pad \(index + 1): \(name) could not be read. "
+                                + "Drop another sample on the pad.")
                     }
                 }
             }
@@ -5720,6 +5784,7 @@ final class WaveformAppModel: ObservableObject {
         // visible moment later, which reads as an unresponsive control
         // even though nothing was actually late.
         deck.echoDivision = engaging ? divisionBeats : nil
+        deck.echoHeld = false
         setState(deck, for: side)
         if engaging {
             engageEcho(side, divisionBeats: divisionBeats)
@@ -5733,6 +5798,19 @@ final class WaveformAppModel: ObservableObject {
         toggleEcho(side, divisionBeats: 1.0)
     }
 
+    /// HOLD on `side`'s echo-out — a toggle, only while the echo is on:
+    /// throw the last phrase, hold it while the needle is lifted and the
+    /// next record goes down, then let it go (HOLD again) or cut it (OUT).
+    func toggleEchoHold(_ side: DeckSide) {
+        guard isRunning, dubFxEnabled else { return }
+        var deck = state(for: side)
+        guard deck.echoDivision != nil else { return }
+        deck.echoHeld.toggle()
+        let on = deck.echoHeld
+        setState(deck, for: side)
+        try? engine.setEchoHold(deckIdx: side.ffiDeckIdx, on: on)
+    }
+
     /// Drop an engaged echo on `side` — called when the deck's context changes
     /// (a new track loads, the source mode is switched) so a muted deck (100 %
     /// wet) never strands the operator in silence (M15). No-op if not engaged.
@@ -5741,6 +5819,7 @@ final class WaveformAppModel: ObservableObject {
         guard deck.echoDivision != nil else { return }
         releaseEcho(side)
         deck.echoDivision = nil
+        deck.echoHeld = false
         setState(deck, for: side)
     }
 
@@ -5757,9 +5836,17 @@ final class WaveformAppModel: ObservableObject {
         // Tempo-lock to the deck's analysed BPM when known; otherwise fall
         // back to a neutral 120 so the echo still fires (the division is then
         // in absolute time rather than beat-locked) — better than a silent
-        // no-op on an un-analysed track.
-        let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
-        let effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        // no-op on an un-analysed track. A THRU record has no analysed
+        // tempo; the Space Echo's TAP is the one the DJ gave for it, at the
+        // platter's real speed already.
+        let effectiveBpm: Double
+        if !deck.isThru, let bpm = deck.bpm, bpm > 0 {
+            effectiveBpm = bpm * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        } else if let fx = dubFxDeck, let tapped = state(for: fx).fxRack.spaceEchoTapBpm {
+            effectiveBpm = tapped
+        } else {
+            effectiveBpm = 120
+        }
         guard effectiveBpm > 0 else { return }
         try? engine.engageEchoOut(
             deckIdx: side.ffiDeckIdx,
@@ -6021,6 +6108,72 @@ final class WaveformAppModel: ObservableObject {
         pushFxRack(side)
     }
 
+    /// HOLD on the Space Echo — a toggle: the tape keeps what it has and
+    /// sustains through a record swap.
+    func toggleFxSpaceEchoHold(_ side: DeckSide) {
+        var c = state(for: side).fxRack
+        c.spaceEchoHold.toggle()
+        setFxRack(side, c)
+    }
+
+    /// TAP on the Space Echo: the music's tempo for SYNC when the deck
+    /// playing it has none — a real record in THRU. Tapping turns SYNC on.
+    func tapFxEcho(_ side: DeckSide) {
+        let now = ProcessInfo.processInfo.systemUptime
+        fxEchoTaps.append(now)
+        fxEchoTaps.removeAll { now - $0 > 8 }
+        var c = state(for: side).fxRack
+        c.spaceEchoSync = true
+        if let bpm = FxRackControls.tappedBpm(fxEchoTaps) {
+            c.spaceEchoTapBpm = bpm
+        }
+        setFxRack(side, c)
+        syncFxEcho()
+    }
+
+    /// TAP's presses, seconds of uptime. Not state anything draws.
+    private var fxEchoTaps: [TimeInterval] = []
+
+    /// The tempo SYNC follows: the music deck's live BPM — its analysed
+    /// tempo at the platter's pitch — when it has one, else the tapped
+    /// tempo.
+    private func fxEchoTempo(fxSide: DeckSide) -> FxEchoTempo? {
+        let music: DeckSide = fxSide == .a ? .b : .a
+        let deck = state(for: music)
+        if deck.hasTrack, !deck.isThru, let base = deck.bpm, base > 0 {
+            let live = base * (1 + (livePitchPercent(music) ?? 0) / 100)
+            return FxEchoTempo(source: .deck(music), bpm: live)
+        }
+        return state(for: fxSide).fxRack.spaceEchoTapBpm.map { FxEchoTempo(source: .tap, bpm: $0) }
+    }
+
+    /// SYNC, on every poll. The repeat follows the platter's pitch, so it
+    /// moves while the DJ rides the fader — but the state, which rebuilds
+    /// the rack, only changes when the repeat would move by more than
+    /// 0.3 % (about a tenth of a BPM). A settled platter never crosses it;
+    /// the engine's heads glide between the steps.
+    private func syncFxEcho() {
+        guard let side = dubFxDeck else { return }
+        var deck = state(for: side)
+        guard deck.fxRack.spaceEchoSync, let tempo = fxEchoTempo(fxSide: side),
+              let ms = FxRackControls.syncedRepeatMs(
+                bpm: tempo.bpm, division: deck.fxRack.spaceEchoDivision)
+        else {
+            if deck.fxEchoTempo != nil {
+                deck.fxEchoTempo = nil
+                setState(deck, for: side)
+            }
+            return
+        }
+        let current = deck.fxRack.spaceEchoRepeatMs
+        let moved = abs(ms - current) > current * 0.003
+        guard moved || deck.fxEchoTempo?.source != tempo.source else { return }
+        deck.fxRack.spaceEchoRepeatMs = ms
+        deck.fxEchoTempo = tempo
+        setState(deck, for: side)
+        pushSpaceEcho(side)
+    }
+
     /// KICK — Tubby's thunder into the spring tank. Momentary.
     func kickFxSpring(_ side: DeckSide) {
         guard isRunning else { return }
@@ -6056,13 +6209,20 @@ final class WaveformAppModel: ObservableObject {
         try? engine.setRackPhaser(
             deckIdx: idx, rateHz: Float(c.phaserRateHz), depth: Float(c.phaserDepth),
             feedback: Float(c.phaserFeedback), mix: Float(c.phaserMix))
-        try? engine.setRackSpaceEcho(
-            deckIdx: idx, mode: c.spaceEchoMode, repeatMs: Float(c.spaceEchoRepeatMs),
-            intensity: Float(c.spaceEchoIntensity), echoVolume: Float(c.spaceEchoVolume),
-            reverb: Float(c.spaceEchoReverb), wowFlutter: Float(c.spaceEchoWowFlutter))
+        pushSpaceEcho(side)
         try? engine.setRackSpring(
             deckIdx: idx, decay: Float(c.springDecay), tone: Float(c.springTone),
             wet: Float(c.springWet))
+        try? engine.setSpaceEchoHold(deckIdx: idx, on: c.spaceEchoHold)
+    }
+
+    private func pushSpaceEcho(_ side: DeckSide) {
+        guard isRunning else { return }
+        let c = state(for: side).fxRack
+        try? engine.setRackSpaceEcho(
+            deckIdx: side.ffiDeckIdx, mode: c.spaceEchoMode, repeatMs: Float(c.spaceEchoRepeatMs),
+            intensity: Float(c.spaceEchoIntensity), echoVolume: Float(c.spaceEchoVolume),
+            reverb: Float(c.spaceEchoReverb), wowFlutter: Float(c.spaceEchoWowFlutter))
     }
 
     /// Bypass every rack slot on both decks and clear the UI flags (called when
@@ -6848,6 +7008,24 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
+            onEchoHold: { side in
+                Task { @MainActor in
+                    model.toggleEchoHold(side)
+                }
+                return true
+            },
+            onFxHold: {
+                Task { @MainActor in
+                    model.fxHoldFromKey()
+                }
+                return true
+            },
+            onFxTap: {
+                Task { @MainActor in
+                    model.fxTapFromKey()
+                }
+                return true
+            },
             onKeyLock: { side in
                 Task { @MainActor in
                     model.toggleKeyLock(side: side)
@@ -6898,6 +7076,9 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onFxToggle: @escaping (_ unit: Int) -> Bool,
             onFxKick: @escaping () -> Bool,
             onEchoOut: @escaping (_ side: DeckSide) -> Bool,
+            onEchoHold: @escaping (_ side: DeckSide) -> Bool,
+            onFxHold: @escaping () -> Bool,
+            onFxTap: @escaping () -> Bool,
             onKeyLock: @escaping (_ side: DeckSide) -> Bool,
             mapCapture: @escaping (_ code: UInt16, _ characters: String?, _ command: Bool) -> Bool
         ) {
@@ -6959,6 +7140,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onFxKick() { return nil }
                 case .echoOut(let side):
                     if onEchoOut(side) { return nil }
+                case .echoHold(let side):
+                    if onEchoHold(side) { return nil }
+                case .fxHold:
+                    if onFxHold() { return nil }
+                case .fxTap:
+                    if onFxTap() { return nil }
                 case .keyLock(let side):
                     if onKeyLock(side) { return nil }
                 }

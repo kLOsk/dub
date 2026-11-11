@@ -508,7 +508,11 @@ pub use rip::{
 ///       side archive, but is not encoded or imported. Removing a split
 ///       *merges* two segments; this discards one — both edits a DJ needs
 ///       once a side is split (2026-09-23).
-pub const FFI_VERSION: u32 = 79;
+///   81. **A failing channel is named, not whitened.**
+///       `DeckTelemetry.weak_channel`: the deck's last calibration was
+///       refused because one channel of the pair is far quieter than the
+///       other (a cartridge / headshell / cable fault), and which one.
+pub const FFI_VERSION: u32 = 81;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -2214,6 +2218,46 @@ impl DubEngine {
             .map_err(map_command_error)
     }
 
+    /// Echo-out HOLD on `deck_idx` (FFI 80), a toggle: the captured beat
+    /// repeats at just-under-endless feedback, so it carries the room
+    /// through a one-turntable record swap. Turning the echo off clears it.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_echo_hold(&self, deck_idx: u64, on: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_echo_hold(on)
+            .map_err(map_command_error)
+    }
+
+    /// Space Echo HOLD on `deck_idx`'s DUB FX rack (FFI 80), a toggle:
+    /// nothing new onto the tape and the loop sustained just under
+    /// self-oscillation, for the record swap.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn set_space_echo_hold(&self, deck_idx: u64, on: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .set_space_echo_hold(on)
+            .map_err(map_command_error)
+    }
+
     /// Live-update echo-out `feedback` and feedback low-pass cutoff (`lpf_hz`)
     /// on `deck_idx` while held or idle (UI sliders). The echo length only
     /// changes on a fresh [`Self::engage_echo_out`].
@@ -3284,6 +3328,7 @@ impl DubEngine {
             control_overridden: tc.overridden,
             whitening: tc.whitening.to_vec(),
             calibration_seq: tc.calibration_seq,
+            weak_channel: tc.weak_channel,
             abs_locked: tc.abs_locked,
             abs_position_secs: tc.abs_position_secs,
             sticker_drift_ms: tc.sticker_drift_ms,
@@ -4452,6 +4497,11 @@ pub struct DeckTelemetry {
     /// Diagnostic: number of calibrations installed since the input was
     /// attached. Bumps each time a fresh whitening is computed.
     pub calibration_seq: u32,
+    /// The deck's last calibration was refused because one channel of
+    /// the pair is far quieter than the other — a cartridge, headshell or
+    /// cable fault: 0 none · 1 first (left) · 2 second (right). Cleared
+    /// by the next calibration that installs.
+    pub weak_channel: u8,
     /// M6: whether the absolute LFSR position tracker is locked on the
     /// control record's bitstream. While `true` the deck's velocity and
     /// playhead come from exact groove-position deltas (bit-exact pitch,
@@ -4522,6 +4572,7 @@ impl DeckTelemetry {
             control_overridden: false,
             whitening: vec![1.0, 0.0, 0.0, 1.0],
             calibration_seq: 0,
+            weak_channel: 0,
             abs_locked: false,
             abs_position_secs: 0.0,
             sticker_drift_ms: f64::NAN,
@@ -6308,7 +6359,8 @@ mod tests {
         // 76→77: rip capture meter ballistics —
         // `RipSessionStatus.level_rms` / `clipped_secs_ago`.
         // 77→78: `set_segment_dropped`, `RipSegment.dropped`.
-        assert_eq!(FFI_VERSION, 79);
+        // 80→81: `DeckTelemetry.weak_channel`.
+        assert_eq!(FFI_VERSION, 81);
     }
 
     #[test]

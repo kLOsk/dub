@@ -497,15 +497,16 @@ struct CalibrationBar: NSViewRepresentable {
     private func configure(_ v: CalibrationBarView) {
         v.read = { [engine, deckIdx] in
             let t = engine.deckTelemetry(deckIdx: deckIdx)
-            return (Double(t.measureProgress), t.calibrating)
+            return (Double(t.measureProgress), t.calibrating, t.weakChannel)
         }
         v.tint = NSColor(tint)
     }
 }
 
 final class CalibrationBarView: NSView {
-    /// `(progress 0…1, still capturing the whitening window?)`.
-    var read: () -> (Double, Bool) = { (0, true) }
+    /// `(progress 0…1, still capturing the whitening window?, the channel
+    /// a refused calibration found failing — 0 none, 1 left, 2 right)`.
+    var read: () -> (Double, Bool, UInt8) = { (0, true, 0) }
     var tint: NSColor = .white {
         didSet { fill.backgroundColor = tint.cgColor }
     }
@@ -522,6 +523,7 @@ final class CalibrationBarView: NSView {
     private var timer: Timer?
     private var progress: Double = 0
     private var capturing = true
+    private var weakChannel: UInt8 = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -575,9 +577,10 @@ final class CalibrationBarView: NSView {
     }
 
     private func refresh() {
-        let (p, c) = read()
+        let (p, c, w) = read()
         progress = max(0, min(1, p))
         capturing = c
+        weakChannel = w
         place()
     }
 
@@ -598,9 +601,23 @@ final class CalibrationBarView: NSView {
         // "Calibrating" is the whitening capture; after it the decoder
         // is fitting the platter's wobble so the pitch reads true. Both
         // hold the deck, and the DJ needs to know it is still working.
-        label.string = capturing ? "CALIBRATING" : "SETTLING PITCH"
-        label.frame = CGRect(x: inset, y: textY, width: b.width / 2, height: 15)
-        percent.string = "\(Int((progress * 100).rounded())) %"
+        // A refused calibration: one channel of the pair is failing, and
+        // whitening it back up would only play its noise. Say which, in
+        // the place the DJ is already watching (rig, 2026-11-11).
+        if weakChannel != 0 {
+            let side = weakChannel == 1 ? "LEFT" : "RIGHT"
+            label.string = "\(side) CHANNEL WEAK — CHECK CARTRIDGE / CABLE"
+            label.foregroundColor = NSColor(DubColor.stateError).cgColor
+            label.frame = CGRect(x: inset, y: textY, width: b.width - inset * 2, height: 15)
+            fill.backgroundColor = NSColor(DubColor.stateError).cgColor
+            percent.string = ""
+        } else {
+            label.string = capturing ? "CALIBRATING" : "SETTLING PITCH"
+            label.foregroundColor = NSColor(DubColor.textPrimary).cgColor
+            label.frame = CGRect(x: inset, y: textY, width: b.width / 2, height: 15)
+            fill.backgroundColor = tint.cgColor
+            percent.string = "\(Int((progress * 100).rounded())) %"
+        }
         percent.frame = CGRect(x: b.width / 2, y: textY, width: b.width / 2 - inset, height: 15)
         CATransaction.commit()
     }

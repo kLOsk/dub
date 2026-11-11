@@ -179,6 +179,15 @@ pub enum Command {
     /// engaged.
     DeckReleaseEcho { idx: u8 },
 
+    /// Echo-out HOLD on deck `idx` (toggle): the captured beat repeats at
+    /// just-under-endless feedback for a one-turntable record swap.
+    /// Cleared by [`Self::DeckReleaseEcho`].
+    DeckSetEchoHold { idx: u8, on: bool },
+
+    /// Space Echo HOLD on deck `idx` (toggle): nothing new onto the tape,
+    /// the loop sustained just under self-oscillation.
+    DeckSetSpaceEchoHold { idx: u8, on: bool },
+
     /// Live-update echo-out `feedback` and feedback low-pass (`lp_coeff`,
     /// resolved off-RT from the cutoff) on deck `idx` while held or idle
     /// (UI sliders). The echo *length* only changes on a fresh
@@ -567,6 +576,16 @@ impl std::fmt::Debug for Command {
             Self::DeckReleaseEcho { idx } => {
                 f.debug_struct("DeckReleaseEcho").field("idx", idx).finish()
             }
+            Self::DeckSetEchoHold { idx, on } => f
+                .debug_struct("DeckSetEchoHold")
+                .field("idx", idx)
+                .field("on", on)
+                .finish(),
+            Self::DeckSetSpaceEchoHold { idx, on } => f
+                .debug_struct("DeckSetSpaceEchoHold")
+                .field("idx", idx)
+                .field("on", on)
+                .finish(),
             Self::DeckSetEchoParams {
                 idx,
                 feedback,

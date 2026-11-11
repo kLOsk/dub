@@ -110,6 +110,35 @@ pub const DEFAULT_STICKY_BLOCKS_TO_DISENGAGE: u32 = 4;
 /// CoreAudio quantum behaves identically to the 64-frame design point.
 const DECODE_CHUNK_FRAMES: usize = 64;
 
+/// Speed band (|raw rate|) a chunk must be in to count toward the
+/// whitening calibration. The cartridge ellipse is only measured on a
+/// carrier the platter is turning — a stopped stylus decodes as a
+/// confident rate of 0 on hum and DC, and one second of that once
+/// installed a [5.0 / 0.71] whitening that made the deck play robotic
+/// until a manual recalibrate (rig, 2026-11-11).
+const CAL_RATE_BAND: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+
+/// Confidence floor for a calibration chunk. Below the lock floor on
+/// purpose: an uncalibrated ellipse is exactly what lowers confidence,
+/// and the calibration is what fixes it. Below 0.5 is noise.
+const CAL_CONFIDENCE_FLOOR: f32 = 0.5;
+
+/// Largest level difference between the two channels a calibration
+/// accepts (amplitude ratio, ~9.5 dB). A healthy cartridge is within a
+/// dB or two; beyond this one channel is failing — a loose headshell
+/// pin, a cartridge clip, a cable — and whitening it back up multiplies
+/// its noise by the same factor. The rig's deck A came in at 7× and then
+/// 33× (2026-11-11) and played robotic with the pitch reading −44 %;
+/// refused, the deck says which channel to check instead.
+const CAL_MAX_IMBALANCE: f64 = 3.0;
+
+/// How long a capture may wait for a second of turning carrier before
+/// it is dropped. A capture started by a short burst on an input that
+/// then carries something else — a mixer send, a stopped platter — would
+/// otherwise sit at CALIBRATING forever (rig, 2026-11-11). Dropped, the
+/// next timecode the deck sees starts a fresh one.
+const CAL_TIMEOUT_SECS: f32 = 10.0;
+
 /// Time constant for decaying a held rate through low-confidence
 /// windows (lukewarm blend remainder + sticky window from its second
 /// block). Models a platter a hand is actively stopping/turning —
@@ -615,6 +644,8 @@ pub struct TimecodeInput {
     /// result that would leave the cartridge ellipse uncorrected).
     installed_whitening: [[f64; 2]; 2],
     calibration_seq: u32,
+    /// See [`Self::weak_channel`].
+    weak_channel: u8,
 
     /// Outlier-rejecting + adaptive smoother for the decoded rate. Sits
     /// on the rate the moment it leaves the decoder, so both the audible
@@ -677,6 +708,26 @@ struct CalCapture {
     sim: f64,
     frames: usize,
     target: usize,
+    /// All input frames since the capture began, clean or not — the
+    /// clock [`CAL_TIMEOUT_SECS`] runs on.
+    elapsed: usize,
+}
+
+impl CalCapture {
+    /// The quieter channel, when the pair's levels differ by more than
+    /// [`CAL_MAX_IMBALANCE`]: 1 the first (`im`, ch0), 2 the second
+    /// (`re`, ch1). `None` for a usable pair.
+    fn weak_channel(&self) -> Option<u8> {
+        #[allow(clippy::cast_precision_loss)]
+        let n = self.frames.max(1) as f64;
+        let var_re = (self.saa / n - (self.sre / n).powi(2)).max(0.0);
+        let var_im = (self.sbb / n - (self.sim / n).powi(2)).max(0.0);
+        let (lo, hi) = (var_re.min(var_im), var_re.max(var_im));
+        if hi <= 0.0 || lo * CAL_MAX_IMBALANCE * CAL_MAX_IMBALANCE >= hi {
+            return None;
+        }
+        Some(if var_re < var_im { 2 } else { 1 })
+    }
 }
 
 impl TimecodeInput {
@@ -701,6 +752,7 @@ impl TimecodeInput {
             calibrated: false,
             installed_whitening: dub_timecode::IDENTITY_WHITENING,
             calibration_seq: 0,
+            weak_channel: 0,
             rate_smoother: RateSmoother::new(),
             last_raw_rate: 1.0,
             anchors: AnchorMap::new(),
@@ -734,6 +786,7 @@ impl TimecodeInput {
             sim: 0.0,
             frames: 0,
             target: target_frames.max(1),
+            elapsed: 0,
         });
         self.calibrated = false;
         // A fresh calibration is a fresh session for the zero anchor
@@ -742,6 +795,15 @@ impl TimecodeInput {
         // the new whitening installs.
         self.anchors.reset();
         self.zero_anchor_cap = None;
+    }
+
+    /// Drop an in-flight calibration without installing it — the input
+    /// stopped being timecode (the deck went to THRU or DUB FX). The deck
+    /// stays uncalibrated, so the next timecode it sees starts a fresh
+    /// capture. A calibration already installed is kept: the cartridge
+    /// has not changed. RT-safe.
+    pub(crate) fn cancel_calibration(&mut self) {
+        self.cal = None;
     }
 
     /// Fold one chunk's raw smoothed rate into the zero (detent) anchor.
@@ -831,6 +893,14 @@ impl TimecodeInput {
     #[must_use]
     pub(crate) fn installed_whitening(&self) -> ([[f64; 2]; 2], u32) {
         (self.installed_whitening, self.calibration_seq)
+    }
+
+    /// Which channel the last calibration refused as too weak (see
+    /// [`CAL_MAX_IMBALANCE`]): 0 none · 1 first · 2 second. Cleared by
+    /// the next calibration that installs.
+    #[must_use]
+    pub fn weak_channel(&self) -> u8 {
+        self.weak_channel
     }
 
     /// Number of input samples currently buffered between the IOProc
@@ -940,6 +1010,13 @@ impl TimecodeInput {
             let end = (start + DECODE_CHUNK_FRAMES * 2).min(popped_even);
             let chunk_frames = (end - start) / 2;
             let mut out = self.decoder.process(&self.scratch[start..end]);
+            if self.cal.is_some()
+                && CAL_RATE_BAND.contains(&out.rate.abs())
+                && out.confidence >= CAL_CONFIDENCE_FLOOR
+                && out.amplitude >= self.anchor_amp_floor
+            {
+                self.fold_calibration(start, end);
+            }
             start = end;
             #[allow(clippy::cast_precision_loss)]
             let dt_secs = chunk_frames as f64 / f64::from(self.input_sample_rate);
@@ -976,7 +1053,7 @@ impl TimecodeInput {
             final_intent = Some(intent);
         }
         self.last_output = last_out;
-        self.accumulate_calibration(popped_even);
+        self.install_calibration_when_complete(popped_even / 2);
         // One intent per quantum, as before. A quantum that was
         // LockedAbsolute end-to-end carries the exact summed groove
         // advance; a mixed quantum (lock transition mid-quantum)
@@ -1047,12 +1124,13 @@ impl TimecodeInput {
         }
     }
 
-    /// Fold this block's raw `(ch1, ch0)` covariance into an in-flight
-    /// calibration, and install the computed whitening once the capture
-    /// window completes. No-op when not calibrating. RT-safe.
-    fn accumulate_calibration(&mut self, popped_even: usize) {
+    /// Fold one decoded chunk's raw `(ch1, ch0)` covariance
+    /// (`scratch[start..end]`) into an in-flight calibration. The caller
+    /// passes only chunks of a turning carrier — see [`CAL_RATE_BAND`].
+    /// No-op when not calibrating. RT-safe.
+    fn fold_calibration(&mut self, start: usize, end: usize) {
         if let Some(cal) = self.cal.as_mut() {
-            for frame in self.scratch[..popped_even].chunks_exact(2) {
+            for frame in self.scratch[start..end].chunks_exact(2) {
                 let re = f64::from(frame[1]);
                 let im = f64::from(frame[0]);
                 cal.saa += re * re;
@@ -1061,10 +1139,33 @@ impl TimecodeInput {
                 cal.sre += re;
                 cal.sim += im;
             }
-            cal.frames += popped_even / 2;
+            cal.frames += (end - start) / 2;
+        }
+    }
+
+    /// Install the computed whitening once the capture window holds
+    /// enough clean carrier — unless one channel is failing, which is
+    /// reported instead — or drop a capture that waited too long for it.
+    /// `block_frames` is this block's input. No-op when not calibrating.
+    /// RT-safe.
+    fn install_calibration_when_complete(&mut self, block_frames: usize) {
+        if let Some(cal) = self.cal.as_mut() {
+            cal.elapsed += block_frames;
         }
         if let Some(cal) = self.cal {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let timeout = (CAL_TIMEOUT_SECS * self.input_sample_rate) as usize;
+            if cal.frames < cal.target && cal.elapsed >= timeout {
+                self.cal = None;
+                return;
+            }
             if cal.frames >= cal.target {
+                if let Some(weak) = cal.weak_channel() {
+                    self.weak_channel = weak;
+                    self.cal = None;
+                    return;
+                }
+                self.weak_channel = 0;
                 let w = whitening_from_covariance(
                     cal.saa, cal.sbb, cal.sab, cal.sre, cal.sim, cal.frames,
                 );
@@ -1783,6 +1884,100 @@ mod anchor_learning_tests {
         // Fine moves survive: +0.1 % off the detent reads ~+0.1 %.
         let mean = run(&mut input, &mut tx, &mut gen, 1.003, 1.0);
         assert!((mean - 1.001).abs() < 5e-4, "fine move distorted: {mean}");
+    }
+
+    /// Rig, 2026-11-11: auto-calibration ran on a stopped stylus — hum
+    /// on one channel, almost nothing on the other — and installed a
+    /// [5.0 / 0.71] whitening; the deck played robotic until a manual
+    /// recalibrate. Only a turning carrier may be measured: half a
+    /// second of lopsided hum first, then the record, must calibrate
+    /// on the record.
+    #[test]
+    fn calibration_measures_the_turning_record_not_a_stopped_stylus() {
+        let (mut input, mut tx) = input_with_producer();
+        input.begin_calibration(4_800);
+        let mut hum = vec![0.0_f32; BLOCK * 2];
+        // Half a second of 512-frame blocks at 48 kHz.
+        #[allow(clippy::cast_precision_loss)]
+        for b in 0..47 {
+            for (i, frame) in hum.chunks_exact_mut(2).enumerate() {
+                let t = (b * BLOCK + i) as f32 / SR;
+                let s = (2.0 * std::f32::consts::PI * 50.0 * t).sin();
+                frame[0] = 0.05 * s;
+                frame[1] = 0.002 * s;
+            }
+            assert_eq!(tx.push_slice(&hum), hum.len());
+            let _ = input.drive();
+        }
+        assert!(
+            !input.is_calibrated(),
+            "calibrated on a stopped stylus: {:?}",
+            input.installed_whitening().0
+        );
+        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
+        let _ = run(&mut input, &mut tx, &mut gen, 1.0, 1.0);
+        assert!(input.is_calibrated(), "the record never calibrated");
+        let w = input.installed_whitening().0;
+        let ratio = w[0][0].abs().max(w[1][1].abs()) / w[0][0].abs().min(w[1][1].abs());
+        assert!(
+            ratio < 1.5,
+            "lopsided whitening from a balanced record: {w:?}"
+        );
+    }
+
+    /// Rig, 2026-11-11: deck A's second channel came in 33× down — a
+    /// cartridge / cable fault — and the calibration whitened it back up,
+    /// noise and all: robotic sound, pitch reading −44 %. A pair that far
+    /// apart is refused and the weak channel named; once the pair is
+    /// healthy again it calibrates and the warning clears.
+    #[test]
+    fn a_failing_channel_is_refused_and_named_not_whitened() {
+        let (mut input, mut tx) = input_with_producer();
+        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
+        input.begin_calibration(4_800);
+        let mut sig = vec![0.0_f32; BLOCK * 2];
+        // 0.5 s of carrier with the second channel 30 dB down.
+        for _ in 0..47 {
+            gen.render(&mut sig, 1.0, 0.4);
+            for frame in sig.chunks_exact_mut(2) {
+                frame[1] *= 0.03;
+            }
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            let _ = input.drive();
+        }
+        assert!(!input.is_calibrated(), "whitened a failing channel");
+        assert_eq!(
+            input.weak_channel(),
+            2,
+            "the second channel is the weak one"
+        );
+
+        input.begin_calibration(4_800);
+        let _ = run(&mut input, &mut tx, &mut gen, 1.0, 0.5);
+        assert!(input.is_calibrated(), "a healthy pair did not calibrate");
+        assert_eq!(input.weak_channel(), 0, "the warning outlived the fault");
+    }
+
+    /// A capture that never sees a turning carrier gives up after
+    /// `CAL_TIMEOUT_SECS` instead of sitting at CALIBRATING for good.
+    #[test]
+    fn a_capture_with_no_turning_carrier_times_out() {
+        let (mut input, mut tx) = input_with_producer();
+        input.begin_calibration(4_800);
+        let silence = vec![0.0_f32; BLOCK * 2];
+        // 9 s: still waiting.
+        for _ in 0..844 {
+            assert_eq!(tx.push_slice(&silence), silence.len());
+            let _ = input.drive();
+        }
+        assert!(input.is_calibrating(), "gave up before the timeout");
+        // Past 10 s: dropped, still uncalibrated.
+        for _ in 0..140 {
+            assert_eq!(tx.push_slice(&silence), silence.len());
+            let _ = input.drive();
+        }
+        assert!(!input.is_calibrating(), "a stuck capture never timed out");
+        assert!(!input.is_calibrated());
     }
 
     #[test]

@@ -162,6 +162,8 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(DubAction.fxToggle(2).id, "fx.unit.2")
         XCTAssertEqual(DubAction.fxKick.id, "fx.kick")
         XCTAssertEqual(DubAction.echoOut(.a).id, "echo.a")
+        XCTAssertEqual(DubAction.echoHold(.b).id, "echo.hold.b")
+        XCTAssertEqual(DubAction.fxHold.id, "fx.hold")
     }
 
     /// Every id round-trips through the parser a stored profile uses,
@@ -171,6 +173,7 @@ final class DubKeymapTests: XCTestCase {
             .loadSelection, .openPreferences, .tapGrid, .hotCue(5), .sirenPreset(0),
             .instantDouble(toDeckB: false), .instantDouble(toDeckB: true), .sampler(3),
             .quickScratch(.a, 0), .quickScratch(.b, 3), .fxToggle(3), .fxKick, .echoOut(.b),
+            .echoHold(.a), .echoHold(.b), .fxHold, .fxTap,
         ]
         for action in all {
             XCTAssertEqual(DubAction(id: action.id), action, action.id)

@@ -97,6 +97,21 @@ impl Re201Mode {
     }
 }
 
+/// Time constant of the repeat-rate glide. The RE-201's Repeat Rate knob
+/// is its motor speed, so turning it bends the echoes in pitch rather than
+/// jumping them; a jump is a click, and a repeat synced to a platter moves
+/// every time the DJ rides the pitch. Long enough to be smooth, short
+/// enough that a synced echo lands on the new tempo within a beat.
+pub const REPEAT_GLIDE_SECS: f32 = 0.08;
+
+/// Least the heads move per sample while gliding: 0.1 % tape speed.
+const GLIDE_MIN_SLEW: f32 = 1e-3;
+
+/// Loop gain while HOLD is on: just under endless, through a loop that
+/// skips the low-end thinning — a held loop neither dies nor runs away over
+/// a record swap (pinned by `hold_sustains_the_loop_without_growing`).
+pub const HOLD_INTENSITY: f32 = 0.995;
+
 /// A Roland RE-201 Space Echo. Insert it on a signal: [`Re201::process_block`]
 /// **adds** the wet echo + reverb on top of the dry already in the buffer (the
 /// unit's direct path is clean; only the echoes are tape-coloured).
@@ -109,7 +124,15 @@ pub struct Re201 {
     max_delay_samples: f32,
 
     /// Per-head delay in (fractional) samples; index 2 is the longest.
+    /// Glides toward `head_targets` — the motor changing speed.
     head_delays: [f32; 3],
+    /// Where the Repeat Rate puts the heads.
+    head_targets: [f32; 3],
+    /// Per-sample glide coefficient ([`REPEAT_GLIDE_SECS`]).
+    glide_coeff: f32,
+    /// Audio has run since construction or [`Re201::reset`]. Until then a
+    /// new rate is taken at once — there is nothing on the tape to bend.
+    primed: bool,
     heads_active: [bool; 3],
     /// Index of the longest *active* head — feedback recirculates from this one
     /// tap, so loop gain tracks Intensity regardless of how many heads are live
@@ -137,6 +160,9 @@ pub struct Re201 {
     // Onboard spring reverb.
     reverb: SpringReverb,
     reverb_on: bool,
+    /// HOLD: no new input onto the tape, loop gain pinned at
+    /// [`HOLD_INTENSITY`].
+    hold: bool,
 }
 
 impl Re201 {
@@ -162,9 +188,15 @@ impl Re201 {
             write: 0,
             max_delay_samples: (cap - 4) as f32,
             head_delays: [0.0; 3],
+            head_targets: [0.0; 3],
+            // Not `one_pole_coeff`: its 20 Hz floor would make this an 8 ms
+            // glide — a race, not a motor.
+            glide_coeff: 1.0 - (-1.0 / (REPEAT_GLIDE_SECS * sample_rate)).exp(),
+            primed: false,
             heads_active: [true, true, true],
             fb_head_idx: 2,
             intensity: 0.5,
+            hold: false,
             echo_volume: 0.7,
             fb_lp: 0.0,
             fb_lp_coeff: one_pole_coeff(3_000.0, sample_rate),
@@ -203,13 +235,33 @@ impl Re201 {
     }
 
     /// Repeat Rate: set the longest head's delay in ms (heads 1 & 2 follow at
-    /// fixed ratios). Resolved to fractional samples off-RT.
+    /// fixed ratios). Resolved to fractional samples off-RT. Once audio is
+    /// running the heads glide there ([`REPEAT_GLIDE_SECS`]).
     pub fn set_repeat_rate(&mut self, longest_delay_ms: f32) {
         let longest =
             (longest_delay_ms / 1000.0 * self.sample_rate).clamp(2.0, self.max_delay_samples);
-        for (d, &r) in self.head_delays.iter_mut().zip(HEAD_RATIOS.iter()) {
+        for (d, &r) in self.head_targets.iter_mut().zip(HEAD_RATIOS.iter()) {
             *d = (longest * r).max(1.0);
         }
+        if !self.primed {
+            self.head_delays = self.head_targets;
+        }
+    }
+
+    /// HOLD (toggle): the tape keeps what it has. Nothing new is recorded
+    /// — the needle lift, the crackle and the thump of the drop during a
+    /// record swap stay out of the loop — and the intensity is pinned just
+    /// under self-oscillation, so the loop sustains at about its level
+    /// instead of dying or running away. Off returns to the set intensity
+    /// and input.
+    pub fn set_hold(&mut self, on: bool) {
+        self.hold = on;
+    }
+
+    /// Whether HOLD is on.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.hold
     }
 
     /// Intensity (feedback): 0 = single repeat, ~1.1 = self-oscillation. The
@@ -259,6 +311,8 @@ impl Re201 {
     /// Clear the tape and all filter/LFO state. Bounded but touches the whole
     /// ring; call off-RT.
     pub fn reset(&mut self) {
+        self.head_delays = self.head_targets;
+        self.primed = false;
         self.tape.fill(0.0);
         self.write = 0;
         self.fb_lp = 0.0;
@@ -293,8 +347,21 @@ impl Re201 {
     /// indexed loads/stores, no allocation.
     pub fn process_block(&mut self, out: &mut [f32], stride: usize, offset: usize) {
         debug_assert!(stride >= 2 && offset + 2 <= stride);
+        self.primed = true;
         for frame in out.chunks_exact_mut(stride) {
             let dry = 0.5 * (frame[offset] + frame[offset + 1]);
+
+            for (d, &t) in self.head_delays.iter_mut().zip(self.head_targets.iter()) {
+                // The floor keeps the last few samples moving: at ~20 000
+                // samples of delay the exponential's step drops below an
+                // f32 ulp and would stall short of the target.
+                let diff = t - *d;
+                *d = if diff.abs() <= GLIDE_MIN_SLEW {
+                    t
+                } else {
+                    *d + diff * self.glide_coeff + diff.signum() * GLIDE_MIN_SLEW
+                };
+            }
 
             // Wow + flutter modulate the read position (→ pitch wobble).
             let wow = self.lut(self.wow_phase);
@@ -331,8 +398,21 @@ impl Re201 {
             // Feedback path: HF loss, low-end thinning, tape saturation.
             self.fb_lp = flush(self.fb_lp + self.fb_lp_coeff * (fb_in - self.fb_lp));
             self.fb_dc = flush(self.fb_dc + self.fb_hp_coeff * (self.fb_lp - self.fb_dc));
-            let coloured = soft_clip(self.fb_lp - self.fb_dc);
-            self.tape[self.write] = flush(dry + coloured * self.intensity);
+            // Held, the loop skips the low-end thinning: it takes ~15 % a
+            // pass off the bass, so no single gain could keep the low end
+            // alive without the mids running away. The gentle HF loss and
+            // the tape saturation stay — the hold still sounds like tape.
+            let coloured = if self.hold {
+                soft_clip(self.fb_lp)
+            } else {
+                soft_clip(self.fb_lp - self.fb_dc)
+            };
+            let (record, gain) = if self.hold {
+                (0.0, HOLD_INTENSITY)
+            } else {
+                (dry, self.intensity)
+            };
+            self.tape[self.write] = flush(record + coloured * gain);
             self.write = (self.write + 1) & self.mask;
 
             let wet = echo * self.echo_volume;
@@ -427,6 +507,140 @@ mod tests {
         assert!(late > 1e-3, "self-oscillation died: {late}");
         // ... but the in-loop soft-clip keeps it bounded and finite.
         assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 4.0));
+    }
+
+    /// HOLD (2026-10-06): the tape keeps what it has — no new input — and
+    /// the loop sustains at roughly its level for a record swap: neither
+    /// dying nor running away into the self-oscillation whine.
+    #[test]
+    fn hold_sustains_the_loop_without_growing() {
+        let mut re = Re201::new(SR);
+        re.set_mode(Re201Mode::Triple);
+        re.set_repeat_rate(450.0);
+        re.set_intensity(0.6);
+        re.set_echo_volume(1.0);
+        let sr = SR as usize;
+        let mut buf = vec![0.0f32; 2];
+        // A second of a 150 Hz tone into the tape, then HOLD.
+        for i in 0..sr {
+            let x = 0.4 * (i as f32 * 2.0 * std::f32::consts::PI * 150.0 / SR).sin();
+            buf[0] = x;
+            buf[1] = x;
+            re.process_block(&mut buf, 2, 0);
+        }
+        re.set_hold(true);
+        let mut out = Vec::with_capacity(sr * 16);
+        for _ in 0..sr * 16 {
+            buf[0] = 0.0;
+            buf[1] = 0.0;
+            re.process_block(&mut buf, 2, 0);
+            out.push(buf[0]);
+        }
+        let early = rms(&out[sr..2 * sr]);
+        let late = rms(&out[15 * sr..16 * sr]);
+        assert!(early > 0.02, "nothing on the tape: {early}");
+        assert!(late > early * 0.5, "held loop died: {early} → {late}");
+        assert!(late < early * 1.5, "held loop ran away: {early} → {late}");
+    }
+
+    /// Held, nothing new reaches the tape: the needle lift, the crackle,
+    /// the thump of the drop stay out of the loop.
+    #[test]
+    fn hold_keeps_new_input_off_the_tape() {
+        let run = |click: bool| {
+            let mut re = Re201::new(SR);
+            re.set_mode(Re201Mode::Triple);
+            re.set_repeat_rate(300.0);
+            re.set_intensity(0.6);
+            re.set_echo_volume(1.0);
+            re.set_hold(true);
+            let mut wet = Vec::new();
+            let mut buf = vec![0.0f32; 2];
+            for i in 0..SR as usize * 2 {
+                let x = if click && i == 1_000 { 1.0 } else { 0.0 };
+                buf[0] = x;
+                buf[1] = x;
+                re.process_block(&mut buf, 2, 0);
+                // The wet alone: subtract the dry that passes through.
+                wet.push(buf[0] - x);
+            }
+            wet
+        };
+        let quiet = run(false);
+        let clicked = run(true);
+        let diff = quiet
+            .iter()
+            .zip(&clicked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-6, "a click during HOLD reached the tape: {diff}");
+    }
+
+    /// Running a 150 Hz tone through, then moving the repeat rate: the
+    /// wet output, sample to sample. A head that jumps leaves a step the
+    /// size of the waveform; one that glides only bends the pitch.
+    fn wet_steps_across_a_repeat_change(from_ms: f32, to_ms: f32, at: usize) -> (f32, f32) {
+        let mut re = Re201::new(SR);
+        re.set_mode(Re201Mode::Triple);
+        re.set_repeat_rate(from_ms);
+        re.set_intensity(0.5);
+        re.set_echo_volume(1.0);
+        let sr = SR as usize;
+        let mut wet = Vec::with_capacity(sr * 2);
+        for i in 0..sr * 2 {
+            if i == sr + at {
+                re.set_repeat_rate(to_ms);
+            }
+            let x = 0.4 * (i as f32 * 2.0 * std::f32::consts::PI * 151.3 / SR).sin();
+            let mut buf = [x, x];
+            re.process_block(&mut buf, 2, 0);
+            wet.push(buf[0] - x);
+        }
+        let step = |w: &[f32]| {
+            w.windows(2)
+                .map(|p| (p[1] - p[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        (step(&wet[sr / 2..sr]), step(&wet[sr..sr + sr / 2]))
+    }
+
+    /// Synced to a platter, the repeat moves while the DJ rides the pitch
+    /// — and a knob turned live moves it too. The heads glide to the new
+    /// time the way the RE-201's motor changes speed (the echo bends in
+    /// pitch), never jump (a click on every move).
+    #[test]
+    fn a_repeat_change_glides_instead_of_clicking() {
+        // Across a spread of instants: wherever the move lands on the
+        // waveform, it must not step.
+        for at in (0..400).step_by(37) {
+            let (before, after) = wet_steps_across_a_repeat_change(300.0, 410.0, at);
+            assert!(
+                after < before * 2.0,
+                "repeat change at +{at} clicked: {before} → {after}"
+            );
+        }
+    }
+
+    /// ... and gets there: the heads settle on the new time.
+    #[test]
+    fn a_glided_repeat_settles_on_the_new_time() {
+        let mut re = Re201::new(SR);
+        re.set_mode(Re201Mode::Triple);
+        re.set_repeat_rate(300.0);
+        let mut buf = [0.0f32; 2];
+        for _ in 0..1_000 {
+            re.process_block(&mut buf, 2, 0);
+        }
+        re.set_repeat_rate(450.0);
+        for _ in 0..SR as usize {
+            re.process_block(&mut buf, 2, 0);
+        }
+        let want = 0.45 * SR;
+        assert!(
+            (re.head_delays[2] - want).abs() < 1.0,
+            "{} vs {want}",
+            re.head_delays[2]
+        );
     }
 
     #[test]

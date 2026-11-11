@@ -230,7 +230,7 @@ Honest about the limits:
 
 ### 2.2.10 Items in the Manual Rig Checklist
 
-Every release runs through this on real hardware. All must pass.
+Every release runs through this on real hardware. All must pass. The runnable form — every item as *do this → expect that*, with a sign-off sheet — is [`RIG-CHECKLIST.md`](../RIG-CHECKLIST.md); this list is the summary.
 
 1. Cold launch with no library configured → first-run experience appears, no crash.
 2. Import a 50k-track Serato library → completes within 60 s, no crash, no missing metadata.
@@ -240,8 +240,8 @@ Every release runs through this on real hardware. All must pass.
 6. Play a track for 30 minutes with timecode active, key lock on, occasional scratching → zero xruns, no audible glitches.
 7. Engage Echo-Out 50 times in a row → no degradation, tail decays cleanly each time.
 8. Switch a deck to Thru, drop a real record → audio passes through the engine (~2.7 ms one-way), waveform builds live, auto-BPM locks.
-9. On the same Thru deck, engage Echo-Out → FX layers on top of the dry record; disengage → echo tail decays naturally over the next bar.
-10. Auto-BPM on Thru locks within 15 s on a 4/4 hip-hop record, a reggae record, and a dnb record.
+9. On the same Thru deck, engage Echo-Out → the record mutes and the echo plays out (§6.3 — 100 % wet); disengage → the record is back at its slipped position.
+10. Auto-BPM on Thru locks within 15 s on a 4/4 hip-hop record, a reggae record, and a dnb record. *(Open: the engine tracks it, but only the CLI wires it up; the app shows no BPM on Thru yet.)*
 11. Unplug the audio interface mid-playback → engine stops cleanly, UI shows "interface lost", reconnect → playback resumes.
 12. Run 60 minutes continuous use (any combination of features), close the app cleanly → no crash, no orphan processes.
 13. Open the macOS sleep/wake cycle while Dub is running → audio resumes without artifacts on wake.
@@ -762,6 +762,7 @@ Hot cues persist per track (`track_cues`, `source='user'`; see [`LIBRARY-SCHEMA.
 - Hold-to-engage button (or keyboard tap with sustain)
 - On the press the deck plays **the next beat** as normal while it is captured into a delay line; then the deck's main signal is muted and that beat repeats with feedback decay. The beat after the press, not the one before it (Daniel, 2026-09-25): the DJ hits the button on the beat they want to throw away, and hears it go. Pressing again inside that beat cancels with nothing muted.
 - Parameters: divisions (1/4, 1/2, 1, 2, 4 beats), feedback (default 60 %), filter (low-pass, default 8 kHz)
+- **HOLD** (toggle, Daniel 2026-10-06): the thrown beat recirculates just under endless (0.995), so it carries the room through a **one-turntable record swap** — traditional dub, where the transition is an effect held while the needle comes up and the next record goes down. HOLD again lets it decay; OUT cuts it and clears HOLD. The DUB FX channel's Space Echo has the same HOLD: nothing new onto the tape (the lift and the drop stay out of the loop), the loop sustained without running away. The deck's HOLD shows only with DUB FX enabled — without it, ECHO OUT is the one button it always was. The Space Echo also has **SYNC** (the repeat follows the other deck's live tempo at ½ · ¾ · 1 beat) and **TAP** (the tempo by hand, for a real record in THRU, which has no BPM); its heads glide to a new repeat as the RE-201's motor does, so a synced echo follows the platter's pitch without clicking.
 - One-button workflow: tap and hold → echo-out engages; release → tail decays naturally; deck's actual playback continues where it would have been (slip-aware).
 
 **Dub Siren**

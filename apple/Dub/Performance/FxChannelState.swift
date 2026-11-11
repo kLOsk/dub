@@ -56,6 +56,19 @@ struct FxRackControls: Equatable {
     var spaceEchoReverb: Double = 0.3
     /// Tape age, 0…2.
     var spaceEchoWowFlutter: Double = 0.3
+    /// HOLD: nothing new onto the tape, the loop sustained — the record
+    /// swap of one-turntable dub.
+    var spaceEchoHold: Bool = false
+    /// SYNC: the repeat follows the music's tempo — the other deck's live
+    /// BPM when it has one, else the tempo tapped in (a real record in
+    /// THRU has no BPM). Turning the Repeat knob takes it off.
+    var spaceEchoSync: Bool = false
+    /// The longest head, in beats, while synced. At ¾ the three heads
+    /// (0.337 · 0.668 · 1 of it) land on a quarter, a half and three
+    /// quarters of a beat — every echo on the sixteenths.
+    var spaceEchoDivision: Double = 0.75
+    /// The tempo tapped on TAP, BPM; `nil` until tapped.
+    var spaceEchoTapBpm: Double?
 
     var springDecay: Double = 0.6
     /// 0 dark → 1 bright (`springToneHz` gives the Hz).
@@ -69,6 +82,60 @@ struct FxRackControls: Equatable {
 
     /// The tape self-oscillates past unity feedback.
     var spaceEchoRunaway: Bool { spaceEchoIntensity > 1.0 }
+
+    /// The divisions SYNC offers, in beats, with their key labels.
+    static let spaceEchoDivisions: [(beats: Double, label: String)] = [
+        (0.5, "½"), (0.75, "¾"), (1.0, "1"),
+    ]
+
+    /// The tape is 750 ms long; reggae and dub sit at 60–90 BPM, where a
+    /// beat is 667–1 000 ms.
+    static let spaceEchoRepeatRange: ClosedRange<Double> = 20...750
+
+    /// The repeat for `division` beats at `bpm`. A time longer than the
+    /// tape is halved until it fits, so the echoes still land on the
+    /// beat grid — ¾ of a beat at 55 BPM becomes ⅜.
+    static func syncedRepeatMs(bpm: Double, division: Double) -> Double? {
+        guard bpm.isFinite, bpm > 0, division > 0 else { return nil }
+        var ms = 60_000 / bpm * division
+        while ms > spaceEchoRepeatRange.upperBound { ms /= 2 }
+        return max(ms, spaceEchoRepeatRange.lowerBound)
+    }
+
+    /// The tempo from TAP: the mean of the last few intervals between
+    /// presses, `taps` in seconds, oldest first. A gap over two seconds
+    /// starts a new count. `nil` until two taps belong together.
+    static func tappedBpm(_ taps: [TimeInterval]) -> Double? {
+        var run: [TimeInterval] = []
+        for t in taps {
+            if let last = run.last, t - last > 2 { run.removeAll() }
+            run.append(t)
+        }
+        let recent = run.suffix(5)
+        guard recent.count >= 2, let first = recent.first, let last = recent.last else { return nil }
+        let interval = (last - first) / Double(recent.count - 1)
+        guard interval > 0 else { return nil }
+        return 60 / interval
+    }
+}
+
+/// Where a synced Space Echo takes its tempo from, as the unit prints it.
+struct FxEchoTempo: Equatable {
+    enum Source: Equatable {
+        case deck(DeckSide)
+        case tap
+    }
+
+    var source: Source
+    var bpm: Double
+
+    var text: String {
+        let bpmText = String(format: "%.1f", bpm)
+        switch source {
+        case .deck(let side): return "\(side == .a ? "A" : "B") · \(bpmText)"
+        case .tap: return "TAP · \(bpmText)"
+        }
+    }
 }
 
 /// The four units in the rack's order — the engine's, top to bottom:
@@ -137,6 +204,11 @@ struct FxChannelState: Equatable {
     /// the map; `nil` until bound.
     var toggleLegends: [String?] = [nil, nil, nil, nil]
     var kickLegend: String?
+    var holdLegend: String?
+    var tapLegend: String?
+    /// Where the synced Space Echo's tempo comes from; `nil` when SYNC is
+    /// off or nothing supplies one.
+    var echoTempo: FxEchoTempo?
 
     func toggleLegend(_ unit: FxRackUnit) -> String? {
         unit.rawValue < toggleLegends.count ? toggleLegends[unit.rawValue] : nil
@@ -184,4 +256,6 @@ struct FxChannelCallbacks {
     var onControls: (_ controls: FxRackControls) -> Void = { _ in }
     /// KICK — Tubby's thunder.
     var onKick: () -> Void = {}
+    /// TAP — the Space Echo's tempo, by hand.
+    var onTap: () -> Void = {}
 }

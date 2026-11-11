@@ -193,7 +193,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         side: DeckSide = .a,
         cues: [CueSlotState]? = nil,
         loopBeats: Double? = nil,
-        echoEngaged: Bool = false
+        echoEngaged: Bool = false,
+        echoHeld: Bool = false
     ) -> DeckColumnState {
         DeckColumnState(
             side: side,
@@ -222,6 +223,7 @@ final class PerformanceSnapshotTests: XCTestCase {
             loopEngaged: loopBeats != nil,
             echoEnabled: true,
             echoEngaged: echoEngaged,
+            echoHeld: echoHeld,
             hasTrack: true,
             isPlaying: true,
             scratch: [
@@ -261,6 +263,17 @@ final class PerformanceSnapshotTests: XCTestCase {
 
     /// The column at the width a 1792 pt window actually gives it —
     /// wide enough for two columns of cue rows.
+    /// The echo thrown and HOLD on — the record swap: OUT lit, HOLD lit
+    /// in the echo's violet, the heading reading `● HOLD`. HOLD is there
+    /// only with DUB FX on; every other column fixture has it off and
+    /// keeps the one ECHO OUT.
+    func test_deckColumn_echoHeld() {
+        var state = Self.columnState(echoEngaged: true, echoHeld: true)
+        state.fxAvailable = true
+        snap(deckBg(columnFixture(state)),
+             width: 540, height: 470, named: "deck-column-echo-held")
+    }
+
     func test_deckColumn_wideWindow() {
         snap(deckBg(columnFixture(Self.columnState(loopBeats: 2))),
              width: 540, height: 470, named: "deck-column-wide")

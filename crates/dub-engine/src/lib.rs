@@ -1333,7 +1333,13 @@ impl Engine {
                 Some(out) => self.source_classifier[idx].update(&out),
                 None => self.source_classifier[idx].current(),
             };
-            if class == SourceClass::Timecode && !calibrated && !calibrating {
+            // Never on THRU or DUB FX: the DJ has declared that input a
+            // record or a send, and music decodes as timecode often enough
+            // to start a capture. One did, on a THRU record (rig,
+            // 2026-11-11): a [3.0 −2.5 / −2.5 3.4] whitening, and the deck
+            // was stuck at SETTLING PITCH 47 % when it came back to TC.
+            let live_input = matches!(self.control_mode[idx], ControlMode::Thru | ControlMode::Fx);
+            if class == SourceClass::Timecode && !calibrated && !calibrating && !live_input {
                 if let Some(input) = self.timecode_inputs[idx].as_mut() {
                     input.begin_calibration(CALIBRATION_FRAMES);
                 }
@@ -1372,7 +1378,7 @@ impl Engine {
             // signal-quality log can show what calibration computed.
             if let Some(input) = self.timecode_inputs[idx].as_ref() {
                 let (w, seq) = input.installed_whitening();
-                self.decks[idx].publish_calibration(w, seq);
+                self.decks[idx].publish_calibration(w, seq, input.weak_channel());
             }
 
             // Only Timecode mode lets the decoder drive the deck. In
@@ -1772,6 +1778,11 @@ impl Engine {
                 self.cancel_panic_play(idx);
                 self.abandon_quick_scratch(idx);
                 self.decks[idx].clear_source();
+                // The DJ has said this input is not timecode. A capture
+                // that started on it would measure music.
+                if let Some(input) = self.timecode_inputs[idx].as_mut() {
+                    input.cancel_calibration();
+                }
             }
         }
         self.control_mode[idx] = mode;
@@ -1913,6 +1924,16 @@ impl Engine {
             Command::DeckReleaseEcho { idx } => {
                 if let Some(echo) = self.echo.get_mut(idx as usize) {
                     echo.release();
+                }
+            }
+            Command::DeckSetEchoHold { idx, on } => {
+                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                    echo.set_hold(on);
+                }
+            }
+            Command::DeckSetSpaceEchoHold { idx, on } => {
+                if let Some(re) = self.re201.get_mut(idx as usize) {
+                    re.set_hold(on);
                 }
             }
             Command::DeckSetEchoParams {
@@ -3254,6 +3275,30 @@ mod tests {
         );
     }
 
+    /// HOLD reaches both effects through the handle, and turning the echo
+    /// off clears the echo's hold (2026-10-06, one-turntable record swap).
+    #[test]
+    fn hold_commands_reach_echo_out_and_space_echo() {
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 64 * 2];
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        handle.deck(0).engage_echo(480, 0.6, lp).unwrap();
+        handle.deck(0).set_echo_hold(true).unwrap();
+        handle.deck(0).set_space_echo_hold(true).unwrap();
+        engine.render(&mut rt, &mut out);
+        assert!(engine.echo[0].is_held());
+        assert!(engine.re201[0].is_held());
+        handle.deck(0).release_echo().unwrap();
+        handle.deck(0).set_space_echo_hold(false).unwrap();
+        engine.render(&mut rt, &mut out);
+        assert!(
+            !engine.echo[0].is_held(),
+            "turning the echo off must clear HOLD"
+        );
+        assert!(!engine.re201[0].is_held());
+    }
+
     #[test]
     fn echo_out_mutes_dry_when_engaged_then_restores_it_on_off() {
         // End-to-end "echo out" on an internal deck: engaging mutes the dry
@@ -3330,8 +3375,8 @@ mod tests {
         );
 
         // Engage. The next 480 frames play dry while they are captured; the
-        // rendered window then ends inside the first (full-level) lap of the
-        // echo, so the wet is the captured 0.2.
+        // rendered window then ends inside the first lap of the echo, so the
+        // wet is the captured 0.2 one feedback step down: 0.12.
         let lp = dub_dsp::one_pole_coeff(8_000.0, sr);
         engine.apply_command(Command::DeckEngageEcho {
             idx: 0,
@@ -3344,9 +3389,9 @@ mod tests {
             engine.render(&mut rt, &mut out);
             last = out[0];
         }
-        // Dry muted ⇒ the bus is the wet alone (≈ 0.2), NOT dry + wet (≈ 0.4).
+        // Dry muted ⇒ the bus is the wet alone (≈ 0.12), NOT dry + wet (≈ 0.32).
         assert!(
-            (last - 0.2).abs() < 0.05,
+            (last - 0.12).abs() < 0.03,
             "thru dry was not muted (100% wet): {last}"
         );
         assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Engaged);
@@ -4242,6 +4287,70 @@ mod tests {
         let pos = engine.deck(0).position_frames();
         assert!(pos > 200.0, "deck position should advance (got {pos})");
         assert!(pos < 1100.0, "and not run away (got {pos})");
+    }
+
+    /// Rig, 2026-11-11: a THRU record decoded as timecode often enough to
+    /// start the auto-calibration, which measured the music; back on TC
+    /// the deck stuck at SETTLING PITCH 47 % until a manual Recalibrate.
+    /// THRU and DUB FX inputs are never measured, a capture under way is
+    /// dropped when the deck leaves for them, and the timecode the deck
+    /// sees back on TC calibrates fresh.
+    #[test]
+    fn auto_calibration_never_measures_a_thru_or_fx_input() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut feed = |engine: &mut Engine, blocks: usize| {
+            for _ in 0..blocks {
+                gen.render(&mut sig, 1.0, 0.5);
+                assert_eq!(tx.push_slice(&sig), sig.len());
+                engine.render(&mut rt, &mut buf);
+            }
+        };
+        let input = |engine: &Engine| {
+            let i = engine.timecode_inputs[0].as_ref().expect("attached");
+            (i.is_calibrating(), i.is_calibrated())
+        };
+        // 2 s of carrier on a THRU deck: nothing measured.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        feed(&mut engine, 375);
+        assert_eq!(input(&engine), (false, false), "measured a THRU input");
+
+        // On TC the capture starts; leaving for DUB FX mid-capture drops it.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        let mut started = false;
+        for _ in 0..200 {
+            feed(&mut engine, 1);
+            if input(&engine).0 {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "TC never started a capture");
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Fx,
+        });
+        feed(&mut engine, 375);
+        assert_eq!(input(&engine), (false, false), "measured a DUB FX input");
+
+        // Back on TC the carrier calibrates from scratch.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        feed(&mut engine, 750);
+        assert_eq!(input(&engine), (false, true), "TC did not calibrate");
     }
 
     /// Drive `engine` to a clean ABS lock: feed `gen` carrier one block

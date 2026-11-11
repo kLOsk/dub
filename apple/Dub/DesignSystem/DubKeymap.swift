@@ -72,6 +72,12 @@ enum DubAction: Hashable {
     case fxKick
     /// A deck's ECHO OUT (tap-toggle).
     case echoOut(DeckSide)
+    /// HOLD on a deck's echo-out (toggle) — the record swap.
+    case echoHold(DeckSide)
+    /// HOLD on the FX channel's Space Echo (toggle).
+    case fxHold
+    /// TAP the Space Echo's tempo, for SYNC with a real record.
+    case fxTap
     /// A deck's key lock (M14). Per deck, like the platter it holds.
     case keyLock(DeckSide)
 
@@ -88,6 +94,9 @@ enum DubAction: Hashable {
         case .fxToggle(let i): return "fx.unit.\(i)"
         case .fxKick: return "fx.kick"
         case .echoOut(let side): return "echo.\(side == .a ? "a" : "b")"
+        case .echoHold(let side): return "echo.hold.\(side == .a ? "a" : "b")"
+        case .fxHold: return "fx.hold"
+        case .fxTap: return "fx.tap"
         case .keyLock(let side): return "keylock.\(side == .a ? "a" : "b")"
         }
     }
@@ -120,6 +129,11 @@ enum DubAction: Hashable {
             guard let n = Int(parts[2]) else { return nil }
             self = .fxToggle(n)
         case (2, "fx") where parts[1] == "kick": self = .fxKick
+        case (2, "fx") where parts[1] == "hold": self = .fxHold
+        case (2, "fx") where parts[1] == "tap": self = .fxTap
+        case (3, "echo") where parts[1] == "hold":
+            guard let d = side(parts[2]) else { return nil }
+            self = .echoHold(d)
         case (2, "echo"):
             guard let d = side(parts[1]) else { return nil }
             self = .echoOut(d)
