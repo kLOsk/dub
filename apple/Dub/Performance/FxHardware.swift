@@ -69,9 +69,28 @@ struct FxEngraved: View {
     var dim: Bool = false
     var color: Color? = nil
     var size: CGFloat = 8
+    /// The width this label keeps, as the texts that set it. A label whose
+    /// width follows its value pushes the whole row sideways each time it
+    /// changes — the Space Echo's knobs walked left and right under a
+    /// synced repeat, and every step re-laid out the window and stalled
+    /// the strips (rig, 2026-11-11). Reserved, the label takes the widest
+    /// of these and its text is laid over it, centred, never resizing the
+    /// row. Every text the label shows must be covered by one of these.
+    var reserve: [String] = []
 
     var body: some View {
-        Text(text.uppercased())
+        if reserve.isEmpty {
+            label(text)
+        } else {
+            ZStack {
+                ForEach(reserve, id: \.self) { label($0).hidden() }
+            }
+            .overlay { label(text) }
+        }
+    }
+
+    private func label(_ s: String) -> some View {
+        Text(s.uppercased())
             .font(.system(size: size, weight: .semibold))
             .tracking(size >= 8 ? 1.1 : 0.8)
             .foregroundStyle(color ?? Color.white.opacity(dim ? 0.45 : 0.72))
@@ -110,14 +129,19 @@ struct FxReadout: View {
     let text: String
     var size: CGFloat = 10
     var color: Color = DubColor.textPrimary
+    /// The widest texts the window can show, so it never changes width
+    /// with its value — see `FxEngraved.reserve`.
+    var reserve: [String] = []
 
     var body: some View {
-        Text(text)
+        ZStack {
+            ForEach(reserve, id: \.self) { Text($0).hidden() }
+            Text(text).foregroundStyle(color)
+        }
             .font(.system(size: size, weight: .medium, design: .monospaced))
             .monospacedDigit()
-            .foregroundStyle(color)
             .lineLimit(1)
-            .padding(.horizontal, 5)
+            .padding(.horizontal, 3)
             .padding(.vertical, 2)
             .background(RoundedRectangle(cornerRadius: 3).fill(DubColor.displayWell))
             .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black, lineWidth: 1))
@@ -209,6 +233,8 @@ struct FxKnobCell: View {
     var detents: Int? = nil
     var readout: String
     var readoutColor: Color = DubColor.textPrimary
+    /// The widest readouts this knob can show — see `FxEngraved.reserve`.
+    var reserve: [String] = []
     var onChange: (_ value: Double) -> Void = { _ in }
 
     var body: some View {
@@ -217,7 +243,7 @@ struct FxKnobCell: View {
             DubKnob(value: value, size: size, detents: detents,
                     ink: Color.white.opacity(0.5), onChange: onChange)
                 .padding(4)
-            FxReadout(text: readout, color: readoutColor)
+            FxReadout(text: readout, color: readoutColor, reserve: reserve)
         }
         .fixedSize()
     }

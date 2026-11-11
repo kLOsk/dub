@@ -45,8 +45,9 @@ struct FxBigKnobUnit: View {
                 dial
                 VStack(alignment: .leading, spacing: 5) {
                     FxEngraved(text: "Cut-off")
-                    FxReadout(text: Self.hzText(controls.bigKnobStep), size: 14)
-                    FxEngraved(text: "Step \(controls.bigKnobStep + 1) of \(Self.steps)", dim: true)
+                    FxReadout(text: Self.hzText(controls.bigKnobStep), size: 14, reserve: ["0 000 Hz"])
+                    FxEngraved(text: "Step \(controls.bigKnobStep + 1) of \(Self.steps)", dim: true,
+                               reserve: ["Step 00 of 00"])
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 VStack(spacing: 2) {
@@ -144,25 +145,29 @@ struct FxPhaserUnit: View {
                 .frame(width: 104, alignment: .leading)
                 HStack(alignment: .bottom, spacing: 6) {
                     FxKnobCell(name: "Rate", value: rateNorm,
-                               readout: String(format: "%.2g Hz", controls.phaserRateHz)) { v in
+                               readout: String(format: "%.2g Hz", controls.phaserRateHz),
+                               reserve: ["0.0 Hz"]) { v in
                         var c = controls
                         c.phaserRateHz = Self.rateMin * pow(Self.rateMax / Self.rateMin, v)
                         onControls(c)
                     }
                     FxKnobCell(name: "Depth", value: controls.phaserDepth,
-                               readout: percent(controls.phaserDepth)) { v in
+                               readout: percent(controls.phaserDepth),
+                               reserve: percentReserve) { v in
                         var c = controls
                         c.phaserDepth = v
                         onControls(c)
                     }
                     FxKnobCell(name: "Feedback", value: controls.phaserFeedback / 0.95,
-                               readout: percent(controls.phaserFeedback)) { v in
+                               readout: percent(controls.phaserFeedback),
+                               reserve: percentReserve) { v in
                         var c = controls
                         c.phaserFeedback = v * 0.95
                         onControls(c)
                     }
                     FxKnobCell(name: "Mix", value: controls.phaserMix,
-                               readout: percent(controls.phaserMix)) { v in
+                               readout: percent(controls.phaserMix),
+                               reserve: percentReserve) { v in
                         var c = controls
                         c.phaserMix = v
                         onControls(c)
@@ -255,6 +260,10 @@ struct FxSpaceEchoUnit: View {
     private static let repeatMin = 20.0
     private static let repeatMax = 750.0
     private static let modeNames = ["Reverb", "Short", "Long", "Triple", "Short+rev", "Long+rev", "Triple+rev"]
+    /// The width of the line under REPEAT: the three head times. A synced
+    /// tempo or the call for a tap is laid over it, never widening the
+    /// unit past its column.
+    private static let repeatLineReserve = ["000 · 000 · 000"]
 
     var body: some View {
         FxUnitChassis(height: Self.height, on: on) {
@@ -274,13 +283,15 @@ struct FxSpaceEchoUnit: View {
                         repeatCell
                         intensityCell
                         FxKnobCell(name: "Echo", value: controls.spaceEchoVolume,
-                                   readout: db(controls.spaceEchoVolume)) { v in
+                                   readout: db(controls.spaceEchoVolume),
+                                   reserve: dbReserve) { v in
                             var c = controls
                             c.spaceEchoVolume = v
                             onControls(c)
                         }
                         FxKnobCell(name: "Reverb", value: controls.spaceEchoReverb,
-                                   readout: db(controls.spaceEchoReverb)) { v in
+                                   readout: db(controls.spaceEchoReverb),
+                                   reserve: dbReserve) { v in
                             var c = controls
                             c.spaceEchoReverb = v
                             onControls(c)
@@ -353,7 +364,8 @@ struct FxSpaceEchoUnit: View {
     /// Tape age: a trimmer in the top row, its reading beside it.
     private var wowFlutter: some View {
         HStack(spacing: 4) {
-            FxEngraved(text: String(format: "W&F %.1f %%", controls.spaceEchoWowFlutter * 0.5), dim: true)
+            FxEngraved(text: String(format: "W&F %.1f %%", controls.spaceEchoWowFlutter * 0.5), dim: true,
+                       reserve: ["W&F 0.0 %"])
             DubKnob(value: controls.spaceEchoWowFlutter / 2, size: 14,
                     ink: Color.white.opacity(0.4)) { v in
                 var c = controls
@@ -394,7 +406,8 @@ struct FxSpaceEchoUnit: View {
                 }
             }
             .frame(width: 60, height: 60)
-            FxReadout(text: Self.modeNames[modeIndex], size: 8, color: DubColor.textSecondary)
+            FxReadout(text: Self.modeNames[modeIndex], size: 8, color: DubColor.textSecondary,
+                      reserve: ["Triple+rev"])
         }
     }
 
@@ -409,7 +422,8 @@ struct FxSpaceEchoUnit: View {
                 value: (ms - Self.repeatMin) / (Self.repeatMax - Self.repeatMin),
                 readout: "\(Int(ms.rounded())) ms",
                 readoutColor: controls.spaceEchoSync && tempo != nil
-                    ? DubColor.spaceEcho : DubColor.textPrimary
+                    ? DubColor.spaceEcho : DubColor.textPrimary,
+                reserve: ["000 ms"]
             ) { v in
                 var c = controls
                 c.spaceEchoRepeatMs = Self.repeatMin + v * (Self.repeatMax - Self.repeatMin)
@@ -419,11 +433,13 @@ struct FxSpaceEchoUnit: View {
             if controls.spaceEchoSync {
                 FxEngraved(
                     text: tempo.map { "♩ \($0.text)" } ?? "No tempo · tap",
-                    color: tempo == nil ? DubColor.stateError : DubColor.spaceEcho)
+                    color: tempo == nil ? DubColor.stateError : DubColor.spaceEcho,
+                    reserve: Self.repeatLineReserve)
             } else {
                 FxEngraved(
                     text: "\(Int((ms * 0.337).rounded())) · \(Int((ms * 0.668).rounded())) · \(Int(ms.rounded()))",
-                    dim: true)
+                    dim: true,
+                    reserve: Self.repeatLineReserve)
             }
         }
     }
@@ -436,7 +452,8 @@ struct FxSpaceEchoUnit: View {
                 name: "Intensity",
                 value: controls.spaceEchoIntensity / 1.2,
                 readout: String(format: "%.2f", controls.spaceEchoIntensity),
-                readoutColor: runaway ? DubColor.stateError : DubColor.textPrimary
+                readoutColor: runaway ? DubColor.stateError : DubColor.textPrimary,
+                reserve: ["0.00"]
             ) { v in
                 var c = controls
                 c.spaceEchoIntensity = v * 1.2
@@ -444,12 +461,16 @@ struct FxSpaceEchoUnit: View {
             }
             if runaway {
                 if motion {
-                    BlinkingEngraved(text: "Runaway", color: DubColor.stateError, on: on)
+                    ZStack {
+                        FxEngraved(text: "Osc > 1.0").hidden()
+                        BlinkingEngraved(text: "Runaway", color: DubColor.stateError, on: on)
+                    }
                 } else {
-                    FxEngraved(text: "Runaway", color: DubColor.stateError.opacity(on ? 1 : 0.35))
+                    FxEngraved(text: "Runaway", color: DubColor.stateError.opacity(on ? 1 : 0.35),
+                               reserve: ["Osc > 1.0", "Runaway"])
                 }
             } else {
-                FxEngraved(text: "Osc > 1.0", dim: true)
+                FxEngraved(text: "Osc > 1.0", dim: true, reserve: ["Osc > 1.0", "Runaway"])
             }
         }
     }
@@ -595,19 +616,22 @@ struct FxSpringUnit: View {
                 .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black, lineWidth: 1))
                 HStack(alignment: .bottom, spacing: 2) {
                     FxKnobCell(name: "Decay", value: controls.springDecay, size: 24,
-                               readout: Self.decayText(controls.springDecay)) { v in
+                               readout: Self.decayText(controls.springDecay),
+                               reserve: ["0.0 s", "00 s"]) { v in
                         var c = controls
                         c.springDecay = v
                         onControls(c)
                     }
                     FxKnobCell(name: "Tone", value: controls.springTone, size: 24,
-                               readout: Self.toneText(controls.springTone)) { v in
+                               readout: Self.toneText(controls.springTone),
+                               reserve: ["0.0 kHz", "000 Hz"]) { v in
                         var c = controls
                         c.springTone = v
                         onControls(c)
                     }
                     FxKnobCell(name: "Wet", value: controls.springWet, size: 24,
-                               readout: percent(controls.springWet)) { v in
+                               readout: percent(controls.springWet),
+                               reserve: percentReserve) { v in
                         var c = controls
                         c.springWet = v
                         onControls(c)
@@ -769,6 +793,12 @@ struct FxSpringTank: View {
 // MARK: - Readout helpers
 
 /// `0.7` → `70 %`.
+/// The width `percent` and `db` readouts keep: two digits, which covers
+/// every dB reading (−60 … 0, then −∞). Only a percent knob at its end
+/// stop reads wider; the rack has no room to reserve a third digit for it.
+let percentReserve = ["00 %"]
+let dbReserve = ["−00 dB"]
+
 func percent(_ v: Double) -> String {
     "\(Int((v * 100).rounded())) %"
 }
