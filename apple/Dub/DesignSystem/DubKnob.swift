@@ -214,7 +214,10 @@ struct DubKnob: View {
     }
 
     private func polar(_ c: CGPoint, _ r: CGFloat, _ a: Double) -> CGPoint {
-        CGPoint(x: c.x + r * cos(a), y: c.y + r * sin(a))
+        // A CGFloat angle: mixed with CGFloat radii, a Double one makes
+        // `cos` ambiguous on arm64 (CoreGraphics' or libm's).
+        let a = CGFloat(a)
+        return CGPoint(x: c.x + r * cos(a), y: c.y + r * sin(a))
     }
 
     private func square(_ c: CGPoint, _ r: CGFloat) -> CGRect {

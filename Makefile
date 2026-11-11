@@ -7,7 +7,7 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check deny audit attribution app app-release run-app open-app xcframework snapshot sweep check-stale
+.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check deny audit attribution app app-release dist run-app open-app xcframework snapshot sweep check-stale
 
 # --- Build-artifact hygiene -------------------------------------------
 #
@@ -50,6 +50,7 @@ help:
 	@echo "Apple shell"
 	@echo "  make app           build Dub.app (Debug) -> apple/build/Build/Products/Debug/Dub.app"
 	@echo "  make app-release   build Dub.app (Release)"
+	@echo "  make dist          universal Release build zipped for a GitHub release (dist/)"
 	@echo "  make run-app       build + launch Dub.app"
 	@echo "  make open-app      open the apple/build/Build/Products/$(APP_CONFIG)/ folder in Finder"
 
@@ -192,6 +193,26 @@ app: check-stale xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 
 app-release:
 	$(MAKE) app APP_CONFIG=Release
+
+# The release artifact: a universal (Apple Silicon + Intel) Release build,
+# zipped with `ditto` so the bundle's signature and symlinks survive, plus
+# its SHA-256. Named after the workspace version; the tag is `v<version>`.
+DUB_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+DIST_ZIP     = dist/Dub-$(DUB_VERSION)-macOS-universal.zip
+
+dist:
+	$(MAKE) app APP_CONFIG=Release
+	@lipo -info "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app/Contents/MacOS/Dub" \
+	    | grep -q 'x86_64 arm64\|arm64 x86_64' \
+	    || { echo "dist: Dub.app is not universal"; exit 1; }
+	@mkdir -p dist
+	@rm -f "$(DIST_ZIP)" "$(DIST_ZIP).sha256"
+	ditto -c -k --sequesterRsrc --keepParent \
+	    "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" "$(DIST_ZIP)"
+	cd dist && shasum -a 256 "$(notdir $(DIST_ZIP))" > "$(notdir $(DIST_ZIP)).sha256"
+	@echo ""
+	@echo "Release artifact: $(DIST_ZIP)"
+	@cat "$(DIST_ZIP).sha256"
 
 # SwiftUI snapshot suite (C-31). Renders the app's internal views to
 # PNGs under apple/DubTests/__Snapshots__/ — no running app, no Metal.

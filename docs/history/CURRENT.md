@@ -5,12 +5,19 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-09-11.
+> Last updated: 2026-11-11.
 
 ## Where the branch is
 
-`main` — the library's `NSTableView` migration (b949f0d…8d6335c) plus its
-follow-up cleanup are committed locally and **unpushed**. Nothing in flight.
+`main` — **1.0.0-alpha.1 released** (tag `v1.0.0-alpha.1`, a GitHub
+pre-release; notes in `docs/releases/v1.0.0-alpha.1.md`). `make dist` builds
+the artifact: a universal Release `Dub.app` (Release no longer builds only
+the host's slice — and the first arm64 build found two `cos` calls that were
+ambiguous there), ad-hoc signed and **not notarized** (no Developer ID yet),
+zipped with `ditto` plus a SHA-256. Version lives in two places, kept in
+step by hand: `[workspace.package] version` and `CFBundleShortVersionString`
+in `apple/project.yml`. The rig checklist is **not** signed off — the alpha
+went out with section 0 partly open (see the rig entry below).
 Pushing is a deliberate act: `.githooks/pre-push` runs fmt-check + clippy +
 docs-check + the Rust suite + the Swift snapshot suite first, and that last
 gate is local-only because GitHub CI has no macOS app job.

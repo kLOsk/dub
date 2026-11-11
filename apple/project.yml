@@ -27,9 +27,9 @@ settings:
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "-"
     DEVELOPMENT_TEAM: ""
-    # Apple Silicon + Intel.
+    # Apple Silicon + Intel. Debug builds only the machine's own slice
+    # (fast iteration); Release builds both — the shipped app is universal.
     ARCHS: "$(ARCHS_STANDARD)"
-    ONLY_ACTIVE_ARCH: YES
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
@@ -40,6 +40,7 @@ settings:
   # it) and Debug builds aren't silently optimized.
   configs:
     Debug:
+      ONLY_ACTIVE_ARCH: YES
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
       SWIFT_OPTIMIZATION_LEVEL: "-Onone"
       GCC_OPTIMIZATION_LEVEL: "0"
@@ -48,6 +49,7 @@ settings:
       # snapshot suite renders the app's internal SwiftUI views).
       ENABLE_TESTABILITY: YES
     Release:
+      ONLY_ACTIVE_ARCH: NO
       SWIFT_OPTIMIZATION_LEVEL: "-O"
       GCC_OPTIMIZATION_LEVEL: "s"
 
@@ -83,7 +85,9 @@ targets:
         CFBundleIdentifier: com.klos.dub
         CFBundleIconName: AppIcon
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.0.1"
+        # Keep in step with `[workspace.package] version` in Cargo.toml; the
+        # release tag is `v` + this. `make dist` names the zip after it.
+        CFBundleShortVersionString: "1.0.0-alpha.1"
         CFBundleVersion: "1"
         LSMinimumSystemVersion: "13.0"
         # Dual-GPU MacBook Pros: without this the first Metal layer makes

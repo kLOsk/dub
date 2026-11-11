@@ -91,3 +91,6 @@ testdata/rip-baselines/*.wav
 # track. The 10 s excerpts in testdata/timecode/ ARE tracked, because the
 # tests that read them have to run in CI.
 testdata/timecode/full/
+
+# `make dist` release artifacts — uploaded to GitHub releases, not committed.
+dist/

@@ -9,7 +9,8 @@
 Two turntables, your own mixer, real records *through* the software.<br>
 Built for hip hop, reggae, dub, drum'n'bass and dubstep — and for never failing on stage.
 
-[![Release](https://img.shields.io/badge/release-1.0%20alpha-D9A33A.svg)](https://github.com/kLOsk/dub/releases)
+[![Release](https://img.shields.io/github/v/release/kLOsk/dub?include_prereleases&label=release&color=D9A33A)](https://github.com/kLOsk/dub/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/kLOsk/dub/total?color=D9A33A)](https://github.com/kLOsk/dub/releases)
 [![CI](https://github.com/kLOsk/dub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kLOsk/dub/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Platform](https://img.shields.io/badge/macOS-13%2B-lightgrey?logo=apple)](#get-dub)
@@ -132,11 +133,23 @@ Finish, and you have tagged, analysed **FLAC** files in your library.
 
 ## Get Dub
 
-**Alpha builds** will be on the [Releases](https://github.com/kLOsk/dub/releases)
-page. Until then, build it — it takes a few minutes.
+### Download
 
-You need a Mac on **macOS 13 or later**, Xcode, Rust stable and
-[XcodeGen](https://github.com/yonaskolb/XcodeGen).
+Grab **`Dub-…-macOS-universal.zip`** from the
+[latest release](https://github.com/kLOsk/dub/releases/latest). One app for
+Apple Silicon and Intel Macs, **macOS 13 or later**.
+
+1. Unzip it and drag **Dub** into **Applications**.
+2. Open it. The alpha is not notarized by Apple yet, so macOS stops it the
+   first time: open **System Settings → Privacy & Security**, scroll to
+   *"Dub" was blocked*, and click **Open Anyway**. You only do this once.
+   (Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/Dub.app`.)
+3. Allow microphone access when asked — that is how macOS names the audio
+   interface's inputs, where the timecode and your records come in.
+
+### Build it yourself
+
+You need Xcode, Rust stable and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
 ```bash
 brew install xcodegen
@@ -167,14 +180,16 @@ set in Preferences.
 
 ## Status
 
-Dub is **alpha**: feature-complete for 1.0 and being signed off against a
-[hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
+Dub is **alpha** — [1.0.0-alpha.1](https://github.com/kLOsk/dub/releases/tag/v1.0.0-alpha.1)
+is the first public build: feature-complete for 1.0 and being signed off
+against a [hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
 
 Known gaps right now:
 
 - Live tempo on a THRU record reads drum'n'bass at two-thirds of its tempo.
   Tap the BPM to override.
 - Traktor MK2 and the Audio 6 have not been confirmed on real hardware.
+- The download is not notarized yet (see [Download](#download)).
 - macOS only.
 
 What is in flight lives in [`docs/history/CURRENT.md`](docs/history/CURRENT.md);

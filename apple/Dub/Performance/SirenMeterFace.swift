@@ -103,7 +103,10 @@ struct SirenMeterFace: View {
     }
 
     private static func point(_ pivot: CGPoint, at level: Double, radius: CGFloat) -> CGPoint {
-        let a = angle(at: level)
+        // CGFloat, not Double: with a Double angle beside a CGFloat radius,
+        // `cos` is ambiguous on arm64 (CoreGraphics' or libm's) and the
+        // universal Release build stopped there.
+        let a = CGFloat(angle(at: level))
         return CGPoint(x: pivot.x + radius * cos(a), y: pivot.y + radius * sin(a))
     }
 
