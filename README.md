@@ -1,148 +1,217 @@
 <div align="center">
 
+<img src="apple/Dub/Assets.xcassets/AboutSplash.imageset/AboutSplash.png" alt="Dub" width="420">
+
 # Dub
 
-**A timecode-vinyl DJ application for scratch DJs and vinyl enthusiasts.**
+### Timecode vinyl for scratch DJs and sound systems.
 
-*Mac-first. Rust-cored. MIT OR Apache-2.0.*
+Two turntables, your own mixer, real records *through* the software.<br>
+Built for hip hop, reggae, dub, drum'n'bass and dubstep — and for never failing on stage.
 
+[![Release](https://img.shields.io/badge/release-1.0%20alpha-D9A33A.svg)](https://github.com/kLOsk/dub/releases)
 [![CI](https://github.com/kLOsk/dub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kLOsk/dub/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#status)
-[![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#milestone-progress)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Platform](https://img.shields.io/badge/macOS-13%2B-lightgrey?logo=apple)](#get-dub)
+[![Rust](https://img.shields.io/badge/core-Rust-orange?logo=rust)](crates)
+[![Swift](https://img.shields.io/badge/shell-SwiftUI%20%2B%20Metal-F05138?logo=swift&logoColor=white)](apple)
+[![Audio thread](https://img.shields.io/badge/audio%20thread-zero%20alloc-6FB04A.svg)](#under-the-hood)
 
-<img src="apple/Dub/Assets.xcassets/AboutSplash.imageset/AboutSplash.png" alt="Dub splash artwork" width="480">
+[**Features**](#features) · [**Get Dub**](#get-dub) · [**Hardware**](#hardware) · [**Under the hood**](#under-the-hood) · [**Docs**](docs/README.md)
+
+<br>
+
+<img src="docs/images/performance.png" alt="Dub's Performance surface: two decks with vertical colour waveforms and a phase meter between them, hot cues, loops, echo, the sampler, the dub siren and the library" width="100%">
 
 </div>
 
-> Dub is the spiritual successor to Serato Scratch Live for the urban music scene
-> (hip hop, reggae, dnb, dubstep, scratch). Two decks, external mixer, real
-> records **through** the software, smart utility FX, fast sample throws.
+<br>
 
-This is **pre-alpha software**. There is no release. There is `main`.
+> **Alpha.** Dub plays, scratches, loops, rips and dubs on real hardware today,
+> and it is still being proven on the rig one session at a time. Expect rough
+> edges; don't take it to a paying gig yet. See [Status](#status).
 
----
+## Why Dub
 
-## What's interesting about this project
+Most DJ software wants to be the whole booth. Dub wants to be the part between
+your turntables and your mixer, and to be very good at it.
 
-- **Rust on the audio thread.** The engine runs in a CoreAudio HAL IOProc with
-  zero allocations, zero locks, and zero syscalls. Verified in CI by the
-  [`rt-audit`](tools/rt-audit) binary, which renders 100k blocks under
-  [`assert_no_alloc`](https://crates.io/crates/assert_no_alloc) before any merge.
-- **Clean-room timecode.** [`dub-timecode`](crates/dub-timecode) decodes Serato
-  CV02 in relative mode — analytic-signal demod, signed rate, confidence
-  estimate, all alloc-free. ([Architecture notes.](docs/spec/ARCHITECTURE.md))
-- **Lift policy hardened on real hardware.** The `LiftPolicy` state machine
-  combines a three-layer defense — RMS amplitude gate, two-edge confidence
-  hysteresis, sticky-block window — driven by SL3 + Serato CV02 testing.
-  Each pathology has a dedicated regression test.
-- **TUI inspector.** [`dub scope`](crates/dub-cli/src/scope.rs) is a ratatui
-  Lissajous + gauges + live thresholds, sharing the same `LiftPolicy` as
-  playback so calibration transfers 1:1.
-- **No mouse on the audio path, ever.** UI = external mixer + controllers + the
-  user's hands on real records. The mouse is for browsing tracks, period.
+- **Your mixer is the mixer.** No software crossfader, EQ or gain. Each deck
+  leaves on its own output pair and you mix with your hands.
+- **Real records are first-class.** Flip a deck to THRU and the record on the
+  platter runs through the engine — with a live waveform, a live tempo and the
+  FX on it.
+- **Reliability is the feature.** The audio thread never allocates, locks or
+  blocks, and CI proves it on every change.
+- **Yours to leave.** Import from Serato, Traktor, rekordbox and Apple Music;
+  export back to rekordbox XML and M3U8. No lock-in.
+- **Open source**, MIT or Apache-2.0, pure Rust underneath.
 
-## Quickstart
+## Features
 
-Mac with Rust stable, an audio interface, and (optionally) a Serato CV02
-control vinyl.
+### Timecode that follows the hand
+
+- **Serato CV02, Traktor MK1 and Traktor MK2** control vinyl, decoded by a
+  clean-room decoder — relative and absolute position.
+- **Scratching, needle drops, rewinds**: forward and backward playback are
+  symmetric, with whole tracks held in RAM.
+- **Calibrates itself** on the needle in about a second, and tells you when a
+  cartridge channel or cable is failing instead of playing badly.
+- **INT · TC · THRU** per deck: internal playback, timecode, or a real record
+  straight through. **Panic Play** keeps the music going if the needle skips.
+- **Key lock** from a pure-Rust time-stretcher.
+
+### Waveforms you can read from across the booth
+
+- **Metal-rendered, multi-colour waveforms** — kicks, snares and hats in
+  their own colours — that stretch with the pitch fader.
+- **Beat grid with set-the-1**: tap the BPM to put the downbeat where you hear
+  it. Lazy analysis with BPM and **Camelot key** for every track.
+- **A one-beat phase meter** between the decks, and matching scroll speeds when
+  two decks are in time.
+
+<img src="docs/images/prep.png" alt="Prep mode: one deck with a wide waveform, beat grid, hot cues and samples above the library" width="100%">
+
+<sub>Prep mode: one deck on the built-in output, for grids, cues and samples before the gig.</sub>
+
+### Cues, loops, scratch tools
+
+- **8 named, coloured hot cues** per track.
+- **Loops** from 1/8 to 16 beats, grid-snapped, plus manual in/out and
+  reverse grab — correct under a real needle.
+- **Sampler** (8 slots), **Quick Scratch** (a scratch sample on the deck in one
+  press, your tune parked underneath) and **instant doubles**.
+- **Map mode**: nothing ships pre-bound. Click a control, press a key, done.
+
+### One-turntable dub
+
+<img src="docs/images/dub-fx.png" alt="The DUB FX channel: Big Knob filter, phaser, Space Echo and spring reverb as a hardware rack" width="640" align="right">
+
+Dub's FX are modelled on the gear that made the sound, and drawn like it.
+
+- **Echo Out + HOLD**: throw the last beat into the echo, hold it while you
+  swap the record, drop the needle, let it go.
+- **The DUB FX channel**: turn a deck into an outboard rack on your mixer's
+  send — an Altec-style **Big Knob** high-pass, a six-stage **phaser**, an
+  RE-201-style **Space Echo** with tape heads, wow & flutter and runaway, and a
+  **spring tank** you can kick.
+- **Space Echo SYNC + TAP**: repeats lock to the other deck's live tempo.
+- Every unit keeps its real controls. No presets pretending to be gear.
+
+<br clear="right">
+
+### Dub siren
+
+<img src="docs/images/siren.png" alt="The sampler and the dub siren with its VU meter and DUB knob" width="100%">
+
+Five shots — Rifle Gun, Alarm, Sine, Laser, Siren — through their own
+PT2399-style echo, with one **DUB** knob from dry to drenched. It is an
+instrument, not an effect: it sounds with or without a track.
+
+### Rip your vinyl
+
+<img src="docs/images/rip-review.png" alt="Rip review: one record side split into tracks with titles, artists and genres" width="100%">
+
+Drop the needle and Dub records the side. It starts on the music, stops at
+the run-out, **splits the tracks**, and hands you a tracklist to check.
+Finish, and you have tagged, analysed **FLAC** files in your library.
+
+- Crash-safe capture with session recovery, and re-splitting from the lossless
+  archive later.
+- Optional **recognition** (AcoustID, MusicBrainz, Discogs) fills in the names.
+  A rip never depends on the network.
+
+### A library that respects yours
+
+- **Imports** Serato (crates, grids, cues), Traktor, rekordbox XML and
+  Apple Music / iTunes, side by side with Dub's own analysis.
+- **Crates, smart crates, ratings, colours**, filters, and "played into"
+  history that remembers what you mixed out of each tune.
+- **Missing-file relocation** and audio-fingerprint duplicate detection.
+- **Exports** rekordbox XML and M3U8.
+
+## Get Dub
+
+**Alpha builds** will be on the [Releases](https://github.com/kLOsk/dub/releases)
+page. Until then, build it — it takes a few minutes.
+
+You need a Mac on **macOS 13 or later**, Xcode, Rust stable and
+[XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
 ```bash
-# Build everything in release mode.
-make ci
-
-# Smoke-test the engine.
-./target/release/dub smoke
-
-# Play a file through CoreAudio at the device's native sample rate.
-./target/release/dub play --realtime path/to/track.mp3
-
-# Live timecode → deck (M5.3 / M6). One deck, Serato CV02 on SL3 ch 3+4.
-# Auto-runs a fresh ~3.5 s calibration on startup (M5.4.3 / M5.4.6);
-# audio output is live immediately, deck attaches the moment the carrier locks.
-./target/release/dub timecode-deck path/to/track.mp3 --input-channels 3,4
-
-# Two-deck timecode (M5.6 + M5.5.2). Single SL3 demuxed in the IOProc; each
-# deck gets its own input ring, its own calibrator, its own output channel pair.
-# The device-profile flag picks up the SL3's deck-A → ch 3+4, deck-B → ch 5+6
-# routing automatically (also auto-detected if the device name matches).
-./target/release/dub timecode-deck a.mp3 b.mp3 \
-    --input-channels 3,4 --deck-b-input-channels 5,6 \
-    --device-profile "SL 3"
-
-# Traktor MK1 or MK2 instead of Serato (M6). Bare `traktor` is rejected as
-# ambiguous — pick the generation, getting it wrong = silent 25 % speed error.
-./target/release/dub timecode-deck a.mp3 --input-channels 3,4 --format traktor-mk2
-
-# Thru mode — real (non-timecode) record routed through the engine (M7).
-# Constant ~2.7 ms one-way latency, software-always-on so M8 BPM + M9 waveform
-# + M15+ FX can hook in. One mode, no flags — there is no hardware-bypass mode.
-./target/release/dub thru --input-channels 3,4 --device-profile "SL 3"
-
-# TUI inspector for tuning your rig against the live timecode signal
-# (M5.4.1). Same LiftPolicy as `timecode-deck`, so what you see here is what
-# you'd hear during playback.
-./target/release/dub scope --input-channels 3,4
-
-# Manual one-shot per-rig calibration (M5.4.2 / M5.4.3 / M5.4.4).
-# Default is single-phase carrier-only (~3.5 s). JSON is a diagnostic
-# artifact only — `timecode-deck` doesn't read it back; every startup
-# recalibrates fresh against whatever rig is in front of you (M5.4.6).
-# Stored at ~/.dub/calibration/<device>_deck_<idx>_<format>.json.
-./target/release/dub calibrate --input-channels 3,4 --deck 0
-
-# Inspect output offline — `dub analyze` runs the M3.5 click detector
-# over any WAV (peak / RMS / DC / clipping / max per-sample delta).
-./target/release/dub analyze path/to/captured.wav
-
-# Bootstrap the macOS app (M0.5 / M10). One-time: `brew install xcodegen`.
-# Generates DubCore.xcframework + Swift UniFFI bindings + Dub.xcodeproj.
-./scripts/bootstrap.sh
-make app                              # or: open apple/Dub.xcodeproj and ⌘R
-open apple/build/Build/Products/Debug/Dub.app
-#                            Two-deck performance surface with library browser,
-#                            Metal waveforms, launch splash, app icon, and
-#                            About sheet (DUB wordmark or Dub → About Dub).
+brew install xcodegen
+git clone https://github.com/kLOsk/dub.git && cd dub
+./scripts/bootstrap.sh                 # one-time: bindings + Xcode project
+make app APP_CONFIG=Release
+open apple/build/Build/Products/Release/Dub.app
 ```
 
-`dub scope` keys: `q`/`Esc` quit, `c` clear lissajous, `↑/↓` engage threshold,
-`PgUp/PgDn` disengage, `←/→` amplitude, hold `Shift` for 10× steps.
+Without an audio interface Dub opens in **Prep**: one deck on the built-in
+output for grids, cues and samples. Plug in an interface with at least
+**4 inputs and 4 outputs** and it becomes the two-deck **Performance** surface.
 
-## Milestone progress
+## Hardware
 
-Roadmap and forward-looking milestones live in [`docs/spec/PRD.md` §12](docs/spec/PRD.md#12-milestones);
-detailed design history for everything shipped lives in
-[`docs/history/SHIPPED.md`](docs/history/SHIPPED.md) (load it by anchor, not whole-file). Beat-grid
-history specifically lives in [`docs/spec/PRD-BEATS.md`](docs/spec/PRD-BEATS.md), the binding
-sub-spec for tempo / downbeat / tap-to-grid / waveform overlay.
+| Hardware | Role | Status |
+|---|---|---|
+| Serato SL 3 | Interface (reference rig) | ✅ tested |
+| Serato Control CV02 vinyl | Timecode | ✅ tested |
+| Traktor Scratch MK1 vinyl | Timecode | ✅ tested |
+| Traktor Scratch MK2 vinyl | Timecode | ⚠️ decoder shipped, awaiting a real pressing |
+| Native Instruments Audio 6 | Interface | ⚠️ profile unverified |
+| Any external mixer with line inputs | The mixer | ✅ |
+| Phase, MIDI / HID controllers | Control | ◻ planned after 1.0 |
 
-| Range | Status | Scope | History |
-|---|---|---|---|
-| **M0 → M4** | ✅ shipped | Scaffold, CI, RT-safety harness + soak/fuzz, first sound, lock-free transport command channel, format coverage (mp3 / flac / m4a / aiff / aac / alac) + hot `Arc<Track>` loading, de-click envelope, `dub analyze` offline click detector, two decks + debug mixer. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M5.1 → M5.6** | ✅ shipped | Clean-room Serato CV02 decoder → live timecode-to-deck with 3-layer `LiftPolicy` (the point Dub becomes a DJ app) → `dub scope` + `dub calibrate` → fast single-phase per-deck calibration → late-binding DJ takeover → external-mixer 4-channel routing → two-deck timecode. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M6 + M7** | ✅ shipped | Traktor MK1 (2 kHz) + MK2 (2.5 kHz) through the same format-agnostic decoder; **Thru Mode** — per-deck always-on software passthrough at constant ~2.7 ms one-way latency, FX-ready, with the `dub thru` CLI. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M7.5 → M8.1** | ✅ shipped | Pure-Rust BPM engine (`dub-bpm`: spectral-flux + harmonic-summed autocorrelation; aubio parked); auto-BPM streaming driver on Thru (`BpmStream`, alloc-free mono tee); log-band ODF + windowed-energy octave fix + `BpmRange` escape hatch. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M9 → M10.8** | ✅ shipped | Live waveform capture (`dub-peaks`); `dub-spectral` extraction + 8-band peak capture; Apple shell (M0.5); `DubEngine` UniFFI surface; Metal multi-colour waveform; palette presets + honest silence/clipping; Performance/Prep shell; mouse transport + Panic Play; Stillpoint (beatmatch aid); Serato-parity waveform baseline freeze (§9.6.0 guardrail). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M11a → M11d.4** | ✅ shipped | SQLite library (path-by-volume-UUID); pure-Rust Chromaprint dedupe; filesystem importer + filename parser; library browser shell, Recently Played, sortable columns, per-row indicators; background missing-files scanner + Relocate panel. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M11c.1 → M11c.4** | ✅ shipped | Lazy auto-beatgrid + analysis lifecycle; Camelot key detection (`track_keys`, schema v3); BPM octave fixes (perceptual prior, reggae/hip-hop double-time rejection, genre-aware `OctaveProfile`, FourOnFloor); tap-to-grid manual override; lazy fingerprint. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M11d.5 → M11d.7** | ✅ shipped | Dogfooding bug-fix rounds (Performance-mode play, library-sourced beat grid as single source of truth); full-screen launch; off-main-thread waveform rendering; beatgrid precision + auto downbeat + drift lock (schema v4 `grid_locked`). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **PRD-BEATS hardening** | ✅ shipped | Uniform Traktor-style beat grid + M11d.6 calibration; tap-to-grid, explicit `bar_phase` (schema v5), relatch "set the 1"; beat-grid robustness rounds 5–10 (universal downbeat, set-the-1 contract, `OctaveProfile::HipHop`/`DrumAndBass`, integer-snap safety net) + `dub diagnose` CLI; waveform + beat-grid jitter killed end to end. | [`PRD-BEATS.md`](docs/spec/PRD-BEATS.md) |
-| **Manual crates** | ✅ shipped | User-created Dub crates (PRD §8.5.1): create, inline-rename, delete, drag tracks in, remove, and reorder (drag-to-reorder + context-menu move). A `#` manual-order column drives the order; reorder is enabled only in manual order, and clicking any other column header sorts the crate as a read-only view. SQLite `crates` / `crate_tracks` CRUD + ordering, FFI surface (FFI **29**), editable "Dub Crates" sidebar section. | [`PRD.md §8.5.1`](docs/spec/PRD.md#851-source-tree) |
-| **M11d-history → loops** | ✅ shipped | Played From / Played Into session history (`SessionTracker`, FFI 37); timecode-display rate = audible (xwax/Mixxx parity; ±8 anchor-warp deleted); PRD-BEATS round 11 (visual kick-edge grid, set-the-1 re-anchor, first-measurable-beat downbeat); **hot cues** (performance cues — FFI 38); **reverse loops** (FFI 39); Stillpoint beatmatch aid (was "Phase-Drift Trail"). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M11e, M12b–f** | ✅ shipped | External-library importers (Serato DB + GEOB grids/cues, Traktor `collection.nml`, iTunes `Library.xml`, rekordbox XML), collection membership + energy overview, ratings / colours / favourites / dynamic filters. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M14 → M16** | ✅ shipped | Key Lock — a **pure-Rust WSOLA** stretcher, not Rubber Band, which was benched and dropped; Echo-Out (100 % wet tap-toggle); the Dub Siren instrument (GS1 / DS01E / SN76477 units, PT2399 echo) + the vintage-chip FX chain. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M11f** | ✅ shipped | Export: rekordbox XML (grid, key, cues, loops, colours, playlists) + M3U8, from the CLI and from the library sidebar. PRD §8.6's anti-lock-in commitment (FFI **63**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M26c** | ✅ shipped | Rip recognition: AcoustID names each track (artist + title, no MusicBrainz needed), opt-in release + Discogs enrichment, BPM/key written into the FLAC tags, `Identify` in the rip review panel, the Discogs token in the login Keychain, and a WhoSampled sample-lineage link-out. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M13** | ✅ shipped | Looping complete: grid-snapped reverse grab, **manual Loop In / Loop Out**, correct under timecode, and key lock holding through a loop (FFI **61**). Closes acceptance §14 #8. | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **M26a + M26b** | ✅ shipped | **Vinyl rip**: drop the needle, get split, tagged, pre-analyzed FLAC tracks in the library. Record tap → crash-safe spill → adaptive gap detection → both-end side trim → encode + tag + import, plus session recovery, re-split from the lossless archive, the Prep review UI and the Real Records browser node. Fully offline. Gates fitted against three real records. | [`PRD.md §5.2.7`](docs/spec/PRD.md) |
-| **M11d-columns** | ✅ shipped | Browser column data plumbing (PRD §8.5.3.1): per-source metadata columns next to Dub's own analysis, audio-file and mix-history groups, and the ⚠ where an imported grid disagrees with the analysed one — the migration-trust view for DJs arriving from Serato. A column that is switched off costs nothing (FFI **64**). | [`SHIPPED.md`](docs/history/SHIPPED.md) |
-| **next** | ◻ planned | Sampler / quick scratch / instant doubles (M17) — the last feature milestone — then Polish → Alpha. See PRD §12.1. | [`PRD.md §12.1`](docs/spec/PRD.md#12-milestones) |
+Other class-compliant 4-in / 4-out interfaces should work; channel routing is
+set in Preferences.
 
-PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
-before stable. The FFI contract version (`dub_ffi::FFI_VERSION`) is **82** at the
-time of writing (`dub version` prints the live crate versions); `dub diagnose
-<track>` dumps a track's beat-grid / tap / BPM rows for grid debugging.
+## Status
+
+Dub is **alpha**: feature-complete for 1.0 and being signed off against a
+[hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
+
+Known gaps right now:
+
+- Live tempo on a THRU record reads drum'n'bass at two-thirds of its tempo.
+  Tap the BPM to override.
+- Traktor MK2 and the Audio 6 have not been confirmed on real hardware.
+- macOS only.
+
+What is in flight lives in [`docs/history/CURRENT.md`](docs/history/CURRENT.md);
+everything shipped is in [`SHIPPED.md`](docs/history/SHIPPED.md); the product
+spec is [`PRD.md`](docs/spec/PRD.md).
+
+## Under the hood
+
+- **Rust on the audio thread.** The engine runs in a CoreAudio IOProc with zero
+  allocations, zero locks and zero syscalls — enforced by
+  [`assert_no_alloc`](https://crates.io/crates/assert_no_alloc) in tests and the
+  [`rt-audit`](tools/rt-audit) harness in CI.
+- **Clean-room timecode.** [`dub-timecode`](crates/dub-timecode) decodes Serato
+  and Traktor vinyl without borrowing anyone's code, and is tested against
+  recordings of real control records.
+- **Pure-Rust DSP**: tempo and beat-grid analysis, key detection, time-stretch,
+  fingerprinting and FLAC encoding, with no C or copyleft dependencies.
+- **SwiftUI + AppKit shell** over UniFFI bindings, with Metal waveforms drawn
+  off the main thread.
+- **Tested like it matters**: over 1,600 Rust tests and 280 Swift unit and
+  snapshot tests, fuzzed library parsers, and gates fitted against real records.
+
+The FFI contract version (`dub_ffi::FFI_VERSION`) is **82** at the
+time of writing. Architecture notes: [`ARCHITECTURE.md`](docs/spec/ARCHITECTURE.md).
+
+### The `dub` CLI
+
+Everything the app does is reachable offline from one binary:
+
+```bash
+make ci                                       # build + every gate CI runs
+./target/release/dub play --realtime track.mp3
+./target/release/dub timecode-deck a.mp3 b.mp3 --device-profile "SL 3"
+./target/release/dub scope --input-channels 3,4    # live timecode inspector (TUI)
+./target/release/dub rip --help                    # rip a record side from the terminal
+./target/release/dub export --help                 # rekordbox XML / M3U8
+```
 
 ## Repo layout
 
@@ -230,20 +299,6 @@ make run-app       # build + launch Dub.app from apple/build/
 ```
 
 See the [Makefile](Makefile) for more targets.
-
-## Hardware tested
-
-These are validated end-to-end on real hardware as each milestone lands.
-
-| Hardware | Used for | Status |
-|---|---|---|
-| Serato SL 3 | 4-in / 6-out interface; deck A on input ch 3+4, deck B on 5+6, output to mixer on ch 3+4 / 5+6 | ✅ M5.2 → M7 (input + two-deck demux + 4-ch routing + Thru) |
-| Serato Control CV02 vinyl | Timecode source (relative mode, 1 kHz carrier) | ✅ M5.1 → M5.4.5 |
-| Traktor Scratch MK1 vinyl | Timecode source (relative mode, 2 kHz carrier) | ✅ M5.4.3 + M6 |
-| Traktor Scratch MK2 vinyl | Timecode source (relative mode, 2.5 kHz carrier) | ⚠️ M6 awaiting empirical channel-polarity validation on real MK2 pressing |
-| Native Instruments Audio 6 | 4-in / 4-out interface alternative | ⚠️ device profile in `KNOWN_DEVICES` is unverified best-effort; warns at startup |
-| Rane mixers (any) | External mixer | ✅ M5.3 + M5.5.2 (line-in compatible) |
-| Phase DJ | HID controller | ◻ planned for v1.x |
 
 ## License
 
