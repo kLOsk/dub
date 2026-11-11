@@ -2442,14 +2442,28 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     crossLow: -1.0,
                     crossHigh: 1.0)
             }
-            // Bright edges at the true in/out, only when on-screen.
+            // Bright edges at the true in/out, only when on-screen. Two
+            // calls, not a loop over `[in, out]`: an array literal is a
+            // heap allocation on the render thread, every frame.
             let loopEdgeVisibleHalfNDC: Float = 1.25 * pxToNDC
             let loopEdgeQuadHalfNDC: Float = (1.25 + 1.0) * pxToNDC
-            for edgeNDC in [Float(inNDC), Float(outNDC)] where edgeNDC >= -1.02 && edgeNDC <= 1.02 {
+            let inEdge = Float(inNDC)
+            if inEdge >= -1.02 && inEdge <= 1.02 {
                 Self.appendBeatLineQuad(
                     vertices: &beatGridScratchVertices,
                     orientation: appearance.orientation,
-                    timeNDC: edgeNDC,
+                    timeNDC: inEdge,
+                    quadHalfNDC: loopEdgeQuadHalfNDC,
+                    visibleHalfNDC: loopEdgeVisibleHalfNDC,
+                    color: Self.loopRGBA(alpha: 0.95),
+                    isDownbeat: true)
+            }
+            let outEdge = Float(outNDC)
+            if outEdge >= -1.02 && outEdge <= 1.02 {
+                Self.appendBeatLineQuad(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: outEdge,
                     quadHalfNDC: loopEdgeQuadHalfNDC,
                     visibleHalfNDC: loopEdgeVisibleHalfNDC,
                     color: Self.loopRGBA(alpha: 0.95),
@@ -2535,19 +2549,24 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                         drawnBelow: drawnBelow,
                         pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                         futureSubChunkOffsetNDC: futureSubChunkOffsetNDC))
-                for (halfPx, tint) in [
-                    (haloHalfPx, SIMD4<Float>(0, 0, 0, 0.6)),
-                    (stemHalfPx, SIMD4(marker.rgb.x, marker.rgb.y, marker.rgb.z, 1.0)),
-                ] {
-                    Self.appendBeatLineQuad(
-                        vertices: &beatGridScratchVertices,
-                        orientation: appearance.orientation,
-                        timeNDC: timeNDC,
-                        quadHalfNDC: (halfPx + 1.0) * pxToNDC,
-                        visibleHalfNDC: halfPx * pxToNDC,
-                        color: tint,
-                        isDownbeat: true)
-                }
+                // Halo, then stem — two calls rather than a loop over a
+                // literal pair, which allocated per cue per frame.
+                Self.appendBeatLineQuad(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: timeNDC,
+                    quadHalfNDC: (haloHalfPx + 1.0) * pxToNDC,
+                    visibleHalfNDC: haloHalfPx * pxToNDC,
+                    color: SIMD4<Float>(0, 0, 0, 0.6),
+                    isDownbeat: true)
+                Self.appendBeatLineQuad(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: timeNDC,
+                    quadHalfNDC: (stemHalfPx + 1.0) * pxToNDC,
+                    visibleHalfNDC: stemHalfPx * pxToNDC,
+                    color: SIMD4(marker.rgb.x, marker.rgb.y, marker.rgb.z, 1.0),
+                    isDownbeat: true)
             }
         }
 
