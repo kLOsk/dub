@@ -207,6 +207,10 @@ dist:
 	    || { echo "dist: Dub.app is not universal"; exit 1; }
 	@mkdir -p dist
 	@rm -f "$(DIST_ZIP)" "$(DIST_ZIP).sha256"
+	@# Xcode rebuilds into the bundle it made on the first Release build, so
+	@# its folders keep that day's date and Finder shows it on the download.
+	@# Folder dates are not part of the code signature.
+	find "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" -type d -exec touch {} +
 	ditto -c -k --sequesterRsrc --keepParent \
 	    "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" "$(DIST_ZIP)"
 	cd dist && shasum -a 256 "$(notdir $(DIST_ZIP))" > "$(notdir $(DIST_ZIP)).sha256"
