@@ -41,6 +41,18 @@ import SwiftUI
 /// Everything the column draws. `header` is the same value the old
 /// header band consumed, so title, tempo, key, pitch and the source
 /// switch keep one source of truth.
+/// The height a deck column's blocks take, padding included — the taller
+/// of the two decks. The Performance surface cuts the deck region to it:
+/// the waveform strip is no longer than the columns beside it, and what
+/// used to be empty space under them is the library's (Daniel,
+/// 2026-11-14).
+struct DeckColumnHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct DeckColumnState: Equatable {
     var side: DeckSide = .a
 
@@ -91,6 +103,9 @@ struct ScratchPadState: Equatable, Identifiable {
     var pad: Int
     /// The tagged sample's name; `nil` when no sample answers to the pad.
     var name: String?
+    /// The tagged sample's shape, as its SAMPLES pad draws it; empty
+    /// until the engine has read it.
+    var wave: [Float] = []
     /// `true` while this pad's sample is on the deck.
     var engaged: Bool = false
     /// The key that fires the pad, from the map; `nil` until bound.
@@ -277,6 +292,29 @@ struct DeckColumn<Overview: View>: View {
     }
 
     private var stack: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            blocks
+                // What the column draws, top to bottom: the height the
+                // deck region is cut to, so the strip ends where the
+                // trigger row does (`DeckColumnHeightKey`).
+                .background(GeometryReader { geo in
+                    Color.clear.preference(
+                        key: DeckColumnHeightKey.self,
+                        value: geo.size.height + DubSpacing.md * 2)
+                })
+            Spacer(minLength: 0)
+        }
+        // Tight, with the slack at the bottom. Distributing it between
+        // the blocks was tried and read as five things drifting apart
+        // rather than one instrument: a control surface wants its
+        // groups close and the empty space in one place.
+        .padding(.leading, state.side == .a ? signalTabInset : DubSpacing.md)
+        .padding(.trailing, state.side == .a ? DubSpacing.md : signalTabInset)
+        .padding(.vertical, DubSpacing.md)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var blocks: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             identityAndReadouts
@@ -299,16 +337,8 @@ struct DeckColumn<Overview: View>: View {
                 triggerRow
                     .padding(.top, DubSpacing.sm)
             }
-            Spacer(minLength: 0)
         }
-        // Tight, with the slack at the bottom. Distributing it between
-        // the blocks was tried and read as five things drifting apart
-        // rather than one instrument: a control surface wants its
-        // groups close and the empty space in one place.
-        .padding(.leading, state.side == .a ? signalTabInset : DubSpacing.md)
-        .padding(.trailing, state.side == .a ? DubSpacing.md : signalTabInset)
-        .padding(.vertical, DubSpacing.md)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     /// The signal slide-out's tab sits on the deck's outer edge, over
@@ -779,15 +809,19 @@ struct DeckColumn<Overview: View>: View {
             onExit: callbacks.onExitLoop)
     }
 
-    /// PRD §7.2: four Quick Scratch pads, drawn as what they are — four
-    /// records. Press one and it is on the deck, under the needle; press
-    /// it again and the tune comes back; press another while engaged and
-    /// the record swaps, the park untouched. Unboxed on purpose: every
-    /// neighbour on this row is a rounded rectangle, and the eye finds
-    /// the records by silhouette alone. The one on the deck is a third
-    /// bigger, its label in the deck's tint, and its sticker turns with
-    /// the platter (`DubRecordGlyph`). Empty pads are a dashed outline
-    /// where a record goes — the shelf's own empty convention.
+    /// PRD §7.2: four Quick Scratch pads. Press one and its sample is on
+    /// the deck, under the needle; press it again and the tune comes
+    /// back; press another while engaged and the sample swaps, the park
+    /// untouched.
+    ///
+    /// Flat pads, in the family of the SAMPLES and DUB SIREN pads
+    /// (canvas *Dub Quick Scratch*, 2026-11-14): each shows its sample's
+    /// own shape — the one its SAMPLES pad draws — so the DJ sees which
+    /// sound they are reaching for, and its name. The one on the deck is
+    /// lit in the deck's tint and draws the needle across that shape:
+    /// played in the tint, still to come in white. They were four
+    /// spinning records, which read as a fourth kind of control on a row
+    /// of pads. Empty pads are a dashed outline with their number.
     private var scratchPads: some View {
         HStack(spacing: DubSpacing.xs) {
             ForEach(state.scratch) { pad in
@@ -796,44 +830,48 @@ struct DeckColumn<Overview: View>: View {
         }
     }
 
-    /// Idle and on-deck record sizes. The slot they sit in is fixed so
-    /// the name beneath does not move when one grows. (`DeckColumn` is
-    /// generic over its overview, so these are computed, not stored.)
-    private var recordIdle: CGFloat { 24 }
-    private var recordOnDeck: CGFloat { 32 }
-    private var recordSlot: CGFloat { 30 }
-
     @ViewBuilder
     private func scratchPad(_ pad: ScratchPadState) -> some View {
         let tint = DubColor.deckTint(state.side)
         let bound = pad.name != nil
-        let look: DubRecordGlyph.Look = pad.engaged ? .onDeck : bound ? .shelved : .empty
-        VStack(spacing: 3) {
-            record(look: look, tint: tint)
-                .frame(width: pad.engaged ? recordOnDeck : recordIdle,
-                       height: pad.engaged ? recordOnDeck : recordIdle)
-                .animation(.spring(response: 0.18, dampingFraction: 0.6), value: pad.engaged)
-                .frame(height: recordSlot)
-            Text(pad.name ?? "QS\(pad.pad + 1)")
-                .font(bound
-                    ? .system(size: 10, weight: .semibold, design: .rounded)
-                    : .system(size: 9, weight: .medium, design: .monospaced))
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .foregroundStyle(
-                    pad.engaged ? DubColor.textPrimary
-                        : bound ? DubColor.textSecondary : DubColor.textPlaceholder)
+        VStack(spacing: 4) {
+            if let name = pad.name {
+                if !pad.wave.isEmpty {
+                    scratchShape(pad, tint: tint)
+                        .frame(height: 12)
+                        .padding(.horizontal, 6)
+                }
+                Text(name)
+                    .font(.system(size: 9, weight: .bold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(pad.engaged ? DubColor.textPrimary : DubColor.textSecondary)
+                    .padding(.horizontal, 3)
+            } else {
+                Text("QS\(pad.pad + 1)")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(DubColor.textPlaceholder)
+            }
         }
-        .padding(.horizontal, 2)
-        // Flexible from the floor up: the four pads share the row's
-        // slack equally, and at the column's floor they sit at
-        // `deckColumnScratchPadMinWidth` so the three blocks sum to the
-        // inner width exactly.
         .frame(minWidth: DubLayout.deckColumnScratchPadMinWidth, maxWidth: .infinity)
         .frame(height: DubLayout.deckColumnEchoHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(pad.engaged ? tint.opacity(0.18) : bound ? DubColor.surface3 : Color.clear))
+        .overlay(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .strokeBorder(
+                    pad.engaged ? tint : DubColor.divider,
+                    style: StrokeStyle(lineWidth: 1, dash: bound ? [] : [3, 3])))
         .overlay(alignment: .topTrailing) {
             if let legend = pad.legend, bound, mapping == nil {
                 DubKeycap(key: legend, lit: pad.engaged)
+            } else if bound {
+                Text("QS\(pad.pad + 1)")
+                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .foregroundStyle(pad.engaged ? tint : DubColor.textTertiary)
+                    .padding(.top, 2)
+                    .padding(.trailing, 4)
             }
         }
         .contentShape(Rectangle())
@@ -842,22 +880,22 @@ struct DeckColumn<Overview: View>: View {
         .mappable(.quickScratch(state.side, pad.pad))
     }
 
-    /// The record, turning with the platter while it is on the deck.
-    /// The angle is read off the engine's lock-free position snapshot
-    /// every frame — the same source the playhead uses — so it follows a
-    /// scratch back and forth and stands still on a paused deck. Without
-    /// an engine (snapshots, previews) it sits at twelve o'clock.
+    /// The pad's sample shape. On the deck the needle is drawn across it,
+    /// read off the engine's lock-free position snapshot every frame — the
+    /// source the playhead uses — so it follows a scratch back and forth
+    /// and stands still on a paused deck. Without an engine (snapshots,
+    /// previews) it stands at the start.
     @ViewBuilder
-    private func record(look: DubRecordGlyph.Look, tint: Color) -> some View {
-        if look == .onDeck, let liveEngine, let liveDeckIdx {
+    private func scratchShape(_ pad: ScratchPadState, tint: Color) -> some View {
+        if pad.engaged, let liveEngine, let liveDeckIdx {
             TimelineView(.animation) { _ in
-                DubRecordGlyph(
-                    look: look, tint: tint,
-                    angle: DubRecordGlyph.angle(
-                        forElapsedSecs: liveEngine.positionSnapshot(deckIdx: liveDeckIdx).elapsedSecs))
+                let p = liveEngine.positionSnapshot(deckIdx: liveDeckIdx)
+                ScratchShape(
+                    bars: pad.wave, played: p.durationSecs > 0 ? p.elapsedSecs / p.durationSecs : 0,
+                    tint: tint, onDeck: true)
             }
         } else {
-            DubRecordGlyph(look: look, tint: tint)
+            ScratchShape(bars: pad.wave, played: 0, tint: tint, onDeck: pad.engaged)
         }
     }
 
@@ -1163,5 +1201,38 @@ extension View {
         } else {
             self
         }
+    }
+}
+
+/// A Quick Scratch pad's sample shape: one bar per slice, mirrored about
+/// the middle. On the deck the bars the needle has passed take the deck's
+/// tint and the rest are white; off it they are grey.
+struct ScratchShape: View {
+    let bars: [Float]
+    /// How far the needle is through the sample, `0...1`.
+    var played: Double = 0
+    let tint: Color
+    var onDeck: Bool = false
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard !bars.isEmpty else { return }
+            let step = size.width / CGFloat(bars.count)
+            let needle = min(max(played, 0), 1)
+            for (i, a) in bars.enumerated() {
+                let h = max(1.5, CGFloat(min(max(a, 0), 1)) * size.height)
+                let rect = CGRect(
+                    x: CGFloat(i) * step, y: (size.height - h) / 2,
+                    width: max(1, step - 0.8), height: h)
+                let ink: Color
+                if onDeck {
+                    ink = Double(i) / Double(bars.count) < needle ? tint : DubColor.textPrimary
+                } else {
+                    ink = DubColor.textSecondary
+                }
+                ctx.fill(Path(rect), with: .color(ink))
+            }
+        }
+        .accessibilityHidden(true)
     }
 }

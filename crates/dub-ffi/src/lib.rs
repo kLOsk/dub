@@ -3181,6 +3181,24 @@ impl DubEngine {
         self.with_running(|running| running.handle.sampler_stop(slot).map_err(map_command_error))
     }
 
+    /// A sample's shape for its pad: `bars` amplitudes in `0...1`, each
+    /// the loudest moment of its slice of the sample, scaled so the
+    /// sample's own loudest is 1. Empty for an empty slot, a bad index or
+    /// a stopped engine. Read once after a load — it takes the engine
+    /// lock.
+    #[must_use]
+    pub fn sampler_waveform(&self, slot: u64, bars: u32) -> Vec<f32> {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return Vec::new();
+        };
+        let peaks = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| running.sampler_peaks.get(slot))
+            .and_then(Option::as_ref);
+        peaks.map_or_else(Vec::new, |p| waveform_bars(&p.broadband, bars as usize))
+    }
+
     /// What every sampler slot is doing right now — sounding or not,
     /// and how far through its take. One row per slot, in slot order,
     /// so the shell's pads light and sweep off it at poll rate.
@@ -5875,6 +5893,32 @@ fn background_analyze_and_install(
     eprintln!("dub-ffi: beat-grid deck={idx} installed ({source_label}, {bpm_ms}ms DSP)");
 }
 
+/// `chunks` reduced to `bars` amplitudes in `0...1`: each bar the loudest
+/// chunk of its slice, the whole scaled to its own loudest.
+fn waveform_bars(chunks: &[PeakChunk], bars: usize) -> Vec<f32> {
+    if chunks.is_empty() || bars == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<f32> = (0..bars)
+        .map(|b| {
+            let from = b * chunks.len() / bars;
+            let to = ((b + 1) * chunks.len() / bars)
+                .max(from + 1)
+                .min(chunks.len());
+            chunks[from.min(chunks.len() - 1)..to]
+                .iter()
+                .fold(0.0f32, |m, c| m.max(c.max.abs()).max(c.min.abs()))
+        })
+        .collect();
+    let top = out.iter().copied().fold(0.0f32, f32::max);
+    if top > 0.0 {
+        for v in &mut out {
+            *v /= top;
+        }
+    }
+    out
+}
+
 /// The band's own beats for `grid`, when following is switched on and the
 /// track's band wanders off it — see [`DubEngine::set_following_grid`].
 fn followed_grid(grid: &BeatGrid, track: &Track, samples: &[f32]) -> Option<BeatGrid> {
@@ -6600,6 +6644,26 @@ mod tests {
     }
     use super::*;
 
+    /// A pad's waveform is the sample's shape at the pad's width: the
+    /// loudest chunk of each slice, the loudest bar at full height.
+    #[test]
+    fn a_samples_waveform_is_its_shape_in_bars() {
+        let chunk = |a: f32| PeakChunk {
+            min: -a,
+            max: a * 0.5,
+            rms: 0.0,
+        };
+        let chunks: Vec<PeakChunk> = [0.1, 0.4, 0.2, 0.2, 0.0, 0.0]
+            .into_iter()
+            .map(chunk)
+            .collect();
+        assert_eq!(waveform_bars(&chunks, 3), vec![1.0, 0.5, 0.0]);
+        // More bars than chunks: every bar still has a chunk to read.
+        assert_eq!(waveform_bars(&chunks[..2], 4).len(), 4);
+        assert!(waveform_bars(&[], 8).is_empty());
+        assert!(waveform_bars(&chunks, 0).is_empty());
+    }
+
     /// A track loaded onto a THRU deck clears the deck's live waveform.
     /// The stream it clears holds the deck's end of the audio tap, and
     /// the next THRU needs it back: lost, that deck has a tempo and
@@ -6823,7 +6887,7 @@ mod tests {
         // 82→83: `ThruTempo.record_secs` / `record_start_secs`,
         // `thru_beat_phase`, `DeckTelemetry.input_rms_left` … `_right`;
         // `set_deck_auto_control` removed.
-        // 83→84: `set_following_grid`, `deck_local_bpm`.
+        // 83→84: `set_following_grid`, `deck_local_bpm`, `sampler_waveform`.
         assert_eq!(FFI_VERSION, 84);
     }
 

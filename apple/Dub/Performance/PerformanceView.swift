@@ -104,7 +104,7 @@ struct PerformanceView: View {
                 deckChromeBudget: model.engineMode == .prep ? 0 : DubLayout.rackBarHeight + 1,
                 deckMinimum: model.engineMode == .prep
                     ? DubLayout.prepRegionMinHeight + prepRipLaneHeight
-                    : DubLayout.waveformMinHeight
+                    : max(deckColumnHeight, DubLayout.waveformMinHeight)
             ) { _ in
                 VStack(spacing: 0) {
                     waveformRegion
@@ -125,6 +125,12 @@ struct PerformanceView: View {
             }
         }
         .background(DubColor.surface0)
+        .onPreferenceChange(DeckColumnHeightKey.self) { height in
+            // Whole points, and only when it really moved: this feeds the
+            // layout that produced it.
+            let rounded = height.rounded(.up)
+            if abs(rounded - deckColumnHeight) >= 1 { deckColumnHeight = rounded }
+        }
     }
 
     // MARK: - Deck headers
@@ -298,6 +304,7 @@ struct PerformanceView: View {
                 return ScratchPadState(
                     pad: pad,
                     name: slot.flatMap { model.sampleBank.slot($0) }.map { SampleBank.label(for: $0) },
+                    wave: slot.flatMap { model.sampleWaves[$0] } ?? [],
                     engaged: deck.quickScratch?.pad == pad,
                     legend: DubKeymap.legend(for: .quickScratch(side, pad)))
             },
@@ -448,6 +455,10 @@ struct PerformanceView: View {
     /// The rack bar folded to its one-line strip — "I am browsing now".
     /// Remembered across launches, like the library's filter bar.
     @AppStorage("dub.rackFolded") private var rackFolded: Bool = false
+    /// The deck columns' own height, as they report it
+    /// (`DeckColumnHeightKey`) — what the deck region is cut to in
+    /// Performance. Zero until the first layout.
+    @State private var deckColumnHeight: CGFloat = 0
 
     /// Fixed chrome carried on the deck side of the divider.
     private var deckChromeHeight: CGFloat {
@@ -490,6 +501,7 @@ struct PerformanceView: View {
                 return SampleSlotState(
                     index: index,
                     name: model.sampleBank.slot(index).map { SampleBank.label(for: $0) },
+                    wave: model.sampleWaves[index] ?? [],
                     playing: voice?.playing ?? false,
                     progress: Double(voice?.progress ?? 0),
                     quickScratch: model.sampleBank.quickScratchTag(index),

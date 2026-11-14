@@ -5506,6 +5506,7 @@ final class WaveformAppModel: ObservableObject {
             let ffiSlot = UInt64(index)
             guard let url else {
                 missingSamples[index] = nil
+                sampleWaves[index] = nil
                 try? engine.samplerClear(slot: ffiSlot)
                 continue
             }
@@ -5515,6 +5516,7 @@ final class WaveformAppModel: ObservableObject {
             // every launch and every SL 3 plug-in).
             guard FileManager.default.fileExists(atPath: url.path) else {
                 try? engine.samplerClear(slot: ffiSlot)
+                sampleWaves[index] = nil
                 if missingSamples[index] != url.lastPathComponent {
                     missingSamples[index] = url.lastPathComponent
                     surfaceNotice(
@@ -5531,6 +5533,8 @@ final class WaveformAppModel: ObservableObject {
             Task.detached(priority: .userInitiated) {
                 do {
                     _ = try engine.samplerLoad(slot: ffiSlot, path: url.path)
+                    let wave = engine.samplerWaveform(slot: ffiSlot, bars: UInt32(Self.sampleWaveBars))
+                    await MainActor.run { self.sampleWaves[index] = wave }
                 } catch {
                     let name = url.lastPathComponent
                     let detail = error.localizedDescription
@@ -5544,6 +5548,12 @@ final class WaveformAppModel: ObservableObject {
             }
         }
     }
+
+    /// Each loaded sample's shape, for its pad: `sampleWaveBars`
+    /// amplitudes in `0...1`, read from the engine once the sample is
+    /// in. Absent for an empty pad or one still loading.
+    @Published private(set) var sampleWaves: [Int: [Float]] = [:]
+    static let sampleWaveBars = 30
 
     // MARK: Quick Scratch (PRD §7.2)
 

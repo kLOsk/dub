@@ -31,21 +31,6 @@ final class PerformanceLayoutTests: XCTestCase {
 
     // MARK: - The pad column
 
-    /// The deck pane a 1440 × 900 window actually produces, asked of
-    /// the splitter rather than restated as a constant.
-    ///
-    /// It used to be a literal 398, derived against 236 pt of chrome —
-    /// 108 of which was the deck header band that no longer exists. A
-    /// constant that has to be re-derived by hand every time the chrome
-    /// moves will be wrong the once it matters, so this computes it.
-    private var paneHeight: CGFloat {
-        let chrome = DubLayout.rackBarHeight + 1
-        let total = 900 - DubLayout.statusStripHeight
-        return DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
-            mode: .timecode, total: total, deckChrome: chrome,
-            deckMinimum: DubLayout.waveformMinHeight) - chrome
-    }
-
     /// A loaded deck with cues set — the tallest the column gets in a
     /// shipping configuration.
     private static let columnFixture = DeckColumnState(
@@ -142,13 +127,18 @@ final class PerformanceLayoutTests: XCTestCase {
         XCTAssertFalse(DeckColumnHeader(settled).calibrating)
     }
 
+    /// The deck region is cut to the columns' own height (2026-11-14),
+    /// so the column fits by construction; what has to hold is the rest:
+    /// on a 1440 × 900 window the column, the rack bar under it and the
+    /// library's floor must all fit.
     func test_deckColumn_fitsThePane_onALaptopScreen() {
         let size = fittingSize(
             DeckColumn(state: Self.columnFixture) { Color.clear },
             width: columnWidthAt1440)
+        let total = 900 - DubLayout.statusStripHeight - 1
         XCTAssertLessThanOrEqual(
-            size.height, paneHeight + 0.5,
-            "deck column overflows the 1440 × 900 pane")
+            size.height + DubLayout.rackBarHeight + 1 + DubLayout.libraryMinHeight, total + 0.5,
+            "the deck column and the rack bar leave the library less than its floor at 1440 × 900")
     }
 
     /// The column's floor has to hold the trigger row — the scratch
@@ -302,16 +292,20 @@ final class PerformanceLayoutTests: XCTestCase {
                              "the library takes the remainder")
     }
 
-    /// Performance keeps the decks dominant — PRD §9.2 is explicit that
-    /// they own the vertical real estate, so the library must not take
-    /// the space Prep gives it.
-    func test_performanceKeepsTheDecksDominant() {
+    /// Performance sizes the deck region to the deck columns and gives
+    /// the rest to the library — the strip as tall as the controls beside
+    /// it, the rack bar straight under them (2026-11-14). It held 68 %
+    /// for the decks before, which left a third of the strip running past
+    /// the columns over a starved library.
+    func test_performanceSizesTheDeckToItsColumns() {
         let total: CGFloat = 900
+        let columns: CGFloat = 390
+        let chrome = DubLayout.rackBarHeight + 1
         let deck = DeckLibrarySplit<EmptyView, EmptyView>.deckHeight(
             mode: .timecode, total: total,
-            deckChrome: DubLayout.rackBarHeight,
-            deckMinimum: DubLayout.waveformMinHeight)
-        XCTAssertGreaterThan(deck, total * 0.5)
+            deckChrome: chrome, deckMinimum: columns)
+        XCTAssertEqual(deck, columns + chrome, accuracy: 0.5)
+        XCTAssertGreaterThan(total - deck, DubLayout.libraryMinHeight)
     }
 
     /// On a window too short for both, the deck yields first and the

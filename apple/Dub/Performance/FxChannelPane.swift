@@ -49,9 +49,9 @@ struct FxChannelPane<Scope: View>: View {
     private var lane: some View {
         FxInputLane(state: state, callbacks: callbacks, meter: meter, scope: scope)
             .frame(
-                minWidth: DubLayout.performanceWaveformMinWidth,
-                idealWidth: DubLayout.performanceWaveformWidth,
-                maxWidth: DubLayout.performanceWaveformWidthCap)
+                minWidth: DubLayout.fxInputLaneMinWidth,
+                idealWidth: DubLayout.fxInputLaneWidth,
+                maxWidth: DubLayout.fxInputLaneWidthCap)
             .frame(maxHeight: .infinity)
             .layoutPriority(1)
     }

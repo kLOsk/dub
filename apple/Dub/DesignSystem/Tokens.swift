@@ -539,7 +539,7 @@ enum DubLayout {
     /// This is the *ideal*: the strip grows toward
     /// `performanceWaveformWidthCap` when the pane allows and shrinks
     /// to `performanceWaveformMinWidth` when it does not.
-    static let performanceWaveformWidth: CGFloat = 106
+    static let performanceWaveformWidth: CGFloat = 85
 
     /// Fixed width of each deck's performance-pad column. The widest
     /// row is CUE / the four LOOP lengths at 4 × 38 + 3 × 8 = 176, plus
@@ -574,8 +574,21 @@ enum DubLayout {
     /// density knee; the floor is well under it, so a pane narrow
     /// enough to force the strip down there is trading peak detail for
     /// the columns on purpose.
-    static let performanceWaveformWidthCap: CGFloat = 150
-    static let performanceWaveformMinWidth: CGFloat = 70
+    ///
+    /// A further fifth off all three (150/106/70 → 120/85/56,
+    /// 2026-11-14), when the deck region was cut to the columns' height:
+    /// a shorter strip read better narrower too (the DJ's ask). The
+    /// width goes back to the deck columns.
+    static let performanceWaveformWidthCap: CGFloat = 120
+    static let performanceWaveformMinWidth: CGFloat = 56
+
+    /// The DUB FX channel's input lane sits where a deck's waveform would.
+    /// It kept the strip's widths from before the strip narrowed: its
+    /// TRIM readout, meter and SEND · MIC switch need them, and at the
+    /// strip's 120 the readout wrapped and the source switch clipped.
+    static let fxInputLaneWidthCap: CGFloat = 150
+    static let fxInputLaneWidth: CGFloat = 106
+    static let fxInputLaneMinWidth: CGFloat = 70
 
     /// The shortest the Prep playing strip is allowed to get before the
     /// pad bar starts giving up height instead.

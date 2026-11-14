@@ -41,6 +41,8 @@ struct SampleSlotState: Equatable, Identifiable {
     var index: Int
     /// Display name of the loaded sample; `nil` is an empty slot.
     var name: String?
+    /// The sample's shape, `0...1` per bar; empty until it is known.
+    var wave: [Float] = []
     /// `true` while the one-shot is sounding.
     var playing: Bool = false
     /// How far through the take, `0...1`. `0` when idle.
@@ -172,20 +174,45 @@ struct SampleShelf: View {
     private func tile(_ slot: SampleSlotState) -> some View {
         let isEmpty = slot.name == nil
         let lit = slot.playing && !isEmpty
-        VStack(spacing: 2) {
-            Text(slot.name ?? "\(slot.index + 1)")
-                .font(.system(
-                    size: isEmpty ? 13 : 11,
-                    weight: isEmpty ? .medium : .semibold,
-                    design: isEmpty ? .monospaced : .default))
-                .foregroundStyle(isEmpty ? DubColor.textPlaceholder : DubColor.textPrimary)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .minimumScaleFactor(0.85)
+        HStack(spacing: DubSpacing.sm) {
+            // The pad's number leads, as on the mock: a loaded pad is
+            // still pad 3.
+            Text("\(slot.index + 1)")
+                .font(.system(size: isEmpty ? 13 : 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(DubColor.textPlaceholder)
+                .frame(maxWidth: isEmpty ? .infinity : nil)
+            if let name = slot.name, slot.wave.isEmpty {
+                // Still loading (or not read at all): no space kept for
+                // a shape that is not there.
+                tileName(name).frame(maxWidth: .infinity, alignment: .leading)
+            } else if let name = slot.name {
+                // The shape first when there is room for it: it is what
+                // tells two horn stabs apart at a glance. One measured
+                // alternative, not nested — eight tiles, two builds each.
+                // The name reports a small ideal width: its full length is
+                // what made the shape look as if it never fit (rig,
+                // 2026-11-14). It truncates in whatever is left. The shape
+                // grows with the pad — with the siren off the shelf has the
+                // whole bar.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: DubSpacing.sm) {
+                        SampleWave(bars: slot.wave, tint: lit ? DubColor.textPrimary : tint)
+                            .frame(minWidth: 48, idealWidth: 60, maxWidth: 140)
+                            .frame(height: 16)
+                        tileName(name)
+                            .frame(minWidth: 0, idealWidth: 70, maxWidth: .infinity, alignment: .leading)
+                            .layoutPriority(1)
+                    }
+                    tileName(name)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Room for the QS tag in the corner.
+                .padding(.trailing, slot.quickScratch == nil ? 0 : 22)
+            }
         }
         .frame(maxWidth: .infinity)
         .frame(height: Self.tileHeight)
-        .padding(.horizontal, DubSpacing.xs)
+        .padding(.horizontal, DubSpacing.sm)
         // Sweep first so it sits between the fill and the label:
         // backgrounds stack outward, each behind the last.
         .background(alignment: .leading) {
@@ -197,7 +224,7 @@ struct SampleShelf: View {
                 }
             }
         }
-        .background(isEmpty ? Color.clear : lit ? tint.opacity(0.24) : DubColor.surface2)
+        .background(isEmpty ? Color.clear : lit ? tint.opacity(0.24) : DubColor.surface3)
         .clipShape(RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
@@ -244,6 +271,14 @@ struct SampleShelf: View {
         .mappable(.sampler(slot.index))
     }
 
+    private func tileName(_ name: String) -> some View {
+        Text(name)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(DubColor.textPrimary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+    }
+
     /// The stopped-state menu: which Quick Scratch pad this sample sits
     /// on, and the way out. Flat rather than a submenu — five lines,
     /// read once.
@@ -267,5 +302,29 @@ struct SampleShelf: View {
             ? "\(name) — click to start over, right-click to stop"
             : "\(name)\(tag) — click to play, right-click for Quick Scratch / unload, "
                 + "drop another to replace"
+    }
+}
+
+
+/// A sample's shape on its pad: one bar per slice, mirrored about the
+/// middle like the waveform it is cut from. Nothing drawn until the
+/// engine has read the sample.
+struct SampleWave: View {
+    let bars: [Float]
+    var tint: Color
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard !bars.isEmpty else { return }
+            let step = size.width / CGFloat(bars.count)
+            for (i, a) in bars.enumerated() {
+                let h = max(1.5, CGFloat(min(max(a, 0), 1)) * size.height)
+                let rect = CGRect(
+                    x: CGFloat(i) * step, y: (size.height - h) / 2,
+                    width: max(1, step - 0.8), height: h)
+                ctx.fill(Path(rect), with: .color(tint))
+            }
+        }
+        .accessibilityHidden(true)
     }
 }

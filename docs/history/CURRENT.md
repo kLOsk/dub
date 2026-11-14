@@ -5,7 +5,7 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-11-12.
+> Last updated: 2026-11-14.
 
 ## Where the branch is
 
@@ -146,6 +146,16 @@ gate is local-only because GitHub CI has no macOS app job.
   siren's and the Space Echo's beat-match time themselves to it; the
   library keeps the one average. No mark on the deck yet says a grid is
   a following one (to be designed).
+- **The performance surface, re-laid out (2026-11-14).** The deck region is
+  cut to the deck columns' own height (`DeckColumnHeightKey`; it held 68 %
+  before), the rack bar sits straight under it and the library takes the
+  rest. The waveform strip is a fifth narrower (cap 150 → 120); the DUB FX
+  input lane keeps the old widths (`fxInputLane*`). The siren block is flat
+  pads with each shot's glyph, a TAIL row and one arc dial (canvas *Dub
+  Siren Rack*, direction B — the VU display is gone). Sample pads draw each
+  sample's shape (`sampler_waveform`), and Quick Scratch pads are flat pads
+  with the tagged sample's shape, the one on the deck drawing the needle
+  across it (canvas *Dub Quick Scratch*) — the spinning records are gone.
 - **Calibration says one thing; the signal panel has one button.** The
   overview's bar read SETTLING PITCH for the second half of the session
   measurement (the wobble fit), which on an empty, stopped deck looked like

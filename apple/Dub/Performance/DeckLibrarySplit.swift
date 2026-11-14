@@ -19,9 +19,11 @@
 //    strip and the `PrepRack` — and gives everything below to the
 //    library. Prep is where you read a track list, so the list should
 //    have the room the controls do not need.
-//  * **Performance** keeps the decks dominant (PRD §9.2: "the decks
-//    dominate vertical real estate intentionally"), at the proportion the
-//    drag used to default to. The library is subordinate there by design.
+//  * **Performance** does the same since 2026-11-14: the deck region is
+//    as tall as the deck columns (source, readouts, overview, cues,
+//    trigger row) and no taller, the rack bar sits straight under it, and
+//    the library has the rest. It used to hold 68 % for the decks, which
+//    left the strip running a third of its height past the columns.
 //
 
 import AppKit
@@ -64,8 +66,8 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
         }
     }
 
-    /// Prep pins the deck to its content and hands the rest over;
-    /// Performance keeps the decks dominant.
+    /// The deck is pinned to its content and the rest handed over, in
+    /// both modes.
     ///
     /// Both are clamped so the library keeps `libraryMinHeight` — on a
     /// short window the deck gives way first, which is the same
@@ -77,19 +79,13 @@ struct DeckLibrarySplit<Deck: View, Library: View>: View {
         deckChromeBudget: CGFloat? = nil,
         deckMinimum: CGFloat
     ) -> CGFloat {
-        let wanted: CGFloat
-        switch mode {
-        case .prep:
-            wanted = deckMinimum + deckChrome
-        case .timecode:
-            // The fraction includes the budgeted chrome; chrome that is
-            // not there (the rack folded) comes off the deck side, so
-            // the waveform region stays exactly where it was.
-            let missing = max(0, (deckChromeBudget ?? deckChrome) - deckChrome)
-            wanted = max(
-                deckMinimum + deckChrome,
-                total * DubLayout.performanceDeckFraction - missing)
-        }
+        // Both modes size the deck to what it draws and hand the rest to
+        // the library. Performance used to keep a fixed 68 % for the
+        // decks; with the pads beside the strip that left a third of the
+        // region empty under the columns while the library was starved
+        // (2026-11-14). `deckMinimum` there is the columns' own height.
+        _ = (mode, deckChromeBudget)
+        let wanted = deckMinimum + deckChrome
         let ceiling = max(0, total - DubLayout.libraryMinHeight)
         return max(0, min(wanted, ceiling))
     }

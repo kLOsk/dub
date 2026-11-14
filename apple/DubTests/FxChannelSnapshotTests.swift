@@ -41,7 +41,7 @@ final class FxChannelSnapshotTests: XCTestCase {
 
     /// The pane at the 1440 × 900 deck row: a 486 pt column beside the
     /// strip at its cap.
-    private static let paneWidth: CGFloat = 486 + DubLayout.performanceWaveformWidthCap
+    private static let paneWidth: CGFloat = 486 + DubLayout.fxInputLaneWidthCap
     private static let paneHeight: CGFloat = 560
 
     /// Deck B on DUB FX with the send patched in: the Big Knob, the Space

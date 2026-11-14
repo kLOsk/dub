@@ -2,8 +2,9 @@
 //  SirenMeterFace.swift
 //  Dub
 //
-//  The VU face of the siren box's meter — see `SirenDisplay` for what
-//  drives the needle and why it is drawn rather than measured.
+//  The VU face of the DUB FX channel's input meter (`FxChannelPane`).
+//  It was the siren box's too, until the siren block went flat
+//  (2026-11-14, `SirenRackGroup`).
 //
 
 import AppKit
