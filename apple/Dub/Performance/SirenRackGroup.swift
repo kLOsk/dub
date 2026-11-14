@@ -280,37 +280,43 @@ struct SirenDubDial: View {
 
     private var clamped: Double { min(max(value, 0), 1) }
 
+    /// The arc, the body and the index line. A plain function with its
+    /// types written out: inside the `Canvas` closure the universal
+    /// Release build gave up type-checking it.
+    private static func draw(in ctx: inout GraphicsContext, size: CGSize, value: Double) {
+        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+        let r: CGFloat = min(size.width, size.height) / 2 - 3
+        let start: Angle = .degrees(135)
+        let full: Path = arc(center: c, radius: r, from: start, fraction: 1)
+        let stroke = StrokeStyle(lineWidth: 3.5, lineCap: .round)
+        ctx.stroke(full, with: .color(DubColor.divider), style: stroke)
+        if value > 0 {
+            let lit: Path = arc(center: c, radius: r, from: start, fraction: value)
+            ctx.stroke(lit, with: .color(DubColor.siren), style: stroke)
+        }
+        let inner: CGFloat = r - 5.5
+        let body = Path(ellipseIn: CGRect(x: c.x - inner, y: c.y - inner, width: inner * 2, height: inner * 2))
+        ctx.fill(body, with: .color(DubColor.surface3))
+        ctx.stroke(body, with: .color(DubColor.plateEdge), lineWidth: 1)
+        let a = CGFloat((start + .degrees(270 * value)).radians)
+        let reach: CGFloat = r - 8
+        var index = Path()
+        index.move(to: CGPoint(x: c.x + cos(a) * 5, y: c.y + sin(a) * 5))
+        index.addLine(to: CGPoint(x: c.x + cos(a) * reach, y: c.y + sin(a) * reach))
+        ctx.stroke(index, with: .color(DubColor.textPrimary), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+    }
+
+    private static func arc(center: CGPoint, radius: CGFloat, from start: Angle, fraction: Double) -> Path {
+        var p = Path()
+        p.addArc(
+            center: center, radius: radius, startAngle: start,
+            endAngle: start + .degrees(270 * fraction), clockwise: false)
+        return p
+    }
+
     var body: some View {
         VStack(spacing: 4) {
-            Canvas { ctx, size in
-                let c = CGPoint(x: size.width / 2, y: size.height / 2)
-                let r = min(size.width, size.height) / 2 - 3
-                // 270° from bottom-left, clockwise through the top.
-                let start = Angle.degrees(135)
-                func arc(to fraction: Double) -> Path {
-                    Path { p in
-                        p.addArc(
-                            center: c, radius: r, startAngle: start,
-                            endAngle: start + .degrees(270 * fraction), clockwise: false)
-                    }
-                }
-                let stroke = StrokeStyle(lineWidth: 3.5, lineCap: .round)
-                ctx.stroke(arc(to: 1), with: .color(DubColor.divider), style: stroke)
-                if clamped > 0 {
-                    ctx.stroke(arc(to: clamped), with: .color(DubColor.siren), style: stroke)
-                }
-                let body = Path(ellipseIn: CGRect(
-                    x: c.x - r + 5.5, y: c.y - r + 5.5, width: (r - 5.5) * 2, height: (r - 5.5) * 2))
-                ctx.fill(body, with: .color(DubColor.surface3))
-                ctx.stroke(body, with: .color(DubColor.plateEdge), lineWidth: 1)
-                let a = (start + .degrees(270 * clamped)).radians
-                var index = Path()
-                index.move(to: CGPoint(x: c.x + cos(a) * 5, y: c.y + sin(a) * 5))
-                index.addLine(to: CGPoint(x: c.x + cos(a) * (r - 8), y: c.y + sin(a) * (r - 8)))
-                ctx.stroke(
-                    index, with: .color(DubColor.textPrimary),
-                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-            }
+            Canvas { ctx, size in Self.draw(in: &ctx, size: size, value: clamped) }
             .frame(width: Self.size, height: Self.size)
             Text(clamped > 0 ? "DUB \(Int((clamped * 100).rounded())) %" : "DRY")
                 .font(.system(size: 9, weight: .heavy))
