@@ -221,6 +221,9 @@ pub struct DeckSharedState {
     /// FX pane. Zero on a deck playing a file.
     input_rms_bits: AtomicU32,
     input_peak_bits: AtomicU32,
+    /// The same, per input channel: RMS left, RMS right, peak left, peak
+    /// right. A THRU deck's two meters.
+    input_channel_bits: [AtomicU32; 4],
 }
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
@@ -402,6 +405,12 @@ impl DeckSharedState {
             quick_scratch_parked_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             input_rms_bits: AtomicU32::new(0.0f32.to_bits()),
             input_peak_bits: AtomicU32::new(0.0f32.to_bits()),
+            input_channel_bits: [
+                AtomicU32::new(0.0f32.to_bits()),
+                AtomicU32::new(0.0f32.to_bits()),
+                AtomicU32::new(0.0f32.to_bits()),
+                AtomicU32::new(0.0f32.to_bits()),
+            ],
         }
     }
 
@@ -555,6 +564,26 @@ impl DeckSharedState {
         self.input_rms_bits.store(rms.to_bits(), Ordering::Relaxed);
         self.input_peak_bits
             .store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publish the live input's level per channel (audio thread). Four
+    /// relaxed stores; RT-safe.
+    pub(crate) fn store_input_channels(&self, rms: [f32; 2], peak: [f32; 2]) {
+        for (slot, v) in self
+            .input_channel_bits
+            .iter()
+            .zip([rms[0], rms[1], peak[0], peak[1]])
+        {
+            slot.store(v.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Lock-free read of the live input's per-channel level:
+    /// `(rms [l, r], peak [l, r])`.
+    #[must_use]
+    pub fn load_input_channels(&self) -> ([f32; 2], [f32; 2]) {
+        let v = |i: usize| f32::from_bits(self.input_channel_bits[i].load(Ordering::Relaxed));
+        ([v(0), v(1)], [v(2), v(3)])
     }
 
     /// Lock-free read of the live input's `(rms, peak)`, for the FFI
@@ -1684,6 +1713,10 @@ impl Deck {
     /// Publish this deck's live input level (F-38 stage 3). RT-safe.
     pub(crate) fn store_input_level(&self, rms: f32, peak: f32) {
         self.shared.store_input_level(rms, peak);
+    }
+
+    pub(crate) fn store_input_channels(&self, rms: [f32; 2], peak: [f32; 2]) {
+        self.shared.store_input_channels(rms, peak);
     }
 
     /// Read back this deck's published dub-siren indicator state. Used by the

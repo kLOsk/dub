@@ -181,6 +181,26 @@ pub struct PassthroughLevel {
     pub sum_sq: f32,
     /// Frames actually carried; less than the block on an underrun.
     pub frames: usize,
+    /// The same peak and square sum per channel, left then right — what a
+    /// THRU deck's two meters read, so a dead side shows as a dead side.
+    pub channel_peak: [f32; 2],
+    /// Σ over frames of each channel's square, left then right.
+    pub channel_sum_sq: [f32; 2],
+}
+
+impl PassthroughLevel {
+    /// One channel's level as a level of its own, for its meter.
+    #[must_use]
+    pub fn channel(&self, ch: usize) -> Self {
+        let ch = ch.min(1);
+        Self {
+            peak: self.channel_peak[ch],
+            sum_sq: self.channel_sum_sq[ch],
+            frames: self.frames,
+            channel_peak: [self.channel_peak[ch]; 2],
+            channel_sum_sq: [self.channel_sum_sq[ch]; 2],
+        }
+    }
 }
 
 /// Off-RT configuration for [`TimecodeInput`]. All fields are validated
@@ -1148,6 +1168,8 @@ impl TimecodeInput {
         let n = frames.min(avail_frames);
         let mut peak = 0.0f32;
         let mut sum_sq = 0.0f32;
+        let mut channel_peak = [0.0f32; 2];
+        let mut channel_sum_sq = [0.0f32; 2];
         for i in 0..n {
             let base = i * num_channels + first;
             let (l, r) = if mono {
@@ -1160,11 +1182,17 @@ impl TimecodeInput {
             out[base + 1] += r;
             peak = peak.max(l.abs()).max(r.abs());
             sum_sq += 0.5 * (l * l + r * r);
+            channel_peak[0] = channel_peak[0].max(l.abs());
+            channel_peak[1] = channel_peak[1].max(r.abs());
+            channel_sum_sq[0] += l * l;
+            channel_sum_sq[1] += r * r;
         }
         PassthroughLevel {
             peak,
             sum_sq,
             frames: n,
+            channel_peak,
+            channel_sum_sq,
         }
     }
 

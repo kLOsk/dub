@@ -280,7 +280,7 @@ pub use rip::{
 ///       that removes the cartridge's decoded-rate bias. [`DeckTelemetry`]
 ///       grows `control_mode` / `source_class` / `calibrated` /
 ///       `calibrating`; new [`DubEngine::set_deck_control_mode`] (with the
-///       [`ControlMode`] enum) / [`DubEngine::set_deck_auto_control`] /
+///       [`ControlMode`] enum) / `DubEngine::set_deck_auto_control` /
 ///       [`DubEngine::calibrate_deck`] drive the deck-header
 ///       Internal/Timecode switch + manual recalibrate.
 ///   35. **Auto-gain (loudness normalization).** `analyze_track` now
@@ -517,7 +517,19 @@ pub use rip::{
 ///       starting over when the needle comes up, and draws the record as
 ///       a live waveform through the deck's ordinary peaks. A deck sent to
 ///       THRU or DUB FX no longer keeps the unloaded track's peaks.
-pub const FFI_VERSION: u32 = 82;
+///   83. **A THRU deck shows its record.** [`ThruTempo`] gains
+///       `record_secs` / `record_start_secs` (how long the record under
+///       the needle has played, and where in the live waveform it began);
+///       [`DubEngine::thru_beat_phase`] finds where the beats fall at a
+///       given tempo, so the waveform can draw the next ones — followed
+///       from look to look, so the drawn beats hold still, and with the
+///       period they are arriving at (`ThruBeatPhase.period_secs`); and
+///       [`DeckTelemetry`] meters the input per channel
+///       (`input_rms_left` … `input_peak_right`). `set_deck_auto_control`
+///       is gone with the signal panel's AUTO button: auto source
+///       detection was removed, and all it still did was clear an
+///       override flag nothing reads.
+pub const FFI_VERSION: u32 = 83;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -675,6 +687,9 @@ pub struct DubEngine {
     /// writes through these atomics; [`Self::position_snapshot`]
     /// reads them without ever touching `Mutex<EngineState>`.
     deck_shared: Arc<[Arc<DeckSharedState>; 2]>,
+    /// Each deck's THRU beat follower, behind its own lock: the waveform
+    /// asks a few times a second, off the audio thread.
+    thru_follow: [Mutex<ThruFollow>; 2],
 }
 
 /// Internal state machine for the engine.
@@ -1233,6 +1248,7 @@ impl DubEngine {
                 Arc::new(DeckSharedState::new()),
                 Arc::new(DeckSharedState::new()),
             ]),
+            thru_follow: [Mutex::default(), Mutex::default()],
         })
     }
 
@@ -3411,13 +3427,113 @@ impl DubEngine {
             TrackerState::Tentative { bpm } => (bpm, false),
             TrackerState::Locked { bpm } => (bpm, true),
         };
+        let sr = f64::from(running.sample_rate.max(1));
+        #[allow(clippy::cast_precision_loss)]
+        let (record_secs, record_start_secs) =
+            snap.record_start_frame.map_or((-1.0, -1.0), |start| {
+                (
+                    snap.consumed_frames.saturating_sub(start) as f64 / sr,
+                    start as f64 / sr,
+                )
+            });
         ThruTempo {
             active: true,
             bpm,
             locked,
             record_seq: snap.record_seq,
             needle_up: snap.needle_up,
+            record_secs,
+            record_start_secs,
         }
+    }
+
+    /// Where a THRU deck's beats fall at `bpm`: the newest beat the live
+    /// waveform's onsets settle on, so the strip can draw the beats still
+    /// to come below a playhead that has no future of its own. `bpm` is
+    /// the tempo the DJ is using — tracked, tapped or doubled — so the
+    /// drawn beats follow it. `found: false` off THRU, before enough has
+    /// been heard, or when the onsets do not agree on a phase. The onsets
+    /// are copied under the engine lock and searched outside it.
+    ///
+    /// Each call is a look by the deck's [`dub_bpm::BeatFollower`]: the
+    /// beat it holds is kept until another phase clearly wins, rather than
+    /// whichever is a hair stronger this time (2026-11-14 — the reggae
+    /// 12″'s skank pulled the drawn beats half a beat over and back again
+    /// several times a second). Asked again before a new onset has come
+    /// in, it answers the same.
+    #[must_use]
+    pub fn thru_beat_phase(&self, deck_idx: u64, bpm: f64) -> ThruBeatPhase {
+        if !(bpm.is_finite() && bpm > 20.0) {
+            return ThruBeatPhase::NONE;
+        }
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return ThruBeatPhase::NONE;
+        };
+        let generation = self.peaks_generation(deck_idx);
+        let (flux, hop_secs, len) = {
+            let state = lock_state(&self.state);
+            let Some(running) = state.as_running() else {
+                return ThruBeatPhase::NONE;
+            };
+            let Some(PeakSource::Live {
+                stream,
+                sample_rate,
+            }) = peak_source_for(running, deck_idx)
+            else {
+                return ThruBeatPhase::NONE;
+            };
+            let hop_secs =
+                dub_peaks::BAND_SAMPLES_PER_CHUNK as f64 / f64::from((*sample_rate).max(1));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let window = (dub_bpm::PHASE_WINDOW_SECS / hop_secs).ceil() as usize + 1;
+            let len = stream.onset_len();
+            let mut chunks = Vec::with_capacity(window.min(len));
+            let _ = stream
+                .buffer()
+                .extend_onset_chunks(len.saturating_sub(window), &mut chunks);
+            let start = len.saturating_sub(window);
+            (
+                (start, chunks.iter().map(|c| c.flux).collect::<Vec<f32>>()),
+                hop_secs,
+                len,
+            )
+        };
+        let (start, flux) = flux;
+        let Some(slot) = self.thru_follow.get(idx) else {
+            return ThruBeatPhase::NONE;
+        };
+        let mut follow = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if follow.generation != generation || len < follow.onsets {
+            *follow = ThruFollow {
+                generation,
+                ..ThruFollow::default()
+            };
+        }
+        #[allow(clippy::float_cmp)]
+        if let Some(answer) = follow
+            .answer
+            .filter(|_| len == follow.onsets && bpm == follow.bpm)
+        {
+            return answer;
+        }
+        // Onset value `k` is the spectral frame over samples `[k, k + 2)`
+        // hops; a hit is timed at the frame's middle.
+        #[allow(clippy::cast_precision_loss)]
+        let start_secs = (start as f64 + 1.0) * hop_secs;
+        let answer = follow
+            .follower
+            .update(&flux, start_secs, hop_secs, 60.0 / bpm)
+            .map_or(ThruBeatPhase::NONE, |beats| ThruBeatPhase {
+                found: true,
+                last_beat_secs: beats.last_beat_secs,
+                period_secs: beats.period_secs,
+            });
+        follow.onsets = len;
+        follow.bpm = bpm;
+        follow.answer = Some(answer);
+        answer
     }
 
     /// Per-deck live telemetry (pitch + timecode signal health) for the
@@ -3465,6 +3581,10 @@ impl DubEngine {
             quick_scratch_parked_secs: shared.load_quick_scratch_parked_secs(),
             input_rms: shared.load_input_level().0,
             input_peak: shared.load_input_level().1,
+            input_rms_left: shared.load_input_channels().0[0],
+            input_rms_right: shared.load_input_channels().0[1],
+            input_peak_left: shared.load_input_channels().1[0],
+            input_peak_right: shared.load_input_channels().1[1],
         }
     }
 
@@ -3529,27 +3649,6 @@ impl DubEngine {
             self.bump_peak_generation(idx);
         }
         Ok(())
-    }
-
-    /// Legacy no-op kept for ABI stability: auto source-detection was
-    /// removed (PRD §5.1.1), so there is nothing to release back to. The
-    /// deck stays in whatever mode the user last selected. Retained so
-    /// existing Swift call sites keep linking; safe to delete once the
-    /// shell drops the call.
-    ///
-    /// # Errors
-    /// [`EngineError::NotRunning`] if the engine isn't running.
-    pub fn set_deck_auto_control(&self, deck_idx: u64) -> Result<(), EngineError> {
-        let idx = deck_idx_to_usize(deck_idx)?;
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::NotRunning);
-        };
-        running
-            .handle
-            .deck(idx)
-            .auto_control_mode()
-            .map_err(map_command_error)
     }
 
     /// Manually (re)calibrate a deck's timecode needle.
@@ -4610,6 +4709,12 @@ pub struct ThruTempo {
     pub record_seq: u32,
     /// The input has been silent long enough to count as the needle up.
     pub needle_up: bool,
+    /// Seconds the record under the needle has been playing, from its
+    /// first sound; `-1` before any sound and while the needle is up.
+    pub record_secs: f64,
+    /// Where that record began, in seconds of the deck's live waveform
+    /// (its peaks start at the switch to THRU); `-1` with no record.
+    pub record_start_secs: f64,
 }
 
 impl ThruTempo {
@@ -4619,7 +4724,47 @@ impl ThruTempo {
         locked: false,
         record_seq: 0,
         needle_up: false,
+        record_secs: -1.0,
+        record_start_secs: -1.0,
     };
+}
+
+/// Where a THRU deck's beats fall — see [`DubEngine::thru_beat_phase`].
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ThruBeatPhase {
+    /// The onsets settled on one phase at the asked tempo.
+    pub found: bool,
+    /// The newest beat, in seconds of the deck's live waveform — the same
+    /// clock as its peaks, so a beat lands on the kick it was found on.
+    pub last_beat_secs: f64,
+    /// The period the beats are arriving at: the asked tempo's, as the
+    /// record's own pace has it — a band pushing ahead of its tempo
+    /// arrives a little sooner. The beats still to come are this far
+    /// apart.
+    pub period_secs: f64,
+}
+
+impl ThruBeatPhase {
+    const NONE: Self = Self {
+        found: false,
+        last_beat_secs: 0.0,
+        period_secs: 0.0,
+    };
+}
+
+/// A THRU deck's beats followed from look to look
+/// ([`DubEngine::thru_beat_phase`]): the follower, and what it last
+/// answered, so asking twice over the same onsets does not count as two
+/// looks.
+#[derive(Debug, Default)]
+struct ThruFollow {
+    follower: dub_bpm::BeatFollower,
+    /// The peak source's generation the follower is following.
+    generation: u64,
+    /// Onsets there were at the last look, and the tempo asked.
+    onsets: usize,
+    bpm: f64,
+    answer: Option<ThruBeatPhase>,
 }
 
 /// Per-deck live telemetry for the Performance deck header: pitch
@@ -4728,6 +4873,15 @@ pub struct DeckTelemetry {
     /// The live input's peak, post-trim, linear: holds and falls at
     /// 20 dB/s — light HOT from it. `0` on a deck playing a file.
     pub input_peak: f32,
+    /// The same RMS and peak per side of the input pair — a THRU deck's
+    /// two meters, so a dead channel reads as one empty meter.
+    pub input_rms_left: f32,
+    /// The right side's RMS — see `input_rms_left`.
+    pub input_rms_right: f32,
+    /// The left side's held peak.
+    pub input_peak_left: f32,
+    /// The right side's held peak.
+    pub input_peak_right: f32,
 }
 
 impl DeckTelemetry {
@@ -4758,6 +4912,10 @@ impl DeckTelemetry {
             quick_scratch_parked_secs: 0.0,
             input_rms: 0.0,
             input_peak: 0.0,
+            input_rms_left: 0.0,
+            input_rms_right: 0.0,
+            input_peak_left: 0.0,
+            input_peak_right: 0.0,
         }
     }
 }
@@ -6155,25 +6313,33 @@ fn start_engine_inner(
     })
 }
 
-/// Translate `dub_engine::CommandError` (audio-thread feedback
-/// channel saturated, bad deck index) into the FFI-surface
-/// equivalent. Pulled out to keep the per-method bodies tidy.
 /// The Advanced siren "dub" super-knob curve: one 0..1 macro → `(speed,
-/// delay_ms, feedback, mix)`. 0 = a dry siren; turning up slows the voice a
-/// touch, lengthens the echo, feeds it back, and brings the wet in — the GS1
-/// "deeper dub" gesture in one knob. Tunable by ear.
+/// delay_ms, feedback, mix, filter)`. 0 = a dry siren; turning up slows the
+/// voice a touch, lengthens the echo, feeds it back, and brings the wet in —
+/// the GS1 "deeper dub" gesture in one knob. Tunable by ear.
 fn siren_dub_macro(macro_value: f32) -> (f32, f32, f32, f32, f32) {
     let m = macro_value.clamp(0.0, 1.0);
     // Speed scales the chip clock (pitch + timing): turning the macro up takes
-    // the siren slower AND lower — deeper, dubbier, less shrill.
+    // the siren slower AND lower — deeper, dubbier, less shrill. Every voice
+    // takes it when it fires.
     let speed = 1.0 - m * 0.35; // 1.0 → 0.65 (~6–7 semitones down at full)
     let delay_ms = 90.0 + m * 330.0; // 90 → 420 ms
-    let feedback = m * 0.85; // 0 → 0.85
+                                     // Even in dB per repeat — −12 near the bottom to −1.4 at full (0.85) —
+                                     // so each stretch of the knob adds about as much tail as the last. Linear
+                                     // in amplitude it left half the knob at two repeats (review, 2026-11-14).
+    let feedback = if m > 0.0 {
+        10f32.powf((-12.0 + 10.6 * m) / 20.0)
+    } else {
+        0.0
+    };
     let mix = m * 0.8; // 0 (echo off) → 0.8
     let filter = 0.35 - m * 0.2; // darken the echo as it deepens (LP 0.35 → 0.15)
     (speed, delay_ms, feedback, mix, filter)
 }
 
+/// Translate `dub_engine::CommandError` (audio-thread feedback
+/// channel saturated, bad deck index) into the FFI-surface
+/// equivalent. Pulled out to keep the per-method bodies tidy.
 fn map_command_error(e: dub_engine::CommandError) -> EngineError {
     match e {
         dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
@@ -6539,7 +6705,24 @@ mod tests {
         // 77→78: `set_segment_dropped`, `RipSegment.dropped`.
         // 80→81: `DeckTelemetry.weak_channel`.
         // 81→82: `thru_tempo`, `ThruTempo`.
-        assert_eq!(FFI_VERSION, 82);
+        // 82→83: `ThruTempo.record_secs` / `record_start_secs`,
+        // `thru_beat_phase`, `DeckTelemetry.input_rms_left` … `_right`;
+        // `set_deck_auto_control` removed.
+        assert_eq!(FFI_VERSION, 83);
+    }
+
+    /// Off THRU — or with no engine — there is no record and no phase.
+    #[test]
+    fn thru_record_and_phase_are_empty_when_stopped() {
+        let engine = DubEngine::new();
+        let t = engine.thru_tempo(0);
+        assert!(!t.active);
+        assert!(t.record_secs < 0.0 && t.record_start_secs < 0.0);
+        assert!(!engine.thru_beat_phase(0, 120.0).found);
+        assert!(!engine.thru_beat_phase(0, f64::NAN).found);
+        let telemetry = engine.deck_telemetry(0);
+        assert_eq!(telemetry.input_rms_left, 0.0);
+        assert_eq!(telemetry.input_peak_right, 0.0);
     }
 
     #[test]
@@ -6763,6 +6946,22 @@ mod tests {
         // The fire-order index the UI sends is the key's position on the
         // box, left to right — five keys, five shots.
         assert_eq!(names, ["Rifle Gun", "Alarm", "Sine", "Laser", "Siren"]);
+    }
+
+    /// The knob's feedback is even in dB per repeat: equal steps of the
+    /// knob, equal steps of tail; full is the 0.85 it always was.
+    #[test]
+    fn the_dub_knob_feedback_is_even_in_db_per_repeat() {
+        let db = |m: f32| 20.0 * siren_dub_macro(m).2.log10();
+        let steps: Vec<f32> = [0.25f32, 0.5, 0.75, 1.0]
+            .windows(2)
+            .map(|w| db(w[1]) - db(w[0]))
+            .collect();
+        for s in &steps {
+            assert!((s - steps[0]).abs() < 0.01, "uneven steps: {steps:?}");
+        }
+        assert!((siren_dub_macro(1.0).2 - 0.85).abs() < 0.005);
+        assert_eq!(siren_dub_macro(0.0).2, 0.0);
     }
 
     #[test]

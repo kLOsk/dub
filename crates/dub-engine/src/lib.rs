@@ -80,6 +80,62 @@ pub const DECK_COUNT: usize = 2;
 /// consecutive slices so any block size is handled allocation-free.
 const SIREN_CHUNK: usize = 1024;
 
+/// The longest echo a beat-matched siren shot gets, in ms. A beat at a
+/// reggae or dub tempo (70–80 BPM) is 750–860 ms, past where the PT2399
+/// sounds like an echo rather than a second shot; it halves to the half
+/// beat, still on the grid.
+const SIREN_SYNC_MAX_MS: f32 = 600.0;
+
+/// Where the siren bus starts to bend (linear, ≈ −4.4 dBFS) and the most
+/// it can reach (≈ −1 dBFS). The siren is added on top of a track already
+/// near full scale; pushed — Expert volume 2, feedback past
+/// self-oscillation, a bubbled shot — it reached +5 dBFS on its own.
+const SIREN_LIMIT_KNEE: f32 = 0.6;
+const SIREN_LIMIT_CEILING: f32 = 0.891;
+
+/// The siren bus's soft limiter: untouched below the knee, a `tanh`
+/// (Padé) curve from there to the ceiling it never passes. Per sample,
+/// no state, RT-safe.
+#[inline]
+fn siren_limit(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= SIREN_LIMIT_KNEE {
+        return x;
+    }
+    let range = SIREN_LIMIT_CEILING - SIREN_LIMIT_KNEE;
+    let y = ((a - SIREN_LIMIT_KNEE) / range).min(3.0);
+    let bent = y * (27.0 + y * y) / (27.0 + 9.0 * y * y);
+    (SIREN_LIMIT_KNEE + range * bent).copysign(x)
+}
+
+/// A beat-matched echo time, in ms, for a beat `frames` long: halved
+/// until it is at most [`SIREN_SYNC_MAX_MS`].
+fn siren_sync_ms(frames: u32, sample_rate: f32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let mut ms = frames as f32 / sample_rate.max(1.0) * 1000.0;
+    for _ in 0..16 {
+        if ms <= SIREN_SYNC_MAX_MS {
+            break;
+        }
+        ms *= 0.5;
+    }
+    ms
+}
+
+/// `frames` at `speed` × the native rate (`0.65` = slower = longer).
+fn scale_frames(frames: u32, speed: f32) -> u32 {
+    if frames == 0 {
+        return 0;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let scaled = (frames as f32 / speed.max(0.05)).round().max(1.0) as u32;
+    scaled
+}
+
 /// What a deck's output is sourced from, selected explicitly by the
 /// user via the deck-header three-way switch (PRD §5.1.1). There is no
 /// automatic source detection — exactly one mode is active per deck and
@@ -355,6 +411,9 @@ pub struct Engine {
     /// mean square (300 ms) and a peak that holds and falls. Pure
     /// arithmetic per block; published through the deck's atomics.
     input_meter: [InputMeter; DECK_COUNT],
+    /// The same meter per input channel, left and right — the THRU deck's
+    /// pair of meters.
+    input_meter_lr: [[InputMeter; 2]; DECK_COUNT],
     /// Per-deck dub-siren **onboard echo** (PT2399, the GS1/Benidub chip). The
     /// siren is a self-contained instrument: its voices render into a scratch,
     /// pass through this echo, get the siren volume, and sum onto the bus
@@ -364,6 +423,14 @@ pub struct Engine {
     siren_echo_active: [bool; DECK_COUNT],
     /// Per-deck siren output level (the GS1 "Volume" knob), default unity.
     siren_volume: [f32; DECK_COUNT],
+    /// The echo time the DUB knob (or Expert TIME) last set, ms; 0 until
+    /// set. What the echo goes back to when a shot is not beat-matched.
+    siren_echo_knob_ms: [f32; DECK_COUNT],
+    /// The beat-matched echo time from the last shot, ms; 0 = the knob's.
+    siren_echo_beat_ms: [f32; DECK_COUNT],
+    /// The DUB knob's "slower and deeper" (chip-clock speed), applied to
+    /// every voice when it fires — it used to reach only the HK628 shots.
+    siren_speed: [f32; DECK_COUNT],
     /// Benidub DS01E MODE patches, resolved off-RT at construction (the
     /// resolve calls `exp`/`powf`). Firing the bank's Sine shot copies one,
     /// applies the deck's PITCH/RATE/TRIGGER, and engages the generic
@@ -525,9 +592,13 @@ impl Engine {
             rack_active: [[false; 4]; DECK_COUNT],
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
+            input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
+            siren_echo_knob_ms: [0.0; DECK_COUNT],
+            siren_echo_beat_ms: [0.0; DECK_COUNT],
+            siren_speed: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
             sampler_shared: std::sync::Arc::default(),
@@ -608,9 +679,13 @@ impl Engine {
             rack_active: [[false; 4]; DECK_COUNT],
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
+            input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
+            siren_echo_knob_ms: [0.0; DECK_COUNT],
+            siren_echo_beat_ms: [0.0; DECK_COUNT],
+            siren_speed: [1.0; DECK_COUNT],
             siren_scratch: vec![0.0; SIREN_CHUNK * 2].into_boxed_slice(),
             samplers: Default::default(),
             sampler_shared: side.sampler_shared,
@@ -837,6 +912,26 @@ impl Engine {
         self.render_routed(rt, out, 2, &INTERNAL_MIXER_ROUTING);
     }
 
+    /// Fold one block of a Thru / FX deck's live input into its meters —
+    /// the combined one and one per channel — and publish them. RT-safe:
+    /// arithmetic and relaxed stores.
+    fn meter_live_input(
+        &mut self,
+        idx: usize,
+        level: crate::timecode::PassthroughLevel,
+        frames: usize,
+        sr: f32,
+    ) {
+        self.input_meter[idx].feed(level, frames, sr);
+        let meter = self.input_meter[idx];
+        self.decks[idx].store_input_level(meter.rms(), meter.peak);
+        for ch in 0..2 {
+            self.input_meter_lr[idx][ch].feed(level.channel(ch), frames, sr);
+        }
+        let [l, r] = self.input_meter_lr[idx];
+        self.decks[idx].store_input_channels([l.rms(), r.rms()], [l.peak, r.peak]);
+    }
+
     /// Render one block with per-deck routing onto an N-channel output
     /// buffer.
     ///
@@ -943,10 +1038,7 @@ impl Engine {
                 );
                 // The channel's meter (F-38 stage 3): post-trim, the way a
                 // desk's VU reads after the gain pot.
-                let frames = out.len() / num_channels;
-                self.input_meter[idx].feed(level, frames, sr);
-                let meter = self.input_meter[idx];
-                self.decks[idx].store_input_level(meter.rms(), meter.peak);
+                self.meter_live_input(idx, level, out.len() / num_channels, sr);
                 // A record on THRU feeds its tempo tracker and live
                 // waveform. Not DUB FX: that input is a send, not a tune.
                 if self.control_mode[idx] == ControlMode::Thru {
@@ -958,7 +1050,9 @@ impl Engine {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
                 if self.input_meter[idx].peak > 0.0 || self.input_meter[idx].mean_sq > 0.0 {
                     self.input_meter[idx] = InputMeter::default();
+                    self.input_meter_lr[idx] = [InputMeter::default(); 2];
                     self.decks[idx].store_input_level(0.0, 0.0);
+                    self.decks[idx].store_input_channels([0.0; 2], [0.0; 2]);
                 }
             }
 
@@ -1067,10 +1161,17 @@ impl Engine {
             self.hk628[idx].process_block(scratch, 2, 0);
             if self.siren_echo_active[idx] {
                 self.siren_echo[idx].process_block(scratch, 2, 0);
+                // Switched off and faded out: stop running it, and forget
+                // the tail — left in the buffer, it replayed the moment the
+                // DUB knob came up again (review, 2026-11-14).
+                if self.siren_echo[idx].is_faded_out() {
+                    self.siren_echo[idx].reset();
+                    self.siren_echo_active[idx] = false;
+                }
             }
             let vol = self.siren_volume[idx];
             for f in 0..n {
-                let s = scratch[f * 2] * vol;
+                let s = siren_limit(scratch[f * 2] * vol);
                 let o = (done + f) * num_channels + first_us;
                 out[o] += s;
                 out[o + 1] += s;
@@ -1961,6 +2062,27 @@ impl Engine {
                 // The shot names its chip; an id past the bank is ignored.
                 let i = idx as usize;
                 if let Some(shot) = siren_shot(preset_id as usize).filter(|_| i < DECK_COUNT) {
+                    // Beat-matched: the echo the DJ hears takes the beat; a
+                    // shot without it goes back to the knob's time. Snapped
+                    // when nothing rings, so the first repeat does not dive.
+                    let beat_ms = if delay_frames_override > 0 {
+                        siren_sync_ms(delay_frames_override, self.sample_rate)
+                    } else {
+                        0.0
+                    };
+                    self.siren_echo_beat_ms[i] = beat_ms;
+                    let echo_ms = if beat_ms > 0.0 {
+                        beat_ms
+                    } else {
+                        self.siren_echo_knob_ms[i]
+                    };
+                    if echo_ms > 0.0 {
+                        self.siren_echo[i].set_delay_ms(echo_ms);
+                        if !self.siren_echo_active[i] {
+                            self.siren_echo[i].snap_delay();
+                        }
+                    }
+                    let speed = self.siren_speed[i];
                     match shot.voice {
                         SirenVoiceId::Hk628(program) => {
                             self.hk628[i].trigger(dub_dsp::hk628_program(program));
@@ -1979,11 +2101,26 @@ impl Engine {
                                 if delay_frames_override > 0 {
                                     patch.delay_frames = delay_frames_override;
                                 }
+                                // The DUB knob's speed: lower and slower.
+                                patch.base_freq *= speed;
+                                patch.lfo_rate *= speed;
+                                patch.gate_frames = scale_frames(patch.gate_frames, speed);
+                                patch.sweep_frames = scale_frames(patch.sweep_frames, speed);
+                                patch.sweep_step = patch.sweep_step.powf(speed);
                                 self.siren[i].engage(&patch);
                             }
                         }
                         SirenVoiceId::Sn76477(preset) => {
-                            if let Some(patch) = self.sn76477_presets.get(preset).copied() {
+                            if let Some(mut patch) = self.sn76477_presets.get(preset).copied() {
+                                // The DUB knob's speed: lower and slower, the
+                                // sweep the same shape over a longer time.
+                                patch.vco_min_freq *= speed;
+                                patch.vco_max_freq *= speed;
+                                patch.slf_freq *= speed;
+                                patch.noise_clock_freq *= speed;
+                                patch.pitch_frames = scale_frames(patch.pitch_frames, speed);
+                                patch.pitch_step = patch.pitch_step.powf(speed);
+                                patch.gate_frames = scale_frames(patch.gate_frames, speed);
                                 self.sn76477[i].trigger(&patch);
                             }
                         }
@@ -2101,17 +2238,31 @@ impl Engine {
             } => {
                 let i = idx as usize;
                 if i < DECK_COUNT {
-                    // HK628 chip-clock (pitch + timing).
+                    // HK628 chip-clock (pitch + timing) now; the other voices
+                    // take the speed when they next fire.
                     self.hk628[i].set_speed(speed);
-                    // Onboard PT2399 echo (all setters pure → RT-safe).
-                    self.siren_echo[i].set_delay_ms(delay_ms);
+                    self.siren_speed[i] = speed.clamp(0.25, 4.0);
+                    // Onboard PT2399 echo (all setters pure → RT-safe). A
+                    // beat-matched time from the last shot stands until the
+                    // next shot says otherwise.
+                    self.siren_echo_knob_ms[i] = delay_ms;
+                    let echo_ms = if self.siren_echo_beat_ms[i] > 0.0 {
+                        self.siren_echo_beat_ms[i]
+                    } else {
+                        delay_ms
+                    };
+                    self.siren_echo[i].set_delay_ms(echo_ms);
                     self.siren_echo[i].set_feedback(feedback);
                     self.siren_echo[i].set_mix(mix);
                     self.siren_echo[i].set_filter(filter);
                     self.siren_echo[i].set_echo_cut(echo_cut);
                     // Run the echo whenever it's audible OR mid-cut (so the loop
                     // keeps recirculating under a cut and returns on release).
-                    self.siren_echo_active[i] = mix > 1.0e-3 || echo_cut;
+                    // Switched off, it keeps running until its mix has faded
+                    // (`render_siren_into`), so a ringing tail is not cut.
+                    if mix > 1.0e-3 || echo_cut {
+                        self.siren_echo_active[i] = true;
+                    }
                     self.siren_volume[i] = volume.clamp(0.0, 2.0);
                 }
             }
@@ -3192,6 +3343,146 @@ mod tests {
         );
     }
 
+    /// Render `blocks` of 256 frames and return the left channel.
+    fn render_left(engine: &mut Engine, rt: &mut RealtimeContext<'_>, blocks: usize) -> Vec<f32> {
+        let mut out = vec![0.0_f32; 256 * 2];
+        let mut left = Vec::with_capacity(blocks * 256);
+        for _ in 0..blocks {
+            engine.render(rt, &mut out);
+            left.extend(out.chunks_exact(2).map(|f| f[0]));
+        }
+        left
+    }
+
+    /// "Beat-match the siren's echo" sets the echo's own time — the PT2399
+    /// the DJ hears — not the DS01E's internal slap-back, which is muted.
+    /// It used to do only the latter, so the preference changed nothing
+    /// (review, 2026-11-14). The DUB knob moving afterwards keeps the beat;
+    /// a shot without it goes back to the knob's time.
+    #[test]
+    fn beat_matched_siren_echo_sets_the_echo_time() {
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 256);
+        let mut rt = RealtimeContext::new();
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 200.0, 0.5, 0.6, 1.0, 0.3, false)
+            .unwrap();
+        // One beat at 120 BPM.
+        handle.deck(0).fire_siren_preset(3, 24_000).unwrap();
+        let _ = render_left(&mut engine, &mut rt, 2);
+        assert!((engine.siren_echo[0].delay_ms() - 500.0).abs() < 1.0);
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 300.0, 0.6, 0.7, 1.0, 0.3, false)
+            .unwrap();
+        let _ = render_left(&mut engine, &mut rt, 1);
+        assert!(
+            (engine.siren_echo[0].delay_ms() - 500.0).abs() < 1.0,
+            "the knob took the beat away"
+        );
+        // A beat longer than the chip's useful time halves: 70 BPM.
+        handle.deck(0).fire_siren_preset(3, 41_143).unwrap();
+        let _ = render_left(&mut engine, &mut rt, 1);
+        assert!((engine.siren_echo[0].delay_ms() - 428.6).abs() < 1.0);
+        handle.deck(0).fire_siren_preset(3, 0).unwrap();
+        let _ = render_left(&mut engine, &mut rt, 1);
+        assert!((engine.siren_echo[0].delay_ms() - 300.0).abs() < 1.0);
+    }
+
+    /// The siren adds to a track already near full scale; on its own it
+    /// must stay under −1 dBFS however hard the echo and volume are pushed
+    /// (Expert volume 2, feedback past self-oscillation, bubbling).
+    #[test]
+    fn the_siren_bus_never_reaches_full_scale() {
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 256);
+        let mut rt = RealtimeContext::new();
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 420.0, 1.05, 1.0, 2.0, 0.15, false)
+            .unwrap();
+        let mut peak = 0.0f32;
+        for _ in 0..5 {
+            handle.deck(0).fire_siren_preset(2, 0).unwrap();
+            let out = render_left(&mut engine, &mut rt, 94);
+            peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        assert!(peak > 0.3, "nothing sounded: {peak}");
+        assert!(
+            peak <= SIREN_LIMIT_CEILING + 1e-6,
+            "the siren peaked at {:.2} dBFS",
+            20.0 * peak.log10()
+        );
+    }
+
+    /// Turning the DUB knob to dry while a tail rings fades it rather than
+    /// cutting it mid-cycle, and forgets it: turning the knob up again
+    /// later, with nothing fired, is silence — not the old tail replayed.
+    #[test]
+    fn a_siren_echo_turned_off_fades_and_forgets() {
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 256);
+        let mut rt = RealtimeContext::new();
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 300.0, 0.8, 0.8, 1.0, 0.3, false)
+            .unwrap();
+        handle.deck(0).fire_siren_preset(3, 0).unwrap();
+        // Two repeats into the Laser's tail.
+        let ringing = render_left(&mut engine, &mut rt, 120);
+        let before = ringing[ringing.len() - 96..]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(before > 1e-3, "no tail ringing: {before}");
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 300.0, 0.8, 0.0, 1.0, 0.3, false)
+            .unwrap();
+        let after = render_left(&mut engine, &mut rt, 1);
+        let first_ms = after[..48].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            first_ms > before * 0.3,
+            "the tail was cut, not faded: {first_ms} after {before}"
+        );
+        let _ = render_left(&mut engine, &mut rt, 200);
+        handle
+            .deck(0)
+            .set_siren_controls(1.0, 300.0, 0.8, 0.3, 1.0, 0.3, false)
+            .unwrap();
+        let later = render_left(&mut engine, &mut rt, 100);
+        let replay = later.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(replay < 1e-3, "the old tail came back at {replay}");
+    }
+
+    /// The DUB knob's "slower and deeper" reaches every shot, not only
+    /// the two HK628 ones: at speed 0.65 each shot crosses zero less often.
+    #[test]
+    fn dub_speed_deepens_every_shot() {
+        let crossings = |id: u8, speed: f32| -> usize {
+            let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 256);
+            let mut rt = RealtimeContext::new();
+            handle
+                .deck(0)
+                .set_siren_controls(speed, 200.0, 0.0, 0.0, 1.0, 0.5, false)
+                .unwrap();
+            handle.deck(0).fire_siren_preset(id, 0).unwrap();
+            // The first 100 ms: a sweep (the Laser) slowed by the speed
+            // covers the same cycles over a longer time, so a whole-shot
+            // count would hide it; its opening is lower whatever the shot.
+            let out = render_left(&mut engine, &mut rt, 19);
+            out.windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count()
+        };
+        for (id, shot) in SIREN_BANK.iter().enumerate() {
+            let id = u8::try_from(id).unwrap();
+            let (native, deep) = (crossings(id, 1.0), crossings(id, 0.65));
+            assert!(
+                deep * 10 < native * 9,
+                "{}: {native} crossings at speed 1, {deep} at 0.65",
+                shot.name
+            );
+        }
+    }
+
     #[test]
     fn siren_bank_routes_each_shot_to_its_chip() {
         // One flat bank, three chips: firing a shot wakes exactly the voice
@@ -3779,6 +4070,36 @@ mod tests {
         });
         engine.render(&mut rt, &mut out);
         assert_eq!(engine.deck(0).shared().load_input_level(), (0.0, 0.0));
+        assert_eq!(
+            engine.deck(0).shared().load_input_channels(),
+            ([0.0; 2], [0.0; 2])
+        );
+    }
+
+    /// A THRU deck meters each side of the pair, so a dead channel — a
+    /// cartridge wire, a cable — reads as one empty meter.
+    #[test]
+    fn thru_deck_meters_each_channel() {
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+        let blk_in: Vec<f32> = (0..block * 2)
+            .map(|i| if i % 2 == 0 { 0.4 } else { 0.0 })
+            .collect();
+        for _ in 0..1_000 {
+            tx.push_slice(&blk_in);
+            assert_no_alloc::assert_no_alloc(|| engine.render(&mut rt, &mut out));
+        }
+        let ([rms_l, rms_r], [peak_l, peak_r]) = engine.deck(0).shared().load_input_channels();
+        assert!((rms_l - 0.4).abs() < 0.01, "left rms {rms_l}");
+        assert!((peak_l - 0.4).abs() < 1e-3, "left peak {peak_l}");
+        assert!(rms_r < 1e-6 && peak_r < 1e-6, "right {rms_r} / {peak_r}");
     }
 
     #[test]

@@ -223,15 +223,21 @@ impl Sn76477 {
         }
     }
 
-    /// Trigger the voice with a resolved patch. Resets the oscillators + glide
-    /// so each shot is deterministic; the attack masks the reset.
+    /// Trigger the voice with a resolved patch. Restarts the glide and the
+    /// modulation; from silence the oscillators start at phase 0 so a shot
+    /// is deterministic, but a voice still sounding keeps its VCO phase and
+    /// envelope — re-firing is how a DJ bubbles a siren, and resetting both
+    /// clicked and dipped ~6 dB each time (review, 2026-11-14).
     pub fn trigger(&mut self, patch: &Sn76477Patch) {
+        let sounding = self.env > ENV_FLOOR;
         self.mixer = patch.mixer;
         self.cv_source = patch.cv_source;
         self.vco_min_freq = patch.vco_min_freq.max(MIN_VCO_FREQ);
         self.vco_max_freq = patch.vco_max_freq.max(self.vco_min_freq);
         self.vco_duty = patch.vco_duty.clamp(0.02, 0.98);
-        self.vco_phase = 0.0;
+        if !sounding {
+            self.vco_phase = 0.0;
+        }
 
         self.pitch_step = if patch.pitch_step.is_finite() && patch.pitch_step > 0.0 {
             patch.pitch_step
@@ -251,13 +257,17 @@ impl Sn76477 {
             (self.sample_rate / patch.noise_clock_freq.clamp(200.0, self.sample_rate)).max(1.0);
         self.noise_clock_acc = 0.0;
         self.noise_lp_coeff = patch.noise_lp_coeff.clamp(0.0, 1.0);
-        self.noise_lp = 0.0;
+        if !sounding {
+            self.noise_lp = 0.0;
+        }
 
         self.attack_coeff = patch.attack_coeff.clamp(1.0e-5, 1.0);
         self.decay_coeff = patch.decay_coeff.clamp(0.0, 0.999_99);
         self.volume = patch.volume.clamp(0.0, 2.0);
 
-        self.env = 0.0;
+        if !sounding {
+            self.env = 0.0;
+        }
         self.env_target = 1.0;
         self.gate_active = true;
         self.one_shot = patch.gate_frames > 0;
@@ -364,12 +374,12 @@ impl Sn76477 {
             let vco_freq = (self.vco_min_freq + (self.vco_max_freq - self.vco_min_freq) * cv)
                 .max(MIN_VCO_FREQ);
 
-            // Hard-square VCO with duty (the crude edge — no band-limiting).
-            let vco_out = if self.vco_phase < self.vco_duty {
-                1.0
-            } else {
-                -1.0
-            };
+            // The VCO: a pulse at its duty, band-limited (`crate::blep`).
+            // The naive one folded its harmonics back as tones under the
+            // fundamental, and on the Laser's sweep they ran against the
+            // pitch; the chip is analog and had none.
+            let vco_out =
+                crate::blep::pulse(self.vco_phase, vco_freq / self.sample_rate, self.vco_duty);
 
             // Noise: clock the LFSR at its rate, sample-and-hold between clocks,
             // then the one-pole noise filter. Always run (the mixer can switch
@@ -508,25 +518,28 @@ impl Sn76477Spec {
 /// The classic SN76477 sounds (datasheet application circuits). Indices are
 /// referenced by `siren::siren_preset_route`, so keep them stable.
 const SN76477_PRESETS: [Sn76477Spec; 7] = [
-    // 0 — Phasor / laser: VCO zapped down in pitch.
+    // 0 — Phasor / laser: VCO zapped down in pitch. The zap ends in the
+    // mids and the gate with it: down to 120 Hz and gated past the sweep,
+    // it ended in a quarter second of low growl (2026-11-14).
     Sn76477Spec {
         name: "Laser",
         mixer: MixerMode::Vco,
         cv_source: CvSource::SweepDown,
-        vco_min_freq: 120.0,
+        vco_min_freq: 450.0,
         vco_max_freq: 2_400.0,
         vco_duty: 0.5,
-        pitch_ms: 240.0,
+        pitch_ms: 180.0,
         slf_freq: 5.0,
         noise_clock_freq: 20_000.0,
         noise_filter_hz: 8_000.0,
         attack_ms: 1.0,
-        decay_ms: 120.0,
-        gate_ms: 280.0,
+        decay_ms: 80.0,
+        gate_ms: 170.0,
         retrigger_from_slf: false,
         explode_after_sweep: false,
-        // Level-matched to the bank's −14 LUFS (was 0.7, ten dB hot).
-        volume: 0.22,
+        // Level-matched to the bank's −14 LUFS (was 0.7, ten dB hot; 0.22
+        // before the zap was shortened).
+        volume: 0.24,
     },
     // 1 — Explosion: filtered noise, slow decay, no tone.
     Sn76477Spec {
@@ -665,8 +678,91 @@ fn decay_coeff(millis: f32, sample_rate: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blep::measure;
 
     const SR: f32 = 48_000.0;
+
+    fn render_n(voice: &mut Sn76477, frames: usize) -> Vec<f32> {
+        let mut buf = vec![0.0f32; frames * 2];
+        voice.process_block(&mut buf, 2, 0);
+        buf.chunks_exact(2).map(|f| f[0]).collect()
+    }
+
+    /// The Siren shot's VCO held at 2333 Hz: its 21st harmonic folds back
+    /// to 993 Hz, ~26 dB under the fundamental when the square was naive.
+    #[test]
+    fn the_vco_is_band_limited() {
+        let mut patch = sn76477_preset(4, SR);
+        patch.cv_source = CvSource::Fixed;
+        patch.vco_min_freq = 2_333.0;
+        patch.vco_max_freq = 2_333.0;
+        let mut v = Sn76477::new(SR);
+        v.trigger(&patch);
+        let out = render_n(&mut v, SR as usize / 2);
+        let steady = &out[4_800..];
+        let fund = measure::tone(steady, 2_333.0, SR);
+        let alias = measure::tone(steady, 993.0, SR);
+        assert!(fund > 0.0);
+        assert!(
+            alias < fund * 0.01,
+            "fold-back at {:.1} dB re the fundamental",
+            20.0 * (alias / fund).log10()
+        );
+    }
+
+    /// The share of `x`'s energy under ~250 Hz (two one-poles there).
+    fn low_share(x: &[f32]) -> f32 {
+        let c = one_pole_coeff(250.0, SR);
+        let (mut a, mut b) = (0.0f32, 0.0f32);
+        let (mut low, mut all) = (0.0f32, 0.0f32);
+        for &v in x {
+            a += c * (v - a);
+            b += c * (a - b);
+            low += b * b;
+            all += v * v;
+        }
+        low / all.max(f32::MIN_POSITIVE)
+    }
+
+    /// The Laser is a zap down from 2.4 kHz — not a zap and then a growl.
+    /// Its CV falls exponentially toward a 120 Hz floor, so after ~60 ms
+    /// of zap it sat under 300 Hz for the rest of a 280 ms gate and its
+    /// 120 ms decay: the "deep sound at the end" (Daniel, 2026-11-14).
+    #[test]
+    fn the_laser_ends_without_a_low_tail() {
+        let mut v = Sn76477::new(SR);
+        v.trigger(&sn76477_preset(0, SR));
+        let out = render_n(&mut v, SR as usize);
+        let share = low_share(&out);
+        assert!(
+            share < 0.05,
+            "{:.0} % of the Laser is under 250 Hz",
+            share * 100.0
+        );
+        assert!(
+            v.state() == Sn76477State::Idle,
+            "the Laser rings past a second"
+        );
+    }
+
+    /// Re-firing the Siren shot while it sounds carries on at its level.
+    #[test]
+    fn refiring_while_sounding_does_not_dip() {
+        let patch = sn76477_preset(4, SR);
+        let mut v = Sn76477::new(SR);
+        v.trigger(&patch);
+        let before = render_n(&mut v, SR as usize / 2);
+        v.trigger(&patch);
+        let after = render_n(&mut v, 96);
+        let was = measure::mean_abs(&before[before.len() - 96..]);
+        let now = measure::mean_abs(&after);
+        assert!(was > 0.0);
+        assert!(
+            now > was * 0.7,
+            "level fell to {:.1} dB on re-fire",
+            20.0 * (now / was).log10()
+        );
+    }
 
     fn render(voice: &mut Sn76477, n: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(n);

@@ -160,9 +160,14 @@ struct DeckSignalPanel: View {
             // The buttons stay SwiftUI: they are controls with actions,
             // they change only on click, and hand-rolling `NSButton`
             // would trade a real affordance for nothing measurable.
+            // One button. AUTO used to sit beside it, from when a deck
+            // could be handed back to automatic source detection; that
+            // was removed (PRD §5.1.1) and the button did nothing a DJ
+            // could see.
             HStack(spacing: DubSpacing.sm) {
                 Button("Calibrate") { try? engine.calibrateDeck(deckIdx: deckIdx) }
-                Button("Auto") { try? engine.setDeckAutoControl(deckIdx: deckIdx) }
+                    .help("Measure the control record again — after a cartridge or cable change, "
+                        + "or if the needle sounds wrong. Play the record while it measures.")
                 Spacer()
             }
             .font(DubFont.micro)

@@ -80,6 +80,13 @@ const ENV_FLOOR: f32 = 1.0e-4;
 /// (e.g. Rifle Echo) clipping. Tunable by ear.
 const OUTPUT_GAIN: f32 = 0.15;
 
+/// Where the noise steps are rounded off. The LFSR is sample-and-held at
+/// its 12 kHz clock, every change a full-scale step in one sample; once
+/// the squares were band-limited, the Rifle Gun's crack was the one thing
+/// left doing that, and it clicked on every round (2026-11-14). A crack
+/// still, just not a click.
+const NOISE_LP_HZ: f32 = 5_000.0;
+
 /// One per-deck HK628 voice. Additive generator: [`Hk628::process_block`] sums
 /// into the deck's output pair.
 #[derive(Debug)]
@@ -100,6 +107,8 @@ pub struct Hk628 {
     noise_value: f32,
     noise_div: u32,
     noise_acc: u32,
+    noise_lp: f32,
+    noise_lp_coeff: f32,
 
     env: f32,
     env_target: f32,
@@ -156,6 +165,9 @@ impl Hk628 {
             noise_value: 0.0,
             noise_div,
             noise_acc: 0,
+            noise_lp: 0.0,
+            noise_lp_coeff: 1.0
+                - (-std::f32::consts::TAU * NOISE_LP_HZ / sample_rate.max(1.0)).exp(),
             env: 0.0,
             env_target: 0.0,
             attack_inc: ramp_inc(2.0, sample_rate),
@@ -170,7 +182,10 @@ impl Hk628 {
             echo_on: false,
             delay_lp: 0.0,
             crush_levels: 32.0,
-            crush_hold: noise_div.max(1),
+            // No sample-and-hold on the output: at 12 kHz it folded the
+            // square's harmonics into tones ~9 dB under the fundamental.
+            // The noise keeps its own hold at the noise clock above.
+            crush_hold: 1,
             crush_counter: 0,
             crush_held: 0.0,
             volume: 0.0,
@@ -181,8 +196,12 @@ impl Hk628 {
         }
     }
 
-    /// Trigger a program (a `&'static` const sound). Resets playback so each
-    /// trigger is deterministic.
+    /// Trigger a program (a `&'static` const sound). Restarts the sequence;
+    /// a voice that is still sounding carries its envelope and phase on into
+    /// the new one — re-firing is how a DJ bubbles a siren, and dropping the
+    /// envelope to zero clicked and dipped ~6 dB each time (review,
+    /// 2026-11-14). From silence it starts at phase 0, so a single shot is
+    /// deterministic.
     pub fn trigger(&mut self, prog: &'static Hk628Program) {
         self.steps = prog.steps;
         self.repeat = prog.repeat;
@@ -194,11 +213,14 @@ impl Hk628 {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let total = (self.sample_rate * prog.total_ms / 1000.0 / self.speed).max(1.0) as u32;
         self.total_frames_left = total;
-        self.sq_phase = 0.0;
-        self.delay_lp = 0.0;
-        self.crush_counter = 0;
-        self.crush_held = 0.0;
-        self.env = 0.0;
+        let sounding = self.env > ENV_FLOOR;
+        if !sounding {
+            self.sq_phase = 0.0;
+            self.delay_lp = 0.0;
+            self.crush_counter = 0;
+            self.crush_held = 0.0;
+            self.env = 0.0;
+        }
         self.env_target = 1.0;
         self.state = Hk628State::Sounding;
         self.quiet_frames = 0;
@@ -296,16 +318,17 @@ impl Hk628 {
                 self.lfsr = ((self.lfsr << 1) | bit) & 0x1_ffff;
                 self.noise_value = if self.lfsr & 1 == 1 { 1.0 } else { -1.0 };
             }
+            // Filtered every sample, not only on noise steps, so a noise
+            // step starts from where the filter already is.
+            self.noise_lp =
+                flush(self.noise_lp + self.noise_lp_coeff * (self.noise_value - self.noise_lp));
 
-            // Source: a hard square at the step pitch, or noise for noise steps.
+            // Source: a square at the step pitch — band-limited, see
+            // `crate::blep` — or the rounded-off noise for noise steps.
             let src = if self.cur_pitch > 0.0 {
-                if self.sq_phase < 0.5 {
-                    1.0
-                } else {
-                    -1.0
-                }
+                crate::blep::square(self.sq_phase, self.cur_pitch / self.sample_rate)
             } else {
-                self.noise_value
+                self.noise_lp
             };
 
             let dry = src * self.cur_level * self.env * self.volume;
@@ -620,8 +643,11 @@ fn flush(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blep::measure;
 
     const SR: f32 = 22_050.0;
+    /// The engine's rate, where the fold-back is measured.
+    const SR48: f32 = 48_000.0;
 
     fn render(voice: &mut Hk628, n: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(n);
@@ -657,6 +683,93 @@ mod tests {
                 hk628_program_name(id)
             );
         }
+    }
+
+    /// One steady square step, for measuring the oscillator alone.
+    static STEADY_3150: Hk628Program = Hk628Program {
+        name: "test 3150",
+        steps: &[Hk628Step {
+            pitch: 3_150.0,
+            level: 1.0,
+            dur_ms: 1_000.0,
+        }],
+        repeat: false,
+        total_ms: 1_000.0,
+        echo: false,
+        volume: 1.0,
+    };
+
+    fn render_mono(v: &mut Hk628, frames: usize) -> Vec<f32> {
+        let mut buf = vec![0.0f32; frames * 2];
+        v.process_block(&mut buf, 2, 0);
+        buf.chunks_exact(2).map(|f| f[0]).collect()
+    }
+
+    /// The Rifle Gun's 3150 Hz step: its 15th harmonic folds back to
+    /// 750 Hz, and the 12 kHz sample-and-hold on the whole output folded
+    /// far more (siren review: −9 dB alias tones). The chip clocks at
+    /// 128 kHz; the fizz was ours.
+    #[test]
+    fn a_square_step_is_band_limited() {
+        let mut v = Hk628::new(SR48);
+        v.trigger(&STEADY_3150);
+        let out = render_mono(&mut v, SR48 as usize / 2);
+        let steady = &out[2_400..];
+        let fund = measure::tone(steady, 3_150.0, SR48);
+        let alias = measure::tone(steady, 750.0, SR48).max(measure::tone(steady, 2_550.0, SR48));
+        assert!(
+            alias < fund * 0.01,
+            "fold-back at {:.1} dB re the fundamental",
+            20.0 * (alias / fund).log10()
+        );
+    }
+
+    /// How bright `x` is: its sample-to-sample change against its level.
+    fn brightness(x: &[f32]) -> f32 {
+        let level: f32 = x.iter().map(|v| v * v).sum();
+        let change: f32 = x.windows(2).map(|w| (w[1] - w[0]) * (w[1] - w[0])).sum();
+        (change / level.max(f32::MIN_POSITIVE)).sqrt()
+    }
+
+    /// The Rifle Gun's crack — the noise step that ends each 400 ms
+    /// round — is no brighter than its brightest tone. With the squares
+    /// band-limited it was the one thing left switching full-scale in a
+    /// sample, a click on every repeat (Daniel, 2026-11-14).
+    #[test]
+    fn the_rifle_crack_is_no_harsher_than_its_tones() {
+        let mut v = Hk628::new(SR48);
+        v.trigger(hk628_program(0));
+        let out = render_mono(&mut v, SR48 as usize * 2 / 5);
+        let step = SR48 as usize / 40;
+        let at = |i: usize| brightness(&out[i * step + 48..(i + 1) * step]);
+        let tones = (0..15).map(at).fold(0.0f32, f32::max);
+        let crack = at(15);
+        assert!(
+            crack <= tones,
+            "the crack is {:.1} dB brighter than the brightest tone",
+            20.0 * (crack / tones).log10()
+        );
+    }
+
+    /// Hitting a shot again while it sounds keeps it sounding: the envelope
+    /// carries on from where it is instead of dropping to zero and
+    /// clicking back up — re-firing is how a DJ bubbles a siren.
+    #[test]
+    fn refiring_while_sounding_does_not_dip() {
+        let prog = hk628_program(2);
+        let mut v = Hk628::new(SR48);
+        v.trigger(prog);
+        let before = render_mono(&mut v, SR48 as usize / 2);
+        v.trigger(prog);
+        let after = render_mono(&mut v, 96);
+        let was = measure::mean_abs(&before[before.len() - 96..]);
+        let now = measure::mean_abs(&after);
+        assert!(was > 0.0);
+        assert!(
+            now > was * 0.7,
+            "level fell to {:.1} dB on re-fire",
+            20.0 * (now / was).log10()
+        );
     }
 
     #[test]

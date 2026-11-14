@@ -1108,6 +1108,131 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         drawnAxisRates.withLock { deckIdx < $0.count ? $0[Int(deckIdx)] : 1.0 }
     }
 
+    /// Each THRU deck's tempo as the DJ is using it — heard, tapped or
+    /// scaled — written by the model's poll, read on the render thread.
+    /// `nil` off THRU or before a tempo is known.
+    private static let thruTempos = OSAllocatedUnfairLock(
+        initialState: [Double?](repeating: nil, count: 8))
+
+    nonisolated static func setThruTempo(deckIdx: UInt64, bpm: Double?) {
+        thruTempos.withLock { if deckIdx < $0.count { $0[Int(deckIdx)] = bpm } }
+    }
+
+    /// A THRU deck's beats, refetched a few times a second, and the tempo
+    /// they were asked at. The engine follows the beat from look to look,
+    /// so it is asked on a clock, not every frame — even when it found
+    /// nothing, or every new onset would count as a look.
+    private var thruPhase: PredictedBeats?
+    private var thruPhaseBpm: Double?
+    private var thruPhaseFetchedAt: CFTimeInterval = 0
+    /// The last bar heard on a THRU deck, refetched with the phase.
+    private var thruGhost: ThruGhost?
+
+    /// Where a THRU deck's beats fall, for the strip to draw: the newest
+    /// one and the period. `nil` with a track loaded (it has a grid), off
+    /// THRU, or while the onsets do not settle on a phase — no line is
+    /// better than a wrong one.
+    private func thruBeats(hasTrack: Bool) -> PredictedBeats? {
+        let idx = deckIdx
+        guard !hasTrack,
+              let bpm = Self.thruTempos.withLock({ idx < $0.count ? $0[Int(idx)] : nil }),
+              bpm > 0
+        else {
+            thruPhase = nil
+            thruPhaseBpm = nil
+            thruGhost = nil
+            return nil
+        }
+        let now = CACurrentMediaTime()
+        if now - thruPhaseFetchedAt > 0.25 || thruPhaseBpm != bpm {
+            thruPhaseFetchedAt = now
+            thruPhaseBpm = bpm
+            let found = engine.thruBeatPhase(deckIdx: deckIdx, bpm: bpm)
+            thruPhase = found.found && found.periodSecs > 0
+                ? PredictedBeats(lastBeatSecs: found.lastBeatSecs, periodSecs: found.periodSecs)
+                : nil
+            thruGhost = fetchGhost(bpm: bpm)
+        }
+        return thruPhase
+    }
+
+    /// The last bar of a THRU deck's record, plus half a second, as one
+    /// amplitude per chunk. Four times a second, not per frame: a bar is
+    /// ~1 500 chunks, and the copy allocates.
+    private func fetchGhost(bpm: Double) -> ThruGhost? {
+        let peakDur = peakChunkDurationSecs
+        guard peakDur > 0 else { return nil }
+        let barChunks = 4 * 60 / bpm / peakDur
+        let want = UInt64((barChunks + 0.5 / peakDur).rounded(.up))
+        let len = engine.peaksLen(deckIdx: deckIdx)
+        guard len > want else { return nil }
+        let start = len - want
+        let data = engine.peaksExtend(deckIdx: deckIdx, startIdx: start, maxChunks: want)
+        let stride = MemoryLayout<Float>.size * 3
+        let count = data.count / stride
+        guard count > 0 else { return nil }
+        var amps = [Float](repeating: 0, count: count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            for i in 0..<count {
+                let p = base.advanced(by: i * stride).assumingMemoryBound(to: Float.self)
+                amps[i] = max(abs(p[0]), abs(p[1]))
+            }
+        }
+        return ThruGhost(startChunk: Double(start), amps: amps, barChunks: barChunks)
+    }
+
+    /// A THRU deck's last bar, to draw forward below the playhead: music
+    /// repeats by the bar, so the bar just heard is the best cheap guess
+    /// at the one coming — its kicks land where the next ones will. Not a
+    /// prediction of the record, a shape to read ahead against.
+    struct ThruGhost: Equatable {
+        /// The chunk index `amps[0]` is.
+        var startChunk: Double
+        var amps: [Float]
+        /// A bar, in chunks.
+        var barChunks: Double
+
+        /// The amplitude the ghost draws at `chunk` (a future one): the
+        /// same place in the newest whole bar heard, the loudest of the
+        /// `span` chunks from there. `nil` before a bar has been heard.
+        func amplitude(atChunk chunk: Double, span: Int) -> Float? {
+            guard barChunks >= 1, !amps.isEmpty else { return nil }
+            let end = startChunk + Double(amps.count - span)
+            var source = chunk
+            if source > end {
+                source -= ((source - end) / barChunks).rounded(.up) * barChunks
+            }
+            let i = Int((source - startChunk).rounded(.down))
+            guard i >= 0, i + span <= amps.count else { return nil }
+            var a: Float = 0
+            for j in i..<(i + span) where amps[j] > a { a = amps[j] }
+            return a
+        }
+    }
+
+    /// A THRU deck's beats: one heard, and the period they repeat at.
+    struct PredictedBeats: Equatable {
+        var lastBeatSecs: Double
+        var periodSecs: Double
+
+        /// The beats inside `[start, end]`, oldest first, capped so a
+        /// nonsense period can never fill the vertex buffer.
+        func beats(from start: Double, to end: Double, cap: Int = 128) -> [Double] {
+            guard periodSecs > 0.05, end >= start else { return [] }
+            let first = ((start - lastBeatSecs) / periodSecs).rounded(.up)
+            var out: [Double] = []
+            var k = first
+            while out.count < cap {
+                let t = lastBeatSecs + k * periodSecs
+                if t > end { break }
+                out.append(t)
+                k += 1
+            }
+            return out
+        }
+    }
+
     /// The axis rate for this frame: the fixed one, or the platter's
     /// followed pitch.
     private func axisRate(fixed: Double?, pos: PositionInfo, targetNs: UInt64?) -> Double {
@@ -1376,10 +1501,14 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         } else {
             pos = engine.positionSnapshot(deckIdx: deckIdx)
         }
+        // A deck with no track (THRU, a rip capture) has no playhead: the
+        // strip draws the newest chunk, so that is where the ring must be.
         ingestNewChunks(
-            playheadSecs: pos.playheadSecsUnclamped, bufferIndex: uniformIndex)
+            playheadSecs: pos.playheadSecsUnclamped, liveEdge: !pos.hasTrack,
+            bufferIndex: uniformIndex)
         ingestNewBandChunks(
-            playheadSecs: pos.playheadSecsUnclamped, bufferIndex: uniformIndex)
+            playheadSecs: pos.playheadSecsUnclamped, liveEdge: !pos.hasTrack,
+            bufferIndex: uniformIndex)
 
         // 2. Compute the visible window.
         //
@@ -1858,16 +1987,19 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         // estimator confidence; cues are independent and draw whenever
         // the deck has a track. The outer gate fires if EITHER has
         // something to show.
-        let hotCueMarkers = hotCues.withLock { $0 }
-        let loopBounds = loopRegion.withLock { $0 }
+        // A THRU deck has no grid, cues or loop; its beats are predicted
+        // from what has been heard (`thruBeats`).
+        let hotCueMarkers = pos.hasTrack ? hotCues.withLock { $0 } : []
+        let loopBounds = pos.hasTrack ? loopRegion.withLock { $0 } : nil
         let drawBeats =
-            appearance.beatGridEnabled
+            pos.hasTrack
+            && appearance.beatGridEnabled
             && beats.confidence > 0
             && !beats.beats.isEmpty
+        let predicted = thruBeats(hasTrack: pos.hasTrack)
         if framesSinceSourceSwap > 20,
            peakChunkDurationSecs > 0,
-           pos.hasTrack,
-           drawBeats || !hotCueMarkers.isEmpty || loopBounds != nil
+           drawBeats || !hotCueMarkers.isEmpty || loopBounds != nil || predicted != nil
         {
             drawBeatGrid(
                 encoder: encoder,
@@ -1877,11 +2009,17 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 drawBeats: drawBeats,
                 hotCueMarkers: hotCueMarkers,
                 loopBounds: loopBounds,
+                predicted: predicted,
+                ghost: predicted == nil ? nil : thruGhost,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
-                drawnBelow: drawnBelow,
+                // A THRU deck draws no waveform below the playhead — there
+                // is nothing there yet — so `drawnBelow` is 0 and the grid
+                // pass returned before drawing a line. The prediction gets
+                // the region's full geometry instead (rig, 2026-11-14).
+                drawnBelow: pos.hasTrack ? drawnBelow : drawnBelowFull,
                 pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
-                futureSubChunkOffsetNDC: futureSubChunkOffsetNDC,
+                futureSubChunkOffsetNDC: pos.hasTrack ? futureSubChunkOffsetNDC : 0,
                 bufferIndex: uniformIndex)
         }
 
@@ -1991,11 +2129,34 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         return newChunkCount
     }
 
+    /// The chunks one frame wants in the ring: `maxChunksIngestPerFrame`
+    /// of them centred on the playhead — or, for a deck with no track
+    /// (`liveEdge`), the newest ones. A THRU deck's playhead stays at 0
+    /// while its strip draws the latest chunk; centring on 0 left the ring
+    /// holding the record's first second and the strip black from then on
+    /// (rig, 2026-11-14).
+    static func ingestWindow(
+        playheadSecs: Double, chunkDurSecs: Double, len: UInt64, liveEdge: Bool
+    ) -> Range<UInt64> {
+        let budget = UInt64(maxChunksIngestPerFrame)
+        if liveEdge {
+            return (len > budget ? len - budget : 0)..<len
+        }
+        let phChunk: UInt64 = {
+            guard chunkDurSecs > 0, len > 0 else { return 0 }
+            let raw = (playheadSecs / chunkDurSecs).rounded(.down)
+            return UInt64(max(0.0, min(Double(len - 1), raw)))
+        }()
+        let half = budget / 2
+        let start = phChunk > half ? phChunk - half : 0
+        return start..<max(start, min(len, start + budget))
+    }
+
     /// Keep a playhead-centred window of broadband peaks in the ring.
     /// Bounded to [`maxChunksIngestPerFrame`] so load / seek / scrub
     /// stays responsive while the column scrolls. Fetches only what
     /// this buffer does not already hold — see `PeakRingCoverage`.
-    private func ingestNewChunks(playheadSecs: Double, bufferIndex: Int) {
+    private func ingestNewChunks(playheadSecs: Double, liveEdge: Bool, bufferIndex: Int) {
         let currentLen = engine.peaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenPeaksLen = 0
@@ -2006,19 +2167,11 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             captureChunkCadences()
         }
 
-        let budget = UInt64(WaveformRenderer.maxChunksIngestPerFrame)
-        let phChunk: UInt64 = {
-            guard peakChunkDurationSecs > 0 else { return 0 }
-            let raw = (playheadSecs / peakChunkDurationSecs).rounded(.down)
-            let clamped = max(0.0, min(Double(currentLen > 0 ? currentLen - 1 : 0), raw))
-            return UInt64(clamped)
-        }()
-        let half = budget / 2
-        let start = phChunk > half ? phChunk - half : 0
-        let end = min(currentLen, start + budget)
         broadbandCoverage[bufferIndex] = Self.ingestDelta(
             held: broadbandCoverage[bufferIndex],
-            window: start..<max(start, end),
+            window: Self.ingestWindow(
+                playheadSecs: playheadSecs, chunkDurSecs: peakChunkDurationSecs,
+                len: currentLen, liveEdge: liveEdge),
             peaksLen: currentLen,
             capacity: UInt64(WaveformRenderer.chunkCapacity)
         ) { range in
@@ -2098,7 +2251,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
 
     /// Playhead-centred band peak ingest; mirrors [`ingestNewChunks`].
     /// Triple-buffered against `bandChunksBuffers[bufferIndex]`.
-    private func ingestNewBandChunks(playheadSecs: Double, bufferIndex: Int) {
+    private func ingestNewBandChunks(playheadSecs: Double, liveEdge: Bool, bufferIndex: Int) {
         let currentLen = engine.bandPeaksLen(deckIdx: deckIdx)
         if currentLen == 0 {
             lastSeenBandPeaksLen = 0
@@ -2106,20 +2259,12 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let budget = UInt64(WaveformRenderer.maxChunksIngestPerFrame)
         let bandDur = engine.bandPeaksChunkDurationSecs(deckIdx: deckIdx)
-        let phChunk: UInt64 = {
-            guard bandDur > 0 else { return 0 }
-            let raw = (playheadSecs / bandDur).rounded(.down)
-            let clamped = max(0.0, min(Double(currentLen > 0 ? currentLen - 1 : 0), raw))
-            return UInt64(clamped)
-        }()
-        let half = budget / 2
-        let start = phChunk > half ? phChunk - half : 0
-        let end = min(currentLen, start + budget)
         bandCoverage[bufferIndex] = Self.ingestDelta(
             held: bandCoverage[bufferIndex],
-            window: start..<max(start, end),
+            window: Self.ingestWindow(
+                playheadSecs: playheadSecs, chunkDurSecs: bandDur,
+                len: currentLen, liveEdge: liveEdge),
             peaksLen: currentLen,
             capacity: UInt64(WaveformRenderer.bandChunkCapacity)
         ) { range in
@@ -2321,6 +2466,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         drawBeats: Bool,
         hotCueMarkers: [HotCueMarker],
         loopBounds: (Double, Double)?,
+        predicted: PredictedBeats?,
+        ghost: ThruGhost?,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
@@ -2468,6 +2615,70 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     visibleHalfNDC: loopEdgeVisibleHalfNDC,
                     color: Self.loopRGBA(alpha: 0.95),
                     isDownbeat: true)
+            }
+        }
+
+        // A THRU deck's beats, from the phase its onsets settled on: dashed
+        // and bright below the playhead, where the record has not played
+        // yet and the line is the only thing to match the other deck to;
+        // faint above it, where they sit on the kicks they were found
+        // from — the check that the prediction can be trusted.
+        // The ghost first, so the beat lines draw over it: the last bar,
+        // repeated down the empty future region, one faint column per
+        // drawn column, fading with distance.
+        if let ghost {
+            let columnHalfNDC = Float(0.75 / Double(max(drawnBelow - 1, 1)))
+            for c in 0..<drawnBelow {
+                let chunk = snappedChunkF + Double((c + 1) * chunksPerColumn)
+                guard let amp = ghost.amplitude(atChunk: chunk, span: chunksPerColumn) else {
+                    continue
+                }
+                let height = min(1, amp * appearance.displayGain)
+                guard height > 0.01 else { continue }
+                let timeNDC = Float(Self.beatTimeNDC(
+                    beatSecs: chunk * peakDur, peakDur: peakDur,
+                    chunksPerColumn: Double(chunksPerColumn), snappedChunkF: snappedChunkF,
+                    drawnAbove: drawnAbove, drawnBelow: drawnBelow,
+                    pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                    futureSubChunkOffsetNDC: futureSubChunkOffsetNDC))
+                let fade = 1 - Float(c) / Float(max(drawnBelow, 1))
+                Self.appendCrossAxisStrip(
+                    vertices: &beatGridScratchVertices,
+                    orientation: appearance.orientation,
+                    timeNDC: timeNDC,
+                    quadHalfNDC: columnHalfNDC,
+                    visibleHalfNDC: columnHalfNDC,
+                    color: SIMD4(0.80, 0.82, 0.88, 0.07 + 0.23 * fade),
+                    crossLow: -height,
+                    crossHigh: height)
+            }
+        }
+
+        if let predicted {
+            let nowSecs = snappedChunkF * peakDur
+            let dashes = 7
+            let step = 2.0 / Float(dashes)
+            for beat in predicted.beats(from: visibleStart, to: visibleEnd) {
+                let timeNDC = Float(Self.beatTimeNDC(
+                    beatSecs: beat, peakDur: peakDur,
+                    chunksPerColumn: Double(chunksPerColumn), snappedChunkF: snappedChunkF,
+                    drawnAbove: drawnAbove, drawnBelow: drawnBelow,
+                    pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
+                    futureSubChunkOffsetNDC: futureSubChunkOffsetNDC))
+                let color = beat > nowSecs
+                    ? Self.downbeatRGBA(alpha: 0.95) : Self.beatTickRGBA(alpha: 0.35)
+                for d in 0..<dashes {
+                    let low = -1 + Float(d) * step + step * 0.2
+                    Self.appendCrossAxisStrip(
+                        vertices: &beatGridScratchVertices,
+                        orientation: appearance.orientation,
+                        timeNDC: timeNDC,
+                        quadHalfNDC: barQuadHalfNDC * 0.8,
+                        visibleHalfNDC: barVisibleHalfNDC * 0.8,
+                        color: color,
+                        crossLow: low,
+                        crossHigh: low + step * 0.6)
+                }
             }
         }
 

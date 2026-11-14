@@ -411,9 +411,21 @@ struct DeckState: Equatable {
     var thruNeedleUp: Bool = false
     /// A tempo the DJ tapped, and the record it belongs to.
     var thruTap: ThruTap? = nil
+    /// The heard tempo scaled by the DJ — ×2, ÷2, ×1.5 from the BPM's
+    /// right-click — and the record it belongs to. It follows the tracker:
+    /// a record read at two-thirds stays at ×1.5 as it drifts.
+    var thruScale: ThruScale? = nil
+    /// Sound has come through since the needle last came up: there is a
+    /// record on the platter, not an empty deck waiting for one.
+    var thruHasRecord: Bool = false
 
     struct ThruTap: Equatable {
         var bpm: Double
+        var recordSeq: UInt32
+    }
+
+    struct ThruScale: Equatable {
+        var factor: Double
         var recordSeq: UInt32
     }
 
@@ -426,6 +438,11 @@ struct DeckState: Equatable {
         guard isThru else { return nil }
         if let tap = thruTap, tap.recordSeq == thruRecordSeq {
             return ThruTempoReadout(bpm: tap.bpm, tapped: true, locked: true)
+        }
+        if let scale = thruScale, scale.recordSeq == thruRecordSeq {
+            return ThruTempoReadout(
+                bpm: thruBpm.map { ($0 * scale.factor * 10).rounded() / 10 },
+                locked: thruLocked, scale: scale.factor)
         }
         return ThruTempoReadout(bpm: thruBpm, tapped: false, locked: thruLocked)
     }
@@ -1071,12 +1088,27 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kRackFxEnabled = "dub.rackFxEnabled"
 
-    /// The DUB FX channel (Preferences ▸ FX, F-38). When on, each deck's
-    /// source switch grows a fourth position, `DUB FX`: the deck stops being a
-    /// turntable and becomes the outboard rack on the mixer's send. Default
-    /// off — it is the dub DJ's feature, and a fourth segment on the switch
-    /// is chrome a scratch set never uses. Turning it off puts any FX deck
-    /// back on its internal clock. Persisted under `dub.dubFxEnabled`.
+    /// Preferences ▸ Alpha: the master switch for features that work but
+    /// are not finished. Off by default, and off it hides every one of them
+    /// whatever its own switch says, so a DJ who turned one on before it was
+    /// gated does not find it on a gig (Daniel, 2026-11-12: DUB FX waits
+    /// until the rest of 1.0 is done). Persisted under `dub.alphaFeatures`.
+    @Published var alphaFeaturesEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(alphaFeaturesEnabled, forKey: Self.kAlphaFeatures)
+            if !alphaFeaturesEnabled { leaveDubFxEverywhere() }
+        }
+    }
+
+    private static let kAlphaFeatures = "dub.alphaFeatures"
+
+    /// The DUB FX channel's own switch (Preferences ▸ Alpha, F-38). When on,
+    /// each deck's source switch grows a fourth position, `DUB FX`: the deck
+    /// stops being a turntable and becomes the outboard rack on the mixer's
+    /// send. Default off — it is the dub DJ's feature, and a fourth segment
+    /// on the switch is chrome a scratch set never uses. Turning it off puts
+    /// any FX deck back on its internal clock. Persisted under
+    /// `dub.dubFxEnabled`. Read `dubFxAvailable`, not this.
     @Published var dubFxEnabled: Bool {
         didSet {
             UserDefaults.standard.set(dubFxEnabled, forKey: Self.kDubFxEnabled)
@@ -1085,6 +1117,9 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private static let kDubFxEnabled = "dub.dubFxEnabled"
+
+    /// DUB FX is on the surface: its own switch, behind the alpha one.
+    var dubFxAvailable: Bool { alphaFeaturesEnabled && dubFxEnabled }
 
     /// The deck that is the DUB FX channel right now, if one is.
     var dubFxDeck: DeckSide? {
@@ -1590,6 +1625,7 @@ final class WaveformAppModel: ObservableObject {
         // code remain in-tree, dormant, for the post-release rebuild.
         self.rackFxEnabled =
             UserDefaults.standard.object(forKey: Self.kRackFxEnabled) as? Bool ?? false
+        self.alphaFeaturesEnabled = UserDefaults.standard.bool(forKey: Self.kAlphaFeatures)
         self.dubFxEnabled =
             UserDefaults.standard.object(forKey: Self.kDubFxEnabled) as? Bool ?? false
         // External-library import enables default OFF, so the plain
@@ -2323,13 +2359,16 @@ final class WaveformAppModel: ObservableObject {
     private func readThruTempo(side: DeckSide, into next: inout DeckState) {
         guard next.isThru else {
             if next.thruBpm != nil || next.thruTap != nil || next.thruRecordSeq != 0
-                || next.thruLocked || next.thruNeedleUp
+                || next.thruLocked || next.thruNeedleUp || next.thruScale != nil
+                || next.thruHasRecord
             {
                 next.thruBpm = nil
                 next.thruLocked = false
                 next.thruRecordSeq = 0
                 next.thruNeedleUp = false
                 next.thruTap = nil
+                next.thruScale = nil
+                next.thruHasRecord = false
                 thruTaps[side] = nil
             }
             return
@@ -2339,11 +2378,16 @@ final class WaveformAppModel: ObservableObject {
         if next.thruBpm != bpm { next.thruBpm = bpm }
         if next.thruLocked != t.locked { next.thruLocked = t.locked }
         if next.thruNeedleUp != t.needleUp { next.thruNeedleUp = t.needleUp }
+        let hasRecord = t.recordSecs >= 0
+        if next.thruHasRecord != hasRecord { next.thruHasRecord = hasRecord }
         if next.thruRecordSeq != t.recordSeq {
             next.thruRecordSeq = t.recordSeq
             if let tap = next.thruTap, tap.recordSeq != t.recordSeq {
                 next.thruTap = nil
                 thruTaps[side] = nil
+            }
+            if let scale = next.thruScale, scale.recordSeq != t.recordSeq {
+                next.thruScale = nil
             }
         }
     }
@@ -2370,6 +2414,48 @@ final class WaveformAppModel: ObservableObject {
 
     /// Tap times per THRU deck, seconds of uptime. Not state anything draws.
     private var thruTaps: [DeckSide: [TimeInterval]] = [:]
+
+    /// The BPM's right-click on a THRU deck: double, halve, or take ×1.5
+    /// of the tempo — the tracker's octave mistakes, put right without
+    /// tapping (Daniel, 2026-11-14). A tapped tempo is scaled itself;
+    /// otherwise the factor rides on the heard one, and stacks (×2 twice
+    /// is ×4). Like a tap it holds for the record and retires with it;
+    /// made while the needle is up, it is for the record about to go
+    /// down. A result outside 40–300 BPM is refused.
+    func scaleThruTempo(_ side: DeckSide, by factor: Double) {
+        var deck = state(for: side)
+        guard deck.isThru, factor > 0 else { return }
+        let record = deck.thruNeedleUp ? deck.thruRecordSeq &+ 1 : deck.thruRecordSeq
+        if var tap = deck.thruTap, tap.recordSeq == record {
+            let bpm = (tap.bpm * factor * 10).rounded() / 10
+            guard Self.thruTempoRange.contains(bpm) else { return }
+            tap.bpm = bpm
+            deck.thruTap = tap
+        } else {
+            let was = deck.thruScale.flatMap { $0.recordSeq == record ? $0.factor : nil } ?? 1
+            let next = was * factor
+            if let heard = deck.thruBpm, !Self.thruTempoRange.contains(heard * next) { return }
+            deck.thruScale = abs(next - 1) < 0.001
+                ? nil : DeckState.ThruScale(factor: next, recordSeq: record)
+        }
+        setState(deck, for: side)
+        syncFxEcho()
+    }
+
+    /// Drop the tap and the scale: the readout goes back to what the
+    /// tracker hears.
+    func resetThruTempo(_ side: DeckSide) {
+        var deck = state(for: side)
+        guard deck.thruTap != nil || deck.thruScale != nil else { return }
+        deck.thruTap = nil
+        deck.thruScale = nil
+        thruTaps[side] = nil
+        setState(deck, for: side)
+        syncFxEcho()
+    }
+
+    /// The tempos a THRU override may land on.
+    static let thruTempoRange: ClosedRange<Double> = 40...300
 
     private func readDeckState(side: DeckSide, prev: DeckState) -> DeckState {
         // M11d.6 round 5 — lock-free FFI snapshot. The position
@@ -2501,6 +2587,9 @@ final class WaveformAppModel: ObservableObject {
         next.calibrating = tele.calibrating
         next.controlOverridden = tele.controlOverridden
         readThruTempo(side: side, into: &next)
+        // The strip draws the THRU deck's coming beats at the tempo the
+        // DJ is using, read on its own thread.
+        WaveformRenderer.setThruTempo(deckIdx: side.ffiDeckIdx, bpm: next.thruReadout?.tempo)
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -4918,7 +5007,7 @@ final class WaveformAppModel: ObservableObject {
     /// what the faces show, and the channel starts with every unit bypassed
     /// (a send with four effects already in it is not a starting point).
     func setDeckDubFx(side: DeckSide) {
-        guard dubFxEnabled else { return }
+        guard dubFxAvailable else { return }
         try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .fx)
         disengageEchoIfEngaged(side)
         var s = state(for: side)
@@ -5889,7 +5978,7 @@ final class WaveformAppModel: ObservableObject {
     /// throw the last phrase, hold it while the needle is lifted and the
     /// next record goes down, then let it go (HOLD again) or cut it (OUT).
     func toggleEchoHold(_ side: DeckSide) {
-        guard isRunning, dubFxEnabled else { return }
+        guard isRunning, dubFxAvailable else { return }
         var deck = state(for: side)
         guard deck.echoDivision != nil else { return }
         deck.echoHeld.toggle()
@@ -5975,10 +6064,17 @@ final class WaveformAppModel: ObservableObject {
         guard isRunning, sirenEnabled else { return }
         guard index >= 0, index < sirenPresetLabels.count else { return }
         // Beat-match (optional): one beat at the deck's effective tempo, else 0
-        // = use the preset's own slap-back. Falls back to 120 with no track.
+        // = the DUB knob's echo time. A THRU deck's tempo is the record's as
+        // heard (tracked, tapped or scaled) — already at the speed it plays;
+        // a track's is its grid BPM at the platter's pitch. 120 with neither.
         let deck = state(for: side)
-        let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
-        let effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        let effectiveBpm: Double
+        if let thru = deck.thruReadout?.tempo, thru > 0 {
+            effectiveBpm = thru
+        } else {
+            let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
+            effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        }
         let syncBeats = sirenDelaySync ? 1.0 : 0.0
         try? engine.fireSirenPreset(
             deckIdx: side.ffiDeckIdx,

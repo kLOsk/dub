@@ -24,8 +24,13 @@
 //! shown in `Locked` is the agreed-upon estimate, not the moment-to-
 //! moment one, and the transition out of `Locked` only happens when
 //! the underlying estimate has either degraded (confidence drop) or
-//! genuinely changed (BPM jump > tolerance, e.g. the DJ swapped
-//! records on the same Thru deck).
+//! genuinely changed: a different tempo, *held* for
+//! [`REJECT_CONSECUTIVE`] updates in a row. One stray estimate used to
+//! be enough, and on a live record the readout flickered from solid to
+//! dim and back — a reggae 12″ locked at 133.4 dropped a second later on
+//! a single 88.8 (rig, 2026-11-14). A record swap does not need the
+//! jump rule: lifting the needle resets the tracker
+//! ([`crate::BpmStream::spawn_live`]).
 //!
 //! The thresholds and tolerances below are an initial calibration
 //! based on M7.5's algorithm characteristics. Expect to revisit once
@@ -86,6 +91,31 @@ pub const LOCK_TOLERANCE_BPM: f64 = 1.5;
 /// doesn't unlock us, but small enough that a real tempo change
 /// (typically ≥ 4 BPM in DJ practice) does.
 pub const REJECT_TOLERANCE_BPM: f64 = 4.0;
+
+/// Consecutive updates a new tempo must hold — each within
+/// [`LOCK_TOLERANCE_BPM`] of the one before — before it replaces a lock.
+/// At a THRU deck's one analysis a second that is six seconds of a
+/// different beat: a DJ riding the pitch gets there, a stray estimate
+/// does not.
+pub const REJECT_CONSECUTIVE: u32 = 6;
+
+/// The same, for a challenger at ×2, ÷2, ×3/2, ×2/3, ×3 or ÷3 of the
+/// lock. That is the estimator changing its mind about which pulse is the
+/// beat, not the music changing — the reggae record's 88.8 against 133.4
+/// held for five seconds at a time — so it takes much longer.
+pub const RELATED_REJECT_CONSECUTIVE: u32 = 20;
+
+/// Whether `b` is a whole-ratio relative of `a` (within 3 %): ×2, ÷2,
+/// ×3/2, ×2/3, ×3, ÷3.
+fn related_tempo(a: f64, b: f64) -> bool {
+    if a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    let r = b / a;
+    [2.0, 0.5, 1.5, 2.0 / 3.0, 3.0, 1.0 / 3.0]
+        .iter()
+        .any(|f| (r / f - 1.0).abs() < 0.03)
+}
 
 /// Consecutive zero-confidence (`BpmEstimate::NONE`) updates that
 /// drop us out of `Tentative` back to `Searching`. From `Locked`
@@ -172,6 +202,9 @@ pub struct ConfidenceTracker {
     /// `Tentative → Searching` at [`LOST_TENTATIVE_CONSECUTIVE`]
     /// and `Locked → Tentative` at [`LOST_LOCKED_CONSECUTIVE`].
     lost_streak: u32,
+    /// While locked: a different tempo the estimates keep landing on,
+    /// and for how many updates in a row. See [`REJECT_CONSECUTIVE`].
+    challenger: Option<(f64, u32)>,
 }
 
 impl Default for ConfidenceTracker {
@@ -188,6 +221,7 @@ impl ConfidenceTracker {
             state: TrackerState::Searching,
             lock_streak: 0,
             lost_streak: 0,
+            challenger: None,
         }
     }
 
@@ -203,6 +237,7 @@ impl ConfidenceTracker {
         self.state = TrackerState::Searching;
         self.lock_streak = 0;
         self.lost_streak = 0;
+        self.challenger = None;
     }
 
     /// Consume one estimator output and step the state machine.
@@ -279,6 +314,7 @@ impl ConfidenceTracker {
             TrackerState::Locked { bpm: current } => {
                 if self.lost_streak >= LOST_LOCKED_CONSECUTIVE {
                     self.lock_streak = 0;
+                    self.challenger = None;
                     return TrackerState::Tentative { bpm: current };
                 }
                 if is_silent {
@@ -286,12 +322,29 @@ impl ConfidenceTracker {
                 }
 
                 let drift = (estimate.bpm - current).abs();
-                if drift > REJECT_TOLERANCE_BPM {
+                if drift <= REJECT_TOLERANCE_BPM {
+                    // The lock is confirmed; any challenge is over. We do
+                    // NOT update `current` here — see the doc on
+                    // TrackerState::Locked.
+                    self.challenger = None;
+                    return TrackerState::Locked { bpm: current };
+                }
+                // A different tempo: count it while it holds steady.
+                let count = match self.challenger {
+                    Some((bpm, n)) if (estimate.bpm - bpm).abs() <= LOCK_TOLERANCE_BPM => n + 1,
+                    _ => 1,
+                };
+                self.challenger = Some((estimate.bpm, count));
+                let needed = if related_tempo(current, estimate.bpm) {
+                    RELATED_REJECT_CONSECUTIVE
+                } else {
+                    REJECT_CONSECUTIVE
+                };
+                if count >= needed {
+                    self.challenger = None;
                     self.lock_streak = 1;
                     TrackerState::Tentative { bpm: estimate.bpm }
                 } else {
-                    // Stay locked. We do NOT update `current` here —
-                    // see the doc on TrackerState::Locked.
                     TrackerState::Locked { bpm: current }
                 }
             }
@@ -499,8 +552,12 @@ mod tests {
         }
         assert!(t.state().is_locked());
 
-        // A 10 BPM jump (well beyond REJECT_TOLERANCE_BPM = 4) → drop
-        // to Tentative carrying the new value.
+        // A 20 BPM jump (well beyond REJECT_TOLERANCE_BPM = 4), held
+        // for REJECT_CONSECUTIVE updates → drop to Tentative carrying the
+        // new value. Until then the lock stands.
+        for _ in 1..REJECT_CONSECUTIVE {
+            assert!(t.update(est(140.0, 0.5)).is_none(), "unlocked too early");
+        }
         let ev = t.update(est(140.0, 0.5));
         assert!(matches!(
             ev,
@@ -509,6 +566,64 @@ mod tests {
         if let TrackerState::Tentative { bpm } = t.state() {
             assert!((bpm - 140.0).abs() < 0.1);
         }
+    }
+
+    /// One stray estimate does not move a lock — the readout flickered
+    /// solid → dim → solid on a live record when it did.
+    #[test]
+    fn a_single_stray_estimate_keeps_the_lock() {
+        let mut t = ConfidenceTracker::new();
+        for _ in 0..(LOCK_CONSECUTIVE + 2) {
+            t.update(est(133.4, 0.5));
+        }
+        assert!(t.state().is_locked());
+        assert!(t.update(est(150.0, 0.5)).is_none());
+        assert!(t.update(est(133.5, 0.5)).is_none());
+        assert_eq!(t.state(), TrackerState::Locked { bpm: 133.4 });
+    }
+
+    /// Estimates that disagree with the lock but not with each other are
+    /// not a new tempo: the challenge starts over each time.
+    #[test]
+    fn a_wandering_challenger_never_unlocks() {
+        let mut t = ConfidenceTracker::new();
+        for _ in 0..(LOCK_CONSECUTIVE + 2) {
+            t.update(est(120.0, 0.5));
+        }
+        for i in 0..40 {
+            let bpm = if i % 2 == 0 { 140.0 } else { 100.0 };
+            assert!(t.update(est(bpm, 0.5)).is_none());
+        }
+        assert!(t.state().is_locked());
+    }
+
+    /// The reggae 12″: locked at 133.4, the estimator wanders to 88.8 —
+    /// two-thirds, the same beat counted differently — for five seconds.
+    /// The lock holds; only a related tempo held far longer takes over.
+    #[test]
+    fn a_related_tempo_needs_far_longer_to_take_over() {
+        let mut t = ConfidenceTracker::new();
+        for _ in 0..(LOCK_CONSECUTIVE + 2) {
+            t.update(est(133.4, 0.5));
+        }
+        for _ in 0..(REJECT_CONSECUTIVE * 2) {
+            t.update(est(88.8, 0.5));
+        }
+        assert_eq!(t.state(), TrackerState::Locked { bpm: 133.4 });
+        for _ in (REJECT_CONSECUTIVE * 2)..RELATED_REJECT_CONSECUTIVE {
+            t.update(est(88.8, 0.5));
+        }
+        assert!(matches!(t.state(), TrackerState::Tentative { .. }));
+    }
+
+    #[test]
+    fn related_tempos_are_the_whole_ratios() {
+        assert!(related_tempo(133.4, 88.8));
+        assert!(related_tempo(116.6, 174.9));
+        assert!(related_tempo(90.0, 180.0));
+        assert!(related_tempo(140.0, 70.0));
+        assert!(!related_tempo(120.0, 140.0));
+        assert!(!related_tempo(0.0, 120.0));
     }
 
     #[test]

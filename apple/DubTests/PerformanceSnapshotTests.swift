@@ -234,7 +234,9 @@ final class PerformanceSnapshotTests: XCTestCase {
             ])
     }
 
-    private static func thruColumnState(_ tempo: ThruTempoReadout) -> DeckColumnState {
+    private static func thruColumnState(
+        _ tempo: ThruTempoReadout, hasRecord: Bool = true
+    ) -> DeckColumnState {
         var header = DeckHeaderState(
             isLive: true, source: .timecode,
             trackTitle: nil, trackArtist: nil,
@@ -248,6 +250,8 @@ final class PerformanceSnapshotTests: XCTestCase {
         state.header = DeckColumnHeader(header)
         state.hasTrack = false
         state.isThru = true
+        state.thruHasRecord = hasRecord
+        state.thruInput = "SL 3 · IN 3+4"
         state.isPlaying = false
         return state
     }
@@ -305,6 +309,22 @@ final class PerformanceSnapshotTests: XCTestCase {
         snap(deckBg(columnFixture(Self.thruColumnState(
             ThruTempoReadout(bpm: 66.7, tapped: true, locked: true)))),
              width: 540, height: 470, named: "deck-column-thru-tapped")
+    }
+
+    /// Needle up on THRU: waiting for a record, not "No track loaded";
+    /// no cues, loop or scratch — the input meters and the tempo instead.
+    func test_deckColumn_thruWaiting() {
+        snap(deckBg(columnFixture(Self.thruColumnState(
+            ThruTempoReadout(bpm: nil), hasRecord: false))),
+             width: 540, height: 470, named: "deck-column-thru-waiting")
+    }
+
+    /// A drum & bass record read at two-thirds, put right from the BPM's
+    /// right-click: the label says ×1.5 in the deck's colour.
+    func test_deckColumn_thruScaled() {
+        snap(deckBg(columnFixture(Self.thruColumnState(
+            ThruTempoReadout(bpm: 174.9, locked: true, scale: 1.5)))),
+             width: 540, height: 470, named: "deck-column-thru-scaled")
     }
 
     func test_deckColumn_wideWindow() {

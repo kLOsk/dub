@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod bigknob;
+mod blep;
 pub mod echo;
 pub mod hk628;
 pub mod loudness;

@@ -124,6 +124,12 @@ pub struct StreamSnapshot {
     pub record_seq: u32,
     /// The input has been silent for [`LiveStreamConfig::needle_up_secs`].
     pub needle_up: bool,
+    /// Frames of input the stream has consumed since it was spawned.
+    pub consumed_frames: u64,
+    /// The frame the current record's sound began at, counted like
+    /// [`Self::consumed_frames`]; `None` before any sound and while the
+    /// needle is up. What a THRU deck's clock and side overview count from.
+    pub record_start_frame: Option<u64>,
 }
 
 /// Lock-free mirror of the analysis thread's state, read by
@@ -135,7 +141,13 @@ struct Shared {
     bpm_bits: AtomicU64,
     record_seq: AtomicU32,
     needle_up: AtomicBool,
+    consumed: AtomicU64,
+    /// [`NO_RECORD`] when there is none.
+    record_start: AtomicU64,
 }
+
+/// `Shared::record_start` with no record under the needle.
+const NO_RECORD: u64 = u64::MAX;
 
 impl Shared {
     fn publish(&self, state: TrackerState) {
@@ -156,10 +168,13 @@ impl Shared {
             2 => TrackerState::Locked { bpm },
             _ => TrackerState::Searching,
         };
+        let start = self.record_start.load(Ordering::Acquire);
         StreamSnapshot {
             state,
             record_seq: self.record_seq.load(Ordering::Relaxed),
             needle_up: self.needle_up.load(Ordering::Relaxed),
+            consumed_frames: self.consumed.load(Ordering::Acquire),
+            record_start_frame: (start != NO_RECORD).then_some(start),
         }
     }
 }
@@ -260,6 +275,7 @@ impl BpmStream {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_for_thread = Arc::clone(&shutdown);
         let shared = Arc::new(Shared::default());
+        shared.record_start.store(NO_RECORD, Ordering::Relaxed);
         let shared_for_thread = Arc::clone(&shared);
 
         let join = thread::Builder::new()
@@ -373,6 +389,11 @@ fn analysis_loop(
             }
             drained_any = true;
             let audio = &block[..n];
+            let block_start = shared.consumed.load(Ordering::Relaxed);
+            let frames = n / live.as_ref().map_or(1, |l| l.channels);
+            shared
+                .consumed
+                .store(block_start + frames as u64, Ordering::Release);
             if let Some(live) = live.as_mut() {
                 // Silence long enough is the needle up: start over, and
                 // stop feeding the tracker until there is sound again —
@@ -388,10 +409,16 @@ fn analysis_loop(
                         shared.needle_up.store(false, Ordering::Relaxed);
                         shared.record_seq.fetch_add(1, Ordering::Relaxed);
                     }
+                    // The first sound of a record — after the needle came
+                    // down, or the first heard since the stream began.
+                    if shared.record_start.load(Ordering::Relaxed) == NO_RECORD {
+                        shared.record_start.store(block_start, Ordering::Release);
+                    }
                 }
                 if !live.needle_up && live.quiet >= live.needle_up_samples {
                     live.needle_up = true;
                     shared.needle_up.store(true, Ordering::Relaxed);
+                    shared.record_start.store(NO_RECORD, Ordering::Release);
                     let was = tracker.state();
                     tracker.reset();
                     shared.publish(TrackerState::Searching);
@@ -644,6 +671,56 @@ mod tests {
             }),
             "the second record did not lock as a new one: {:?}",
             stream.snapshot()
+        );
+    }
+
+    /// The record's clock starts at its first sound, stops when the
+    /// needle comes up, and starts again at the next record's first sound.
+    #[test]
+    fn the_record_start_follows_the_needle() {
+        let sr = 48_000u32;
+        let (mut tx, rx) = ring_for_samples(200_000);
+        let stream =
+            BpmStream::spawn_live(rx, cfg_mono(sr), LiveStreamConfig::default()).expect("spawn");
+
+        push_all(&mut tx, &vec![0.0; 24_000]);
+        assert!(wait_until(Duration::from_secs(5), || {
+            stream.snapshot().consumed_frames >= 24_000
+        }));
+        assert_eq!(
+            stream.snapshot().record_start_frame,
+            None,
+            "silence is no record"
+        );
+
+        push_all(&mut tx, &synthetic::click_track(120.0, 2.0, sr));
+        assert!(wait_until(Duration::from_secs(5), || {
+            stream.snapshot().consumed_frames >= 24_000 + 96_000
+        }));
+        let start = stream
+            .snapshot()
+            .record_start_frame
+            .expect("the clicks are a record");
+        assert!(
+            (20_000..=24_000).contains(&start),
+            "the record started at frame {start}"
+        );
+
+        push_all(&mut tx, &vec![0.0; 72_000]);
+        assert!(
+            wait_until(Duration::from_secs(5), || stream.snapshot().needle_up),
+            "the lift was not heard"
+        );
+        assert_eq!(stream.snapshot().record_start_frame, None);
+
+        push_all(&mut tx, &synthetic::click_track(120.0, 1.0, sr));
+        assert!(wait_until(Duration::from_secs(5), || {
+            stream.snapshot().record_start_frame.is_some()
+        }));
+        let next = stream.snapshot().record_start_frame.unwrap_or(0);
+        assert!(
+            next >= 24_000 + 96_000 + 60_000,
+            "the next record started at {next}"
         );
     }
 

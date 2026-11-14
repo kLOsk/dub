@@ -378,10 +378,14 @@ impl SirenVoice {
         }
     }
 
-    /// Start (or re-trigger) the voice with `patch` (a resolved preset). Phases
-    /// and filter state reset so each trigger is deterministic; the attack ramp
-    /// masks the reset transient. All inputs are clamped defensively.
+    /// Start (or re-trigger) the voice with `patch` (a resolved preset). The
+    /// modulation restarts, so the wail begins again; from silence the
+    /// oscillator and filters start from zero so a shot is deterministic, but
+    /// a voice still sounding keeps its oscillator phase and filter state —
+    /// a phase reset on a pure sine jumps by its whole amplitude, a click on
+    /// every re-fire (review, 2026-11-14). All inputs are clamped defensively.
     pub fn engage(&mut self, patch: &SirenPatch) {
+        let sounding = self.env > ENV_FLOOR;
         self.osc_wave = patch.osc_wave;
         self.lfo_wave = patch.lfo_wave;
         self.trem_wave = patch.trem_wave;
@@ -412,7 +416,9 @@ impl SirenVoice {
             1.0
         };
         self.source_lp_sweep_left = patch.source_lp_sweep_frames;
-        self.source_lp1 = 0.0;
+        if !sounding {
+            self.source_lp1 = 0.0;
+        }
 
         self.attack_inc = patch.attack_inc.max(MIN_RAMP_INC);
         self.release_coeff = patch.release_coeff.clamp(0.0, 0.999_99);
@@ -422,14 +428,15 @@ impl SirenVoice {
         self.delay_feedback = patch.delay_feedback.clamp(0.0, MAX_FEEDBACK);
         self.delay_mix = patch.delay_mix.clamp(0.0, 1.0);
         self.delay_lp_coeff = patch.delay_lp_coeff.clamp(0.0, 1.0);
-        self.delay_lp = 0.0;
 
         self.crush_hold = patch.crush_hold.max(1);
         self.crush_levels = patch.crush_levels.max(0.0);
-        self.crush_counter = 0;
-        self.crush_held = 0.0;
-
-        self.osc_phase = 0.0;
+        if !sounding {
+            self.delay_lp = 0.0;
+            self.crush_counter = 0;
+            self.crush_held = 0.0;
+            self.osc_phase = 0.0;
+        }
         self.lfo_phase = 0.0;
         self.trem_phase = 0.0;
         self.env_target = 1.0;
@@ -1225,6 +1232,46 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    /// Re-firing Sine 1 while it sounds: the oscillator carries on from
+    /// its phase. It used to restart at 0, and on a pure sine that jump is
+    /// the whole amplitude — a clean click on every bubble (review,
+    /// 2026-11-14).
+    #[test]
+    fn refiring_the_sine_does_not_click() {
+        let patch = benidub_preset_patch(0, SR);
+        let step = |w: &[f32]| {
+            w.windows(2)
+                .map(|p| (p[1] - p[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let mut worst = 0.0f32;
+        let mut steady = f32::MAX;
+        // A phase reset jumps by wherever the sine was, so try a dozen
+        // points across a cycle rather than trust one.
+        for k in 0..12 {
+            let held = 24_000 + k * 7;
+            let mut v = SirenVoice::new(SR);
+            v.engage(&patch);
+            let mut first = vec![0.0f32; held * 2];
+            v.process_block(&mut first, 2, 0);
+            v.engage(&patch);
+            let mut second = vec![0.0f32; 480 * 2];
+            v.process_block(&mut second, 2, 0);
+            let mono: Vec<f32> = first
+                .chunks_exact(2)
+                .chain(second.chunks_exact(2))
+                .map(|f| f[0])
+                .collect();
+            steady = steady.min(step(&mono[held - 4_000..held]));
+            worst = worst.max(step(&mono[held - 2..held + 100]));
+        }
+        assert!(steady > 0.0);
+        assert!(
+            worst < steady * 1.5,
+            "a {worst:.3} step at the re-fire against {steady:.3} in the tone"
+        );
+    }
 
     // The crate's test-binary `#[global_allocator]` is declared in `echo.rs`.
 

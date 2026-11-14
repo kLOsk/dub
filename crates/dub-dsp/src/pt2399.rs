@@ -58,6 +58,10 @@ pub struct Pt2399 {
 
     feedback: f32,
     mix: f32,
+    /// Where `mix` is heading; it glides there over ~10 ms, so an echo
+    /// switched off fades rather than cutting a ringing tail mid-cycle.
+    mix_target: f32,
+    mix_smooth: f32,
     /// ECHO CUT: while true the wet output is muted, but the echo loop keeps
     /// running underneath (rhythmic echo chopping). Pure flag, RT-safe.
     cut: bool,
@@ -122,11 +126,18 @@ impl Pt2399 {
             delay_smooth: one_pole_coeff(18.0, sample_rate), // ~9 ms glide → pitch dive
             feedback: 0.4,
             mix: 0.5,
+            mix_target: 0.5,
+            mix_smooth: one_pole_coeff(10.0, sample_rate),
             cut: false,
             filter_g: 0.0,
             filter_g_target: 0.0,
             filter_g_smooth: one_pole_coeff(40.0, sample_rate), // click-free filter sweep
-            filter_k: 0.9,                                      // Q ≈ 1.1, gentle resonance
+            // Butterworth (Q ≈ 0.71): no peak. The filter sits inside the
+            // feedback loop, so any resonance multiplies the feedback in its
+            // band — at 0.9 (Q ≈ 1.1) a 1.24× peak made feedback 0.85 a loop
+            // gain of ~1.06, and the DUB knob's top howled at ~600 Hz instead
+            // of darkening away (siren review, 2026-11-14).
+            filter_k: std::f32::consts::SQRT_2,
             filter_is_hp: false,
             filter_ic1: 0.0,
             filter_ic2: 0.0,
@@ -151,15 +162,38 @@ impl Pt2399 {
         self.delay_target = samples;
     }
 
-    /// Feedback / regeneration: 0 = one repeat, ~1.05 = dub self-oscillation
-    /// (the soft-clip keeps it bounded). RT-safe.
+    /// Feedback / regeneration: 0 = one repeat; the loop's filter has no
+    /// gain anywhere, so the repeats fall away below 1.0 and self-oscillate
+    /// above it (the soft-clip keeps that bounded). RT-safe.
     pub fn set_feedback(&mut self, fb: f32) {
         self.feedback = fb.clamp(0.0, 1.1);
     }
 
-    /// Echo wet mix added on top of the dry (0..1). RT-safe.
+    /// Echo wet mix added on top of the dry (0..1), reached over ~10 ms.
+    /// RT-safe.
     pub fn set_mix(&mut self, mix: f32) {
-        self.mix = mix.clamp(0.0, 1.0);
+        self.mix_target = mix.clamp(0.0, 1.0);
+    }
+
+    /// The echo time last set, in ms (where the glide is heading).
+    #[must_use]
+    pub fn delay_ms(&self) -> f32 {
+        self.delay_target / self.sample_rate * 1000.0
+    }
+
+    /// Jump to the delay last set, skipping the tape-style glide — for a new
+    /// echo time chosen while nothing rings (a beat-matched shot), where a
+    /// glide would only be a pitch dive on the first repeat. RT-safe.
+    pub fn snap_delay(&mut self) {
+        self.delay = self.delay_target;
+    }
+
+    /// The mix has been set to 0 and has faded there: nothing of the echo
+    /// is heard, and the owner may stop running it (and should `reset` it,
+    /// or the old tail replays when the mix comes back up).
+    #[must_use]
+    pub fn is_faded_out(&self) -> bool {
+        self.mix_target <= 1.0e-3 && self.mix <= 1.0e-4
     }
 
     /// The DS01E **FILTER** knob (0..1): one resonant filter shaping the echo
@@ -198,6 +232,7 @@ impl Pt2399 {
         self.filter_ic2 = 0.0;
         self.filter_g = self.filter_g_target;
         self.delay = self.delay_target;
+        self.mix = self.mix_target;
         self.sh_counter = 0;
     }
 
@@ -230,6 +265,7 @@ impl Pt2399 {
         debug_assert!(stride >= 2 && offset + 2 <= stride);
         for frame in out.chunks_exact_mut(stride) {
             let dry = 0.5 * (frame[offset] + frame[offset + 1]);
+            self.mix = flush(self.mix + self.mix_smooth * (self.mix_target - self.mix));
 
             self.delay = flush(self.delay + self.delay_smooth * (self.delay_target - self.delay));
             let read = self.read_frac(self.delay);
@@ -376,6 +412,42 @@ mod tests {
         let late = rms(&out[(SR as usize * 3)..]);
         assert!(late > 1e-3, "self-oscillation died: {late}");
         assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 4.0));
+    }
+
+    /// The DUB knob's top setting (420 ms, feedback 0.85, the filter at
+    /// 0.15 — `siren_dub_macro` at 1.0) is a long dub tail, not a howl.
+    /// With a resonant loop filter the band near its peak gained more per
+    /// pass than the feedback took away, so a siren tone in that band
+    /// (550–650 Hz) rang on at full level indefinitely (review, 2026-11-14).
+    #[test]
+    fn the_top_of_the_dub_knob_decays_instead_of_howling() {
+        let mut p = Pt2399::new(SR);
+        p.set_delay_ms(420.0);
+        p.set_feedback(0.85);
+        p.set_mix(0.8);
+        p.set_filter(0.15);
+        let n = SR as usize * 14;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f32 / SR;
+            let x = if t < 0.3 {
+                0.3 * (std::f32::consts::TAU * 600.0 * t).sin()
+            } else {
+                0.0
+            };
+            let mut buf = [x, x];
+            p.process_block(&mut buf, 2, 0);
+            out.push(buf[0]);
+        }
+        let first = rms(&out[(SR * 0.42) as usize..(SR * 0.72) as usize]);
+        let late = rms(&out[(SR * 12.0) as usize..]);
+        assert!(first > 1e-3, "no first repeat: {first}");
+        assert!(
+            late < first * 0.01,
+            "the tail is still {:.1} dB re the first repeat after 12 s",
+            20.0 * (late / first).log10()
+        );
     }
 
     #[test]

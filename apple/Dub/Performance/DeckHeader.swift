@@ -38,9 +38,33 @@ struct ThruTempoReadout: Equatable {
     var tapped: Bool = false
     /// The tracker confirmed it. A tentative tempo reads dim.
     var locked: Bool = false
+    /// The heard tempo was scaled from the BPM's right-click (×2, ÷2,
+    /// ×1.5 …); `nil` when it reads as heard or tapped.
+    var scale: Double? = nil
 
     /// The tempo to sync to, when there is one.
     var tempo: Double? { bpm }
+
+    /// The DJ set it, by tap or by scaling: the readout says so.
+    var overridden: Bool { tapped || scale != nil }
+
+    /// The readout's label: what the number is.
+    var label: String {
+        if tapped { return "BPM · TAP" }
+        if let scale { return "BPM · " + Self.scaleText(scale) }
+        return "BPM"
+    }
+
+    /// A scale as the DJ chose it: `×2`, `÷2`, `×1.5`, `×⅔` — or, stacked
+    /// past those, the plain factor.
+    static func scaleText(_ factor: Double) -> String {
+        let named: [(Double, String)] = [
+            (2, "×2"), (0.5, "÷2"), (1.5, "×1.5"), (2.0 / 3, "×⅔"), (4, "×4"),
+            (0.25, "÷4"), (3, "×3"), (1.0 / 3, "÷3"), (0.75, "×¾"), (4.0 / 3, "×4/3"),
+        ]
+        for (value, text) in named where abs(value - factor) < 0.001 { return text }
+        return String(format: "×%.2f", factor)
+    }
 }
 
 struct DeckHeaderState: Equatable {

@@ -290,6 +290,8 @@ struct PerformanceView: View {
             echoHeld: deck.echoHeld,
             hasTrack: deck.hasTrack,
             isThru: deck.isThru,
+            thruHasRecord: deck.thruHasRecord,
+            thruInput: deck.isThru ? thruInputName(side) : nil,
             isPlaying: deck.isPlaying,
             scratch: (0..<SampleBank.quickScratchCount).map { pad in
                 let slot = model.sampleBank.quickScratchSlot(pad: pad)
@@ -299,9 +301,19 @@ struct PerformanceView: View {
                     engaged: deck.quickScratch?.pad == pad,
                     legend: DubKeymap.legend(for: .quickScratch(side, pad)))
             },
-            fxAvailable: model.dubFxEnabled,
+            fxAvailable: model.dubFxAvailable,
             echoLegend: DubKeymap.legend(for: .echoOut(side)),
             echoHoldLegend: DubKeymap.legend(for: .echoHold(side)))
+    }
+
+    /// Where a THRU deck's record comes in, as the DJ patched it: the
+    /// interface and the input pair (`SL 3 · IN 3+4`).
+    private func thruInputName(_ side: DeckSide) -> String {
+        let pair = (side == .a ? model.channelsAText : model.channelsBText)
+            .replacingOccurrences(of: ",", with: "+")
+            .replacingOccurrences(of: " ", with: "")
+        let device = model.selectedInputDevice?.name ?? model.performanceDevices.first?.name
+        return [device, pair.isEmpty ? nil : "IN \(pair)"].compactMap { $0 }.joined(separator: " · ")
     }
 
     /// The file the deck parked for a quick scratch, so the header can
@@ -334,6 +346,8 @@ struct PerformanceView: View {
             onEchoToggle: { model.toggleEchoOut(side) },
             onEchoHold: { model.toggleEchoHold(side) },
             onTapTempo: { model.tapThruTempo(side) },
+            onScaleTempo: { factor in model.scaleThruTempo(side, by: factor) },
+            onResetTempo: { model.resetThruTempo(side) },
             onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
             // Select Internal *and* start playing, which is the
             // contract `SourceControlView` documents for the segment

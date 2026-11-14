@@ -670,6 +670,7 @@ name = "dub-bpm"
 version = "1.0.0-alpha.1"
 dependencies = [
  "dub-io",
+ "dub-peaks",
  "dub-spectral",
  "hound",
  "proptest",

@@ -64,8 +64,13 @@ struct DeckColumnState: Equatable {
     var echoHeld: Bool = false
     var hasTrack: Bool = false
     /// THRU: a live record with no track loaded. Echo out is the
-    /// one-turntable throw, so it answers here too.
+    /// one-turntable throw, so it answers here too. The column then draws
+    /// the record rather than a track — see `ThruDeck.swift`.
     var isThru: Bool = false
+    /// THRU, and sound has come through since the needle last came up.
+    var thruHasRecord: Bool = false
+    /// Where a THRU deck's record comes in: the interface and its pair.
+    var thruInput: String? = nil
     var isPlaying: Bool = false
     /// The four Quick Scratch pads (PRD §7.2), in pad order. An untagged
     /// pad is drawn dark and dead so the hand's positions never move.
@@ -186,6 +191,10 @@ struct DeckColumnCallbacks {
     var onEchoHold: () -> Void = {}
     /// A tap on a THRU deck's BPM: one beat of the record's tempo.
     var onTapTempo: () -> Void = {}
+    /// The BPM's right-click on a THRU deck: scale the tempo (×2, ÷2 …).
+    var onScaleTempo: (_ factor: Double) -> Void = { _ in }
+    /// The BPM's right-click: back to the tempo the tracker hears.
+    var onResetTempo: () -> Void = {}
     /// Quick Scratch pad `pad` pressed: engage its sample, swap to it,
     /// or — if it is the one on the deck — release.
     var onScratch: (_ pad: Int) -> Void = { _ in }
@@ -273,10 +282,19 @@ struct DeckColumn<Overview: View>: View {
             // undifferentiated list.
             overviewAndTimes
                 .padding(.top, DubSpacing.sm)
-            cueBank
-                .padding(.top, DubSpacing.sm)
-            triggerRow
-                .padding(.top, DubSpacing.sm)
+            if state.isThru {
+                // A live record has no cues, loops or quick scratch: its
+                // signal and its tempo take their places (2026-11-14).
+                thruInputBlock
+                    .padding(.top, DubSpacing.sm)
+                thruTriggerRow
+                    .padding(.top, DubSpacing.sm)
+            } else {
+                cueBank
+                    .padding(.top, DubSpacing.sm)
+                triggerRow
+                    .padding(.top, DubSpacing.sm)
+            }
             Spacer(minLength: 0)
         }
         // Tight, with the slack at the bottom. Distributing it between
@@ -298,10 +316,27 @@ struct DeckColumn<Overview: View>: View {
     /// under its end — where a DJ reads them off a Serato overview.
     private var overviewAndTimes: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 0) {
-                time(.elapsed, colour: DubColor.textSecondary)
-                Spacer(minLength: 0)
-                time(.remaining, colour: DubColor.textPrimary)
+            if state.isThru {
+                // How long the record has played, not where a file is:
+                // there is no end to count down to.
+                HStack(alignment: .lastTextBaseline, spacing: DubSpacing.sm) {
+                    thruClock
+                    Text(state.thruHasRecord ? "SINCE THE NEEDLE WENT DOWN" : "NEEDLE UP")
+                        .font(DubFont.micro)
+                        .tracking(DubFont.capsTracking)
+                        .foregroundStyle(DubColor.textTertiary)
+                    Spacer(minLength: 0)
+                    Text("THE SIDE SO FAR")
+                        .font(DubFont.micro)
+                        .tracking(DubFont.capsTracking)
+                        .foregroundStyle(DubColor.textTertiary)
+                }
+            } else {
+                HStack(spacing: 0) {
+                    time(.elapsed, colour: DubColor.textSecondary)
+                    Spacer(minLength: 0)
+                    time(.remaining, colour: DubColor.textPrimary)
+                }
             }
             // No `.frame(height:)` here. The overview pins its own
             // height and the inner frame wins, so a wrapper only
@@ -336,6 +371,88 @@ struct DeckColumn<Overview: View>: View {
                 .monospacedDigit()
                 .foregroundStyle(DubColor.textPlaceholder)
         }
+    }
+
+    @ViewBuilder
+    private var thruClock: some View {
+        if let liveEngine, let liveDeckIdx {
+            ThruRecordClock(
+                engine: liveEngine, deckIdx: liveDeckIdx,
+                size: DubFont.numericLargeSize, color: DubColor.textPrimary)
+                .fixedSize()
+        } else {
+            Text(state.thruHasRecord ? "00:00" : "--:--")
+                .font(DubFont.numericLarge)
+                .monospacedDigit()
+                .foregroundStyle(DubColor.textPlaceholder)
+        }
+    }
+
+    // MARK: - THRU
+
+    /// The input, left and right, where the hot cues sit on a track: the
+    /// one thing on a THRU deck that says a signal is coming in, and the
+    /// first place a dead channel shows.
+    private var thruInputBlock: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            SectionHeading(
+                title: "INPUT", accent: DubColor.deckTint(state.side),
+                trailing: state.thruHasRecord ? "● SIGNAL" : "○ NO SIGNAL",
+                trailingAccent: state.thruHasRecord
+                    ? DubColor.deckTint(state.side) : DubColor.textPlaceholder)
+            ThruMeterPair(
+                engine: liveEngine, deckIdx: liveDeckIdx ?? 0,
+                tint: DubColor.deckTint(state.side))
+                .frame(height: 30)
+                .accessibilityLabel("Input level, left and right")
+        }
+    }
+
+    /// TEMPO beside ECHO: the beat lamp and what the tempo is based on,
+    /// then the one-turntable throw.
+    private var thruTriggerRow: some View {
+        HStack(alignment: .top, spacing: DubSpacing.md) {
+            VStack(alignment: .leading, spacing: DubSpacing.sm) {
+                SectionHeading(
+                    title: "TEMPO", accent: DubColor.deckTint(state.side),
+                    trailing: thruTempoStatus,
+                    trailingAccent: state.header.thruTempo?.bpm == nil
+                        ? DubColor.textPlaceholder : DubColor.deckTint(state.side))
+                HStack(spacing: DubSpacing.sm) {
+                    ThruBeatLamp(
+                        engine: liveEngine, deckIdx: liveDeckIdx ?? 0,
+                        bpm: state.header.thruTempo?.tempo,
+                        tint: DubColor.deckTint(state.side))
+                        .frame(width: 14, height: 14)
+                    Text(thruTempoLine)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(height: DubLayout.deckColumnEchoHeight, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity)
+            echoSection
+        }
+    }
+
+    private var thruTempoStatus: String {
+        guard let t = state.header.thruTempo, t.bpm != nil else { return "○ LISTENING" }
+        if t.tapped { return "● YOUR TAP" }
+        if let scale = t.scale { return "● HEARD " + ThruTempoReadout.scaleText(scale) }
+        return t.locked ? "● LOCKED" : "◐ TENTATIVE"
+    }
+
+    private var thruTempoLine: String {
+        guard let t = state.header.thruTempo, t.bpm != nil else {
+            return state.thruHasRecord
+                ? "Listening for the beat. Tap BPM to set it now."
+                : "Drop the needle."
+        }
+        if t.tapped { return "Holds until the needle comes up. Right-click BPM to go back." }
+        if t.scale != nil { return "Follows what is heard. Right-click BPM to change it." }
+        return "Heard from the record. Tap BPM to set it; right-click for ×2 · ÷2 · ×1.5."
     }
 
     // MARK: - Identity
@@ -492,17 +609,28 @@ struct DeckColumn<Overview: View>: View {
             // rather than quietly showing a sample's name as a title.
             // Outer side on both decks, like the title.
             if scratching && outward { scratchBadge(tint) }
-            Text(state.header.trackTitle ?? "No track loaded")
+            // A THRU deck is not empty: the record on the platter is the
+            // source, it just has no name (rig, 2026-11-14).
+            Text(state.header.trackTitle ?? emptyTitle)
                 .font(DubFont.title)
                 .foregroundStyle(
                     state.header.trackTitle == nil
-                        ? DubColor.textPlaceholder
+                        ? (state.isThru && state.thruHasRecord
+                            ? DubColor.textSecondary : DubColor.textPlaceholder)
                         : scratching ? tint : DubColor.textPrimary)
                 .lineLimit(2, reservesSpace: true)
                 .multilineTextAlignment(outward ? .leading : .trailing)
             if scratching && !outward { scratchBadge(tint) }
         }
         .frame(maxWidth: .infinity, alignment: outward ? .leading : .trailing)
+    }
+
+    /// What the title line says with no track: a THRU deck is not empty —
+    /// the record on the platter is the source, it just has no name (rig,
+    /// 2026-11-14).
+    private var emptyTitle: String {
+        guard state.isThru else { return "No track loaded" }
+        return state.thruHasRecord ? "Live record" : "Waiting for the needle"
     }
 
     private func scratchBadge(_ tint: Color) -> some View {
@@ -519,6 +647,9 @@ struct DeckColumn<Overview: View>: View {
 
     private var subtitle: String {
         guard let scratch = state.header.scratch else {
+            if state.isThru, state.header.trackArtist == nil {
+                return state.thruInput.map { "THRU · \($0)" } ?? "THRU"
+            }
             return state.header.trackArtist ?? "—"
         }
         guard let parked = scratch.parkedTitle else { return "← empty deck" }
@@ -538,8 +669,10 @@ struct DeckColumn<Overview: View>: View {
             live: liveEngine.flatMap { engine in
                 liveDeckIdx.map { DeckReadouts.Live(engine: engine, deckIdx: $0) }
             },
-            onToggleKeyLock: callbacks.onToggleKeyLock,
-            onTapTempo: state.header.thruTempo == nil ? nil : callbacks.onTapTempo)
+            onToggleKeyLock: state.isThru ? nil : callbacks.onToggleKeyLock,
+            onTapTempo: state.header.thruTempo == nil ? nil : callbacks.onTapTempo,
+            onScaleTempo: callbacks.onScaleTempo,
+            onResetTempo: callbacks.onResetTempo)
     }
 
     // MARK: - The two things you play
@@ -595,6 +728,14 @@ struct DeckColumn<Overview: View>: View {
                 loop
             }
             .frame(width: LoopEngine.minWidth)
+            echoSection
+        }
+    }
+
+    /// ECHO OUT, and HOLD with the DUB FX set on. Shared by the track's
+    /// trigger row and the THRU one.
+    @ViewBuilder
+    private var echoSection: some View {
             if state.echoEnabled {
                 VStack(alignment: .leading, spacing: DubSpacing.sm) {
                     SectionHeading(
@@ -617,7 +758,6 @@ struct DeckColumn<Overview: View>: View {
                 }
                 .frame(width: DubLayout.deckColumnEchoWidth)
             }
-        }
     }
 
     private var scratchEngaged: Bool { state.scratch.contains { $0.engaged } }
@@ -825,6 +965,10 @@ struct DeckReadouts: View {
     var onToggleKeyLock: (() -> Void)? = nil
     /// Tap tempo on a THRU deck's BPM. Only with `header.thruTempo`.
     var onTapTempo: (() -> Void)? = nil
+    /// The THRU BPM's right-click: scale the tempo, or go back to the
+    /// heard one.
+    var onScaleTempo: ((Double) -> Void)? = nil
+    var onResetTempo: (() -> Void)? = nil
 
     struct Live {
         let engine: DubEngine
@@ -841,6 +985,8 @@ struct DeckReadouts: View {
     var body: some View {
         HStack(alignment: .top, spacing: DubSpacing.md) {
             if let thru = header.thruTempo {
+                // A live record has no key and plays at the speed it is
+                // heard at: the tempo is the only number it has.
                 thruBpm(thru)
             } else {
                 readout(
@@ -854,19 +1000,21 @@ struct DeckReadouts: View {
                     },
                     size: DubFont.numericLargeSize)
             }
-            readout(
-                "KEY", header.key,
-                font: DubFont.numericInline, widest: "12B",
-                tint: DubColor.camelotKey(header.key))
-            // Six places: the sign, three digits, the point and a tenth.
-            // A scratch drives the smoothed rate well past ±100 %, and
-            // the slot has to hold that too or the row jumps mid-cut.
-            readout(
-                "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
-                font: DubFont.numericInline, widest: "-888.8",
-                live: live.map { l in { l.pitch().map { String(format: "%+.1f", $0) } } },
-                size: DubFont.numericInlineSize)
-            keyLockButton
+            if header.thruTempo == nil {
+                readout(
+                    "KEY", header.key,
+                    font: DubFont.numericInline, widest: "12B",
+                    tint: DubColor.camelotKey(header.key))
+                // Six places: the sign, three digits, the point and a tenth.
+                // A scratch drives the smoothed rate well past ±100 %, and
+                // the slot has to hold that too or the row jumps mid-cut.
+                readout(
+                    "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
+                    font: DubFont.numericInline, widest: "-888.8",
+                    live: live.map { l in { l.pitch().map { String(format: "%+.1f", $0) } } },
+                    size: DubFont.numericInlineSize)
+                keyLockButton
+            }
         }
         .fixedSize()
     }
@@ -878,10 +1026,10 @@ struct DeckReadouts: View {
     /// measured at the speed it plays.
     private func thruBpm(_ t: ThruTempoReadout) -> some View {
         VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
-            Text(t.tapped ? "BPM · TAP" : "BPM")
+            Text(t.label)
                 .font(DubFont.micro)
                 .tracking(DubFont.capsTracking)
-                .foregroundStyle(t.tapped ? DubColor.deckTint(side) : DubColor.textTertiary)
+                .foregroundStyle(t.overridden ? DubColor.deckTint(side) : DubColor.textTertiary)
             staticValue(
                 t.bpm.map { String(format: "%.1f", $0) },
                 font: DubFont.numericLarge, widest: "888.8",
@@ -889,7 +1037,20 @@ struct DeckReadouts: View {
         }
         .contentShape(Rectangle())
         .onPressDown(enabled: onTapTempo != nil) { onTapTempo?() }
-        .help("The record's tempo, heard live. Tap the beat here to set it — it holds until the needle comes up.")
+        // The tracker's usual mistake is an octave — or, on drum & bass,
+        // two-thirds — so the fix is one right-click, not four taps
+        // (Daniel, 2026-11-14).
+        .contextMenu {
+            Button("Double — ×2") { onScaleTempo?(2) }
+            Button("Half — ÷2") { onScaleTempo?(0.5) }
+            Button("×1.5 — drum & bass read at two-thirds") { onScaleTempo?(1.5) }
+            Button("×⅔") { onScaleTempo?(2.0 / 3) }
+            Divider()
+            Button("Back to the heard tempo") { onResetTempo?() }
+                .disabled(!t.overridden)
+        }
+        .help("The record's tempo, heard live. Tap the beat here to set it, or right-click to "
+            + "double, halve or take ×1.5 — either holds until the needle comes up.")
         .accessibilityLabel("Tempo")
         .accessibilityValue(t.bpm.map { String(format: "%.1f BPM", $0) } ?? "listening")
         .mappable(.tapTempo(side))

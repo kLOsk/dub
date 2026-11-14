@@ -119,4 +119,27 @@ final class PeakRingCoverageTests: XCTestCase {
         XCTAssertEqual(p.fetch, [])
         XCTAssertEqual(p.after, cov(10, 20))
     }
+
+    /// A THRU deck has no playhead: its window is the newest chunks, not
+    /// the record's first second.
+    func testALiveDeckIngestsAtTheNewestChunk() {
+        let budget = UInt64(WaveformRenderer.maxChunksIngestPerFrame)
+        let len = budget * 40
+        let live = WaveformRenderer.ingestWindow(
+            playheadSecs: 0, chunkDurSecs: 1.0 / 750, len: len, liveEdge: true)
+        XCTAssertEqual(live, (len - budget)..<len)
+        let short = WaveformRenderer.ingestWindow(
+            playheadSecs: 0, chunkDurSecs: 1.0 / 750, len: 10, liveEdge: true)
+        XCTAssertEqual(short, 0..<10)
+    }
+
+    /// A loaded track still centres on its playhead.
+    func testALoadedDeckIngestsAroundThePlayhead() {
+        let budget = UInt64(WaveformRenderer.maxChunksIngestPerFrame)
+        let len = budget * 40
+        let window = WaveformRenderer.ingestWindow(
+            playheadSecs: Double(budget * 10) / 750, chunkDurSecs: 1.0 / 750,
+            len: len, liveEdge: false)
+        XCTAssertEqual(window, (budget * 10 - budget / 2)..<(budget * 10 + budget / 2))
+    }
 }

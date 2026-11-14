@@ -5,7 +5,7 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-11-11.
+> Last updated: 2026-11-12.
 
 ## Where the branch is
 
@@ -21,6 +21,122 @@ went out with section 0 partly open (see the rig entry below).
 Pushing is a deliberate act: `.githooks/pre-push` runs fmt-check + clippy +
 docs-check + the Rust suite + the Swift snapshot suite first, and that last
 gate is local-only because GitHub CI has no macOS app job.
+
+**Since alpha.1, for the next alpha** (uncommitted until it is cut):
+
+- **DUB FX is behind an alpha switch.** Preferences grew an **Alpha** tab:
+  one master *Alpha features* switch, off by default, and under it the Dub
+  FX channel's own switch, moved there from the FX tab. With the master
+  off, the source switch has no DUB FX position and the echo has no HOLD,
+  whatever the feature's own switch says (`dubFxAvailable`). Daniel wants
+  the rest of 1.0 finished before DUB FX is. Later unfinished features go
+  on the same tab.
+- **A THRU deck shows its record (FFI 83, 2026-11-14, not yet on the
+  rig).** The rig found THRU drew nothing past its first seconds and the
+  header said *No track loaded*. The waveform loaded peaks around the
+  playhead, which a THRU deck pins at 0 while drawing the newest chunk —
+  `WaveformRenderer.ingestWindow` now takes the live edge when there is no
+  track. The column was redesigned from the canvas Daniel approved
+  (artifact *Dub THRU Mode*): *Waiting for the needle* / *Live record*, a
+  clock since the needle went down, *the side so far* (`ThruSideOverview`,
+  the rip tiler on a layer), L/R input meters where the cues were
+  (`DeckTelemetry.input_*_left/right`), TEMPO with a beat lamp beside ECHO;
+  no cues, loop or scratch on THRU. The strip draws **predicted beats**:
+  `dub_bpm::latest_beat` folds the live onsets at the tempo in use
+  (`thru_beat_phase`), dashed below the playhead, faint above. The BPM's
+  right-click scales the heard tempo — ×2, ÷2, ×1.5 (the dnb fix), ×⅔ — and
+  holds like a tap until the next record.
+  Second rig pass, same day: the strip was still black — a deck renders
+  continuously only while it "plays", and THRU never does
+  (`continuouslyRendering` now includes `isThru`); and the BPM went solid,
+  then dim, then solid. That was the tracker dropping a lock on **one**
+  estimate > 4 BPM off — on the reggae 12″ a single 88.8 against 133.4.
+  A lock now gives way only to a new tempo held 6 updates in a row, 20
+  when it is ×2 / ÷2 / ×3/2 / ×2/3 of the lock (`confidence.rs`);
+  `thru_real_records.rs` now asserts the lock holds for 90 s.
+  Third pass: the beat lines jumped with the BPM solid. Asked fresh four
+  times a second, the fold picked whichever phase was a hair stronger — on
+  the reggae 12″ the skank, half a beat off the kick, 25 times in 85 s
+  (224 ms jumps) — and on the soul sampler, a band ~2 % ahead of its
+  locked 112.9, the beat slid and caught up in jumps of up to 67 ms.
+  `dub_bpm::BeatFollower` now holds the beat it has (another phase must
+  win by 1.2× for 2 s, or the held one be gone 0.75 s), follows it on a
+  four-beat fold, and reads the record's own pace as the slope of where
+  the beat landed over 4 s — read, not fed back: a loop through the 8 s
+  fold rang. `thru_beat_phase` keeps one per deck and returns that pace
+  (`period_secs`), which the strip spaces the beats at. Worst move with
+  the tempo locked: reggae 224 → 5.7 ms, soul 67 → 6.4 ms (asserted in
+  `thru_real_records.rs`); the dnb side at a hand-given 174, 37 jumps
+  over 50 ms → 1. The renderer also stopped asking every frame while no
+  phase was found.
+- **The siren's DSP, fixed from a measured review (2026-11-14).** Every
+  shot was rendered through the engine and measured (renders and numbers in
+  the session scratchpad; not committed). Fixed, each with a test:
+  - The PT2399's loop filter is Butterworth (`filter_k` √2, was 0.9): its
+    resonance multiplied the feedback, so the DUB knob's top self-oscillated
+    at ~600 Hz instead of decaying. Full DUB now ends: 6–10 s to −40 dBFS.
+  - HK628 and SN76477 squares are band-limited (`dub_dsp::blep`, PolyBLEP);
+    the HK628's 12 kHz sample-and-hold on the whole output is gone (the
+    noise keeps its own). Fold-back was −9 dB (Rifle) / −26 dB (Siren).
+  - Re-firing a sounding shot keeps its envelope and phase (all three
+    voices): it dipped ~6 dB and clicked on every bubble.
+  - "Beat-match the siren's echo" sets the PT2399's time (half a beat past
+    600 ms); it only reached the DS01E's muted slap-back, i.e. nothing. The
+    beat comes from a THRU deck's tempo when there is one.
+  - A soft limiter on the siren bus (knee −4.4, ceiling −1 dBFS): pushed, it
+    reached +5 dBFS on its own.
+  - DUB to dry fades the echo (~10 ms mix glide) and clears its buffer; it
+    cut the tail and replayed it later.
+  - The DUB knob's speed (slower + deeper) reaches every voice, not only
+    the HK628; its feedback curve is even in dB per repeat (−12 → −1.4).
+  Left for Daniel's ear: HK628 release 10 → 25 ms, some harmonics on the
+  pure-sine Sine.
+  His ear, same day: **the Laser ended in a deep growl** — its CV falls
+  exponentially to a 120 Hz floor, so after ~60 ms of zap it sat under
+  300 Hz for the rest of the gate; a third of its energy was under 250 Hz.
+  It now zaps to 450 Hz over 180 ms with the gate closing as the sweep
+  ends (−14.2 LUFS, was −15 after the shortening). **The Rifle clicked on
+  each round**: with its squares band-limited, the 25 ms noise crack was
+  the one thing left switching full-scale in a sample. The HK628's noise
+  is low-passed at 5 kHz — a crack, 1.7 dB under its brightest tone where
+  it was 2 dB over.
+- **The auto grid's tempo refine reaches the tempo (2026-11-14).** The
+  local-detrend experiment was A/B'd on the 94-track corpus and the 31
+  hand-set grids and is **negative** (11 → 19 tempo failures); the
+  numbers, and what the hand-set grids say is left, are in
+  `BPM-DETECTOR-V2-INVESTIGATION.md` §7.5a. With the genre's profile the
+  corpus is 4 / 94, not 11. Of seven grids that sat off the hand-set
+  beat, two were the taps, two are live bands, two are 28–44 ms placement
+  offsets, and one was a bug: *Apocalypse*, a true 175.0, came out at
+  173.78 because the estimator's first guess (173.46) was further out
+  than the ±0.5 % the refine searched. The refine now looks ±2 % and
+  starts from a tempo outside the old range only when it folds ≥ 1.25×
+  everything inside it, over the whole track and each half. Three tempos
+  change over 125 tracks, all checked against the audio; nothing else
+  moves. Already-analysed tracks keep their stored grid.
+  The two 28–44 ms offsets: *Evacuation*'s tap predates the kick-edge
+  snap and sits on the kick's body — the detector is right. Kaytranada's
+  *If* was real: the kick sat 42 ms past the fitted line, just outside
+  the ±40 ms the edge shift looks in, so it moved 14 ms onto a smaller
+  hit and stopped. The shift now looks up to three times, each from
+  where it moved to (−28.4 → +0.3 ms at the hand-set 1).
+  The eight wrong 1s were all "the 1 is the first audible beat" on a
+  track that opens on a pickup; the backbeat check it pre-empted was
+  right on seven. The backbeat now overrules the first beat when it
+  disagrees at confidence ≥ 0.10: 15 → 21 of the 23 well-placed hand-set
+  grids, none lost (*Lowkey* and *Broken Drum* remain).
+- **Calibration says one thing; the signal panel has one button.** The
+  overview's bar read SETTLING PITCH for the second half of the session
+  measurement (the wobble fit), which on an empty, stopped deck looked like
+  a different job stuck. It now reads CALIBRATING throughout, and
+  CALIBRATING — PLAY THE RECORD while nothing is turning. The panel's AUTO
+  button (and `set_deck_auto_control`, FFI 83) is gone: auto source
+  detection was removed long ago and it only cleared an unused flag.
+- **`make dist` re-dates the bundle's folders.** Xcode rebuilds into the
+  `Dub.app` it made on the first Release build, so the folders kept that
+  day's date (9 Sep) and Finder showed it on the alpha.1 download. Folder
+  dates are not in the signature (`codesign --verify --deep --strict`
+  passed on a re-dated copy and on that copy unzipped).
 
 ### The migration's cleanup pass — done
 
@@ -881,7 +997,8 @@ becoming a surface nobody asked for. `PrepRack` is three sections and does
 not reserve room for a fourth.
 
 **The vintage FX rack has its home** — the `DUB FX` deck role, F-38 stage
-2, shipped 2026-09-15. Off by default (Preferences ▸ FX).
+2, shipped 2026-09-15. Off by default (Preferences ▸ Alpha since
+2026-11-12, behind the *Alpha features* switch; it was Preferences ▸ FX).
 
 **Placement rule, for future features.** A capability belongs where the DJ
 is in that state of mind. Prep is couch work with no rig; Performance is a

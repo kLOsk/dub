@@ -28,3 +28,8 @@ proptest = { workspace = true }
 # follow at the application layer (see PRD §5.3).
 dub-io = { workspace = true }
 hound = { workspace = true }
+# The THRU forecast test on real records reads the onsets a THRU deck's
+# waveform stream computes — dub-peaks' `OnsetDecimator` — so it follows
+# exactly what the app follows. Test-only; dub-peaks does not depend on
+# dub-bpm.
+dub-peaks = { workspace = true }

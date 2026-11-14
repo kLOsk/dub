@@ -99,6 +99,9 @@ Dub's FX are modelled on the gear that made the sound, and drawn like it.
 - **Space Echo SYNC + TAP**: repeats lock to the other deck's live tempo.
 - Every unit keeps its real controls. No presets pretending to be gear.
 
+*HOLD and the DUB FX channel are still being finished. They're off by
+default, under **Preferences ▸ Alpha**.*
+
 <br clear="right">
 
 ### Dub siren
@@ -212,7 +215,7 @@ spec is [`PRD.md`](docs/spec/PRD.md).
 - **Tested like it matters**: over 1,600 Rust tests and 280 Swift unit and
   snapshot tests, fuzzed library parsers, and gates fitted against real records.
 
-The FFI contract version (`dub_ffi::FFI_VERSION`) is **82** at the
+The FFI contract version (`dub_ffi::FFI_VERSION`) is **83** at the
 time of writing. Architecture notes: [`ARCHITECTURE.md`](docs/spec/ARCHITECTURE.md).
 
 ### The `dub` CLI

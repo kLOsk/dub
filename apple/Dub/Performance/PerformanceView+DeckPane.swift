@@ -194,10 +194,18 @@ extension PerformanceView {
             liveDeckIdx: deckIdx
         ) {
             if Self.overviewEnabled {
-                TrackOverviewView(
-                    model: model, side: side, deckIdx: deckIdx,
-                    orientation: .horizontal,
-                    height: DubLayout.deckColumnOverviewHeight)
+                // A THRU deck's map is the record so far, not a file's whole.
+                if (side == .a ? model.deckA : model.deckB).isThru {
+                    ThruSideOverview(
+                        engine: model.engine, deckIdx: deckIdx,
+                        tint: DubColor.deckTint(side),
+                        height: DubLayout.deckColumnOverviewHeight)
+                } else {
+                    TrackOverviewView(
+                        model: model, side: side, deckIdx: deckIdx,
+                        orientation: .horizontal,
+                        height: DubLayout.deckColumnOverviewHeight)
+                }
             }
         }
         .equatable()
@@ -228,8 +236,12 @@ extension PerformanceView {
                     palette: model.palette, side: side,
                     orientation: orientation,
                     scrubHandler: scrubHandler(side: side),
+                    // A THRU deck never "plays" — there is no file to
+                    // advance — but its record arrives every frame; without
+                    // it here the strip drew once and froze (rig, 2026-11-14).
                     continuouslyRendering:
-                        deckState.isPlaying || model.scratchingDeck == side
+                        deckState.isPlaying || deckState.isThru
+                        || model.scratchingDeck == side
                         || (side == .a && model.ripPhase == .capture),
                     seekGeneration: deckState.seekGeneration,
                     peaksGeneration: deckState.peaksGeneration,

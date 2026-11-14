@@ -11,8 +11,8 @@
 //  picker, and no channel fields in a shipping build — the Audio tab
 //  is a read-only status line.
 //
-//  Six tabs down the left, one per thing the DJ is configuring — AUDIO
-//  · DECKS · FX · LIBRARY · VINYL · KEYS — the shape of Traktor's
+//  Seven tabs down the left, one per thing the DJ is configuring — AUDIO
+//  · DECKS · FX · LIBRARY · VINYL · KEYS · ALPHA — the shape of Traktor's
 //  preferences and of System Settings, in Dub's own chrome. It replaced
 //  (2026-09-16) one scroll of eight caps-titled blocks, each toggle
 //  under a paragraph, where FX sat below the fold and the sheet read
@@ -20,6 +20,9 @@
 //  line, the explanation under it in the tertiary tone, so a tab scans
 //  as a column of decisions rather than a page of prose. Every control
 //  auto-applies; nothing here is committed by a button.
+//
+//  ALPHA holds what works but is not finished, behind one master switch
+//  that is off by default (2026-11-12, DUB FX first).
 //
 //  A DEV-only block (compiled in `#if DEBUG` only) on the Audio tab
 //  adds a manual mode override and device/channel overrides so the
@@ -41,6 +44,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
     case library
     case vinyl
     case keys
+    case alpha
 
     var id: String { rawValue }
 
@@ -52,6 +56,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         case .library: return "Library"
         case .vinyl: return "Vinyl"
         case .keys: return "Keys"
+        case .alpha: return "Alpha"
         }
     }
 
@@ -60,10 +65,11 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         switch self {
         case .audio: return "What the hardware decided. Dub configures audio from the interface you plug in."
         case .decks: return "How a deck behaves when a track lands on it."
-        case .fx: return "The dub instruments on the surface, and the FX channel."
+        case .fx: return "The dub instruments on the surface."
         case .library: return "The DJ apps whose libraries Dub reads into your one collection."
         case .vinyl: return "Recording records into the library, and naming what you ripped."
         case .keys: return "What the keyboard fires. Mapped on the live surface, listed here."
+        case .alpha: return "Features that work but aren't finished. They will change; leave them off at a gig."
         }
     }
 }
@@ -177,6 +183,7 @@ struct PreferencesSheet: View {
         case .library: libraryTab
         case .vinyl: vinylTab
         case .keys: keysTab
+        case .alpha: alphaTab
         }
     }
 
@@ -267,7 +274,7 @@ struct PreferencesSheet: View {
 
     // MARK: - FX
 
-    /// The dub instruments (PRD §6.3) and the FX channel (F-38).
+    /// The dub instruments (PRD §6.3). The FX channel (F-38) is on Alpha.
     private var fxTab: some View {
         VStack(alignment: .leading, spacing: DubSpacing.xl) {
             group("On the decks") {
@@ -283,14 +290,32 @@ struct PreferencesSheet: View {
                     isOn: $model.sirenEnabled)
                 toggleRow(
                     "Beat-match the siren's echo",
-                    "Locks the siren's echo to the deck's tempo — one beat per repeat — instead of each shot's own slap-back, so the echoes fall in time with the tune.",
+                    "Locks the siren's echo to the deck's tempo — one beat per repeat, or half a beat when a beat is longer than the echo can hold — instead of the DUB knob's time, so the repeats fall in time with the tune.",
                     isOn: $model.sirenDelaySync, enabled: model.sirenEnabled, last: true)
             }
-            group("The FX channel") {
+        }
+    }
+
+    // MARK: - Alpha
+
+    /// The master switch, then each unfinished feature's own. With the
+    /// master off a feature's switch reads off and greyed, whatever it
+    /// was left at — that is what the surface does too — and comes back
+    /// as it was when the master goes on.
+    private var alphaTab: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.xl) {
+            group("Alpha") {
+                toggleRow(
+                    "Alpha features",
+                    "Lets the switches below turn their features on. Off, every one of them is gone from the surface.",
+                    isOn: $model.alphaFeaturesEnabled, last: true)
+            }
+            group("In progress") {
                 toggleRow(
                     "Dub FX channel",
-                    "Adds a DUB FX position to each deck's source switch. Flip a deck to it and the deck stops being a turntable: the record is replaced by the vintage rack — Big Knob, phaser, Space Echo, spring — on the mixer's send, patched into the pair that deck's needle used, returning on its output pair. Every knob is the unit's own; ride them from a controller.",
-                    isOn: $model.dubFxEnabled, last: true)
+                    "Adds a DUB FX position to each deck's source switch, and HOLD to each deck's echo. Flip a deck to it and the deck stops being a turntable: the record is replaced by the vintage rack — Big Knob, phaser, Space Echo, spring — on the mixer's send, patched into the pair that deck's needle used, returning on its output pair. Every knob is the unit's own; ride them from a controller.",
+                    isOn: model.alphaFeaturesEnabled ? $model.dubFxEnabled : .constant(false),
+                    enabled: model.alphaFeaturesEnabled, last: true)
             }
         }
     }

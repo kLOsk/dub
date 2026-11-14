@@ -36,7 +36,8 @@ cannot reproduce is still a FAIL until it is explained.
 
 Clear these first; they are the open items in `history/CURRENT.md`.
 
-- [ ] **One-turntable swap.** DUB FX on. Play a record in THRU on deck A,
+- [ ] **One-turntable swap.** DUB FX on (Preferences ▸ Alpha: *Alpha
+      features*, then *Dub FX channel*). Play a record in THRU on deck A,
       ECHO OUT on the last phrase, **HOLD**, lift the needle, change the
       record, drop it, **HOLD** off → the echo carries the whole swap
       (10–20 s) at nearly its level, never grows, fades when released.
@@ -56,8 +57,9 @@ Clear these first; they are the open items in `history/CURRENT.md`.
       record's tempo once it is heard, and SYNC reads `♩ A · <bpm>`. Tap the
       deck's BPM four times → `BPM · TAP`, echoes on your beat. (The
       Space Echo's own TAP is the fallback while nothing is heard yet.)
-- [ ] **Deck HOLD only with DUB FX.** Preferences: DUB FX off → the echo is
-      the single ECHO OUT, no HOLD. On → OUT · HOLD.
+- [ ] **Deck HOLD only with DUB FX.** Preferences ▸ Alpha: either switch
+      off → the echo is the single ECHO OUT, no HOLD, and the source switch
+      has no DUB FX. Both on → OUT · HOLD.
 - [ ] **FX rack responsiveness.** Switch a deck to DUB FX and back five
       times; fold and unfold the rack bar. The rack appears in well under
       a second, knobs answer at once, no stall dumps appear.
@@ -121,7 +123,9 @@ Clear these first; they are the open items in `history/CURRENT.md`.
       off → the record is back. Lift the needle while it rings → the echo
       finishes before it turns itself off.
 - [ ] Siren: all five shots, the DUB knob end to end → level-matched,
-      no clicks, the VU throws on each press.
+      no clicks, the VU throws on each press. The Laser is a zap with no low
+      growl at its end; the Rifle Gun's crack at the end of each round does
+      not click (both 2026-11-14).
 - [ ] Sampler pads and Quick Scratch on both decks → fire, swap, release.
 - [ ] Every mapped key fires its control; map mode rebinds and unbinds.
 
@@ -155,15 +159,33 @@ Clear these first; they are the open items in `history/CURRENT.md`.
 
 ## 8. Thru — real records
 
-- [ ] THRU on a deck, drop a record → it passes through the engine with no
-      audible latency; the waveform builds live, scrolling in from the right.
+- [ ] THRU on a deck, needle up → the title reads *Waiting for the needle*,
+      the clock `--:--`, INPUT `○ NO SIGNAL`; no cues, loop or scratch pads.
+- [ ] Drop a record → it passes through the engine with no audible latency;
+      the title reads *Live record*, the clock counts from `00:00`, both
+      INPUT meters move (one dead meter = a dead channel), and the strip's
+      waveform keeps building past the first ten seconds (the 2026-11-14
+      bug: black after ~11 s).
+- [ ] *The side so far* grows left to right against minute marks; lift the
+      needle → it stays drawn; the next record → it starts over.
+- [ ] Once the BPM is solid → dashed beat lines below the playhead, faint
+      ones above sitting on the kicks; the TEMPO lamp flashes on the beat.
+      Note if the lines sit early or late against the kicks. With the BPM
+      solid the lines **hold still** — no hopping half a beat and back (the
+      2026-11-14 reggae 12″), no catching up in jumps on a live band.
 - [ ] Auto-BPM: a reggae, a hip-hop and a dnb record in THRU → the deck's BPM
-      shows a dim number, then a solid one within 15 s, on the right tempo.
+      shows a dim number, then a solid one within 15 s, on the right tempo —
+      and **stays solid** through the record (it flickered solid/dim on
+      2026-11-14).
       **Known:** dnb reads two-thirds of its tempo (~116 for ~175) — note it.
 - [ ] Tap override: tap the deck's BPM four times on the beat → it reads
       `BPM · TAP` with your tempo; the Space Echo's SYNC follows it. Lift the
       needle, put the next record down → the tap is gone and the deck listens
       again.
+- [ ] Right-click the BPM → ×2, ÷2, ×1.5 and ×⅔: the label reads
+      `BPM · ×2` etc., the number follows the tracker scaled, the beat lines
+      re-space. On the dnb record ×1.5 → ~175. *Back to the heard tempo*
+      clears it; the next record clears it too.
 
 ## 9. Robustness
 
