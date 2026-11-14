@@ -385,7 +385,7 @@ them. All ship with unit tests and pass `clippy -D warnings`.
 |---|---|---|---|
 | **#5 snare-2&4 + bass-on-1 downbeat** | `dub-bpm/src/downbeat.rs` (`refine_downbeat_backbeat`) | opt-in API call | **Built + 8 tests.** Band-splits the audio (snare 300 Hz–2.5 kHz, kick < 240 Hz), onset-envelopes each, votes per-bar-position energy over the whole track, returns a `bar_phase`. Resolves the case the kick-ODF picker cannot (kick on 1 & 3). Caller applies the phase when its confidence clears a bar. |
 | **#3 beat-location metric** | `dub-bpm/src/eval.rs` + `tests/beat_location_corpus.rs` | `DUB_BPM_BEAT_CORPUS` | **Built + 11 tests.** F-measure (±70 ms), Cemgil, CMLt/CMLc/AMLt/AMLc. This is the measurement substrate the others need — it makes a phase/downbeat change (e.g. #5) gradable, which BPM-only scoring cannot. |
-| **#2 local sliding-mean detrend** | `dub-bpm/src/tempo.rs` (`detrend_odf`) | `DUB_BPM_DETREND=local` | **Built + tests.** Asymmetric `p_pre=8 / p_post=7` window. Default global-mean path unchanged. Awaiting corpus A/B. |
+| **#2 local sliding-mean detrend** | `dub-bpm/src/tempo.rs` (`detrend_odf`) | `DUB_BPM_DETREND=local` | **Built + tests; corpus A/B NEGATIVE (2026-11-14, §7.5a).** Asymmetric `p_pre=8 / p_post=7` window. Default global-mean path unchanged — and it stays the default. |
 | **#1 DFT×ACF cross-tempogram** | `dub-bpm/src/tempo.rs` (`tempogram_weights`, Goertzel) | `DUB_BPM_TEMPOGRAM=1` | **Built, but smoke-test NEGATIVE.** See below. |
 
 **#1 did not pan out — and that is a result.** A blanket Goertzel-tempogram
@@ -406,6 +406,124 @@ octave+downbeat win is the learned tracker, not another DSP heuristic.
 measurement capability dub lacked) and **#5** (a principled downbeat that
 covers the kick-on-1&3 case the heuristic misses). **#2** is a clean,
 low-risk experiment awaiting the corpus. **#1** is empirically parked.
+
+### 7.5a The corpus A/B, and what is actually left (2026-11-14)
+
+**#2 local detrend is negative.** Run profile-aware over both sets, the
+switch the only difference:
+
+| Set | Shipped | `DUB_BPM_DETREND=local` |
+|---|---|---|
+| 94-track corpus, tempo failures (5 %) | 11 | **19** |
+| 31 `user_tap` grids, tempo within 1 % | 28 | 28 |
+| same, lines within 25 ms of the hand-set 1 | 21 | 22 |
+
+It fixes none of the 11 and breaks 8 — 2 dnb (175 → 87.5, 177 → 118),
+3 rap (two ×2, one 88 → 99), 3 reggae (×3/2, two ×4/3) — every one an
+octave-family flip: a local mean lifts the weak in-between onsets the
+global mean leaves under the floor, and the picker takes them for beats.
+On the hand-set grids three tracks moved, one much better (−216 → +13 ms),
+one much worse (+160 → +306 ms). Parked with #1.
+
+**The 11 are 4 with the genre's profile.** The fixture manifests run dnb
+and rap with profile `default` — no genre hint, the hard case. A track
+tagged *Drum & Bass* or *Hip-Hop* in the library gets its profile, and
+with those: dnb 8 → 2 (the two ~180s read 90), rap 1 → 0. The octave
+problem is mostly a **missing-tag** problem: it bites untagged files and a
+THRU deck, which has no tag — not a tagged library. That weakens §5's
+case for a learned tracker on octave grounds.
+
+**What the hand-set grids say.** `track_beatgrids` holds 31 `user_tap`
+rows in the maintainer's library — biased toward misses, since they are
+the tracks he corrected. The shipped detector against them:
+
+| Result | Tracks |
+|---|---|
+| tempo, lines and the 1 all right | 13 |
+| lines right, the 1 wrong | 8 |
+| tempo right, lines > 25 ms off the hand-set beat | 7 |
+| tempo wrong (one ×3/2, one +5 %, one test file) | 3 |
+
+One of the 21 well-placed grids drifts over its track (170.000 against a
+tapped 169.939). So the residual is **the 1** (§5's remaining case) and
+**line placement** — a DSP matter: two of the seven sit within 0.05 beat
+of exactly half a beat off, the off-beat lock.
+
+**The seven misplaced grids, with the audio as referee.** Each grid —
+the detector's and the hand-set one — was folded against the track's
+onsets in 10 s windows, giving the shift that would put its lines on the
+kicks there. A right grid reads a steady few ms all the way along:
+
+| Track | What it is |
+|---|---|
+| *Cheddar*, *All The Critics In New York* | **The detector is right** (0–6 ms end to end); the taps' tempos drift ~120 ms over the track. Neither tap is the active grid. |
+| *Excel – Apocalypse* | **Tempo bug, fixed below.** 173.78 against a true 175.00; the hand grid reads +12 ms for four minutes. |
+| *Cherry Bomb*, *Ain't No Mountain High Enough* | **Live bands.** Neither grid fits; both wander by hundreds of ms. No even grid can — this is the following grid (`dub_bpm::BeatFollower`'s pace, offline). |
+| *Bredren – Evacuation* | Right tempo, a steady 44 ms: the detector's lines on the first full-band transient, the hand-set 1 on the kick's body. |
+| *Janet Jackson – If (Kaytranada remix)* | Right tempo, a steady 28 ms early: swung, soft kicks; the hand grid sits on the kick's onset to 0–3 ms. |
+
+So the "line placement" residual is one tempo bug, two placement
+offsets of 28–44 ms, and two tracks no uniform grid can serve.
+
+**The tempo bug: the refine could not reach the tempo.** The estimator's
+first guess comes from whole-frame ACF lags — at 175 BPM one frame is
+3 % — and on *Apocalypse* its interpolated answer was 173.46, 0.9 %
+under. `refine_full_pipeline` searched ±0.5 % of that, so 175 was never
+tried and the LSQ settled on 173.78. Folded over the whole track, 175.02
+scores 1.64× the best tempo in that range. The refine now looks ±2 %
+first (`dominant_tempo_beyond_refine_range`) and starts from a tempo
+outside the ordinary range only when it folds ≥ 1.25× everything inside
+it **over the whole track and over each half** — a band holds some tempo
+for a stretch; a stretch is not a tempo. Otherwise the search runs as it
+always did. Measured on the 125 tracks: 9 analyses fold ≥ 1.5×, one
+1.15×, the rest ≤ 1.03× (the two live bands 1.00 and 1.01); three tempos
+change, all verified against the audio — *Apocalypse* 173.78 → 175.000
+(line at the hand-set 1: +160 → +11 ms; F at 20 ms 0.12 → 1.00),
+*Backbone* 175.4 → 176.000 (the hand-set tempo), *King Tubby – Burial*
+174.21 → 175.000 — and no other track moves. ~8 ms more per analysis.
+Stored `auto` grids are not versioned, so an analysed track keeps its
+grid until it is analysed again.
+
+**The two placement offsets.** *Evacuation*'s hand grid dates from
+2026-05-25, before the kick-edge snap existed (2026-06-22): it sits on
+the kick's body, the old behaviour, and the detector's line is on the
+broadband edge at every window size — the detector is right. *If* was
+real: the fit put the lines 42 ms ahead of the kicks, and
+`kick_edge_offset_secs` looks ±40 ms round each line, so it found the
+smaller thing before the kick (median +13.6 ms) and stopped, the kick
+just out of view; the same code at ±60 ms reads +39.8. Rather than widen
+the window — it must not reach a neighbouring hit — the shift now looks
+up to three times, each from where the last look moved the lines. *If*:
+−28.4 → +0.3 ms at the hand-set 1. Of the other 30 hand-set grids only
+the two live bands move (by ~10 ms, on grids no position can fix).
+
+**The wrong 1s were one rule, not a judgement call.** The 1 is chosen by
+"the first audible beat is the 1" (`first_audible_downbeat_phase`), and
+the backbeat (`refine_downbeat_backbeat`) only ran when that found
+nothing — never, in practice. Against the 23 hand-set grids whose lines
+are right:
+
+| Stage | Agrees with the hand-set 1 |
+|---|---|
+| first audible beat (what shipped) | 15 |
+| backbeat, snare 2&4 + bass on 1 | 18 |
+| whole-track kick vote | 6 |
+
+All eight misses were the first-beat rule on a track that opens on a
+pickup. The backbeat was right on seven of them — six at confidence
+0.16–0.30, *Lowkey* at 0.05 — and wrong on *Broken Drum*. Where the
+first-beat rule was right and the backbeat disagreed, it was unsure:
+0.01 (*Bangin'*) and 0.07 (*Armed & Dangerous*). The backbeat now
+overrules the first beat when it disagrees at ≥ 0.10
+(`DOWNBEAT_OVERRULE_MIN_CONFIDENCE`): **15 → 21 of 23**, nothing that was
+right going wrong. The bar is fitted to the tracks it is scored on, and
+they are tracks the maintainer corrected, so a library gains less than
+that. §5's learned tracker is left with two tracks of 23 to win here.
+
+**Tooling pitfall.** `examples/diagnose_bpm --manifest` reads the
+manifest's `profile` column as notes and analyses with no profile, so it
+reports 11 of 14 dubstep tracks failing where the profile-aware figure is
+1. Use `tests/real_music_corpus.rs` for corpus numbers.
 
 ### 7.6 Sources
 

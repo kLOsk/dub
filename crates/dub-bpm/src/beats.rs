@@ -256,6 +256,15 @@ pub fn analyze_beat_grid_with_profile(
 /// override scored ≥ 0.057, the single mis-pick scored 0.039.
 const DOWNBEAT_REFINE_MIN_CONFIDENCE: f32 = 0.05;
 
+/// How sure the backbeat must be to overrule "the 1 is the first audible
+/// beat" when the two disagree. On the operator's 23 well-placed hand-set
+/// grids (2026-11-14) the first-beat rule was right on 15; the backbeat
+/// disagreed and was right on six at 0.16–0.30, and disagreed and was
+/// wrong on two at 0.01 and 0.07. The bar sits in that gap. Fitted to
+/// the tracks it is scored on — tracks he corrected — so it earns less
+/// across a library than 15 → 21 reads.
+const DOWNBEAT_OVERRULE_MIN_CONFIDENCE: f32 = 0.10;
+
 /// A beat counts as "audible" once its local peak clears this fraction
 /// of the whole-track amplitude max. Low on purpose: it must catch the
 /// SOFT first hit of a track (the perceptual downbeat) — Bangin's intro
@@ -321,37 +330,46 @@ fn first_audible_downbeat_phase(
     None
 }
 
-/// Choose the bar phase (which beat is the "1"). Primary rule: the
-/// downbeat is the FIRST measurable kick ([`first_kick_downbeat_phase`])
-/// — the operator's dance-music rule, right ~95 % of the time and the
-/// thing the eye does. Fallback for ambiguous intros (reggae roll-ups,
-/// vocal / talk over the start) where no clean early kick exists: the
-/// backbeat snare-2&4 + bass-on-1 rule. Pure bar-phase rotation; bpm,
-/// beats, anchor and quality are preserved.
+/// Choose the bar phase (which beat is the "1"). The rule is the
+/// operator's for dance music — the 1 is the first audible beat
+/// ([`first_audible_downbeat_phase`]) — unless the backbeat (snare on 2
+/// and 4, bass on 1) disagrees and is sure of it
+/// ([`DOWNBEAT_OVERRULE_MIN_CONFIDENCE`]): a track that opens on a
+/// pickup has its first sound a beat before the bar. A silent track has
+/// no first beat, and the backbeat decides alone. Pure bar-phase
+/// rotation; bpm, beats, anchor and quality are preserved.
 fn apply_downbeat_refinement(
     mut grid: BeatGrid,
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
 ) -> BeatGrid {
-    if let Some(phase) = first_audible_downbeat_phase(
+    let first = first_audible_downbeat_phase(
         &grid.beats,
         samples,
         sample_rate,
         channels,
         grid.beats_per_bar,
-    ) {
-        grid.bar_phase = phase;
-        grid.downbeat_confidence = 1.0;
-        return grid;
-    }
-    if let Some(r) =
-        crate::downbeat::refine_downbeat_backbeat(samples, sample_rate, channels, &grid)
-    {
-        if r.confidence >= DOWNBEAT_REFINE_MIN_CONFIDENCE {
+    );
+    let backbeat = crate::downbeat::refine_downbeat_backbeat(samples, sample_rate, channels, &grid);
+    match (first, backbeat) {
+        // A track that opens on a pickup: the drums say clearly that the
+        // bar starts elsewhere.
+        (Some(first), Some(r))
+            if r.bar_phase != first && r.confidence >= DOWNBEAT_OVERRULE_MIN_CONFIDENCE =>
+        {
             grid.bar_phase = r.bar_phase;
             grid.downbeat_confidence = r.confidence;
         }
+        (Some(first), _) => {
+            grid.bar_phase = first;
+            grid.downbeat_confidence = 1.0;
+        }
+        (None, Some(r)) if r.confidence >= DOWNBEAT_REFINE_MIN_CONFIDENCE => {
+            grid.bar_phase = r.bar_phase;
+            grid.downbeat_confidence = r.confidence;
+        }
+        (None, _) => {}
     }
     grid
 }
@@ -2024,6 +2042,9 @@ fn refine_full_pipeline(
     duration_secs: f64,
     fixed_anchor: Option<f64>,
 ) -> Option<(f64, f64, GridQuality)> {
+    // The estimator's first guess can sit past the ±0.5 % the search
+    // below covers; start from a tempo that dominates, when there is one.
+    let bpm_init = dominant_tempo_beyond_refine_range(odf, odf_sr, bpm_init).unwrap_or(bpm_init);
     let (period, _phase) = sweep_and_parabolic(
         odf,
         odf_sr,
@@ -2070,6 +2091,79 @@ fn refine_full_pipeline(
             },
         ))
     }
+}
+
+/// How far either side of the first estimate the refine looks for a
+/// tempo that dominates. The estimator's lags are whole ODF frames —
+/// at 175 BPM one frame is 3 % — and its interpolated answer has come
+/// in 0.9 % out.
+const AUTO_WIDE_RANGE_PCT: f64 = 0.02;
+
+/// The step of that wider look. A steady track's whole-track fold peaks
+/// within ~0.05 % of its tempo and is back to the floor beyond; half
+/// that keeps a point on the peak.
+const AUTO_WIDE_STEP_PCT: f64 = 0.000_25;
+
+/// How much better than anything inside [`AUTO_REFINE_RANGE_PCT`] a tempo
+/// outside it must fold before the refine starts from it instead.
+/// *Apocalypse*'s 175 folds 1.64× the best the ordinary search could
+/// see; over 125 real tracks nothing fell between 1.15× and 1.5×.
+const AUTO_WIDE_DOMINANCE: f64 = 1.25;
+
+/// A tempo beyond the ordinary refine range of `bpm_init` — but within
+/// [`AUTO_WIDE_RANGE_PCT`] of it — whose fold clearly dominates
+/// everything inside that range, over the whole track **and in each half
+/// of it**. `None` when the best tempo is already in range, or nothing
+/// outside it stands out: then the ordinary search runs exactly as it
+/// always has.
+///
+/// Each half has to agree because a band that wanders will hold some
+/// tempo for a stretch, and that stretch alone can out-fold a range in
+/// which nothing lines up. A steady track has its tempo all the way
+/// through; a stretch is not a tempo.
+fn dominant_tempo_beyond_refine_range(odf: &[f32], odf_sr: f64, bpm_init: f64) -> Option<f64> {
+    if bpm_init <= 0.0 || odf_sr <= 0.0 || odf.is_empty() {
+        return None;
+    }
+    let period_init = (60.0 * odf_sr) / bpm_init;
+    let fits = |part: &[f32], period: f64| period >= 2.0 && (period * 2.0) < part.len() as f64;
+    // The best fold inside the ordinary range, and the best outside it.
+    let scan = |part: &[f32]| -> (f64, Option<(f64, f64)>) {
+        let (mut near, mut far): (f64, Option<(f64, f64)>) = (f64::NEG_INFINITY, None);
+        let mut frac = -AUTO_WIDE_RANGE_PCT;
+        while frac <= AUTO_WIDE_RANGE_PCT + 1e-12 {
+            let period = period_init * (1.0 + frac);
+            if fits(part, period) {
+                let (_, score) = best_phase_for_period(part, period);
+                if frac.abs() <= AUTO_REFINE_RANGE_PCT + 1e-12 {
+                    near = near.max(score);
+                } else if far.is_none_or(|(_, best)| score > best) {
+                    far = Some((period, score));
+                }
+            }
+            frac += AUTO_WIDE_STEP_PCT;
+        }
+        (near, far)
+    };
+    let dominates = |near: f64, score: f64| near > 0.0 && score >= near * AUTO_WIDE_DOMINANCE;
+
+    let (near, far) = scan(odf);
+    let (period, score) = far?;
+    if !dominates(near, score) {
+        return None;
+    }
+    let (first, second) = odf.split_at(odf.len() / 2);
+    for half in [first, second] {
+        if !fits(half, period) {
+            return None;
+        }
+        let (near, _) = scan(half);
+        let (_, score) = best_phase_for_period(half, period);
+        if !dominates(near, score) {
+            return None;
+        }
+    }
+    Some(60.0 * odf_sr / period)
 }
 
 fn sweep_and_parabolic(
@@ -2612,6 +2706,12 @@ const KICK_EDGE_MIN_BEAT_FRACTION: f32 = 0.25;
 /// can never yank the grid more than a hair off the LSQ phase.
 const KICK_EDGE_MAX_SHIFT_SECS: f64 = 0.050;
 
+/// How many times the auto shift looks for the kick edge, each look
+/// from where the last one moved the lines. The window stays tight —
+/// it must not reach a neighbouring hit — so a kick 40 ms out is found
+/// by stepping toward it, not by looking wider.
+const KICK_EDGE_LOOKS: usize = 3;
+
 /// Median SIGNED offset (seconds) from each beat to its nearest visual
 /// kick edge — the uniform shift that lands the whole grid on the kick
 /// leading edges the DJ sees. Signed (it can pull the grid EARLIER, off
@@ -2628,22 +2728,38 @@ fn kick_edge_offset_secs(beats: &[f64], samples: &[f32], sample_rate: u32, chann
         return 0.0;
     }
     let env_max = env.iter().copied().fold(0.0f32, f32::max);
-    let mut offsets: Vec<f64> = Vec::with_capacity(beats.len());
-    for &beat in beats {
-        if let Some(edge) =
-            kick_leading_edge_secs(&env, env_sr, env_max, beat, KICK_EDGE_AUTO_HALF_WINDOW_SECS)
-        {
-            offsets.push(edge - beat);
+    #[allow(clippy::cast_precision_loss)]
+    let min_beats = ((KICK_EDGE_MIN_BEAT_FRACTION * beats.len() as f32).ceil() as usize).max(6);
+    // The median edge offset with every line moved by `moved` first.
+    let median_from = |moved: f64| -> Option<f64> {
+        let mut offsets: Vec<f64> = beats
+            .iter()
+            .filter_map(|&beat| {
+                let at = beat + moved;
+                kick_leading_edge_secs(&env, env_sr, env_max, at, KICK_EDGE_AUTO_HALF_WINDOW_SECS)
+                    .map(|edge| edge - at)
+            })
+            .collect();
+        if offsets.len() < min_beats {
+            return None;
+        }
+        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(offsets[offsets.len() / 2])
+    };
+    // Look, move, and look again from there: a kick sitting just past
+    // the window is cut off on the first look, and what the look finds
+    // instead is the smaller thing before it.
+    let mut moved = 0.0;
+    for _ in 0..KICK_EDGE_LOOKS {
+        let Some(step) = median_from(moved) else {
+            break;
+        };
+        moved = (moved + step).clamp(-KICK_EDGE_MAX_SHIFT_SECS, KICK_EDGE_MAX_SHIFT_SECS);
+        if step.abs() < 1e-3 {
+            break;
         }
     }
-    #[allow(clippy::cast_precision_loss)]
-    let min_beats = (KICK_EDGE_MIN_BEAT_FRACTION * beats.len() as f32).ceil() as usize;
-    if offsets.len() < min_beats.max(6) {
-        return 0.0;
-    }
-    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = offsets[offsets.len() / 2];
-    median.clamp(-KICK_EDGE_MAX_SHIFT_SECS, KICK_EDGE_MAX_SHIFT_SECS)
+    moved
 }
 
 /// Shift every beat in `grid` by the median visual-kick-edge offset so
@@ -3204,6 +3320,215 @@ mod tests {
              got swapped {} ms vs main {} ms",
             chosen_quality.rms_ms,
             wrong_quality.rms_ms
+        );
+    }
+
+    /// A tick and then the kick, the fitted lines 44 ms ahead of the
+    /// kick: `tick_ms` and `kick_ms` after each line.
+    fn tick_then_kick(bpm: f64, secs: f64, tick_ms: f64, kick_ms: f64) -> (Vec<f32>, Vec<f64>) {
+        let sr = f64::from(SR);
+        let mut samples = vec![0.0f32; (secs * sr) as usize];
+        let beats: Vec<f64> = (0..)
+            .map(|k| 0.5 + f64::from(k) * 60.0 / bpm)
+            .take_while(|t| t + 0.3 < secs)
+            .collect();
+        for &b in &beats {
+            for (at_ms, level, len) in [(tick_ms, 0.25f32, 240usize), (kick_ms, 1.0, 4_800)] {
+                let at = ((b + at_ms / 1000.0) * sr) as usize;
+                for (i, s) in samples[at..].iter_mut().take(len).enumerate() {
+                    *s += level * (-(i as f32) / (len as f32 / 5.0)).exp();
+                }
+            }
+        }
+        (samples, beats)
+    }
+
+    /// Kaytranada's remix of *If*: swung, soft kicks, and the fit put the
+    /// lines 42 ms ahead of them. The shift looks ±40 ms round each line,
+    /// so it found the small thing before the kick, moved 14 ms and
+    /// stopped — the kick still just out of view (2026-11-14). Looking
+    /// again from where it moved to brings the kick in.
+    #[test]
+    fn a_kick_just_past_the_window_is_reached_on_a_second_look() {
+        let (samples, beats) = tick_then_kick(108.0, 60.0, 12.0, 44.0);
+        let shift = kick_edge_offset_secs(&beats, &samples, SR, 1) * 1000.0;
+        assert!(
+            (shift - 44.0).abs() < 4.0,
+            "shifted {shift:+.1} ms, the kick is at +44"
+        );
+    }
+
+    /// Lines already on the kick stay there: a second look finds nothing
+    /// more to do, and a tick *after* the kick is not walked onto.
+    #[test]
+    fn lines_on_the_kick_do_not_walk_to_the_next_thing() {
+        let (samples, beats) = tick_then_kick(108.0, 60.0, 36.0, 0.0);
+        let shift = kick_edge_offset_secs(&beats, &samples, SR, 1) * 1000.0;
+        assert!(
+            shift.abs() < 4.0,
+            "shifted {shift:+.1} ms off a kick it was on"
+        );
+    }
+
+    /// A tone burst at `t_secs`: a drum hit with its energy in one band.
+    fn hit(buf: &mut [f32], t_secs: f64, freq: f64, amp: f32) {
+        let fs = f64::from(SR);
+        let start = (t_secs * fs) as usize;
+        for n in 0..(0.08 * fs) as usize {
+            let Some(s) = buf.get_mut(start + n) else {
+                break;
+            };
+            let tt = n as f64 / fs;
+            *s += amp * ((-tt / 0.03).exp() * (std::f64::consts::TAU * freq * tt).sin()) as f32;
+        }
+    }
+
+    /// 16 bars at 174 with a grid from t = 0, the drums laid by `drum`:
+    /// `(beat index) -> Some((frequency, level))`.
+    fn drums(drum: impl Fn(usize) -> Option<(f64, f32)>) -> (Vec<f32>, BeatGrid) {
+        let period = 60.0 / 174.0;
+        let mut buf = vec![0.0f32; (65.0 * period * f64::from(SR)) as usize];
+        for i in 0..64 {
+            if let Some((freq, amp)) = drum(i) {
+                hit(&mut buf, i as f64 * period, freq, amp);
+            }
+        }
+        let mut grid = BeatGrid::none();
+        grid.bpm = 174.0;
+        grid.confidence = 1.0;
+        grid.beats = (0..64).map(|i| f64::from(i) * period).collect();
+        grid.beats_per_bar = 4;
+        (buf, grid)
+    }
+
+    /// A track that opens on a pickup — one snare hit, then bar 1. The
+    /// first audible beat is the pickup, so "the 1 is the first beat"
+    /// puts every 1 a beat early; the snare on 2 and 4 and the kick on 1
+    /// say where the bar is, and say it clearly. Six of the operator's
+    /// eight wrong 1s were this (2026-11-14): *LK*, *Come Back*,
+    /// *Baddadan*, *Liquor & Cigarettes*, *Terrorist Threats*, *Believe
+    /// Me* — the backbeat right on each at 0.16–0.30.
+    #[test]
+    fn a_clear_backbeat_overrules_the_first_audible_beat() {
+        let (buf, grid) = drums(|i| match (i, (i + 3) % 4) {
+            (0, _) => Some((1_000.0, 0.9)),
+            (_, 0) => Some((55.0, 1.0)),
+            (_, 2) => Some((55.0, 0.6)),
+            _ => Some((1_000.0, 0.9)),
+        });
+        assert_eq!(
+            first_audible_downbeat_phase(&grid.beats, &buf, SR, 1, 4),
+            Some(0)
+        );
+        let refined = apply_downbeat_refinement(grid, &buf, SR, 1);
+        assert_eq!(refined.bar_phase, 1, "the 1 stayed on the pickup");
+    }
+
+    /// With no backbeat to speak of — a kick on every beat, alike — the
+    /// first audible beat is the 1, as it always was. (*Bangin'* and
+    /// *Armed & Dangerous*: the backbeat disagrees there at 0.01 and
+    /// 0.07, and is wrong.)
+    #[test]
+    fn an_unsure_backbeat_leaves_the_first_audible_beat_the_one() {
+        let (buf, grid) = drums(|i| (i >= 2).then_some((55.0, 1.0)));
+        let refined = apply_downbeat_refinement(grid, &buf, SR, 1);
+        assert_eq!(refined.bar_phase, 2, "the 1 left the first audible beat");
+    }
+
+    /// The onsets of mono `samples`, as the auto path sees them.
+    fn odf_of(samples: &[f32]) -> (Vec<f32>, f64, f64) {
+        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+            samples,
+            SR,
+            1,
+            BpmRange::DEFAULT,
+            OctaveProfile::Default,
+        )
+        .expect("odf");
+        (
+            odf,
+            f64::from(SR) / HOP_SIZE as f64,
+            samples.len() as f64 / f64::from(SR),
+        )
+    }
+
+    /// The tempo estimator hands the refine a first guess that can be
+    /// most of a percent out — its lags are whole ODF frames. Excel's
+    /// *Apocalypse* is a true 175.0 that came in at 173.46: the ±0.5 %
+    /// search never reached 175, and the fit settled on 173.78, a grid
+    /// that walks a whole beat off the kicks every half minute
+    /// (2026-11-14). Folded over the whole track 175.02 stands at 100
+    /// against ~61 for everything the search could see.
+    #[test]
+    fn a_first_estimate_most_of_a_percent_out_still_finds_the_tempo() {
+        let samples = click_track(175.0, 120.0, SR);
+        let (odf, odf_sr, duration_secs) = odf_of(&samples);
+        let (bpm, _, _) =
+            refine_full_pipeline(&odf, odf_sr, 173.459, duration_secs, None).expect("refine");
+        assert!((bpm - 175.0).abs() < 0.05, "refined to {bpm:.3}, not 175");
+    }
+
+    /// A first guess the ordinary search already covers is left to it.
+    #[test]
+    fn a_first_estimate_inside_the_refine_range_is_left_alone() {
+        let samples = click_track(175.0, 120.0, SR);
+        let (odf, odf_sr, _) = odf_of(&samples);
+        assert_eq!(
+            dominant_tempo_beyond_refine_range(&odf, odf_sr, 174.6),
+            None
+        );
+        assert_eq!(
+            dominant_tempo_beyond_refine_range(&odf, odf_sr, 175.0),
+            None
+        );
+    }
+
+    /// A band that pushes and pulls round its tempo is not pulled off
+    /// it: with the first guess on that tempo, the wider look finds
+    /// bumps, not a peak, and leaves the ordinary search where it was.
+    /// (*Cherry Bomb* and *Ain't No Mountain High Enough* fold 1.01× and
+    /// 1.00× outside the range; a steady track mis-guessed folds 1.5×
+    /// and up.) Here the band runs 2 % ahead and 2 % behind over every
+    /// four bars. A band that *holds* another tempo for most of a track,
+    /// in both halves, is a different thing, and is followed there.
+    #[test]
+    fn a_band_pushing_and_pulling_is_not_pulled_off_its_tempo() {
+        let sr = f64::from(SR);
+        let mut samples = vec![0.0f32; (120.0 * sr) as usize];
+        let (mut t, mut beat) = (0.0f64, 0u32);
+        while t < 119.0 {
+            let at = (t * sr) as usize;
+            for (i, s) in samples[at..].iter_mut().take(2_400).enumerate() {
+                *s += (-(i as f32) / 600.0).exp();
+            }
+            // A triangle: up for eight beats, down for eight.
+            let along = f64::from(beat % 16) / 8.0;
+            let push = 0.02 * (if along < 1.0 { along } else { 2.0 - along } * 2.0 - 1.0);
+            t += 60.0 / (129.0 * (1.0 + push));
+            beat += 1;
+        }
+        let (odf, odf_sr, _) = odf_of(&samples);
+        for first in [128.6, 129.0, 129.4] {
+            assert_eq!(
+                dominant_tempo_beyond_refine_range(&odf, odf_sr, first),
+                None,
+                "a dominant tempo found from {first}"
+            );
+        }
+    }
+
+    /// A tempo held for one stretch is not the track's tempo: the first
+    /// half steady at 127, the second at 131, a first guess between them.
+    /// Each folds well over its own half and neither over the other, so
+    /// neither is taken.
+    #[test]
+    fn a_tempo_held_for_half_the_track_is_not_taken() {
+        let mut samples = click_track(127.0, 60.0, SR);
+        samples.extend(click_track(131.0, 60.0, SR));
+        let (odf, odf_sr, _) = odf_of(&samples);
+        assert_eq!(
+            dominant_tempo_beyond_refine_range(&odf, odf_sr, 129.0),
+            None
         );
     }
 

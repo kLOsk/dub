@@ -1,7 +1,9 @@
 //! Local reproduction: Apocalypse tap-tempo should land on 175.0,
 //! not 175.10. Runs only when the author's file is present.
 
-use dub_bpm::{analyze_beat_grid_from_bpm_and_anchor, OctaveProfile};
+use dub_bpm::{
+    analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_with_profile, OctaveProfile,
+};
 use dub_io::Track;
 
 const APOCALYPSE: &str =
@@ -60,5 +62,34 @@ fn apocalypse_tap_175_lands_on_integer() {
                 );
             }
         }
+    }
+}
+
+/// The auto path on the same track. The estimator's first guess is
+/// 173.46 — 0.9 % under — and the refine only searched ±0.5 % of it, so
+/// the grid came out at 173.78 and walked a whole beat off the kicks
+/// every half minute (2026-11-14). 175 folds 1.6× anything in that
+/// range, over the whole track and over each half of it.
+#[test]
+fn apocalypse_auto_lands_on_175() {
+    if !std::path::Path::new(APOCALYPSE).exists() {
+        eprintln!("skip apocalypse_auto: fixture not found");
+        return;
+    }
+    let track = Track::load_from_path(APOCALYPSE).expect("decode");
+    for profile in [OctaveProfile::DrumAndBass, OctaveProfile::Default] {
+        let grid = analyze_beat_grid_with_profile(
+            track.samples(),
+            track.sample_rate(),
+            track.channels(),
+            profile,
+        )
+        .expect("auto grid");
+        eprintln!("{profile:?} -> bpm {:.4}", grid.bpm);
+        assert!(
+            (grid.bpm - 175.0).abs() < 0.001,
+            "auto on a DnB 175.0 track must land on 175.0, got {:.4} ({profile:?})",
+            grid.bpm
+        );
     }
 }
