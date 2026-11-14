@@ -57,6 +57,12 @@ Clear these first; they are the open items in `history/CURRENT.md`.
       record's tempo once it is heard, and SYNC reads `♩ A · <bpm>`. Tap the
       deck's BPM four times → `BPM · TAP`, echoes on your beat. (The
       Space Echo's own TAP is the fallback while nothing is heard yet.)
+- [ ] **Following beat grid (Alpha).** Preferences ▸ Alpha: *Alpha
+      features* and *Following beat grid* on. Load a live-band track (roots
+      reggae, soul) → the beat lines sit on the band's beats through the
+      track, unevenly spaced. Load a drum-machine track → an even grid, as
+      before. Switch it off, load the live track again → the even grid is
+      back. Note any track where the followed lines wobble or hop.
 - [ ] **Deck HOLD only with DUB FX.** Preferences ▸ Alpha: either switch
       off → the echo is the single ECHO OUT, no HOLD, and the source switch
       has no DUB FX. Both on → OUT · HOLD.

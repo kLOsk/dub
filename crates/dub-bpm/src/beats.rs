@@ -2719,7 +2719,12 @@ const KICK_EDGE_LOOKS: usize = 3;
 /// amplitude leading edge, not a near-max / peak region. Returns 0 when
 /// too few beats expose a clean
 /// edge (see [`KICK_EDGE_MIN_BEAT_FRACTION`]).
-fn kick_edge_offset_secs(beats: &[f64], samples: &[f32], sample_rate: u32, channels: u8) -> f64 {
+pub(crate) fn kick_edge_offset_secs(
+    beats: &[f64],
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+) -> f64 {
     if beats.is_empty() {
         return 0.0;
     }

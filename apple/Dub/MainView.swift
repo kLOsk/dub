@@ -1097,6 +1097,7 @@ final class WaveformAppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(alphaFeaturesEnabled, forKey: Self.kAlphaFeatures)
             if !alphaFeaturesEnabled { leaveDubFxEverywhere() }
+            syncFollowingGrid()
         }
     }
 
@@ -1117,6 +1118,27 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private static let kDubFxEnabled = "dub.dubFxEnabled"
+
+    /// Preferences ▸ Alpha: a beat grid that follows the band. On, a
+    /// track whose band wanders off any even grid — live reggae, soul,
+    /// rock — gets a line on each beat it played, worked out when the
+    /// track loads; a steady track keeps its even grid. Off, every grid
+    /// is even, as before. Nothing is stored, so it is undone by turning
+    /// it off and loading the track again. Persisted under
+    /// `dub.followingGrid`.
+    @Published var followingGridEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(followingGridEnabled, forKey: Self.kFollowingGrid)
+            syncFollowingGrid()
+        }
+    }
+
+    private static let kFollowingGrid = "dub.followingGrid"
+
+    /// Tell the engine whether the next load may follow the band.
+    private func syncFollowingGrid() {
+        engine.setFollowingGrid(on: alphaFeaturesEnabled && followingGridEnabled)
+    }
 
     /// DUB FX is on the surface: its own switch, behind the alpha one.
     var dubFxAvailable: Bool { alphaFeaturesEnabled && dubFxEnabled }
@@ -1628,6 +1650,11 @@ final class WaveformAppModel: ObservableObject {
         self.alphaFeaturesEnabled = UserDefaults.standard.bool(forKey: Self.kAlphaFeatures)
         self.dubFxEnabled =
             UserDefaults.standard.object(forKey: Self.kDubFxEnabled) as? Bool ?? false
+        let followGrid = UserDefaults.standard.bool(forKey: Self.kFollowingGrid)
+        self.followingGridEnabled = followGrid
+        // `didSet` does not run in `init`: hand the engine the stored choice.
+        engine.setFollowingGrid(
+            on: followGrid && UserDefaults.standard.bool(forKey: Self.kAlphaFeatures))
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)

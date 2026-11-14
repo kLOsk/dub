@@ -55,6 +55,7 @@ mod confidence;
 mod downbeat;
 mod estimator;
 pub mod eval;
+mod follow;
 mod octave_profile;
 mod offline;
 mod onset;
@@ -76,6 +77,7 @@ pub use confidence::{
 };
 pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
+pub use follow::follow_grid;
 pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
 pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};
 pub use phase::{latest_beat, BeatFollower, FollowedBeats, PHASE_WINDOW_SECS};

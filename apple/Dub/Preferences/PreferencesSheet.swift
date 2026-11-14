@@ -315,6 +315,11 @@ struct PreferencesSheet: View {
                     "Dub FX channel",
                     "Adds a DUB FX position to each deck's source switch, and HOLD to each deck's echo. Flip a deck to it and the deck stops being a turntable: the record is replaced by the vintage rack — Big Knob, phaser, Space Echo, spring — on the mixer's send, patched into the pair that deck's needle used, returning on its output pair. Every knob is the unit's own; ride them from a controller.",
                     isOn: model.alphaFeaturesEnabled ? $model.dubFxEnabled : .constant(false),
+                    enabled: model.alphaFeaturesEnabled)
+                toggleRow(
+                    "Following beat grid",
+                    "For records played by a band. When a track loads and its beats wander off any even grid — live reggae, soul, rock — each beat gets its own line where the band played it. A steady track keeps its even grid. Nothing is saved: turn this off and load the track again to get the even grid back.",
+                    isOn: model.alphaFeaturesEnabled ? $model.followingGridEnabled : .constant(false),
                     enabled: model.alphaFeaturesEnabled, last: true)
             }
         }

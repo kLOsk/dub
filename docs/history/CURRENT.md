@@ -125,6 +125,23 @@ gate is local-only because GitHub CI has no macOS app job.
   right on seven. The backbeat now overrules the first beat when it
   disagrees at confidence ≥ 0.10: 15 → 21 of the 23 well-placed hand-set
   grids, none lost (*Lowkey* and *Broken Drum* remain).
+- **A beat grid that follows the band (Alpha, FFI 84, branch
+  `feat/following-grid`, not yet on the rig).** `dub_bpm::follow_grid`
+  tracks the beats a band actually played (Ellis's dynamic-programming
+  chain over the onsets, held to the even grid's period) and replaces the
+  even grid only when its beats land on ≥ 1.5× the onset and wander
+  ≥ 60 ms. Over the 125 test tracks it follows 16 — live reggae, soul,
+  rock, two half-time dubstep — each with clearly more lines on a hit
+  (e.g. 0.28 → 0.96, 0.39 → 0.82, by an envelope the tracker does not
+  use); 109 keep their even grid exactly. *Ain't No Mountain High Enough*
+  is refused: its onsets do not carry the beat (1.09×). Runs in the load
+  worker on top of the library's or the analyser's grid when Preferences
+  ▸ Alpha ▸ *Following beat grid* is on (`set_following_grid`); ~0.3 s a
+  track. **Nothing is stored** — the library keeps tempo, anchor and the
+  1 — so it is undone by the switch, and a set-the-1 or tap lays an even
+  grid again. Known limits: lines sit at onset-frame precision (~±6 ms),
+  the 1 is carried from the even grid, and beat-synced things (echo
+  time, loops by beats) still read the one tempo.
 - **Calibration says one thing; the signal panel has one button.** The
   overview's bar read SETTLING PITCH for the second half of the session
   measurement (the wobble fit), which on an empty, stopped deck looked like

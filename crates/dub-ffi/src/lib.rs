@@ -529,7 +529,18 @@ pub use rip::{
 ///       is gone with the signal panel's AUTO button: auto source
 ///       detection was removed, and all it still did was clear an
 ///       override flag nothing reads.
-pub const FFI_VERSION: u32 = 83;
+///   84. **A grid that follows the band (Alpha).**
+///       [`DubEngine::set_following_grid`]: with it on, a track whose
+///       band wanders off any even grid gets its own beats at load
+///       (`dub_bpm::follow_grid`), on top of the grid the library or the
+///       analyser supplied. Off — the default — nothing changes. Nothing
+///       is stored: the library keeps tempo, anchor and the 1.
+pub const FFI_VERSION: u32 = 84;
+
+/// Whether a loading track's grid may follow its band
+/// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
+/// detached and reads it when its grid is ready.
+static FOLLOWING_GRID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -3746,6 +3757,17 @@ impl DubEngine {
         }
     }
 
+    /// Let a loading track's beat grid follow its band (Alpha). With it
+    /// on, the load worker runs `dub_bpm::follow_grid` over the grid it
+    /// is about to install — the library's or the analyser's — and, for
+    /// a track whose band wanders off any even grid, installs the band's
+    /// own beats instead. A steady track keeps its even grid exactly.
+    /// Takes effect at the next load; a later set-the-1 or tap lays an
+    /// even grid again. Off by default.
+    pub fn set_following_grid(&self, on: bool) {
+        FOLLOWING_GRID.store(on, Ordering::Release);
+    }
+
     /// Replace the loaded File deck's beat grid in place (M11c.3b).
     ///
     /// Synthesises per-beat timestamps from `(bpm, anchor_secs)` and
@@ -5783,6 +5805,10 @@ fn background_analyze_and_install(
         };
         (grid, bpm_ms, "analyzed")
     };
+    let (grid, source_label) = match followed_grid(&grid, &track, full_samples.get()) {
+        Some(followed) => (followed, "followed"),
+        None => (grid, source_label),
+    };
 
     {
         let mut guard = lock_state(&state);
@@ -5807,6 +5833,29 @@ fn background_analyze_and_install(
         a.fetch_add(1, Ordering::Release);
     }
     eprintln!("dub-ffi: beat-grid deck={idx} installed ({source_label}, {bpm_ms}ms DSP)");
+}
+
+/// The band's own beats for `grid`, when following is switched on and the
+/// track's band wanders off it — see [`DubEngine::set_following_grid`].
+fn followed_grid(grid: &BeatGrid, track: &Track, samples: &[f32]) -> Option<BeatGrid> {
+    if !FOLLOWING_GRID.load(Ordering::Acquire) || grid.beats.is_empty() {
+        return None;
+    }
+    let even = CoreBeatGrid {
+        bpm: grid.bpm,
+        confidence: grid.confidence,
+        beats: grid.beats.clone(),
+        beats_per_bar: u8::try_from(grid.beats_per_bar).unwrap_or(4),
+        bar_phase: u8::try_from(grid.bar_phase).unwrap_or(0),
+        quality: None,
+        downbeat_confidence: grid.downbeat_confidence,
+    };
+    let followed = dub_bpm::follow_grid(samples, track.sample_rate(), track.channels(), &even)?;
+    Some(BeatGrid {
+        beats: followed.beats,
+        bar_phase: u32::from(followed.bar_phase),
+        ..grid.clone()
+    })
 }
 
 /// Materialise a [`BeatGrid`] from the scalar `(bpm, anchor_secs)`
@@ -6708,7 +6757,7 @@ mod tests {
         // 82→83: `ThruTempo.record_secs` / `record_start_secs`,
         // `thru_beat_phase`, `DeckTelemetry.input_rms_left` … `_right`;
         // `set_deck_auto_control` removed.
-        assert_eq!(FFI_VERSION, 83);
+        assert_eq!(FFI_VERSION, 84);
     }
 
     /// Off THRU — or with no engine — there is no record and no phase.
