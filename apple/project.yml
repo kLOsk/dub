@@ -87,8 +87,8 @@ targets:
         CFBundlePackageType: APPL
         # Keep in step with `[workspace.package] version` in Cargo.toml; the
         # release tag is `v` + this. `make dist` names the zip after it.
-        CFBundleShortVersionString: "1.0.0-alpha.1"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "1.0.0-alpha.2"
+        CFBundleVersion: "2"
         LSMinimumSystemVersion: "13.0"
         # Dual-GPU MacBook Pros: without this the first Metal layer makes
         # macOS switch to the discrete GPU — seconds on the main thread at

@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "dub-audio"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "coreaudio-rs",
  "dub-engine",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "dub-bpm"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "dub-io",
  "dub-peaks",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "dub-cli"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -710,18 +710,18 @@ dependencies = [
 
 [[package]]
 name = "dub-controller"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 
 [[package]]
 name = "dub-dsp"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "assert_no_alloc",
 ]
 
 [[package]]
 name = "dub-encode"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "flacenc",
  "metaflac",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "dub-engine"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "assert_no_alloc",
  "dub-bpm",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "dub-ffi"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "dirs",
  "dub-audio",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "dub-fingerprint"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "rusty-chromaprint",
  "thiserror 1.0.69",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "dub-io"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "hound",
  "proptest",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "dub-library"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "base64",
  "dirs",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "dub-peaks"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "dub-spectral",
  "ringbuf",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "dub-recognize"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "base64",
  "rusty-chromaprint",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "dub-rip"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "dub-encode",
  "dub-io",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "dub-spectral"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "realfft",
  "thiserror 1.0.69",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "dub-stretch"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "assert_no_alloc",
  "insta",
@@ -873,11 +873,11 @@ dependencies = [
 
 [[package]]
 name = "dub-thru"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 
 [[package]]
 name = "dub-timecode"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "assert_no_alloc",
 ]
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "rt-audit"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "assert_no_alloc",
