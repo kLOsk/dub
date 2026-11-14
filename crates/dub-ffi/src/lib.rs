@@ -535,6 +535,8 @@ pub use rip::{
 ///       (`dub_bpm::follow_grid`), on top of the grid the library or the
 ///       analyser supplied. Off — the default — nothing changes. Nothing
 ///       is stored: the library keeps tempo, anchor and the 1.
+///       [`DubEngine::deck_local_bpm`] is the band's tempo at the
+///       playhead on such a grid, for the deck's readout.
 pub const FFI_VERSION: u32 = 84;
 
 /// Whether a loading track's grid may follow its band
@@ -1067,6 +1069,26 @@ fn drain_stale(rx: &mut ringbuf::HeapCons<f32>) {
     rx.skip(stale);
 }
 
+/// Empty a deck's waveform slot. A live waveform's stream owns the deck's
+/// end of the audio tap, and that end cannot be made again while the
+/// engine runs: dropping the stream with it left every later THRU on the
+/// deck with a tempo and meters and no waveform (2026-11-14 — a track
+/// loaded onto a THRU deck did it). So the stream is stopped and its
+/// consumer handed back to `taps` first. Returns whether the slot held
+/// anything.
+fn clear_peaks(slot: &mut Option<PeakSource>, taps: &mut LiveDeckTaps) -> bool {
+    match slot.take() {
+        Some(PeakSource::Live { stream, .. }) => {
+            if let Some(rx) = stream.into_audio_rx() {
+                taps.peaks_rx = Some(rx);
+            }
+            true
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
 impl RunningState {
     /// A deck went to THRU: spawn its tempo tracker and live waveform on
     /// the deck's taps. Already running (THRU pressed twice) keeps them.
@@ -1110,10 +1132,7 @@ impl RunningState {
             taps.bpm_rx = stream.into_audio_rx();
         }
         if matches!(self.peaks[idx], Some(PeakSource::Live { .. })) {
-            if let Some(PeakSource::Live { stream, .. }) = self.peaks[idx].take() {
-                taps.peaks_rx = stream.into_audio_rx();
-            }
-            return true;
+            return clear_peaks(&mut self.peaks[idx], taps);
         }
         false
     }
@@ -1899,7 +1918,7 @@ impl DubEngine {
             running.quick_scratch_parked[idx] = None;
             running.double_host_view[idx] = None;
             running.file_tracks[idx] = Some(track.clone());
-            running.peaks[idx] = None;
+            clear_peaks(&mut running.peaks[idx], &mut running.live_taps[idx]);
             if let Some(a) = self.peak_generation_seq.get(idx) {
                 a.fetch_add(1, Ordering::Release);
             }
@@ -3648,7 +3667,7 @@ impl DubEngine {
                 }
                 ControlMode::Fx => {
                     running.stop_live_analysis(idx);
-                    running.peaks[idx] = None;
+                    clear_peaks(&mut running.peaks[idx], &mut running.live_taps[idx]);
                     true
                 }
                 ControlMode::InternalPlay | ControlMode::Timecode => {
@@ -3766,6 +3785,27 @@ impl DubEngine {
     /// even grid again. Off by default.
     pub fn set_following_grid(&self, on: bool) {
         FOLLOWING_GRID.store(on, Ordering::Release);
+    }
+
+    /// The tempo the band is playing at the deck's playhead, when its grid
+    /// follows the band: the average over the two bars up to it
+    /// (`dub_bpm::local_bpm`), before pitch. `0.0` for an even grid — its
+    /// tempo is the grid's own — an empty deck, or a stopped engine. Poll
+    /// a few times a second; it takes the engine lock.
+    #[must_use]
+    pub fn deck_local_bpm(&self, deck_idx: u64) -> f64 {
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return 0.0;
+        };
+        let at_secs = self.position_snapshot(deck_idx).playhead_secs_unclamped;
+        let state = lock_state(&self.state);
+        let EngineState::Running(running) = &*state else {
+            return 0.0;
+        };
+        let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
+            return 0.0;
+        };
+        dub_bpm::local_bpm(&fp.beat_grid.beats, at_secs).unwrap_or(0.0)
     }
 
     /// Replace the loaded File deck's beat grid in place (M11c.3b).
@@ -6560,6 +6600,32 @@ mod tests {
     }
     use super::*;
 
+    /// A track loaded onto a THRU deck clears the deck's live waveform.
+    /// The stream it clears holds the deck's end of the audio tap, and
+    /// the next THRU needs it back: lost, that deck has a tempo and
+    /// meters and never a waveform again.
+    #[test]
+    fn clearing_a_live_waveform_hands_its_tap_back() {
+        use ringbuf::traits::Split;
+        let (_tx, rx) = ringbuf::HeapRb::<f32>::new(4_096).split();
+        let stream = PeakStream::spawn(rx, PeakStreamConfig::at(48_000)).expect("spawn");
+        let mut slot = Some(PeakSource::Live {
+            stream,
+            sample_rate: 48_000,
+        });
+        let mut taps = LiveDeckTaps::default();
+        assert!(clear_peaks(&mut slot, &mut taps));
+        assert!(slot.is_none());
+        assert!(
+            taps.peaks_rx.is_some(),
+            "the waveform tap was dropped with its stream"
+        );
+        assert!(
+            !clear_peaks(&mut slot, &mut taps),
+            "an empty slot held nothing"
+        );
+    }
+
     #[test]
     fn ffi_version_is_sixteen_after_tap_to_grid() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
@@ -6757,6 +6823,7 @@ mod tests {
         // 82→83: `ThruTempo.record_secs` / `record_start_secs`,
         // `thru_beat_phase`, `DeckTelemetry.input_rms_left` … `_right`;
         // `set_deck_auto_control` removed.
+        // 83→84: `set_following_grid`, `deck_local_bpm`.
         assert_eq!(FFI_VERSION, 84);
     }
 

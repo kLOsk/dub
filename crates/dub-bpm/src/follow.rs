@@ -102,6 +102,41 @@ pub fn follow_grid(
     })
 }
 
+/// How many beats back the local tempo is read over: two bars. One
+/// beat's gap on a live drummer jumps about; two bars move slowly enough
+/// to read off a deck and fast enough to follow a band pushing.
+const LOCAL_TEMPO_BEATS: usize = 8;
+
+/// A grid whose gaps differ by less than this is even — every grid the
+/// analyser or a tap lays — and has one tempo, its own.
+const EVEN_GAP_TOLERANCE_SECS: f64 = 0.001;
+
+/// The tempo the band is playing at `at_secs` on a followed grid: the
+/// average over the [`LOCAL_TEMPO_BEATS`] beats up to the playhead (the
+/// first ones, before that many have gone by). `None` for an even grid —
+/// its tempo is the grid's — or one too short to read.
+#[must_use]
+pub fn local_bpm(beats: &[f64], at_secs: f64) -> Option<f64> {
+    if beats.len() <= LOCAL_TEMPO_BEATS {
+        return None;
+    }
+    let (mut least, mut most) = (f64::MAX, f64::MIN);
+    for w in beats.windows(2) {
+        least = least.min(w[1] - w[0]);
+        most = most.max(w[1] - w[0]);
+    }
+    if most - least < EVEN_GAP_TOLERANCE_SECS {
+        return None;
+    }
+    let at = beats
+        .partition_point(|&b| b <= at_secs)
+        .saturating_sub(1)
+        .clamp(LOCAL_TEMPO_BEATS, beats.len() - 1);
+    let span = beats[at] - beats[at - LOCAL_TEMPO_BEATS];
+    #[allow(clippy::cast_precision_loss)]
+    (span > 0.0).then(|| 60.0 * LOCAL_TEMPO_BEATS as f64 / span)
+}
+
 /// The best chain of beats through `odf` at about `period` frames
 /// apart, as fractional frame positions, oldest first.
 fn chain(odf: &[f32], period: f64) -> Option<Vec<f64>> {
@@ -299,6 +334,30 @@ mod tests {
             followed.beats.len(),
             played.len()
         );
+    }
+
+    /// On a followed grid the tempo is the band's at the playhead: 100
+    /// where it plays 100, 110 where it has sped up to 110.
+    #[test]
+    fn the_local_tempo_is_the_bands_at_the_playhead() {
+        let mut beats = vec![0.0];
+        for i in 0..32 {
+            let bpm = if i < 16 { 100.0 } else { 110.0 };
+            beats.push(beats[i] + 60.0 / bpm);
+        }
+        let early = local_bpm(&beats, beats[12]).expect("followed");
+        let late = local_bpm(&beats, beats[30]).expect("followed");
+        assert!((early - 100.0).abs() < 0.01, "{early}");
+        assert!((late - 110.0).abs() < 0.01, "{late}");
+        // Before two bars have gone by, the first two bars' tempo.
+        assert!((local_bpm(&beats, 0.0).expect("followed") - 100.0).abs() < 0.01);
+    }
+
+    /// An even grid has no local tempo of its own.
+    #[test]
+    fn an_even_grid_has_one_tempo() {
+        assert_eq!(local_bpm(&uniform_beats(174.0, 0.0, 60.0), 20.0), None);
+        assert_eq!(local_bpm(&[0.0, 0.5, 1.0], 0.5), None);
     }
 
     /// A steady track keeps its even grid: nothing to follow.

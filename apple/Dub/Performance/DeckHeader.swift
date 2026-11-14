@@ -261,6 +261,15 @@ struct DeckHeaderState: Equatable {
     /// with a default so the `from(...)` call sites keep compiling.
     var thruTempo: ThruTempoReadout? = nil
 
+    /// The track's beat grid follows its band (Preferences ▸ Alpha): the
+    /// BPM is the band's at the playhead and moves as it plays, and the
+    /// readout says so — `BPM · FOLLOW` — because a tempo that drifts
+    /// under a label that looks fixed reads as a fault.
+    var followingGrid: Bool = false
+
+    /// The BPM readout's label.
+    var bpmLabel: String { followingGrid ? "BPM · FOLLOW" : "BPM" }
+
     enum Source: Equatable {
         case off
         case thru
@@ -1080,7 +1089,7 @@ struct DeckHeader: View {
     @ViewBuilder
     private var bpmStatColumn: some View {
         HStack(spacing: DubSpacing.sm) {
-            Text("BPM")
+            Text(state.bpmLabel)
                 .font(DubFont.caps)
                 .tracking(0.8)
                 .foregroundStyle(DubColor.textSecondary)
@@ -1425,12 +1434,12 @@ extension DeckHeaderState {
             } else {
                 source = .file
             }
-            return DeckHeaderState(
+            var header = DeckHeaderState(
                 isLive: true,
                 source: source,
                 trackTitle: resolvedTitle,
                 trackArtist: resolvedArtist,
-                bpm: deckState.bpm,
+                bpm: deckState.playingBpm,
                 pitchPercent: deckState.pitchPercent,
                 pitchSettled: deckState.pitchSettled,
                 tempoPitchPercent: deckState.tempoPitchPercent,
@@ -1454,6 +1463,8 @@ extension DeckHeaderState {
                 gridLocked: deckState.gridLocked,
                 gridDriftQuality: deckState.gridDriftQuality,
                 historyHint: deckState.historyHint)
+            header.followingGrid = deckState.localBpm != nil
+            return header
         }
 
         if thruMode {

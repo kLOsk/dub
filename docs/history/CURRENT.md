@@ -140,8 +140,12 @@ gate is local-only because GitHub CI has no macOS app job.
   track. **Nothing is stored** — the library keeps tempo, anchor and the
   1 — so it is undone by the switch, and a set-the-1 or tap lays an even
   grid again. Known limits: lines sit at onset-frame precision (~±6 ms),
-  the 1 is carried from the even grid, and beat-synced things (echo
-  time, loops by beats) still read the one tempo.
+  and the 1 is carried from the even grid. On a followed grid the
+  deck's BPM is the band's at the playhead — the average over the two
+  bars up to it (`deck_local_bpm`), read four times a second — and the
+  siren's and the Space Echo's beat-match time themselves to it; the
+  library keeps the one average. No mark on the deck yet says a grid is
+  a following one (to be designed).
 - **Calibration says one thing; the signal panel has one button.** The
   overview's bar read SETTLING PITCH for the second half of the session
   measurement (the wobble fit), which on an empty, stopped deck looked like

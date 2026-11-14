@@ -108,6 +108,9 @@ struct DeckColumnHeader: Equatable {
     /// raw grid BPM, so pitching a deck moved PITCH and left BPM
     /// standing (found on the rig, 2026-09-22).
     var bpm: Double?
+    /// `DeckHeaderState.bpmLabel`: `BPM`, or `BPM · FOLLOW` on a grid
+    /// that follows its band.
+    var bpmLabel: String = "BPM"
     var key: String?
     /// M14 key lock: what the DJ set, and what the engine is doing with
     /// it (0 off · 1 standby · 2 engaged).
@@ -156,6 +159,7 @@ struct DeckColumnHeader: Equatable {
         baseBpm = state.bpm
         tempoPitchPercent = state.tempoPitchPercent
         thruTempo = state.thruTempo
+        bpmLabel = state.bpmLabel
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
         self.scratch = scratch
@@ -990,7 +994,7 @@ struct DeckReadouts: View {
                 thruBpm(thru)
             } else {
                 readout(
-                    "BPM", header.bpm.map { String(format: "%.1f", $0) },
+                    header.bpmLabel, header.bpm.map { String(format: "%.1f", $0) },
                     font: DubFont.numericLarge, widest: "888.8",
                     live: live.map { l in
                         { [base = header.baseBpm, tempo = header.tempoPitchPercent] in

@@ -230,6 +230,17 @@ struct DeckState: Equatable {
     /// deck-header BPM column renders `—` in that case.
     var bpm: Double? = nil
 
+    /// The band's tempo at the playhead when the grid follows the band
+    /// (Preferences ▸ Alpha), to the tenth, before pitch — `nil` on an
+    /// even grid, whose tempo is `bpm` all the way through.
+    var localBpm: Double? = nil
+
+    /// The track's tempo where the playhead is: the band's own on a
+    /// following grid, the grid's otherwise. What the readout shows and
+    /// the echo and siren time themselves to; `bpm` stays the one number
+    /// the library keeps.
+    var playingBpm: Double? { localBpm ?? bpm }
+
     /// M10.5u. Confidence the BPM estimator returned alongside
     /// `bpm`, in `[0, 1]`. `0` when no usable estimate exists.
     /// Currently informational only — the header doesn't gate
@@ -2419,6 +2430,26 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// When each deck's local tempo was last read, seconds of uptime.
+    private var localBpmReadAt: [DeckSide: TimeInterval] = [:]
+
+    /// The band's tempo at the playhead on a following grid, read four
+    /// times a second — it moves a little each beat, and the call takes
+    /// the engine lock. Cleared with the track, and when the switch is
+    /// off so an even grid is never asked.
+    private func readLocalBpm(side: DeckSide, into next: inout DeckState) {
+        guard next.hasTrack, !next.isThru, alphaFeaturesEnabled, followingGridEnabled else {
+            if next.localBpm != nil { next.localBpm = nil }
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - (localBpmReadAt[side] ?? 0) >= 0.25 else { return }
+        localBpmReadAt[side] = now
+        let bpm = engine.deckLocalBpm(deckIdx: side.ffiDeckIdx)
+        let local = bpm > 0 ? (bpm * 10).rounded() / 10 : nil
+        if next.localBpm != local { next.localBpm = local }
+    }
+
     /// Tap the record's tempo on a THRU deck. Four taps make a tempo; it
     /// holds for this record — the tracker's reading gives way to it — and
     /// retires when the needle comes up and the next record goes down.
@@ -2617,6 +2648,7 @@ final class WaveformAppModel: ObservableObject {
         // The strip draws the THRU deck's coming beats at the tempo the
         // DJ is using, read on its own thread.
         WaveformRenderer.setThruTempo(deckIdx: side.ffiDeckIdx, bpm: next.thruReadout?.tempo)
+        readLocalBpm(side: side, into: &next)
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -6044,7 +6076,7 @@ final class WaveformAppModel: ObservableObject {
         // that the Space Echo's TAP; both are at the platter's real speed
         // already.
         let effectiveBpm: Double
-        if !deck.isThru, let bpm = deck.bpm, bpm > 0 {
+        if !deck.isThru, let bpm = deck.playingBpm, bpm > 0 {
             effectiveBpm = bpm * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
         } else if let thru = deck.thruReadout?.tempo {
             effectiveBpm = thru
@@ -6099,7 +6131,7 @@ final class WaveformAppModel: ObservableObject {
         if let thru = deck.thruReadout?.tempo, thru > 0 {
             effectiveBpm = thru
         } else {
-            let base = (deck.bpm ?? 0) > 0 ? (deck.bpm ?? 120) : 120
+            let base = (deck.playingBpm ?? 0) > 0 ? (deck.playingBpm ?? 120) : 120
             effectiveBpm = base * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
         }
         let syncBeats = sirenDelaySync ? 1.0 : 0.0
@@ -6356,7 +6388,7 @@ final class WaveformAppModel: ObservableObject {
         if let thru = deck.thruReadout?.tempo {
             return FxEchoTempo(source: .deck(music), bpm: thru)
         }
-        if deck.hasTrack, !deck.isThru, let base = deck.bpm, base > 0 {
+        if deck.hasTrack, !deck.isThru, let base = deck.playingBpm, base > 0 {
             let live = base * (1 + (livePitchPercent(music) ?? 0) / 100)
             return FxEchoTempo(source: .deck(music), bpm: live)
         }
