@@ -160,14 +160,21 @@ struct StatusStrip: View {
             if state.showsMap {
                 mapButton
             }
-            clockView
-            batteryView
             if let openPreferences {
                 gearButton(action: openPreferences)
             }
         }
         .padding(.horizontal, DubSpacing.lg)
         .frame(height: DubLayout.statusStripHeight)
+        // Time and battery at the bar's centre, on the window's middle
+        // whatever stands left and right — between the two decks, where
+        // the DJ looks anyway (Daniel, 2026-11-15).
+        .overlay {
+            HStack(spacing: DubSpacing.lg) {
+                clockView
+                batteryView
+            }
+        }
         .background(DubColor.surface1)
     }
 

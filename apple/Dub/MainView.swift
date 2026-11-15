@@ -1592,7 +1592,9 @@ final class WaveformAppModel: ObservableObject {
     /// error supersedes the previous one within the visibility
     /// window.
     private var lastErrorClearTask: Task<Void, Never>?
-    private static let errorVisibilitySecs: UInt64 = 5_000_000_000
+    /// Ten seconds: five was gone before a DJ mid-mix looked up to read
+    /// it (Daniel, 2026-11-15).
+    private static let errorVisibilitySecs: UInt64 = 10_000_000_000
 
     /// M11d.4 — long-lived background missing-files scanner.
     /// Started lazily after the first library open, cancelled

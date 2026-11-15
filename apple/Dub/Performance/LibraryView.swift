@@ -629,43 +629,162 @@ private struct LibraryFacetValue: Identifiable {
 /// view. Same idiom as `LibraryTable`'s drag-image sizing.
 enum LibraryFilterBoxWidth {
 
-    /// Row furniture: the checkbox, the gap after it, the gap before
-    /// the count, and the row's own horizontal padding.
-    private static let rowChrome: CGFloat = 9 + DubSpacing.xs + DubSpacing.xs + DubSpacing.sm * 2
+    /// The rows read at the track list's size (`DubFont.body`, 14 pt) —
+    /// the bar is used on stage, at arm's length, and 11 pt was not
+    /// readable there (2026-11-15). The checkbox, swatch and clear
+    /// button are drawn at `glyphSize` to sit with that text.
+    static let textSize: CGFloat = 14
+    static let glyphSize: CGFloat = 12
+
+    /// The checkbox glyph as `filterValueRow` draws it. An SF Symbol at
+    /// a point size is wider than that size; counting it as 9 is part of what cut
+    /// "Nice - Warmup - Friendly" short on the rig (2026-11-15).
+    private static let checkbox: CGFloat = {
+        let config = NSImage.SymbolConfiguration(pointSize: glyphSize, weight: .regular)
+        let image = NSImage(systemSymbolName: "checkmark.square.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+        return max(image?.size.width ?? glyphSize + 2, glyphSize)
+    }()
+
+    /// The list's vertical scroller. Reserved whatever the scroller
+    /// style: a legacy scroller takes the width from the rows, and an
+    /// overlay one would sit on top of the counts.
+    private static let scroller: CGFloat = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+
+    /// Row furniture, exactly as `filterValueRow` lays it out: the
+    /// checkbox, the three stack gaps (checkbox | label | spacer |
+    /// count), the spacer's minimum, the row's horizontal padding, and
+    /// the scroller beside the rows.
+    private static var rowChrome: CGFloat {
+        checkbox + DubSpacing.xs * 3 + 2 + DubSpacing.sm * 2 + scroller
+    }
     /// The colour box's swatch and its gap — only `.color` draws one.
-    private static let swatch: CGFloat = 9 + DubSpacing.xs
+    private static let swatch: CGFloat = glyphSize + DubSpacing.xs
     /// The header's own padding, plus the clear button that appears
     /// there once the box has a selection. Reserved always: a box must
     /// not change width when you tick a row in it.
-    private static let headerChrome: CGFloat = DubSpacing.sm * 2 + DubSpacing.xs + 9
+    private static let headerChrome: CGFloat = DubSpacing.sm * 2 + DubSpacing.xs + glyphSize + 2
 
-    private static let rowFont = NSFont.systemFont(ofSize: 11, weight: .regular)
-    private static let headerFont = NSFont.systemFont(ofSize: 11, weight: .regular)
+    private static let rowFont = NSFont.systemFont(ofSize: textSize, weight: .regular)
+    /// The count is drawn `.monospacedDigit()`.
+    private static let countFont = NSFont.monospacedDigitSystemFont(ofSize: textSize, weight: .regular)
+    /// `DubFont.caps`.
+    private static let headerFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
 
     private static func width(_ text: String, _ font: NSFont) -> CGFloat {
         (text as NSString).size(withAttributes: [.font: font]).width
     }
 
+    /// The most one box may take of a bar `barWidth` wide: a share of
+    /// the bar, never past `libraryFilterBoxMaxWidth` and never under
+    /// the floor. On a wide window GENRE and COMMENT get what they need;
+    /// on a narrow one a long comment can't push every other box off
+    /// screen. `nil` (bar not measured yet) is the absolute ceiling.
+    static func ceiling(barWidth: CGFloat?) -> CGFloat {
+        guard let barWidth, barWidth > 0 else { return DubLayout.libraryFilterBoxMaxWidth }
+        return min(
+            max(barWidth * DubLayout.libraryFilterBoxMaxShare, DubLayout.libraryFilterBoxMinWidth),
+            DubLayout.libraryFilterBoxMaxWidth)
+    }
+
     /// `labels` are the row texts, `counts` their counts (same order, or
     /// empty for a box whose rows carry none). `header` is the box's
-    /// title. The result is already clamped.
+    /// title. The result is clamped between the floor and `maxWidth`.
     static func width(
         header: String,
         labels: [String],
         counts: [Int],
-        hasSwatch: Bool
+        hasSwatch: Bool,
+        maxWidth: CGFloat = DubLayout.libraryFilterBoxMaxWidth
     ) -> CGFloat {
         var widest = width(header.uppercased(), headerFont) + headerChrome
         for (i, label) in labels.enumerated() {
             let count = i < counts.count ? counts[i] : 0
             var w = width(label, rowFont) + rowChrome
-            w += width("\(count)", rowFont)
+            w += width("\(count)", countFont)
             if hasSwatch { w += swatch }
             widest = max(widest, w)
         }
         return min(
             max(widest.rounded(.up), DubLayout.libraryFilterBoxMinWidth),
-            DubLayout.libraryFilterBoxMaxWidth)
+            max(maxWidth, DubLayout.libraryFilterBoxMinWidth))
+    }
+}
+
+/// A rectangle rounded at its top-leading corner only — the status
+/// tab's, which sits in the list's bottom-right corner. (SwiftUI's
+/// `UnevenRoundedRectangle` needs macOS 14.)
+struct TopLeadingRoundedRectangle: Shape {
+    let radius: CGFloat
+    func path(in rect: CGRect) -> Path {
+        let r = min(radius, rect.width, rect.height)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
+        path.addArc(
+            center: CGPoint(x: rect.minX + r, y: rect.minY + r), radius: r,
+            startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.closeSubpath()
+        return path
+    }
+}
+
+/// The track count in the library's status tab: `108 tracks`, or `12 of 108`
+/// while a filter narrows the list.
+enum LibraryStatusCount {
+    static func text(listed: Int, shown: Int, filtered: Bool) -> String {
+        if filtered { return "\(shown) of \(listed)" }
+        return listed == 1 ? "1 track" : "\(listed) tracks"
+    }
+}
+
+/// The folded FILTER line's account of what is set:
+/// `GENRE Dub, Reggae · BPM 160–180 · RATING ≥ 3★`.
+enum LibraryFilterSummary {
+    static func text(_ parts: [(field: String, values: [String])]) -> String {
+        parts
+            .filter { !$0.values.isEmpty }
+            .map { "\($0.field.uppercased()) \($0.values.joined(separator: ", "))" }
+            .joined(separator: " · ")
+    }
+}
+
+/// How tall the filter boxes are: their full height when the library
+/// has room, less on a short one so the track list keeps
+/// `libraryRowsKeptWhileFiltering` rows, never under the floor.
+///
+/// On a 13″ screen the open boxes took every row the library had
+/// (`ReleaseScreenTests`, 2026-11-15); a filter with nothing under it
+/// to look at is no filter.
+enum LibraryFilterBoxHeight {
+    /// The boxes' padding under them.
+    static let padding: CGFloat = DubSpacing.xs
+
+    static func height(libraryHeight: CGFloat?) -> CGFloat {
+        guard let libraryHeight, libraryHeight > 0 else { return DubLayout.libraryFilterBoxHeight }
+        let room = libraryHeight - DubLayout.libraryChromeHeight - padding
+            - LibraryRowLayout.estimatedHeight * DubLayout.libraryRowsKeptWhileFiltering - 1
+        return min(
+            DubLayout.libraryFilterBoxHeight,
+            max(DubLayout.libraryFilterBoxMinHeight, room.rounded(.down)))
+    }
+}
+
+/// The library's own height, for `LibraryFilterBoxHeight`.
+private struct LibraryHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The FILTER bar's width, for `LibraryFilterBoxWidth.ceiling`.
+private struct LibraryFilterBarWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -902,6 +1021,13 @@ struct LibraryView: View {
     /// real changes (refresh / filter toggle / enabled-set change) — same
     /// per-body-re-eval discipline as `sortedTracks`.
     @State private var facets: [LibraryFilterField: [LibraryFacetValue]] = [:]
+    /// The FILTER bar's measured width; sets each box's ceiling.
+    @State private var filterBarWidth: CGFloat = 0
+    /// The library's measured height; sets the filter boxes' height.
+    @State private var libraryHeight: CGFloat = 0
+    /// The last import's result is on screen — for a few seconds after
+    /// it lands (`libraryStatus`).
+    @State private var importSummaryVisible = false
     /// Memoized BPM bucket rows + cascaded counts.
     @State private var bpmBucketFacet: [LibraryBpmBucketCount] = []
 
@@ -1026,6 +1152,14 @@ struct LibraryView: View {
         // A minimum here would be reported and drawn even inside a
         // shorter frame, overflowing rather than clamping.
         .background(DubColor.surface0)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: LibraryHeightKey.self, value: proxy.size.height)
+            })
+        .onPreferenceChange(LibraryHeightKey.self) { height in
+            let rounded = height.rounded()
+            if abs(rounded - libraryHeight) >= 1 { libraryHeight = rounded }
+        }
         .onAppear { refreshColumnParseCaches() }
         .onChange(of: columnWidthsStorage) { _ in refreshColumnParseCaches() }
         .onChange(of: visibleColumnsStorage) { _ in refreshColumnParseCaches() }
@@ -1621,14 +1755,18 @@ struct LibraryView: View {
                     favoritesStrip
                     Divider().overlay(DubColor.divider)
                 }
-                if libraryModel.libraryIsOpen && !enabledFilterFields.isEmpty {
+                if showsFilterBar {
                     filterBar
                     Divider().overlay(DubColor.divider)
                 }
                 trackListContainer
+                    .overlay(alignment: .bottomTrailing) { statusTab }
             }
-            Divider().overlay(DubColor.divider)
-            footer
+            // The past-rips pane has no track list to carry the status.
+            if selectedSource == .realRecords {
+                Divider().overlay(DubColor.divider)
+                footer
+            }
         }
         .background(DubColor.surface0)
         .contentShape(Rectangle())
@@ -1820,20 +1958,20 @@ struct LibraryView: View {
 
     private var filterBar: some View {
         VStack(spacing: 0) {
+            // The whole line folds and unfolds the bar, not just the
+            // chevron and the word: those were a hard target (rig,
+            // 2026-11-15). Clear and the box picker are buttons of their
+            // own and keep their clicks.
             HStack(spacing: DubSpacing.sm) {
-                Button {
-                    filterBarCollapsed.toggle()
-                } label: {
-                    HStack(spacing: DubSpacing.xs) {
-                        Image(systemName: filterBarCollapsed ? "chevron.right" : "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(DubColor.textSecondary)
-                        Text("FILTER")
-                            .font(DubFont.micro)
-                            .foregroundStyle(DubColor.textTertiary)
-                    }
+                HStack(spacing: DubSpacing.xs) {
+                    Image(systemName: filterBarCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(DubColor.textSecondary)
+                    Text("FILTER")
+                        .font(DubFont.caps)
+                        .foregroundStyle(
+                            filterState.isActive ? DubColor.deckATint : DubColor.textTertiary)
                 }
-                .buttonStyle(.plain)
                 if filterState.isActive {
                     Button {
                         filterState.reset()
@@ -1845,31 +1983,76 @@ struct LibraryView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Spacer()
+                // Folded, the line says what the list is filtered by —
+                // "Clear" alone did not.
+                if filterBarCollapsed, filterState.isActive {
+                    Text(filterSummary)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(filterSummary)
+                }
+                Spacer(minLength: DubSpacing.sm)
                 filterBoxPicker
             }
             .padding(.horizontal, DubSpacing.lg)
-            .padding(.vertical, DubSpacing.xs)
-            if !filterBarCollapsed {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: DubSpacing.sm) {
-                        ForEach(enabledFilterFields) { field in
-                            filterBox(field)
-                        }
-                    }
-                    .padding(.horizontal, DubSpacing.lg)
-                    .padding(.bottom, DubSpacing.xs)
-                }
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture { filterBarCollapsed.toggle() }
+            .accessibilityElement(children: .contain)
+            .accessibilityAction(named: filterBarCollapsed ? "Open filter" : "Fold filter") {
+                filterBarCollapsed.toggle()
             }
+            // Built once and kept while folded, at zero height: opening
+            // the bar is then a frame change. Built on every open, it
+            // cost ~105 ms per toggle — six scroll views and every value
+            // row made and torn down (sampled, 2026-11-15).
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: DubSpacing.sm) {
+                    ForEach(enabledFilterFields) { field in
+                        filterBox(field)
+                    }
+                }
+                .padding(.horizontal, DubSpacing.lg)
+                .padding(.bottom, DubSpacing.xs)
+            }
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: LibraryFilterBarWidthKey.self, value: proxy.size.width)
+                })
+            .onPreferenceChange(LibraryFilterBarWidthKey.self) { filterBarWidth = $0 }
+            .frame(height: filterBarCollapsed ? 0 : nil)
+            .clipped()
+            .opacity(filterBarCollapsed ? 0 : 1)
+            .allowsHitTesting(!filterBarCollapsed)
+            .accessibilityHidden(filterBarCollapsed)
         }
         .background(DubColor.surface1)
+    }
+
+    /// The active filters in one line, in the bar's box order.
+    private var filterSummary: String {
+        LibraryFilterSummary.text(enabledFilterFields.compactMap { field -> (field: String, values: [String])? in
+            switch field.kind {
+            case .categorical:
+                let picked = filterState.categorical[field] ?? []
+                guard !picked.isEmpty else { return nil }
+                return (field.headerLabel, picked.map { $0 ?? "(none)" }.sorted())
+            case .bpmBuckets:
+                guard !filterState.bpmBuckets.isEmpty else { return nil }
+                return (field.headerLabel, filterState.bpmBuckets.sorted { $0.lo < $1.lo }.map(\.label))
+            case .ratingThreshold:
+                return filterState.ratingThreshold.map { (field.headerLabel, ["≥ \($0)★"]) }
+            }
+        })
     }
 
     private func filterBox(_ field: LibraryFilterField) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: DubSpacing.xs) {
                 Text(field.headerLabel.uppercased())
-                    .font(DubFont.micro)
+                    .font(DubFont.caps)
                     .foregroundStyle(DubColor.textSecondary)
                 Spacer(minLength: 0)
                 if filterBoxHasSelection(field) {
@@ -1877,7 +2060,7 @@ struct LibraryView: View {
                         clearFilterBox(field)
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 9))
+                            .font(.system(size: LibraryFilterBoxWidth.glyphSize))
                             .foregroundStyle(DubColor.textTertiary)
                     }
                     .buttonStyle(.plain)
@@ -1890,7 +2073,7 @@ struct LibraryView: View {
         }
         .frame(
             width: filterBoxWidth(field),
-            height: DubLayout.libraryFilterBoxHeight,
+            height: LibraryFilterBoxHeight.height(libraryHeight: libraryHeight > 0 ? libraryHeight : nil),
             alignment: .top)
         .background(RoundedRectangle(cornerRadius: 4).fill(DubColor.surface2))
         .overlay(RoundedRectangle(cornerRadius: 4).stroke(DubColor.divider, lineWidth: 1))
@@ -1900,6 +2083,7 @@ struct LibraryView: View {
     /// facets change — the values cascade as other boxes are ticked, so
     /// a box narrows once its list does.
     private func filterBoxWidth(_ field: LibraryFilterField) -> CGFloat {
+        let ceiling = LibraryFilterBoxWidth.ceiling(barWidth: filterBarWidth > 0 ? filterBarWidth : nil)
         switch field.kind {
         case .categorical:
             let values = facets[field] ?? []
@@ -1907,13 +2091,15 @@ struct LibraryView: View {
                 header: field.headerLabel,
                 labels: values.map { $0.value ?? "(none)" },
                 counts: values.map(\.count),
-                hasSwatch: field == .color)
+                hasSwatch: field == .color,
+                maxWidth: ceiling)
         case .bpmBuckets:
             return LibraryFilterBoxWidth.width(
                 header: field.headerLabel,
                 labels: bpmBucketFacet.map(\.bucket.label),
                 counts: bpmBucketFacet.map(\.count),
-                hasSwatch: false)
+                hasSwatch: false,
+                maxWidth: ceiling)
         case .ratingThreshold:
             // Five stars and "Any rating" — no list to measure, and the
             // floor already clears both.
@@ -1938,12 +2124,14 @@ struct LibraryView: View {
         let values = facets[field] ?? []
         if values.isEmpty {
             Text("—")
-                .font(DubFont.micro)
+                .font(DubFont.body)
                 .foregroundStyle(DubColor.textTertiary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView(showsIndicators: true) {
-                VStack(spacing: 0) {
+                // Lazy: a box shows six rows of a list that can run to
+                // hundreds (COMMENT), and only those need building.
+                LazyVStack(spacing: 0) {
                     ForEach(values) { fv in
                         let selected = filterState.categorical[field]?.contains(fv.value) ?? false
                         filterValueRow(
@@ -1965,12 +2153,14 @@ struct LibraryView: View {
     private func bpmBucketList() -> some View {
         if bpmBucketFacet.isEmpty {
             Text("No BPM")
-                .font(DubFont.micro)
+                .font(DubFont.body)
                 .foregroundStyle(DubColor.textTertiary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView(showsIndicators: true) {
-                VStack(spacing: 0) {
+                // Lazy: a box shows six rows of a list that can run to
+                // hundreds (COMMENT), and only those need building.
+                LazyVStack(spacing: 0) {
                     ForEach(bpmBucketFacet) { row in
                         filterValueRow(
                             label: row.bucket.label,
@@ -1990,7 +2180,7 @@ struct LibraryView: View {
     private func ratingThresholdControl() -> some View {
         VStack(alignment: .leading, spacing: DubSpacing.xs) {
             Text(filterState.ratingThreshold.map { "≥ \($0) stars" } ?? "Any rating")
-                .font(DubFont.micro)
+                .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
             HStack(spacing: 2) {
                 ForEach(1..<6, id: \.self) { star in
@@ -2000,7 +2190,7 @@ struct LibraryView: View {
                         applyFilterChange()
                     } label: {
                         Image(systemName: n <= (filterState.ratingThreshold ?? 0) ? "star.fill" : "star")
-                            .font(.system(size: 12))
+                            .font(.system(size: 18))
                             .foregroundStyle(
                                 n <= (filterState.ratingThreshold ?? 0)
                                     ? DubColor.stateTentative : DubColor.textTertiary)
@@ -2024,24 +2214,25 @@ struct LibraryView: View {
         Button(action: action) {
             HStack(spacing: DubSpacing.xs) {
                 Image(systemName: selected ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 9))
+                    .font(.system(size: LibraryFilterBoxWidth.glyphSize))
                     .foregroundStyle(selected ? DubColor.deckATint : DubColor.textTertiary)
                 if let swatch {
-                    RoundedRectangle(cornerRadius: 2).fill(swatch).frame(width: 9, height: 9)
+                    RoundedRectangle(cornerRadius: 2).fill(swatch)
+                        .frame(width: LibraryFilterBoxWidth.glyphSize, height: LibraryFilterBoxWidth.glyphSize)
                 }
                 Text(label)
-                    .font(DubFont.micro)
+                    .font(DubFont.body)
                     .foregroundStyle(dim ? DubColor.textTertiary : DubColor.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 2)
                 Text("\(count)")
-                    .font(DubFont.micro)
+                    .font(DubFont.body)
                     .foregroundStyle(DubColor.textTertiary)
                     .monospacedDigit()
             }
             .padding(.horizontal, DubSpacing.sm)
-            .padding(.vertical, 2)
+            .padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(selected ? DubColor.surface3 : Color.clear)
             .contentShape(Rectangle())
@@ -3263,7 +3454,52 @@ struct LibraryView: View {
         return base.appendingPathComponent(rel)
     }
 
+    /// Whether the FILTER line is drawn — and so carries the status.
+    private var showsFilterBar: Bool {
+        selectedSource != .realRecords && libraryModel.libraryIsOpen && !enabledFilterFields.isEmpty
+    }
+
+    /// The status in a tab over the right end of the track list's last
+    /// row (2026-11-15). The table scrolls one row past its end
+    /// (`LibraryTable`'s bottom inset), so at the bottom of a list the
+    /// last track sits clear of it.
+    private var statusTab: some View {
+        libraryStatus
+            .padding(.horizontal, DubSpacing.md)
+            .frame(height: LibraryRowLayout.estimatedHeight)
+            .background(
+                TopLeadingRoundedRectangle(radius: DubRadius.panel)
+                    .fill(DubColor.surface1))
+            .overlay(
+                TopLeadingRoundedRectangle(radius: DubRadius.panel)
+                    .stroke(DubColor.divider, lineWidth: 1))
+    }
+
+    /// The bottom row, for the past-rips pane, which has no track list.
     private var footer: some View {
+        HStack(spacing: DubSpacing.md) {
+            libraryStatus
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .background(DubColor.surface1)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        }
+    }
+
+    /// The library's status: what is happening (a notice, an import, an
+    /// analysis), missing files, and how many tracks are listed.
+    ///
+    /// It had a 23 pt row of its own under the list and now rides on the
+    /// FILTER line (2026-11-15). The last import's result shows for a few
+    /// seconds after it lands instead of for the rest of the session —
+    /// "0 added, 356 refreshed, 358 skipped" from the launch scan was
+    /// still on screen hours later.
+    @ViewBuilder
+    private var libraryStatus: some View {
         HStack(spacing: DubSpacing.md) {
             if let notice = libraryModel.lastNotice {
                 // U-15: the quiet channel. Informational, so it takes the
@@ -3274,10 +3510,11 @@ struct LibraryView: View {
                     .foregroundStyle(DubColor.textSecondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-            } else if let summary = libraryModel.lastImportSummary {
+            } else if importSummaryVisible, let summary = libraryModel.lastImportSummary {
                 Text(importSummaryLine(summary))
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
+                    .lineLimit(1)
             } else if libraryModel.libraryImportInProgress {
                 Text("Importing…")
                     .font(DubFont.micro)
@@ -3320,34 +3557,29 @@ struct LibraryView: View {
                 Button(action: { showRelocateSheet = true }) {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red.opacity(0.85))
-                        Text(missingFooterLine(libraryModel.missingTrackCount))
-                            .underline()
+                        Text("\(libraryModel.missingTrackCount) missing")
                     }
                     .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textSecondary)
+                    .foregroundStyle(DubColor.stateTentative)
                 }
                 .buttonStyle(.plain)
-                .help("Open the Relocate panel to point Dub at the directory that holds the missing files.")
+                .help("\(libraryModel.missingTrackCount) tracks can't be found. "
+                    + "Click to point Dub at the folder that holds them.")
             }
-            Spacer(minLength: 0)
-            Text("\(tracks.count) shown · \(libraryModel.libraryTrackCount) total")
+            Text(LibraryStatusCount.text(
+                listed: tracks.count, shown: filteredTracks.count,
+                filtered: filterState.isActive))
                 .font(DubFont.micro)
+                .monospacedDigit()
                 .foregroundStyle(DubColor.textTertiary)
         }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
-        .background(DubColor.surface1)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            searchFocused = false
-            NSApp.keyWindow?.makeFirstResponder(nil)
+        .fixedSize()
+        .task(id: libraryModel.lastImportSummary.map(importSummaryLine)) {
+            guard libraryModel.lastImportSummary != nil else { return }
+            importSummaryVisible = true
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            importSummaryVisible = false
         }
-    }
-
-    private func missingFooterLine(_ n: UInt64) -> String {
-        let label = n == 1 ? "track missing" : "tracks missing"
-        return "\(n) \(label) · Click to relocate"
     }
 
     /// "Analyzing N of M…" — N is the 1 based index of the track
@@ -3760,7 +3992,9 @@ struct LibraryColumnLayout {
 
 enum LibraryRowLayout {
     static let estimatedHeight: CGFloat = 28
-    static let headerHeight: CGFloat = 22
+    /// The column header: the 10 pt caps label with 4 pt above and
+    /// below. Was AppKit's 28 pt default.
+    static let headerHeight: CGFloat = 20
 }
 
 /// Where a "Move…" crate context-menu item places the track within

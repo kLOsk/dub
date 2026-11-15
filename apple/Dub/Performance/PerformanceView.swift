@@ -117,14 +117,60 @@ struct PerformanceView: View {
                         Rectangle().fill(DubColor.divider).frame(height: 1)
                         GlobalRackBar(
                             state: rackBarState, callbacks: rackBarCallbacks,
-                            folded: rackFolded, onFold: { rackFolded.toggle() })
+                            folded: rackShownFolded, onFold: toggleRackFold)
                     }
                 }
             } library: {
-                LibraryView(model: model, libraryModel: model.libraryModel)
+                // A slot, not the library: the library is drawn once, over
+                // the surface, so browse mode can raise it without
+                // rebuilding it — selection, scroll and search survive.
+                Color.clear.anchorPreference(key: LibraryPlacementKey.self, value: .bounds) {
+                    LibraryPlacement(slot: $0)
+                }
             }
         }
         .background(DubColor.surface0)
+        .overlayPreferenceValue(LibraryPlacementKey.self) { placement in
+            GeometryReader { geo in
+                if let slot = placement.slot {
+                    let rect = geo[slot]
+                    let top = Self.libraryTop(
+                        slotTop: rect.minY,
+                        overviewBottoms: placement.overviewBottoms.map { geo[$0].y },
+                        raised: libraryRaised && browseActive)
+                    ZStack(alignment: .topLeading) {
+                        LibraryView(model: model, libraryModel: model.libraryModel)
+                            .overlay(alignment: .top) {
+                                if top < rect.minY {
+                                    Rectangle().fill(DubColor.divider).frame(height: 1)
+                                }
+                            }
+                            .shadow(color: .black.opacity(top < rect.minY ? 0.5 : 0), radius: 8, y: -2)
+                            // Read directly, not as a preference: what the
+                            // overlay of `overlayPreferenceValue` sets does
+                            // not reach the surface, and the frame stayed
+                            // zero — every click read as "outside".
+                            .background(
+                                GeometryReader { lib in
+                                    let frame = lib.frame(in: .global)
+                                    Color.clear
+                                        .onAppear { libraryWindowFrame = frame }
+                                        .onChange(of: frame) { libraryWindowFrame = $0 }
+                                })
+                            .frame(width: rect.width, height: max(0, rect.maxY - top))
+                            .padding(.leading, rect.minX)
+                            .padding(.top, top)
+                    }
+                }
+            }
+        }
+        .onChange(of: model.deckTrackIds) { _ in lowerLibrary() }
+        .onChange(of: browseActive) { active in if !active { libraryRaised = false } }
+        .onAppear { installBrowseMonitor() }
+        .onDisappear { removeBrowseMonitor() }
+        .onChange(of: filterBarCollapsed) { collapsed in
+            if collapsed { rackOpenedOverFilter = false }
+        }
         .onPreferenceChange(DeckColumnHeightKey.self) { height in
             // Whole points, and only when it really moved: this feeds the
             // layout that produced it.
@@ -455,6 +501,100 @@ struct PerformanceView: View {
     /// The rack bar folded to its one-line strip — "I am browsing now".
     /// Remembered across launches, like the library's filter bar.
     @AppStorage("dub.rackFolded") private var rackFolded: Bool = false
+
+    // MARK: Browse mode
+
+    /// Preferences ▸ Decks ▸ Browse mode: in Performance, a click in the
+    /// library raises it over the deck controls, up to the track
+    /// overviews; a load or a click outside it lowers it again.
+    @AppStorage(Self.browseModeKey) private var browseMode = false
+    static let browseModeKey = "dub.browseMode"
+    @State private var libraryRaised = false
+    /// The library's frame in window coordinates (top-left origin), for
+    /// telling a click in it from a click elsewhere.
+    @State private var libraryWindowFrame: CGRect = .zero
+    @State private var browseMonitor: Any?
+
+    private var browseActive: Bool { browseMode && model.engineMode != .prep }
+
+    /// Where the library's top edge sits. Lowered, it is its slot under
+    /// the rack bar. Raised, it climbs to just under the lowest track
+    /// overview — the decks keep title, readouts and overview in view —
+    /// and never below its own slot. With no overview drawn it stays put.
+    static func libraryTop(slotTop: CGFloat, overviewBottoms: [CGFloat], raised: Bool) -> CGFloat {
+        guard raised, let overview = overviewBottoms.max() else { return slotTop }
+        return min(slotTop, (overview + DubSpacing.sm).rounded())
+    }
+
+    private func raiseLibrary() {
+        guard browseActive, !libraryRaised else { return }
+        // A switch, not a slide: a slide resizes the AppKit track table
+        // on every frame, and it stuttered (rig, 2026-11-15).
+        libraryRaised = true
+    }
+
+    private func lowerLibrary() {
+        guard libraryRaised else { return }
+        libraryRaised = false
+    }
+
+    /// Clicks are watched at the window, not with SwiftUI gestures: the
+    /// track list is an AppKit table and takes its own mouse-downs, and
+    /// the decks are full of buttons. The event is always passed on.
+    private func installBrowseMonitor() {
+        guard browseMonitor == nil else { return }
+        browseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { event in
+            guard browseActive, let window = event.window, window === NSApp.mainWindow,
+                  !(window is NSPanel), window.attachedSheet == nil,
+                  let height = window.contentView?.bounds.height
+            else { return event }
+            let point = CGPoint(x: event.locationInWindow.x, y: height - event.locationInWindow.y)
+            if libraryWindowFrame.contains(point) {
+                raiseLibrary()
+            } else {
+                lowerLibrary()
+            }
+            return event
+        }
+    }
+
+    private func removeBrowseMonitor() {
+        if let browseMonitor { NSEvent.removeMonitor(browseMonitor) }
+        browseMonitor = nil
+    }
+    /// The library's FILTER bar, read from the key `LibraryView` keeps.
+    @AppStorage("libraryFilterBarCollapsed") private var filterBarCollapsed: Bool = false
+    /// The DJ opened the rack while the filter has it folded. Session
+    /// state, and dropped when the filter closes.
+    @State private var rackOpenedOverFilter = false
+
+    /// Whether the rack bar draws folded.
+    ///
+    /// An open FILTER folds it (2026-11-15): with both open a 13″ or 14″
+    /// screen showed no track rows at all — the boxes take ~194 pt and
+    /// the library had ~300 (`ReleaseScreenTests`). Browsing is when the
+    /// rows matter, and folding gives back the bar's height. The DJ can
+    /// still open it over the filter; that wins until the filter closes.
+    static func rackIsFolded(stored: Bool, filterOpen: Bool, openedOverFilter: Bool) -> Bool {
+        if stored { return true }
+        return filterOpen && !openedOverFilter
+    }
+
+    private var rackShownFolded: Bool {
+        Self.rackIsFolded(
+            stored: rackFolded, filterOpen: !filterBarCollapsed,
+            openedOverFilter: rackOpenedOverFilter)
+    }
+
+    /// The bar's fold button. Over an open filter it opens and closes
+    /// the bar for this browse only; otherwise it is the remembered fold.
+    private func toggleRackFold() {
+        if !filterBarCollapsed && !rackFolded {
+            rackOpenedOverFilter.toggle()
+        } else {
+            rackFolded.toggle()
+        }
+    }
     /// The deck columns' own height, as they report it
     /// (`DeckColumnHeightKey`) — what the deck region is cut to in
     /// Performance. Zero until the first layout.
@@ -463,7 +603,7 @@ struct PerformanceView: View {
     /// Fixed chrome carried on the deck side of the divider.
     private var deckChromeHeight: CGFloat {
         guard model.engineMode != .prep else { return 0 }
-        return (rackFolded ? DubLayout.rackBarFoldedHeight : DubLayout.rackBarHeight) + 1
+        return (rackShownFolded ? DubLayout.rackBarFoldedHeight : DubLayout.rackBarHeight) + 1
     }
 
     // MARK: - Global rack bar
@@ -632,7 +772,7 @@ struct PerformanceView: View {
             // and handing both panes a resolved number makes the pass
             // arithmetic instead of a search.
             GeometryReader { geo in
-                perfDeckRow(columnWidth: perfColumnWidth(paneWidth: geo.size.width))
+                perfDeckRow(columnWidth: Self.perfColumnWidth(paneWidth: geo.size.width))
             }
             .background(DubColor.divider)
         }
@@ -652,7 +792,9 @@ struct PerformanceView: View {
     /// answering a question nobody asked.
     @State var waveformHovered = false
 
-    private func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
+    /// Static so `ReleaseScreenTests` sizes its columns with this rule,
+    /// not a copy of it.
+    static func perfColumnWidth(paneWidth: CGFloat) -> CGFloat {
         let claimed = DubLayout.performanceWaveformWidthCap * 2
             + DubLayout.phaseMeterGutterWidth + 2
         return max(
@@ -683,6 +825,9 @@ struct PerformanceView: View {
             PhaseMeterView(model: model)
                 .frame(width: DubLayout.phaseMeterGutterWidth)
                 .frame(maxHeight: .infinity)
+                // Under the meter, the gutter's empty foot: what is
+                // leaving the soundcard for each deck (`OutputMeter.swift`).
+                .overlay { OutputMeterPair(engine: model.engine) }
                 .overlay(alignment: .top) {
                     // The one place both strips can see it, and out of
                     // the way of either.
@@ -1134,4 +1279,21 @@ enum DeckDoubleDrag {
         openPreferences: {},
         openAbout: {})
         .frame(width: 1440, height: 900)
+}
+
+
+/// Where the library goes: its slot under the deck region, and the
+/// track overviews' bottom edges browse mode raises it to.
+struct LibraryPlacement {
+    var slot: Anchor<CGRect>?
+    var overviewBottoms: [Anchor<CGPoint>] = []
+}
+
+struct LibraryPlacementKey: PreferenceKey {
+    static var defaultValue = LibraryPlacement()
+    static func reduce(value: inout LibraryPlacement, nextValue: () -> LibraryPlacement) {
+        let next = nextValue()
+        value.slot = value.slot ?? next.slot
+        value.overviewBottoms += next.overviewBottoms
+    }
 }

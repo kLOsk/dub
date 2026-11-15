@@ -100,7 +100,9 @@ struct GlobalRackBar: View {
 
     private var samplerGroup: some View {
         group {
-            SampleShelf(state: state.sampler, callbacks: callbacks.sampler)
+            SampleShelf(
+                state: state.sampler, callbacks: callbacks.sampler,
+                padHeight: DubLayout.rackPadHeight)
                 .frame(minWidth: DubLayout.rackSamplerMinWidth)
         }
     }

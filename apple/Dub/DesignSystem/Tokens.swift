@@ -49,7 +49,16 @@ enum DubColor {
     /// instead, so a deck visibly changed shade the moment a track
     /// landed. Mirrors `WaveformRenderer.laneClearRGB` — change one and
     /// `WaveformLaneColourTests` fails.
-    static let waveformLane = Color(hex: 0x121214)
+    ///
+    /// In *device* RGB, unlike every other token: the Metal layer is
+    /// untagged, so its clear reaches the screen as raw device values.
+    /// As sRGB the same numbers were colour-managed up to about
+    /// #17171A on the MacBook panel, and the empty deck read grey
+    /// against the loaded one's black (rig, 2026-11-15).
+    static let waveformLane = Color(
+        nsColor: NSColor(
+            deviceRed: CGFloat(0x12) / 255, green: CGFloat(0x12) / 255,
+            blue: CGFloat(0x14) / 255, alpha: 1))
 
     /// Deck header / status strip background.
     static let surface1 = Color(hex: 0x14161B)
@@ -453,7 +462,16 @@ enum DubLayout {
     /// Was 92, sized for a single 36 pt pad row, when the sampler was
     /// four `TriggerPadGroup` pads bound in Preferences.
     static let rackBarHeight: CGFloat =
-        DubSpacing.md + 14 + DubSpacing.sm + prepSectionContent + DubSpacing.md
+        DubSpacing.md + 14 + DubSpacing.sm + rackSectionContent + DubSpacing.md
+
+    /// A sample tile in the Performance rack bar. Prep's shelf keeps
+    /// 42 pt — it shares a baseline with Prep's cue and loop sections —
+    /// but here the tile's name is one line and the 8 pt of padding
+    /// above and below it went to the library (2026-11-15).
+    static let rackPadHeight: CGFloat = 34
+    /// The rack bar's pad area: two rows of `rackPadHeight` and a 4 pt
+    /// gap. The siren's faceplate matches it.
+    static let rackSectionContent: CGFloat = rackPadHeight * 2 + DubSpacing.xs
 
     /// The rack bar folded away: one line — a chevron and the blocks'
     /// names — so it can be found and opened again. The 113 pt it gives
@@ -466,7 +484,7 @@ enum DubLayout {
     /// The siren box's faceplate: exactly the shelf's two rows, so the
     /// bar's two blocks share a bottom edge and the siren no longer
     /// leaves half its height empty under one row of pads.
-    static let sirenPlateHeight: CGFloat = prepSectionContent
+    static let sirenPlateHeight: CGFloat = rackSectionContent
     /// The five keys on the plate — wide enough for RIFLE GUN on two
     /// lines at the cap's 10 pt, tall enough to read as a key and not a
     /// tile. `SirenRackGroup.width` sums the plate from these.
@@ -524,9 +542,29 @@ enum DubLayout {
     /// whole other box on screen — the bar scrolls horizontally, so a
     /// runaway value would otherwise push everything after it out of
     /// reach.
-    static let libraryFilterBoxMinWidth: CGFloat = 120
+    static let libraryFilterBoxMinWidth: CGFloat = 140
     static let libraryFilterBoxMaxWidth: CGFloat = 520
-    static let libraryFilterBoxHeight: CGFloat = 150
+    /// …and no more than this share of the bar, so on a narrow window a
+    /// long COMMENT still leaves room to see the boxes beside it.
+    static let libraryFilterBoxMaxShare: CGFloat = 0.4
+    /// Header plus six rows at the 14 pt row size (2026-11-15: the rows
+    /// grew from 11 pt for the stage, and the box with them).
+    static let libraryFilterBoxHeight: CGFloat = 190
+    /// The boxes give height back on a short library, down to this —
+    /// about four rows — so the track list keeps rows to filter
+    /// (`LibraryFilterBoxHeight`, 2026-11-15).
+    static let libraryFilterBoxMinHeight: CGFloat = 120
+    /// The library's chrome around its rows with FILTER folded: the
+    /// favourites strip, the FILTER line, the column header, the
+    /// horizontal scroller and the import footer. Measured off the
+    /// running app (2026-11-15) at 122, then the column header came down
+    /// 8 pt, the FILTER line grew 4 for its click target, and the 23 pt
+    /// status row moved onto the FILTER line. Re-measure if any of
+    /// those change.
+    static let libraryChromeHeight: CGFloat = 95
+    /// Track rows the open FILTER bar leaves showing before its boxes
+    /// stop giving way.
+    static let libraryRowsKeptWhileFiltering: CGFloat = 2
 
     /// Ideal width of each deck's playing waveform in Performance
     /// (Timecode) mode — the strip's *width* is the equivalent of

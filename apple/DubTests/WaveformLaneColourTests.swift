@@ -15,8 +15,17 @@ import simd
 /// instead of by a shared constant.
 final class WaveformLaneColourTests: XCTestCase {
 
+    /// Compared in device RGB, not sRGB: the Metal layer is untagged,
+    /// so its clear reaches the screen as device values, and the token
+    /// is authored in device RGB for that reason. Compared as sRGB the
+    /// two matched in numbers and still differed on screen — the empty
+    /// deck grey, the loaded one black (rig, 2026-11-15).
     func testTheIdleLaneMatchesTheMetalClearColour() {
-        let token = HotCueMarker.components(DubColor.waveformLane)
+        guard let device = NSColor(DubColor.waveformLane).usingColorSpace(.deviceRGB) else {
+            return XCTFail("the lane token has no device RGB form")
+        }
+        let token = SIMD3<Float>(
+            Float(device.redComponent), Float(device.greenComponent), Float(device.blueComponent))
         let clear = WaveformRenderer.laneClearRGB
         // One 8-bit step of tolerance: the token is authored as a hex
         // triple and the clear as floats, so they cannot be bit-equal.

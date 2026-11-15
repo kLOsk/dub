@@ -75,7 +75,7 @@ struct SirenRackGroup: View {
                     }
                     SirenTail(
                         on: state.dubMacro > 0, delayMs: Double(dub.delayMs),
-                        feedback: Double(dub.feedback))
+                        feedback: Double(dub.feedback), amount: Double(state.dubMacro))
                         .frame(width: Self.padsWidth, height: Self.tailHeight)
                 }
                 dial
@@ -228,14 +228,35 @@ struct SirenTail: View {
     let delayMs: Double
     /// 0…1, the level each repeat keeps of the one before.
     let feedback: Double
+    /// The DUB knob, 0…1.
+    let amount: Double
 
     private static let repeats = 12
+    private static let dark = 0.08
+    /// The last lit segment of a full row, against the first.
+    private static let tailEnd = 0.35
 
-    /// How lit repeat `i` is: `feedback^i`, with a floor so a dark
-    /// segment is still a segment.
-    static func level(repeat i: Int, on: Bool, feedback: Double) -> Double {
-        guard on else { return 0.08 }
-        return max(0.08, pow(min(max(feedback, 0), 1), Double(i)))
+    /// How lit segment `i` is: segment 0 is the shot, the other eleven
+    /// fill in step with the knob — a twentieth of the knob is the same
+    /// stretch of row anywhere on it — and fade along the row the way a
+    /// tail does. The partly reached segment lights in part.
+    ///
+    /// Linear in the knob, on the DJ's call (rig, 2026-11-15). Two
+    /// readings of the echo itself came first: by repeat amplitude (half
+    /// the knob drew one segment), then by each repeat's dB against the
+    /// shot (still about 2 → 5 → 9 → 11 repeats at 10 / 50 / 75 / 100 %,
+    /// because the tail itself grows fastest at the top). The row says
+    /// how much DUB is dialled in; the figures beside it say what that
+    /// sets.
+    static func level(repeat i: Int, on: Bool, amount: Double) -> Double {
+        guard on else { return dark }
+        if i == 0 { return 1 }
+        let span = Double(repeats - 1)
+        let reach = min(max(amount, 0), 1) * span
+        let fill = min(max(reach - Double(i - 1), 0), 1)
+        guard fill > 0 else { return dark }
+        let fade = 1 - (1 - tailEnd) * Double(i - 1) / (span - 1)
+        return dark + (fade - dark) * fill
     }
 
     var body: some View {
@@ -248,7 +269,7 @@ struct SirenTail: View {
                 ForEach(0..<Self.repeats, id: \.self) { i in
                     RoundedRectangle(cornerRadius: 1, style: .continuous)
                         .fill(DubColor.siren)
-                        .opacity(Self.level(repeat: i, on: on, feedback: feedback))
+                        .opacity(Self.level(repeat: i, on: on, amount: amount))
                         .frame(height: 5)
                 }
             }

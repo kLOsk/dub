@@ -222,9 +222,30 @@ pub struct DeckSharedState {
     input_rms_bits: AtomicU32,
     input_peak_bits: AtomicU32,
     /// The same, per input channel: RMS left, RMS right, peak left, peak
-    /// right. A THRU deck's two meters.
+    /// right. A THRU deck's two meters, and a timecode deck's signal
+    /// panel.
     input_channel_bits: [AtomicU32; 4],
+    /// What leaves the deck's output pair, after everything — the track,
+    /// echo out, the rack, the siren and samples routed here: a held peak
+    /// falling at 20 dB/s, linear, `f32` bits. The output meter in the
+    /// performance gutter, so a DJ can see whether anything is going to
+    /// the mixer channel at all.
+    output_peak_bits: AtomicU32,
+    /// The deck has an output pair this block. `false` is "nowhere to
+    /// go": no pair routed, or the engine not running.
+    output_routed: AtomicBool,
+    /// The last [`SCOPE_FRAMES`] input frames, interleaved left/right,
+    /// `f32` bits — what the signal panel's scope draws. A healthy
+    /// carrier is a circle; a weak channel squashes it. Display only, so
+    /// a read that tears across a block is harmless.
+    scope_bits: [AtomicU32; SCOPE_FRAMES * 2],
+    /// How many frames of `scope_bits` hold samples (≤ `SCOPE_FRAMES`).
+    scope_len: AtomicU32,
 }
+
+/// Frames of raw input the signal panel's scope holds: about two and a
+/// half turns of a 1 kHz carrier at 48 kHz.
+pub const SCOPE_FRAMES: usize = 128;
 
 /// Lock-free snapshot of a deck's active loop, in **track seconds**.
 /// `active == false` means no loop; the positions are then unspecified.
@@ -411,6 +432,10 @@ impl DeckSharedState {
                 AtomicU32::new(0.0f32.to_bits()),
                 AtomicU32::new(0.0f32.to_bits()),
             ],
+            scope_bits: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            scope_len: AtomicU32::new(0),
+            output_peak_bits: AtomicU32::new(0.0f32.to_bits()),
+            output_routed: AtomicBool::new(false),
         }
     }
 
@@ -452,6 +477,7 @@ impl DeckSharedState {
         self.tc_sticker_drift_ms_bits
             .store(f64::NAN.to_bits(), Ordering::Relaxed);
         self.tc_pitch_settled.store(true, Ordering::Relaxed);
+        self.store_output(0.0, false);
         self.store_loop(false, 0.0, 0.0);
         self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0, 0);
         // Bring the seqlock-protected publish triple back to a
@@ -576,6 +602,46 @@ impl DeckSharedState {
         {
             slot.store(v.to_bits(), Ordering::Relaxed);
         }
+    }
+
+    /// Publish what leaves the deck's output pair (audio thread). Two
+    /// relaxed stores; RT-safe.
+    pub(crate) fn store_output(&self, peak: f32, routed: bool) {
+        self.output_peak_bits
+            .store(peak.to_bits(), Ordering::Relaxed);
+        self.output_routed.store(routed, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the output meter: `(held peak, routed)`.
+    #[must_use]
+    pub fn load_output(&self) -> (f32, bool) {
+        (
+            f32::from_bits(self.output_peak_bits.load(Ordering::Relaxed)),
+            self.output_routed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Publish the scope's frames (audio thread): `frames` is interleaved
+    /// left/right, its tail kept. Relaxed stores only; RT-safe.
+    pub(crate) fn store_scope(&self, frames: &[f32]) {
+        let n = (frames.len() / 2).min(SCOPE_FRAMES);
+        let tail = &frames[frames.len() / 2 * 2 - n * 2..frames.len() / 2 * 2];
+        for (slot, v) in self.scope_bits.iter().zip(tail) {
+            slot.store(v.to_bits(), Ordering::Relaxed);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        self.scope_len.store(n as u32, Ordering::Relaxed);
+    }
+
+    /// Lock-free read of the scope: interleaved left/right frames, oldest
+    /// first. Empty when the deck has no input.
+    #[must_use]
+    pub fn load_scope(&self) -> Vec<f32> {
+        let n = (self.scope_len.load(Ordering::Relaxed) as usize).min(SCOPE_FRAMES);
+        self.scope_bits[..n * 2]
+            .iter()
+            .map(|b| f32::from_bits(b.load(Ordering::Relaxed)))
+            .collect()
     }
 
     /// Lock-free read of the live input's per-channel level:
@@ -1719,6 +1785,14 @@ impl Deck {
         self.shared.store_input_channels(rms, peak);
     }
 
+    pub(crate) fn store_output(&self, peak: f32, routed: bool) {
+        self.shared.store_output(peak, routed);
+    }
+
+    pub(crate) fn store_scope(&self, frames: &[f32]) {
+        self.shared.store_scope(frames);
+    }
+
     /// Read back this deck's published dub-siren indicator state. Used by the
     /// FFI telemetry snapshot and engine tests.
     #[cfg(test)]
@@ -2523,6 +2597,24 @@ impl Deck {
 )]
 mod tests {
     use super::*;
+
+    /// The scope keeps the tail of a long block, and only as many frames
+    /// as a short one carried.
+    #[test]
+    fn the_scope_keeps_the_last_frames() {
+        let shared = DeckSharedState::new();
+        let long: Vec<f32> = (0..(SCOPE_FRAMES + 10) * 2).map(|i| i as f32).collect();
+        shared.store_scope(&long);
+        let scope = shared.load_scope();
+        assert_eq!(scope.len(), SCOPE_FRAMES * 2);
+        assert_eq!(scope[0], 20.0, "oldest kept frame");
+        assert_eq!(*scope.last().unwrap(), long[long.len() - 1]);
+
+        shared.store_scope(&[0.5, -0.5, 0.25, -0.25]);
+        assert_eq!(shared.load_scope(), vec![0.5, -0.5, 0.25, -0.25]);
+        shared.store_scope(&[]);
+        assert!(shared.load_scope().is_empty());
+    }
     use proptest::prelude::*;
 
     fn const_track(samples: &[f32], channels: u8, sample_rate: u32) -> Arc<Track> {

@@ -185,6 +185,23 @@ extension PerformanceView {
     /// see the layout note in `deckPane`. The floor is what the cue
     /// rows and the loop need side by side; below it the bank drops to
     /// one column on its own.
+    /// The track overview in a deck column — the record so far on a THRU deck.
+    @ViewBuilder
+    func overviewBand(side: DeckSide, deckIdx: UInt64) -> some View {
+        // A THRU deck's map is the record so far, not a file's whole.
+        if (side == .a ? model.deckA : model.deckB).isThru {
+            ThruSideOverview(
+                engine: model.engine, deckIdx: deckIdx,
+                tint: DubColor.deckTint(side),
+                height: DubLayout.deckColumnOverviewHeight)
+        } else {
+            TrackOverviewView(
+                model: model, side: side, deckIdx: deckIdx,
+                orientation: .horizontal,
+                height: DubLayout.deckColumnOverviewHeight)
+                }
+    }
+
     @ViewBuilder
     func deckColumn(side: DeckSide, deckIdx: UInt64, width: CGFloat?) -> some View {
         DeckColumn(
@@ -194,18 +211,11 @@ extension PerformanceView {
             liveDeckIdx: deckIdx
         ) {
             if Self.overviewEnabled {
-                // A THRU deck's map is the record so far, not a file's whole.
-                if (side == .a ? model.deckA : model.deckB).isThru {
-                    ThruSideOverview(
-                        engine: model.engine, deckIdx: deckIdx,
-                        tint: DubColor.deckTint(side),
-                        height: DubLayout.deckColumnOverviewHeight)
-                } else {
-                    TrackOverviewView(
-                        model: model, side: side, deckIdx: deckIdx,
-                        orientation: .horizontal,
-                        height: DubLayout.deckColumnOverviewHeight)
-                }
+                overviewBand(side: side, deckIdx: deckIdx)
+                    // Browse mode raises the library to just under here.
+                    .anchorPreference(key: LibraryPlacementKey.self, value: .bottom) {
+                        LibraryPlacement(overviewBottoms: [$0])
+                    }
             }
         }
         .equatable()

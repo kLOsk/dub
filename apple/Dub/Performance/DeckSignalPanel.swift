@@ -8,17 +8,16 @@
 //  edge; clicking it slides the panel over the performance-pads area
 //  (an overlay, so the waveform column never reflows).
 //
-//  Surfaces the engine's lock-free deck telemetry (FFI 33): carrier
-//  confidence and amplitude, lock state, a rolling pitch-stability
-//  trace, calibration state, and the sticker-drift readout. A healthy
-//  carrier sits high on both bars with a green lock and a flat pitch
-//  trace; dust, a worn stylus, or an uncalibrated needle makes the
-//  trace jump.
+//  The panel says what a DJ asks of it: is the control record locked,
+//  and if not, what to check — a big state word with one line of advice,
+//  the carrier on a scope, the two sides of the pair and the decode
+//  quality as bars, the pitch (redesign, 2026-11-15; `SignalStatus` holds
+//  the rules). Sticker drift shows in Debug builds only.
 //
 //  Calibration: the engine auto-calibrates the moment it's sure the
 //  input is timecode (PRD §5.1.1). **Calibrate** forces a fresh capture
 //  (after a cartridge swap, or if the auto pass landed on a noisy
-//  window); **Auto** hands the deck back to automatic source detection.
+//  window).
 //
 
 import SwiftUI
@@ -100,7 +99,7 @@ struct DeckSignalSlideOut: View {
     private var panel: some View {
         Group {
             if open {
-                DeckSignalPanel(engine: engine, side: side, deckIdx: deckIdx)
+                DeckSignalPanel(engine: engine, side: side, deckIdx: deckIdx) { open = false }
             }
         }
         .frame(width: open ? DubLayout.deckSignalPanelWidth : 0)
@@ -116,9 +115,11 @@ struct DeckSignalSlideOut: View {
             open.toggle()
         } label: {
             VStack(spacing: DubSpacing.sm) {
+                // The deck's signal at a glance, panel shut: green
+                // locked, amber weak, grey nothing.
                 Circle()
-                    .fill(lockColor(t.lockState, hasInput: t.hasTimecodeInput))
-                    .frame(width: 6, height: 6)
+                    .fill(Self.dotColour(t))
+                    .frame(width: 9, height: 9)
                 Text("SIGNAL")
                     .font(DubFont.caps)
                     .tracking(1.2)
@@ -128,82 +129,88 @@ struct DeckSignalSlideOut: View {
                     .frame(width: 10, height: 56)
             }
             .frame(width: 18, height: 96)
-            .background(DubColor.surface2.opacity(open ? 1.0 : 0.6))
+            .background(DubColor.surface2)
             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Toggle deck \(side.label) signal panel")
         .onReceive(dotTick) { _ in telemetry = engine.deckTelemetry(deckIdx: deckIdx) }
     }
+
+    /// The tab's dot, from the same rules as the panel's big word.
+    static func dotColour(_ t: DeckTelemetry) -> Color {
+        SignalStatus.of(
+            hasInput: t.hasTimecodeInput, lockState: t.lockState, weakChannel: t.weakChannel,
+            rms: (t.inputRmsLeft, t.inputRmsRight), pitchPercent: t.pitchPercent
+        ).colour
+    }
 }
 
-/// The panel body: one deck's signal health + calibration controls.
+/// The panel body: one deck's signal, as the DJ needs it — the state in
+/// a word, the carrier on a scope, the two sides and the decode quality
+/// as bars, the pitch, and the calibration line with its button.
 ///
-/// Everything live in here is drawn by `SignalScopeView`, an
-/// `NSView`. That is not a stylistic choice — see its file comment for
-/// the measurements. The short version: this window lays out on every
-/// display cycle whether or not anything changed, and the cost of that
-/// is proportional to how much view exists. Replacing the readouts with
-/// `Color.clear` took the open drawer from 18 % to 4 %, while changing
-/// how *often* they updated did nothing at all. So they are drawn.
+/// Everything live is drawn by `SignalScopeView`, an `NSView` (see its
+/// file comment for why). The header and the button are SwiftUI: they
+/// are controls, and they change only on a click.
 struct DeckSignalPanel: View {
 
     let engine: DubEngine
     let side: DeckSide
     let deckIdx: UInt64
+    var onClose: () -> Void = {}
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DubSpacing.md) {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            HStack {
+                Text("SIGNAL · DECK \(side.label)")
+                    .font(DubFont.caps)
+                    .tracking(1.2)
+                    .foregroundStyle(DubColor.textSecondary)
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(DubColor.textSecondary)
+                        .frame(width: 24, height: 24)
+                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(DubColor.divider))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close the signal panel")
+            }
+
             SignalScopeView(engine: engine, deckIdx: deckIdx)
                 .frame(height: SignalScopeView.height)
-
-            // The buttons stay SwiftUI: they are controls with actions,
-            // they change only on click, and hand-rolling `NSButton`
-            // would trade a real affordance for nothing measurable.
-            // One button. AUTO used to sit beside it, from when a deck
-            // could be handed back to automatic source detection; that
-            // was removed (PRD §5.1.1) and the button did nothing a DJ
-            // could see.
-            HStack(spacing: DubSpacing.sm) {
-                Button("Calibrate") { try? engine.calibrateDeck(deckIdx: deckIdx) }
+                .overlay(alignment: .bottomTrailing) {
+                    Button { try? engine.calibrateDeck(deckIdx: deckIdx) } label: {
+                        Text("CALIBRATE")
+                            .font(.system(size: 10, weight: .bold))
+                            .tracking(1.1)
+                            .foregroundStyle(DubColor.textPrimary)
+                            .padding(.horizontal, 10)
+                            .frame(height: 26)
+                            .background(RoundedRectangle(cornerRadius: 5).fill(DubColor.surface3))
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(DubColor.divider))
+                    }
+                    .buttonStyle(.plain)
                     .help("Measure the control record again — after a cartridge or cable change, "
                         + "or if the needle sounds wrong. Play the record while it measures.")
-                Spacer()
-            }
-            .font(DubFont.micro)
+                }
 
             Spacer(minLength: 0)
         }
         .padding(DubSpacing.md)
         .frame(width: DubLayout.deckSignalPanelWidth)
         .frame(maxHeight: .infinity)
-        .background(DubColor.surface2.opacity(0.97))
+        // Solid: the pads showed through the old 97 % ground and read as
+        // part of the panel (rig, 2026-11-15).
+        .background(DubColor.surface2)
         .overlay(
             Rectangle()
                 .fill(DubColor.divider)
                 .frame(width: 1),
             alignment: side == .a ? .trailing : .leading)
-    }
-}
-
-/// Shared lock-state → colour/label mapping (PRD §5.4 tracking dot).
-func lockColor(_ state: UInt8, hasInput: Bool) -> Color {
-    guard hasInput else { return DubColor.textPlaceholder }
-    switch state {
-    case 1:  return DubColor.stateLocked
-    case 2:  return DubColor.stateTentative
-    case 3:  return DubColor.stateError
-    default: return DubColor.textPlaceholder
-    }
-}
-
-func lockLabel(_ state: UInt8, hasInput: Bool) -> String {
-    guard hasInput else { return "No timecode input" }
-    switch state {
-    case 1:  return "Locked"
-    case 2:  return "Degraded"
-    case 3:  return "No lock / scratching"
-    default: return "—"
     }
 }
 

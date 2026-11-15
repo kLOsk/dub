@@ -14,13 +14,15 @@ final class LibraryFilterBoxWidthTests: XCTestCase {
         header: String = "Genre",
         labels: [String],
         counts: [Int]? = nil,
-        swatch: Bool = false
+        swatch: Bool = false,
+        maxWidth: CGFloat = DubLayout.libraryFilterBoxMaxWidth
     ) -> CGFloat {
         LibraryFilterBoxWidth.width(
             header: header,
             labels: labels,
             counts: counts ?? labels.map { _ in 1 },
-            hasSwatch: swatch)
+            hasSwatch: swatch,
+            maxWidth: maxWidth)
     }
 
     /// Short values don't shrink the box past the floor — five stars
@@ -56,7 +58,7 @@ final class LibraryFilterBoxWidthTests: XCTestCase {
     func testACountIsPartOfTheRow() {
         // A label long enough to be off the floor, or both clamp to it
         // and the count has nothing to widen.
-        let label = String(repeating: "Drum & Bass - Irie ", count: 4)
+        let label = String(repeating: "Drum & Bass - Irie ", count: 2)
         XCTAssertGreaterThan(
             width(labels: [label], counts: [1234]),
             width(labels: [label], counts: [1]))
@@ -64,10 +66,53 @@ final class LibraryFilterBoxWidthTests: XCTestCase {
 
     /// COLOUR draws a swatch the other boxes don't.
     func testTheSwatchIsCountedOnlyWhereItIsDrawn() {
-        let labels = [String(repeating: "Some fairly long label here ", count: 3)]
+        let labels = [String(repeating: "Some fairly long label here ", count: 2)]
         XCTAssertGreaterThan(
             width(header: "Color", labels: labels, swatch: true),
             width(header: "Color", labels: labels, swatch: false))
+    }
+
+    /// The row's furniture is measured as drawn: a box sized for
+    /// "Nice - Warmup - Friendly" truncated it on the rig (2026-11-15)
+    /// because one stack gap, the spacer and the scroller were left out.
+    /// The label alone must leave room for at least those.
+    func testARowLeavesRoomForItsFurniture() {
+        let label = "Nice - Warmup - Friendly"
+        let text = (label as NSString).size(
+            withAttributes: [.font: NSFont.systemFont(ofSize: LibraryFilterBoxWidth.textSize)]).width
+        let furniture = LibraryFilterBoxWidth.glyphSize + DubSpacing.xs * 3 + 2 + DubSpacing.sm * 2
+            + NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        XCTAssertGreaterThanOrEqual(width(labels: [label]), text + furniture)
+    }
+
+    /// On a wide bar a box may grow to the absolute ceiling; on a narrow
+    /// one it gets a share of the bar, so one long COMMENT can't push
+    /// every other box out of sight. Never under the floor.
+    func testTheCeilingFollowsTheBar() {
+        XCTAssertEqual(LibraryFilterBoxWidth.ceiling(barWidth: nil), DubLayout.libraryFilterBoxMaxWidth)
+        XCTAssertEqual(LibraryFilterBoxWidth.ceiling(barWidth: 4000), DubLayout.libraryFilterBoxMaxWidth)
+        let narrow = LibraryFilterBoxWidth.ceiling(barWidth: 600)
+        XCTAssertLessThan(narrow, DubLayout.libraryFilterBoxMaxWidth)
+        XCTAssertEqual(LibraryFilterBoxWidth.ceiling(barWidth: 100), DubLayout.libraryFilterBoxMinWidth)
+
+        let runaway = [String(repeating: "Reggae Revival ", count: 24)]
+        XCTAssertEqual(width(labels: runaway, maxWidth: narrow), narrow)
+    }
+
+    /// The rows are read on stage: at least the track list's size.
+    func testTheRowsAreAsBigAsTheTrackList() {
+        XCTAssertGreaterThanOrEqual(LibraryFilterBoxWidth.textSize, 14)
+    }
+
+    /// The folded FILTER line names what is set, box by box, and skips
+    /// a box with nothing ticked.
+    func testTheFoldedLineSaysWhatIsFiltered() {
+        XCTAssertEqual(
+            LibraryFilterSummary.text([
+                ("Genre", ["Dub", "Reggae"]), ("Key", []), ("BPM", ["160–180"]), ("Rating", ["≥ 3★"]),
+            ]),
+            "GENRE Dub, Reggae · BPM 160–180 · RATING ≥ 3★")
+        XCTAssertEqual(LibraryFilterSummary.text([]), "")
     }
 
     /// Ticking a row must not resize the box under the pointer — the

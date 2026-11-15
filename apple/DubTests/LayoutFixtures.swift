@@ -34,6 +34,33 @@ extension PerformancePadsState {
     }
 }
 
+extension DeckColumnState {
+    /// A loaded, playing deck with all eight cues named — the tallest the
+    /// column gets in a shipping configuration.
+    static func loadedFixture(side: DeckSide) -> DeckColumnState {
+        DeckColumnState(
+            side: side,
+            header: DeckColumnHeader(DeckHeaderState(
+                isLive: true, source: .file,
+                trackTitle: "Baddadan (extended mix) (feat. IRah, Flowdan)",
+                trackArtist: "Chase & Status",
+                bpm: 176.0, pitchPercent: -1.2, timecodeLockState: 1,
+                key: "7A", formatChip: "MP3 · 44.1 kHz · stereo",
+                timeRow: .remainingOnly,
+                isMaster: side == .a, isPlaying: true,
+                isPanicPlay: false, useTimecodeToggle: false,
+                gridLocked: false, gridDriftQuality: nil)),
+            cues: (0..<8).map {
+                CueSlotState(
+                    index: $0,
+                    mark: CueMark(positionSecs: Double($0) * 30, name: "MARK", color: "aqua"))
+            },
+            activeLoopBeats: 2, loopEngaged: true,
+            echoEnabled: true, echoEngaged: false,
+            hasTrack: true, isPlaying: true)
+    }
+}
+
 extension GlobalRackBarState {
     /// A populated bar: the siren box after one shot, its knob part
     /// way up, and three sampler slots loaded — one sounding, one tagged

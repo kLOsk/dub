@@ -147,7 +147,10 @@ struct LibraryTable: NSViewRepresentable {
         table.allowsColumnReordering = true
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.rowHeight = LibraryRowLayout.estimatedHeight
-        table.headerView = LibraryTableHeaderView()
+        // AppKit's default header is 28 pt for a 10 pt label; the
+        // library's height is short on a laptop (2026-11-15).
+        table.headerView = LibraryTableHeaderView(
+            frame: NSRect(x: 0, y: 0, width: 0, height: LibraryRowLayout.headerHeight))
         table.intercellSpacing = .zero
         table.dataSource = context.coordinator
         table.delegate = context.coordinator
@@ -177,6 +180,14 @@ struct LibraryTable: NSViewRepresentable {
         scroll.drawsBackground = true
         scroll.backgroundColor = NSColor(DubColor.surface0)
         scroll.borderType = .noBorder
+        // One row of room past the last track: the status tab sits over
+        // the right end of the bottom row, and at the end of a list the
+        // last track scrolls clear of it. The header is tiled by the
+        // scroll view itself, not by the top inset, so the automatic
+        // insets have nothing else to do here.
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsets(
+            top: 0, left: 0, bottom: LibraryRowLayout.estimatedHeight, right: 0)
 
         context.coordinator.syncColumns(columns)
         context.coordinator.observeColumnGeometry(table)

@@ -112,6 +112,9 @@ struct SampleShelf: View {
     /// height every Prep section ends on, and what the rack bar's own
     /// height is derived from.
     static let tileHeight: CGFloat = 42
+    /// This shelf's tile height: `tileHeight` in Prep, the rack bar's
+    /// shorter `DubLayout.rackPadHeight` in Performance.
+    var padHeight: CGFloat = SampleShelf.tileHeight
 
     private var filled: Int { state.slots.filter { $0.name != nil }.count }
     private var tint: Color {
@@ -211,7 +214,7 @@ struct SampleShelf: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: Self.tileHeight)
+        .frame(height: padHeight)
         .padding(.horizontal, DubSpacing.sm)
         // Sweep first so it sits between the fill and the label:
         // backgrounds stack outward, each behind the last.

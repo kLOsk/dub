@@ -133,7 +133,11 @@ final class PerformanceLayoutTests: XCTestCase {
     /// library's floor must all fit.
     func test_deckColumn_fitsThePane_onALaptopScreen() {
         let size = fittingSize(
-            DeckColumn(state: Self.columnFixture) { Color.clear },
+            DeckColumn(state: Self.columnFixture) {
+                // The overview at its drawn height: a bare `Color.clear`
+                // measures 0 pt and under-measured the column by 56.
+                Color.clear.frame(height: DubLayout.deckColumnOverviewHeight)
+            },
             width: columnWidthAt1440)
         let total = 900 - DubLayout.statusStripHeight - 1
         XCTAssertLessThanOrEqual(

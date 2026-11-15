@@ -256,6 +256,20 @@ struct PreferencesSheet: View {
     /// (M10.5r, PRD §5.5 / §6.4), loudness auto-gain (PRD §8.4) and
     /// hot-cue grid snap.
     private var decksTab: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.xl) {
+            group("Browsing") {
+                toggleRow(
+                    "Browse mode",
+                    "In Performance. Click anywhere in the library and it slides up over the deck controls, to just under the track overviews, so you see more of the crate. Loading a track onto a deck, or clicking outside the library, slides it back down.",
+                    isOn: $browseMode, last: true)
+            }
+            loadingGroup
+        }
+    }
+
+    @AppStorage(PerformanceView.browseModeKey) private var browseMode = false
+
+    private var loadingGroup: some View {
         group("Loading") {
             toggleRow(
                 "Allow loading onto a playing deck",

@@ -537,7 +537,20 @@ pub use rip::{
 ///       is stored: the library keeps tempo, anchor and the 1.
 ///       [`DubEngine::deck_local_bpm`] is the band's tempo at the
 ///       playhead on such a grid, for the deck's readout.
-pub const FFI_VERSION: u32 = 84;
+///   85. **The signal panel sees a timecode deck's input.**
+///       `DeckTelemetry.input_rms_left` … `input_peak_right` (and
+///       `input_rms` / `input_peak`) now meter any deck with an input
+///       attached, not only THRU and DUB FX, and
+///       [`DubEngine::deck_scope`] returns the last block of raw input for
+///       the panel's scope — the carrier's circle, squashed by a weak
+///       channel.
+///   86. **Each deck's output, metered.** `DeckTelemetry.output_peak` is
+///       the held peak of what leaves the deck's output pair after
+///       everything (echo out, rack, siren, samples, master gain), and
+///       `output_routed` says whether the deck has a pair at all — the
+///       gutter's A / B meters, so a DJ can see whether anything is going
+///       to the mixer.
+pub const FFI_VERSION: u32 = 86;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -3584,6 +3597,20 @@ impl DubEngine {
         answer
     }
 
+    /// The deck's last block of raw input for the signal panel's scope:
+    /// up to 128 frames, interleaved left/right, oldest first. Plotted
+    /// left against right, a healthy carrier is a circle and a weak
+    /// channel squashes it flat. Empty for a deck with no input or an
+    /// out-of-range index. Lock-free; poll at UI cadence.
+    #[must_use]
+    pub fn deck_scope(&self, deck_idx: u64) -> Vec<f32> {
+        deck_idx_to_usize(deck_idx)
+            .ok()
+            .and_then(|idx| self.deck_shared.get(idx))
+            .map(|shared| shared.load_scope())
+            .unwrap_or_default()
+    }
+
     /// Per-deck live telemetry (pitch + timecode signal health) for the
     /// Performance deck header, tracking dot, and signal-quality panel.
     /// Lock-free read of the deck's shared state — the same hot path as
@@ -3633,6 +3660,8 @@ impl DubEngine {
             input_rms_right: shared.load_input_channels().0[1],
             input_peak_left: shared.load_input_channels().1[0],
             input_peak_right: shared.load_input_channels().1[1],
+            output_peak: shared.load_output().0,
+            output_routed: shared.load_output().1,
         }
     }
 
@@ -4962,6 +4991,12 @@ pub struct DeckTelemetry {
     pub input_peak_left: f32,
     /// The right side's held peak.
     pub input_peak_right: f32,
+    /// What leaves the deck's output pair, after everything: a held peak,
+    /// linear, falling at 20 dB/s. Zero while echo out holds a spent tail.
+    pub output_peak: f32,
+    /// The deck has an output pair to send to; `false` while unrouted or
+    /// with no engine running.
+    pub output_routed: bool,
 }
 
 impl DeckTelemetry {
@@ -4996,6 +5031,8 @@ impl DeckTelemetry {
             input_rms_right: 0.0,
             input_peak_left: 0.0,
             input_peak_right: 0.0,
+            output_peak: 0.0,
+            output_routed: false,
         }
     }
 }
@@ -6888,7 +6925,9 @@ mod tests {
         // `thru_beat_phase`, `DeckTelemetry.input_rms_left` … `_right`;
         // `set_deck_auto_control` removed.
         // 83→84: `set_following_grid`, `deck_local_bpm`, `sampler_waveform`.
-        assert_eq!(FFI_VERSION, 84);
+        // 84→85: `deck_scope`; a timecode deck meters its input.
+        // 85→86: `DeckTelemetry.output_peak` / `output_routed`.
+        assert_eq!(FFI_VERSION, 86);
     }
 
     /// Off THRU — or with no engine — there is no record and no phase.

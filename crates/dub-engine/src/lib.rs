@@ -414,6 +414,9 @@ pub struct Engine {
     /// The same meter per input channel, left and right — the THRU deck's
     /// pair of meters.
     input_meter_lr: [[InputMeter; 2]; DECK_COUNT],
+    /// Per-deck output meter: the held peak of what leaves each deck's
+    /// pair, after everything (`meter_output`).
+    output_meter: [InputMeter; DECK_COUNT],
     /// Per-deck dub-siren **onboard echo** (PT2399, the GS1/Benidub chip). The
     /// siren is a self-contained instrument: its voices render into a scratch,
     /// pass through this echo, get the siren volume, and sum onto the bus
@@ -593,6 +596,7 @@ impl Engine {
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
+            output_meter: [InputMeter::default(); DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -680,6 +684,7 @@ impl Engine {
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
+            output_meter: [InputMeter::default(); DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -932,6 +937,64 @@ impl Engine {
         self.decks[idx].store_input_channels([l.rms(), r.rms()], [l.peak, r.peak]);
     }
 
+    /// Vintage-FX rack (PRD §6.3) — the dub processing chain. Each
+    /// engaged slot processes the deck's output bus in turn: the inserts
+    /// (Big Knob HPF, phaser) rewrite in place, then the sends (RE-201
+    /// tape echo, spring reverb) add their wet on top. A disengaged slot
+    /// is skipped entirely. No state is published — the UI toggle is the
+    /// source of truth (these never self-terminate). RT-safe.
+    fn process_rack(&mut self, idx: usize, out: &mut [f32], num_channels: usize, first_us: usize) {
+        let active = self.rack_active[idx];
+        if active[FxSlot::BigKnob as usize] {
+            self.bigknob[idx].process_block(out, num_channels, first_us);
+        }
+        if active[FxSlot::Phaser as usize] {
+            self.phaser[idx].process_block(out, num_channels, first_us);
+        }
+        if active[FxSlot::SpaceEcho as usize] {
+            self.re201[idx].process_block(out, num_channels, first_us);
+        }
+        if active[FxSlot::Spring as usize] {
+            self.spring[idx].process_block(out, num_channels, first_us);
+        }
+    }
+
+    /// Meter what leaves deck `idx`'s pair this block — the last thing
+    /// before the soundcard, master gain included (it is applied to the
+    /// whole bus below). A deck in echo out whose tail has died reads
+    /// nothing here while its record plays on, which is the point.
+    /// RT-safe: one pass of arithmetic and two relaxed stores.
+    fn meter_output(&mut self, idx: usize, out: &[f32], num_channels: usize, first_us: usize) {
+        let mut level = crate::timecode::PassthroughLevel::default();
+        for frame in out.chunks_exact(num_channels) {
+            let l = frame[first_us] * self.master_gain;
+            let r = frame[first_us + 1] * self.master_gain;
+            level.peak = level.peak.max(l.abs()).max(r.abs());
+            level.sum_sq += (l * l + r * r) * 0.5;
+            level.frames += 1;
+        }
+        let frames = level.frames;
+        self.output_meter[idx].feed(level, frames, self.sample_rate);
+        self.decks[idx].store_output(self.output_meter[idx].peak, true);
+    }
+
+    /// A deck under timecode: meter and scope its control record for the
+    /// signal panel, so a dead side or a squashed carrier shows without
+    /// opening Preferences. Internal play is not listening to the record,
+    /// so it reads nothing. RT-safe: arithmetic and relaxed stores.
+    fn meter_timecode_input(&mut self, idx: usize, frames: usize, sr: f32) {
+        let Some(level) = self.timecode_inputs[idx]
+            .as_ref()
+            .map(crate::timecode::TimecodeInput::input_level)
+        else {
+            return;
+        };
+        self.meter_live_input(idx, level, frames, sr);
+        if let Some(input) = self.timecode_inputs[idx].as_ref() {
+            self.decks[idx].store_scope(input.last_block());
+        }
+    }
+
     /// Render one block with per-deck routing onto an N-channel output
     /// buffer.
     ///
@@ -999,7 +1062,11 @@ impl Engine {
         // trivially bounds-checked at the array level.
         #[allow(clippy::needless_range_loop)]
         for idx in 0..DECK_COUNT {
-            let Some(first) = routing[idx] else { continue };
+            let Some(first) = routing[idx] else {
+                self.output_meter[idx] = InputMeter::default();
+                self.decks[idx].store_output(0.0, false);
+                continue;
+            };
             let first_us = first as usize;
             debug_assert!(
                 first_us + 2 <= num_channels,
@@ -1046,6 +1113,11 @@ impl Engine {
                         input.push_live_taps();
                     }
                 }
+            } else if self.control_mode[idx] == ControlMode::Timecode
+                && self.timecode_inputs[idx].is_some()
+            {
+                self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
+                self.meter_timecode_input(idx, out.len() / num_channels, sr);
             } else {
                 self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
                 if self.input_meter[idx].peak > 0.0 || self.input_meter[idx].mean_sq > 0.0 {
@@ -1084,30 +1156,13 @@ impl Engine {
                 self.render_samplers_into(idx, out, num_channels, first_us);
             }
 
-            // Vintage-FX rack (PRD §6.3) — the dub processing chain. Each
-            // engaged slot processes the deck's output bus in turn: the
-            // inserts (Big Knob HPF, phaser) rewrite in place, then the sends
-            // (RE-201 tape echo, spring reverb) add their wet on top. A
-            // disengaged slot is skipped entirely. No state is published — the
-            // UI toggle is the source of truth (these never self-terminate).
-            let active = &self.rack_active[idx];
-            if active[FxSlot::BigKnob as usize] {
-                self.bigknob[idx].process_block(out, num_channels, first_us);
-            }
-            if active[FxSlot::Phaser as usize] {
-                self.phaser[idx].process_block(out, num_channels, first_us);
-            }
-            if active[FxSlot::SpaceEcho as usize] {
-                self.re201[idx].process_block(out, num_channels, first_us);
-            }
-            if active[FxSlot::Spring as usize] {
-                self.spring[idx].process_block(out, num_channels, first_us);
-            }
+            self.process_rack(idx, out, num_channels, first_us);
 
             if !instruments_first {
                 self.render_siren_into(idx, out, num_channels, first_us);
                 self.render_samplers_into(idx, out, num_channels, first_us);
             }
+            self.meter_output(idx, out, num_channels, first_us);
         }
         self.sampler_shared.publish(&self.samplers);
 
@@ -3023,6 +3078,37 @@ mod tests {
         }
     }
 
+    /// The output meter reads what leaves each deck's pair — the thing a
+    /// DJ asks when nothing comes out of the mixer channel.
+    #[test]
+    fn each_deck_meters_what_it_sends() {
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        });
+        let (peak_a, routed_a) = engine.deck(0).shared().load_output();
+        let (peak_b, routed_b) = engine.deck(1).shared().load_output();
+        assert!(routed_a && routed_b);
+        assert!((peak_a - 0.3).abs() < 1e-3, "deck A peak {peak_a}");
+        assert!((peak_b - 0.7).abs() < 1e-3, "deck B peak {peak_b}");
+    }
+
+    #[test]
+    fn an_unrouted_deck_reads_no_output() {
+        let mut engine = engine_with_two_decks(0.3, 0.7);
+        let mut out = vec![0.0_f32; 64];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), None]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(engine.deck(1).shared().load_output(), (0.0, false));
+        }
+        assert!(engine.deck(0).shared().load_output().1);
+    }
+
     #[test]
     fn render_routed_none_does_not_advance_transport() {
         // Unrouted decks are skipped end-to-end — their transport
@@ -3646,6 +3732,36 @@ mod tests {
         assert_eq!(engine.echo[0].state(), dub_dsp::EchoState::Idle);
     }
 
+    /// The confusing case on stage: echo out still on, the tail long
+    /// gone, the record playing underneath — and nothing leaving the
+    /// deck. The output meter has to fall to nothing, not hold the dry.
+    #[test]
+    fn a_spent_echo_out_empties_the_output_meter() {
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 2_000_000], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; 256 * 2];
+        for _ in 0..8 {
+            engine.render(&mut rt, &mut out);
+        }
+        assert!(engine.deck(0).shared().load_output().0 > 0.45);
+
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        // 4 s: the loop decays to nothing and the held peak falls past
+        // the meter's floor.
+        for _ in 0..750 {
+            engine.render(&mut rt, &mut out);
+        }
+        let (peak, routed) = engine.deck(0).shared().load_output();
+        assert!(routed);
+        assert!(peak < 0.004, "a spent echo still reads {peak}");
+        assert!(engine.deck(0).is_playing(), "the record plays on");
+    }
+
     #[test]
     fn echo_mutes_thru_deck_dry_too() {
         // End-to-end on a Thru deck: the live record flows through the engine,
@@ -4100,6 +4216,38 @@ mod tests {
         assert!((rms_l - 0.4).abs() < 0.01, "left rms {rms_l}");
         assert!((peak_l - 0.4).abs() < 1e-3, "left peak {peak_l}");
         assert!(rms_r < 1e-6 && peak_r < 1e-6, "right {rms_r} / {peak_r}");
+    }
+
+    /// A deck on timecode meters its control record too, and keeps the
+    /// last block for the signal panel's scope — a dead channel shows as
+    /// one empty meter and a flat line where the circle should be.
+    #[test]
+    fn timecode_deck_meters_and_scopes_its_input() {
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0_f32; block * 2];
+        let blk_in: Vec<f32> = (0..block * 2)
+            .map(|i| if i % 2 == 0 { 0.4 } else { 0.0 })
+            .collect();
+        for _ in 0..1_000 {
+            tx.push_slice(&blk_in);
+            assert_no_alloc::assert_no_alloc(|| engine.render(&mut rt, &mut out));
+        }
+        let ([rms_l, rms_r], _) = engine.deck(0).shared().load_input_channels();
+        assert!((rms_l - 0.4).abs() < 0.01, "left rms {rms_l}");
+        assert!(rms_r < 1e-6, "right rms {rms_r}");
+
+        let scope = engine.deck(0).shared().load_scope();
+        assert_eq!(scope.len(), block * 2, "one block of frames");
+        assert!(scope
+            .chunks_exact(2)
+            .all(|f| (f[0] - 0.4).abs() < 1e-6 && f[1] == 0.0));
     }
 
     #[test]

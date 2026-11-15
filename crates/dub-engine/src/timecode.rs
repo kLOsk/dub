@@ -1196,6 +1196,33 @@ impl TimecodeInput {
         }
     }
 
+    /// This block's input level at unity gain, written nowhere — what a
+    /// timecode deck's signal panel meters. The passthrough measures the
+    /// same while it renders; a deck playing a file under timecode
+    /// renders none, so it is measured here. RT-safe.
+    pub(crate) fn input_level(&self) -> PassthroughLevel {
+        let n = self.last_popped / 2;
+        let mut level = PassthroughLevel {
+            frames: n,
+            ..PassthroughLevel::default()
+        };
+        for frame in self.scratch[..n * 2].chunks_exact(2) {
+            let (l, r) = (frame[0], frame[1]);
+            level.peak = level.peak.max(l.abs()).max(r.abs());
+            level.sum_sq += 0.5 * (l * l + r * r);
+            level.channel_peak[0] = level.channel_peak[0].max(l.abs());
+            level.channel_peak[1] = level.channel_peak[1].max(r.abs());
+            level.channel_sum_sq[0] += l * l;
+            level.channel_sum_sq[1] += r * r;
+        }
+        level
+    }
+
+    /// This block's raw input, interleaved left/right, for the scope.
+    pub(crate) fn last_block(&self) -> &[f32] {
+        &self.scratch[..self.last_popped]
+    }
+
     /// Fold one decoded chunk's raw `(ch1, ch0)` covariance
     /// (`scratch[start..end]`) into an in-flight calibration. The caller
     /// passes only chunks of a turning carrier — see [`CAL_RATE_BAND`].
