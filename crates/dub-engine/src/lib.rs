@@ -80,6 +80,16 @@ pub const DECK_COUNT: usize = 2;
 /// consecutive slices so any block size is handled allocation-free.
 const SIREN_CHUNK: usize = 1024;
 
+/// The routing test tone (Preferences ▸ Audio, CLICK): long enough for a
+/// mixer channel's meter to light and be seen, short enough to be a pip.
+const TEST_TONE_SECS: f32 = 0.25;
+/// 1 kHz: the line-up tone, and audible on any monitor.
+const TEST_TONE_HZ: f32 = 1_000.0;
+/// −12 dBFS: clear on a channel meter, nowhere near the ceiling.
+const TEST_TONE_LEVEL: f32 = 0.25;
+/// Fades in and out, so it is a tone and not two clicks.
+const TEST_TONE_FADE_SECS: f32 = 0.005;
+
 /// The longest echo a beat-matched siren shot gets, in ms. A beat at a
 /// reggae or dub tempo (70–80 BPM) is 750–860 ms, past where the PT2399
 /// sounds like an echo rather than a second shot; it halves to the half
@@ -417,6 +427,9 @@ pub struct Engine {
     /// Per-deck output meter: the held peak of what leaves each deck's
     /// pair, after everything (`meter_output`).
     output_meter: [InputMeter; DECK_COUNT],
+    /// Frames of the routing test tone still to play on each deck's pair
+    /// (`DeckTestTone`); 0 when silent.
+    test_tone_left: [u32; DECK_COUNT],
     /// Per-deck dub-siren **onboard echo** (PT2399, the GS1/Benidub chip). The
     /// siren is a self-contained instrument: its voices render into a scratch,
     /// pass through this echo, get the siren volume, and sum onto the bus
@@ -597,6 +610,7 @@ impl Engine {
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
             output_meter: [InputMeter::default(); DECK_COUNT],
+            test_tone_left: [0; DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -685,6 +699,7 @@ impl Engine {
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
             output_meter: [InputMeter::default(); DECK_COUNT],
+            test_tone_left: [0; DECK_COUNT],
             siren_echo: std::array::from_fn(|_| dub_dsp::Pt2399::new(sample_rate)),
             siren_echo_active: [false; DECK_COUNT],
             siren_volume: [1.0; DECK_COUNT],
@@ -964,6 +979,40 @@ impl Engine {
     /// whole bus below). A deck in echo out whose tail has died reads
     /// nothing here while its record plays on, which is the point.
     /// RT-safe: one pass of arithmetic and two relaxed stores.
+    /// Add what is left of deck `idx`'s routing test tone to its pair.
+    /// RT-safe: a sine per sample, no state but the countdown.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn render_test_tone(
+        &mut self,
+        idx: usize,
+        out: &mut [f32],
+        num_channels: usize,
+        first_us: usize,
+    ) {
+        if self.test_tone_left[idx] == 0 {
+            return;
+        }
+        let sr = self.sample_rate;
+        let total = (TEST_TONE_SECS * sr) as u32;
+        let fade = TEST_TONE_FADE_SECS * sr;
+        for frame in out.chunks_exact_mut(num_channels) {
+            let left = self.test_tone_left[idx];
+            if left == 0 {
+                break;
+            }
+            let t = (total - left) as f32;
+            let env = (t / fade).min(left as f32 / fade).min(1.0);
+            let s = (std::f32::consts::TAU * TEST_TONE_HZ * t / sr).sin() * TEST_TONE_LEVEL * env;
+            frame[first_us] += s;
+            frame[first_us + 1] += s;
+            self.test_tone_left[idx] = left - 1;
+        }
+    }
+
     fn meter_output(&mut self, idx: usize, out: &[f32], num_channels: usize, first_us: usize) {
         let mut level = crate::timecode::PassthroughLevel::default();
         for frame in out.chunks_exact(num_channels) {
@@ -1162,6 +1211,7 @@ impl Engine {
                 self.render_siren_into(idx, out, num_channels, first_us);
                 self.render_samplers_into(idx, out, num_channels, first_us);
             }
+            self.render_test_tone(idx, out, num_channels, first_us);
             self.meter_output(idx, out, num_channels, first_us);
         }
         self.sampler_shared.publish(&self.samplers);
@@ -2348,6 +2398,16 @@ impl Engine {
                     *o = false;
                 }
             }
+            Command::DeckTestTone { idx } => {
+                // Never on top of music: a pip into a playing deck's
+                // channel is a pip into the room.
+                let i = idx as usize;
+                if i < DECK_COUNT && !self.decks[i].is_playing() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let frames = (TEST_TONE_SECS * self.sample_rate) as u32;
+                    self.test_tone_left[i] = frames;
+                }
+            }
             Command::DeckCalibrateTimecode { idx } => {
                 if let Some(Some(input)) = self.timecode_inputs.get_mut(idx as usize) {
                     input.begin_calibration(CALIBRATION_FRAMES);
@@ -3028,6 +3088,60 @@ mod tests {
                 frame[3],
             );
         }
+    }
+
+    /// Preferences ▸ Audio's CLICK: a quarter-second 1 kHz tone on one
+    /// deck's pair and nowhere else, faded at both ends — the way a DJ
+    /// finds which mixer channel a deck lands on. Refused while the deck
+    /// plays, and allocation-free like the rest of the render.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_test_tone_lands_on_its_deck_pair_only() {
+        let sr = 48_000.0_f32;
+        let mut engine = Engine::new(sr, 256);
+        let mut rt = RealtimeContext::new();
+        engine.apply_command(Command::DeckTestTone { idx: 1 });
+        let mut out = vec![0.0_f32; 256 * 4];
+        let (mut peak_b, mut peak_a, mut sounding) = (0.0_f32, 0.0_f32, 0_usize);
+        let mut first_frame = None;
+        for _ in 0..80 {
+            out.fill(0.0);
+            assert_no_alloc::assert_no_alloc(|| {
+                engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            });
+            for frame in out.chunks_exact(4) {
+                peak_a = peak_a.max(frame[0].abs()).max(frame[1].abs());
+                peak_b = peak_b.max(frame[2].abs());
+                assert!(
+                    (frame[2] - frame[3]).abs() < 1e-7,
+                    "the tone is not on both sides"
+                );
+                if frame[2] != 0.0 {
+                    sounding += 1;
+                    first_frame.get_or_insert(frame[2]);
+                }
+            }
+        }
+        assert!(peak_a < 1e-9, "the tone leaked onto deck A's pair");
+        assert!((peak_b - TEST_TONE_LEVEL).abs() < 0.01, "peak {peak_b}");
+        let secs = sounding as f32 / sr;
+        assert!((secs - TEST_TONE_SECS).abs() < 0.01, "sounded {secs} s");
+        assert!(
+            first_frame.unwrap_or(1.0).abs() < 0.01,
+            "it starts with a click, not a fade"
+        );
+
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.0_f32; 48_000 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(1).set_source(track);
+        engine.deck_mut(1).set_playing(true);
+        engine.apply_command(Command::DeckTestTone { idx: 1 });
+        out.fill(0.0);
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+        assert!(
+            out.chunks_exact(4).all(|f| f[2] == 0.0),
+            "a test tone over a playing deck"
+        );
     }
 
     #[test]
@@ -4826,6 +4940,86 @@ mod tests {
         assert!(pos < 1100.0, "and not run away (got {pos})");
     }
 
+    /// The stage rescue (P-33): with the set playing on INT, the DJ puts
+    /// the new needle (or the new control record) down and recalibrates.
+    /// The capture measures the carrier while INT plays on untouched —
+    /// the calibration gate holds only a TC deck that has not started.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_needle_calibrates_while_int_plays_on() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 30 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Internal,
+        });
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut feed = |engine: &mut Engine, blocks: usize| {
+            for _ in 0..blocks {
+                gen.render(&mut sig, 1.0, 0.5);
+                assert_eq!(tx.push_slice(&sig), sig.len());
+                engine.render(&mut rt, &mut buf);
+            }
+        };
+        let input = |engine: &Engine| {
+            let i = engine.timecode_inputs[0].as_ref().expect("attached");
+            (i.is_calibrating(), i.is_calibrated())
+        };
+        let seq = |engine: &Engine| {
+            engine.timecode_inputs[0]
+                .as_ref()
+                .expect("attached")
+                .installed_whitening()
+                .1
+        };
+        feed(&mut engine, 750);
+        let before = seq(&engine);
+        engine.apply_command(Command::DeckCalibrateTimecode { idx: 0 });
+        let start = engine.deck(0).position_frames();
+        let mut measuring = false;
+        let mut blocks = 0_usize;
+        for _ in 0..1_500 {
+            feed(&mut engine, 1);
+            blocks += 1;
+            measuring |= input(&engine).0;
+            assert!(
+                engine.deck(0).is_playing(),
+                "INT stopped for the calibration"
+            );
+            assert_eq!(
+                engine.control_mode[0],
+                ControlMode::Internal,
+                "the calibration took the deck"
+            );
+            if measuring && input(&engine) == (false, true) {
+                break;
+            }
+        }
+        assert!(measuring, "the recalibration never ran");
+        assert_eq!(
+            input(&engine),
+            (false, true),
+            "the needle did not calibrate under INT"
+        );
+        assert_ne!(seq(&engine), before, "no new whitening installed");
+        // INT ran at unity through the capture: a frame of track per
+        // frame of time, not a stall or a jump.
+        let advanced = engine.deck(0).position_frames() - start;
+        let expected = (blocks * block) as f64;
+        assert!(
+            (advanced - expected).abs() < expected / (blocks as f64),
+            "INT moved {advanced} frames in {expected}"
+        );
+    }
+
     /// Rig, 2026-11-11: a THRU record decoded as timecode often enough to
     /// start the auto-calibration, which measured the music; back on TC
     /// the deck stuck at SETTLING PITCH 47 % until a manual Recalibrate.
@@ -5006,6 +5200,86 @@ mod tests {
         assert!(
             advanced > 0.5 * expected && advanced < 1.5 * expected,
             "post-exit advance {advanced} not ~{expected} (heal creep / stall on loop exit?)"
+        );
+    }
+
+    /// The stage rescue (P-33, Daniel 2026-11-15): something breaks, the
+    /// DJ switches to INT and the set plays on; the record stops under a
+    /// resting needle while he looks at it; he starts it again and hands
+    /// back to TC. The deck must carry on from where INT has it — the
+    /// groove and the playhead parted on purpose, and that is not drift.
+    /// The switch re-anchors the drift monitor for exactly this. Without
+    /// it the 2 s the platter stood still read as −1.9 s of lost motion —
+    /// under the 5 s fallback, with no lift or skid to re-anchor it — and
+    /// the heal would pull the track back at 1 % for minutes.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn int_back_to_tc_keeps_the_playhead_where_int_has_it() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let track =
+            Arc::new(Track::from_interleaved(vec![0.5_f32; 48_000 * 30 * 2], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+
+        let mut rt = RealtimeContext::new();
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(dub_timecode::Format::SeratoCv02, 0.4));
+        render_to_abs_lock(&mut engine, &mut tx, &mut gen, &mut rt, block);
+
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut buf = vec![0.0_f32; block * 2];
+        let secs = |s: f64| (s * f64::from(sr) / block as f64) as usize;
+        let mut run = |engine: &mut Engine,
+                       gen: &mut dub_timecode::signal::Generator,
+                       rate: f64,
+                       n: usize| {
+            for _ in 0..n {
+                gen.render(&mut sig, rate, 0.5);
+                assert_eq!(tx.push_slice(&sig), sig.len());
+                engine.render(&mut rt, &mut buf);
+            }
+        };
+        run(&mut engine, &mut gen, 1.0, secs(1.0));
+        assert!(
+            engine.deck(0).is_playing(),
+            "the platter never took the deck"
+        );
+
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Internal,
+        });
+        run(&mut engine, &mut gen, 0.0, secs(2.0));
+        run(&mut engine, &mut gen, 1.0, secs(1.0));
+        assert!(engine.deck(0).is_playing(), "INT stopped with the platter");
+
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        run(&mut engine, &mut gen, 1.0, secs(0.25));
+        let handed_back = engine.deck(0).position_frames();
+        run(&mut engine, &mut gen, 1.0, secs(2.0));
+        let advanced = (engine.deck(0).position_frames() - handed_back) / f64::from(sr);
+        let drift = engine.tc_drift[0].drift_secs();
+        assert!(
+            drift.abs() < 0.01,
+            "the INT spell read as {:.0} ms of drift",
+            drift * 1000.0
+        );
+        assert!(
+            (advanced - 2.0).abs() < 0.005,
+            "back on TC the deck moved {advanced:.4} s in 2 s — the heal is pulling it"
         );
     }
 

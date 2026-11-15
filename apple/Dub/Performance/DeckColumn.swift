@@ -151,6 +151,7 @@ struct DeckColumnHeader: Equatable {
     var thruTempo: ThruTempoReadout?
     var sourceControl: SourceControlStatus?
     var sourceControlOverridden: Bool
+    var timecodeReadiness: TimecodeReadiness
     /// Set while Quick Scratch has a sample on the deck: what is parked
     /// underneath and where it is. The identity block then shouts.
     var scratch: ScratchBadge?
@@ -177,6 +178,7 @@ struct DeckColumnHeader: Equatable {
         bpmLabel = state.bpmLabel
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
+        timecodeReadiness = state.timecodeReadiness
         self.scratch = scratch
         isMaster = state.isMaster
     }
@@ -548,6 +550,7 @@ struct DeckColumn<Overview: View>: View {
         // permanently in its "start" state.
         SourceControlView(
             status: state.header.sourceControl ?? .internalPlay,
+            readiness: state.header.timecodeReadiness,
             overridden: state.header.sourceControlOverridden,
             isPlaying: state.isPlaying,
             side: state.side,

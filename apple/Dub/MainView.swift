@@ -2082,6 +2082,7 @@ final class WaveformAppModel: ObservableObject {
     /// the 6-channel deck routing) must never silently redirect deck
     /// audio off the interface.
     private func openTimecodeCapture(on inputDevice: AudioDeviceInfo) {
+        applySavedRouting(for: inputDevice)
         let routing = engine.performanceRoutingFor(deviceName: inputDevice.name)
         let outputUID: String? = inputDevice.uid
         // Product behaviour is timecode (control vinyl drives the loaded
@@ -2133,9 +2134,82 @@ final class WaveformAppModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.engineStarts.finish(ticket) else { return }
                 self.commitTimecodeStart(result, routing: routing)
+                if case .success = result { self.pointAtAudioIfUnrouted(inputDevice) }
             }
         }
     }
+
+    // MARK: Routing an interface Dub does not know (FFI 87)
+
+    /// The interface Performance runs on.
+    var activeInterface: AudioDeviceInfo? { selectedInputDevice ?? performanceDevices.first }
+
+    /// The interface as `devices.toml` knows it; `nil` when the DJ routes it.
+    func knownInterface(_ device: AudioDeviceInfo) -> KnownInterfaceInfo? {
+        engine.knownInterface(deviceName: device.name)
+    }
+
+    /// The interface's input channel count. Reads the input scope, which
+    /// can raise the microphone prompt, so only while Performance runs —
+    /// by then the DJ has granted it.
+    func inputChannelCount(_ device: AudioDeviceInfo) -> UInt32 {
+        guard engineMode == .timecode, isRunning else { return 0 }
+        return engine.listAudioDevices().first(where: { $0.uid == device.uid })?.inputChannels ?? 0
+    }
+
+    /// The routing the engine is using for this interface now.
+    func currentRouting(_ device: AudioDeviceInfo) -> AudioRouting {
+        AudioRouting(engine.performanceRoutingFor(deviceName: device.name))
+    }
+
+    /// Whether this interface has a routing the DJ set.
+    func hasSavedRouting(_ device: AudioDeviceInfo) -> Bool {
+        AudioRoutingStore.load(device.name) != nil
+    }
+
+    /// Save the DJ's routing for an unknown interface (`nil` forgets it)
+    /// and reconnect it. Applying restarts the audio and empties the
+    /// decks, so it is refused while either deck plays; the sheet locks
+    /// the pickers then.
+    func setAudioRouting(_ routing: AudioRouting?, for device: AudioDeviceInfo) {
+        guard !deckA.isPlaying, !deckB.isPlaying, knownInterface(device) == nil else { return }
+        let ffi = routing?.ffi(outputChannels: device.outputChannels)
+        do {
+            try engine.setRoutingOverride(deviceName: device.name, routing: ffi)
+        } catch {
+            surfaceError("That routing cannot open on \(device.name).")
+            return
+        }
+        AudioRoutingStore.save(routing, for: device.name)
+        if engineMode == .timecode { applyConfig() }
+    }
+
+    /// A quarter second of 1 kHz on a deck's pair — which mixer channel
+    /// lights? The engine ignores it while the deck plays.
+    func testTone(_ side: DeckSide) {
+        try? engine.testTone(deckIdx: side.ffiDeckIdx)
+    }
+
+    /// Before a start: the DJ's routing for an interface Dub does not
+    /// know. A known interface keeps its shipped map.
+    private func applySavedRouting(for device: AudioDeviceInfo) {
+        guard knownInterface(device) == nil, let saved = AudioRoutingStore.load(device.name) else { return }
+        try? engine.setRoutingOverride(
+            deviceName: device.name, routing: saved.ffi(outputChannels: device.outputChannels))
+    }
+
+    /// An unknown interface nobody has routed runs one deck on inputs
+    /// 1 – 2; say where to change that, once a launch, quietly.
+    private func pointAtAudioIfUnrouted(_ device: AudioDeviceInfo) {
+        guard knownInterface(device) == nil, !hasSavedRouting(device),
+            !pointedAtAudio.contains(device.name)
+        else { return }
+        pointedAtAudio.insert(device.name)
+        surfaceNotice(
+            "Dub doesn't know \(device.name) yet: one deck on inputs 1 – 2. Set its channels in Preferences ▸ Audio.")
+    }
+
+    private var pointedAtAudio: Set<String> = []
 
     /// The main-thread half of `openTimecodeCapture`.
     private func commitTimecodeStart(_ result: Result<Void, Error>, routing: PerformanceRouting) {

@@ -12,7 +12,11 @@
 //  - DUB FX — the deck is the outboard rack on the mixer's send (F-38);
 //    only drawn once the channel is enabled in Preferences.
 //
-//  The small ↻ (shown on TC) recalibrates the needle.
+//  The small ↻ recalibrates the needle — on TC, and on INT too: the
+//  stage rescue (P-33, 2026-11-15) is INT to save the set, a new needle
+//  or control record, calibrate it while INT plays, then TC by hand.
+//  While INT runs over a timecode input, a lamp in the TC segment says
+//  whether the record under it is ready to take the deck back.
 //
 
 import SwiftUI
@@ -30,9 +34,31 @@ enum SourceControlStatus: Equatable {
     case fx           // the DUB FX channel: the rack on the mixer's send
 }
 
+/// While INT plays over a timecode input: can the record take the deck
+/// back? Pure, so the rule is tested (`SourceControlReadinessTests`).
+enum TimecodeReadiness: Equatable {
+    /// Not on INT, or no carrier worth naming: no lamp.
+    case none
+    /// A calibration is measuring the needle.
+    case measuring
+    /// Calibrated and cleanly locked: TC picks the deck up where INT
+    /// has it.
+    case ready
+
+    static func of(status: SourceControlStatus?, calibrating: Bool, calibrated: Bool, lockState: UInt8)
+        -> Self
+    {
+        guard status == .internalPlay else { return .none }
+        if calibrating { return .measuring }
+        return calibrated && lockState == 1 ? .ready : .none
+    }
+}
+
 struct SourceControlView: View {
 
     let status: SourceControlStatus
+    /// The TC segment's lamp while INT runs (`TimecodeReadiness`).
+    var readiness: TimecodeReadiness = .none
     /// Retained for call-site compatibility; the explicit switch no
     /// longer distinguishes "pinned" from "auto" (every mode is pinned).
     var overridden: Bool = false
@@ -67,7 +93,7 @@ struct SourceControlView: View {
             // shows ▶ to start internal playback and ⏸ while playing.
             HStack(spacing: 0) {
                 intSegment
-                segment("TC", active: isTimecodeActive, action: onTimecode)
+                segment("TC", active: isTimecodeActive, lamp: tcLamp, action: onTimecode)
                 segment("THRU", active: isThruActive, action: onThru)
                 if showFx {
                     segment("DUB FX", active: status == .fx, action: onFx)
@@ -77,14 +103,16 @@ struct SourceControlView: View {
             .clipShape(Capsule())
             .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
 
-            if status == .timecode || status == .calibrating {
+            if Self.offersRecalibrate(status) {
                 Button(action: onRecalibrate) {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DubColor.textSecondary)
                 }
                 .buttonStyle(.plain)
-                .help("Recalibrate this needle")
+                .help(status == .internalPlay
+                    ? "Calibrate the needle while INT plays on"
+                    : "Recalibrate this needle")
             }
         }
     }
@@ -116,26 +144,57 @@ struct SourceControlView: View {
             .help(playingInternally ? "Pause" : "Play internally")
     }
 
-    private func segment(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+    private func segment(
+        _ title: String, active: Bool, lamp: Color? = nil, action: @escaping () -> Void
+    ) -> some View {
         Text(title)
             .font(DubFont.caps)
             .tracking(0.6)
             .foregroundStyle(active ? DubColor.surface0 : DubColor.textSecondary)
             .padding(.horizontal, DubSpacing.sm)
             .padding(.vertical, 3)
+            // In the segment's own leading padding: the lamp coming and
+            // going must not move THRU or re-lay-out the column.
+            .overlay(alignment: .leading) {
+                if let lamp {
+                    Circle().fill(lamp).frame(width: 5, height: 5).padding(.leading, 2)
+                }
+            }
             .background(active ? DubColor.controlAccent : Color.clear)
-            .onPressDown(perform: action)
-            .accessibilityAddTraits(.isButton)
+        .onPressDown(perform: action)
+        .accessibilityAddTraits(.isButton)
     }
 
     private var isTimecodeActive: Bool { status == .timecode || status == .calibrating }
     private var isThruActive: Bool { status == .thru }
+
+    /// Green: the record is calibrated and locked, TC takes the deck back
+    /// where INT has it. Amber: the needle is being measured.
+    private var tcLamp: Color? {
+        switch readiness {
+        case .none: return nil
+        case .measuring: return DubColor.stateTentative
+        case .ready: return DubColor.stateLocked
+        }
+    }
+
+    /// TC and INT — INT is where a needle is calibrated mid-set. Never
+    /// THRU or DUB FX: those inputs are not timecode, and the engine
+    /// refuses to measure them.
+    static func offersRecalibrate(_ status: SourceControlStatus) -> Bool {
+        switch status {
+        case .timecode, .calibrating, .internalPlay: return true
+        case .off, .thru, .fx: return false
+        }
+    }
 
 }
 
 #Preview("Source control — states") {
     VStack(alignment: .leading, spacing: 12) {
         SourceControlView(status: .internalPlay)
+        SourceControlView(status: .internalPlay, readiness: .measuring, isPlaying: true)
+        SourceControlView(status: .internalPlay, readiness: .ready, isPlaying: true)
         SourceControlView(status: .calibrating)
         SourceControlView(status: .timecode)
         SourceControlView(status: .thru)

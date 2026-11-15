@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -550,7 +551,14 @@ pub use rip::{
 ///       `output_routed` says whether the deck has a pair at all — the
 ///       gutter's A / B meters, so a DJ can see whether anything is going
 ///       to the mixer.
-pub const FFI_VERSION: u32 = 86;
+///   87. **The DJ routes an interface Dub does not know.**
+///       [`DubEngine::set_routing_override`] sets (or forgets) each deck's
+///       input and output pair for a device by name; it wins in
+///       [`DubEngine::performance_routing_for`] and at every start.
+///       [`DubEngine::known_interface`] says whether `devices.toml` has
+///       the device, and [`DubEngine::test_tone`] puts a quarter second of
+///       1 kHz on a deck's pair — Preferences ▸ Audio.
+pub const FFI_VERSION: u32 = 87;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -716,6 +724,10 @@ pub struct DubEngine {
     /// Each deck's THRU beat follower, behind its own lock: the waveform
     /// asks a few times a second, off the audio thread.
     thru_follow: [Mutex<ThruFollow>; 2],
+    /// Routing the DJ set for an interface Dub has no map for, by device
+    /// name (Preferences ▸ Audio). Wins over the registry in
+    /// [`Self::performance_routing_for`] and at every start.
+    routing_overrides: Mutex<HashMap<String, PerformanceRouting>>,
 }
 
 /// Internal state machine for the engine.
@@ -1276,6 +1288,22 @@ impl DubEngine {
     }
 }
 
+impl DubEngine {
+    /// The routing a start uses: the DJ's for this device when set, else
+    /// the registry's.
+    fn routing_info(&self, device_name: &str) -> dub_audio::PerformanceRouting {
+        let set = self
+            .routing_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(device_name)
+            .map(PerformanceRouting::to_audio);
+        set.unwrap_or_else(|| {
+            dub_audio::DeviceRegistry::embedded().performance_routing(device_name)
+        })
+    }
+}
+
 #[uniffi::export]
 impl DubEngine {
     /// Construct a fresh engine handle. The audio system is not
@@ -1292,6 +1320,7 @@ impl DubEngine {
                 Arc::new(DeckSharedState::new()),
             ]),
             thru_follow: [Mutex::default(), Mutex::default()],
+            routing_overrides: Mutex::default(),
         })
     }
 
@@ -1390,9 +1419,71 @@ impl DubEngine {
     /// Pure registry lookup; touches no HAL and is always safe to call.
     #[must_use]
     pub fn performance_routing_for(&self, device_name: String) -> PerformanceRouting {
-        PerformanceRouting::from_audio(
-            dub_audio::DeviceRegistry::embedded().performance_routing(&device_name),
-        )
+        PerformanceRouting::from_audio(self.routing_info(&device_name))
+    }
+
+    /// Set the routing for an interface Dub has no map for (Preferences ▸
+    /// Audio), or `None` to forget it. Applies from the next start; the
+    /// shell restarts the engine. Refused when a pair is malformed, two
+    /// decks share an input or an output pair, or an output pair runs
+    /// past `output_channels`. Whether the pairs exist on the device is
+    /// the shell's to check against its channel counts.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidChannels`] with the offending channels.
+    pub fn set_routing_override(
+        &self,
+        device_name: String,
+        routing: Option<PerformanceRouting>,
+    ) -> Result<(), EngineError> {
+        let mut map = self
+            .routing_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match routing {
+            None => {
+                map.remove(&device_name);
+            }
+            Some(r) => {
+                r.validate()?;
+                map.insert(device_name, r);
+            }
+        }
+        Ok(())
+    }
+
+    /// The interface as `devices.toml` knows it, or `None` when Dub has
+    /// no map for it and the DJ sets the routing.
+    #[must_use]
+    pub fn known_interface(&self, device_name: String) -> Option<KnownInterfaceInfo> {
+        dub_audio::DeviceRegistry::embedded()
+            .match_interface(&device_name)
+            .map(|k| KnownInterfaceInfo {
+                display_name: k.display_name.clone(),
+                verified: k.verified,
+            })
+    }
+
+    /// Play the routing test tone — a quarter second of 1 kHz at −12
+    /// dBFS — on `deck_idx`'s output pair, so the DJ sees which mixer
+    /// channel lights. The engine ignores it while that deck plays.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotRunning`] when no session is up;
+    /// [`EngineError::InvalidDeck`] for a bad index.
+    pub fn test_tone(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .test_tone()
+            .map_err(map_command_error)
     }
 
     /// Return `true` iff at least one external audio interface
@@ -1460,8 +1551,10 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
+        let routing = self.routing_info(&device_name);
         let running = start_thru_inner(
             &device_name,
+            routing,
             &channels,
             None,
             output_device_uid.as_deref(),
@@ -1519,8 +1612,10 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(combined));
         }
 
+        let routing = self.routing_info(&device_name);
         let running = start_thru_inner(
             &device_name,
+            routing,
             &channels_a,
             Some(&channels_b),
             output_device_uid.as_deref(),
@@ -1565,8 +1660,10 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
+        let routing = self.routing_info(&device_name);
         let running = start_thru_inner(
             &device_name,
+            routing,
             &channels,
             None,
             output_device_uid.as_deref(),
@@ -1623,8 +1720,10 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(combined));
         }
 
+        let routing = self.routing_info(&device_name);
         let running = start_thru_inner(
             &device_name,
+            routing,
             &channels_a,
             Some(&channels_b),
             output_device_uid.as_deref(),
@@ -5432,7 +5531,58 @@ pub struct PerformanceRouting {
     pub two_deck: bool,
 }
 
+/// An interface Dub ships a channel map for (`devices.toml`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KnownInterfaceInfo {
+    /// The name Dub shows for it, e.g. `"Serato SL 3"`.
+    pub display_name: String,
+    /// Played on, end to end; an unverified map is a best guess.
+    pub verified: bool,
+}
+
 impl PerformanceRouting {
+    fn first_of(pair: &[u32]) -> Result<u32, EngineError> {
+        match pair {
+            [a, b] if *a >= 1 && *b == *a + 1 => Ok(*a),
+            _ => Err(EngineError::InvalidChannels(pair.to_vec())),
+        }
+    }
+
+    /// A routing a start can open: whole adjacent pairs, outputs inside
+    /// the channel count, and with two decks no pair shared.
+    fn validate(&self) -> Result<(), EngineError> {
+        let a_in = Self::first_of(&self.deck_a_input)?;
+        let out_err = |first: u32| EngineError::InvalidChannels(vec![first, first + 1]);
+        for first in [self.deck_a_output_first, self.deck_b_output_first] {
+            if first < 1 || first + 1 > self.output_channels {
+                return Err(out_err(first));
+            }
+        }
+        if self.two_deck {
+            let b_in = Self::first_of(&self.deck_b_input)?;
+            if a_in.abs_diff(b_in) < 2 {
+                let mut both = self.deck_a_input.clone();
+                both.extend(&self.deck_b_input);
+                return Err(EngineError::InvalidChannels(both));
+            }
+            if self.deck_a_output_first.abs_diff(self.deck_b_output_first) < 2 {
+                return Err(out_err(self.deck_b_output_first));
+            }
+        }
+        Ok(())
+    }
+
+    fn to_audio(&self) -> dub_audio::PerformanceRouting {
+        dub_audio::PerformanceRouting {
+            deck_a_input_first: self.deck_a_input.first().copied().unwrap_or(1),
+            deck_b_input_first: self.deck_b_input.first().copied().unwrap_or(3),
+            output_channels: self.output_channels,
+            deck_a_output_first: self.deck_a_output_first,
+            deck_b_output_first: self.deck_b_output_first,
+            two_deck: self.two_deck,
+        }
+    }
+
     fn from_audio(r: dub_audio::PerformanceRouting) -> Self {
         Self {
             deck_a_input: vec![r.deck_a_input_first, r.deck_a_input_first + 1],
@@ -6196,8 +6346,13 @@ enum PerfSource {
 /// Pulled out of `start_thru` so the `Mutex` guard stays narrow:
 /// this function never touches `self.state`, only the audio
 /// subsystem.
+// Eight because the routing is resolved by the caller, which holds the
+// overrides; every argument is one decision about the session, and a
+// struct around them would only rename the list.
+#[allow(clippy::too_many_arguments)]
 fn start_thru_inner(
     device_name: &str,
+    routing_info: dub_audio::PerformanceRouting,
     channels_a: &[u32],
     channels_b: Option<&[u32]>,
     output_device_uid: Option<&str>,
@@ -6272,7 +6427,6 @@ fn start_thru_inner(
     // by the input device name (the interface). Single-deck Thru and
     // unknown / heuristic-only devices fall back to the 2-channel
     // internal-mixer sum so the dev rig (built-in output) still works.
-    let routing_info = dub_audio::DeviceRegistry::embedded().performance_routing(device_name);
     let (output_channels, output_routing): (u32, dub_engine::OutputRouting) =
         if channels_b.is_some() && routing_info.two_deck && routing_info.output_channels >= 4 {
             (
@@ -6927,7 +7081,93 @@ mod tests {
         // 83→84: `set_following_grid`, `deck_local_bpm`, `sampler_waveform`.
         // 84→85: `deck_scope`; a timecode deck meters its input.
         // 85→86: `DeckTelemetry.output_peak` / `output_routed`.
-        assert_eq!(FFI_VERSION, 86);
+        // 86→87: `set_routing_override` / `known_interface` / `test_tone`.
+        assert_eq!(FFI_VERSION, 87);
+    }
+
+    fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
+        PerformanceRouting {
+            deck_a_input: vec![a_in, a_in + 1],
+            deck_b_input: vec![b_in, b_in + 1],
+            output_channels: outs,
+            deck_a_output_first: a_out,
+            deck_b_output_first: b_out,
+            two_deck: true,
+        }
+    }
+
+    /// An interface Dub has no map for gets one deck on 1+2 and a summed
+    /// output — until the DJ routes it; then the DJ's routing is what a
+    /// start uses, and forgetting it brings the fallback back.
+    #[test]
+    fn the_djs_routing_wins_for_its_device_and_only_that_one() {
+        let engine = DubEngine::new();
+        let dev = "UMC404HD 192k".to_string();
+        assert!(!engine.performance_routing_for(dev.clone()).two_deck);
+        assert!(engine.known_interface(dev.clone()).is_none());
+
+        engine
+            .set_routing_override(dev.clone(), Some(routing(1, 3, 1, 3, 4)))
+            .expect("a good routing");
+        let r = engine.performance_routing_for(dev.clone());
+        assert!(r.two_deck);
+        assert_eq!((r.deck_a_input, r.deck_b_input), (vec![1, 2], vec![3, 4]));
+        assert_eq!(
+            (
+                r.deck_a_output_first,
+                r.deck_b_output_first,
+                r.output_channels
+            ),
+            (1, 3, 4)
+        );
+        assert!(!engine.performance_routing_for("Other Box".into()).two_deck);
+
+        engine
+            .set_routing_override(dev.clone(), None)
+            .expect("forget");
+        assert!(!engine.performance_routing_for(dev).two_deck);
+    }
+
+    #[test]
+    fn a_routing_that_cannot_open_is_refused() {
+        let engine = DubEngine::new();
+        let set = |r| engine.set_routing_override("Box".into(), Some(r));
+        assert!(
+            set(routing(1, 1, 1, 3, 4)).is_err(),
+            "two decks on one input pair"
+        );
+        assert!(
+            set(routing(1, 2, 1, 3, 4)).is_err(),
+            "input pairs overlapping"
+        );
+        assert!(
+            set(routing(1, 3, 1, 1, 4)).is_err(),
+            "two decks on one output pair"
+        );
+        assert!(
+            set(routing(1, 3, 1, 4, 4)).is_err(),
+            "an output pair past the last channel"
+        );
+        assert!(set(routing(0, 3, 1, 3, 4)).is_err(), "channel 0");
+        let mut split = routing(1, 3, 1, 3, 4);
+        split.deck_a_input = vec![1, 3];
+        assert!(set(split).is_err(), "a pair that is not two neighbours");
+        let mut one = routing(1, 1, 1, 1, 2);
+        one.two_deck = false;
+        assert!(set(one).is_ok(), "one deck on a stereo box");
+    }
+
+    #[test]
+    fn the_sl3_is_known_and_tested() {
+        let engine = DubEngine::new();
+        let k = engine
+            .known_interface("SL 3".into())
+            .expect("in devices.toml");
+        assert!(k.verified);
+        assert!(
+            engine.test_tone(0).is_err(),
+            "a tone with no engine running"
+        );
     }
 
     /// Off THRU — or with no engine — there is no record and no phase.

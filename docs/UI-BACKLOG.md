@@ -179,7 +179,20 @@ Trivial follow-up; can land with the next library-related PR.
 
 ---
 
-### C-30. RT-thread audit doesn't cover the new SwiftUI render path
+### C-30. RT-thread audit doesn't cover the new SwiftUI render path — **done**
+
+**Done 2026-11-15** — as a test rather than an Instruments session, so the
+baseline is checked on every push: `PollAllocationTests` counts main-thread
+allocations through `malloc_logger` (Rust's and Swift's alike) for each
+engine read the polls make and for the polls themselves. Per call, Debug /
+Release: `positionSnapshot` 11 / 6, `deckTelemetry` 33 / 8,
+`peaksGeneration` 5 / 0, `thruTempo` 9 / 4, `samplerTelemetry` 52 / 7 — the
+UniFFI record lift (a `RustBuffer`, its `Data`, any array inside). Per
+second: the model's 10 Hz deck poll 1 860 / 510, the output meters' 30 Hz
+read 2 160 / 510. About a thousand small blocks a second in Release, a
+fraction of a millisecond of malloc — nothing to fix, and now a regression
+shows. The cheapest cut if one is ever wanted: several readers take the whole
+`DeckTelemetry` (with its `whitening` array) for one field.
 
 The RT-thread auditor walks the engine's audio callback. The
 30 Hz UI poll lives on the main actor and is therefore RT-safe by
@@ -266,6 +279,13 @@ What shipped in this round (for context, not action):
 
 ### P-32. End-zone auto-internal needs absolute-position decoding (M6)
 
+_Approach agreed 2026-11-15 (Daniel): the end zone is a locked groove, so
+the decoded absolute position repeats — it jumps back one revolution
+(~1.8 s at 33⅓) every turn while the platter runs at speed. A lift never
+does that. Detect the repeat, then go INT. First a real SL 3 capture
+running from play into the end zone (`testdata/timecode/`), so it is
+built and tested offline before the rig._
+
 The intended behaviour is: when the timecode runs into the control
 record's end zone (the lead-out / indefinite loop area), the deck
 auto-switches to internal play so the track keeps going; the operator
@@ -288,7 +308,39 @@ operator presses internal Play to continue past the end zone.
 
 ---
 
-### P-33. Cannot switch to internal play while timecode is actively running
+### P-33. Cannot switch to internal play while timecode is actively running — **done**
+
+**Done 2026-11-15, not yet on the rig.** The engine already did both
+halves; they are pinned now: `int_back_to_tc_keeps_the_playhead_where_int_has_it`
+(INT, the platter stopped 2 s under a resting needle, back to TC — no
+drift, no heal; it reads −1.9 s of drift if the `DeckSetControlMode`
+re-anchor is taken out) and `a_needle_calibrates_while_int_plays_on`.
+Gap (2) below was wrong: the command path re-anchors the monitor
+(`lib.rs`, `DeckSetControlMode`). The app half: ↻ Recalibrate is on INT
+as well as TC (`SourceControlView.offersRecalibrate`), and while INT plays
+over a timecode input the TC segment carries a lamp — amber while the
+needle is measured, green once the record is calibrated and locked
+(`TimecodeReadiness`, `SourceControlReadinessTests`). The lamp sits in the
+segment's own padding, so it never moves the switch.
+
+**Decided 2026-11-15 (Daniel): INT latches.** The stage rescue: something
+breaks mid-set, the DJ switches to INT and the set carries on; he fixes the
+needle or swaps the control record; he **calibrates while INT still plays**;
+then he presses TC himself and the deck carries on under the platter
+**without a dropped beat**. A clean carrier never takes the deck back on
+its own. Where the code stands (checked the same day): the INT·TC·THRU
+switch already latches INT and keeps the platter's pitch
+(`set_deck_control_mode`), and timecode advances the playhead by groove
+distance, so TC picks up from where INT is. Missing: (1) Recalibrate is
+offered only while the switch is on TC (`SourceControlView`), so the
+needle cannot be calibrated under INT; (2) INT chosen *by the switch*
+does not re-anchor the drift monitor (`tc_drift.note_remap`, which the
+Play button path does), so back on TC an offset under
+`FALLBACK_REMAP_SECS` (5 s) with no lift would be "healed" — slewed
+toward the groove — instead of kept; (3) a test that runs INT → TC with
+the playhead and groove apart and asserts the playhead does not move.
+
+The text below is the item as first written (2026-06), before the switch.
 
 While the control vinyl is driving the deck, the deck Play button does
 not let the operator switch to internal play. Today they have to lift
@@ -312,7 +364,12 @@ enablement/labeling in timecode mode), `apple/Dub/MainView.swift`
 
 ---
 
-### P-34. Performance source pill is not self-explanatory
+### P-34. Performance source pill is not self-explanatory — **closed, folded into P-33**
+
+_2026-11-15: the INT·TC·THRU switch now names the source and carries the
+lock dot. What is left — while INT is lit, the TC segment shows whether
+the record under it is locked, so the DJ knows the hand-back is safe —
+is part of P-33's stage rescue._
 
 The deck-header source pill currently reads "FILE", and the dropout
 state surfaces as "TC HOLD"; neither communicates the actual deck state
@@ -417,6 +474,9 @@ for a different program without touching the chip tables.
 **Location**: `crates/dub-dsp/src/{hk628,siren,sn76477}.rs`.
 
 ### F-37. Siren Expert panel needs a home on the box
+
+_Delayed 2026-11-15 (Daniel): its switch belongs in Preferences, and the
+panel needs a full UI design first._
 
 _Narrowed 2026-09-15: the "deck B" half is moot — the siren is one box on the
 global bar, firing the deck its `→` pill names, so there is no per-deck panel
@@ -688,15 +748,13 @@ _One line each; full write-ups are in git history. Kept so a reopened symptom is
   closed context.
 * M11d.8 "Polish & First-Run" also closed U-12, U-16, U-19, U-20,
   U-22 (UX truthfulness sweep) and U-23 (first-run onboarding).
-  Remaining open UX items (U-14, U-15, U-17, U-18, U-21) are
-  non-blocking and can ride along with the next library PR.
+  U-14, U-15, U-17, U-18 and U-21 have since been done too.
 * The beat-grid cluster (B-11 octave, U-18 grid jitter, U-19
   tap-to-grid) has shipped / closed. Further automatic octave gains
   are gated on a learned beat tracker — see
   `BPM-DETECTOR-V2-INVESTIGATION.md`, not a heuristic-tuning task here.
 * C-24 / C-25 (`FileBrowserView` + `LibraryPlaceholder` dead code) are
-  deleted. The remaining open code-health items (C-27, C-28, C-30, C-31)
-  are non-blocking and should ride along with the next library PR.
+  deleted. C-27, C-28, C-30 and C-31 are done or closed.
 * The UX bucket can land alongside M11d-columns — most
   items are surface-level copy or layout tweaks.
 * Code-health items are not blocking but should be ticked off

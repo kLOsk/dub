@@ -1627,6 +1627,16 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckCalibrateTimecode { idx })
     }
 
+    /// Play the routing test tone on this deck's output pair, unless the
+    /// deck is playing.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn test_tone(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckTestTone { idx })
+    }
+
     /// Hot-load a track onto this deck while the engine is running.
     ///
     /// Auto-drains the trash channel before sending so the user never

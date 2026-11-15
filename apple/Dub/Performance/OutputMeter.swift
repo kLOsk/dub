@@ -113,7 +113,7 @@ struct OutputMeterPair: NSViewRepresentable {
         configure(v)
     }
 
-    private func configure(_ v: OutputMeterPairView) {
+    func configure(_ v: OutputMeterPairView) {
         guard let engine else {
             v.read = { [OutputMeterReading.of(peak: 0, routed: false, echoEngaged: false), .of(peak: 0, routed: false, echoEngaged: false)] }
             return

@@ -335,6 +335,10 @@ pub enum Command {
     /// timecode input is attached.
     DeckCalibrateTimecode { idx: u8 },
 
+    /// Play the routing test tone on deck `idx`'s output pair (Preferences
+    /// ▸ Audio): which mixer channel lights? Refused while the deck plays.
+    DeckTestTone { idx: u8 },
+
     /// Load a new track on deck `idx`. The `Arc<Track>` is sent by value;
     /// the engine swaps it onto the deck on the audio thread without
     /// dropping the previous `Arc` — that goes back through the trash
@@ -733,6 +737,7 @@ impl std::fmt::Debug for Command {
                 .debug_struct("DeckCalibrateTimecode")
                 .field("idx", idx)
                 .finish(),
+            Self::DeckTestTone { idx } => f.debug_struct("DeckTestTone").field("idx", idx).finish(),
             Self::DeckLoad { idx, gain, .. } => f
                 .debug_struct("DeckLoad")
                 .field("idx", idx)

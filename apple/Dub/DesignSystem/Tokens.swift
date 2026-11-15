@@ -452,9 +452,9 @@ enum DubLayout {
 
     /// The global rack bar (siren · sampler), which replaces the old
     /// placeholder FX bar. Sized by its tallest block,
-    /// the sampler, which is the same two-row shelf Prep draws: 12 top
-    /// padding + the 14 pt heading + 8 + `prepSectionContent` (two 42 pt
-    /// rows and a 4 pt gap) + 12 bottom = 134. Derived rather than typed
+    /// the sampler's two-row shelf: 12 top padding + the 14 pt heading +
+    /// 8 + `rackSectionContent` (two 34 pt rows and a 4 pt gap) + 12
+    /// bottom = 118 (134 with Prep's 42 pt rows, until 2026-11-15). Derived rather than typed
     /// so it moves with the shelf; `test_rackBar_fitsItsHeightToken`
     /// holds it. The siren row sits at the top of the extra height,
     /// which is where the eye already reads it.
@@ -474,7 +474,7 @@ enum DubLayout {
     static let rackSectionContent: CGFloat = rackPadHeight * 2 + DubSpacing.xs
 
     /// The rack bar folded away: one line — a chevron and the blocks'
-    /// names — so it can be found and opened again. The 113 pt it gives
+    /// names — so it can be found and opened again. The 96 pt it gives
     /// up go to the library (`DeckLibrarySplit`), not the waveform:
     /// folding is "I am browsing now", and the decks do not move.
     static let rackBarFoldedHeight: CGFloat = 22

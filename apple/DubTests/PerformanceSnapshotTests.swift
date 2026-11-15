@@ -514,9 +514,13 @@ final class PerformanceSnapshotTests: XCTestCase {
             ForEach(0..<states.count, id: \.self) { i in
                 SourceControlView(status: states[i].0, overridden: states[i].1)
             }
+            // The stage rescue (P-33): INT playing over a needle being
+            // measured, then over a record ready to take the deck back.
+            SourceControlView(status: .internalPlay, readiness: .measuring, isPlaying: true)
+            SourceControlView(status: .internalPlay, readiness: .ready, isPlaying: true)
         }
         .padding()
-        snap(deckBg(stack), width: 440, height: 260, named: "source-control-states")
+        snap(deckBg(stack), width: 440, height: 320, named: "source-control-states")
     }
 
     // MARK: - Waveform zoom control

@@ -747,8 +747,10 @@ impl DubEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
+        let routing = self.routing_info(&device_name);
         let running = crate::start_thru_inner(
             &device_name,
+            routing,
             &channels,
             None,
             output_device_uid.as_deref(),

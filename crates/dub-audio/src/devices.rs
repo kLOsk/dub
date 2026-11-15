@@ -52,9 +52,12 @@
 //! actually uses and (in our testing across the dev rig and the user's
 //! real machine) nothing else. When a borderline device shows up that
 //! the heuristic gets wrong, the registry's allowlist (`[[interface]]`
-//! in `devices.toml`) is the correction path — no UI toggle, no
-//! recompile-and-ship; a single-file PR with the new entry plus its
-//! per-deck channel map.
+//! in `devices.toml`) is the correction path for everyone — a
+//! single-file PR with the new entry plus its per-deck channel map. For
+//! the DJ with the box in front of them it is Preferences ▸ Audio
+//! (2026-11-15): an interface the registry does not know gets its
+//! pairs set there, and `dub_ffi`'s `set_routing_override` hands them to
+//! every start. Two shipped maps cannot cover the interfaces DJs own.
 
 use serde::Deserialize;
 use std::sync::OnceLock;

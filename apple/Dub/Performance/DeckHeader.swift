@@ -131,6 +131,10 @@ struct DeckHeaderState: Equatable {
     /// switch. `var` default so existing `from(...)` call sites compile.
     var sourceControlOverridden: Bool = false
 
+    /// While INT plays over a timecode input, whether the record under it
+    /// can take the deck back (P-33) — the TC segment's lamp.
+    var timecodeReadiness: TimecodeReadiness = .none
+
     /// M11c.2. Canonical Camelot key of the loaded library track
     /// (e.g. `"8B"` for C major). `nil` when no track is loaded,
     /// when key analysis returned zero confidence, **or** when the
@@ -535,7 +539,8 @@ struct DeckHeader: View {
     private var sourceSwitchView: some View {
         if let sc = state.sourceControl {
             SourceControlView(
-                status: sc, overridden: state.sourceControlOverridden,
+                status: sc, readiness: state.timecodeReadiness,
+                overridden: state.sourceControlOverridden,
                 isPlaying: state.isPlaying, side: side,
                 onInternal: { callbacks.onSetInternal?() },
                 onPause: { callbacks.onPause() },
@@ -1367,6 +1372,12 @@ extension DeckHeaderState {
         }
     }
 
+    static func timecodeReadiness(from d: DeckState) -> TimecodeReadiness {
+        .of(
+            status: sourceControl(from: d), calibrating: d.calibrating,
+            calibrated: d.calibrated, lockState: d.timecodeLockState)
+    }
+
     static func from(
         side: DeckSide,
         deckState: DeckState,
@@ -1464,6 +1475,7 @@ extension DeckHeaderState {
                 gridDriftQuality: deckState.gridDriftQuality,
                 historyHint: deckState.historyHint)
             header.followingGrid = deckState.localBpm != nil
+            header.timecodeReadiness = Self.timecodeReadiness(from: deckState)
             return header
         }
 

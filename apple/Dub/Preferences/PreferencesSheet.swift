@@ -7,9 +7,11 @@
 //  Plug in a DJ interface and the app runs Performance mode with the
 //  deck channels pulled from `devices.toml`; with no interface it runs
 //  Track Preparation on the built-in output; hot-plugging switches
-//  live. There is therefore NO Prep/Performance switch, no input
-//  picker, and no channel fields in a shipping build — the Audio tab
-//  is a read-only status line.
+//  live. There is therefore NO Prep/Performance switch and no input
+//  picker. The one exception to "the registry decides the channels"
+//  is an interface `devices.toml` does not know: the Audio tab lets the
+//  DJ pick its pairs (2026-11-15, FFI 87) — two shipped maps cannot
+//  cover the interfaces DJs actually own.
 //
 //  Seven tabs down the left, one per thing the DJ is configuring — AUDIO
 //  · DECKS · FX · LIBRARY · VINYL · KEYS · ALPHA — the shape of Traktor's
@@ -63,7 +65,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
     /// One line under the tab's title: what the tab decides.
     var intro: String {
         switch self {
-        case .audio: return "What the hardware decided. Dub configures audio from the interface you plug in."
+        case .audio: return "Where each deck comes in and goes out. Dub sets this up from the interface you plug in."
         case .decks: return "How a deck behaves when a track lands on it."
         case .fx: return "The dub instruments on the surface."
         case .library: return "The DJ apps whose libraries Dub reads into your one collection."
@@ -187,20 +189,22 @@ struct PreferencesSheet: View {
         }
     }
 
-    // MARK: - Audio (read-only)
+    // MARK: - Audio
 
-    /// Read-only summary of what the engine auto-selected. There is no
-    /// control here on purpose: the hardware decides the mode and the
-    /// registry decides the channels.
+    /// The hardware still decides the mode. In Performance the interface
+    /// and its routing: read-only for a box `devices.toml` knows, set by
+    /// the DJ for any other (`AudioRoutingSection`, FFI 87).
     private var audioTab: some View {
         VStack(alignment: .leading, spacing: DubSpacing.xl) {
-            group("Now") {
-                statusRow(label: "Mode", value: model.engineMode.displayName)
-                statusRow(label: "Device", value: currentDeviceLabel)
-                if model.engineMode == .timecode {
-                    statusRow(label: "Decks", value: currentChannelLabel)
+            if model.engineMode == .timecode, model.isRunning, let device = model.activeInterface {
+                AudioRoutingSection(model: model, device: device)
+                    .id(device.uid)
+            } else {
+                group("Now") {
+                    statusRow(label: "Mode", value: model.engineMode.displayName)
+                    statusRow(label: "Device", value: currentDeviceLabel)
+                    note("Connect a DJ interface to enter Performance mode, and its routing shows here. With none connected Dub runs Track Preparation through the built-in output.")
                 }
-                note("Connect a DJ interface to enter Performance mode — deck channels come from devices.toml. With none connected Dub runs Track Preparation through the built-in output. Add an interface to devices.toml to support new hardware.")
             }
             #if DEBUG
             devSection
@@ -236,18 +240,6 @@ struct PreferencesSheet: View {
             }
             return "Built-in output (system default)"
         }
-    }
-
-    /// Registry-resolved deck channels for the active interface, shown
-    /// read-only so the user can see what Dub picked.
-    private var currentChannelLabel: String {
-        guard let device = model.selectedInputDevice ?? model.performanceDevices.first
-        else { return "—" }
-        let r = model.engine.performanceRoutingFor(deviceName: device.name)
-        let a = r.deckAInput.map(String.init).joined(separator: "+")
-        guard r.twoDeck else { return "A \(a) (single deck)" }
-        let b = r.deckBInput.map(String.init).joined(separator: "+")
-        return "A \(a) · B \(b)"
     }
 
     // MARK: - Decks
