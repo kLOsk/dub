@@ -8,8 +8,9 @@
 Format notes for external DJ libraries. Shipped: Dub-native filesystem import
 (M11c), the **Serato importer (M11e)**, the **Traktor NML importer (M12b)**, the
 **iTunes / Apple Music importer (M12c)**, and the **rekordbox XML importer
-(M12d)**. Lexicon is still forward-looking. Fill each section as its importer
-lands, and keep format-specific quirks here rather than expanding PRD §8.
+(M12d)**. Lexicon needs no importer of its own: it syncs into those apps'
+files, and **M12-lexicon** documents which of them Dub reads (one does not:
+Serato 4/5). Keep format-specific quirks here rather than expanding PRD §8.
 
 Each section should end up with:
 
@@ -306,12 +307,100 @@ constraint, schema v6.)* Run headless with `dub import --itunes <Library.xml>`.
 
 **Fuzz target.** `fuzz/fuzz_targets/fuzz_itunes_xml.rs` over `parse_library`.
 
-### Lexicon DJ
+### Lexicon DJ — **documented path (M12-lexicon)**
 
-- **Lexicon owns its own database** but its primary mode is *exporting* to
-  Serato / Traktor / rekordbox / iTunes.
-- We don't read Lexicon's native format directly; we read whichever target
-  format Lexicon has exported to. Lexicon → rekordbox.xml → us.
+Lexicon is a library manager, not a player: it keeps its own database and
+*syncs* it into the DJ apps' own files. Dub never reads Lexicon's database —
+it is private, unversioned, and not the DJ's interchange point. We read
+whatever Lexicon wrote into an app whose format we already import. No
+Lexicon-specific code exists, on purpose.
+
+Lexicon's sync is **Sync to → *app*** in its Sync window; every target
+needs the app fully closed while it writes, and backs the app's library up
+first. Per target, as of Lexicon 1.10 (from its manual, linked below):
+
+| Lexicon target | What Lexicon writes | Dub reads it? |
+|---|---|---|
+| **Rekordbox 5 & 6 XML** — *Save Rekordbox XML* | an XML file, wherever the DJ saves it | **Yes — the recommended path.** rekordbox importer (M12d). |
+| Rekordbox 6 & 7 Direct | rekordbox's own database | No — Dub does not read `master.db` (PRD §8.1, parked). |
+| **Traktor** | `collection.nml` in Traktor's root folder (the newest version's, or `traktorNmlPath` in Lexicon's advanced settings) | **Yes.** Traktor importer (M12b), same auto-discovery. |
+| Serato 3 | `_Serato_` crates + database on the Music folder and each drive | **Yes.** Serato importer (M11e). |
+| Serato 4 / 5 | the new library in `~/Library/Application Support/Serato/Library` | **No — a gap.** See below. |
+
+**The recommended path: Lexicon → rekordbox XML → Dub.** In Lexicon, Sync to
+→ *Rekordbox 5 & 6 XML* → *Save Rekordbox XML*. Save it as
+`~/Documents/rekordbox/rekordbox.xml` and Dub's rekordbox source finds it on
+its own (`sources::discover_rekordbox` checks there first); anywhere else,
+use Import ▸ rekordbox.xml… and pick it. It is the one target that is a
+file Lexicon hands the DJ rather than a database it edits in place, and the
+format is the documented interchange standard (PRD §8.6) — the same one
+Dub's own export writes.
+
+**What survives the XML route** — Lexicon's side from its manual, Dub's
+from the rekordbox section above:
+
+- **Grid:** Lexicon converts fluid grids with their tempo changes; Dub keeps
+  the **first** `<TEMPO>` as anchor + BPM + bar phase and drops the rest. A
+  variable-tempo grid arrives as a fixed one from its first marker — fine for
+  the electronic records most grids come from, wrong for a live-drummer
+  track, which `dub-bpm`'s cross-check flags with ⚠.
+- **Cues:** hot cues (pads 0–7) and memory cues (`Num −1`) both, by
+  Lexicon's *Cue Destination* setting. Hot-cue colours come across; the XML
+  has no memory-cue colour. Lexicon notes rekordbox reads only 8 hot cues
+  of the 16 it can hold — the same 8 Dub has.
+- **Loops:** saved loops arrive as `POSITION_MARK Type="4"`. The XML does
+  not mark a loop *active*.
+- **Key:** `Tonality` in whatever notation Lexicon wrote; Dub stores it
+  verbatim and shows Camelot.
+- **Rating / colour / comments:** rating and colour through the same
+  mapping as a rekordbox export; comments as metadata.
+- **Playlists:** folders and playlists mirror into `imported_crates`.
+  Lexicon smartlists arrive as **plain playlists frozen at export time** —
+  the XML has no rules — and MyTags do not travel at all.
+
+**Re-syncing.** The XML route only ever *adds and updates*: a track removed
+in Lexicon is not removed from the XML's consumers. Dub's re-import is
+idempotent by `(volume_uuid, relative_path)` (shared with every importer),
+refreshes each source row, and truncates-and-rewrites the playlist mirror —
+so after a fresh *Save Rekordbox XML*, re-import picks up new tracks, new
+cues and the current playlist tree, and leaves Dub's own crates, grid taps
+and history alone.
+
+**The Traktor route** works too, with Traktor's limits: Traktor has no cue
+colours, so none come back; Lexicon's handling of variable grids for
+Traktor is undocumented, and Dub keeps one AutoGrid anchor anyway. Traktor
+must be closed while Lexicon writes, and Dub reads the NML only on import,
+so re-import after a sync. Lexicon's backups go in a `Lexicon` folder
+*inside* the Traktor folder; discovery only looks for `collection.nml` at
+each `Traktor*` folder's top level, so they are never mistaken for the
+collection.
+
+**The gap: Serato 4 / 5.** Serato's newer versions keep the library in SQLite
+under `~/Library/Application Support/Serato/Library` (`master.sqlite` /
+`root.sqlite` on the dev machine), not in `_Serato_/database V2` — and
+Lexicon's Serato 4/5 sync writes there. Dub's Serato importer reads only
+`database V2` + `.crate` files + the GEOB tags in the audio, so a Lexicon →
+Serato 4/5 library is invisible to it. Lexicon also writes Serato 5 grids
+"to a new tag" its manual does not name, which the GEOB reader may not
+know. Until there is a Serato SQLite reader, a Lexicon user on Serato 4/5
+takes the rekordbox XML route. Reading that database is its own job —
+undocumented, with no third-party spec yet found — and is listed in
+`CURRENT.md`.
+
+**Going the other way.** Dub's export (M11f) writes rekordbox XML, the same
+format, so a DJ can bring Dub crates, cues and grid corrections back into
+Lexicon through its rekordbox XML import. Not yet round-tripped against a
+real Lexicon.
+
+*(Not yet validated against a real Lexicon export; Lexicon 1.10.7 is on the
+dev machine, so the XML route can be pinned with a fixture the first time
+one is saved. Everything about Lexicon's side here is from its manual —
+[sync](https://www.lexicondj.com/manual/sync),
+[rekordbox XML](https://www.lexicondj.com/manual/sync-rekordbox-xml),
+[Serato](https://www.lexicondj.com/manual/sync-serato),
+[Traktor](https://www.lexicondj.com/manual/sync-traktor),
+[limitations](https://www.lexicondj.com/manual/library-conversion-limitations)
+— read 2026-11-16.)*
 
 ## Common concerns
 

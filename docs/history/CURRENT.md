@@ -128,6 +128,13 @@ hardware.
   jumping back one revolution (~1.8 s at 33⅓) each turn while the platter
   runs at speed — which a lift never does. Needs a capture of the SL 3
   running into the end zone first.
+- **Serato 4/5's library is not read.** Newer Serato keeps it in SQLite
+  under `~/Library/Application Support/Serato/Library`, not in
+  `_Serato_/database V2`, and Lexicon's Serato 4/5 sync writes there. The
+  Serato importer reads only the old files, so that library is invisible
+  (found while documenting M12-lexicon, 2026-11-16). Workaround: the
+  rekordbox XML route. A reader is its own job — no public spec found yet;
+  start by confirming which Serato version wrote `master.sqlite` here.
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.
@@ -144,8 +151,6 @@ before trusted-DJ hands is polish, carrying real deferred work:
   Expert panel (F-37) is delayed until it has a full design.
 - Calibration UX, preferences, dark-mode polish, and the manual rig
   checklist.
-- **M12-lexicon** (0.5 day, docs only): document the Lexicon → Serato /
-  rekordbox / Traktor export paths in `LIBRARY-FORMATS.md`.
 
 Post-1.0: **M27 — UI themes** (PRD §12.2). Until then, keep every colour
 in `DubColor`.
