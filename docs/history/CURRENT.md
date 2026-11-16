@@ -5,13 +5,13 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-11-15. Everything shipped up to alpha.2, and the rig
-> rounds before it, moved to `SHIPPED.md` the same day.
+> Last updated: 2026-11-16 (alpha.3). Everything shipped up to alpha.2, and
+> the rig rounds before it, moved to `SHIPPED.md` on 2026-11-15.
 
 ## Where the branch is
 
-`main` — **1.0.0-alpha.2 released** (tag `v1.0.0-alpha.2`, a GitHub
-pre-release; notes in `docs/releases/v1.0.0-alpha.2.md`). `make dist` builds
+`main` — **1.0.0-alpha.3 released** (tag `v1.0.0-alpha.3`, a GitHub
+pre-release; notes in `docs/releases/v1.0.0-alpha.3.md`). `make dist` builds
 a universal Release `Dub.app`, ad-hoc signed and **not notarized** (no
 Developer ID yet), zipped with `ditto` plus a SHA-256. Version lives in two
 places, kept in step by hand: `[workspace.package] version` and
@@ -21,7 +21,7 @@ Pushing is a deliberate act: `.githooks/pre-push` runs fmt-check + clippy +
 docs-check + the Rust suite + the Swift snapshot suite first, and that last
 gate is local-only because GitHub CI has no macOS app job.
 
-**Since alpha.2, on `main`, for the next alpha** (none of it on the rig yet):
+**In alpha.3, since alpha.2** (none of it on the rig yet):
 
 - **The signal panel speaks the DJ's language (FFI 85, 2026-11-15; canvas
   *Dub Signal Panel*).** It printed the decoder's own numbers (CONFIDENCE,
@@ -74,6 +74,10 @@ gate is local-only because GitHub CI has no macOS app job.
   the slot (`SampleSlot.name`, persisted; a new file drops the name).
 - **C-30, the poll's Swift-side allocations, have a baseline**
   (`PollAllocationTests`, numbers on C-30 in `UI-BACKLOG.md`).
+- **The DJ manual** (2026-11-16): `site/`, a Mintlify site published from
+  `main` at https://dub-3ccc829c.mintlify.site. Writing rules in
+  `site/AGENTS.md`; UI words are copied from `apple/Dub/`, so a renamed
+  label means a manual edit in the same change.
 
 ## Waiting on the rig
 
@@ -135,6 +139,14 @@ hardware.
   (found while documenting M12-lexicon, 2026-11-16). Workaround: the
   rekordbox XML route. A reader is its own job — no public spec found yet;
   start by confirming which Serato version wrote `master.sqlite` here.
+- **Set-the-1 is unreachable in Performance.** `DubAction.tapGrid` and
+  `.instantDouble` still have handlers and names in Preferences ▸ Keys,
+  but no `.mappable` control carries them, so since the default `G` and
+  `⌘←→` went (2026-09-15) nothing can bind them; the BPM tap pad is
+  Prep-only (`DeckHeader`). Grids are fixed in Prep for now; instant
+  doubles still work by dragging a deck's title. Needs a decision: a
+  mappable control in the deck column, or a binding row in the Keys tab
+  (found writing the manual, 2026-11-16).
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.
