@@ -17,18 +17,70 @@
     "dark": "/logo/dark.svg"
   },
   "navigation": {
-    "groups": [
+    "tabs": [
       {
-        "group": "Get started",
-        "pages": ["index", "install", "hardware", "first-set"]
+        "tab": "Manual",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "install",
+              "hardware",
+              "first-set"
+            ]
+          },
+          {
+            "group": "Playing",
+            "pages": [
+              "performance/decks",
+              "performance/samples-and-siren",
+              "map-mode"
+            ]
+          },
+          {
+            "group": "Prep and records",
+            "pages": [
+              "prep",
+              "rip"
+            ]
+          },
+          {
+            "group": "Library",
+            "pages": [
+              "library/import",
+              "library/organize",
+              "library/export",
+              "library/lexicon"
+            ]
+          },
+          {
+            "group": "Settings",
+            "pages": [
+              "preferences",
+              "dub-fx"
+            ]
+          },
+          {
+            "group": "Help",
+            "pages": [
+              "troubleshooting"
+            ]
+          }
+        ]
       },
       {
-        "group": "Library",
-        "pages": ["library/import", "library/lexicon"]
-      },
-      {
-        "group": "Help",
-        "pages": ["troubleshooting"]
+        "tab": "Developers",
+        "groups": [
+          {
+            "group": "Developers",
+            "pages": [
+              "developers/build",
+              "developers/cli",
+              "developers/architecture"
+            ]
+          }
+        ]
       }
     ],
     "global": {
@@ -59,7 +111,12 @@
     }
   },
   "contextual": {
-    "options": ["copy", "view", "chatgpt", "claude"]
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude"
+    ]
   },
   "footer": {
     "socials": {

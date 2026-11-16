@@ -1,0 +1,152 @@
+---
+title: "The deck"
+description: "Everything on a deck column in Performance: the readouts, the strip, the beat grid, hot cues, loops, echo out and what to do when the needle skips."
+icon: "compact-disc"
+---
+
+![The Performance surface: two deck columns either side of the playing strips](/images/performance.png)
+
+Each deck has a column beside its waveform strip. Top to bottom: the source
+switch, the title and readouts, the track overview, the hot cues, then one row
+of **SCRATCH**, **LOOP** and **ECHO**.
+
+The source switch (**INT · TC · THRU**), calibration and the **SIGNAL** panel
+are covered in [Your first set](/first-set#the-source-switch-int-tc-thru).
+
+<Note>
+Nothing you play ships with a key. Click **MAP** in the status strip, click a
+control, then press the key you want on it. Only **Space** (load) and **⌘,**
+(Preferences) are bound out of the box.
+</Note>
+
+## The readouts
+
+- **MASTER** sits in the deck's top corner. It marks the deck the siren and
+  samples land on, and the one Space-load avoids.
+- **BPM** is the tempo the record is playing at right now: the track's tempo
+  scaled by your pitch. Ride the pitch until the two BPMs agree.
+- **KEY** is the track's key in Camelot.
+- **PITCH** follows the platter, in percent.
+- **LOCK** is key lock. **ON**, the key holds while the platter moves the
+  tempo; **OFF**, pitch rides the platter like a record. Its dot is dim while
+  there's nothing to hold (at +0.0 % or inside a loop) and solid once it's
+  working.
+
+Elapsed and remaining time sit above the overview. Click the overview to jump
+anywhere in the track; a paused deck stays paused.
+
+## The strip and zoom
+
+The playing waveform runs vertically, with the playhead a quarter of the way
+down. Drag the strip to cue by hand: pushing it up plays forward, holding
+still is a stopped record.
+
+Hover over the strips and a **+** / **−** pair appears in the gap between
+them. It zooms both decks together, from **0.25×** to **2×**, so the two
+strips always share a scale.
+
+## The phase meter
+
+The bar between the decks is one beat tall, centred on the playhead line. Its
+marker is the other deck's beat against the master's, labelled **A** or **B**.
+
+- Marker **above** the line: that deck is late. Push the record.
+- Marker **below** the line: it's early.
+- The marker turns **green** when both decks play within 15 ms of each other.
+
+The meter only shows phase. Match tempo by the BPM readouts first. Both decks
+need a beat grid for the marker to appear.
+
+## Beat grid and set the 1
+
+Fix a track's grid before the gig, in [Prep](/prep). There the BPM itself
+is the tap pad: 1–2 taps on the downbeat set the 1, 3 or more set the tempo.
+Right-click it for **2×**, **½**, **Reset to auto** and **Lock grid**. The fix
+is saved with the track, so Performance plays the corrected grid.
+
+<Note>
+**Alpha.** With **Following beat grid** on in **Preferences ▸ Alpha**, a
+track played by a band gets a line on each beat where the band played it. The
+readout then says **BPM · FOLLOW** and moves as the track plays.
+</Note>
+
+### A real record on THRU
+
+A THRU deck has no track, so its BPM is the record's tempo, heard live. The
+**TEMPO** heading says how sure it is: **○ LISTENING**, **◐ TENTATIVE**,
+**● LOCKED**.
+
+- **Tap the BPM** on the beat to set it yourself (**● YOUR TAP**).
+- **Right-click the BPM** for **Double — ×2**, **Half — ÷2**,
+  **×1.5 — drum & bass read at two-thirds** and **×⅔**.
+  **Back to the heard tempo** undoes it.
+
+Either holds until the needle comes up.
+
+## Hot cues
+
+Eight per deck, saved with the track. The **HOTCUE** heading counts them:
+**3 OF 8**.
+
+| Do this | On |
+| --- | --- |
+| Click | An empty cue: sets it at the playhead. |
+| Click | A set cue, deck playing: jumps there and keeps playing. |
+| Hold | A set cue, deck paused: plays from it until you let go, then returns. |
+| ⇧-click | A set cue: clears it. |
+| Right-click | A set cue: **Rename…**, **Colour**, **Clear**. |
+
+**Rename…** asks for a name like **INTRO**. **Colour** offers **None**,
+**Red**, **Orange**, **Yellow**, **Green**, **Aqua**, **Blue**, **Purple** and
+**Pink**.
+
+New cues snap to the nearest beat. Turn that off with **Snap cue points to the
+beat grid** in **Preferences ▸ Decks**.
+
+Mapped hot-cue keys fire on the master deck. Hold **⇧** with the key to clear.
+
+## Loops
+
+Loops grab the beats you just heard: press **4** and the last four beats
+repeat, the playhead jumping back into them. They need the track's beat grid.
+
+- Lengths run from **1/8** to **16** beats, four on screen at a time. At rest
+  you see **1 · 2 · 4 · 8**; **‹** and **›** show shorter or longer lengths.
+- While a loop runs, those buttons become **÷2** and **×2**. They halve or
+  double the running loop and keep its start.
+- Press the lit length again to leave the loop. Playback carries on from
+  there.
+
+## Echo out
+
+**ECHO OUT** throws the deck into its echo, 100 % wet. Tap it on the beat you
+want to throw away: that beat plays, then repeats and decays while the dry
+signal is cut. The deck keeps playing underneath. Tap again and the tune comes
+back where it has got to.
+
+It works on THRU too. Loading a track or switching the source drops a running
+echo. Turn the button off in **Preferences ▸ FX ▸ Echo out**.
+
+If the deck's output meter reads **ECHO OUT**, the tail has died and the deck
+is silent. Tap it off.
+
+<Note>
+**Alpha.** With **Dub FX channel** on in **Preferences ▸ Alpha**, the button
+becomes **OUT** beside a **HOLD** toggle. HOLD sustains the thrown beat
+through a record swap; tap HOLD again to let it decay, or **OUT** to cut it.
+</Note>
+
+## Instant doubles
+
+Drag a deck's title or artist onto the other deck. The track lands there at
+the same position, in sync, replacing what was loaded.
+
+## When the needle skips
+
+A brief dropout from dust or a skip is held: the deck carries on at the speed
+it had. If the signal stays gone, the deck pauses where it was.
+
+To keep the music going while you fix the needle, switch the deck to **INT**:
+the track plays on its own clock from exactly where it was. Then recalibrate
+and hand it back to **TC**, step by step in
+[Saving a set on stage](/troubleshooting#saving-a-set-on-stage).

@@ -1,0 +1,82 @@
+---
+title: "The dub CLI"
+description: "The headless dub binary: test the engine, inspect timecode, rip records and move your library from the terminal."
+icon: "terminal"
+---
+
+`dub` is a command-line tool built from the same Rust engine as the app. It
+talks to the engine directly, without the Swift app or its bindings, which
+makes it the place to test the engine, check a rig, and reproduce a problem
+with numbers instead of by ear.
+
+It comes with the source. Build it with Cargo; the binary lands in
+`target/release/dub`:
+
+```bash
+cargo build --release -p dub-cli
+./target/release/dub help
+```
+
+## Examples
+
+```bash
+./target/release/dub play --realtime track.mp3
+./target/release/dub timecode-deck a.mp3 b.mp3 --device-profile "SL 3"
+./target/release/dub scope --input-channels 3,4    # live timecode inspector (TUI)
+./target/release/dub rip --help                    # rip a record side from the terminal
+./target/release/dub export --help                 # rekordbox XML / M3U8
+```
+
+`--input-channels` counts from 1. On a Serato SL 3, deck A is `3,4`.
+
+## Subcommands
+
+`dub help` prints every flag. In one line each:
+
+### Engine
+
+| Command | For |
+| --- | --- |
+| `smoke` | Check the engine starts and renders a block of silence. |
+| `rt-audit` | Stress the render path with allocation checks on. |
+| `version` | Print the engine and FFI versions. |
+| `play` | Play one or two tracks through the engine, live or rendered to a WAV, with scheduled rate, gain, pause, seek and swap events. |
+| `analyze` | Audit a rendered WAV for clicks: peak, RMS, DC, clipping and sample-to-sample jumps. |
+| `stretch-bench` | Compare the time-stretch backends on CPU, pitch, transients and timbre. |
+
+### Audio interface and timecode
+
+| Command | For |
+| --- | --- |
+| `list-inputs` | List the DJ audio interfaces Dub recognises. |
+| `list-outputs` | List output devices. |
+| `levels` | Live level meters per input channel. |
+| `capture` | Record an input to a WAV. |
+| `measure-latency` | Break down an output's latency. |
+| `decode-timecode` | Decode a recording of Serato or Traktor control vinyl offline and report what the decoder saw. |
+| `timecode-deck` | Play tracks from control vinyl, one or two decks. |
+| `thru` | Route a real record through the engine. |
+| `scope` | A live timecode scope in the terminal. |
+| `calibrate` | Calibrate the timecode decoder to your rig and save it. |
+
+### Library
+
+| Command | For |
+| --- | --- |
+| `import` | Import a Serato, Traktor, rekordbox or iTunes library, or a folder, without the app. |
+| `export` | Write the library or a crate to rekordbox XML or M3U8. See [Export](/library/export). |
+| `diagnose` | Explain a track's beat grid, waveform and BPM in one report. |
+
+### Ripping vinyl
+
+| Command | For |
+| --- | --- |
+| `rip` | Record a vinyl side, split it, encode FLAC with tags, and import it analysed. |
+| `rip-tune` | Replay a recorded side through the rip's gap and auto-start gates, to tune their thresholds without a turntable. |
+| `rip-resplit` | Split a side you already ripped again, from its lossless archive. |
+| `recognize` | Name a rip's tracks with AcoustID and MusicBrainz. Read-only unless you pass `--apply`. |
+
+<Note>
+`recognize` needs an AcoustID key, passed with `--key` or set in
+`$DUB_ACOUSTID_KEY`. Keys are free at acoustid.org.
+</Note>

@@ -18,7 +18,7 @@ Built for hip hop, reggae, dub, drum'n'bass and dubstep — and for never failin
 [![Swift](https://img.shields.io/badge/shell-SwiftUI%20%2B%20Metal-F05138?logo=swift&logoColor=white)](apple)
 [![Audio thread](https://img.shields.io/badge/audio%20thread-zero%20alloc-6FB04A.svg)](#under-the-hood)
 
-[**Features**](#features) · [**Get Dub**](#get-dub) · [**Hardware**](#hardware) · [**Under the hood**](#under-the-hood) · [**Docs**](docs/README.md)
+[**Features**](#features) · [**Get Dub**](#get-dub) · [**Hardware**](#hardware) · [**Under the hood**](#under-the-hood) · [**Manual**](https://dub-3ccc829c.mintlify.site)
 
 <br>
 
@@ -178,14 +178,18 @@ output for grids, cues and samples. Plug in an interface with at least
 | Any external mixer with line inputs | The mixer | ✅ |
 | Phase, MIDI / HID controllers | Control | ◻ planned after 1.0 |
 
-Other class-compliant 4-in / 4-out interfaces should work; channel routing is
-set in Preferences.
+Other class-compliant 4-in / 4-out interfaces should work: pick each deck's
+input and output pair in **Preferences ▸ Audio**
+([how](https://dub-3ccc829c.mintlify.site/hardware#setting-up-your-interface)).
 
 ## Status
 
-Dub is **alpha** — [1.0.0-alpha.1](https://github.com/kLOsk/dub/releases/tag/v1.0.0-alpha.1)
-is the first public build: feature-complete for 1.0 and being signed off
-against a [hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
+Dub is **alpha** — the latest build is
+[1.0.0-alpha.3](https://github.com/kLOsk/dub/releases/tag/v1.0.0-alpha.3):
+feature-complete for 1.0 and being signed off against a
+[hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
+
+How to use it is in the **[manual](https://dub-3ccc829c.mintlify.site)**.
 
 Known gaps right now:
 
@@ -195,6 +199,7 @@ Known gaps right now:
 - The download is not notarized yet (see [Download](#download)).
 - macOS only.
 
+For contributors, the engineering docs start at [`docs/README.md`](docs/README.md).
 What is in flight lives in [`docs/history/CURRENT.md`](docs/history/CURRENT.md);
 everything shipped is in [`SHIPPED.md`](docs/history/SHIPPED.md); the product
 spec is [`PRD.md`](docs/spec/PRD.md).

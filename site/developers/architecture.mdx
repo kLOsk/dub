@@ -1,0 +1,94 @@
+---
+title: "How Dub is built"
+description: "The Rust crates, the rules for the audio thread, and the bridge to the Swift app, with links to the full engineering docs."
+icon: "sitemap"
+---
+
+Dub is a Rust audio engine inside a native macOS app. Rust owns the audio
+thread; Swift owns the UI thread. They talk through lock-free state snapshots
+and single-producer, single-consumer ring buffers, never through callbacks
+across threads.
+
+This page is the map. The detail lives in the repo, linked below.
+
+## The crates
+
+| Crate | What it does |
+| --- | --- |
+| `dub-engine` | The audio graph, decks and transport. The only crate that runs on the audio thread. Also plays real records in Thru. |
+| `dub-audio` | CoreAudio input and output. |
+| `dub-timecode` | Decodes Serato CV02 and Traktor MK1 and MK2 control vinyl. Clean-room. |
+| `dub-dsp` | Resamplers, filters and the effects: echo out, the dub siren and its echo, and the vintage rack. |
+| `dub-stretch` | Key lock: a pure-Rust time-stretcher. |
+| `dub-io` | Decodes audio files into memory. |
+| `dub-bpm` | Tempo and beat-grid detection. |
+| `dub-spectral` | The shared spectrum analysis, and key detection. |
+| `dub-peaks` | Waveform data. |
+| `dub-fingerprint` | Audio fingerprints, for duplicate detection and relocating files. |
+| `dub-library` | The SQLite library, the importers for other DJ apps, and export. |
+| `dub-rip` | Recording, splitting and committing vinyl rips. |
+| `dub-encode` | FLAC encoding and tagging for rips. |
+| `dub-recognize` | Naming ripped tracks online. The only crate that touches the network, and a rip never depends on it. |
+| `dub-thru`, `dub-controller` | Placeholders for later work. |
+| `dub-ffi` | The bridge to Swift. |
+| `dub-cli` | The [`dub` command-line tool](/developers/cli). |
+
+The Swift app lives in `apple/Dub/`. Waveforms are drawn with Metal.
+
+## The audio thread is sacred
+
+A crash or a dropout on stage ends a DJ's night, so code that runs on the
+audio thread may not allocate memory, take a lock, make a system call, log,
+do I/O, call `unwrap()`, or box a `dyn Trait`.
+
+That's enforced three ways:
+
+1. **At compile time.** Every function reachable from the engine's render
+   call takes a `RealtimeContext` token, which can't leave the audio thread.
+2. **In tests.** Tests of the render path run under `assert_no_alloc`; any
+   allocation aborts the test.
+3. **In release builds.** The same allocator check records the violation
+   instead of crashing.
+
+Work that can't follow those rules, such as decoding, analysis and the
+library, runs on other threads. Whole tracks are decoded into memory on load,
+which is what lets a record play backwards exactly as it plays forwards.
+
+## The bridge to Swift
+
+`dub-ffi` exposes the engine to the app through
+[UniFFI](https://mozilla.github.io/uniffi-rs/). The Rust signatures are the
+single source of truth: the Swift bindings are generated from them, packed
+with the Rust core into `DubCore.xcframework`. Three objects make up the
+surface: `DubEngine`, `DubLibrary` and `DubRipSession`. They stay separate
+so library and disk work never becomes an audio-thread dependency.
+
+The bridge carries a contract number, `FFI_VERSION`. Changing the surface
+means bumping it, and `make docs-check` holds the docs to it.
+
+The CLI doesn't go through the bridge. It links the engine directly.
+
+## Engineering docs
+
+The full picture is on GitHub:
+
+<CardGroup cols={2}>
+  <Card title="ARCHITECTURE.md" icon="diagram-project" href="https://github.com/kLOsk/dub/blob/main/docs/spec/ARCHITECTURE.md">
+    Threads, messaging, timecode, Thru, the BPM engine and the build.
+  </Card>
+  <Card title="PRD.md" icon="file-lines" href="https://github.com/kLOsk/dub/blob/main/docs/spec/PRD.md">
+    What Dub is for, and the spec everything else answers to.
+  </Card>
+  <Card title="LIBRARY-SCHEMA.md" icon="database" href="https://github.com/kLOsk/dub/blob/main/docs/spec/LIBRARY-SCHEMA.md">
+    The library's SQLite schema.
+  </Card>
+  <Card title="LIBRARY-FORMATS.md" icon="file-import" href="https://github.com/kLOsk/dub/blob/main/docs/spec/LIBRARY-FORMATS.md">
+    How each DJ app's library is read and written.
+  </Card>
+  <Card title="LICENSE-DEPENDENCIES.md" icon="scale-balanced" href="https://github.com/kLOsk/dub/blob/main/docs/spec/LICENSE-DEPENDENCIES.md">
+    Every dependency's licence, and why Dub is MIT OR Apache-2.0.
+  </Card>
+  <Card title="docs/README.md" icon="map" href="https://github.com/kLOsk/dub/blob/main/docs/README.md">
+    Which doc to read for which task, including what's in flight and the lessons learned.
+  </Card>
+</CardGroup>

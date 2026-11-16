@@ -1,0 +1,90 @@
+---
+title: "Export"
+description: "Write your library or a crate to rekordbox XML or an M3U8 playlist, from the app or the terminal."
+icon: "file-export"
+---
+
+Leaving Dub should be easy. Export writes your work into a file other DJ
+apps read, so nothing you do here is locked in.
+
+## From the app
+
+<Steps>
+  <Step title="Choose what to export">
+    For the whole library, choose **File ▸ Export Library As…** (⇧⌘E).
+    For one crate, right-click it under **DUB CRATES** and choose
+    **Export As…**.
+  </Step>
+  <Step title="Pick a format">
+    In the save panel, set **Format:** to
+    **rekordbox XML (grid, cues, loops, key)** or
+    **M3U8 playlist (file paths only)**. The file name's extension follows
+    the format.
+  </Step>
+  <Step title="Save">
+    Click **Export**. Dub shows the new file in the Finder, ready to drag
+    into the other app.
+  </Step>
+</Steps>
+
+## Which format
+
+**rekordbox XML** moves a collection. Serato, Traktor, rekordbox and Lexicon
+all read it. Use it unless you only need a list of files.
+
+**M3U8** is a plain playlist: each track's length, artist, title and file
+path, and nothing else. Almost any player opens it. It's UTF-8, so accented
+artist names survive.
+
+## What the rekordbox XML carries
+
+| Kept | Notes |
+| --- | --- |
+| Title, artist, album, genre, composer, year, track number, comment | As Dub has them. |
+| BPM and beat grid | The first beat and the tempo, in 4/4. BPM to 2 decimals, times to the millisecond, which is rekordbox's own precision. |
+| Key | Written in Camelot. |
+| Rating | Your stars. |
+| Colour | One of Dub's eight track colours. A colour imported from another app was already matched to one of those eight, so its exact shade is not kept. |
+| Hot cues, memory cues and loops | With their names and colours. |
+| Crates | One playlist per Dub crate, in a whole-library export. A crate export holds that crate. |
+
+A track can carry cues from more than one app. Dub writes one set: the cues
+you set in Dub if there are any, otherwise the set from the app with the most
+to say.
+
+<Note>
+A whole-library export includes every track Dub has a file for, including
+tracks you browse under **IMPORTED SOURCES** but haven't played yet. A track
+with no file is skipped, since the other app couldn't open it anyway.
+</Note>
+
+## Round trip
+
+Dub's rekordbox XML writer is the exact inverse of its reader, and that is
+tested: what Dub writes, Dub reads back unchanged. So Serato in, rekordbox XML
+out keeps your cues.
+
+Lexicon's rekordbox XML import should take Dub's export back the same way,
+but that route hasn't been tested against Lexicon yet.
+
+## From the terminal
+
+The `dub` command-line tool exports too. It comes with the source, not the
+app; see [Build from source](/developers/build).
+
+```bash
+./target/release/dub export --rekordbox ~/Desktop/dub.xml
+./target/release/dub export --m3u8 ~/Desktop/warmup.m3u8 --crate "Warm up"
+```
+
+| Flag | Does |
+| --- | --- |
+| `--rekordbox <out.xml>` | Write rekordbox XML. |
+| `--m3u8 <out.m3u8>` | Write an M3U8 playlist. `--m3u` works too. |
+| `--crate NAME` | Export one crate instead of the whole library. The name isn't case-sensitive. |
+| `--library PATH` | Read a library other than your own. |
+
+Without `--library`, it reads the library the app uses, at
+`~/Library/Application Support/Dub/library.sqlite`. A crate name that doesn't
+exist stops the export before any file is written, and lists the crates it
+found.

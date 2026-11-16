@@ -1,0 +1,93 @@
+---
+title: "Build from source"
+description: "Set up the toolchain, build Dub.app, and run the same checks CI runs."
+icon: "hammer"
+---
+
+Dub is a Rust engine in `crates/` and a SwiftUI and AppKit app in
+`apple/Dub/`. You build both on a Mac.
+
+## Prerequisites
+
+- **Xcode** (the bootstrap script asks for Xcode 15 or later).
+- **Rust** through [rustup](https://rustup.rs). The repo pins its toolchain in
+  `rust-toolchain.toml` (with both the Apple Silicon and Intel targets), so
+  you build with the same Rust as CI.
+- **[XcodeGen](https://github.com/yonaskolb/XcodeGen)**:
+  `brew install xcodegen`. The Xcode project is generated from
+  `apple/project.yml` and isn't checked in.
+
+Optional: `cargo-nextest` makes the test suite faster, and `cargo-deny` runs
+the licence check. The Makefile falls back or skips without them.
+
+## Build the app
+
+```bash
+git clone https://github.com/kLOsk/dub.git && cd dub
+./scripts/bootstrap.sh                 # one-time: bindings + Xcode project
+make app
+```
+
+`bootstrap.sh` installs the git hooks, builds the Rust core into
+`DubCore.xcframework`, generates the Swift bindings, and generates
+`apple/Dub.xcodeproj`. Run it again after `apple/project.yml` or
+`crates/dub-ffi/src/lib.rs` changes.
+
+`make app` builds a Debug app to
+`apple/build/Build/Products/Debug/Dub.app`, rebuilding the Rust core only when
+Rust sources changed.
+
+| Command | Does |
+| --- | --- |
+| `make app` | Debug build. |
+| `make app APP_CONFIG=Release` or `make app-release` | Release build. |
+| `make run-app` | Build, quit any running Dub, and launch the new one. |
+| `make dist` | Universal Release build, zipped with its SHA-256 in `dist/`. |
+
+## Run the checks
+
+```bash
+make test          # cargo nextest run --workspace + clippy -D warnings
+make ci            # docs-check + deny + fmt-check + clippy + test
+```
+
+`make ci` is exactly what CI runs. `docs-check` fails when a number in the
+docs, such as the FFI version, no longer matches the code. `deny` checks every
+dependency's licence: Dub is MIT OR Apache-2.0 and takes no GPL or LGPL
+dependencies.
+
+`make snapshot` runs the Swift snapshot tests. CI has no macOS app job, so
+those run only on your machine. Change a view, re-record its baseline in the
+same change.
+
+## The pre-push hook
+
+`bootstrap.sh` (or `make hooks`) points git at `.githooks/`. Before every
+push it runs:
+
+1. `cargo fmt --check`
+2. `cargo clippy` with warnings as errors
+3. `check-docs`
+4. the Rust test suite
+5. the Swift snapshot suite, when `xcodebuild` is present
+
+A red gate blocks the push. `DUB_PREPUSH_TESTS=0` skips the tests and
+`DUB_PREPUSH_SNAPSHOT=0` skips the snapshots; `git push --no-verify` skips
+the hook once.
+
+<Tip>
+If the test suite suddenly crawls, count the build artifacts:
+`ls target/debug/deps | wc -l`. Tens of thousands of files make every test
+process slow to start. `make sweep` removes artifacts unused for 14 days
+without forcing a rebuild.
+</Tip>
+
+## Before you open a PR
+
+- Read [`AGENTS.md`](https://github.com/kLOsk/dub/blob/main/AGENTS.md): the
+  repo's conventions, in one page.
+- Write the failing test first. Audio-path code needs `assert_no_alloc`
+  coverage.
+- Branches are `feat/`, `fix/`, `chore/`, `refactor/`, `docs/` or `test/`;
+  commits are conventional (`fix(timecode): …`); one concern per PR, with a
+  **Test plan** section.

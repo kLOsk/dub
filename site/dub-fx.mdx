@@ -1,0 +1,127 @@
+---
+title: "DUB FX (alpha)"
+description: "Turn a deck into an outboard effects rack on your mixer's send, hold an echo through a record swap, and let the beat grid follow a band."
+icon: "flask"
+---
+
+<Warning>
+  Everything on this page is alpha. It works, but it isn't finished and it
+  will change. It's off by default; leave it off at a gig.
+</Warning>
+
+## Turn it on
+
+Open **Preferences ▸ Alpha**. Turn on **Alpha features**, then the feature
+you want: **Dub FX channel** or **Following beat grid**. Turn **Alpha
+features** off and every one of them is gone from the surface again.
+
+## The DUB FX channel
+
+With **Dub FX channel** on, each deck's source switch gets a fourth position:
+**INT · TC · THRU · DUB FX**. Click **DUB FX** and the deck stops being a
+turntable. Its track is unloaded and the record is replaced by a rack of four
+vintage units, working on whatever your mixer sends it.
+
+<img src="/images/dub-fx.png" alt="A deck on DUB FX: the Big Knob, phaser, Space Echo and spring units stacked as a rack, with the input lane beside them" />
+
+To go back, click **INT**, **TC** or **THRU** on the same switch.
+
+### Patch it on the mixer
+
+Dub doesn't route anything inside itself. The mixer does:
+
+- **In:** patch the mixer's aux send or FX loop into the input pair that
+  deck's needle used.
+- **Out:** the rack returns on that deck's output pair, into a mixer channel.
+
+Anything you send from the mixer goes through the rack: the other deck, the
+MC's mic, the siren. On a battle mixer with no send, plug a mic straight into
+the interface instead.
+
+### The input lane
+
+| Control | What it does |
+| --- | --- |
+| **SEND** / **MIC** | **SEND** for the mixer's send. **MIC** for a mic straight into the interface; it puts the mic in both channels. |
+| **TRIM** | Input gain, −24 to +24 dB. |
+| The VU | The input level after the trim. |
+| **● HOT** | The input peaked within 1 dB of full scale. Turn the trim down. |
+
+### The rack
+
+The channel has one mode, **EXPERT**: every knob is the unit's own control.
+The line under the title shows the signal path, each unit lit while it's in.
+The units run top to bottom:
+
+| Unit | What it is | Controls |
+| --- | --- | --- |
+| **BIG KNOB** | A high-pass filter, 12 dB/oct, 11 steps from 70 Hz to 7.5 kHz | The dial, **Q** |
+| **PHASER** | A 6-stage stereo phaser | **RATE**, **DEPTH**, **FEEDBACK**, **MIX** |
+| **SPACE ECHO** | A tape echo with reverb | **MODE**, **REPEAT**, **INTENSITY**, **ECHO**, **REVERB**, **W&F**, and **HOLD**, **SYNC**, **TAP** |
+| **SPRING** | A spring reverb tank | **DECAY**, **TONE**, **WET**, and **KICK** to kick the tank |
+
+Each unit has an **IN**/**OUT** toggle. The channel starts with all four out.
+A unit that's out stays readable, so you can set it up first and then throw
+it in.
+
+On the **SPACE ECHO**, **INTENSITY** past 1.0 makes the tape feed itself and
+the unit says **RUNAWAY**.
+
+### SYNC and TAP
+
+**SYNC** puts the Space Echo's repeats in time with the music. It takes the
+tempo from the other deck when that deck has one; otherwise from what you
+**TAP**. The unit shows where the tempo comes from, or **No tempo · tap**.
+
+- **½**, **¾** and **1** set the longest echo to that much of a beat.
+- **TAP** the beat a few times. A gap of more than two seconds starts a new
+  count.
+- Turning **REPEAT** by hand takes **SYNC** off.
+
+### Space Echo HOLD
+
+**HOLD** on the Space Echo stops anything new going onto the tape and keeps
+the loop going, so the echo carries the room while you swap the record. Press
+it again to let the tape fade.
+
+### The siren and samples into the rack
+
+When the siren or the samples are sent to the deck that's the FX channel,
+their output pill reads **→ FX**: the siren plays through the rack.
+
+## HOLD on a deck's echo
+
+With **Dub FX channel** on, each deck's echo gets a **HOLD** button beside
+it, and **ECHO OUT** reads **OUT**. **Echo out** must be on in
+**Preferences ▸ FX**.
+
+This is the one-turntable dub transition:
+
+<Steps>
+  <Step title="Throw the echo">
+    Press **OUT** on the record that's playing.
+  </Step>
+  <Step title="Press HOLD">
+    The last beat sustains instead of dying away. **HOLD** only works while
+    the echo is on.
+  </Step>
+  <Step title="Swap the record">
+    Lift the needle and put the next record down while the echo holds.
+  </Step>
+  <Step title="Let it go">
+    Press **HOLD** again to let the echo decay, or **OUT** to cut it.
+  </Step>
+</Steps>
+
+Both **HOLD** buttons, the rack's **IN**/**OUT** toggles, **TAP** and
+**KICK** can take keys in [map mode](/map-mode).
+
+## Following beat grid
+
+For records played by a band. With **Following beat grid** on, a track whose
+beats wander off any even grid (live reggae, soul, rock) gets a line on each
+beat where the band played it, worked out when the track loads. A steady
+track keeps its even grid.
+
+Nothing is saved. Turn it off and load the track again to get the even grid
+back.

@@ -1,0 +1,82 @@
+---
+title: "Preferences"
+description: "Every setting in Dub's Preferences, tab by tab, and what each one does."
+icon: "gear"
+---
+
+Open Preferences with **⌘,** or the gear at the right end of the top bar.
+Every setting applies the moment you change it; there's nothing to save.
+**Close** or **Escape** shuts the sheet. **Show Welcome Guide** at the bottom
+opens the first-run guide again.
+
+The tabs run down the left, in this order.
+
+## Audio
+
+Where each deck comes in and goes out. With a DJ interface plugged in, this
+tab shows the interface and each deck's input and output pair: read-only for
+an interface Dub knows, set by you for one it doesn't. See
+[Setting up your interface](/hardware#setting-up-your-interface).
+
+With no interface connected, it shows the **Mode** and **Device** Dub is
+running on: Track Preparation through the built-in output.
+
+## Decks
+
+How a deck behaves when a track lands on it.
+
+| Setting | What it does |
+| --- | --- |
+| **Browse mode** | In Performance, clicking the library slides it up over the deck controls so you see more of the crate. Loading a track, or clicking outside the library, slides it back down. |
+| **Allow loading onto a playing deck** | In Performance. Off, a drop or **Space** load onto a running deck is refused and the deck flashes red; lift the needle or pause first. Prep always allows the load. |
+| **Auto-match loudness on load** | A track with a measured loudness loads at a gain that matches the others, so you don't ride the trim. Off, tracks load untouched and you set level at the mixer. |
+| **Snap cue points to the beat grid** | A hot cue you set lands on the nearest beat line. Off, it lands exactly at the playhead. |
+
+## FX
+
+The dub instruments on the surface.
+
+| Setting | What it does |
+| --- | --- |
+| **Echo out** | One **ECHO OUT** button per deck. Tap it and the tune cuts to 100 % wet while the deck plays on underneath; tap again and it picks up where it has got to. |
+| **Dub siren** | The siren box on the rack bar: five shots (Rifle Gun, Alarm, Sine, Laser, Siren) and a **DUB** knob for the box's own echo. Keys come from [map mode](/map-mode). |
+| **Beat-match the siren's echo** | Locks the siren's echo to the deck's tempo, so the repeats fall in time with the tune, instead of following the **DUB** knob. Needs **Dub siren** on. |
+
+## Library
+
+The DJ apps whose libraries Dub reads into your one collection: **Serato**,
+**Traktor**, **rekordbox** and **Apple Music**. Turn one on and Dub scans its
+default folder now and on every launch, read-only, and shows that app's crates
+and playlists in the sidebar. Each row says whether the library was found and
+where. **Rescan** reads it again. See [Bring your library](/library/import).
+
+## Vinyl
+
+Recording records into the library, and naming what you ripped.
+
+| Setting | What it does |
+| --- | --- |
+| **Vinyl recording** | Record a side through your DJ interface in Prep. A **PREP · REC · PERF** switch appears in the top bar; **REC** starts a rip ([how](/rip)). **PERF** shows only while an interface is connected. |
+| **AcoustID key** | Your free key from acoustid.org. Without it, **Identify** in the rip review panel does nothing. |
+| **Also identify the pressing** | Adds album, label and catalogue number by asking MusicBrainz. Slower, and it often can't settle on one release for a compilation. |
+| **Discogs token** | Optional, shown once **Also identify the pressing** is on. Adds Discogs' style tags and pressing detail. It's kept in your login Keychain. |
+
+## Keys
+
+What the keyboard fires. You map keys on the live surface, not here; see
+[Map mode](/map-mode). This tab lists every bound control with its key.
+**Reset all bindings…** takes every key you mapped away and brings back
+**Space** and **⌘,**.
+
+## Alpha
+
+<Warning>
+  Alpha features work but aren't finished. They will change. They're off by
+  default; leave them off at a gig.
+</Warning>
+
+| Setting | What it does |
+| --- | --- |
+| **Alpha features** | The master switch. Off, every feature below is gone from the surface, whatever its own switch says. |
+| **Dub FX channel** | Adds a **DUB FX** position to each deck's source switch, and **HOLD** to each deck's echo. See [DUB FX](/dub-fx). |
+| **Following beat grid** | For records played by a band. A track whose beats wander off any even grid gets a line on each beat where the band played it. Nothing is saved: turn it off and load the track again for the even grid. |

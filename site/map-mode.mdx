@@ -1,0 +1,84 @@
+---
+title: "Map mode"
+description: "Put the controls you play on the keys you want: turn MAP on, click a control, press a key."
+icon: "keyboard"
+---
+
+## Nothing you play has a key
+
+Dub ships with two keys bound, and both are app conventions:
+
+| Key | What it does |
+| --- | --- |
+| **Space** | Loads the library selection onto the deck that isn't the master. |
+| **⌘,** | Opens Preferences. |
+
+Hot cues, the sampler, Quick Scratch, the siren, echo out: everything you
+play starts with no key. Your hands know their own keys, so you map them
+yourself.
+
+## Map a control
+
+<Steps>
+  <Step title="Turn MAP on">
+    Click **MAP** in the top bar. It lights while map mode is on. Every
+    control you can bind shows a dashed ring and its key cap, empty if
+    nothing is bound yet. The controls don't fire while MAP is on.
+  </Step>
+  <Step title="Click a control">
+    The ring goes solid and the control says **PRESS A KEY**. Click it
+    again to let it go.
+  </Step>
+  <Step title="Press the key">
+    The key is bound and its cap prints on the control. Map the next
+    control, or leave map mode.
+  </Step>
+  <Step title="Click MAP to leave">
+    The controls play again, each with its key on it.
+  </Step>
+</Steps>
+
+While a control waits for a key:
+
+- **Escape** backs out without changing anything.
+- **⌫** leaves the control with no key.
+- A key with **⌘** held is its own binding: **⌘J** and **J** are two
+  different keys.
+- A modifier on its own (⇧, ⌥, ⌃, ⌘) isn't a key; Dub waits for the real one.
+
+**MAP** is on the **Performance** surface only. It isn't there in **Prep**,
+or while you record a side.
+
+## One key, one control
+
+If you press a key that another control already has, the key moves: the new
+control gets it and the old one is left with no key. That includes
+**Space**, so you can give it to something else.
+
+**⌘,** can't be moved or taken. It's always the way back into Preferences.
+
+## What you can map
+
+| Where | Controls |
+| --- | --- |
+| Each deck | The hot cue pads, the Quick Scratch pads, **ECHO OUT**, key **LOCK** |
+| A deck on **THRU** | The tempo readout, to tap the record's tempo |
+| The rack bar | The siren's five shots, the sampler pads |
+| The DUB FX channel ([alpha](/dub-fx)) | Each unit's **IN**/**OUT** toggle, the Space Echo's **HOLD** and **TAP**, the spring's **KICK**, and **HOLD** on each deck's echo |
+
+Holding **⇧** while you press a hot cue's key clears that cue.
+
+## See and reset your map
+
+**Preferences ▸ Keys** lists every bound control with its key, under
+**BOUND NOW**. You map on the surface, not there.
+
+**Reset all bindings…** at the bottom of that list puts everything back:
+every control you mapped loses its key, and **Space** and **⌘,** come back.
+It asks first.
+
+Dub saves your map on this Mac as you make it and keeps it across launches.
+
+## MIDI
+
+Map mode binds keys today. Binding MIDI controls the same way is planned.

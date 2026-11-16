@@ -1,0 +1,174 @@
+---
+title: "Your library"
+description: "Browse, search, filter and sort your tracks, keep crates, rate and colour them, and let Dub keep track of what you played."
+icon: "table-list"
+---
+
+The library sits under the decks. The sidebar on the left picks what the list
+shows; the list on the right is your tracks.
+
+## The sidebar
+
+| Section | What it lists |
+| --- | --- |
+| **LIBRARY ▸ All Tracks** | Your collection. The number next to it is how many tracks it holds. |
+| **SMART CRATES** | **Recently Played**, **Session History** and **Just Imported**. Dub fills these by itself. |
+| **DUB CRATES** | The crates you make in Dub. |
+| **IMPORTED SOURCES** | Serato, Traktor, rekordbox and Apple Music, with their playlists. See [Bring your library](/library/import). |
+| **REAL RECORDS** | The record sides you've ripped. |
+
+Above the list is a strip of eight favourite slots. Drag a crate or a
+playlist from the sidebar onto a slot, then click the slot to open it.
+Right-click a slot and choose **Clear Slot** to empty it.
+
+## Search
+
+Type in **Search** at the top of the sidebar. The list narrows as you type.
+The clear button at the end of the field empties it.
+
+## Filter
+
+The **FILTER** bar above the list holds a box per field: **Genre**, **BPM**,
+**Key** and **Rating** to start with. Tick values in a box to show only
+those tracks. Each value shows how many tracks match.
+
+- **BPM** splits the list into tempo ranges, such as `124–128`.
+- **Rating** shows tracks with at least the stars you click.
+- Tracks with an empty field collect under **(none)**.
+
+Add or remove boxes with the **+** at the right of the bar. Click the bar's
+line to fold it away; folded, it still says what you're filtering by. Click
+**Clear** to drop every filter.
+
+## Columns and sorting
+
+**Artist** and **Title** are always there. Right-click a column header to
+show or hide the others:
+
+- **Analysis**: **Length**, **BPM**, **Key**
+- **ID3 metadata**: **Album**, **Genre**, **Year**, **Comment**,
+  **Composer**, **Track #**
+- **Library**: **Rating**, **Color**, **Version**, **Source**
+- **More columns**: everything else, grouped. Each app you imported from
+  gets its own group with its own BPM, key and tags, so you can put
+  **Serato BPM** next to **BPM (auto)** and compare. There are also groups
+  for the audio file (codec, rate, size, path) and for your **Mix history**
+  (**Plays**, **Last played**).
+
+Drag a header to move a column. Click a header to sort: once ascending,
+twice descending, a third time to turn the sort off. Empty cells always go
+to the bottom.
+
+The **Key** column is in Camelot, coloured around the wheel so compatible
+keys stand out down the list. Right-click a header and choose **Toggle Key
+Notation (Musical)** to read it as `C major` instead.
+
+## Crates
+
+<Steps>
+  <Step title="Make a crate">
+    Click the **+** next to **DUB CRATES** and type a name.
+  </Step>
+  <Step title="Fill it">
+    Drag tracks from the list onto the crate in the sidebar. A file dragged
+    from the Finder joins only if it's already in your library.
+  </Step>
+  <Step title="Put it in order">
+    Open the crate. The **#** column is its running order; sort by it and
+    drag rows to reorder. Or right-click a track: **Move Up**, **Move
+    Down**, **Move to Top**, **Move to Bottom**.
+  </Step>
+</Steps>
+
+Right-click a crate for **Rename**, **Export As…** and **Delete**. Deleting a
+crate removes only the list. The tracks stay in your library. Inside a
+crate, **Remove from Crate** takes the selected tracks out.
+
+Playlists under **IMPORTED SOURCES** are read-only. They show what the other
+app has; you can't rename, reorder or drop into them.
+
+## Ratings and colours
+
+Turn on the **Rating** and **Color** columns.
+
+- **Rating**: click a star to rate from one to five. Click the same star
+  again to clear it.
+- **Color**: click the swatch and pick **Red**, **Orange**, **Yellow**,
+  **Green**, **Aqua**, **Blue**, **Purple** or **Pink**, or **None**. The
+  whole row takes a tint of the colour.
+
+## What you played
+
+Dub records what each deck loads and plays. It never sees your mixer, so it
+works out a transition from the decks: when one deck stops while the other
+keeps playing a different track, and the outgoing track played for at least
+30 seconds, that counts as a mix from one into the other.
+
+- **Recently Played** lists tracks you've loaded on a deck, newest first.
+- **Session History** is the set you've played since you opened Dub. A track you
+  mixed into shows **← from** and the track before it.
+- When you load a track you've mixed out of before, the deck header shows
+  **↝ usually:** and the track you most often play next. Click it to find
+  that track in the library, then press Space to load it.
+
+## Analysis
+
+Dub reads tempo, beat grid and key from the audio itself. It does this
+lazily: importing stays fast, and a track is analysed the first time you
+load it. The deck plays straight away and the **BPM** fills in a few
+seconds later. While it works, the bottom-right corner of the list shows
+**Analyzing 1 track…**.
+
+To analyse ahead of a gig, select tracks, right-click and choose **Analyze**
+(or **Re-analyze** for tracks done before). The menu counts what it will
+do: **Re-analyze Selected (3 of 5)** means two of the five have a locked
+grid and are skipped.
+
+Marks in the **BPM** column:
+
+| Mark | Means |
+| --- | --- |
+| **⚠** *Imported and analysed grids disagree* | Another app's grid and Dub's analysis don't match. Show the per-app BPM columns to compare. |
+| **⚠** *May drift over a long mix* | The grid may wander late in the track. Right-click ▸ **Lock grid** to accept it. |
+| Padlock | The grid is locked. Analysis leaves it alone. Right-click ▸ **Unlock grid** to free it. |
+
+Hover a **⚠** to see which one it is.
+
+Key comes out as Camelot. A grid from another app stays in charge: Dub's own
+reading sits beside it in **BPM (auto)** and **Key (auto)**.
+
+## Duplicates
+
+When you import, Dub fingerprints each file. A file that sounds the same as a
+track you already have, with the same length, joins that track as a second
+copy rather than a second row.
+
+Dub won't merge versions. A title or filename marked `(Clean)`, `(Dirty)`,
+`(Instrumental)`, `(Acapella)`, `(Radio Edit)`, `(Extended Mix)` or
+`(12" Mix)` stays its own track, and the **Version** column shows the tag.
+Versions of the same recording get a link icon in the row. Click it to jump to the other version.
+
+## Missing files
+
+A track on a drive that's unplugged shows a red triangle in its row. When
+files can't be found, the bottom-right corner of the list counts them, for
+example **12 missing**.
+
+<Steps>
+  <Step title="Open Relocate">
+    Click the missing count. **Relocate Missing Files** opens.
+  </Step>
+  <Step title="Point Dub at the files">
+    Click **Match Folder…** and choose the folder that now holds them. Dub
+    matches files by fingerprint and length, so renamed files are found
+    too.
+  </Step>
+  <Step title="Check the result">
+    The sheet reports how many it relocated. Anything still missing can be
+    tried against another folder.
+  </Step>
+</Steps>
+
+Dub never deletes a track because its file went missing. Your grids, cues,
+ratings and history stay, and when the drive comes back the old path works
+again.
