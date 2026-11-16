@@ -96,6 +96,45 @@ final class SampleBankTests: XCTestCase {
         XCTAssertEqual(SampleBank.label(for: horn), "horn.wav")
     }
 
+    // MARK: - Names
+
+    func testARenamedSlotReadsAsItsNameAndBlankGoesBack() {
+        var bank = SampleBank(urls: [horn])
+        XCTAssertEqual(bank.label(0), "horn.wav")
+        bank.rename(0, to: "  AIR HORN ")
+        XCTAssertEqual(bank.label(0), "AIR HORN")
+        XCTAssertEqual(bank.customName(0), "AIR HORN")
+        bank.rename(0, to: "   ")
+        XCTAssertEqual(bank.label(0), "horn.wav")
+        XCTAssertNil(bank.customName(0))
+    }
+
+    func testAnEmptySlotCannotBeNamed() {
+        var bank = SampleBank()
+        bank.rename(3, to: "STAB")
+        XCTAssertNil(bank.label(3))
+        XCTAssertNil(bank.customName(3))
+    }
+
+    /// The name went with the sound; the tag stays with the pad.
+    func testDroppingAnotherFileDropsTheNameButKeepsTheTag() {
+        var bank = SampleBank(urls: [horn])
+        bank.setQuickScratch(2, for: 0)
+        bank.rename(0, to: "AIR HORN")
+        bank.load(stab, into: 0)
+        XCTAssertEqual(bank.label(0), "stab.aiff")
+        XCTAssertEqual(bank.quickScratchTag(0), 2)
+    }
+
+    func testANameSurvivesPersistence() {
+        var bank = SampleBank(urls: [horn, stab])
+        bank.rename(1, to: "STAB")
+        bank.setQuickScratch(0, for: 1)
+        let restored = SampleBank(persisted: bank.persisted)
+        XCTAssertEqual(restored, bank)
+        XCTAssertEqual(restored.label(1), "STAB")
+    }
+
     // MARK: - Quick Scratch tags
 
     /// A pad names one slot: tagging another slot with the same pad

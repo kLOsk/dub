@@ -946,10 +946,11 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kSampleBank = "dub.sampleBank"
 
-    /// Pads whose file was gone at the last push, by pad, with the file's
-    /// name: a press says why it is silent, and a reconnect does not
+    /// Pads whose file was gone or unreadable at the last push, by slot:
+    /// the pads draw MISSING / UNREADABLE instead of a name that looks
+    /// ready, a press says why it is silent, and a reconnect does not
     /// repeat the notice.
-    private var missingSamples: [Int: String] = [:]
+    @Published private(set) var sampleFaults: [Int: SampleFault] = [:]
 
     /// Where the sampler lands — the master deck by default, or a deck
     /// the DJ pinned it to, or both. Persisted under `dub.samplerOutput`.
@@ -5539,8 +5540,8 @@ final class WaveformAppModel: ObservableObject {
     /// of this.
     func triggerSampler(_ index: Int) {
         guard isRunning, sampleBank.slot(index) != nil else { return }
-        if let name = missingSamples[index] {
-            surfaceNotice("Sampler pad \(index + 1): \(name) is gone. Drop a sample on the pad.")
+        if let fault = sampleFaults[index] {
+            surfaceNotice("Sampler pad \(index + 1): \(fault.sentence)")
             return
         }
         let output: SamplerOutput
@@ -5581,7 +5582,7 @@ final class WaveformAppModel: ObservableObject {
             guard previous == nil || url != previous?.slot(index) else { continue }
             let ffiSlot = UInt64(index)
             guard let url else {
-                missingSamples[index] = nil
+                sampleFaults[index] = nil
                 sampleWaves[index] = nil
                 try? engine.samplerClear(slot: ffiSlot)
                 continue
@@ -5589,19 +5590,19 @@ final class WaveformAppModel: ObservableObject {
             // A file moved or deleted since it was put on the pad. Not
             // something that stops the set, so not the red banner — and
             // not again on every reconnect (rig, 2026-11-11: it greeted
-            // every launch and every SL 3 plug-in).
+            // every launch and every SL 3 plug-in). The pad itself says
+            // MISSING from here on.
             guard FileManager.default.fileExists(atPath: url.path) else {
                 try? engine.samplerClear(slot: ffiSlot)
                 sampleWaves[index] = nil
-                if missingSamples[index] != url.lastPathComponent {
-                    missingSamples[index] = url.lastPathComponent
-                    surfaceNotice(
-                        "Sampler pad \(index + 1): \(url.lastPathComponent) is gone. "
-                            + "Drop a sample on the pad.")
+                let fault = SampleFault.missing(url.lastPathComponent)
+                if sampleFaults[index] != fault {
+                    sampleFaults[index] = fault
+                    surfaceNotice("Sampler pad \(index + 1): \(fault.sentence)")
                 }
                 continue
             }
-            missingSamples[index] = nil
+            sampleFaults[index] = nil
             // Decode + resample + measure, so off the main queue. The
             // gain it reports is applied engine-side; the waveform
             // draws the file as decoded (see the deck pane's note on
@@ -5612,13 +5613,15 @@ final class WaveformAppModel: ObservableObject {
                     let wave = engine.samplerWaveform(slot: ffiSlot, bars: UInt32(Self.sampleWaveBars))
                     await MainActor.run { self.sampleWaves[index] = wave }
                 } catch {
-                    let name = url.lastPathComponent
+                    let fault = SampleFault.unreadable(url.lastPathComponent)
                     let detail = error.localizedDescription
                     dubLog.error("Sampler \(index + 1): \(detail, privacy: .public)")
                     await MainActor.run {
-                        self.surfaceNotice(
-                            "Sampler pad \(index + 1): \(name) could not be read. "
-                                + "Drop another sample on the pad.")
+                        // Only if the slot still holds this file — a drop
+                        // during the decode is the newer truth.
+                        guard self.sampleBank.slot(index) == url else { return }
+                        self.sampleFaults[index] = fault
+                        self.surfaceNotice("Sampler pad \(index + 1): \(fault.sentence)")
                     }
                 }
             }
@@ -5665,6 +5668,11 @@ final class WaveformAppModel: ObservableObject {
             releaseQuickScratch(side)
             return
         }
+        // A pad with no sample behind it would park the tune for silence.
+        if let fault = sampleFaults[slot] {
+            surfaceNotice("Quick Scratch \(pad + 1): \(fault.sentence)")
+            return
+        }
         let parkedTitle: String?
         if let current = deck.quickScratch {
             parkedTitle = current.parkedTitle
@@ -5699,7 +5707,7 @@ final class WaveformAppModel: ObservableObject {
         quickScratchEngagedAt[side] = Date()
         var sample = DeckState()
         sample.hasTrack = true
-        sample.displayName = sampleBank.slot(slot).map { SampleBank.label(for: $0) }
+        sample.displayName = sampleBank.label(slot)
         sample.trackTitle = sample.displayName
         sample.sourceURL = sampleBank.slot(slot)
         sample.formatChip = "SAMPLE"
@@ -5870,6 +5878,19 @@ final class WaveformAppModel: ObservableObject {
     /// Empty a sampler slot.
     func clearSampleSlot(_ index: Int) {
         sampleBank.unload(index)
+    }
+
+    /// Name a sampler slot on its pads; blank goes back to the filename.
+    /// A deck holding it through Quick Scratch shows the new name too.
+    func renameSampleSlot(_ index: Int, to name: String?) {
+        sampleBank.rename(index, to: name)
+        for side in [DeckSide.a, .b] {
+            var deck = state(for: side)
+            guard deck.quickScratch?.slot == index else { continue }
+            deck.displayName = sampleBank.label(index)
+            deck.trackTitle = deck.displayName
+            setState(deck, for: side)
+        }
     }
 
     /// Name and/or colour an existing cue on `side`.

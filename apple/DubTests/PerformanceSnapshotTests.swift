@@ -227,7 +227,7 @@ final class PerformanceSnapshotTests: XCTestCase {
             hasTrack: true,
             isPlaying: true,
             scratch: [
-                ScratchPadState(pad: 0, name: "Horn"),
+                ScratchPadState(pad: 0, name: "Horn", fault: .missing("horn.wav")),
                 ScratchPadState(pad: 1, name: "Rewind!"),
                 ScratchPadState(pad: 2),
                 ScratchPadState(pad: 3),

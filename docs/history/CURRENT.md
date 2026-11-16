@@ -66,6 +66,12 @@ gate is local-only because GitHub CI has no macOS app job.
   Applying reconnects the interface and empties the decks, so it is
   locked while a deck plays. An unknown interface nobody has routed gets
   one quiet notice pointing at the tab.
+- **A sample pad says when its file is gone (2026-11-16).** A SAMPLES
+  tile or Quick Scratch pad whose file is missing or unreadable wears a
+  red **MISSING** / **UNREADABLE** badge where its shape would be (it
+  read as still loading); Quick Scratch refuses it rather than parking
+  the tune for silence. **Rename…** on either pad's right-click names
+  the slot (`SampleSlot.name`, persisted; a new file drops the name).
 - **C-30, the poll's Swift-side allocations, have a baseline**
   (`PollAllocationTests`, numbers on C-30 in `UI-BACKLOG.md`).
 

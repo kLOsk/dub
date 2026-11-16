@@ -492,7 +492,7 @@ struct PreferencesSheet: View {
             return "Siren · \(i < names.count ? names[i] : "shot \(i + 1)")"
         case .instantDouble(let toB): return toB ? "Instant double → B" : "Instant double → A"
         case .sampler(let i):
-            let name = model.sampleBank.slot(i).map { SampleBank.label(for: $0) }
+            let name = model.sampleBank.label(i)
             return "Sample \(i + 1)" + (name.map { " · \($0)" } ?? "")
         case .quickScratch(let side, let i): return "Quick Scratch \(side.label) · \(i + 1)"
         case .fxToggle(let i):

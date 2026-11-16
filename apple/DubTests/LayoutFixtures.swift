@@ -79,7 +79,7 @@ extension GlobalRackBarState {
                     SampleSlotState(index: 1, name: "Reload", quickScratch: 0),
                     SampleSlotState(index: 2),
                     SampleSlotState(index: 3),
-                    SampleSlotState(index: 4, name: "Siren Up"),
+                    SampleSlotState(index: 4, name: "Siren Up", fault: .missing("siren-up.wav")),
                     SampleSlotState(index: 5),
                     SampleSlotState(index: 6),
                     SampleSlotState(index: 7),

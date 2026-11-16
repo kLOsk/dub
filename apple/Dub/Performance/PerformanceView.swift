@@ -349,10 +349,11 @@ struct PerformanceView: View {
                 let slot = model.sampleBank.quickScratchSlot(pad: pad)
                 return ScratchPadState(
                     pad: pad,
-                    name: slot.flatMap { model.sampleBank.slot($0) }.map { SampleBank.label(for: $0) },
+                    name: slot.flatMap { model.sampleBank.label($0) },
                     wave: slot.flatMap { model.sampleWaves[$0] } ?? [],
                     engaged: deck.quickScratch?.pad == pad,
-                    legend: DubKeymap.legend(for: .quickScratch(side, pad)))
+                    legend: DubKeymap.legend(for: .quickScratch(side, pad)),
+                    fault: slot.flatMap { model.sampleFaults[$0] })
             },
             fxAvailable: model.dubFxAvailable,
             echoLegend: DubKeymap.legend(for: .echoOut(side)),
@@ -402,6 +403,9 @@ struct PerformanceView: View {
             onScaleTempo: { factor in model.scaleThruTempo(side, by: factor) },
             onResetTempo: { model.resetThruTempo(side) },
             onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
+            onRenameScratch: { pad in
+                if let index = model.sampleBank.quickScratchSlot(pad: pad) { renameSample(index) }
+            },
             // Select Internal *and* start playing, which is the
             // contract `SourceControlView` documents for the segment
             // ("Select Internal and start playing the loaded file").
@@ -640,12 +644,13 @@ struct PerformanceView: View {
                 let voice = voices.indices.contains(index) ? voices[index] : nil
                 return SampleSlotState(
                     index: index,
-                    name: model.sampleBank.slot(index).map { SampleBank.label(for: $0) },
+                    name: model.sampleBank.label(index),
                     wave: model.sampleWaves[index] ?? [],
                     playing: voice?.playing ?? false,
                     progress: Double(voice?.progress ?? 0),
                     quickScratch: model.sampleBank.quickScratchTag(index),
-                    legend: DubKeymap.legend(for: .sampler(index)))
+                    legend: DubKeymap.legend(for: .sampler(index)),
+                    fault: model.sampleFaults[index])
             },
             output: output)
     }
@@ -657,7 +662,27 @@ struct PerformanceView: View {
             onDrop: { index, url in model.setSampleSlot(index, url: url) },
             onUnload: { index in model.clearSampleSlot(index) },
             onQuickScratch: { index, pad in model.sampleBank.setQuickScratch(pad, for: index) },
+            onRename: { index in renameSample(index) },
             onOutput: { output in model.samplerOutput = output })
+    }
+
+    /// Name a sampler slot — on its SAMPLES tile and on any Quick
+    /// Scratch pad it answers to. Same sheet as naming a cue; a blank
+    /// name goes back to the filename, which the field shows as its hint.
+    private func renameSample(_ index: Int) {
+        guard let url = model.sampleBank.slot(index) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Name sample \(index + 1)"
+        alert.informativeText = SampleBank.label(for: url)
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = model.sampleBank.customName(index) ?? ""
+        field.placeholderString = SampleBank.label(for: url)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        model.renameSampleSlot(index, to: field.stringValue)
     }
 
     /// Prep's surface, as values. Read fresh each render; nothing here

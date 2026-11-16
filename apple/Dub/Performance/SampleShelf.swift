@@ -18,7 +18,8 @@
 //    sounding slot starts it over (the engine crossfades the retrigger).
 //  * **Right-click while sounding stops it.** No menu — a hand mid-set
 //    wants the horn gone, not a list to read.
-//  * **Right-click while quiet offers the Quick Scratch tag and Unload.**
+//  * **Right-click while quiet offers the Quick Scratch tag, Rename… and
+//    Unload.**
 //    The destructive gesture only exists when there is nothing to
 //    interrupt; the tag is prep work and lives on the tile because the
 //    tile is where the sample is.
@@ -53,6 +54,9 @@ struct SampleSlotState: Equatable, Identifiable {
     /// The key that fires the slot, from the map; `nil` until the DJ
     /// binds one in map mode.
     var legend: String?
+    /// Set when the slot's file is gone or unreadable: the tile says so
+    /// instead of drawing a name that looks ready to fire.
+    var fault: SampleFault?
 
     var id: Int { index }
 }
@@ -91,6 +95,8 @@ struct SampleShelfCallbacks {
     /// Tag slot `index` with Quick Scratch pad `pad` (0-based), or
     /// `nil` to clear the tag.
     var onQuickScratch: (_ index: Int, _ pad: Int?) -> Void = { _, _ in }
+    /// Rename… on slot `index`: the host asks for the name.
+    var onRename: (_ index: Int) -> Void = { _ in }
     /// The pill's right-click: pin the rack's output or let it follow
     /// the master again.
     var onOutput: (_ output: RackOutput) -> Void = { _ in }
@@ -184,7 +190,18 @@ struct SampleShelf: View {
                 .font(.system(size: isEmpty ? 13 : 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(DubColor.textPlaceholder)
                 .frame(maxWidth: isEmpty ? .infinity : nil)
-            if let name = slot.name, slot.wave.isEmpty {
+            if let name = slot.name, let fault = slot.fault {
+                // The badge where the shape would be: a missing file
+                // has no shape, and without the word the tile looked
+                // as if it were still loading.
+                HStack(spacing: DubSpacing.sm) {
+                    SampleFaultBadge(fault: fault)
+                    tileName(name, faulted: true)
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, slot.quickScratch == nil ? 0 : 22)
+            } else if let name = slot.name, slot.wave.isEmpty {
                 // Still loading (or not read at all): no space kept for
                 // a shape that is not there.
                 tileName(name).frame(maxWidth: .infinity, alignment: .leading)
@@ -232,7 +249,7 @@ struct SampleShelf: View {
         .overlay(
             RoundedRectangle(cornerRadius: DubRadius.panel, style: .continuous)
                 .strokeBorder(
-                    lit ? tint : DubColor.divider,
+                    lit ? tint : slot.fault != nil ? DubColor.stateError.opacity(0.6) : DubColor.divider,
                     style: StrokeStyle(lineWidth: 1, dash: isEmpty ? [3, 3] : [])))
         .overlay(alignment: .topTrailing) {
             if let pad = slot.quickScratch {
@@ -274,17 +291,17 @@ struct SampleShelf: View {
         .mappable(.sampler(slot.index))
     }
 
-    private func tileName(_ name: String) -> some View {
+    private func tileName(_ name: String, faulted: Bool = false) -> some View {
         Text(name)
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(DubColor.textPrimary)
+            .foregroundStyle(faulted ? DubColor.textTertiary : DubColor.textPrimary)
             .lineLimit(1)
             .truncationMode(.middle)
     }
 
     /// The stopped-state menu: which Quick Scratch pad this sample sits
-    /// on, and the way out. Flat rather than a submenu — five lines,
-    /// read once.
+    /// on, its name, and the way out. Flat rather than a submenu — a
+    /// handful of lines, read once.
     private func quietMenu(_ slot: SampleSlotState) -> [SecondaryMenuItem] {
         var items = (0..<SampleBank.quickScratchCount).map { pad in
             SecondaryMenuItem("Quick Scratch \(pad + 1)", checked: slot.quickScratch == pad) {
@@ -292,6 +309,7 @@ struct SampleShelf: View {
             }
         }
         items.append(.separator)
+        items.append(SecondaryMenuItem("Rename…") { callbacks.onRename(slot.index) })
         items.append(SecondaryMenuItem("Unload") { callbacks.onUnload(slot.index) })
         return items
     }
@@ -300,11 +318,35 @@ struct SampleShelf: View {
         guard let name = slot.name else {
             return "Slot \(slot.index + 1) — drag a track here from the library or Finder"
         }
+        if let fault = slot.fault {
+            return "\(name) — \(fault.sentence) Right-click to rename or unload."
+        }
         let tag = slot.quickScratch.map { " · Quick Scratch \($0 + 1)" } ?? ""
         return slot.playing
             ? "\(name) — click to start over, right-click to stop"
-            : "\(name)\(tag) — click to play, right-click for Quick Scratch / unload, "
-                + "drop another to replace"
+            : "\(name)\(tag) — click to play, right-click for Quick Scratch / rename / "
+                + "unload, drop another to replace"
+    }
+}
+
+/// MISSING / UNREADABLE, in the error red, small enough to sit in a
+/// pad beside the name it qualifies. Shared by the SAMPLES tiles and the
+/// Quick Scratch pads so the same fault reads the same in both.
+struct SampleFaultBadge: View {
+    let fault: SampleFault
+    var size: CGFloat = 8
+
+    var body: some View {
+        Text(fault.badge)
+            .font(.system(size: size, weight: .bold, design: .monospaced))
+            .foregroundStyle(DubColor.stateError)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .strokeBorder(DubColor.stateError.opacity(0.7), lineWidth: 1))
     }
 }
 

@@ -110,6 +110,9 @@ struct ScratchPadState: Equatable, Identifiable {
     var engaged: Bool = false
     /// The key that fires the pad, from the map; `nil` until bound.
     var legend: String?
+    /// The tagged sample's file is gone or unreadable: the pad says so
+    /// rather than showing a name with no shape that looks ready.
+    var fault: SampleFault?
 
     var id: Int { pad }
 }
@@ -219,6 +222,8 @@ struct DeckColumnCallbacks {
     /// Quick Scratch pad `pad` pressed: engage its sample, swap to it,
     /// or — if it is the one on the deck — release.
     var onScratch: (_ pad: Int) -> Void = { _ in }
+    /// Rename… on a Quick Scratch pad: renames the SAMPLES slot behind it.
+    var onRenameScratch: (_ pad: Int) -> Void = { _ in }
     var onSetInternal: () -> Void = {}
     var onPause: () -> Void = {}
     var onSetTimecode: () -> Void = {}
@@ -839,7 +844,9 @@ struct DeckColumn<Overview: View>: View {
         let bound = pad.name != nil
         VStack(spacing: 4) {
             if let name = pad.name {
-                if !pad.wave.isEmpty {
+                if let fault = pad.fault {
+                    SampleFaultBadge(fault: fault, size: 7)
+                } else if !pad.wave.isEmpty {
                     scratchShape(pad, tint: tint)
                         .frame(height: 12)
                         .padding(.horizontal, 6)
@@ -848,7 +855,9 @@ struct DeckColumn<Overview: View>: View {
                     .font(.system(size: 9, weight: .bold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .foregroundStyle(pad.engaged ? DubColor.textPrimary : DubColor.textSecondary)
+                    .foregroundStyle(
+                        pad.engaged ? DubColor.textPrimary
+                            : pad.fault != nil ? DubColor.textTertiary : DubColor.textSecondary)
                     .padding(.horizontal, 3)
             } else {
                 Text("QS\(pad.pad + 1)")
@@ -864,12 +873,15 @@ struct DeckColumn<Overview: View>: View {
         .overlay(
             RoundedRectangle(cornerRadius: 4, style: .continuous)
                 .strokeBorder(
-                    pad.engaged ? tint : DubColor.divider,
+                    pad.engaged ? tint
+                        : pad.fault != nil ? DubColor.stateError.opacity(0.6) : DubColor.divider,
                     style: StrokeStyle(lineWidth: 1, dash: bound ? [] : [3, 3])))
         .overlay(alignment: .topTrailing) {
             if let legend = pad.legend, bound, mapping == nil {
                 DubKeycap(key: legend, lit: pad.engaged)
-            } else if bound {
+            } else if bound, pad.fault == nil {
+                // A faulted pad's badge takes the top line; the number
+                // would crowd it, and the pad's place already says it.
                 Text("QS\(pad.pad + 1)")
                     .font(.system(size: 7, weight: .bold, design: .monospaced))
                     .foregroundStyle(pad.engaged ? tint : DubColor.textTertiary)
@@ -879,6 +891,14 @@ struct DeckColumn<Overview: View>: View {
         }
         .contentShape(Rectangle())
         .onPressDown(enabled: bound) { callbacks.onScratch(pad.pad) }
+        // Only while it is off the deck: a right-click mid-scratch is a
+        // hand that slipped, not a request for a dialog.
+        .onSecondaryClick {
+            guard bound, !pad.engaged else { return .handled }
+            return .menu([
+                SecondaryMenuItem("Rename…") { callbacks.onRenameScratch(pad.pad) }
+            ])
+        }
         .help(scratchHelp(pad))
         .mappable(.quickScratch(state.side, pad.pad))
     }
@@ -906,6 +926,9 @@ struct DeckColumn<Overview: View>: View {
         guard let name = pad.name else {
             return "Quick Scratch \(pad.pad + 1) — tag a sample with it: right-click a "
                 + "SAMPLES tile"
+        }
+        if let fault = pad.fault {
+            return "Quick Scratch \(pad.pad + 1): \(fault.sentence)"
         }
         return pad.engaged
             ? "\(name) is on the deck — press to bring the tune back"

@@ -8,10 +8,40 @@ struct SampleSlot: Codable, Equatable {
     /// this sample answers to on the deck columns, or `nil`. One slot
     /// per pad — see `SampleBank.setQuickScratch`.
     var quickScratch: Int?
+    /// The DJ's own name for the pad, set with Rename…; `nil` shows the
+    /// filename. Optional so a table persisted before it decodes as-is.
+    var name: String?
 
-    init(url: URL, quickScratch: Int? = nil) {
+    init(url: URL, quickScratch: Int? = nil, name: String? = nil) {
         self.url = url
         self.quickScratch = quickScratch
+        self.name = name
+    }
+}
+
+/// Why a loaded slot has no sound behind it. The pad keeps its place
+/// and name — the DJ put it there — but must not look ready: a name
+/// with no shape read as "still loading" (rig, 2026-11-16).
+enum SampleFault: Equatable {
+    /// The file was moved or deleted since it went on the pad.
+    case missing(String)
+    /// The file is there and the decoder refused it.
+    case unreadable(String)
+
+    /// The word the pad wears.
+    var badge: String {
+        switch self {
+        case .missing: "MISSING"
+        case .unreadable: "UNREADABLE"
+        }
+    }
+
+    /// The notice a press or a push raises.
+    var sentence: String {
+        switch self {
+        case .missing(let file): "\(file) is gone. Drop a sample on the pad."
+        case .unreadable(let file): "\(file) could not be read. Drop another sample on the pad."
+        }
     }
 }
 
@@ -88,10 +118,30 @@ struct SampleBank: Equatable {
         slots.indices.contains(index) ? slots[index]?.url : nil
     }
 
+    /// What slot `index` reads as on its pads: the DJ's name for it,
+    /// else the filename; `nil` when empty.
+    func label(_ index: Int) -> String? {
+        guard slots.indices.contains(index), let slot = slots[index] else { return nil }
+        return slot.name ?? Self.label(for: slot.url)
+    }
+
+    /// The DJ's own name for slot `index`, if they gave it one.
+    func customName(_ index: Int) -> String? {
+        slots.indices.contains(index) ? slots[index]?.name : nil
+    }
+
+    /// Name slot `index`; blank or `nil` goes back to the filename. An
+    /// empty slot has nothing to name.
+    mutating func rename(_ index: Int, to name: String?) {
+        guard slots.indices.contains(index), slots[index] != nil else { return }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        slots[index]?.name = trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Put `url` in slot `index`, replacing whatever was there. Dropping
     /// onto a full slot is the same gesture as filling an empty one, and
     /// the slot keeps its Quick Scratch tag — the tag names the pad, not
-    /// the file.
+    /// the file. A name does not survive: it named the sound that left.
     mutating func load(_ url: URL, into index: Int) {
         guard slots.indices.contains(index) else { return }
         slots[index] = SampleSlot(url: url, quickScratch: slots[index]?.quickScratch)
