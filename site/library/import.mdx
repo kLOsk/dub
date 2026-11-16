@@ -1,0 +1,63 @@
+---
+title: "Bring your library"
+description: "Read your Serato, Traktor, rekordbox and Apple Music libraries into Dub, and take your work back out."
+icon: "folder-open"
+---
+
+Dub reads your other DJ apps' libraries. It never writes to them, so you can
+keep using Serato, Traktor or rekordbox alongside it.
+
+## What Dub reads
+
+| App | What Dub reads | What comes across |
+| --- | --- | --- |
+| **Serato** (up to Serato 3's library format) | the `_Serato_` folder in your Music folder and on each drive | Crates, beat grids, hot cues, loops |
+| **Traktor** | `collection.nml` | Playlists, beat grids, cues, loops, key, rating |
+| **rekordbox** | a rekordbox XML export (`File → Export Collection in xml format`) | Playlists, beat grids, hot and memory cues, loops, key, rating, colour |
+| **Apple Music / iTunes** | the shared library XML | Playlists and track details (no grids or cues) |
+| **Lexicon** | whatever Lexicon syncs into the apps above | See [Lexicon](/library/lexicon) |
+
+<Note>
+Newer Serato versions keep their library in a new place that Dub can't read
+yet. If your Serato crates don't show up, export from your library manager
+to rekordbox XML instead, or see [Lexicon](/library/lexicon).
+</Note>
+
+## Turn a source on
+
+Open **Preferences ▸ Library** and switch on the apps you use. Dub looks for
+each library where that app keeps it and adds the app to the sidebar under
+**IMPORTED SOURCES**, with its playlists underneath.
+
+If your library lives somewhere else, right-click **LIBRARY** or **All
+Tracks** in the sidebar and choose **Import**, then the source and its file.
+
+## Browsing versus your collection
+
+An imported app's tracks are there to **browse**: they show under that app's
+node, but they don't fill up **All Tracks**. A track joins your collection
+when you play it, or when you import its folder (**Import ▸ Folder…**).
+
+Your grids, cues and loops from the other app come with the track. Dub still
+analyses tempo and key itself and flags a track with **⚠** when its own
+reading disagrees with the imported grid.
+
+## Re-importing
+
+Importing again refreshes what Dub knows from that app and picks up new
+tracks and playlists. It never touches what you did in Dub: your crates,
+beat-grid corrections, ratings and play history stay.
+
+## Missing files
+
+If tracks have moved, the corner of the library shows how many are missing.
+Click it to relocate them.
+
+## Taking it back out
+
+**File → Export Library As…** (⇧⌘E), or **Export As…** on a crate's
+right-click menu, writes:
+
+- **rekordbox XML**: tracks, beat grids, hot cues, loops and crates.
+  Serato, Traktor, rekordbox and Lexicon can all read it.
+- **M3U8**: a plain playlist of file paths, readable almost anywhere.

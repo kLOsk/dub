@@ -1,0 +1,73 @@
+---
+title: "Hardware"
+description: "Which interfaces and control vinyl Dub works with, and how to set up an interface Dub doesn't know."
+icon: "sliders"
+---
+
+## What you need
+
+Dub sits between your turntables and your mixer. For the two-deck
+**Performance** surface you need:
+
+- **An audio interface with at least 4 inputs and 4 outputs**: one stereo
+  pair in and one out per deck.
+- **Control vinyl** on each turntable.
+- **An external mixer** with line inputs. Dub has no software mixer; each
+  deck leaves on its own output pair and you mix on your hardware.
+
+## Tested hardware
+
+| Hardware | Role | Status |
+| --- | --- | --- |
+| Serato SL 3 | Interface (reference rig) | Tested |
+| Serato Control CV02 vinyl | Timecode | Tested |
+| Traktor Scratch MK1 vinyl | Timecode | Tested |
+| Traktor Scratch MK2 vinyl | Timecode | Decoder shipped, not yet confirmed on a real pressing |
+| Native Instruments Audio 6 | Interface | Known to Dub, not yet confirmed on hardware |
+| Any external mixer with line inputs | The mixer | Works |
+| Phase, MIDI and HID controllers | Control | Planned after 1.0 |
+
+Other class-compliant interfaces with 4 inputs and 4 outputs should work.
+Dub needs to know which channels each deck uses, which is the next section.
+
+## Setting up your interface
+
+Open **Preferences ▸ Audio** while Dub is running with the interface
+plugged in. It shows the interface and, for each deck, the pair the
+**needle comes in** on and the pair that goes **to the mixer**.
+
+The badge on the interface says how Dub knows it:
+
+| Badge | Meaning |
+| --- | --- |
+| **KNOWN · TESTED** | Dub ships this interface's channel map and it has been played on. Nothing to set; the routing is read-only. |
+| **KNOWN · UNTESTED** | Dub ships a map for it that hasn't been confirmed on hardware yet. |
+| **NOT SET UP** | Dub doesn't know this interface. Until you set it up, it runs one deck on inputs 1–2. |
+| **SET BY YOU** | You routed it here. Dub remembers it by the interface's name. |
+
+The first time you plug in an interface Dub doesn't know, it says so once
+and points you to this tab.
+
+### Routing an unknown interface
+
+<Steps>
+  <Step title="Choose one deck or two">
+    **TWO DECKS** needs 4 inputs and 4 outputs. **ONE DECK** works on any
+    interface.
+  </Step>
+  <Step title="Find each deck's input">
+    Channel numbers are the ones printed on the back of the interface. Drop
+    the needle on control vinyl and watch the meter next to each input: it
+    reads **timecode**, **music, not timecode**, or nothing, so the right
+    pair finds itself.
+  </Step>
+  <Step title="Find each deck's output">
+    Press **TEST** next to a deck's output: it plays a short tone on that
+    pair. Whichever mixer channel lights up is that deck's channel.
+  </Step>
+</Steps>
+
+Your routing applies as soon as you change it: the interface reconnects and
+both decks empty, so the routing is locked while a deck is playing. If two
+decks would share a pair, Dub tells you and keeps the last routing that
+worked. **Forget this interface** removes your routing for it.

@@ -1,0 +1,97 @@
+---
+title: "Troubleshooting"
+description: "What to do when the music stops, the needle won't lock, or a pad stays silent."
+icon: "life-ring"
+---
+
+## Saving a set on stage
+
+The needle breaks or the control record gives out mid-set. Dub is built so
+the beat doesn't stop:
+
+<Steps>
+  <Step title="Switch the deck to INT">
+    The track keeps playing on Dub's own clock from exactly where it was.
+    The deck stays on INT until you switch it back; the record can't take it
+    over by accident.
+  </Step>
+  <Step title="Fix the needle or swap the record">
+    Take your time. The set plays on.
+  </Step>
+  <Step title="Recalibrate while INT plays">
+    Put the needle down on the turning record and press **↻**. A lamp in the
+    TC segment shows the record's state: **amber** while it measures,
+    **green** when it's ready to take the deck back.
+  </Step>
+  <Step title="Switch back to TC">
+    When the lamp is green, press **TC**. The record picks the track up
+    where INT has it, without a dropped beat.
+  </Step>
+</Steps>
+
+## The needle won't lock
+
+Open the deck's **SIGNAL** panel and read its word:
+
+<AccordionGroup>
+  <Accordion title="NO SIGNAL">
+    Nothing is arriving on that deck's input. Is the needle down and the
+    record turning? Check the interface's **PHONO/LINE** switch for that
+    input, and the cable.
+  </Accordion>
+  <Accordion title="WEAK">
+    One channel is low or the signal is noisy. The panel names the low
+    channel. Check that cable and the needle; a worn or dirty stylus does
+    this too.
+  </Accordion>
+  <Accordion title="NO LOCK">
+    Timecode is arriving but isn't readable right now. That's normal while
+    you scratch or when the record is stopped.
+  </Accordion>
+  <Accordion title="NO INPUT">
+    The deck has no input assigned. Pick one in **Preferences ▸ Audio**.
+  </Accordion>
+</AccordionGroup>
+
+If the word is right but the deck still drifts, press **↻** to recalibrate
+on the record that's on the platter now.
+
+## The fader is up but nothing comes out
+
+Look at the deck's output meter between the decks:
+
+- **ECHO OUT**: echo out is still on, and its tail has died away. The record
+  plays on but nothing leaves the deck. Turn echo out off.
+- **NO OUTPUT**: the deck has no output pair, or the audio engine isn't
+  running. Check **Preferences ▸ Audio**.
+- **The meter moves**: Dub is sending. Check the mixer channel, its input
+  selector and the cable.
+
+## Dub doesn't know my interface
+
+Dub runs an interface it doesn't know as one deck on inputs 1–2, and tells
+you so once. Set its channels in **Preferences ▸ Audio**; see
+[Setting up your interface](/hardware#setting-up-your-interface).
+
+## A sample or Quick Scratch pad says MISSING
+
+The sample's file was moved or deleted since you put it on the pad.
+**UNREADABLE** means the file is there but can't be decoded. Drop another
+file on the pad. Pressing a missing pad tells you which file is gone, and a
+missing Quick Scratch pad won't park your tune for silence.
+
+## A THRU record reads at the wrong tempo
+
+Drum'n'bass on THRU can read at two-thirds of its tempo. Right-click the BPM
+and choose **×1.5**, or tap the tempo.
+
+## macOS won't open Dub
+
+The alpha isn't notarized by Apple yet. Open **System Settings → Privacy &
+Security**, find *"Dub" was blocked*, and click **Open Anyway**. See
+[Install Dub](/install).
+
+## Still stuck
+
+[Open an issue](https://github.com/kLOsk/dub/issues) with what you did, what
+you expected, and which interface and control vinyl you use.

@@ -1,0 +1,59 @@
+---
+title: "Dub"
+description: "Timecode vinyl for scratch DJs and sound systems. Two turntables, your own mixer, real records through the software."
+sidebarTitle: "Introduction"
+icon: "record-vinyl"
+---
+
+![Dub's Performance surface: two decks with vertical colour waveforms and a phase meter between them, hot cues, loops, echo, the sampler, the dub siren and the library](/images/performance.png)
+
+Dub is a timecode-vinyl DJ app for macOS, built for hip hop, reggae, dub,
+drum'n'bass and dubstep, and for never failing on stage. It is open source
+(MIT or Apache-2.0) with a Rust audio engine underneath.
+
+<Warning>
+**Dub is in alpha.** It plays, scratches, loops, rips and dubs on real
+hardware today, and it is still being proven on the rig one session at a
+time. Try it at home, in the studio, at a practice session. Don't take it to a
+paying gig yet, and please [tell us what breaks](https://github.com/kLOsk/dub/issues).
+</Warning>
+
+## What makes it different
+
+Most DJ software wants to be the whole booth. Dub wants to be the part
+between your turntables and your mixer, and to be very good at it.
+
+- **Your mixer is the mixer.** There is no software crossfader, EQ or gain.
+  Each deck leaves on its own output pair and you mix with your hands.
+- **Real records are first-class.** Flip a deck to **THRU** and the record on
+  the platter runs through Dub, with a live waveform, a live tempo and the
+  effects on it.
+- **Reliability is the feature.** The audio engine never allocates memory,
+  waits on a lock or blocks while it plays, and every change is tested for it.
+- **Yours to leave.** Dub imports from Serato, Traktor, rekordbox, Apple Music
+  and Lexicon, and exports back to rekordbox XML and M3U8.
+
+## Two surfaces
+
+- **Performance** is the two-deck surface for the set. It needs an audio
+  interface with at least 4 inputs and 4 outputs, control vinyl and an
+  external mixer.
+- **Prep** is one deck on your Mac's own output, for beat grids, cues and
+  samples before the gig. Dub opens in Prep when no interface is plugged in.
+
+## Start here
+
+<Columns cols={2}>
+  <Card title="Install Dub" icon="download" href="/install">
+    Download the alpha and get it past macOS's first-run check.
+  </Card>
+  <Card title="Hardware" icon="sliders" href="/hardware">
+    Interfaces, control vinyl, and setting up an interface Dub doesn't know.
+  </Card>
+  <Card title="Your first set" icon="record-vinyl" href="/first-set">
+    Wire it up, drop the needle, read the signal panel.
+  </Card>
+  <Card title="Bring your library" icon="folder-open" href="/library/import">
+    Serato, Traktor, rekordbox, Apple Music and Lexicon.
+  </Card>
+</Columns>

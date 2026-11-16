@@ -1,0 +1,61 @@
+---
+title: "Lexicon"
+description: "Get a library managed in Lexicon into Dub, and what survives the trip."
+icon: "arrows-rotate"
+---
+
+[Lexicon](https://www.lexicondj.com) is a library manager: it keeps your
+library and syncs it into your DJ apps. Dub doesn't read Lexicon directly.
+It reads what Lexicon writes into the apps Dub already imports.
+
+## Which Lexicon sync Dub reads
+
+| In Lexicon, **Sync to…** | Dub reads it? |
+| --- | --- |
+| **Rekordbox 5 & 6 XML** | **Yes. This is the route we recommend.** |
+| **Traktor** | Yes |
+| **Serato 3** | Yes |
+| Rekordbox 6 & 7 Direct | No: it writes rekordbox's own database |
+| Serato 4 / 5 | No: Dub can't read Serato's new library yet |
+
+## The recommended route: rekordbox XML
+
+<Steps>
+  <Step title="Save the XML from Lexicon">
+    In Lexicon's Sync window choose **Rekordbox 5 & 6 XML**, then **Save
+    Rekordbox XML**. Save it as `rekordbox.xml` in `Documents/rekordbox` in
+    your home folder.
+  </Step>
+  <Step title="Turn rekordbox on in Dub">
+    In **Preferences ▸ Library**, switch on rekordbox. Dub finds the file in
+    that folder by itself. Saved somewhere else? Right-click **All Tracks**,
+    choose **Import ▸ rekordbox.xml…** and pick it.
+  </Step>
+  <Step title="After every Lexicon change">
+    Save the XML again from Lexicon, then import it again in Dub.
+  </Step>
+</Steps>
+
+## What survives
+
+- **Beat grids.** Dub uses the first grid marker and the tempo. A track whose
+  tempo changes (a live drummer, say) arrives with a steady grid from its
+  first marker; Dub's own analysis flags it with **⚠** when they disagree.
+- **Cues.** Up to 8 hot cues, plus memory cues. Hot-cue colours come across;
+  memory-cue colours don't exist in the XML.
+- **Loops.** Saved loops come across.
+- **Key, rating, colour and comments.**
+- **Playlists and folders.** Lexicon's smartlists arrive as ordinary
+  playlists, frozen at the moment you saved the XML. Lexicon's tags don't
+  come across.
+
+<Note>
+Saving the XML only ever adds and updates. A track you remove in Lexicon is
+not removed from Dub by a re-import.
+</Note>
+
+## Through Traktor instead
+
+Lexicon can also sync straight into Traktor's `collection.nml`, which Dub
+reads. Traktor has no cue colours, so none come across. Close Traktor while
+Lexicon syncs, then import again in Dub.

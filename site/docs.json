@@ -1,0 +1,69 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Dub",
+  "description": "Timecode vinyl for scratch DJs and sound systems. The manual for Dub, the open-source DVS for macOS.",
+  "colors": {
+    "primary": "#A8752F",
+    "light": "#D9A33A",
+    "dark": "#C49157"
+  },
+  "appearance": {
+    "default": "dark"
+  },
+  "favicon": "/favicon.png",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": ["index", "install", "hardware", "first-set"]
+      },
+      {
+        "group": "Library",
+        "pages": ["library/import", "library/lexicon"]
+      },
+      {
+        "group": "Help",
+        "pages": ["troubleshooting"]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "Download",
+          "href": "https://github.com/kLOsk/dub/releases/latest",
+          "icon": "download"
+        },
+        {
+          "anchor": "Source on GitHub",
+          "href": "https://github.com/kLOsk/dub",
+          "icon": "github"
+        }
+      ]
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Report a bug",
+        "href": "https://github.com/kLOsk/dub/issues"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/kLOsk/dub"
+    }
+  },
+  "contextual": {
+    "options": ["copy", "view", "chatgpt", "claude"]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/kLOsk/dub"
+    }
+  }
+}

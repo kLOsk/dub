@@ -1,0 +1,64 @@
+---
+title: "Install Dub"
+description: "Download the alpha, open it past macOS's first-run check, and allow audio input."
+icon: "download"
+---
+
+## Requirements
+
+- macOS 13 Ventura or later, on Apple Silicon or Intel. One app runs on both.
+- For **Performance**: an audio interface with at least 4 inputs and 4
+  outputs, control vinyl, and an external mixer. The Serato SL 3 is the
+  reference rig. See [Hardware](/hardware).
+- For **Prep** alone: nothing but the Mac.
+
+## Download and open
+
+<Steps>
+  <Step title="Download">
+    Get **`Dub-…-macOS-universal.zip`** from the
+    [latest release](https://github.com/kLOsk/dub/releases/latest). A `.sha256`
+    file next to it holds the zip's checksum.
+  </Step>
+  <Step title="Move it to Applications">
+    Unzip it and drag **Dub** into **Applications**.
+  </Step>
+  <Step title="Open it once past macOS's check">
+    The alpha is not notarized by Apple yet, so macOS stops it the first time
+    you open it. Open **System Settings → Privacy & Security**, scroll to
+    *"Dub" was blocked*, and click **Open Anyway**. You only do this once.
+
+    Or, in Terminal:
+
+    ```bash
+    xattr -dr com.apple.quarantine /Applications/Dub.app
+    ```
+  </Step>
+  <Step title="Allow microphone access">
+    Allow it when macOS asks. That is how macOS names an audio interface's
+    inputs, where the timecode and your records come in. Dub saves no audio
+    to disk unless you rip a record.
+  </Step>
+</Steps>
+
+## Prep or Performance
+
+Dub picks its surface from the hardware:
+
+- **No interface plugged in:** Dub opens in **Prep**, one deck on the Mac's
+  built-in output. Set beat grids, cues and samples here before the gig.
+- **An interface with 4 inputs and 4 outputs or more:** Dub opens the
+  two-deck **Performance** surface.
+
+## Build it yourself
+
+Dub is open source. To build it you need Xcode, Rust stable and
+[XcodeGen](https://github.com/yonaskolb/XcodeGen):
+
+```bash
+brew install xcodegen
+git clone https://github.com/kLOsk/dub.git && cd dub
+./scripts/bootstrap.sh                 # one-time: bindings + Xcode project
+make app APP_CONFIG=Release
+open apple/build/Build/Products/Release/Dub.app
+```

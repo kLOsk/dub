@@ -1,0 +1,83 @@
+---
+title: "Your first set"
+description: "Wire the turntables and mixer, load tracks, drop the needle, and read what Dub tells you about the signal."
+icon: "record-vinyl"
+---
+
+## Wire it up
+
+<Steps>
+  <Step title="Turntables into the interface">
+    Each turntable goes into its own input pair on the interface. If the
+    interface has a **PHONO/LINE** switch per input, set it to **PHONO** for
+    a turntable.
+  </Step>
+  <Step title="Interface into the mixer">
+    Each deck's output pair goes into a line input on your mixer. The mixer
+    does all the mixing.
+  </Step>
+  <Step title="Open Dub">
+    With the interface plugged in, Dub opens the two-deck **Performance**
+    surface. A known interface like the Serato SL 3 is routed for you; any
+    other is set up once in **Preferences ▸ Audio** (see
+    [Hardware](/hardware#setting-up-your-interface)).
+  </Step>
+</Steps>
+
+## Load a track
+
+- **Drag** a track from the library onto a deck.
+- Or select it in the library and press **Space**: it loads onto the deck
+  that isn't the master, so the deck you're playing out of stays untouched.
+
+In Performance, loading never starts playback. The record does that.
+
+## The source switch: INT · TC · THRU
+
+Each deck has a three-way switch in its header. You choose the mode; Dub
+never switches it for you.
+
+| Mode | What drives the deck |
+| --- | --- |
+| **INT** | The track plays on Dub's own clock, like a CD player. Press it to start. |
+| **TC** | The control vinyl drives the track: scratching, needle drops and rewinds. |
+| **THRU** | A real record on the platter passes straight through Dub, with a live waveform, a live tempo and the effects on it. |
+
+## Calibration
+
+You don't need to calibrate by hand. The first time a deck hears a turning
+control record in a session, it measures the needle by itself: the deck says
+**CALIBRATING** while it does, then **Calibrated**. Keep the record playing at
+normal speed for a moment.
+
+The **↻** button next to the switch recalibrates on demand, after a needle
+change or a new control record. It works on **TC** and on **INT**, so you can
+recalibrate while the set plays on (see
+[Saving a set on stage](/troubleshooting#saving-a-set-on-stage)).
+
+## The signal panel
+
+Each deck has a **SIGNAL** tab at its outer edge. It opens one word for the
+state of that deck's timecode and one line on what to check:
+
+| Word | Meaning | What to check |
+| --- | --- | --- |
+| **LOCKED** | Dub is reading the timecode, forward, reverse or stopped. | Nothing. |
+| **WEAK** | One channel is low, or the signal is noisy. | The cable and the needle; the panel names the low channel. |
+| **NO LOCK** | Timecode is there but not readable right now. | Usually you're scratching or the record is stopped. |
+| **NO SIGNAL** | Nothing arriving. | Needle down, record turning? The PHONO/LINE switch. |
+| **NO INPUT** | The deck has no input pair. | Pick one in **Preferences ▸ Audio**. |
+
+The panel also meters each input channel in dB and draws the timecode's
+shape: a clean signal is a round circle, a weak channel squashes it.
+
+## The output meters
+
+Between the decks, under the phase meter, two slim meters show what each
+deck is actually sending to the mixer. When a meter is empty for a reason,
+it says so:
+
+- **ECHO OUT**: echo out is still on and its tail has died away. The record
+  plays on underneath, but nothing leaves the deck. Turn echo out off.
+- **NO OUTPUT**: the deck has no output pair, or the audio engine isn't
+  running.
