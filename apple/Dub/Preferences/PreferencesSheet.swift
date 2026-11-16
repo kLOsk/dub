@@ -402,7 +402,7 @@ struct PreferencesSheet: View {
             group("Recording") {
                 toggleRow(
                     "Vinyl recording",
-                    "Record a side through your DJ interface in Prep mode. A PREP / PERF switch appears in the top bar while an interface is connected.",
+                    "Record a side through your DJ interface in Prep mode. A PREP · REC · PERF switch appears in the top bar; REC starts a rip.",
                     isOn: $model.vinylRecordingEnabled, last: true)
             }
             group("Identify ripped tracks") {

@@ -123,7 +123,7 @@ struct RipPastSessionsPane: View {
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textSecondary)
             if !state.isLoading {
-                Text("Rip a side from the Prep bar and it will show up here, "
+                Text("Rip a side with REC in the top bar and it will show up here, "
                      + "ready to split again from its lossless archive.")
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)

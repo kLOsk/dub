@@ -1806,7 +1806,7 @@ struct LibraryView: View {
             // what to do rather than doing it.
             return model.vinylRecordingEnabled
                 ? "Switch to PREP to re-split a side."
-                : "Turn on Preferences ▸ Recording ▸ Vinyl recording to re-split a side."
+                : "Turn on Preferences ▸ Vinyl ▸ Vinyl recording to re-split a side."
         }
         return nil
     }
