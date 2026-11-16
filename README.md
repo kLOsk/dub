@@ -106,7 +106,7 @@ default, under **Preferences ▸ Alpha**.*
 
 ### Dub siren
 
-<img src="docs/images/siren.png" alt="The sampler and the dub siren with its VU meter and DUB knob" width="100%">
+<img src="docs/images/siren.png" alt="The sampler's named pads and the dub siren's five shots, tail meter and DUB knob" width="100%">
 
 Five shots — Rifle Gun, Alarm, Sine, Laser, Siren — through their own
 PT2399-style echo, with one **DUB** knob from dry to drenched. It is an
