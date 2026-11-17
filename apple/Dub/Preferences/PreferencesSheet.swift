@@ -470,7 +470,7 @@ struct PreferencesSheet: View {
                 }
             }
             group("Modifiers") {
-                note("A key with a modifier is a key of its own: ⇧← loads deck A while ← does something else, and ⌘J and J are two keys. When nothing is bound to the key with ⇧ or ⌥ held, they change what the plain key does instead: ⇧ with a hot cue's key clears that cue; ⇧ with Tap the BPM halves a track's tempo, ⌥ doubles it.")
+                note("A key with a modifier is a key of its own: ⇧← loads deck A while ← does something else, and ⌘J and J are two keys. When nothing is bound to the key with ⇧ or ⌥ held, they change what the plain key does instead: ⇧ with a hot cue's key clears that cue (so does ⌘⇧, as in Serato); ⇧ with Tap the BPM halves a track's tempo, ⌥ doubles it.")
             }
             group("Bound on the surface") {
                 if bound.isEmpty {

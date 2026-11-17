@@ -79,6 +79,16 @@ gate is local-only because GitHub CI has no macOS app job.
   `site/AGENTS.md`; UI words are copied from `apple/Dub/`, so a renamed
   label means a manual edit in the same change.
 
+**Since alpha.4, on `main`:**
+
+- **Serato's ⌘ keys (2026-11-17, Daniel, from Serato's shortcut page).**
+  Serato's "control" is ⌘ on a Mac, so instant doubles are `⌘⇧←`/`⌘⇧→`
+  (were `⌃⇧`, which also fought macOS's Spaces), and `⌘⇧` + a cue key
+  clears it as `⇧` does. Folders moved to `⌘←`/`⌘→`; plain `←`/`→` stay
+  free (Daniel maps echo out there). The left-hand / right-hand letter
+  keys stay ("I prefer the left right mode"); no default for key lock or
+  INT play.
+
 **In alpha.4, since alpha.3** (not on the rig yet):
 
 - **A default keymap (2026-11-17, Daniel).** Replaces "no default keymap"

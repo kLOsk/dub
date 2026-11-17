@@ -42,7 +42,7 @@
 //  two keys. When nothing is bound to the exact key, an unclaimed `⇧`
 //  or `⌥` falls back to the plain key as an argument — `⇧` on a hot cue
 //  means *clear it*, `⇧`/`⌥` on the BPM tap mean halve/double. Until
-//  2026-11-17 only `⌘` was part of a key; the default map's `⇧`/`⌃⇧`
+//  2026-11-17 only `⌘` was part of a key; the default map's `⇧`/`⌘⇧`
 //  arrows needed the rest.
 //
 
@@ -198,6 +198,14 @@ enum DubAction: Hashable {
         }
     }
 
+    /// A hot cue, on a deck or on the master.
+    var isHotCue: Bool {
+        switch self {
+        case .hotCue, .deckCue: return true
+        default: return false
+        }
+    }
+
     /// Whether map mode may rebind it. `⌘,` stays Preferences whatever
     /// happens — it is the way back to everything else.
     var isRemappable: Bool {
@@ -211,7 +219,7 @@ enum DubAction: Hashable {
 /// the DJ's own keyboard says.
 ///
 /// `⇧`, `⌃` and `⌥` joined `⌘` as part of a key on 2026-11-17, for the
-/// default map's `⇧←` (load A) and `⌃⇧←` (double onto A). A map saved
+/// default map's `⇧←` (load A); `⌃` for whatever the DJ maps. A map saved
 /// before then has no such fields; they decode as "not held".
 struct DubKeyChord: Codable, Hashable {
     let code: UInt16
@@ -351,8 +359,11 @@ enum DubKeymap {
     /// on the outer keys of the row below (Q / P), echo out on its middle
     /// (T / Y), loop off next to the tap (W / O), Quick Scratch on the
     /// home row (A S D F / H J K L), the sampler on the bottom row. Loads
-    /// and doubles ride the arrows: `⇧` loads, `⌃⇧` doubles onto that
-    /// side's deck. `⌘⇧` arrows walk the sidebar.
+    /// and doubles ride the arrows: `⇧` loads, `⌘⇧` doubles onto that
+    /// side's deck — Serato's keys on a Mac, where its "control" is `⌘`
+    /// (2026-11-17; `⌃⇧` first, which also collided with macOS's Spaces).
+    /// `⌘⇧↑↓` walk the sidebar as Serato's crates; `⌘←→` close and open
+    /// a folder. Plain `←` / `→` stay free: Daniel maps echo out there.
     static let defaults: [DubBinding] = {
         var map: [DubBinding] = [
             DubBinding(action: .loadSelection, match: .code(49), legend: "SPACE"),
@@ -364,12 +375,12 @@ enum DubKeymap {
             .key(.browse(next: false), 126, "↑"),
             .key(.sidebar(next: true), 125, "↓", command: true, shift: true),
             .key(.sidebar(next: false), 126, "↑", command: true, shift: true),
-            .key(.folder(open: true), 124, "→", command: true, shift: true),
-            .key(.folder(open: false), 123, "←", command: true, shift: true),
+            .key(.folder(open: true), 124, "→", command: true),
+            .key(.folder(open: false), 123, "←", command: true),
             .key(.loadInto(.a), 123, "←", shift: true),
             .key(.loadInto(.b), 124, "→", shift: true),
-            .key(.instantDouble(toDeckB: false), 123, "←", shift: true, control: true),
-            .key(.instantDouble(toDeckB: true), 124, "→", shift: true, control: true),
+            .key(.instantDouble(toDeckB: false), 123, "←", command: true, shift: true),
+            .key(.instantDouble(toDeckB: true), 124, "→", command: true, shift: true),
             .key(.tapTempo(.a), 12, "Q"),
             .key(.tapTempo(.b), 35, "P"),
             .key(.loopOff(.a), 13, "W"),
@@ -446,7 +457,15 @@ enum DubKeymap {
             return exact
         }
         guard !control else { return nil }
-        return live.first { $0.requiresCommand == command && !$0.hasArgumentModifiers }
+        if let plain = live.first(where: { $0.requiresCommand == command && !$0.hasArgumentModifiers }) {
+            return plain
+        }
+        // Serato clears a cue with ⌘⇧ + its key; Dub's ⇧ alone does too.
+        // ⌘⇧ on a cue key nothing else holds reaches the cue, ⇧ as clear.
+        guard command, shift else { return nil }
+        return live.first {
+            !$0.requiresCommand && !$0.hasArgumentModifiers && $0.action.isHotCue
+        }
     }
 
     /// The action of `binding(...)` — what most callers need.

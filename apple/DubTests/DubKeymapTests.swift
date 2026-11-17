@@ -59,22 +59,35 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(shifted?.requiresShift, false, "⇧ is the clear argument, not part of the key")
     }
 
-    /// Loads and doubles ride the arrows: ⇧ loads, ⌃⇧ doubles onto that
-    /// side's deck; the plain arrows browse tracks and ⌘⇧ the sidebar.
+    /// Loads and doubles ride the arrows: ⇧ loads, ⌘⇧ doubles onto that
+    /// side's deck (Serato's keys on a Mac); ⌘⇧↑↓ walk the sidebar, ⌘←→
+    /// fold it. Plain ← / → stay free for the DJ (echo out, for Daniel).
     func testTheArrows() {
         XCTAssertEqual(fire(123, shift: true), .loadInto(.a))
         XCTAssertEqual(fire(124, shift: true), .loadInto(.b))
-        XCTAssertEqual(fire(123, shift: true, ctrl: true), .instantDouble(toDeckB: false))
-        XCTAssertEqual(fire(124, shift: true, ctrl: true), .instantDouble(toDeckB: true))
+        XCTAssertEqual(fire(123, cmd: true, shift: true), .instantDouble(toDeckB: false))
+        XCTAssertEqual(fire(124, cmd: true, shift: true), .instantDouble(toDeckB: true))
         XCTAssertEqual(fire(125), .browse(next: true))
         XCTAssertEqual(fire(126), .browse(next: false))
         XCTAssertEqual(fire(125, cmd: true, shift: true), .sidebar(next: true))
         XCTAssertEqual(fire(126, cmd: true, shift: true), .sidebar(next: false))
-        XCTAssertEqual(fire(124, cmd: true, shift: true), .folder(open: true))
-        XCTAssertEqual(fire(123, cmd: true, shift: true), .folder(open: false))
+        XCTAssertEqual(fire(124, cmd: true), .folder(open: true))
+        XCTAssertEqual(fire(123, cmd: true), .folder(open: false))
         XCTAssertNil(fire(123), "a plain ← is free")
-        XCTAssertNil(fire(123, ctrl: true), "⌃ never falls back to the plain key")
-        XCTAssertEqual(DubKeymap.legend(for: .instantDouble(toDeckB: false)), "⌃⇧←")
+        XCTAssertNil(fire(124), "a plain → is free")
+        XCTAssertNil(fire(123, shift: true, ctrl: true), "⌃⇧ is not the double any more")
+        XCTAssertEqual(DubKeymap.legend(for: .instantDouble(toDeckB: false)), "⇧⌘←")
+    }
+
+    /// Serato clears a cue with ⌘⇧ + its key. Dub's ⇧ does too, and ⌘⇧
+    /// reaches the same cue with clear set.
+    func testCommandShiftClearsACueAsInSerato() {
+        let b = DubKeymap.binding(forKeyCode: 22, character: "6", command: true, shift: true)
+        XCTAssertEqual(b?.action, .deckCue(.b, 0))
+        XCTAssertEqual(b?.requiresShift, false, "⇧ arrives as the clear argument")
+        XCTAssertNil(
+            DubKeymap.action(forKeyCode: 0, character: "a", command: true, shift: true),
+            "only a cue key falls back from ⌘⇧")
     }
 
     /// The letters: tap and loop off on the outer row keys, echo in the

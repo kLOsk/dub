@@ -621,8 +621,8 @@ v1.0 ships a **default keymap** (Daniel, 2026-11-17 — replacing the "no defaul
 | `⌘,` | Open Preferences (cannot be moved or taken) |
 | `Space` | Load the library selection into the **empty** deck — A if both are; with both loaded, the non-master deck, refused with the red flash while it plays (§5.5 / §6.4) |
 | `⇧←` / `⇧→` | Load into deck A / B |
-| `⌃⇧←` / `⌃⇧→` | Instant double onto deck A / B (§7.3) |
-| `1–5` / `6–0` | Hot cues 1–5 on deck A / B; `⇧` clears |
+| `⌘⇧←` / `⌘⇧→` | Instant double onto deck A / B (§7.3) — Serato's keys on a Mac |
+| `1–5` / `6–0` | Hot cues 1–5 on deck A / B; `⇧` or `⌘⇧` (Serato's) clears |
 | `Q` / `P` | Tap the BPM, A / B — `⇧` halves, `⌥` doubles (it absorbed Tap the grid) |
 | `W` / `O` | Loop off, A / B |
 | `T` / `Y` | Echo out, A / B |
@@ -630,7 +630,7 @@ v1.0 ships a **default keymap** (Daniel, 2026-11-17 — replacing the "no defaul
 | `Z X C V B N M ,` | Sampler slots 1–8 |
 | `↑` / `↓` | Previous / next track |
 | `⌘F` | Search |
-| `⌘⇧↑` / `⌘⇧↓`, `⌘⇧←` / `⌘⇧→` | Previous / next playlist; close / open the folder |
+| `⌘⇧↑` / `⌘⇧↓`, `⌘←` / `⌘→` | Previous / next playlist; close / open the folder. Plain `←` / `→` are left free |
 
 A key carries its modifiers (`⇧←` ≠ `←`); an unclaimed `⇧`/`⌥` falls back to the plain key as an argument (clear a cue, halve/double on the BPM tap).
 
