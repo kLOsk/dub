@@ -108,7 +108,21 @@ struct LibraryRevealRequest: Equatable {
     let token: UUID
 }
 
+/// A mapped next / previous track key: move the browser selection one
+/// row. The token makes two presses in a row two changes.
+struct LibraryBrowseRequest: Equatable {
+    let next: Bool
+    let token: UUID
+}
+
 final class LibraryAppModel: ObservableObject {
+
+    /// The mapped "jump to search" key, bumped per press; LibraryView
+    /// puts the cursor in its search field on each change.
+    @Published var searchFocusRequest: Int = 0
+
+    /// The mapped next / previous track key; LibraryView consumes it.
+    @Published var browseRequest: LibraryBrowseRequest? = nil
 
     /// `true` once `library.openDefault()` has succeeded. Drives
     /// the browser's "Open library" affordance — until this flips,

@@ -124,6 +124,10 @@ struct PreferencesSheet: View {
         // switches say it in the same colour rather than the system blue.
         .tint(DubColor.controlAccent)
         .onAppear { sourceLocations = model.discoveredSourceLocations() }
+        // An action armed on the Keys tab must not keep waiting for a key
+        // once the sheet is gone and nothing shows that it is.
+        .onDisappear { if !model.mapMode { model.cancelMapping() } }
+        .onChange(of: tab) { _ in if !model.mapMode { model.cancelMapping() } }
         .onChange(of: model.seratoImportEnabled) { on in if on { model.scanEnabledSources() } }
         .onChange(of: model.traktorImportEnabled) { on in if on { model.scanEnabledSources() } }
         .onChange(of: model.rekordboxImportEnabled) { on in if on { model.scanEnabledSources() } }
@@ -444,17 +448,31 @@ struct PreferencesSheet: View {
 
     // MARK: - Keys (M18 map mode)
 
-    /// The map is made on the live surface — MAP in the top bar, click a
-    /// control, press a key — so this tab lists rather than edits: every
-    /// bound action with its cap, and the one thing the surface cannot
-    /// do, which is start over.
+    /// Controls on the surface are mapped there — MAP in the top bar,
+    /// click a control, press a key. What has no control to click (load
+    /// into a deck, instant doubles, the grid tap, loop off, the library
+    /// keys) is mapped here, the same way: click its cap, press the key.
+    /// Below that, every other bound action with its cap, and the reset.
     private var keysTab: some View {
-        let bound = keymap.resolved.filter { $0.action.isRemappable }
+        let buttonless = Set(DubKeymap.buttonless)
+        let bound = keymap.resolved.filter {
+            $0.action.isRemappable && !buttonless.contains($0.action)
+        }
         return VStack(alignment: .leading, spacing: DubSpacing.xl) {
             group("How to map") {
                 note("Turn MAP on in the top bar. Every bindable control shows its cap; click one and press the key you want on it — the same key on another control moves it. Escape backs out, ⌫ leaves a control unbound. Nothing you play has a default key; Space loads the selection and ⌘, opens this sheet.")
             }
-            group("Bound now") {
+            group("Actions with no button") {
+                note("These have nothing on the surface to click, so map them here: click a cap, then press the key.")
+                    .padding(.bottom, DubSpacing.xs)
+                ForEach(Array(DubKeymap.buttonless.enumerated()), id: \.offset) { index, action in
+                    buttonlessRow(action, last: index == DubKeymap.buttonless.count - 1)
+                }
+            }
+            group("Modifiers") {
+                note("⇧ and ⌥ are not keys of their own: held with a bound key they change what it does. ⇧ with a hot cue's key clears that cue; ⇧ with Tap the grid halves the tempo, ⌥ doubles it. ⌘ is different — ⌘J and J are two separate keys, each bound to its own action.")
+            }
+            group("Bound on the surface") {
                 if bound.isEmpty {
                     Text("Nothing mapped yet.")
                         .font(DubFont.body)
@@ -498,17 +516,96 @@ struct PreferencesSheet: View {
         }
     }
 
+    /// One action with no button: its name, what it does, and its cap,
+    /// which arms it for the next key — PRESS A KEY while it waits.
+    private func buttonlessRow(_ action: DubAction, last: Bool) -> some View {
+        let armed = model.mapArmed == action
+        let legend = DubKeymap.legend(for: action)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: DubSpacing.md) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayName(action))
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                    if let detail = Self.buttonlessDetail(action) {
+                        Text(detail)
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: DubSpacing.md)
+                Button {
+                    model.armFromPreferences(action)
+                } label: {
+                    if armed {
+                        Text("PRESS A KEY")
+                            .font(.system(size: 9, weight: .bold))
+                            .tracking(0.6)
+                            .foregroundStyle(DubColor.surface0)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+                            .background(DubColor.controlAccent)
+                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                    } else if let legend {
+                        DubKeycap(key: legend, size: .list)
+                    } else {
+                        Text("Set key")
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textSecondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .strokeBorder(
+                                        DubColor.controlAccent.opacity(0.55),
+                                        style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(armed
+                      ? "Press the key — Escape cancels, ⌫ unbinds"
+                      : "Click, then press the key for this action")
+            }
+            .padding(.vertical, DubSpacing.xs)
+            if !last { Divider() }
+        }
+    }
+
+    /// The line under a no-button action's name, where the name alone
+    /// leaves a question.
+    static func buttonlessDetail(_ action: DubAction) -> String? {
+        switch action {
+        case .loadSelection:
+            return "Onto the deck that isn't the master. Space, unless you move it."
+        case .loadInto:
+            return "Refused while that deck plays, as for Space."
+        case .instantDouble:
+            return "The other deck's track, at its playhead."
+        case .tapGrid:
+            return "The 1 at the playhead. ⇧ halves, ⌥ doubles. Not on a locked grid."
+        case .focusSearch:
+            return "Type, then the next-track key (an arrow or F-key) leaves the field."
+        default:
+            return nil
+        }
+    }
+
     /// The name a binding prints in the list.
     private func displayName(_ action: DubAction) -> String {
         switch action {
-        case .loadSelection: return "Load the selection"
+        case .loadSelection: return "Load into the deck not playing"
+        case .loadInto(let side): return "Load into \(side == .a ? "the left deck (A)" : "the right deck (B)")"
         case .openPreferences: return "Preferences"
-        case .tapGrid: return "Tap the grid"
+        case .tapGrid(let side): return "Tap the grid \(side.label)"
+        case .loopOff(let side): return "Loop off \(side.label)"
+        case .focusSearch: return "Jump to search"
+        case .browse(let next): return next ? "Next track" : "Previous track"
         case .hotCue(let i): return "Hot cue \(i + 1)"
         case .sirenPreset(let i):
             let names = model.sirenPresetLabels
             return "Siren · \(i < names.count ? names[i] : "shot \(i + 1)")"
-        case .instantDouble(let toB): return toB ? "Instant double → B" : "Instant double → A"
+        case .instantDouble(let toB): return toB ? "Instant double A → B" : "Instant double B → A"
         case .sampler(let i):
             let name = model.sampleBank.label(i)
             return "Sample \(i + 1)" + (name.map { " · \($0)" } ?? "")

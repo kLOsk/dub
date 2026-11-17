@@ -1219,6 +1219,14 @@ final class WaveformAppModel: ObservableObject {
         mapArmed = (mapArmed == action) ? nil : action
     }
 
+    /// Preferences ▸ Keys arming an action that has no control on the
+    /// surface (`DubKeymap.buttonless`). Map mode need not be on — the
+    /// key monitor takes the next key for whatever is armed.
+    func armFromPreferences(_ action: DubAction) {
+        guard action.isRemappable else { return }
+        mapArmed = (mapArmed == action) ? nil : action
+    }
+
     /// A key arrived while a control was armed: bind it. The chord takes
     /// the key from whatever else held it (`DubKeymapStore.bind`).
     func bindArmedControl(code: UInt16, characters: String?, command: Bool) {
@@ -4486,7 +4494,10 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    func loadBrowserSelectionIntoTargetDeck() async {
+    /// `side` names the deck (the mapped "load into A / B" keys); `nil`
+    /// is Space's rule, the deck that is not the master. On one deck,
+    /// either key loads that deck.
+    func loadBrowserSelectionIntoTargetDeck(side: DeckSide? = nil) async {
         guard isRunning else {
             surfaceError("Engine not running.")
             return
@@ -4506,7 +4517,7 @@ final class WaveformAppModel: ObservableObject {
             surfaceError("Selected entry is a folder — double-click it to enter, or pick an audio file inside.")
             return
         }
-        let candidate = spaceLoadTarget()
+        let candidate = twoDeckMode ? (side ?? spaceLoadTarget()) : .a
         let target = state(for: candidate)
         if target.isPlaying, !canLoadIntoPlayingDeck() {
             flashLoadError(side: candidate)
@@ -5511,17 +5522,19 @@ final class WaveformAppModel: ObservableObject {
         return .success(out)
     }
 
-    /// M11c.3b — re-anchor the master deck's beat grid at the
-    /// playhead and optionally halve / double the BPM (`G` /
-    /// `Shift+G` / `Option+G`). Persists `user_tap` when the deck
-    /// holds a library track.
-    func applyTapToGrid(halve: Bool, double: Bool) {
+    /// M11c.3b — re-anchor `side`'s beat grid at the playhead and
+    /// optionally halve / double the BPM (the mapped Tap the grid key,
+    /// `⇧` / `⌥`). Persists `user_tap` when the deck holds a library
+    /// track. Per deck since 2026-11-17; it used to follow the master.
+    func applyTapToGrid(_ side: DeckSide, halve: Bool, double: Bool) {
         guard isRunning else { return }
         // Same rule as `handleTapForGrid`: no grid on a rip's side.
         guard ripPhase == .none else { return }
-        let side = masterDeck ?? stickyMaster
         var deck = state(for: side)
         guard deck.hasTrack else { return }
+        // A locked grid is the DJ's word on it (PRD-BEATS §3.5), as for
+        // the BPM tap.
+        guard !deck.gridLocked else { return }
 
         // Extrapolated playhead — same clock-domain rationale as
         // `handleTapForGrid` (the deck-header BPM tap). The keyboard
@@ -7447,9 +7460,38 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
-            onTapGrid: { halve, double in
+            onTapGrid: { side, halve, double in
                 Task { @MainActor in
-                    model.applyTapToGrid(halve: halve, double: double)
+                    model.applyTapToGrid(side, halve: halve, double: double)
+                }
+                return true
+            },
+            onLoadInto: { side in
+                Task { @MainActor in
+                    // A rip's review owns deck A and has no selection to
+                    // load — as for Space, but these keys have no
+                    // play/pause meaning there, so they do nothing.
+                    guard model.ripPhase == .none else { return }
+                    await model.loadBrowserSelectionIntoTargetDeck(side: side)
+                }
+                return true
+            },
+            onLoopOff: { side in
+                Task { @MainActor in
+                    model.exitLoop(side)
+                }
+                return true
+            },
+            onFocusSearch: {
+                Task { @MainActor in
+                    model.libraryModel.searchFocusRequest &+= 1
+                }
+                return true
+            },
+            onBrowse: { next in
+                Task { @MainActor in
+                    model.libraryModel.browseRequest = LibraryBrowseRequest(
+                        next: next, token: UUID())
                 }
                 return true
             },
@@ -7567,7 +7609,11 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         func install(
             onSpace: @escaping () -> Bool,
             onCmdComma: @escaping () -> Bool,
-            onTapGrid: @escaping (_ halve: Bool, _ double: Bool) -> Bool,
+            onTapGrid: @escaping (_ side: DeckSide, _ halve: Bool, _ double: Bool) -> Bool,
+            onLoadInto: @escaping (_ side: DeckSide) -> Bool,
+            onLoopOff: @escaping (_ side: DeckSide) -> Bool,
+            onFocusSearch: @escaping () -> Bool,
+            onBrowse: @escaping (_ next: Bool) -> Bool,
             onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
             onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool,
@@ -7596,6 +7642,20 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 // future search boxes, etc.). `⌘,` is a global
                 // shortcut so it always wins.
                 if self.isTextFirstResponder() {
+                    // One way out of the search field: a next / previous
+                    // track key that types nothing (an arrow, a function
+                    // key) still browses, so search → ↓ → Space works
+                    // with no mouse. The browse takes the cursor out of
+                    // the field, so Space then loads.
+                    if Coordinator.typesNothing(event.keyCode),
+                       case .browse(let next)? = DubKeymap.action(
+                           forKeyCode: event.keyCode,
+                           character: event.charactersIgnoringModifiers,
+                           command: isCmd),
+                       onBrowse(next)
+                    {
+                        return nil
+                    }
                     return event
                 }
                 // A control armed in map mode takes the key, whatever it
@@ -7617,8 +7677,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 else { return event }
 
                 switch action {
-                case .tapGrid:
-                    if onTapGrid(flags.contains(.shift), flags.contains(.option)) { return nil }
+                case .tapGrid(let side):
+                    if onTapGrid(side, flags.contains(.shift), flags.contains(.option)) { return nil }
+                case .loadInto(let side):
+                    if onLoadInto(side) { return nil }
+                case .loopOff(let side):
+                    if onLoopOff(side) { return nil }
+                case .focusSearch:
+                    if onFocusSearch() { return nil }
+                case .browse(let next):
+                    if onBrowse(next) { return nil }
                 case .hotCue(let index):
                     if onHotCue(index, flags.contains(.shift)) { return nil }
                 case .sirenPreset(let index):
@@ -7659,6 +7727,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         func uninstall() {
             if let m = monitor { NSEvent.removeMonitor(m) }
             monitor = nil
+        }
+
+        /// Keys that put no character into a text field: the arrows,
+        /// Page Up/Down, Home/End and F1–F12.
+        nonisolated static func typesNothing(_ code: UInt16) -> Bool {
+            [123, 124, 125, 126, 115, 119, 116, 121,
+             122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111].contains(code)
         }
 
         private func isTextFirstResponder() -> Bool {

@@ -165,22 +165,64 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(DubAction.echoHold(.b).id, "echo.hold.b")
         XCTAssertEqual(DubAction.fxHold.id, "fx.hold")
         XCTAssertEqual(DubAction.tapTempo(.b).id, "tempo.tap.b")
+        XCTAssertEqual(DubAction.loadInto(.a).id, "transport.load.a")
+        XCTAssertEqual(DubAction.tapGrid(.b).id, "grid.tap.b")
+        XCTAssertEqual(DubAction.loopOff(.a).id, "loop.off.a")
+        XCTAssertEqual(DubAction.focusSearch.id, "library.search")
+        XCTAssertEqual(DubAction.browse(next: false).id, "library.previous")
+    }
+
+    // MARK: - Actions with no button (Preferences ▸ Keys)
+
+    /// Each action Preferences lists binds and fires like a surface
+    /// control, and none of them ships with a key except Space's loader.
+    func testButtonlessActionsBindAndFire() {
+        for action in DubKeymap.buttonless where action != .loadSelection {
+            XCTAssertNil(DubKeymap.legend(for: action), "\(action.id) has no default key")
+        }
+        DubKeymapStore.shared.bind(.browse(next: true), to: chord(125, "↓"))
+        DubKeymapStore.shared.bind(.tapGrid(.b), to: chord(5, "G"))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 125, character: nil, command: false), .browse(next: true))
+        XCTAssertEqual(
+            DubKeymap.action(forKeyCode: 5, character: "g", command: false), .tapGrid(.b))
+        XCTAssertNil(DubKeymap.legend(for: .tapGrid(.a)), "per deck: B's key is not A's")
+    }
+
+    /// Next / previous track move one row in the list's order, start at
+    /// an end when nothing is selected, and stop at the ends.
+    func testBrowseTarget() {
+        let ids = ["a", "b", "c"]
+        XCTAssertEqual(LibraryView.browseTarget(from: nil, in: ids, next: true), "a")
+        XCTAssertEqual(LibraryView.browseTarget(from: nil, in: ids, next: false), "c")
+        XCTAssertEqual(LibraryView.browseTarget(from: "a", in: ids, next: true), "b")
+        XCTAssertEqual(LibraryView.browseTarget(from: "b", in: ids, next: false), "a")
+        XCTAssertEqual(LibraryView.browseTarget(from: "c", in: ids, next: true), "c")
+        XCTAssertEqual(LibraryView.browseTarget(from: "a", in: ids, next: false), "a")
+        XCTAssertEqual(
+            LibraryView.browseTarget(from: "gone", in: ids, next: true), "a",
+            "a selection no longer listed starts over")
+        XCTAssertNil(LibraryView.browseTarget(from: nil, in: [], next: true))
     }
 
     /// Every id round-trips through the parser a stored profile uses,
     /// and an id no version issued is refused rather than guessed.
     func testActionIdsRoundTrip() {
         let all: [DubAction] = [
-            .loadSelection, .openPreferences, .tapGrid, .hotCue(5), .sirenPreset(0),
+            .loadSelection, .openPreferences, .tapGrid(.a), .tapGrid(.b), .hotCue(5), .sirenPreset(0),
             .instantDouble(toDeckB: false), .instantDouble(toDeckB: true), .sampler(3),
             .quickScratch(.a, 0), .quickScratch(.b, 3), .fxToggle(3), .fxKick, .echoOut(.b),
             .echoHold(.a), .echoHold(.b), .fxHold, .fxTap, .keyLock(.a),
             .tapTempo(.a), .tapTempo(.b),
+            .loadInto(.a), .loadInto(.b), .loopOff(.a), .loopOff(.b),
+            .focusSearch, .browse(next: true), .browse(next: false),
         ]
         for action in all {
             XCTAssertEqual(DubAction(id: action.id), action, action.id)
         }
+        XCTAssertEqual(Set(all.map(\.id)).count, all.count, "no two actions share an id")
         XCTAssertNil(DubAction(id: "siren.preset.x"))
+        XCTAssertNil(DubAction(id: "grid.tap"), "the master deck's tap is gone")
         XCTAssertNil(DubAction(id: "midi.cc.7"))
         XCTAssertNil(DubAction(id: ""))
     }

@@ -81,6 +81,18 @@ gate is local-only because GitHub CI has no macOS app job.
 
 **Since alpha.3, on `main`** (not on the rig yet):
 
+- **Keys for actions with no button (2026-11-17, Daniel).** Preferences ▸
+  Keys maps what map mode cannot click (`DubKeymap.buttonless`): load
+  into A / B / the deck not playing, instant doubles, Tap the grid **per
+  deck** (was the master's — "per deck", Daniel; refused on a locked
+  grid), loop off per deck, jump to search, next / previous track. Click
+  the cap, press the key — the same store and capture as MAP. A browse
+  key that types nothing (arrow, F-key) still fires from the search
+  field and leaves it, so search → ↓ → Space needs no mouse. The tab now
+  explains ⇧ / ⌥ as modifiers and ⌘ as part of the key. Closes the
+  "unreachable actions" item. The old `grid.tap` id parses to nothing;
+  nothing could bind it.
+
 - **Tap the BPM, on every deck (2026-11-16, Daniel).** The Performance
   column's track BPM is the Prep header's tap pad now — 1–2 taps set the
   1, 3+ re-take the tempo, a locked grid takes none and wears a padlock,
@@ -202,13 +214,6 @@ hardware.
   (found while documenting M12-lexicon, 2026-11-16). Workaround: the
   rekordbox XML route. A reader is its own job — no public spec found yet;
   start by confirming which Serato version wrote `master.sqlite` here.
-- **Unreachable actions.** `DubAction.tapGrid` (the master deck's
-  grid, ⇧ halves, ⌥ doubles) and `.instantDouble` still have handlers
-  and names in Preferences ▸ Keys, but no `.mappable` control carries
-  them, so nothing can bind them since their default keys went
-  (2026-09-15). Set-the-1 is covered now by tapping the deck's BPM;
-  instant doubles still work by dragging a deck's title. Either give
-  them a control or drop them.
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.

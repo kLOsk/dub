@@ -52,9 +52,21 @@ import Foundation
 /// The `id` is what a saved profile will persist. **Never renumber or
 /// rename one** — a stored map would silently rebind.
 enum DubAction: Hashable {
+    /// Space's default: the selection onto the deck that is not the master.
     case loadSelection
+    /// The selection onto one deck, whichever is playing.
+    case loadInto(DeckSide)
     case openPreferences
-    case tapGrid
+    /// Re-anchor a deck's grid at its playhead; `⇧` halves, `⌥` doubles.
+    /// Per deck, not on the master: the master moves mid-mix, and a key
+    /// that lands on a different deck than the hands meant is a trap.
+    case tapGrid(DeckSide)
+    /// A deck's loop off — the loop row's ✕, without finding it.
+    case loopOff(DeckSide)
+    /// Put the cursor in the library's search field.
+    case focusSearch
+    /// The library selection one row down (`true`) or up.
+    case browse(next: Bool)
     case hotCue(Int)
     case sirenPreset(Int)
     /// `true` duplicates deck A onto B; `false` is the reverse.
@@ -89,8 +101,12 @@ enum DubAction: Hashable {
     var id: String {
         switch self {
         case .loadSelection: return "transport.loadSelection"
+        case .loadInto(let side): return "transport.load.\(side == .a ? "a" : "b")"
         case .openPreferences: return "app.preferences"
-        case .tapGrid: return "grid.tap"
+        case .tapGrid(let side): return "grid.tap.\(side == .a ? "a" : "b")"
+        case .loopOff(let side): return "loop.off.\(side == .a ? "a" : "b")"
+        case .focusSearch: return "library.search"
+        case .browse(let next): return "library.\(next ? "next" : "previous")"
         case .hotCue(let i): return "cue.\(i)"
         case .sirenPreset(let i): return "siren.preset.\(i)"
         case .instantDouble(let b): return "deck.instantDouble.\(b ? "b" : "a")"
@@ -114,8 +130,21 @@ enum DubAction: Hashable {
         func side(_ s: String) -> DeckSide? { s == "a" ? .a : s == "b" ? .b : nil }
         switch (parts.count, parts.first ?? "") {
         case (2, "transport") where parts[1] == "loadSelection": self = .loadSelection
+        case (3, "transport") where parts[1] == "load":
+            guard let d = side(parts[2]) else { return nil }
+            self = .loadInto(d)
         case (2, "app") where parts[1] == "preferences": self = .openPreferences
-        case (2, "grid") where parts[1] == "tap": self = .tapGrid
+        // `grid.tap` (no side) was the master deck's, and was never
+        // bindable after its `G` default went; it parses to nothing.
+        case (3, "grid") where parts[1] == "tap":
+            guard let d = side(parts[2]) else { return nil }
+            self = .tapGrid(d)
+        case (3, "loop") where parts[1] == "off":
+            guard let d = side(parts[2]) else { return nil }
+            self = .loopOff(d)
+        case (2, "library") where parts[1] == "search": self = .focusSearch
+        case (2, "library") where parts[1] == "next": self = .browse(next: true)
+        case (2, "library") where parts[1] == "previous": self = .browse(next: false)
         case (2, "cue"):
             guard let n = Int(parts[1]) else { return nil }
             self = .hotCue(n)
@@ -255,6 +284,18 @@ enum DubKeymap {
         DubBinding(
             action: .openPreferences, match: .character(","),
             requiresCommand: true, legend: "⌘,"),
+    ]
+
+    /// Actions with no control on the surface for map mode to click, so
+    /// Preferences ▸ Keys binds them instead. Before this list, the grid
+    /// tap and instant doubles had handlers and names but nothing could
+    /// reach them (from 2026-09-15, when their defaults went).
+    static let buttonless: [DubAction] = [
+        .loadInto(.a), .loadInto(.b), .loadSelection,
+        .instantDouble(toDeckB: true), .instantDouble(toDeckB: false),
+        .tapGrid(.a), .tapGrid(.b),
+        .loopOff(.a), .loopOff(.b),
+        .focusSearch, .browse(next: true), .browse(next: false),
     ]
 
     private static var byAction: [DubAction: DubBinding] {

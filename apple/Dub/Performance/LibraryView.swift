@@ -1280,6 +1280,13 @@ struct LibraryView: View {
             guard let request else { return }
             revealTrack(request.trackId)
         }
+        .onChange(of: libraryModel.searchFocusRequest) { _ in
+            searchFocused = true
+        }
+        .onChange(of: libraryModel.browseRequest) { request in
+            guard let request else { return }
+            browse(next: request.next)
+        }
         .onChange(of: libraryModel.crateContentGeneration) { _ in
             // A crate's membership / order changed (add / remove /
             // reorder / delete). Only the currently-open crate view
@@ -3417,6 +3424,28 @@ struct LibraryView: View {
         rowSelection.selectionAnchorId = trackId
         syncModelPrimarySelection()
         keyboardScrollTarget = trackId
+    }
+
+    /// The mapped next / previous track key: one row from the selection,
+    /// in the order the list shows. With nothing selected it starts at
+    /// the top (next) or the bottom (previous); at either end it stays.
+    /// Leaves the search field, so Space loads what it lands on.
+    private func browse(next: Bool) {
+        guard let target = Self.browseTarget(
+            from: primarySelectedTrackId, in: sortedTrackIds, next: next)
+        else { return }
+        searchFocused = false
+        completeReveal(target)
+    }
+
+    /// The row a browse lands on — pure, so it is tested without a view.
+    static func browseTarget(from current: String?, in ids: [String], next: Bool) -> String? {
+        guard !ids.isEmpty else { return nil }
+        guard let current, let at = ids.firstIndex(of: current) else {
+            return next ? ids.first : ids.last
+        }
+        let to = next ? min(at + 1, ids.count - 1) : max(at - 1, 0)
+        return ids[to]
     }
 
     /// Highlight a track id in the visible list, scrolling it
