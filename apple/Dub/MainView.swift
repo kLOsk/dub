@@ -1229,11 +1229,15 @@ final class WaveformAppModel: ObservableObject {
 
     /// A key arrived while a control was armed: bind it. The chord takes
     /// the key from whatever else held it (`DubKeymapStore.bind`).
-    func bindArmedControl(code: UInt16, characters: String?, command: Bool) {
+    func bindArmedControl(code: UInt16, characters: String?, flags: NSEvent.ModifierFlags) {
         guard let action = mapArmed else { return }
+        let command = flags.contains(.command), shift = flags.contains(.shift)
+        let control = flags.contains(.control), option = flags.contains(.option)
         let chord = DubKeyChord(
-            code: code, command: command,
-            legend: DubKeyChord.legend(code: code, characters: characters, command: command))
+            code: code, command: command, shift: shift, control: control, option: option,
+            legend: DubKeyChord.legend(
+                code: code, characters: characters, command: command,
+                shift: shift, control: control, option: option))
         DubKeymapStore.shared.bind(action, to: chord)
         mapArmed = nil
     }
@@ -4571,8 +4575,19 @@ final class WaveformAppModel: ObservableObject {
     /// See `loadBrowserSelectionIntoTargetDeck` for the rules.
     private func spaceLoadTarget() -> DeckSide {
         guard twoDeckMode else { return .a }
-        let m = masterDeck ?? stickyMaster
-        return m == .a ? .b : .a
+        return Self.spaceTarget(
+            aLoaded: deckA.hasTrack, bLoaded: deckB.hasTrack, master: masterDeck ?? stickyMaster)
+    }
+
+    /// Space loads into the empty deck (Daniel, 2026-11-17): A when both
+    /// are empty, and when both are loaded the deck that is not the
+    /// master — the old rule, refused if that deck plays. Pure, so tested.
+    nonisolated static func spaceTarget(aLoaded: Bool, bLoaded: Bool, master: DeckSide) -> DeckSide {
+        switch (aLoaded, bLoaded) {
+        case (false, _): return .a
+        case (true, false): return .b
+        case (true, true): return master == .a ? .b : .a
+        }
     }
 
     /// Start audible playback on `side`. M11d.5: in Performance /
@@ -5522,109 +5537,17 @@ final class WaveformAppModel: ObservableObject {
         return .success(out)
     }
 
-    /// M11c.3b — re-anchor `side`'s beat grid at the playhead and
-    /// optionally halve / double the BPM (the mapped Tap the grid key,
-    /// `⇧` / `⌥`). Persists `user_tap` when the deck holds a library
-    /// track. Per deck since 2026-11-17; it used to follow the master.
-    func applyTapToGrid(_ side: DeckSide, halve: Bool, double: Bool) {
-        guard isRunning else { return }
-        // Same rule as `handleTapForGrid`: no grid on a rip's side.
-        guard ripPhase == .none else { return }
-        var deck = state(for: side)
-        guard deck.hasTrack else { return }
-        // A locked grid is the DJ's word on it (PRD-BEATS §3.5), as for
-        // the BPM tap.
-        guard !deck.gridLocked else { return }
-
-        // Extrapolated playhead — same clock-domain rationale as
-        // `handleTapForGrid` (the deck-header BPM tap). The keyboard
-        // `G` shortcut puts the downbeat "where the playhead is
-        // right now"; the visible playhead lives in the vsync-
-        // extrapolated domain, so the captured anchor has to as
-        // well or the marker lands behind the visible position.
-        let pos = engine.positionSnapshot(deckIdx: side.ffiDeckIdx)
-        let anchor = pos.elapsedSecs
-
-        let currentBpm: Double
-        if let bpm = deck.bpm, bpm > 0 {
-            currentBpm = bpm
-        } else {
-            let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-            guard grid.confidence > 0, grid.bpm > 0 else { return }
-            currentBpm = grid.bpm
-        }
-
-        let newBpm: Double
-        if halve {
-            newBpm = currentBpm / 2.0
-        } else if double {
-            newBpm = currentBpm * 2.0
-        } else {
-            newBpm = currentBpm
-        }
-        guard newBpm.isFinite, newBpm > 0 else { return }
-
-        do {
-            try engine.installBeatGrid(
-                deckIdx: side.ffiDeckIdx,
-                bpm: newBpm,
-                anchorSecs: anchor)
-        } catch let error as EngineError {
-            surfaceError(describe(error))
-            return
-        } catch {
-            surfaceError("Beat grid update failed: \(error.localizedDescription)")
-            return
-        }
-
-        let postInstallGrid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-        let installedBarPhase = postInstallGrid.evenBarPhase
-
-        if libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
-            let library = self.library
-            // `[weak self]` lives on the main-actor closure, not on
-            // the outer @Sendable Task body. The detached body only
-            // touches Sendable locals (`library`, `trackId`,
-            // `anchor`, `newBpm`, `installedBarPhase`); reaching
-            // back to the actor-isolated instance happens inside
-            // `MainActor.run` where weak capture is safe.
-            Task.detached(priority: .background) {
-                let persistError: String?
-                do {
-                    try library.upsertUserTapBeatgrid(
-                        trackId: trackId,
-                        anchorSecs: anchor,
-                        bpm: newBpm,
-                        barPhase: installedBarPhase)
-                    persistError = nil
-                } catch {
-                    persistError = error.localizedDescription
-                }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    if let persistError {
-                        self.surfaceError(
-                            "Saved grid on deck but library write failed: \(persistError)")
-                    } else {
-                        self.libraryModel.analysisGeneration &+= 1
-                        self.libraryModel.libraryRowAnalysisUpdate = LibraryRowAnalysisUpdate(
-                            trackId: trackId,
-                            bpm: newBpm,
-                            key: nil,
-                            isAnalyzed: true)
-                    }
-                }
-            }
-        }
-
-        deck.bpm = newBpm
-        deck.bpmConfidence = 1.0
-        setState(deck, for: side)
+    /// ⇧ / ⌥ on the BPM tap key: ½ or 2× the track's tempo, as the BPM
+    /// menu does. Not on THRU, whose tempo comes from the taps, nor on a
+    /// rip's side; `scaleLoadedDeckBpm` refuses a locked grid.
+    func scaleBpmFromKey(_ side: DeckSide, multiplier: Double) {
+        guard ripPhase == .none, state(for: side).controlMode != 2 else { return }
+        scaleLoadedDeckBpm(side: side, multiplier: multiplier)
     }
 
     /// M11d.6 — which deck the manual beatgrid nudge controls
     /// (arrow-key shortcuts + on-screen ◀ ▶ + − buttons) target.
-    /// Mirrors `applyTapToGrid`'s rule: prefer the active master
+    /// Prefer the active master
     /// deck, otherwise fall back to the sticky master (deck A by
     /// default). Always returns a side — callers don't have to
     /// branch on `nil` — but `nudgeBeatGrid*` early-out when the
@@ -7415,7 +7338,7 @@ struct MainView: View {
 /// always reachable through the captured `$showingPreferences`).
 ///
 /// **Closure props**: callbacks are wired in `Coordinator.install`
-/// (`onSpace`, `onCmdComma`, `onTapGrid`, `onHotCue`). Each closure spawns
+/// (`onSpace`, `onCmdComma`, `onTapTempo`, `onHotCue`). Each closure spawns
 /// `Task { @MainActor in … }` because the NSEvent monitor's
 /// handler block has no implicit actor isolation.
 ///
@@ -7460,12 +7383,6 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
-            onTapGrid: { side, halve, double in
-                Task { @MainActor in
-                    model.applyTapToGrid(side, halve: halve, double: double)
-                }
-                return true
-            },
             onLoadInto: { side in
                 Task { @MainActor in
                     // A rip's review owns deck A and has no selection to
@@ -7495,9 +7412,15 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
-            onHotCue: { index, clear in
+            onHotCue: { side, index, clear in
                 Task { @MainActor in
-                    model.handleHotCue(model.focusedDeckForGridNudge, index: index, clear: clear)
+                    model.handleHotCue(side ?? model.focusedDeckForGridNudge, index: index, clear: clear)
+                }
+                return true
+            },
+            onSidebar: { step in
+                Task { @MainActor in
+                    model.libraryModel.sidebarRequest = LibrarySidebarRequest(step: step, token: UUID())
                 }
                 return true
             },
@@ -7568,9 +7491,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
-            onTapTempo: { side in
+            onTapTempo: { side, halve, double in
                 Task { @MainActor in
-                    model.tapBpm(side)
+                    if halve || double {
+                        model.scaleBpmFromKey(side, multiplier: halve ? 0.5 : 2.0)
+                    } else {
+                        model.tapBpm(side)
+                    }
                 }
                 return true
             },
@@ -7578,14 +7505,14 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             // binding — Escape backs out, ⌫ unbinds. Checked on the main
             // actor synchronously so the key never also fires the action
             // it was about to be bound to.
-            mapCapture: { code, characters, command in
+            mapCapture: { code, characters, flags in
                 guard model.mapArmed != nil else { return false }
                 switch code {
                 case 53: model.cancelMapping()
                 case 51, 117: model.unbindArmedControl()
                 // Modifier keys alone are not a chord.
                 case 54, 55, 56, 57, 58, 59, 60, 61, 62, 63: return true
-                default: model.bindArmedControl(code: code, characters: characters, command: command)
+                default: model.bindArmedControl(code: code, characters: characters, flags: flags)
                 }
                 return true
             })
@@ -7609,12 +7536,12 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         func install(
             onSpace: @escaping () -> Bool,
             onCmdComma: @escaping () -> Bool,
-            onTapGrid: @escaping (_ side: DeckSide, _ halve: Bool, _ double: Bool) -> Bool,
             onLoadInto: @escaping (_ side: DeckSide) -> Bool,
             onLoopOff: @escaping (_ side: DeckSide) -> Bool,
             onFocusSearch: @escaping () -> Bool,
             onBrowse: @escaping (_ next: Bool) -> Bool,
-            onHotCue: @escaping (_ index: Int, _ clear: Bool) -> Bool,
+            onHotCue: @escaping (_ side: DeckSide?, _ index: Int, _ clear: Bool) -> Bool,
+            onSidebar: @escaping (_ step: LibrarySidebarStep) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
             onInstantDouble: @escaping (_ toDeckB: Bool) -> Bool,
             onSampler: @escaping (_ slot: Int) -> Bool,
@@ -7626,13 +7553,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onFxHold: @escaping () -> Bool,
             onFxTap: @escaping () -> Bool,
             onKeyLock: @escaping (_ side: DeckSide) -> Bool,
-            onTapTempo: @escaping (_ side: DeckSide) -> Bool,
-            mapCapture: @escaping (_ code: UInt16, _ characters: String?, _ command: Bool) -> Bool
+            onTapTempo: @escaping (_ side: DeckSide, _ halve: Bool, _ double: Bool) -> Bool,
+            mapCapture: @escaping (
+                _ code: UInt16, _ characters: String?, _ flags: NSEvent.ModifierFlags
+            ) -> Bool
         ) {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self else { return event }
                 let isCmd = event.modifierFlags.contains(.command)
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if isCmd, event.charactersIgnoringModifiers == "," {
                     if onCmdComma() { return nil }
                     return event
@@ -7651,7 +7581,10 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                        case .browse(let next)? = DubKeymap.action(
                            forKeyCode: event.keyCode,
                            character: event.charactersIgnoringModifiers,
-                           command: isCmd),
+                           command: isCmd,
+                           shift: flags.contains(.shift),
+                           control: flags.contains(.control),
+                           option: flags.contains(.option)),
                        onBrowse(next)
                     {
                         return nil
@@ -7661,24 +7594,29 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 // A control armed in map mode takes the key, whatever it
                 // is — before the table, so a key already bound elsewhere
                 // moves rather than fires.
-                if mapCapture(event.keyCode, event.charactersIgnoringModifiers, isCmd) {
+                // The cap prints the key with no modifier applied — `1`,
+                // where `charactersIgnoringModifiers` would say `!` for ⇧1.
+                if mapCapture(event.keyCode, event.characters(byApplyingModifiers: []), flags) {
                     return nil
                 }
                 // Every binding below resolves through `DubKeymap` —
                 // one table shared with the caps the pads print, so a
                 // rendered legend and the key that fires it cannot drift.
-                // Modifiers other than ⌘ are arguments to the action, not
-                // part of the match; see the keymap's header.
-                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                guard let action = DubKeymap.action(
+                // A modifier is part of the key first; one the binding
+                // didn't claim is an argument (see the keymap's header).
+                guard let binding = DubKeymap.binding(
                     forKeyCode: event.keyCode,
                     character: event.charactersIgnoringModifiers,
-                    command: isCmd)
+                    command: isCmd,
+                    shift: flags.contains(.shift),
+                    control: flags.contains(.control),
+                    option: flags.contains(.option))
                 else { return event }
+                let action = binding.action
+                let argShift = flags.contains(.shift) && !binding.requiresShift
+                let argOption = flags.contains(.option) && !binding.requiresOption
 
                 switch action {
-                case .tapGrid(let side):
-                    if onTapGrid(side, flags.contains(.shift), flags.contains(.option)) { return nil }
                 case .loadInto(let side):
                     if onLoadInto(side) { return nil }
                 case .loopOff(let side):
@@ -7688,7 +7626,13 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 case .browse(let next):
                     if onBrowse(next) { return nil }
                 case .hotCue(let index):
-                    if onHotCue(index, flags.contains(.shift)) { return nil }
+                    if onHotCue(nil, index, argShift) { return nil }
+                case .deckCue(let side, let index):
+                    if onHotCue(side, index, argShift) { return nil }
+                case .sidebar(let next):
+                    if onSidebar(.move(next: next)) { return nil }
+                case .folder(let open):
+                    if onSidebar(.fold(open: open)) { return nil }
                 case .sirenPreset(let index):
                     if onSirenPreset(index) { return nil }
                 case .instantDouble(let toDeckB):
@@ -7718,7 +7662,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 case .keyLock(let side):
                     if onKeyLock(side) { return nil }
                 case .tapTempo(let side):
-                    if onTapTempo(side) { return nil }
+                    if onTapTempo(side, argShift, argOption) { return nil }
                 }
                 return event
             }

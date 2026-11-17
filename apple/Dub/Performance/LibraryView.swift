@@ -1287,6 +1287,13 @@ struct LibraryView: View {
             guard let request else { return }
             browse(next: request.next)
         }
+        .onChange(of: libraryModel.sidebarRequest) { request in
+            guard let request else { return }
+            switch request.step {
+            case .move(let next): walkSidebar(next: next)
+            case .fold(let open): foldSidebar(open: open)
+            }
+        }
         .onChange(of: libraryModel.crateContentGeneration) { _ in
             // A crate's membership / order changed (add / remove /
             // reorder / delete). Only the currently-open crate view
@@ -3438,8 +3445,89 @@ struct LibraryView: View {
         completeReveal(target)
     }
 
+    // MARK: - Sidebar keys (⌘⇧ arrows by default)
+
+    /// One row the sidebar keys can land on, in the order the tree draws
+    /// them — only rows on screen: a folded section, source or folder
+    /// hides its rows from the keys as from the eye.
+    private struct SidebarStop {
+        let source: LibrarySource
+        /// An imported source's row, when it has playlists to fold.
+        var foldsSource: ImportedSourceKind? = nil
+        /// An imported playlist or folder: its source and path.
+        var node: (kind: ImportedSourceKind, path: [String], hasChildren: Bool, isOpen: Bool)? = nil
+    }
+
+    private var sidebarStops: [SidebarStop] {
+        var stops: [SidebarStop] = []
+        func section(_ heading: String, _ entries: [LibrarySource]) {
+            guard !folding.isSectionFolded(heading) else { return }
+            stops += entries.filter(\.isAvailable).map { SidebarStop(source: $0) }
+        }
+        section("Library", [.allTracks])
+        section("Smart Crates", [.recentlyPlayed, .sessionHistory, .justImported])
+        section("Dub Crates", libraryModel.crates.map { .dubCrate(id: $0.id) })
+        if !libraryModel.importedSources.isEmpty, !folding.isSectionFolded("Imported Sources") {
+            for group in libraryModel.importedSources {
+                stops.append(SidebarStop(
+                    source: .importedSource(kind: group.kind),
+                    foldsSource: group.crates.isEmpty ? nil : group.kind))
+                guard !folding.isSourceFolded(group.kind) else { continue }
+                for n in folding.visibleNodes(group.crates, kind: group.kind) {
+                    stops.append(SidebarStop(
+                        source: .importedCrate(id: n.crate.id),
+                        node: (group.kind, n.path, n.hasChildren, n.isOpen)))
+                }
+            }
+        }
+        section("Real Records", [.realRecords])
+        return stops
+    }
+
+    /// The playlist keys: one row down or up the tree. A folder is a stop
+    /// too, so it can be opened from the keys; selecting it lists nothing.
+    private func walkSidebar(next: Bool) {
+        let stops = sidebarStops
+        let ids = stops.map(\.source)
+        guard let target = Self.browseTarget(
+            from: ids.contains(selectedSource) ? selectedSource : nil, in: ids, next: next)
+        else { return }
+        selectSidebar(target)
+    }
+
+    /// The folder keys, as in a Finder list: open shows a folder's (or a
+    /// source's) playlists; close folds it, and on a playlist or a folder
+    /// already closed moves up to the folder that holds it.
+    private func foldSidebar(open: Bool) {
+        guard let stop = sidebarStops.first(where: { $0.source == selectedSource }) else { return }
+        if let kind = stop.foldsSource {
+            if folding.isSourceFolded(kind) == open { fold { $0.toggleSource(kind) } }
+            return
+        }
+        guard let node = stop.node else { return }
+        if node.hasChildren, node.isOpen != open {
+            fold { $0.toggleFolder(node.kind, path: node.path) }
+            return
+        }
+        guard !open else { return }
+        // Up to the parent: the folder one level up, or the source itself.
+        let parentPath = Array(node.path.dropLast())
+        let parent = sidebarStops.first {
+            parentPath.isEmpty
+                ? $0.source == .importedSource(kind: node.kind)
+                : ($0.node.map { $0.kind == node.kind && $0.path == parentPath } ?? false)
+        }
+        if let parent { selectSidebar(parent.source) }
+    }
+
+    private func selectSidebar(_ source: LibrarySource) {
+        searchFocused = false
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        selectedSource = source
+    }
+
     /// The row a browse lands on — pure, so it is tested without a view.
-    static func browseTarget(from current: String?, in ids: [String], next: Bool) -> String? {
+    static func browseTarget<ID: Equatable>(from current: ID?, in ids: [ID], next: Bool) -> ID? {
         guard !ids.isEmpty else { return nil }
         guard let current, let at = ids.firstIndex(of: current) else {
             return next ? ids.first : ids.last

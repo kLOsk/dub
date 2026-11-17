@@ -295,8 +295,8 @@ struct AudioRoutingSection: View {
 
 /// What arrives on a deck's input pair right now: five segments and a
 /// word. Read off the engine ten times a second — only while the sheet
-/// is open.
-private struct InputSignal: View {
+/// is open. The welcome guide's signal check shares `segments`.
+struct InputSignal: View {
     let engine: DubEngine
     let deckIdx: UInt64
 

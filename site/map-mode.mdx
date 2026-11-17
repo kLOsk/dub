@@ -4,18 +4,37 @@ description: "Put the controls you play on the keys you want: turn MAP on, click
 icon: "keyboard"
 ---
 
-## Nothing you play has a key
+## Dub's own keys
 
-Dub ships with two keys bound, and both are app conventions:
+Dub starts with a full map. The left hand plays deck **A** and the right hand
+plays deck **B**:
 
 | Key | What it does |
 | --- | --- |
-| **Space** | Loads the library selection onto the deck that isn't the master. |
-| **⌘,** | Opens Preferences. |
+| **1 2 3 4 5** · **6 7 8 9 0** | Hot cues 1–5 on deck A · on deck B. Hold **⇧** to clear one. |
+| **Q** · **P** | Tap the BPM, deck A · deck B: 1–2 taps set the 1, 3 or more the tempo. Hold **⇧** to halve a track's tempo, **⌥** to double it. |
+| **W** · **O** | Loop off, deck A · deck B |
+| **T** · **Y** | Echo out, deck A · deck B |
+| **A S D F** · **H J K L** | Quick Scratch pads, deck A · deck B |
+| **Z X C V B N M ,** | Samples 1–8 |
+| **Space** | Loads the library selection into the empty deck: A if both are, the other one if one is loaded. With both loaded, the deck that isn't the master. |
+| **⇧←** · **⇧→** | Load the selection into deck A · deck B |
+| **⌃⇧←** · **⌃⇧→** | Double onto deck A (from B) · onto deck B (from A) |
+| **↑** · **↓** | Previous · next track in the library |
+| **⌘F** | Jump to search |
+| **⌘⇧↑** · **⌘⇧↓** | Previous · next playlist in the sidebar |
+| **⌘⇧←** · **⌘⇧→** | Close · open the folder in the sidebar |
+| **⌘,** | Opens Preferences |
 
-Hot cues, the sampler, Quick Scratch, the siren, echo out: everything you
-play starts with no key. Your hands know their own keys, so you map them
-yourself.
+**E R U I G** and the siren's shots start free. Every key
+above moves like any other: map the control to another key, or give its key
+to something else.
+
+<Note>
+  macOS uses **⌃←** and **⌃→** to switch Spaces. **⌃⇧** with the arrows
+  reaches Dub on a standard setup; if yours doesn't, map the doubles to other
+  keys.
+</Note>
 
 ## Map a control
 
@@ -42,8 +61,8 @@ While a control waits for a key:
 
 - **Escape** backs out without changing anything.
 - **⌫** leaves the control with no key.
-- A key with **⌘** held is its own binding: **⌘J** and **J** are two
-  different keys.
+- A key with a modifier held is its own binding: **⇧←** and **←**, **⌘J**
+  and **J** are different keys.
 - A modifier on its own (⇧, ⌥, ⌃, ⌘) isn't a key; Dub waits for the real one.
 
 **MAP** is on the **Performance** surface only. It isn't there in **Prep**,
@@ -52,8 +71,8 @@ or while you record a side.
 ## One key, one control
 
 If you press a key that another control already has, the key moves: the new
-control gets it and the old one is left with no key. That includes
-**Space**, so you can give it to something else.
+control gets it and the old one is left with no key. That includes Dub's
+own keys, **Space** among them.
 
 **⌘,** can't be moved or taken. It's always the way back into Preferences.
 
@@ -75,38 +94,41 @@ taken work as they do on the surface.
 | Action | What it does |
 | --- | --- |
 | **Load into the left deck (A)**, **Load into the right deck (B)** | The library selection onto that deck. Refused while the deck plays, as for Space. |
-| **Load into the deck not playing** | What **Space** does: onto the deck that isn't the master. |
-| **Instant double A → B**, **B → A** | The other deck's track, at its playhead. Dragging a deck's title still works too. |
-| **Tap the grid A**, **B** | Puts the 1 at that deck's playhead. Hold **⇧** to halve the tempo, **⌥** to double it. Does nothing on a locked grid. |
+| **Load into the empty deck** | What **Space** does. |
+| **Double onto A (from B)**, **Double onto B (from A)** | The other deck's track, at its playhead. Dragging a deck's title still works too. |
 | **Loop off A**, **B** | Ends that deck's loop, without finding the ✕ on the loop row. |
 | **Jump to search** | Puts the cursor in the library's search field. |
 | **Next track**, **Previous track** | Moves the library selection one row. With nothing selected, it starts at the top or the bottom. |
+| **Next playlist**, **Previous playlist** | Moves through the sidebar, in the order you see it. A folder is a stop too. |
+| **Open folder**, **Close folder** | Opens or folds the selected folder or app. Close on a playlist goes up to its folder. |
 
 <Tip>
-  Map next track to a key that types nothing, such as **↓** or an F-key.
-  It then works from inside the search field too: jump to search, type, press
-  next track to land on the first result, and Space loads it.
+  Next track works from inside the search field too, as long as its key types
+  nothing (like **↓**, the default, or an F-key): **⌘F**, type, **↓** lands on
+  the first result, and Space loads it.
 </Tip>
 
 ## Modifiers
 
-**⇧** and **⌥** aren't keys of their own. Held with a bound key, they change
-what it does:
+A key with a modifier is a key of its own: **⇧←** loads deck A, while **←**
+is free for something else.
+
+When nothing is bound to the key with **⇧** or **⌥** held, they change what
+the plain key does instead:
 
 - **⇧** with a hot cue's key clears that cue.
-- **⇧** with **Tap the grid** halves the tempo; **⌥** doubles it.
-
-**⌘** is different: **⌘J** and **J** are two separate keys, each bound to its
-own action.
+- **⇧** with **Tap the BPM** halves a track's tempo; **⌥** doubles it.
 
 ## See and reset your map
 
 **Preferences ▸ Keys** lists every bound control with its key, under
 **BOUND NOW**. You map on the surface, not there.
 
-**Reset all bindings…** at the bottom of that list puts everything back:
-every control you mapped loses its key, and **Space** and **⌘,** come back.
-It asks first.
+**Reset all bindings…** at the bottom of that list puts Dub's own map back
+and forgets what you mapped. It asks first.
+
+If you mapped keys before Dub had its own map, yours stay: a key you bound
+wins, and the default that wanted it goes without.
 
 Dub saves your map on this Mac as you make it and keeps it across launches.
 

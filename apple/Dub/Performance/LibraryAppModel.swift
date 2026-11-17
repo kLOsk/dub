@@ -115,7 +115,23 @@ struct LibraryBrowseRequest: Equatable {
     let token: UUID
 }
 
+/// A sidebar key: walk the playlists, or open / close the folder.
+enum LibrarySidebarStep: Equatable {
+    case move(next: Bool)
+    case fold(open: Bool)
+}
+
+/// A mapped sidebar key; LibraryView consumes it. The token makes two
+/// presses in a row two changes.
+struct LibrarySidebarRequest: Equatable {
+    let step: LibrarySidebarStep
+    let token: UUID
+}
+
 final class LibraryAppModel: ObservableObject {
+
+    /// The mapped sidebar keys (`⌘⇧` arrows by default).
+    @Published var sidebarRequest: LibrarySidebarRequest? = nil
 
     /// The mapped "jump to search" key, bumped per press; LibraryView
     /// puts the cursor in its search field on each change.

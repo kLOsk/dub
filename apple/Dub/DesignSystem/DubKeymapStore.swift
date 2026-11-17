@@ -77,6 +77,8 @@ final class DubKeymapStore: ObservableObject {
     /// it. `⌘,` cannot be taken and cannot be rebound.
     func bind(_ action: DubAction, to chord: DubKeyChord) {
         guard action.isRemappable else { return }
+        // `⌘,` cannot be taken either.
+        guard !resolved.contains(where: { !$0.action.isRemappable && Self.matches($0, chord) }) else { return }
         var next = overrides
         for holder in resolved where holder.transport == .key && holder.action != action {
             guard holder.action.isRemappable, Self.matches(holder, chord) else { continue }
@@ -113,6 +115,13 @@ final class DubKeymapStore: ObservableObject {
     // MARK: - Resolution
 
     private func rebuild() {
+        // What the DJ bound wins over a default that wants the same key:
+        // a map made before the defaults existed (2026-11-17) keeps every
+        // key it had, and the default that collides simply goes unbound.
+        let bound: [DubBinding] = overrides.sorted(by: { $0.key < $1.key }).compactMap { id, o in
+            guard let chord = o.chord, let action = DubAction(id: id) else { return nil }
+            return Self.binding(action, chord)
+        }
         var table: [DubBinding] = []
         var seen = Set<String>()
         for binding in DubKeymap.defaults {
@@ -122,15 +131,15 @@ final class DubKeymapStore: ObservableObject {
                     table.append(Self.binding(binding.action, chord))
                 }
                 // `nil`: unbound on purpose — drop the default.
-            } else {
+            } else if !binding.action.isRemappable
+                || !bound.contains(where: { Self.sameKey($0, binding) })
+            {
                 table.append(binding)
             }
         }
-        // Actions with no default at all — the sampler, Quick Scratch,
-        // the siren, the FX rack — exist only as overrides.
-        for (id, override) in overrides.sorted(by: { $0.key < $1.key }) where !seen.contains(id) {
-            guard let chord = override.chord, let action = DubAction(id: id) else { continue }
-            table.append(Self.binding(action, chord))
+        // Actions with no default — or bound since — exist only as overrides.
+        for binding in bound where !seen.contains(binding.action.id) {
+            table.append(binding)
         }
         resolved = table
         resolvedByAction = Dictionary(
@@ -140,19 +149,27 @@ final class DubKeymapStore: ObservableObject {
     private static func binding(_ action: DubAction, _ chord: DubKeyChord) -> DubBinding {
         DubBinding(
             action: action, match: .code(chord.code),
-            requiresCommand: chord.command, legend: chord.legend)
+            requiresCommand: chord.command, requiresShift: chord.shift,
+            requiresControl: chord.control, requiresOption: chord.option,
+            legend: chord.legend)
     }
 
-    /// Whether a binding fires on `chord`. A `.character` default is
-    /// compared on its printed glyph, which is what the chord's legend
-    /// carries for a plain letter.
-    private static func matches(_ binding: DubBinding, _ chord: DubKeyChord) -> Bool {
-        guard binding.requiresCommand == chord.command else { return false }
-        switch binding.match {
-        case .code(let c): return c == chord.code
-        case .character(let ch):
-            return ch.caseInsensitiveCompare(chord.legend) == .orderedSame
+    /// Whether two bindings fire on the same key, modifiers included. A
+    /// `.character` default is compared on its printed glyph.
+    private static func sameKey(_ a: DubBinding, _ b: DubBinding) -> Bool {
+        guard a.requiresCommand == b.requiresCommand, a.requiresShift == b.requiresShift,
+              a.requiresControl == b.requiresControl, a.requiresOption == b.requiresOption
+        else { return false }
+        switch (a.match, b.match) {
+        case (.code(let x), .code(let y)): return x == y
+        case (.character(let x), .character(let y)): return x.caseInsensitiveCompare(y) == .orderedSame
+        default: return a.legend.caseInsensitiveCompare(b.legend) == .orderedSame
         }
+    }
+
+    /// Whether a binding fires on `chord`.
+    private static func matches(_ binding: DubBinding, _ chord: DubKeyChord) -> Bool {
+        sameKey(binding, Self.binding(binding.action, chord))
     }
 
     private func persist() {

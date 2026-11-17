@@ -36,96 +36,95 @@ final class DubKeymapTests: XCTestCase {
         super.tearDown()
     }
 
-    // MARK: - Nothing you play has a default key
+    // MARK: - The default map (Daniel, 2026-11-17)
 
-    /// The number row used to fire the hot cues. It falls through now —
-    /// a DJ maps their own keys (2026-09-15) — and `⇧` on a mapped cue
-    /// still clears rather than selecting a different action.
-    func testHotCuesHaveNoDefaultKey() {
-        // 1-8. Not contiguous past 4 on macOS: 5 and 6 are 23 and 22.
-        let codes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28]
+    private func fire(
+        _ code: UInt16, _ ch: String? = nil, cmd: Bool = false, shift: Bool = false,
+        ctrl: Bool = false, opt: Bool = false
+    ) -> DubAction? {
+        DubKeymap.action(
+            forKeyCode: code, character: ch, command: cmd, shift: shift, control: ctrl, option: opt)
+    }
+
+    /// The number row splits: 1–5 are deck A's first five cues, 6–0 deck
+    /// B's. `⇧` on a cue's key still clears it — the plain key fires,
+    /// with ⇧ left over as the argument.
+    func testHotCuesSplitAcrossTheNumberRow() {
+        let codes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29]
         for (i, code) in codes.enumerated() {
-            XCTAssertNil(
-                DubKeymap.action(forKeyCode: code, character: "\(i + 1)", command: false),
-                "cue \(i + 1) must not be pre-assigned")
+            XCTAssertEqual(fire(code), .deckCue(i < 5 ? .a : .b, i % 5), "key \(i + 1)")
         }
-        DubKeymapStore.shared.bind(.hotCue(0), to: DubKeyChord(code: 18, legend: "1"))
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 18, character: "1", command: false), .hotCue(0))
+        let shifted = DubKeymap.binding(forKeyCode: 18, character: "!", command: false, shift: true)
+        XCTAssertEqual(shifted?.action, .deckCue(.a, 0))
+        XCTAssertEqual(shifted?.requiresShift, false, "⇧ is the clear argument, not part of the key")
     }
 
-    /// Only the two app conventions ship bound.
-    func testOnlySpaceAndPreferencesAreDefaults() {
-        XCTAssertEqual(
-            Set(DubKeymap.defaults.map(\.action)), [.loadSelection, .openPreferences])
+    /// Loads and doubles ride the arrows: ⇧ loads, ⌃⇧ doubles onto that
+    /// side's deck; the plain arrows browse tracks and ⌘⇧ the sidebar.
+    func testTheArrows() {
+        XCTAssertEqual(fire(123, shift: true), .loadInto(.a))
+        XCTAssertEqual(fire(124, shift: true), .loadInto(.b))
+        XCTAssertEqual(fire(123, shift: true, ctrl: true), .instantDouble(toDeckB: false))
+        XCTAssertEqual(fire(124, shift: true, ctrl: true), .instantDouble(toDeckB: true))
+        XCTAssertEqual(fire(125), .browse(next: true))
+        XCTAssertEqual(fire(126), .browse(next: false))
+        XCTAssertEqual(fire(125, cmd: true, shift: true), .sidebar(next: true))
+        XCTAssertEqual(fire(126, cmd: true, shift: true), .sidebar(next: false))
+        XCTAssertEqual(fire(124, cmd: true, shift: true), .folder(open: true))
+        XCTAssertEqual(fire(123, cmd: true, shift: true), .folder(open: false))
+        XCTAssertNil(fire(123), "a plain ← is free")
+        XCTAssertNil(fire(123, ctrl: true), "⌃ never falls back to the plain key")
+        XCTAssertEqual(DubKeymap.legend(for: .instantDouble(toDeckB: false)), "⌃⇧←")
     }
 
-    /// The siren's bottom row `Z X C V B N M ,` is unbound until map
-    /// mode: every one of those keys must fall through, and no binding
-    /// may claim the action.
-    func testSirenKeysAreNotBoundAndFallThrough() {
-        for code: UInt16 in [6, 7, 8, 9, 11, 45, 46, 43] {
-            XCTAssertNil(
-                DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                "an unbound key must not be consumed")
+    /// The letters: tap and loop off on the outer row keys, echo in the
+    /// middle, Quick Scratch on the home row, the sampler on the bottom.
+    func testTheLetters() {
+        XCTAssertEqual(fire(12), .tapTempo(.a))
+        XCTAssertEqual(fire(35), .tapTempo(.b))
+        XCTAssertEqual(fire(13), .loopOff(.a))
+        XCTAssertEqual(fire(31), .loopOff(.b))
+        XCTAssertEqual(fire(17), .echoOut(.a))
+        XCTAssertEqual(fire(16), .echoOut(.b))
+        let scratch: [UInt16] = [0, 1, 2, 3, 4, 38, 40, 37]
+        for (i, code) in scratch.enumerated() {
+            XCTAssertEqual(fire(code), .quickScratch(i < 4 ? .a : .b, i % 4))
         }
-        XCTAssertFalse(
-            DubKeymap.bindings.contains { $0.action.id.hasPrefix("siren.") },
-            "the siren's keys come back with map mode, not before")
-    }
-
-    /// `Q W E R` used to fire Quick Scratch. Its pads are per deck now
-    /// (PRD §7.2), which the old four keys could not address, so they
-    /// wait for map mode too — and `⌘Q` has to stay Quit regardless.
-    func testQuickScratchKeysAreNotBoundAndFallThrough() {
-        for code: UInt16 in [12, 13, 14, 15] {
-            XCTAssertNil(
-                DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                "an unbound key must not be consumed")
+        let samples: [UInt16] = [6, 7, 8, 9, 11, 45, 46, 43]
+        for (i, code) in samples.enumerated() {
+            XCTAssertEqual(fire(code), .sampler(i))
         }
-        XCTAssertNil(
-            DubKeymap.action(forKeyCode: 12, character: "q", command: true),
-            "⌘Q must fall through to Quit")
-        XCTAssertFalse(
-            DubKeymap.bindings.contains { $0.action.id.hasPrefix("quickScratch.") })
+        XCTAssertEqual(fire(3, "f", cmd: true), .focusSearch, "⌘F and F are two keys")
+        XCTAssertEqual(fire(43, ",", cmd: true), .openPreferences, "⌘, is not the eighth sample")
+        XCTAssertNil(fire(12, "q", cmd: true), "⌘Q must fall through to Quit")
+        XCTAssertNil(fire(14), "E is left free")
     }
 
-    func testSpaceLoadsTheSelection() {
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 49, character: " ", command: false),
-            .loadSelection)
+    /// Space loads into the empty deck: A if both are, the other one if
+    /// one is loaded, and the deck that isn't the master if both are.
+    func testSpaceLoadsTheEmptyDeck() {
+        XCTAssertEqual(fire(49, " "), .loadSelection)
+        XCTAssertEqual(WaveformAppModel.spaceTarget(aLoaded: false, bLoaded: false, master: .a), .a)
+        XCTAssertEqual(WaveformAppModel.spaceTarget(aLoaded: false, bLoaded: true, master: .b), .a)
+        XCTAssertEqual(WaveformAppModel.spaceTarget(aLoaded: true, bLoaded: false, master: .a), .b)
+        XCTAssertEqual(WaveformAppModel.spaceTarget(aLoaded: true, bLoaded: true, master: .a), .b)
+        XCTAssertEqual(WaveformAppModel.spaceTarget(aLoaded: true, bLoaded: true, master: .b), .a)
     }
 
-    /// `⌘→` / `⌘←` used to be instant doubles and `G` the grid tap. Both
-    /// wait for the DJ now, and the arrows and the letter fall through.
-    func testInstantDoublesAndGridTapHaveNoDefaultKey() {
-        XCTAssertNil(DubKeymap.action(forKeyCode: 124, character: nil, command: true))
-        XCTAssertNil(DubKeymap.action(forKeyCode: 123, character: nil, command: true))
-        XCTAssertNil(DubKeymap.action(forKeyCode: 5, character: "g", command: false))
-        DubKeymapStore.shared.bind(.instantDouble(toDeckB: true), to: DubKeyChord(code: 124, command: true, legend: "⌘→"))
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 124, character: nil, command: true),
-            .instantDouble(toDeckB: true))
-        XCTAssertNil(
-            DubKeymap.action(forKeyCode: 124, character: nil, command: false),
-            "a ⌘ chord does not fire on the bare key")
-    }
-
-    // MARK: - The sampler has no bindings
-
-    /// `A S D F` used to be reserved for the sampler. They were dropped
-    /// rather than extended to eight slots — the keys wait for map mode —
-    /// so the letters must fall through to the rest of the app, and no
-    /// binding may claim them.
-    func testSamplerKeysAreNotBoundAndFallThrough() {
-        for code in UInt16(0)...UInt16(3) {
-            XCTAssertNil(
-                DubKeymap.action(forKeyCode: code, character: nil, command: false),
-                "an unbound key must not be consumed")
-        }
-        XCTAssertFalse(
-            DubKeymap.bindings.contains { $0.action.id.hasPrefix("sampler.") },
-            "the sampler's keys come back with map mode, not before")
+    /// A map saved before the defaults existed keeps its keys: a key the
+    /// DJ bound beats the default that wants it, and that default goes
+    /// unbound rather than both firing.
+    func testAKeyTheDJBoundBeatsADefault() {
+        let name = "dub.tests.keymap.legacy.\(UUID().uuidString)"
+        let legacy = UserDefaults(suiteName: name)!
+        legacy.removePersistentDomain(forName: name)
+        // `1` on the master deck's cue, as map mode saved it in October.
+        legacy.set(Data(#"{"cue.0":{"chord":{"code":18,"command":false,"legend":"1"}}}"#.utf8),
+                   forKey: "dub.keymap.v1")
+        DubKeymapStore.shared = DubKeymapStore(defaults: legacy)
+        XCTAssertEqual(fire(18, "1"), .hotCue(0))
+        XCTAssertNil(DubKeymap.legend(for: .deckCue(.a, 0)), "the default lost its key")
+        XCTAssertEqual(DubKeymap.legend(for: .deckCue(.a, 1)), "2", "the rest of the map stands")
     }
 
     // MARK: - The invariant the table exists for
@@ -144,6 +143,7 @@ final class DubKeymapTests: XCTestCase {
         var seen: Set<String> = []
         for binding in DubKeymap.bindings where binding.isLive {
             let key = "\(binding.transport.rawValue)|\(binding.match)|\(binding.requiresCommand)"
+                + "|\(binding.requiresShift)|\(binding.requiresControl)|\(binding.requiresOption)"
             XCTAssertTrue(
                 seen.insert(key).inserted,
                 "two live bindings claim \(key) — one of them will never fire")
@@ -166,27 +166,40 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(DubAction.fxHold.id, "fx.hold")
         XCTAssertEqual(DubAction.tapTempo(.b).id, "tempo.tap.b")
         XCTAssertEqual(DubAction.loadInto(.a).id, "transport.load.a")
-        XCTAssertEqual(DubAction.tapGrid(.b).id, "grid.tap.b")
         XCTAssertEqual(DubAction.loopOff(.a).id, "loop.off.a")
         XCTAssertEqual(DubAction.focusSearch.id, "library.search")
         XCTAssertEqual(DubAction.browse(next: false).id, "library.previous")
+        XCTAssertEqual(DubAction.deckCue(.b, 4).id, "cue.b.4")
+        XCTAssertEqual(DubAction.sidebar(next: true).id, "library.playlist.next")
+        XCTAssertEqual(DubAction.folder(open: false).id, "library.folder.close")
     }
 
     // MARK: - Actions with no button (Preferences ▸ Keys)
 
     /// Each action Preferences lists binds and fires like a surface
-    /// control, and none of them ships with a key except Space's loader.
+    /// control, and a modifier held with a key is a key of its own once
+    /// something is bound to it.
     func testButtonlessActionsBindAndFire() {
-        for action in DubKeymap.buttonless where action != .loadSelection {
-            XCTAssertNil(DubKeymap.legend(for: action), "\(action.id) has no default key")
-        }
-        DubKeymapStore.shared.bind(.browse(next: true), to: chord(125, "↓"))
-        DubKeymapStore.shared.bind(.tapGrid(.b), to: chord(5, "G"))
+        DubKeymapStore.shared.bind(.browse(next: true), to: chord(121, "⇟"))
         XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 125, character: nil, command: false), .browse(next: true))
-        XCTAssertEqual(
-            DubKeymap.action(forKeyCode: 5, character: "g", command: false), .tapGrid(.b))
-        XCTAssertNil(DubKeymap.legend(for: .tapGrid(.a)), "per deck: B's key is not A's")
+            DubKeymap.action(forKeyCode: 121, character: nil, command: false), .browse(next: true))
+        XCTAssertNil(
+            DubKeymap.action(forKeyCode: 125, character: nil, command: false), "↓ moved off")
+        DubKeymapStore.shared.bind(.loopOff(.a), to: chord(5, "⇧G", shift: true))
+        XCTAssertEqual(fire(5, "G", shift: true), .loopOff(.a), "⇧G is its own key once bound")
+        XCTAssertNil(fire(5, "g"), "and plain G stays free")
+    }
+
+    /// Tap the BPM absorbed Tap the grid: ⇧ and ⌥ with its key reach it
+    /// as arguments (halve / double), and the grid tap's ids are gone.
+    func testTheBpmTapTakesHalveAndDouble() {
+        let halve = DubKeymap.binding(forKeyCode: 12, character: "Q", command: false, shift: true)
+        XCTAssertEqual(halve?.action, .tapTempo(.a))
+        XCTAssertEqual(halve?.requiresShift, false, "⇧ is the halve argument")
+        let double = DubKeymap.binding(forKeyCode: 35, character: "p", command: false, option: true)
+        XCTAssertEqual(double?.action, .tapTempo(.b))
+        XCTAssertNil(DubAction(id: "grid.tap.a"))
+        XCTAssertFalse(DubKeymap.buttonless.contains { $0.id.hasPrefix("grid.") })
     }
 
     /// Next / previous track move one row in the list's order, start at
@@ -202,35 +215,39 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertEqual(
             LibraryView.browseTarget(from: "gone", in: ids, next: true), "a",
             "a selection no longer listed starts over")
-        XCTAssertNil(LibraryView.browseTarget(from: nil, in: [], next: true))
+        XCTAssertNil(LibraryView.browseTarget(from: nil, in: [String](), next: true))
     }
 
     /// Every id round-trips through the parser a stored profile uses,
     /// and an id no version issued is refused rather than guessed.
     func testActionIdsRoundTrip() {
         let all: [DubAction] = [
-            .loadSelection, .openPreferences, .tapGrid(.a), .tapGrid(.b), .hotCue(5), .sirenPreset(0),
+            .loadSelection, .openPreferences, .hotCue(5), .sirenPreset(0),
             .instantDouble(toDeckB: false), .instantDouble(toDeckB: true), .sampler(3),
             .quickScratch(.a, 0), .quickScratch(.b, 3), .fxToggle(3), .fxKick, .echoOut(.b),
             .echoHold(.a), .echoHold(.b), .fxHold, .fxTap, .keyLock(.a),
             .tapTempo(.a), .tapTempo(.b),
             .loadInto(.a), .loadInto(.b), .loopOff(.a), .loopOff(.b),
             .focusSearch, .browse(next: true), .browse(next: false),
+            .sidebar(next: true), .sidebar(next: false), .folder(open: true), .folder(open: false),
+            .deckCue(.a, 0), .deckCue(.b, 4),
         ]
         for action in all {
             XCTAssertEqual(DubAction(id: action.id), action, action.id)
         }
         XCTAssertEqual(Set(all.map(\.id)).count, all.count, "no two actions share an id")
         XCTAssertNil(DubAction(id: "siren.preset.x"))
-        XCTAssertNil(DubAction(id: "grid.tap"), "the master deck's tap is gone")
+        XCTAssertNil(DubAction(id: "grid.tap"), "the grid tap is gone: Tap the BPM does it")
         XCTAssertNil(DubAction(id: "midi.cc.7"))
         XCTAssertNil(DubAction(id: ""))
     }
 
     // MARK: - Map mode (M18)
 
-    private func chord(_ code: UInt16, _ legend: String, command: Bool = false) -> DubKeyChord {
-        DubKeyChord(code: code, command: command, legend: legend)
+    private func chord(
+        _ code: UInt16, _ legend: String, command: Bool = false, shift: Bool = false
+    ) -> DubKeyChord {
+        DubKeyChord(code: code, command: command, shift: shift, legend: legend)
     }
 
     /// Turn MAP on, click the siren's LASER key, press Z: Z fires LASER
@@ -286,7 +303,8 @@ final class DubKeymapTests: XCTestCase {
         DubKeymapStore.shared.bind(.sampler(4), to: chord(0, "A"))
         DubKeymapStore.shared.reset()
         XCTAssertEqual(DubKeymap.legend(for: .loadSelection), "SPACE")
-        XCTAssertNil(DubKeymap.legend(for: .sampler(4)))
+        XCTAssertEqual(DubKeymap.legend(for: .sampler(4)), "B", "back to the default map")
+        XCTAssertEqual(DubKeymap.legend(for: .quickScratch(.a, 0)), "A")
         XCTAssertFalse(DubKeymapStore.shared.isOverridden(.loadSelection))
     }
 

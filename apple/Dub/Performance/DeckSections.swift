@@ -86,6 +86,9 @@ struct CueRowBank: View {
     let onPreviewUp: () -> Void
     let onRename: (Int) -> Void
     let onColor: (Int, String?) -> Void
+    /// The deck the bank belongs to: map mode binds a pad to *that*
+    /// deck's cue. `nil` keeps the old master-deck action.
+    var side: DeckSide? = nil
     /// How many columns to split the bank across.
     ///
     /// Fixed, not adaptive. This was briefly a `ViewThatFits` ladder
@@ -246,7 +249,7 @@ struct CueRowBank: View {
                 Button("Clear") { onCue(slot.index, true) }
             }
         }
-        .mappable(.hotCue(slot.index))
+        .mappable(side.map { .deckCue($0, slot.index) } ?? .hotCue(slot.index))
     }
 
 }

@@ -81,11 +81,38 @@ gate is local-only because GitHub CI has no macOS app job.
 
 **Since alpha.3, on `main`** (not on the rig yet):
 
+- **A default keymap (2026-11-17, Daniel).** Replaces "no default keymap"
+  (2026-09-15). Left hand deck A, right hand deck B: cues `1–5`/`6–0`
+  (new per-deck `deckCue`; the master-deck `hotCue` stays for maps made
+  before), tap `Q`/`P`, loop off `W`/`O`, echo `T`/`Y`, Quick Scratch
+  `ASDF`/`HJKL`, samples `ZXCVBNM,`, load `⇧←`/`⇧→`, double onto a deck
+  `⌃⇧←`/`⌃⇧→`, tracks `↑`/`↓`, `⌘F` search, sidebar `⌘⇧↑↓` and folders
+  `⌘⇧←→` (new `sidebar` / `folder` actions). Space loads into the
+  *empty* deck. A key now carries ⇧ ⌃ ⌥ as well as ⌘; an unclaimed ⇧/⌥
+  falls back to the plain key as an argument. Tap the grid merged into
+  Tap the BPM (Daniel): ⇧Q / ⌥Q halve / double deck A's track tempo, the
+  BPM menu's ½ / 2×; the `grid.tap.*` ids parse to nothing. A key the DJ bound beats a
+  default; `⌘,` can't be taken. To check on the rig: ⌃⇧ arrows vs
+  macOS's Spaces shortcuts.
+
+- **Welcome guide reworked (2026-11-17, Daniel).** Three stale pages
+  (it said audio needs no setup; it offered only a folder import) became
+  a setup checklist over the live rig: your rig (interface → Performance,
+  none → Prep; one line of principles) · audio (the microphone permission
+  before macOS asks; routing ready for a known box, `AudioRoutingSection`
+  embedded for an unknown one) · signal check (a light per deck, green
+  once timecode arrives — `DeckSignalCheck`) · music (Traktor / Serato /
+  rekordbox / Apple Music found on this Mac, read-only; or a folder) ·
+  keys (MAP and Preferences ▸ Keys; *bound now* read from the keymap, so
+  default keys added later show up by themselves) · ready (INT · TC ·
+  THRU, calibrate, the manual). Audio and signal appear in Performance
+  only. A new interface does not reopen it (Daniel).
+
 - **Keys for actions with no button (2026-11-17, Daniel).** Preferences ▸
   Keys maps what map mode cannot click (`DubKeymap.buttonless`): load
   into A / B / the deck not playing, instant doubles, Tap the grid **per
   deck** (was the master's — "per deck", Daniel; refused on a locked
-  grid), loop off per deck, jump to search, next / previous track. Click
+  grid; merged into Tap the BPM later that day), loop off per deck, jump to search, next / previous track. Click
   the cap, press the key — the same store and capture as MAP. A browse
   key that types nothing (arrow, F-key) still fires from the search
   field and leaves it, so search → ↓ → Space needs no mouse. The tab now

@@ -460,7 +460,7 @@ struct PreferencesSheet: View {
         }
         return VStack(alignment: .leading, spacing: DubSpacing.xl) {
             group("How to map") {
-                note("Turn MAP on in the top bar. Every bindable control shows its cap; click one and press the key you want on it — the same key on another control moves it. Escape backs out, ⌫ leaves a control unbound. Nothing you play has a default key; Space loads the selection and ⌘, opens this sheet.")
+                note("Turn MAP on in the top bar. Every bindable control shows its cap; click one and press the key you want on it — the same key on another control moves it. Escape backs out, ⌫ leaves a control unbound. Dub starts with a full map — the left hand plays deck A, the right hand deck B — and every key in it moves the same way.")
             }
             group("Actions with no button") {
                 note("These have nothing on the surface to click, so map them here: click a cap, then press the key.")
@@ -470,7 +470,7 @@ struct PreferencesSheet: View {
                 }
             }
             group("Modifiers") {
-                note("⇧ and ⌥ are not keys of their own: held with a bound key they change what it does. ⇧ with a hot cue's key clears that cue; ⇧ with Tap the grid halves the tempo, ⌥ doubles it. ⌘ is different — ⌘J and J are two separate keys, each bound to its own action.")
+                note("A key with a modifier is a key of its own: ⇧← loads deck A while ← does something else, and ⌘J and J are two keys. When nothing is bound to the key with ⇧ or ⌥ held, they change what the plain key does instead: ⇧ with a hot cue's key clears that cue; ⇧ with Tap the BPM halves a track's tempo, ⌥ doubles it.")
             }
             group("Bound on the surface") {
                 if bound.isEmpty {
@@ -508,7 +508,7 @@ struct PreferencesSheet: View {
                         ) {
                             Button("Reset", role: .destructive) { keymap.reset() }
                         } message: {
-                            Text("Every control you mapped goes back to having no key; Space and ⌘, come back.")
+                            Text("Every key goes back to Dub's own map; what you mapped yourself is forgotten.")
                         }
                 }
                 .padding(.top, DubSpacing.sm)
@@ -577,15 +577,17 @@ struct PreferencesSheet: View {
     static func buttonlessDetail(_ action: DubAction) -> String? {
         switch action {
         case .loadSelection:
-            return "Onto the deck that isn't the master. Space, unless you move it."
+            return "The empty one; A if both are. With both loaded, the deck that isn't the master."
         case .loadInto:
             return "Refused while that deck plays, as for Space."
         case .instantDouble:
             return "The other deck's track, at its playhead."
-        case .tapGrid:
-            return "The 1 at the playhead. ⇧ halves, ⌥ doubles. Not on a locked grid."
         case .focusSearch:
             return "Type, then the next-track key (an arrow or F-key) leaves the field."
+        case .sidebar:
+            return "In the sidebar on the left; a folder is a stop too."
+        case .folder:
+            return "Close on a playlist goes up to its folder."
         default:
             return nil
         }
@@ -593,19 +595,27 @@ struct PreferencesSheet: View {
 
     /// The name a binding prints in the list.
     private func displayName(_ action: DubAction) -> String {
+        Self.displayName(action, model: model)
+    }
+
+    /// Shared with the welcome guide's keys step, so an action reads the
+    /// same wherever it is listed.
+    static func displayName(_ action: DubAction, model: WaveformAppModel) -> String {
         switch action {
-        case .loadSelection: return "Load into the deck not playing"
+        case .loadSelection: return "Load into the empty deck"
         case .loadInto(let side): return "Load into \(side == .a ? "the left deck (A)" : "the right deck (B)")"
         case .openPreferences: return "Preferences"
-        case .tapGrid(let side): return "Tap the grid \(side.label)"
         case .loopOff(let side): return "Loop off \(side.label)"
         case .focusSearch: return "Jump to search"
         case .browse(let next): return next ? "Next track" : "Previous track"
-        case .hotCue(let i): return "Hot cue \(i + 1)"
+        case .hotCue(let i): return "Hot cue \(i + 1) · master deck"
+        case .deckCue(let side, let i): return "Hot cue \(i + 1) · \(side.label)"
+        case .sidebar(let next): return next ? "Next playlist" : "Previous playlist"
+        case .folder(let open): return open ? "Open folder" : "Close folder"
         case .sirenPreset(let i):
             let names = model.sirenPresetLabels
             return "Siren · \(i < names.count ? names[i] : "shot \(i + 1)")"
-        case .instantDouble(let toB): return toB ? "Instant double A → B" : "Instant double B → A"
+        case .instantDouble(let toB): return toB ? "Double onto B (from A)" : "Double onto A (from B)"
         case .sampler(let i):
             let name = model.sampleBank.label(i)
             return "Sample \(i + 1)" + (name.map { " · \($0)" } ?? "")
@@ -618,7 +628,7 @@ struct PreferencesSheet: View {
         case .fxHold: return "FX · Space Echo hold"
         case .fxTap: return "FX · Space Echo tap tempo"
         case .keyLock(let side): return "Key lock \(side.label)"
-        case .tapTempo(let side): return "Tap the BPM \(side.label)"
+        case .tapTempo(let side): return "Tap the BPM \(side.label) · ⇧ ½ · ⌥ 2×"
         }
     }
 
