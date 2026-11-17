@@ -32,7 +32,7 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; the current applied version is **9**.
+v1.0 baseline is **version 1**; the current applied version is **11**.
 Each bump is additive (new tables / columns with safe defaults / indexes),
 so a third-party reader that ignores the new columns keeps working. Any
 change to the table set, column set, indexes, FTS5 definition, or trigger
@@ -51,6 +51,8 @@ logic requires a version bump and a migration step.
 | 7       | M12e (collection membership) | `tracks.in_collection INTEGER NOT NULL DEFAULT 0 CHECK (in_collection IN (0,1))` + partial index `idx_tracks_in_collection`. External-source scans mint browse-only rows; folder import and first play promote into the collection (PRD §8.4.1). Backfills existing rows: members = folder-imported (carries an `id3`/`filename` metadata row) **or** ever-played (any `play_history` row). Additive. |
 | 8       | M12f (organization attrs) | `tracks.user_rating INTEGER CHECK (0..5)` (user star rating, overrides imported source ratings) + `tracks.color TEXT` (user colour-label token; tints the browser row). New `favorite_slots` table — the fixed 8-slot quick-access strip above the library; each slot points at a Dub crate (`dub_crate_id`, FK-cascaded) or an imported playlist by `(imported_source, imported_path)` (re-scan-stable, since the imported mirror's ids are rewritten on every import). Additive. |
 | 9       | M12f (per-source colour) | `track_metadata_source.color TEXT` — the imported per-source colour label (rekordbox `Colour`, Traktor `COLOR`), mapped to a Dub palette token. Displayed colour is `COALESCE(tracks.color, …source colours…)` so the DJ's own colour wins. Additive. |
+| 10      | Imported cues on the pads | `track_cue_takeover (track_id PK, taken_at)` — the tracks whose imported hot cues the DJ took over by editing one in Dub; from then on the pads read `source='user'` only, so a cleared cue stays cleared. Additive. See `track_cues`. |
+| 11      | Saved following grid | `track_tempo_maps (track_id PK, kind CHECK ('followed'), beats BLOB f64 LE, bar_phase, base_source / base_bpm / base_anchor_secs, bpm_min / bpm_max, created_at)` — the band-followed beats the deck played, kept with the even grid they were followed from. Reused while that grid is active; always on a locked track. `kind` leaves room for time-stretched tracks. Additive. |
 
 ### Backward compatibility contract
 
@@ -492,6 +494,48 @@ rekordbox-XML exporter round-trips them losslessly. *(Earlier drafts
 deferred all cues to v2; that conflated hot cues with the CDJ-style cue
 button — see PRD §6.6.)*
 
+**Which cues fill the pads (FFI 88, schema v10).** The DJ's own
+(`source='user'`) when the track has any, or has been taken over;
+otherwise the hot cues (`kind='hot_cue'`, slots 0–7) of the first of
+`serato > rekordbox > traktor` that has one — the beat-grid order, one
+source's set, never a merge (`Library::pad_cues`). The DJ's first set,
+clear or label on such a track copies that source's hot and memory cues
+to `user` rows and records the track in `track_cue_takeover`, so the edit
+lands on what the pads showed and a re-import can no longer change them.
+The rekordbox-XML export picks its one source by the same order.
+
+```sql
+CREATE TABLE IF NOT EXISTS track_cue_takeover (
+    track_id  TEXT    PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    taken_at  INTEGER NOT NULL
+);
+```
+
+### `track_tempo_maps` — a grid that is not even (schema v11)
+
+```sql
+CREATE TABLE IF NOT EXISTS track_tempo_maps (
+    track_id          TEXT    PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    kind              TEXT    NOT NULL CHECK (kind IN ('followed')),
+    beats             BLOB    NOT NULL,   -- f64 little-endian seconds, ascending
+    bar_phase         INTEGER NOT NULL,
+    base_source       TEXT    NOT NULL,   -- the even grid it was followed from
+    base_bpm          REAL    NOT NULL,
+    base_anchor_secs  REAL    NOT NULL,
+    bpm_min           REAL    NOT NULL,   -- the band's tempo range, for the browser
+    bpm_max           REAL    NOT NULL,
+    created_at        INTEGER NOT NULL
+);
+```
+
+The following beat grid (alpha) moves each beat to where the band played
+it. The deck saves what it played here (`Library::save_tempo_map`), against
+the track's active even grid. A later load reuses the map while that grid is
+still the one it was followed from (`TempoMap::follows_base`) and always on a
+locked track — a locked moving grid is an accepted one. The browser colours a
+moving grid's BPM by `kind`. `track_beatgrids` stays the even grid: every
+edit, export and the disagreement check read it, never the map.
+
 ### `track_loops` — saved loops (stored from v1, surfaced in v1.x)
 
 ```sql
@@ -895,7 +939,7 @@ path once encoded, `library_uuid` once imported), `side_archive`
 outside them are discarded at commit; `None` means the whole
 recording), and `replaced_uuids` / `split_generation` (re-split
 bookkeeping). Every field added after M26a carries `serde(default)`,
-which is exactly why the **SQLite schema stays at v9**: the manifest is
+which is exactly why the rip never needed a **SQLite schema** bump: the manifest is
 a sidecar that versions itself, and an older `rip.json` still loads.
 Commit is an **idempotent retry**:
 segments that already carry a `library_uuid` are skipped, so a crash

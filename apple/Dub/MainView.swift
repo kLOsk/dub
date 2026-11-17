@@ -194,6 +194,11 @@ struct DeckState: Equatable {
     /// the number the pad row happened to fit, not a decision.
     static let hotCueCount = 8
     var hotCues: [CueMark?] = Array(repeating: nil, count: DeckState.hotCueCount)
+    /// The app `hotCues` came from while they are an import's — `"traktor"`,
+    /// `"serato"`, `"rekordbox"` (FFI 88) — so the HOTCUE heading can say
+    /// so. `nil` for the DJ's own cues, and from the first edit on, which
+    /// takes the set over (`Library::adopt_imported_cues`).
+    var hotCuesFrom: String? = nil
 
     /// Length in *beats* of the loop currently engaged; `nil` when none
     /// is. Beats because that is what the engine takes — the bars field
@@ -430,9 +435,26 @@ struct DeckState: Equatable {
     /// record on the platter, not an empty deck waiting for one.
     var thruHasRecord: Bool = false
 
+    /// Where the DJ tapped the 1 on a THRU record, in the live waveform's
+    /// seconds, and the record it belongs to. The strip snaps it to the
+    /// nearest beat it hears and draws a bar line every four beats from
+    /// there. Retires with the record, like the tap.
+    var thruOne: ThruOne? = nil
+
     struct ThruTap: Equatable {
         var bpm: Double
         var recordSeq: UInt32
+    }
+
+    struct ThruOne: Equatable {
+        var waveSecs: Double
+        var recordSeq: UInt32
+    }
+
+    /// The 1 the strip should draw for the record on the platter now.
+    var thruOneSecs: Double? {
+        guard isThru, let one = thruOne, one.recordSeq == thruRecordSeq else { return nil }
+        return one.waveSecs
     }
 
     struct ThruScale: Equatable {
@@ -542,8 +564,8 @@ struct DeckState: Equatable {
 
     /// M11d-history — display title of the track the DJ has most
     /// often mixed into from this one (`played_into` top-1),
-    /// fetched once at load time. Drives the deck header's row-3
-    /// "↝ usually: <track>" hint in Performance mode. `nil` for
+    /// fetched once at load time. Drives the Performance deck column's
+    /// "↝ usually: <track>" hint (`DeckColumn.historyHint`). `nil` for
     /// Finder drags, never-transitioned tracks, and closed
     /// libraries — the header simply omits the hint.
     var historyHint: String? = nil
@@ -598,6 +620,7 @@ struct DeckState: Equatable {
         gridDriftQuality = nil
         isLoading = false
         hotCues = Array(repeating: nil, count: DeckState.hotCueCount)
+        hotCuesFrom = nil
     }
 
     /// Take on another deck's loaded track (M17 §7.3, Instant
@@ -636,6 +659,7 @@ struct DeckState: Equatable {
         // The same track carries the same cues; they are persisted per
         // track, not per deck.
         hotCues = other.hotCues
+        hotCuesFrom = other.hotCuesFrom
         // Nothing is being fetched — the engine already has the buffer.
         isLoading = false
         activeLoopBars = nil
@@ -855,6 +879,17 @@ final class WaveformAppModel: ObservableObject {
     }
 
     private static let kCueSnapToGrid = "dub.cueSnapToGridEnabled"
+
+    /// The "↝ usually: <track>" hint on the Performance deck: the track
+    /// the DJ has most often mixed into from the loaded one. On by
+    /// default; Preferences ▸ Decks turns it off (Daniel, 2026-11-16).
+    /// Only the drawing — the hint is still stamped at load, so turning
+    /// it back on shows it for the tracks already loaded.
+    @Published var historyHintEnabled: Bool {
+        didSet { UserDefaults.standard.set(historyHintEnabled, forKey: Self.kHistoryHint) }
+    }
+
+    private static let kHistoryHint = "dub.historyHintEnabled"
 
     /// M26a vinyl-recording feature toggle (Preferences ▸ Recording).
     /// When on — and a DJ interface is present — Prep mode grows a
@@ -1147,9 +1182,11 @@ final class WaveformAppModel: ObservableObject {
 
     private static let kFollowingGrid = "dub.followingGrid"
 
-    /// Tell the engine whether the next load may follow the band.
+    /// Tell the engine whether the next load may follow the band, and the
+    /// library whether to show moving grids.
     private func syncFollowingGrid() {
         engine.setFollowingGrid(on: alphaFeaturesEnabled && followingGridEnabled)
+        libraryModel.movingGridsShown = alphaFeaturesEnabled && followingGridEnabled
     }
 
     /// DUB FX is on the surface: its own switch, behind the alpha one.
@@ -1618,6 +1655,8 @@ final class WaveformAppModel: ObservableObject {
             UserDefaults.standard.object(forKey: Self.kLoudnessAutoGain) as? Bool ?? true
         self.cueSnapToGridEnabled =
             UserDefaults.standard.object(forKey: Self.kCueSnapToGrid) as? Bool ?? true
+        self.historyHintEnabled =
+            UserDefaults.standard.object(forKey: Self.kHistoryHint) as? Bool ?? true
         // M26a — vinyl recording defaults OFF, so plain `bool(forKey:)`
         // ("unset" → false) is the correct cold-boot value. The mode
         // override is rehydrated *before* `applyAutoDetect()` below so
@@ -1688,6 +1727,7 @@ final class WaveformAppModel: ObservableObject {
         self.selectedInputUID = storedInputUID
         self.selectedOutputUID = storedOutputUID
         wireTapToGridControllers()
+        libraryModel.movingGridsShown = alphaFeaturesEnabled && followingGridEnabled
         applyAutoDetect()
         // `refreshDevices()` is now TCC-safe in every mode (it goes
         // through `listOutputDevices()`, which never reads an
@@ -2475,13 +2515,14 @@ final class WaveformAppModel: ObservableObject {
         guard next.isThru else {
             if next.thruBpm != nil || next.thruTap != nil || next.thruRecordSeq != 0
                 || next.thruLocked || next.thruNeedleUp || next.thruScale != nil
-                || next.thruHasRecord
+                || next.thruHasRecord || next.thruOne != nil
             {
                 next.thruBpm = nil
                 next.thruLocked = false
                 next.thruRecordSeq = 0
                 next.thruNeedleUp = false
                 next.thruTap = nil
+                next.thruOne = nil
                 next.thruScale = nil
                 next.thruHasRecord = false
                 thruTaps[side] = nil
@@ -2503,6 +2544,61 @@ final class WaveformAppModel: ObservableObject {
             }
             if let scale = next.thruScale, scale.recordSeq != t.recordSeq {
                 next.thruScale = nil
+            }
+            if let one = next.thruOne, one.recordSeq != t.recordSeq {
+                next.thruOne = nil
+            }
+        }
+    }
+
+    /// What each deck's grid was last checked at for saving: the track,
+    /// the engine's grid generation, and the library's analysis
+    /// generation (a grid edit's library write bumps it).
+    private var tempoMapCheckedAt: [DeckSide: (trackId: String, grid: UInt64, library: UInt64)] = [:]
+    private var tempoMapCheckThrottle: [DeckSide: TimeInterval] = [:]
+
+    /// Save the band-followed grid the deck is playing to its track
+    /// (schema v11; Daniel, 2026-11-16: "if following beat grid is
+    /// enabled the grid should be saved to the track"). Checked once per
+    /// grid change, at most once a second: when the engine's grid follows
+    /// the band and the library holds no map for the track's current even
+    /// grid, the beats are saved against that grid — the base the next
+    /// load compares with. A load that played a saved map finds it current
+    /// and writes nothing.
+    private func saveTempoMapIfNeeded(side: DeckSide, deck: DeckState) {
+        guard alphaFeaturesEnabled, followingGridEnabled, libraryModel.libraryIsOpen,
+              deck.hasTrack, !deck.isThru, let trackId = deck.loadedLibraryTrackId
+        else { return }
+        let gridGen = engine.beatGridGeneration(deckIdx: side.ffiDeckIdx)
+        let libraryGen = libraryModel.analysisGeneration
+        if let at = tempoMapCheckedAt[side], at.trackId == trackId, at.grid == gridGen,
+           at.library == libraryGen { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - (tempoMapCheckThrottle[side] ?? 0) >= 1 else { return }
+        tempoMapCheckThrottle[side] = now
+        let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
+        guard grid.confidence > 0, !grid.beats.isEmpty else { return }
+        tempoMapCheckedAt[side] = (trackId, gridGen, libraryGen)
+        guard grid.follows else { return }
+        let library = self.library
+        Task.detached(priority: .background) {
+            // The base is the library's active even grid: what the next
+            // load hands the engine, and what the map must stand for.
+            guard let active = (try? library.activeBeatGrid(trackId: trackId)) ?? nil else { return }
+            if let map = active.tempoMap,
+               map.baseSource == active.source,
+               abs(map.baseBpm - active.bpm) <= 0.001,
+               abs(map.baseAnchorSecs - active.anchorSecs) <= 0.002,
+               map.beats == grid.beats
+            { return }
+            do {
+                try library.saveTempoMap(
+                    trackId: trackId, beats: grid.beats, barPhase: grid.barPhase,
+                    baseSource: active.source, baseBpm: active.bpm,
+                    baseAnchorSecs: active.anchorSecs)
+            } catch { return }
+            await MainActor.run { [weak self] in
+                self?.libraryModel.analysisGeneration &+= 1
             }
         }
     }
@@ -2537,14 +2633,40 @@ final class WaveformAppModel: ObservableObject {
         guard isRunning, deck.isThru else { return }
         let now = ProcessInfo.processInfo.systemUptime
         var taps = thruTaps[side] ?? []
+        let startsRun = taps.last.map { now - $0 > FxRackControls.tapRunGapSecs } ?? true
         taps.append(now)
         taps.removeAll { now - $0 > 8 }
         thruTaps[side] = taps
-        guard let bpm = FxRackControls.tappedBpm(taps) else { return }
+        // The first tap of a run is the 1, as on a track (Daniel,
+        // 2026-11-16): one or two taps set it, and a run tapped on for the
+        // tempo keeps the bar where it began. Not with the needle up —
+        // there is no record under the tap to put a bar on.
+        if startsRun, !deck.thruNeedleUp {
+            let wave = Double(engine.peaksLen(deckIdx: side.ffiDeckIdx))
+                * engine.peaksChunkDurationSecs(deckIdx: side.ffiDeckIdx)
+            if wave > 0 {
+                deck.thruOne = DeckState.ThruOne(waveSecs: wave, recordSeq: deck.thruRecordSeq)
+                setState(deck, for: side)
+            }
+        }
+        // A tempo takes three taps, as on a track: two would turn a
+        // double-tap on the 1 into a tempo.
+        guard let bpm = FxRackControls.tappedBpm(taps, minTaps: 3) else { return }
         let record = deck.thruNeedleUp ? deck.thruRecordSeq &+ 1 : deck.thruRecordSeq
         deck.thruTap = DeckState.ThruTap(bpm: (bpm * 10).rounded() / 10, recordSeq: record)
         setState(deck, for: side)
         syncFxEcho()
+    }
+
+    /// A tap on a deck's BPM, by click or by its mapped key: on THRU the
+    /// record's 1 and tempo, on a track the grid's (`handleTapForGrid` —
+    /// 1–2 taps set the 1, 3+ the tempo, never on a locked grid).
+    func tapBpm(_ side: DeckSide) {
+        if state(for: side).isThru {
+            tapThruTempo(side)
+        } else {
+            handleTapForGrid(side)
+        }
     }
 
     /// Tap times per THRU deck, seconds of uptime. Not state anything draws.
@@ -2725,7 +2847,9 @@ final class WaveformAppModel: ObservableObject {
         // The strip draws the THRU deck's coming beats at the tempo the
         // DJ is using, read on its own thread.
         WaveformRenderer.setThruTempo(deckIdx: side.ffiDeckIdx, bpm: next.thruReadout?.tempo)
+        WaveformRenderer.setThruOne(deckIdx: side.ffiDeckIdx, waveSecs: next.thruOneSecs)
         readLocalBpm(side: side, into: &next)
+        saveTempoMapIfNeeded(side: side, deck: next)
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -3049,6 +3173,7 @@ final class WaveformAppModel: ObservableObject {
             // theirs in `recordLibraryLoadIfApplicable`, Finder drags
             // stay empty.
             next.hotCues = Array(repeating: nil, count: DeckState.hotCueCount)
+            next.hotCuesFrom = nil
             if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
                 next.formatChip = formatChip(for: url, info: info)
@@ -3891,8 +4016,11 @@ final class WaveformAppModel: ObservableObject {
             // for library drags that bypassed selection.
             var stamped = state(for: side)
             stamped.loadedLibraryTrackId = trackId
-            // Recall persisted hot cues (best-effort; a read failure
-            // just leaves the pads empty this session).
+            // Recall the pads' hot cues — the DJ's own, or the ranked
+            // import's (FFI 88) — best-effort; a read failure just leaves
+            // the pads empty this session.
+            let from = (try? library.hotCueSource(trackId: trackId)) ?? nil
+            stamped.hotCuesFrom = from == "user" ? nil : from
             if let cues = try? library.hotCues(trackId: trackId) {
                 var slots: [CueMark?] = Array(repeating: nil, count: DeckState.hotCueCount)
                 for cue in cues where cue.cueIndex < UInt32(DeckState.hotCueCount) {
@@ -3915,12 +4043,17 @@ final class WaveformAppModel: ObservableObject {
                 stamped.gridLocked = snap.gridLocked
                 stamped.gridDriftQuality = snap.gridDriftQuality
             }
-            // M11d-history: top played-into target for the row-3
-            // "↝ usually:" hint. Best-effort — a query failure just
-            // omits the hint. The id rides along so a click on the
-            // hint can reveal the track in the browser.
+            // M11d-history: top played-into target for the deck
+            // column's "↝ usually:" hint. Best-effort — a query failure
+            // just omits the hint. The id rides along so a click on the
+            // hint can reveal the track in the browser. Title · artist,
+            // as the library lists them; the column truncates the tail.
             let topInto = (try? library.playedInto(trackId: trackId, limit: 1))?.first
-            if let topInto, let label = topInto.track.title ?? topInto.track.artist {
+            let label = topInto.map {
+                [$0.track.title, $0.track.artist]
+                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            } ?? ""
+            if let topInto, !label.isEmpty {
                 stamped.historyHint = label
                 stamped.historyHintTrackId = topInto.track.id
             } else {
@@ -5432,7 +5565,7 @@ final class WaveformAppModel: ObservableObject {
         }
 
         let postInstallGrid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-        let installedBarPhase = postInstallGrid.barPhase
+        let installedBarPhase = postInstallGrid.evenBarPhase
 
         if libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
@@ -5770,6 +5903,7 @@ final class WaveformAppModel: ObservableObject {
         if clear {
             guard deck.hotCues[index] != nil else { return }
             deck.hotCues[index] = nil
+            deck.hotCuesFrom = nil
             deck.seekGeneration &+= 1
             setState(deck, for: side)
             persistHotCue(deck: deck, index: index, position: nil)
@@ -5798,6 +5932,7 @@ final class WaveformAppModel: ObservableObject {
                 position = snappedToGrid(position, side: side)
             }
             deck.hotCues[index] = CueMark(positionSecs: position)
+            deck.hotCuesFrom = nil
             deck.seekGeneration &+= 1
             setState(deck, for: side)
             persistHotCue(deck: deck, index: index, position: position)
@@ -5906,6 +6041,7 @@ final class WaveformAppModel: ObservableObject {
         mark.name = name
         mark.color = color
         deck.hotCues[index] = mark
+        deck.hotCuesFrom = nil
         setState(deck, for: side)
 
         guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
@@ -6749,7 +6885,9 @@ final class WaveformAppModel: ObservableObject {
         grid: BeatGrid,
         playheadTimes: [Double]
     ) {
-        guard let anchor = grid.beats.first else { return }
+        // The even grid's anchor, not `beats[0]` — see `persistNudgedGrid`.
+        guard !grid.beats.isEmpty else { return }
+        let anchor = grid.evenAnchorSecs
         deck.manualGridEditCount += 1
         deck.bpm = grid.bpm
         deck.bpmConfidence = Double(grid.confidence)
@@ -6772,7 +6910,7 @@ final class WaveformAppModel: ObservableObject {
         guard libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId else { return }
         let library = self.library
         let quality = grid.quality
-        let barPhase = grid.barPhase
+        let barPhase = grid.evenBarPhase
         // `[weak self]` on the main-actor closure, not the outer
         // detached body — see ensureTrackAnalyzed comment for the
         // Swift-6 strict-concurrency rationale.
@@ -7028,10 +7166,11 @@ final class WaveformAppModel: ObservableObject {
         delta: Double
     ) {
         let grid = engine.beatGrid(deckIdx: side.ffiDeckIdx)
-        guard grid.confidence > 0, grid.bpm > 0, let firstBeat = grid.beats.first
-        else { return }
+        // The even grid's anchor, not `beats[0]`: on a following grid the
+        // first beat is the band's (FFI 89).
+        guard grid.confidence > 0, grid.bpm > 0, !grid.beats.isEmpty else { return }
         let newBpm = grid.bpm
-        let newAnchor = Double(firstBeat)
+        let newAnchor = grid.evenAnchorSecs
         let playhead = engine.position(deckIdx: side.ffiDeckIdx).elapsedSecs
 
         deck.manualGridEditCount &+= 1
@@ -7061,7 +7200,7 @@ final class WaveformAppModel: ObservableObject {
         // continuously via `CVDisplayLink`.
         deck.seekGeneration &+= 1
 
-        let nudgedBarPhase = grid.barPhase
+        let nudgedBarPhase = grid.evenBarPhase
         if libraryModel.libraryIsOpen, let trackId = deck.loadedLibraryTrackId {
             let library = self.library
             // `[weak self]` on the main-actor closure, not the outer
@@ -7389,7 +7528,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             },
             onTapTempo: { side in
                 Task { @MainActor in
-                    model.tapThruTempo(side)
+                    model.tapBpm(side)
                 }
                 return true
             },

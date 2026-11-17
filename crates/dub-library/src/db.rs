@@ -269,6 +269,14 @@ pub struct TrackRow {
     /// until a second grid source exists for the track, so a
     /// Dub-only library never sees it.
     pub bpm_disagreement: bool,
+    /// The kind of the track's saved tempo map (schema v11) —
+    /// `"followed"` when its grid follows a band — or `None` for an even
+    /// grid. The browser colours a moving grid's BPM by it.
+    pub tempo_map_kind: Option<String>,
+    /// The band's tempo range across the saved map, for the BPM tooltip.
+    pub tempo_bpm_min: Option<f64>,
+    /// See [`Self::tempo_bpm_min`].
+    pub tempo_bpm_max: Option<f64>,
     /// Cells for the configurable columns (PRD §8.5.3.1), in the
     /// order of the [`Library`]'s active [`ColumnSet`]. Empty — and
     /// free — until the user switches a column on.
@@ -436,8 +444,9 @@ const TRACK_ROW_COLUMNS: &str = "\
            COALESCE(t.color, sr.color, rb.color, tr.color, it.color) AS color";
 
 /// Fixed column count in [`TRACK_ROW_COLUMNS`] plus the appended
-/// `bpm_disagreement`. Configurable columns start at this index.
-const FIXED_COLUMN_COUNT: usize = 25;
+/// `bpm_disagreement` and the three tempo-map columns. Configurable
+/// columns start at this index.
+const FIXED_COLUMN_COUNT: usize = 28;
 
 /// PRD §8.3: two sources' grids disagree when their tempi differ by
 /// more than this fraction. The motivating case is an octave error —
@@ -496,7 +505,9 @@ const TRACK_ROW_JOINS: &str = "\
     LEFT JOIN track_keys ak \
               ON ak.track_id = t.id AND ak.is_active = 1 \
     LEFT JOIN analysis_cache ac \
-              ON ac.fingerprint_id = t.fingerprint_id ";
+              ON ac.fingerprint_id = t.fingerprint_id \
+    LEFT JOIN track_tempo_maps tm \
+              ON tm.track_id = t.id ";
 
 /// The primary-file subquery, with the projected `track_files`
 /// columns left to the caller so the audio-file column group is paid
@@ -534,7 +545,9 @@ fn primary_file_join(extra_columns: &[&str]) -> String {
 /// is what holds it to that.
 fn track_row_select(set: &ColumnSet) -> String {
     format!(
-        "SELECT {TRACK_ROW_COLUMNS}, {disagreement} AS bpm_disagreement{extras} \
+        "SELECT {TRACK_ROW_COLUMNS}, {disagreement} AS bpm_disagreement, \
+                tm.kind AS tempo_map_kind, tm.bpm_min AS tempo_bpm_min, \
+                tm.bpm_max AS tempo_bpm_max{extras} \
          {TRACK_ROW_JOINS}{files}{joins}",
         disagreement = bpm_disagreement_sql(),
         extras = set.select_fragment(),
@@ -591,6 +604,9 @@ fn track_row_from_columns(
             let flag: i64 = r.get(24)?;
             flag != 0
         },
+        tempo_map_kind: r.get(25)?,
+        tempo_bpm_min: r.get(26)?,
+        tempo_bpm_max: r.get(27)?,
         extras: extra_columns.read_row(r, FIXED_COLUMN_COUNT)?,
     })
 }

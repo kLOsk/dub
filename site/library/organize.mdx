@@ -17,6 +17,12 @@ shows; the list on the right is your tracks.
 | **IMPORTED SOURCES** | Serato, Traktor, rekordbox and Apple Music, with their playlists. See [Bring your library](/library/import). |
 | **REAL RECORDS** | The record sides you've ripped. |
 
+Click a heading to fold its section away, and again to open it. The arrow
+beside each imported source folds its playlists, and a folder inside one,
+such as an Apple Music playlist folder, has an arrow of its own. Folders
+start folded; click the arrow, or an empty folder's name, to open one. Dub
+remembers what you folded.
+
 Above the list is a strip of eight favourite slots. Drag a crate or a
 playlist from the sidebar onto a slot, then click the slot to open it.
 Right-click a slot and choose **Clear Slot** to empty it.
@@ -107,9 +113,11 @@ keeps playing a different track, and the outgoing track played for at least
 - **Recently Played** lists tracks you've loaded on a deck, newest first.
 - **Session History** is the set you've played since you opened Dub. A track you
   mixed into shows **← from** and the track before it.
-- When you load a track you've mixed out of before, the deck header shows
-  **↝ usually:** and the track you most often play next. Click it to find
-  that track in the library, then press Space to load it.
+- When you load a track you've mixed out of before, the deck in
+  **Performance** shows **↝ usually:** and the track you most often play
+  next, between the elapsed and remaining time. Click it to find that track
+  in the library, then press Space to load it. Turn it off with **Show what
+  you usually play next** in **Preferences ▸ Decks**.
 
 ## Analysis
 
@@ -131,8 +139,10 @@ Marks in the **BPM** column:
 | **⚠** *Imported and analysed grids disagree* | Another app's grid and Dub's analysis don't match. Show the per-app BPM columns to compare. |
 | **⚠** *May drift over a long mix* | The grid may wander late in the track. Right-click ▸ **Lock grid** to accept it. |
 | Padlock | The grid is locked. Analysis leaves it alone. Right-click ▸ **Unlock grid** to free it. |
+| **BPM in cyan** | A moving grid: it follows the band (**Following beat grid**, alpha). Hover it for the band's tempo range. |
+| Cyan padlock | A moving grid you accepted: the track always plays it as saved. |
 
-Hover a **⚠** to see which one it is.
+A track shows one **⚠** however many of these apply, amber when the grids disagree. Hover it to see every problem it stands for.
 
 Key comes out as Camelot. A grid from another app stays in charge: Dub's own
 reading sits beside it in **BPM (auto)** and **Key (auto)**.

@@ -954,12 +954,18 @@ struct LibraryView: View {
     /// track list runs against.
     @State private var selectedSource: LibrarySource = .allTracks
 
-    /// Imported-source nodes (Serato / Traktor / Apple Music) the user
-    /// has collapsed in the sidebar. Membership = collapsed, so the
-    /// default (empty) shows every source expanded with its playlist
-    /// tree visible. Toggled by the disclosure triangle on each source
-    /// row; selecting the row still lists that source's tracks.
-    @State private var collapsedImportedSources: Set<ImportedSourceKind> = []
+    /// What is folded in the sidebar — sections, imported sources and
+    /// the folders inside them (`SidebarFolding`). Persisted, so the
+    /// sidebar opens the way the DJ left it.
+    @AppStorage("librarySidebarFolding") private var foldingRaw: String = ""
+
+    private var folding: SidebarFolding { SidebarFolding(raw: foldingRaw) }
+
+    private func fold(_ change: (inout SidebarFolding) -> Void) {
+        var f = folding
+        change(&f)
+        foldingRaw = f.raw
+    }
 
     /// M11d-history — per-row "← from <track>" annotations for the
     /// Session History source, keyed by track id. Populated only by
@@ -1168,6 +1174,7 @@ struct LibraryView: View {
         // moves. Without this the header relabelled to "KEY (♪)" and
         // every row underneath kept showing Camelot.
         .onChange(of: keyNotationMode) { _ in tracksContentRevision &+= 1 }
+        .onChange(of: libraryModel.movingGridsShown) { _ in tracksContentRevision &+= 1 }
         // The on-deck markers. A load changes no row id, so the table
         // would keep the old gutter without a revision.
         .onChange(of: model.deckTrackIds) { _ in tracksContentRevision &+= 1 }
@@ -1392,23 +1399,51 @@ struct LibraryView: View {
     @ViewBuilder
     private func section(heading: String, entries: [LibrarySource]) -> some View {
         let importable = heading.caseInsensitiveCompare("Library") == .orderedSame
-        Text(heading.uppercased())
-            .font(DubFont.caps)
-            .tracking(1.0)
-            .foregroundStyle(DubColor.textTertiary)
-            .padding(.horizontal, DubSpacing.lg)
-            .padding(.top, DubSpacing.sm)
-            .padding(.bottom, 2)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+        sectionHeading(heading)
             // Import lives here now rather than on a toolbar button —
             // see `importMenuItems`. On the LIBRARY heading and on the
             // All Tracks row beneath it, which are the two places you
             // would point at when you mean "the library".
             .contextMenu { if importable { importMenuItems } }
-        ForEach(entries) { entry in
-            sidebarRow(entry)
-                .contextMenu { if entry == .allTracks { importMenuItems } }
+        if !folding.isSectionFolded(heading) {
+            ForEach(entries) { entry in
+                sidebarRow(entry)
+                    .contextMenu { if entry == .allTracks { importMenuItems } }
+            }
+        }
+    }
+
+    /// A section's heading, which folds it: the whole line is the target,
+    /// as on the filter bar, with the chevron saying which way it is.
+    /// `trailing` carries a heading's own button (Dub Crates' +), which
+    /// keeps its click.
+    private func sectionHeading<Trailing: View>(
+        _ heading: String, @ViewBuilder trailing: () -> Trailing = { EmptyView() }
+    ) -> some View {
+        let folded = folding.isSectionFolded(heading)
+        return HStack(spacing: DubSpacing.xs) {
+            Image(systemName: folded ? "chevron.right" : "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(DubColor.textTertiary)
+                .frame(width: 10)
+            Text(heading.uppercased())
+                .font(DubFont.caps)
+                .tracking(1.0)
+                .foregroundStyle(DubColor.textTertiary)
+            Spacer(minLength: 0)
+            trailing()
+        }
+        .padding(.leading, DubSpacing.lg - 12)
+        .padding(.trailing, DubSpacing.lg)
+        .padding(.top, DubSpacing.sm)
+        .padding(.bottom, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { fold { $0.toggleSection(heading) } }
+        .help(folded ? "Show \(heading)" : "Fold \(heading)")
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(named: folded ? "Show \(heading)" : "Fold \(heading)") {
+            fold { $0.toggleSection(heading) }
         }
     }
 
@@ -1422,13 +1457,11 @@ struct LibraryView: View {
     /// reads as broken when the user has no crates yet.
     @ViewBuilder
     private var dubCratesSection: some View {
-        HStack(spacing: DubSpacing.sm) {
-            Text("DUB CRATES")
-                .font(DubFont.caps)
-                .tracking(1.0)
-                .foregroundStyle(DubColor.textTertiary)
-            Spacer(minLength: 0)
+        sectionHeading("Dub Crates") {
             Button {
+                // A new crate opens the section, or its rename field
+                // would be hidden.
+                if folding.isSectionFolded("Dub Crates") { fold { $0.toggleSection("Dub Crates") } }
                 createCrateAndRename()
             } label: {
                 Image(systemName: "plus")
@@ -1439,11 +1472,10 @@ struct LibraryView: View {
             .disabled(!libraryModel.libraryIsOpen)
             .help("New crate")
         }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.top, DubSpacing.sm)
-        .padding(.bottom, 2)
 
-        if libraryModel.crates.isEmpty {
+        if folding.isSectionFolded("Dub Crates") {
+            EmptyView()
+        } else if libraryModel.crates.isEmpty {
             Text("No crates yet — drag tracks here.")
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textPlaceholder)
@@ -1550,55 +1582,27 @@ struct LibraryView: View {
     @ViewBuilder
     private var importedSourcesSection: some View {
         if !libraryModel.importedSources.isEmpty {
-            Text("IMPORTED SOURCES")
-                .font(DubFont.caps)
-                .tracking(1.0)
-                .foregroundStyle(DubColor.textTertiary)
-                .padding(.horizontal, DubSpacing.lg)
-                .padding(.top, DubSpacing.sm)
-                .padding(.bottom, 2)
-            ForEach(libraryModel.importedSources) { group in
-                importedSourceRow(group)
-                if !collapsedImportedSources.contains(group.kind) {
-                    ForEach(flattenedImportedCrates(group.crates), id: \.crate.id) { node in
-                        importedCrateRow(node.crate, depth: node.depth)
+            sectionHeading("Imported Sources")
+            if !folding.isSectionFolded("Imported Sources") {
+                ForEach(libraryModel.importedSources) { group in
+                    importedSourceRow(group)
+                    if !folding.isSourceFolded(group.kind) {
+                        ForEach(
+                            folding.visibleNodes(group.crates, kind: group.kind), id: \.crate.id
+                        ) { node in
+                            importedCrateRow(node, kind: group.kind)
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Flatten an imported source's crate tree (flat list + `parentId`,
-    /// document order) into rows tagged with nesting depth, so a folder's
-    /// children render indented under it. Roots first, depth-first.
-    private func flattenedImportedCrates(
-        _ crates: [LibraryImportedCrate]
-    ) -> [(crate: LibraryImportedCrate, depth: Int)] {
-        var childrenByParent: [Int64: [LibraryImportedCrate]] = [:]
-        var roots: [LibraryImportedCrate] = []
-        for c in crates {
-            if let parent = c.parentId {
-                childrenByParent[parent, default: []].append(c)
-            } else {
-                roots.append(c)
-            }
-        }
-        var out: [(crate: LibraryImportedCrate, depth: Int)] = []
-        func visit(_ c: LibraryImportedCrate, _ depth: Int) {
-            out.append((c, depth))
-            for child in childrenByParent[c.id] ?? [] {
-                visit(child, depth + 1)
-            }
-        }
-        for root in roots { visit(root, 0) }
-        return out
-    }
-
     private func importedSourceRow(_ group: ImportedSourceGroup) -> some View {
         let source = LibrarySource.importedSource(kind: group.kind)
         let isSelected = selectedSource == source
         let canCollapse = !group.crates.isEmpty
-        let isCollapsed = collapsedImportedSources.contains(group.kind)
+        let isCollapsed = folding.isSourceFolded(group.kind)
         return HStack(spacing: DubSpacing.sm) {
             // Disclosure triangle: only a source with playlists/crates
             // has anything to collapse. Sources without keep an empty
@@ -1606,7 +1610,7 @@ struct LibraryView: View {
             Group {
                 if canCollapse {
                     Button {
-                        toggleImportedSourceCollapsed(group.kind)
+                        fold { $0.toggleSource(group.kind) }
                     } label: {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 9, weight: .semibold))
@@ -1645,20 +1649,31 @@ struct LibraryView: View {
         }
     }
 
-    /// Toggle whether an imported source's playlist tree is shown.
-    private func toggleImportedSourceCollapsed(_ kind: ImportedSourceKind) {
-        if collapsedImportedSources.contains(kind) {
-            collapsedImportedSources.remove(kind)
-        } else {
-            collapsedImportedSources.insert(kind)
-        }
-    }
-
-    private func importedCrateRow(_ crate: LibraryImportedCrate, depth: Int) -> some View {
+    private func importedCrateRow(_ node: SidebarFolding.Node, kind: ImportedSourceKind) -> some View {
+        let crate = node.crate
+        let depth = node.depth
         let source = LibrarySource.importedCrate(id: crate.id)
         let isSelected = selectedSource == source
         return HStack(spacing: DubSpacing.sm) {
-            Image(systemName: "list.bullet")
+            // A folder folds, like its source; a playlist keeps the
+            // slot empty so the icons line up.
+            Group {
+                if node.hasChildren {
+                    Button {
+                        fold { $0.toggleFolder(kind, path: node.path) }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DubColor.textTertiary)
+                            .rotationEffect(.degrees(node.isOpen ? 90 : 0))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(node.isOpen ? "Fold \(crate.name)" : "Show what's in \(crate.name)")
+                }
+            }
+            .frame(width: 10)
+            Image(systemName: node.hasChildren ? "folder" : "list.bullet")
                 .frame(width: 16)
                 .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
             Text(crate.name)
@@ -1667,10 +1682,13 @@ struct LibraryView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 0)
-            Text("\(crate.trackCount)")
+            Text("\(node.count.value)")
                 .font(DubFont.micro)
                 .foregroundStyle(DubColor.textTertiary)
                 .monospacedDigit()
+                .help(node.count.isPlaylists
+                    ? "\(node.count.value) playlist\(node.count.value == 1 ? "" : "s")"
+                    : "\(node.count.value) track\(node.count.value == 1 ? "" : "s")")
         }
         .padding(.leading, DubSpacing.lg + CGFloat(depth + 1) * DubSpacing.md)
         .padding(.trailing, DubSpacing.lg)
@@ -1679,6 +1697,12 @@ struct LibraryView: View {
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
+            // A folder with no tracks of its own has nothing to list:
+            // a click on it folds it, as on a Finder sidebar.
+            if node.hasChildren, crate.trackCount == 0 {
+                fold { $0.toggleFolder(kind, path: node.path) }
+                return
+            }
             searchFocused = false
             NSApp.keyWindow?.makeFirstResponder(nil)
             selectedSource = source
@@ -3321,6 +3345,7 @@ struct LibraryView: View {
                 track: track,
                 sessionFromTitle: sessionFromTitles[track.id],
                 keyNotationMode: keyNotationMode,
+                movingGridsShown: libraryModel.movingGridsShown,
                 extraIndexById: extraColumnIndex),
             isOnDeckA: model.deckTrackIds.a == track.id,
             isOnDeckB: model.deckTrackIds.b == track.id,
@@ -4276,6 +4301,9 @@ private extension LibraryTrack {
             // had an imported one, so the ⚠ has to survive the patch;
             // the row is only re-fetched on the next refresh.
             bpmDisagreement: bpmDisagreement,
+            tempoMapKind: tempoMapKind,
+            tempoBpmMin: tempoBpmMin,
+            tempoBpmMax: tempoBpmMax,
             extras: extras)
     }
 }

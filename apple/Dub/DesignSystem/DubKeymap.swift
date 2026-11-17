@@ -80,8 +80,10 @@ enum DubAction: Hashable {
     case fxTap
     /// A deck's key lock (M14). Per deck, like the platter it holds.
     case keyLock(DeckSide)
-    /// Tap a THRU deck's tempo — the record's, overriding the tracker
-    /// until the needle comes up.
+    /// Tap a deck's BPM, as clicking it does: on THRU the record's 1 and
+    /// tempo (held until the needle comes up), on a track the grid's —
+    /// 1–2 taps set the 1, 3+ the tempo. The id stays `tempo.tap.*` so
+    /// keys mapped before it reached track decks keep working.
     case tapTempo(DeckSide)
 
     var id: String {

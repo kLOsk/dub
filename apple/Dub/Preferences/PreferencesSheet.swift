@@ -274,7 +274,11 @@ struct PreferencesSheet: View {
             toggleRow(
                 "Snap cue points to the beat grid",
                 "Setting a hot cue snaps the marker to the nearest beat line, so a rough tap lands clean. Off, the cue lands exactly at the playhead. Tracks with no analysed grid keep the raw position either way.",
-                isOn: $model.cueSnapToGridEnabled, last: true)
+                isOn: $model.cueSnapToGridEnabled)
+            toggleRow(
+                "Show what you usually play next",
+                "In Performance, the deck shows “↝ usually:” and the track you have most often mixed into from the loaded one, between elapsed and remaining. Click it to find that track in the library. Learned from your own mixes; nothing leaves this Mac.",
+                isOn: $model.historyHintEnabled, last: true)
         }
     }
 
@@ -338,13 +342,27 @@ struct PreferencesSheet: View {
     /// app's crates/playlists appear in the sidebar's Imported Sources
     /// section. Read-only on the source data.
     private var libraryTab: some View {
-        group("Import from") {
-            note("Dub reads each library read-only, merges its tracks into your collection, and shows that app's crates and playlists in the sidebar. Enabling a source scans its default folder now and on every launch.")
-                .padding(.bottom, DubSpacing.xs)
-            librarySourceRow("Serato", kind: .serato, isOn: $model.seratoImportEnabled)
-            librarySourceRow("Traktor", kind: .traktor, isOn: $model.traktorImportEnabled)
-            librarySourceRow("rekordbox", kind: .rekordbox, isOn: $model.rekordboxImportEnabled)
-            librarySourceRow("Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled, last: true)
+        VStack(alignment: .leading, spacing: DubSpacing.xl) {
+            group("Import from") {
+                note("Dub reads each library read-only, merges its tracks into your collection, and shows that app's crates and playlists in the sidebar. Enabling a source scans its default folder now and on every launch.")
+                    .padding(.bottom, DubSpacing.xs)
+                librarySourceRow("Serato", kind: .serato, isOn: $model.seratoImportEnabled)
+                librarySourceRow("Traktor", kind: .traktor, isOn: $model.traktorImportEnabled)
+                librarySourceRow("rekordbox", kind: .rekordbox, isOn: $model.rekordboxImportEnabled)
+                librarySourceRow("Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled, last: true)
+            }
+            // Daniel, 2026-11-16: with more than one app on, say whose grid
+            // and whose cues a track gets. The order is
+            // `Library::grid_source_rank` and `CUE_SOURCE_ORDER`.
+            group("When a track is in more than one app") {
+                note("A track you find through any of them is the same track: Dub matches them by the file.")
+                    .padding(.bottom, DubSpacing.xs)
+                note("Beat grid. A grid you fix in Dub comes first. Then Serato, then rekordbox, then Traktor, then Dub's own analysis. Apple Music has no grids. Dub still analyses every track and marks its BPM with ⚠ when an app's grid disagrees.")
+                    .padding(.bottom, DubSpacing.xs)
+                note("Hot cues. Cues you set in Dub come first. A track you haven't touched in Dub shows the hot cues of the first app in the same order that has any: Serato, rekordbox, then Traktor. One app's set, never a mix, and the HOTCUE heading says which. Your first change to one of those cues makes the set yours: the change sticks, and later edits in that app no longer reach Dub's pads.")
+                    .padding(.bottom, DubSpacing.xs)
+                note("Dub never writes to these apps. What you change in Dub stays in Dub; File ▸ Export Library As… takes it elsewhere.")
+            }
         }
     }
 
@@ -503,7 +521,7 @@ struct PreferencesSheet: View {
         case .fxHold: return "FX · Space Echo hold"
         case .fxTap: return "FX · Space Echo tap tempo"
         case .keyLock(let side): return "Key lock \(side.label)"
-        case .tapTempo(let side): return "Tap tempo \(side.label) (THRU)"
+        case .tapTempo(let side): return "Tap the BPM \(side.label)"
         }
     }
 

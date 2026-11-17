@@ -57,6 +57,8 @@ import SwiftUI
 /// Everything Prep's surface draws.
 struct PrepRackState: Equatable {
     var cues: [CueSlotState] = (0..<8).map { CueSlotState(index: $0) }
+    /// `DeckState.hotCuesFrom`: the app the pads' cues came from.
+    var cuesFrom: String?
     /// Beats of the loop currently running; `nil` when none is.
     var activeLoopBeats: Double?
     var loopEngaged: Bool = false
@@ -107,7 +109,8 @@ struct PrepRack: View {
                 onRename: callbacks.onRenameCue,
                 onColor: callbacks.onColorCue,
                 columns: 4,
-                contentHeight: DubLayout.prepSectionContent)
+                contentHeight: DubLayout.prepSectionContent,
+                cuesFrom: state.cuesFrom)
                 .frame(width: DubLayout.prepCueColumn, alignment: .leading)
 
 

@@ -301,8 +301,7 @@ struct PerformanceView: View {
             onSetInternal: { model.setDeckInternal(side: side) },
             onSetTimecode: { model.setDeckTimecode(side: side) },
             onSetThru: { model.setDeckThru(side: side) },
-            onRecalibrate: { model.recalibrateDeck(side: side) },
-            onHistoryHintTap: { model.revealHistoryHint(side: side) })
+            onRecalibrate: { model.recalibrateDeck(side: side) })
     }
 
     // MARK: - Performance pad column
@@ -319,6 +318,7 @@ struct PerformanceView: View {
             side: side,
             header: DeckColumnHeader(
                 headerState(side: side),
+                showsHistoryHint: model.historyHintEnabled,
                 scratch: deck.quickScratch.map { scratch in
                     ScratchBadge(
                         parkedTitle: scratch.parkedTitle,
@@ -335,6 +335,7 @@ struct PerformanceView: View {
             cues: (0..<DeckState.hotCueCount).map {
                 CueSlotState(index: $0, mark: deck.hotCues[$0])
             },
+            cuesFrom: deck.hotCuesFrom,
             activeLoopBeats: deck.activeLoopBeats,
             loopEngaged: deck.loopActive,
             echoEnabled: model.echoOutEnabled,
@@ -399,7 +400,12 @@ struct PerformanceView: View {
             onExitLoop: { model.exitLoop(side) },
             onEchoToggle: { model.toggleEchoOut(side) },
             onEchoHold: { model.toggleEchoHold(side) },
-            onTapTempo: { model.tapThruTempo(side) },
+            onTapTempo: { model.tapBpm(side) },
+            onDoubleBpm: { model.scaleLoadedDeckBpm(side: side, multiplier: 2.0) },
+            onHalveBpm: { model.scaleLoadedDeckBpm(side: side, multiplier: 0.5) },
+            onResetBpm: { model.resetLoadedDeckBeatGrid(side: side) },
+            onToggleGridLocked: { model.toggleLoadedDeckGridLocked(side: side) },
+            onHistoryHint: { model.revealHistoryHint(side: side) },
             onScaleTempo: { factor in model.scaleThruTempo(side, by: factor) },
             onResetTempo: { model.resetThruTempo(side) },
             onScratch: { pad in model.toggleQuickScratch(side, pad: pad) },
@@ -692,6 +698,7 @@ struct PerformanceView: View {
             cues: (0..<DeckState.hotCueCount).map {
                 CueSlotState(index: $0, mark: model.deckA.hotCues[$0])
             },
+            cuesFrom: model.deckA.hotCuesFrom,
             activeLoopBeats: model.deckA.activeLoopBeats,
             loopEngaged: model.deckA.loopActive,
             samples: sampleShelfState(output: nil),

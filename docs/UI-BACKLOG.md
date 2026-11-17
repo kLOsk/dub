@@ -277,6 +277,59 @@ What shipped in this round (for context, not action):
   (`PANIC_RELOCK_BLOCKS_TO_HANDBACK`), so dropping the control record
   back on resumes timecode control.
 
+### P-41. Hot cues and loops on a THRU record (post-1.0, PRD M28)
+
+_Brainstorm, 2026-11-16 (Daniel: "in theory it should be possible").
+Not designed, not started._
+
+**The idea.** A THRU deck records everything it plays into a buffer as it
+goes. A hot cue is a timestamp in that recording; pressing it plays the
+recording from there while the real record turns on underneath. A loop
+replays a stretch of it. The record is recorded the whole time, so
+nothing is lost while a loop runs. Cues and loops are temporary: they
+retire with the record (`thruRecordSeq`), like the tapped tempo and 1.
+
+**The one hard limit:** playback can be at or behind the needle, never
+ahead of it — nothing later has been heard yet. A cue can jump back, and
+forward only as far as live.
+
+**Proposed model.** A THRU deck as a *track still being written*: the
+decode-ahead watermark (PRD §4.4 / §6.4) is the needle, and "live" is the
+playhead pinned to it. Cues, loops, echo out and the grid are then the
+track features that exist, not THRU-only copies. Loop edges come from
+the followed beats and the tapped 1 (`PredictedBeats`, 2026-11-16); with
+no phase yet, manual in/out. Check first how far the engine's
+decode-ahead path allows a buffer that grows for the whole session.
+
+**Leaving a loop — two modes:**
+1. **Slip back to live (default).** Release and you are on the needle,
+   wherever the record has got to; always in time with it.
+2. **Timeshift (maybe later).** Play on from the loop's end, now behind
+   the needle, until a jump back to live. No smooth catch-up (only playing
+   fast under key lock — a gimmick). The platter no longer drives what is
+   heard: a real record has no timecode, so pitching or scratching it does
+   nothing to the recording. The strip needs two marks, needle and
+   playhead, and a "−0:12 behind" readout.
+
+**Why Dub.** The one-turntable dub transition with the music itself:
+loop the record, lift, swap, drop the next one, release — live on the new
+record (what echo-out HOLD reaches for with an echo tail). And the
+recording is a rip already made: after a set Dub could offer "you played
+this side — keep it?" into the existing rip review.
+
+**Open questions:**
+- Memory: stereo f32 at 48 kHz is ~23 MB a minute (~460 MB a 20-minute
+  side). A ring of the last ~10 minutes, allocated before playback; the
+  audio thread only copies each block in. The rip's record tap is the
+  starting point.
+- The live → recording hand-over: passthrough runs a few ms ahead of
+  anything read back, so the switch and every loop seam need a short
+  crossfade.
+- Beatless intros, and the follower before it locks.
+- The deck column and strip: a cue bank and loop row that read as
+  temporary on THRU; needle vs playhead. Needs a design pass (canvas)
+  before code.
+
 ### P-32. End-zone auto-internal needs absolute-position decoding (M6)
 
 _Approach agreed 2026-11-15 (Daniel): the end zone is a locked groove, so

@@ -106,8 +106,21 @@ struct CueRowBank: View {
     /// Performance's column has no neighbour to match, and a row that
     /// divides a fixed height gets shorter every time a cue is added.
     var contentHeight: CGFloat?
+    /// The app these cues came from while the pads show an import's
+    /// (`DeckState.hotCuesFrom`); the heading says so, so a Traktor set
+    /// is never mistaken for cues set in Dub. `nil` for the DJ's own.
+    var cuesFrom: String? = nil
 
     private var setCount: Int { slots.filter(\.isSet).count }
+
+    /// The source tag as the heading prints it.
+    static func appName(_ source: String) -> String {
+        switch source {
+        case "rekordbox": return "REKORDBOX"
+        case "itunes": return "APPLE MUSIC"
+        default: return source.uppercased()
+        }
+    }
 
     /// Rows needed to hold every slot at `columns` per row, rounded up
     /// so the last row is the short one.
@@ -127,7 +140,8 @@ struct CueRowBank: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             SectionHeading(
                 title: "HOTCUE", accent: DubColor.hotCue,
-                trailing: "\(setCount) OF \(slots.count)")
+                trailing: (cuesFrom.map { "FROM \(Self.appName($0)) · " } ?? "")
+                    + "\(setCount) OF \(slots.count)")
             grid(columns: columns)
         }
     }
@@ -267,8 +281,8 @@ struct CueRowGesture: ViewModifier {
 /// The two steppers do not move a window — they **resize the running
 /// loop**, keeping its start, so `÷2` gives you the first half of what
 /// is currently looping rather than a new loop somewhere else. The four
-/// visible buttons follow whatever length is engaged, so the neighbours
-/// you would reach next are always the ones on screen.
+/// visible buttons stay put under a press, and follow the running loop
+/// only when a resize carries it past either end.
 ///
 /// Pressing the lit length again exits the loop. A loop you engaged with
 /// one press should not need a different control to leave.
@@ -308,29 +322,37 @@ struct LoopEngine: View {
     /// lengths a DJ reaches for first.
     private static let idleStart = 3
 
-    /// Sit the window under the engaged length so its neighbours are
-    /// reachable without a stepper press. An even window has no true
-    /// centre: `idx - windowSize / 2` puts the running length third of
-    /// four, which leaves two *shorter* lengths on its left. That is
-    /// the direction loop work actually travels — engage 4, then halve
-    /// into a build — so the asymmetry falls the useful way.
-    /// Where the window sits while nothing is engaged. `nil` is the
-    /// default position; the browse arrows move it.
+    /// Where the window sits. `nil` is the default position; the browse
+    /// arrows move it, and so does a running loop that ÷2 / ×2 carries
+    /// past either end.
     ///
-    /// View state rather than model state on purpose: which four
-    /// lengths you are *looking at* before you commit to one is a
-    /// property of looking, not of the deck. Engaging a loop puts the
-    /// window back under the running length, so the browse position
-    /// never survives to confuse the next glance.
+    /// **The window never moves under a press** (Daniel, 2026-11-16:
+    /// "when i click a loop the clicked loop button moves to the
+    /// right"). It used to re-centre on the engaged length, third of
+    /// four, so pressing 1 slid the row to 1/4 · 1/2 · 1 · 2 and the lit
+    /// button jumped away from the finger. A length you can see is
+    /// engaged where it is; only a resize that takes the loop out of
+    /// view shifts the window, by the least that brings it back, and the
+    /// window stays there after the loop ends.
+    ///
+    /// View state rather than model state: which four lengths you are
+    /// *looking at* is a property of looking, not of the deck.
     @State private var browseStart: Int?
 
     private static var lastStart: Int { sizes.count - windowSize }
 
     private var windowStart: Int {
+        let base = min(max(browseStart ?? Self.idleStart, 0), Self.lastStart)
         guard let active = activeBeats,
               let idx = Self.sizes.firstIndex(where: { abs($0 - active) < 1e-9 })
-        else { return min(max(browseStart ?? Self.idleStart, 0), Self.lastStart) }
-        return min(max(idx - Self.windowSize / 2, 0), Self.sizes.count - Self.windowSize)
+        else { return base }
+        return Self.window(base: base, showing: idx)
+    }
+
+    /// The window starting at `base`, moved the least that shows `idx`.
+    static func window(base: Int, showing idx: Int) -> Int {
+        let start = idx < base ? idx : (idx >= base + windowSize ? idx - windowSize + 1 : base)
+        return min(max(start, 0), lastStart)
     }
 
     var body: some View {
@@ -340,6 +362,9 @@ struct LoopEngine: View {
             stepper("×2", double: true)
         }
         .frame(height: height)
+        // Keep where a resize carried the window, so ending the loop
+        // does not snap the row back somewhere else.
+        .onChange(of: activeBeats) { _ in browseStart = windowStart }
     }
 
     private var sizeButtons: some View {

@@ -32,6 +32,9 @@ struct LibraryCellState: Equatable {
     /// mixed in from. Only that source populates it.
     var sessionFromTitle: String?
     var keyNotationMode: KeyNotationMode = .camelot
+    /// The following grid is on, so a saved tempo map is what the deck
+    /// plays and the BPM shows it (`LibraryAppModel.movingGridsShown`).
+    var movingGridsShown: Bool = false
     /// Registry id → index into `track.extras`, from what the FFI
     /// actually applied (see `applyExtraColumns`).
     var extraIndexById: [String: Int] = [:]
@@ -137,30 +140,33 @@ struct LibraryColumnCell: View {
     }
 
     private var bpmCell: some View {
-        HStack(spacing: 4) {
+        let moving = state.movingGridsShown && track.tempoMapKind == "followed"
+        let issues = LibraryCellFormat.bpmIssues(
+            disagreement: track.bpmDisagreement, locked: track.gridLocked,
+            drift: moving ? nil : track.gridDriftQuality)
+        return HStack(spacing: 4) {
+            // A moving grid's BPM in its colour; its padlock too, once
+            // locked: moving, and accepted.
             Text(LibraryCellFormat.bpm(track.bpm))
-            // PRD §8.3 — two sources' grids disagree on the tempo or
-            // the downbeat. Shown ahead of the drift warning: "Serato
-            // says 92, the audio looks like 184" is a bigger problem
-            // than a slow drift, and the per-source BPM columns are
-            // where the DJ goes to resolve it.
-            if track.bpmDisagreement {
+                .foregroundStyle(moving ? DubColor.gridMoving : DubColor.textSecondary)
+                .help(moving ? LibraryCellFormat.movingGridHelp(
+                    min: track.tempoBpmMin, max: track.tempoBpmMax, locked: track.gridLocked) : "")
+            // One mark, never two side by side (Daniel, 2026-11-16: the
+            // double ⚠ "is bad"). It takes the colour of the worse
+            // problem and its tooltip names every one.
+            if let worst = issues.first {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 9))
-                    .foregroundStyle(DubColor.stateTentative)
-                    .help(
-                        "Imported and analysed grids disagree · "
-                            + "enable the per-source BPM columns to compare")
+                    .foregroundStyle(worst == .disagreement ? DubColor.stateTentative : .orange)
+                    .help(issues.map(\.sentence).joined(separator: "\n"))
             }
             if track.gridLocked {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 9))
-                    .foregroundStyle(DubColor.textSecondary)
-            } else if let drift = track.gridDriftQuality, abs(drift) >= 3 {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.orange)
-                    .help("May drift over a long mix · right-click → Lock grid to accept")
+                    .foregroundStyle(moving ? DubColor.gridMoving : DubColor.textSecondary)
+                    .help(moving
+                        ? "Moving grid, accepted · it plays as saved · right-click → Unlock grid to change it"
+                        : "Grid locked · right-click → Unlock grid to change it")
             }
         }
         .font(DubFont.body)
@@ -223,6 +229,46 @@ enum LibraryCellFormat {
     static func bpm(_ bpm: Double?) -> String {
         guard let bpm, bpm > 0 else { return "—" }
         return String(format: "%.0f", bpm)
+    }
+
+    /// The tooltip on a moving grid's BPM: the band's tempo range across
+    /// the saved map, and whether it is accepted.
+    static func movingGridHelp(min: Double?, max: Double?, locked: Bool) -> String {
+        var text = "Follows the band"
+        if let min, let max, min > 0, max > 0 {
+            let lo = Int(min.rounded()), hi = Int(max.rounded())
+            text += lo == hi ? " · \(lo) BPM" : " · \(lo)–\(hi) BPM"
+        }
+        return text + (locked ? " · locked: plays as saved" : " · lock to accept it")
+    }
+
+    /// What can be wrong with a track's grid, worst first.
+    enum BpmIssue: Equatable {
+        /// Two sources' grids disagree on the tempo or the downbeat (PRD
+        /// §8.3) — "Serato says 92, the audio looks like 184".
+        case disagreement
+        /// The grid may wander late in a long track.
+        case drift
+
+        var sentence: String {
+            switch self {
+            case .disagreement:
+                return "Imported and analysed grids disagree · "
+                    + "enable the per-source BPM columns to compare"
+            case .drift:
+                return "May drift over a long mix · right-click → Lock grid to accept"
+            }
+        }
+    }
+
+    /// The BPM cell's problems, worst first; the cell draws one mark for
+    /// all of them. A locked grid has been accepted, so it never warns of
+    /// drift — but a disagreement is about the sources, and still shows.
+    static func bpmIssues(disagreement: Bool, locked: Bool, drift: Float?) -> [BpmIssue] {
+        var out: [BpmIssue] = []
+        if disagreement { out.append(.disagreement) }
+        if !locked, let drift, abs(drift) >= 3 { out.append(.drift) }
+        return out
     }
 
     static func duration(_ ms: UInt32) -> String {

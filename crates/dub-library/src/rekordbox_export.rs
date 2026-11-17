@@ -452,24 +452,26 @@ fn rows_to_tracks(library: &Library, rows: &[TrackRow]) -> LibResult<Vec<ParsedT
 /// A track can carry a Serato set and a Traktor set at once, on
 /// overlapping pad indices. Emitting both would put two markers on pad
 /// 1 and the receiving app would keep whichever it read last. The DJ's
-/// own cues win; failing that, the source with the most to say.
+/// own cues win; failing that, the first source in
+/// [`crate::cues::CUE_SOURCE_ORDER`] with anything to say — the order the
+/// pads and the beat grids use, so the export carries the cues the DJ
+/// saw in Dub (it used to take the source with the most cues).
 fn preferred_source<'a>(cues: &'a [StoredCue], loops: &'a [StoredLoop]) -> Option<&'a str> {
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for c in cues {
-        *counts.entry(c.source.as_str()).or_default() += 1;
-    }
-    for l in loops {
-        *counts.entry(l.source.as_str()).or_default() += 1;
-    }
-    if counts.contains_key("user") {
+    let has = |s: &str| cues.iter().any(|c| c.source == s) || loops.iter().any(|l| l.source == s);
+    if has("user") {
         return Some("user");
     }
-    counts
+    crate::cues::CUE_SOURCE_ORDER
         .into_iter()
-        // Deterministic: most cues, ties broken by name so the same
-        // library always exports the same file.
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
-        .map(|(source, _)| source)
+        .find(|s| has(s))
+        .or_else(|| {
+            // A source outside the ranked three (none today): keep the
+            // export deterministic all the same.
+            cues.iter()
+                .map(|c| c.source.as_str())
+                .chain(loops.iter().map(|l| l.source.as_str()))
+                .min()
+        })
 }
 
 /// Pad slots are 0-7; the importers park memory cues above them so they
@@ -498,6 +500,40 @@ fn to_parsed_loop(l: &StoredLoop) -> ParsedLoop {
 
 #[cfg(test)]
 mod tests {
+
+    fn cue(source: &str) -> StoredCue {
+        StoredCue {
+            source: source.to_string(),
+            cue_index: 0,
+            position_secs: 1.0,
+            name: None,
+            color: None,
+            kind: "hot_cue".to_string(),
+        }
+    }
+
+    /// The export carries the cues the pads showed: the DJ's own, else the
+    /// first of Serato > rekordbox > Traktor — not the source with the
+    /// most cues, which could disagree with the pads.
+    #[test]
+    fn the_exported_cue_source_follows_the_pad_order() {
+        let traktor_heavy = [
+            cue("traktor"),
+            cue("traktor"),
+            cue("traktor"),
+            cue("serato"),
+        ];
+        assert_eq!(preferred_source(&traktor_heavy, &[]), Some("serato"));
+        assert_eq!(
+            preferred_source(&[cue("traktor"), cue("rekordbox")], &[]),
+            Some("rekordbox")
+        );
+        assert_eq!(
+            preferred_source(&[cue("serato"), cue("user")], &[]),
+            Some("user")
+        );
+        assert_eq!(preferred_source(&[], &[]), None);
+    }
     use super::*;
     use crate::rekordbox::parse_xml;
     use std::path::PathBuf;

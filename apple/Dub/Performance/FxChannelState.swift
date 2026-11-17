@@ -102,17 +102,23 @@ struct FxRackControls: Equatable {
         return max(ms, spaceEchoRepeatRange.lowerBound)
     }
 
+    /// A gap between taps longer than this starts a new count.
+    static let tapRunGapSecs: TimeInterval = 2
+
     /// The tempo from TAP: the mean of the last few intervals between
     /// presses, `taps` in seconds, oldest first. A gap over two seconds
-    /// starts a new count. `nil` until two taps belong together.
-    static func tappedBpm(_ taps: [TimeInterval]) -> Double? {
+    /// starts a new count. `nil` until `minTaps` taps belong together —
+    /// two on the Space Echo, three on a THRU deck's BPM, where fewer
+    /// set the 1.
+    static func tappedBpm(_ taps: [TimeInterval], minTaps: Int = 2) -> Double? {
         var run: [TimeInterval] = []
         for t in taps {
-            if let last = run.last, t - last > 2 { run.removeAll() }
+            if let last = run.last, t - last > tapRunGapSecs { run.removeAll() }
             run.append(t)
         }
         let recent = run.suffix(5)
-        guard recent.count >= 2, let first = recent.first, let last = recent.last else { return nil }
+        guard recent.count >= max(minTaps, 2), let first = recent.first, let last = recent.last
+        else { return nil }
         let interval = (last - first) / Double(recent.count - 1)
         guard interval > 0 else { return nil }
         return 60 / interval

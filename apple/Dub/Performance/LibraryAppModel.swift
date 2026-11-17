@@ -181,6 +181,12 @@ final class LibraryAppModel: ObservableObject {
     /// bursts.
     @Published var analysisGeneration: UInt64 = 0
 
+    /// The following grid (alpha) is switched on, so a track's saved
+    /// tempo map is what its deck plays — and the BPM column shows a
+    /// moving grid in `DubColor.gridMoving`. Off, the decks play even
+    /// grids and the column says nothing of the saved maps.
+    @Published var movingGridsShown: Bool = false
+
     /// M11c.1 — immediate row patch for the LibraryView BPM / key /
     /// dim-state columns. Emitted alongside `analysisGeneration`
     /// so the browser can update the affected row before the async
@@ -293,4 +299,110 @@ struct LibraryRowAttributePatch: Equatable {
     /// Makes two identical changes distinct, so setting the same colour
     /// twice still publishes.
     let token: UUID
+}
+
+/// What is folded in the library sidebar (Daniel, 2026-11-16: "library
+/// left needs more folding options … sections should be collapsible").
+///
+/// Three kinds of fold, one set of keys, persisted as one string so it
+/// survives a relaunch:
+/// - a **section** (Library, Smart Crates, Dub Crates, Imported Sources,
+///   Real Records) — open until folded;
+/// - an **imported source** (Serato, Traktor, Apple Music …) — open
+///   until folded;
+/// - a **folder** inside a source (an Apple Music playlist folder, a
+///   Traktor folder) — **folded until opened**: a big iTunes library is
+///   dozens of folders, and showing every playlist in every one buried
+///   the rest of the sidebar.
+///
+/// Folders are keyed by their source and the names on the path down to
+/// them, not by row id: a rescan re-imports the tree, and the folds
+/// should survive it.
+struct SidebarFolding: Equatable {
+    private(set) var keys: Set<String>
+
+    init(raw: String = "") {
+        keys = Set(raw.split(separator: "\n").map(String.init))
+    }
+
+    var raw: String { keys.sorted().joined(separator: "\n") }
+
+    static func sectionKey(_ heading: String) -> String { "section:" + heading.lowercased() }
+    static func sourceKey(_ kind: ImportedSourceKind) -> String { "source:" + kind.rawValue }
+    static func folderKey(_ kind: ImportedSourceKind, path: [String]) -> String {
+        "folder:" + kind.rawValue + ":" + path.joined(separator: "\u{1F}")
+    }
+
+    func isSectionFolded(_ heading: String) -> Bool { keys.contains(Self.sectionKey(heading)) }
+    func isSourceFolded(_ kind: ImportedSourceKind) -> Bool { keys.contains(Self.sourceKey(kind)) }
+    /// Folders start folded: the key marks one the DJ opened.
+    func isFolderOpen(_ kind: ImportedSourceKind, path: [String]) -> Bool {
+        keys.contains(Self.folderKey(kind, path: path))
+    }
+
+    mutating func toggleSection(_ heading: String) { toggle(Self.sectionKey(heading)) }
+    mutating func toggleSource(_ kind: ImportedSourceKind) { toggle(Self.sourceKey(kind)) }
+    mutating func toggleFolder(_ kind: ImportedSourceKind, path: [String]) {
+        toggle(Self.folderKey(kind, path: path))
+    }
+
+    private mutating func toggle(_ key: String) {
+        if keys.contains(key) { keys.remove(key) } else { keys.insert(key) }
+    }
+
+    /// One row of an imported source's tree as the sidebar draws it.
+    struct Node {
+        let crate: LibraryImportedCrate
+        let depth: Int
+        /// The names from the source's root down to this node.
+        let path: [String]
+        let hasChildren: Bool
+        let isOpen: Bool
+        /// The playlists under a folder, nested folders' included — what
+        /// its counter shows, since a folder holds playlists, not tracks
+        /// (Daniel, 2026-11-16). 0 for a playlist.
+        let playlistCount: Int
+
+        /// What the row's counter says: a folder with no tracks of its
+        /// own counts its playlists; anything holding tracks (a playlist,
+        /// or a Serato crate with sub-crates) counts its tracks.
+        var count: (value: Int, isPlaylists: Bool) {
+            hasChildren && crate.trackCount == 0
+                ? (playlistCount, true) : (Int(crate.trackCount), false)
+        }
+    }
+
+    /// An imported source's tree (flat list + `parentId`, document
+    /// order) as the rows to draw: depth-first, each folder's children
+    /// under it — and only under an open folder.
+    func visibleNodes(
+        _ crates: [LibraryImportedCrate], kind: ImportedSourceKind
+    ) -> [Node] {
+        var children: [Int64: [LibraryImportedCrate]] = [:]
+        var roots: [LibraryImportedCrate] = []
+        for c in crates {
+            if let parent = c.parentId { children[parent, default: []].append(c) } else { roots.append(c) }
+        }
+        var playlists: [Int64: Int] = [:]
+        func countPlaylists(_ c: LibraryImportedCrate) -> Int {
+            if let known = playlists[c.id] { return known }
+            let kids = children[c.id] ?? []
+            let n = kids.reduce(0) { $0 + ((children[$1.id] ?? []).isEmpty ? 1 : countPlaylists($1)) }
+            playlists[c.id] = n
+            return n
+        }
+        var out: [Node] = []
+        func visit(_ c: LibraryImportedCrate, _ depth: Int, _ above: [String]) {
+            let path = above + [c.name]
+            let kids = children[c.id] ?? []
+            let open = !kids.isEmpty && isFolderOpen(kind, path: path)
+            out.append(Node(
+                crate: c, depth: depth, path: path, hasChildren: !kids.isEmpty, isOpen: open,
+                playlistCount: countPlaylists(c)))
+            guard open else { return }
+            for child in kids { visit(child, depth + 1, path) }
+        }
+        for root in roots { visit(root, 0, []) }
+        return out
+    }
 }

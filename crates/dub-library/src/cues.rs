@@ -41,6 +41,26 @@ pub struct HotCue {
 /// `source`).
 const USER_SOURCE: &str = "user";
 
+/// The imported sources whose cues can fill the pads, highest first —
+/// the same order their beat grids rank in
+/// (`Library::grid_source_rank`), so one rule answers "whose grid, whose
+/// cues" and Preferences ▸ Library can state it once. iTunes carries no
+/// cues.
+pub const CUE_SOURCE_ORDER: [&str; 3] = ["serato", "rekordbox", "traktor"];
+
+/// The pad slots. Importers park unslotted memory cues above this range.
+const PAD_COUNT: i64 = 8;
+
+/// The cues a deck's pads show for a track, and where they came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PadCues {
+    /// `"user"` for cues set (or taken over) in Dub, else the imported
+    /// source they come from; `None` when the track has none.
+    pub source: Option<String>,
+    /// The cues on pads 0–7, ascending by pad.
+    pub cues: Vec<HotCue>,
+}
+
 impl Library {
     /// Set (or move) hot cue `cue_index` for `track_id` to
     /// `position_secs`. No-op on a non-finite / negative position.
@@ -53,6 +73,7 @@ impl Library {
         if !position_secs.is_finite() || position_secs < 0.0 {
             return Ok(());
         }
+        self.adopt_imported_cues(track_id)?;
         self.connection()
             .execute(
                 "INSERT INTO track_cues \
@@ -78,6 +99,7 @@ impl Library {
         name: Option<&str>,
         color: Option<&str>,
     ) -> Result<()> {
+        self.adopt_imported_cues(track_id)?;
         self.connection()
             .execute(
                 "UPDATE track_cues SET name = ?4, color = ?5 \
@@ -91,6 +113,7 @@ impl Library {
 
     /// Clear hot cue `cue_index` for `track_id`. Idempotent.
     pub fn delete_hot_cue(&self, track_id: &str, cue_index: u8) -> Result<()> {
+        self.adopt_imported_cues(track_id)?;
         self.connection()
             .execute(
                 "DELETE FROM track_cues \
@@ -126,6 +149,115 @@ impl Library {
             out.push(row.map_err(|e| LibraryError::sqlite("hot_cues_row", e))?);
         }
         Ok(out)
+    }
+
+    /// Where a track's pad cues come from: `"user"` once the DJ has set or
+    /// taken over any cue in Dub, else the highest imported source in
+    /// [`CUE_SOURCE_ORDER`] with a cue on a pad, else `None`.
+    pub fn pad_cue_source(&self, track_id: &str) -> Result<Option<String>> {
+        let conn = self.connection();
+        // Any cue set in Dub, or a track taken over (schema v10) even if
+        // the DJ has since cleared every cue.
+        let user: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM track_cues WHERE track_id = ?1 AND source = ?2) \
+                      + (SELECT COUNT(*) FROM track_cue_takeover WHERE track_id = ?1)",
+                params![track_id, USER_SOURCE],
+                |r| r.get(0),
+            )
+            .map_err(|e| LibraryError::sqlite("pad_cue_source_user", e))?;
+        if user > 0 {
+            return Ok(Some(USER_SOURCE.to_string()));
+        }
+        for source in CUE_SOURCE_ORDER {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM track_cues WHERE track_id = ?1 AND source = ?2 \
+                     AND kind = 'hot_cue' AND cue_index BETWEEN 0 AND ?3",
+                    params![track_id, source, PAD_COUNT - 1],
+                    |r| r.get(0),
+                )
+                .map_err(|e| LibraryError::sqlite("pad_cue_source_import", e))?;
+            if n > 0 {
+                return Ok(Some(source.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// What the deck's pads show for `track_id`: the DJ's own cues, or —
+    /// on a track whose cues were never touched in Dub — the hot cues of
+    /// the imported source that ranks highest ([`Self::pad_cue_source`]).
+    /// Daniel, 2026-11-16: Traktor's (and Serato's, rekordbox's) hot cues
+    /// on the pads.
+    pub fn pad_cues(&self, track_id: &str) -> Result<PadCues> {
+        let Some(source) = self.pad_cue_source(track_id)? else {
+            return Ok(PadCues {
+                source: None,
+                cues: Vec::new(),
+            });
+        };
+        let conn = self.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT cue_index, position_secs, name, color FROM track_cues \
+                 WHERE track_id = ?1 AND source = ?2 AND kind = 'hot_cue' \
+                   AND cue_index BETWEEN 0 AND ?3 \
+                 ORDER BY cue_index",
+            )
+            .map_err(|e| LibraryError::sqlite("pad_cues_prepare", e))?;
+        let rows = stmt
+            .query_map(params![track_id, source, PAD_COUNT - 1], |r| {
+                Ok(HotCue {
+                    cue_index: u8::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                    position_secs: r.get(1)?,
+                    name: r.get(2)?,
+                    color: r.get(3)?,
+                })
+            })
+            .map_err(|e| LibraryError::sqlite("pad_cues_query", e))?;
+        let mut cues = Vec::new();
+        for row in rows {
+            cues.push(row.map_err(|e| LibraryError::sqlite("pad_cues_row", e))?);
+        }
+        Ok(PadCues {
+            source: Some(source),
+            cues,
+        })
+    }
+
+    /// Before the DJ's first cue edit on a track whose pads show an
+    /// import's cues: copy that source's cues — hot and memory — to
+    /// `user` rows and record the track in `track_cue_takeover`, so the
+    /// edit applies to what the DJ is looking at and the import never
+    /// comes back over it (a cleared cue stays cleared; the source app is
+    /// never written to). A no-op once the track is the DJ's, or when it
+    /// has no imported cues.
+    fn adopt_imported_cues(&self, track_id: &str) -> Result<()> {
+        let Some(source) = self.pad_cue_source(track_id)? else {
+            return Ok(());
+        };
+        if source == USER_SOURCE {
+            return Ok(());
+        }
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO track_cues \
+             (track_id, source, cue_index, position_secs, name, color, kind, imported_at) \
+             SELECT track_id, ?2, cue_index, position_secs, name, color, kind, \
+                    strftime('%s','now') \
+             FROM track_cues WHERE track_id = ?1 AND source = ?3 \
+               AND kind IN ('hot_cue', 'memory')",
+            params![track_id, USER_SOURCE, source],
+        )
+        .map_err(|e| LibraryError::sqlite("adopt_imported_cues_copy", e))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO track_cue_takeover (track_id, taken_at) \
+             VALUES (?1, strftime('%s','now'))",
+            params![track_id],
+        )
+        .map_err(|e| LibraryError::sqlite("adopt_imported_cues_mark", e))?;
+        Ok(())
     }
 
     /// Upsert an imported cue/marker row (`serato` / `traktor` /
@@ -255,6 +387,154 @@ mod tests {
                 rusqlite::params![id],
             )
             .unwrap();
+    }
+
+    fn import(lib: &Library, track: &str, source: &str, index: u8, secs: f64, name: &str) {
+        lib.upsert_imported_cue(track, source, index, secs, Some(name), None, "hot_cue")
+            .unwrap();
+    }
+
+    fn pads(lib: &Library, track: &str) -> Vec<(u8, f64)> {
+        lib.pad_cues(track)
+            .unwrap()
+            .cues
+            .iter()
+            .map(|c| (c.cue_index, c.position_secs))
+            .collect()
+    }
+
+    /// Daniel, 2026-11-16: Traktor's hot cues on the pads — and Serato's
+    /// and rekordbox's. With several, the beat-grid order decides.
+    #[test]
+    fn pads_show_the_highest_ranked_imports_hot_cues() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        assert_eq!(lib.pad_cues("t1").unwrap().source, None);
+
+        import(&lib, "t1", "traktor", 0, 10.0, "Drop");
+        import(&lib, "t1", "traktor", 3, 40.0, "Break");
+        let p = lib.pad_cues("t1").unwrap();
+        assert_eq!(p.source.as_deref(), Some("traktor"));
+        assert_eq!(pads(&lib, "t1"), vec![(0, 10.0), (3, 40.0)]);
+        assert_eq!(p.cues[0].name.as_deref(), Some("Drop"));
+
+        import(&lib, "t1", "rekordbox", 1, 20.0, "Verse");
+        assert_eq!(
+            lib.pad_cue_source("t1").unwrap().as_deref(),
+            Some("rekordbox")
+        );
+        import(&lib, "t1", "serato", 2, 30.0, "Hook");
+        assert_eq!(lib.pad_cue_source("t1").unwrap().as_deref(), Some("serato"));
+        assert_eq!(
+            pads(&lib, "t1"),
+            vec![(2, 30.0)],
+            "one source's set, never a merge"
+        );
+    }
+
+    /// Memory cues and anything past pad 8 never fill a pad, and a source
+    /// with only those does not claim the pads.
+    #[test]
+    fn only_pad_slots_reach_the_pads() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.upsert_imported_cue("t1", "serato", 9, 5.0, None, None, "memory")
+            .unwrap();
+        lib.upsert_imported_cue("t1", "serato", 8, 6.0, None, None, "hot_cue")
+            .unwrap();
+        import(&lib, "t1", "traktor", 7, 70.0, "Outro");
+        assert_eq!(
+            lib.pad_cue_source("t1").unwrap().as_deref(),
+            Some("traktor")
+        );
+        assert_eq!(pads(&lib, "t1"), vec![(7, 70.0)]);
+    }
+
+    /// The first edit takes the shown set over: the edit lands on what the
+    /// DJ sees, the rest of the set comes along, and from then on the
+    /// pads are the DJ's — a re-import can no longer change them.
+    #[test]
+    fn the_first_edit_takes_the_imported_set_over() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        import(&lib, "t1", "traktor", 0, 10.0, "Drop");
+        import(&lib, "t1", "traktor", 3, 40.0, "Break");
+        lib.upsert_imported_cue("t1", "traktor", 20, 55.0, Some("mem"), None, "memory")
+            .unwrap();
+
+        lib.set_hot_cue("t1", 5, 60.0).unwrap();
+        let p = lib.pad_cues("t1").unwrap();
+        assert_eq!(p.source.as_deref(), Some("user"));
+        assert_eq!(pads(&lib, "t1"), vec![(0, 10.0), (3, 40.0), (5, 60.0)]);
+        assert_eq!(p.cues[1].name.as_deref(), Some("Break"), "names come along");
+
+        // Traktor moves its drop; Dub's pads keep the DJ's.
+        lib.clear_imported_cues("t1", "traktor").unwrap();
+        import(&lib, "t1", "traktor", 0, 12.0, "Drop");
+        assert_eq!(pads(&lib, "t1")[0], (0, 10.0));
+
+        // The memory cue came along too, for the export.
+        let user_memory = lib
+            .all_cues("t1")
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.source == "user" && c.kind == "memory")
+            .count();
+        assert_eq!(user_memory, 1);
+    }
+
+    /// Clearing an imported cue clears it — every one of them, even — and
+    /// the import never comes back over the empty pads.
+    #[test]
+    fn a_cleared_imported_cue_stays_cleared() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        import(&lib, "t1", "rekordbox", 0, 10.0, "A");
+        import(&lib, "t1", "rekordbox", 1, 20.0, "B");
+
+        lib.delete_hot_cue("t1", 0).unwrap();
+        assert_eq!(pads(&lib, "t1"), vec![(1, 20.0)]);
+        lib.delete_hot_cue("t1", 1).unwrap();
+        let p = lib.pad_cues("t1").unwrap();
+        assert!(p.cues.is_empty());
+        assert_eq!(p.source.as_deref(), Some("user"));
+    }
+
+    /// Renaming or recolouring an imported cue takes the set over too, and
+    /// the label lands on the copied cue.
+    #[test]
+    fn labelling_an_imported_cue_takes_the_set_over() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        import(&lib, "t1", "serato", 2, 30.0, "Hook");
+        lib.set_hot_cue_label("t1", 2, Some("CHORUS"), Some("red"))
+            .unwrap();
+        let p = lib.pad_cues("t1").unwrap();
+        assert_eq!(p.source.as_deref(), Some("user"));
+        assert_eq!(p.cues[0].name.as_deref(), Some("CHORUS"));
+        assert_eq!(p.cues[0].color.as_deref(), Some("red"));
+        // The import itself is untouched.
+        let serato: Vec<_> = lib
+            .all_cues("t1")
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.source == "serato")
+            .collect();
+        assert_eq!(serato[0].name.as_deref(), Some("Hook"));
+    }
+
+    /// A track with no imports behaves as before: a cue set in Dub is a
+    /// user cue, and clearing the last one leaves no take-over behind.
+    #[test]
+    fn a_track_without_imports_is_untouched_by_take_over() {
+        let lib = Library::open_in_memory().unwrap();
+        seed_track(&lib, "t1");
+        lib.set_hot_cue("t1", 0, 1.0).unwrap();
+        lib.delete_hot_cue("t1", 0).unwrap();
+        assert_eq!(lib.pad_cue_source("t1").unwrap(), None);
+        // An import arriving later fills the pads.
+        import(&lib, "t1", "traktor", 0, 10.0, "Drop");
+        assert_eq!(pads(&lib, "t1"), vec![(0, 10.0)]);
     }
 
     #[test]

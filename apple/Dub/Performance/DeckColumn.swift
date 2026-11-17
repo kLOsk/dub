@@ -68,6 +68,8 @@ struct DeckColumnState: Equatable {
     /// makes the comparison mean something.
     var header: DeckColumnHeader
     var cues: [CueSlotState] = (0..<DeckState.hotCueCount).map { CueSlotState(index: $0) }
+    /// `DeckState.hotCuesFrom`: the app the pads' cues came from.
+    var cuesFrom: String?
     var activeLoopBeats: Double?
     var loopEngaged: Bool = false
     var echoEnabled: Bool = false
@@ -152,6 +154,15 @@ struct DeckColumnHeader: Equatable {
     /// A THRU deck's tempo — the record's, tracked or tapped. Replaces the
     /// track BPM in the readout.
     var thruTempo: ThruTempoReadout?
+    /// The loaded track's grid is locked: the BPM takes no taps, and
+    /// shows the padlock the Prep header does.
+    var gridLocked: Bool = false
+    /// The grid follows the band (`DeckHeaderState.followingGrid`): the
+    /// BPM, its label and its padlock wear `DubColor.gridMoving`.
+    var gridMoves: Bool = false
+    /// "↝ usually: <track>" — the track most often mixed into from this
+    /// one, `nil` with none or with the hint off in Preferences.
+    var historyHint: String?
     var sourceControl: SourceControlStatus?
     var sourceControlOverridden: Bool
     var timecodeReadiness: TimecodeReadiness
@@ -162,7 +173,7 @@ struct DeckColumnHeader: Equatable {
     /// one the siren and sampler land on, the one Space-load avoids.
     var isMaster: Bool
 
-    init(_ state: DeckHeaderState, scratch: ScratchBadge? = nil) {
+    init(_ state: DeckHeaderState, showsHistoryHint: Bool = true, scratch: ScratchBadge? = nil) {
         trackTitle = state.trackTitle
         trackArtist = state.trackArtist
         // Rounded to the tenth the readout prints, like `pitchTenths`:
@@ -178,6 +189,9 @@ struct DeckColumnHeader: Equatable {
         baseBpm = state.bpm
         tempoPitchPercent = state.tempoPitchPercent
         thruTempo = state.thruTempo
+        gridLocked = state.gridLocked
+        gridMoves = state.followingGrid
+        historyHint = showsHistoryHint ? state.historyHint : nil
         bpmLabel = state.bpmLabel
         sourceControl = state.sourceControl
         sourceControlOverridden = state.sourceControlOverridden
@@ -213,8 +227,17 @@ struct DeckColumnCallbacks {
     var onExitLoop: () -> Void = {}
     var onEchoToggle: () -> Void = {}
     var onEchoHold: () -> Void = {}
-    /// A tap on a THRU deck's BPM: one beat of the record's tempo.
+    /// A tap on the BPM — THRU or track, `MainViewModel.tapBpm`.
     var onTapTempo: () -> Void = {}
+    /// The track BPM's right-click, as in Prep's header: 2×, ½, back to
+    /// the analysed grid, and the grid lock.
+    var onDoubleBpm: () -> Void = {}
+    var onHalveBpm: () -> Void = {}
+    var onResetBpm: () -> Void = {}
+    var onToggleGridLocked: () -> Void = {}
+    /// A click on "↝ usually:" — show that track in the library, so
+    /// Space loads it.
+    var onHistoryHint: () -> Void = {}
     /// The BPM's right-click on a THRU deck: scale the tempo (×2, ÷2 …).
     var onScaleTempo: (_ factor: Double) -> Void = { _ in }
     /// The BPM's right-click: back to the tempo the tracker hears.
@@ -268,6 +291,10 @@ struct DeckColumn<Overview: View>: View {
     /// snapshots leave these nil and get a placeholder.
     var liveEngine: DubEngine?
     var liveDeckIdx: UInt64?
+    /// The open tap session on this deck's track, for the tap count by
+    /// the BPM. Observed by the readouts alone, so a tap does not
+    /// rebuild the column.
+    var tapSession: TapSessionViewModel?
     @ViewBuilder var overview: () -> Overview
 
     var body: some View {
@@ -373,9 +400,11 @@ struct DeckColumn<Overview: View>: View {
                         .foregroundStyle(DubColor.textTertiary)
                 }
             } else {
-                HStack(spacing: 0) {
+                HStack(alignment: .bottom, spacing: 0) {
                     time(.elapsed, colour: DubColor.textSecondary)
-                    Spacer(minLength: 0)
+                    Spacer(minLength: DubSpacing.md)
+                    historyHint
+                    Spacer(minLength: DubSpacing.md)
                     time(.remaining, colour: DubColor.textPrimary)
                 }
             }
@@ -393,6 +422,29 @@ struct DeckColumn<Overview: View>: View {
                             .allowsHitTesting(false)
                     }
                 }
+        }
+    }
+
+    /// "↝ usually: <track>" in the time row's empty middle (PRD §9.5 row
+    /// 3; Daniel picked the spot, 2026-11-16): the DJ's own past answer
+    /// to "what next?", the moment a track lands. It gives way first —
+    /// the times never move — and a click shows the track in the
+    /// library, where Space loads it.
+    @ViewBuilder
+    private var historyHint: some View {
+        if let hint = state.header.historyHint, !hint.isEmpty, state.hasTrack {
+            Button(action: callbacks.onHistoryHint) {
+                Text("↝ usually: \(hint)")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .buttonStyle(.plain)
+            // Sits on the big digits' baseline, not their box bottom.
+            .padding(.bottom, 4)
+            .layoutPriority(-1)
+            .help("Show “\(hint)” in the library — Space loads it.")
         }
     }
 
@@ -714,7 +766,16 @@ struct DeckColumn<Overview: View>: View {
             onToggleKeyLock: state.isThru ? nil : callbacks.onToggleKeyLock,
             onTapTempo: state.header.thruTempo == nil ? nil : callbacks.onTapTempo,
             onScaleTempo: callbacks.onScaleTempo,
-            onResetTempo: callbacks.onResetTempo)
+            onResetTempo: callbacks.onResetTempo,
+            track: state.header.thruTempo == nil
+                ? DeckReadouts.TrackTap(
+                    onTap: callbacks.onTapTempo,
+                    onDouble: callbacks.onDoubleBpm,
+                    onHalve: callbacks.onHalveBpm,
+                    onReset: callbacks.onResetBpm,
+                    onToggleLock: callbacks.onToggleGridLocked)
+                : nil,
+            tapSession: tapSession ?? TapSessionViewModel())
     }
 
     // MARK: - The two things you play
@@ -735,7 +796,8 @@ struct DeckColumn<Overview: View>: View {
             onRename: callbacks.onRenameCue,
             onColor: callbacks.onColorCue,
             columns: 4,
-            rowHeight: DubLayout.cueRowHeight)
+            rowHeight: DubLayout.cueRowHeight,
+            cuesFrom: state.cuesFrom)
     }
 
     /// One row, three controls at one height: SCRATCH · LOOP · ECHO. All
@@ -1037,6 +1099,19 @@ struct DeckReadouts: View {
     /// heard one.
     var onScaleTempo: ((Double) -> Void)? = nil
     var onResetTempo: (() -> Void)? = nil
+    /// The track BPM as a tap pad, as in Prep's header (Daniel,
+    /// 2026-11-16: hitting the BPM sets the 1 in Performance too). `nil`
+    /// leaves it a plain readout — the layout tests, and THRU.
+    var track: TrackTap? = nil
+    @ObservedObject var tapSession = TapSessionViewModel()
+
+    struct TrackTap {
+        var onTap: () -> Void
+        var onDouble: () -> Void
+        var onHalve: () -> Void
+        var onReset: () -> Void
+        var onToggleLock: () -> Void
+    }
 
     struct Live {
         let engine: DubEngine
@@ -1056,17 +1131,10 @@ struct DeckReadouts: View {
                 // A live record has no key and plays at the speed it is
                 // heard at: the tempo is the only number it has.
                 thruBpm(thru)
+            } else if let track {
+                trackBpm(track)
             } else {
-                readout(
-                    header.bpmLabel, header.bpm.map { String(format: "%.1f", $0) },
-                    font: DubFont.numericLarge, widest: "888.8",
-                    live: live.map { l in
-                        { [base = header.baseBpm, tempo = header.tempoPitchPercent] in
-                            DeckHeaderState.liveBpm(base: base, pitch: l.pitch(), tempoPitch: tempo)
-                                .map { String(format: "%.1f", $0) }
-                        }
-                    },
-                    size: DubFont.numericLargeSize)
+                trackBpmReadout
             }
             if header.thruTempo == nil {
                 readout(
@@ -1085,6 +1153,55 @@ struct DeckReadouts: View {
             }
         }
         .fixedSize()
+    }
+
+    private var trackBpmReadout: some View {
+        readout(
+            bpmLabelText, header.bpm.map { String(format: "%.1f", $0) },
+            font: DubFont.numericLarge, widest: "888.8",
+            tint: header.gridMoves ? DubColor.gridMoving : nil,
+            live: live.map { l in
+                { [base = header.baseBpm, tempo = header.tempoPitchPercent] in
+                    DeckHeaderState.liveBpm(base: base, pitch: l.pitch(), tempoPitch: tempo)
+                        .map { String(format: "%.1f", $0) }
+                }
+            },
+            size: DubFont.numericLargeSize,
+            labelTint: tapSession.tapCount > 0
+                ? DubColor.deckTint(side) : (header.gridMoves ? DubColor.gridMoving : nil),
+            labelLock: header.gridLocked,
+            lockTint: header.gridMoves ? DubColor.gridMoving : nil)
+    }
+
+    /// The label counts an open tap run, `BPM (2)` — the signal Prep's
+    /// header gives, on the label because the number is drawn on a layer.
+    private var bpmLabelText: String {
+        tapSession.tapCount > 0 ? header.bpmLabel + " (\(tapSession.tapCount))" : header.bpmLabel
+    }
+
+    /// A loaded track's BPM, tapped like Prep's: 1–2 taps on the beat set
+    /// the 1, 3+ re-take the tempo. Fires on mouse-down — the tap is the
+    /// moment, and a button's mouse-up lands it late. A locked grid takes
+    /// no taps, but its right-click still reaches Unlock grid.
+    private func trackBpm(_ t: TrackTap) -> some View {
+        trackBpmReadout
+            .contentShape(Rectangle())
+            .onPressDown(enabled: header.bpm != nil && !header.gridLocked) { t.onTap() }
+            .contextMenu {
+                if !header.gridLocked, header.bpm != nil {
+                    Button("2×", action: t.onDouble)
+                    Button("½", action: t.onHalve)
+                    Divider()
+                    Button("Reset to auto", action: t.onReset)
+                    Divider()
+                }
+                Button(header.gridLocked ? "Unlock grid" : "Lock grid", action: t.onToggleLock)
+            }
+            .help(header.gridLocked
+                  ? "Grid is locked. Right-click to unlock before tapping."
+                  : "Tap on the 1 to set the downbeat (1–2 taps), or tap the beat to re-take "
+                    + "the tempo (3+). Right-click for 2× / ½ / Reset / Lock.")
+            .mappable(.tapTempo(side))
     }
 
     /// A THRU deck's BPM: the record's tempo as the tracker hears it —
@@ -1176,13 +1293,22 @@ struct DeckReadouts: View {
     /// rather than a hand-typed point count.
     private func readout(
         _ label: String, _ value: String?, font: Font, widest: String, tint: Color? = nil,
-        live: (() -> String?)? = nil, size: CGFloat = 0
+        live: (() -> String?)? = nil, size: CGFloat = 0,
+        labelTint: Color? = nil, labelLock: Bool = false, lockTint: Color? = nil
     ) -> some View {
         VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
-            Text(label)
-                .font(DubFont.micro)
-                .tracking(DubFont.capsTracking)
-                .foregroundStyle(DubColor.textTertiary)
+            HStack(spacing: 3) {
+                Text(label)
+                    .font(DubFont.micro)
+                    .tracking(DubFont.capsTracking)
+                    .foregroundStyle(labelTint ?? DubColor.textTertiary)
+                if labelLock {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 7))
+                        .foregroundStyle(lockTint ?? DubColor.textTertiary)
+                        .accessibilityLabel(lockTint == nil ? "Grid locked" : "Moving grid, accepted")
+                }
+            }
             if let live {
                 Text(widest)
                     .font(font)

@@ -1118,11 +1118,25 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         thruTempos.withLock { if deckIdx < $0.count { $0[Int(deckIdx)] = bpm } }
     }
 
+    /// Where the DJ tapped the 1 on each THRU deck, in live-waveform
+    /// seconds — written by the model's poll, read on the render thread.
+    /// `nil` when nobody has tapped this record.
+    private static let thruOnes = OSAllocatedUnfairLock(
+        initialState: [Double?](repeating: nil, count: 8))
+
+    nonisolated static func setThruOne(deckIdx: UInt64, waveSecs: Double?) {
+        thruOnes.withLock { if deckIdx < $0.count { $0[Int(deckIdx)] = waveSecs } }
+    }
+
     /// A THRU deck's beats, refetched a few times a second, and the tempo
     /// they were asked at. The engine follows the beat from look to look,
     /// so it is asked on a clock, not every frame — even when it found
     /// nothing, or every new onset would count as a look.
     private var thruPhase: PredictedBeats?
+    /// The tapped 1 the bar was last taken from, and the bar: a beat that
+    /// is a 1, kept rolling forward with the record (`PredictedBeats.roll`).
+    private var thruOneTap: Double?
+    private var thruBar: Double?
     private var thruPhaseBpm: Double?
     private var thruPhaseFetchedAt: CFTimeInterval = 0
     /// The last bar heard on a THRU deck, refetched with the phase.
@@ -1141,6 +1155,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             thruPhase = nil
             thruPhaseBpm = nil
             thruGhost = nil
+            thruOneTap = nil
+            thruBar = nil
             return nil
         }
         let now = CACurrentMediaTime()
@@ -1152,6 +1168,15 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 ? PredictedBeats(lastBeatSecs: found.lastBeatSecs, periodSecs: found.periodSecs)
                 : nil
             thruGhost = fetchGhost(bpm: bpm)
+            let tap = Self.thruOnes.withLock { idx < $0.count ? $0[Int(idx)] : nil }
+            if tap != thruOneTap {
+                thruOneTap = tap
+                thruBar = nil
+            }
+            if let phase = thruPhase, let tap {
+                thruBar = thruBar.map { phase.roll(bar: $0) } ?? phase.snap(tap: tap)
+            }
+            thruPhase?.barSecs = thruBar
         }
         return thruPhase
     }
@@ -1215,6 +1240,37 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     struct PredictedBeats: Equatable {
         var lastBeatSecs: Double
         var periodSecs: Double
+        /// A beat that is a 1, once the DJ has tapped one; every fourth
+        /// beat from it is drawn as a bar line.
+        var barSecs: Double?
+
+        static let beatsPerBar = 4
+
+        /// The beat nearest a tap: the tap says which beat is the 1, the
+        /// onsets say exactly where it fell — as a track's set-the-1 snaps
+        /// to the kick.
+        func snap(tap: Double) -> Double {
+            lastBeatSecs + ((tap - lastBeatSecs) / periodSecs).rounded() * periodSecs
+        }
+
+        /// The newest 1 at or before `lastBeatSecs`, counted from `bar` in
+        /// whole beats. Rolled forward on every look rather than counted
+        /// from the tap, so the period's drift over a long record never
+        /// adds up past a fraction of a beat.
+        func roll(bar: Double) -> Double {
+            let beats = Int(((lastBeatSecs - bar) / periodSecs).rounded())
+            let n = Self.beatsPerBar
+            let into = ((beats % n) + n) % n
+            return lastBeatSecs - Double(into) * periodSecs
+        }
+
+        /// Whether the beat at `beat` is a 1.
+        func isOne(_ beat: Double) -> Bool {
+            guard let barSecs, periodSecs > 0 else { return false }
+            let n = Self.beatsPerBar
+            let k = Int(((beat - barSecs) / periodSecs).rounded())
+            return ((k % n) + n) % n == 0
+        }
 
         /// The beats inside `[start, end]`, oldest first, capped so a
         /// nonsense period can never fill the vertex buffer.
@@ -2665,6 +2721,18 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     drawnAbove: drawnAbove, drawnBelow: drawnBelow,
                     pastSubChunkOffsetNDC: pastSubChunkOffsetNDC,
                     futureSubChunkOffsetNDC: futureSubChunkOffsetNDC))
+                // The tapped 1: a solid bar line, as on a track's grid.
+                if predicted.isOne(beat) {
+                    Self.appendBeatLineQuad(
+                        vertices: &beatGridScratchVertices,
+                        orientation: appearance.orientation,
+                        timeNDC: timeNDC,
+                        quadHalfNDC: barQuadHalfNDC,
+                        visibleHalfNDC: barVisibleHalfNDC,
+                        color: Self.downbeatRGBA(alpha: beat > nowSecs ? 1.0 : 0.45),
+                        isDownbeat: true)
+                    continue
+                }
                 let color = beat > nowSecs
                     ? Self.downbeatRGBA(alpha: 0.95) : Self.beatTickRGBA(alpha: 0.35)
                 for d in 0..<dashes {

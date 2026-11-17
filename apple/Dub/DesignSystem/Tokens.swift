@@ -163,6 +163,15 @@ enum DubColor {
     /// Clip / error / destructive.
     static let stateError = Color(hex: 0xD45C5C)
 
+    /// A **moving grid**: a track whose beat grid follows the band (the
+    /// following grid, saved as a tempo map — schema v11) rather than an
+    /// even one. Its BPM wears this colour in the library and on the deck,
+    /// and so does its padlock once locked — a moving grid, accepted
+    /// (Daniel, 2026-11-16). A bright cyan: the teal family, but clear of
+    /// deck B's muted teal and the spring FX's aqua. A time-stretched track
+    /// will get a colour of its own in the same scheme.
+    static let gridMoving = Color(hex: 0x45C8E8)
+
     /// Hot cue marker / pad accent. Vivid magenta-pink, hue- AND
     /// luminance-distinct from both deck tints (amber, teal) and the
     /// off-white beat ticks, so a cue reads clearly on any surface

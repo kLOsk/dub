@@ -60,6 +60,7 @@ mod serato_import;
 /// Default-location discovery for external libraries (Serato / Traktor /
 /// iTunes), for the Preferences "Libraries" toggles + auto-scan.
 pub mod sources;
+mod tempo_map;
 /// Traktor `collection.nml` parser (M12b). Public so the fuzz target and
 /// the import adapter can consume the pure `parse_nml` entry point.
 pub mod traktor;
@@ -74,7 +75,7 @@ pub use analysis::{
 pub use columns::{
     ColumnGroup, ColumnKind, ColumnSet, ColumnValue, LibraryColumnId, MetadataField, MetadataSource,
 };
-pub use cues::HotCue;
+pub use cues::{HotCue, PadCues, CUE_SOURCE_ORDER};
 pub use db::{
     CrateRow, FavoriteSlot, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay,
     StoredFingerprint, TrackRow, TrackSortKey, TransitionStat,
@@ -93,6 +94,7 @@ pub use rekordbox_import::import_rekordbox;
 pub use schema::SCHEMA_VERSION;
 pub use serato_import::import_serato;
 pub use sources::{discover_default_sources, discover_source, DiscoveredSource, SourceKind};
+pub use tempo_map::{tempo_range, TempoMap};
 pub use traktor_import::import_traktor;
 pub use version_tokens::{parse as parse_version_tokens, VersionToken};
 pub use volumes::{discover_for_path, DiscoveredVolume};

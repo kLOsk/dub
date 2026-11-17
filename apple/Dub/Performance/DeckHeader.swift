@@ -254,11 +254,11 @@ struct DeckHeaderState: Equatable {
 
     /// M11d-history — display title of the track the DJ has most
     /// often mixed into from the loaded one (top `played_into`
-    /// row, stamped at load). Renders as the "↝ usually: <track>"
-    /// hint in row 3's spare middle region — Performance mode
-    /// (`.remainingOnly`) only; Prep mode's row 3 is fully
-    /// occupied by elapsed + remaining. `var` with a default so
-    /// existing `from(...)` call sites keep compiling.
+    /// row, stamped at load). Carried here for the Performance deck
+    /// column, which draws it as "↝ usually: <track>" between elapsed
+    /// and remaining (`DeckColumn.historyHint`); this header — Prep —
+    /// does not show it (Daniel, 2026-11-16: nobody mixes in Prep).
+    /// `nil` when Preferences ▸ Decks has the hint off.
     var historyHint: String? = nil
 
     /// Set on a THRU deck: the record's tempo, for the BPM readout. `var`
@@ -390,11 +390,6 @@ struct DeckHeaderCallbacks {
     var onSetTimecode: (() -> Void)? = nil
     var onSetThru: (() -> Void)? = nil
     var onRecalibrate: (() -> Void)? = nil
-
-    /// M11d-history — click on the row-3 "↝ usually: <track>" hint.
-    /// Reveals the suggested track in the library browser (PRD §9.5
-    /// row 3); Space then loads the selection via the existing flow.
-    var onHistoryHintTap: () -> Void = {}
 
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
@@ -790,7 +785,6 @@ struct DeckHeader: View {
                 case .remainingOnly:
                     liveTime(slot: .remaining, textColor: DubColor.textPrimary)
                     Spacer(minLength: 0)
-                    historyHintView
                 case .elapsedAndRemaining:
                     liveTime(slot: .remaining, textColor: DubColor.textSecondary)
                     Spacer(minLength: 0)
@@ -810,7 +804,6 @@ struct DeckHeader: View {
                 sourceSwitchView
                 switch time {
                 case .remainingOnly:
-                    historyHintView
                     Spacer(minLength: 0)
                     liveTime(slot: .remaining, textColor: DubColor.textPrimary)
                 case .elapsedAndRemaining:
@@ -821,30 +814,6 @@ struct DeckHeader: View {
             }
         }
         .monospacedDigit()
-    }
-
-    /// M11d-history "↝ usually: <track>" hint (PRD §9.5 row 3).
-    /// Fills the otherwise-empty middle region of the Performance
-    /// time row with the most-mixed-into target for the loaded
-    /// track, so the DJ sees their own past answer to "what do I
-    /// reach for next?" the moment a track lands on the deck.
-    /// Truncates tail-first and never competes with the remaining
-    /// time (which is the §6.1 "30 seconds to mix" cue and keeps
-    /// layout priority).
-    @ViewBuilder
-    private var historyHintView: some View {
-        if let hint = state.historyHint, !hint.isEmpty {
-            Button(action: callbacks.onHistoryHintTap) {
-                Text("↝ usually: \(hint)")
-                    .font(DubFont.micro)
-                    .foregroundStyle(DubColor.textTertiary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            .buttonStyle(.plain)
-            .help("Show “\(hint)” in the library — Space loads the selection.")
-            .layoutPriority(-1)
-        }
     }
 
     /// Render one time-slot. Production callers (Performance /
@@ -1120,7 +1089,8 @@ struct DeckHeader: View {
                 if state.gridLocked {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 9))
-                        .foregroundStyle(DubColor.textSecondary)
+                        .foregroundStyle(
+                            state.followingGrid ? DubColor.gridMoving : DubColor.textSecondary)
                 } else if let drift = state.gridDriftQuality,
                           abs(drift) >= 3
                 {
@@ -1192,7 +1162,9 @@ struct DeckHeader: View {
         if tapSession.rollingBpm != nil {
             return DubColor.deckTint(side)
         }
-        return state.bpm == nil ? DubColor.textPlaceholder : DubColor.textPrimary
+        if state.bpm == nil { return DubColor.textPlaceholder }
+        // A moving grid (the following grid) wears its colour.
+        return state.followingGrid ? DubColor.gridMoving : DubColor.textPrimary
     }
 
     /// Tooltip on the BPM column. Surfaces the dynamic-window

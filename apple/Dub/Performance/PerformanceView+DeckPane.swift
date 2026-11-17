@@ -208,7 +208,8 @@ extension PerformanceView {
             state: deckColumnState(side: side),
             callbacks: deckColumnCallbacks(side: side),
             liveEngine: model.engine,
-            liveDeckIdx: deckIdx
+            liveDeckIdx: deckIdx,
+            tapSession: model.tapSession(for: side)
         ) {
             if Self.overviewEnabled {
                 overviewBand(side: side, deckIdx: deckIdx)

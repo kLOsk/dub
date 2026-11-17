@@ -332,6 +332,73 @@ final class PerformanceSnapshotTests: XCTestCase {
              width: 540, height: 470, named: "deck-column-wide")
     }
 
+    /// "↝ usually:" between elapsed and remaining (Daniel, 2026-11-16):
+    /// small and grey, centred in the time row's gap, truncating before
+    /// either time moves — the long name here has to give way at the
+    /// floor width.
+    func test_deckColumn_historyHint() {
+        var state = Self.columnState()
+        var header = DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: "Armed & Dangerous", trackArtist: "Oppidan, Cutty Ranks",
+            bpm: 133.0, pitchPercent: 0.4, tempoPitchPercent: 0.4,
+            timecodeLockState: 1, key: "6A", formatChip: nil,
+            timeRow: .remainingOnly, isMaster: true, isPlaying: true,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil,
+            historyHint: "Baddadan (extended mix) (feat. IRah, Flowdan) · Chase & Status")
+        header.sourceControl = .timecode
+        state.header = DeckColumnHeader(header)
+        snap(deckBg(columnFixture(state)), width: 540, height: 470, named: "deck-column-hint")
+        snap(deckBg(columnFixture(state)),
+             width: DubLayout.performanceDeckColumnMinWidth, height: 470,
+             named: "deck-column-hint-floor")
+    }
+
+    /// A moving grid, accepted: BPM · FOLLOW, the number and the padlock
+    /// in `DubColor.gridMoving` (schema v11; Daniel, 2026-11-16).
+    func test_deckColumn_movingGridAccepted() {
+        var header = DeckHeaderState(
+            isLive: true, source: .file,
+            trackTitle: "Armed & Dangerous", trackArtist: "Oppidan, Cutty Ranks",
+            bpm: 92.0, pitchPercent: 0.4, tempoPitchPercent: 0.4,
+            timecodeLockState: 1, key: "6A", formatChip: nil,
+            timeRow: .remainingOnly, isMaster: true, isPlaying: true,
+            isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: true, gridDriftQuality: nil)
+        header.sourceControl = .timecode
+        header.followingGrid = true
+        var state = Self.columnState()
+        state.header = DeckColumnHeader(header)
+        snap(deckBg(columnFixture(state)),
+             width: DubLayout.performanceDeckColumnMinWidth, height: 470,
+             named: "deck-column-moving-accepted")
+    }
+
+    /// A track never touched in Dub shows Traktor's hot cues on the pads
+    /// (FFI 88), and the heading says whose they are: "FROM TRAKTOR".
+    func test_deckColumn_importedCues() {
+        var state = Self.columnState()
+        state.cuesFrom = "traktor"
+        snap(deckBg(columnFixture(state)),
+             width: DubLayout.performanceDeckColumnMinWidth, height: 470,
+             named: "deck-column-imported-cues")
+    }
+
+    /// Preferences ▸ Decks ▸ Show what you usually play next, off: the
+    /// hint is not handed to the column at all.
+    func test_deckColumnHeader_historyHintOff() {
+        var header = DeckHeaderState(
+            isLive: true, source: .file, trackTitle: "A", trackArtist: nil,
+            bpm: nil, key: nil, formatChip: nil, timeRow: .remainingOnly,
+            isMaster: true, isPlaying: false, isPanicPlay: false, useTimecodeToggle: false,
+            gridLocked: false, gridDriftQuality: nil, historyHint: "Backbone")
+        XCTAssertEqual(DeckColumnHeader(header).historyHint, "Backbone")
+        XCTAssertNil(DeckColumnHeader(header, showsHistoryHint: false).historyHint)
+        header.historyHint = nil
+        XCTAssertNil(DeckColumnHeader(header).historyHint)
+    }
+
     /// At its floor the bank drops to one column on its own. This is
     /// the arrangement a 960 pt window produces.
     func test_deckColumn_atItsFloor() {

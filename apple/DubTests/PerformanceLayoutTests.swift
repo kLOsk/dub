@@ -467,4 +467,21 @@ final class PerformanceLayoutTests: XCTestCase {
             "deck pane cannot fit its fixed columns plus a minimum "
                 + "waveform at the smallest supported window")
     }
+
+    /// The loop row never slides under a press (Daniel, 2026-11-16): idle
+    /// it shows 1 · 2 · 4 · 8 (start 3), and engaging any of those keeps
+    /// it there. A resize past an end moves it the least that shows the
+    /// loop, and never past the ladder's ends.
+    func testTheLoopRowStaysPutUnderAPress() {
+        let sizes = LoopEngine.sizes
+        for beats in [1.0, 2, 4, 8] {
+            let idx = try! XCTUnwrap(sizes.firstIndex(of: beats))
+            XCTAssertEqual(LoopEngine.window(base: 3, showing: idx), 3, "pressing \(beats)")
+        }
+        // ×2 from 8 → 16: one step right. ÷2 from 1 → 1/2: one step left.
+        XCTAssertEqual(LoopEngine.window(base: 3, showing: sizes.firstIndex(of: 16)!), 4)
+        XCTAssertEqual(LoopEngine.window(base: 3, showing: sizes.firstIndex(of: 0.5)!), 2)
+        XCTAssertEqual(LoopEngine.window(base: 0, showing: 0), 0)
+        XCTAssertEqual(LoopEngine.window(base: 9, showing: 7), sizes.count - LoopEngine.windowSize)
+    }
 }

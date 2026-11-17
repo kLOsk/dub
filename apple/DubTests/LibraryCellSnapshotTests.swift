@@ -50,14 +50,16 @@ final class LibraryCellSnapshotTests: XCTestCase {
         _ field: LibraryColumnField,
         _ track: LibraryTrack,
         mode: KeyNotationMode = .camelot,
-        sessionFrom: String? = nil
+        sessionFrom: String? = nil,
+        moving: Bool = false
     ) -> LibraryColumnCell {
         LibraryColumnCell(
             field: field,
             state: LibraryCellState(
                 track: track,
                 sessionFromTitle: sessionFrom,
-                keyNotationMode: mode))
+                keyNotationMode: mode,
+                movingGridsShown: moving))
     }
 
     // MARK: - Text columns
@@ -97,9 +99,9 @@ final class LibraryCellSnapshotTests: XCTestCase {
 
     // MARK: - BPM glyph states
 
-    /// The three-way glyph state: a grid disagreement (PRD §8.3) is
-    /// independent and can co-render with lock or drift; lock and drift
-    /// are mutually exclusive.
+    /// The glyph states. One warning mark at most — a disagreement and a
+    /// drift together draw a single amber ⚠, not two (Daniel,
+    /// 2026-11-16) — and the padlock beside it when the grid is locked.
     func test_bpmCell_glyphStates() {
         let states: [(String, LibraryTrack)] = [
             ("plain", .fixture(bpm: 174)),
@@ -108,6 +110,8 @@ final class LibraryCellSnapshotTests: XCTestCase {
             ("disagreement", .fixture(bpm: 92, bpmDisagreement: true)),
             ("disagreement-locked",
              .fixture(bpm: 92, gridLocked: true, bpmDisagreement: true)),
+            ("disagreement-drifting",
+             .fixture(bpm: 92, gridDriftQuality: 5, bpmDisagreement: true)),
             ("none", .fixture(bpm: nil)),
         ]
         let row = HStack(spacing: 0) {
@@ -115,7 +119,55 @@ final class LibraryCellSnapshotTests: XCTestCase {
                 self.cell(.bpm, entry.1).frame(width: 90, alignment: .leading)
             }
         }
-        snap(row, width: 540, named: "bpm-glyph-states")
+        snap(row, width: 630, named: "bpm-glyph-states")
+    }
+
+    /// A moving grid (the following grid, saved — schema v11): its BPM in
+    /// `DubColor.gridMoving`; locked, the padlock too — moving, accepted.
+    /// Drift is not warned of: the grid follows the band. With the
+    /// following grid off, the same tracks read as even ones.
+    func test_bpmCell_movingGrid() {
+        let follows = LibraryTrack.fixture(
+            bpm: 92, gridDriftQuality: 5, tempoMapKind: "followed",
+            tempoBpmMin: 89.2, tempoBpmMax: 95.8)
+        let accepted = LibraryTrack.fixture(
+            bpm: 92, gridLocked: true, tempoMapKind: "followed",
+            tempoBpmMin: 89.2, tempoBpmMax: 95.8)
+        let row = HStack(spacing: 0) {
+            self.cell(.bpm, follows, moving: true).frame(width: 90, alignment: .leading)
+            self.cell(.bpm, accepted, moving: true).frame(width: 90, alignment: .leading)
+            self.cell(.bpm, follows, moving: false).frame(width: 90, alignment: .leading)
+            self.cell(.bpm, accepted, moving: false).frame(width: 90, alignment: .leading)
+        }
+        snap(row, width: 360, named: "bpm-moving-grid")
+    }
+
+    func test_movingGridHelp() {
+        XCTAssertEqual(
+            LibraryCellFormat.movingGridHelp(min: 89.2, max: 95.8, locked: false),
+            "Follows the band · 89–96 BPM · lock to accept it")
+        XCTAssertEqual(
+            LibraryCellFormat.movingGridHelp(min: 92.1, max: 91.9, locked: true),
+            "Follows the band · 92 BPM · locked: plays as saved")
+        XCTAssertEqual(
+            LibraryCellFormat.movingGridHelp(min: nil, max: nil, locked: false),
+            "Follows the band · lock to accept it")
+    }
+
+    /// Worst first: a disagreement outranks drift, and a locked grid never
+    /// warns of drift — it has been accepted.
+    func test_bpmIssues_rankAndLock() {
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: true, locked: false, drift: 5),
+            [.disagreement, .drift])
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: -4), [.drift])
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: true, locked: true, drift: 5), [.disagreement])
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: 2), [])
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: nil), [])
     }
 
     // MARK: - Key notation
@@ -191,7 +243,10 @@ extension LibraryTrack {
         gridLocked: Bool = false,
         gridDriftQuality: Float? = nil,
         bpmDisagreement: Bool = false,
-        isAnalyzed: Bool = true
+        isAnalyzed: Bool = true,
+        tempoMapKind: String? = nil,
+        tempoBpmMin: Double? = nil,
+        tempoBpmMax: Double? = nil
     ) -> LibraryTrack {
         LibraryTrack(
             id: id,
@@ -220,6 +275,9 @@ extension LibraryTrack {
             color: color,
             crateOrdinal: crateOrdinal,
             bpmDisagreement: bpmDisagreement,
+            tempoMapKind: tempoMapKind,
+            tempoBpmMin: tempoBpmMin,
+            tempoBpmMax: tempoBpmMax,
             extras: [])
     }
 }

@@ -79,6 +79,69 @@ gate is local-only because GitHub CI has no macOS app job.
   `site/AGENTS.md`; UI words are copied from `apple/Dub/`, so a renamed
   label means a manual edit in the same change.
 
+**Since alpha.3, on `main`** (not on the rig yet):
+
+- **Tap the BPM, on every deck (2026-11-16, Daniel).** The Performance
+  column's track BPM is the Prep header's tap pad now — 1–2 taps set the
+  1, 3+ re-take the tempo, a locked grid takes none and wears a padlock,
+  and its right-click has 2× / ½ / Reset to auto / Lock grid. On THRU the
+  first tap of a run is the record's 1: the renderer snaps it to the
+  nearest followed beat (`PredictedBeats.snap`), rolls it forward look by
+  look (`roll`, so the follower's drift never adds up) and draws a solid
+  bar line every fourth beat. A THRU tempo takes three taps now, not
+  two — two would turn a double-tap on the 1 into a tempo; the Space
+  Echo's TAP still takes two. One mappable action for both,
+  `.tapTempo(side)` ("Tap the BPM A"), id unchanged so old maps keep
+  working.
+- **"↝ usually:" is back where it was designed to be (2026-11-16,
+  Daniel).** The M11d-history hint lived in the Prep header's
+  remaining-only time row — a layout Prep never uses — so after the
+  Performance column replaced the header band it showed nowhere. It now
+  sits in the deck column's time row, between elapsed and remaining
+  (title · artist, truncating first; click reveals it in the library),
+  and is gone from Prep. **Preferences ▸ Decks ▸ Show what you usually
+  play next**, on by default (`dub.historyHintEnabled`).
+- **The loop row stays put under a press (2026-11-16, Daniel: "the
+  clicked loop button moves to the right").** It re-centred on the
+  engaged length, so pressing 1 slid the row to 1/4 · 1/2 · 1 · 2. Now a
+  visible length engages where it is; only ÷2 / ×2 past an end moves the
+  window, by one, and it stays there (`LoopEngine.window`).
+- **The library sidebar folds (2026-11-16, Daniel).** Every section
+  heading folds its section; imported sources fold as before; folders
+  inside a source (Apple Music playlist folders, Traktor folders) fold
+  too and **start folded**; an empty folder's row folds on a click.
+  All of it persists (`SidebarFolding`, `librarySidebarFolding`), folders
+  keyed by source + name path so a rescan keeps them.
+- **One ⚠ in the BPM column, never two (2026-11-16, Daniel).** A grid
+  disagreement and a drift warning drew two near-identical triangles side
+  by side. Now one mark, amber for a disagreement and orange for drift
+  alone, its tooltip listing each (`LibraryCellFormat.bpmIssues`); the
+  padlock stays its own glyph.
+- **Imported hot cues on the pads (FFI 88, schema v10; 2026-11-16,
+  Daniel).** Serato / rekordbox / Traktor cues were imported but the pads
+  showed user cues only. Now the pads show the DJ's own cues, else one
+  import's set in the beat-grid order (Serato > rekordbox > Traktor —
+  `Library::pad_cues`), and the HOTCUE heading says **FROM TRAKTOR**.
+  The first set / clear / label on such a track copies that set to
+  `user` rows and records it in `track_cue_takeover`, so edits land on
+  what the DJ sees and a re-import never overrides them. The rekordbox
+  export now picks its cue source by the same order (it took the source
+  with the most cues). **Preferences ▸ Library** explains the order.
+  To check on the rig: Traktor cue positions against Dub's decode on
+  MP3s (encoder-delay handling can differ between apps).
+- **The following grid is saved (FFI 89, schema v11; 2026-11-16,
+  Daniel).** It was recomputed on every load and never kept, so the
+  library could not show it and a lock could not keep it. Now the deck
+  saves the band-followed beats to `track_tempo_maps` with the even grid
+  they came from; a load reuses them while that grid stands and always on
+  a locked track. A moving grid's BPM is `DubColor.gridMoving` (cyan) in
+  the library and on the deck, and its padlock too once locked — moving,
+  accepted. A grid edit on a following deck follows the band again
+  instead of flattening it (`DubEngine::refollow`), and tap / nudge saves
+  write the even grid's anchor and phase (`BeatGrid.even_*`), not the
+  band's first beat. `kind` leaves room for time-stretched tracks, which
+  will get their own colour.
+
 ## Waiting on the rig
 
 **Confirmed by Daniel on the rig, 2026-11-15:** the SL3 plug-in freeze is
@@ -139,14 +202,13 @@ hardware.
   (found while documenting M12-lexicon, 2026-11-16). Workaround: the
   rekordbox XML route. A reader is its own job — no public spec found yet;
   start by confirming which Serato version wrote `master.sqlite` here.
-- **Set-the-1 is unreachable in Performance.** `DubAction.tapGrid` and
-  `.instantDouble` still have handlers and names in Preferences ▸ Keys,
-  but no `.mappable` control carries them, so since the default `G` and
-  `⌘←→` went (2026-09-15) nothing can bind them; the BPM tap pad is
-  Prep-only (`DeckHeader`). Grids are fixed in Prep for now; instant
-  doubles still work by dragging a deck's title. Needs a decision: a
-  mappable control in the deck column, or a binding row in the Keys tab
-  (found writing the manual, 2026-11-16).
+- **Unreachable actions.** `DubAction.tapGrid` (the master deck's
+  grid, ⇧ halves, ⌥ doubles) and `.instantDouble` still have handlers
+  and names in Preferences ▸ Keys, but no `.mappable` control carries
+  them, so nothing can bind them since their default keys went
+  (2026-09-15). Set-the-1 is covered now by tapping the deck's BPM;
+  instant doubles still work by dragging a deck's title. Either give
+  them a control or drop them.
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.

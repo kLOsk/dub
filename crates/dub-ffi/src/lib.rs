@@ -558,7 +558,21 @@ pub use rip::{
 ///       [`DubEngine::known_interface`] says whether `devices.toml` has
 ///       the device, and [`DubEngine::test_tone`] puts a quarter second of
 ///       1 kHz on a deck's pair — Preferences ▸ Audio.
-pub const FFI_VERSION: u32 = 87;
+///   88. **Imported hot cues on the pads.** [`DubLibrary::hot_cues`]
+///       returns the DJ's own cues or, on a track never edited in Dub,
+///       the highest-ranked import's (Serato > rekordbox > Traktor —
+///       the beat-grid order); the first edit takes that set over
+///       (schema v10, `track_cue_takeover`). [`DubLibrary::hot_cue_source`]
+///       says which.
+///   89. **The following grid is saved.** [`DubLibrary::save_tempo_map`] /
+///       [`DubLibrary::delete_tempo_map`] keep a track's band-followed
+///       beats (schema v11); [`LibraryBeatGrid::tempo_map`] hands them to
+///       the load, which plays them while they stand for the grid and
+///       always on a locked track. [`BeatGrid::follows`] and
+///       [`BeatGrid::even_anchor_secs`]; [`LibraryTrack::tempo_map_kind`]
+///       and the band's range for the BPM column. A grid edit on a
+///       following deck follows the band again instead of flattening it.
+pub const FFI_VERSION: u32 = 89;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -1199,6 +1213,53 @@ impl DubEngine {
         if let Some(a) = self.beat_grid_generation_seq.get(deck_idx) {
             a.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// A grid edit — a tap on the 1, a re-tempo, a nudge — rebuilds an
+    /// even grid. On a deck whose grid followed the band that flattened
+    /// it for the rest of the load (Daniel, 2026-11-16), so the band is
+    /// followed again on top of the new even grid. Called only where the
+    /// replaced grid was following: a nudge on a steady track stays
+    /// instant. A no-op with the following grid off, or once the deck
+    /// has moved on to another track.
+    fn refollow(&self, idx: usize) {
+        if !FOLLOWING_GRID.load(Ordering::Acquire) {
+            return;
+        }
+        let (track, grid) = {
+            let state = lock_state(&self.state);
+            let EngineState::Running(running) = &*state else {
+                return;
+            };
+            let Some(track) = running.file_tracks.get(idx).and_then(Clone::clone) else {
+                return;
+            };
+            let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
+                return;
+            };
+            (track, fp.beat_grid.clone())
+        };
+        let samples = samples_for_offline_analysis(&track);
+        let Some(followed) = followed_grid(&grid, &track, &samples) else {
+            return;
+        };
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return;
+        };
+        let same_track = running
+            .file_tracks
+            .get(idx)
+            .and_then(|t| t.as_ref())
+            .is_some_and(|t| Arc::ptr_eq(t, &track));
+        if !same_track {
+            return;
+        }
+        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            fp.beat_grid = followed;
+        }
+        drop(state);
+        self.bump_beat_grid_generation(idx);
     }
 
     /// Bump `peak_generation_seq[idx]` for every deck slot that
@@ -3996,9 +4057,13 @@ impl DubEngine {
         let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
             return Err(EngineError::NoTrackLoaded(deck_idx));
         };
+        let was_following = fp.beat_grid.follows;
         fp.beat_grid = grid;
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -4034,9 +4099,13 @@ impl DubEngine {
         let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
             return Err(EngineError::NoTrackLoaded(deck_idx));
         };
+        let was_following = fp.beat_grid.follows;
         fp.beat_grid = grid;
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -4107,11 +4176,16 @@ impl DubEngine {
         let EngineState::Running(running) = &mut *state else {
             return Err(EngineError::NotRunning);
         };
+        let mut was_following = false;
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            was_following = fp.beat_grid.follows;
             fp.beat_grid = grid;
         }
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -4210,11 +4284,16 @@ impl DubEngine {
         let EngineState::Running(running) = &mut *state else {
             return Err(EngineError::NotRunning);
         };
+        let mut was_following = false;
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            was_following = fp.beat_grid.follows;
             fp.beat_grid = grid;
         }
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -4310,11 +4389,16 @@ impl DubEngine {
         let EngineState::Running(running) = &mut *state else {
             return Err(EngineError::NotRunning);
         };
+        let mut was_following = false;
         if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
+            was_following = fp.beat_grid.follows;
             fp.beat_grid = grid;
         }
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -4412,9 +4496,13 @@ impl DubEngine {
         if grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
         }
+        let was_following = fp.beat_grid.follows;
         fp.beat_grid = grid;
         drop(state);
         self.bump_beat_grid_generation(idx);
+        if was_following {
+            self.refollow(idx);
+        }
         Ok(())
     }
 
@@ -5373,6 +5461,17 @@ pub struct BeatGrid {
     pub quality: Option<GridQuality>,
     /// M11d.7 kick-band downbeat confidence (`best / second_best`).
     pub downbeat_confidence: f32,
+    /// The beats follow a band rather than an even grid (FFI 89): the
+    /// following grid moved them, or a saved tempo map supplied them.
+    /// `bpm` is then the even grid's tempo underneath.
+    pub follows: bool,
+    /// The even grid's first beat — what the library stores as its
+    /// anchor. Equal to `beats[0]` on an even grid; on a following one
+    /// `beats[0]` is the band's, and a grid edit must save this instead.
+    pub even_anchor_secs: f64,
+    /// The even grid's bar phase, which pairs with
+    /// [`Self::even_anchor_secs`]; `bar_phase` indexes `beats`.
+    pub even_bar_phase: u32,
 }
 
 impl BeatGrid {
@@ -5385,6 +5484,9 @@ impl BeatGrid {
             bar_phase: 0,
             quality: None,
             downbeat_confidence: 0.0,
+            follows: false,
+            even_anchor_secs: 0.0,
+            even_bar_phase: 0,
         }
     }
 
@@ -5393,6 +5495,9 @@ impl BeatGrid {
         Self {
             bpm: g.bpm,
             confidence: g.confidence,
+            even_anchor_secs: g.beats.first().copied().unwrap_or(0.0),
+            even_bar_phase: u32::from(g.bar_phase),
+            follows: false,
             beats: g.beats,
             beats_per_bar: u32::from(g.beats_per_bar),
             bar_phase: u32::from(g.bar_phase),
@@ -6050,9 +6155,30 @@ fn background_analyze_and_install(
         };
         (grid, bpm_ms, "analyzed")
     };
-    let (grid, source_label) = match followed_grid(&grid, &track, full_samples.get()) {
-        Some(followed) => (followed, "followed"),
-        None => (grid, source_label),
+    // A saved tempo map (schema v11) stands in for following the band
+    // again: while it was followed from this very grid, and always on a
+    // locked track — a locked moving grid is an accepted one (Daniel,
+    // 2026-11-16). Only with the following grid switched on.
+    let saved = library_grid.as_ref().and_then(|lg| {
+        let map = lg.tempo_map.as_ref()?;
+        let usable = FOLLOWING_GRID.load(Ordering::Acquire)
+            && map.beats.len() >= 2
+            && (lg.grid_locked || map.stands_for(lg));
+        usable.then(|| BeatGrid {
+            beats: map.beats.clone(),
+            bar_phase: map.bar_phase,
+            follows: true,
+            even_anchor_secs: grid.beats.first().copied().unwrap_or(grid.even_anchor_secs),
+            even_bar_phase: grid.bar_phase,
+            ..grid.clone()
+        })
+    });
+    let (grid, source_label) = match saved {
+        Some(saved) => (saved, "followed (saved)"),
+        None => match followed_grid(&grid, &track, full_samples.get()) {
+            Some(followed) => (followed, "followed"),
+            None => (grid, source_label),
+        },
     };
 
     {
@@ -6125,6 +6251,9 @@ fn followed_grid(grid: &BeatGrid, track: &Track, samples: &[f32]) -> Option<Beat
     Some(BeatGrid {
         beats: followed.beats,
         bar_phase: u32::from(followed.bar_phase),
+        follows: true,
+        even_anchor_secs: grid.beats.first().copied().unwrap_or(grid.even_anchor_secs),
+        even_bar_phase: grid.bar_phase,
         ..grid.clone()
     })
 }
@@ -6192,11 +6321,14 @@ fn synthesise_beat_grid(bpm: f64, anchor_secs: f64, duration_secs: f64, bar_phas
     BeatGrid {
         bpm,
         confidence: 1.0,
+        even_anchor_secs: beats[0],
+        even_bar_phase: u32::from(recomputed_phase),
         beats,
         beats_per_bar: 4,
         bar_phase: u32::from(recomputed_phase),
         quality: None,
         downbeat_confidence: 1.0,
+        follows: false,
     }
 }
 
@@ -7082,7 +7214,10 @@ mod tests {
         // 84→85: `deck_scope`; a timecode deck meters its input.
         // 85→86: `DeckTelemetry.output_peak` / `output_routed`.
         // 86→87: `set_routing_override` / `known_interface` / `test_tone`.
-        assert_eq!(FFI_VERSION, 87);
+        // 87→88: `hot_cues` returns an import's cues; `hot_cue_source`.
+        // 88→89: `save_tempo_map` / `delete_tempo_map`, `LibraryTempoMap`,
+        // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
+        assert_eq!(FFI_VERSION, 89);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
@@ -8211,6 +8346,14 @@ pub struct LibraryTrack {
     /// [`Self::key_disagreement`]. Always `false` for a track with one
     /// grid, so a Dub-only library never sees it.
     pub bpm_disagreement: bool,
+    /// The kind of the track's saved tempo map — `"followed"` when its
+    /// grid follows a band (schema v11, FFI 89) — or `None` for an even
+    /// grid. The BPM column colours a moving grid by it.
+    pub tempo_map_kind: Option<String>,
+    /// The band's tempo range across the saved map, for the tooltip.
+    pub tempo_bpm_min: Option<f64>,
+    /// See [`Self::tempo_bpm_min`].
+    pub tempo_bpm_max: Option<f64>,
     /// M11d-columns: cells for the configurable columns, in the order
     /// last passed to [`DubLibrary::set_visible_columns`]. Empty — and
     /// free, no expression and no join in the query — until the user
@@ -8485,6 +8628,43 @@ pub struct LibraryBeatGrid {
     /// [`synthesise_beat_grid`] so a load round-trips set-the-1
     /// edits without re-anchoring the grid.
     pub bar_phase: u32,
+    /// The track's saved tempo map (schema v11, FFI 89), when it has
+    /// one. With the following grid on, the engine plays these beats
+    /// instead of following the band again — while the map was followed
+    /// from this very grid, and always on a locked track.
+    pub tempo_map: Option<LibraryTempoMap>,
+}
+
+/// A track's saved tempo map as the engine takes it at load (FFI 89).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LibraryTempoMap {
+    /// Beat times in seconds from sample 0, ascending.
+    pub beats: Vec<f64>,
+    /// Index into `beats` of the first downbeat.
+    pub bar_phase: u32,
+    /// The even grid the map was followed from.
+    pub base_source: String,
+    /// See [`Self::base_source`].
+    pub base_bpm: f64,
+    /// See [`Self::base_source`].
+    pub base_anchor_secs: f64,
+}
+
+impl LibraryTempoMap {
+    /// Whether the map was followed from `grid` and still stands for it.
+    fn stands_for(&self, grid: &LibraryBeatGrid) -> bool {
+        dub_library::TempoMap {
+            kind: "followed".into(),
+            beats: Vec::new(),
+            bar_phase: 0,
+            base_source: self.base_source.clone(),
+            base_bpm: self.base_bpm,
+            base_anchor_secs: self.base_anchor_secs,
+            bpm_min: 0.0,
+            bpm_max: 0.0,
+        }
+        .follows_base(&grid.source, grid.bpm, grid.anchor_secs)
+    }
 }
 
 impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
@@ -8498,6 +8678,7 @@ impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
             grid_drift_quality: g.grid_drift_quality,
             waveform_sidecar_path: g.waveform_sidecar_path,
             bar_phase: u32::from(g.bar_phase),
+            tempo_map: None,
         }
     }
 }
@@ -8575,6 +8756,9 @@ impl From<dub_library::TrackRow> for LibraryTrack {
             // hides the `#` column accordingly.
             crate_ordinal: None,
             bpm_disagreement: r.bpm_disagreement,
+            tempo_map_kind: r.tempo_map_kind,
+            tempo_bpm_min: r.tempo_bpm_min,
+            tempo_bpm_max: r.tempo_bpm_max,
             extras: r.extras.into_iter().map(LibraryColumnValue::from).collect(),
         }
     }
@@ -9967,9 +10151,20 @@ impl DubLibrary {
         track_id: String,
     ) -> std::result::Result<Option<LibraryBeatGrid>, LibraryFfiError> {
         self.with_library(|lib| {
-            Ok(lib
+            let Some(mut grid) = lib
                 .active_beatgrid_for_track(&track_id)?
-                .map(LibraryBeatGrid::from))
+                .map(LibraryBeatGrid::from)
+            else {
+                return Ok(None);
+            };
+            grid.tempo_map = lib.tempo_map(&track_id)?.map(|m| LibraryTempoMap {
+                beats: m.beats,
+                bar_phase: u32::from(m.bar_phase),
+                base_source: m.base_source,
+                base_bpm: m.base_bpm,
+                base_anchor_secs: m.base_anchor_secs,
+            });
+            Ok(Some(grid))
         })
     }
 
@@ -10067,12 +10262,61 @@ impl DubLibrary {
         })
     }
 
-    /// All user hot cues for `track_id`, ascending by pad index.
-    /// Read on track load to restore the deck's cue pads.
+    /// The hot cues the deck's pads show for `track_id`, ascending by pad
+    /// index: the DJ's own, or — on a track never edited in Dub — the
+    /// highest-ranked import's (Serato > rekordbox > Traktor, FFI 88).
+    /// Read on track load to fill the cue pads. Editing any cue on an
+    /// imported set takes the set over into the DJ's own cues first.
     pub fn hot_cues(&self, track_id: String) -> std::result::Result<Vec<HotCue>, LibraryFfiError> {
         self.with_library(|lib| {
-            lib.hot_cues(&track_id)
-                .map(|v| v.into_iter().map(HotCue::from).collect())
+            lib.pad_cues(&track_id)
+                .map(|p| p.cues.into_iter().map(HotCue::from).collect())
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Save the following grid the deck worked out for `track_id` — its
+    /// band's beats, followed from the even grid `(base_source, base_bpm,
+    /// base_anchor_secs)` (schema v11, FFI 89). Replaces any earlier map.
+    pub fn save_tempo_map(
+        &self,
+        track_id: String,
+        beats: Vec<f64>,
+        bar_phase: u32,
+        base_source: String,
+        base_bpm: f64,
+        base_anchor_secs: f64,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            let map = dub_library::TempoMap::followed(
+                beats,
+                u8::try_from(bar_phase).unwrap_or(0),
+                &base_source,
+                base_bpm,
+                base_anchor_secs,
+            );
+            lib.save_tempo_map(&track_id, &map)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Forget `track_id`'s saved tempo map: its grid is even again.
+    pub fn delete_tempo_map(&self, track_id: String) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.delete_tempo_map(&track_id)
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+
+    /// Where `hot_cues` came from: `"user"`, `"serato"`, `"rekordbox"`,
+    /// `"traktor"`, or `None` when the track has none (FFI 88). The pads
+    /// say so while they show an import's cues.
+    pub fn hot_cue_source(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<String>, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.pad_cue_source(&track_id)
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
     }
@@ -10532,6 +10776,54 @@ mod library_ffi_tests {
         lib.open_at(path.to_string_lossy().to_string()).unwrap();
         assert!(lib.played_into("anything".into(), 5).unwrap().is_empty());
         assert!(lib.session_history(50).unwrap().is_empty());
+    }
+
+    /// Schema v11 / FFI 89: a saved following grid comes back with the
+    /// track's active grid, and stands for it only while that grid is the
+    /// one it was followed from — the load's test for reusing it.
+    #[test]
+    fn a_saved_tempo_map_rides_with_the_active_grid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-library.sqlite");
+        let lib = DubLibrary::new();
+        lib.open_at(path.to_string_lossy().to_string()).unwrap();
+        lib.with_library(|l| {
+            l.connection()
+                .execute(
+                    "INSERT INTO tracks (id, created_at, updated_at) VALUES ('t1', 0, 0)",
+                    [],
+                )
+                .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        lib.upsert_user_tap_beatgrid("t1".into(), 0.25, 93.0, 0)
+            .unwrap();
+        let grid = lib.active_beat_grid("t1".into()).unwrap().unwrap();
+        assert!(grid.tempo_map.is_none());
+
+        let beats: Vec<f64> = (0..32).map(|i| 0.25 + f64::from(i) * 0.645).collect();
+        lib.save_tempo_map("t1".into(), beats.clone(), 1, "user_tap".into(), 93.0, 0.25)
+            .unwrap();
+        let grid = lib.active_beat_grid("t1".into()).unwrap().unwrap();
+        let map = grid.tempo_map.clone().expect("the map rides with the grid");
+        assert_eq!(map.beats, beats);
+        assert_eq!(map.bar_phase, 1);
+        assert!(map.stands_for(&grid));
+
+        // A new tap moves the grid: the map no longer stands for it.
+        lib.upsert_user_tap_beatgrid("t1".into(), 0.9, 93.0, 0)
+            .unwrap();
+        let grid = lib.active_beat_grid("t1".into()).unwrap().unwrap();
+        assert!(!grid.tempo_map.as_ref().unwrap().stands_for(&grid));
+
+        lib.delete_tempo_map("t1".into()).unwrap();
+        assert!(lib
+            .active_beat_grid("t1".into())
+            .unwrap()
+            .unwrap()
+            .tempo_map
+            .is_none());
     }
 
     // === M11d.5 round 4: active_beat_grid FFI smoke tests ====================

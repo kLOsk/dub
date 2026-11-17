@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -89,6 +89,14 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 9,
         sql: V9_MIGRATION,
+    },
+    Migration {
+        target_version: 10,
+        sql: V10_MIGRATION,
+    },
+    Migration {
+        target_version: 11,
+        sql: V11_MIGRATION,
     },
 ];
 
@@ -713,6 +721,46 @@ CREATE TABLE IF NOT EXISTS favorite_slots (
 /// Additive.
 const V9_MIGRATION: &str = r#"
 ALTER TABLE track_metadata_source ADD COLUMN color TEXT;
+"#;
+
+/// v10 — imported hot cues on the pads (2026-11-16).
+///
+/// The pads show an import's hot cues (Serato > rekordbox > Traktor)
+/// until the DJ edits a cue in Dub. The first edit copies that source's
+/// cues to `user` rows and records the track here; from then on the pads
+/// read the user rows only, so a cue the DJ cleared stays cleared rather
+/// than coming back from the import. A table of its own rather than a
+/// marker row in `track_cues`, whose `kind` CHECK lists real cue kinds
+/// only. Additive.
+const V10_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS track_cue_takeover (
+    track_id  TEXT    PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    taken_at  INTEGER NOT NULL
+);
+"#;
+
+/// v11 — a track's saved tempo map (2026-11-16).
+///
+/// The following beat grid (alpha) puts each beat where a band played
+/// it. It was worked out on every load and never kept; now it is saved
+/// here with the even grid it was followed from (`base_*`), reused while
+/// that grid is unchanged, and — on a locked track — always: a locked
+/// moving grid is an accepted one. `bpm_min` / `bpm_max` are the band's
+/// tempo range, for the browser. `kind` is the general slot: `followed`
+/// today, a time-stretched track's map later. Additive.
+const V11_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS track_tempo_maps (
+    track_id          TEXT    PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    kind              TEXT    NOT NULL CHECK (kind IN ('followed')),
+    beats             BLOB    NOT NULL,
+    bar_phase         INTEGER NOT NULL,
+    base_source       TEXT    NOT NULL,
+    base_bpm          REAL    NOT NULL,
+    base_anchor_secs  REAL    NOT NULL,
+    bpm_min           REAL    NOT NULL,
+    bpm_max           REAL    NOT NULL,
+    created_at        INTEGER NOT NULL
+);
 "#;
 
 #[cfg(test)]

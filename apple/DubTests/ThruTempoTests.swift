@@ -114,6 +114,63 @@ final class ThruTempoTests: XCTestCase {
         XCTAssertEqual(p.beats(from: 0, to: 1_000).count, 128)
     }
 
+    /// Tapping the 1 on a THRU record (Daniel, 2026-11-16): the tap lands
+    /// near a beat, and that beat is the 1 — the tap says which, the
+    /// onsets say where.
+    func testATappedOneSnapsToTheNearestHeardBeat() {
+        let p = WaveformRenderer.PredictedBeats(lastBeatSecs: 10.0, periodSecs: 0.5)
+        XCTAssertEqual(p.snap(tap: 8.43), 8.5, accuracy: 1e-9)
+        XCTAssertEqual(p.snap(tap: 10.2), 10.0, accuracy: 1e-9)
+        XCTAssertEqual(p.snap(tap: 10.3), 10.5, accuracy: 1e-9)
+    }
+
+    /// Every fourth beat from the 1 is a 1, either side of it.
+    func testEveryFourthBeatFromTheOneIsAOne() {
+        var p = WaveformRenderer.PredictedBeats(lastBeatSecs: 10.0, periodSecs: 0.5)
+        XCTAssertFalse(p.isOne(10.0), "no tap, no bar")
+        p.barSecs = 8.5
+        XCTAssertTrue(p.isOne(8.5))
+        XCTAssertTrue(p.isOne(10.5))
+        XCTAssertTrue(p.isOne(6.5))
+        XCTAssertFalse(p.isOne(9.0))
+        XCTAssertFalse(p.isOne(10.0))
+        XCTAssertTrue(p.isOne(10.49), "a drifted beat still counts as the one it is")
+    }
+
+    /// The bar rolls forward to the newest 1 at or before the newest beat,
+    /// so a record that drifts never adds its drift up from the tap.
+    func testTheBarRollsForwardWithTheRecord() {
+        let p = WaveformRenderer.PredictedBeats(lastBeatSecs: 20.0, periodSecs: 0.5)
+        XCTAssertEqual(p.roll(bar: 8.5), 18.5, accuracy: 1e-9)
+        XCTAssertEqual(p.roll(bar: 20.0), 20.0, accuracy: 1e-9)
+        // The beats arrive a hair late: the 1 is still the beat it was.
+        let drifted = WaveformRenderer.PredictedBeats(lastBeatSecs: 20.03, periodSecs: 0.5)
+        XCTAssertEqual(drifted.roll(bar: 18.0), 20.03, accuracy: 1e-9)
+        XCTAssertEqual(drifted.roll(bar: 18.5), 18.53, accuracy: 1e-9)
+    }
+
+    /// On a THRU deck's BPM, one or two taps set the 1; the tempo takes
+    /// three, as on a track. The Space Echo's TAP still takes two.
+    func testATempoFromTheBpmTakesThreeTaps() {
+        XCTAssertNil(FxRackControls.tappedBpm([0, 0.5], minTaps: 3))
+        XCTAssertEqual(FxRackControls.tappedBpm([0, 0.5, 1.0], minTaps: 3) ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(FxRackControls.tappedBpm([0, 0.5]) ?? 0, 120, accuracy: 0.01)
+    }
+
+    /// The tapped 1 belongs to its record: the next record retires it,
+    /// and off THRU there is none.
+    func testTheTappedOneRetiresWithItsRecord() {
+        var deck = thruDeck()
+        deck.thruRecordSeq = 3
+        deck.thruOne = DeckState.ThruOne(waveSecs: 42.0, recordSeq: 3)
+        XCTAssertEqual(deck.thruOneSecs, 42.0)
+        deck.thruRecordSeq = 4
+        XCTAssertNil(deck.thruOneSecs)
+        deck.thruRecordSeq = 3
+        deck.controlMode = 1
+        XCTAssertNil(deck.thruOneSecs)
+    }
+
     func testTheRecordClockReadsMinutesAndSeconds() {
         XCTAssertEqual(ThruRecordClock.text(secs: -1), "--:--")
         XCTAssertEqual(ThruRecordClock.text(secs: 0), "00:00")
