@@ -5,13 +5,13 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-11-16 (alpha.3). Everything shipped up to alpha.2, and
+> Last updated: 2026-11-17 (alpha.4). Everything shipped up to alpha.2, and
 > the rig rounds before it, moved to `SHIPPED.md` on 2026-11-15.
 
 ## Where the branch is
 
-`main` — **1.0.0-alpha.3 released** (tag `v1.0.0-alpha.3`, a GitHub
-pre-release; notes in `docs/releases/v1.0.0-alpha.3.md`). `make dist` builds
+`main` — **1.0.0-alpha.4 released** (tag `v1.0.0-alpha.4`, a GitHub
+pre-release; notes in `docs/releases/v1.0.0-alpha.4.md`). `make dist` builds
 a universal Release `Dub.app`, ad-hoc signed and **not notarized** (no
 Developer ID yet), zipped with `ditto` plus a SHA-256. Version lives in two
 places, kept in step by hand: `[workspace.package] version` and
@@ -79,7 +79,7 @@ gate is local-only because GitHub CI has no macOS app job.
   `site/AGENTS.md`; UI words are copied from `apple/Dub/`, so a renamed
   label means a manual edit in the same change.
 
-**Since alpha.3, on `main`** (not on the rig yet):
+**In alpha.4, since alpha.3** (not on the rig yet):
 
 - **A default keymap (2026-11-17, Daniel).** Replaces "no default keymap"
   (2026-09-15). Left hand deck A, right hand deck B: cues `1–5`/`6–0`
