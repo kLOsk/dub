@@ -185,7 +185,7 @@ input and output pair in **Preferences ▸ Audio**
 ## Status
 
 Dub is **alpha** — the latest build is
-[1.0.0-alpha.4](https://github.com/kLOsk/dub/releases/tag/v1.0.0-alpha.4):
+[1.0.0-alpha.5](https://github.com/kLOsk/dub/releases/tag/v1.0.0-alpha.5):
 feature-complete for 1.0 and being signed off against a
 [hardware checklist](docs/RIG-CHECKLIST.md) on real turntables.
 
