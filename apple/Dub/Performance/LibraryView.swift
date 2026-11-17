@@ -807,6 +807,10 @@ private enum LibrarySource: Hashable, Identifiable {
     /// were mixed into from the other deck.
     case sessionHistory
     case justImported
+    /// Tracks that mix with the one playing: a key a step either way
+    /// round the Camelot wheel (or its relative), a tempo within ±3 BPM.
+    /// It follows the playing track (Daniel, 2026-11-17).
+    case matching
     /// A user-created Dub crate (M11d-next, PRD §8.5.1). Carries the
     /// crate id only; the display name + track count are looked up
     /// live from `libraryModel.crates` so a rename doesn't strand a
@@ -835,6 +839,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .recentlyPlayed:              return "Recently Played"
         case .sessionHistory:              return "Session History"
         case .justImported:                return "Just Imported"
+        case .matching:                    return "Matching"
         case .dubCrate:                    return "Crate"
         case .importedSource(let kind):    return kind.label
         case .importedCrate:               return "Playlist"
@@ -847,6 +852,7 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks:                   return "music.note.list"
         case .recentlyPlayed:              return "clock.arrow.circlepath"
+        case .matching:                    return "tuningfork"
         case .sessionHistory:              return "calendar.day.timeline.left"
         case .justImported:                return "tray.and.arrow.down"
         case .dubCrate:                    return "square.stack.fill"
@@ -873,7 +879,7 @@ private enum LibrarySource: Hashable, Identifiable {
     /// `false` for the v1.0 placeholders that render disabled.
     var isAvailable: Bool {
         switch self {
-        case .allTracks, .recentlyPlayed, .sessionHistory, .justImported: return true
+        case .allTracks, .recentlyPlayed, .sessionHistory, .justImported, .matching: return true
         case .dubCrate, .importedSource, .importedCrate, .favoriteSlot: return true
         // M26b: no longer a placeholder — it lists committed rips and
         // hands one back for re-splitting (R-44).
@@ -898,8 +904,9 @@ private enum LibrarySource: Hashable, Identifiable {
         // the user just dragged into place, exactly like the smart
         // crates' recency order. Session History is the set's
         // play order — same contract.
+        // Matching is ranked: the nearest key and tempo first.
         case .recentlyPlayed, .sessionHistory, .justImported, .dubCrate, .importedCrate,
-            .favoriteSlot:
+            .favoriteSlot, .matching:
             return true
         default: return false
         }
@@ -910,7 +917,7 @@ private enum LibrarySource: Hashable, Identifiable {
         switch self {
         case .allTracks:
             return "Library"
-        case .recentlyPlayed, .sessionHistory, .justImported:
+        case .recentlyPlayed, .sessionHistory, .justImported, .matching:
             return "Smart Crates"
         case .dubCrate:
             return "Dub Crates"
@@ -1147,6 +1154,8 @@ struct LibraryView: View {
     /// Listing fetch limit. Sized for the M11d.1/2 single-page
     /// model; real virtualization + paging lands at M11d.4.
     private static let listingLimit: UInt32 = 5_000
+    /// How far the Matching crate looks: every track, in practice.
+    private static let matchingScanLimit: UInt32 = 200_000
 
     var body: some View {
         // The sidebar's width is the split's own state, not this
@@ -1287,6 +1296,13 @@ struct LibraryView: View {
             guard let request else { return }
             browse(next: request.next)
         }
+        .onChange(of: libraryModel.matchReference) { _ in
+            // The crate follows the playing track.
+            if selectedSource == .matching { refreshTracks(preserveSelection: true) }
+        }
+        .onChange(of: libraryModel.matchWindow) { _ in
+            if selectedSource == .matching { refreshTracks(preserveSelection: true) }
+        }
         .onChange(of: libraryModel.sidebarRequest) { request in
             guard let request else { return }
             switch request.step {
@@ -1399,7 +1415,7 @@ struct LibraryView: View {
                     entries: [.allTracks])
                 section(
                     heading: "Smart Crates",
-                    entries: [.recentlyPlayed, .sessionHistory, .justImported])
+                    entries: [.matching, .recentlyPlayed, .sessionHistory, .justImported])
                 dubCratesSection
                 importedSourcesSection
                 section(
@@ -1797,6 +1813,10 @@ struct LibraryView: View {
                     filterBar
                     Divider().overlay(DubColor.divider)
                 }
+                if selectedSource == .matching, let ref = libraryModel.matchReference {
+                    matchingCaption(ref)
+                    Divider().overlay(DubColor.divider)
+                }
                 trackListContainer
                     .overlay(alignment: .bottomTrailing) { statusTab }
             }
@@ -1812,6 +1832,42 @@ struct LibraryView: View {
             searchFocused = false
             NSApp.keyWindow?.makeFirstResponder(nil)
         }
+    }
+
+    /// What the Matching crate matches against: the playing track, its
+    /// key and tempo, and the window either side.
+    private func matchingCaption(_ ref: MatchReference) -> some View {
+        let name = [ref.title, ref.artist].compactMap { $0 }.joined(separator: " — ")
+        let window = libraryModel.matchWindow
+        let keys = ref.key.neighbours(within: window.keySteps).map(\.notation).joined(separator: " ")
+        return HStack(spacing: DubSpacing.sm) {
+            Text("MATCHING")
+                .font(DubFont.caps)
+                .tracking(DubFont.capsTracking)
+                .foregroundStyle(DubColor.textTertiary)
+            Text(name.isEmpty ? "the playing track" : name)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: DubSpacing.md)
+            Text("\(keys) · \(Self.bpmFormat(ref.bpm - window.bpm))–\(Self.bpmFormat(ref.bpm + window.bpm)) BPM"
+                 + (window.halfDouble ? " · ½× 2×" : "")
+                 + (ref.pitched ? " · as pitched" : ""))
+                .font(DubFont.micro)
+                .monospacedDigit()
+                .foregroundStyle(DubColor.textSecondary)
+                .help("Keys within \(window.keySteps) step\(window.keySteps == 1 ? "" : "s") round the Camelot wheel and tempos within ±\(Self.bpmFormat(window.bpm)) BPM of the playing track (\(ref.key.notation), \(String(format: "%.1f", ref.bpm)) BPM). Preferences ▸ Library sets both.")
+        }
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .background(DubColor.surface1)
+    }
+
+    /// A tempo as the caption prints it: whole BPM, or one decimal when
+    /// the window is a half.
+    static func bpmFormat(_ bpm: Double) -> String {
+        abs(bpm - bpm.rounded()) < 0.05 ? String(format: "%.0f", bpm) : String(format: "%.1f", bpm)
     }
 
     /// The "Real Records" pane: committed rips, each re-splittable
@@ -3465,7 +3521,7 @@ struct LibraryView: View {
             stops += entries.filter(\.isAvailable).map { SidebarStop(source: $0) }
         }
         section("Library", [.allTracks])
-        section("Smart Crates", [.recentlyPlayed, .sessionHistory, .justImported])
+        section("Smart Crates", [.matching, .recentlyPlayed, .sessionHistory, .justImported])
         section("Dub Crates", libraryModel.crates.map { .dubCrate(id: $0.id) })
         if !libraryModel.importedSources.isEmpty, !folding.isSectionFolded("Imported Sources") {
             for group in libraryModel.importedSources {
@@ -3753,6 +3809,10 @@ struct LibraryView: View {
             return "Nothing played this session yet."
         case .justImported:
             return "No imports this session."
+        case .matching:
+            return libraryModel.matchReference == nil
+                ? "Play a track and what mixes with it shows here."
+                : "Nothing in key and tempo with this one."
         case .dubCrate:
             return "This crate is empty."
         case .importedSource(let kind):
@@ -3779,6 +3839,8 @@ struct LibraryView: View {
             return "Tracks you play this session show up here, in set order."
         case .justImported:
             return "Tracks imported this session show up here."
+        case .matching:
+            return "Its key and tempo window is in Preferences ▸ Library. Tracks with no BPM or key yet don't show."
         case .dubCrate:
             return "Drag tracks onto the crate in the sidebar to add them."
         case .importedSource(let kind):
@@ -3900,6 +3962,8 @@ struct LibraryView: View {
         let fieldsSnapshot = enabledFilterFields
         let libraryOpen = libraryModel.libraryIsOpen
         let reachabilityBefore = libraryModel.volumeReachability
+        let matchReference = libraryModel.matchReference
+        let matchWindow = libraryModel.matchWindow
 
         isLoading = true
         Task.detached(priority: .userInitiated) {
@@ -3938,6 +4002,18 @@ struct LibraryView: View {
                         rows = try library.importedCrateTracks(importedCrateId: id)
                     case .favoriteSlot(let slot):
                         rows = try library.favoriteSlotTracks(slot: slot)
+                    case .matching:
+                        // The whole library, not the browser's page: a
+                        // match can be anywhere in a 30 000-track
+                        // collection. Off the main thread, and only when
+                        // the playing track changes.
+                        if let matchReference {
+                            rows = TrackMatching.matches(
+                                try library.listTracks(limit: Self.matchingScanLimit, offset: 0),
+                                against: matchReference, window: matchWindow)
+                        } else {
+                            rows = []
+                        }
                     default:
                         rows = []
                     }

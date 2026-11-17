@@ -80,6 +80,23 @@ gate is local-only because GitHub CI has no macOS app job.
   `site/AGENTS.md`; UI words are copied from `apple/Dub/`, so a renamed
   label means a manual edit in the same change.
 
+**Since alpha.5, on `main`:**
+
+- **The Matching smart crate (2026-11-17, Daniel).** Lists what mixes
+  with the playing track (master deck, else any playing deck; kept when
+  the decks stop): Camelot distance ≤ N steps (relative major/minor = 1)
+  and BPM within ±X, nearest key then nearest tempo first. `CamelotKey`
+  reads Camelot, musical and Open Key spellings. Window in Preferences ▸
+  Library ▸ Matching (`MatchWindow`, defaults 1 step / ±3 BPM; Daniel
+  asked for both to be prefs), plus two switches, both off by default:
+  half / double time, and match the pitched tempo (track BPM × the
+  deck's pitch, held until it moves 0.5 BPM so platter wobble doesn't
+  rescan the library every poll; a lift keeps the last value). Scans the whole library off the main
+  thread, only when the reference or window changes.
+- **The loop row is mappable.** Each ladder length (`loop.size.<deck>.<n>`,
+  pressing the running length exits, as the button does) and ÷2 / ×2
+  (`loop.halve/double.<deck>`), per deck, no default keys.
+
 **In alpha.5** (alpha.4 never went out; not on the rig yet):
 
 - **Serato's ⌘ keys (2026-11-17, Daniel, from Serato's shortcut page).**

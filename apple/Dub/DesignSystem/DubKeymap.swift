@@ -60,6 +60,12 @@ enum DubAction: Hashable {
     case openPreferences
     /// A deck's loop off — the loop row's ✕, without finding it.
     case loopOff(DeckSide)
+    /// One length on a deck's loop row, by its place on the ladder
+    /// (`LoopEngine.sizes`, 0 = 1/8 … 7 = 16): loops the last that many
+    /// beats; on the running length it exits, as the button does.
+    case loopSize(DeckSide, Int)
+    /// The loop row's ×2 (`true`) / ÷2 on the running loop.
+    case loopScale(DeckSide, double: Bool)
     /// Put the cursor in the library's search field.
     case focusSearch
     /// The library selection one row down (`true`) or up.
@@ -113,6 +119,9 @@ enum DubAction: Hashable {
         case .loadInto(let side): return "transport.load.\(side == .a ? "a" : "b")"
         case .openPreferences: return "app.preferences"
         case .loopOff(let side): return "loop.off.\(side == .a ? "a" : "b")"
+        case .loopSize(let side, let i): return "loop.size.\(side == .a ? "a" : "b").\(i)"
+        case .loopScale(let side, let double):
+            return "loop.\(double ? "double" : "halve").\(side == .a ? "a" : "b")"
         case .focusSearch: return "library.search"
         case .browse(let next): return "library.\(next ? "next" : "previous")"
         case .sidebar(let next): return "library.playlist.\(next ? "next" : "previous")"
@@ -151,6 +160,12 @@ enum DubAction: Hashable {
         case (3, "loop") where parts[1] == "off":
             guard let d = side(parts[2]) else { return nil }
             self = .loopOff(d)
+        case (3, "loop") where parts[1] == "double" || parts[1] == "halve":
+            guard let d = side(parts[2]) else { return nil }
+            self = .loopScale(d, double: parts[1] == "double")
+        case (4, "loop") where parts[1] == "size":
+            guard let d = side(parts[2]), let n = Int(parts[3]) else { return nil }
+            self = .loopSize(d, n)
         case (2, "library") where parts[1] == "search": self = .focusSearch
         case (2, "library") where parts[1] == "next": self = .browse(next: true)
         case (2, "library") where parts[1] == "previous": self = .browse(next: false)

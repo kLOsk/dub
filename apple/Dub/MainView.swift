@@ -1354,7 +1354,9 @@ final class WaveformAppModel: ObservableObject {
 
     /// Master deck per PRD §6.4 (sticky single-master). `nil` only
     /// while the engine is stopped.
-    @Published private(set) var masterDeck: DeckSide? = nil
+    @Published private(set) var masterDeck: DeckSide? = nil {
+        didSet { if masterDeck != oldValue { updateMatchReference() } }
+    }
 
     // MARK: Vinyl rip (M26a)
     //
@@ -5502,6 +5504,54 @@ final class WaveformAppModel: ObservableObject {
         case .a: deckA = next
         case .b: deckB = next
         }
+        updateMatchReference()
+    }
+
+    /// The Matching smart crate follows the track playing now: the
+    /// master deck's when it plays, else whichever deck plays. When
+    /// nothing plays the last reference stays, so the crate doesn't
+    /// empty while the DJ cues the next record. Cheap, and assigned only
+    /// on change — this runs on every deck update.
+    private func updateMatchReference() {
+        let side: DeckSide?
+        if let m = masterDeck, state(for: m).isPlaying {
+            side = m
+        } else if deckA.isPlaying {
+            side = .a
+        } else if deckB.isPlaying {
+            side = .b
+        } else {
+            side = nil
+        }
+        guard let side else { return }
+        let deck = state(for: side)
+        guard let id = deck.loadedLibraryTrackId, let bpm = deck.bpm, bpm > 0,
+              let key = CamelotKey(deck.key)
+        else { return }
+        let other = state(for: side == .a ? .b : .a).loadedLibraryTrackId
+        let current = libraryModel.matchReference
+        let followPitch = libraryModel.matchWindow.followPitch
+        var tempo = bpm
+        // A lift or a dropout has no pitch for a moment: keep the
+        // pitched tempo the crate already has for this track.
+        if followPitch, deck.pitchPercent == nil, let current, current.trackId == id, current.pitched {
+            return
+        }
+        if followPitch, let pitch = deck.pitchPercent {
+            tempo = bpm * (1 + pitch / 100)
+            // The platter wobbles: hold the tempo until it moves half a
+            // BPM, or the crate would rescan the library every poll.
+            if let current, current.trackId == id, current.pitched, abs(current.bpm - tempo) < 0.5 {
+                tempo = current.bpm
+            }
+        }
+        let reference = MatchReference(
+            trackId: id, title: deck.trackTitle, artist: deck.trackArtist,
+            bpm: (tempo * 10).rounded() / 10, pitched: followPitch && deck.pitchPercent != nil, key: key,
+            onDecks: Set([id, other].compactMap { $0 }))
+        if libraryModel.matchReference != reference {
+            libraryModel.matchReference = reference
+        }
     }
 
     private func formatChip(for url: URL, info: TrackInfo) -> String {
@@ -6127,6 +6177,19 @@ final class WaveformAppModel: ObservableObject {
     ///
     /// Clamped to the same 1/8…16-beat range the buttons offer, and a
     /// no-op when nothing is looping — there is nothing to halve.
+    /// A loop-length key: that length, or out of the loop when it is the
+    /// running one — what a press on the button does.
+    func loopSizeFromKey(_ side: DeckSide, index: Int) {
+        guard LoopEngine.sizes.indices.contains(index) else { return }
+        let beats = LoopEngine.sizes[index]
+        let deck = state(for: side)
+        if deck.loopActive, let active = deck.activeLoopBeats, abs(active - beats) < 1e-9 {
+            exitLoop(side)
+        } else {
+            handleLoopBeats(side, beats: beats)
+        }
+    }
+
     func scaleLoop(_ side: DeckSide, double: Bool) {
         guard isRunning else { return }
         var deck = state(for: side)
@@ -7399,6 +7462,16 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
+            onLoopKey: { action in
+                Task { @MainActor in
+                    switch action {
+                    case .loopSize(let side, let index): model.loopSizeFromKey(side, index: index)
+                    case .loopScale(let side, let double): model.scaleLoop(side, double: double)
+                    default: break
+                    }
+                }
+                return true
+            },
             onFocusSearch: {
                 Task { @MainActor in
                     model.libraryModel.searchFocusRequest &+= 1
@@ -7538,6 +7611,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onCmdComma: @escaping () -> Bool,
             onLoadInto: @escaping (_ side: DeckSide) -> Bool,
             onLoopOff: @escaping (_ side: DeckSide) -> Bool,
+            onLoopKey: @escaping (_ action: DubAction) -> Bool,
             onFocusSearch: @escaping () -> Bool,
             onBrowse: @escaping (_ next: Bool) -> Bool,
             onHotCue: @escaping (_ side: DeckSide?, _ index: Int, _ clear: Bool) -> Bool,
@@ -7621,6 +7695,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                     if onLoadInto(side) { return nil }
                 case .loopOff(let side):
                     if onLoopOff(side) { return nil }
+                case .loopSize, .loopScale:
+                    if onLoopKey(action) { return nil }
                 case .focusSearch:
                     if onFocusSearch() { return nil }
                 case .browse(let next):

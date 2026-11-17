@@ -875,6 +875,7 @@ struct DeckColumn<Overview: View>: View {
             engaged: state.loopEngaged,
             hasTrack: state.hasTrack,
             height: DubLayout.deckColumnLoopHeight,
+            side: state.side,
             onLoop: callbacks.onLoop,
             onScale: callbacks.onScaleLoop,
             onExit: callbacks.onExitLoop)

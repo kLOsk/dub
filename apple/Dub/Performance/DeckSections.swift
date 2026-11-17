@@ -300,6 +300,8 @@ struct LoopEngine: View {
     /// read as two sizes of thing however exactly the frames matched.
     /// The buttons are their own container now, at the echo's height.
     var height: CGFloat = DubLayout.deckColumnLoopHeight
+    /// The deck, so map mode binds a length or a stepper to *its* loop.
+    var side: DeckSide = .a
     let onLoop: (Double) -> Void
     let onScale: (_ double: Bool) -> Void
     let onExit: () -> Void
@@ -401,6 +403,7 @@ struct LoopEngine: View {
                     .onPressDown(enabled: hasTrack) {
                         if on { onExit() } else { onLoop(beats) }
                     }
+                    .mappable(.loopSize(side, index))
                     .help(on
                         ? "Looping \(Self.label(beats)) — press again to exit"
                         : "Loop the last \(Self.label(beats)) beat"
@@ -453,6 +456,7 @@ struct LoopEngine: View {
                     browseStart = min(max(start + (double ? 1 : -1), 0), Self.lastStart)
                 }
             }
+            .mappable(.loopScale(side, double: double))
             .help(engaged
                 ? (double
                     ? "Double the running loop"

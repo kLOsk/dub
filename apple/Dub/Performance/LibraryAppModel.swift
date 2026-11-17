@@ -115,6 +115,152 @@ struct LibraryBrowseRequest: Equatable {
     let token: UUID
 }
 
+/// A key on the Camelot wheel: 1…12, minor (`A`) or major (`B`).
+///
+/// Libraries hold keys in several spellings — Dub's own analysis and
+/// Mixed In Key write Camelot (`8A`), Traktor and rekordbox exports often
+/// musical notation (`Am`, `F#`, `Bb minor`), Traktor's own display Open
+/// Key (`1m`, `1d`). All of them land on the one wheel here, so matching
+/// compares like with like.
+struct CamelotKey: Hashable {
+    let number: Int
+    let minor: Bool
+
+    init(number: Int, minor: Bool) {
+        self.number = number
+        self.minor = minor
+    }
+
+    init?(_ notation: String?) {
+        guard let raw = notation?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        let upper = raw.uppercased()
+        // Camelot: 8A / 12B.
+        if let last = upper.last, last == "A" || last == "B",
+           let n = Int(upper.dropLast()), (1...12).contains(n)
+        {
+            self.init(number: n, minor: last == "A")
+            return
+        }
+        // Open Key: 1m / 1d — 1d is C major, Camelot 8B.
+        if let last = upper.last, last == "M" || last == "D",
+           let n = Int(upper.dropLast()), (1...12).contains(n)
+        {
+            self.init(number: (n + 6) % 12 + 1, minor: last == "M")
+            return
+        }
+        // Musical: a note, an accidental, then a mode word or `m`.
+        let notes: [Character: Int] = ["C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11]
+        var chars = Array(raw)
+        guard let first = chars.first.map({ Character($0.uppercased()) }), var pc = notes[first]
+        else { return nil }
+        chars.removeFirst()
+        if let acc = chars.first {
+            if acc == "#" || acc == "♯" { pc += 1; chars.removeFirst() }
+            else if acc == "b" || acc == "♭" { pc -= 1; chars.removeFirst() }
+        }
+        pc = (pc + 12) % 12
+        let mode = String(chars).trimmingCharacters(in: .whitespaces).lowercased()
+        let minor: Bool
+        switch mode {
+        case "", "maj", "major", "dur": minor = false
+        case "m", "min", "minor", "moll": minor = true
+        default: return nil
+        }
+        // A major key's place on the wheel walks in fifths from C (8B);
+        // a minor key sits with its relative major, three semitones up.
+        let major = minor ? (pc + 3) % 12 : pc
+        self.init(number: ((major * 7) % 12 + 7) % 12 + 1, minor: minor)
+    }
+
+    var notation: String { "\(number)\(minor ? "A" : "B")" }
+
+    /// Steps round the wheel to `other`: 0 the same key, 1 a neighbour
+    /// either way or the relative major / minor, and so on — crossing
+    /// between minor and major costs a step.
+    func distance(to other: CamelotKey) -> Int {
+        let step = abs(other.number - number)
+        return min(step, 12 - step) + (other.minor == minor ? 0 : 1)
+    }
+
+    /// Every key within `steps` of this one, nearest first.
+    func neighbours(within steps: Int) -> [CamelotKey] {
+        (1...12).flatMap { n in [CamelotKey(number: n, minor: true), CamelotKey(number: n, minor: false)] }
+            .filter { distance(to: $0) <= steps }
+            .sorted { (distance(to: $0), $0.number, $0.minor ? 0 : 1) < (distance(to: $1), $1.number, $1.minor ? 0 : 1) }
+    }
+}
+
+/// The track the Matching smart crate matches against: the one playing.
+struct MatchReference: Equatable {
+    let trackId: String
+    let title: String?
+    let artist: String?
+    /// The tempo matched against: the track's BPM, or with "current
+    /// pitch" on the tempo the deck plays at now.
+    let bpm: Double
+    /// Whether `bpm` carries the platter's pitch.
+    var pitched: Bool = false
+    let key: CamelotKey
+    /// The tracks on the decks now, the reference among them: a match
+    /// list that offers what is already playing is no help.
+    let onDecks: Set<String>
+}
+
+/// How wide the Matching smart crate looks — Preferences ▸ Library
+/// (Daniel, 2026-11-17: "prefs should allow the user to decide on bpm
+/// distance and on key distance").
+struct MatchWindow: Equatable {
+    /// BPM either side of the playing track's.
+    var bpm: Double = 3
+    /// Steps round the Camelot wheel: 0 the same key only, 1 a neighbour
+    /// either way and the relative major / minor.
+    var keySteps: Int = 1
+    /// Also match at half and double time — an 87 BPM dub track against a
+    /// 174 drum'n'bass one. Off by default (Daniel, 2026-11-17).
+    var halfDouble: Bool = false
+    /// Match the tempo the playing deck runs at now — its track BPM with
+    /// the platter's pitch on it — rather than the track's own BPM. Off
+    /// by default (Daniel, 2026-11-17).
+    var followPitch: Bool = false
+
+    static let bpmRange: ClosedRange<Double> = 1...10
+    static let keyStepsRange: ClosedRange<Int> = 0...3
+}
+
+/// The Matching smart crate's rule (Daniel, 2026-11-17: "songs with the
+/// same key (or one above / below) and same bpm (plus minus 2–3 bpm) of
+/// the currently playing song"). Pure, so tested.
+enum TrackMatching {
+    /// Where `track` ranks against `ref`, or `nil` when it isn't a match:
+    /// key distance first, then how near its tempo is.
+    static func rank(
+        bpm: Double?, key: String?, id: String, against ref: MatchReference,
+        window: MatchWindow = MatchWindow()
+    ) -> (keyDistance: Int, bpmDelta: Double)? {
+        guard !ref.onDecks.contains(id), let bpm, bpm > 0, let k = CamelotKey(key) else { return nil }
+        let distance = ref.key.distance(to: k)
+        let delta = (window.halfDouble ? [bpm, bpm * 2, bpm / 2] : [bpm])
+            .map { abs($0 - ref.bpm) }.min() ?? .infinity
+        guard distance <= window.keySteps, delta <= window.bpm + 1e-9 else { return nil }
+        return (distance, delta)
+    }
+
+    /// The tracks that match, best first.
+    static func matches(
+        _ tracks: [LibraryTrack], against ref: MatchReference, window: MatchWindow = MatchWindow()
+    ) -> [LibraryTrack] {
+        tracks
+            .compactMap { t in
+                rank(bpm: t.bpm, key: t.key, id: t.id, against: ref, window: window).map { (t, $0) }
+            }
+            .sorted { a, b in
+                a.1.keyDistance != b.1.keyDistance
+                    ? a.1.keyDistance < b.1.keyDistance : a.1.bpmDelta < b.1.bpmDelta
+            }
+            .map(\.0)
+    }
+}
+
 /// A sidebar key: walk the playlists, or open / close the folder.
 enum LibrarySidebarStep: Equatable {
     case move(next: Bool)
@@ -129,6 +275,36 @@ struct LibrarySidebarRequest: Equatable {
 }
 
 final class LibraryAppModel: ObservableObject {
+
+    /// The track playing now, for the Matching smart crate. Kept when the
+    /// decks stop, so the crate doesn't empty between two tracks.
+    @Published var matchReference: MatchReference? = nil
+
+    /// How wide the Matching crate looks, from Preferences ▸ Library.
+    @Published var matchWindow: MatchWindow = LibraryAppModel.loadMatchWindow() {
+        didSet {
+            UserDefaults.standard.set(matchWindow.bpm, forKey: "dub.matchingBpm")
+            UserDefaults.standard.set(matchWindow.keySteps, forKey: "dub.matchingKeySteps")
+            UserDefaults.standard.set(matchWindow.halfDouble, forKey: "dub.matchingHalfDouble")
+            UserDefaults.standard.set(matchWindow.followPitch, forKey: "dub.matchingFollowPitch")
+        }
+    }
+
+    private static func loadMatchWindow() -> MatchWindow {
+        let d = UserDefaults.standard
+        var w = MatchWindow()
+        if d.object(forKey: "dub.matchingBpm") != nil {
+            w.bpm = min(max(d.double(forKey: "dub.matchingBpm"), MatchWindow.bpmRange.lowerBound),
+                        MatchWindow.bpmRange.upperBound)
+        }
+        if d.object(forKey: "dub.matchingKeySteps") != nil {
+            w.keySteps = min(max(d.integer(forKey: "dub.matchingKeySteps"), 0),
+                             MatchWindow.keyStepsRange.upperBound)
+        }
+        w.halfDouble = d.bool(forKey: "dub.matchingHalfDouble")
+        w.followPitch = d.bool(forKey: "dub.matchingFollowPitch")
+        return w
+    }
 
     /// The mapped sidebar keys (`⌘⇧` arrows by default).
     @Published var sidebarRequest: LibrarySidebarRequest? = nil

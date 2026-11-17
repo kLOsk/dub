@@ -82,6 +82,8 @@ struct PreferencesSheet: View {
     /// The key map, for the Keys tab's list — observed so a rebind on
     /// the surface behind the sheet shows up here.
     @ObservedObject private var keymap = DubKeymapStore.shared
+    /// For the Matching window, which lives on the library model.
+    @ObservedObject private var libraryModel: LibraryAppModel
     @Environment(\.dismiss) private var dismiss
 
     /// The tab is remembered: a DJ who lives in FX opens on FX.
@@ -90,6 +92,7 @@ struct PreferencesSheet: View {
 
     init(model: WaveformAppModel) {
         self.model = model
+        self._libraryModel = ObservedObject(wrappedValue: model.libraryModel)
     }
 
     private static let sidebarWidth: CGFloat = 148
@@ -355,6 +358,30 @@ struct PreferencesSheet: View {
                 librarySourceRow("rekordbox", kind: .rekordbox, isOn: $model.rekordboxImportEnabled)
                 librarySourceRow("Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled, last: true)
             }
+            group("Matching") {
+                note("The Matching smart crate lists what mixes with the track playing now, nearest first, and follows it as the music changes.")
+                    .padding(.bottom, DubSpacing.xs)
+                matchStepperRow(
+                    "Tempo",
+                    "How far a track's BPM may be from the playing one, either side.",
+                    value: "± \(LibraryView.bpmFormat(libraryModel.matchWindow.bpm)) BPM",
+                    decrement: { libraryModel.matchWindow.bpm = max(MatchWindow.bpmRange.lowerBound, libraryModel.matchWindow.bpm - 0.5) },
+                    increment: { libraryModel.matchWindow.bpm = min(MatchWindow.bpmRange.upperBound, libraryModel.matchWindow.bpm + 0.5) })
+                matchStepperRow(
+                    "Key",
+                    "Steps round the Camelot wheel. 0: the same key only. 1: a step either way, and the relative major or minor. Each step more widens it again.",
+                    value: Self.keyStepsLabel(libraryModel.matchWindow.keySteps),
+                    decrement: { libraryModel.matchWindow.keySteps = max(0, libraryModel.matchWindow.keySteps - 1) },
+                    increment: { libraryModel.matchWindow.keySteps = min(MatchWindow.keyStepsRange.upperBound, libraryModel.matchWindow.keySteps + 1) })
+                toggleRow(
+                    "Half and double time",
+                    "Also match a track at half or double the tempo: an 87 BPM track beside a 174 one.",
+                    isOn: $libraryModel.matchWindow.halfDouble)
+                toggleRow(
+                    "Match the pitched tempo",
+                    "Match the tempo the deck plays at now, with your platter's pitch on it. Off, Matching uses the playing track's own BPM.",
+                    isOn: $libraryModel.matchWindow.followPitch, last: true)
+            }
             // Daniel, 2026-11-16: with more than one app on, say whose grid
             // and whose cues a track gets. The order is
             // `Library::grid_source_rank` and `CUE_SOURCE_ORDER`.
@@ -406,6 +433,44 @@ struct PreferencesSheet: View {
             .padding(.vertical, DubSpacing.sm)
             if !last { Divider() }
         }
+    }
+
+    /// A value set by − / +: name and what it does, the value, the pair.
+    private func matchStepperRow(
+        _ title: String, _ description: String, value: String,
+        decrement: @escaping () -> Void, increment: @escaping () -> Void, last: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: DubSpacing.md) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                    Text(description)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: DubSpacing.md)
+                Text(value)
+                    .font(DubFont.body)
+                    .monospacedDigit()
+                    .foregroundStyle(DubColor.textPrimary)
+                    .frame(minWidth: 72, alignment: .trailing)
+                ControlGroup {
+                    Button(action: decrement) { Image(systemName: "minus") }
+                    Button(action: increment) { Image(systemName: "plus") }
+                }
+                .controlSize(.small)
+                .frame(width: 64)
+            }
+            .padding(.vertical, DubSpacing.sm)
+            if !last { Divider() }
+        }
+    }
+
+    static func keyStepsLabel(_ steps: Int) -> String {
+        steps == 0 ? "Same key" : "± \(steps) step\(steps == 1 ? "" : "s")"
     }
 
     private func sourceStatusText(_ loc: LibrarySourceLocation?) -> String {
@@ -606,6 +671,10 @@ struct PreferencesSheet: View {
         case .loadInto(let side): return "Load into \(side == .a ? "the left deck (A)" : "the right deck (B)")"
         case .openPreferences: return "Preferences"
         case .loopOff(let side): return "Loop off \(side.label)"
+        case .loopSize(let side, let i):
+            let beats = LoopEngine.sizes.indices.contains(i) ? LoopEngine.sizes[i] : 0
+            return "Loop \(LoopEngine.label(beats)) \(side.label)"
+        case .loopScale(let side, let double): return "Loop \(double ? "×2" : "÷2") \(side.label)"
         case .focusSearch: return "Jump to search"
         case .browse(let next): return next ? "Next track" : "Previous track"
         case .hotCue(let i): return "Hot cue \(i + 1) · master deck"
