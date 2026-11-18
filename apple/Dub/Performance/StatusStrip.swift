@@ -142,10 +142,16 @@ struct StatusStrip: View {
     var onSelectMode: ((StudioSurface) -> Void)? = nil
     /// M18 — MAP tap target. `nil` renders the button inert.
     var onToggleMap: (() -> Void)? = nil
+    /// The full-screen window dots (`WindowDots`). Only the live strip
+    /// shows them: the snapshot suite runs inside a Dub that is itself full
+    /// screen, and a picture of the strip must not depend on that.
+    var showsWindowDots = false
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
-            WindowDots()
+            if showsWindowDots {
+                WindowDots()
+            }
             wordmark
             Divider()
                 .frame(height: 12)
@@ -444,7 +450,8 @@ struct StatusStripContainer: View {
             openPreferences: openPreferences,
             openAbout: openAbout,
             onSelectMode: onSelectMode,
-            onToggleMap: onToggleMap)
+            onToggleMap: onToggleMap,
+            showsWindowDots: true)
             .onAppear(perform: refresh)
             .onReceive(tick) { _ in refresh() }
     }
