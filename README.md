@@ -9,7 +9,7 @@
 Two turntables, your own mixer, real records *through* the software.<br>
 Built for hip hop, reggae, dub, drum'n'bass and dubstep — and for never failing on stage.
 
-[![Release](https://img.shields.io/github/v/release/kLOsk/dub?include_prereleases&label=release&color=D9A33A)](https://github.com/kLOsk/dub/releases/latest)
+[![Release](https://img.shields.io/github/v/release/kLOsk/dub?include_prereleases&label=release&color=D9A33A)](https://github.com/kLOsk/dub/releases)
 [![Downloads](https://img.shields.io/github/downloads/kLOsk/dub/total?color=D9A33A)](https://github.com/kLOsk/dub/releases)
 [![CI](https://github.com/kLOsk/dub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kLOsk/dub/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -138,9 +138,10 @@ Finish, and you have tagged, analysed **FLAC** files in your library.
 
 ### Download
 
-Grab **`Dub-…-macOS-universal.zip`** from the
-[latest release](https://github.com/kLOsk/dub/releases/latest). One app for
-Apple Silicon and Intel Macs, **macOS 13 or later**.
+**[⬇ Download Dub for macOS](https://github.com/kLOsk/dub/releases/latest/download/Dub-macOS-universal.zip)**
+(the newest release, a zip). One app for Apple Silicon and Intel Macs,
+**macOS 13 or later**. Release notes and older versions are on the
+[releases page](https://github.com/kLOsk/dub/releases).
 
 1. Unzip it and drag **Dub** into **Applications**.
 2. Open it. The alpha is not notarized by Apple yet, so macOS stops it the

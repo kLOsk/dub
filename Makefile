@@ -199,6 +199,11 @@ app-release:
 # its SHA-256. Named after the workspace version; the tag is `v<version>`.
 DUB_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST_ZIP     = dist/Dub-$(DUB_VERSION)-macOS-universal.zip
+# The same zip under a name with no version, uploaded beside it on every
+# release, so `releases/latest/download/Dub-macOS-universal.zip` (the
+# README's download button) always gets the newest Dub. GitHub resolves
+# `latest` only for a release not marked pre-release.
+DIST_LATEST  = dist/Dub-macOS-universal.zip
 
 dist:
 	$(MAKE) app APP_CONFIG=Release
@@ -206,7 +211,7 @@ dist:
 	    | grep -q 'x86_64 arm64\|arm64 x86_64' \
 	    || { echo "dist: Dub.app is not universal"; exit 1; }
 	@mkdir -p dist
-	@rm -f "$(DIST_ZIP)" "$(DIST_ZIP).sha256"
+	@rm -f "$(DIST_ZIP)" "$(DIST_ZIP).sha256" "$(DIST_LATEST)"
 	@# Xcode rebuilds into the bundle it made on the first Release build, so
 	@# its folders keep that day's date and Finder shows it on the download.
 	@# Folder dates are not part of the code signature.
@@ -214,8 +219,9 @@ dist:
 	ditto -c -k --sequesterRsrc --keepParent \
 	    "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" "$(DIST_ZIP)"
 	cd dist && shasum -a 256 "$(notdir $(DIST_ZIP))" > "$(notdir $(DIST_ZIP)).sha256"
+	cp "$(DIST_ZIP)" "$(DIST_LATEST)"
 	@echo ""
-	@echo "Release artifact: $(DIST_ZIP)"
+	@echo "Release artifact: $(DIST_ZIP) (+ $(DIST_LATEST) for the README button)"
 	@cat "$(DIST_ZIP).sha256"
 
 # SwiftUI snapshot suite (C-31). Renders the app's internal views to
