@@ -82,6 +82,47 @@ gate is local-only because GitHub CI has no macOS app job.
 
 **Since alpha.5, on `main`:**
 
+- **Window dots in full screen (2026-11-18, Daniel).** With the menu bar
+  kept away, macOS's window buttons go too, so `WindowDots` puts three at
+  the left of the status strip, Serato-style, in full screen only
+  (`FullScreenState`, set by the window delegate): left → the quit page,
+  middle (minimise) disabled, right → window mode. Dub greys at rest,
+  macOS red / green with glyphs on hover; the disabled one stays grey.
+
+- **⌘Q asks first (2026-11-18, Daniel).** `QuitGuard`: ⌘Q, the Dock's Quit
+  and the window's close button cover the surface with a full-window
+  "Quit Dub?" page (after Serato's); only a click on Quit quits (no key,
+  Daniel: a stray ⏎ must not end a set), Esc goes back to the decks, and every other key is swallowed so nothing fires behind it.
+  Logout / restart / shutdown (a quit event with `kAEQuitReason`) and the
+  XCTest host are never held up.
+
+- **Full screen keeps the menu bar away (2026-11-18, Daniel).** Like
+  Serato's: `window(_:willUseFullScreenPresentationOptions:)` returns
+  `.hideMenuBar` + `.hideDock` instead of the auto-hide pair, so the
+  pointer at the screen edge reveals nothing. Preferences ▸ Decks ▸
+  Screen, on by default (`dub.fullScreenHidesMenuBar`); toggling it while
+  full screen applies at once via `NSApp.presentationOptions`.
+
+- **Serato 4 / 5's library (2026-11-18, Daniel).** New `serato_sqlite.rs`
+  reads a copy of `~/Library/Application Support/Serato/Library/master.sqlite`
+  (never Serato's own file): tracks of the `Serato Library` space through the
+  Serato 3 per-track path (so grids, cues and loops still come from GEOB),
+  and the crate tree in Serato's order, smart crates skipped. `import_serato`
+  takes the file or a folder holding it; discovery picks whichever of
+  `database V2` / `master.sqlite` Serato wrote last. No FFI or schema change.
+
+- **Apple Music, choosable and reloadable (2026-11-18, Daniel).** Preferences ▸
+  Library ▸ Apple Music has **Choose…** / **Default** (`dub.itunesLibraryPath`;
+  nil = the default discovery), and the sidebar's Import ▸ iTunes
+  Library.xml… picks the followed library too while the source is on.
+  Read at launch and on the Apple Music node's right-click **Reload Apple
+  Music Library** only; a background file watch was built and taken out
+  again (Daniel: less pressure on the app). The import now retires
+  `itunes` metadata rows for tracks the XML no longer lists
+  (`imported_at = 0`; the per-source list and count skip them), so the
+  node shows the current library, not every library ever read. A track
+  on an offline drive is never retired; no schema bump, no FFI change.
+
 - **The Matching smart crate (2026-11-17, Daniel).** Lists what mixes
   with the playing track (master deck, else any playing deck; kept when
   the decks stop): Camelot distance ≤ N steps (relative major/minor = 1)
@@ -262,13 +303,12 @@ hardware.
   jumping back one revolution (~1.8 s at 33⅓) each turn while the platter
   runs at speed — which a lift never does. Needs a capture of the SL 3
   running into the end zone first.
-- **Serato 4/5's library is not read.** Newer Serato keeps it in SQLite
-  under `~/Library/Application Support/Serato/Library`, not in
-  `_Serato_/database V2`, and Lexicon's Serato 4/5 sync writes there. The
-  Serato importer reads only the old files, so that library is invisible
-  (found while documenting M12-lexicon, 2026-11-16). Workaround: the
-  rekordbox XML route. A reader is its own job — no public spec found yet;
-  start by confirming which Serato version wrote `master.sqlite` here.
+- **Serato 4/5 library: unverified edges.** Read since 2026-11-18
+  (`serato_sqlite.rs`, see the entry above and `LIBRARY-FORMATS.md`), checked
+  against Serato DJ Pro 4.0.7 on the dev Mac (3 tracks, grids + keys from
+  GEOB, 1 crate). Still to see: a Serato 5 library, a library on an
+  external drive (`location.path` non-empty), and Lexicon's Serato 5 grid
+  tag. A Serato 4/5 smart crate is skipped, not evaluated.
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.

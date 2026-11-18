@@ -1812,6 +1812,8 @@ impl Library {
     /// this source" node. The rows are the **unified** [`TrackRow`] — display
     /// fields merged across every source by the §8.1 priority chain — just
     /// filtered to those a given source contributed to. Newest-first, paged.
+    /// A row the source has since dropped (`imported_at = 0`, see
+    /// [`Self::retire_metadata_source`]) no longer counts as membership.
     pub fn list_tracks_by_source(
         &self,
         source: &str,
@@ -1822,7 +1824,8 @@ impl Library {
         let sql = format!(
             "{select} \
              WHERE EXISTS (SELECT 1 FROM track_metadata_source ms \
-                           WHERE ms.track_id = t.id AND ms.source = ?1) \
+                           WHERE ms.track_id = t.id AND ms.source = ?1 \
+                             AND ms.imported_at > 0) \
              ORDER BY t.created_at ASC LIMIT ?2 OFFSET ?3"
         );
         let mut stmt = self
@@ -1845,12 +1848,45 @@ impl Library {
             .conn
             .query_row(
                 "SELECT COUNT(DISTINCT track_id) FROM track_metadata_source \
-                 WHERE source = ?1",
+                 WHERE source = ?1 AND imported_at > 0",
                 params![source],
                 |r| r.get(0),
             )
             .map_err(|e| LibraryError::sqlite("count_tracks_by_source", e))?;
         Ok(n.max(0) as u64)
+    }
+
+    /// Track ids that `source` currently vouches for (rows not retired).
+    pub fn source_track_ids(&self, source: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT track_id FROM track_metadata_source \
+                 WHERE source = ?1 AND imported_at > 0",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_source_track_ids", e))?;
+        let rows = stmt
+            .query_map(params![source], |r| r.get::<_, String>(0))
+            .map_err(|e| LibraryError::sqlite("query_source_track_ids", e))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LibraryError::sqlite("collect_source_track_ids", e))
+    }
+
+    /// Mark a track as no longer in `source` (the DJ removed it from that
+    /// app, or switched to another of its libraries) without deleting the
+    /// row: its title, artist and BPM still feed the display chain, so a
+    /// track that came only from that app keeps its name in All Tracks.
+    /// `imported_at = 0` is the marker; nothing else reads that column,
+    /// and the next import that sees the track again stamps it afresh.
+    pub fn retire_metadata_source(&self, track_uuid: &str, source: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE track_metadata_source SET imported_at = 0 \
+                 WHERE track_id = ?1 AND source = ?2",
+                params![track_uuid, source],
+            )
+            .map_err(|e| LibraryError::sqlite("retire_metadata_source", e))?;
+        Ok(())
     }
 
     /// FTS5-backed substring search per PRD §8.5.4. Whitespace-

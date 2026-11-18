@@ -33,10 +33,11 @@ use crate::key_notation;
 use crate::serato::{autotags, beatgrid, database, geob, markers2};
 use crate::volumes::{discover_for_path, DiscoveredVolume};
 
-const SERATO: &str = "serato";
+pub(crate) const SERATO: &str = "serato";
 
 /// Import a `_Serato_` library folder (`~/Music/_Serato_` or a drive's
-/// `/Volumes/<drive>/_Serato_`).
+/// `/Volumes/<drive>/_Serato_`), or a Serato 4 / 5 `master.sqlite` (see
+/// [`crate::serato_sqlite`]).
 ///
 /// Idempotent: a re-import refreshes metadata / grids / cues / loops in place
 /// and rebuilds the crate mirror without duplicating identities.
@@ -46,6 +47,15 @@ const SERATO: &str = "serato";
 /// be resolved, or `database V2` can't be read). Per-track failures (a missing
 /// file) accumulate in [`ImportSummary::errors`].
 pub fn import_serato(library: &mut Library, serato_dir: &Path) -> Result<ImportSummary> {
+    // Serato 4 / 5: the `master.sqlite` itself, or the folder that holds it
+    // when there is no Serato 3 database beside it.
+    if serato_dir.is_file() {
+        return crate::serato_sqlite::import_serato_sqlite(library, serato_dir);
+    }
+    let master = serato_dir.join("master.sqlite");
+    if master.is_file() && !serato_dir.join("database V2").is_file() {
+        return crate::serato_sqlite::import_serato_sqlite(library, &master);
+    }
     let db_path = serato_dir.join("database V2");
     let data = std::fs::read(&db_path).map_err(|e| LibraryError::io(&db_path, e))?;
 
@@ -90,12 +100,12 @@ pub fn import_serato(library: &mut Library, serato_dir: &Path) -> Result<ImportS
     Ok(summary)
 }
 
-struct EntryOutcome {
-    track_id: String,
-    added: bool,
+pub(crate) struct EntryOutcome {
+    pub(crate) track_id: String,
+    pub(crate) added: bool,
 }
 
-fn import_entry(
+pub(crate) fn import_entry(
     library: &Library,
     volume: &DiscoveredVolume,
     relative_path: &str,

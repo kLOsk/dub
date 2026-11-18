@@ -325,7 +325,7 @@ first. Per target, as of Lexicon 1.10 (from its manual, linked below):
 | Rekordbox 6 & 7 Direct | rekordbox's own database | No — Dub does not read `master.db` (PRD §8.1, parked). |
 | **Traktor** | `collection.nml` in Traktor's root folder (the newest version's, or `traktorNmlPath` in Lexicon's advanced settings) | **Yes.** Traktor importer (M12b), same auto-discovery. |
 | Serato 3 | `_Serato_` crates + database on the Music folder and each drive | **Yes.** Serato importer (M11e). |
-| Serato 4 / 5 | the new library in `~/Library/Application Support/Serato/Library` | **No — a gap.** See below. |
+| Serato 4 / 5 | the new library in `~/Library/Application Support/Serato/Library` | **Tracks + crates (2026-11-18)**, `serato_sqlite`; grids/cues from GEOB as for Serato 3. Checked on Serato 4.0.7 only. See below. |
 
 **The recommended path: Lexicon → rekordbox XML → Dub.** In Lexicon, Sync to
 → *Rekordbox 5 & 6 XML* → *Save Rekordbox XML*. Save it as
@@ -375,17 +375,29 @@ so re-import after a sync. Lexicon's backups go in a `Lexicon` folder
 each `Traktor*` folder's top level, so they are never mistaken for the
 collection.
 
-**The gap: Serato 4 / 5.** Serato's newer versions keep the library in SQLite
-under `~/Library/Application Support/Serato/Library` (`master.sqlite` /
-`root.sqlite` on the dev machine), not in `_Serato_/database V2` — and
-Lexicon's Serato 4/5 sync writes there. Dub's Serato importer reads only
-`database V2` + `.crate` files + the GEOB tags in the audio, so a Lexicon →
-Serato 4/5 library is invisible to it. Lexicon also writes Serato 5 grids
-"to a new tag" its manual does not name, which the GEOB reader may not
-know. Until there is a Serato SQLite reader, a Lexicon user on Serato 4/5
-takes the rekordbox XML route. Reading that database is its own job —
-undocumented, with no third-party spec yet found — and is listed in
-`CURRENT.md`.
+**Serato 4 / 5 (read since 2026-11-18).** Serato's newer versions keep the
+library in SQLite under `~/Library/Application Support/Serato/Library`
+(`master.sqlite` + `root.sqlite`), not in `_Serato_/database V2`, and Serato
+DJ Pro 4.0.7 stops writing the old files. Lexicon's Serato 4/5 sync writes
+there too. `serato_sqlite.rs` reads a copy of `master.sqlite` (+ `-wal`):
+
+- `asset` — `portable_id` (path relative to `location.path`; '' = `/`),
+  name, artist, album, genre, comments, composer, grouping, label, key
+  (musical), bpm.
+- `space` — Serato's sources. Only `Serato Library` is the DJ's; `iTunes`,
+  `Tidal`, … are Serato's views of elsewhere and are not read.
+- `container` (`space_id`, `parent_id`, `list_order`) — the crate tree; a row
+  in `smart_crate_rules` marks a smart crate (skipped, with its subtree).
+- `container_asset` → `location_container` → `container` — membership.
+- No cue / grid tables: they stay in the files' GEOB tags, so each track goes
+  through the Serato 3 per-track path.
+
+Discovery reads whichever of `database V2` / `master.sqlite` (+`-wal`) was
+written last. Unverified: Serato 5, a library on an external drive (a
+non-empty `location.path`; a bare name is read as `/Volumes/<name>`), and
+Lexicon's Serato 5 grids, which its manual says go "to a new tag" the GEOB
+reader may not know. Until those are seen, a Lexicon user on Serato 5 is
+better off on rekordbox XML.
 
 **Going the other way.** Dub's export (M11f) writes rekordbox XML, the same
 format, so a DJ can bring Dub crates, cues and grid corrections back into

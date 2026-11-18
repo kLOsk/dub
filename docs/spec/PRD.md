@@ -1018,7 +1018,7 @@ Dub reads (does not own) external libraries. **One-shot import + manual re-scan*
 | Traktor | `collection.nml` (XML) | Tracks, BPM, beatgrids, cues, key, comments, gain |
 | rekordbox | XML export (v1.0); `master.db` (SQLite, encrypted, v1.1) | Tracks, BPM, beatgrids, cues, key |
 | iTunes / Apple Music | `Library.xml` | Tracks, BPM (often missing), playlists, ratings |
-| Lexicon DJ | Indirect: reads what it syncs into rekordbox XML (recommended), Traktor or Serato 3. Not Serato 4/5's SQLite library. `LIBRARY-FORMATS.md` | As above |
+| Lexicon DJ | Indirect: reads what it syncs into rekordbox XML (recommended), Traktor, Serato 3, or Serato 4/5's SQLite library (tracks + crates; Serato 5 unverified). `LIBRARY-FORMATS.md` | As above |
 
 **rekordbox `master.db` decryption:** the DB6 key is community-known. We will use a clean-room implementation when we tackle it. **v1.0 ships XML-export-only**; DB6 lands in v1.1 if the format is still stable then. Pioneer can change the format at any time; the XML path is the durable contract.
 

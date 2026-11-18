@@ -366,6 +366,12 @@ CREATE TABLE IF NOT EXISTS track_metadata_source (
     -- palette token. Displayed colour is `COALESCE(tracks.color, …)` —
     -- the DJ's own colour wins. NULL for sources without one.
     color           TEXT,
+    -- When the source last vouched for the row. 0 = the source has since
+    -- dropped the track (the Apple Music library it left, or one the DJ
+    -- switched away from): the row still feeds the display chain, but the
+    -- track no longer lists under that source's sidebar node. The next
+    -- import that sees the track stamps it afresh. Set by the iTunes
+    -- importer only, and only for a track whose file is on disk.
     imported_at     INTEGER NOT NULL,
     UNIQUE (track_id, source)
 );

@@ -62,6 +62,12 @@ final class DubAppDelegate: NSObject, NSApplicationDelegate {
         controller.window?.toggleFullScreen(nil)
     }
 
+    /// ⌘Q, the menu and the Dock all land here: the first asks on the quit
+    /// page (`QuitGuard`) instead of stopping the set.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated { QuitGuard.shared.shouldTerminate() }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }

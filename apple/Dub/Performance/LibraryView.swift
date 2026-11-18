@@ -1677,6 +1677,18 @@ struct LibraryView: View {
             NSApp.keyWindow?.makeFirstResponder(nil)
             selectedSource = source
         }
+        // Dub reads Apple Music's library at launch and on this, never on
+        // its own while you play (Daniel, 2026-11-18).
+        .contextMenu {
+            if group.kind == .itunes {
+                Button {
+                    model.reloadItunesLibrary()
+                } label: {
+                    Label("Reload Apple Music Library", systemImage: "arrow.clockwise")
+                }
+                .disabled(libraryModel.libraryImportInProgress)
+            }
+        }
     }
 
     private func importedCrateRow(_ node: SidebarFolding.Node, kind: ImportedSourceKind) -> some View {
@@ -4115,9 +4127,11 @@ struct LibraryView: View {
         panel.prompt = "Import"
         switch kind {
         case .serato:
-            panel.canChooseFiles = false
+            // Serato 3: the `_Serato_` folder. Serato 4: its `master.sqlite`
+            // (Library/Application Support/Serato/Library).
+            panel.canChooseFiles = true
             panel.canChooseDirectories = true
-            panel.message = "Choose a “_Serato_” folder to import."
+            panel.message = "Choose a “_Serato_” folder, or Serato 4’s “master.sqlite”, to import."
         case .traktor:
             panel.canChooseFiles = true
             panel.canChooseDirectories = false
@@ -4132,6 +4146,13 @@ struct LibraryView: View {
             panel.message = "Choose an iTunes “Library.xml” to import."
         }
         if panel.runModal() == .OK, let url = panel.url {
+            // With the Apple Music source on, picking an XML picks the
+            // library Dub watches; importing it once beside the watched one
+            // would have the two take the Apple Music node from each other.
+            if kind == .itunes, model.itunesImportEnabled {
+                model.chooseItunesLibrary(url.path)
+                return
+            }
             Task { @MainActor in
                 await model.importExternalSource(kind, path: url.path)
             }

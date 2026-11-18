@@ -1298,6 +1298,14 @@ final class WaveformAppModel: ObservableObject {
     private static let kRekordboxImport = "dub.rekordboxImportEnabled"
     private static let kItunesImport = "dub.itunesImportEnabled"
 
+    /// The Apple Music library XML the DJ chose in Preferences ▸ Library;
+    /// nil follows the default location. Music's libraries are separate
+    /// files, and a DJ who keeps one for gigs points Dub at that one.
+    @Published var itunesLibraryPath: String? {
+        didSet { UserDefaults.standard.set(itunesLibraryPath, forKey: Self.kItunesLibraryPath) }
+    }
+    private static let kItunesLibraryPath = "dub.itunesLibraryPath"
+
     // MARK: Live engine state
 
     @Published private(set) var isRunning: Bool = false
@@ -1728,6 +1736,7 @@ final class WaveformAppModel: ObservableObject {
         self.traktorImportEnabled = UserDefaults.standard.bool(forKey: Self.kTraktorImport)
         self.rekordboxImportEnabled = UserDefaults.standard.bool(forKey: Self.kRekordboxImport)
         self.itunesImportEnabled = UserDefaults.standard.bool(forKey: Self.kItunesImport)
+        self.itunesLibraryPath = UserDefaults.standard.string(forKey: Self.kItunesLibraryPath)
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
         // the only place the cold-boot value enters the model. We
@@ -3758,7 +3767,41 @@ final class WaveformAppModel: ObservableObject {
     /// Discover the default on-disk locations of the importable external
     /// libraries. Cheap; safe to call before the library is open.
     func discoveredSourceLocations() -> [LibrarySourceLocation] {
-        library.discoverDefaultSources()
+        var locations = library.discoverDefaultSources()
+        if let chosen = itunesLibraryPath {
+            let tag = ImportedSourceKind.itunes.sourceTag
+            locations.removeAll { $0.kind == tag }
+            locations.append(LibrarySourceLocation(
+                kind: tag, path: chosen,
+                exists: FileManager.default.fileExists(atPath: chosen)))
+        }
+        return locations
+    }
+
+    /// The XML the Apple Music source reads: the DJ's choice, else the
+    /// first default location that exists.
+    var itunesLibraryLocation: LibrarySourceLocation? {
+        discoveredSourceLocations().first { $0.kind == ImportedSourceKind.itunes.sourceTag }
+    }
+
+    /// Point the Apple Music source at another library XML (nil: back to
+    /// the default) and read it now, which swaps the Apple Music node over
+    /// to that library's tracks and playlists.
+    func chooseItunesLibrary(_ path: String?) {
+        itunesLibraryPath = path
+        guard itunesImportEnabled else { return }
+        reloadItunesLibrary()
+    }
+
+    /// Read the followed Apple Music library again (the sidebar node's
+    /// right-click). Besides launch, the only time Dub reads it: no
+    /// background watch competes with a set for the disk or the CPU.
+    func reloadItunesLibrary() {
+        guard let loc = itunesLibraryLocation, loc.exists else {
+            surfaceError("Apple Music library not found. Choose it in Preferences ▸ Library.")
+            return
+        }
+        Task { @MainActor in await importExternalSource(.itunes, path: loc.path) }
     }
 
     /// Import one external source from `path` (the `_Serato_` folder, a
@@ -7268,6 +7311,7 @@ struct MainView: View {
     @State private var showingAbout: Bool = false
     @State private var showingOnboarding: Bool = false
     @State private var showLaunchSplash: Bool = true
+    @ObservedObject private var quitGuard = QuitGuard.shared
 
     /// U-23 — once the user finishes or skips the first-run guide we
     /// never show it unbidden again. Persisted so it survives relaunch;
@@ -7295,7 +7339,14 @@ struct MainView: View {
                     .transition(.opacity)
                     .zIndex(2)
             }
+
+            if quitGuard.asking {
+                QuitOverlay(guardian: quitGuard)
+                    .transition(.opacity)
+                    .zIndex(3)
+            }
         }
+        .animation(.easeOut(duration: 0.12), value: quitGuard.asking)
             .sheet(isPresented: $showingPreferences) {
                 PreferencesSheet(model: model)
             }
@@ -7635,6 +7686,8 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             uninstall()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self else { return event }
+                // The quit page owns the keyboard (`QuitGuard`).
+                if MainActor.assumeIsolated({ QuitGuard.shared.asking }) { return event }
                 let isCmd = event.modifierFlags.contains(.command)
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if isCmd, event.charactersIgnoringModifiers == "," {

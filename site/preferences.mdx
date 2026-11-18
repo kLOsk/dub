@@ -28,6 +28,7 @@ How a deck behaves when a track lands on it.
 | Setting | What it does |
 | --- | --- |
 | **Browse mode** | In Performance, clicking the library slides it up over the deck controls so you see more of the crate. Loading a track, or clicking outside the library, slides it back down. |
+| **Keep the menu bar away in full screen** | On to start. The menu bar and Dock stay hidden even when the pointer reaches the edge of the screen, as in Serato. The keys still work: **⌘,** for Preferences, **⌃⌘F** to leave full screen, **⌘Q** to quit (Dub asks first: click **Quit** to quit, **esc** goes back to the decks). Off, macOS shows them at the edge. In full screen, three dots at the left of the top bar stand in for the window buttons: the left one quits (Dub asks first), the right one goes to window mode. |
 | **Allow loading onto a playing deck** | In Performance. Off, a drop or **Space** load onto a running deck is refused and the deck flashes red; lift the needle or pause first. Prep always allows the load. |
 | **Auto-match loudness on load** | A track with a measured loudness loads at a gain that matches the others, so you don't ride the trim. Off, tracks load untouched and you set level at the mixer. |
 | **Snap cue points to the beat grid** | A hot cue you set lands on the nearest beat line. Off, it lands exactly at the playhead. |
@@ -49,7 +50,10 @@ The DJ apps whose libraries Dub reads into your one collection: **Serato**,
 **Traktor**, **rekordbox** and **Apple Music**. Turn one on and Dub scans its
 default folder now and on every launch, read-only, and shows that app's crates
 and playlists in the sidebar. Each row says whether the library was found and
-where. **Rescan** reads it again. See [Bring your library](/library/import).
+where. **Rescan** reads it again. On the Apple Music row, **Choose…** picks
+which of Music's libraries Dub reads, and **Default** goes back to Music's
+usual one. See
+[Bring your library](/library/import#apple-music).
 
 **Matching** sets how wide the [Matching](/library/organize#matching) smart
 crate looks: **Tempo**, how many BPM either side of the playing track (3 to

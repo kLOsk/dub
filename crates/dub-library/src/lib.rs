@@ -57,6 +57,7 @@ mod schema;
 /// adapter can consume the pure `parse_*` entry points.
 pub mod serato;
 mod serato_import;
+mod serato_sqlite;
 /// Default-location discovery for external libraries (Serato / Traktor /
 /// iTunes), for the Preferences "Libraries" toggles + auto-scan.
 pub mod sources;

@@ -76,12 +76,29 @@ pub fn discover_source(kind: SourceKind) -> Option<DiscoveredSource> {
 
 fn discover_serato(home: &std::path::Path) -> DiscoveredSource {
     let dir = home.join("Music").join("_Serato_");
-    // `database V2` is the file the importer needs; treat its presence as
-    // "Serato is set up here".
-    let exists = dir.join("database V2").is_file();
+    let v2 = dir.join("database V2");
+    let master = crate::serato_sqlite::master_path(home);
+    // Serato 3 writes `_Serato_/database V2`; Serato 4 / 5 write
+    // `master.sqlite` and stop touching the old file. A DJ can have both,
+    // and can go back a version, so the one Serato wrote last is the
+    // library in use. Serato 4 writes through its `-wal` first.
+    let written = |p: &std::path::Path| -> Option<std::time::SystemTime> {
+        let mut wal = p.as_os_str().to_owned();
+        wal.push("-wal");
+        [p.to_path_buf(), std::path::PathBuf::from(wal)]
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok()?.modified().ok())
+            .max()
+    };
+    let path = match (master.is_file(), v2.is_file()) {
+        (true, true) if written(&master) > written(&v2) => master,
+        (true, false) => master,
+        _ => dir,
+    };
+    let exists = path.is_file() || path.join("database V2").is_file();
     DiscoveredSource {
         kind: SourceKind::Serato,
-        path: dir,
+        path,
         exists,
     }
 }

@@ -36,6 +36,7 @@
 
 import SwiftUI
 import DubCore
+import UniformTypeIdentifiers
 
 /// The tabs, in sidebar order: what is played through first, what the
 /// DJ plays with last.
@@ -262,11 +263,19 @@ struct PreferencesSheet: View {
                     "In Performance. Click anywhere in the library and it slides up over the deck controls, to just under the track overviews, so you see more of the crate. Loading a track onto a deck, or clicking outside the library, slides it back down.",
                     isOn: $browseMode, last: true)
             }
+            group("Screen") {
+                toggleRow(
+                    "Keep the menu bar away in full screen",
+                    "The menu bar and Dock stay hidden even when the pointer touches the edge of the screen, so nothing slides over the decks mid-set. The keys still work: ⌘, for Preferences, ⌃⌘F to leave full screen, ⌘Q to quit (Dub asks first). Off, macOS shows them when you reach the edge.",
+                    isOn: $hideMenuBar, last: true)
+                    .onChange(of: hideMenuBar) { _ in MainWindowController.applyMenuBarPreference() }
+            }
             loadingGroup
         }
     }
 
     @AppStorage(PerformanceView.browseModeKey) private var browseMode = false
+    @AppStorage(MainWindowController.hideMenuBarKey) private var hideMenuBar = true
 
     private var loadingGroup: some View {
         group("Loading") {
@@ -353,10 +362,14 @@ struct PreferencesSheet: View {
             group("Import from") {
                 note("Dub reads each library read-only, merges its tracks into your collection, and shows that app's crates and playlists in the sidebar. Enabling a source scans its default folder now and on every launch.")
                     .padding(.bottom, DubSpacing.xs)
-                librarySourceRow("Serato", kind: .serato, isOn: $model.seratoImportEnabled)
+                librarySourceRow(
+                    "Serato", kind: .serato, isOn: $model.seratoImportEnabled,
+                    detail: "Serato DJ 4's new library, or the _Serato_ folder of Serato 3 and earlier: Dub reads whichever Serato wrote last. Smart crates are left out.")
                 librarySourceRow("Traktor", kind: .traktor, isOn: $model.traktorImportEnabled)
                 librarySourceRow("rekordbox", kind: .rekordbox, isOn: $model.rekordboxImportEnabled)
                 librarySourceRow("Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled, last: true)
+                note("Apple Music keeps each of its libraries apart (hold ⌥ as you open Music to switch). Dub reads the one you choose here when it starts; right-click Apple Music in the sidebar to read it again after you change it. In Music, turn on Settings ▸ Files ▸ Share Library XML with other applications; Music then keeps that library's XML current, and Choose… takes it, or a library you exported with File ▸ Library ▸ Export Library….")
+                    .padding(.top, DubSpacing.xs)
             }
             group("Matching") {
                 note("The Matching smart crate lists what mixes with the track playing now, nearest first, and follows it as the music changes.")
@@ -401,6 +414,7 @@ struct PreferencesSheet: View {
         _ label: String,
         kind: ImportedSourceKind,
         isOn: Binding<Bool>,
+        detail: String? = nil,
         last: Bool = false
     ) -> some View {
         let loc = sourceLocations.first { $0.kind == kind.sourceTag }
@@ -416,8 +430,31 @@ struct PreferencesSheet: View {
                             loc?.exists == true ? DubColor.textTertiary : DubColor.textPlaceholder)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if let detail {
+                        Text(detail)
+                            .font(DubFont.micro)
+                            .foregroundStyle(DubColor.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: DubSpacing.md)
+                if kind == .itunes {
+                    if model.itunesLibraryPath != nil {
+                        Button("Default") {
+                            model.chooseItunesLibrary(nil)
+                            sourceLocations = model.discoveredSourceLocations()
+                        }
+                        .buttonStyle(.plain)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .help("Follow the library at Apple Music's default location again.")
+                    }
+                    Button("Choose…") { chooseItunesLibrary() }
+                        .buttonStyle(.plain)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .help("Pick which Apple Music library Dub follows.")
+                }
                 if isOn.wrappedValue {
                     Button("Rescan") { model.scanEnabledSources() }
                         .buttonStyle(.plain)
@@ -471,6 +508,25 @@ struct PreferencesSheet: View {
 
     static func keyStepsLabel(_ steps: Int) -> String {
         steps == 0 ? "Same key" : "± \(steps) step\(steps == 1 ? "" : "s")"
+    }
+
+    /// Pick the Apple Music library XML Dub follows. Choosing turns the
+    /// source on: picking a library is asking for it.
+    private func chooseItunesLibrary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.xml]
+        panel.prompt = "Follow"
+        panel.message = "Choose the Apple Music library XML Dub should follow."
+        if let current = model.itunesLibraryLocation?.path {
+            panel.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.chooseItunesLibrary(url.path)
+        if !model.itunesImportEnabled { model.itunesImportEnabled = true }
+        sourceLocations = model.discoveredSourceLocations()
     }
 
     private func sourceStatusText(_ loc: LibrarySourceLocation?) -> String {

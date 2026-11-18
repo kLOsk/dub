@@ -105,9 +105,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// centered. Performance runs full-screen; prep mode runs at
     /// the reference rectangle. See plan: full-screen window
     /// mode.
+    /// Closing the only window quits Dub, so the close button asks first,
+    /// on the same page as ⌘Q.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        MainActor.assumeIsolated { QuitGuard.shared.shouldClose() }
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        MainActor.assumeIsolated { FullScreenState.shared.isFullScreen = true }
+    }
+
     func windowDidExitFullScreen(_ notification: Notification) {
+        MainActor.assumeIsolated { FullScreenState.shared.isFullScreen = false }
         guard let window else { return }
         window.setContentSize(MainWindowController.defaultContentSize)
         window.center()
+    }
+
+    // MARK: - Full screen without the menu bar
+
+    /// Preferences ▸ Decks ▸ Screen. On (the default), full screen keeps
+    /// the menu bar and Dock away entirely, as Serato does: in macOS's own
+    /// full screen they slide in whenever the pointer touches the top or
+    /// bottom edge, which at a gig is a menu over the waveforms. The keys
+    /// still work: ⌘, Preferences, ⌃⌘F leaves full screen, ⌘Q quits.
+    static let hideMenuBarKey = "dub.fullScreenHidesMenuBar"
+
+    static var hidesMenuBar: Bool {
+        UserDefaults.standard.object(forKey: hideMenuBarKey) as? Bool ?? true
+    }
+
+    private static func fullScreenOptions() -> NSApplication.PresentationOptions {
+        hidesMenuBar
+            ? [.fullScreen, .hideDock, .hideMenuBar]
+            : [.fullScreen, .autoHideDock, .autoHideMenuBar, .autoHideToolbar]
+    }
+
+    func window(
+        _ window: NSWindow,
+        willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions
+    ) -> NSApplication.PresentationOptions {
+        Self.fullScreenOptions()
+    }
+
+    /// Apply a change to the preference now, if Dub is already full screen
+    /// (otherwise it applies the next time it goes full screen).
+    static func applyMenuBarPreference() {
+        guard NSApp.windows.contains(where: { $0.styleMask.contains(.fullScreen) }) else { return }
+        NSApp.presentationOptions = fullScreenOptions()
     }
 }

@@ -11,16 +11,19 @@ keep using Serato, Traktor or rekordbox alongside it.
 
 | App | What Dub reads | What comes across |
 | --- | --- | --- |
-| **Serato** (up to Serato 3's library format) | the `_Serato_` folder in your Music folder and on each drive | Crates, beat grids, hot cues, loops |
+| **Serato** | Serato 4's library, or the `_Serato_` folder of Serato 3 and earlier | Crates, beat grids, hot cues, loops |
 | **Traktor** | `collection.nml` | Playlists, beat grids, cues, loops, key, rating |
 | **rekordbox** | a rekordbox XML export (`File → Export Collection in xml format`) | Playlists, beat grids, hot and memory cues, loops, key, rating, colour |
 | **Apple Music / iTunes** | the shared library XML | Playlists and track details (no grids or cues) |
 | **Lexicon** | whatever Lexicon syncs into the apps above | See [Lexicon](/library/lexicon) |
 
 <Note>
-Newer Serato versions keep their library in a new place that Dub can't read
-yet. If your Serato crates don't show up, export from your library manager
-to rekordbox XML instead, or see [Lexicon](/library/lexicon).
+Serato DJ 4 keeps its library in a new database instead of the `_Serato_`
+folder. Dub reads that too, and when both are on your Mac it reads the one
+Serato wrote last. Serato's smart crates don't come across. Dub has been
+checked against Serato 4 but not yet Serato 5. If your Serato 5 crates don't
+show up, export from your library manager to rekordbox XML instead, or see
+[Lexicon](/library/lexicon).
 </Note>
 
 ## Turn a source on
@@ -31,6 +34,27 @@ each library where that app keeps it and adds the app to the sidebar under
 
 If your library lives somewhere else, right-click **LIBRARY** or **All
 Tracks** in the sidebar and choose **Import**, then the source and its file.
+
+## Apple Music
+
+Apple Music can keep several libraries (hold **⌥** as you open Music to
+switch or make one), so you can keep one just for gigs. Dub follows one of
+them:
+
+1. In Music, open **Settings ▸ Files** and turn on **Share Library XML with
+   other applications**. Music then keeps an XML of the open library up to
+   date. (Or export one with **File ▸ Library ▸ Export Library…**.)
+2. In Dub, open **Preferences ▸ Library**, click **Choose…** on the Apple
+   Music row and pick that XML. **Default** goes back to the library in
+   Music's usual place.
+
+Dub reads that library each time it starts. Changed it in Music since?
+Right-click **Apple Music** in the sidebar and choose **Reload Apple Music
+Library**. Dub never rereads it on its own, so nothing competes with your
+set for the disk. Choose another library and the node changes over to it. A track that leaves
+the library leaves the node, but it stays in your collection if you played
+it. A track whose file is on a drive that isn't plugged in stays put until
+the drive is back.
 
 ## Browsing versus your collection
 

@@ -145,6 +145,7 @@ struct StatusStrip: View {
 
     var body: some View {
         HStack(spacing: DubSpacing.lg) {
+            WindowDots()
             wordmark
             Divider()
                 .frame(height: 12)

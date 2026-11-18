@@ -71,7 +71,29 @@ pub fn import_itunes(library: &mut Library, xml_path: &Path) -> Result<ImportSum
     }
 
     import_playlists(library, &lib.playlists, &id_map)?;
+    retire_departed(library, &id_map)?;
     Ok(summary)
+}
+
+/// The Apple Music node mirrors the library the XML describes *now*: a
+/// track removed there, or one from a different library the DJ switched
+/// away from, stops counting as Apple Music's. Only a track whose file is
+/// on disk right now is retired. One on an unplugged drive was skipped
+/// above for that reason alone, so its absence says nothing.
+fn retire_departed(library: &Library, id_map: &HashMap<i64, String>) -> Result<()> {
+    let present: std::collections::HashSet<&str> = id_map.values().map(String::as_str).collect();
+    for track_id in library.source_track_ids(ITUNES)? {
+        if present.contains(track_id.as_str()) {
+            continue;
+        }
+        let reachable = library
+            .resolve_track_path(&track_id)?
+            .is_some_and(|p| p.is_file());
+        if reachable {
+            library.retire_metadata_source(&track_id, ITUNES)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve + persist one iTunes track, returning its canonical uuid and
@@ -230,6 +252,88 @@ fn ensure_crate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal Apple Music XML listing `files` as tracks 1…n.
+    fn library_xml(files: &[&Path]) -> String {
+        let tracks: String = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                format!(
+                    "<key>{id}</key><dict><key>Track ID</key><integer>{id}</integer>\
+                     <key>Name</key><string>{name}</string>\
+                     <key>Location</key><string>file://{loc}</string></dict>",
+                    id = i + 1,
+                    name = p.file_stem().unwrap().to_string_lossy(),
+                    loc = p.display()
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>\
+             <key>Tracks</key><dict>{tracks}</dict>\
+             <key>Playlists</key><array></array></dict></plist>"
+        )
+    }
+
+    fn import(lib: &mut Library, dir: &Path, files: &[&Path]) {
+        let xml = dir.join("Library.xml");
+        std::fs::write(&xml, library_xml(files)).unwrap();
+        import_itunes(lib, &xml).expect("itunes import");
+    }
+
+    /// Switching Apple Music libraries, or removing a track there, takes it
+    /// out of the Apple Music node but not out of Dub, and it keeps its
+    /// name. A track whose file is missing is left alone; it comes back
+    /// the moment a later XML lists it again.
+    #[test]
+    fn the_node_follows_the_current_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let [a, b, c, gone] = ["a.mp3", "b.mp3", "c.mp3", "gone.mp3"].map(|n| dir.join(n));
+        for f in [&a, &b, &c, &gone] {
+            std::fs::write(f, b"not really audio").unwrap();
+        }
+        let mut lib = Library::open_at(&dir.join("library.sqlite")).unwrap();
+
+        import(&mut lib, &dir, &[&a, &b, &gone]);
+        assert_eq!(lib.count_tracks_by_source(ITUNES).unwrap(), 3);
+
+        std::fs::remove_file(&gone).unwrap();
+        import(&mut lib, &dir, &[&b, &c]);
+        assert_eq!(
+            lib.count_tracks_by_source(ITUNES).unwrap(),
+            3,
+            "b, c, and the missing file, which is not ours to judge"
+        );
+        let titles: Vec<_> = lib
+            .list_tracks_by_source(ITUNES, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title.unwrap_or_default())
+            .collect();
+        assert!(!titles.contains(&"a".to_string()), "a left: {titles:?}");
+        let a_id = lib.track_id_for_absolute_path(&a).unwrap().unwrap();
+        let a_title: Option<String> = lib
+            .connection()
+            .query_row(
+                "SELECT title FROM track_metadata_source WHERE track_id = ?1 AND source = 'itunes'",
+                [&a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_title.as_deref(),
+            Some("a"),
+            "a stays in Dub and keeps its name"
+        );
+
+        import(&mut lib, &dir, &[&a]);
+        assert!(
+            lib.source_track_ids(ITUNES).unwrap().contains(&a_id),
+            "a is back"
+        );
+    }
 
     /// Opt-in end-to-end import into a throwaway temp library (never the
     /// developer's real DB). `DUB_ITUNES_XML=… cargo test … itunes_import_real
