@@ -21,7 +21,7 @@
 //! ±2 still rejects every octave error (½×, 2×, ⅔×, ¾×) for the
 //! tempi we test, which is the actual goal.
 
-use dub_bpm::{analyze_bpm, synthetic};
+use dub_bpm::{analyze_bpm, analyze_bpm_with_profile, synthetic, OctaveProfile};
 
 /// Tolerance for drum-pattern fixtures. ±2 BPM is tight enough to
 /// reject every octave/triplet error (½×, 2×, ⅔×, ¾×, etc.) in
@@ -102,33 +102,41 @@ fn hip_hop_90_bpm_locks_at_90_not_180() {
 // alignment (K-K, S-S) while every other harmonic of lag 32 lands
 // on the cross K-S correlation (weaker).
 //
-// That K-S-backbeat half-tempo problem is the same class as
-// dubstep at 140 → 70 BPM detection. The user explicitly
-// acknowledged this is an unavoidable property of beat-tracking
-// without genre / tempo priors (M9+ scope). Rolling dnb is a real
-// sub-genre (jump-up, neuro, some liquid) and is what we use here
-// to validate the M8.1 multi-band ODF doesn't introduce *new*
-// errors for bass-heavy content at fast tempi.
+// Whether that is "174" or "87" is not in the audio. The genre says:
+// drum & bass is read in 100–200. With no genre the same audio is read
+// in the DJ's own range, 78–156 by default, and comes out at 87 — the
+// same tempo, counted in half time.
 
 #[test]
 fn drum_n_bass_174_bpm_locks_at_174_not_87() {
     let sr = 48_000u32;
     let audio = synthetic::drum_pattern_drum_n_bass(174.0, TEST_DURATION_SECS, sr);
-    let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    let est = analyze_bpm_with_profile(&audio, sr, 1, OctaveProfile::DrumAndBass)
+        .expect("analysis should succeed");
     assert_within(174.0, est, TOLERANCE_BPM, "rolling dnb 174 BPM");
+
+    let untagged = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    assert_within(87.0, untagged, TOLERANCE_BPM, "the same, with no genre");
 }
 
 // ============================================================
 // Sparse / slow / low-end-heavy: reggae one-drop at 65 BPM
 // ============================================================
 //
-// M11c.3c skank double-time rejection resolves the 130 BPM false
-// octave when a credible 65 BPM one-drop sibling exists.
+// Reggae is read in 60–120, at the one-drop. The rule that used to
+// get it there — throw out a 118–160 reading whenever half of it scores
+// as well — ran on every song without a house tag, and cost every
+// untagged four-on-the-floor song its tempo. With no genre this reads
+// 130, the skank.
 
 #[test]
 fn reggae_one_drop_65_bpm_locks_at_one_drop_tempo() {
     let sr = 48_000u32;
     let audio = synthetic::drum_pattern_reggae_one_drop(65.0, TEST_DURATION_SECS, sr);
-    let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    let est = analyze_bpm_with_profile(&audio, sr, 1, OctaveProfile::RootsReggae)
+        .expect("analysis should succeed");
     assert_within(65.0, est, TOLERANCE_BPM, "reggae one-drop 65 BPM");
+
+    let untagged = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    assert_within(130.0, untagged, TOLERANCE_BPM, "the same, with no genre");
 }

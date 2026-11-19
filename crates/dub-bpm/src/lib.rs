@@ -22,9 +22,12 @@
 //!    consecutive frames. Output is the *onset detection function* (ODF),
 //!    sampled at `sr / HOP_SIZE` Hz (≈ 94 Hz at 48 kHz).
 //! 4. Local-mean subtract + half-wave rectify the ODF.
-//! 5. Autocorrelate the ODF over lags corresponding to 60–200 BPM. The
-//!    largest peak in that range gives the period; parabolic interpolation
-//!    around the peak yields sub-bin precision.
+//! 5. Autocorrelate the ODF and score each lag in **one octave of tempo**
+//!    ([`TempoOctave`]) by the harmonic mean of its windowed energy. The
+//!    best lag gives the period; a centroid over its window yields
+//!    sub-bin precision. Which octave is the caller's to say — a genre
+//!    ([`OctaveProfile`]) or the DJ's tempo range — because half and
+//!    double tempo are both in the audio.
 //! 6. Confidence = peak / autocorr-at-zero, clamped to `[0, 1]`.
 //!
 //! Aubio (or any future backend) can replace the internals later without
@@ -67,8 +70,9 @@ mod tracker;
 
 pub use beats::{
     analyze_beat_grid, analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_from_taps,
-    analyze_beat_grid_with_profile, bar_phase_from_tap, latch_beat_grid_at_downbeat,
-    median_bpm_from_beats, relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid, GridQuality,
+    analyze_beat_grid_in_octave, analyze_beat_grid_with_profile, bar_phase_from_tap,
+    fit_grid_at_playing_tap, latch_beat_grid_at_downbeat, median_bpm_from_beats,
+    relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid, GridQuality,
 };
 pub use confidence::{
     ConfidenceTracker, TrackerEvent, TrackerState, LOCK_CONSECUTIVE, LOCK_THRESHOLD,
@@ -78,8 +82,13 @@ pub use confidence::{
 pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
 pub use follow::{follow_grid, local_bpm};
-pub use octave_profile::{octave_profile_from_genre, octave_profile_from_label, OctaveProfile};
-pub use offline::{analyze_bpm, analyze_bpm_with_profile, analyze_bpm_with_range, AnalysisError};
+pub use octave_profile::{
+    octave_profile_from_genre, octave_profile_from_label, OctaveProfile, TempoOctave,
+};
+pub use offline::{
+    analyze_bpm, analyze_bpm_in_octave, analyze_bpm_with_profile, analyze_bpm_with_range,
+    AnalysisError,
+};
 pub use phase::{latest_beat, BeatFollower, FollowedBeats, PHASE_WINDOW_SECS};
 pub use stream::{BpmStream, LiveStreamConfig, StreamSnapshot};
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
@@ -98,8 +107,7 @@ pub(crate) use dub_spectral::{FRAME_SIZE, HOP_SIZE};
 pub const MIN_BPM: f64 = 60.0;
 
 /// Maximum tempo of the default [`BpmRange`]. Above ~200 BPM most DJs
-/// feel half time anyway; for dnb/jungle (170–180) and gabber (>200) we'd
-/// want genre-specific priors, which are deferred to M9+.
+/// feel half time anyway.
 pub const MAX_BPM: f64 = 200.0;
 
 /// A single tempo estimate.
@@ -132,13 +140,12 @@ impl BpmEstimate {
 /// `[MIN_BPM, MAX_BPM]` = 60–200 BPM that the M8.1 algorithm is
 /// calibrated for.
 ///
-/// Constraining the range is the recommended escape hatch for the
-/// inherent half-tempo ambiguity in beat-tracking (dubstep at
-/// 140 BPM masquerading as 70 BPM, drum-n-bass with strong K-S
-/// backbeat masquerading as half tempo, …). The M8.1 algorithm
-/// resolves the common cases — reggae 65, hip-hop 90/100, rolling
-/// dnb 174 — out of the box without any range hint, so the range
-/// only needs to be tightened for the edge cases.
+/// This is what the analyser *can* read, not where a song's tempo is
+/// looked for: a range of an octave or more is cut to one octave, the
+/// [`TempoOctave`] the caller names, so half and double tempo are never
+/// both candidates. A range narrower than an octave is searched as
+/// given — the caller already knows roughly where the tempo is (a tap,
+/// a test).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BpmRange {
     /// Inclusive lower BPM bound. Must be `>= MIN_BPM`.

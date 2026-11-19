@@ -68,9 +68,28 @@ ID3v2 `GEOB` frames inside each audio file (read via the `id3` crate; MP3 / AIFF
   padding-indifferent decoder) of NUL-terminated-name entries (`name\0` +
   `u32 len` + body). `CUE` body = `00 index(1) position_be_u32_ms 00 color(3)
   00 00 name\0` → hot cue (ms). `LOOP` body = `00 index start_ms end_ms …`.
-  `COLOR` / `BPMLOCK` skipped.
+  `COLOR` skipped. `BPMLOCK` (one byte, non-zero = locked) → Dub's grid lock
+  when Serato's grid is the active one (PRD-BEATS §4.4).
 - `Serato Autotags` — short header + ASCII BPM / auto-gain / gain (NUL-separated;
   parsed tolerantly). Gain → `track_metadata_source.gain_db`.
+
+**Serato's MP3 timeline (2026-11-18).** Serato plays an MP3's encoder header
+frame (`Xing` / `Info` / `VBRI`) as silence, as Traktor does, and drops the
+decoder's 529-sample delay, which Dub keeps. Every GEOB position in an MP3 —
+grid, cues, loops — is moved by `header frame − 529 samples` on import
+(`crate::mp3_frames::serato_lead_secs`): 14.1 ms earlier with the frame,
+12.0 ms *later* without it, at 44.1 kHz. ✓ Measured against Traktor's
+corrected grids on 1,456 of Daniel's MP3s carrying both: the gap went from
++11.4 / −16.9 ms (with / without the frame) to −3.4 ms median, the rest being
+the two analysers' own placement. Mixxx corrects Serato MP3 positions by
+12–60 ms depending on decoder and encoder (`SeratoTags::guessTimingOffsetMillis`);
+12 ms is this model's no-frame case.
+
+**GEOBs in files outside a Serato library.** The Apple Music and folder
+imports read the same GEOBs from each file (grid, cues, loops under
+`source='serato'`; no metadata row, so the file doesn't join the Serato
+node), in the same once-per-file-version pass as Traktor's frame
+(`crate::traktor_tag::sync_file_tags`).
 
 ### Traktor — **shipped (M12b)**
 
@@ -148,6 +167,32 @@ decode, no fingerprint at import; a track first seen via NML lands with
 `fingerprint_id = NULL`. A reference whose file isn't on this machine is
 reported in `ImportSummary::skipped` (with a reason), never inserted. Run it
 headless with `dub import --traktor <collection.nml>`.
+
+**Traktor's data inside the file (2026-11-18).** Traktor also writes each
+track's analysis into the file it plays: an ID3 `PRIV` frame owned by
+`TRAKTOR4` (`crate::traktor_tag`). It is a chunk tree — four-character tag
+stored byte-reversed (`DMRT` = `TRMD`), `u32` payload length, `u32` child
+count, little-endian — and `TRMD/DATA` mirrors the collection entry: `HBPM`
+(`f32`, = `TEMPO BPM`), `MKEY` (`u32`, = `MUSICAL_KEY VALUE`), and `CUEP`
+(`u32` count, then per cue `u32` version 1, `u32` UTF-16 name length + name,
+`u32` display order, `i32` type, `f64` start ms, `f64` length ms, `i32`
+repeats, `i32` hot cue: the `<CUE_V2>` record). Also present, unread:
+`TIT2`/`TPE1`/`TALB`/`TCON`/`TKEY` (copies of the ID3 text), `ARTW`, `TRN3`
+(transients), `SYNC/LOCK`. ✓ Validated on Daniel's library: BPM, key value
+and AutoGrid start identical to the collection for the file in both; every
+`CUEP` of 2,168 real frames parses to its exact length. The Apple Music and
+folder imports read it (grid, key, cues and loops under `source='traktor'`,
+no metadata row, so the file doesn't join the Traktor node), once per file
+version (`track_files.tags_read_mtime`, schema v12).
+
+**Traktor's MP3 timeline is one frame later.** An MP3 that opens with an
+encoder header frame (`Xing` / `Info` / `VBRI`, i.e. most of them) is played
+by Traktor with that frame as silence; Dub's decoder skips it. Every Traktor
+position in such a file — collection *and* file tag — is moved one frame
+earlier on import (`crate::mp3_frames`; 1,152 samples, 26.1 ms at 44.1 kHz).
+✓ Measured against Daniel's own set-the-1 taps on 20 MP3s: +27.4 ms median
+before, +1.4 ms after; MP3s without the frame and AIFF were already within
+±4 ms.
 
 **Fuzz target.** `fuzz/fuzz_targets/fuzz_traktor_nml.rs` over `parse_nml`
 (PRD §2.2.5). The parser's contract is *never panic / hang / OOB on any bytes*

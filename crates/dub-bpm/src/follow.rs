@@ -20,8 +20,6 @@
 //! answers `None`, and the even grid, exact and drift-free, stands.
 
 use crate::beats::BeatGrid;
-use crate::octave_profile::OctaveProfile;
-use crate::BpmRange;
 use dub_spectral::HOP_SIZE;
 
 /// How strongly a gap between beats is held to the period: the penalty
@@ -63,14 +61,7 @@ pub fn follow_grid(
     if grid.bpm <= 0.0 || grid.beats.len() < 8 || sample_rate == 0 {
         return None;
     }
-    let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-        samples,
-        sample_rate,
-        channels,
-        BpmRange::DEFAULT,
-        OctaveProfile::Default,
-    )
-    .ok()?;
+    let (odf, _) = crate::offline::onset_envelopes(samples, sample_rate, channels).ok()?;
     #[allow(clippy::cast_precision_loss)]
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
     let frames = chain(&odf, 60.0 / grid.bpm * odf_sr)?;

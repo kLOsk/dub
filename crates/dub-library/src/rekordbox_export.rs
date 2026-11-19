@@ -405,7 +405,7 @@ fn rows_to_tracks(library: &Library, rows: &[TrackRow]) -> LibResult<Vec<ParsedT
         let grid = library.active_beatgrid_for_track(&row.id)?;
         let cues = library.all_cues(&row.id)?;
         let loops = library.all_loops(&row.id)?;
-        let source = preferred_source(&cues, &loops);
+        let source = preferred_source(&cues, &loops, &library.source_prefs()?.cue_order());
 
         out.push(ParsedTrack {
             track_id: i64::try_from(i + 1).unwrap_or(i64::MAX),
@@ -453,25 +453,26 @@ fn rows_to_tracks(library: &Library, rows: &[TrackRow]) -> LibResult<Vec<ParsedT
 /// overlapping pad indices. Emitting both would put two markers on pad
 /// 1 and the receiving app would keep whichever it read last. The DJ's
 /// own cues win; failing that, the first source in
-/// [`crate::cues::CUE_SOURCE_ORDER`] with anything to say — the order the
+/// the DJ's import order (`Library::import_order`) with anything to say — the order the
 /// pads and the beat grids use, so the export carries the cues the DJ
 /// saw in Dub (it used to take the source with the most cues).
-fn preferred_source<'a>(cues: &'a [StoredCue], loops: &'a [StoredLoop]) -> Option<&'a str> {
+fn preferred_source<'a>(
+    cues: &'a [StoredCue],
+    loops: &'a [StoredLoop],
+    order: &[&'static str],
+) -> Option<&'a str> {
     let has = |s: &str| cues.iter().any(|c| c.source == s) || loops.iter().any(|l| l.source == s);
     if has("user") {
         return Some("user");
     }
-    crate::cues::CUE_SOURCE_ORDER
-        .into_iter()
-        .find(|s| has(s))
-        .or_else(|| {
-            // A source outside the ranked three (none today): keep the
-            // export deterministic all the same.
-            cues.iter()
-                .map(|c| c.source.as_str())
-                .chain(loops.iter().map(|l| l.source.as_str()))
-                .min()
-        })
+    order.iter().copied().find(|s| has(s)).or_else(|| {
+        // A source outside the ranked three (none today): keep the
+        // export deterministic all the same.
+        cues.iter()
+            .map(|c| c.source.as_str())
+            .chain(loops.iter().map(|l| l.source.as_str()))
+            .min()
+    })
 }
 
 /// Pad slots are 0-7; the importers park memory cues above them so they
@@ -523,16 +524,30 @@ mod tests {
             cue("traktor"),
             cue("serato"),
         ];
-        assert_eq!(preferred_source(&traktor_heavy, &[]), Some("serato"));
         assert_eq!(
-            preferred_source(&[cue("traktor"), cue("rekordbox")], &[]),
+            preferred_source(&traktor_heavy, &[], &crate::DEFAULT_IMPORT_ORDER[..]),
+            Some("serato")
+        );
+        assert_eq!(
+            preferred_source(
+                &[cue("traktor"), cue("rekordbox")],
+                &[],
+                &crate::DEFAULT_IMPORT_ORDER
+            ),
             Some("rekordbox")
         );
         assert_eq!(
-            preferred_source(&[cue("serato"), cue("user")], &[]),
+            preferred_source(
+                &[cue("serato"), cue("user")],
+                &[],
+                &crate::DEFAULT_IMPORT_ORDER
+            ),
             Some("user")
         );
-        assert_eq!(preferred_source(&[], &[]), None);
+        assert_eq!(
+            preferred_source(&[], &[], &crate::DEFAULT_IMPORT_ORDER[..]),
+            None
+        );
     }
     use super::*;
     use crate::rekordbox::parse_xml;

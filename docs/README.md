@@ -59,10 +59,13 @@ above says where each lives.
 
 ## Investigation notes and runbooks — `investigations/`
 
-- `BPM-DETECTOR-V2-INVESTIGATION.md` records why a classical (non-ML) detector
-  does not beat the tuned Classic `dub-bpm` octave logic, and the learned
-  beat-tracker plan that can. Load before any "replace the BPM detector" work;
-  the experimental code it describes was measured and removed.
+- `BPM-DETECTOR-V2-INVESTIGATION.md` records the detector experiments. Its
+  §1–§7 concluded that nothing classical beats the tuned rule set and that a
+  learned beat tracker was the way on; **§8 (2026-11-19) overturns that**:
+  scored against 1,767 grids locked in Traktor the rules got 62 % of tempos,
+  and one octave per genre with no rules gets 96 %. Load it, §8 first, before
+  any change to tempo or beat placement, and score the change with
+  `crates/dub-bpm/tests/traktor_grid_corpus.rs`.
 - `WAVEFORM-JITTER-CAPTURE.md` is the `os_signpost` capture runbook for
   diagnosing waveform / beat-grid jitter regressions. The originally
   investigated jitter was fixed end to end; this remains the procedure if it

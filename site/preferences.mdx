@@ -49,8 +49,11 @@ The dub instruments on the surface.
 The DJ apps whose libraries Dub reads into your one collection: **Serato**,
 **Traktor**, **rekordbox** and **Apple Music**. Turn one on and Dub scans its
 default folder now and on every launch, read-only, and shows that app's crates
-and playlists in the sidebar. Each row says whether the library was found and
-where. **Rescan** reads it again. On the Apple Music row, **Choose…** picks
+and playlists in the sidebar. Turn one off and its node leaves the sidebar
+and Dub ignores everything from that app, including the grids and cues it
+wrote into your files, until you turn it back on (nothing is lost; it comes
+straight back). Each row says whether the library was found and where.
+**Rescan** reads it again. On the Apple Music row, **Choose…** picks
 which of Music's libraries Dub reads, and **Default** goes back to Music's
 usual one. See
 [Bring your library](/library/import#apple-music).
@@ -64,9 +67,21 @@ an 87 BPM track beside a 174 one. **Match the pitched tempo** matches the
 tempo the deck plays at now, with your platter's pitch on it, instead of the
 track's own BPM. Both start off.
 
-**When a track is in more than one app** explains whose beat grid and whose
-hot cues a track gets: your own fixes in Dub first, then Serato, rekordbox
-and Traktor in that order. See
+**Tempo range** is the range Dub reads a track's tempo in. A beat can be
+counted at half or double speed (70 or 140, 87 or 174), so Dub keeps every
+track inside one range and the two never trade places. Pick the one your
+music sits in: 60–120, 68–136, 78–156 (to start with), 88–176 or 100–200.
+A track whose genre settles it uses that genre's range instead: drum & bass
+100–200, house, garage, grime and dubstep 88–176, dancehall 75–150, hip-hop
+68–136, reggae and dub 60–120. The range applies to tracks analysed from now
+on. A track that already has a grid keeps it: right-click its **BPM** on the
+deck for **2×** or **½**, or **Re-analyze** it in the library.
+
+**When a track is in more than one app** sets whose beat grid, key and hot
+cues a track gets. Your own fixes in Dub always come first; under **Which app
+comes first**, move Serato, rekordbox or Traktor up with its arrow (Serato
+first to start with). Changing it updates every track you haven't locked or
+set yourself. See
 [A track in more than one app](/library/import#a-track-in-more-than-one-app).
 
 ## Vinyl

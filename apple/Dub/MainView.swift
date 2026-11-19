@@ -1301,6 +1301,106 @@ final class WaveformAppModel: ObservableObject {
     /// The Apple Music library XML the DJ chose in Preferences ▸ Library;
     /// nil follows the default location. Music's libraries are separate
     /// files, and a DJ who keeps one for gigs points Dub at that one.
+    /// Which app's grid, key and pad cues a track gets when several have
+    /// one: `serato`, `rekordbox`, `traktor`, first first (FFI 90). Kept in
+    /// the library, read when it opens; Preferences ▸ Library sets it.
+    @Published private(set) var importOrder: [String] = ["serato", "rekordbox", "traktor"]
+
+    /// Low end of the DJ's tempo range (FFI 91): a song whose genre says
+    /// nothing about tempo is read in `[low, 2 × low)` BPM, so half and
+    /// double never trade places. Kept in the library, read when it opens;
+    /// Preferences ▸ Library sets it.
+    @Published private(set) var tempoRangeLow: Double = WaveformAppModel.tempoRangeChoices[2]
+
+    /// The ranges on offer, by their low end: 60–120 … 100–200.
+    static let tempoRangeChoices: [Double] = [60, 68, 78, 88, 100]
+
+    /// Set the tempo range. The library keeps it and analyses by it; the
+    /// engine gets a copy for songs loaded from outside the library. Grids
+    /// already stored are left alone.
+    func setTempoRangeLow(_ low: Double) {
+        guard libraryModel.libraryIsOpen, low != tempoRangeLow else { return }
+        do {
+            try library.setTempoRangeLow(low: low)
+            try engine.setTempoRangeLow(low: low)
+            tempoRangeLow = low
+        } catch {
+            surfaceError("Couldn't change the tempo range: \(error.localizedDescription)")
+        }
+    }
+
+    func isSourceEnabled(_ kind: ImportedSourceKind) -> Bool {
+        switch kind {
+        case .serato: return seratoImportEnabled
+        case .traktor: return traktorImportEnabled
+        case .rekordbox: return rekordboxImportEnabled
+        case .itunes: return itunesImportEnabled
+        }
+    }
+
+    /// The apps switched off in Preferences ▸ Library, as the library
+    /// names them.
+    private var disabledSourceTags: [String] {
+        ImportedSourceKind.allCases.filter { !isSourceEnabled($0) }.map(\.sourceTag)
+    }
+
+    /// An app switched on or off (Daniel, 2026-11-18: Serato off left its
+    /// node and its grids in place). Off, its node goes and the library
+    /// stops counting its grids, keys, cues and names — those read from
+    /// inside the files too — re-picking every track; on, they come
+    /// straight back and the app is read again.
+    func sourceSwitched(_ kind: ImportedSourceKind) {
+        guard libraryModel.libraryIsOpen else { return }
+        reloadImportedSources()
+        let library = self.library
+        let off = disabledSourceTags
+        Task { @MainActor in
+            let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    try library.setDisabledSources(sources: off)
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch result {
+            case .success:
+                libraryModel.analysisGeneration &+= 1
+                if isSourceEnabled(kind) { scanEnabledSources() }
+            case .failure(let err):
+                surfaceError("Couldn't switch \(kind.label): \(err.localizedDescription)")
+            }
+        }
+    }
+
+    /// Set the order. Every track the DJ hasn't locked, tapped or keyed by
+    /// hand is re-picked, a couple of thousand rows, so off the main actor;
+    /// the browser redraws when it lands.
+    func setImportOrder(_ order: [String]) {
+        guard libraryModel.libraryIsOpen, order != importOrder else { return }
+        let previous = importOrder
+        importOrder = order
+        let library = self.library
+        Task { @MainActor in
+            let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    try library.setImportOrder(order: order)
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch result {
+            case .success:
+                libraryModel.analysisGeneration &+= 1
+                refreshLibraryStats()
+            case .failure(let err):
+                importOrder = previous
+                surfaceError("Couldn't change the app order: \(err.localizedDescription)")
+            }
+        }
+    }
+
     @Published var itunesLibraryPath: String? {
         didSet { UserDefaults.standard.set(itunesLibraryPath, forKey: Self.kItunesLibraryPath) }
     }
@@ -1483,8 +1583,8 @@ final class WaveformAppModel: ObservableObject {
         tapToGridA.onTapCountChanged = { [weak self] count in
             self?.tapSessionA.tapCount = count
         }
-        tapToGridA.onCommit = { [weak self] taps, bpm in
-            self?.commitTapGrid(side: .a, playheadTimes: taps, wallClockBpm: bpm)
+        tapToGridA.onCommit = { [weak self] taps, whilePlaying in
+            self?.commitTapGrid(side: .a, playheadTimes: taps, whilePlaying: whilePlaying)
         }
         tapToGridA.onRollingBpmChanged = { [weak self] bpm in
             self?.tapSessionA.rollingBpm = bpm
@@ -1492,8 +1592,8 @@ final class WaveformAppModel: ObservableObject {
         tapToGridB.onTapCountChanged = { [weak self] count in
             self?.tapSessionB.tapCount = count
         }
-        tapToGridB.onCommit = { [weak self] taps, bpm in
-            self?.commitTapGrid(side: .b, playheadTimes: taps, wallClockBpm: bpm)
+        tapToGridB.onCommit = { [weak self] taps, whilePlaying in
+            self?.commitTapGrid(side: .b, playheadTimes: taps, whilePlaying: whilePlaying)
         }
         tapToGridB.onRollingBpmChanged = { [weak self] bpm in
             self?.tapSessionB.rollingBpm = bpm
@@ -3274,6 +3374,12 @@ final class WaveformAppModel: ObservableObject {
         do {
             try library.openDefault()
             libraryModel.libraryIsOpen = true
+            if let order = try? library.importOrder() { importOrder = order }
+            if let low = try? library.tempoRangeLow() {
+                tempoRangeLow = low
+                try? engine.setTempoRangeLow(low: low)
+            }
+            try? library.setDisabledSources(sources: disabledSourceTags)
             refreshLibraryStats()
             reloadCrates()
             reloadImportedSources()
@@ -3332,7 +3438,7 @@ final class WaveformAppModel: ObservableObject {
             return
         }
         var groups: [ImportedSourceGroup] = []
-        for kind in ImportedSourceKind.allCases {
+        for kind in ImportedSourceKind.allCases where isSourceEnabled(kind) {
             let tag = kind.sourceTag
             let crates = (try? library.listImportedCrates(source: tag)) ?? []
             let count = (try? library.countTracksBySource(source: tag)) ?? 0
@@ -4225,6 +4331,23 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// The deck reads the key once, as the track loads. A track loaded
+    /// before its first analysis has none yet, so the header kept its
+    /// em-dash while the library row filled in (Daniel, 2026-11-18).
+    /// Only the key: the grid stays out of lazy analysis, which would
+    /// race set-the-1 (see `refreshLoadedDecksAfterLibraryAnalysis`).
+    private func showKeyOnLoadedDecks(trackId: String, outcome: LibraryAnalysisOutcome) {
+        guard outcome.wroteKey, outcome.keyAutoIsActive, !outcome.camelot.isEmpty else { return }
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            guard deck.loadedLibraryTrackId == trackId, deck.hasTrack || deck.isLoading,
+                  deck.key == nil
+            else { continue }
+            deck.key = outcome.camelot
+            setState(deck, for: side)
+        }
+    }
+
     /// M11c.1 — kick off lazy analysis for `trackId` if it has
     /// not been analyzed yet. Returns immediately; analysis runs
     /// on a background task and bumps `analysisGeneration` when
@@ -4278,6 +4401,7 @@ final class WaveformAppModel: ObservableObject {
                 case .success(let outcome):
                     self.publishLibraryRowAnalysisUpdate(
                         trackId: trackId, outcome: outcome)
+                    self.showKeyOnLoadedDecks(trackId: trackId, outcome: outcome)
                 case .failure(let err):
                     // A fresh track shouldn't be locked, but a
                     // racing manual lock toggle between the
@@ -6848,31 +6972,34 @@ final class WaveformAppModel: ObservableObject {
     /// on a now-locked deck). In that case the engine returns
     /// `EngineError.GridLocked`; we treat it as a silent no-op
     /// per PRD-BEATS §13 (no error toast).
-    func commitTapGrid(side: DeckSide, playheadTimes: [Double], wallClockBpm: Double?) {
+    func commitTapGrid(side: DeckSide, playheadTimes: [Double], whilePlaying: Bool) {
         guard isRunning, !playheadTimes.isEmpty else { return }
         var deck = state(for: side)
         guard deck.hasTrack else { return }
 
-        let genre = librarySelection.selectedLibraryTrack?.genre
-        // §4.1: 1–2 tap "set the 1" re-anchors the grid onto the tapped
-        // kick (engine.setBarPhase → relatch_grid_at_downbeat_tap, BPM
-        // preserved). 3+ taps re-tempo from the WALL-CLOCK BPM — never the
-        // rate-scaled playhead deltas the old installBeatGridFromTaps
-        // derived — with the first tap as the ODF-snapped anchor.
+        // §4.1: 1–2 tap "set the 1" re-anchors the grid at the same BPM
+        // (engine.setBarPhase). On a stopped deck the tap is the spot the
+        // DJ parked on; on a playing deck it only says which beat is the
+        // 1, and the whole song places the lines (2026-11-19: taps while
+        // playing hung the grid on one hit, and no two attempts agreed).
+        // 3+ taps re-take the tempo, and they are a hint (Daniel,
+        // 2026-11-19: "the dj always taps wrong, he's never as accurate
+        // as the transients"): the engine finds the track's own tempo
+        // near the tapped one and lets the whole track place the lines.
+        // It gets the taps' PLAYHEAD positions — the track's own time, so
+        // the pitch does not come into it.
         let downbeat = playheadTimes[0]
 
         do {
-            if playheadTimes.count >= 3, let bpm = wallClockBpm {
-                try engine.installBeatGridFromBpmAndAnchor(
+            if playheadTimes.count >= 3 {
+                try engine.installBeatGridFromTaps(
                     deckIdx: side.ffiDeckIdx,
-                    bpm: bpm,
-                    anchorSecs: downbeat,
-                    genre: genre)
+                    tapTimes: playheadTimes)
             } else {
                 try engine.setBarPhase(
                     deckIdx: side.ffiDeckIdx,
                     tapSecs: downbeat,
-                    genre: genre)
+                    playing: whilePlaying)
             }
         } catch EngineError.GridLocked {
             return

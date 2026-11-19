@@ -56,6 +56,24 @@ the library leaves the node, but it stays in your collection if you played
 it. A track whose file is on a drive that isn't plugged in stays put until
 the drive is back.
 
+<Tip>
+  A library from another Mac still names that Mac's user folder
+  (`/Users/dj/…`). When a song isn't at the path the library gives, Dub looks
+  for it at the same place in your own user folder and uses it if it's there.
+  So a Music folder copied across from the old Mac to the same spot just
+  works. This applies to Serato, Traktor and rekordbox libraries too.
+</Tip>
+
+<Tip>
+  Played your music in Traktor or Serato? Both write their beat grid and
+  cues into each file (Traktor its key too), and Dub reads them when it
+  reads your Apple Music library or imports a folder. You don't need the
+  app's own library for this, so it works even if it ran on another Mac.
+  If a file has both, Serato's grid is used first. The first read
+  of a big library takes a little while; after that Dub only rereads files
+  that changed.
+</Tip>
+
 ## Browsing versus your collection
 
 An imported app's tracks are there to **browse**: they show under that app's
@@ -72,10 +90,14 @@ reading disagrees with the imported grid.
 Dub matches the same file across apps, so a song you find through an Apple
 Music playlist carries the grid and cues Traktor has for it.
 
-- **Beat grid:** a grid you fix in Dub comes first, then Serato, then
-  rekordbox, then Traktor, then Dub's own analysis.
+- **Which app comes first is yours to set.** Preferences ▸ Library ▸
+  **Which app comes first** orders Serato, rekordbox and Traktor (Serato
+  first to start with). The order picks the grid, the key and the hot cues.
+- **Beat grid:** a grid you fix in Dub comes first, then the apps in your
+  order, then Dub's own analysis. A grid the app locked arrives locked: Dub
+  keeps it and still works out the key, waveform and loudness.
 - **Hot cues:** cues you set in Dub come first. Otherwise the pads show one
-  app's hot cues, the first of Serato, rekordbox and Traktor that has any.
+  app's hot cues, the first app in your order that has any.
   The **HOTCUE** heading says whose, for example **FROM TRAKTOR**.
 - **Your first change to one of those cues makes the set yours.** The change
   sticks, a cue you clear stays cleared, and later edits in the other app no

@@ -4,7 +4,7 @@
 //! full auto-analyze → user-tap relatch path that the deck-header BPM
 //! column uses for 1–2 tap sessions.
 
-use dub_bpm::{analyze_beat_grid, latch_beat_grid_at_downbeat, OctaveProfile};
+use dub_bpm::{analyze_beat_grid_with_profile, latch_beat_grid_at_downbeat, OctaveProfile};
 use dub_io::Track;
 
 const BROWN_PAPER_BAG: &str = "/Users/klos/Music/Music/DrumnBass/Roni Size:Reprazent - Brown Paper Bag (Crissy Criss Plastic Bag instrumental remix).mp3";
@@ -47,7 +47,8 @@ fn brown_paper_bag_set_the_one_latches_downbeat_on_first_kick() {
     let sr = track.sample_rate();
     let ch = track.channels();
 
-    let auto = analyze_beat_grid(samples, sr, ch).expect("auto analyze");
+    let auto = analyze_beat_grid_with_profile(samples, sr, ch, OctaveProfile::DrumAndBass)
+        .expect("auto analyze");
     assert!(auto.confidence > 0.0, "auto grid must lock");
     assert!(
         auto.bpm > 160.0 && auto.bpm < 190.0,
@@ -76,8 +77,7 @@ fn brown_paper_bag_set_the_one_latches_downbeat_on_first_kick() {
     );
 
     let latched =
-        latch_beat_grid_at_downbeat(samples, sr, ch, auto.bpm, tap_secs, OctaveProfile::Default)
-            .expect("relatch");
+        latch_beat_grid_at_downbeat(samples, sr, ch, auto.bpm, tap_secs).expect("relatch");
     let new_downbeat = latched.beats[latched.bar_phase as usize];
     eprintln!(
         "relatch: downbeat at {:.4} (Δtap={:.1} ms) bpm={:.2}",

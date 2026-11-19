@@ -32,7 +32,7 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; the current applied version is **11**.
+v1.0 baseline is **version 1**; the current applied version is **12**.
 Each bump is additive (new tables / columns with safe defaults / indexes),
 so a third-party reader that ignores the new columns keeps working. Any
 change to the table set, column set, indexes, FTS5 definition, or trigger
@@ -53,6 +53,7 @@ logic requires a version bump and a migration step.
 | 9       | M12f (per-source colour) | `track_metadata_source.color TEXT` — the imported per-source colour label (rekordbox `Colour`, Traktor `COLOR`), mapped to a Dub palette token. Displayed colour is `COALESCE(tracks.color, …source colours…)` so the DJ's own colour wins. Additive. |
 | 10      | Imported cues on the pads | `track_cue_takeover (track_id PK, taken_at)` — the tracks whose imported hot cues the DJ took over by editing one in Dub; from then on the pads read `source='user'` only, so a cleared cue stays cleared. Additive. See `track_cues`. |
 | 11      | Saved following grid | `track_tempo_maps (track_id PK, kind CHECK ('followed'), beats BLOB f64 LE, bar_phase, base_source / base_bpm / base_anchor_secs, bpm_min / bpm_max, created_at)` — the band-followed beats the deck played, kept with the even grid they were followed from. Reused while that grid is active; always on a locked track. `kind` leaves room for time-stretched tracks. Additive. |
+| 12      | Tags inside the file | `track_files.tags_read_mtime INTEGER` — the file's `mtime` when its embedded DJ tags (Traktor's `TRAKTOR4` frame) were last read; NULL = never. An import reads them only when it differs, so an unchanged library costs one indexed read per file. Also `track_beatgrids.source_locked INTEGER NOT NULL DEFAULT 0` (the app locked that grid) and `library_settings (key PK, value)` (`import_order`: which app comes first). Additive. |
 
 ### Backward compatibility contract
 
@@ -292,6 +293,10 @@ CREATE TABLE IF NOT EXISTS track_files (
     -- prioritises those rows first via the
     -- `idx_track_files_last_checked` index below.
     last_checked_at INTEGER,
+    -- schema v12 — `mtime` when the file's own DJ tags (Traktor's
+    -- TRAKTOR4 frame) were last read; NULL = never. Reread only when the
+    -- file's `mtime` moves (`crate::traktor_tag::sync_file_tags`).
+    tags_read_mtime INTEGER,
     UNIQUE (volume_uuid, relative_path)
 );
 CREATE INDEX IF NOT EXISTS idx_track_files_track  ON track_files(track_id);

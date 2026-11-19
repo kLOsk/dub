@@ -207,7 +207,8 @@ pub struct AnalysisJob {
     track_id: String,
     existing_fingerprint_id: Option<i64>,
     file_path: PathBuf,
-    profile: dub_bpm::OctaveProfile,
+    /// The octave the tempo is read in: the genre's, or the DJ's range.
+    octave: dub_bpm::TempoOctave,
 }
 
 /// Chromaprint computed during the lock-free phase, pending
@@ -323,11 +324,11 @@ pub fn analyze_compute_with_track(
     };
 
     // ---- Beat grid (M11c.1) ----------------------------------
-    let grid = dub_bpm::analyze_beat_grid_with_profile(
+    let grid = dub_bpm::analyze_beat_grid_in_octave(
         track.samples(),
         track.sample_rate(),
         track.channels(),
-        job.profile,
+        job.octave,
     )
     .map_err(|e| LibraryError::DecodeFailed {
         track_id: track_id.to_string(),
@@ -445,46 +446,42 @@ impl Library {
     /// M11c.4 lazy-attach case), and the genre-derived octave
     /// profile. Cheap (three indexed reads).
     ///
-    /// PRD-BEATS §3.5 "lock is absolute": if the grid is locked we
-    /// refuse the whole analysis pass rather than skipping just the
-    /// beat-grid step. Locking is a user contract, not a
+    /// PRD-BEATS §3.5 "lock is absolute": if the lock guards Dub's own
+    /// grid we refuse the whole analysis pass rather than skipping just
+    /// the beat-grid step. Locking is a user contract, not a
     /// performance gate, so we surface the refusal as
     /// [`LibraryError::GridLocked`] and let the Apple shell turn it
-    /// into a no-op. ([`Self::analyze_commit`] re-checks, since the
-    /// lock can flip while compute runs unlocked.)
+    /// into a no-op. A lock over an imported grid doesn't refuse: no
+    /// analysis displaces that grid ([`Self::lock_refuses_analysis`]).
+    /// ([`Self::analyze_commit`] re-checks, since the lock can flip
+    /// while compute runs unlocked.)
     pub fn analyze_prepare(&self, track_id: &str) -> Result<AnalysisJob> {
-        if self.is_grid_locked(track_id)? {
+        if self.lock_refuses_analysis(track_id)? {
             return Err(LibraryError::GridLocked {
                 track_id: track_id.to_string(),
             });
         }
         let (existing_fingerprint_id, file_path) = self.track_analysis_keys(track_id)?;
-        // Genre is a pure octave-profile hint (M11c.3d). A failure
-        // to read it (missing `track_metadata_source` row, NULL
-        // column, or a SQLite error) must NOT abort analysis —
-        // the worst that happens with no genre is we fall back to
-        // `OctaveProfile::Default`, which is the profile used for
-        // every track that never had an ID3 tag to begin with
-        // (PRD-BEATS §4.4 contract: re-analyze is a pure reset,
-        // must succeed on any track that decodes).
-        let profile = match self.track_id3_genre(track_id) {
-            Ok(g) => g
-                .as_deref()
-                .map(dub_bpm::octave_profile_from_genre)
-                .unwrap_or(dub_bpm::OctaveProfile::Default),
-            Err(e) => {
+        // The genre only says which octave the tempo is read in. A
+        // failure to read it (no metadata row, a SQLite error) must not
+        // abort analysis — the song is then read in the default octave,
+        // like any song with no genre (PRD-BEATS §4.4: re-analyze must
+        // succeed on any track that decodes).
+        let octave = self
+            .track_id3_genre(track_id)
+            .and_then(|genre| self.tempo_octave_for_genre(genre.as_deref()))
+            .unwrap_or_else(|e| {
                 eprintln!(
                     "dub-library: genre lookup failed for {track_id} ({e}); \
-                     falling back to OctaveProfile::Default"
+                     reading its tempo in the default range"
                 );
-                dub_bpm::OctaveProfile::Default
-            }
-        };
+                dub_bpm::TempoOctave::DEFAULT
+            });
         Ok(AnalysisJob {
             track_id: track_id.to_string(),
             existing_fingerprint_id,
             file_path,
-            profile,
+            octave,
         })
     }
 
@@ -502,7 +499,7 @@ impl Library {
         computed: AnalysisComputed,
     ) -> Result<AnalysisOutcome> {
         let track_id = job.track_id.as_str();
-        if self.is_grid_locked(track_id)? {
+        if self.lock_refuses_analysis(track_id)? {
             return Err(LibraryError::GridLocked {
                 track_id: track_id.to_string(),
             });
@@ -905,13 +902,18 @@ impl Library {
         Ok((fingerprint_id, path))
     }
 
-    /// ID3 genre tag for octave-profile selection (M11c.3d).
+    /// Genre for octave-profile selection (M11c.3d): the file's own ID3
+    /// tag first, else any library's. A track read only from Apple Music
+    /// has no ID3 row, so its "House" went unseen and the Default profile
+    /// put SOSA UK's "The Wave" at 88 instead of 132 (Daniel, 2026-11-18).
     fn track_id3_genre(&self, track_id: &str) -> Result<Option<String>> {
         let genre: Option<String> = self
             .connection()
             .query_row(
                 "SELECT genre FROM track_metadata_source \
-                 WHERE track_id = ?1 AND source = 'id3'",
+                 WHERE track_id = ?1 \
+                   AND TRIM(COALESCE(genre, '')) != '' \
+                 ORDER BY source = 'id3' DESC LIMIT 1",
                 params![track_id],
                 |r| r.get(0),
             )
@@ -1016,27 +1018,76 @@ impl Library {
         Ok(())
     }
 
-    /// Beat-grid source priority for the single active slot, highest first.
-    /// PRD §8.3 ranks imports `serato > rekordbox > traktor` over `auto`;
-    /// `user_tap` (the DJ's deliberate Dub correction) is preserved above
-    /// imports across re-import (PRD §8.1), so it sits at the top. Kept a
-    /// function, not a constant, because §8.3 makes the order
-    /// Preferences-configurable.
-    fn grid_source_rank(source: &str) -> u8 {
-        match source {
-            "user_tap" => 5,
-            "serato" => 4,
-            "rekordbox" => 3,
-            "traktor" => 2,
-            "itunes" => 1,
-            _ => 0, // "auto" / unknown
+    /// [`Self::upsert_imported_beatgrid`] for a grid the source app may
+    /// have locked (Traktor's `LOCK`, Serato's `BPMLOCK`). Dub's lock
+    /// follows it only as the grid arrives or changes, and only when it
+    /// is the active grid: an unlock in Dub isn't undone by the next
+    /// launch's import, and Traktor's lock never pins Serato's grid.
+    /// Such a lock keeps the grid but not the rest of the analysis out
+    /// (see [`Self::lock_refuses_analysis`]).
+    pub(crate) fn upsert_imported_beatgrid_locked(
+        &self,
+        track_id: &str,
+        source: &str,
+        anchor_secs: f64,
+        bpm: f64,
+        locked: bool,
+    ) -> Result<()> {
+        let grid_of = |lib: &Self| -> Result<Option<(f64, f64, bool)>> {
+            lib.connection()
+                .query_row(
+                    "SELECT anchor_secs, bpm, is_active FROM track_beatgrids \
+                     WHERE track_id = ?1 AND source = ?2",
+                    params![track_id, source],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+                )
+                .optional()
+                .map_err(|e| LibraryError::sqlite("imported_grid", e))
+        };
+        let before = grid_of(self)?;
+        self.upsert_imported_beatgrid(track_id, source, anchor_secs, bpm, 0)?;
+        self.connection()
+            .execute(
+                "UPDATE track_beatgrids SET source_locked = ?3 WHERE track_id = ?1 AND source = ?2",
+                params![track_id, source, i64::from(locked)],
+            )
+            .map_err(|e| LibraryError::sqlite("source_locked", e))?;
+        if !locked {
+            return Ok(());
         }
+        let after = grid_of(self)?;
+        let changed = before.map(|(a, b, _)| (a, b)) != after.map(|(a, b, _)| (a, b));
+        if changed && after.is_some_and(|(_, _, active)| active) {
+            self.set_grid_locked(track_id, true)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the grid lock stops analysis. It does when the grid it
+    /// guards is Dub's own (auto or set-the-1), which a pass would replace;
+    /// not when it is an imported grid, which no analysis displaces. Such a
+    /// track still gets its key, waveform and loudness (Daniel, 2026-11-18:
+    /// ~1,775 of his files arrive locked from Traktor).
+    pub fn lock_refuses_analysis(&self, track_id: &str) -> Result<bool> {
+        if !self.is_grid_locked(track_id)? {
+            return Ok(false);
+        }
+        let active: Option<String> = self
+            .connection()
+            .query_row(
+                "SELECT source FROM track_beatgrids WHERE track_id = ?1 AND is_active = 1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("lock_refuses_analysis", e))?;
+        Ok(!matches!(active.as_deref(), Some(s) if s != "auto" && s != "user_tap"))
     }
 
     /// Upsert an imported (`serato` / `traktor` / `rekordbox` / `itunes`)
     /// beat-grid row, idempotent on `(track_id, source)`. Claims the single
     /// active slot only when it outranks every currently-active row from
-    /// another source ([`Self::grid_source_rank`]); when it claims the slot,
+    /// another source (`SourcePrefs::grid_rank`); when it claims the slot,
     /// the other active row is demoted first (the one-active-per-track index
     /// forbids two). A non-finite / non-positive grid is skipped (graceful —
     /// a corrupt source row never aborts an import).
@@ -1051,7 +1102,10 @@ impl Library {
         if !bpm.is_finite() || bpm <= 0.0 || !anchor_secs.is_finite() {
             return Ok(());
         }
-        let rank = Self::grid_source_rank(source);
+        // `crate::import_order::SourcePrefs::grid_rank`: the DJ's app order,
+        // and `None` for an app switched off, which never takes the slot.
+        let prefs = self.source_prefs()?;
+        let rank = prefs.grid_rank(source);
         let conn = self.connection();
         let active_others: Vec<String> = {
             let mut stmt = conn
@@ -1069,9 +1123,8 @@ impl Library {
             }
             v
         };
-        let claim_active = active_others
-            .iter()
-            .all(|s| Self::grid_source_rank(s) < rank);
+        let claim_active =
+            active_others.iter().all(|s| prefs.grid_rank(s) < rank) && rank.is_some();
         if claim_active {
             conn.execute(
                 "UPDATE track_beatgrids SET is_active = 0 \
@@ -1471,29 +1524,6 @@ impl Library {
         Ok(())
     }
 
-    /// Key-notation source priority for the single active slot, highest
-    /// first. Mirrors [`Self::grid_source_rank`]; `mixedinkey` (a dedicated
-    /// key-detection authority DJs trust) and a `user` override rank above
-    /// the library imports. Preferences-configurable later (§8.3).
-    ///
-    /// The file's own tag ranks above `auto`, not level with it: a
-    /// `TKEY` was written by whatever keyed the DJ's collection, and
-    /// §8.3 puts every import ahead of Dub's estimate. Level ranks
-    /// would have made the active key depend on whether the folder
-    /// was imported before or after the track was analysed.
-    fn key_source_rank(source: &str) -> u8 {
-        match source {
-            "user" => 7,
-            "mixedinkey" => 6,
-            "serato" => 5,
-            "rekordbox" => 4,
-            "traktor" => 3,
-            "itunes" => 2,
-            "id3" => 1,
-            _ => 0, // "auto" / unknown
-        }
-    }
-
     /// Upsert an imported key row, idempotent on `(track_id, source)`.
     /// `key_notation` is canonical Camelot (the adapter converts the
     /// source's notation); `original_notation` keeps the source's verbatim
@@ -1510,7 +1540,8 @@ impl Library {
         if key_notation.trim().is_empty() {
             return Ok(());
         }
-        let rank = Self::key_source_rank(source);
+        let prefs = self.source_prefs()?;
+        let rank = prefs.key_rank(source);
         let conn = self.connection();
         let active_others: Vec<String> = {
             let mut stmt = conn
@@ -1528,9 +1559,7 @@ impl Library {
             }
             v
         };
-        let claim_active = active_others
-            .iter()
-            .all(|s| Self::key_source_rank(s) < rank);
+        let claim_active = active_others.iter().all(|s| prefs.key_rank(s) < rank) && rank.is_some();
         if claim_active {
             conn.execute(
                 "UPDATE track_keys SET is_active = 0 WHERE track_id = ?1 AND source != ?2",
@@ -1567,6 +1596,49 @@ mod tests {
     use crate::Fingerprint;
     use std::f32::consts::PI;
     use std::io::Write;
+
+    #[test]
+    fn the_genre_comes_from_any_library_when_the_file_has_no_tag() {
+        let lib = Library::open_in_memory().unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        lib.insert_track(id, None, None, None).unwrap();
+        let genre = |lib: &Library, source: &str, g: &str| {
+            lib.upsert_metadata_source(
+                id,
+                source,
+                None,
+                None,
+                None,
+                Some(g),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        };
+        assert_eq!(lib.track_id3_genre(id).unwrap(), None);
+
+        genre(&lib, "itunes", "House");
+        assert_eq!(lib.track_id3_genre(id).unwrap().as_deref(), Some("House"));
+        assert_eq!(
+            dub_bpm::octave_profile_from_genre("House"),
+            dub_bpm::OctaveProfile::FourOnFloor,
+            "House is what keeps a 132 track off its 88 twin"
+        );
+
+        genre(&lib, "id3", "Garage");
+        assert_eq!(
+            lib.track_id3_genre(id).unwrap().as_deref(),
+            Some("Garage"),
+            "the file's own tag still comes first"
+        );
+    }
 
     /// Generate a single-channel click track at `bpm` for `duration_secs`.
     /// One short click (a sin-window envelope around a 1 kHz pulse)
@@ -2711,6 +2783,116 @@ mod tests {
             .expect("tap row must still be active");
         assert_eq!(post.source, "user_tap");
         assert!((post.bpm - 120.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_lock_over_an_imported_grid_still_lets_the_rest_be_analysed() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.upsert_imported_beatgrid_locked(&track_id, "traktor", 0.25, 121.0, true)
+            .unwrap();
+        assert!(
+            lib.is_grid_locked(&track_id).unwrap(),
+            "Traktor's lock arrives"
+        );
+        assert!(!lib.lock_refuses_analysis(&track_id).unwrap());
+
+        lib.analyze_track(&track_id).expect("analysis runs");
+        let active = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        assert_eq!(active.source, "traktor", "the locked grid is untouched");
+        assert!((active.bpm - 121.0).abs() < 1e-9);
+        assert!(lib.is_track_analyzed(&track_id).unwrap());
+    }
+
+    #[test]
+    fn an_imported_lock_follows_its_grid_only_as_the_grid_arrives() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        let lock = |source: &str, anchor: f64, locked: bool| {
+            lib.upsert_imported_beatgrid_locked(&track_id, source, anchor, 120.0, locked)
+                .unwrap();
+        };
+
+        lock("serato", 0.5, false);
+        lock("traktor", 0.4, true);
+        assert!(
+            !lib.is_grid_locked(&track_id).unwrap(),
+            "Traktor's lock never pins Serato's grid"
+        );
+
+        lock("serato", 0.5, true);
+        assert!(
+            !lib.is_grid_locked(&track_id).unwrap(),
+            "same grid as before: nothing arrived to lock"
+        );
+        lock("serato", 0.6, true);
+        assert!(
+            lib.is_grid_locked(&track_id).unwrap(),
+            "a changed locked grid"
+        );
+
+        lib.set_grid_locked(&track_id, false).unwrap();
+        lock("serato", 0.6, true);
+        assert!(
+            !lib.is_grid_locked(&track_id).unwrap(),
+            "the next launch's import doesn't undo the DJ's unlock"
+        );
+    }
+
+    /// 174 clicks a minute are also 87, counted in half time; the audio
+    /// does not say which. The genre does where it can, and the DJ's
+    /// tempo range does for every other song.
+    #[test]
+    fn a_songs_tempo_is_read_in_its_genres_octave_or_the_djs_range() {
+        let read = |genre: Option<&str>, range_low: Option<f64>| -> f64 {
+            let lib = Library::open_in_memory().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let (track_id, _) = seed_track_without_fingerprint(&lib, &tmp, 174.0, 12.0);
+            if let Some(genre) = genre {
+                lib.upsert_metadata_source(
+                    &track_id,
+                    "id3",
+                    None,
+                    None,
+                    None,
+                    Some(genre),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            if let Some(low) = range_low {
+                lib.set_tempo_octave(low).unwrap();
+            }
+            let outcome = lib.analyze_track(&track_id).unwrap();
+            assert!(outcome.bpm_confidence > 0.0, "a click track has a tempo");
+            outcome.bpm
+        };
+        let near = |bpm: f64, want: f64, what: &str| {
+            assert!((bpm - want).abs() < 1.0, "{what}: read {bpm}, want {want}");
+        };
+        near(read(None, None), 87.0, "no genre, the default 78-156");
+        near(read(Some("Drum & Bass"), None), 174.0, "drum & bass");
+        near(read(None, Some(100.0)), 174.0, "no genre, the DJ's 100-200");
+        near(
+            read(Some("Bmore - Funk"), Some(100.0)),
+            174.0,
+            "a genre that says nothing",
+        );
+        near(
+            read(Some("Hip-Hop"), Some(100.0)),
+            87.0,
+            "hip-hop keeps its own 68-136",
+        );
     }
 
     /// PRD-BEATS §3.5 lock-is-absolute across the three-phase split:

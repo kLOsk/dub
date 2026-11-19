@@ -41,13 +41,6 @@ pub struct HotCue {
 /// `source`).
 const USER_SOURCE: &str = "user";
 
-/// The imported sources whose cues can fill the pads, highest first —
-/// the same order their beat grids rank in
-/// (`Library::grid_source_rank`), so one rule answers "whose grid, whose
-/// cues" and Preferences ▸ Library can state it once. iTunes carries no
-/// cues.
-pub const CUE_SOURCE_ORDER: [&str; 3] = ["serato", "rekordbox", "traktor"];
-
 /// The pad slots. Importers park unslotted memory cues above this range.
 const PAD_COUNT: i64 = 8;
 
@@ -153,7 +146,8 @@ impl Library {
 
     /// Where a track's pad cues come from: `"user"` once the DJ has set or
     /// taken over any cue in Dub, else the highest imported source in
-    /// [`CUE_SOURCE_ORDER`] with a cue on a pad, else `None`.
+    /// the DJ's import order (`Library::import_order`, the order their grids
+    /// rank in too) with a cue on a pad, else `None`.
     pub fn pad_cue_source(&self, track_id: &str) -> Result<Option<String>> {
         let conn = self.connection();
         // Any cue set in Dub, or a track taken over (schema v10) even if
@@ -169,7 +163,7 @@ impl Library {
         if user > 0 {
             return Ok(Some(USER_SOURCE.to_string()));
         }
-        for source in CUE_SOURCE_ORDER {
+        for source in self.source_prefs()?.cue_order() {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM track_cues WHERE track_id = ?1 AND source = ?2 \

@@ -1,72 +1,139 @@
-//! Genre-aware octave disambiguation (M11c.3d+).
+//! Which octave a song's tempo is read in.
 //!
-//! Offline library analysis can pass an [`OctaveProfile`] derived from
-//! ID3 genre tags. Thru-mode streaming keeps [`OctaveProfile::Default`]
-//! because live wax has no tag until fingerprint match (v1.1).
+//! A beat can be counted at half or double speed and both are "right":
+//! 70 or 140 for dubstep, 87 or 174 for drum & bass. The audio does not
+//! settle it, so Dub reads every tempo inside one octave — a
+//! [`TempoOctave`], `[low, 2 × low)` BPM — the way Traktor, Serato and
+//! rekordbox do with their BPM-range setting. The genre tag picks the
+//! octave where it says something ([`OctaveProfile`]); the DJ's
+//! preference picks it for everything else.
 //!
-//! ## Scope of the genre matcher
+//! This replaced a prior over 60–200 BPM plus nine genre-specific
+//! rejection rules (2026-11-19). Scored against 1,758 grids the operator
+//! had locked in Traktor, those agreed on 62 % of tempos — one rule,
+//! written for reggae, threw the right tempo away on every untagged
+//! four-on-the-floor song. The same detector with no rules and these
+//! octaves agrees on 96 %. See
+//! `docs/investigations/BPM-DETECTOR-V2-INVESTIGATION.md` §8.
 //!
-//! The matcher prioritises the urban-scratch DJ niche the product
-//! targets (PRD §1): hip-hop, reggae / dub family, dancehall, UK
-//! garage, jungle / DnB, dubstep, plus their substyles. Genres
-//! outside that niche fall to [`OctaveProfile::Default`] and rely
-//! on the M11c.3a perceptual prior — they still analyse, just
-//! without a tempo-band hint. Tags accepted today:
+//! ## Genre tags recognised
+//!
+//! The matcher covers the urban-scratch niche the product targets
+//! (PRD §1). Anything else is [`OctaveProfile::Default`]: the DJ's own
+//! range.
 //!
 //! * **HipHop** — `hip-hop`, `hip hop`, `hiphop`, `rap`, `trap`,
 //!   `r&b`, `r & b`, `rnb`, `boom bap` / `boom-bap` / `boombap`,
-//!   `drill` (UK / Brooklyn / Chicago, kick perceived at ~70 BPM),
-//!   `lo-fi` / `lofi` / `lo fi` (chill hop), `reggaeton`
-//!   (dembow, 90–100 BPM — explicit override of the `reggae`
-//!   substring trap).
+//!   `drill`, `lo-fi` / `lofi` / `lo fi`, `reggaeton` (dembow —
+//!   explicit override of the `reggae` substring trap).
 //! * **FourOnFloor** — `house`, `garage`, `ukg`, `4x4` / `4×4`,
-//!   `2-step` / `2step` / `two-step`, `bassline`, `grime` (140 BPM
-//!   mix tempo, sparse kick), `jersey club`, `baltimore club`,
-//!   `techno`, `trance`, `electro`, `club`.
+//!   `2-step` / `2step` / `two-step`, `bassline`, `grime`, `dubstep`,
+//!   `jersey club`, `baltimore club`, `techno`, `trance`, `electro`,
+//!   `club`.
 //! * **DrumAndBass** — `drum & bass` / `drum and bass` /
 //!   `drum n bass` / `drum'n'bass` / `drumandbass`, `dnb`, `d&b`,
 //!   `jungle`, `neurofunk`, `breakcore`, `liquid funk`, `footwork`,
 //!   `juke`, `uk hardcore`, `happy hardcore`.
 //! * **Dancehall** — `dancehall`, `ragga`, `bashment`.
-//! * **Dub** — `dub` (but not `dubstep` greediness), `dubstep`.
-//! * **RootsReggae** — `reggae` (after reggaeton override),
-//!   `rocksteady`, `roots`, `lovers`, `stepper(s)`, `ska`.
+//! * **Dub** — `dub` (not `dubstep`).
+//! * **RootsReggae** — `reggae` (after the reggaeton override),
+//!   `rocksteady`, `roots`, `lovers`, `stepper(s)`, and `ska` as a word
+//!   of its own (`Skate Punk` is not ska).
 
-/// How pass 2 resolves octave / subdivision ambiguity when metadata
-/// supplies genre context. [`Default`] is the mixable-band prior from
-/// M11c.3a.
+/// One octave of tempo: `[low, 2 × low)` BPM. Every tempo Dub reads for a
+/// song lands inside the song's octave, so half and double are never both
+/// on the table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TempoOctave {
+    low: f64,
+}
+
+impl TempoOctave {
+    /// The lowest an octave may start: [`crate::MIN_BPM`].
+    pub const MIN_LOW: f64 = crate::MIN_BPM;
+    /// The highest an octave may start, so it still ends at
+    /// [`crate::MAX_BPM`].
+    pub const MAX_LOW: f64 = crate::MAX_BPM / 2.0;
+
+    /// 78–156: the octave that holds the most of an unlabelled library.
+    /// Of the operator's 629 locked Traktor grids with no recognised
+    /// genre, 97.9 % sit in it.
+    pub const DEFAULT: Self = Self { low: 78.0 };
+
+    /// The octaves offered as a preference, by their low end.
+    pub const CHOICES: [f64; 5] = [60.0, 68.0, 78.0, 88.0, 100.0];
+
+    /// The octave starting at `low` BPM, or `None` outside
+    /// [`Self::MIN_LOW`]..=[`Self::MAX_LOW`].
+    #[must_use]
+    pub fn from_low(low: f64) -> Option<Self> {
+        (low.is_finite() && (Self::MIN_LOW..=Self::MAX_LOW).contains(&low)).then_some(Self { low })
+    }
+
+    /// The slowest tempo in the octave (inclusive).
+    #[must_use]
+    pub const fn low(self) -> f64 {
+        self.low
+    }
+
+    /// Twice [`Self::low`]: the first tempo past the octave.
+    #[must_use]
+    pub fn high(self) -> f64 {
+        self.low * 2.0
+    }
+}
+
+impl Default for TempoOctave {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The genre family a tag belongs to, as far as tempo goes: which octave
+/// its songs are mixed in. [`OctaveProfile::tempo_octave`] holds the
+/// numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OctaveProfile {
-    /// Untagged or genre-tagged "other" — existing perceptual prior.
-    /// No lower- or upper-octave bias; pass 2 picks the spectral
-    /// winner.
+    /// No genre, or one that says nothing about tempo: the DJ's own
+    /// range decides.
     #[default]
     Default,
-    /// Roots reggae, rocksteady: prefer one-drop / skank root (~65–95).
+    /// Roots reggae, rocksteady, ska: counted at the one-drop, 60–120.
     RootsReggae,
-    /// Dub, dubstep (half-time feel): prefer ~65–75 when tied.
+    /// Dub (the reggae kind): 60–120.
     Dub,
-    /// Fast dancehall / ragga: keep full-tempo detections (e.g. ~132).
+    /// Dancehall, ragga, bashment: 75–150.
     Dancehall,
-    /// House, garage, techno: prefer 4/4 kick grid (~120–140).
+    /// House, garage, techno, grime, dubstep: 88–176. Dubstep is mixed
+    /// at 140, not 70 — 157 of the operator's 158 locked dubstep grids
+    /// sit between 120 and 150.
     FourOnFloor,
-    /// PRD-BEATS Round 6 §6d — Hip-hop, rap, trap, R&B, boom-bap.
-    /// Mix tempo lives at 75–105 BPM (kick on 1+3 grid). Without
-    /// a lower-octave bias, the busy hi-hat / 16th-note rhythm
-    /// section wins spectral energy at 150–210 BPM and the auto-
-    /// analyser picks that octave instead of the perceptual kick
-    /// tempo. Mirrors `RootsReggae`'s sibling-rejection logic
-    /// against the same 150–200 BPM band.
+    /// Hip-hop, rap, trap, R&B: 68–136.
     HipHop,
-    /// PRD-BEATS Round 6 §6e — Drum & bass, jungle. Mix tempo
-    /// lives at 160–185 BPM (rolling-kick / amen-break grid).
-    /// Without an upper-octave preference an analyser presented
-    /// with a strong snare backbeat at the 2-beat period can
-    /// resolve to half tempo (~82 BPM) — the same K-S-backbeat
-    /// half-tempo problem the rolling-dnb fixture in
-    /// `tests/genre_octave.rs` documents. Mirrors `Dancehall`'s
-    /// "keep full-tempo" behaviour for the fast-urban band.
+    /// Drum & bass, jungle: 100–200.
     DrumAndBass,
+}
+
+impl OctaveProfile {
+    /// The octave this family's tempos are read in; `fallback` (the DJ's
+    /// preference) for [`OctaveProfile::Default`].
+    ///
+    /// Each is the octave holding the most of that family among the
+    /// operator's locked Traktor grids (2026-11-19): hip-hop 98 %,
+    /// house/garage/dubstep 99.7 %, reggae and dub 95 %, drum & bass
+    /// 100 %, dancehall 98 %.
+    #[must_use]
+    pub fn tempo_octave(self, fallback: TempoOctave) -> TempoOctave {
+        let low = match self {
+            Self::Default => return fallback,
+            Self::RootsReggae | Self::Dub => 60.0,
+            Self::HipHop => 68.0,
+            Self::Dancehall => 75.0,
+            Self::FourOnFloor => 88.0,
+            Self::DrumAndBass => 100.0,
+        };
+        TempoOctave { low }
+    }
 }
 
 /// Map a container genre string to an [`OctaveProfile`].
@@ -75,20 +142,19 @@ pub enum OctaveProfile {
 /// `"Reggae / Dub"` or `"UK Garage 4x4"` resolve sensibly.
 ///
 /// **Ordering is load-bearing.** The chain is `reggaeton →
-/// dancehall → dub → reggae → four-on-floor (incl. UKG / grime)
-/// → drum & bass → hip-hop → default`. Two cases force an explicit
-/// override of substring greediness:
+/// dancehall → dubstep → dub → reggae → four-on-floor (incl. UKG /
+/// grime) → drum & bass → hip-hop → default`. Substring greediness
+/// forces these overrides:
 ///
 /// * `"Reggaeton"` contains `"reggae"` but is a 90–100 BPM dembow
-///   genre that mixes at the kick (HipHop band), not the half-
-///   time one-drop. Without the up-front check, every reggaeton
-///   tag misroutes to [`OctaveProfile::RootsReggae`] and the
-///   half-time bias actively flips the perceived ~95 BPM into
-///   ~48.
+///   genre mixed at the kick, not the one-drop.
+/// * `"Dubstep"` contains `"dub"` but is mixed at 140 with garage and
+///   grime, so it is caught first — `"Dubstep - Reggae"` included.
+/// * `"Skate Punk"` contains `"ska"`; ska only counts as a word of its
+///   own.
 /// * `"Lo-Fi House"` and `"4x4 House"` contain `"house"` and must
-///   stay in the four-on-floor arm. Ordering is fine here because
-///   the four-on-floor arm runs before the hip-hop arm (`"lo-fi"`
-///   lives), so the house tag wins by position.
+///   stay in the four-on-floor arm, which runs before the hip-hop arm
+///   where `"lo-fi"` lives.
 #[must_use]
 pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
     let g = genre.trim().to_ascii_lowercase();
@@ -103,10 +169,10 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
     if g.contains("dancehall") || g.contains("ragga") || g.contains("bashment") {
         return OctaveProfile::Dancehall;
     }
-    if g.contains("dub") && !g.contains("dubstep") {
-        return OctaveProfile::Dub;
-    }
     if g.contains("dubstep") {
+        return OctaveProfile::FourOnFloor;
+    }
+    if g.contains("dub") {
         return OctaveProfile::Dub;
     }
     if g.contains("reggae")
@@ -114,25 +180,13 @@ pub fn octave_profile_from_genre(genre: &str) -> OctaveProfile {
         || g.contains("roots")
         || g.contains("lovers")
         || g.contains("stepper")
-        || g.contains("ska")
+        || g.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "ska")
     {
         return OctaveProfile::RootsReggae;
     }
-    // UK garage family lives here. The 4/4 kick + 130–135 BPM mix
-    // tempo of UKG, 4x4 garage, speed garage, 2-step (kick on 1+3
-    // perceptually still mixed at 130), and bassline all sit
-    // squarely inside the FourOnFloor band (115–145 BPM) and benefit
-    // from `four_on_floor_halfbar_rejected` killing the ~87 BPM
-    // half-time twin. `"speed garage"` already passes via `"garage"`;
-    // explicit entries for `"ukg"`, `"4x4"`, `"4×4"`, `"2-step"`,
-    // `"bassline"` close the gaps where the bare token is what
-    // ships in id3.
-    //
-    // Grime: 140 BPM mix tempo, sparse kick on 1+3, snare on 2+4,
-    // bass synth at 140. UK grime DJs mix at 140, not 70. Mapping
-    // to FourOnFloor keeps the 140 octave intact (the HipHop
-    // profile would actively reject 140 in favour of a 70 BPM
-    // sibling, which is the wrong call for grime).
+    // Grime sits here with garage: both are mixed at 130–140, not at
+    // the half-time a hip-hop tag would give them.
     if g.contains("house")
         || g.contains("garage")
         || g.contains("ukg")
@@ -238,11 +292,11 @@ pub fn octave_profile_from_label(label: &str) -> OctaveProfile {
         "roots" | "roots_reggae" | "reggae" | "rocksteady" | "ska" | "steppers" => {
             OctaveProfile::RootsReggae
         }
-        "dub" | "dubstep" => OctaveProfile::Dub,
+        "dub" => OctaveProfile::Dub,
         "dancehall" | "ragga" | "bashment" => OctaveProfile::Dancehall,
         "house" | "four_on_floor" | "four-on-floor" | "garage" | "ukg" | "uk_garage"
         | "uk-garage" | "4x4" | "2-step" | "2step" | "two_step" | "bassline" | "grime"
-        | "techno" | "trance" | "electro" => OctaveProfile::FourOnFloor,
+        | "dubstep" | "techno" | "trance" | "electro" => OctaveProfile::FourOnFloor,
         "hip_hop" | "hiphop" | "hip-hop" | "rap" | "trap" | "rnb" | "drill" | "lofi" | "lo-fi"
         | "lo_fi" | "reggaeton" => OctaveProfile::HipHop,
         "dnb" | "drum_and_bass" | "drum-and-bass" | "drumandbass" | "jungle" | "neurofunk"
@@ -251,324 +305,6 @@ pub fn octave_profile_from_label(label: &str) -> OctaveProfile {
         }
         _ => OctaveProfile::Default,
     }
-}
-
-/// Reggae skank pass false-flips house kicks at ~129 BPM (M11c.3f).
-#[must_use]
-pub fn profile_skips_skank_pass(profile: OctaveProfile) -> bool {
-    matches!(profile, OctaveProfile::FourOnFloor)
-}
-
-/// Returns `true` when the profile's mix tempo legitimately lives in the
-/// generic hip-hop "double-time" band (~160–180 BPM), so the
-/// genre-agnostic `hiphop_doubletime_rejected` pass must **not** throw
-/// out the true tempo.
-///
-/// A Drum & Bass tag means a ~172 BPM peak IS the quarter-note pulse —
-/// not the double-time of an ~86 BPM hip-hop beat. Without this gate the
-/// strongest, correct DnB peak (e.g. "Murder Dem": 172 raw=8.26, the top
-/// peak) is hard-rejected and the ⅔-subdivision (≈115 BPM) wins — the
-/// exact "174 reads as 116" failure on a DnB-tagged library. DnB keeps
-/// its own half-time rejection ([`profile_halftime_rejected`]), so the
-/// 87 BPM sub-octave is still killed; only the spurious hip-hop-shaped
-/// double-time veto on the true tempo is lifted.
-#[must_use]
-pub fn profile_skips_hiphop_doubletime_pass(profile: OctaveProfile) -> bool {
-    matches!(profile, OctaveProfile::DrumAndBass)
-}
-
-/// Returns `true` when the profile forbids the post-pass-2
-/// `octave_self_verify` from swapping the chosen BPM down to its
-/// half (BPM → BPM/2).
-///
-/// Genres whose mix tempo lives in the **upper** octave (4/4 kick
-/// or kick-roll grid) suffer a structural LSQ trap at the half
-/// octave: when the production has sparse kick patterns (UK
-/// garage 2-step, broken-beat house, DnB kick rolls), the predicted
-/// beat positions at the true tempo land in dead air half the time,
-/// while the half-tempo grid only predicts every-other-beat and
-/// happens to align with the kicks that *do* land. RMS at the half
-/// octave reads dramatically tighter even though the half octave is
-/// musically wrong — Oppidan & Cutty Ranks "Armed & Dangerous" was
-/// the canonical case: true 133 BPM UKG with rms 31.5 ms at 133,
-/// rms 5.8 ms at 66.5; profile-blind self-verify swapped to 66.5
-/// and surfaced it in the deck header.
-///
-/// The profile-driven block is the right layer to fix this: the
-/// genre tag already says "the kick / mix tempo is in the upper
-/// octave, don't second-guess pass 2's pick". Pass 2 itself
-/// already prefers the upper octave for these profiles via the
-/// perceptual prior + `four_on_floor_halfbar_rejected` /
-/// `profile_halftime_rejected` (DnB) / Dancehall's
-/// continue-don't-reject behaviour; the self-verify must respect
-/// that decision instead of undoing it.
-#[must_use]
-pub fn profile_blocks_half_octave_swap(profile: OctaveProfile) -> bool {
-    matches!(
-        profile,
-        OctaveProfile::FourOnFloor | OctaveProfile::DrumAndBass | OctaveProfile::Dancehall
-    )
-}
-
-/// Returns `true` when the profile forbids the post-pass-2
-/// `octave_self_verify` from swapping the chosen BPM up to its
-/// double (BPM → BPM×2).
-///
-/// Mirror of [`profile_blocks_half_octave_swap`]. Genres whose mix
-/// tempo lives in the **lower** octave (one-drop, dub, hip-hop kick
-/// on 1+3) suffer the inverse LSQ trap: when the production has a
-/// dense hi-hat or shaker layer, the upper-octave grid finds
-/// tighter onset alignment to the hat / shaker pulses than the
-/// kick-aligned lower octave does. The profile already encodes
-/// "mix at the lower octave"; the self-verify must respect that.
-#[must_use]
-pub fn profile_blocks_double_octave_swap(profile: OctaveProfile) -> bool {
-    matches!(
-        profile,
-        OctaveProfile::RootsReggae | OctaveProfile::Dub | OctaveProfile::HipHop
-    )
-}
-
-/// Upper BPM band for profile-driven double-time rejection.
-const PROFILE_HIGH_BPM_MIN: f64 = 135.0;
-const PROFILE_HIGH_BPM_MAX: f64 = 180.0;
-
-/// Lower BPM band paired with the profile high band (2:1 ratio).
-const PROFILE_LOW_BPM_MIN: f64 = 60.0;
-const PROFILE_LOW_BPM_MAX: f64 = 100.0;
-
-const PROFILE_OCTAVE_RATIO: f64 = 2.0;
-const PROFILE_OCTAVE_TOLERANCE: f64 = 0.04;
-
-const ROOTS_SIBLING_MIN_RAW_RATIO: f64 = 0.75;
-const DUB_NEAR_TIE_MAX_GAP: f64 = 0.02;
-const DUB_SIBLING_MIN_RAW_RATIO: f64 = 0.80;
-
-/// 4/4 house: false half-bar candidates in this band.
-const FOF_HALF_BAR_LOW_MIN: f64 = 80.0;
-const FOF_HALF_BAR_LOW_MAX: f64 = 100.0;
-const FOF_HALF_BAR_HIGH_MIN: f64 = 115.0;
-const FOF_HALF_BAR_HIGH_MAX: f64 = 145.0;
-const FOF_HALF_BAR_RATIO: f64 = 1.5;
-const FOF_HALF_BAR_MIN_RAW_RATIO: f64 = 0.85;
-
-/// Shuffle-feel phantom peaks ~4/3 above the true house tempo.
-const FOF_SHUFFLE_HIGH_MIN: f64 = 152.0;
-const FOF_SHUFFLE_HIGH_MAX: f64 = 170.0;
-const FOF_SHUFFLE_LOW_MIN: f64 = 118.0;
-const FOF_SHUFFLE_LOW_MAX: f64 = 130.0;
-const FOF_SHUFFLE_RATIO: f64 = 4.0 / 3.0;
-const FOF_SHUFFLE_MIN_RAW_RATIO: f64 = 0.85;
-
-/// Dubstep mid-band false peaks (~93 vs true ~70).
-const DUB_MID_LOW_MIN: f64 = 85.0;
-const DUB_MID_LOW_MAX: f64 = 100.0;
-const DUB_MID_ROOT_MIN: f64 = 65.0;
-const DUB_MID_ROOT_MAX: f64 = 74.0;
-const DUB_MID_RATIO: f64 = 4.0 / 3.0;
-const DUB_MID_MIN_RAW_RATIO: f64 = 0.80;
-
-fn ratio_matches(actual: f64, target: f64, tolerance: f64) -> bool {
-    (actual - target).abs() <= tolerance * target
-}
-
-/// PRD-BEATS Round 6 §6d — Hip-hop sibling-rejection threshold.
-/// Same shape as `ROOTS_SIBLING_MIN_RAW_RATIO` but slightly
-/// stricter (the hip-hop hi-hat layer is often 4-to-1 louder than
-/// the kick in raw spectral terms, so we accept the lower octave
-/// even when its raw spectral score is only 70 % of the upper
-/// octave's). Validated against the synthetic hip-hop fixture
-/// (`drum_pattern_hip_hop`) at 80, 88, and 100 BPM.
-const HIPHOP_SIBLING_MIN_RAW_RATIO: f64 = 0.70;
-
-/// Returns `true` when a qualifying upper-octave candidate should be
-/// discarded because genre context says the lower octave is the mix
-/// tempo (M11c.3d). Extended in PRD-BEATS Round 6 §6d to cover
-/// [`OctaveProfile::HipHop`].
-pub(crate) fn profile_doubletime_rejected(
-    profile: OctaveProfile,
-    candidate_bpm: f64,
-    candidate_raw: f64,
-    qualified: &[(f64, f64)],
-) -> bool {
-    if !matches!(
-        profile,
-        OctaveProfile::RootsReggae | OctaveProfile::Dub | OctaveProfile::HipHop
-    ) {
-        return false;
-    }
-
-    if !(PROFILE_HIGH_BPM_MIN..=PROFILE_HIGH_BPM_MAX).contains(&candidate_bpm) {
-        return false;
-    }
-
-    for &(other_bpm, other_raw) in qualified {
-        if !(PROFILE_LOW_BPM_MIN..=PROFILE_LOW_BPM_MAX).contains(&other_bpm) {
-            continue;
-        }
-        let ratio = candidate_bpm / other_bpm;
-        if (ratio - PROFILE_OCTAVE_RATIO).abs() > PROFILE_OCTAVE_TOLERANCE * PROFILE_OCTAVE_RATIO {
-            continue;
-        }
-
-        let min_ratio = match profile {
-            OctaveProfile::RootsReggae => ROOTS_SIBLING_MIN_RAW_RATIO,
-            OctaveProfile::HipHop => HIPHOP_SIBLING_MIN_RAW_RATIO,
-            OctaveProfile::Dub => {
-                let raw_gap = (candidate_raw - other_raw).abs() / candidate_raw.max(other_raw);
-                if raw_gap <= DUB_NEAR_TIE_MAX_GAP {
-                    return true;
-                }
-                DUB_SIBLING_MIN_RAW_RATIO
-            }
-            OctaveProfile::Default
-            | OctaveProfile::Dancehall
-            | OctaveProfile::FourOnFloor
-            | OctaveProfile::DrumAndBass => {
-                continue;
-            }
-        };
-
-        if other_raw >= candidate_raw * min_ratio {
-            return true;
-        }
-    }
-    false
-}
-
-/// PRD-BEATS Round 6 §6e — DnB / jungle: REJECT the lower-octave
-/// candidate when a credible 150–200 BPM sibling exists at the
-/// 2:1 ratio. Inverse of [`profile_doubletime_rejected`]: that
-/// function discards an UPPER-octave candidate (for genres whose
-/// mix tempo is low); this discards a LOWER-octave candidate
-/// (for genres whose mix tempo is high).
-///
-/// DnB at 165–185 mixed at the kick-roll grid often produces a
-/// strong half-time autocorrelation peak at 82–92 BPM because
-/// the snare backbeat lands every other beat (same K-S half-time
-/// problem documented in the rolling-dnb regression test). The
-/// existing `Dancehall` profile sidesteps the symmetric issue by
-/// NOT actively rejecting either side (the spectral winner just
-/// happens to be the upper); this rule is more decisive because
-/// for DnB the upper octave should ALWAYS win when paired —
-/// nobody DJs a 170 BPM DnB track at 85.
-pub(crate) fn profile_halftime_rejected(
-    profile: OctaveProfile,
-    candidate_bpm: f64,
-    candidate_raw: f64,
-    qualified: &[(f64, f64)],
-) -> bool {
-    if !matches!(profile, OctaveProfile::DrumAndBass) {
-        return false;
-    }
-
-    if !(PROFILE_LOW_BPM_MIN..=PROFILE_LOW_BPM_MAX).contains(&candidate_bpm) {
-        return false;
-    }
-
-    for &(other_bpm, other_raw) in qualified {
-        if !(PROFILE_HIGH_BPM_MIN..=PROFILE_HIGH_BPM_MAX).contains(&other_bpm) {
-            continue;
-        }
-        let ratio = other_bpm / candidate_bpm;
-        if (ratio - PROFILE_OCTAVE_RATIO).abs() > PROFILE_OCTAVE_TOLERANCE * PROFILE_OCTAVE_RATIO {
-            continue;
-        }
-        // Upper sibling must carry at least 70 % of the candidate
-        // (lower) raw score. Symmetric with `HIPHOP_SIBLING_MIN_
-        // RAW_RATIO`: the K-S half-time problem regularly pushes
-        // the lower octave 20–40 % above the upper on raw score,
-        // so requiring the upper to be near-equal would never
-        // fire. 0.70 catches the structural-DnB case while
-        // staying silent when the lower octave is overwhelmingly
-        // dominant (true 85 BPM track tagged "DnB" by mistake).
-        if other_raw >= candidate_raw * 0.70 {
-            return true;
-        }
-    }
-    false
-}
-
-/// Profile-specific pass-2 rejections beyond the global rules.
-pub(crate) fn profile_subdivision_rejected(
-    profile: OctaveProfile,
-    candidate_bpm: f64,
-    candidate_raw: f64,
-    qualified: &[(f64, f64)],
-) -> bool {
-    match profile {
-        OctaveProfile::FourOnFloor => {
-            four_on_floor_halfbar_rejected(candidate_bpm, candidate_raw, qualified)
-                || four_on_floor_shuffle_high_rejected(candidate_bpm, candidate_raw, qualified)
-        }
-        OctaveProfile::Dub => dub_midband_rejected(candidate_bpm, candidate_raw, qualified),
-        _ => false,
-    }
-}
-
-fn four_on_floor_halfbar_rejected(
-    candidate_bpm: f64,
-    candidate_raw: f64,
-    qualified: &[(f64, f64)],
-) -> bool {
-    if !(FOF_HALF_BAR_LOW_MIN..=FOF_HALF_BAR_LOW_MAX).contains(&candidate_bpm) {
-        return false;
-    }
-    for &(other_bpm, other_raw) in qualified {
-        if !(FOF_HALF_BAR_HIGH_MIN..=FOF_HALF_BAR_HIGH_MAX).contains(&other_bpm) {
-            continue;
-        }
-        let ratio = other_bpm / candidate_bpm;
-        if !ratio_matches(ratio, FOF_HALF_BAR_RATIO, PROFILE_OCTAVE_TOLERANCE) {
-            continue;
-        }
-        if other_raw >= candidate_raw * FOF_HALF_BAR_MIN_RAW_RATIO {
-            return true;
-        }
-    }
-    false
-}
-
-fn four_on_floor_shuffle_high_rejected(
-    candidate_bpm: f64,
-    candidate_raw: f64,
-    qualified: &[(f64, f64)],
-) -> bool {
-    if !(FOF_SHUFFLE_HIGH_MIN..=FOF_SHUFFLE_HIGH_MAX).contains(&candidate_bpm) {
-        return false;
-    }
-    for &(other_bpm, other_raw) in qualified {
-        if !(FOF_SHUFFLE_LOW_MIN..=FOF_SHUFFLE_LOW_MAX).contains(&other_bpm) {
-            continue;
-        }
-        let ratio = candidate_bpm / other_bpm;
-        if !ratio_matches(ratio, FOF_SHUFFLE_RATIO, PROFILE_OCTAVE_TOLERANCE) {
-            continue;
-        }
-        if other_raw >= candidate_raw * FOF_SHUFFLE_MIN_RAW_RATIO {
-            return true;
-        }
-    }
-    false
-}
-
-fn dub_midband_rejected(candidate_bpm: f64, candidate_raw: f64, qualified: &[(f64, f64)]) -> bool {
-    if !(DUB_MID_LOW_MIN..=DUB_MID_LOW_MAX).contains(&candidate_bpm) {
-        return false;
-    }
-    for &(other_bpm, other_raw) in qualified {
-        if !(DUB_MID_ROOT_MIN..=DUB_MID_ROOT_MAX).contains(&other_bpm) {
-            continue;
-        }
-        let ratio = candidate_bpm / other_bpm;
-        if !ratio_matches(ratio, DUB_MID_RATIO, PROFILE_OCTAVE_TOLERANCE) {
-            continue;
-        }
-        if other_raw >= candidate_raw * DUB_MID_MIN_RAW_RATIO {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -660,34 +396,6 @@ mod tests {
                 octave_profile_from_genre(tag),
                 OctaveProfile::DrumAndBass,
                 "tag {tag:?} should map to DrumAndBass"
-            );
-        }
-    }
-
-    /// Round 7 — a Drum & Bass tag must lift the genre-agnostic
-    /// hip-hop double-time veto, the bug that read 174 BPM DnB as 116
-    /// (the ⅔ subdivision) on the operator's library: the true 172 peak
-    /// was the strongest but `hiphop_doubletime_rejected` hard-killed it
-    /// as an "86 BPM hip-hop played double-time", leaving the triplet to
-    /// win. Validated end-to-end on the real corpus (LK / Murder Dem /
-    /// Evacuation / Ten Toes all 116/87 → 174 with the DnB profile).
-    #[test]
-    fn dnb_profile_lifts_the_hiphop_doubletime_veto() {
-        assert!(profile_skips_hiphop_doubletime_pass(
-            OctaveProfile::DrumAndBass
-        ));
-        // No other profile lifts it — hip-hop especially must keep it.
-        for p in [
-            OctaveProfile::Default,
-            OctaveProfile::HipHop,
-            OctaveProfile::FourOnFloor,
-            OctaveProfile::Dub,
-            OctaveProfile::Dancehall,
-            OctaveProfile::RootsReggae,
-        ] {
-            assert!(
-                !profile_skips_hiphop_doubletime_pass(p),
-                "{p:?} must NOT lift the hip-hop double-time veto"
             );
         }
     }
@@ -829,128 +537,69 @@ mod tests {
         );
     }
 
-    /// PRD-BEATS Round 6 §6d: hip-hop profile rejects the upper
-    /// octave with a less strict raw-score gate than the global
-    /// M11c.3e rule (0.70 instead of 0.96). Validates against a
-    /// Bangin'-shape qualified list where the 175 BPM peak wins
-    /// on raw but the 87 BPM peer carries 75 % of its score.
     #[test]
-    fn hiphop_profile_rejects_bangin_shape() {
-        let qualified = [(175.0, 1.0), (87.0, 0.75)];
-        assert!(
-            profile_doubletime_rejected(OctaveProfile::HipHop, 175.0, 1.0, &qualified),
-            "HipHop must reject the 175 BPM peak when a 75%-strength 87 BPM peer exists"
-        );
-        // Default must NOT reject — that's the pre-Round 6 behaviour
-        // that produced Bangin's wrong octave in the first place.
-        assert!(
-            !profile_doubletime_rejected(OctaveProfile::Default, 175.0, 1.0, &qualified),
-            "Default must keep the 175 BPM spectral winner (regression \
-             of the Bangin' diagnosis)"
+    fn dubstep_is_read_with_garage_not_with_dub() {
+        for tag in [
+            "Dubstep",
+            "Dubstep - Bretter",
+            "Dubstep - Reggae",
+            "dubstep",
+        ] {
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::FourOnFloor,
+                "{tag}"
+            );
+        }
+        assert_eq!(octave_profile_from_genre("Dub"), OctaveProfile::Dub);
+        assert_eq!(
+            octave_profile_from_label("dubstep"),
+            OctaveProfile::FourOnFloor
         );
     }
 
-    /// PRD-BEATS Round 6 §6e: DnB profile rejects the lower
-    /// octave when paired with a credible upper-octave sibling.
-    /// Mirror of the hip-hop test but inverted: the 87 BPM peak
-    /// gets rejected even though it wins on raw, because the
-    /// 174 BPM peer is credible (70 % of the candidate's score).
     #[test]
-    fn drumandbass_profile_rejects_inverted_halftime() {
-        let qualified = [(87.0, 1.0), (174.0, 0.75)];
-        assert!(
-            profile_halftime_rejected(OctaveProfile::DrumAndBass, 87.0, 1.0, &qualified),
-            "DrumAndBass must reject the 87 BPM half-time peak when a \
-             75%-strength 174 BPM peer exists"
-        );
-        // Non-DnB profiles must keep the 87 BPM candidate.
-        for p in [
-            OctaveProfile::Default,
-            OctaveProfile::HipHop,
-            OctaveProfile::RootsReggae,
-        ] {
-            assert!(
-                !profile_halftime_rejected(p, 87.0, 1.0, &qualified),
-                "{p:?} must not reject the 87 BPM peak"
+    fn ska_is_a_word_not_a_fragment() {
+        for tag in ["Ska", "Reggae - Ska", "2 Tone / Ska"] {
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::RootsReggae,
+                "{tag}"
+            );
+        }
+        for tag in ["Skate Punk", "Skate Punk - Rock", "Alaska"] {
+            assert_eq!(
+                octave_profile_from_genre(tag),
+                OctaveProfile::Default,
+                "{tag}"
             );
         }
     }
 
     #[test]
-    fn roots_profile_rejects_here_i_come_shape() {
-        let qualified = [(171.0, 2.33), (85.0, 2.71)];
-        assert!(profile_doubletime_rejected(
-            OctaveProfile::RootsReggae,
-            171.0,
-            2.33,
-            &qualified
-        ));
+    fn each_family_reads_in_its_own_octave() {
+        let fallback = TempoOctave::from_low(88.0).unwrap();
+        let low = |p: OctaveProfile| p.tempo_octave(fallback).low();
+        assert_eq!(low(OctaveProfile::Default), 88.0, "the DJ's range");
+        assert_eq!(low(OctaveProfile::RootsReggae), 60.0);
+        assert_eq!(low(OctaveProfile::Dub), 60.0);
+        assert_eq!(low(OctaveProfile::HipHop), 68.0);
+        assert_eq!(low(OctaveProfile::Dancehall), 75.0);
+        assert_eq!(low(OctaveProfile::FourOnFloor), 88.0);
+        assert_eq!(low(OctaveProfile::DrumAndBass), 100.0);
     }
 
     #[test]
-    fn dancehall_profile_spares_all_night_shape() {
-        let qualified = [(132.5, 3.48), (66.3, 3.41)];
-        assert!(!profile_doubletime_rejected(
-            OctaveProfile::Dancehall,
-            132.5,
-            3.48,
-            &qualified
-        ));
-    }
-
-    #[test]
-    fn dub_profile_rejects_blind_prophet_shape() {
-        let qualified = [(139.67, 5.034), (69.84, 4.992)];
-        assert!(profile_doubletime_rejected(
-            OctaveProfile::Dub,
-            139.67,
-            5.034,
-            &qualified
-        ));
-    }
-
-    #[test]
-    fn four_on_floor_rejects_molly_half_bar() {
-        let qualified = [(129.20, 8.754), (86.13, 8.002), (65.42, 4.498)];
-        assert!(profile_subdivision_rejected(
-            OctaveProfile::FourOnFloor,
-            86.13,
-            8.002,
-            &qualified
-        ));
-        assert!(!profile_subdivision_rejected(
-            OctaveProfile::FourOnFloor,
-            129.20,
-            8.754,
-            &qualified
-        ));
-    }
-
-    #[test]
-    fn four_on_floor_rejects_jaden_shuffle_high() {
-        let qualified = [(164.0, 5.45), (123.05, 6.73), (97.51, 5.34)];
-        assert!(profile_subdivision_rejected(
-            OctaveProfile::FourOnFloor,
-            164.0,
-            5.45,
-            &qualified
-        ));
-    }
-
-    #[test]
-    fn dub_profile_rejects_midband_false_peak() {
-        let qualified = [(93.0, 2.5), (70.0, 2.2)];
-        assert!(profile_subdivision_rejected(
-            OctaveProfile::Dub,
-            93.0,
-            2.5,
-            &qualified
-        ));
-    }
-
-    #[test]
-    fn profile_skips_skank_only_for_house() {
-        assert!(profile_skips_skank_pass(OctaveProfile::FourOnFloor));
-        assert!(!profile_skips_skank_pass(OctaveProfile::Default));
+    fn an_octave_stays_inside_what_the_analyser_can_read() {
+        assert!(TempoOctave::from_low(59.9).is_none());
+        assert!(TempoOctave::from_low(100.1).is_none());
+        assert!(TempoOctave::from_low(f64::NAN).is_none());
+        let o = TempoOctave::from_low(60.0).unwrap();
+        assert_eq!((o.low(), o.high()), (60.0, 120.0));
+        assert_eq!(TempoOctave::from_low(100.0).unwrap().high(), crate::MAX_BPM);
+        assert_eq!(TempoOctave::default(), TempoOctave::DEFAULT);
+        for low in TempoOctave::CHOICES {
+            assert!(TempoOctave::from_low(low).is_some(), "{low}");
+        }
     }
 }

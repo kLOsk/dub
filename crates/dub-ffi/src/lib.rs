@@ -37,10 +37,10 @@ use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
 use dub_bpm::{
-    analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_from_taps,
-    analyze_beat_grid_with_profile, bar_phase_from_tap, octave_profile_from_genre,
-    relatch_grid_at_downbeat_tap, uniform_beats, BeatGrid as CoreBeatGrid, BpmRange, BpmStream,
-    GridQuality as CoreGridQuality, LiveStreamConfig, OctaveProfile, TrackerConfig, TrackerState,
+    analyze_beat_grid_from_taps, analyze_beat_grid_in_octave, bar_phase_from_tap,
+    fit_grid_at_playing_tap, octave_profile_from_genre, relatch_grid_at_downbeat_tap,
+    uniform_beats, BeatGrid as CoreBeatGrid, BpmRange, BpmStream, GridQuality as CoreGridQuality,
+    LiveStreamConfig, OctaveProfile, TempoOctave, TrackerConfig, TrackerState,
 };
 use dub_engine::{
     reverse_loop_region, DeckSharedState, Engine, EngineHandle, LiveTapConsumers, ThruInputConfig,
@@ -572,7 +572,33 @@ pub use rip::{
 ///       [`BeatGrid::even_anchor_secs`]; [`LibraryTrack::tempo_map_kind`]
 ///       and the band's range for the BPM column. A grid edit on a
 ///       following deck follows the band again instead of flattening it.
-pub const FFI_VERSION: u32 = 89;
+///   90. **Which app comes first.** [`DubLibrary::import_order`] /
+///       [`DubLibrary::set_import_order`]: the order of Serato, rekordbox
+///       and Traktor that picks a track's grid, key and pad cues
+///       (Preferences ▸ Library; schema v12 `library_settings`). Setting it
+///       re-picks every track the DJ hasn't locked, tapped or keyed by hand.
+///       [`DubLibrary::set_disabled_sources`]: an app switched off in
+///       Preferences counts for nothing — grids, keys, cues and names —
+///       until it is back on; its data stays stored.
+///   91. **Tempo range; a playing-deck tap fitted to the whole song.**
+///       [`DubLibrary::tempo_range_low`] /
+///       [`DubLibrary::set_tempo_range_low`] and
+///       [`DubEngine::set_tempo_range_low`]: the octave a song's tempo is
+///       read in when its genre doesn't say (Preferences ▸ Library;
+///       `library_settings`, no schema change). It replaces the tempo
+///       prior and the genre-specific octave rules.
+///       [`DubEngine::set_bar_phase`] takes `playing`: on a playing deck
+///       the tap picks the beat and the whole song places the lines
+///       (`dub_bpm::fit_grid_at_playing_tap`); a stopped deck keeps the
+///       exact spot. The tap entry points lose `genre`, which they only
+///       passed to a tempo estimate they threw away.
+///       [`DubEngine::install_beat_grid_from_taps`] is tap tempo again,
+///       and the taps are a hint: the track's own tempo is found within
+///       12 % of the tapped one and the whole track places the lines.
+///       `install_beat_grid_from_bpm_and_anchor` is gone — it took the
+///       wall-clock tap rate as the track's tempo, right only at zero
+///       pitch.
+pub const FFI_VERSION: u32 = 91;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -726,6 +752,11 @@ pub struct DubEngine {
     /// `load_track`). Separate from `peak_generation_seq` so a
     /// grid correction does not wipe the waveform ring.
     beat_grid_generation_seq: Arc<[AtomicU64; 2]>,
+    /// Low end of the DJ's tempo range, as `f64` bits: the octave a song
+    /// with no recognised genre is analysed in when it is loaded from
+    /// outside the library. The library keeps the setting; the app hands
+    /// it over at start and on every change.
+    tempo_range_low_bits: AtomicU64,
     /// Per-deck lock-free transport snapshot (M11d.6 round 5).
     ///
     /// Constructed once at [`Self::new`] and reused across every
@@ -1209,6 +1240,14 @@ impl DubEngine {
         }
     }
 
+    /// The DJ's tempo range ([`Self::set_tempo_range_low`]).
+    fn tempo_range(&self) -> TempoOctave {
+        TempoOctave::from_low(f64::from_bits(
+            self.tempo_range_low_bits.load(Ordering::Relaxed),
+        ))
+        .unwrap_or_default()
+    }
+
     fn bump_beat_grid_generation(&self, deck_idx: usize) {
         if let Some(a) = self.beat_grid_generation_seq.get(deck_idx) {
             a.fetch_add(1, Ordering::Release);
@@ -1376,6 +1415,7 @@ impl DubEngine {
             state: Arc::new(Mutex::new(EngineState::Stopped)),
             peak_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
             beat_grid_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
+            tempo_range_low_bits: AtomicU64::new(TempoOctave::DEFAULT.low().to_bits()),
             deck_shared: Arc::new([
                 Arc::new(DeckSharedState::new()),
                 Arc::new(DeckSharedState::new()),
@@ -2123,7 +2163,7 @@ impl DubEngine {
         let beat_grid_gen_handle = Arc::clone(&self.beat_grid_generation_seq);
         let track_for_thread = Arc::clone(&track);
         let supplied_grid_for_thread = library_beat_grid.clone();
-        let genre_for_thread = genre.clone();
+        let octave = tempo_octave_for(genre.as_deref(), self.tempo_range());
         let thread_name = format!("dub-load-{idx}");
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
@@ -2135,7 +2175,7 @@ impl DubEngine {
                     gen_handle,
                     beat_grid_gen_handle,
                     supplied_grid_for_thread,
-                    genre_for_thread,
+                    octave,
                 );
             });
 
@@ -2167,7 +2207,7 @@ impl DubEngine {
                 Arc::clone(&self.peak_generation_seq),
                 Arc::clone(&self.beat_grid_generation_seq),
                 library_beat_grid,
-                genre,
+                octave,
             );
         }
 
@@ -4109,98 +4149,41 @@ impl DubEngine {
         Ok(())
     }
 
-    /// M11d.7-fix — install a tap grid from an **authoritative
-    /// wall-clock `bpm`** plus a single anchor tap (deck-header 3+ tap
-    /// session).
-    ///
-    /// Unlike [`Self::install_beat_grid_from_taps`], tempo is taken from
-    /// `bpm` (computed in the UI from the human's wall-clock tap rhythm)
-    /// rather than re-derived from the spacing of the tap *playhead*
-    /// positions — those advance at the platter's live rate, so the old
-    /// path committed `wall_bpm ÷ rate` (e.g. ~189 for a 174 track tapped
-    /// at −8 % pitch). The anchor is still ODF-snapped to the nearest real
-    /// transient and `bpm` ODF-refined ±3 % via
-    /// [`dub_bpm::analyze_beat_grid_from_bpm_and_anchor`].
+    /// Hand the engine the DJ's tempo range (FFI 91): the octave
+    /// `[low, 2 × low)` BPM a song with no recognised genre is analysed
+    /// in when it is loaded from outside the library. Songs in the
+    /// library are analysed by the library, which keeps this setting
+    /// ([`DubLibrary::set_tempo_range_low`]).
     ///
     /// # Errors
     ///
-    /// Mirrors [`Self::install_beat_grid_from_taps`]: deck/engine/track
-    /// state errors, [`EngineError::GridLocked`], and
-    /// [`EngineError::InvalidBeatGridParams`] for non-finite/≤0 inputs.
-    pub fn install_beat_grid_from_bpm_and_anchor(
-        &self,
-        deck_idx: u64,
-        bpm: f64,
-        anchor_secs: f64,
-        genre: Option<String>,
-    ) -> Result<(), EngineError> {
-        let idx = deck_idx_to_usize(deck_idx)?;
-        if !bpm.is_finite() || bpm <= 0.0 || !anchor_secs.is_finite() {
-            return Err(EngineError::InvalidBeatGridParams);
-        }
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::NotRunning);
-        };
-        let track = running
-            .file_tracks
-            .get(idx)
-            .and_then(|t| t.as_ref())
-            .ok_or(EngineError::NoTrackLoaded(deck_idx))?
-            .clone();
-        let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
-            return Err(EngineError::NoTrackLoaded(deck_idx));
-        };
-        if fp.grid_locked {
-            return Err(EngineError::GridLocked(deck_idx));
-        }
-        let profile = octave_profile_from_optional_genre(genre.as_deref());
-        drop(state);
-
-        let samples = samples_for_offline_analysis(&track);
-        let core = analyze_beat_grid_from_bpm_and_anchor(
-            &samples,
-            track.sample_rate(),
-            track.channels(),
-            bpm,
-            anchor_secs,
-            profile,
-        )
-        .map_err(|e| EngineError::TrackDecodeFailed(format!("tap grid (bpm+anchor): {e}")))?;
-        let grid = BeatGrid::from_core(core);
-        if grid.confidence <= 0.0 || grid.beats.is_empty() {
-            return Err(EngineError::InvalidBeatGridParams);
-        }
-
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::NotRunning);
-        };
-        let mut was_following = false;
-        if let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() {
-            was_following = fp.beat_grid.follows;
-            fp.beat_grid = grid;
-        }
-        drop(state);
-        self.bump_beat_grid_generation(idx);
-        if was_following {
-            self.refollow(idx);
-        }
+    /// [`EngineError::InvalidBeatGridParams`] when `low` is outside
+    /// 60–100.
+    pub fn set_tempo_range_low(&self, low: f64) -> Result<(), EngineError> {
+        let octave = TempoOctave::from_low(low).ok_or(EngineError::InvalidBeatGridParams)?;
+        self.tempo_range_low_bits
+            .store(octave.low().to_bits(), Ordering::Relaxed);
         Ok(())
     }
 
     /// PRD-BEATS §4.1 — "set the 1" (1–2 taps in a session).
     ///
-    /// **Re-anchors the whole grid** so a beat lands on the kick the user
-    /// tapped: it snaps `tap_secs` to the kick's leading edge and rebuilds
-    /// the grid from that anchor, preserving BPM bit-exact
-    /// (`relatch_grid_at_downbeat_tap`). Every beat shifts by the same
-    /// offset; beat *spacing* is unchanged, only the grid's position and
-    /// which beat is the 1. This is **not** a pure `bar_phase` rotation —
-    /// rotation can only re-label an existing grid beat and cannot move the
-    /// grid onto the kick when the auto anchor is sub-beat off (Brown Paper
-    /// Bag: auto anchor in silence ~97 ms left of the first kick). The
-    /// rotation model was tried and reverted; see PRD-BEATS §4.1 / §4.3.
+    /// **Re-anchors the whole grid** at the unchanged BPM and makes the
+    /// tapped beat the 1. How the lines are placed depends on `playing`:
+    ///
+    /// * **Stopped** (`playing = false`): the DJ has parked the playhead
+    ///   on what they see. The tap snaps to that kick's leading edge and
+    ///   the grid is rebuilt from it (`relatch_grid_at_downbeat_tap`); no
+    ///   clean edge, and the tap is kept exactly.
+    /// * **Playing** (`playing = true`): a hand tapping along is tens of
+    ///   milliseconds out, so the tap only says which beat is the 1 and
+    ///   which run of hits is the beat. The whole song then places the
+    ///   lines (`fit_grid_at_playing_tap`) — the same lines wherever in
+    ///   the song, and however early or late, the tap fell.
+    ///
+    /// Either way this is **not** a pure `bar_phase` rotation: rotation
+    /// can only re-label an existing line and cannot move a grid that
+    /// sits off the beat (PRD-BEATS §4.1 / §4.3).
     ///
     /// `tap_secs` is the playhead position at the tap. It is already on the
     /// audible timeline — the engine pairs the playhead with CoreAudio's
@@ -4220,20 +4203,12 @@ impl DubEngine {
         &self,
         deck_idx: u64,
         tap_secs: f64,
-        genre: Option<String>,
+        playing: bool,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         if !tap_secs.is_finite() || tap_secs < 0.0 {
             return Err(EngineError::InvalidBeatGridParams);
         }
-        // "Set the 1" re-anchors the grid PHASE onto the user's
-        // downbeat tap, keeping the existing BPM. This is the
-        // `latch`/`relatch` contract guarded by
-        // `brown_paper_bag_set_the_one` — NOT the pure-rotation
-        // `bar_phase_from_tap`, which can only pick the nearest
-        // analysed beat (up to half a beat away) and so cannot
-        // correct a sub-beat-offset auto grid. `genre` selects the
-        // octave profile for the ODF transient snap.
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
             return Err(EngineError::NotRunning);
@@ -4257,24 +4232,22 @@ impl DubEngine {
             return Err(EngineError::InvalidBeatGridParams);
         }
         let bpm = fp.beat_grid.bpm;
-        let profile = octave_profile_from_optional_genre(genre.as_deref());
         drop(state);
 
-        // Snap the tap to the visual kick edge (the waveform leading
-        // edge the user aligns to by eye); the detector keeps it
-        // verbatim when the kick has no clean edge. Works the same
-        // whether the deck is stopped or playing — it lands on the
-        // visible edge either way. See `relatch_grid_at_downbeat_tap`.
         let samples = samples_for_offline_analysis(&track);
-        let core = relatch_grid_at_downbeat_tap(
+        let place = if playing {
+            fit_grid_at_playing_tap
+        } else {
+            relatch_grid_at_downbeat_tap
+        };
+        let core = place(
             &samples,
             track.sample_rate(),
             track.channels(),
             bpm,
             tap_secs,
-            profile,
         )
-        .map_err(|e| EngineError::TrackDecodeFailed(format!("set-the-1 relatch: {e}")))?;
+        .map_err(|e| EngineError::TrackDecodeFailed(format!("set-the-1: {e}")))?;
         let grid = BeatGrid::from_core(core);
         if grid.confidence <= 0.0 || grid.beats.is_empty() {
             return Err(EngineError::InvalidBeatGridParams);
@@ -4324,13 +4297,31 @@ impl DubEngine {
         Ok(())
     }
 
-    /// M11d.7 — rebuild the deck grid from user tap times (≥3 taps).
-    /// Anchor is the first tap; tempo is ODF-refined from tap seed.
+    /// Tap tempo: rebuild the deck's grid from a run of taps (3 or more)
+    /// made while the track plays.
+    ///
+    /// **The taps are a hint; the track is the answer**
+    /// (`dub_bpm::analyze_beat_grid_from_taps`, FFI 91). They say roughly
+    /// how fast the track is and roughly where its beats fall — which is
+    /// what a wrong analysis got wrong. The track's own tempo is looked
+    /// for within 12 % of the tapped one and its lines are placed by the
+    /// whole track; the beat by the first tap is the 1. Only a track that
+    /// holds no tempo of its own keeps the tapped one.
+    ///
+    /// `tap_times` are **playhead positions**, not clock times: one of
+    /// the track's beats passes per tap whatever the pitch, so their
+    /// spacing is the track's own tempo. (FFI 39–90 took a wall-clock
+    /// BPM instead — the sounding tempo, right only at zero pitch.)
+    ///
+    /// # Errors
+    ///
+    /// Deck/engine/track state errors, [`EngineError::GridLocked`], and
+    /// [`EngineError::InvalidBeatGridParams`] for fewer than 3 taps or a
+    /// non-finite / negative tap.
     pub fn install_beat_grid_from_taps(
         &self,
         deck_idx: u64,
         tap_times: Vec<f64>,
-        genre: Option<String>,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
         if tap_times.len() < 3 {
@@ -4368,7 +4359,6 @@ impl DubEngine {
         if fp.grid_locked {
             return Err(EngineError::GridLocked(deck_idx));
         }
-        let profile = octave_profile_from_optional_genre(genre.as_deref());
         drop(state);
 
         let samples = samples_for_offline_analysis(&track);
@@ -4377,7 +4367,6 @@ impl DubEngine {
             track.sample_rate(),
             track.channels(),
             &tap_times,
-            profile,
         )
         .map_err(|e| EngineError::TrackDecodeFailed(format!("tap grid analysis: {e}")))?;
         let grid = BeatGrid::from_core(core);
@@ -5800,10 +5789,13 @@ fn peak_source_for(running: &RunningState, deck_idx: u64) -> Option<&PeakSource>
 ///
 /// All time logging is `eprintln!` for now; M10.5v dogfood is using
 /// the numbers to validate the non-blocking load contract.
-fn octave_profile_from_optional_genre(genre: Option<&str>) -> OctaveProfile {
+/// The octave a song of this genre is read in: its genre family's, or
+/// the DJ's own range when the genre is missing or says nothing.
+fn tempo_octave_for(genre: Option<&str>, djs_range: TempoOctave) -> TempoOctave {
     genre
         .map(octave_profile_from_genre)
         .unwrap_or(OctaveProfile::Default)
+        .tempo_octave(djs_range)
 }
 
 /// Samples for offline (non-RT) analysis of a deck-loaded track.
@@ -5934,9 +5926,8 @@ fn background_analyze_and_install(
     peak_generation_seq: Arc<[AtomicU64; 2]>,
     beat_grid_generation_seq: Arc<[AtomicU64; 2]>,
     library_grid: Option<LibraryBeatGrid>,
-    genre: Option<String>,
+    octave: TempoOctave,
 ) {
-    let profile = octave_profile_from_optional_genre(genre.as_deref());
     // Whole-track samples for the uncached compute paths below. For
     // a streaming load, first use parks until the tail decode lands;
     // the cached paths never touch it.
@@ -6139,11 +6130,11 @@ fn background_analyze_and_install(
         (grid, 0, "library")
     } else {
         let t_bpm = std::time::Instant::now();
-        let grid_result = analyze_beat_grid_with_profile(
+        let grid_result = analyze_beat_grid_in_octave(
             full_samples.get(),
             track.sample_rate(),
             track.channels(),
-            profile,
+            octave,
         );
         let bpm_ms = t_bpm.elapsed().as_millis();
         let grid = match grid_result {
@@ -7014,6 +7005,50 @@ mod tests {
     }
 
     #[test]
+    fn a_song_loaded_from_outside_the_library_is_read_in_its_genres_octave_or_the_djs_range() {
+        let engine = DubEngine::new();
+        assert_eq!(engine.tempo_range(), TempoOctave::DEFAULT);
+
+        engine.set_tempo_range_low(100.0).expect("100-200");
+        let low = |genre: Option<&str>| tempo_octave_for(genre, engine.tempo_range()).low();
+        assert_eq!(low(None), 100.0, "no genre: the DJ's range");
+        assert_eq!(
+            low(Some("Bmore - Funk")),
+            100.0,
+            "a genre that says nothing"
+        );
+        assert_eq!(low(Some("Hip-Hop")), 68.0, "a genre that does");
+        assert_eq!(low(Some("Dubstep - Bretter")), 88.0);
+
+        for nonsense in [0.0, 59.0, 101.0, f64::NAN] {
+            assert!(matches!(
+                engine.set_tempo_range_low(nonsense),
+                Err(EngineError::InvalidBeatGridParams)
+            ));
+        }
+        assert_eq!(
+            engine.tempo_range().low(),
+            100.0,
+            "a refused range changes nothing"
+        );
+    }
+
+    #[test]
+    fn set_the_one_needs_a_running_engine_playing_or_stopped() {
+        let engine = DubEngine::new();
+        for playing in [false, true] {
+            assert!(matches!(
+                engine.set_bar_phase(0, 1.0, playing),
+                Err(EngineError::NotRunning)
+            ));
+            assert!(matches!(
+                engine.set_bar_phase(0, f64::NAN, playing),
+                Err(EngineError::InvalidBeatGridParams)
+            ));
+        }
+    }
+
+    #[test]
     fn ffi_version_is_sixteen_after_tap_to_grid() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
@@ -7217,7 +7252,7 @@ mod tests {
         // 87→88: `hot_cues` returns an import's cues; `hot_cue_source`.
         // 88→89: `save_tempo_map` / `delete_tempo_map`, `LibraryTempoMap`,
         // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
-        assert_eq!(FFI_VERSION, 89);
+        assert_eq!(FFI_VERSION, 91);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
@@ -10389,6 +10424,53 @@ impl DubLibrary {
             lib.track_key(&track_id)
                 .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
         })
+    }
+
+    /// The order of `serato`, `rekordbox` and `traktor`, first first
+    /// (FFI 90).
+    pub fn import_order(&self) -> std::result::Result<Vec<String>, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.import_order()
+                .map(|o| o.iter().map(|s| (*s).to_string()).collect())
+                .map_err(LibraryFfiError::from)
+        })
+    }
+
+    /// Set the order and re-pick every track's grid, key and pad cues by
+    /// it (FFI 90). Refused unless it names each app once.
+    pub fn set_import_order(&self, order: Vec<String>) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| lib.set_import_order(&order).map_err(LibraryFfiError::from))
+    }
+
+    /// The apps switched off in Preferences (FFI 90): any of `serato`,
+    /// `rekordbox`, `traktor`, `itunes`. Their grids, keys, cues and names
+    /// stop counting and every track is re-picked; switching back on brings
+    /// them straight back. Refused for any other name.
+    pub fn set_disabled_sources(
+        &self,
+        sources: Vec<String>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.set_disabled_sources(&sources)
+                .map_err(LibraryFfiError::from)
+        })
+    }
+
+    /// Low end of the DJ's tempo range (FFI 91): a song whose genre says
+    /// nothing about tempo is analysed in `[low, 2 × low)` BPM. 78 until
+    /// the DJ picks another.
+    pub fn tempo_range_low(&self) -> std::result::Result<f64, LibraryFfiError> {
+        self.with_library(|lib| {
+            lib.tempo_octave()
+                .map(dub_bpm::TempoOctave::low)
+                .map_err(LibraryFfiError::from)
+        })
+    }
+
+    /// Set the tempo range (FFI 91). Songs analysed from now on use it;
+    /// grids already stored stay as they are. Refused outside 60–100.
+    pub fn set_tempo_range_low(&self, low: f64) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| lib.set_tempo_octave(low).map_err(LibraryFfiError::from))
     }
 
     /// M11d.7 — read the per-track grid lock flag.

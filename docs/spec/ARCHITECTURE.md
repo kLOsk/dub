@@ -1123,10 +1123,15 @@ M8.1 multi-band + windowed-energy derivation, including the
 "why not biased ACF" and "why not wider tie tolerance"
 trade-offs that landed on the chosen design.
 
-**Bpm range as escape hatch.** The M8.1 algorithm cannot in
-principle resolve genres whose autocorrelation legitimately peaks
-at a different octave than the convention (dubstep at 140 / 70,
-K-S-backbeat dnb at 174 / 87) without a tempo or genre prior. The
+**One octave, chosen outside the audio (2026-11-19).** The algorithm
+cannot in principle say whether dubstep is 140 or 70, or a K-S-backbeat
+dnb tune 174 or 87: both repeat in the audio. So every tempo is read
+inside one octave (`TempoOctave`, `[low, 2 × low)`): the genre family's
+for a library song (`OctaveProfile::tempo_octave`), the DJ's tempo range
+otherwise, the default 78–156 for a Thru deck. A prior over 60–200 and
+nine genre rules used to guess instead; PRD-BEATS §6 has why they went.
+
+**Bpm range for a narrower search.** The
 [`BpmRange`](../../crates/dub-bpm/src/lib.rs) value type +
 `analyze_bpm_with_range(samples, sr, channels, range)` (offline)
 + `TrackerConfig::bpm_range` (streaming) + `dub thru --bpm-range

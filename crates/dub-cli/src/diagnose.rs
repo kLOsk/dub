@@ -18,7 +18,7 @@
 //! When called with a path, the tool:
 //!
 //! * Decodes the audio with `dub-io`.
-//! * Runs the same `analyze_beat_grid_with_profile` pipeline the
+//! * Runs the same `analyze_beat_grid_in_octave` pipeline the
 //!   library uses for re-analyze, prints BPM, bar phase, fit
 //!   quality, the first 8 beats with downbeat markers.
 //! * Computes a broadband amplitude envelope and a low-band RMS
@@ -54,7 +54,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use dub_bpm::{
-    analyze_beat_grid_with_profile, octave_profile_from_genre, octave_profile_from_label,
+    analyze_beat_grid_in_octave, octave_profile_from_genre, octave_profile_from_label,
     refine_downbeat_backbeat, BeatGrid, OctaveProfile,
 };
 use dub_io::Track;
@@ -116,7 +116,7 @@ fn print_usage() {
   dub diagnose --grids <path-or-track-id>             beat-grid rows only
   dub diagnose --taps <path-or-track-id>              user-tap rows only
 
-profile labels: default | reggae | roots | dub | dancehall | ragga | house | techno | garage |
+profile labels: default | reggae | roots | dub | dancehall | ragga | house | techno | garage | dubstep |
                 hip_hop | rap | trap | rnb | dnb | drum_and_bass | jungle"
     );
 }
@@ -154,19 +154,31 @@ fn full_diagnosis(target: &str, profile_label: Option<&str>) -> Result<()> {
         (None, Some(g)) => format!("genre {g:?}"),
         (None, None) => "no genre tag → Default".to_string(),
     };
+    // The DJ's tempo range covers every song whose genre names no octave,
+    // as it does in the app; without a library it is the default.
+    let djs_range = lib
+        .as_ref()
+        .and_then(|(library, _)| library.tempo_octave().ok())
+        .unwrap_or_default();
+    let octave = profile.tempo_octave(djs_range);
 
     if let ResolvedRef::Path { path, .. } | ResolvedRef::PathInLibrary { path, .. } = &resolved {
         let track =
             Track::load_from_path(path).with_context(|| format!("decoding {}", path.display()))?;
         print_audio_summary(&track);
-        let grid = analyze_beat_grid_with_profile(
+        let grid = analyze_beat_grid_in_octave(
             track.samples(),
             track.sample_rate(),
             track.channels(),
-            profile,
+            octave,
         )
-        .context("analyze_beat_grid_with_profile")?;
-        println!("\n=== FRESH ANALYSIS ({profile:?} profile, from {profile_source}) ===");
+        .context("analyze_beat_grid_in_octave")?;
+        println!(
+            "\n=== FRESH ANALYSIS ({profile:?} profile, from {profile_source}; tempo read in \
+             {:.0}-{:.0} BPM) ===",
+            octave.low(),
+            octave.high()
+        );
         print_grid_summary(&grid);
         // `grid.bar_phase` is the backbeat-refined downbeat (the auto
         // path now applies the snare-2&4 + bass-on-1 rule). Surface the

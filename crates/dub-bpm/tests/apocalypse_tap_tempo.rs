@@ -39,28 +39,21 @@ fn apocalypse_tap_175_lands_on_integer() {
     let ch = track.channels();
     let first_kick = first_strong_peak_secs(samples, sr, ch, 8.0);
 
-    // The app taps WHILE PLAYING, so the anchor is a mid-track tap,
-    // and `genre` may be nil at tap time → Default profile. On this
-    // poor-onset DnB track the LSQ minimum wanders to 174.8/174.9
-    // depending on the tap anchor; the tap-path integer snap must
-    // pull every one of them to the clean 175.0 the human tapped.
-    for profile in [OctaveProfile::DrumAndBass, OctaveProfile::Default] {
-        for anchor in [first_kick, 30.013, 61.027, 95.5] {
-            for hint in [170.0, 174.2, 175.0, 175.6, 180.0] {
-                let grid =
-                    analyze_beat_grid_from_bpm_and_anchor(samples, sr, ch, hint, anchor, profile)
-                        .expect("tap grid");
-                eprintln!(
-                    "{profile:?} anchor {anchor:6.2} hint {hint:6.2} -> bpm {:.4}",
-                    grid.bpm
-                );
-                assert!(
-                    (grid.bpm - 175.0).abs() < 0.001,
-                    "tap on a DnB 175.0 track must snap to 175.0, got {:.4} \
-                     ({profile:?}, anchor {anchor:.2}, hint {hint:.2})",
-                    grid.bpm
-                );
-            }
+    // The app taps WHILE PLAYING, so the anchor is a mid-track tap. On
+    // this poor-onset DnB track the LSQ minimum wanders to 174.8/174.9
+    // depending on the tap anchor; the tap-path integer snap must pull
+    // every one of them to the clean 175.0 the human tapped.
+    for anchor in [first_kick, 30.013, 61.027, 95.5] {
+        for hint in [170.0, 174.2, 175.0, 175.6, 180.0] {
+            let grid = analyze_beat_grid_from_bpm_and_anchor(samples, sr, ch, hint, anchor)
+                .expect("tap grid");
+            eprintln!("anchor {anchor:6.2} hint {hint:6.2} -> bpm {:.4}", grid.bpm);
+            assert!(
+                (grid.bpm - 175.0).abs() < 0.001,
+                "tap on a DnB 175.0 track must snap to 175.0, got {:.4} \
+                 (anchor {anchor:.2}, hint {hint:.2})",
+                grid.bpm
+            );
         }
     }
 }
@@ -70,6 +63,9 @@ fn apocalypse_tap_175_lands_on_integer() {
 /// the grid came out at 173.78 and walked a whole beat off the kicks
 /// every half minute (2026-11-14). 175 folds 1.6× anything in that
 /// range, over the whole track and over each half of it.
+///
+/// Read in the drum & bass octave: without the tag the same song reads
+/// 87.5, in the DJ's default range, and that is its tempo too.
 #[test]
 fn apocalypse_auto_lands_on_175() {
     if !std::path::Path::new(APOCALYPSE).exists() {
@@ -77,7 +73,10 @@ fn apocalypse_auto_lands_on_175() {
         return;
     }
     let track = Track::load_from_path(APOCALYPSE).expect("decode");
-    for profile in [OctaveProfile::DrumAndBass, OctaveProfile::Default] {
+    for (profile, tempo) in [
+        (OctaveProfile::DrumAndBass, 175.0),
+        (OctaveProfile::Default, 87.5),
+    ] {
         let grid = analyze_beat_grid_with_profile(
             track.samples(),
             track.sample_rate(),
@@ -87,8 +86,8 @@ fn apocalypse_auto_lands_on_175() {
         .expect("auto grid");
         eprintln!("{profile:?} -> bpm {:.4}", grid.bpm);
         assert!(
-            (grid.bpm - 175.0).abs() < 0.001,
-            "auto on a DnB 175.0 track must land on 175.0, got {:.4} ({profile:?})",
+            (grid.bpm - tempo).abs() < 0.001,
+            "auto on a DnB 175.0 track must land on {tempo}, got {:.4} ({profile:?})",
             grid.bpm
         );
     }

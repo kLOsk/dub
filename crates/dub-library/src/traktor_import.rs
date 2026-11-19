@@ -118,6 +118,8 @@ fn import_entry(
     // `discover_for_path` queries the file via `getattrlist`, so a path that
     // doesn't exist on this machine fails here — exactly the dangling-NML
     // case we want to report as skipped rather than insert a phantom track.
+    let relocated = crate::relocate::relocate(path);
+    let path = relocated.as_path();
     let volume = discover_for_path(path).map_err(|e| format!("volume UUID unavailable: {e}"))?;
     library.upsert_volume(&volume).map_err(|e| e.to_string())?;
     let relative_path = volume
@@ -174,13 +176,18 @@ fn import_entry(
         )
         .map_err(|e| e.to_string())?;
 
-    write_traktor_metadata(library, &track_id, entry).map_err(|e| e.to_string())?;
+    write_traktor_metadata(library, &track_id, entry, path).map_err(|e| e.to_string())?;
     Ok(EntryOutcome { track_id, added })
 }
 
 /// Write the `traktor` metadata row + imported grid / key / cues / loops for
 /// one resolved track.
-fn write_traktor_metadata(library: &Library, track_id: &str, entry: &ParsedEntry) -> Result<()> {
+fn write_traktor_metadata(
+    library: &Library,
+    track_id: &str,
+    entry: &ParsedEntry,
+    path: &Path,
+) -> Result<()> {
     library.upsert_metadata_source(
         track_id,
         TRAKTOR,
@@ -201,11 +208,40 @@ fn write_traktor_metadata(library: &Library, track_id: &str, entry: &ParsedEntry
     // Per-source colour label (schema v9). Always written (incl. `None`)
     // so a re-import that dropped the colour clears the stale one.
     library.set_metadata_source_color(track_id, TRAKTOR, entry.color.as_deref())?;
+    write_traktor_analysis(library, track_id, entry, path)
+}
 
+/// The grid, key, cues and loops of one Traktor entry, without the metadata
+/// row: the file-tag reader (`crate::traktor_tag`) writes only these, so a
+/// file Traktor once played doesn't join the Traktor node.
+///
+/// Positions come in on Traktor's timeline and are moved onto Dub's first:
+/// an MP3's header frame is a frame of silence to Traktor and nothing to
+/// Dub (`crate::mp3_frames`).
+pub(crate) fn write_traktor_analysis(
+    library: &Library,
+    track_id: &str,
+    entry: &ParsedEntry,
+    path: &Path,
+) -> Result<()> {
+    let aligned;
+    let entry = match crate::mp3_frames::traktor_lead_secs(path) {
+        lead if lead > 0.0 => {
+            aligned = entry.earlier_by(lead);
+            &aligned
+        }
+        _ => entry,
+    };
     // AutoGrid downbeat → an imported beatgrid. `bar_phase = 0`: a Traktor
     // grid anchor *is* a downbeat (beat 1).
     if let (Some(anchor), Some(bpm)) = (entry.grid_anchor_secs, entry.bpm) {
-        library.upsert_imported_beatgrid(track_id, TRAKTOR, anchor, bpm, 0)?;
+        library.upsert_imported_beatgrid_locked(
+            track_id,
+            TRAKTOR,
+            anchor,
+            bpm,
+            entry.grid_locked,
+        )?;
     }
 
     if let Some(key) = entry.key_camelot.as_deref() {

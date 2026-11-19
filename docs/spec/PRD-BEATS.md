@@ -5,8 +5,8 @@
 > the grid and the waveform. Implementation lives in
 > `crates/dub-bpm/`, `crates/dub-ffi/`, and `apple/Dub/Performance/`.
 
-**Version:** 1.4 (Round 11 — visual kick-leading-edge grid; set-the-1 re-anchors; first-measurable-beat downbeat; ±3 % LSQ tap)
-**Date:** 2026-06-23
+**Version:** 1.7 (one octave of tempo; taps are a hint; a playing-deck tap takes the hit it is by; drift warning from 8 ms/min)
+**Date:** 2026-11-19
 **Status:** Replaces PRD §8.3.1. PRD §8.3, §8.3.3, §9 (waveform) refer
 back here for definitions and behaviour.
 
@@ -146,8 +146,8 @@ contract.
 |---|---|---|---|---|---|
 | **Auto analyze** | first deck-load of an un-analyzed track, or right-click → Analyze (when the track has never been analyzed) | Set from estimator | Set from estimator | First-measurable-beat rule (the 1 = first grid beat clearing the amplitude floor; backbeat snare/bass fallback) — §6.3 | Writes `auto` row in `track_beatgrids`; `is_active=1` unless a higher-priority row exists. |
 | **Re-analyze** | right-click → Re-analyze (when the track has been analyzed at least once, and `grid_locked = false`) | Recomputed | Recomputed | Recomputed | Writes new `auto` row; demotes any active `user_tap` row so the new auto grid becomes active. |
-| **Tap tempo** (3+ taps in one session) | deck-header BPM column (when `grid_locked = false` **and deck transport is playing**) | **Constrained re-analysis**: weighted-median tap seed → ±3 % LSQ refinement (quantised 0.1 BPM), kept-fraction filtered, integer-snapped if safe (§6.1) | Snap first tap to nearest transient with noise floor (§6.2) | Among the 4 candidate phases, pick the one whose downbeats minimize residual against the tap times | Writes new `user_tap` row; demotes any prior `user_tap` row for this track to `is_active = 0`. Each tap session is independent of all prior tap sessions (§4.6). Session window is dynamic (§4.2). |
-| **Set the 1** (1–2 taps in one session) | deck-header BPM column (when `grid_locked = false`) — works in any transport state (playing, paused, cued) | Unchanged (BPM preserved bit-exact) | **Re-anchored** so a beat lands on the tapped kick's leading edge (§4.1) | Set so the re-anchored beat is the 1 | Writes new `user_tap` row (BPM copied from the previous active grid; anchor + phase recomputed by the relatch). Demotes any prior `user_tap` row to `is_active = 0`. |
+| **Tap tempo** (3+ taps in one session) | deck-header BPM column (when `grid_locked = false` **and deck transport is playing**) | **The taps are a hint** (§4.2): the song's own tempo is found within ±12 % of the tapped one, refined and integer-snapped like an analysed tempo. Only a song that holds no tempo of its own keeps the tapped one (±3 % fit) | The whole song places the lines, in the phase the taps point at (§4.1, playing deck) | The beat by the first tap is the 1 | Writes new `user_tap` row; demotes any prior `user_tap` row for this track to `is_active = 0`. Each tap session is independent of all prior tap sessions (§4.6). Session window is dynamic (§4.2). |
+| **Set the 1** (1–2 taps in one session) | deck-header BPM column (when `grid_locked = false`) — works in any transport state (playing, paused, cued) | Unchanged (BPM preserved bit-exact) | **Re-anchored** (§4.1): on a stopped deck, onto the leading edge of the kick under the playhead; on a playing deck, onto the beats of the whole song in the phase the tap chose | Set so the tapped beat is the 1 | Writes new `user_tap` row (BPM copied from the previous active grid; anchor + phase recomputed by the relatch). Demotes any prior `user_tap` row to `is_active = 0`. |
 | **Nudge anchor** | future v1.x (PRD §15 backlog) | Unchanged | `± ε` (typically 5 ms) | Unchanged | UI not in v1. |
 | **Nudge BPM** | future v1.x | `± ε` (typically 0.1 BPM); anchor pinned to playhead so the visible beat doesn't jump | Adjusted to pin playhead beat | Unchanged | UI not in v1. |
 | **Toggle lock** | right-click → Lock grid | Unchanged | Unchanged | Unchanged | Flips `tracks.grid_locked`. Only action available on a locked grid. |
@@ -158,8 +158,12 @@ Precondition: `grid_locked = false` (otherwise the gesture is a
 no-op; the deck-header BPM column does not accept taps on a
 locked grid).
 
-Set the 1 **re-anchors the whole grid** to the kick the user tapped,
-keeping BPM bit-exact (`relatch_grid_at_downbeat_tap`). Given a tap at
+Set the 1 **re-anchors the whole grid**, keeping BPM bit-exact, and makes
+the tapped beat the 1. Where the lines go depends on whether the deck was
+playing when the tap came (2026-11-19).
+
+**Stopped deck** — the DJ has parked the playhead on what they see, and
+that spot is the answer (`relatch_grid_at_downbeat_tap`). Given a tap at
 time `t_tap`:
 
 ```text
@@ -169,9 +173,48 @@ beat_anchor_secs := kick_edge                    // the grid moves onto the kick
 bar_phase set so the re-anchored beat IS the 1
 ```
 
-The whole grid is re-emitted from the new anchor (beats both before and
-after the tap), so every beat shifts by the same `kick_edge −
-old_nearest_beat` offset. BPM and all beat *spacings* are unchanged; only
+**Playing deck** — a hand tapping along lands tens of milliseconds from the
+beat, so the tap says two things and no more: which beat is the 1, and
+which run of hits is the beat (the kicks, not the off-beat half a beat
+away). The whole song places the lines (`fit_grid_at_playing_tap`):
+
+```text
+period    = 60 / bpm                                   // unchanged
+runs      = the places across one beat where, beat after beat through
+            the whole song, the level JUMPS (quiet just before, loud
+            just after) — the hits the DJ sees and taps to
+hit       = the run the tap is by: each run's strength × a bell 80 ms
+            wide centred 30 ms after t_tap             // the tap picks the beat
+grid      = lines through hit, shifted onto the kicks' leading edge
+bar_phase set so the line by t_tap IS the 1
+```
+
+Tapping the same beat early, late, or in another bar gives the same lines.
+A tap by the off-beat picks the off-beat: this is how the DJ puts right a
+grid that came out half a beat off. A song whose hits do not jump out of
+the waveform is asked through its onsets instead; one with too little
+beat to fit at all (under a fifth of its beats carry a clear onset, or it
+is silent) has the tap handled as a stopped-deck tap.
+
+**The tap means the hit it is by, not the strongest thing near it**
+(*Hey Ya*, 2026-11-19, the operator: "i hit it but it always jumps to the
+next half beat"). The first version took the strongest run of *onsets*
+within 0.35 beat. His taps read 20 ms ahead of the hit they were for; the
+guitar strums between the beats collect more onsets than the beats do,
+and the grid went to one 215 ms away. Onsets count everything that
+starts; the waveform's jumps are the kick and the snare. And strength is
+weighed against distance, in milliseconds, not beats: taps by ear land
+within a few tens of ms and read a little early (30 ms is the bell's
+lead; his have read 10–20 ms ahead of the hit's foot).
+
+**Why two.** Until 2026-11-19 a playing tap took the stopped-deck path: it
+latched onto the loudest rise within 60 ms and hung the grid on that one
+hit, or on the raw tap when no hit was clean. Of the 18 set-the-1 taps in
+the operator's log, 6 were kept raw, and every one of the four sessions he
+retried ended more than 20 ms from the attempt before it.
+
+In both cases the whole grid is re-emitted from the new anchor (beats both
+before and after the tap). BPM and all beat *spacings* are unchanged; only
 the grid's *position* and which beat is the 1 change.
 
 **Why re-anchor, not rotate.** Pure `bar_phase` rotation
@@ -231,72 +274,77 @@ without a new tap. At that point:
 - 3+ taps in the closed session → fire **constrained
   re-analysis** (this section, below).
 
-**Constrained re-analysis** is the heart of this section: tap
-tempo is not tap-derived BPM substitution. The user's taps tell
-the algorithm where to look; the algorithm tells the user the
-precise answer. A 3–8 tap session will never beat a full-track
-spectral-flux estimator on tempo precision (human reaction-time
-jitter contaminates every tap edge by ~25 ms 1σ), so the taps
-are a *hint*, never the answer.
+**The taps are a hint; the song is the answer** (2026-11-19, the
+operator: "the dj always taps wrong, he's never as accurate as the
+transients… with the tap dub should understand: this is roughly the
+correct bpm and the correct transients for the beats"). A DJ tapping along
+is tens of milliseconds out on every tap and several percent out on the
+tempo. What the taps do carry is what a wrong analysis got wrong: roughly
+how fast the song is, and roughly where its beats fall.
 
-Given tap times `t_1, t_2, ..., t_n` with `n ≥ 3`:
+Given the tap **playhead positions** `t_1 … t_n`, `n ≥ 3`
+(`dub_bpm::analyze_beat_grid_from_taps`):
 
 ```text
-tap_median        = weighted_median(60 / interval(t_1..t_n))   // ±0.5 BPM typical
+tap_tempo = weighted_median(60 / interval(t_1..t_n))      // a double-tap or a
+                                                          // skipped beat dropped
+# 1. Tempo. Every tempo within ±12 % of tap_tempo is scored by how much
+#    onset energy its best grid collects per beat over the whole song.
+#    A song that holds a tempo has one sharp peak there.
+song_tempo = the best-scoring tempo, if it stands 1.3× clear of the run
+             of the others — over the whole song and in each half of it
+bpm        = refine + integer-snap(song_tempo)            // as an analysed tempo
 
-# 1. BPM neighborhood. ±3% around the median is wider than the
-# tap-intent noise (once intervals are median-filtered) yet too
-# narrow to reach half/double or an adjacent metric level, so an
-# octave-error correction lands in the right octave (§6.1).
-search_range      = BpmRange::new(tap_median * 0.97, tap_median * 1.03)
+# 2. Lines. Against that tempo the taps say which run of hits is the beat.
+tap_point  = t_1 moved by the taps' mean lean round one beat
+grid       = place_grid_by_tap(bpm, tap_point)            // §4.1, playing deck:
+             the hit the taps are by — or, if they slid through the beat
+             (tapped at the wrong tempo, they do) and so say nothing
+             about where it is, the song's strongest run of hits
 
-# 2. Run the full estimator with the constrained range. The
-# strongest real autocorrelation peak inside `search_range` is
-# the answer. Integer-BPM snap fires when residuals don't get
-# worse (§6.1).
-(new_bpm, odf, kick_odf) = analyze_bpm_with_range(samples, search_range)
-new_bpm           = snap_to_integer_if_safe(new_bpm, residuals)
-
-# 3. Snap the first tap to the nearest significant kick within
-# ±min(period/4, 70 ms). Falls back to the raw tap when the
-# window is silent (§6.2).
-new_anchor        = snap_to_nearest_transient(t_1, kick_odf, odf,
-                                              noise_floor = 12% of p95)
-
-# 4. Bar phase: among the 4 candidates, pick the one whose
-# downbeats best fit the user's tap times. With n taps and an
-# anchored grid, this is a min-residual search across 4 integers.
-new_bar_phase     = argmin over phase in [0,1,2,3] of
-                      Σ_i |t_i − nearest_downbeat(t_i, phase)|²
+# 3. The 1 is the line by tap_point.
 ```
+
+If no tempo in reach stands out — a band that wanders, a beatless
+stretch — the song cannot overrule the DJ: the tapped tempo is kept,
+fitted within ±3 % and anchored on the first tap (the whole of tap tempo
+before this round, §6.1).
+
+**Why ±12 %.** The operator's own taps have come in 8.5 % under the song
+(118–121 on a 129). The nearest thing a song can be mistaken for is a
+five-fourths or four-thirds reading, 20–25 % away, so 12 % takes in the
+rough tap and nothing else. The old search was ±3 %: it committed 121.
+
+**Playhead positions, not clock times.** The taps' spacing in the track
+is the track's own tempo whatever the pitch: at −8 % a 174 song sounds at
+160, the DJ taps 160 against the clock, and one of the track's beats
+still passes per tap. Between Round 11 and this round the tempo came from
+the wall-clock tap rate instead — the *sounding* tempo, right only at
+zero pitch. The rolling preview in the deck header still shows the
+wall-clock rate: it is what the DJ is tapping to.
 
 **What the user perceives:**
 
-- Auto says 87 BPM (octave error). User taps near 174. Search
-  range becomes 168.8–179.2. Algorithm picks the peak at 174.3 (or
-  wherever the real peak is in that range). User's tap was a
-  hint that excluded the wrong octave; auto-precision is preserved.
-- Auto says 109.3 BPM. User taps 108 (small error). Search
-  range becomes 104.8–111.2. The strongest peak in that range is
-  still 109.3. Result: 109.3 unchanged. User's small misread
-  doesn't disturb the good auto BPM.
-- DnB tune detected at 174 BPM, user wants half-time reference
-  (87). User taps near 87. Search range 84.4–89.6. Picks the
-  peak at 87.0. Now both decks can mix against the half-time
-  reference even though the auto picked the other octave.
-- Breakbeat with bar 1 mis-placed by the auto kick-emphasis
-  scorer. User taps the actual downbeats. BPM unchanged
-  (constrained search confirms the auto BPM), but `bar_phase`
-  rotates because the user's tap times fit a different phase
-  candidate.
+- Auto says 85.3 (a two-thirds reading). User taps roughly 125. The
+  song's own tempo near 125 is 128.0: the grid comes back at 128.0, its
+  lines on the kicks.
+- Auto says 109.3. User taps 108. The song's tempo near 108 is still
+  109.3: unchanged. A small misread doesn't disturb a good tempo.
+- DnB tune read at 174, user wants the half-time reference. User taps
+  near 87: 87.0.
+- A grid on the off-beat. User taps on the beat, at the right tempo: the
+  tempo is confirmed and the lines move onto the beat.
+- A live band that never holds a tempo. User taps 104: the grid is 104,
+  give or take the ±3 % fit.
 
 ### 4.3 What "Set the 1" does and does NOT do
 
 Re-anchoring (since Rounds 6/8/11) means the anchor *does* move — the
 opposite of the reverted Round-4 pure-rotation contract. To be precise:
 
-- It **does** move `beat_anchor_secs` so a beat lands on the tapped
-  kick's leading edge, and makes that beat the 1.
+- It **does** move `beat_anchor_secs` — onto the tapped kick's leading
+  edge on a stopped deck, onto the whole song's beats on a playing one
+  (§4.1) — and makes the tapped beat the 1.
 - It does NOT change `bpm` — BPM is preserved bit-exact; beat *spacing*
   is untouched, only the grid's position shifts.
 - It does NOT trim beats before the tap — the grid still extends both
@@ -319,6 +367,15 @@ Lock is absolute. When `grid_locked = true`:
   disabled, with a tooltip: *"Unlock the grid first."* This tells
   the user the option exists and points them at the gesture
   needed to enable it.
+- **A lock that arrives with an imported grid (2026-11-18).** Traktor
+  (`<ENTRY LOCK="1">`, the file's `SYNC/LOCK`) and Serato (`BPMLOCK`)
+  carry the DJ's lock; Dub's lock follows it when that grid arrives or
+  changes and is the active one (an unlock in Dub isn't undone by the next
+  import). Over an *imported* grid the lock keeps the grid but lets the
+  first analysis run: no auto pass displaces an imported grid, and the
+  track still needs its key, waveform and loudness
+  (`Library::lock_refuses_analysis`). The menu item stays disabled as
+  above.
 - Toggle lock is the only available grid action. The user
   explicitly unlocks, then runs the desired mutation, then
   (optionally) re-locks. Two clicks by design — combining
@@ -494,13 +551,36 @@ waveform peak at the kick, which is fine because the line is
 ### 5.3 Drift indication
 
 Per PRD §8.3.3, a track whose audible transients deviate > 5 %
-from the grid over its length is non-uniform. When `GridQuality`
-metrics cross the drift threshold (`drift_slope_ms_per_min ≥ 3`,
-or `p95_ms ≥ 25`), the deck header shows the ⚠ "May drift"
-indicator. The grid itself is still drawn uniformly — it's the
-indicator's job to warn the DJ that the visual alignment will
-degrade across the track, and the mitigation (pitch slider) is
-on the turntable hardware.
+from the grid over its length is non-uniform. Short of that, a
+uniform grid can still be a little fast or slow for its song, and
+the hits then move against the lines as the song goes on.
+
+**The mark.** An unlocked grid whose hits move against its lines
+by **8 ms per minute of song or more**, either way
+(`GridQuality::drifts`, `DRIFT_WARNING_MS_PER_MIN`), shows the ⚠
+"May drift over a long mix" mark in the deck header and in the
+library's BPM column. A locked grid never shows it: the DJ has
+accepted it. The grid itself is still drawn uniformly — the mark
+warns that the alignment will degrade across the track, and the
+mitigation (pitch slider) is on the turntable hardware.
+
+**The reading.** `drift_slope_ms_per_min` is the *median* of what
+every pair of hits at least 20 s apart says (`drift_ms_per_min`),
+over about 300 hits spread through the song. The hits are the
+strongest onset by each line, and in real music many of those are
+not the beat — a strum, a hat — and come and go with the
+arrangement; a least-squares slope through them reads a guitar
+entering in the last chorus as drift.
+
+**Why 8.** Two fixed points from the operator: *Hey Ya* at about
+4 ms/min is "perfect", and a drum & bass grid at 8.6 ms/min
+(43 ms over five minutes, Round 10) was audibly off by the end.
+Measured on 1,767 grids he locked in Traktor as good enough to mix
+on (`tests/traktor_grid_corpus.rs`): 7.0 % read 8 or more, and the
+same grids made to drift 12 ms/min are marked 92.3 % of the time.
+Dub marks 4.7 % of its own grids for the same songs.
+The limit was 3 ms/min on a least-squares slope until 2026-11-19;
+that marked 28 % of the locked grids, and *Hey Ya*.
 
 ### 5.4 Two-deck mode
 
@@ -522,14 +602,21 @@ End-to-end, what happens when auto-analyze runs on a fresh track:
 2. **Compute the spectral-flux ODFs** — broadband and kick-band —
    via the shared STFT pipeline (`dub-spectral`,
    `BpmEstimator::analyze_*_with_range_profile_and_odfs`).
-3. **Estimate BPM** by harmonic-summed autocorrelation over the
-   broadband ODF, with the perceptual tempo prior (PRD §5.2.3),
-   skank rejection (M11c.3c), and genre-aware octave profile if
-   the importer attached an ID3 genre.
+3. **Estimate BPM** by harmonic-mean windowed autocorrelation over
+   the broadband ODF, searched inside **one octave of tempo**
+   (§6.0): the strongest periodicity in it is the tempo. No prior,
+   no genre rule.
 4. **Find the beat anchor** by `score_grid` sweep over phases in
    `[0, period)`: the phase that maximises the sum of ODF samples
    at grid positions wins. Parabolic refinement gives sub-frame
    accuracy.
+4a. **Off the off-beat** (2026-11-19): the phase with the most onsets
+   is not always the beat — off-beat hats and bass can out-shout the
+   kicks. After the kick-edge alignment (step 8 in code order), if the
+   song's first sound falls ≥ 0.30 beat from the lines **and** what is
+   played half a beat from them is louder than what is played on them,
+   the grid moves half a beat (`move_off_the_off_beat`). Both must
+   agree: songs open on pickups, and songs carry loud off-beat stabs.
 5. **LSQ refit** of `(bpm, anchor)` against the actual transient
    peaks in the first ~32 bars; produces `GridQuality` residuals.
 6. **Integer-BPM snap** (M11d.7a): if the LSQ-refined BPM is
@@ -546,12 +633,50 @@ The output of auto-analyze is exactly `(bpm, beat_anchor_secs,
 bar_phase)` plus a `GridQuality` for the drift indicator and a
 `downbeat_confidence` for the auto-lock heuristic.
 
+### 6.0 The octave a tempo is read in
+
+A beat can be counted at half or double speed and both are right: 70 or
+140 for dubstep, 87 or 174 for drum & bass. The audio does not settle it.
+So every tempo is read inside one octave, `[low, 2 × low)` BPM
+(`dub_bpm::TempoOctave`) — what Traktor, Serato and rekordbox do with
+their BPM-range setting:
+
+| Song | Octave |
+|---|---|
+| Genre says roots reggae, rocksteady, ska, or dub | 60–120 |
+| Genre says hip-hop, rap, trap, R&B | 68–136 |
+| Genre says dancehall, ragga, bashment | 75–150 |
+| Genre says house, garage, techno, grime, dubstep | 88–176 |
+| Genre says drum & bass, jungle | 100–200 |
+| Any other genre, or none | the DJ's **tempo range** (Preferences ▸ Library): 60–120, 68–136, **78–156** (default), 88–176 or 100–200 |
+| A Thru deck (no genre) | 78–156 |
+
+The genre comes from the file's own tag, else from whichever library the
+song was found in (`Library::track_id3_genre`). The tempo range is kept in
+the library (`library_settings`), so the app and the `dub` CLI analyse
+alike; changing it leaves stored grids alone.
+
+A song counted in the wrong octave is fixed on the deck with **2×** / **½**
+(§4.4); any other wrong tempo by tapping it (§4.2). There are no ratio
+buttons (×2/3, ×3/4 …) by the operator's choice.
+
+**Why (2026-11-19).** Between M11c.3 and that date a tempo prior over
+60–200 BPM and nine genre-specific rejection rules guessed the octave.
+Scored against 1,758 grids the operator had locked in Traktor — his mark
+for "right, or good enough to mix on" — they agreed on **62.4 %**. Most
+misses were not octaves: 16 % read two-thirds and 7 % four-thirds, because
+a rule written for reggae skank ran on every song without a house tag and
+threw the true tempo away. The same detector with no rules and the octaves
+above agrees on **96.3 %** of 1,767. `crates/dub-bpm/tests/traktor_grid_corpus.rs`
+is that measurement; run it before and after any change here. Full account:
+`docs/investigations/BPM-DETECTOR-V2-INVESTIGATION.md` §8.
+
 ### 6.1 Tap as hint for constrained re-analysis
 
-Tap tempo (`analyze_beat_grid_from_taps`) runs a constrained fit
-seeded by the taps. The taps never decide the BPM directly; the
-weighted median of the tap intervals seeds a narrow LSQ search and
-the audio decides the exact tempo.
+This is tap tempo's **fallback**, for a song that holds no tempo of its
+own within reach of the taps (§4.2); until 2026-11-19 it was the whole of
+it. The weighted median of the tap intervals seeds a narrow LSQ search
+and the audio decides the exact tempo inside it.
 
 ```text
 TAP_HINT_SEARCH_PCT = 0.03   // ±3 % around the tap-interval median
@@ -584,8 +709,9 @@ rule instead of four branches.
 ### 6.2 Transient snap
 
 Used in **tap tempo** to refine the first tap into a precise beat
-anchor, and in **set the 1** to snap the re-anchor onto the tapped
-kick's leading edge (§4.1).
+anchor, and in **set the 1 on a stopped deck** to snap the re-anchor
+onto the tapped kick's leading edge (§4.1). A set-the-1 tap on a playing
+deck does not use it: there the whole song places the lines.
 
 The snap window is bounded by `min(period/4, 70 ms)`. Inside that
 window, the highest ODF peak above the noise floor wins;
@@ -1048,6 +1174,9 @@ specific regression tracks are in git history — `git log crates/dub-bpm`.
 
 | Version | Date | Notes |
 |---|---|---|
+| 1.7 | 2026-11-19 | **Drift warning from 8 ms/min, read by a median.** §5.3 rewritten. Daniel, on *Hey Ya*: "it says may drift over a long mix but i find the grid perfect". The grid did drift — about 4 ms a minute, 15–20 ms over the song, its tempo being a Serato value rounded to two decimals — and the mark fired at 3. Scored against 1,767 grids locked in Traktor, the least-squares slope at 3 ms/min marked 28 % of grids he had accepted, and the reading was too scattered to do better by moving the limit alone (at 10 it still marked 6.7 % and caught only 58 % of a 12 ms/min drift). `drift_ms_per_min` is now the median over pairs of hits ≥ 20 s apart; `GridQuality::DRIFT_WARNING_MS_PER_MIN = 8` and `GridQuality::drifts()` are the rule, mirrored by `LibraryCellFormat.driftWarningMsPerMin`: 7.0 % of locked grids marked, 92.3 % of a 12 ms/min drift caught, 4.7 % of Dub's own grids marked. The benchmark holds both. The drift value feeds only the mark; no grid moves. `auto_lock_safe` (unused by the app since auto-lock was turned off) keeps its 3. |
+| 1.6 | 2026-11-19 | **Tap tempo: the taps are a hint.** §4.2 rewritten: the song's own tempo is found within ±12 % of the tapped one (`tempo_near_tap`: whole-song onset fold, 1.3× dominance, both halves) and the whole song places the lines in the phase the taps point at; the old ±3 % fit is the fallback for a song with no tempo of its own. Tempo is read from the taps' playhead positions — the track's own time — not the wall-clock rate, which was right only at zero pitch. FFI: `install_beat_grid_from_taps` again; `install_beat_grid_from_bpm_and_anchor` removed. §6 step 4a (new): a grid on the off-beat is moved half a beat when the song opens on the off-beat lines and plays them louder (`move_off_the_off_beat`). |
+| 1.5 | 2026-11-19 | **One octave of tempo; a playing-deck tap fitted to the whole song.** §6.0 (new): tempo is read inside one octave — the genre family's, or the DJ's tempo range (Preferences ▸ Library, `library_settings`, FFI 91) — replacing the perceptual prior, the triplet / skank / dancehall / hip-hop rejection rules, the per-profile rules and `octave_self_verify`. Against 1,767 grids locked in Traktor: 62.4 % → 96.3 % of tempos (`tests/traktor_grid_corpus.rs`). Dubstep is read at 140 with garage, not at 70 with dub; `ska` matches as a word, not inside "Skate Punk". §4.1: set-the-1 on a playing deck picks the beat and lets the whole song place the lines (`fit_grid_at_playing_tap`); a stopped deck keeps the exact spot. The tap entry points drop the `genre` they never used. |
 | 1.4 | 2026-06-23 | **Round 11 — visual kick-leading-edge grid.** Auto `shift_grid_to_kick_edge` snaps the grid to the kick LEADING EDGE the waveform draws (~2 ms of the hand-set grid), retiring the forward-only amplitude-peak shift (−516 LOC). Set-the-1 (1–2 tap) **re-anchors** the grid via `relatch_grid_at_downbeat_tap` instead of rotating `bar_phase` — §4.1 / §4.3 updated to match. Downbeat primary rule = "the 1 is the first measurable beat"; the backbeat snare/bass rule (`refine_downbeat_backbeat`, formerly carrying a vendor-patent name) is the reggae/vocal-intro fallback (§6.3). Tap-tempo integer-snap policy `IntegerSnapPolicy::{AUTO,TAP}`; DnB genre lifts the hip-hop double-time veto. This entry also reconciles the §4 / §6.1 / §6.3 normative body, which had drifted to the reverted Round-4 rotation + ±15 % descriptions. |
 | 0.1 | 2026-05-24 | Initial spec, post-M11d.7 round 3 design conversation. Replaces PRD §8.3.1. |
 | 0.2 | 2026-05-24 | Round 4: C1 (waveform sidecar) + C2 (`bar_phase` refactor) shipped. |

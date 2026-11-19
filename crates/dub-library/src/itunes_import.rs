@@ -103,7 +103,8 @@ fn import_track(
     path: &str,
     track: &ItunesTrack,
 ) -> std::result::Result<(String, bool), String> {
-    let abs = Path::new(path);
+    let relocated = crate::relocate::relocate(Path::new(path));
+    let abs = relocated.as_path();
     let volume = discover_for_path(abs).map_err(|e| format!("volume UUID unavailable: {e}"))?;
     library.upsert_volume(&volume).map_err(|e| e.to_string())?;
     let relative_path = volume
@@ -158,6 +159,16 @@ fn import_track(
             mtime,
         )
         .map_err(|e| e.to_string())?;
+    // Traktor's grid and cues, from inside the file: an Apple Music library
+    // played in Traktor on another Mac still carries them.
+    crate::traktor_tag::sync_file_tags(
+        library,
+        &track_id,
+        &volume.volume_uuid,
+        &relative_path,
+        abs,
+    )
+    .map_err(|e| e.to_string())?;
 
     library
         .upsert_metadata_source(
@@ -167,10 +178,10 @@ fn import_track(
             track.name.as_deref(),
             track.album.as_deref(),
             track.genre.as_deref(),
-            None, // comment
+            track.comment.as_deref(),
             track.composer.as_deref(),
             track.year,
-            None, // track_number — not parsed yet
+            track.track_number,
             track.bpm,
             None, // key — iTunes has none
             None, // gain
@@ -363,6 +374,57 @@ mod tests {
             count("SELECT COUNT(*) FROM track_metadata_source WHERE source='itunes'"),
             count("SELECT COUNT(*) FROM imported_crates WHERE source='itunes'"),
             count("SELECT COUNT(*) FROM imported_crate_tracks"),
+        );
+        eprintln!(
+            "traktor grids={} cues={} (from the files' own tags)",
+            count("SELECT COUNT(*) FROM track_beatgrids WHERE source='traktor'"),
+            count("SELECT COUNT(*) FROM track_cues WHERE source='traktor'"),
+        );
+        // Serato vs Traktor on files with both: once each is on Dub's
+        // timeline their grids should agree to within analysis noise.
+        let mut gaps: Vec<f64> = lib
+            .connection()
+            .prepare(
+                "SELECT s.anchor_secs, t.anchor_secs, t.bpm FROM track_beatgrids s \
+                 JOIN track_beatgrids t ON t.track_id = s.track_id AND t.source = 'traktor' \
+                 WHERE s.source = 'serato' AND ABS(s.bpm - t.bpm) < 0.3",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, f64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| {
+                let (s, t, bpm) = r.unwrap();
+                let beat = 60.0 / bpm;
+                ((s - t + beat / 2.0).rem_euclid(beat) - beat / 2.0) * 1000.0
+            })
+            .collect();
+        gaps.sort_by(f64::total_cmp);
+        if !gaps.is_empty() {
+            let q = |f: f64| gaps[((gaps.len() - 1) as f64 * f) as usize];
+            eprintln!(
+                "serato grids={} | serato-traktor on {} files: median {:+.1} ms, p25 {:+.1}, p75 {:+.1}",
+                count("SELECT COUNT(*) FROM track_beatgrids WHERE source='serato'"),
+                gaps.len(),
+                q(0.5),
+                q(0.25),
+                q(0.75)
+            );
+        }
+        eprintln!(
+            "locked from Serato / Traktor: {}",
+            count("SELECT COUNT(*) FROM tracks WHERE grid_locked = 1")
+        );
+        let again = std::time::Instant::now();
+        import_itunes(&mut lib, Path::new(&path)).expect("re-import");
+        eprintln!(
+            "re-import with every tag already read: {:?}",
+            again.elapsed()
         );
     }
 }

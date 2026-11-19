@@ -5,7 +5,7 @@
 > that grows stops being read, and an unread status page is how
 > `docs/html/` drifted ten milestones before anyone noticed.
 >
-> Last updated: 2026-11-17 (alpha.5). Everything shipped up to alpha.2, and
+> Last updated: 2026-11-19 (alpha.5 + main). Everything shipped up to alpha.2, and
 > the rig rounds before it, moved to `SHIPPED.md` on 2026-11-15.
 
 ## Where the branch is
@@ -82,6 +82,73 @@ gate is local-only because GitHub CI has no macOS app job.
 
 **Since alpha.5, on `main`:**
 
+- **Tempo is read inside one octave; the rule pile is gone (FFI 91,
+  2026-11-19, Daniel: "the quality of analysis is pretty poor").** Scored
+  against his 1,758 locked Traktor grids the detector got 62.4 % of tempos:
+  a reggae rule threw the right tempo away on every untagged
+  four-on-the-floor song (128 → 85.3), dubstep was told to prefer 70, and
+  a prior penalised anything under 95. All of it is removed. A song is now
+  read in its genre family's octave (`OctaveProfile::tempo_octave`: reggae
+  and dub 60–120, hip-hop 68–136, dancehall 75–150, house / garage / grime
+  / dubstep 88–176, drum & bass 100–200), else in the DJ's **tempo range**
+  (Preferences ▸ Library ▸ Tempo, 78–156 to start; `library_settings`, no
+  schema change). **96.3 %** on the same songs; the 94-song fixture set
+  reads 4 known misses, its expectations corrected from Traktor (eight
+  were the old detector's own four-thirds). `tests/traktor_grid_corpus.rs`
+  is the benchmark, path-gated on a manifest written from the library.
+  Songs already analysed keep their grid until re-analysed. Account:
+  `BPM-DETECTOR-V2-INVESTIGATION.md` §8; contract: PRD-BEATS §6.0.
+  Thru decks don't follow the tempo range yet.
+- **Grids on the off-beat are moved onto the beat (2026-11-19, Daniel:
+  "the grid sits on the actual beat and not half a beat off").**
+  `move_off_the_off_beat`: when the song's first sound falls half a beat
+  from the lines and the off-beat is the louder, the grid moves half a
+  beat. Against the locked Traktor grids: 105 → 58 half a beat out, lines
+  within 25 ms 84.7 % → 87.0 %. Whole-song cues (kick band, several bands
+  at once, kick edges, kick/snare alternation) were measured first and
+  separate nothing. About 30 of the 58 left are songs where Traktor's own
+  lines sit off the low end.
+- **A tap on a playing deck picks the beat; the song places the lines
+  (FFI 91, 2026-11-19, Daniel).** `setBarPhase(playing:)`. Playing: the
+  tap says which beat is the 1 and which run of hits is the beat, and
+  `fit_grid_at_playing_tap` fits the whole song — the same lines however
+  early, late or far along the tap fell, and the way to put an off-beat
+  grid right. Stopped: unchanged, the exact kick under the playhead. It
+  used to hang the grid on the loudest hit within 60 ms of a tap made by
+  ear. **To check on the rig:** tap the 1 on a playing deck, a few times,
+  on a locked-quality house track and on a reggae one. **Corrected the
+  same day** (Daniel, on *Hey Ya*: "it always jumps to the next half
+  beat"): it took the strongest run of onsets in reach and landed 215 ms
+  from the tap, on the strums. It now takes the hit the tap is *by*, and
+  a hit is where the waveform's level jumps, not what the onset function
+  counts; his two logged taps replay to 20 and 26 ms from the tap
+  (`tests/hey_ya_playing_tap.rs`).
+- **The drift warning starts at 8 ms a minute (2026-11-19, Daniel on
+  *Hey Ya*: "it says may drift over a long mix but i find the grid
+  perfect").** It fired at 3, on a reading too scattered for that: 28 %
+  of the grids he locked in Traktor would have carried it. The drift is
+  now read as a median over pairs of hits and marked from 8
+  (`GridQuality::drifts`; PRD-BEATS §5.3): 7.0 % of locked grids, 92.3 %
+  of a 12 ms/min drift. Stored readings are the old kind until a song is
+  re-analysed or its 1 is set again; *Hey Ya*'s stored 5.6 is under the
+  new limit either way. **Not run:** the Swift snapshot suite — the
+  fixtures that draw the mark moved from 5 to 12 so the pictures should
+  not change.
+- **Tap tempo: the taps are a hint (FFI 91, 2026-11-19, Daniel: "the dj
+  always taps wrong, he's never as accurate as the transients").** 3+ taps
+  on a playing deck now tell Dub roughly how fast and roughly where; the
+  track's own tempo is found within ±12 % of the tapped one and the whole
+  track places the lines (`analyze_beat_grid_from_taps`;
+  `installBeatGridFromTaps`). His logged 118–121 on a 129 song committed
+  121; it now gives 129. Simulated on the 1,767 locked songs (tempo 8 %
+  out, tap 35 ms late): 94.3 % come back within 0.05 BPM of Traktor,
+  85.9 % with their lines within 25 ms. The tempo is read from the taps'
+  playhead positions, so the pitch no longer comes into it — the
+  wall-clock rate it used was the sounding tempo, right only at zero
+  pitch. A track with no tempo of its own keeps the tapped one.
+  **To check on the rig:** tap a track Dub read wrong, roughly, with the
+  pitch well off zero.
+
 - **Window dots in full screen (2026-11-18, Daniel).** With the menu bar
   kept away, macOS's window buttons go too, so `WindowDots` puts three at
   the left of the status strip, Serato-style, in full screen only
@@ -122,6 +189,71 @@ gate is local-only because GitHub CI has no macOS app job.
   (`imported_at = 0`; the per-source list and count skip them), so the
   node shows the current library, not every library ever read. A track
   on an offline drive is never retired; no schema bump, no FFI change.
+- **Libraries from another Mac (2026-11-18, Daniel).** An XML from an old
+  account names `/Users/dj/…`; Daniel's 2,186 tracks were 0 found as
+  written. `dub-library/src/relocate.rs`: a missing `/Users/<name>/rest`
+  is retried as `$HOME/rest` and taken only if that file exists. Every
+  absolute-path importer (iTunes, Traktor, rekordbox, Serato 4) and
+  Serato 3's volume-relative `pfil` go through it. His real XML: 2,184
+  found, 2 genuinely absent.
+- **Apple Music tracks: genre, BPM, comment (2026-11-18, Daniel).** SOSA UK
+  "The Wave" (Apple Music: House, 132) analysed at 88: the octave profile
+  read the genre from the `id3` row only, and a track read from Apple
+  Music has none, so it fell to Default. `track_id3_genre` now takes the
+  file's tag first, else any library's (`dub diagnose --profile house`:
+  132 at 0.84 vs 88 at 0.73). The BPM column shows a DJ library's BPM
+  (`sr`/`rb`/`tr`/`it`, never `i3`) until there is an active grid, and
+  the iTunes reader now keeps `Comments` and `Track Number`. Tracks
+  already analysed wrongly need Re-analyze; nothing reruns on its own.
+  The deck header's key also fills in when the first analysis lands on a
+  track already loaded (`showKeyOnLoadedDecks`), not only on the next load.
+- **Traktor's grid and cues from inside the file (schema v12, 2026-11-18,
+  Daniel).** Traktor writes a `TRAKTOR4` ID3 frame into every file it
+  plays; 2,167 of Daniel's 2,171 MP3s carry one while the collection
+  itself stayed on another Mac. `dub-library/src/traktor_tag.rs` reads it
+  (format in LIBRARY-FORMATS.md) on Apple Music and folder imports, once
+  per file version (`track_files.tags_read_mtime`): 2,156 grids and 287
+  cues from his XML, ~20 s the first time, ~4 s a reload. Found on the
+  way: Traktor's MP3 timeline is one frame (26 ms) later than Dub's on
+  files with an encoder header frame, and the NML import had the same
+  offset; `mp3_frames.rs` now corrects both (median vs his taps +27.4 ms
+  → +1.4 ms). No FFI change. Open: a fuzz target for the frame parser.
+  Serato's GEOBs ride the same pass (1,642 of his files): Serato's MP3
+  timeline is the header frame *minus* the 529-sample decoder delay, which
+  the Serato library import had never corrected either; corrected grids
+  agree with Traktor's to −3.4 ms median over 1,456 files (was +11.4 /
+  −16.9). A Serato library already imported moves on its next import.
+  Grid locks come along (Traktor `LOCK` / `SYNC/LOCK`, Serato `BPMLOCK`;
+  PRD-BEATS §4.4): Dub locks when that grid arrives or changes and is the
+  active one, and a lock over an imported grid no longer blocks the first
+  analysis. Serato is written before Traktor so Traktor's lock can't pin
+  Serato's grid. His library: 390 tracks arrive locked (Traktor locked
+  ~1,775, but Serato's unlocked grid outranks it on most).
+- **Which app comes first (FFI 90, schema v12; 2026-11-18, Daniel).**
+  Preferences ▸ Library orders Serato / rekordbox / Traktor
+  (`Library::import_order`, kept in `library_settings`); the order ranks
+  grids, keys and pad cues and the rekordbox export's cue set (was the
+  fixed `CUE_SOURCE_ORDER`, now gone). Setting it re-picks every track
+  whose active grid / key is an app's, skipping locked grids; a grid its
+  app locked (`track_beatgrids.source_locked`) brings the lock when it
+  takes over. user_tap / user keys / mixedinkey still outrank every app.
+- **The ⚠ compares the grid in use with Dub's analysis (2026-11-18,
+  Daniel: "a lot of imported and analysed grid disagree").** It compared
+  every pair of grids, so with Serato and Traktor both read from the
+  files 509 tracks lit up where the two apps disagreed with each other —
+  a fraction of a beat on old hip-hop / breaks, either app the wrong one
+  (16 sampled against `dub diagnose`). Now: active app grid vs `auto`
+  only, never on a set-the-1 grid (PRD §8.3's wording). Live library:
+  9 of 14 analysed tracks flagged, all genuine (Dub's pre-genre-fix 88s
+  and two ¼-beat splits).
+- **An app switched off counts for nothing (FFI 90; 2026-11-18, Daniel:
+  "Serato disabled, the node still shows").** Preferences ▸ Library's
+  switches now reach the library (`set_disabled_sources`, kept in
+  `library_settings`): the node hides, the app's grids / keys / pad cues
+  never take the slot (`SourcePrefs::grid_rank` → `None`), every track is
+  re-picked (a locked one too when its active grid was that app's; the
+  lock then follows the new grid's `source_locked`), and its metadata
+  drops out of the row joins. Data stays stored: on again is instant.
 
 - **The Matching smart crate (2026-11-17, Daniel).** Lists what mixes
   with the playing track (master deck, else any playing deck; kept when

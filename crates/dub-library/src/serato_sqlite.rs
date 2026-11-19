@@ -170,6 +170,8 @@ fn import_asset(
     abs: &Path,
     entry: &SeratoEntry,
 ) -> std::result::Result<(String, bool), String> {
+    let relocated = crate::relocate::relocate(abs);
+    let abs = relocated.as_path();
     if !abs.is_file() {
         return Err(format!("file not found at {abs:?}"));
     }

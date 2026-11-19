@@ -14,7 +14,7 @@ use dub_io::Track;
 const BLAZE: &str = "/Users/klos/Music/Music/house/Caru - Blaze Up Tha Dance.mp3";
 const BANGIN: &str = "/Users/klos/Music/The Best Of Westside Connection_ The Gangsta, The Killa, The Dope Dealer [2007] [320 kbps]/14. Bangin' (feat. Master P).mp3";
 
-fn downbeat(path: &str, bpm: f64, tap: f64, profile: OctaveProfile) -> Option<f64> {
+fn downbeat(path: &str, bpm: f64, tap: f64) -> Option<f64> {
     let track = Track::load_from_path(path).ok()?;
     let grid = relatch_grid_at_downbeat_tap(
         track.samples(),
@@ -22,7 +22,6 @@ fn downbeat(path: &str, bpm: f64, tap: f64, profile: OctaveProfile) -> Option<f6
         track.channels(),
         bpm,
         tap,
-        profile,
     )
     .ok()?;
     Some(grid.beats[grid.bar_phase as usize])
@@ -37,7 +36,7 @@ fn blaze_crisp_kick_locks_to_visual_edge() {
     // Ground truth: user_tap anchor 0.0843 s. Tap rough, all over the bar.
     let mut edges = Vec::new();
     for tap in [0.060, 0.075, 0.0843, 0.095, 0.110] {
-        let d = downbeat(BLAZE, 136.0, tap, OctaveProfile::FourOnFloor).expect("relatch");
+        let d = downbeat(BLAZE, 136.0, tap).expect("relatch");
         eprintln!(
             "blaze tap {tap:.4} -> downbeat {d:.4} ({:+.1} ms vs 0.0843)",
             (d - 0.0843) * 1000.0
@@ -134,7 +133,7 @@ fn bangin_soft_kick_stays_verbatim() {
     }
     // No clean edge → detector declines → the tap is kept verbatim.
     for tap in [0.180, 0.1912, 0.205] {
-        let d = downbeat(BANGIN, 88.0, tap, OctaveProfile::HipHop).expect("relatch");
+        let d = downbeat(BANGIN, 88.0, tap).expect("relatch");
         eprintln!(
             "bangin tap {tap:.4} -> downbeat {d:.4} ({:+.1} ms)",
             (d - tap) * 1000.0

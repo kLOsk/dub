@@ -4,9 +4,8 @@
 //! that places the most transients on grid lines, emit a strictly uniform
 //! grid `anchor + i × period`.
 
-use crate::octave_profile::{profile_blocks_double_octave_swap, profile_blocks_half_octave_swap};
-use crate::offline::analyze_bpm_with_range_profile_and_odfs;
-use crate::{AnalysisError, BpmRange, OctaveProfile, HOP_SIZE, MAX_BPM, MIN_BPM};
+use crate::offline::{analyze_with_odfs, onset_envelopes};
+use crate::{AnalysisError, BpmRange, OctaveProfile, TempoOctave, HOP_SIZE, MAX_BPM, MIN_BPM};
 
 const AUTO_REFINE_RANGE_PCT: f64 = 0.005;
 const AUTO_REFINE_STEP_PCT: f64 = 0.0005;
@@ -55,6 +54,25 @@ pub struct GridQuality {
 }
 
 impl GridQuality {
+    /// The drift ([`Self::drift_slope_ms_per_min`], either way) from
+    /// which a DJ is warned that the grid may not hold through a mix.
+    ///
+    /// The operator's two fixed points: *Hey Ya* at about 4 ms/min was
+    /// "perfect", and a drum & bass grid at 8.6 ms/min (43 ms over five
+    /// minutes) was audibly off by the end. Of 1,767 grids he locked in
+    /// Traktor as good enough to mix on, 7.0 % read 8 or more — and two
+    /// in three of those do drift by the waveform as well — while a grid
+    /// made to drift 12 ms/min is caught 92 % of the time and one at 6 is
+    /// left alone 89 %. The limit was 3 until 2026-11-19, which warned on
+    /// 28 % of those locked grids.
+    pub const DRIFT_WARNING_MS_PER_MIN: f32 = 8.0;
+
+    /// Whether the lines move against the song far enough to warn of.
+    #[must_use]
+    pub fn drifts(&self) -> bool {
+        self.drift_slope_ms_per_min.abs() >= Self::DRIFT_WARNING_MS_PER_MIN
+    }
+
     /// Whether the uniform grid fits tightly enough to auto-lock.
     #[must_use]
     pub fn auto_lock_safe(&self) -> bool {
@@ -184,29 +202,41 @@ pub fn bar_phase_from_tap(grid: &BeatGrid, tap_time_secs: f64) -> u8 {
     u8::try_from((best_idx as u64) % bpb).unwrap_or(0)
 }
 
-/// Analyze a track and emit a uniform 4/4 beat grid (default octave profile).
+/// Analyze a track and emit a uniform 4/4 beat grid, its tempo read in
+/// the default octave ([`TempoOctave::DEFAULT`]).
 pub fn analyze_beat_grid(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
 ) -> Result<BeatGrid, AnalysisError> {
-    analyze_beat_grid_with_profile(samples, sample_rate, channels, OctaveProfile::Default)
+    analyze_beat_grid_in_octave(samples, sample_rate, channels, TempoOctave::DEFAULT)
 }
 
-/// Like [`analyze_beat_grid`] with an explicit [`OctaveProfile`].
+/// Like [`analyze_beat_grid`], in the octave `profile`'s genre family is
+/// mixed in ([`OctaveProfile::tempo_octave`]).
 pub fn analyze_beat_grid_with_profile(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
-    let (estimate, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
+    analyze_beat_grid_in_octave(
         samples,
         sample_rate,
         channels,
-        BpmRange::DEFAULT,
-        profile,
-    )?;
+        profile.tempo_octave(TempoOctave::DEFAULT),
+    )
+}
+
+/// Like [`analyze_beat_grid`], with the tempo read in `octave`.
+pub fn analyze_beat_grid_in_octave(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    octave: TempoOctave,
+) -> Result<BeatGrid, AnalysisError> {
+    let (estimate, odf, kick_odf) =
+        analyze_with_odfs(samples, sample_rate, channels, BpmRange::DEFAULT, octave)?;
     if estimate.confidence <= 0.0 {
         return Ok(BeatGrid::none());
     }
@@ -223,7 +253,6 @@ pub fn analyze_beat_grid_with_profile(
         estimate.bpm,
         estimate.confidence,
         None,
-        profile,
     )?;
     // Visual grid alignment. The ODF-snapped grid sits at spectral-
     // flux time (mid-attack). Shift it (in either direction) by the
@@ -234,6 +263,11 @@ pub fn analyze_beat_grid_with_profile(
     // kicks (the user's repeated "the 1 is behind the kick" reports).
     // Soft-kick tracks with no clean edge keep their LSQ phase.
     let grid = shift_grid_to_kick_edge(grid, samples, sample_rate, channels);
+    // The fit lands on whichever run of onsets is strongest, and
+    // off-beat hats and bass notes can out-shout the kicks. Where the
+    // song itself opens on the off-beat lines and plays them louder, the
+    // lines are half a beat out.
+    let grid = move_off_the_off_beat(grid, samples, sample_rate, channels);
     // Downbeat refinement (backbeat: snare-2&4 + bass-on-1):
     // `find_downbeat_offset` votes on the kick ODF alone and cannot
     // separate bar 1 from bar 3 (both carry a kick in 4/4). The
@@ -423,7 +457,6 @@ pub fn latch_beat_grid_at_downbeat(
     channels: u8,
     bpm: f64,
     downbeat_secs: f64,
-    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     if !(bpm.is_finite() && bpm > 0.0 && downbeat_secs.is_finite() && downbeat_secs >= 0.0) {
         return Ok(BeatGrid::none());
@@ -431,13 +464,7 @@ pub fn latch_beat_grid_at_downbeat(
     // Need the ODF only for `measure_grid_quality` (drift
     // indicator).  The actual anchor is `downbeat_secs` verbatim
     // — no snap, no amp-peak shift, no BPM refit.
-    let (_, odf, _kick_odf) = analyze_bpm_with_range_profile_and_odfs(
-        samples,
-        sample_rate,
-        channels,
-        BpmRange::DEFAULT,
-        profile,
-    )?;
+    let (odf, _kick_odf) = onset_envelopes(samples, sample_rate, channels)?;
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
     let duration_secs =
         samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
@@ -651,18 +678,11 @@ pub fn relatch_grid_at_downbeat_tap(
     channels: u8,
     bpm: f64,
     downbeat_tap: f64,
-    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     if !(bpm.is_finite() && bpm > 0.0 && downbeat_tap.is_finite() && downbeat_tap >= 0.0) {
         return Ok(BeatGrid::none());
     }
-    let (_estimate, odf, _kick_odf) = analyze_bpm_with_range_profile_and_odfs(
-        samples,
-        sample_rate,
-        channels,
-        BpmRange::DEFAULT,
-        profile,
-    )?;
+    let (odf, _kick_odf) = onset_envelopes(samples, sample_rate, channels)?;
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
     let duration_secs =
         samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
@@ -709,74 +729,366 @@ pub fn relatch_grid_at_downbeat_tap(
     })
 }
 
-/// Build a grid from user tap times (M11d.7 round 3 tap-to-grid).
+/// How far ahead of its beat a tap made by ear reads, on average. A
+/// hand tapping along anticipates: the operator's taps on *Hey Ya* read
+/// 77 and 83 ms ahead, his first taps on *Where The Party At* 10 and
+/// 15 ms (2026-11-19).
+const PLAYING_TAP_LEAD_SECS: f64 = 0.030;
+
+/// How far from where it was aimed a tap made by ear lands, give or take
+/// (one standard deviation). It sets how fast a beat loses its claim on
+/// a tap as it gets further from it.
+const PLAYING_TAP_SPREAD_SECS: f64 = 0.080;
+
+/// A run of hits counts as something a tap can mean once it collects
+/// this share of what the song's strongest run does. Under it, it is the
+/// gap between the beats.
+const PLAYING_TAP_MIN_SHARE: f64 = 0.5;
+
+/// How closely a run of taps must agree on where the beat is — the
+/// length of their mean direction round the beat, 1 for taps that all
+/// lean the same way — before they are taken to say so. Taps at the wrong
+/// tempo slide through the beat as they go (8.5 % out, seven taps: half a
+/// beat) and say nothing about where it is; the song decides alone.
+const TAPS_AGREE_ON_THE_BEAT: f64 = 0.8;
+
+/// Below this share of beats with a hit to fit, the song gave the fit
+/// nothing to hold on to (a beatless stretch, an ambient intro) and the
+/// tap is handled as a stopped-deck tap instead.
+const PLAYING_TAP_MIN_KEPT: f32 = 0.20;
+
+/// Set the 1 from a tap made **while the song plays**, keeping `bpm`
+/// bit-identical.
 ///
-/// **The taps ARE the BPM.** User feedback override of PRD-BEATS
-/// §6.1: the constrained-re-analysis pipeline was producing
-/// "wrong" BPMs on tracks where the auto-pass landed badly in a
-/// non-tapped neighborhood. Example the user surfaced: a 175 BPM
-/// DnB track that auto-resolved to ~135 BPM; tapping at 175 used
-/// to come back as ~160 because the ±15 % search window ([148,
-/// 201]) found a stronger ODF peak in that range than the truth
-/// at 175. The PRD argued the constrained autocorrelation beats
-/// human tap jitter on precision; the user prefers honesty: "show
-/// the bpm how the user taps it (building an average of the
-/// actual taps)". So the constrained re-analysis is gone — the
-/// tap-interval median IS the answer, no algorithmic second-guess
-/// on the BPM number.
+/// A hand tapping along lands tens of milliseconds from the beat, so the
+/// tap says two things and no more: which beat is the 1, and which run of
+/// hits is "the beat" (the kicks, not the off-beat hats half a beat
+/// away). Where exactly the lines go is then read off the whole song —
+/// the run of hits the tap is by ([`hit_by_the_tap`]), moved onto the
+/// kicks' leading edge like an analysed grid. Tapping the same beat early, late, or in
+/// another bar gives the same lines.
 ///
-/// Pipeline (PRD-BEATS Round 6 §6b — tap-as-hint contract):
+/// A stopped deck is the other tool ([`relatch_grid_at_downbeat_tap`]):
+/// there the DJ has parked the playhead on what they see, and that one
+/// spot is the answer. It is also the fallback here when the song has
+/// too little beat to fit ([`PLAYING_TAP_MIN_KEPT`]).
 ///
-/// 1. **BPM hint** = weighted median of tap-to-tap intervals
-///    after dropping intervals that imply BPMs outside
-///    `[MIN_BPM, MAX_BPM]`. Same logic as before: a double-tap
-///    inside one beat or a missed-beat interval cannot drag the
-///    median past the analysable range.
-/// 2. **BPM refinement** = narrow ±[`TAP_HINT_SEARCH_PCT`] LSQ
-///    search around the hint, picking the BPM with tightest
-///    grid fit (lowest `rms_ms`) against the ODF. This absorbs
-///    the 5–15 ms / tap human jitter that the hint alone would
-///    bake into the persisted BPM — the user surfaced this as
-///    "tap at 87 BPM, get 86.232 BPM stored, grid drifts off
-///    the kicks". After the constrained refit the result is
-///    almost always the clean integer (or half-integer) the
-///    track was actually produced at.
-/// 3. **Integer-snap**: if the refined BPM sits within
-///    [`INTEGER_BPM_SNAP_TOLERANCE`] of an integer AND that
-///    integer doesn't meaningfully worsen the fit (same safety
-///    net as the auto path), prefer the integer. Most commercial
-///    music is integer-BPM.
-/// 4. **Anchor** = first tap snapped to the nearest significant
-///    transient in the kick ODF (fallback broadband) inside a
-///    window capped at `min(period/4, 70 ms)`. The
-///    `odf_noise_floor` check keeps the snap from latching onto
-///    sub-noise ODF wiggle when the first tap landed in dead
-///    space — in that case we keep the raw tap (`unwrap_or`).
-/// 5. Confidence is fixed at `1.0` (the user supplied ground
-///    truth for tempo and bar position); `GridQuality` is
-///    measured against the final BPM/anchor for the drift
-///    indicator.
+/// Before 2026-11-19 a playing tap went through the stopped-deck path:
+/// it latched onto the loudest rise within 60 ms and hung the whole grid
+/// on that one hit, or on the raw tap when no hit was clean. Every
+/// retried session in the operator's tap log ended more than 20 ms from
+/// the attempt before it.
 ///
-/// **Why narrow.** The previous incarnation of this function
-/// (M11d.7a) ran constrained re-analysis at ±15 %; user feedback
-/// surfaced "tap at 175 BPM, get 160 BPM" because the autocorre-
-/// lation peak winner inside ±15 % was a neighbouring metric
-/// level. The user then asked for "tap median IS the BPM" which
-/// produced jitter; this round threads the needle with ±3 %, so
-/// the refinement window is narrower than the gap to the
-/// nearest neighbour metric level (typically ≥ 10 %). Cannot
-/// drift to a different musical interpretation by construction.
+/// # Errors
 ///
-/// **No `bpm_hint` parameter.** Idempotence by construction: the
-/// function takes only the new tap session's data, never prior
-/// `user_tap` BPM or any "previous session" state. Each invocation
-/// is independent of all prior tap sessions (PRD-BEATS §4.6).
+/// See [`AnalysisError`]. Returns `Ok(BeatGrid::none())` for a
+/// non-finite or non-positive `bpm`, or a non-finite or negative `tap`.
+pub fn fit_grid_at_playing_tap(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    bpm: f64,
+    tap: f64,
+) -> Result<BeatGrid, AnalysisError> {
+    if !(bpm.is_finite() && bpm > 0.0 && tap.is_finite() && tap >= 0.0) {
+        return Ok(BeatGrid::none());
+    }
+    let (odf, _kick_odf) = onset_envelopes(samples, sample_rate, channels)?;
+    match place_grid_by_tap(samples, sample_rate, channels, &odf, bpm, tap, true) {
+        Some(grid) => Ok(grid),
+        None => relatch_grid_at_downbeat_tap(samples, sample_rate, channels, bpm, tap),
+    }
+}
+
+/// The grid at `bpm` whose lines the whole song places and whose 1 is the
+/// beat by `tap`: the run of hits the tap means ([`hit_by_the_tap`], or
+/// [`onsets_by_the_tap`] where nothing jumps out of the waveform), moved
+/// onto the kicks' leading edge.
+/// `taps_say_where` is false for a run of taps that do not agree on a
+/// place in the beat; the song's strongest run is then taken.
+///
+/// `None` when the song has too little beat to fit
+/// ([`PLAYING_TAP_MIN_KEPT`]) — silence included, which "fits" anything:
+/// a window with no onset in it has no second-best to lose to.
+fn place_grid_by_tap(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    odf: &[f32],
+    bpm: f64,
+    tap: f64,
+    taps_say_where: bool,
+) -> Option<BeatGrid> {
+    let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
+    let duration_secs =
+        samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
+    let period = 60.0 / bpm;
+
+    let has_onsets = odf.iter().any(|&v| v > 0.0);
+    let enough_beat =
+        |quality: &GridQuality| has_onsets && quality.kept_fraction >= PLAYING_TAP_MIN_KEPT;
+
+    // First by eye: the hits that jump out of the waveform, which is what
+    // the DJ sees and taps to. A song with no such hits (soft kicks, a
+    // wash of sound) is read by its onsets instead.
+    let (env, env_sr) = broadband_amp_envelope(samples, sample_rate, channels);
+    let seen = hit_by_the_tap(&env, env_sr, period, tap, taps_say_where).and_then(|near| {
+        // The onsets still say how well this grid holds through the song;
+        // where its lines go is the waveform's to say.
+        refit_anchor_at_bpm(odf, odf_sr, bpm, near.rem_euclid(period), duration_secs)
+            .filter(|(_, quality)| enough_beat(quality))
+            .map(|(_, quality)| (near, near, quality))
+    });
+    let (near, anchor, quality) = match seen {
+        Some(seen) => seen,
+        None => {
+            let near = onsets_by_the_tap(odf, odf_sr, period, tap, taps_say_where);
+            // Fit from the song's first beat on that phase, so every hit
+            // counts and not only those after the tap.
+            let (anchor, quality) =
+                refit_anchor_at_bpm(odf, odf_sr, bpm, near.rem_euclid(period), duration_secs)
+                    .filter(|(_, quality)| enough_beat(quality))?;
+            (near, anchor, quality)
+        }
+    };
+
+    let one = anchor + ((near - anchor) / period).round() * period;
+    let beats_per_bar: u8 = 4;
+    let beats = uniform_beats(bpm, one, duration_secs);
+    if beats.is_empty() {
+        return None;
+    }
+    let bar_phase = bar_phase_for_downbeat_time(&beats, one, beats_per_bar);
+    let grid = BeatGrid {
+        bpm,
+        confidence: 1.0,
+        beats,
+        beats_per_bar,
+        bar_phase,
+        quality: Some(quality),
+        downbeat_confidence: 1.0,
+    };
+    Some(shift_grid_to_kick_edge(
+        grid,
+        samples,
+        sample_rate,
+        channels,
+    ))
+}
+
+/// How long after a place in the song its level is read for a jump, and
+/// the stretch before it the level is read against (it ends
+/// [`HIT_JUMP_GAP_SECS`] short of the place, so a hit's own rise is not
+/// counted as what came before it).
+const HIT_JUMP_AFTER_SECS: f64 = 0.010;
+const HIT_JUMP_BEFORE_SECS: f64 = 0.030;
+const HIT_JUMP_GAP_SECS: f64 = 0.005;
+
+/// Two runs closer together than this are one.
+const RUNS_APART_SECS: f64 = 0.015;
+
+/// Where a tap by ear was aimed, among the runs of hits a song holds at
+/// one period.
+///
+/// `scores` holds, for every place across one beat centred on the tap
+/// (`step_secs` apart), how much the whole song has there. Its peaks
+/// that reach [`PLAYING_TAP_MIN_SHARE`] of the best are the runs a tap
+/// can mean — the beat, the off-beat, something between. The tap means
+/// the one it is **by**: each run is weighed by how likely a tap aimed at
+/// it would land where this one did (a bell [`PLAYING_TAP_SPREAD_SECS`]
+/// wide, centred [`PLAYING_TAP_LEAD_SECS`] after the tap, because taps
+/// read early). A stronger run does not win from further off.
+///
+/// With `by_the_tap` false the weighing is skipped and the strongest run
+/// is taken — for a run of taps that slid through the beat and say
+/// nothing about where it is.
+///
+/// Returns the run's offset from the tap, or `None` when the song has
+/// nothing there at all.
+fn run_by_the_tap(scores: &[f64], step_secs: f64, by_the_tap: bool) -> Option<f64> {
+    let strongest = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if scores.len() < 3 || !(strongest.is_finite() && strongest > 0.0) {
+        return None;
+    }
+    let n = scores.len();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let apart = ((RUNS_APART_SECS / step_secs).round() as usize).clamp(1, n / 2);
+    #[allow(clippy::cast_precision_loss)]
+    let centre = (n / 2) as f64;
+    let mut best: Option<(f64, f64)> = None;
+    for (i, &score) in scores.iter().enumerate() {
+        if score < PLAYING_TAP_MIN_SHARE * strongest {
+            continue;
+        }
+        // The places wrap: the two ends of the beat are neighbours.
+        let is_a_run =
+            (1..=apart).all(|d| score >= scores[(i + n - d) % n] && score >= scores[(i + d) % n]);
+        if !is_a_run {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let offset = (i as f64 - centre) * step_secs;
+        let claim = if by_the_tap {
+            let off_aim = (offset - PLAYING_TAP_LEAD_SECS) / PLAYING_TAP_SPREAD_SECS;
+            score * (-0.5 * off_aim * off_aim).exp()
+        } else {
+            score
+        };
+        if best.is_none_or(|(_, held)| claim > held) {
+            best = Some((offset, claim));
+        }
+    }
+    best.map(|(offset, _)| offset)
+}
+
+/// The time of the hit a tap means, read off the waveform: the place by
+/// the tap where, beat after beat through the whole song, the level
+/// **jumps** — quiet just before, loud just after. That is the kick or
+/// snare the DJ sees and taps to; the hats and strums between the beats
+/// are onsets too, and plenty of them, but they do not jump out.
+///
+/// `None` when nothing in the song jumps at this period.
+///
+/// The onset function was asked first, and on *Hey Ya* it answered with
+/// the guitar strum (more onsets than the beat) and then with a hi-hat a
+/// sixteenth before the beat (nearer the tap). The operator's taps were
+/// 80 ms ahead of beats whose level goes from the floor to the ceiling.
+fn hit_by_the_tap(
+    env: &[f32],
+    env_sr: f64,
+    period_secs: f64,
+    tap_secs: f64,
+    by_the_tap: bool,
+) -> Option<f64> {
+    if env.is_empty() || env_sr <= 0.0 || period_secs <= 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let samples_in = |secs: f64| (secs * env_sr).round().max(1.0) as usize;
+    let (after, before, gap) = (
+        samples_in(HIT_JUMP_AFTER_SECS),
+        samples_in(HIT_JUMP_BEFORE_SECS),
+        samples_in(HIT_JUMP_GAP_SECS),
+    );
+    let loudest = |from: usize, to: usize| -> f32 {
+        env.get(from..to.min(env.len()))
+            .map_or(0.0, |part| part.iter().copied().fold(0.0f32, f32::max))
+    };
+    let jumps: Vec<f32> = (0..env.len())
+        .map(|i| {
+            let was = loudest(i.saturating_sub(before), i.saturating_sub(gap));
+            (loudest(i, i + after) - was).max(0.0)
+        })
+        .collect();
+
+    let period = period_secs * env_sr;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let half = (period / 2.0).floor().max(1.0) as i64;
+    let scores: Vec<f64> = (-half..=half)
+        .map(|k| {
+            #[allow(clippy::cast_precision_loss)]
+            let mut at = (tap_secs * env_sr + k as f64).rem_euclid(period);
+            let mut sum = 0.0f64;
+            while at < jumps.len() as f64 - 1.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let i = at.round() as usize;
+                sum += f64::from(jumps[i]);
+                at += period;
+            }
+            sum
+        })
+        .collect();
+    run_by_the_tap(&scores, 1.0 / env_sr, by_the_tap).map(|offset| tap_secs + offset)
+}
+
+/// The same question put to the onset function, for a song whose hits do
+/// not jump out of the waveform: the place by the tap that the most
+/// onsets of the whole song sit on. Falls back to the tap itself when
+/// the song has no onsets at all.
+fn onsets_by_the_tap(
+    odf: &[f32],
+    odf_sr: f64,
+    period_secs: f64,
+    tap_secs: f64,
+    by_the_tap: bool,
+) -> f64 {
+    let period = period_secs * odf_sr;
+    let step_secs = 0.5 / odf_sr;
+    #[allow(clippy::cast_possible_truncation)]
+    let steps = ((period_secs / 2.0) / step_secs).floor().max(1.0) as i64;
+    let scores: Vec<f64> = (-steps..=steps)
+        .map(|k| {
+            #[allow(clippy::cast_precision_loss)]
+            let at = tap_secs + k as f64 * step_secs;
+            score_grid(odf, (at * odf_sr).rem_euclid(period), period)
+        })
+        .collect();
+    tap_secs + run_by_the_tap(&scores, step_secs, by_the_tap).unwrap_or(0.0)
+}
+
+/// How far either side of a tapped tempo the song's own tempo is looked
+/// for. The operator's taps have come in 8.5 % under the song (118–121
+/// for a 129); the nearest thing a song can be mistaken for is a
+/// five-fourths or four-thirds reading, 20–25 % away, so 12 % takes in
+/// the rough tap and nothing else.
+const TAP_TEMPO_REACH: f64 = 0.12;
+
+/// The step of that look, as a fraction of the period. A steady song's
+/// whole-track fold peaks within ~0.05 % of its tempo and is back at the
+/// floor beyond; half that keeps a point on the peak.
+const TAP_TEMPO_STEP: f64 = 0.000_25;
+
+/// How far above the run of tempos in reach the best one must fold before
+/// it is taken as the song's own. A band that wanders has no tempo to
+/// stand out, and the tapped one is kept (within the old ±3 % fit).
+///
+/// On 1,764 locked Traktor grids, each "tapped" 8 % out (2026-11-19),
+/// the best tempo in reach was Traktor's on 99.3 %, and those stood a
+/// median 2.3× clear of the run (5th percentile 1.38×); the 13 wrong
+/// picks a median 1.06×. At 1.1 the look answers for 99 % of songs and
+/// is right on 99.8 % of those; 1.3 sent 65 right answers to the
+/// fallback for nothing.
+const TAP_TEMPO_DOMINANCE: f64 = 1.1;
+
+/// Build the grid a tap session points at (3 or more taps on a playing
+/// deck).
+///
+/// **The taps are a hint; the song is the answer.** A DJ tapping along is
+/// never as exact as the transients — tens of milliseconds out on every
+/// tap, and several percent out on the tempo. What the taps do carry is
+/// what the analysis got wrong: roughly how fast the song is, and roughly
+/// where its beats fall. So:
+///
+/// 1. **Tempo** — the tap intervals give a rough tempo (their weighted
+///    median, a double-tap or a skipped beat dropped). The song's own
+///    tempo is then looked for within [`TAP_TEMPO_REACH`] of it: the one
+///    whose grid the most onsets of the whole song sit on
+///    ([`tempo_near_tap`]), refined and integer-snapped like an analysed
+///    tempo. A tap at 121 on a 129 song gives 129.
+/// 2. **Lines** — the taps, set against that tempo, say which run of hits
+///    is the beat. The whole song places the lines on it
+///    ([`place_grid_by_tap`], as for a set-the-1 tap on a playing deck).
+/// 3. **The 1** — the beat by the first tap.
+///
+/// When the song holds no tempo of its own in reach (a band that wanders,
+/// a beatless stretch), the tapped tempo is all there is: it is kept,
+/// fitted within ±[`TAP_HINT_SEARCH_PCT`] and anchored on the first tap,
+/// as every tap session was before 2026-11-19.
+///
+/// `tap_times` are positions **in the track** (the playhead at each
+/// tap), so their spacing is the track's own tempo whatever the pitch:
+/// at −8 % a 174 song sounds at 160, the DJ taps 160 against the clock,
+/// and the playhead still moves one of the track's beats per tap. (For
+/// five months the tempo came from the wall-clock tap rate instead, which
+/// is the *sounding* tempo, right only at zero pitch.)
+///
+/// Each session stands alone: nothing from an earlier session or the
+/// grid it replaces is read (PRD-BEATS §4.6).
 pub fn analyze_beat_grid_from_taps(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     tap_times: &[f64],
-    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     if tap_times.len() < 3 {
         return Ok(BeatGrid::none());
@@ -784,65 +1096,77 @@ pub fn analyze_beat_grid_from_taps(
     let Some(bpm_hint) = weighted_median_bpm_from_taps(tap_times) else {
         return Ok(BeatGrid::none());
     };
-    analyze_beat_grid_from_bpm_and_anchor(
-        samples,
-        sample_rate,
-        channels,
-        bpm_hint,
-        tap_times[0],
-        profile,
-    )
+    grid_from_tap_hints(samples, sample_rate, channels, bpm_hint, tap_times)
 }
 
-/// Build a tap grid from an **authoritative `bpm`** plus a single anchor
-/// tap, instead of re-deriving tempo from the spacing of `tap_times`.
-///
-/// This is the correct path for a tap-while-playing session. Tempo MUST
-/// come from the human's wall-clock tapping rhythm (computed in the UI),
-/// never from playhead-position deltas — those are scaled by the platter's
-/// live playback rate (`committed ≈ wall ÷ rate`), which is exactly why
-/// tapping a 174 BPM track at −8 % pitch used to commit ~189. The anchor is
-/// still ODF-snapped to the nearest real transient for phase robustness,
-/// and `bpm` is still ODF-refined ±3 % + integer-snapped so a clean tap
-/// tempo lands on the track's true integer BPM.
+/// [`analyze_beat_grid_from_taps`] for a caller that has a rough tempo
+/// and one rough beat position instead of a run of taps.
 ///
 /// # Errors
 ///
 /// See [`AnalysisError`]. Returns `Ok(BeatGrid::none())` for non-finite or
-/// non-positive `bpm`/`anchor_tap`.
+/// non-positive `bpm_hint`/`anchor_tap`.
 pub fn analyze_beat_grid_from_bpm_and_anchor(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     bpm_hint: f64,
     anchor_tap: f64,
-    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     if !(bpm_hint.is_finite() && bpm_hint > 0.0 && anchor_tap.is_finite()) {
         return Ok(BeatGrid::none());
     }
+    grid_from_tap_hints(samples, sample_rate, channels, bpm_hint, &[anchor_tap])
+}
 
-    // ODFs are still required: the anchor snap reads kick + broadband
-    // ODF to find the nearest real transient to the first tap, the
-    // constrained search reads broadband ODF to fit the period, and
-    // `measure_grid_quality` reads broadband ODF for the drift
-    // indicator. The estimator's BPM is deliberately discarded — the
-    // user's tap session is authoritative for the metric level.
-    let (_estimate, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
-        samples,
-        sample_rate,
-        channels,
-        BpmRange::DEFAULT,
-        profile,
-    )?;
-
+fn grid_from_tap_hints(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    bpm_hint: f64,
+    taps: &[f64],
+) -> Result<BeatGrid, AnalysisError> {
+    let (odf, kick_odf) = onset_envelopes(samples, sample_rate, channels)?;
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
     let duration_secs =
         samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
-    if duration_secs <= 0.0 {
+    if duration_secs <= 0.0 || taps.is_empty() {
         return Ok(BeatGrid::none());
     }
 
+    let from_the_song = tempo_near_tap(&odf, odf_sr, bpm_hint)
+        .and_then(|found| refine_full_pipeline(&odf, odf_sr, found, duration_secs, None))
+        .and_then(|(bpm_raw, anchor, quality)| {
+            // The tempo is the song's, so it is rounded as an analysed
+            // tempo is — only when the fit says so. (The tap policy
+            // rounds on trust, for a tempo that is the DJ's.)
+            let (bpm, _, _) = snap_bpm_to_integer_if_safe(
+                &odf,
+                odf_sr,
+                bpm_raw,
+                anchor,
+                duration_secs,
+                quality,
+                IntegerSnapPolicy::AUTO,
+            );
+            let (tap, agreement) = where_the_taps_point(taps, 60.0 / bpm);
+            let taps_say_where = agreement >= TAPS_AGREE_ON_THE_BEAT;
+            place_grid_by_tap(
+                samples,
+                sample_rate,
+                channels,
+                &odf,
+                bpm,
+                tap,
+                taps_say_where,
+            )
+        });
+    if let Some(grid) = from_the_song {
+        return Ok(grid);
+    }
+
+    // No tempo of the song's own in reach: the taps are all there is.
+    let anchor_tap = taps[0];
     let period_hint = 60.0 / bpm_hint;
     let snap_half = (period_hint * 0.25).min(SNAP_MAX_HALF_WINDOW_SECS);
     let kick_floor = odf_noise_floor(&kick_odf, SNAP_NOISE_FLOOR_FRAC);
@@ -858,12 +1182,6 @@ pub fn analyze_beat_grid_from_bpm_and_anchor(
     )
     .unwrap_or(anchor_tap);
 
-    // PRD-BEATS Round 6 §6b — narrow constrained BPM refinement.
-    // Tap jitter on a clean session is ~1–3 BPM standard
-    // deviation on the median; we want the integer that fits the
-    // ODF best, not the noisy median. Skip when the hint sits
-    // at a pathological band edge so the search can't escape the
-    // `[MIN_BPM, MAX_BPM]` range.
     let (bpm, anchor) =
         refine_bpm_around_tap_hint(&odf, odf_sr, bpm_hint, snapped_anchor, duration_secs)
             .unwrap_or((bpm_hint, snapped_anchor));
@@ -893,15 +1211,97 @@ pub fn analyze_beat_grid_from_bpm_and_anchor(
         quality: Some(quality),
         downbeat_confidence: 1.0,
     };
-    // Visual alignment: land the grid on the kick LEADING EDGE the DJ
-    // sees, same as the auto path. Replaces the old forward-only
-    // amplitude-PEAK shift (which sat late on slow kicks).
     Ok(shift_grid_to_kick_edge(
         grid,
         samples,
         sample_rate,
         channels,
     ))
+}
+
+/// The song's own tempo within [`TAP_TEMPO_REACH`] of a tapped one, or
+/// `None` when no tempo there stands out.
+///
+/// Each tempo in reach is scored by how much onset energy its best grid
+/// collects per beat over the whole song. A song that holds a tempo has
+/// one sharp peak there; it must clear the run of the others by
+/// [`TAP_TEMPO_DOMINANCE`], over the whole song **and in each half of
+/// it** — a band that wanders will hold some tempo for a stretch, and a
+/// stretch is not a tempo.
+fn tempo_near_tap(odf: &[f32], odf_sr: f64, bpm_hint: f64) -> Option<f64> {
+    if !(bpm_hint.is_finite() && bpm_hint > 0.0) || odf_sr <= 0.0 || odf.is_empty() {
+        return None;
+    }
+    let period_hint = 60.0 * odf_sr / bpm_hint;
+    let (fastest, slowest) = (60.0 * odf_sr / MAX_BPM, 60.0 * odf_sr / MIN_BPM);
+    let per_beat = |part: &[f32], period: f64| -> Option<f64> {
+        (period >= 2.0 && period * 2.0 < part.len() as f64)
+            .then(|| best_phase_for_period(part, period).1 * period / part.len() as f64)
+    };
+    // (period, score) for every tempo in reach, and the best of them.
+    let scan = |part: &[f32]| -> Vec<(f64, f64)> {
+        let mut scores = Vec::new();
+        let mut frac = -TAP_TEMPO_REACH;
+        while frac <= TAP_TEMPO_REACH + 1e-12 {
+            let period = period_hint * (1.0 + frac);
+            if (fastest..=slowest).contains(&period) {
+                if let Some(score) = per_beat(part, period) {
+                    scores.push((period, score));
+                }
+            }
+            frac += TAP_TEMPO_STEP;
+        }
+        scores
+    };
+    let run_of = |scores: &[(f64, f64)]| -> f64 {
+        let mut all: Vec<f64> = scores.iter().map(|&(_, s)| s).collect();
+        all.sort_by(f64::total_cmp);
+        all.get(all.len() / 2).copied().unwrap_or(0.0)
+    };
+
+    let whole = scan(odf);
+    let &(period, best) = whole.iter().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let run = run_of(&whole);
+    if run <= 0.0 || best < run * TAP_TEMPO_DOMINANCE {
+        return None;
+    }
+    let (first, second) = odf.split_at(odf.len() / 2);
+    for half in [first, second] {
+        let run = run_of(&scan(half));
+        let here = per_beat(half, period)?;
+        if run <= 0.0 || here < run * TAP_TEMPO_DOMINANCE {
+            return None;
+        }
+    }
+    Some(60.0 * odf_sr / period)
+}
+
+/// One time that stands for a run of taps — the first tap, moved by the
+/// taps' average lean against a grid of this period — and how far the
+/// taps agree on it (0–1, the length of their mean direction round the
+/// beat). The beat by that time is the 1.
+///
+/// The average is taken round the circle of one beat, so a tap that
+/// slipped past the half-beat does not pull the others backwards.
+fn where_the_taps_point(taps: &[f64], period: f64) -> (f64, f64) {
+    let Some(&first) = taps.first() else {
+        return (0.0, 0.0);
+    };
+    let (mut sin, mut cos) = (0.0f64, 0.0f64);
+    for &tap in taps {
+        let turn = std::f64::consts::TAU * (tap - first) / period;
+        sin += turn.sin();
+        cos += turn.cos();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let agreement = sin.hypot(cos) / taps.len() as f64;
+    if agreement < 1e-9 {
+        return (first, 0.0);
+    }
+    (
+        first + sin.atan2(cos) / std::f64::consts::TAU * period,
+        agreement,
+    )
 }
 
 /// PRD-BEATS Round 6 §6b — half-width of the BPM refinement
@@ -1112,7 +1512,6 @@ fn analyze_uniform_grid_from_odf(
     bpm_init: f64,
     confidence: f32,
     fixed_anchor: Option<f64>,
-    profile: OctaveProfile,
 ) -> Result<BeatGrid, AnalysisError> {
     let Some((bpm_raw, anchor_secs, quality_raw)) =
         refine_full_pipeline(odf, odf_sr, bpm_init, duration_secs, fixed_anchor)
@@ -1142,30 +1541,6 @@ fn analyze_uniform_grid_from_odf(
         duration_secs,
         quality_raw,
         IntegerSnapPolicy::AUTO,
-    );
-
-    // PRD-BEATS Round 6 §6c — profile-independent octave self-
-    // verification. Re-fit the grid at `bpm / 2` and `bpm * 2`
-    // and swap to whichever alternate octave has a materially
-    // tighter LSQ fit. Catches the hip-hop double-tempo failure
-    // mode (Bangin' Westside Connection: auto-picked 175.7 BPM
-    // with rms 41 ms / kept 46 %; the same audio at 88 BPM gives
-    // rms 10 ms / kept 72 %) when the genre tag would have set
-    // the right profile but didn't, AND on untagged tracks
-    // where the profile system can't help at all. The threshold
-    // is strict on purpose: only swap when the alternate octave
-    // is so much better that "the algorithm picked the hat grid
-    // instead of the kick grid" is the only plausible
-    // explanation. See [`octave_self_verify`] for the criteria.
-    let (bpm, anchor_secs, quality) = octave_self_verify(
-        odf,
-        odf_sr,
-        bpm,
-        anchor_secs,
-        duration_secs,
-        quality,
-        fixed_anchor,
-        profile,
     );
 
     let period = 60.0 / bpm;
@@ -1559,258 +1934,6 @@ fn snap_bpm_to_integer_if_safe(
         );
         (bpm_raw, anchor_secs, quality_raw)
     }
-}
-
-/// PRD-BEATS Round 6 §6c — `rms_alt < OCTAVE_RECHECK_RMS_RATIO *
-/// rms_main` is the materiality bar for swapping to a half- or
-/// double-tempo octave during the self-verification pass. 0.65
-/// means the alternate octave must be at least 35 % tighter in
-/// RMS terms. Empirically chosen against the hip-hop / DnB /
-/// reggae corpus: a borderline-correct octave (a track that
-/// genuinely sits between two metric levels) sees the two
-/// octaves' RMS within ~5–15 % of each other; a true octave
-/// misfire (the hat grid winning over the kick grid) sees a
-/// 2–4× RMS gap. 0.65 sits comfortably in the gap so the swap
-/// fires when it should and stays silent when it shouldn't.
-const OCTAVE_RECHECK_RMS_RATIO: f64 = 0.65;
-
-/// PRD-BEATS Round 6 §6c — the alternate octave must also fit
-/// AT LEAST this fraction of beats (`kept_fraction`) before we
-/// swap. Without this guard, a spurious tempo at twice the real
-/// rate could produce extremely tight RMS on the small subset of
-/// beats it does fit and pass the ratio check while ignoring
-/// most of the track. 0.50 means at least half the predicted
-/// beats land on a real ODF peak — comfortably above the noise
-/// of a wrong tempo and well below the typical 0.75–0.90 a
-/// correct grid achieves.
-const OCTAVE_RECHECK_MIN_KEPT: f32 = 0.50;
-
-/// PRD-BEATS Round 6 §6c — profile-independent octave self-
-/// verification. After [`snap_bpm_to_integer_if_safe`] picks
-/// `(bpm, anchor, quality)`, also re-fit the grid at `bpm / 2`
-/// and `bpm * 2` via [`refit_anchor_at_bpm`]. If either
-/// alternate octave fits the ODF materially tighter than the
-/// main (`rms_alt < OCTAVE_RECHECK_RMS_RATIO * rms_main` AND
-/// `kept_alt >= kept_main` AND `kept_alt >= OCTAVE_RECHECK_MIN_
-/// KEPT`), swap to it and integer-snap the alternate BPM with
-/// the same tolerance rules as the main octave.
-///
-/// Why this exists. Our pass-2 octave decision in
-/// `octave_profile.rs` compares **spectral autocorrelation
-/// energy** at each candidate period, not **LSQ fit quality**
-/// against the actual ODF. On hip-hop with a busy hat layer the
-/// 175 BPM hat grid wins on spectral energy even though an 88
-/// BPM kick grid fits the actual onsets much tighter; same
-/// shape for tracks with a busy 16th-note shaker / off-beat
-/// snare pattern. The genre profile (`HipHop`, `RootsReggae`,
-/// `Dub`) is the first line of defence and handles tagged
-/// tracks. This is the second line, profile-independent, and
-/// catches untagged tracks plus edge cases the profile rules
-/// don't know about.
-///
-/// Strictly profile-independent on purpose: the profile system
-/// expresses a prior ("this genre tends to live at X tempo"),
-/// this expresses a measurement ("at this anchor, BPM X fits
-/// the ODF better than BPM 2X"). Both signals together are
-/// stronger than either alone.
-///
-/// Skipped when:
-/// * `fixed_anchor.is_some()` — the caller has asserted both
-///   anchor and intent; don't second-guess them.
-/// * The alternate BPM falls outside `[MIN_BPM, MAX_BPM]`.
-/// * `refit_anchor_at_bpm` returns `None` (insufficient
-///   observations at the alternate tempo).
-#[allow(clippy::too_many_arguments)]
-fn octave_self_verify(
-    odf: &[f32],
-    odf_sr: f64,
-    bpm: f64,
-    anchor: f64,
-    duration_secs: f64,
-    quality: GridQuality,
-    fixed_anchor: Option<f64>,
-    profile: OctaveProfile,
-) -> (f64, f64, GridQuality) {
-    if fixed_anchor.is_some() {
-        return (bpm, anchor, quality);
-    }
-    let main_rms = quality.rms_ms;
-    let main_kept = quality.kept_fraction;
-
-    let mut best = (bpm, anchor, quality);
-    let mut best_rms = main_rms;
-    let period_main = 60.0 / bpm;
-
-    // Each (alternate BPM, list of starting anchors to try). At
-    // the half octave the grid period is 2× the main octave's
-    // period, so only every other main beat lands on the new
-    // grid. There are TWO possible sub-phases that fit (the
-    // half-octave grid starting on main beat 0 vs main beat 1);
-    // the wrong sub-phase lands every beat on a SNARE instead of
-    // a KICK in a hip-hop programming, which destroys the fit.
-    // Trying both sub-phases is essential — without it, the
-    // half-octave's measured RMS is dominated by whichever
-    // sub-phase the LSQ refit happened to find first, which is
-    // almost always the wrong one (Bangin' Westside Connection:
-    // the wrong sub-phase reports 73 ms rms, the right sub-phase
-    // reports 10 ms rms — without trying both, the rule never
-    // fires). At the double octave the current anchor already
-    // sits on a beat of the new grid (every existing beat
-    // doubles up), so only one sub-phase exists.
-    //
-    // PRD-BEATS round 6+ — direction-blocked octaves are also
-    // skipped here based on `profile`. Pass 2's profile-aware
-    // rules already committed to the genre's mix octave (e.g.
-    // FourOnFloor picking 133 over 66.5 via the perceptual prior
-    // + half-bar rejection); the self-verify must respect that
-    // decision. Profile-blind swap on Oppidan / Cutty Ranks
-    // (UKG 133 → 66.5) was the canonical regression.
-    let half_anchors = [anchor, anchor + period_main];
-    let double_anchors = [anchor];
-    let candidates: [(f64, &[f64], bool); 2] = [
-        (
-            bpm / 2.0,
-            &half_anchors,
-            profile_blocks_half_octave_swap(profile),
-        ),
-        (
-            bpm * 2.0,
-            &double_anchors,
-            profile_blocks_double_octave_swap(profile),
-        ),
-    ];
-
-    for (cand_bpm_hint, sub_anchors, blocked) in candidates {
-        if blocked {
-            continue;
-        }
-        if !(MIN_BPM..=MAX_BPM).contains(&cand_bpm_hint) {
-            continue;
-        }
-
-        // For each sub-anchor, run a narrow ±2 % BPM search
-        // around the alternate-octave hint. Pass-2's BPM
-        // commitment at the WRONG octave is a sub-integer
-        // spectral autocorrelation peak whose half need not
-        // coincide with the true tempo's integer (Bangin'
-        // Westside Connection: pass 2 picks 175.742, strict
-        // half is 87.871, the truth is 88.000 — 0.13 BPM off
-        // the strict half; without the BPM search the strict
-        // half measures 73 ms RMS where the true 88.0 measures
-        // 10 ms). The 2 % window is narrower than the gap to
-        // any neighbour metric level (which is ±50 % away).
-        let mut best_sub: Option<(f64, f64, GridQuality)> = None;
-        for &start_anchor in sub_anchors {
-            if let Some((sub_bpm, sub_anchor, sub_quality)) = refine_alternate_octave_at_anchor(
-                odf,
-                odf_sr,
-                cand_bpm_hint,
-                start_anchor,
-                duration_secs,
-            ) {
-                let take = match best_sub {
-                    Some((_, _, ref q)) => sub_quality.rms_ms < q.rms_ms,
-                    None => true,
-                };
-                if take {
-                    best_sub = Some((sub_bpm, sub_anchor, sub_quality));
-                }
-            }
-        }
-        let Some((cand_bpm, cand_anchor, cand_quality)) = best_sub else {
-            continue;
-        };
-
-        let materially_tighter =
-            f64::from(cand_quality.rms_ms) < f64::from(best_rms) * OCTAVE_RECHECK_RMS_RATIO;
-        let not_worse_kept = cand_quality.kept_fraction >= main_kept;
-        let kept_above_floor = cand_quality.kept_fraction >= OCTAVE_RECHECK_MIN_KEPT;
-        if !(materially_tighter && not_worse_kept && kept_above_floor) {
-            continue;
-        }
-
-        // Integer-snap the alternate BPM too, with the same
-        // safety net as the main octave (`snap_bpm_to_integer_
-        // if_safe`): if the snapped tempo doesn't fit
-        // meaningfully worse, prefer the integer. Most music is
-        // produced at integer BPM; if the alternate octave fits
-        // tightly at e.g. 87.95 the truth is almost always 88.0.
-        let (snapped_bpm, snapped_anchor, snapped_quality) = snap_bpm_to_integer_if_safe(
-            odf,
-            odf_sr,
-            cand_bpm,
-            cand_anchor,
-            duration_secs,
-            cand_quality,
-            IntegerSnapPolicy::AUTO,
-        );
-        eprintln!(
-            "dub-bpm: octave self-verify SWAPPED {:.3} -> {:.3} \
-             (rms {:.2} -> {:.2} ms, kept {:.0}% -> {:.0}%)",
-            best.0,
-            snapped_bpm,
-            main_rms,
-            snapped_quality.rms_ms,
-            f64::from(main_kept) * 100.0,
-            f64::from(snapped_quality.kept_fraction) * 100.0,
-        );
-        best = (snapped_bpm, snapped_anchor, snapped_quality);
-        best_rms = snapped_quality.rms_ms;
-    }
-    best
-}
-
-/// PRD-BEATS Round 6 §6c — half-width of the per-sub-anchor BPM
-/// search inside [`octave_self_verify`], as a fraction of the
-/// alternate-octave hint. 0.02 = ±2 %. Tight enough that the
-/// search cannot reach a different metric level (next octave is
-/// ±50 % away) yet wide enough to absorb the gap between pass-2's
-/// sub-integer spectral pick and the real tempo's integer.
-const OCTAVE_RECHECK_BPM_SEARCH_PCT: f64 = 0.02;
-
-/// PRD-BEATS Round 6 §6c — step of the per-sub-anchor BPM
-/// search inside [`octave_self_verify`]. 0.10 BPM matches the
-/// integer-snap tolerance so every integer inside the window is
-/// sampled exactly once.
-const OCTAVE_RECHECK_BPM_SEARCH_STEP: f64 = 0.10;
-
-/// Helper for [`octave_self_verify`]: at a given sub-anchor,
-/// sweep BPM ±[`OCTAVE_RECHECK_BPM_SEARCH_PCT`] around the
-/// alternate-octave hint and return the `(bpm, anchor, quality)`
-/// triple with the lowest LSQ RMS. The grid is quantised to
-/// 0.1 BPM (matching [`refine_bpm_around_tap_hint`]) so integers
-/// and half-integers are always sampled.
-fn refine_alternate_octave_at_anchor(
-    odf: &[f32],
-    odf_sr: f64,
-    cand_bpm_hint: f64,
-    start_anchor: f64,
-    duration_secs: f64,
-) -> Option<(f64, f64, GridQuality)> {
-    let lo_raw = (cand_bpm_hint * (1.0 - OCTAVE_RECHECK_BPM_SEARCH_PCT)).max(MIN_BPM);
-    let hi = (cand_bpm_hint * (1.0 + OCTAVE_RECHECK_BPM_SEARCH_PCT)).min(MAX_BPM);
-    if hi <= lo_raw {
-        return None;
-    }
-    let lo = ((lo_raw * 10.0).ceil() / 10.0).max(MIN_BPM);
-
-    let mut best: Option<(f64, f64, GridQuality)> = None;
-    let mut cand_bpm = lo;
-    while cand_bpm <= hi + 1e-9 {
-        if let Some((sub_anchor, sub_quality)) =
-            refit_anchor_at_bpm(odf, odf_sr, cand_bpm, start_anchor, duration_secs)
-        {
-            let take = match best {
-                Some((_, _, ref q)) => sub_quality.rms_ms < q.rms_ms,
-                None => true,
-            };
-            if take {
-                best = Some((cand_bpm, sub_anchor, sub_quality));
-            }
-        }
-        cand_bpm += OCTAVE_RECHECK_BPM_SEARCH_STEP;
-    }
-    best
 }
 
 /// Refit the grid anchor (intercept) at a fixed `bpm`, then
@@ -2353,17 +2476,8 @@ fn quality_from_residuals(
     let p95_ms = sorted[(sorted.len() as f64 * 0.95).floor() as usize] as f32;
     let max_abs_ms = *sorted.last().unwrap_or(&0.0) as f32;
 
-    let mean_t: f64 = observations.iter().map(|(_, t)| t).sum::<f64>() / n;
-    let mean_r: f64 = residuals.iter().sum::<f64>() / n;
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for ((_, t), r) in observations.iter().zip(residuals.iter()) {
-        let dt = t - mean_t;
-        num += dt * (r - mean_r);
-        den += dt * dt;
-    }
-    let slope_secs_per_sec = if den > 1e-12 { num / den } else { 0.0 };
-    let drift_slope_ms_per_min = (slope_secs_per_sec * 60.0 * 1000.0) as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let drift_slope_ms_per_min = drift_ms_per_min(observations, residuals) as f32;
 
     GridQuality {
         rms_ms,
@@ -2372,6 +2486,55 @@ fn quality_from_residuals(
         kept_fraction,
         drift_slope_ms_per_min,
     }
+}
+
+/// Hits read for drift; a longer song is thinned to about this many.
+const DRIFT_HITS_READ: usize = 300;
+/// Two hits closer together than this say little about drift — a few ms
+/// of scatter between them is a large slope — so only pairs further apart
+/// are asked. A clip too short for that asks pairs a quarter of its
+/// length apart.
+const DRIFT_PAIR_APART_SECS: f64 = 20.0;
+
+/// How far the hits move against the lines, in ms per minute of song:
+/// the **median** of what every pair of hits says.
+///
+/// The hits are the strongest onset by each line, and in real music a
+/// good share of those are not the beat at all — a strum 150 ms on, a
+/// hat a sixteenth early — and they come and go with the arrangement. A
+/// least-squares slope through them reads a guitar entering in the last
+/// chorus as drift, and reads real drift low when the strays sit at one
+/// end. On 1,767 grids locked in Traktor it called 28 % of them drifting
+/// at the 3 ms/min the warning then used, and caught only 58 % of a
+/// 12 ms/min drift at a limit of 10. The median over pairs warns on 7 %
+/// at [`GridQuality::DRIFT_WARNING_MS_PER_MIN`] and catches 92 %.
+fn drift_ms_per_min(observations: &[(f64, f64)], residuals: &[f64]) -> f64 {
+    let stride = (residuals.len() / DRIFT_HITS_READ).max(1);
+    let hits: Vec<(f64, f64)> = observations
+        .iter()
+        .zip(residuals)
+        .step_by(stride)
+        .map(|((_, at), late)| (*at, *late))
+        .collect();
+    let (Some(first), Some(last)) = (hits.first(), hits.last()) else {
+        return 0.0;
+    };
+    let apart = DRIFT_PAIR_APART_SECS.min((last.0 - first.0) / 4.0);
+    let mut slopes: Vec<f64> = Vec::with_capacity(hits.len() * hits.len() / 2);
+    for (i, earlier) in hits.iter().enumerate() {
+        for later in &hits[i + 1..] {
+            let between = later.0 - earlier.0;
+            if between > apart && between > 0.0 {
+                slopes.push((later.1 - earlier.1) / between);
+            }
+        }
+    }
+    if slopes.is_empty() {
+        return 0.0;
+    }
+    let middle = slopes.len() / 2;
+    let (_, median, _) = slopes.select_nth_unstable_by(middle, f64::total_cmp);
+    *median * 60_000.0
 }
 
 fn strongest_peak_in_window(
@@ -2765,6 +2928,105 @@ pub(crate) fn kick_edge_offset_secs(
         }
     }
     moved
+}
+
+/// How far from the lines (in beats) the song's first sound must fall
+/// before the lines are suspected of sitting on the off-beat. Past this it
+/// is nearer the half-beat than a line.
+const OFF_BEAT_FIRST_SOUND_BEATS: f64 = 0.30;
+
+/// How long after a line its hit is given to show its level.
+const OFF_BEAT_LEVEL_WINDOW_SECS: f64 = 0.030;
+
+/// Whether `beats` sit on the song's off-beats: the first sound of the
+/// song falls about half a beat from them, **and** what is played half a
+/// beat from them is at least as loud as what is played on them.
+///
+/// A song nearly always opens on a beat, and the beat is nearly always
+/// the loud thing. Either alone is no evidence — plenty of songs open on
+/// a pickup, and plenty carry a loud off-beat stab — so both must agree.
+///
+/// Of the operator's 1,487 locked Traktor grids whose tempo Dub matched
+/// and whose lines were either on Traktor's or half a beat from them
+/// (2026-11-19), this is true of 53 of the 105 half a beat out and 5 of
+/// the 1,382 on the beat; fitted on half of them and tried on the other
+/// half, it kept the same proportions. The whole-song cues tried first —
+/// kick-band onsets, onsets in several bands at once, visual kick edges,
+/// kick/snare alternation — do not separate the two groups at all: bass
+/// on the off-beat is as low, as wide and as regular as a kick.
+fn lines_on_the_off_beat(beats: &[f64], bpm: f64, env: &[f32], env_sr: f64) -> bool {
+    if beats.is_empty() || !(bpm.is_finite() && bpm > 0.0) || env.is_empty() || env_sr <= 0.0 {
+        return false;
+    }
+    let env_max = env.iter().copied().fold(0.0f32, f32::max);
+    if env_max <= 0.0 {
+        return false;
+    }
+    let period = 60.0 / bpm;
+
+    let Some(first_sound) = env
+        .iter()
+        .position(|&v| v >= FIRST_BEAT_AUDIBLE_FRAC * env_max)
+    else {
+        return false;
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let beats_from_line = (first_sound as f64 / env_sr - beats[0]) / period;
+    let off_the_lines = (beats_from_line - beats_from_line.round()).abs();
+    if off_the_lines < OFF_BEAT_FIRST_SOUND_BEATS {
+        return false;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let window = ((OFF_BEAT_LEVEL_WINDOW_SECS * env_sr).round() as usize).max(1);
+    let level_at = |secs: f64| -> f64 {
+        if secs < 0.0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let from = (secs * env_sr).round() as usize;
+        env.iter()
+            .skip(from)
+            .take(window)
+            .fold(0.0f32, |peak, &v| peak.max(v))
+            .into()
+    };
+    let (mut on, mut off) = (0.0f64, 0.0f64);
+    for &beat in beats {
+        on += level_at(beat);
+        off += level_at(beat + period / 2.0);
+    }
+    off > on
+}
+
+/// Move a grid that sits on the off-beats ([`lines_on_the_off_beat`])
+/// half a beat, and settle it on the kick edges there. Tempo and quality
+/// are kept; the 1 is left for the downbeat pass that follows.
+fn move_off_the_off_beat(
+    grid: BeatGrid,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+) -> BeatGrid {
+    if grid.beats.is_empty() || grid.bpm <= 0.0 {
+        return grid;
+    }
+    let (env, env_sr) = broadband_amp_envelope(samples, sample_rate, channels);
+    if !lines_on_the_off_beat(&grid.beats, grid.bpm, &env, env_sr) {
+        return grid;
+    }
+    let duration_secs =
+        samples.len() as f64 / (f64::from(sample_rate) * f64::from(channels.max(1)));
+    let beats = uniform_beats(grid.bpm, grid.beats[0] + 30.0 / grid.bpm, duration_secs);
+    if beats.is_empty() {
+        return grid;
+    }
+    let moved = BeatGrid {
+        beats,
+        bar_phase: 0,
+        ..grid
+    };
+    shift_grid_to_kick_edge(moved, samples, sample_rate, channels)
 }
 
 /// Shift every beat in `grid` by the median visual-kick-edge offset so
@@ -3169,8 +3431,7 @@ mod tests {
     fn relatch_at_user_downbeat_emits_uniform_grid() {
         let bpm = 120.0;
         let samples = click_track(bpm, 8.0, SR);
-        let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, bpm, 1.0, OctaveProfile::Default)
-            .expect("relatch");
+        let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, bpm, 1.0).expect("relatch");
         // PRD-BEATS Round 6 §6a: latch is a phase-only operation;
         // BPM must come out bit-identical to the input (was `< 1.0`
         // before the fix, which let `refine_period_at_anchor` and
@@ -3225,9 +3486,8 @@ mod tests {
         // edge detector fires and pulls the beat onto ~4.0, not the raw
         // 4.02 tap.
         let near = 4.02;
-        let on_click =
-            relatch_grid_at_downbeat_tap(&samples, SR, 1, auto.bpm, near, OctaveProfile::Default)
-                .expect("relatch on click");
+        let on_click = relatch_grid_at_downbeat_tap(&samples, SR, 1, auto.bpm, near)
+            .expect("relatch on click");
         assert!(
             (on_click.bpm - auto.bpm).abs() < 1e-9,
             "relatch must preserve BPM exactly"
@@ -3245,9 +3505,8 @@ mod tests {
         // rotation to the nearest analysed beat (≈0.13 s away) could
         // never achieve, proving relatch re-phases rather than rotates.
         let off = 4.13;
-        let between =
-            relatch_grid_at_downbeat_tap(&samples, SR, 1, auto.bpm, off, OctaveProfile::Default)
-                .expect("relatch between clicks");
+        let between = relatch_grid_at_downbeat_tap(&samples, SR, 1, auto.bpm, off)
+            .expect("relatch between clicks");
         assert!((between.bpm - auto.bpm).abs() < 1e-9);
         assert!(beats_are_uniform(&between.beats, between.bpm));
         assert!(
@@ -3256,76 +3515,291 @@ mod tests {
         );
     }
 
-    /// PRD-BEATS Round 6 §6c regression — profile-independent
-    /// octave self-verification. Manually construct the scenario:
-    /// a click track at the real BPM, then pass `octave_self_
-    /// verify` the **wrong octave** (2×) as "main" along with a
-    /// deliberately-poor quality and the anchor at the wrong
-    /// octave. The self-verify must measure the actual fit at
-    /// `bpm / 2` and swap to it because the half-tempo grid
-    /// landings on every other click are tight while the
-    /// double-tempo grid has every other prediction landing on
-    /// silence (the kick interval). Pre-fix the algorithm
-    /// trusted the spectral-energy pick and never even measured
-    /// the alternate octave.
+    /// One minute at 120: a kick on every beat from 0.5 s, and whatever
+    /// `extra` lays over it. Each hit starts at full level, so its
+    /// leading edge is its start.
+    fn kicks_at_120(extra: &[(f64, f32)]) -> Vec<f32> {
+        let sr = f64::from(SR);
+        let mut samples = vec![0.0f32; (60.0 * sr) as usize];
+        let kicks = (0..118).map(|k| (0.5 + f64::from(k) * 0.5, 1.0f32));
+        for (at_secs, level) in kicks.chain(extra.iter().copied()) {
+            let at = (at_secs * sr) as usize;
+            for (i, s) in samples[at..].iter_mut().take(4_800).enumerate() {
+                *s += level * (-(i as f32) / 960.0).exp();
+            }
+        }
+        samples
+    }
+
+    /// The grid line nearest `t`.
+    fn line_near(grid: &BeatGrid, t: f64) -> f64 {
+        grid.beats
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
+            .expect("beats")
+    }
+
+    /// A hand tapping along is tens of milliseconds out, each time
+    /// differently. Early, late, or two bars on: the lines come out in
+    /// the same place — on the kicks — and the tapped beat is the 1.
     #[test]
-    fn octave_self_verify_swaps_when_alternate_fits_materially_tighter() {
-        let real_bpm = 90.0;
-        let samples = click_track(real_bpm, 30.0, SR);
+    fn a_tap_while_playing_lands_on_the_songs_beats_however_it_falls() {
+        let samples = kicks_at_120(&[]);
+        for (tap, kick) in [
+            (20.545, 20.5),
+            (20.440, 20.5),
+            (24.530, 24.5),
+            (41.02, 41.0),
+        ] {
+            let grid = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, tap).expect("grid");
+            assert_eq!(grid.bpm, 120.0, "the tempo is not the tap's to change");
+            assert!(beats_are_uniform(&grid.beats, 120.0));
+            let line = line_near(&grid, kick);
+            assert!(
+                (line - kick).abs() < 0.004,
+                "tap {tap}: the line by the kick at {kick} is at {line}"
+            );
+            let one = grid.beats[usize::from(grid.bar_phase)];
+            let beats_from_one = (kick - one) / 0.5;
+            assert!(
+                (beats_from_one / 4.0 - (beats_from_one / 4.0).round()).abs() < 0.01,
+                "tap {tap}: the 1 is at {one}, the tapped kick at {kick}"
+            );
+        }
+    }
 
-        // Re-derive the ODF that the analyzer would have built so
-        // we can call `octave_self_verify` with a realistic input.
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-            &samples,
-            SR,
-            1,
-            BpmRange::DEFAULT,
-            OctaveProfile::Default,
-        )
-        .expect("odf");
-        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
-        let duration_secs = samples.len() as f64 / f64::from(SR);
+    /// One loud stray hit beside the beat the DJ tapped. A stopped-deck
+    /// tap latches onto the loudest thing in reach and hangs the grid on
+    /// it; a playing tap asks the whole song, and one hit out of 118
+    /// does not move it.
+    #[test]
+    fn one_loud_stray_hit_by_the_tap_does_not_move_the_grid() {
+        let samples = kicks_at_120(&[(20.555, 1.6)]);
+        let tap = 20.540;
 
-        // Manufacture a "main = wrong octave" quality. The exact
-        // numbers don't matter — they just have to be worse than
-        // what the self-verify will find at the real BPM.
-        // Anchor on a click (period = 60/90 = 0.667 s) so
-        // `refit_anchor_at_bpm` at the alternate octave finds
-        // observations on the first pass; an anchor halfway
-        // between clicks would leave the LSQ window empty and
-        // the refit would early-return `None` without measuring.
-        let wrong_bpm = real_bpm * 2.0;
-        let wrong_anchor = 60.0 / real_bpm; // first non-zero click
-        let wrong_quality = GridQuality {
-            rms_ms: 35.0,
-            p95_ms: 60.0,
-            max_abs_ms: 80.0,
-            kept_fraction: 0.45,
-            drift_slope_ms_per_min: 0.0,
+        let stopped = relatch_grid_at_downbeat_tap(&samples, SR, 1, 120.0, tap).expect("grid");
+        assert!(
+            (line_near(&stopped, tap) - 20.555).abs() < 0.004,
+            "the stopped-deck tap takes the hit it is parked on: {}",
+            line_near(&stopped, tap)
+        );
+
+        let playing = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, tap).expect("grid");
+        assert!(
+            (line_near(&playing, tap) - 20.5).abs() < 0.004,
+            "the playing tap stays on the kicks: {}",
+            line_near(&playing, tap)
+        );
+    }
+
+    /// Kicks on the beat and hits just as loud on the off-beat: the
+    /// audio cannot say which is "the beat". The tap can — it is what
+    /// puts right a grid that came out half a beat off.
+    #[test]
+    fn a_tap_while_playing_chooses_the_beat_over_the_off_beat() {
+        let off_beats: Vec<(f64, f32)> =
+            (0..118).map(|k| (0.75 + f64::from(k) * 0.5, 1.0)).collect();
+        let samples = kicks_at_120(&off_beats);
+
+        let on = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, 30.03).expect("grid");
+        assert!(
+            (line_near(&on, 30.0) - 30.0).abs() < 0.004,
+            "tapped by the beat: {}",
+            line_near(&on, 30.0)
+        );
+        let off = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, 30.22).expect("grid");
+        assert!(
+            (line_near(&off, 30.25) - 30.25).abs() < 0.004,
+            "tapped by the off-beat: {}",
+            line_near(&off, 30.25)
+        );
+    }
+
+    /// The operator on *Hey Ya*, 2026-11-19: "i hit it but it always
+    /// jumps to the next half beat". His taps read 80 ms ahead of the
+    /// beat — a hand tapping along anticipates — and the strums between
+    /// the beats collect more onsets than the beats do. The strongest
+    /// thing in reach was the strum before the tap; the beat he meant
+    /// was the nearer. A tap means the beat it is by.
+    #[test]
+    fn a_tap_just_ahead_of_the_beat_is_not_pulled_back_to_a_louder_off_beat() {
+        // A low kick on each beat; between the beats a strum across the
+        // mid and high bands, which the onset function hears as more.
+        let mut samples = vec![0.0f32; SR as usize * 60];
+        for k in 0..118 {
+            let beat = 0.5 + f64::from(k) * 0.5;
+            hit(&mut samples, beat, 60.0, 1.0);
+            for freq in [400.0, 1_500.0, 5_000.0, 9_000.0] {
+                hit(&mut samples, beat + 0.25, freq, 0.3);
+            }
+        }
+        let (odf, odf_sr, _) = odf_of(&samples);
+        let fold = |by: f64| {
+            (0..50)
+                .map(|ms| by - 0.010 + f64::from(ms) / 1000.0)
+                .map(|at| score_grid(&odf, (at * odf_sr).rem_euclid(0.5 * odf_sr), 0.5 * odf_sr))
+                .fold(0.0, f64::max)
         };
-
-        let (chosen_bpm, _, chosen_quality) = octave_self_verify(
-            &odf,
-            odf_sr,
-            wrong_bpm,
-            wrong_anchor,
-            duration_secs,
-            wrong_quality,
-            None,
-            OctaveProfile::Default,
+        assert!(
+            fold(0.75) > fold(0.5),
+            "the fixture's off-beat must collect more onsets than its beat: {} vs {}",
+            fold(0.75),
+            fold(0.5)
         );
 
-        assert!(
-            (chosen_bpm - real_bpm).abs() < 0.01,
-            "self-verify must swap to {real_bpm} BPM; got {chosen_bpm}"
+        for early in [0.080, 0.050, 0.020] {
+            let tap = 20.5 - early;
+            let grid = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, tap).expect("grid");
+            assert!(
+                (line_near(&grid, 20.5) - 20.5).abs() < 0.012,
+                "tapped {:.0} ms ahead of the kick at 20.5: line at {}",
+                early * 1000.0,
+                line_near(&grid, 20.5)
+            );
+        }
+        // And a tap a little late still means that beat.
+        let grid = fit_grid_at_playing_tap(&samples, SR, 1, 120.0, 20.54).expect("grid");
+        assert!((line_near(&grid, 20.5) - 20.5).abs() < 0.012);
+    }
+
+    /// Nothing to fit — silence — and the tap is all there is: it is
+    /// kept where it fell, as on a stopped deck.
+    #[test]
+    fn a_tap_while_playing_over_no_beat_at_all_is_kept_as_tapped() {
+        let samples = vec![0.0f32; SR as usize * 30];
+        let grid = fit_grid_at_playing_tap(&samples, SR, 1, 100.0, 12.345).expect("grid");
+        assert!((line_near(&grid, 12.345) - 12.345).abs() < 1e-6);
+        assert_eq!(
+            fit_grid_at_playing_tap(&samples, SR, 1, f64::NAN, 1.0).expect("grid"),
+            BeatGrid::none()
         );
-        assert!(
-            chosen_quality.rms_ms < wrong_quality.rms_ms,
-            "swapped quality must be tighter than the rejected main; \
-             got swapped {} ms vs main {} ms",
-            chosen_quality.rms_ms,
-            wrong_quality.rms_ms
+        assert_eq!(
+            fit_grid_at_playing_tap(&samples, SR, 1, 100.0, -1.0).expect("grid"),
+            BeatGrid::none()
         );
+    }
+
+    /// A minute at 120 from 0.5 s: `beat` and `off_beat` are the levels
+    /// of the hits on the beat and half a beat after it, `first` the time
+    /// of the first hit of each kind.
+    fn beat_and_off_beat(beat: f32, off_beat: f32, first: (f64, f64)) -> (Vec<f32>, f64) {
+        let sr = f64::from(SR);
+        let mut samples = vec![0.0f32; (60.0 * sr) as usize];
+        let hits = (0..118).flat_map(|k| {
+            let at = 0.5 + f64::from(k) * 0.5;
+            [(at, beat, first.0), (at + 0.25, off_beat, first.1)]
+        });
+        for (at_secs, level, from) in hits {
+            if at_secs + 1e-9 < from {
+                continue;
+            }
+            let at = (at_secs * sr) as usize;
+            for (i, s) in samples[at..].iter_mut().take(2_400).enumerate() {
+                *s += level * (-(i as f32) / 480.0).exp();
+            }
+        }
+        let (env, env_sr) = broadband_amp_envelope(&samples, SR, 1);
+        (env, env_sr)
+    }
+
+    fn lines_from(first: f64) -> Vec<f64> {
+        (0..118).map(|k| first + f64::from(k) * 0.5).collect()
+    }
+
+    /// Lines on the off-beat hits, which are quieter than the kicks half
+    /// a beat away, in a song that opens on a kick: half a beat out.
+    #[test]
+    fn lines_on_quiet_off_beats_of_a_song_that_opens_on_the_beat_are_out() {
+        let (env, env_sr) = beat_and_off_beat(1.0, 0.4, (0.5, 0.75));
+        assert!(lines_on_the_off_beat(
+            &lines_from(0.75),
+            120.0,
+            &env,
+            env_sr
+        ));
+        assert!(
+            !lines_on_the_off_beat(&lines_from(0.5), 120.0, &env, env_sr),
+            "lines on the kicks stay"
+        );
+    }
+
+    /// A pickup: the song opens on an off-beat hit, but the lines carry
+    /// the loud hits. Its first sound alone moves nothing.
+    #[test]
+    fn a_song_that_opens_on_a_pickup_keeps_its_lines() {
+        let (env, env_sr) = beat_and_off_beat(1.0, 0.4, (1.0, 0.75));
+        assert!(!lines_on_the_off_beat(
+            &lines_from(0.5),
+            120.0,
+            &env,
+            env_sr
+        ));
+    }
+
+    /// A loud off-beat stab in a song that opens on its beat: loudness
+    /// alone moves nothing either.
+    #[test]
+    fn a_loud_off_beat_stab_does_not_move_lines_the_song_opens_on() {
+        let (env, env_sr) = beat_and_off_beat(0.6, 1.0, (0.5, 0.75));
+        assert!(!lines_on_the_off_beat(
+            &lines_from(0.5),
+            120.0,
+            &env,
+            env_sr
+        ));
+    }
+
+    #[test]
+    fn silence_and_nonsense_are_not_off_the_beat() {
+        assert!(!lines_on_the_off_beat(&lines_from(0.5), 120.0, &[], 1000.0));
+        assert!(!lines_on_the_off_beat(
+            &lines_from(0.5),
+            120.0,
+            &[0.0; 4000],
+            1000.0
+        ));
+        assert!(!lines_on_the_off_beat(&[], 120.0, &[1.0; 4000], 1000.0));
+        assert!(!lines_on_the_off_beat(
+            &lines_from(0.5),
+            f64::NAN,
+            &[1.0; 4000],
+            1000.0
+        ));
+    }
+
+    /// The whole move: a grid handed over on the off-beats comes back on
+    /// the kicks, same tempo.
+    #[test]
+    fn a_grid_on_the_off_beats_is_moved_onto_the_kicks() {
+        let sr = f64::from(SR);
+        let mut samples = vec![0.0f32; (60.0 * sr) as usize];
+        for k in 0..118 {
+            for (at_secs, level) in [
+                (0.5 + f64::from(k) * 0.5, 1.0f32),
+                (0.75 + f64::from(k) * 0.5, 0.4),
+            ] {
+                let at = (at_secs * sr) as usize;
+                for (i, s) in samples[at..].iter_mut().take(2_400).enumerate() {
+                    *s += level * (-(i as f32) / 480.0).exp();
+                }
+            }
+        }
+        let mut grid = BeatGrid::none();
+        grid.bpm = 120.0;
+        grid.confidence = 1.0;
+        grid.beats = lines_from(0.75);
+        let moved = move_off_the_off_beat(grid.clone(), &samples, SR, 1);
+        assert_eq!(moved.bpm, 120.0);
+        assert!(
+            (line_near(&moved, 20.5) - 20.5).abs() < 0.004,
+            "line by the kick at 20.5: {}",
+            line_near(&moved, 20.5)
+        );
+
+        grid.beats = lines_from(0.5);
+        let kept = move_off_the_off_beat(grid.clone(), &samples, SR, 1);
+        assert_eq!(kept.beats, grid.beats, "a grid on the kicks is left alone");
     }
 
     /// A tick and then the kick, the fitted lines 44 ms ahead of the
@@ -3442,12 +3916,12 @@ mod tests {
 
     /// The onsets of mono `samples`, as the auto path sees them.
     fn odf_of(samples: &[f32]) -> (Vec<f32>, f64, f64) {
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+        let (_, odf, _) = crate::offline::analyze_with_odfs(
             samples,
             SR,
             1,
             BpmRange::DEFAULT,
-            OctaveProfile::Default,
+            OctaveProfile::Default.tempo_octave(TempoOctave::DEFAULT),
         )
         .expect("odf");
         (
@@ -3537,252 +4011,6 @@ mod tests {
         );
     }
 
-    /// PRD-BEATS Round 6 §6c — the converse: when the main octave
-    /// already fits tightly the self-verify must NOT swap, even
-    /// though the half-tempo grid trivially also fits (every other
-    /// beat at 60 BPM lands on a 120 BPM click). The materiality
-    /// gate (`OCTAVE_RECHECK_RMS_RATIO`) is what protects against
-    /// over-eager swapping.
-    #[test]
-    fn octave_self_verify_keeps_main_when_quality_is_already_tight() {
-        let real_bpm = 120.0;
-        let samples = click_track(real_bpm, 30.0, SR);
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-            &samples,
-            SR,
-            1,
-            BpmRange::DEFAULT,
-            OctaveProfile::Default,
-        )
-        .expect("odf");
-        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
-        let duration_secs = samples.len() as f64 / f64::from(SR);
-
-        // Fit the main grid through the normal pipeline so the
-        // input quality is what the production code would see.
-        let (bpm_main, anchor_main, quality_main) =
-            refine_full_pipeline(&odf, odf_sr, real_bpm, duration_secs, None).expect("refine main");
-        let (bpm_snapped, anchor_snapped, quality_snapped) = snap_bpm_to_integer_if_safe(
-            &odf,
-            odf_sr,
-            bpm_main,
-            anchor_main,
-            duration_secs,
-            quality_main,
-            IntegerSnapPolicy::AUTO,
-        );
-
-        let (chosen_bpm, _, _) = octave_self_verify(
-            &odf,
-            odf_sr,
-            bpm_snapped,
-            anchor_snapped,
-            duration_secs,
-            quality_snapped,
-            None,
-            OctaveProfile::Default,
-        );
-
-        assert!(
-            (chosen_bpm - real_bpm).abs() < 0.5,
-            "self-verify must not swap a tight {real_bpm} BPM fit; \
-             got {chosen_bpm}"
-        );
-    }
-
-    /// PRD-BEATS Round 6 §6c — `fixed_anchor` callers (the
-    /// tap-driven paths) bypass self-verification because the
-    /// caller has already asserted the period via their tap
-    /// intervals.
-    #[test]
-    fn octave_self_verify_respects_fixed_anchor_bypass() {
-        let real_bpm = 90.0;
-        let samples = click_track(real_bpm, 30.0, SR);
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-            &samples,
-            SR,
-            1,
-            BpmRange::DEFAULT,
-            OctaveProfile::Default,
-        )
-        .expect("odf");
-        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
-        let duration_secs = samples.len() as f64 / f64::from(SR);
-
-        let wrong_bpm = real_bpm * 2.0;
-        let wrong_quality = GridQuality {
-            rms_ms: 35.0,
-            p95_ms: 60.0,
-            max_abs_ms: 80.0,
-            kept_fraction: 0.45,
-            drift_slope_ms_per_min: 0.0,
-        };
-
-        let (chosen_bpm, _, _) = octave_self_verify(
-            &odf,
-            odf_sr,
-            wrong_bpm,
-            0.5,
-            duration_secs,
-            wrong_quality,
-            Some(0.5),
-            OctaveProfile::Default,
-        );
-
-        assert!(
-            (chosen_bpm - wrong_bpm).abs() < 1e-9,
-            "self-verify must respect fixed_anchor bypass; \
-             got {chosen_bpm}"
-        );
-    }
-
-    /// Oppidan / Cutty Ranks regression — UK garage tagged
-    /// `FourOnFloor` must keep the upper octave even when the
-    /// half-tempo grid measures a tighter LSQ fit. Production-
-    /// sparse kick patterns (kick on 1+3, snare on 2+4, hat
-    /// fills) make the half-octave grid land on kicks only and
-    /// look misleadingly clean; the profile already said "mix
-    /// at the upper octave" via pass 2, and the self-verify
-    /// must respect that.
-    ///
-    /// Fixture: synthesise a perfectly clean click at the
-    /// upper octave so the main grid fits as tight as it can,
-    /// and pass a *worse* manufactured `GridQuality` for the
-    /// upper octave so the rule would unambiguously swap if it
-    /// were profile-blind. Default profile MUST swap (control);
-    /// FourOnFloor MUST NOT swap. Same shape covers Dancehall
-    /// and DrumAndBass via the parameterised loop.
-    #[test]
-    fn octave_self_verify_does_not_swap_down_for_upper_octave_profiles() {
-        let real_bpm = 133.0;
-        let samples = click_track(real_bpm, 30.0, SR);
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-            &samples,
-            SR,
-            1,
-            BpmRange::DEFAULT,
-            OctaveProfile::Default,
-        )
-        .expect("odf");
-        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
-        let duration_secs = samples.len() as f64 / f64::from(SR);
-
-        // Anchor on a click so refit at the half octave finds
-        // observations; pass a deliberately-poor main quality so
-        // Default profile is forced to swap (control).
-        let upper_anchor = 60.0 / real_bpm;
-        let poor_main_quality = GridQuality {
-            rms_ms: 35.0,
-            p95_ms: 60.0,
-            max_abs_ms: 80.0,
-            kept_fraction: 0.45,
-            drift_slope_ms_per_min: 0.0,
-        };
-
-        let (control_bpm, _, _) = octave_self_verify(
-            &odf,
-            odf_sr,
-            real_bpm,
-            upper_anchor,
-            duration_secs,
-            poor_main_quality,
-            None,
-            OctaveProfile::Default,
-        );
-        assert!(
-            (control_bpm - real_bpm / 2.0).abs() < 0.5,
-            "Default profile MUST swap UKG-shaped 133 -> 66.5 (control); got {control_bpm}"
-        );
-
-        for profile in [
-            OctaveProfile::FourOnFloor,
-            OctaveProfile::DrumAndBass,
-            OctaveProfile::Dancehall,
-        ] {
-            let (kept_bpm, _, _) = octave_self_verify(
-                &odf,
-                odf_sr,
-                real_bpm,
-                upper_anchor,
-                duration_secs,
-                poor_main_quality,
-                None,
-                profile,
-            );
-            assert!(
-                (kept_bpm - real_bpm).abs() < 0.01,
-                "{profile:?} must refuse to swap 133 -> 66.5; got {kept_bpm}"
-            );
-        }
-    }
-
-    /// Symmetric to `does_not_swap_down`: profiles whose mix
-    /// tempo lives in the lower octave (RootsReggae, Dub,
-    /// HipHop) must refuse the BPM → BPM×2 swap even when the
-    /// upper-octave grid measures tighter. A 88 BPM hip-hop
-    /// track whose hi-hat layer doubles the autocorrelation at
-    /// 176 must stay at 88 once the profile has spoken.
-    #[test]
-    fn octave_self_verify_does_not_swap_up_for_lower_octave_profiles() {
-        let real_bpm = 88.0;
-        let samples = click_track(real_bpm * 2.0, 30.0, SR);
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
-            &samples,
-            SR,
-            1,
-            BpmRange::DEFAULT,
-            OctaveProfile::Default,
-        )
-        .expect("odf");
-        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
-        let duration_secs = samples.len() as f64 / f64::from(SR);
-
-        let lower_anchor = 60.0 / real_bpm;
-        let poor_main_quality = GridQuality {
-            rms_ms: 35.0,
-            p95_ms: 60.0,
-            max_abs_ms: 80.0,
-            kept_fraction: 0.45,
-            drift_slope_ms_per_min: 0.0,
-        };
-
-        let (control_bpm, _, _) = octave_self_verify(
-            &odf,
-            odf_sr,
-            real_bpm,
-            lower_anchor,
-            duration_secs,
-            poor_main_quality,
-            None,
-            OctaveProfile::Default,
-        );
-        assert!(
-            (control_bpm - real_bpm * 2.0).abs() < 0.5,
-            "Default profile MUST swap hip-hop-shaped 88 -> 176 (control); got {control_bpm}"
-        );
-
-        for profile in [
-            OctaveProfile::HipHop,
-            OctaveProfile::RootsReggae,
-            OctaveProfile::Dub,
-        ] {
-            let (kept_bpm, _, _) = octave_self_verify(
-                &odf,
-                odf_sr,
-                real_bpm,
-                lower_anchor,
-                duration_secs,
-                poor_main_quality,
-                None,
-                profile,
-            );
-            assert!(
-                (kept_bpm - real_bpm).abs() < 0.01,
-                "{profile:?} must refuse to swap 88 -> 176; got {kept_bpm}"
-            );
-        }
-    }
-
     /// PRD-BEATS Round 6 §6a regression: "set the 1" must not
     /// refit BPM, even when the LSQ would prefer a slightly
     /// different period. The user's Apocalypse report: analyse at
@@ -3806,9 +4034,7 @@ mod tests {
         let real_bpm = 120.0;
         let lied_bpm = 120.7;
         let samples = click_track(real_bpm, 30.0, SR);
-        let grid =
-            latch_beat_grid_at_downbeat(&samples, SR, 1, lied_bpm, 1.0, OctaveProfile::FourOnFloor)
-                .expect("relatch");
+        let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, lied_bpm, 1.0).expect("relatch");
         assert!(
             (grid.bpm - lied_bpm).abs() < 1e-9,
             "set-the-1 must not refit BPM; got {} (expected {})",
@@ -3877,14 +4103,15 @@ mod tests {
     #[test]
     fn tap_grid_respects_user_bpm_within_0_1() {
         let true_bpm = 133.0;
-        let samples = click_track(true_bpm, 30.0, SR);
+        // Two minutes: the drift reading is a slope through onsets known
+        // to the nearest 11.6 ms frame, and over half a minute of them
+        // that slope is only good to about ±3 ms/min — the bound below.
+        let samples = click_track(true_bpm, 120.0, SR);
         let period = 60.0 / true_bpm;
         // Five clean taps starting one beat in. Tap[0] purposely
         // 6 ms late so the snap has to find the click.
         let tap_times: Vec<f64> = (0..5).map(|i| 1.0 + 0.006 + i as f64 * period).collect();
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
 
         assert!(grid.confidence > 0.0, "should accept user taps");
         assert!(
@@ -3916,9 +4143,7 @@ mod tests {
         let tap_times: Vec<f64> = (0..5)
             .map(|i| 1.0 + tap_offset + i as f64 * period)
             .collect();
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
 
         assert!(grid.confidence > 0.0);
         let anchor = grid.beats[0];
@@ -3947,15 +4172,8 @@ mod tests {
         let samples = click_track(true_bpm, 30.0, SR);
         let mut bpms = Vec::new();
         for anchor in [1.0, 1.37, 2.5, 4.913] {
-            let grid = analyze_beat_grid_from_bpm_and_anchor(
-                &samples,
-                SR,
-                1,
-                true_bpm,
-                anchor,
-                OctaveProfile::FourOnFloor,
-            )
-            .expect("analysis");
+            let grid = analyze_beat_grid_from_bpm_and_anchor(&samples, SR, 1, true_bpm, anchor)
+                .expect("analysis");
             assert!(
                 grid.confidence > 0.0,
                 "anchor {anchor} should produce a grid"
@@ -3976,50 +4194,135 @@ mod tests {
         );
     }
 
-    /// Locks in the bug numerically: a 174 BPM track tapped during r=0.92
-    /// playback gives PLAYHEAD-position deltas of 0.92×period, so the OLD
-    /// playhead-derived path commits ~189 BPM (174/0.92) and the ±3 %
-    /// refine cannot pull it back — while the NEW (bpm, anchor) path, fed
-    /// the correct wall-clock 174, commits 174.
+    /// The operator's own session, 2026-11-18: a 129 song, seven taps at
+    /// about 118 — 8.5 % under, every interval long (555, 533, 480, 469,
+    /// 501, 512 ms against the song's 465). The old ±3 % fit could not
+    /// reach 129 and committed 121. The taps only have to say "about
+    /// this fast"; the song says exactly.
     #[test]
-    fn bpm_and_anchor_uses_given_bpm_not_rate_scaled_playhead() {
-        let true_bpm = 174.0;
-        let samples = click_track(true_bpm, 30.0, SR);
-        let period = 60.0 / true_bpm;
-        let rate = 0.92;
-        // Playhead positions advance at the platter rate, so the inter-tap
-        // playhead deltas are rate×wall-interval.
-        let playhead_taps: Vec<f64> = (0..6).map(|i| 1.0 + i as f64 * period * rate).collect();
+    fn taps_well_off_the_tempo_still_find_the_songs_own() {
+        let samples = click_track(129.0, 60.0, SR);
+        let mut taps = vec![14.901];
+        for gap in [0.555, 0.533, 0.480, 0.469, 0.501, 0.512] {
+            taps.push(taps[taps.len() - 1] + gap);
+        }
+        let hint = weighted_median_bpm_from_taps(&taps).expect("hint");
+        assert!((hint - 129.0).abs() > 8.0, "the taps are well off: {hint}");
 
-        let old = analyze_beat_grid_from_taps(
-            &samples,
-            SR,
-            1,
-            &playhead_taps,
-            OctaveProfile::FourOnFloor,
-        )
-        .expect("old path");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &taps).expect("grid");
         assert!(
-            (old.bpm - true_bpm).abs() > 6.0,
-            "OLD playhead-delta path commits a materially rate-scaled BPM (~189-193, the \
-             bug) instead of {true_bpm}; got {}",
-            old.bpm
+            (grid.bpm - 129.0).abs() < 0.05,
+            "taps at {hint:.1} on a 129 song gave {}",
+            grid.bpm
         );
+        let click = (20.0_f64 / (60.0 / 129.0)).round() * (60.0 / 129.0);
+        assert!(
+            (line_near(&grid, click) - click).abs() < 0.006,
+            "the lines sit on the clicks: {} by {click}",
+            line_near(&grid, click)
+        );
+    }
 
-        let new = analyze_beat_grid_from_bpm_and_anchor(
-            &samples,
-            SR,
-            1,
-            true_bpm,
-            playhead_taps[0],
-            OctaveProfile::FourOnFloor,
-        )
-        .expect("new path");
+    /// Either side of the tempo, and as far out as a rough tap goes.
+    #[test]
+    fn a_tapped_tempo_ten_percent_out_either_way_finds_the_song() {
+        let samples = kicks_at_120(&[]);
+        for hint in [108.0, 114.0, 120.0, 126.0, 132.0] {
+            let grid =
+                analyze_beat_grid_from_bpm_and_anchor(&samples, SR, 1, hint, 20.53).expect("grid");
+            assert!(
+                (grid.bpm - 120.0).abs() < 0.05,
+                "a tap at {hint} gave {}",
+                grid.bpm
+            );
+            assert!(
+                (line_near(&grid, 20.5) - 20.5).abs() < 0.004,
+                "tap at {hint}: line at {}",
+                line_near(&grid, 20.5)
+            );
+        }
+    }
+
+    /// Taps are positions in the track, so their spacing is the track's
+    /// own tempo whatever the pitch. At −8 % a 174 song sounds at 160
+    /// and the DJ taps 160 against the clock — but the playhead moves
+    /// one of the track's beats per tap, and the grid must come out at
+    /// the track's 174, not the 160 he hears.
+    #[test]
+    fn taps_are_read_in_the_tracks_own_time_whatever_the_pitch() {
+        let samples = click_track(174.0, 30.0, SR);
+        let period = 60.0 / 174.0;
+        let lean = [0.012, -0.020, 0.025, -0.008, 0.016, -0.014];
+        let taps: Vec<f64> = (0..6)
+            .map(|i| 10.0 * period * 3.0 + i as f64 * period + lean[i])
+            .collect();
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &taps).expect("grid");
+        assert!((grid.bpm - 174.0).abs() < 0.05, "got {}", grid.bpm);
+    }
+
+    /// Rough taps on the beat: the lines go on the kicks and the beat
+    /// the first tap was by is the 1 — though every tap leaned.
+    #[test]
+    fn rough_taps_put_the_one_on_the_beat_they_started_by() {
+        let samples = kicks_at_120(&[]);
+        let lean = [0.030, -0.025, 0.040, 0.010, -0.035];
+        let taps: Vec<f64> = (0..5).map(|i| 22.5 + i as f64 * 0.5 + lean[i]).collect();
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &taps).expect("grid");
+        assert!((grid.bpm - 120.0).abs() < 0.05, "got {}", grid.bpm);
+        let one = grid.beats[usize::from(grid.bar_phase)];
+        let beats_from_one = (22.5 - one) / 0.5;
         assert!(
-            (new.bpm - true_bpm).abs() < 1.0,
-            "NEW wall-clock-bpm path commits the correct {true_bpm}; got {}",
-            new.bpm
+            (one - (one / 0.5).round() * 0.5).abs() < 0.004,
+            "the 1 sits on a kick: {one}"
         );
+        assert!(
+            (beats_from_one / 4.0 - (beats_from_one / 4.0).round()).abs() < 0.01,
+            "the kick by the first tap, 22.5, is a 1; the 1 is at {one}"
+        );
+    }
+
+    /// A song with no tempo of its own in reach — here one that plays
+    /// its first half at 100 and its second at 108 — cannot overrule the
+    /// DJ. The tapped tempo is kept, to within the old ±3 % fit.
+    #[test]
+    fn a_song_that_holds_no_tempo_keeps_the_tapped_one() {
+        let mut samples = click_track(100.0, 30.0, SR);
+        samples.extend(click_track(108.0, 30.0, SR));
+        let hint = 104.0;
+        let odf = odf_of(&samples).0;
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        assert_eq!(tempo_near_tap(&odf, odf_sr, hint), None);
+
+        let grid =
+            analyze_beat_grid_from_bpm_and_anchor(&samples, SR, 1, hint, 12.0).expect("grid");
+        assert!(
+            (grid.bpm / hint - 1.0).abs() <= 0.03 + 1e-9,
+            "tapped {hint}, got {}",
+            grid.bpm
+        );
+    }
+
+    #[test]
+    fn the_taps_average_lean_is_taken_round_the_beat() {
+        // Leaning 40 ms late on average: the taps point 40 ms after the first.
+        let taps = [10.00, 10.56, 11.04, 11.56];
+        let (at, agreement) = where_the_taps_point(&taps, 0.5);
+        assert!((at - 10.04).abs() < 0.002, "{at}");
+        assert!(agreement > TAPS_AGREE_ON_THE_BEAT, "{agreement}");
+        // One tap past the half-beat counts as early for the next beat,
+        // not as very late for this one.
+        let taps = [10.00, 10.50, 11.00, 11.26];
+        let (at, _) = where_the_taps_point(&taps, 0.5);
+        assert!(at < 10.0 && at > 9.9, "{at}");
+        assert_eq!(where_the_taps_point(&[3.5], 0.5), (3.5, 1.0));
+        // The operator's 118-on-129 session slides through half a beat:
+        // those taps do not say where the beat is.
+        let mut taps = vec![14.901];
+        for gap in [0.555, 0.533, 0.480, 0.469, 0.501, 0.512] {
+            taps.push(taps[taps.len() - 1] + gap);
+        }
+        let (_, agreement) = where_the_taps_point(&taps, 60.0 / 129.0);
+        assert!(agreement < TAPS_AGREE_ON_THE_BEAT, "{agreement}");
     }
 
     /// One mistapped beat (skipped a kick → 2× interval) must not
@@ -4038,9 +4341,7 @@ mod tests {
             1.0 + 3.0 * period,
             1.0 + 5.0 * period,
         ];
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
 
         assert!(grid.confidence > 0.0);
         assert!(
@@ -4067,9 +4368,7 @@ mod tests {
         let period = 60.0 / true_bpm;
         // User taps from t = 1.0 onward, on the clicks.
         let tap_times: Vec<f64> = (0..5).map(|i| 1.0 + i as f64 * period).collect();
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
 
         assert!(grid.confidence > 0.0);
         // Downbeat = beats[bar_phase], must land on the first
@@ -4173,12 +4472,12 @@ mod tests {
     fn integer_snap_rejects_genuine_non_integer_chase_status() {
         let true_bpm = 174.9756;
         let samples = click_track(true_bpm, 313.0, SR);
-        let (_, odf, _) = crate::offline::analyze_bpm_with_range_profile_and_odfs(
+        let (_, odf, _) = crate::offline::analyze_with_odfs(
             &samples,
             SR,
             1,
             BpmRange::DEFAULT,
-            OctaveProfile::FourOnFloor,
+            OctaveProfile::FourOnFloor.tempo_octave(TempoOctave::DEFAULT),
         )
         .expect("odf");
         let odf_sr = f64::from(SR) / HOP_SIZE as f64;
@@ -4369,12 +4668,12 @@ mod tests {
     fn snap_to_nearest_transient_recovers_click_position() {
         let bpm = 120.0;
         let samples = click_track(bpm, 8.0, SR);
-        let (_, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
+        let (_, odf, kick_odf) = analyze_with_odfs(
             &samples,
             SR,
             1,
             crate::BpmRange::DEFAULT,
-            OctaveProfile::FourOnFloor,
+            OctaveProfile::FourOnFloor.tempo_octave(TempoOctave::DEFAULT),
         )
         .expect("odfs");
         let odf_sr = f64::from(SR) / crate::HOP_SIZE as f64;
@@ -4408,12 +4707,12 @@ mod tests {
         let bpm = 120.0;
         let mut samples = vec![0.0_f32; (SR as usize) * 2];
         samples.extend(click_track(bpm, 8.0, SR));
-        let (_, odf, kick_odf) = analyze_bpm_with_range_profile_and_odfs(
+        let (_, odf, kick_odf) = analyze_with_odfs(
             &samples,
             SR,
             1,
             crate::BpmRange::DEFAULT,
-            OctaveProfile::FourOnFloor,
+            OctaveProfile::FourOnFloor.tempo_octave(TempoOctave::DEFAULT),
         )
         .expect("odfs");
         let odf_sr = f64::from(SR) / crate::HOP_SIZE as f64;
@@ -4453,7 +4752,7 @@ mod tests {
     #[test]
     fn tap_grid_refines_to_integer_within_search_window() {
         let true_bpm = 133.0;
-        let samples = click_track(true_bpm, 30.0, SR);
+        let samples = click_track(true_bpm, 120.0, SR);
         let period = 60.0 / true_bpm;
         // Small symmetric jitter so the raw median ends up close
         // to 133 but with sub-BPM noise.
@@ -4465,9 +4764,7 @@ mod tests {
             .collect();
         let raw_median = weighted_median_bpm_from_taps(&tap_times).expect("tap median");
 
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
         assert!(
             (grid.bpm - true_bpm).abs() < 1e-9,
             "constrained refinement must snap to the integer the click \
@@ -4507,8 +4804,7 @@ mod tests {
         let samples = crate::synthetic::drum_pattern_hip_hop(true_bpm, 30.0, SR);
         let period = 60.0 / true_bpm;
         let tap_times: Vec<f64> = (0..5).map(|i| 1.0 + i as f64 * period).collect();
-        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::HipHop)
-            .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
         let distance_to_truth = (grid.bpm - true_bpm).abs();
         let distance_to_lower_int = (grid.bpm - true_bpm.floor()).abs();
         let distance_to_upper_int = (grid.bpm - true_bpm.ceil()).abs();
@@ -4542,9 +4838,7 @@ mod tests {
         // User taps at the real tempo. We do NOT pass any prior
         // octave-doubled BPM; constraint is purely from taps.
         let tap_times: Vec<f64> = (0..6).map(|i| 1.0 + i as f64 * period).collect();
-        let grid =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis");
+        let grid = analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis");
         assert!(
             (grid.bpm - true_bpm).abs() < 0.5,
             "tap-derived BPM must match user's tapped octave; got {}",
@@ -4568,11 +4862,9 @@ mod tests {
         let period = 60.0 / true_bpm;
         let tap_times: Vec<f64> = (0..5).map(|i| 1.0 + i as f64 * period).collect();
         let grid_a =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis A");
+            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis A");
         let grid_b =
-            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times, OctaveProfile::FourOnFloor)
-                .expect("tap analysis B");
+            analyze_beat_grid_from_taps(&samples, SR, 1, &tap_times).expect("tap analysis B");
         assert!(
             (grid_a.bpm - grid_b.bpm).abs() < 1e-12,
             "BPM must be identical across sessions; got {} vs {}",
@@ -4635,15 +4927,7 @@ mod tests {
         // late deliberately; the marker MUST land at the tap.
         let true_downbeat = period;
         let tapped = true_downbeat + 0.030;
-        let grid = latch_beat_grid_at_downbeat(
-            &samples,
-            SR,
-            1,
-            true_bpm,
-            tapped,
-            OctaveProfile::FourOnFloor,
-        )
-        .expect("relatch");
+        let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, true_bpm, tapped).expect("relatch");
         assert!(grid.confidence > 0.0);
         let downbeat = grid.beats[usize::from(grid.bar_phase)];
         let err = (downbeat - tapped).abs();
@@ -4665,15 +4949,8 @@ mod tests {
         let mut samples = vec![0.0_f32; (SR as usize) * 3];
         samples.extend(click_track(true_bpm, 12.0, SR));
         let raw_downbeat = 1.0;
-        let grid = latch_beat_grid_at_downbeat(
-            &samples,
-            SR,
-            1,
-            true_bpm,
-            raw_downbeat,
-            OctaveProfile::FourOnFloor,
-        )
-        .expect("relatch");
+        let grid =
+            latch_beat_grid_at_downbeat(&samples, SR, 1, true_bpm, raw_downbeat).expect("relatch");
         assert!(grid.confidence > 0.0);
         let downbeat_idx = usize::from(grid.bar_phase);
         assert!(downbeat_idx < grid.beats.len(), "bar_phase out of range");
@@ -4862,15 +5139,7 @@ mod tests {
         // / intentional / doesn't matter — the algorithm must
         // not "fix" the tap).
         let user_tap = kick_secs + 0.002;
-        let grid = latch_beat_grid_at_downbeat(
-            &samples,
-            SR,
-            1,
-            true_bpm,
-            user_tap,
-            OctaveProfile::FourOnFloor,
-        )
-        .expect("latch");
+        let grid = latch_beat_grid_at_downbeat(&samples, SR, 1, true_bpm, user_tap).expect("latch");
 
         // The closest downbeat to `user_tap` must equal
         // `user_tap` exactly (within f64 round-off).  Every
@@ -5149,5 +5418,77 @@ mod tests {
              equally and the first audible kick lands at t = 1.0 s; got offset {offset} \
              (confidence {confidence})"
         );
+    }
+
+    /// Hits every half second for `secs`, each `late(t)` seconds off its
+    /// line: what a grid fit hands [`drift_ms_per_min`].
+    fn hits_against_lines(
+        secs: f64,
+        late: impl Fn(usize, f64) -> f64,
+    ) -> (Vec<(f64, f64)>, Vec<f64>) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = (secs / 0.5) as usize;
+        let residuals: Vec<f64> = (0..count).map(|i| late(i, i as f64 * 0.5)).collect();
+        let observations = residuals
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as f64, i as f64 * 0.5 + r))
+            .collect();
+        (observations, residuals)
+    }
+
+    #[test]
+    fn strums_late_in_a_song_do_not_read_as_drift() {
+        // The last minute brings in a guitar: on every third beat the
+        // strongest onset by the line is the strum 150 ms after it. The
+        // drums have not moved.
+        let (observations, residuals) =
+            hits_against_lines(
+                240.0,
+                |i, t| {
+                    if t >= 180.0 && i % 3 == 0 {
+                        0.150
+                    } else {
+                        0.0
+                    }
+                },
+            );
+        let drift = drift_ms_per_min(&observations, &residuals);
+        assert!(
+            drift.abs() < 1.0,
+            "a grid that sits on the drums all song reads {drift:.1} ms/min of drift"
+        );
+    }
+
+    #[test]
+    fn a_grid_that_drifts_reads_its_drift_through_stray_hits() {
+        // 12 ms a minute. For the first minute every third hit read is a
+        // strum 120 ms after the line, which pulls a least-squares slope
+        // down to under 1.
+        let (observations, residuals) = hits_against_lines(240.0, |i, t| {
+            let stray = if t < 60.0 && i % 3 == 0 { 0.120 } else { 0.0 };
+            0.012 * t / 60.0 + stray
+        });
+        let drift = drift_ms_per_min(&observations, &residuals);
+        assert!(
+            (drift - 12.0).abs() < 1.0,
+            "a grid drifting 12 ms/min reads {drift:.1}"
+        );
+    }
+
+    #[test]
+    fn a_short_clip_still_reads_its_drift() {
+        let (observations, residuals) = hits_against_lines(30.0, |_, t| 0.020 * t / 60.0);
+        let drift = drift_ms_per_min(&observations, &residuals);
+        assert!(
+            (drift - 20.0).abs() < 1.0,
+            "30 s drifting 20 ms/min reads {drift:.1}"
+        );
+    }
+
+    #[test]
+    fn too_few_hits_read_no_drift() {
+        assert_eq!(drift_ms_per_min(&[], &[]), 0.0);
+        assert_eq!(drift_ms_per_min(&[(0.0, 1.0)], &[0.01]), 0.0);
     }
 }

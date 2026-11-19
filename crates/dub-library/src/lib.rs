@@ -36,6 +36,7 @@ mod dedupe;
 mod error;
 mod filename_parser;
 mod history;
+mod import_order;
 mod imported_crates;
 mod importer;
 /// iTunes / Apple Music `Library.xml` parser (M12c). Public so the fuzz
@@ -46,12 +47,14 @@ mod itunes_import;
 /// importer that reads a key someone else wrote.
 pub mod key_notation;
 pub mod m3u;
+mod mp3_frames;
 mod paths;
 /// rekordbox `rekordbox.xml` (`DJ_PLAYLISTS`) parser (M12d). Public so the
 /// fuzz target and the import adapter can consume the pure `parse_xml` entry.
 pub mod rekordbox;
 pub mod rekordbox_export;
 mod rekordbox_import;
+mod relocate;
 mod schema;
 /// Serato library parsers (M11e). Public so the fuzz targets and the import
 /// adapter can consume the pure `parse_*` entry points.
@@ -62,10 +65,12 @@ mod serato_sqlite;
 /// iTunes), for the Preferences "Libraries" toggles + auto-scan.
 pub mod sources;
 mod tempo_map;
+mod tempo_range;
 /// Traktor `collection.nml` parser (M12b). Public so the fuzz target and
 /// the import adapter can consume the pure `parse_nml` entry point.
 pub mod traktor;
 mod traktor_import;
+mod traktor_tag;
 mod version_tokens;
 mod volumes;
 
@@ -76,7 +81,7 @@ pub use analysis::{
 pub use columns::{
     ColumnGroup, ColumnKind, ColumnSet, ColumnValue, LibraryColumnId, MetadataField, MetadataSource,
 };
-pub use cues::{HotCue, PadCues, CUE_SOURCE_ORDER};
+pub use cues::{HotCue, PadCues};
 pub use db::{
     CrateRow, FavoriteSlot, FileScanRow, ImportedCrateRow, Library, MissingTrack, SessionPlay,
     StoredFingerprint, TrackRow, TrackSortKey, TransitionStat,
@@ -88,6 +93,7 @@ pub use dedupe::{
 pub use error::{LibraryError, Result};
 pub use filename_parser::{is_junk_title, parse as parse_filename, ParsedFilename};
 pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION_PLAY_MS};
+pub use import_order::{DEFAULT_IMPORT_ORDER, IMPORT_SOURCES};
 pub use importer::{import_file, import_folder, ImportError, ImportSummary, ImportedTrack};
 pub use itunes_import::import_itunes;
 pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};

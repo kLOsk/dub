@@ -8,9 +8,10 @@
 //! name\0   u32 body_len   body[body_len]
 //! ```
 //!
-//! Entry bodies we decode (others — `COLOR`, `BPMLOCK`, `FLIP` — are skipped):
+//! Entry bodies we decode (others — `COLOR`, `FLIP` — are skipped):
 //! * `CUE`  : `00 index(1) position_be_u32_ms 00 color(3) 00 00 name\0`
 //! * `LOOP` : `00 index(1) start_be_u32_ms end_be_u32_ms …trailer… name\0`
+//! * `BPMLOCK`: one byte, non-zero when the DJ locked the grid in Serato.
 //!
 //! Positions are **milliseconds**. Pure + panic-free; any framing error stops
 //! the scan. Offsets here are validated against a real export by the
@@ -49,6 +50,8 @@ pub struct SeratoMarkers {
     pub cues: Vec<SeratoCue>,
     /// Saved loops, in stored order.
     pub loops: Vec<SeratoLoop>,
+    /// The grid is locked in Serato (`BPMLOCK`).
+    pub bpm_locked: bool,
 }
 
 /// Decode a `Serato Markers2` GEOB payload (the bytes of the GEOB frame,
@@ -118,6 +121,7 @@ fn parse_decoded(data: &[u8]) -> SeratoMarkers {
                     out.loops.push(lp);
                 }
             }
+            b"BPMLOCK" => out.bpm_locked = body.first().is_some_and(|b| *b != 0),
             _ => {}
         }
     }
@@ -212,6 +216,22 @@ mod tests {
         assert_eq!(m.cues[0].name.as_deref(), Some("Intro"));
         assert_eq!(m.cues[1].index, 3);
         assert_eq!(m.cues[1].name.as_deref(), Some("Drop"));
+    }
+
+    #[test]
+    fn reads_the_grid_lock() {
+        let entry = |locked: u8| {
+            let mut inner = vec![0x01, 0x01];
+            inner.extend_from_slice(b"BPMLOCK\0");
+            inner.extend_from_slice(&1u32.to_be_bytes());
+            inner.push(locked);
+            inner.extend(cue_entry(0, 16000, "Intro"));
+            inner.push(0x00);
+            parse(&wrap(&inner))
+        };
+        assert!(entry(1).bpm_locked);
+        assert!(!entry(0).bpm_locked);
+        assert_eq!(entry(1).cues.len(), 1, "the entries after it still read");
     }
 
     #[test]

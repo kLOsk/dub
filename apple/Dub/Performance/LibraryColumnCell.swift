@@ -261,13 +261,27 @@ enum LibraryCellFormat {
         }
     }
 
+    /// The drift, in ms per minute either way, from which a grid is
+    /// marked as drifting. `GridQuality::DRIFT_WARNING_MS_PER_MIN` in
+    /// `dub-bpm` is the same number and carries the measurement behind
+    /// it; change the two together. It was 3 until 2026-11-19, which
+    /// marked *Hey Ya* at 5.6 — a grid Daniel called perfect — and would
+    /// have marked 28 % of the grids he locked in Traktor.
+    static let driftWarningMsPerMin: Float = 8
+
+    /// Whether a stored drift reading is worth the mark.
+    static func drifts(_ drift: Float?) -> Bool {
+        guard let drift else { return false }
+        return abs(drift) >= driftWarningMsPerMin
+    }
+
     /// The BPM cell's problems, worst first; the cell draws one mark for
     /// all of them. A locked grid has been accepted, so it never warns of
     /// drift — but a disagreement is about the sources, and still shows.
     static func bpmIssues(disagreement: Bool, locked: Bool, drift: Float?) -> [BpmIssue] {
         var out: [BpmIssue] = []
         if disagreement { out.append(.disagreement) }
-        if !locked, let drift, abs(drift) >= 3 { out.append(.drift) }
+        if !locked, drifts(drift) { out.append(.drift) }
         return out
     }
 

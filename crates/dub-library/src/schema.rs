@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -97,6 +97,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 11,
         sql: V11_MIGRATION,
+    },
+    Migration {
+        target_version: 12,
+        sql: V12_MIGRATION,
     },
 ];
 
@@ -760,6 +764,28 @@ CREATE TABLE IF NOT EXISTS track_tempo_maps (
     bpm_min           REAL    NOT NULL,
     bpm_max           REAL    NOT NULL,
     created_at        INTEGER NOT NULL
+);
+"#;
+
+/// v12 — tags read from inside the file (2026-11-18).
+///
+/// Traktor writes its grid, key and cues into every file it plays (a
+/// `TRAKTOR4` ID3 frame), so a library from another app arrives with them
+/// even when the Traktor collection itself stayed on another Mac. Reading a
+/// file's tags is the slow part of an import, so `tags_read_mtime` is the
+/// file's `mtime` when they were last read: NULL means never, and a
+/// different `mtime` means the file changed since. Additive.
+///
+/// Also v12, from the same day: `track_beatgrids.source_locked` keeps
+/// whether the source app locked that grid, so a later change of which
+/// app comes first can bring the lock along; `library_settings` holds
+/// library-wide settings the app and CLI share (`import_order`).
+const V12_MIGRATION: &str = r#"
+ALTER TABLE track_files ADD COLUMN tags_read_mtime INTEGER;
+ALTER TABLE track_beatgrids ADD COLUMN source_locked INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS library_settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
 );
 "#;
 

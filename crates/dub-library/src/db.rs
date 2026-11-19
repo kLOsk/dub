@@ -157,10 +157,13 @@ pub struct TrackRow {
     /// `is_active = 1`). Honours PRD §8.3 priority: an imported
     /// Serato / rekordbox / Traktor grid wins over the auto grid;
     /// the auto grid wins over nothing. `None` for tracks that
-    /// have never been analyzed (M11c.1 onward). The browser
-    /// renders `None` as an em-dash; ID3 BPM is **not** used as a
-    /// fallback here because ID3 carries no anchor and is too
-    /// unreliable to bind to the deck (PRD §8.3).
+    /// Until the track has a grid, the BPM a DJ library carries (Apple
+    /// Music's BPM field above all): an Apple Music library read for the
+    /// first time otherwise showed no tempo at all (Daniel, 2026-11-18).
+    /// A file's own ID3 TBPM still never shows: whatever tool last wrote
+    /// it, nobody vouched for it. Display and the Matching crate only:
+    /// the deck binds to `track_beatgrids`, never to this number. `None`
+    /// when neither exists; the browser renders an em-dash.
     pub bpm: Option<f64>,
     /// Musical key from the active row of `track_keys` (M11c.2).
     /// Always Camelot when present (e.g. `8B`); the per-source
@@ -261,13 +264,12 @@ pub struct TrackRow {
     /// `tracks.color`. `None` when unset. The browser tints the row
     /// background with it.
     pub color: Option<String>,
-    /// `true` when two sources' beat grids for this track disagree by
-    /// more than [`BPM_DISAGREEMENT_FRACTION`] in tempo or
+    /// `true` when the active grid is an app's and disagrees with Dub's own
+    /// analysis by more than [`BPM_DISAGREEMENT_FRACTION`] in tempo or
     /// [`ANCHOR_DISAGREEMENT_SECS`] in downbeat phase (PRD §8.3).
     /// Drives the ⚠ in the BPM column — the at-a-glance form of what
     /// the per-source `{source}_bpm` columns spell out. Always `false`
-    /// until a second grid source exists for the track, so a
-    /// Dub-only library never sees it.
+    /// until the track is analysed, and on a grid set in Dub.
     pub bpm_disagreement: bool,
     /// The kind of the track's saved tempo map (schema v11) —
     /// `"followed"` when its grid follows a band — or `None` for an even
@@ -360,7 +362,7 @@ impl TrackSortKey {
                 "COALESCE(sr.artist, rb.artist, tr.artist, it.artist, i3.artist, fn.artist)"
             }
             Self::Album => "COALESCE(sr.album, rb.album, tr.album, it.album, i3.album)",
-            Self::Bpm => "ag.bpm",
+            Self::Bpm => "COALESCE(ag.bpm, sr.bpm, rb.bpm, tr.bpm, it.bpm)",
             Self::Duration => "t.duration_ms",
             Self::Year => "COALESCE(fn.year, sr.year, rb.year, tr.year, it.year, i3.year)",
             Self::Composer => {
@@ -403,7 +405,7 @@ const TRACK_ROW_COLUMNS: &str = "\
            COALESCE(sr.album,  rb.album,  tr.album,  it.album,  i3.album)             AS album, \
            COALESCE(sr.genre,  rb.genre,  tr.genre,  it.genre,  i3.genre)             AS genre, \
            COALESCE(fn.year, sr.year, rb.year, tr.year, it.year, i3.year)          AS year, \
-           ag.bpm                              AS bpm, \
+           COALESCE(ag.bpm, sr.bpm, rb.bpm, tr.bpm, it.bpm) AS bpm, \
            ak.key_notation                     AS key, \
            t.duration_ms                       AS duration_ms, \
            COALESCE(fn.version_token, i3.version_token) AS version_tokens, \
@@ -460,9 +462,13 @@ const BPM_DISAGREEMENT_FRACTION: f64 = 0.05;
 /// agree on the beat but anchor on different bars are not in conflict.
 const ANCHOR_DISAGREEMENT_SECS: f64 = 0.050;
 
-/// The §8.3 grid-disagreement predicate, as a correlated subquery over
-/// every pair of grid sources on the track. `g2.source > g1.source`
-/// visits each unordered pair once.
+/// The §8.3 grid-disagreement predicate, as a correlated subquery: the
+/// grid the deck will play, when it is an app's, against Dub's own
+/// analysis of the audio. Not every pair: with Serato and Traktor grids
+/// both read from the files, comparing them with each other flagged 509
+/// of Daniel's tracks (2026-11-18), most of them songs where the grid in
+/// use agrees with the audio and the *other* app is off. A grid the DJ set
+/// in Dub is never flagged; they placed it by ear.
 fn bpm_disagreement_sql() -> String {
     let period = "(60.0 / g1.bpm)";
     let delta = "ABS(g1.anchor_secs - g2.anchor_secs)";
@@ -474,8 +480,10 @@ fn bpm_disagreement_sql() -> String {
              SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END \
              FROM track_beatgrids g1 \
              JOIN track_beatgrids g2 \
-               ON g2.track_id = g1.track_id AND g2.source > g1.source \
-             WHERE g1.track_id = t.id AND g1.bpm > 0 AND g2.bpm > 0 \
+               ON g2.track_id = g1.track_id AND g2.source = 'auto' \
+             WHERE g1.track_id = t.id AND g1.is_active = 1 \
+               AND g1.source NOT IN ('auto', 'user_tap') \
+               AND g1.bpm > 0 AND g2.bpm > 0 \
                AND (ABS(g1.bpm - g2.bpm) > \
                         {BPM_DISAGREEMENT_FRACTION} * MIN(g1.bpm, g2.bpm) \
                     OR MIN({phase}, {period} - {phase}) > {ANCHOR_DISAGREEMENT_SECS}) \
@@ -486,6 +494,10 @@ fn bpm_disagreement_sql() -> String {
 /// Joins the fixed columns need. Every metadata source is here
 /// because the §8.1 priority chain reads all of them — which is why
 /// the per-source column group costs no extra join.
+///
+/// An app the DJ switched off (`library_settings.disabled_sources`,
+/// `crate::import_order`) joins as if it had no row: its names, comment
+/// and BPM drop out of every column until it is switched back on.
 const TRACK_ROW_JOINS: &str = "\
     FROM tracks t \
     LEFT JOIN track_metadata_source fn \
@@ -494,12 +506,20 @@ const TRACK_ROW_JOINS: &str = "\
               ON i3.track_id = t.id AND i3.source = 'id3' \
     LEFT JOIN track_metadata_source sr \
               ON sr.track_id = t.id AND sr.source = 'serato' \
+             AND NOT EXISTS (SELECT 1 FROM library_settings ls WHERE ls.key = 'disabled_sources' \
+                             AND instr(',' || ls.value || ',', ',serato,') > 0) \
     LEFT JOIN track_metadata_source rb \
               ON rb.track_id = t.id AND rb.source = 'rekordbox' \
+             AND NOT EXISTS (SELECT 1 FROM library_settings ls WHERE ls.key = 'disabled_sources' \
+                             AND instr(',' || ls.value || ',', ',rekordbox,') > 0) \
     LEFT JOIN track_metadata_source tr \
               ON tr.track_id = t.id AND tr.source = 'traktor' \
+             AND NOT EXISTS (SELECT 1 FROM library_settings ls WHERE ls.key = 'disabled_sources' \
+                             AND instr(',' || ls.value || ',', ',traktor,') > 0) \
     LEFT JOIN track_metadata_source it \
               ON it.track_id = t.id AND it.source = 'itunes' \
+             AND NOT EXISTS (SELECT 1 FROM library_settings ls WHERE ls.key = 'disabled_sources' \
+                             AND instr(',' || ls.value || ',', ',itunes,') > 0) \
     LEFT JOIN track_beatgrids ag \
               ON ag.track_id = t.id AND ag.is_active = 1 \
     LEFT JOIN track_keys ak \
@@ -1424,7 +1444,7 @@ impl Library {
 
     /// Single-row variant of the canonical browser query. `None`
     /// when the id doesn't resolve (deleted track).
-    fn track_row_by_id(&self, track_id: &str) -> Result<Option<TrackRow>> {
+    pub(crate) fn track_row_by_id(&self, track_id: &str) -> Result<Option<TrackRow>> {
         let sql = format!("{} WHERE t.id = ?1", self.track_select);
         let mut stmt = self
             .conn
@@ -3193,8 +3213,8 @@ mod tests {
         // seeded track with no `track_beatgrids` row reports
         // `None`. ID3 BPM stays preserved verbatim in
         // `track_metadata_source` but never bleeds into the
-        // browser column (PRD §8.3: ID3 BPM has no anchor and
-        // can't be bound to the deck).
+        // browser column; a DJ library's BPM does, until there is
+        // a grid (`a_librarys_bpm_shows_until_the_track_has_a_grid`).
         assert!(rows[0].bpm.is_none());
         // No `analysis_cache` row yet → row reads as unanalyzed.
         assert!(!rows[0].is_analyzed);
@@ -3457,6 +3477,45 @@ mod tests {
         let row = rows.iter().find(|r| r.id == ids[0]).unwrap();
         assert!((row.bpm.unwrap() - 92.5).abs() < 1e-6);
         assert!(row.is_analyzed);
+    }
+
+    #[test]
+    fn a_librarys_bpm_shows_until_the_track_has_a_grid() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["The Wave"]);
+        lib.upsert_metadata_source(
+            &ids[0],
+            "itunes",
+            Some("SOSA UK"),
+            Some("The Wave"),
+            None,
+            Some("House"),
+            None,
+            None,
+            None,
+            None,
+            Some(132.0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let bpm = |lib: &Library| {
+            let rows = lib.list_tracks(10, 0).unwrap();
+            rows.iter().find(|r| r.id == ids[0]).unwrap().bpm
+        };
+        assert_eq!(bpm(&lib), Some(132.0), "Apple Music's BPM before analysis");
+
+        lib.connection()
+            .execute(
+                "INSERT INTO track_beatgrids \
+                 (track_id, source, anchor_secs, bpm, is_active, captured_at) \
+                 VALUES (?1, 'auto', 0.0, 131.5, 1, 1)",
+                params![ids[0]],
+            )
+            .unwrap();
+        assert_eq!(bpm(&lib), Some(131.5), "the grid wins once there is one");
     }
 
     #[test]
@@ -4512,6 +4571,27 @@ mod tests {
             .unwrap();
     }
 
+    fn activate(lib: &Library, track: &str, source: &str) {
+        let conn = lib.connection();
+        conn.execute(
+            "UPDATE track_beatgrids SET is_active = 0 WHERE track_id = ?1",
+            params![track],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE track_beatgrids SET is_active = 1 WHERE track_id = ?1 AND source = ?2",
+            params![track, source],
+        )
+        .unwrap();
+    }
+
+    fn disagrees(lib: &Library, track: &str) -> bool {
+        lib.track_row_by_id(track)
+            .unwrap()
+            .unwrap()
+            .bpm_disagreement
+    }
+
     fn extras_for(lib: &Library, track: &str) -> Vec<ColumnValue> {
         lib.track_row_by_id(track)
             .unwrap()
@@ -4750,6 +4830,7 @@ mod tests {
         let track = seed_column_fixture(&lib);
         insert_grid(&lib, &track, "auto", 0.5, 184.0);
         insert_grid(&lib, &track, "serato", 0.5, 92.0);
+        activate(&lib, &track, "serato");
         assert!(
             lib.track_row_by_id(&track)
                 .unwrap()
@@ -4768,6 +4849,7 @@ mod tests {
         let beat = 60.0 / 120.0;
         insert_grid(&lib, &track, "auto", 0.25, 120.0);
         insert_grid(&lib, &track, "serato", 0.25 + 4.0 * beat, 120.0);
+        activate(&lib, &track, "serato");
         assert!(
             !lib.track_row_by_id(&track)
                 .unwrap()
@@ -4782,12 +4864,48 @@ mod tests {
         let track = seed_column_fixture(&lib);
         insert_grid(&lib, &track, "auto", 0.25, 120.0);
         insert_grid(&lib, &track, "serato", 0.33, 120.0);
+        activate(&lib, &track, "serato");
         assert!(
             lib.track_row_by_id(&track)
                 .unwrap()
                 .unwrap()
                 .bpm_disagreement
         );
+    }
+
+    /// Two apps disagreeing with each other is not the warning: the grid
+    /// in use agrees with the audio.
+    #[test]
+    fn another_apps_grid_off_the_beat_is_not_flagged() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        insert_grid(&lib, &track, "traktor", 0.26, 120.0);
+        insert_grid(&lib, &track, "serato", 0.50, 120.0);
+        activate(&lib, &track, "traktor");
+        assert!(!disagrees(&lib, &track));
+        activate(&lib, &track, "serato");
+        assert!(
+            disagrees(&lib, &track),
+            "the grid in use is the one off the beat"
+        );
+    }
+
+    #[test]
+    fn no_analysis_and_a_grid_set_in_dub_are_not_flagged() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "traktor", 0.26, 120.0);
+        insert_grid(&lib, &track, "serato", 0.50, 120.0);
+        activate(&lib, &track, "serato");
+        assert!(
+            !disagrees(&lib, &track),
+            "nothing of Dub's own to compare with"
+        );
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        insert_grid(&lib, &track, "user_tap", 0.40, 121.0);
+        activate(&lib, &track, "user_tap");
+        assert!(!disagrees(&lib, &track), "set by ear in Dub");
     }
 
     #[test]

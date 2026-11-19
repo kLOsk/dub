@@ -6,7 +6,7 @@
 //! — it's broken, full stop. Real-music robustness is a separate concern
 //! (deferred to M8 with the streaming driver and richer fixtures).
 
-use dub_bpm::{analyze_bpm, synthetic};
+use dub_bpm::{analyze_bpm, analyze_bpm_in_octave, synthetic, TempoOctave};
 
 /// Tolerance for synthetic clicks: ±1 BPM.
 ///
@@ -50,7 +50,8 @@ fn click_track_120_bpm() {
 fn click_track_60_bpm() {
     let sr = 48_000u32;
     let audio = synthetic::click_track(60.0, TEST_DURATION_SECS, sr);
-    let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    let slowest = TempoOctave::from_low(60.0).expect("60-120");
+    let est = analyze_bpm_in_octave(&audio, sr, 1, slowest).expect("analysis should succeed");
     assert_close(60.0, est, SYNTHETIC_TOLERANCE_BPM);
 }
 
@@ -74,8 +75,13 @@ fn click_track_140_bpm() {
 fn click_track_174_bpm_dnb() {
     let sr = 48_000u32;
     let audio = synthetic::click_track(174.0, TEST_DURATION_SECS, sr);
-    let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    let fastest = TempoOctave::from_low(100.0).expect("100-200");
+    let est = analyze_bpm_in_octave(&audio, sr, 1, fastest).expect("analysis should succeed");
     assert_close(174.0, est, SYNTHETIC_TOLERANCE_BPM);
+
+    // In the default octave the same clicks are 87: every other one.
+    let est = analyze_bpm(&audio, sr, 1).expect("analysis should succeed");
+    assert_close(87.0, est, SYNTHETIC_TOLERANCE_BPM);
 }
 
 #[test]

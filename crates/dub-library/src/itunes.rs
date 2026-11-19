@@ -28,6 +28,10 @@ pub struct ItunesTrack {
     pub composer: Option<String>,
     /// `Genre`.
     pub genre: Option<String>,
+    /// `Comments`, which DJs use for their own notes on a track.
+    pub comment: Option<String>,
+    /// `Track Number`.
+    pub track_number: Option<i32>,
     /// `BPM` (iTunes stores an integer).
     pub bpm: Option<f64>,
     /// `Year`.
@@ -264,6 +268,8 @@ fn parse_track_dict(
                 "Album" => t.album = nonempty(text),
                 "Composer" => t.composer = nonempty(text),
                 "Genre" => t.genre = nonempty(text),
+                "Comments" => t.comment = nonempty(text),
+                "Track Number" => t.track_number = text.parse().ok(),
                 "BPM" => t.bpm = text.parse::<f64>().ok().filter(|b| *b > 0.0),
                 "Year" => t.year = text.parse().ok(),
                 // iTunes `Rating` is 0–100 in steps of 20 (20 = 1 star).
@@ -434,6 +440,8 @@ mod tests {
       <key>Artist</key><string>DJ Donna Summer</string>
       <key>Genre</key><string>Mashup</string>
       <key>BPM</key><integer>135</integer>
+      <key>Comments</key><string>straight housey</string>
+      <key>Track Number</key><integer>3</integer>
       <key>Year</key><integer>2008</integer>
       <key>Rating</key><integer>80</integer>
       <key>Total Time</key><integer>261459</integer>
@@ -468,6 +476,8 @@ mod tests {
         assert_eq!(t.artist.as_deref(), Some("DJ Donna Summer"));
         assert_eq!(t.genre.as_deref(), Some("Mashup"));
         assert!((t.bpm.unwrap() - 135.0).abs() < 1e-9);
+        assert_eq!(t.comment.as_deref(), Some("straight housey"));
+        assert_eq!(t.track_number, Some(3));
         assert_eq!(t.year, Some(2008));
         // iTunes Rating 80 → 4 stars (0–100 in steps of 20).
         assert_eq!(t.rating, Some(4));

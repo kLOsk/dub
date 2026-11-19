@@ -106,12 +106,12 @@ final class LibraryCellSnapshotTests: XCTestCase {
         let states: [(String, LibraryTrack)] = [
             ("plain", .fixture(bpm: 174)),
             ("locked", .fixture(bpm: 174, gridLocked: true)),
-            ("drifting", .fixture(bpm: 174, gridDriftQuality: 5)),
+            ("drifting", .fixture(bpm: 174, gridDriftQuality: 12)),
             ("disagreement", .fixture(bpm: 92, bpmDisagreement: true)),
             ("disagreement-locked",
              .fixture(bpm: 92, gridLocked: true, bpmDisagreement: true)),
             ("disagreement-drifting",
-             .fixture(bpm: 92, gridDriftQuality: 5, bpmDisagreement: true)),
+             .fixture(bpm: 92, gridDriftQuality: 12, bpmDisagreement: true)),
             ("none", .fixture(bpm: nil)),
         ]
         let row = HStack(spacing: 0) {
@@ -128,7 +128,7 @@ final class LibraryCellSnapshotTests: XCTestCase {
     /// following grid off, the same tracks read as even ones.
     func test_bpmCell_movingGrid() {
         let follows = LibraryTrack.fixture(
-            bpm: 92, gridDriftQuality: 5, tempoMapKind: "followed",
+            bpm: 92, gridDriftQuality: 12, tempoMapKind: "followed",
             tempoBpmMin: 89.2, tempoBpmMax: 95.8)
         let accepted = LibraryTrack.fixture(
             bpm: 92, gridLocked: true, tempoMapKind: "followed",
@@ -158,14 +158,19 @@ final class LibraryCellSnapshotTests: XCTestCase {
     /// warns of drift — it has been accepted.
     func test_bpmIssues_rankAndLock() {
         XCTAssertEqual(
-            LibraryCellFormat.bpmIssues(disagreement: true, locked: false, drift: 5),
+            LibraryCellFormat.bpmIssues(disagreement: true, locked: false, drift: 12),
             [.disagreement, .drift])
         XCTAssertEqual(
-            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: -4), [.drift])
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: -9), [.drift])
         XCTAssertEqual(
-            LibraryCellFormat.bpmIssues(disagreement: true, locked: true, drift: 5), [.disagreement])
+            LibraryCellFormat.bpmIssues(disagreement: true, locked: true, drift: 12),
+            [.disagreement])
+        // Hey Ya read 5.6 and Daniel found its grid perfect: under the
+        // limit, no mark.
         XCTAssertEqual(
-            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: 2), [])
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: 5.6), [])
+        XCTAssertEqual(
+            LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: 8), [.drift])
         XCTAssertEqual(
             LibraryCellFormat.bpmIssues(disagreement: false, locked: false, drift: nil), [])
     }

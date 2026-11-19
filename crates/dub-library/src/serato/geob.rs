@@ -26,6 +26,11 @@ pub fn read_serato_geobs(path: &Path) -> Vec<(String, Vec<u8>)> {
     let Some(tag) = read_tag(path) else {
         return Vec::new();
     };
+    serato_geobs(&tag)
+}
+
+/// The Serato GEOB blobs of an already-read tag.
+pub(crate) fn serato_geobs(tag: &id3::Tag) -> Vec<(String, Vec<u8>)> {
     tag.encapsulated_objects()
         .filter(|obj| obj.description.starts_with("Serato"))
         .map(|obj| (obj.description.clone(), obj.data.clone()))
@@ -40,7 +45,7 @@ pub fn find<'a>(geobs: &'a [(String, Vec<u8>)], description: &str) -> Option<&'a
         .map(|(_, data)| data.as_slice())
 }
 
-fn read_tag(path: &Path) -> Option<id3::Tag> {
+pub(crate) fn read_tag(path: &Path) -> Option<id3::Tag> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         // `read_from_path` auto-detects the MP3 / AIFF / WAV ID3 container.

@@ -92,6 +92,34 @@ pub struct ParsedEntry {
     pub cues: Vec<ParsedCue>,
     /// Stored loops.
     pub loops: Vec<ParsedLoop>,
+    /// The DJ locked the grid in Traktor (`<ENTRY LOCK="1">`, or `SYNC/LOCK`
+    /// in the file's own `TRAKTOR4` frame).
+    pub grid_locked: bool,
+}
+
+impl ParsedEntry {
+    /// Every position `secs` earlier: Traktor's timeline onto Dub's
+    /// (`crate::mp3_frames`). A grid anchor that would fall before the
+    /// start moves on a whole bar, which keeps it a downbeat; a cue or a
+    /// loop start stops at 0.
+    pub(crate) fn earlier_by(&self, secs: f64) -> Self {
+        let mut out = self.clone();
+        out.grid_anchor_secs = self.grid_anchor_secs.map(|a| {
+            let moved = a - secs;
+            match self.bpm.filter(|b| *b > 0.0) {
+                Some(bpm) if moved < 0.0 => moved + 4.0 * 60.0 / bpm,
+                _ => moved.max(0.0),
+            }
+        });
+        for cue in &mut out.cues {
+            cue.position_secs = (cue.position_secs - secs).max(0.0);
+        }
+        for lp in &mut out.loops {
+            lp.start_secs = (lp.start_secs - secs).max(0.0);
+            lp.end_secs = (lp.end_secs - secs).max(lp.start_secs);
+        }
+        out
+    }
 }
 
 /// One node of Traktor's `<PLAYLISTS>` tree — a folder or a playlist. Both
@@ -230,6 +258,7 @@ fn parse_entry_open(e: &BytesStart) -> ParsedEntry {
     ParsedEntry {
         title: attr(e, b"TITLE"),
         artist: attr(e, b"ARTIST"),
+        grid_locked: attr(e, b"LOCK").is_some_and(|v| v == "1"),
         ..ParsedEntry::default()
     }
 }
@@ -293,13 +322,35 @@ fn apply_cue(cur: &mut ParsedEntry, e: &BytesStart) {
     let Some(start_ms) = attr(e, b"START").and_then(|s| s.parse::<f64>().ok()) else {
         return;
     };
+    add_cue(
+        cur,
+        attr(e, b"TYPE").and_then(|s| s.parse::<i64>().ok()),
+        attr(e, b"HOTCUE").and_then(|s| s.parse::<i64>().ok()),
+        start_ms,
+        attr(e, b"LEN").and_then(|s| s.parse::<f64>().ok()),
+        attr(e, b"NAME"),
+    );
+}
+
+/// One Traktor cue, from the collection's `<CUE_V2>` or the same record in
+/// the `TRAKTOR4` block Traktor writes into the file (`crate::traktor_tag`):
+/// both carry type, slot, start and length in milliseconds.
+pub(crate) fn add_cue(
+    cur: &mut ParsedEntry,
+    cue_type: Option<i64>,
+    hotcue: Option<i64>,
+    start_ms: f64,
+    len_ms: Option<f64>,
+    name: Option<String>,
+) {
+    if !start_ms.is_finite() {
+        return;
+    }
     let start_secs = start_ms / 1000.0; // START is ms (validated on a real export).
-    let cue_type = attr(e, b"TYPE").and_then(|s| s.parse::<i64>().ok());
-    let hotcue = attr(e, b"HOTCUE")
-        .and_then(|s| s.parse::<i64>().ok())
+    let hotcue = hotcue
         .filter(|&h| h >= 0)
         .and_then(|h| u8::try_from(h).ok());
-    let name = attr(e, b"NAME").filter(|s| !s.is_empty() && s != "n.n.");
+    let name = name.filter(|s| !s.is_empty() && s != "n.n.");
 
     match cue_type {
         Some(4) => {
@@ -309,9 +360,7 @@ fn apply_cue(cur: &mut ParsedEntry, e: &BytesStart) {
             }
         }
         Some(5) => {
-            let len_ms = attr(e, b"LEN")
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
+            let len_ms = len_ms.filter(|l| l.is_finite()).unwrap_or(0.0);
             cur.loops.push(ParsedLoop {
                 hotcue,
                 start_secs,
@@ -434,7 +483,7 @@ fn path_from_primarykey(key: &str) -> Option<PathBuf> {
 /// math below is correct *given* Traktor's chromatic 0–23 ordering (0–11 =
 /// major C..B, 12–23 = minor C..B); that ORDERING is the assumption to
 /// confirm against a real export.
-fn musical_key_to_camelot(value: u8) -> Option<&'static str> {
+pub(crate) fn musical_key_to_camelot(value: u8) -> Option<&'static str> {
     // 0..11 major C,C#,D,D#,E,F,F#,G,G#,A,A#,B ; 12..23 minor C..B.
     const TABLE: [&str; 24] = [
         "8B", "3B", "10B", "5B", "12B", "7B", "2B", "9B", "4B", "11B", "6B", "1B", // major
@@ -452,7 +501,7 @@ mod tests {
         let nml = br#"<?xml version="1.0" encoding="UTF-8"?>
 <NML VERSION="19">
   <COLLECTION ENTRIES="1">
-    <ENTRY TITLE="Test Track" ARTIST="Test Artist">
+    <ENTRY TITLE="Test Track" ARTIST="Test Artist" LOCK="1">
       <LOCATION DIR="/:Users/:dj/:Music/:" FILE="track.mp3" VOLUME="Macintosh HD"/>
       <ALBUM TITLE="Test Album"/>
       <INFO GENRE="Techno" COMMENT="hello" PLAYTIME="167" PLAYTIME_FLOAT="166.523" RANKING="153" COLOR="4"/>
@@ -482,6 +531,7 @@ mod tests {
         assert_eq!(e.color.as_deref(), Some("green")); // COLOR index 4 → green (best-effort)
         assert!((e.duration_secs.unwrap() - 166.523).abs() < 1e-6); // PLAYTIME_FLOAT
         assert!((e.bpm.unwrap() - 128.0).abs() < 1e-9);
+        assert!(e.grid_locked, "ENTRY LOCK=\"1\"");
         assert_eq!(e.key_camelot.as_deref(), Some("8B")); // VALUE 0 = C major
         assert_eq!(e.key_original.as_deref(), Some("0"));
         assert_eq!(
@@ -582,6 +632,32 @@ mod tests {
         );
         // No `/:` separator → not a real track key.
         assert_eq!(path_from_primarykey("garbage"), None);
+    }
+
+    #[test]
+    fn earlier_by_moves_everything_and_keeps_the_grid_on_a_downbeat() {
+        let e = ParsedEntry {
+            bpm: Some(120.0),
+            grid_anchor_secs: Some(0.01),
+            cues: vec![ParsedCue {
+                hotcue: Some(0),
+                position_secs: 10.0,
+                name: None,
+            }],
+            loops: vec![ParsedLoop {
+                hotcue: None,
+                start_secs: 0.02,
+                end_secs: 2.0,
+                name: None,
+            }],
+            ..ParsedEntry::default()
+        };
+        let moved = e.earlier_by(0.026);
+        // 0.01 - 0.026 is before the start: one 4-beat bar (2 s) on.
+        assert!((moved.grid_anchor_secs.unwrap() - 1.984).abs() < 1e-9);
+        assert!((moved.cues[0].position_secs - 9.974).abs() < 1e-9);
+        assert_eq!(moved.loops[0].start_secs, 0.0);
+        assert!((moved.loops[0].end_secs - 1.974).abs() < 1e-9);
     }
 
     #[test]

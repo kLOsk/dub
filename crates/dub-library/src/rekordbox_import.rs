@@ -110,6 +110,8 @@ fn import_track(
     // `discover_for_path` queries the file via `getattrlist`, so a path absent
     // on this machine fails here — the dangling-reference case we report as
     // skipped rather than inserting a phantom track.
+    let relocated = crate::relocate::relocate(path);
+    let path = relocated.as_path();
     let volume = discover_for_path(path).map_err(|e| format!("volume UUID unavailable: {e}"))?;
     library.upsert_volume(&volume).map_err(|e| e.to_string())?;
     let relative_path = volume

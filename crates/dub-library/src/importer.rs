@@ -286,6 +286,14 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<Importe
         library
             .promote_to_collection(&existing_uuid)
             .map_err(|e| e.to_string())?;
+        crate::traktor_tag::sync_file_tags(
+            library,
+            &existing_uuid,
+            &volume.volume_uuid,
+            &relative_path,
+            path,
+        )
+        .map_err(|e| e.to_string())?;
         return Ok(ImportedTrack {
             uuid: existing_uuid,
             was_new: false,
@@ -329,6 +337,14 @@ fn import_one(library: &mut Library, path: &Path) -> std::result::Result<Importe
     library
         .promote_to_collection(&new_track_uuid)
         .map_err(|e| e.to_string())?;
+    crate::traktor_tag::sync_file_tags(
+        library,
+        &new_track_uuid,
+        &volume.volume_uuid,
+        &relative_path,
+        path,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(ImportedTrack {
         uuid: new_track_uuid,
         was_new: true,

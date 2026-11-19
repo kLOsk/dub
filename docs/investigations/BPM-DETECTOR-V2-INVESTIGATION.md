@@ -1,10 +1,12 @@
 # BPM detector — V2 investigation & the path forward
 
-> Status: **investigation complete, experimental code removed.** This
-> document is the durable artifact. It records what was tried against the
-> double/half-tempo and downbeat problems, the measured results, why a
-> classical (non-ML) replacement does not beat the tuned Classic detector,
-> and the concrete plan for the approach that can.
+> Status: **§1–§7 are superseded on tempo by §8 (2026-11-19).** They
+> record what was tried against the double/half-tempo and downbeat
+> problems and conclude that no classical replacement beats the tuned
+> rule set, on a 94-song corpus those rules were fitted to. §8 scores the
+> same rules against 1,758 grids locked in Traktor (62 %), finds the cause,
+> and records the replacement (96 %). Read §8 first; §1–§7 still stand for
+> the experiments they describe and for the downbeat.
 
 ## 1. Problem
 
@@ -548,3 +550,274 @@ reports 11 of 14 dubstep tracks failing where the profile-aware figure is
   <https://patents.google.com>
 - Qosmo × Pioneer DJ (ML analysis in rekordbox 6):
   <https://qosmo.jp/en/news/pioneer-dj-2>
+
+## 8. Scored against Traktor, and replaced (2026-11-19)
+
+### 8.1 Why this was reopened
+
+The operator added his working library — 2,654 songs, 2,169 of them with a
+Traktor grid — and found the analysis "pretty poor": half, double and
+"three-quarter" tempos. §2's verdict (11 of 94, or 4 of 94 with the
+genre's own profile) said tempo was all but solved.
+
+### 8.2 The reference
+
+His Traktor grids, by his own rule (2026-11-19):
+
+- **Lock set** — the grid is right, or good enough to mix on, for tempo
+  and for where the lines sit. 1,768 songs.
+- **No lock** — the song drifts (a live drummer: reggae, funk, oldies,
+  rock). It was his "careful with this one" mark. 390 songs; not scored.
+- **The marker is not the 1.** He never corrected which beat Traktor
+  called the 1, only that the grid sat on the beat and not half a beat
+  off. So Traktor is no reference for the downbeat.
+- **Serato's grids are no reference at all** — he never worked in it.
+
+Traktor's positions are on its own MP3 timeline; `mp3_frames.rs` converts
+them (checked against his set-the-1 taps: +27 ms median before, +1.4 ms
+after).
+
+### 8.3 The rules, scored
+
+`analyze_beat_grid_with_profile` as shipped, each song with the profile
+its genre tag gave it, 1,758 locked songs:
+
+| vs Traktor | Share |
+|---|---|
+| Same tempo (within 2 %) | 62.4 % |
+| Two-thirds (128 read as 85.3) | 16.0 % |
+| Half | 11.0 % |
+| Four-thirds (70 read as 93) | 6.9 % |
+| Other | 2.6 % |
+| Double | 0.9 % |
+
+By profile: FourOnFloor 98 %, DrumAndBass 94 %, HipHop 79 %, Dancehall
+64 %, RootsReggae 57 %, **Default 46 %** (36 % of the songs — his genre
+tags are crate-like labels: Bmore, Funk, NuDisco, Baile, Cheese), **Dub
+10 %**.
+
+Three causes, in `tempo.rs` / `octave_profile.rs` as they then were:
+
+1. **`skank_doubletime_rejected` ran for every profile but FourOnFloor.**
+   It rejects a 118–160 BPM candidate when a 2:1 sibling in 60–80 scores
+   even 0.1 % higher. On four-on-the-floor music the half tempo scores
+   about as high as the tempo by construction (the bar accent), so the
+   true tempo was rejected on a coin flip; the prior then gave 64 BPM a
+   weight of 0.3, and the two-thirds candidate won. The genre profile
+   "helped" house (98 % with it, 30 % without) only by switching this
+   rule off.
+2. **`dubstep` mapped to the Dub profile**, which prefers ~70. Every
+   dubstep song in his Traktor library is 120–150.
+3. **The prior's 60–95 ramp** (weight 0.43 at 70 BPM) cost slow hip-hop
+   and roots their tempo to the four-thirds candidate.
+
+Also: `"ska"` matched inside "Skate Punk" and sent 21 songs to
+RootsReggae.
+
+When the tempo family *was* right, the rest was good: 96 % within
+0.05 BPM of Traktor, 87 % of lines within 25 ms.
+
+### 8.4 What was tried (scratch copy, 700 locked songs)
+
+| Variant | Same tempo as Traktor |
+|---|---|
+| As shipped | 63.7 % |
+| Skank rule only for the reggae profiles | 82.4 % |
+| …and dubstep kept at 140 | 91.0 % (fixes 191, breaks 1) |
+| …and 3:2 / 4:3 candidates in `octave_self_verify` | 91.7 % (trades 4:3 for doubles) |
+| …and the prior lifted to 1.0 over 60–95 for hip-hop and roots | 91.5 % (fixes 27, breaks 23) |
+| **No rules, no prior, one octave 78–156; octave ignored** | **97.8 %** (59.1 % for the shipped code scored the same way) |
+
+The last row is the finding: the onset function and the harmonic-mean
+score were never the problem. Inside one octave the best-scoring lag is
+the right tempo family 98 times in 100; everything above it was the
+rules undoing that. `GridQuality` (rms, kept fraction) does not separate
+right from wrong tempos — rms median 20 ms against 36 ms, heavily
+overlapping — so it cannot referee between candidates, which is why the
+3:2 / 4:3 self-check bought nothing.
+
+### 8.5 What shipped
+
+`TempoOctave` (`[low, 2 × low)`), searched directly; the octave per genre
+family in `OctaveProfile::tempo_octave`, each the octave holding the most
+of that family's locked grids; the DJ's tempo range for everything else
+(PRD-BEATS §6.0). Removed: `tempo_prior_weight`, the triplet / skank /
+dancehall / hip-hop rejection passes, `linked_halftime_penalty`, every
+`profile_*_rejected`, `octave_self_verify`.
+
+All 1,767 readable locked songs, the shipped code
+(`tests/traktor_grid_corpus.rs`):
+
+| vs Traktor | Share |
+|---|---|
+| Same tempo | 96.3 % |
+| Half | 1.0 % |
+| Four-thirds | 1.0 % |
+| Two-thirds | 0.9 % |
+| Double | 0.4 % |
+| Other | 0.4 % |
+
+By family: DrumAndBass 98 %, FourOnFloor (with dubstep) 98 %, Default
+97 %, HipHop 96 %, Dancehall 93 %, Dub and RootsReggae 89 %.
+
+Placement, on the 1,631 songs within 0.05 BPM of Traktor: 84.7 % of
+lines within 25 ms (median 8.7 ms); **105 songs (6.4 %) sit half a beat
+off**. That is now the largest single defect and the one the operator
+names as mattering most.
+
+The octaves were chosen on the same songs they are scored on — five
+round numbers, but in-sample all the same.
+
+### 8.6 The 94-song corpus was partly wrong
+
+Eight of its "expected" tempos were the old detector's own four-thirds
+readings, entered as truth: *Skankin' Sweet* and *Spanish Town Rockin'*
+at 104 (Traktor, locked: 78), *Duppy Conqueror* and Barrington Levy's
+*Murderer* at 95 (71), *Hills And Valleys* 96 (72), *Still Blazing* 97
+(73), *Welcome to Jamrock* 102 (77), Dead Prez *Hip Hop* 103 (77), Chief
+Keef *I Don't Like* 88 (66). *OG Reppa* and *We Multiply*, "known fails"
+at an expected 174, are 135 in Traktor — and read 135. Its dubstep rows
+expected 70. The manifests now carry Traktor's values and each song's own
+genre family, and read 4 known misses of 94: *Gold Dust* (two-thirds — the
+one song the removed `linked_halftime_penalty` existed for), *I Don't
+Like* (66, just under the hip-hop octave, reads 132), *Keep It Up* and
+*Endorphin* (both unlocked in Traktor).
+
+### 8.7 Half a beat off (same day)
+
+105 of the 1,631 tempo-matched songs sat half a beat from Traktor's
+lines. They are not one problem. Scoring 30-second stretches of each for
+whether the kick band sits on Traktor's lines or Dub's: 38 have it on
+Traktor's (Dub on the off-beat), 30 have it on **Dub's** (bass on the
+off-beat — bassline house, dubstep — or Traktor's own grid half out),
+31 show nothing either way, 6 move from one to the other mid-song.
+
+Whole-song cues, each tried as "flip when the off-beat scores higher"
+against the 105 and the 1,382 on the beat:
+
+| Cue (off-beat ÷ on-beat) | Best rule fixes | …and breaks |
+|---|---|---|
+| Kick-band onsets (30–68 Hz) | 23 | 20 |
+| Onsets in low, mid and high at once | 8 | 4 |
+| Geometric mean of the 8 bands | 13 | 7 |
+| Mid-band onsets | 48 | 19 |
+| Visual kick edges found | 1 | 1 |
+| Kick/snare alternation between lines | 4–19 | 11–141 |
+| Peak level in the 30 ms after the line | 39 | 9 |
+
+None separates the groups: off-beat bass is as low, as wide and as
+regular as a kick. What does is **where the song starts**: the first
+sound over 10 % of the track's peak falls ≥ 0.4 beat from Dub's lines on
+74 of the 105 and 92 of the 1,382 — it is evidently where Traktor puts
+its marker. Alone it breaks more than it fixes; with "and the off-beat
+is the louder" it fixes 53 and breaks 5, and fitted on half the songs
+and tried on the other it held (26 of 52 fixed, 5 of 691 broken).
+
+Shipped as `move_off_the_off_beat`. Measured on the real code: **105 →
+58 half a beat off**, lines within 25 ms 84.7 % → **87.0 %**, 90th
+percentile 39 → 29.5 ms. About 30 of the 58 left are the songs where
+Traktor's own lines sit off the low end; nothing here can call those.
+
+### 8.8 Tap tempo: the taps are a hint (same day)
+
+The operator: "the dj always taps wrong, he's never as accurate as the
+transients… with the tap dub should understand: this is roughly the
+correct bpm and the correct transients for the beats." His logged
+session on a 129 song: seven taps at 118–121, committed 121 — the fit
+only looked ±3 % around the tapped tempo.
+
+Now (`analyze_beat_grid_from_taps`, PRD-BEATS §4.2): the song's own
+tempo is looked for within ±12 % of the tapped one by folding the
+whole-song onset function at every tempo in reach, and the lines are
+placed by the whole song in the phase the taps point at.
+
+Each locked song "tapped" 8 % out (under and over alternately), one tap
+35 ms late:
+
+| | Share of 1,767 |
+|---|---|
+| Best-folding tempo in reach is Traktor's (within 0.4 %) | 99.3 % |
+| Grid comes back within 0.05 BPM of Traktor | **94.3 %** |
+| …and with its lines within 25 ms | **85.9 %** |
+| (plain analysis, no tap: within 0.05 BPM / lines too) | 92.3 % / 80.3 % |
+
+Two settings came from this run. The dominance a tempo needs before it
+overrules the tap was 1.3 by guess and sent 65 right answers to the
+fallback; right picks stand a median 2.3× clear (5th percentile 1.38),
+the 13 wrong ones 1.06 — it is 1.1. And the tap path rounded to whole
+BPMs on trust (`IntegerSnapPolicy::TAP`, built for a tempo that was the
+DJ's): with it only 81.6 % came back within 0.05 BPM. A tempo that is
+the song's is rounded as an analysed one.
+
+The tempo is read from the taps' **playhead positions**. Since Round 11
+it had come from the wall-clock tap rate, justified by a test in which
+the DJ taps the track's native tempo while hearing it 8 % slow. He taps
+what he hears; in the track's own time that is one beat per tap at any
+pitch.
+
+### 8.9 The drift warning (same day)
+
+The operator, on *Hey Ya*: "it says may drift over a long mix but i find
+the grid perfect". The stored reading was 5.6 ms/min; the mark fired at 3.
+
+The grid does drift: against the waveform its hits sit 4 ms before the
+lines in the first sixth of the song and 9 ms after them in the last,
+about 4 ms a minute. The tempo, 79.49, is Serato's, rounded to two
+decimals; the song is nearer 79.486. Nobody hears 15 ms over four
+minutes.
+
+Scored on the 1,767 locked grids, each measured as set-the-1 measures a
+grid (`fit_grid_at_playing_tap` at Traktor's tempo), and again with the
+tempo made 6, 12 and 20 ms/min slow:
+
+| Reading | Limit | Locked grids marked | 6 ms/min caught | 12 caught | 20 caught |
+|---|---|---|---|---|---|
+| least squares (as shipped) | 3 | 27.8 % | — | — | — |
+| least squares | 10 | 6.7 % | 11.5 % | 58.3 % | 83.8 % |
+| median over pairs ≥ 20 s apart | 8 | 6.7 % | 11.1 % | 92.5 % | 96.7 % |
+| median over pairs | 10 | 5.4 % | 7.0 % | 86.9 % | 95.2 % |
+| least squares, strays over 40 ms dropped | 8 | 4.1 % | 8.2 % | 86.9 % | 91.5 % |
+| medians of eight stretches | 8 | 10.3 % | 16.1 % | 89.8 % | 94.0 % |
+
+The least-squares slope under-reads a real drift (a 12 ms/min drift reads
+a median 10.4, and under 4 on one song in ten) and invents one where the
+arrangement changes. The median over pairs reads 11.9, and 10.6 or more
+on nine in ten.
+
+The locked grids that still read 8 or more are mostly real: for two in
+three, a second reading that shares nothing with the first (where the
+waveform's level jumps, folded per sixth of the song) agrees in sign and
+size. He mixed on them; a played drummer wanders.
+
+Dub's own grids were also read. With least squares, every one of the 237
+marked at 3 had had its tempo rounded to a whole number; the fit that
+sets a tempo minimises this reading, so the mark says little about Dub's
+own grids either way — of 162 whose tempo sat 10 ms/min or more from
+Traktor's, 18 were marked.
+
+Shipped: the median reading, `GridQuality::DRIFT_WARNING_MS_PER_MIN = 8`,
+one rule for the deck header and the library column. The benchmark, on
+the code as shipped, has 7.0 % of the locked grids marked and 92.3 % of
+the 12 ms/min drift caught, and holds both. It also has Dub marking
+4.7 % of its own grids — more than least squares did (2.6 % at 8),
+since the median is not what the tempo fit minimises. Whether those 83
+are the songs where Dub's tempo is off Traktor's was not checked.
+
+### 8.10 Not done
+
+- **Dub's own tempo against Traktor's.** Where both read the same tempo,
+  the two grids part by 9.5 ms/min or more on one song in ten (p95 19).
+  Which of the two is nearer the song was not measured; the drift mark
+  does not show it (§8.9).
+
+- **Half-a-beat-off grids, the 58 left (3.6 %).** §8.7. A tap on the
+  beat of a playing deck fixes one by hand (PRD-BEATS §4.1).
+- **The 1.** Unscored: Traktor is no reference for it. §5's learned
+  tracker remains the only categorical answer on record.
+- **Two-thirds and four-thirds (1.9 %)** still happen where sixteenth-note
+  content makes those lags as periodic as the beat.
+- **Thru decks** read in the default octave; the DJ's tempo range does not
+  reach them yet. The dnb baseline record still reads 116.5, two-thirds.
+- **None of the tap work has been tried on a deck.** The numbers above
+  are simulated taps on files.
+

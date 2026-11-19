@@ -132,10 +132,10 @@ struct PreferencesSheet: View {
         // once the sheet is gone and nothing shows that it is.
         .onDisappear { if !model.mapMode { model.cancelMapping() } }
         .onChange(of: tab) { _ in if !model.mapMode { model.cancelMapping() } }
-        .onChange(of: model.seratoImportEnabled) { on in if on { model.scanEnabledSources() } }
-        .onChange(of: model.traktorImportEnabled) { on in if on { model.scanEnabledSources() } }
-        .onChange(of: model.rekordboxImportEnabled) { on in if on { model.scanEnabledSources() } }
-        .onChange(of: model.itunesImportEnabled) { on in if on { model.scanEnabledSources() } }
+        .onChange(of: model.seratoImportEnabled) { _ in model.sourceSwitched(.serato) }
+        .onChange(of: model.traktorImportEnabled) { _ in model.sourceSwitched(.traktor) }
+        .onChange(of: model.rekordboxImportEnabled) { _ in model.sourceSwitched(.rekordbox) }
+        .onChange(of: model.itunesImportEnabled) { _ in model.sourceSwitched(.itunes) }
     }
 
     /// Default locations of the external libraries, loaded once on appear so
@@ -395,15 +395,34 @@ struct PreferencesSheet: View {
                     "Match the tempo the deck plays at now, with your platter's pitch on it. Off, Matching uses the playing track's own BPM.",
                     isOn: $libraryModel.matchWindow.followPitch, last: true)
             }
+            // Daniel, 2026-11-19: half, double and "three-quarter" tempos on
+            // a newly added library. The octave is the DJ's to set, as in
+            // Traktor; the genre only overrides it where it names one.
+            group("Tempo") {
+                matchStepperRow(
+                    "Tempo range",
+                    "A beat can be counted at half or double speed: 70 or 140, 87 or 174. Dub reads every song inside one range, so the two never trade places. This range is for songs whose genre doesn't settle it.",
+                    value: Self.tempoRangeLabel(model.tempoRangeLow),
+                    decrement: { stepTempoRange(by: -1) },
+                    increment: { stepTempoRange(by: 1) },
+                    last: true)
+                note("A genre that does settle it has its own range: drum & bass 100–200, house, garage, grime and dubstep 88–176, dancehall 75–150, hip-hop 68–136, reggae and dub 60–120.")
+                    .padding(.bottom, DubSpacing.xs)
+                note("The range applies to songs analysed from now on. A song that already has a grid keeps it: right-click its BPM on the deck for 2× or ½, or Re-analyze it in the library.")
+            }
             // Daniel, 2026-11-16: with more than one app on, say whose grid
-            // and whose cues a track gets. The order is
-            // `Library::grid_source_rank` and `CUE_SOURCE_ORDER`.
+            // and whose cues a track gets. 2026-11-18: and let the DJ set
+            // the order (`Library::import_order`, FFI 90).
             group("When a track is in more than one app") {
                 note("A track you find through any of them is the same track: Dub matches them by the file.")
                     .padding(.bottom, DubSpacing.xs)
-                note("Beat grid. A grid you fix in Dub comes first. Then Serato, then rekordbox, then Traktor, then Dub's own analysis. Apple Music has no grids. Dub still analyses every track and marks its BPM with ⚠ when an app's grid disagrees.")
+                importOrderRows
+                    .padding(.bottom, DubSpacing.sm)
+                note("Beat grid. A grid you fix in Dub comes first. Then \(orderedAppNames), then Dub's own analysis. Apple Music has no grids. Dub still analyses every track and marks its BPM with ⚠ when the grid in use disagrees with that analysis. A grid the app locked arrives locked.")
                     .padding(.bottom, DubSpacing.xs)
-                note("Hot cues. Cues you set in Dub come first. A track you haven't touched in Dub shows the hot cues of the first app in the same order that has any: Serato, rekordbox, then Traktor. One app's set, never a mix, and the HOTCUE heading says which. Your first change to one of those cues makes the set yours: the change sticks, and later edits in that app no longer reach Dub's pads.")
+                note("Key. A key you set in Dub comes first, then \(orderedAppNames), then Dub's own.")
+                    .padding(.bottom, DubSpacing.xs)
+                note("Hot cues. Cues you set in Dub come first. A track you haven't touched in Dub shows the hot cues of the first app in the same order that has any: \(orderedAppNames). One app's set, never a mix, and the HOTCUE heading says which. Your first change to one of those cues makes the set yours: the change sticks, and later edits in that app no longer reach Dub's pads.")
                     .padding(.bottom, DubSpacing.xs)
                 note("Dub never writes to these apps. What you change in Dub stays in Dub; File ▸ Export Library As… takes it elsewhere.")
             }
@@ -504,6 +523,72 @@ struct PreferencesSheet: View {
             .padding(.vertical, DubSpacing.sm)
             if !last { Divider() }
         }
+    }
+
+    /// The three apps in the DJ's order, each with a button to move it up.
+    private var importOrderRows: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Which app comes first")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .padding(.top, DubSpacing.sm)
+            Text("Its beat grid, key and hot cues win when a track has them from more than one app. Changing it updates every track you haven't locked or set yourself.")
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, DubSpacing.xs)
+            ForEach(Array(model.importOrder.enumerated()), id: \.element) { index, source in
+                HStack(spacing: DubSpacing.md) {
+                    Text("\(index + 1)")
+                        .font(DubFont.body)
+                        .monospacedDigit()
+                        .foregroundStyle(DubColor.textTertiary)
+                        .frame(width: 16, alignment: .trailing)
+                    Text(Self.appName(source))
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                    Spacer(minLength: DubSpacing.md)
+                    Button {
+                        var order = model.importOrder
+                        order.swapAt(index, index - 1)
+                        model.setImportOrder(order)
+                    } label: {
+                        Image(systemName: "chevron.up")
+                    }
+                    .controlSize(.small)
+                    .disabled(index == 0)
+                    .help("Move \(Self.appName(source)) up")
+                }
+                .padding(.vertical, 3)
+            }
+        }
+    }
+
+    private var orderedAppNames: String {
+        let names = model.importOrder.map(Self.appName)
+        guard names.count == 3 else { return names.joined(separator: ", ") }
+        return "\(names[0]), then \(names[1]), then \(names[2])"
+    }
+
+    static func appName(_ source: String) -> String {
+        switch source {
+        case "serato": return "Serato"
+        case "rekordbox": return "rekordbox"
+        case "traktor": return "Traktor"
+        default: return source
+        }
+    }
+
+    static func tempoRangeLabel(_ low: Double) -> String {
+        "\(Int(low))–\(Int(low * 2)) BPM"
+    }
+
+    /// Move the tempo range one choice down or up, stopping at the ends.
+    private func stepTempoRange(by step: Int) {
+        let choices = WaveformAppModel.tempoRangeChoices
+        let current = choices.firstIndex(of: model.tempoRangeLow) ?? 2
+        let next = min(max(current + step, 0), choices.count - 1)
+        model.setTempoRangeLow(choices[next])
     }
 
     static func keyStepsLabel(_ steps: Int) -> String {

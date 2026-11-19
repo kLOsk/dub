@@ -77,7 +77,11 @@ pub fn import_serato(library: &mut Library, serato_dir: &Path) -> Result<ImportS
             });
             continue;
         };
-        match import_entry(library, &volume, &rel, &entry) {
+        // A `_Serato_` folder from another Mac's system drive names that
+        // Mac's user folder; crates still join on the path Serato wrote.
+        let here = crate::relocate::relocate(&volume.mount_point.join(&rel));
+        let on_disk = volume.relative_to(&here).unwrap_or_else(|| rel.clone());
+        match import_entry(library, &volume, &on_disk, &entry) {
             Ok(outcome) => {
                 if outcome.added {
                     summary.added += 1;
@@ -189,11 +193,6 @@ fn write_metadata(
         None, // version_token
     )?;
 
-    // Beat grid (Serato BeatGrid GEOB).
-    if let Some(grid) = geob::find(&geobs, geob::BEATGRID).and_then(beatgrid::parse) {
-        library.upsert_imported_beatgrid(track_id, SERATO, grid.anchor_secs, grid.bpm, 0)?;
-    }
-
     // Key → Camelot (Serato stores musical notation, e.g. "Em"); preserve
     // the original. Anything the converter does not recognise is not
     // written: `key_notation` is Camelot by contract, and a verbatim
@@ -204,28 +203,66 @@ fn write_metadata(
         }
     }
 
+    write_serato_analysis(library, track_id, &geobs, abs_path)
+}
+
+/// The grid, cues and loops from a file's Serato GEOBs, without the
+/// metadata row: the file-tag reader (`crate::traktor_tag`) writes only
+/// these, so a file Serato once analysed doesn't join the Serato node.
+///
+/// Positions come in on Serato's timeline and are moved onto Dub's first
+/// (`crate::mp3_frames::serato_lead_secs`).
+pub(crate) fn write_serato_analysis(
+    library: &Library,
+    track_id: &str,
+    geobs: &[(String, Vec<u8>)],
+    path: &Path,
+) -> Result<()> {
+    let lead = crate::mp3_frames::serato_lead_secs(path);
+    let at = |secs: f64| (secs - lead).max(0.0);
+
+    let markers = geob::find(geobs, geob::MARKERS2).map(markers2::parse);
+    let locked = markers.as_ref().is_some_and(|m| m.bpm_locked);
+
+    // Beat grid (Serato BeatGrid GEOB). An anchor moved before the start
+    // goes on a whole bar, so it stays a downbeat.
+    if let Some(grid) = geob::find(geobs, geob::BEATGRID).and_then(beatgrid::parse) {
+        let mut anchor = grid.anchor_secs - lead;
+        if anchor < 0.0 && grid.bpm > 0.0 {
+            anchor += 4.0 * 60.0 / grid.bpm;
+        }
+        library.upsert_imported_beatgrid_locked(
+            track_id,
+            SERATO,
+            anchor.max(0.0),
+            grid.bpm,
+            locked,
+        )?;
+    }
+
     // Cues + loops (Serato Markers2 GEOB) — truncate-and-rewrite.
     library.clear_imported_cues(track_id, SERATO)?;
     library.clear_imported_loops(track_id, SERATO)?;
-    if let Some(markers) = geob::find(&geobs, geob::MARKERS2).map(markers2::parse) {
+    if let Some(markers) = markers {
         for cue in &markers.cues {
             library.upsert_imported_cue(
                 track_id,
                 SERATO,
                 cue.index,
-                f64::from(cue.position_ms) / 1000.0,
+                at(f64::from(cue.position_ms) / 1000.0),
                 cue.name.as_deref(),
                 None,
                 "hot_cue",
             )?;
         }
         for lp in &markers.loops {
+            let start = at(f64::from(lp.start_ms) / 1000.0);
             library.upsert_imported_loop(
                 track_id,
                 SERATO,
                 lp.index,
-                f64::from(lp.start_ms) / 1000.0,
-                f64::from(lp.end_ms) / 1000.0,
+                start,
+                at(f64::from(lp.end_ms) / 1000.0).max(start),
                 lp.name.as_deref(),
                 None,
             )?;

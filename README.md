@@ -221,7 +221,7 @@ spec is [`PRD.md`](docs/spec/PRD.md).
 - **Tested like it matters**: over 1,600 Rust tests and 280 Swift unit and
   snapshot tests, fuzzed library parsers, and gates fitted against real records.
 
-The FFI contract version (`dub_ffi::FFI_VERSION`) is **89** at the
+The FFI contract version (`dub_ffi::FFI_VERSION`) is **91** at the
 time of writing. Architecture notes: [`ARCHITECTURE.md`](docs/spec/ARCHITECTURE.md).
 
 ### The `dub` CLI

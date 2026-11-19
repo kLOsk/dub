@@ -73,14 +73,23 @@ final class TapToGridController {
         let playheadSecs: Double
     }
 
-    /// Called when the session window closes. Carries the buffered tap
-    /// PLAYHEAD positions (used for the grid anchor) plus, for a ≥3-tap
-    /// tempo session, the **wall-clock-derived BPM** (`nil` for a 1–2 tap
-    /// set-the-1). Tempo MUST come from wall-clock — the same value the
-    /// rolling preview shows — never from playhead-position deltas, which
-    /// are scaled by the platter's live playback rate (the cause of the
-    /// "committed BPM vastly off from the preview" bug).
-    var onCommit: ((_ playheads: [Double], _ wallClockBpm: Double?) -> Void)?
+    /// Called when the session window closes, with the PLAYHEAD position
+    /// of each tap: 1–2 taps set the 1, 3 or more re-take the tempo.
+    ///
+    /// The positions are in the track's own time, so their spacing is the
+    /// track's tempo whatever the pitch — at −8 % a 174 track sounds at
+    /// 160, the DJ taps 160 against the clock, and one of the track's
+    /// beats still passes per tap. The wall-clock rate
+    /// (`wallClockBpm()`) is what the rolling preview shows while
+    /// tapping; it is the sounding tempo, and is not what a grid is made
+    /// from.
+    ///
+    /// `whilePlaying` says which kind of tap it was. A hand tapping along
+    /// to a playing song is tens of milliseconds out, so the engine takes
+    /// such taps as a hint and lets the whole song place the lines; a tap
+    /// on a stopped deck is the DJ parking the playhead on what they see,
+    /// and is kept where it is.
+    var onCommit: ((_ playheads: [Double], _ whilePlaying: Bool) -> Void)?
 
     /// Called whenever the open tap count changes (0 = idle).
     var onTapCountChanged: ((Int) -> Void)?
@@ -174,7 +183,7 @@ final class TapToGridController {
         entries.removeAll(keepingCapacity: true)
         onRollingBpmChanged?(nil)
         onTapCountChanged?(0)
-        onCommit?([playheadSecs], nil)
+        onCommit?([playheadSecs], false)
     }
 
     /// Returns the median tap interval (seconds) over the current
@@ -212,10 +221,10 @@ final class TapToGridController {
     }
 
     /// Wall-clock tap tempo (BPM) for the open session, or `nil` if fewer
-    /// than two taps / no positive interval. The single source of truth
-    /// for committed tempo — identical to the rolling-preview value, so the
-    /// committed grid BPM always matches what the DJ saw while tapping.
-    /// Derived purely from `Entry.wallTime` deltas, never the playhead.
+    /// than two taps / no positive interval: the tempo the DJ is tapping
+    /// to, as it sounds, for the rolling preview. The committed grid is
+    /// built from the taps' playhead positions and the track itself, so
+    /// it can differ — it is the track's tempo, found near this one.
     func wallClockBpm() -> Double? {
         guard let median = medianTapIntervalSecs(), median > 0 else { return nil }
         return 60.0 / median
@@ -255,9 +264,6 @@ final class TapToGridController {
 
     private func flushCommit() {
         guard !entries.isEmpty else { return }
-        let playheads = entries.map(\.playheadSecs)
-        // Tempo only for a real ≥3-tap session; 1–2 taps are set-the-1.
-        let bpm = entries.count >= Self.previewMinTapCount ? wallClockBpm() : nil
-        onCommit?(playheads, bpm)
+        onCommit?(entries.map(\.playheadSecs), true)
     }
 }

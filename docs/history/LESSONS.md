@@ -152,15 +152,29 @@
 
 ## BPM / beat grid
 
-- **The octave ceiling is structural, not a tuning bug.** Double/half-tempo
-  errors come from genuinely overlapping decision classes; no global threshold
-  separates them. We fixed what we could with a windowed-energy picker (the
-  `2P > P` overshoot is a `Σ 1/(N−kP)` artifact — no fixed tie-tolerance is
-  robust across 2–60 s ODF lengths) and genre-aware `OctaveProfile`s. The
-  Classic detector sits at ~11/94 on the real-music corpus and **further gains
-  need a learned beat tracker (RNN/TCN + DBN), not more heuristics** — see
-  `BPM-DETECTOR-V2-INVESTIGATION.md`. Do not reopen this as heuristic tuning;
-  the per-track escape hatch is tap-to-grid + `BpmRange`.
+- **Which octave a tempo is counted in is not in the audio — so don't guess
+  it, take it from outside.** 70 or 140, 87 or 174: both repeat in the audio
+  and no threshold separates them. For five months a tempo prior over 60–200
+  BPM plus nine genre-specific rejection rules tried anyway, each rule fitted
+  to the handful of songs that prompted it, and the 94-song corpus they were
+  fitted on read 11 misses — "solved, bar a learned tracker". Scored on
+  2026-11-19 against 1,758 grids the operator had locked in Traktor they got
+  **62 %**, and most misses were not octaves at all: a reggae rule
+  (`skank_doubletime_rejected`) ran on every song without a house tag, threw
+  out the true 118–160 candidate whenever the half tempo scored a hair
+  higher, the prior then threw out the half, and 128 read as 85.3. The same
+  detector with **no rules and one octave per genre family** (`TempoOctave`;
+  the DJ's tempo range for songs with no telling genre — what Traktor, Serato
+  and rekordbox do) gets **96 %**. Two lessons beyond the fix: a rule added
+  for one genre must be scoped to it, and a corpus the rules were tuned on
+  cannot grade them — eight of its "expected" tempos were the old detector's
+  own four-thirds mistakes. Grade tempo work with
+  `tests/traktor_grid_corpus.rs` (the operator's Traktor lock = right; no
+  lock = the song drifts; the marker says nothing about the 1).
+- **The windowed-energy picker stays.** The `2P > P` overshoot is a
+  `Σ 1/(N−kP)` artifact; no fixed tie-tolerance is robust across 2–60 s ODF
+  lengths, which is why candidates are scored by window sums, not peak
+  heights.
 - **Honesty contract.** The estimator returns `confidence = 0` for silence or a
   single click and `Err(TooShort)` for sub-2-beat input — callers must be able
   to tell "no detection" from "unanalyzable." Never fabricate a tempo.
@@ -185,6 +199,67 @@
   grid, invariant to where in the bar you tap. Soft/ramping kicks with no clean
   edge fall back to verbatim (the user's eye wins). Used by all three paths:
   auto (`shift_grid_to_kick_edge`), set-the-1, and 3+ tap.
+- **A tap on a playing deck says which beat, not where.** A hand tapping
+  along lands tens of milliseconds from the beat. Until 2026-11-19 a playing
+  tap took the stopped-deck path: latch onto the loudest rise within 60 ms and
+  hang the whole grid on that one hit, or on the raw tap when no hit was
+  clean — and in the tap log every retried session ended more than 20 ms from
+  the attempt before. Now the tap picks the beat (and the 1) and the whole
+  song places the lines (`fit_grid_at_playing_tap`): same lines wherever and
+  however roughly you tap. The stopped deck keeps the exact spot, because
+  there the DJ parked the playhead on what they see.
+- **Taps are a hint, never the measurement — and they are in the track's
+  time, not the clock's.** A DJ tapping along is tens of ms out per tap and
+  several percent out on the tempo (the operator: 118–121 on a 129 song).
+  Tap tempo therefore asks the song: its own tempo within ±12 % of the
+  tapped one, its lines in the phase the taps point at
+  (`analyze_beat_grid_from_taps`). The ±3 % fit it replaced could only
+  confirm a tap that was already right. And the tempo comes from the taps'
+  **playhead positions**: one of the track's beats passes per tap whatever
+  the pitch. For five months it came from the wall-clock tap rate, on the
+  strength of a test that had the DJ tapping the track's native tempo while
+  hearing it 8 % slow — a model of something nobody does. The wall-clock
+  rate is the sounding tempo and belongs in the preview only.
+- **Where the beat is, as against the off-beat, is not in any whole-song
+  statistic we could find.** Tried on 1,487 locked Traktor grids
+  (2026-11-19): kick-band onsets, onsets in several bands at once, visual
+  kick edges, kick/snare alternation between consecutive lines. None
+  separates grids on the beat from grids half a beat out — off-beat bass
+  is as low, as wide and as regular as a kick. What does: **where the song
+  starts.** In four of five half-out grids the song's first sound fell
+  half a beat from the lines — which is how Traktor anchors its grid.
+  `move_off_the_off_beat` moves a grid half a beat when the first sound
+  says so *and* the off-beat is the louder; either alone breaks more than
+  it fixes.
+- **A tap means the hit it is BY — nearest, not strongest — and "hit" is
+  what jumps out of the waveform, not what the onset function counts.**
+  The first playing-deck tap took the strongest run of onsets within a
+  third of a beat. On *Hey Ya* the operator's taps, 20 ms ahead of the
+  hit, sent the grid 215 ms away to a guitar strum (more onsets than the
+  beat); with "nearest run of onsets" it went to a hi-hat a sixteenth
+  early. Onsets count everything that starts. The run a DJ taps to is
+  where the **level jumps** beat after beat (`hit_by_the_tap`), weighed
+  against its distance from the tap in milliseconds
+  (`run_by_the_tap`: an 80 ms bell, 30 ms late because taps read early).
+  Replayed from his log in `tests/hey_ya_playing_tap.rs`.
+- **The drift warning is a measurement with scatter; set its limit against
+  grids known to be good, and read the drift with a median.** The ⚠ fired
+  at 3 ms/min on a least-squares slope through "the strongest onset by
+  each line". On *Hey Ya* that read 5.6 for a grid Daniel called perfect
+  (real drift ≈ 4: the Serato tempo is rounded to two decimals). On 1,767
+  grids he locked in Traktor it marked **28 %**. Raising the limit alone
+  does not rescue it — the slope is dragged by strums and hats that come
+  and go with the arrangement, so it both invents drift and under-reads
+  real drift. The median over pairs of hits ≥ 20 s apart
+  (`drift_ms_per_min`) with a limit of 8 (`GridQuality::drifts`) marks
+  7.0 % of the locked grids and catches 92.3 % of a 12 ms/min drift. Two
+  in three of the locked grids still marked drift by the waveform too:
+  they are real, and he mixed on them. Dub marks 4.7 % of its own grids:
+  with least squares it marked only tempos it had rounded to a whole
+  number, because the fit that sets a tempo minimises that slope; the
+  median is not what the fit minimises, so it can disagree with it.
+  **A limit lives in two places** — Rust and
+  `LibraryCellFormat.driftWarningMsPerMin` — change both.
 - **"Set the 1" RE-ANCHORS the whole grid, it does not rotate `bar_phase`.**
   A 1–2 tap on the deck-header BPM re-phases every beat onto the tapped kick
   (`relatch_grid_at_downbeat_tap`), keeping BPM bit-exact. Pure rotation

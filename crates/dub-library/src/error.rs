@@ -196,6 +196,11 @@ pub enum LibraryError {
         /// The conflicting name the caller tried to use.
         name: String,
     },
+
+    /// A setting the caller passed is not one Dub accepts (e.g. an import
+    /// order that doesn't name each app once).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl LibraryError {

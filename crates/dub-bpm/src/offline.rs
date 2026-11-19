@@ -7,7 +7,7 @@
 //! cross-checks itself against in tests — same algorithm internals,
 //! different driving pattern.
 
-use crate::octave_profile::OctaveProfile;
+use crate::octave_profile::{OctaveProfile, TempoOctave};
 use crate::tempo::estimate_tempo;
 use crate::{BpmEstimate, BpmRange, FRAME_SIZE, HOP_SIZE};
 
@@ -68,8 +68,8 @@ pub enum AnalysisError {
     },
 }
 
-/// Analyse a complete audio buffer and return a single tempo estimate
-/// using the default 60–200 BPM search range.
+/// Analyse a complete audio buffer and return a single tempo estimate,
+/// read in the default octave ([`TempoOctave::DEFAULT`], 78–156 BPM).
 ///
 /// `samples` is interleaved (`L R L R …` for stereo, `M M …` for mono).
 /// Stereo input is downmixed to mono internally (mean of L+R).
@@ -85,39 +85,49 @@ pub fn analyze_bpm(
     sample_rate: u32,
     channels: u8,
 ) -> Result<BpmEstimate, AnalysisError> {
-    analyze_bpm_with_profile(samples, sample_rate, channels, OctaveProfile::Default)
+    analyze_bpm_in_octave(samples, sample_rate, channels, TempoOctave::DEFAULT)
 }
 
-/// Like [`analyze_bpm`] but applies a genre-derived [`OctaveProfile`]
-/// during pass-2 octave disambiguation (M11c.3d).
+/// Like [`analyze_bpm`], with the tempo read in `octave`.
+///
+/// # Errors
+///
+/// See [`analyze_bpm`].
+pub fn analyze_bpm_in_octave(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    octave: TempoOctave,
+) -> Result<BpmEstimate, AnalysisError> {
+    analyze_with_odfs(samples, sample_rate, channels, BpmRange::DEFAULT, octave)
+        .map(|(est, _, _)| est)
+}
+
+/// Like [`analyze_bpm`], in the octave `profile`'s genre family is mixed
+/// in ([`OctaveProfile::tempo_octave`]).
+///
+/// # Errors
+///
+/// See [`analyze_bpm`].
 pub fn analyze_bpm_with_profile(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     profile: OctaveProfile,
 ) -> Result<BpmEstimate, AnalysisError> {
-    analyze_bpm_with_range_and_profile(samples, sample_rate, channels, BpmRange::DEFAULT, profile)
-        .map(|(est, _)| est)
-}
-
-/// Like [`analyze_bpm_with_range`] but also applies `profile`.
-pub(crate) fn analyze_bpm_with_range_and_profile(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u8,
-    range: BpmRange,
-    profile: OctaveProfile,
-) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
-    analyze_bpm_with_range_profile_and_odf(samples, sample_rate, channels, range, profile)
+    analyze_bpm_in_octave(
+        samples,
+        sample_rate,
+        channels,
+        profile.tempo_octave(TempoOctave::DEFAULT),
+    )
 }
 
 /// Like [`analyze_bpm`] but restricts the tempo search to `range`.
 ///
-/// Useful when the caller has a strong genre / style prior that the
-/// algorithm's defaults can't disambiguate on its own — e.g. forcing
-/// `BpmRange::new(120.0, 180.0)` on dubstep tracks that the bare
-/// algorithm would (correctly per its math but incorrectly per the
-/// genre convention) report as half-tempo.
+/// A `range` narrower than an octave is searched as given — the caller
+/// knows roughly where the tempo is. A wider one is still cut to the
+/// default octave.
 ///
 /// # Errors
 ///
@@ -128,72 +138,44 @@ pub fn analyze_bpm_with_range(
     channels: u8,
     range: BpmRange,
 ) -> Result<BpmEstimate, AnalysisError> {
-    analyze_bpm_with_range_and_profile(
-        samples,
-        sample_rate,
-        channels,
-        range,
-        OctaveProfile::Default,
-    )
-    .map(|(est, _)| est)
+    analyze_with_odfs(samples, sample_rate, channels, range, TempoOctave::DEFAULT)
+        .map(|(est, _, _)| est)
 }
 
-/// Internal hook shared by offline BPM + beat-grid analysis.
-#[allow(dead_code)]
-pub(crate) fn analyze_bpm_with_range_and_odf(
+/// The tempo estimate plus the two onset envelopes it was read from:
+/// broadband, and the kick band the downbeat picker uses.
+pub(crate) fn analyze_with_odfs(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     range: BpmRange,
-) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
-    analyze_bpm_with_range_profile_and_odf(
-        samples,
-        sample_rate,
-        channels,
-        range,
-        OctaveProfile::Default,
-    )
-}
-
-fn analyze_bpm_with_range_profile_and_odf(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u8,
-    range: BpmRange,
-    profile: OctaveProfile,
-) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
-    let (estimate, odf, _) =
-        analyze_bpm_with_range_profile_and_odfs(samples, sample_rate, channels, range, profile)?;
-    Ok((estimate, odf))
-}
-
-/// Like [`analyze_bpm_with_range_profile_and_odf`] but also returns
-/// the kick-band ODF for M11d.7 downbeat detection.
-pub(crate) fn analyze_bpm_with_range_profile_and_odfs(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u8,
-    range: BpmRange,
-    profile: OctaveProfile,
+    octave: TempoOctave,
 ) -> Result<(BpmEstimate, Vec<f32>, Vec<f32>), AnalysisError> {
-    let (estimate, detector) = analyze_bpm_with_range_profile_into_detector(
-        samples,
-        sample_rate,
-        channels,
-        range,
-        profile,
-    )?;
+    let detector = detect_onsets(samples, sample_rate, channels, range)?;
+    let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
+    let estimate =
+        estimate_tempo(detector.odf(), odf_sr, range, octave).unwrap_or(BpmEstimate::NONE);
     let (odf, kick_odf) = detector.into_odfs();
     Ok((estimate, odf, kick_odf))
 }
 
-fn analyze_bpm_with_range_profile_into_detector(
+/// The broadband and kick-band onset envelopes alone, for callers that
+/// already have a tempo (a tap, a stored grid) and only need to see where
+/// the hits are.
+pub(crate) fn onset_envelopes(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+) -> Result<(Vec<f32>, Vec<f32>), AnalysisError> {
+    Ok(detect_onsets(samples, sample_rate, channels, BpmRange::DEFAULT)?.into_odfs())
+}
+
+fn detect_onsets(
     samples: &[f32],
     sample_rate: u32,
     channels: u8,
     range: BpmRange,
-    profile: OctaveProfile,
-) -> Result<(BpmEstimate, crate::onset::OnsetDetector), AnalysisError> {
+) -> Result<crate::onset::OnsetDetector, AnalysisError> {
     if sample_rate == 0 {
         return Err(AnalysisError::ZeroSampleRate);
     }
@@ -237,9 +219,7 @@ fn analyze_bpm_with_range_profile_into_detector(
         detector.process(&mono);
     }
 
-    let estimate =
-        estimate_tempo(detector.odf(), odf_sr, range, profile).unwrap_or(BpmEstimate::NONE);
-    Ok((estimate, detector))
+    Ok(detector)
 }
 
 #[cfg(test)]

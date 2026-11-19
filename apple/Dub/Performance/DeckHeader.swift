@@ -1091,9 +1091,7 @@ struct DeckHeader: View {
                         .font(.system(size: 9))
                         .foregroundStyle(
                             state.followingGrid ? DubColor.gridMoving : DubColor.textSecondary)
-                } else if let drift = state.gridDriftQuality,
-                          abs(drift) >= 3
-                {
+                } else if LibraryCellFormat.drifts(state.gridDriftQuality) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 9))
                         .foregroundStyle(.orange)
@@ -1564,7 +1562,7 @@ extension DeckHeaderState {
         timeRow: .remainingOnly,
         isMaster: true, isPlaying: true,
         isPanicPlay: true, useTimecodeToggle: true,
-        gridLocked: false, gridDriftQuality: 4.5),
+        gridLocked: false, gridDriftQuality: 12),
         mirrored: true)
         .frame(width: 720)
         .background(DubColor.surface0)

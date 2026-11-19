@@ -16,7 +16,10 @@
 //! placement as a diagnostic for inspection (no over-assertion on the
 //! genuinely ambiguous quantity).
 
-use dub_bpm::{analyze_beat_grid, eval, refine_downbeat_backbeat, synthetic};
+use dub_bpm::{
+    analyze_beat_grid, analyze_beat_grid_with_profile, eval, refine_downbeat_backbeat, synthetic,
+    OctaveProfile,
+};
 
 const SR: u32 = 44_100;
 const DUR: f64 = 24.0;
@@ -29,9 +32,10 @@ fn truth_beats(bpm: f64, dur: f64) -> Vec<f64> {
     (0..n).map(|k| k as f64 * beat).collect()
 }
 
-/// Analyze a mono pattern and return (grid, F-measure vs ground truth).
-fn analyze(samples: &[f32], bpm: f64) -> (dub_bpm::BeatGrid, f64) {
-    let grid = analyze_beat_grid(samples, SR, 1).expect("grid must lock");
+/// Analyze a mono pattern as `profile`'s genre and return (grid,
+/// F-measure vs ground truth).
+fn analyze(samples: &[f32], bpm: f64, profile: OctaveProfile) -> (dub_bpm::BeatGrid, f64) {
+    let grid = analyze_beat_grid_with_profile(samples, SR, 1, profile).expect("grid must lock");
     let f = eval::f_measure(&grid.beats, &truth_beats(bpm, DUR), eval::F_MEASURE_TOL);
     (grid, f)
 }
@@ -72,7 +76,7 @@ fn report_downbeat(name: &str, grid: &dub_bpm::BeatGrid, samples: &[f32], bpm: f
 fn hip_hop_beat_phase_locks() {
     let bpm = 93.0;
     let s = synthetic::drum_pattern_hip_hop(bpm, DUR, SR);
-    let (grid, f) = analyze(&s, bpm);
+    let (grid, f) = analyze(&s, bpm, OctaveProfile::HipHop);
     report_downbeat("hip-hop", &grid, &s, bpm);
     assert!(
         f > 0.9,
@@ -84,7 +88,7 @@ fn hip_hop_beat_phase_locks() {
 fn dnb_rolling_beat_phase_locks() {
     let bpm = 174.0;
     let s = synthetic::drum_pattern_drum_n_bass(bpm, DUR, SR);
-    let (grid, f) = analyze(&s, bpm);
+    let (grid, f) = analyze(&s, bpm, OctaveProfile::DrumAndBass);
     report_downbeat("dnb", &grid, &s, bpm);
     assert!(
         f > 0.9,
