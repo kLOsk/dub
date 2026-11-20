@@ -195,6 +195,10 @@ pub struct DeckSharedState {
     /// header's green/dim key-lock dot (PRD §6.1.1). Plain relaxed atomic — a
     /// one-block tear is invisible.
     key_lock_state: AtomicU8,
+    /// The band's beats and the DJ's switch for steadying
+    /// ([`crate::steady`]): written by the control thread, read here once
+    /// a block.
+    steady: crate::steady::SteadyMap,
     /// M15 echo-out state, published each block: `0` = off, `1` = engaged
     /// (dry muted, loop repeating), `2` = engaged & ready to auto-off (muted
     /// input + wet tail both silent). Drives the deck's echo-out pad glow
@@ -420,6 +424,7 @@ impl DeckSharedState {
             loop_in_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             key_lock_state: AtomicU8::new(0),
+            steady: crate::steady::SteadyMap::new(),
             echo_state: AtomicU8::new(0),
             siren_state: AtomicU8::new(0),
             quick_scratch_slot: AtomicU8::new(crate::quick_scratch::QUICK_SCRATCH_NONE),
@@ -556,6 +561,13 @@ impl DeckSharedState {
     #[must_use]
     pub fn load_key_lock_state(&self) -> u8 {
         self.key_lock_state.load(Ordering::Relaxed)
+    }
+
+    /// The deck's steadying: where the control thread lays the band's
+    /// beats and turns the DJ's switch, and reads what the deck is doing.
+    #[must_use]
+    pub fn steady(&self) -> &crate::steady::SteadyMap {
+        &self.steady
     }
 
     /// Publish the M15 echo-out indicator state (0 off / 1 engaged) from the
@@ -1096,6 +1108,13 @@ pub struct Deck {
     /// user-set enable, plumbed via [`Command::DeckSetKeyLock`].
     key_lock_enabled: bool,
 
+    /// How much faster than the band played it the last block played the
+    /// record, to hold it to its tempo ([`crate::steady`]); `None` when
+    /// the block was not steadied. Read at the top of a block it says
+    /// what the DJ's switch wants of the stretcher, which is the question
+    /// the engage decision asks.
+    steadying: Option<f64>,
+
     /// M14 live A/B: which time-stretch engine engages when key lock is
     /// on. `ResamplerOnly` means "never engage" (no key lock — pitch
     /// shifts with rate). Plumbed via [`Command::DeckSetStretchBackend`].
@@ -1259,6 +1278,7 @@ impl Deck {
             pending_advance: None,
             loop_region: None,
             key_lock_enabled: false,
+            steadying: None,
             stretch_backend: dub_stretch::StretchBackend::DubOwn,
             stretchers,
             stretch_in: vec![0.0; KL_FEED_HOP * 2].into_boxed_slice(),
@@ -1595,8 +1615,10 @@ impl Deck {
             dub_stretch::StretchBackend::ResamplerOnly => false,
             dub_stretch::StretchBackend::DubOwn => true,
         };
-        let base_ok = self.key_lock_enabled
-            && backend_ok
+        // Steadying engages the stretcher whatever the key-lock backend
+        // says: that setting is about holding pitch, and with it off the
+        // pitch is simply left to the platter.
+        let base_ok = ((self.key_lock_enabled && backend_ok) || self.steadying.is_some())
             && self.playing
             && self.rate.is_finite()
             && self.rate > KL_MIN_RATE
@@ -1606,6 +1628,13 @@ impl Deck {
         let can_engage = base_ok && slew < KL_SLEW_ENGAGE;
         let must_bypass = !base_ok || slew >= KL_SLEW_DISENGAGE;
         (can_engage, must_bypass)
+    }
+
+    /// Whether the last block held the record to its tempo: its playhead
+    /// then moved by more or less than the platter did, on purpose.
+    #[must_use]
+    pub fn is_steadying(&self) -> bool {
+        self.steadying.is_some() && !matches!(self.lock_state, KeyLockState::Bypassed)
     }
 
     /// Current playback position in track frames.
@@ -1929,6 +1958,40 @@ impl Deck {
             .source
             .as_ref()
             .map_or(1.0, |t| f64::from(t.sample_rate()) / engine_sr_f);
+        // Steadying: how much faster than the band played it this block
+        // plays the record, read once where the block starts. A beat is
+        // some hundred blocks long, so the step at a beat's edge lands a
+        // few milliseconds late at most.
+        self.steadying = self.source.as_ref().and_then(|t| {
+            let sr = f64::from(t.sample_rate());
+            #[allow(clippy::cast_precision_loss)]
+            let on_the_record = pos >= 0.0 && pos < t.frames() as f64;
+            (sr > 0.0 && on_the_record && loop_region.is_none())
+                .then(|| {
+                    self.shared
+                        .steady
+                        .factor_at(Arc::as_ptr(t) as usize, pos / sr)
+                })
+                .flatten()
+        });
+        // What the stretcher is asked for when it runs this block. Key
+        // lock feeds it the record at its own speed and has it make up
+        // the platter's; without key lock the pitch is the platter's, so
+        // the record is fed at the platter's speed and the stretcher only
+        // makes up what steadying asks. The playhead moves at the two
+        // together either way.
+        let steady_factor = self.steadying.unwrap_or(1.0);
+        let holds_pitch = self.key_lock_enabled
+            && matches!(self.stretch_backend, dub_stretch::StretchBackend::DubOwn);
+        let (engaged_feed, engaged_tempo) = if holds_pitch {
+            (feed_increment, self.rate * steady_factor)
+        } else {
+            (new_increment, steady_factor)
+        };
+        let engaged_increment = new_increment * steady_factor;
+        // Whether the stretcher ran this block: only then did steadying
+        // move the playhead.
+        let mut stretched = false;
 
         // Loop seam window, computed once per block. Capped at a
         // quarter of the loop body so a short loop keeps some
@@ -2090,7 +2153,7 @@ impl Deck {
                                     &self.declick_envelope,
                                     &mut self.read_cursor,
                                     pos,
-                                    feed_increment,
+                                    engaged_feed,
                                     loop_seam,
                                     &mut self.stretch_in,
                                     &mut self.stretch_out,
@@ -2109,9 +2172,9 @@ impl Deck {
                                 offset,
                                 frames_consumed_in_fade,
                                 gain,
-                                self.rate,
-                                new_increment,
-                                feed_increment,
+                                engaged_tempo,
+                                engaged_increment,
+                                engaged_feed,
                                 loop_seam,
                                 &mut pos,
                                 &mut self.read_cursor,
@@ -2123,13 +2186,11 @@ impl Deck {
                             );
                         }};
                     }
-                    match self.stretch_backend {
-                        dub_stretch::StretchBackend::DubOwn => {
-                            engaged!(&mut self.stretchers.splice);
-                        }
-                        // ResamplerOnly: unreachable — engage requires `backend_ok`.
-                        dub_stretch::StretchBackend::ResamplerOnly => {}
-                    }
+                    // One stretcher. With the `ResamplerOnly` backend the
+                    // deck engages only to steady, and `holds_pitch` above
+                    // has already left the pitch to the platter.
+                    engaged!(&mut self.stretchers.splice);
+                    stretched = true;
                 }
 
                 // End-of-track flag tracks the steady-state position only;
@@ -2162,7 +2223,9 @@ impl Deck {
         // timecode), but the guard makes the precedence explicit.
         if self.playing && self.source.is_some() && loop_region.is_none() {
             if let Some(delta) = advance {
-                let pinned = block_start + delta;
+                // The platter moved `delta`; a steadied record moves by
+                // that times what steadying asked of this block.
+                let pinned = block_start + delta * if stretched { steady_factor } else { 1.0 };
                 let correction = pinned - pos;
                 pos = pinned;
                 // Key lock engaged: the stretcher follows the tempo it was
@@ -2175,7 +2238,7 @@ impl Deck {
                 // re-prime cleanly at the new position.
                 if !matches!(self.lock_state, KeyLockState::Bypassed) {
                     if correction.abs() <= KL_MAX_REPIN_FRAMES {
-                        self.stretchers.splice.owe(correction / feed_increment);
+                        self.stretchers.splice.owe(correction / engaged_feed);
                     } else {
                         self.lock_state = KeyLockState::Bypassed;
                         self.settle_frames = 0;
@@ -2198,6 +2261,17 @@ impl Deck {
             2
         };
         self.shared.store_key_lock_state(kl_state);
+        let steadied = stretched && self.steadying.is_some();
+        self.shared.steady.store_state(
+            if steadied {
+                crate::steady::SteadyState::Steadying
+            } else if self.shared.steady.is_on() {
+                crate::steady::SteadyState::Waiting
+            } else {
+                crate::steady::SteadyState::Off
+            },
+            if steadied { steady_factor } else { 1.0 },
+        );
         self.shared.store_position(pos);
         // Publish playhead in seconds for the lock-free
         // `position_snapshot` reader (M11d.6 round 5). One divide
@@ -2228,7 +2302,12 @@ impl Deck {
                 let track_sr = f64::from(track.sample_rate());
                 if track_sr > 0.0 {
                     let secs = pos / track_sr;
-                    let pub_rate = if self.playing { self.rate } else { 0.0 };
+                    let moving = if steadied { steady_factor } else { 1.0 };
+                    let pub_rate = if self.playing {
+                        self.rate * moving
+                    } else {
+                        0.0
+                    };
                     (secs, pub_rate)
                 } else {
                     (0.0, 0.0)
@@ -2511,7 +2590,7 @@ fn kl_prime<S: TimeStretcher>(
 }
 
 /// Render the steady-state engaged path for one block: the record goes to
-/// `stretcher` at its own speed and comes back at the platter's tempo, with
+/// `stretcher` at `feed_increment` and comes back `rate` times as fast, with
 /// the bypass↔engaged equal-power crossfade while `*lock_state` is
 /// `Engaging`. The audible playhead `*pos` advances by `new_increment` per
 /// output frame in every state, so the publish path is unchanged;
@@ -2540,9 +2619,9 @@ fn render_engaged<S: TimeStretcher>(
     out_read: &mut usize,
     lock_state: &mut KeyLockState,
 ) {
-    // The stretcher changes the record's length and nothing else: played at
-    // `rate`, it lasts `1 / rate` as long. `rate > 0` is guaranteed by the
-    // engage predicate.
+    // The stretcher changes the length of what it is fed and nothing else:
+    // played `rate` times as fast, it lasts `1 / rate` as long. `rate > 0`
+    // is guaranteed by the engage predicate and the bounds on steadying.
     stretcher.set_time_ratio(1.0 / rate);
     stretcher.set_pitch_scale(1.0);
 
@@ -3453,6 +3532,214 @@ mod tests {
                 deck.render(&mut rt, &mut out, 48_000.0);
             }
         });
+    }
+
+    /// A band that wanders: a tone with a click on every beat around
+    /// 120 BPM — a bar 2 % slower, a bar on it, a bar 2 % faster, and
+    /// round again, so the tempo it keeps is 120. The track, and the
+    /// beats in seconds.
+    fn steady_band(bars: usize) -> (Arc<Track>, Vec<f64>) {
+        let mut at = 24_137usize;
+        let mut clicks = Vec::new();
+        for bar in 0..bars {
+            let gap = [24_480, 24_000, 23_520][bar % 3];
+            for _ in 0..4 {
+                clicks.push(at);
+                at += gap;
+            }
+        }
+        let frames = at + 24_000;
+        let mut s = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let v = (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() * 0.1;
+            s[i * 2] = v;
+            s[i * 2 + 1] = v;
+        }
+        for &at in &clicks {
+            for k in 0..48 {
+                let v = if k % 2 == 0 { 0.9 } else { -0.9 };
+                s[(at + k) * 2] += v;
+                s[(at + k) * 2 + 1] += v;
+            }
+        }
+        let beats = clicks.iter().map(|&c| c as f64 / 48_000.0).collect();
+        (const_track(&s, 2, 48_000), beats)
+    }
+
+    /// The frames at which the output's clicks start.
+    fn steady_clicks(stereo: &[f32]) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < stereo.len() / 2 {
+            if stereo[i * 2].abs() > 0.5 {
+                found.push(i);
+                i += 4_800;
+            } else {
+                i += 1;
+            }
+        }
+        found
+    }
+
+    /// The furthest any gap between clicks, from the fourth on, is from
+    /// `gap` frames.
+    fn steady_unevenness(clicks: &[usize], gap: f64) -> f64 {
+        assert!(clicks.len() >= 20, "clicks heard: {}", clicks.len());
+        clicks[3..]
+            .windows(2)
+            .map(|w| ((w[1] - w[0]) as f64 - gap).abs())
+            .fold(0.0, f64::max)
+    }
+
+    fn steady_deck(track: &Arc<Track>, beats: &[f64], lock: bool, rate: f64) -> Deck {
+        let mut deck = test_deck();
+        deck.set_source(track.clone());
+        deck.set_playing(true);
+        // As the app sets a deck: key lock off is the resampler backend.
+        deck.set_stretch_backend(if lock {
+            dub_stretch::StretchBackend::DubOwn
+        } else {
+            dub_stretch::StretchBackend::ResamplerOnly
+        });
+        deck.set_key_lock(lock);
+        deck.set_rate(rate);
+        deck.quiesce_declick_for_test();
+        deck.shared
+            .steady()
+            .install(Arc::as_ptr(track) as usize, beats);
+        deck
+    }
+
+    /// Steadying is the whole point of the splice stretcher's rework: a
+    /// band that moves 2 % either side of its tempo, bar by bar, heard at
+    /// one tempo — with key lock and without, at the record's speed and
+    /// off it.
+    #[test]
+    fn a_steadied_record_keeps_one_tempo() {
+        let (track, beats) = steady_band(9);
+        for (lock, rate) in [(false, 1.0), (true, 1.0), (true, 1.04), (false, 0.97)] {
+            let gap = 24_000.0 / rate;
+            let blocks = (track.frames() as f64 / rate / 256.0) as usize - 8;
+
+            let mut band = steady_deck(&track, &beats, lock, rate);
+            let as_played =
+                steady_unevenness(&steady_clicks(&kl_render(&mut band, blocks, 256)), gap);
+            assert!(
+                as_played > 400.0,
+                "off, the band is heard as it played: {as_played} frames (lock {lock}, x{rate})"
+            );
+            assert_eq!(
+                band.shared.steady().state(),
+                crate::steady::SteadyState::Off
+            );
+
+            let mut deck = steady_deck(&track, &beats, lock, rate);
+            deck.shared.steady().set_on(true);
+            let steadied =
+                steady_unevenness(&steady_clicks(&kl_render(&mut deck, blocks, 256)), gap);
+            assert!(
+                steadied <= 144.0,
+                "steadied, a beat is {:.1} ms off its tempo (lock {lock}, x{rate})",
+                steadied / 48.0
+            );
+        }
+    }
+
+    /// Steadying holds the tempo, not the pitch: that is still the
+    /// platter's without key lock, and the record's with it.
+    #[test]
+    fn steadying_leaves_the_pitch_to_the_platter_and_key_lock() {
+        let (track, beats) = steady_band(9);
+        for (lock, rate, heard) in [
+            (false, 1.04, 228.8),
+            (true, 1.04, 220.0),
+            (false, 1.0, 220.0),
+        ] {
+            let mut deck = steady_deck(&track, &beats, lock, rate);
+            deck.shared.steady().set_on(true);
+            let out = kl_render(&mut deck, 600, 256);
+            assert_eq!(
+                deck.shared.steady().state(),
+                crate::steady::SteadyState::Steadying
+            );
+            // Between two clicks, so the tone alone is read.
+            let f = kl_fundamental(&out, 100_000);
+            assert!(
+                (f - heard).abs() < 3.0,
+                "the tone is heard at {f} Hz, wanted {heard} (lock {lock}, x{rate})"
+            );
+        }
+    }
+
+    /// On a timecode deck the groove says how far the record moved, and a
+    /// steadied record moves by that times what steadying asks. The
+    /// re-pin has to carry it, or it pulls every beat back to the band's.
+    #[test]
+    fn a_steadied_timecode_deck_keeps_one_tempo() {
+        let (track, beats) = steady_band(9);
+        let mut deck = steady_deck(&track, &beats, true, 1.0);
+        deck.shared.steady().set_on(true);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut audio = Vec::new();
+        let blocks = track.frames() / 256 - 8;
+        let mut steadied = 0;
+        for b in 0..blocks {
+            let wobble = 0.002 * ((b as f64) * 0.7).sin();
+            deck.set_rate(1.0 + wobble);
+            deck.advance_position_frames(256.0 * (1.0 + 0.5 * wobble));
+            out.fill(0.0);
+            deck.render(&mut rt, &mut out, 48_000.0);
+            audio.extend_from_slice(&out);
+            steadied += usize::from(deck.is_steadying());
+        }
+        // All of it but the lead-in, the engage and the tail past the
+        // last beat.
+        assert!(steadied > blocks * 8 / 10, "{steadied} of {blocks} blocks");
+        let uneven = steady_unevenness(&steady_clicks(&audio), 24_000.0);
+        assert!(
+            uneven <= 144.0,
+            "steadied on timecode, a beat is {:.1} ms off its tempo",
+            uneven / 48.0
+        );
+    }
+
+    /// Beats laid for another track steady nothing: a track loaded since
+    /// plays as it is until its own are laid.
+    #[test]
+    fn beats_for_another_track_steady_nothing() {
+        let (track, beats) = steady_band(9);
+        let (other, _) = steady_band(9);
+        let mut deck = steady_deck(&track, &beats, false, 1.0);
+        deck.shared.steady().set_on(true);
+        deck.set_source(other.clone());
+        deck.quiesce_declick_for_test();
+        let blocks = other.frames() / 256 - 8;
+        let uneven =
+            steady_unevenness(&steady_clicks(&kl_render(&mut deck, blocks, 256)), 24_000.0);
+        assert!(uneven > 400.0, "the other track plays as it is: {uneven}");
+        assert_eq!(
+            deck.shared.steady().state(),
+            crate::steady::SteadyState::Waiting
+        );
+    }
+
+    #[test]
+    fn a_steadied_render_is_alloc_free() {
+        let (track, beats) = steady_band(6);
+        let mut deck = steady_deck(&track, &beats, false, 1.02);
+        deck.shared.steady().set_on(true);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut steadied = 0;
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..600 {
+                out.fill(0.0);
+                deck.render(&mut rt, &mut out, 48_000.0);
+                steadied += usize::from(deck.is_steadying());
+            }
+        });
+        assert!(steadied > 400, "{steadied} of 600 blocks steadied");
     }
 
     #[test]

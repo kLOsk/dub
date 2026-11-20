@@ -1212,7 +1212,7 @@ tempo-synced features still read the one tempo; lines sit at onset-frame
 precision. Straightening the audio to the even grid (warping) would build
 on this and is not started.
 
-**The pulse (2026-11-19, not yet used by the app).** A line on each hit is
+**The pulse (2026-11-19; the following grid's lines since 2026-11-20).** A line on each hit is
 the band's feel; straightening a record needs the tempo underneath it.
 `dub_bpm::band_pulse` reads that: through a window four bars wide, moved a
 bar at a time, every tempo within 8 % of the track's and every place the
@@ -1233,6 +1233,39 @@ first and last 20 seconds left out:
 | Steady: songs never more than 0.5 % off | 31 % | 91 % |
 | Drifting ±1 %: off, median song (rms) | 0.23 % | 0.06 % |
 | Drifting ±1 %: songs never more than 0.5 % off | 27 % | 87 % |
+
+**Wired in (2026-11-20, FFI 93; for Daniel to judge).** `follow_grid`
+still asks the hits whether a track is followed — a line on each is what
+shows a band leaving the even grid — and then lays the lines on the pulse,
+on the side of the beat the hits are mostly on (`pulse::pulse_near`). A track
+is also followed when its pulse leaves the even grid by 150 ms or more,
+whatever the hits say: *Ain't No Mountain High Enough* wanders a third of
+a second and its hits land on only 1.1× the even grid's onset, so the
+hits' test turned it away, and it had only been shown as followed from a
+saved map (Daniel, 2026-11-20: "it should be"). That adds *The Passenger*
+and *Lust for Life* too, and none of 99 Traktor-locked tracks. An
+unlocked track is followed afresh at each load, since a saved map does not
+say which tracker made it; a locked one plays as saved. Checked on twelve
+of his tracks: on six the lines sit 4–9 ms from the hits; on *Mary Jane*
+the pulse is a straight line at 93.0 BPM where the even grid says 92.5 and
+the hits jump half a beat from section to section — the old lines were
+the ones moving. Open: on *Funky Kingston* and *Gold* pulse and hits part
+by half a beat for whole sections and it is not known which is right, so
+lines can still sit on the off-beat in places.
+
+**Steadying (2026-11-20, Alpha, FFI 93; built, untried).** A deck's
+**STEADY** switch, shown beside LOCK on a record whose grid follows its
+band: on, each beat is played in the time a beat takes at the tempo the
+band keeps — the middle gap of its beats — so the record holds one tempo
+while a second is brought in; off, the band plays as it played (Daniel,
+2026-11-19: "pull them in line during transition but keep them funky when
+you dont transition"). `DubEngine::set_deck_steady`,
+`DeckTelemetry.steady_state`, `dub_engine::steady`. The pitch stays the
+platter's, or the record's under key lock. It lets go through a scratch,
+in a loop, and over any gap more than 8 % off the tempo — a break, a lost
+beat — and a load turns it off. On timecode the playhead moves by more or
+less than the groove on purpose, so drift healing stands down while it
+holds. The readout says **BPM · STEADY** and shows the held tempo.
 
 Over the library (2,547 tracks), the four-bar tempo's whole swing in the
 body of a track is 0.19 % at the median where the Traktor grid is locked

@@ -18,6 +18,11 @@
 //!
 //! A track the even grid already fits is left alone — [`follow_grid`]
 //! answers `None`, and the even grid, exact and drift-free, stands.
+//!
+//! Since 2026-11-20 that chain decides *whether* a track is followed and
+//! the lines themselves are laid on the band's pulse ([`crate::pulse`]):
+//! a line on each hit moves a percent or two from bar to bar on a record
+//! a drum machine made, which is the players' feel and not the tempo.
 
 use crate::beats::BeatGrid;
 use dub_spectral::HOP_SIZE;
@@ -44,6 +49,34 @@ const WANDER_SECS_TO_FOLLOW: f64 = 0.060;
 /// wobbles for nothing is worse than one that is even.
 const FIT_GAIN_TO_FOLLOW: f64 = 1.5;
 
+/// The even grid also gives way when the band's pulse leaves it by this
+/// much ([`leaves_the_grid_secs`]), whatever the hits say. *Ain't No
+/// Mountain High Enough* is why: its band wanders a third of a second
+/// off any even grid, and the hits land on only 1.1× the onset the even
+/// grid's lines do — under [`FIT_GAIN_TO_FOLLOW`] — because a line a
+/// little off a soft soul kick loses little. The pulse does not ask how
+/// loud the hits are.
+const PULSE_LEAVES_GRID_SECS: f64 = 0.150;
+
+/// How far the pulse's beats move against a grid of `period` seconds a
+/// beat: each beat's distance from where its count puts it, as the
+/// spread between the 5th and 95th percentile. A drum machine at the
+/// grid's tempo reads next to nothing; a band, or a steady record whose
+/// grid has the tempo a little wrong, reads a large part of a beat.
+fn leaves_the_grid_secs(pulse: &[f64], period: f64) -> f64 {
+    if pulse.len() < 16 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mut off: Vec<f64> = pulse
+        .iter()
+        .enumerate()
+        .map(|(i, &at)| at - i as f64 * period)
+        .collect();
+    off.sort_by(f64::total_cmp);
+    off[off.len() * 95 / 100] - off[off.len() * 5 / 100]
+}
+
 /// The band's own beats for a track `grid` lays evenly, or `None` when
 /// the even grid already fits (or nothing better is found) and should
 /// stand.
@@ -64,10 +97,32 @@ pub fn follow_grid(
     let (odf, _) = crate::offline::onset_envelopes(samples, sample_rate, channels).ok()?;
     #[allow(clippy::cast_precision_loss)]
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
-    let beats = beats_on_the_band(&odf, odf_sr, samples, sample_rate, channels, grid.bpm)?;
-    if beats.len() < 8 || !worth_following(&odf, odf_sr, &beats, &grid.beats) {
+    let hits = beats_on_the_band(&odf, odf_sr, samples, sample_rate, channels, grid.bpm)?;
+    if hits.len() < 8 {
         return None;
     }
+    // Whether to follow is asked of the hits: a line on each is what
+    // shows a band wandering off the even grid. Where the lines then go
+    // is the pulse underneath (`crate::pulse`) — the tempo the band keeps,
+    // which is what a deck's tempo readout and steadying want, and not
+    // each laid-back snare. The hits say which side of the beat it is on.
+    let pulse = crate::pulse::pulse_near(
+        &odf,
+        odf_sr,
+        samples,
+        sample_rate,
+        channels,
+        grid.bpm,
+        &hits,
+    )
+    .filter(|pulse| pulse.len() >= 8);
+    let leaves = pulse
+        .as_ref()
+        .is_some_and(|p| leaves_the_grid_secs(p, 60.0 / grid.bpm) >= PULSE_LEAVES_GRID_SECS);
+    if !leaves && !worth_following(&odf, odf_sr, &hits, &grid.beats) {
+        return None;
+    }
+    let beats = pulse.unwrap_or(hits);
 
     let bar = usize::from(grid.beats_per_bar.max(1));
     let one = grid.beats[usize::from(grid.bar_phase).min(grid.beats.len() - 1)];
@@ -309,6 +364,7 @@ fn worth_following(odf: &[f32], odf_sr: f64, followed: &[f64], even: &[f64]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::beats::uniform_beats;
     use crate::synthetic::click_track;
 

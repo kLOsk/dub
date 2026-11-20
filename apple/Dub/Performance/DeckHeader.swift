@@ -199,6 +199,9 @@ struct DeckHeaderState: Equatable {
     /// loop — armed, nothing to hold yet — and the button's dot says so
     /// rather than claiming the stretcher is working.
     var keyLockState: UInt8 = 0
+    /// Steadying as the engine has it: 0 off · 1 on, nothing held for
+    /// now · 2 held to its tempo. See `WaveformAppModel.toggleSteady`.
+    var steadyState: UInt8 = 0
 
     /// Format / SR caption ("MP3 · 44.1 kHz · stereo"). `nil` for
     /// Thru / off decks.
@@ -272,7 +275,11 @@ struct DeckHeaderState: Equatable {
     var followingGrid: Bool = false
 
     /// The BPM readout's label.
-    var bpmLabel: String { followingGrid ? "BPM · FOLLOW" : "BPM" }
+    var bpmLabel: String {
+        // Held to its tempo, the record is not following anything.
+        if steadyState == 2 { return "BPM · STEADY" }
+        return followingGrid ? "BPM · FOLLOW" : "BPM"
+    }
 
     enum Source: Equatable {
         case off
@@ -1445,6 +1452,7 @@ extension DeckHeaderState {
                 gridDriftQuality: deckState.gridDriftQuality,
                 historyHint: deckState.historyHint)
             header.followingGrid = deckState.localBpm != nil
+            header.steadyState = deckState.steadyState
             header.timecodeReadiness = Self.timecodeReadiness(from: deckState)
             return header
         }

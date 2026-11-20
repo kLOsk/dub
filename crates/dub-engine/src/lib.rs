@@ -41,6 +41,7 @@ pub mod realtime;
 pub mod sampler;
 /// The dub siren's five-shot bank (PRD §6.3).
 pub mod siren_bank;
+pub mod steady;
 pub mod thru;
 pub mod timecode;
 
@@ -1794,6 +1795,16 @@ impl Engine {
                         if let Some(track_sr) = track_sr {
                             let delta = advance_frames * track_sr / f64::from(self.sample_rate);
                             deck.advance_position_frames(delta);
+                            // A steadied record moves by more or less
+                            // than the groove on purpose, a beat at a
+                            // time. That is not drift to heal — healing
+                            // it would undo the steadying — and where it
+                            // leaves the playhead is where the groove
+                            // meets the track from now on.
+                            if deck.is_steadying() {
+                                self.tc_drift[idx].note_remap();
+                                continue;
+                            }
                             // Groove-continuity healing (PRD §5.4.3):
                             // with this block's exact advance applied,
                             // playhead and groove position sit on the

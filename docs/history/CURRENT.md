@@ -94,6 +94,22 @@ gate is local-only because GitHub CI has no macOS app job.
   arrow folds. No row-height setting and no shortcut for the size: the
   one setting is enough (Daniel, 2026-11-20).
 
+- **The following grid on the band's pulse, and a STEADY switch
+  (2026-11-20, Daniel: "tempo tracker i need to judge. please wire it in.
+  i would want to try the transition way"; uncommitted, built, FFI 93,
+  none of it heard or seen in the app yet).** Both are behind
+  Preferences ▸ Alpha ▸ Following beat grid. The followed grid's lines
+  are the pulse (`band_pulse`), with the hit chain deciding whether a
+  track is followed and which side of the beat the lines are on; unlocked
+  tracks are followed afresh at every load. **STEADY**, beside LOCK on a
+  deck whose grid follows, holds the record to the band's own middle
+  tempo while it is on (`dub_engine::steady`, `set_deck_steady`): the
+  transition switch. Details and what is open in PRD-BEATS, "Wired in"
+  and "Steadying". For Daniel to judge: whether the lines sit right
+  (known weak: whole sections half a beat off on some tracks), and
+  whether steadying sounds right and helps a mix. Not done: a key for
+  STEADY in the key map; snapshot baselines for the deck row.
+
 - **A click on a playlist: 670 ms → 150 ms (2026-11-20, Daniel:
   "Traktor clicking of the library is instant … can we get there?";
   uncommitted, built, measured with `LibraryBench` in a Release build on

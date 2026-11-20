@@ -136,6 +136,9 @@ struct DeckColumnHeader: Equatable {
     /// it (0 off · 1 standby · 2 engaged).
     var keyLockOn: Bool = false
     var keyLockState: UInt8 = 0
+    /// Steadying, as the engine has it (0 off · 1 on, nothing held for
+    /// now · 2 held to its tempo).
+    var steadyState: UInt8 = 0
     /// The deck is still in its session-start measurement (whitening
     /// capture, then the pitch settle) and the engine is holding the
     /// track. A flag, not the progress: the progress is continuous and
@@ -185,6 +188,7 @@ struct DeckColumnHeader: Equatable {
         calibrating = !state.pitchSettled
         keyLockOn = state.keyLockOn
         keyLockState = state.keyLockState
+        steadyState = state.steadyState
         pitchTenths = state.pitchPercent.map { ($0 * 10).rounded() / 10 }
         baseBpm = state.bpm
         tempoPitchPercent = state.tempoPitchPercent
@@ -256,6 +260,8 @@ struct DeckColumnCallbacks {
     /// M14 key lock on / off. `nil` hides the button — Prep has no
     /// platter to hold a pitch against.
     var onToggleKeyLock: (() -> Void)? = nil
+    /// Steadying on / off, for a deck whose grid follows its band.
+    var onToggleSteady: (() -> Void)? = nil
 }
 
 /// Skippable: SwiftUI compares `state` and rebuilds only when it moved.
@@ -764,6 +770,7 @@ struct DeckColumn<Overview: View>: View {
                 liveDeckIdx.map { DeckReadouts.Live(engine: engine, deckIdx: $0) }
             },
             onToggleKeyLock: state.isThru ? nil : callbacks.onToggleKeyLock,
+            onToggleSteady: state.isThru ? nil : callbacks.onToggleSteady,
             onTapTempo: state.header.thruTempo == nil ? nil : callbacks.onTapTempo,
             onScaleTempo: callbacks.onScaleTempo,
             onResetTempo: callbacks.onResetTempo,
@@ -1096,6 +1103,8 @@ struct DeckReadouts: View {
     var live: Live? = nil
     /// M14 key lock. `nil` leaves the button out entirely.
     var onToggleKeyLock: (() -> Void)? = nil
+    /// Steadying. Drawn only on a grid that follows its band.
+    var onToggleSteady: (() -> Void)? = nil
     /// Tap tempo on a THRU deck's BPM. Only with `header.thruTempo`.
     var onTapTempo: (() -> Void)? = nil
     /// The THRU BPM's right-click: scale the tempo, or go back to the
@@ -1153,6 +1162,7 @@ struct DeckReadouts: View {
                     live: live.map { l in { l.pitch().map { String(format: "%+.1f", $0) } } },
                     size: DubFont.numericInlineSize)
                 keyLockButton
+                steadyButton
             }
         }
         .fixedSize()
@@ -1292,6 +1302,52 @@ struct DeckReadouts: View {
             .accessibilityLabel("Key lock")
             .accessibilityValue(on ? "on" : "off")
             .mappable(.keyLock(side))
+        }
+    }
+
+    /// Steadying (Alpha), beside the key lock it is built on: hold a
+    /// record whose grid follows its band to the grid's tempo while a
+    /// second record is brought in, and let the band play as it played
+    /// otherwise. Only on such a record — one with an even grid has one
+    /// tempo already, and a switch that does nothing is a switch too many.
+    ///
+    /// Lit from the DJ's switch; the dot is solid while the engine is
+    /// holding the tempo and dim while it is not for now (a scratch, a
+    /// stretch without beats), as LOCK's is.
+    @ViewBuilder
+    private var steadyButton: some View {
+        if let toggle = onToggleSteady, header.gridMoves || header.steadyState != 0 {
+            let on = header.steadyState != 0
+            let tint = DubColor.controlAccent
+            VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
+                Text("STEADY")
+                    .font(DubFont.micro)
+                    .tracking(DubFont.capsTracking)
+                    .foregroundStyle(DubColor.textTertiary)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(on ? tint.opacity(header.steadyState == 2 ? 1.0 : 0.35)
+                                 : DubColor.textPlaceholder)
+                        .frame(width: 5, height: 5)
+                    Text(on ? "ON" : "OFF")
+                        .font(DubFont.numericInline)
+                        .foregroundStyle(on ? tint : DubColor.textPlaceholder)
+                }
+                .padding(.horizontal, DubSpacing.sm)
+                .padding(.vertical, 3)
+                .background(on ? tint.opacity(0.16) : DubColor.surface2)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
+                .contentShape(Rectangle())
+                .onPressDown(perform: toggle)
+            }
+            .help(on
+                  ? "Steady on — the record is held to its tempo; turn it off to let the band play as it played"
+                  : "Steady off — the band plays as it played. Turn it on to hold one tempo while you mix")
+            .accessibilityLabel("Steady")
+            .accessibilityValue(on ? "on" : "off")
         }
     }
 

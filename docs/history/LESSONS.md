@@ -588,6 +588,13 @@
   drawn by `NSTextField`, and a host left alone when it already shows the
   value (most rows have no stars, no colour, no badge). Not
   `usesSingleLineMode` on those labels — it sets 18 pt text 4 pt high.
+- **The even grid's tempo is not the tempo a band keeps.** *Mary Jane*
+  never moves — its pulse is a straight line at 93.0 BPM — but one tempo
+  fitted to the whole record came out 92.5, the even grid walked half a
+  beat off by the end, and the hit chain, held to that period, jumped
+  half a beat from section to section. It looked like a band drifting.
+  Anything that pulls a record "to its tempo" has to take the tempo from
+  the band's own beats (the middle gap), or it slows a steady record.
 - **`sorted(using: KeyPathComparator)` is slow.** 113 ms for 2,183
   titles against 15 for `localizedStandardCompare` on the same strings,
   same order. For the usual sort — one text column — take the keys out

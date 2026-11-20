@@ -309,6 +309,10 @@ struct DeckState: Equatable {
     /// LOCK dot; the button itself lights from `keyLockOn` so the tap is
     /// immediate — the same split the echo pad uses.
     var keyLockState: UInt8 = 0
+    /// Steadying as the engine has it (`DeckTelemetry.steadyState`): 0
+    /// off · 1 on, the record playing as the band played it for now · 2
+    /// on and held to its tempo.
+    var steadyState: UInt8 = 0
 
     /// Whether the DJ asked for key lock on this deck. The engine's own
     /// state lags it (standby until the platter actually leaves unity),
@@ -2925,6 +2929,7 @@ final class WaveformAppModel: ObservableObject {
         next.measureProgress = Double(tele.measureProgress)
         next.timecodeLockState = tele.lockState
         next.keyLockState = tele.keyLockState
+        next.steadyState = tele.steadyState
         next.echoState = tele.echoState
         // M15 auto-off: the engine reports echo_state == 2 once the muted
         // input AND the wet tail have both been silent for a moment — e.g. a
@@ -5563,6 +5568,19 @@ final class WaveformAppModel: ObservableObject {
     func toggleKeyLock(side: DeckSide) {
         setKeyLockSelection(
             side: side, keyLockSelection(side) == .resampler ? .ours : .resampler)
+    }
+
+    /// The deck's STEADY switch (Alpha): hold a record whose grid follows
+    /// its band to the tempo the band keeps for as long as it is on — the length
+    /// of a transition — and let the band play as it played otherwise
+    /// (Daniel, 2026-11-19). The engine turns it off at a load.
+    func toggleSteady(side: DeckSide) {
+        var deck = state(for: side)
+        let on = deck.steadyState == 0
+        // Lit at once; the next telemetry says what the engine made of it.
+        deck.steadyState = on ? 1 : 0
+        setState(deck, for: side)
+        try? engine.setDeckSteady(deckIdx: side.ffiDeckIdx, on: on)
     }
 
     /// **Testing only** (M14): set the prep deck's playback rate from the pitch

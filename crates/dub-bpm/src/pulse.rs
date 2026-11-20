@@ -54,14 +54,80 @@ pub fn band_pulse(samples: &[f32], sample_rate: u32, channels: u8, bpm: f64) -> 
     let (odf, _) = crate::offline::onset_envelopes(samples, sample_rate, channels).ok()?;
     #[allow(clippy::cast_precision_loss)]
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
-    let frames = pulse_frames(&odf, 60.0 / bpm * odf_sr)?;
+    let halves = pulse_halves(&odf, 60.0 / bpm * odf_sr)?;
+    let frames = on_the_louder_half(&halves, &odf);
+    Some(on_the_kick(&frames, odf_sr, samples, sample_rate, channels))
+}
+
+/// [`band_pulse`] for a caller that knows where the beat is: of the two
+/// sets the pulse could sit on, the one nearer `beats` — any beats on the
+/// right side of the bar, however roughly placed. `odf` is the record's
+/// onset envelope at `odf_sr` frames a second.
+pub(crate) fn pulse_near(
+    odf: &[f32],
+    odf_sr: f64,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    bpm: f64,
+    beats: &[f64],
+) -> Option<Vec<f64>> {
+    if bpm <= 0.0 || odf_sr <= 0.0 {
+        return None;
+    }
+    let halves = pulse_halves(odf, 60.0 / bpm * odf_sr)?;
+    let frames: Vec<f64> = beats.iter().map(|&b| b * odf_sr).collect();
+    // How far `frames` stand, in all, from the nearest half beat of one
+    // parity.
+    let away = |parity: usize| -> f64 {
+        let set: Vec<f64> = halves.iter().skip(parity).step_by(2).copied().collect();
+        frames
+            .iter()
+            .map(|&at| {
+                let after = set.partition_point(|&h| h < at);
+                let before = after.checked_sub(1).map_or(f64::MAX, |i| at - set[i]);
+                set.get(after).map_or(before, |&h| before.min(h - at))
+            })
+            .sum()
+    };
+    let parity = usize::from(away(1) < away(0));
+    let frames: Vec<f64> = halves.into_iter().skip(parity).step_by(2).collect();
+    Some(on_the_kick(&frames, odf_sr, samples, sample_rate, channels))
+}
+
+/// Beats at onset `frames`, in seconds, set on the kick's visible edge as
+/// the even grid's are.
+fn on_the_kick(
+    frames: &[f64],
+    odf_sr: f64,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+) -> Vec<f64> {
     let mut beats: Vec<f64> = frames.iter().map(|&f| f / odf_sr).collect();
     let shift = crate::beats::kick_edge_offset_secs(&beats, samples, sample_rate, channels);
     for beat in &mut beats {
         *beat += shift;
     }
     beats.retain(|&b| b >= 0.0);
-    Some(beats)
+    beats
+}
+
+/// Every other half beat is a beat. Which, for a caller with nothing else
+/// to go by: the set with more onset on it, over the whole record at
+/// once. That is right for most music and a coin toss on a record that
+/// plays its off-beats as loud as its beats.
+fn on_the_louder_half(halves: &[f64], odf: &[f32]) -> Vec<f64> {
+    let onset_on = |parity: usize| -> f64 {
+        halves
+            .iter()
+            .skip(parity)
+            .step_by(2)
+            .map(|&at| f64::from(onset_at(odf, at)))
+            .sum()
+    };
+    let parity = usize::from(onset_on(1) > onset_on(0));
+    halves.iter().skip(parity).step_by(2).copied().collect()
 }
 
 /// `odf` at a place between frames.
@@ -100,10 +166,11 @@ fn comb(odf: &[f32], middle: f64, period: f64) -> f32 {
     sum
 }
 
-/// The pulse's beats in onset frames, for a record whose tempo is about
-/// one beat every `period` frames.
+/// The pulse's half beats in onset frames — the beats and the places
+/// midway between them, which of the two not yet said — for a record
+/// whose tempo is about one beat every `period` frames.
 #[allow(clippy::too_many_lines)]
-fn pulse_frames(odf: &[f32], period: f64) -> Option<Vec<f64>> {
+fn pulse_halves(odf: &[f32], period: f64) -> Option<Vec<f64>> {
     #[allow(clippy::cast_precision_loss)]
     let len = odf.len() as f64;
     if period < 4.0 || len < period * 32.0 {
@@ -297,20 +364,7 @@ fn pulse_frames(odf: &[f32], period: f64) -> Option<Vec<f64>> {
         halves.push(at);
         at += last_period / 2.0;
     }
-    // Every other one is a beat. Which: the set with more onset on it,
-    // over the whole record at once. That is right for most music and a
-    // coin toss on a record that plays its off-beats as loud as its beats;
-    // a caller that knows where the beat is should say.
-    let onset_on = |parity: usize| -> f64 {
-        halves
-            .iter()
-            .skip(parity)
-            .step_by(2)
-            .map(|&at| f64::from(onset_at(odf, at)))
-            .sum()
-    };
-    let parity = usize::from(onset_on(1) > onset_on(0));
-    Some(halves.into_iter().skip(parity).step_by(2).collect())
+    Some(halves)
 }
 
 #[cfg(test)]
@@ -330,6 +384,45 @@ mod tests {
             }
         }
         samples
+    }
+
+    /// A record whose off-beats are the louder — a skank over a soft kick
+    /// — is a coin toss by loudness, and lands on the off-beat. Told
+    /// roughly where the beats are, the pulse sits on them.
+    #[test]
+    fn told_where_the_beat_is_the_pulse_sits_on_it() {
+        let secs = 40.0;
+        let beats: Vec<f64> = (0..76).map(|i| 1.0 + f64::from(i) * 0.5).collect();
+        let offs: Vec<f64> = beats.iter().map(|b| b + 0.25).collect();
+        let mut samples = clicks(&beats, secs);
+        for (s, off) in samples.iter_mut().zip(clicks(&offs, secs)) {
+            *s += 2.0 * off;
+        }
+        let (odf, _) = crate::offline::onset_envelopes(&samples, SR, 1).unwrap();
+        let odf_sr = f64::from(SR) / HOP_SIZE as f64;
+        // The hint: every beat, 40 ms late.
+        let hint: Vec<f64> = beats.iter().map(|b| b + 0.04).collect();
+        let pulse = pulse_near(&odf, odf_sr, &samples, SR, 1, 120.0, &hint).unwrap();
+        let off_beat = |pulse: &[f64]| {
+            pulse
+                .iter()
+                .filter(|&&p| p > 5.0 && p < 35.0)
+                .map(|p| {
+                    let nearest = beats.iter().map(|b| (b - p).abs()).fold(f64::MAX, f64::min);
+                    nearest
+                })
+                .fold(0.0, f64::max)
+        };
+        assert!(
+            off_beat(&pulse) < 0.06,
+            "the pulse is up to {:.0} ms from a beat",
+            off_beat(&pulse) * 1000.0
+        );
+        let alone = band_pulse(&samples, SR, 1, 120.0).unwrap();
+        assert!(
+            off_beat(&alone) > 0.15,
+            "by loudness alone this record reads on its off-beats, or the test proves nothing"
+        );
     }
 
     /// Tempo over four bars at each bar of `beats`, in BPM.

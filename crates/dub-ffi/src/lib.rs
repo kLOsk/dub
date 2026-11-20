@@ -603,7 +603,12 @@ pub use rip::{
 ///       matches, in the collection or not. [`DubLibrary::search`] is
 ///       collection-only, so with another app's library selected the
 ///       search field answered "no matches" for tracks in plain view.
-pub const FFI_VERSION: u32 = 92;
+///   93. **Steadying.** [`DubEngine::set_deck_steady`] holds a record
+///       whose grid follows its band to the band's own tempo while it is on,
+///       and [`DeckTelemetry::steady_state`] says whether it is. The
+///       following grid's beats are now the band's pulse
+///       (`dub_bpm::band_pulse`), not a line on each hit.
+pub const FFI_VERSION: u32 = 93;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -1257,6 +1262,9 @@ impl DubEngine {
         if let Some(a) = self.beat_grid_generation_seq.get(deck_idx) {
             a.fetch_add(1, Ordering::Release);
         }
+        // Every change of a deck's grid comes through here, and what the
+        // deck steadies by is that grid.
+        sync_steady(&self.state, &self.deck_shared, deck_idx);
     }
 
     /// A grid edit — a tap on the 1, a re-tempo, a nudge — rebuilds an
@@ -1385,7 +1393,12 @@ impl DubEngine {
             is_panic_play,
             debug_publish_secs: publish.position_secs,
             debug_elapsed_ns,
-            debug_advance_rate: publish.rate,
+            // The platter's rate, not the playhead's: a steadied record's
+            // playhead runs a few percent faster or slower from one beat
+            // to the next, and the waveform scales its time axis by this —
+            // it breathed with every beat ("the beatgrid goes crazy",
+            // Daniel, 2026-11-20).
+            debug_advance_rate: publish.rate / shared.steady().moved().max(0.5),
             loop_active: loop_state.active,
             loop_in_secs: loop_state.in_secs,
             loop_out_secs: loop_state.out_secs,
@@ -2136,6 +2149,12 @@ impl DubEngine {
             running.quick_scratch_parked[idx] = None;
             running.double_host_view[idx] = None;
             running.file_tracks[idx] = Some(track.clone());
+            // A new record plays as it is: the switch off, and nothing to
+            // steady it by until its own grid is laid.
+            if let Some(shared) = self.deck_shared.get(idx) {
+                shared.steady().set_on(false);
+                shared.steady().clear();
+            }
             clear_peaks(&mut running.peaks[idx], &mut running.live_taps[idx]);
             if let Some(a) = self.peak_generation_seq.get(idx) {
                 a.fetch_add(1, Ordering::Release);
@@ -2170,6 +2189,8 @@ impl DubEngine {
         let supplied_grid_for_thread = library_beat_grid.clone();
         let octave = tempo_octave_for(genre.as_deref(), self.tempo_range());
         let thread_name = format!("dub-load-{idx}");
+        let (steady_state, steady_shared) =
+            (Arc::clone(&self.state), Arc::clone(&self.deck_shared));
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -2182,6 +2203,7 @@ impl DubEngine {
                     supplied_grid_for_thread,
                     octave,
                 );
+                sync_steady(&steady_state, &steady_shared, idx);
             });
 
         // Spawn can fail (process thread limit reached, OOM at
@@ -2214,6 +2236,7 @@ impl DubEngine {
                 library_beat_grid,
                 octave,
             );
+            sync_steady(&self.state, &self.deck_shared, idx);
         }
 
         Ok(())
@@ -2339,6 +2362,29 @@ impl DubEngine {
             .deck(idx)
             .set_key_lock(on)
             .map_err(map_command_error)
+    }
+
+    /// Hold a deck's record to its tempo (Alpha): on, a record whose grid
+    /// follows its band is played a beat at a time in the time a beat
+    /// takes at the tempo the band keeps, so it keeps one tempo for as long as
+    /// this is on — the time a transition takes — and a second record can
+    /// be laid against it. Off, the band plays as it played. The pitch is
+    /// untouched: the platter's, or the record's own under key lock.
+    ///
+    /// Does nothing on a record with an even grid, which has one tempo
+    /// already, and lets go by itself through a scratch.
+    /// [`DeckTelemetry::steady_state`] says which. A load turns it off.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidDeckIndex`] on a bad index.
+    pub fn set_deck_steady(&self, deck_idx: u64, on: bool) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        self.deck_shared
+            .get(idx)
+            .ok_or(EngineError::InvalidDeckIndex(deck_idx))?
+            .steady()
+            .set_on(on);
+        Ok(())
     }
 
     /// Select a deck's key-lock state (M14). `ResamplerOnly` disables key lock
@@ -3855,6 +3901,7 @@ impl DubEngine {
             pitch_settled: tc.pitch_settled,
             measure_progress: tc.measure_progress,
             key_lock_state: shared.load_key_lock_state(),
+            steady_state: shared.steady().state() as u8,
             echo_state: shared.load_echo_state(),
             siren_state: shared.load_siren_state(),
             quick_scratch_slot: shared.load_quick_scratch_slot(),
@@ -4041,14 +4088,21 @@ impl DubEngine {
 
     /// The tempo the band is playing at the deck's playhead, when its grid
     /// follows the band: the average over the two bars up to it
-    /// (`dub_bpm::local_bpm`), before pitch. `0.0` for an even grid — its
-    /// tempo is the grid's own — an empty deck, or a stopped engine. Poll
-    /// a few times a second; it takes the engine lock.
+    /// (`dub_bpm::local_bpm`), before pitch — or, while the deck holds
+    /// the record to its tempo ([`Self::set_deck_steady`]), that tempo.
+    /// `0.0` for an even grid — its tempo is the grid's own — an empty
+    /// deck, or a stopped engine. Poll a few times a second; it takes the
+    /// engine lock.
     #[must_use]
     pub fn deck_local_bpm(&self, deck_idx: u64) -> f64 {
         let Ok(idx) = deck_idx_to_usize(deck_idx) else {
             return 0.0;
         };
+        if let Some(steady) = self.deck_shared.get(idx).map(|s| s.steady()) {
+            if steady.state() == dub_engine::steady::SteadyState::Steadying {
+                return steady.bpm().unwrap_or(0.0);
+            }
+        }
         let at_secs = self.position_snapshot(deck_idx).playhead_secs_unclamped;
         let state = lock_state(&self.state);
         let EngineState::Running(running) = &*state else {
@@ -5139,6 +5193,10 @@ pub struct DeckTelemetry {
     /// scratch / reverse / extreme rate) · 2 engaged (pitch held). Drives the
     /// deck-header key-lock dot (dim / green). PRD §6.1.1.
     pub key_lock_state: u8,
+    /// Steadying ([`DubEngine::set_deck_steady`]): 0 off · 1 on, and the
+    /// record plays as the band played it for now (an even grid, a
+    /// scratch, a stretch without beats) · 2 on and held to its tempo.
+    pub steady_state: u8,
     /// M15 echo-out state: 0 off · 1 engaged (dry muted, captured loop
     /// repeating) · 2 engaged & ready to auto-off (the muted input and the wet
     /// tail have both gone silent — e.g. Thru needle lifted + echo finished,
@@ -5202,6 +5260,7 @@ impl DeckTelemetry {
             pitch_settled: true,
             measure_progress: 1.0,
             key_lock_state: 0,
+            steady_state: 0,
             echo_state: 0,
             siren_state: 0,
             quick_scratch_slot: None,
@@ -6152,14 +6211,19 @@ fn background_analyze_and_install(
         (grid, bpm_ms, "analyzed")
     };
     // A saved tempo map (schema v11) stands in for following the band
-    // again: while it was followed from this very grid, and always on a
-    // locked track — a locked moving grid is an accepted one (Daniel,
-    // 2026-11-16). Only with the following grid switched on.
+    // again on a locked track — a locked moving grid is an accepted one
+    // (Daniel, 2026-11-16). Only with the following grid switched on.
+    //
+    // It used to stand in on an unlocked track too, while it was followed
+    // from this very grid, to save following the band at every load. The
+    // tracker changed on 2026-11-20 (the lines are on the band's pulse
+    // now) and a saved map does not say which tracker made it, so an
+    // unlocked track is followed afresh; that is a second or so on the
+    // load worker, after the record is already playing.
     let saved = library_grid.as_ref().and_then(|lg| {
         let map = lg.tempo_map.as_ref()?;
-        let usable = FOLLOWING_GRID.load(Ordering::Acquire)
-            && map.beats.len() >= 2
-            && (lg.grid_locked || map.stands_for(lg));
+        let usable =
+            FOLLOWING_GRID.load(Ordering::Acquire) && map.beats.len() >= 2 && lg.grid_locked;
         usable.then(|| BeatGrid {
             beats: map.beats.clone(),
             bar_phase: map.bar_phase,
@@ -6226,6 +6290,30 @@ fn waveform_bars(chunks: &[PeakChunk], bars: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Lay what deck `idx` steadies by ([`DubEngine::set_deck_steady`]) from
+/// the grid it shows now: the band's beats when the grid follows a band,
+/// nothing for an even grid, an empty deck or a sample — those have one
+/// tempo already.
+fn sync_steady(state: &Mutex<EngineState>, shared: &[Arc<DeckSharedState>; 2], idx: usize) {
+    let Some(shared) = shared.get(idx) else {
+        return;
+    };
+    let guard = lock_state(state);
+    if let EngineState::Running(running) = &*guard {
+        let track = running.file_tracks.get(idx).and_then(Option::as_ref);
+        let peaks = running.peaks.get(idx).and_then(Option::as_ref);
+        if let (Some(track), Some(PeakSource::File(fp))) = (track, peaks) {
+            if fp.beat_grid.follows {
+                shared
+                    .steady()
+                    .install(Arc::as_ptr(track) as usize, &fp.beat_grid.beats);
+                return;
+            }
+        }
+    }
+    shared.steady().clear();
 }
 
 /// The band's own beats for `grid`, when following is switched on and the
@@ -7258,7 +7346,8 @@ mod tests {
         // 88→89: `save_tempo_map` / `delete_tempo_map`, `LibraryTempoMap`,
         // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
         // 91→92: `search_track_ids`.
-        assert_eq!(FFI_VERSION, 92);
+        // 92→93: `set_deck_steady`, `DeckTelemetry.steady_state`.
+        assert_eq!(FFI_VERSION, 93);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
@@ -8689,23 +8778,6 @@ pub struct LibraryTempoMap {
     pub base_bpm: f64,
     /// See [`Self::base_source`].
     pub base_anchor_secs: f64,
-}
-
-impl LibraryTempoMap {
-    /// Whether the map was followed from `grid` and still stands for it.
-    fn stands_for(&self, grid: &LibraryBeatGrid) -> bool {
-        dub_library::TempoMap {
-            kind: "followed".into(),
-            beats: Vec::new(),
-            bar_phase: 0,
-            base_source: self.base_source.clone(),
-            base_bpm: self.base_bpm,
-            base_anchor_secs: self.base_anchor_secs,
-            bpm_min: 0.0,
-            bpm_max: 0.0,
-        }
-        .follows_base(&grid.source, grid.bpm, grid.anchor_secs)
-    }
 }
 
 impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
@@ -10880,8 +10952,8 @@ mod library_ffi_tests {
     }
 
     /// Schema v11 / FFI 89: a saved following grid comes back with the
-    /// track's active grid, and stands for it only while that grid is the
-    /// one it was followed from — the load's test for reusing it.
+    /// track's active grid, whatever becomes of that grid afterwards. The
+    /// load uses it on a locked track only.
     #[test]
     fn a_saved_tempo_map_rides_with_the_active_grid() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10910,13 +10982,12 @@ mod library_ffi_tests {
         let map = grid.tempo_map.clone().expect("the map rides with the grid");
         assert_eq!(map.beats, beats);
         assert_eq!(map.bar_phase, 1);
-        assert!(map.stands_for(&grid));
 
-        // A new tap moves the grid: the map no longer stands for it.
+        // A new tap moves the grid; the map still comes with it.
         lib.upsert_user_tap_beatgrid("t1".into(), 0.9, 93.0, 0)
             .unwrap();
         let grid = lib.active_beat_grid("t1".into()).unwrap().unwrap();
-        assert!(!grid.tempo_map.as_ref().unwrap().stands_for(&grid));
+        assert!(grid.tempo_map.is_some());
 
         lib.delete_tempo_map("t1".into()).unwrap();
         assert!(lib
