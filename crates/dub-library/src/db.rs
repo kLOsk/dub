@@ -1920,10 +1920,9 @@ impl Library {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
-        // Global search backs the "All Tracks" search field, so it
-        // shares that surface's collection-only scope (PRD §8.4.1).
-        // Browsing a source node and searching it is a separate, node-
-        // scoped concern (not wired here).
+        // This backs the "All Tracks" search field, so it shares that
+        // surface's collection-only scope (PRD §8.4.1). Searching any
+        // other list goes through `search_track_ids`.
         let select = &self.track_select;
         let sql = format!(
             "{select} \
@@ -1942,6 +1941,33 @@ impl Library {
             .query_map(params![fts_query, limit as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_search_tracks", e))?;
         collect_track_rows(rows, "search_tracks")
+    }
+
+    /// The ids of every track the search matches, in the collection or
+    /// not, by the same rules as [`Self::search_tracks`].
+    ///
+    /// For searching a list the DJ is looking at — another app's
+    /// library, one of its playlists, a crate — whose tracks are mostly
+    /// not in Dub's collection. The caller already holds that list's
+    /// rows in the list's order and keeps the ones named here.
+    pub fn search_track_ids(&self, query: &str, limit: u32) -> Result<Vec<String>> {
+        let fts_query = build_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT DISTINCT track_id FROM track_metadata_fts \
+                 WHERE track_metadata_fts MATCH ?1 LIMIT ?2",
+            )
+            .map_err(|e| LibraryError::sqlite("prepare_search_track_ids", e))?;
+        let ids = stmt
+            .query_map(params![fts_query, i64::from(limit)], |row| row.get(0))
+            .map_err(|e| LibraryError::sqlite("query_search_track_ids", e))?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| LibraryError::sqlite("search_track_ids", e))?;
+        Ok(ids)
     }
 
     /// Recently Played smart crate per §8.5.2. Reads `play_history`
@@ -2077,16 +2103,34 @@ impl Library {
         Ok(out)
     }
 
-    /// Tracks in one imported-crate node, in the source's playlist order
-    /// (`imported_crate_tracks.ordinal`). The read-only sibling of the
-    /// user-crate track listing, against the imported mirror.
+    /// Tracks in one imported-crate node and in everything under it, each
+    /// once: the node's own in the source's playlist order
+    /// (`imported_crate_tracks.ordinal`), then each node below it, nearer
+    /// ones first and in the order they were imported. For a playlist
+    /// that is the playlist; for a folder it is all the folder holds,
+    /// which is what a click on it should show. The read-only sibling of
+    /// the user-crate track listing, against the imported mirror.
     pub fn imported_crate_tracks(&self, imported_crate_id: i64) -> Result<Vec<TrackRow>> {
         let select = &self.track_select;
+        // The walk down is bounded so a malformed cycle can't hang.
         let sql = format!(
-            "{select} \
-             JOIN imported_crate_tracks ict ON ict.track_id = t.id \
-             WHERE ict.imported_crate_id = ?1 \
-             ORDER BY ict.ordinal ASC"
+            "WITH RECURSIVE under(id, depth) AS (\
+                SELECT ?1, 0 \
+                UNION ALL \
+                SELECT c.id, u.depth + 1 FROM imported_crates c \
+                  JOIN under u ON c.parent_imported_crate_id = u.id \
+                 WHERE u.depth < 32\
+             ), placed AS (\
+                SELECT track_id, MIN(place) AS place FROM (\
+                    SELECT ict.track_id AS track_id, \
+                           ROW_NUMBER() OVER (ORDER BY u.depth, u.id, ict.ordinal) AS place \
+                      FROM imported_crate_tracks ict \
+                      JOIN under u ON ict.imported_crate_id = u.id\
+                ) GROUP BY track_id\
+             ) \
+             {select} \
+             JOIN placed ON placed.track_id = t.id \
+             ORDER BY placed.place ASC"
         );
         let mut stmt = self
             .conn
@@ -3386,6 +3430,54 @@ mod tests {
         assert_eq!(rows[2].title.as_deref(), Some("ZZZ id3"));
     }
 
+    /// Clicking a folder in another app's library shows what is in it:
+    /// every playlist under it, however deep, each track once, the
+    /// playlists in the order they were imported and each in its own
+    /// order. A folder used to list nothing — it has no tracks of its own
+    /// — so the browser could only fold it (Daniel, 2026-11-20).
+    #[test]
+    fn a_folder_lists_the_tracks_of_the_playlists_under_it() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Alpha", "Bravo", "Charlie", "Delta"]);
+        let folder = lib.create_imported_crate("itunes", "Sets", None).unwrap();
+        let friday = lib
+            .create_imported_crate("itunes", "Friday", Some(folder))
+            .unwrap();
+        let inner = lib
+            .create_imported_crate("itunes", "Late", Some(folder))
+            .unwrap();
+        let saturday = lib
+            .create_imported_crate("itunes", "Saturday", Some(inner))
+            .unwrap();
+        let elsewhere = lib.create_imported_crate("itunes", "Other", None).unwrap();
+        lib.add_track_to_imported_crate(friday, &ids[1], 0).unwrap();
+        lib.add_track_to_imported_crate(friday, &ids[0], 1).unwrap();
+        // Bravo again, and Charlie, two levels down.
+        lib.add_track_to_imported_crate(saturday, &ids[1], 0)
+            .unwrap();
+        lib.add_track_to_imported_crate(saturday, &ids[2], 1)
+            .unwrap();
+        lib.add_track_to_imported_crate(elsewhere, &ids[3], 0)
+            .unwrap();
+
+        let listed: Vec<String> = lib
+            .imported_crate_tracks(folder)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(listed, vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]);
+
+        // A playlist still lists itself, in its own order.
+        let own: Vec<String> = lib
+            .imported_crate_tracks(saturday)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(own, vec![ids[1].clone(), ids[2].clone()]);
+    }
+
     #[test]
     fn imported_crate_and_by_source_reads() {
         let lib = Library::open_in_memory().unwrap();
@@ -3623,6 +3715,38 @@ mod tests {
         // No-match query returns empty.
         let hits = lib.search_tracks("nonexistent", 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// A DJ browsing another app's library searches what is in front of
+    /// them. Most of those tracks are not in Dub's collection — 2,540 of
+    /// 2,654 on the rig, 2026-11-19 — and the collection-only search
+    /// answered "no matches" for every one of them.
+    #[test]
+    fn search_track_ids_finds_tracks_outside_the_collection() {
+        let lib = Library::open_in_memory().unwrap();
+        let ids = seed_tracks(&lib, &["Stakes Is High", "High Tide"]);
+        lib.conn
+            .execute(
+                "UPDATE tracks SET in_collection = 0 WHERE id = ?1",
+                params![ids[1]],
+            )
+            .unwrap();
+
+        let in_collection = lib.search_tracks("high", 10).unwrap();
+        assert_eq!(
+            in_collection.len(),
+            1,
+            "the collection search stays in the collection"
+        );
+
+        let mut anywhere = lib.search_track_ids("high", 10).unwrap();
+        anywhere.sort();
+        let mut both = ids.clone();
+        both.sort();
+        assert_eq!(anywhere, both);
+
+        assert!(lib.search_track_ids("a", 10).unwrap().is_empty());
+        assert_eq!(lib.search_track_ids("high", 1).unwrap().len(), 1);
     }
 
     #[test]

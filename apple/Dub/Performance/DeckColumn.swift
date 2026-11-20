@@ -1085,8 +1085,9 @@ struct DeckReadouts: View {
     /// the edge the row sits against: trailing on deck A, where the
     /// readouts end at the column's inner edge, leading on deck B.
     var trailing: Bool = false
-    /// Tints the LOCK button. Defaults to A so the layout tests, which
-    /// render the row on its own, keep their one-argument call.
+    /// Which deck's key lock the LOCK button is, for key mapping.
+    /// Defaults to A so the layout tests, which render the row on its
+    /// own, keep their one-argument call.
     var side: DeckSide = .a
     /// The engine, when there is one: BPM and PITCH are then read off
     /// it on layers (`LayerReadout`) rather than rebuilt as `Text` on
@@ -1256,7 +1257,11 @@ struct DeckReadouts: View {
     private var keyLockButton: some View {
         if let toggle = onToggleKeyLock {
             let on = header.keyLockOn
-            let tint = DubColor.deckTint(side)
+            // The control accent, not the deck's tint: a lit control
+            // means "on" on either deck (`DubColor.controlAccent`). In
+            // the deck's tint the right deck's LOCK lit teal beside
+            // amber controls (Daniel, 2026-11-19).
+            let tint = DubColor.controlAccent
             VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
                 Text("LOCK")
                     .font(DubFont.micro)

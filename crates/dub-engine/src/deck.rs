@@ -1152,7 +1152,7 @@ const KL_FEED_HOP: usize = 256;
 const KL_XFADE_MS: f32 = 25.0;
 /// Below this |rate| key lock bypasses (near-pause: pitch_scale would blow up).
 const KL_MIN_RATE: f64 = 0.10;
-/// Above this |rate| key lock bypasses (extreme varispeed Rubber Band/WSOLA
+/// Above this |rate| key lock bypasses (extreme varispeed a stretcher
 /// can't track musically; also the resampler is fine there).
 const KL_MAX_RATE: f64 = 2.0;
 /// `|Δrate|` per block at or below which the deck counts as "settled" this
@@ -1174,16 +1174,16 @@ const KL_SETTLE_FRAMES: u32 = 2_400;
 /// a discontinuity (needle drop, a stuck decoder recovering) and re-primes.
 const KL_MAX_REPIN_FRAMES: f64 = 256.0;
 
-/// Per-deck resident key-lock stretcher (WSOLA), preallocated off-RT.
+/// Per-deck resident key-lock stretcher, preallocated off-RT.
 struct DeckStretchers {
-    wsola: dub_stretch::WsolaStretcher,
+    splice: dub_stretch::SpliceStretcher,
 }
 
 impl DeckStretchers {
     /// Build the stretcher sized for `engine_sr`. Off-RT (allocates).
     fn new(engine_sr: f32) -> Self {
         Self {
-            wsola: dub_stretch::WsolaStretcher::new(engine_sr),
+            splice: dub_stretch::SpliceStretcher::new(engine_sr),
         }
     }
 }
@@ -1241,10 +1241,9 @@ impl Deck {
         engine_sr: f32,
     ) -> Self {
         let stretchers = DeckStretchers::new(engine_sr);
-        // Size the playout scratch from WSOLA's bound; Rubber Band caps its
-        // own writes to the buffer, so this also covers it.
+        // Size the playout scratch from the stretcher's own bound.
         let out_cap = stretchers
-            .wsola
+            .splice
             .max_output_for(KL_FEED_HOP)
             .max(KL_FEED_HOP * 2);
         Self {
@@ -1924,6 +1923,12 @@ impl Deck {
         let new_increment = self.source.as_ref().map_or(0.0, |t| {
             self.rate * (f64::from(t.sample_rate()) / engine_sr_f)
         });
+        // Track frames per engine frame with the platter at the record's own
+        // speed: the rate key lock feeds the stretcher at.
+        let feed_increment = self
+            .source
+            .as_ref()
+            .map_or(1.0, |t| f64::from(t.sample_rate()) / engine_sr_f);
 
         // Loop seam window, computed once per block. Capped at a
         // quarter of the loop body so a short loop keeps some
@@ -2085,7 +2090,7 @@ impl Deck {
                                     &self.declick_envelope,
                                     &mut self.read_cursor,
                                     pos,
-                                    new_increment,
+                                    feed_increment,
                                     loop_seam,
                                     &mut self.stretch_in,
                                     &mut self.stretch_out,
@@ -2106,6 +2111,7 @@ impl Deck {
                                 gain,
                                 self.rate,
                                 new_increment,
+                                feed_increment,
                                 loop_seam,
                                 &mut pos,
                                 &mut self.read_cursor,
@@ -2119,7 +2125,7 @@ impl Deck {
                     }
                     match self.stretch_backend {
                         dub_stretch::StretchBackend::DubOwn => {
-                            engaged!(&mut self.stretchers.wsola);
+                            engaged!(&mut self.stretchers.splice);
                         }
                         // ResamplerOnly: unreachable — engage requires `backend_ok`.
                         dub_stretch::StretchBackend::ResamplerOnly => {}
@@ -2159,16 +2165,17 @@ impl Deck {
                 let pinned = block_start + delta;
                 let correction = pinned - pos;
                 pos = pinned;
-                // Key lock engaged: the stretcher reads through its own
-                // cursor, which the integrator above advanced alongside
-                // `pos`. Move it by the same correction, or the audio
-                // walks off the groove a fraction of a frame per block and
-                // never comes back. A correction too big to be a platter's
-                // wobble is a discontinuity — drop to bypass and let the
-                // settle timer re-prime cleanly at the new position.
+                // Key lock engaged: the stretcher follows the tempo it was
+                // told, not `pos`. Tell it the record is this much further
+                // on, or the audio walks off the groove a fraction of a
+                // frame per block and never comes back. It repays that at
+                // its next join, so the record it is fed stays untouched.
+                // A correction too big to be a platter's wobble is a
+                // discontinuity — drop to bypass and let the settle timer
+                // re-prime cleanly at the new position.
                 if !matches!(self.lock_state, KeyLockState::Bypassed) {
                     if correction.abs() <= KL_MAX_REPIN_FRAMES {
-                        self.read_cursor += correction;
+                        self.stretchers.splice.owe(correction / feed_increment);
                     } else {
                         self.lock_state = KeyLockState::Bypassed;
                         self.settle_frames = 0;
@@ -2360,9 +2367,13 @@ fn wrap_looped(pos: f64, seam: Option<LoopSeam>) -> f64 {
 }
 
 /// Read one [`KL_FEED_HOP`] of input from `*read_cursor` (advancing at
-/// `new_increment`, with the track tail-fade), push it through `stretcher`, and
+/// `feed_increment`, with the track tail-fade), push it through `stretcher`, and
 /// advance `*read_cursor` by the frames the stretcher actually consumed.
 /// Returns frames written into `stretch_out`. RT-safe (no alloc).
+///
+/// The record is fed at its own speed, so a track at the engine's sample
+/// rate reaches the stretcher sample for sample: `feed_increment` is then 1
+/// and every read lands on a whole frame.
 #[allow(clippy::too_many_arguments)]
 fn kl_refill<S: TimeStretcher>(
     stretcher: &mut S,
@@ -2370,7 +2381,7 @@ fn kl_refill<S: TimeStretcher>(
     track_len: f64,
     env: &DeclickEnvelope,
     read_cursor: &mut f64,
-    new_increment: f64,
+    feed_increment: f64,
     seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
@@ -2379,18 +2390,22 @@ fn kl_refill<S: TimeStretcher>(
     // fed a seam-crossfaded, already-wrapped stream the stretcher sees
     // ordinary continuous audio and needs no reset, no re-prime and no
     // knowledge that a loop exists.
+    let whole_frames = (feed_increment - 1.0).abs() < f64::EPSILON;
     let mut rc = wrap_looped(*read_cursor, seam);
     for k in 0..KL_FEED_HOP {
-        let (l, r) = read_looped(track, rc, seam, env);
-        let edge = track_tail_fade_scale(track_len, rc, env);
+        // A loop's seam can leave the cursor between frames; reading there
+        // would be a filter on the whole record.
+        let at = if whole_frames { rc.round() } else { rc };
+        let (l, r) = read_looped(track, at, seam, env);
+        let edge = track_tail_fade_scale(track_len, at, env);
         stretch_in[k * 2] = l * edge;
         stretch_in[k * 2 + 1] = r * edge;
-        rc = wrap_looped(rc + new_increment, seam);
+        rc = wrap_looped(rc + feed_increment, seam);
     }
     let (consumed, produced) = stretcher.process(stretch_in, stretch_out);
     #[allow(clippy::cast_precision_loss)]
     {
-        *read_cursor = wrap_looped(*read_cursor + consumed as f64 * new_increment, seam);
+        *read_cursor = wrap_looped(*read_cursor + consumed as f64 * feed_increment, seam);
     }
     produced
 }
@@ -2404,7 +2419,7 @@ fn kl_next<S: TimeStretcher>(
     track_len: f64,
     env: &DeclickEnvelope,
     read_cursor: &mut f64,
-    new_increment: f64,
+    feed_increment: f64,
     seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
@@ -2419,7 +2434,7 @@ fn kl_next<S: TimeStretcher>(
             track_len,
             env,
             read_cursor,
-            new_increment,
+            feed_increment,
             seam,
             stretch_in,
             stretch_out,
@@ -2436,10 +2451,11 @@ fn kl_next<S: TimeStretcher>(
     (stretch_out[i * 2], stretch_out[i * 2 + 1])
 }
 
-/// Prime the stretcher at engage: reset it, point the read cursor at the
-/// audible playhead, and discard the algorithmic-latency frames so the first
-/// played frame lines up with what the bypass path reads at `start_pos` — the
-/// crossfade then blends only pitch, no phase flam.
+/// Prime the stretcher at engage: reset it and point the read cursor at the
+/// audible playhead, so the first frame it plays is the one the bypass path
+/// reads at `start_pos` — the crossfade then blends only pitch, no phase
+/// flam. Any latency a stretcher reports is discarded first; the splice
+/// stretcher reports none.
 #[allow(clippy::too_many_arguments)]
 fn kl_prime<S: TimeStretcher>(
     stretcher: &mut S,
@@ -2448,7 +2464,7 @@ fn kl_prime<S: TimeStretcher>(
     env: &DeclickEnvelope,
     read_cursor: &mut f64,
     start_pos: f64,
-    new_increment: f64,
+    feed_increment: f64,
     seam: Option<LoopSeam>,
     stretch_in: &mut [f32],
     stretch_out: &mut [f32],
@@ -2469,7 +2485,7 @@ fn kl_prime<S: TimeStretcher>(
             track_len,
             env,
             read_cursor,
-            new_increment,
+            feed_increment,
             seam,
             stretch_in,
             stretch_out,
@@ -2494,11 +2510,12 @@ fn kl_prime<S: TimeStretcher>(
     }
 }
 
-/// Render the steady-state engaged path for one block: pitch-correct via
-/// `stretcher` (tempo already moved by `new_increment`), with the bypass↔engaged
-/// equal-power crossfade while `*lock_state` is `Engaging`. The audible playhead
-/// `*pos` advances by `new_increment` per output frame in every state, so the
-/// publish path is unchanged; `*read_cursor` is the (leading) stretcher feed.
+/// Render the steady-state engaged path for one block: the record goes to
+/// `stretcher` at its own speed and comes back at the platter's tempo, with
+/// the bypass↔engaged equal-power crossfade while `*lock_state` is
+/// `Engaging`. The audible playhead `*pos` advances by `new_increment` per
+/// output frame in every state, so the publish path is unchanged;
+/// `*read_cursor` is the (leading) stretcher feed.
 #[allow(clippy::too_many_arguments)]
 fn render_engaged<S: TimeStretcher>(
     stretcher: &mut S,
@@ -2513,6 +2530,7 @@ fn render_engaged<S: TimeStretcher>(
     gain: f32,
     rate: f64,
     new_increment: f64,
+    feed_increment: f64,
     seam: Option<LoopSeam>,
     pos: &mut f64,
     read_cursor: &mut f64,
@@ -2522,11 +2540,11 @@ fn render_engaged<S: TimeStretcher>(
     out_read: &mut usize,
     lock_state: &mut KeyLockState,
 ) {
-    // Pitch-correction insert: hold tempo (the deck's resampler already applied
-    // `rate`), undo the resampler's pitch shift. `rate > 0` is guaranteed by the
+    // The stretcher changes the record's length and nothing else: played at
+    // `rate`, it lasts `1 / rate` as long. `rate > 0` is guaranteed by the
     // engage predicate.
-    stretcher.set_time_ratio(1.0);
-    stretcher.set_pitch_scale(1.0 / rate);
+    stretcher.set_time_ratio(1.0 / rate);
+    stretcher.set_pitch_scale(1.0);
 
     for chunk in out.chunks_exact_mut(stride).skip(start) {
         let (sl, sr) = kl_next(
@@ -2535,7 +2553,7 @@ fn render_engaged<S: TimeStretcher>(
             track_len,
             declick_env,
             read_cursor,
-            new_increment,
+            feed_increment,
             seam,
             stretch_in,
             stretch_out,
@@ -3050,6 +3068,65 @@ mod tests {
         best as f32 * 48_000.0 / N as f32
     }
 
+    /// A held tone with a click every half second, and the click frames.
+    fn kl_click_track(frames: usize) -> (Arc<Track>, Vec<usize>) {
+        let mut s = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let v = (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() * 0.1;
+            s[i * 2] = v;
+            s[i * 2 + 1] = v;
+        }
+        let clicks: Vec<usize> = (1..frames / 24_000).map(|n| n * 24_000 + 137).collect();
+        for &at in &clicks {
+            for k in 0..48 {
+                let v = if k % 2 == 0 { 0.9 } else { -0.9 };
+                s[(at + k) * 2] += v;
+                s[(at + k) * 2 + 1] += v;
+            }
+        }
+        (const_track(&s, 2, 48_000), clicks)
+    }
+
+    /// Output frame at which the click due at `due` starts, searching 40 ms
+    /// either side.
+    fn kl_click_found(stereo: &[f32], due: usize) -> usize {
+        (due - 1_920..due + 1_920)
+            .find(|&i| stereo[i * 2].abs() > 0.5)
+            .expect("the click is in the output")
+    }
+
+    /// Key lock changes a record's pitch, not when it plays. The deck used
+    /// to throw away the stretcher's first 20 ms on engaging — "latency" the
+    /// stretcher never had — so a locked deck played 20 ms ahead of its own
+    /// playhead, waveform and phase meter.
+    #[test]
+    fn key_lock_plays_a_hit_when_the_unlocked_deck_does() {
+        let (track, clicks) = kl_click_track(240_000);
+        for rate in [0.94, 1.0, 1.06] {
+            let render = |lock: bool| {
+                let mut deck = test_deck();
+                deck.set_source(track.clone());
+                deck.set_playing(true);
+                deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+                deck.set_key_lock(lock);
+                deck.set_rate(rate);
+                deck.quiesce_declick_for_test();
+                kl_render(&mut deck, 800, 256)
+            };
+            let (locked, unlocked) = (render(true), render(false));
+            for &click in &clicks[2..6] {
+                let due = (click as f64 / rate) as usize;
+                let (on, off) = (kl_click_found(&locked, due), kl_click_found(&unlocked, due));
+                assert!(
+                    on.abs_diff(off) <= 144,
+                    "at x{rate} the locked deck plays the hit at frame {on}, the unlocked at \
+                     {off}: {:.1} ms apart",
+                    (on as f64 - off as f64) / 48.0
+                );
+            }
+        }
+    }
+
     #[test]
     fn key_lock_holds_pitch_while_resampler_shifts_it() {
         let track = kl_sine_track(440.0, 120_000);
@@ -3137,42 +3214,65 @@ mod tests {
         );
     }
 
-    /// The stretched audio has to stay with the record. The engaged path
-    /// reads through its own cursor and the timecode path re-pins the
+    /// The stretched audio has to stay with the record. The stretcher
+    /// follows the tempo it is told and the timecode path re-pins the
     /// playhead to the groove every block; if the correction is not
-    /// carried into the cursor, the audio drifts away from the needle
+    /// carried to the stretcher, the audio drifts away from the needle
     /// a little every block and never comes back.
     #[test]
     fn timecode_key_lock_stays_with_the_groove() {
-        let track = kl_sine_track(440.0, 700_000);
+        let (track, clicks) = kl_click_track(700_000);
         let mut deck = test_deck();
         deck.set_source(track);
         deck.set_playing(true);
         deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
         deck.set_key_lock(true);
         deck.quiesce_declick_for_test();
-        let _ = tc_render(&mut deck, 100, 1.06);
-        assert_eq!(
-            deck.shared.load_key_lock_state(),
-            2,
-            "engaged before measuring"
-        );
-        let lead_early = deck.read_cursor - deck.position_frames();
-        // ~10 s more of a wobbling platter.
-        let _ = tc_render(&mut deck, 1_900, 1.06);
-        let lead_late = deck.read_cursor - deck.position_frames();
-        // The cursor moves in feed hops while the playhead moves every
-        // frame, so the lead legitimately swings by up to one hop at the
-        // platter's rate. Without the correction it drifts ~0.8 frames a
-        // block here — ~1 500 frames over the run, far outside that.
-        #[allow(clippy::cast_precision_loss)]
-        let hop = KL_FEED_HOP as f64 * 1.06;
-        assert!(
-            (lead_late - lead_early).abs() <= hop + 1.0,
-            "the stretcher's read cursor drifted {} frames from the groove \
-             in ten seconds (lead {lead_early} → {lead_late}); one feed hop is {hop}",
-            lead_late - lead_early
-        );
+
+        // `tc_render`, keeping the playhead after every block.
+        let (rate, block) = (1.06, 256usize);
+        let mut rt = RealtimeContext::new();
+        let mut out = vec![0.0f32; block * 2];
+        let mut audio = Vec::new();
+        let mut playhead = vec![0.0f64];
+        for b in 0..2_000 {
+            let wobble = 0.002 * ((b as f64) * 0.7).sin();
+            deck.set_rate(rate * (1.0 + wobble));
+            deck.advance_position_frames(block as f64 * rate * (1.003 + 0.5 * wobble));
+            out.fill(0.0);
+            deck.render(&mut rt, &mut out, 48_000.0);
+            audio.extend_from_slice(&out);
+            playhead.push(deck.position_frames());
+        }
+        assert_eq!(deck.shared.load_key_lock_state(), 2, "engaged");
+
+        // Each click late in the run: when the playhead passed it, against
+        // when it is heard. Without the correction the audio is ~0.8 frames
+        // a block behind — 30 ms by the end.
+        let mut checked = 0;
+        for &click in &clicks {
+            let click = click as f64;
+            let Some(b) = playhead
+                .windows(2)
+                .position(|w| w[0] <= click && click < w[1])
+            else {
+                continue;
+            };
+            if b < 1_500 {
+                continue;
+            }
+            let within = (click - playhead[b]) / (playhead[b + 1] - playhead[b]);
+            let due = ((b as f64 + within) * block as f64) as usize;
+            let heard = kl_click_found(&audio, due);
+            assert!(
+                heard.abs_diff(due) <= 144,
+                "the playhead passes the click at frame {due} and it is heard at {heard}: \
+                 {:.1} ms off the groove",
+                (heard as f64 - due as f64) / 48.0
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "clicks late in the run to check: {checked}");
     }
 
     /// A scratch still bypasses: the slew rule has to keep working now

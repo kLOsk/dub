@@ -28,6 +28,9 @@ proptest = { workspace = true }
 # follow at the application layer (see PRD §5.3).
 dub-io = { workspace = true }
 hound = { workspace = true }
+# `tests/follow_corpus.rs` bends steady records by a known tempo curve to
+# see whether the tracker reads the curve back.
+dub-stretch = { workspace = true }
 # The THRU forecast test on real records reads the onsets a THRU deck's
 # waveform stream computes — dub-peaks' `OnsetDecimator` — so it follows
 # exactly what the app follows. Test-only; dub-peaks does not depend on

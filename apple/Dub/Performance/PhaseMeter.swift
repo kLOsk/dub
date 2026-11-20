@@ -28,6 +28,7 @@
 //
 
 import AppKit
+import DubCore
 import SwiftUI
 
 // MARK: - Model
@@ -43,27 +44,58 @@ struct PhaseMeterInputs: Equatable {
     /// The platter's pitch, so a beat's length in the room is known.
     var pitchPercent: Double?
     var playheadSecs: Double = 0
+    /// Every beat of the grid, in track seconds, when the grid follows
+    /// the band. Its beats are not evenly spaced, so one tempo and one
+    /// anchor do not say where they are: read off those two, the marker
+    /// on a followed track wandered with the band's drift and meant
+    /// nothing (Daniel, 2026-11-19). `nil` for an even grid.
+    var followedBeats: [Double]?
 
     /// Whether the deck has a grid to take a phase from.
     var hasGrid: Bool {
         hasTrack && (bpm ?? 0) > 0 && gridAnchorSecs != nil
     }
 
+    /// The beat the playhead is in: where it starts and how long it
+    /// lasts, in track seconds. Before the first followed beat and after
+    /// the last, the nearest gap is carried on.
+    var beatUnderPlayhead: (start: Double, length: Double)? {
+        guard hasGrid else { return nil }
+        if let beats = followedBeats, beats.count >= 2 {
+            // First beat after the playhead, by bisection.
+            var (low, high) = (0, beats.count)
+            while low < high {
+                let middle = (low + high) / 2
+                if beats[middle] <= playheadSecs { low = middle + 1 } else { high = middle }
+            }
+            let i = min(max(low - 1, 0), beats.count - 2)
+            let length = beats[i + 1] - beats[i]
+            guard length > 0 else { return nil }
+            let whole = ((playheadSecs - beats[i]) / length).rounded(.down)
+            // Outside the grid, step on by whole beats of the edge gap.
+            let outside = playheadSecs < beats[0] || playheadSecs >= beats[beats.count - 1]
+            return (beats[i] + (outside ? whole * length : 0), length)
+        }
+        guard let bpm, let anchor = gridAnchorSecs else { return nil }
+        let length = 60 / bpm
+        return (anchor + ((playheadSecs - anchor) / length).rounded(.down) * length, length)
+    }
+
     /// Where the playhead sits inside its beat, 0 ≤ φ < 1 — from the
     /// grid, in track time, so the platter's pitch does not enter.
     var beatPhase: Double? {
-        guard hasGrid, let bpm, let anchor = gridAnchorSecs else { return nil }
-        let beats = (playheadSecs - anchor) * bpm / 60
-        return beats - beats.rounded(.down)
+        guard let beat = beatUnderPlayhead else { return nil }
+        let phase = (playheadSecs - beat.start) / beat.length
+        return phase - phase.rounded(.down)
     }
 
-    /// A beat's length in the room, in ms — the grid's beat at the
-    /// platter's pitch.
+    /// A beat's length in the room, in ms — the grid's beat under the
+    /// playhead at the platter's pitch.
     var beatMs: Double? {
-        guard hasGrid, let bpm else { return nil }
+        guard let beat = beatUnderPlayhead else { return nil }
         let rate = 1 + (pitchPercent ?? 0) / 100
         guard rate > 0.05 else { return nil }
-        return 60_000 / (bpm * rate)
+        return beat.length * 1_000 / rate
     }
 }
 
@@ -123,38 +155,69 @@ enum PhaseMeter {
 /// marker reads both decks on its own clock.
 struct PhaseMeterView: View {
     let model: WaveformAppModel
+    @State private var grids = PhaseMeterGrids()
 
     var body: some View {
         ZStack {
             PhaseMeterCanvas(frame: PhaseMeterFrame())
                 .accessibilityHidden(true)
-            PhaseMeterMarker(read: { [model] in PhaseMeterView.frame(model) })
+            PhaseMeterMarker(read: { [model, grids] in PhaseMeterView.frame(model, grids) })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DubColor.surface0)
     }
 
     @MainActor
-    static func frame(_ model: WaveformAppModel) -> PhaseMeterFrame {
+    static func frame(_ model: WaveformAppModel, _ grids: PhaseMeterGrids) -> PhaseMeterFrame {
         PhaseMeter.frame(
-            a: inputs(model, model.deckA, idx: 0),
-            b: inputs(model, model.deckB, idx: 1),
+            a: inputs(model, model.deckA, idx: 0, grids),
+            b: inputs(model, model.deckB, idx: 1, grids),
             masterIsA: model.masterDeck != .b)
     }
 
     @MainActor
-    private static func inputs(_ model: WaveformAppModel, _ deck: DeckState, idx: UInt64) -> PhaseMeterInputs {
+    private static func inputs(
+        _ model: WaveformAppModel, _ deck: DeckState, idx: UInt64, _ grids: PhaseMeterGrids
+    ) -> PhaseMeterInputs {
         var i = PhaseMeterInputs()
         i.hasTrack = deck.hasTrack
         i.isPlaying = deck.isPlaying
         i.bpm = deck.bpm
         i.gridAnchorSecs = deck.gridAnchorSecs
+        i.followedBeats = deck.hasTrack ? grids.followedBeats(model.engine, idx: idx) : nil
         // The engine's, not the model's: the model holds pitch to the
         // readout's 0.1 % steps, and the meter integrates the rate.
         i.pitchPercent = deck.isPlaying
             ? model.engine.deckTelemetry(deckIdx: idx).pitchPercent : nil
         i.playheadSecs = model.engine.positionSnapshot(deckIdx: idx).playheadSecsUnclamped
         return i
+    }
+}
+
+/// The beats of each deck's grid when it follows the band, fetched once
+/// per grid: the marker asks every frame, the two generation counters it
+/// checks are atomics, and the grid itself crosses the FFI — taking the
+/// engine lock and copying every beat — only when one of them has moved.
+@MainActor
+final class PhaseMeterGrids {
+    private struct Held {
+        var peaks: UInt64
+        var grid: UInt64
+        var beats: [Double]?
+    }
+
+    private var held: [UInt64: Held] = [:]
+
+    func followedBeats(_ engine: DubEngine, idx: UInt64) -> [Double]? {
+        let peaks = engine.peaksGeneration(deckIdx: idx)
+        let grid = engine.beatGridGeneration(deckIdx: idx)
+        if let known = held[idx], known.peaks == peaks, known.grid == grid {
+            return known.beats
+        }
+        let fetched = engine.beatGrid(deckIdx: idx)
+        let beats = fetched.follows && fetched.beats.count >= 2 ? fetched.beats : nil
+        held[idx] = Held(peaks: peaks, grid: grid, beats: beats)
+        return beats
     }
 }
 

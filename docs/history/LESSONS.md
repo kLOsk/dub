@@ -242,6 +242,20 @@
   against its distance from the tap in milliseconds
   (`run_by_the_tap`: an 80 ms bell, 30 ms late because taps read early).
   Replayed from his log in `tests/hey_ya_playing_tap.rs`.
+- **A line on each hit is not the tempo.** The followed chain lets a beat
+  sit up to a tenth of a beat early or late for almost nothing, which is
+  right for drawing lines on what a drummer played and useless for reading
+  how fast he is going: over four bars it read a drum machine as moving
+  1–2 %. Before reading meaning into a statistic, read it on a group where
+  the answer is known — here, tracks locked in Traktor at Dub's own tempo,
+  which read the same "spread" as the unlocked ones.
+- **A tracker that can prefer the off-beat will go there.** With one tooth
+  a beat, the pulse slid half a beat through breakdowns wherever the
+  off-beat was louder afterwards — about 2.2 % of tempo, on house tracks.
+  A tooth every half beat makes the two score alike; decide which is the
+  beat once, outside the search.
+- **The stretcher makes the tracker's test data.** Bend a steady record by
+  a known tempo curve and the truth for every beat is the curve itself.
 - **The drift warning is a measurement with scatter; set its limit against
   grids known to be good, and read the drift with a median.** The ⚠ fired
   at 3 ms/min on a least-squares slope through "the strongest onset by
@@ -475,7 +489,7 @@
 - **Two sheets can't present at once.** Re-opening onboarding from Preferences
   dismisses Preferences, then presents onboarding on the next runloop tick.
 - **A reused `NSTableView` cell is only reconfigured when the row set or
-  `contentRevision` moves.** `LibraryTable.updateNSView` calls `reloadData()`
+  `contentRevision` moves.** `LibraryTable.updateNSView` refills the rows
   on an id-list change or a `tracksContentRevision` bump — nothing else. So any
   state that changes how a cell *draws* without changing which rows exist has
   to bump that revision, or it lands on the header and nowhere else. The
@@ -538,6 +552,59 @@
   block-by-block bisect (a launch argument per section) turned the rest into
   arithmetic. `-dubForceMode perf|prep` and `-signalOpen` exist so that
   measurement does not need a human to click anything.
+
+- **`reloadData()` is not a refresh.** It takes every row view off the
+  table and re-adds it, and with a SwiftUI host in each cell that is
+  hundreds of hosts leaving and re-entering the window: half a second of
+  main thread per click on a playlist, after data that took 30 ms to
+  fetch. Cells configured by value can be refilled where they stand
+  (`noteNumberOfRowsChanged` + `enumerateAvailableRowViews`). The timing
+  log said the wait was not in the fetch; the watchdog's stack said where
+  it was. Both were needed — "it feels slow" pointed at the database.
+- **When the time is inside SwiftUI, a profile names nothing; leave
+  parts out and subtract.** After the fix above a click still took 670 ms
+  and the stacks all ended in `NSHostingView.layout` → AttributeGraph,
+  with no frame of ours and no usable symbol. What found it was a bench
+  the app runs on itself (`-dubLibraryBench 1`, `LibraryBench`): the same
+  nine lists, once as it is and once with each part of the browser left
+  out. The differences were additive to within a few ms and named three
+  causes nobody had guessed in the right order — the *folded* filter bar
+  (290 ms), the cells' hosts (170), the sidebar (90).
+- **A view kept alive while hidden is still fed.** The filter bar's boxes
+  were kept at zero height so that opening it was instant, and so every
+  list that arrived rebuilt five invisible boxes. If a hidden view is
+  kept for a fast return, give it nothing to do while it is hidden.
+- **Rows built by a function of the parent view are all rebuilt when the
+  parent's state moves.** `sidebarRow(…)` returning `some View` is not a
+  view SwiftUI can skip: closures make it incomparable, so a hundred rows
+  were diffed for a change to an unrelated `@State`. A row that is its
+  own `Equatable` struct, used with `.equatable()`, is skipped — provided
+  everything its closures capture is in the comparison, or a kept closure
+  acts on the wrong row.
+- **A SwiftUI host per table cell costs about a third of a millisecond
+  per update, whatever it shows.** Switching off the hosts' size
+  reporting (`sizingOptions = []`) moved the cost from the constraint
+  pass to layout and made it larger. The fix is fewer hosts: text columns
+  drawn by `NSTextField`, and a host left alone when it already shows the
+  value (most rows have no stars, no colour, no badge). Not
+  `usesSingleLineMode` on those labels — it sets 18 pt text 4 pt high.
+- **`sorted(using: KeyPathComparator)` is slow.** 113 ms for 2,183
+  titles against 15 for `localizedStandardCompare` on the same strings,
+  same order. For the usual sort — one text column — take the keys out
+  once and sort indices.
+- **A change to one row must cost one row.** `applyAnalysisUpdate`
+  patched its row and then called the same `recomputeSortedTracks()` a
+  whole new listing uses — a sort of the view with string collation and an
+  equality check of the result against the old array. Unnoticed on a
+  short list; on 2,600 rows, with several results per load and a Debug
+  build, four-second freezes. The watchdog's stack named it at once
+  (`~/Library/Logs/Dub/stall-*.txt`): read that before guessing — the
+  report was "beachballs while skipping through the track", and neither
+  the seek nor the stretcher that had changed that day was in it.
+- **A search field searches what the DJ is looking at.** The collection-
+  only search carried a comment that node-scoped search was "not wired
+  here", and with most of a library living in other apps' nodes that
+  read as search being broken.
 
 ## Vinyl rip (M26)
 
@@ -709,6 +776,42 @@
   `&&`. And a drift test must fail without the fix: the first one here passed
   with the correction deleted, because a symmetric wobble averages out and the
   tolerance sat just above the drift. Bias the input the way the rig does.
+
+- **A stretcher's search reach is a pitch floor.** WSOLA with a ±10 ms
+  search can jump at most 20 ms, one turn of a 50 Hz wave. Below that it
+  finds no place to jump to, slides its window a little every hop, and the
+  note comes out at the platter's pitch: 41 Hz, a bass guitar's low E, sat
+  133 cents sharp at +8 % while the rest of the tune held. A dip-and-wobble
+  test saw nothing (the note was steady, only wrong), and M14's sub-bass
+  signal was 55 Hz, just above the floor. Test the lowest note the music
+  has, and measure its pitch, not only its level.
+- **"Latency" a stretcher reports gets thrown away at engage.** WSOLA
+  reported its window as latency though its first frame out is its first
+  frame in; the deck discarded that much at every engage and a locked deck
+  played ~10 ms ahead of its playhead, waveform and phase meter for two
+  months. Record needed *ahead* is not delay. Pin it with a click through
+  the deck, locked against unlocked.
+- **Pitching a record and pitching it back is two filters.** Key lock ran
+  the deck's straight-line interpolation at the platter's rate and then the
+  stretcher's at the inverse: −5 dB at 12–16 kHz. Ask the stretcher for a
+  length and feed it the record at its own speed; at a matching sample rate
+  that is no interpolation at all.
+- **Two bands joined apart cancel where they overlap.** The splice
+  stretcher split bass from the rest with a gentle filter, so 80–300 Hz
+  was in both, played a few milliseconds apart whenever the halves read
+  different places: 0.3–1.7 dB gone below 170 Hz. Every test signal was a
+  pure tone, and a pure tone's joins are whole waves, so the halves stayed
+  in step and the tests read 0.0. Daniel heard it ("the old had more
+  bass") from two files. Test with something that does not repeat —
+  noise — and compare band levels on real records against the untouched
+  record, not only against the last version. The fix was a steep split
+  placed above the bass's notes; where the split falls matters as much as
+  how steep it is.
+- **Measure a stretcher by what happens to hits.** Crest factor (M14's
+  transient number) cannot tell a doubled or misplaced hit from a clean
+  one. Find each hit's shape in the output: where it landed against the
+  tempo, how much of it arrived, whether a second copy sits beside it —
+  and discount hits the record itself plays twice.
 
 ## Build + test hygiene
 

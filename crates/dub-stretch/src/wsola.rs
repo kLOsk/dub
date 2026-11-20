@@ -607,6 +607,36 @@ mod tests {
     }
 
     #[test]
+    fn splice_process_is_alloc_free() {
+        // Here, not beside the splice stretcher's other tests, because the
+        // test binary has one global allocator and it is declared above.
+        let mut s = crate::SpliceStretcher::new(SR);
+        s.set_time_ratio(1.0 / 1.06);
+        let mut input = sine(110.0, 96_000);
+        for hit in (4_800..96_000).step_by(9_600) {
+            for k in 0..200 {
+                let v = if k % 3 == 0 { 0.8 } else { -0.5 };
+                input[(hit + k) * 2] += v;
+                input[(hit + k) * 2 + 1] += v;
+            }
+        }
+        let mut output = vec![0.0f32; 512 * 2];
+        // Warm up: fill the lookahead.
+        let (mut cursor, _) = s.process(&input[..16_384 * 2], &mut output);
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..120 {
+                let (c, _) = s.process(&input[cursor * 2..(cursor + 512) * 2], &mut output);
+                cursor += c;
+            }
+        });
+        let joins = s.joins();
+        assert!(
+            joins.before_hits + joins.matched + joins.forced > 0,
+            "the run made joins, so the join path was under the allocator too"
+        );
+    }
+
+    #[test]
     fn reset_returns_to_initial_state() {
         let mut s = WsolaStretcher::new(SR);
         s.set_time_ratio(1.4);

@@ -5959,6 +5959,10 @@ final class WaveformAppModel: ObservableObject {
             surfaceNotice("Quick Scratch \(pad + 1): \(fault.sentence)")
             return
         }
+        // The sample is a new thing on the deck, as a loaded track is:
+        // an echo-out left on would hold it at 100 % wet — silent.
+        disengageEchoIfEngaged(side)
+        deck = state(for: side)
         let parkedTitle: String?
         if let current = deck.quickScratch {
             parkedTitle = current.parkedTitle
@@ -5979,6 +5983,8 @@ final class WaveformAppModel: ObservableObject {
             // The tune is on the other deck now: same track, same cues
             // and grid, at the same playhead — what `instantDouble` does.
             // What the host showed is parked, to come back at release.
+            // An echo-out on the host would mute the tune it just took.
+            disengageEchoIfEngaged(other)
             var destination = state(for: other)
             doubleHostParked[other] = destination
             destination.adoptLoadedTrack(from: deck)
@@ -6476,7 +6482,6 @@ final class WaveformAppModel: ObservableObject {
 
     func engageEcho(_ side: DeckSide, divisionBeats: Double) {
         guard isRunning else { return }
-        let deck = state(for: side)
         // Tempo-lock to the deck's analysed BPM when known; otherwise fall
         // back to a neutral 120 so the echo still fires (the division is then
         // in absolute time rather than beat-locked) — better than a silent
@@ -6484,16 +6489,17 @@ final class WaveformAppModel: ObservableObject {
         // deck's live one — tracked, or tapped on the deck — and failing
         // that the Space Echo's TAP; both are at the platter's real speed
         // already.
-        let effectiveBpm: Double
-        if !deck.isThru, let bpm = deck.playingBpm, bpm > 0 {
-            effectiveBpm = bpm * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
-        } else if let thru = deck.thruReadout?.tempo {
-            effectiveBpm = thru
-        } else if let fx = dubFxDeck, let tapped = state(for: fx).fxRack.spaceEchoTapBpm {
-            effectiveBpm = tapped
-        } else {
-            effectiveBpm = 120
-        }
+        //
+        // With the other deck the master and playing, the echo keeps
+        // *its* time: echoing the old tune out under the one just
+        // dropped in, the repeats have to land on the new tune's beat
+        // (Daniel, 2026-11-19).
+        let other: DeckSide = side == .a ? .b : .a
+        let effectiveBpm = Self.echoOutTempo(
+            own: tempoAsHeard(side),
+            master: masterDeck == other && state(for: other).isPlaying
+                ? tempoAsHeard(other) : nil,
+            tapped: dubFxDeck.flatMap { state(for: $0).fxRack.spaceEchoTapBpm })
         guard effectiveBpm > 0 else { return }
         try? engine.engageEchoOut(
             deckIdx: side.ffiDeckIdx,
@@ -6501,6 +6507,27 @@ final class WaveformAppModel: ObservableObject {
             bpm: effectiveBpm,
             feedback: 0.6,    // PRD §6.3 default feedback (60 %)
             lpfHz: 8000)      // PRD §6.3 default feedback low-pass (8 kHz)
+    }
+
+    /// A deck's tempo as the room hears it: a track's tempo where the
+    /// playhead is, at the platter's pitch, or a THRU record's live one.
+    /// `nil` with neither.
+    private func tempoAsHeard(_ side: DeckSide) -> Double? {
+        let deck = state(for: side)
+        if !deck.isThru, let bpm = deck.playingBpm, bpm > 0 {
+            return bpm * (1.0 + (livePitchPercent(side) ?? 0) / 100.0)
+        }
+        return deck.thruReadout?.tempo
+    }
+
+    /// The tempo an echo-out keeps: the master deck's when that is the
+    /// other deck (`master`), else the deck's own, else the tempo tapped
+    /// on the Space Echo, else 120.
+    nonisolated static func echoOutTempo(own: Double?, master: Double?, tapped: Double?) -> Double {
+        for tempo in [master, own, tapped] {
+            if let tempo, tempo > 0 { return tempo }
+        }
+        return 120
     }
 
     /// Release a held echo-out on `side`; the captured-loop tail decays
@@ -7446,6 +7473,7 @@ struct MainView: View {
     @AppStorage("dub.hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
     var body: some View {
+        let _ = LibraryListTiming.windowBody()
         ZStack {
             PerformanceView(
                 model: model,

@@ -67,8 +67,18 @@ enum WaveformZoom {
         4.0,         // 0.25x — 1 (floored; see above)
     ]
 
-    /// `1.0` — the shipped Performance scale.
-    static let defaultIndex = 3
+    /// `0.5×`: about twice as much record on the strip as `1×` shows —
+    /// the scale Daniel plays at (2026-11-20; it was `1×`).
+    static let defaultIndex = 5
+
+    /// Where the DJ's last choice is kept, so a restart comes back to it.
+    static let storageKey = "dub.waveformZoomIndex"
+
+    /// A stored index brought inside the ladder: a build with a
+    /// different ladder must not index past its end.
+    static func clamped(_ index: Int) -> Int {
+        min(max(index, 0), steps.count - 1)
+    }
 
     /// Two decimals, trailing zeros trimmed: 2x, 1.75x, 1.5x, 1.25x,
     /// 1x, 0.75x, 0.5x. `%.2g` was fine for the old whole-and-thirds

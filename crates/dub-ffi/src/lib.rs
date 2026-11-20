@@ -598,7 +598,12 @@ pub use rip::{
 ///       `install_beat_grid_from_bpm_and_anchor` is gone — it took the
 ///       wall-clock tap rate as the track's tempo, right only at zero
 ///       pitch.
-pub const FFI_VERSION: u32 = 91;
+///   92. **Search looks in the list on screen.**
+///       [`DubLibrary::search_track_ids`]: every track the search
+///       matches, in the collection or not. [`DubLibrary::search`] is
+///       collection-only, so with another app's library selected the
+///       search field answered "no matches" for tracks in plain view.
+pub const FFI_VERSION: u32 = 92;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -2337,7 +2342,7 @@ impl DubEngine {
     }
 
     /// Select a deck's key-lock state (M14). `ResamplerOnly` disables key lock
-    /// (pitch shifts with rate); `DubOwn` enables our WSOLA key lock.
+    /// (pitch shifts with rate); `DubOwn` enables our own key lock.
     ///
     /// # Errors
     /// [`EngineError::NotRunning`] if the engine isn't running;
@@ -5242,12 +5247,12 @@ impl From<ControlMode> for dub_engine::ControlMode {
 }
 
 /// Whether a deck's key lock is on (M14). `ResamplerOnly` = off (pitch shifts
-/// with rate); `DubOwn` = our WSOLA key lock.
+/// with rate); `DubOwn` = our own key lock.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum StretchBackend {
     /// No key lock — the deck's resampler handles rate (pitch shifts).
     ResamplerOnly,
-    /// Dub's pure-Rust WSOLA key lock.
+    /// Dub's pure-Rust key lock (the splice stretcher since 2026-11-19).
     DubOwn,
 }
 
@@ -7252,7 +7257,8 @@ mod tests {
         // 87→88: `hot_cues` returns an import's cues; `hot_cue_source`.
         // 88→89: `save_tempo_map` / `delete_tempo_map`, `LibraryTempoMap`,
         // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
-        assert_eq!(FFI_VERSION, 91);
+        // 91→92: `search_track_ids`.
+        assert_eq!(FFI_VERSION, 92);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
@@ -9276,6 +9282,18 @@ impl DubLibrary {
         })
     }
 
+    /// The ids of every track the search matches, in the collection or
+    /// not. The browser searches the list it is showing by keeping the
+    /// rows of that list whose ids come back here; [`Self::search`]
+    /// stays the collection's own search, behind All Tracks.
+    pub fn search_track_ids(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> std::result::Result<Vec<String>, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.search_track_ids(&query, limit)?))
+    }
+
     /// Recently Played smart crate per §8.5.2. Empty until the deck
     /// transport actually writes `play_history` rows (M11d.2 wires
     /// the load hook; until then the smart crate renders empty).
@@ -9519,7 +9537,8 @@ impl DubLibrary {
 
     /// List an imported crate/playlist's member tracks in the source's
     /// order, in the same [`LibraryTrack`] shape the rest of the browser
-    /// uses.
+    /// uses. A folder lists every track of the playlists under it, each
+    /// once (2026-11-20; it used to list only its own, which is none).
     pub fn imported_crate_tracks(
         &self,
         imported_crate_id: i64,

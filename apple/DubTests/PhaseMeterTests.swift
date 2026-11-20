@@ -27,6 +27,41 @@ final class PhaseMeterTests: XCTestCase {
         return d
     }
 
+    /// A band that speeds up: beats 0.50 s apart, then 0.48, then 0.46.
+    /// The phase is read inside the beat the playhead is in, whatever
+    /// its length — an even grid at the band's average tempo would put
+    /// the same playhead a tenth of a beat out by the third beat.
+    func testAFollowedGridIsReadBeatByBeat() {
+        var band = deck(at: 0, bpm: 125)
+        band.followedBeats = [1.00, 1.50, 1.98, 2.44, 2.90]
+        band.playheadSecs = 1.98
+        XCTAssertEqual(band.beatPhase ?? 1, 0, accuracy: 1e-9, "on its third beat")
+        band.playheadSecs = 1.98 + 0.23
+        XCTAssertEqual(band.beatPhase ?? 0, 0.5, accuracy: 1e-9, "half way through a 0.46 s beat")
+        XCTAssertEqual(band.beatMs ?? 0, 460, accuracy: 1e-6)
+
+        // Against a steady master on its beat: in phase on the band's
+        // beat, half a beat out between two.
+        band.playheadSecs = 2.44
+        let on = PhaseMeter.frame(a: deck(at: 10.0), b: band, masterIsA: true)
+        XCTAssertEqual(on.phaseBeats ?? 1, 0, accuracy: 1e-9)
+        XCTAssertTrue(on.locked)
+
+        // Before the first beat and past the last, the edge gap carries on.
+        band.playheadSecs = 0.75
+        XCTAssertEqual(band.beatPhase ?? 0, 0.5, accuracy: 1e-9)
+        band.playheadSecs = 2.90 + 0.46 + 0.115
+        XCTAssertEqual(band.beatPhase ?? 0, 0.25, accuracy: 1e-9)
+    }
+
+    /// The old tune echoed out under the new one keeps the new one's time.
+    func testEchoOutKeepsTheMastersTime() {
+        XCTAssertEqual(WaveformAppModel.echoOutTempo(own: 92, master: 96, tapped: nil), 96)
+        XCTAssertEqual(WaveformAppModel.echoOutTempo(own: 92, master: nil, tapped: 100), 92)
+        XCTAssertEqual(WaveformAppModel.echoOutTempo(own: nil, master: nil, tapped: 100), 100)
+        XCTAssertEqual(WaveformAppModel.echoOutTempo(own: nil, master: 0, tapped: nil), 120)
+    }
+
     func testInPhaseReadsZeroAndLocks() {
         let f = PhaseMeter.frame(a: deck(at: 10.0), b: deck(at: 4.5), masterIsA: true)
         XCTAssertEqual(f.phaseBeats ?? 1, 0, accuracy: 1e-9)

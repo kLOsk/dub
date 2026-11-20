@@ -63,6 +63,7 @@ mod octave_profile;
 mod offline;
 mod onset;
 mod phase;
+mod pulse;
 mod stream;
 pub mod synthetic;
 mod tempo;
@@ -81,7 +82,7 @@ pub use confidence::{
 };
 pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
-pub use follow::{follow_grid, local_bpm};
+pub use follow::{follow_grid, followed_beats, local_bpm};
 pub use octave_profile::{
     octave_profile_from_genre, octave_profile_from_label, OctaveProfile, TempoOctave,
 };
@@ -90,6 +91,7 @@ pub use offline::{
     AnalysisError,
 };
 pub use phase::{latest_beat, BeatFollower, FollowedBeats, PHASE_WINDOW_SECS};
+pub use pulse::band_pulse;
 pub use stream::{BpmStream, LiveStreamConfig, StreamSnapshot};
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
 

@@ -30,16 +30,17 @@
 //! resampler-only baseline simply reads `R` input frames per output frame
 //! (tempo `×R` *and* pitch `×R`).
 //!
-//! Flags: `[--input <wav>]` runs a real file instead of the synthetic corpus;
-//! `[--dump <dir>]` writes every output cell to a WAV for ear inspection;
-//! `[--full]` runs the full rate sweep (default is a shorter representative
-//! set).
+//! Flags: `[--input <file>]` runs a music file instead of the synthetic
+//! corpus, `[--from <secs>] [--secs <secs>]` choosing the excerpt (30 s from
+//! one minute in); `[--dump <dir>]` writes every output cell to a WAV for ear
+//! inspection; `[--full]` runs the full rate sweep and `[--rates a,b]` a
+//! chosen one (default is a shorter representative set).
 
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use dub_stretch::{TimeStretcher, WsolaStretcher};
+use dub_stretch::{SpliceStretcher, TimeStretcher, WsolaStretcher};
 use realfft::RealFftPlanner;
 
 /// Audio-callback block size used for per-block timing + the xrun deadline.
@@ -58,6 +59,12 @@ enum Backend {
     ResamplerOnly,
     /// Our pure-Rust WSOLA, holding pitch.
     DubOwn,
+    /// Key lock as the deck ran it until 2026-11: the record played fast or
+    /// slow by straight-line interpolation, then pitched back by WSOLA.
+    LockBefore,
+    /// The splice stretcher: the record copied untouched and joined before
+    /// hits and where it repeats.
+    Splice,
 }
 
 impl Backend {
@@ -65,6 +72,8 @@ impl Backend {
         match self {
             Backend::ResamplerOnly => "resampler",
             Backend::DubOwn => "dub-wsola",
+            Backend::LockBefore => "lock-before",
+            Backend::Splice => "dub-splice",
         }
     }
 }
@@ -222,16 +231,170 @@ fn run_blocked<F: FnMut(&mut [f32]) -> usize>(mut produce: F) -> (Vec<f32>, Vec<
     (out, times)
 }
 
+/// Play `input` through `s` at `rate` times its tempo, pitch held: a pure
+/// time-stretch by `1 / rate`.
+fn run_stretcher<S: TimeStretcher>(mut s: S, input: &[f32], rate: f64) -> (Vec<f32>, Vec<f64>) {
+    s.set_time_ratio(1.0 / rate);
+    run_stretcher_as_set(s, input)
+}
+
+fn run_stretcher_as_set<S: TimeStretcher>(mut s: S, input: &[f32]) -> (Vec<f32>, Vec<f64>) {
+    let mut cursor = 0usize;
+    run_blocked(|block| {
+        let mut got = 0usize;
+        while got < BLOCK {
+            let (c, p) = s.process(&input[cursor * 2..], &mut block[got * 2..]);
+            cursor += c;
+            got += p;
+            if c == 0 && p == 0 {
+                break;
+            }
+        }
+        got
+    })
+}
+
+/// What became of the record's drum hits.
+///
+/// A stretcher that copies the record puts each hit in the output as it was;
+/// one that joins through a hit fades it, plays it twice, or moves it. Each
+/// strong hit in `source` is looked for in `out` around where the tempo puts
+/// it.
+struct Hits {
+    found: usize,
+    /// How alike the output is to the hit where it was found, 1 = the same.
+    usual_match: f32,
+    /// Hits the output holds no good copy of.
+    damaged: usize,
+    /// Hits with a second good copy beside the first.
+    doubled: usize,
+    /// How far hits sit from their beat, against the usual: 95th centile
+    /// and worst, in ms.
+    off_p95_ms: f64,
+    off_worst_ms: f64,
+}
+
+fn hits(source: &[f32], out: &[f32], sr: f32, rate: f64) -> Hits {
+    let edges = |buf: &[f32]| -> Vec<f32> {
+        let mono: Vec<f32> = buf.chunks_exact(2).map(|f| f[0] + f[1]).collect();
+        std::iter::once(0.0)
+            .chain(mono.windows(2).map(|w| w[1] - w[0]))
+            .collect()
+    };
+    let (source, out) = (edges(source), edges(out));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = |x: f32| (sr * x / 1_000.0) as usize;
+    let block = ms(2.0);
+    let levels: Vec<f64> = source
+        .chunks_exact(block)
+        .map(|c| c.iter().map(|s| f64::from(s * s)).sum())
+        .collect();
+    let loudest = levels.iter().copied().fold(0.0f64, f64::max);
+    let (lead, shape_len, reach, apart) = (ms(1.0), ms(7.0), ms(25.0), ms(2.0));
+
+    let mut matches = Vec::new();
+    let mut offs = Vec::new();
+    let (mut damaged, mut doubled) = (0usize, 0usize);
+    let mut rest_until = 0usize;
+    for k in 8..levels.len() {
+        let usual = levels[k - 8..k].iter().sum::<f64>() / 8.0;
+        if k < rest_until || levels[k] < 8.0 * usual || levels[k] < loudest * 0.02 {
+            continue;
+        }
+        rest_until = k + 40;
+        let at = k * block;
+        if at < lead + reach || at + shape_len + reach >= source.len() {
+            continue;
+        }
+        let shape = &source[at - lead..at - lead + shape_len];
+        let shape_power: f64 = shape.iter().map(|s| f64::from(s * s)).sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let due = ((at - lead) as f64 / rate).round() as usize;
+        if due < reach || due + reach + shape_len >= out.len() {
+            continue;
+        }
+        let match_at = |from: usize| -> f32 {
+            let there = &out[from..from + shape_len];
+            let (mut dot, mut power) = (0.0f64, 0.0f64);
+            for (a, b) in shape.iter().zip(there) {
+                dot += f64::from(a * b);
+                power += f64::from(b * b);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (dot / (shape_power * power).sqrt().max(1e-12)) as f32
+            }
+        };
+        let all: Vec<f32> = (due - reach..=due + reach).map(match_at).collect();
+        let (best, best_match) = all
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((reach, 0.0));
+        let second = all
+            .iter()
+            .enumerate()
+            .filter(|(lag, _)| lag.abs_diff(best) > apart)
+            .map(|(_, m)| *m)
+            .fold(0.0f32, f32::max);
+        // A hit the record itself plays twice (an echo, a flam) is not the
+        // stretcher's doing.
+        let twice_on_record = (at - lead - reach..=at - lead + reach)
+            .filter(|from| from.abs_diff(at - lead) > apart)
+            .any(|from| {
+                let there = &source[from..from + shape_len];
+                let (mut dot, mut power) = (0.0f64, 0.0f64);
+                for (a, b) in shape.iter().zip(there) {
+                    dot += f64::from(a * b);
+                    power += f64::from(b * b);
+                }
+                dot / (shape_power * power).sqrt().max(1e-12) >= 0.6
+            });
+        matches.push(best_match);
+        damaged += usize::from(best_match < 0.7);
+        doubled += usize::from(best_match >= 0.7 && second >= 0.7 && !twice_on_record);
+        if best_match >= 0.7 {
+            #[allow(clippy::cast_precision_loss)]
+            offs.push((best as f64 - reach as f64) * 1_000.0 / f64::from(sr));
+        }
+    }
+    matches.sort_by(f32::total_cmp);
+    offs.sort_by(f64::total_cmp);
+    let usual_off = offs.get(offs.len() / 2).copied().unwrap_or(0.0);
+    let mut spread: Vec<f64> = offs.iter().map(|o| (o - usual_off).abs()).collect();
+    spread.sort_by(f64::total_cmp);
+    Hits {
+        found: matches.len(),
+        usual_match: matches.get(matches.len() / 2).copied().unwrap_or(0.0),
+        damaged,
+        doubled,
+        off_p95_ms: spread.get(spread.len() * 95 / 100).copied().unwrap_or(0.0),
+        off_worst_ms: spread.last().copied().unwrap_or(0.0),
+    }
+}
+
 /// Run one backend over `input` at playback rate `rate`, returning the output
 /// and the per-block timings.
 fn run_backend(backend: Backend, input: &[f32], sr: f32, rate: f64) -> (Vec<f32>, Vec<f64>) {
     let in_frames = input.len() / 2;
     match backend {
-        Backend::DubOwn => {
+        Backend::DubOwn => run_stretcher(WsolaStretcher::new(sr), input, rate),
+        Backend::LockBefore => {
+            let (pitched, _) = run_backend(Backend::ResamplerOnly, input, sr, rate);
             let mut s = WsolaStretcher::new(sr);
-            s.set_time_ratio(1.0 / rate); // S = 1/R
+            s.set_pitch_scale(1.0 / rate);
+            run_stretcher_as_set(s, &pitched)
+        }
+        Backend::Splice => {
+            let mut s = SpliceStretcher::new(sr);
+            s.set_time_ratio(1.0 / rate);
             let mut cursor = 0usize;
-            run_blocked(|block| {
+            let ran = run_blocked(|block| {
                 let mut got = 0usize;
                 while got < BLOCK {
                     let (c, p) = s.process(&input[cursor * 2..], &mut block[got * 2..]);
@@ -242,7 +405,17 @@ fn run_backend(backend: Backend, input: &[f32], sr: f32, rate: f64) -> (Vec<f32>
                     }
                 }
                 got
-            })
+            });
+            let joins = s.joins();
+            #[allow(clippy::cast_precision_loss)]
+            let secs = ran.0.len() as f64 / 2.0 / f64::from(sr);
+            println!(
+                "        joins a second: {:.1} before hits, {:.1} matched, {:.1} forced",
+                f64::from(joins.before_hits) / secs,
+                f64::from(joins.matched) / secs,
+                f64::from(joins.forced) / secs
+            );
+            ran
         }
         Backend::ResamplerOnly => {
             let mut pos = 0.0f64; // fractional read position, source frames
@@ -448,7 +621,25 @@ fn fmt_cents(c: Option<f32>) -> String {
     c.map_or_else(|| "    -".to_string(), |v| format!("{v:+5.0}"))
 }
 
+/// Load `secs` of a music file from `from` seconds in, as interleaved stereo.
+fn load_excerpt(path: &Path, from: f64, secs: f64) -> Result<(Vec<f32>, f32)> {
+    let track = dub_io::Track::load_from_path(path)
+        .map_err(|e| anyhow!("loading {}: {e}", path.display()))?;
+    let sr = f64::from(track.sample_rate());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let start = ((from * sr) as usize).min(track.frames());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let end = (start + (secs * sr) as usize).min(track.frames());
+    let mut out = Vec::with_capacity((end - start) * 2);
+    for i in start..end {
+        out.extend_from_slice(&track.frame(i));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok((out, sr as f32))
+}
+
 /// Load an interleaved-stereo `f32` buffer from a WAV (mono is duplicated).
+#[allow(dead_code)]
 fn load_wav(path: &Path) -> Result<(Vec<f32>, f32)> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -496,13 +687,19 @@ fn dump_wav(dir: &Path, name: &str, buf: &[f32], sr: f32) -> Result<()> {
 
 /// Backends to print in the live table.
 fn table_backends() -> Vec<Backend> {
-    vec![Backend::ResamplerOnly, Backend::DubOwn]
+    vec![
+        Backend::ResamplerOnly,
+        Backend::LockBefore,
+        Backend::DubOwn,
+        Backend::Splice,
+    ]
 }
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut input_path: Option<String> = None;
     let mut dump_dir: Option<String> = None;
-    let mut rates = RATES_SHORT;
+    let mut rates: Vec<f64> = RATES_SHORT.to_vec();
+    let (mut from, mut secs) = (60.0f64, 30.0f64);
 
     let mut i = 0;
     while i < args.len() {
@@ -523,8 +720,28 @@ pub fn run(args: &[String]) -> Result<()> {
                 );
                 i += 2;
             }
+            "--from" | "--secs" => {
+                let value: f64 = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("{} needs seconds", args[i]))?
+                    .parse()?;
+                if args[i] == "--from" {
+                    from = value;
+                } else {
+                    secs = value;
+                }
+                i += 2;
+            }
+            "--rates" => {
+                let list = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--rates needs a list, e.g. 0.94,1.06"))?;
+                let parsed: Vec<f64> = list.split(',').map(str::parse).collect::<Result<_, _>>()?;
+                rates = parsed;
+                i += 2;
+            }
             "--full" => {
-                rates = RATES_FULL;
+                rates = RATES_FULL.to_vec();
                 i += 1;
             }
             other => return Err(anyhow!("unknown stretch-bench flag: {other}")),
@@ -532,7 +749,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let corpus = if let Some(p) = &input_path {
-        let (signal, sr) = load_wav(Path::new(p))?;
+        let (signal, sr) = load_excerpt(Path::new(p), from, secs)?;
         vec![(
             Corpus {
                 name: "input",
@@ -577,20 +794,30 @@ pub fn run(args: &[String]) -> Result<()> {
             "crest",
             "lsd"
         );
-        for &rate in rates {
+        for &rate in &rates {
             for &backend in &table_backends() {
                 let (out, times) = run_backend(backend, &item.signal, *sr, rate);
                 let q = quality(&out, &item.signal, item.fundamental, *sr);
                 let t = timing(&times, q.out_frames, *sr);
                 let lat = match backend {
                     Backend::ResamplerOnly => 0,
-                    Backend::DubOwn => WsolaStretcher::new(*sr).latency_frames(),
+                    Backend::DubOwn | Backend::LockBefore => {
+                        WsolaStretcher::new(*sr).latency_frames()
+                    }
+                    Backend::Splice => SpliceStretcher::new(*sr).latency_frames(),
                 };
                 println!(
                     "  {:>5.2} {:>10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>5} {:>6} {:>6.3} {:>6.2}",
                     rate, backend.label(), t.cpu_ms_per_s, t.p50_us, t.p99_us, t.xrun_1, t.xrun_2,
                     lat, fmt_cents(q.pitch_cents), q.crest_ratio, q.lsd_db
                 );
+                if backend != Backend::ResamplerOnly {
+                    let h = hits(&item.signal, &out, *sr, rate);
+                    println!(
+                        "        hits: {} found, alike {:.2}, {} damaged, {} doubled, off beat p95 {:.1} ms, worst {:.1} ms",
+                        h.found, h.usual_match, h.damaged, h.doubled, h.off_p95_ms, h.off_worst_ms
+                    );
+                }
                 if let Some(dir) = &dump_dir {
                     let name = format!("{}_{}_{:.2}", item.name, backend.label(), rate);
                     dump_wav(Path::new(dir), &name, &out, *sr)?;

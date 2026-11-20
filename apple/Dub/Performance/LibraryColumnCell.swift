@@ -57,86 +57,17 @@ struct LibraryColumnCell: View {
 
     var body: some View {
         switch field {
-        case .crateOrder:
-            Text(track.crateOrdinal.map { String($0 + 1) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textTertiary)
-                .monospacedDigit()
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        case .artist:
-            plain(track.artist)
-        case .title:
-            HStack(spacing: DubSpacing.sm) {
-                Text(LibraryCellFormat.displayTitle(track))
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let from = state.sessionFromTitle {
-                    Text("← from \(from)")
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textTertiary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .layoutPriority(-1)
-                }
-            }
-        case .duration:
-            Text(LibraryCellFormat.duration(track.durationMs))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
         case .bpm:
             bpmCell
-        case .album:
-            plain(track.album)
-        case .genre:
-            plain(track.genre)
-        case .year:
-            Text(track.year.map { String($0) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
-        case .key:
-            // Coloured by the Camelot wheel, so a compatible key can be
-            // spotted down a list without reading it. Falls back to the
-            // plain secondary ink for anything that is not a Camelot
-            // string — an unanalysed track, or an importer's verbatim
-            // musical notation.
-            Text(state.keyNotationMode.render(track.key))
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.camelotKey(track.key) ?? DubColor.textSecondary)
-                .help(state.keyNotationMode.tooltip(track.key))
-        case .comment:
-            plain(track.comment)
-                .help(track.comment ?? "")
-        case .versionTokens:
-            plain(track.versionTokens)
-        case .source:
-            plain(track.source)
-        case .composer:
-            plain(track.composer)
-        case .trackNumber:
-            Text(track.trackNumber.map { String($0) } ?? "—")
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textSecondary)
-                .monospacedDigit()
         case .rating:
             ratingCell
         case .color:
             LibraryColorCell(color: track.color, onPick: actions.onColor)
-        case let .extra(id):
-            extraCell(id: id)
+        default:
+            // A column that is a line of text is `LibraryCellText`,
+            // drawn by `LibraryTextCellView` without a SwiftUI host.
+            EmptyView()
         }
-    }
-
-    /// The shared "text, or an em-dash" cell.
-    private func plain(_ value: String?) -> some View {
-        Text(value ?? "—")
-            .font(DubFont.body)
-            .foregroundStyle(DubColor.textSecondary)
-            .lineLimit(1)
-            .truncationMode(.middle)
     }
 
     private var bpmCell: some View {
@@ -169,7 +100,7 @@ struct LibraryColumnCell: View {
                         : "Grid locked · right-click → Unlock grid to change it")
             }
         }
-        .font(DubFont.body)
+        .libraryRowText()
         .foregroundStyle(DubColor.textSecondary)
         .monospacedDigit()
     }
@@ -193,28 +124,103 @@ struct LibraryColumnCell: View {
             }
         }
     }
+}
 
-    /// One configurable column's cell (PRD §8.5.3.1). Formatting comes
-    /// from the registry's kind rather than a per-column branch, which
-    /// is what lets the deeper groups ship without a Swift case each.
-    private func extraCell(id: String) -> some View {
-        let info = LibraryColumnCatalog.shared.info(for: id)
-        let value: LibraryColumnValue = {
-            guard let index = state.extraIndexById[id],
-                  track.extras.indices.contains(index)
-            else { return .empty }
-            return track.extras[index]
-        }()
-        let kind = info?.kind ?? .text
-        let text = value.display(kind: kind)
-        return Text(text ?? "—")
-            .font(DubFont.body)
-            .foregroundStyle(text == nil ? DubColor.textTertiary : DubColor.textSecondary)
-            .lineLimit(1)
-            .truncationMode(kind == .text ? .middle : .tail)
-            .monospacedDigit()
-            .frame(maxWidth: .infinity, alignment: kind.isNumeric ? .trailing : .leading)
-            .help(text ?? "")
+/// A column that is one line of text, as the values to draw: every
+/// column but the three `LibraryColumnCell` above draws. Data rather than
+/// a view so that `LibraryTextCellView` can draw it without a SwiftUI
+/// host per cell (see there for what a host costs).
+struct LibraryCellText: Equatable {
+    enum Ink: Equatable {
+        case primary, secondary, tertiary
+        /// A Camelot key's colour on the wheel.
+        case key(String)
+    }
+
+    var text: String
+    var ink: Ink = .secondary
+    /// A smaller, fainter remark after the text.
+    var note: String?
+    /// Digits of one width, so a column of numbers lines up.
+    var digits = false
+    var truncation: NSLineBreakMode = .byTruncatingTail
+    /// Set against the column's right edge.
+    var trailing = false
+    var toolTip: String?
+
+    static func isText(_ field: LibraryColumnField) -> Bool {
+        switch field {
+        case .bpm, .rating, .color: return false
+        default: return true
+        }
+    }
+
+    /// `nil` for a column that is more than text.
+    static func make(_ field: LibraryColumnField, _ state: LibraryCellState) -> LibraryCellText? {
+        let track = state.track
+        func plain(_ value: String?) -> LibraryCellText {
+            LibraryCellText(text: value ?? "—", truncation: .byTruncatingMiddle)
+        }
+        func number(_ value: String?) -> LibraryCellText {
+            LibraryCellText(text: value ?? "—", digits: true)
+        }
+        switch field {
+        case .bpm, .rating, .color:
+            return nil
+        case .crateOrder:
+            return LibraryCellText(
+                text: track.crateOrdinal.map { String($0 + 1) } ?? "—",
+                ink: .tertiary, digits: true, trailing: true)
+        case .artist: return plain(track.artist)
+        case .album: return plain(track.album)
+        case .genre: return plain(track.genre)
+        case .versionTokens: return plain(track.versionTokens)
+        case .source: return plain(track.source)
+        case .composer: return plain(track.composer)
+        case .comment:
+            var cell = plain(track.comment)
+            cell.toolTip = track.comment
+            return cell
+        case .title:
+            var cell = LibraryCellText(
+                text: LibraryCellFormat.displayTitle(track), ink: .primary,
+                truncation: .byTruncatingMiddle)
+            // M11d-history: the remark gives way first, as it did with a
+            // lower layout priority, so the line is cut at its end.
+            if let from = state.sessionFromTitle {
+                cell.note = "← from \(from)"
+                cell.truncation = .byTruncatingTail
+            }
+            return cell
+        case .duration: return number(LibraryCellFormat.duration(track.durationMs))
+        case .year: return number(track.year.map { String($0) })
+        case .trackNumber: return number(track.trackNumber.map { String($0) })
+        case .key:
+            // Coloured by the Camelot wheel, so a compatible key can be
+            // spotted down a list without reading it; plain for anything
+            // that is not a Camelot string.
+            var cell = LibraryCellText(text: state.keyNotationMode.render(track.key))
+            if let key = track.key, DubColor.camelotKey(key) != nil { cell.ink = .key(key) }
+            cell.toolTip = state.keyNotationMode.tooltip(track.key)
+            return cell
+        case let .extra(id):
+            // One configurable column's cell (PRD §8.5.3.1). Formatting
+            // comes from the registry's kind rather than a per-column
+            // branch, which is what lets the deeper groups ship without
+            // a Swift case each.
+            let value: LibraryColumnValue = {
+                guard let index = state.extraIndexById[id],
+                      track.extras.indices.contains(index)
+                else { return .empty }
+                return track.extras[index]
+            }()
+            let kind = LibraryColumnCatalog.shared.info(for: id)?.kind ?? .text
+            let text = value.display(kind: kind)
+            return LibraryCellText(
+                text: text ?? "—", ink: text == nil ? .tertiary : .secondary, digits: true,
+                truncation: kind == .text ? .byTruncatingMiddle : .byTruncatingTail,
+                trailing: kind.isNumeric, toolTip: text)
+        }
     }
 }
 

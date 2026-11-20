@@ -202,16 +202,23 @@ struct LibraryTable: NSViewRepresentable {
         let ids = tracks.map(\.id)
         let tracksChanged = coordinator.lastTrackIds != ids
         coordinator.syncColumns(columns)
-
-        if tracksChanged {
-            coordinator.lastTrackIds = ids
-            table.reloadData()
-            coordinator.applySelection()
-        } else if coordinator.lastContentRevision != contentRevision {
-            // Row *contents* changed under the same ids. Reloading data
-            // keeps the selection, so it does not need re-applying.
+        // The text size is the DJ's setting; the rows follow it live.
+        if table.rowHeight != LibraryRowLayout.estimatedHeight {
+            table.rowHeight = LibraryRowLayout.estimatedHeight
             table.reloadData()
         }
+
+        let refillStarted = LibraryListTiming.now
+        if tracksChanged {
+            coordinator.lastTrackIds = ids
+            coordinator.refillRows(table)
+            coordinator.applySelection()
+        } else if coordinator.lastContentRevision != contentRevision {
+            // Row *contents* changed under the same ids. The rows stay
+            // where they are, and so does the selection.
+            coordinator.refillRows(table)
+        }
+        LibraryListTiming.tableUpdated(refill: LibraryListTiming.now - refillStarted)
         coordinator.lastContentRevision = contentRevision
         coordinator.syncSelectionFromModel()
 
@@ -350,14 +357,56 @@ struct LibraryTable: NSViewRepresentable {
             let actions = parent.rowActions(track)
 
             let id = tableColumn.identifier
-            let cell = (tableView.makeView(withIdentifier: id, owner: self)
-                as? LibraryHostingCellView) ?? LibraryHostingCellView(identifier: id)
+            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? LibraryCellView)
+                ?? LibraryCellView.make(column: id)
+            fill(cell, column: id, state: state, actions: actions)
+            return cell
+        }
+
+        private func fill(
+            _ cell: LibraryCellView, column id: NSUserInterfaceItemIdentifier,
+            state: LibraryRowState, actions: LibraryRowActions
+        ) {
             if id == LibraryGutterColumn.identifier {
-                cell.configureGutter(state: state, actions: actions)
+                (cell as? LibraryHostingCellView)?.configureGutter(state: state, actions: actions)
             } else if let field = LibraryColumnField(rawValue: id.rawValue) {
                 cell.configure(field: field, state: state, actions: actions)
             }
-            return cell
+        }
+
+        private func rowTint(_ track: LibraryTrack) -> NSColor? {
+            DubColor.trackLabel(track.color).map { NSColor($0).withAlphaComponent(0.18) }
+        }
+
+        /// Show the current tracks in the rows the table already has.
+        ///
+        /// `reloadData()` takes every row view off the table and puts it
+        /// back, and each one then carried a SwiftUI host per column: with
+        /// thirty rows on screen that is some three hundred hosts leaving
+        /// and re-entering the window, and it held the main thread for
+        /// half a second after every click on a playlist
+        /// (`MainThreadWatchdog`, 2026-11-20: `NSTableRowData
+        /// _addRowViewForVisibleRow` → `-[NSView _setWindow:]` → SwiftUI).
+        /// The cells are configured by value, so a row that is to show a
+        /// different track only needs new values: nothing leaves the
+        /// window. The table is told the count changed, which adds or
+        /// drops rows at the end, and every row view it holds — on screen
+        /// or prepared just off it — is given the track now at its index.
+        func refillRows(_ table: NSTableView) {
+            table.noteNumberOfRowsChanged()
+            let columns = table.tableColumns.map(\.identifier)
+            table.enumerateAvailableRowViews { rowView, row in
+                guard self.parent.tracks.indices.contains(row) else { return }
+                let track = self.parent.tracks[row]
+                (rowView as? LibraryTintedRowView)?.tint = self.rowTint(track)
+                let state = self.parent.rowState(track)
+                let actions = self.parent.rowActions(track)
+                for (index, id) in columns.enumerated() {
+                    guard let cell = rowView.view(atColumn: index) as? LibraryCellView
+                    else { continue }
+                    self.fill(cell, column: id, state: state, actions: actions)
+                }
+            }
         }
 
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
@@ -369,8 +418,7 @@ struct LibraryTable: NSViewRepresentable {
                 return fresh
             }()
             if parent.tracks.indices.contains(row) {
-                view.tint = DubColor.trackLabel(parent.tracks[row].color)
-                    .map { NSColor($0).withAlphaComponent(0.18) }
+                view.tint = rowTint(parent.tracks[row])
             } else {
                 view.tint = nil
             }
@@ -568,18 +616,185 @@ struct LibraryTable: NSViewRepresentable {
     }
 }
 
+/// One cell of the track list: one column of one row.
+///
+/// Two kinds, chosen by the column and never by the row, so a column's
+/// cells are all one class and the table can hand any of them to any
+/// row: `LibraryTextCellView` for a column that is a line of text, and
+/// `LibraryHostingCellView` for the ones that are more — the gutter's
+/// badges, the BPM with its marks, the stars, the colour swatch.
+class LibraryCellView: NSTableCellView {
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Show `field` of the row. Cheap when the cell already shows it.
+    func configure(field: LibraryColumnField, state: LibraryRowState, actions: LibraryRowActions) {}
+
+    /// The cell for a column, by its identifier (a field's `rawValue`, or
+    /// the gutter's).
+    static func make(column id: NSUserInterfaceItemIdentifier) -> LibraryCellView {
+        if let field = LibraryColumnField(rawValue: id.rawValue), LibraryCellText.isText(field) {
+            return LibraryTextCellView(identifier: id)
+        }
+        return LibraryHostingCellView(identifier: id)
+    }
+}
+
+/// A cell that is one line of text, drawn by AppKit.
+///
+/// Every cell used to be a SwiftUI host. A host is a whole view graph of
+/// its own, and giving it a new value costs a third of a millisecond
+/// whatever the value is; a screen of rows is some three hundred of
+/// them, which was 80 ms of every click on a playlist once the larger
+/// costs were gone (`LibraryBench`, 2026-11-20). Most columns are a
+/// string in a colour. For those this sets a label's text, which costs
+/// about nothing, and the hosts are left to the columns that need them.
+final class LibraryTextCellView: LibraryCellView {
+    private struct Shown: Equatable {
+        var text: LibraryCellText
+        var dimmed: Bool
+        var size: CGFloat
+    }
+
+    private let label = NSTextField(labelWithString: "")
+    private var shown: Shown?
+
+    /// `NSTextFieldCell` sets its text this far in from each side of its
+    /// frame. SwiftUI's `Text` does not, so the label's frame reaches
+    /// that far out and the text stands where it stood.
+    private static let fragmentPadding: CGFloat = 2
+
+    override init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(identifier: identifier)
+        // Not `usesSingleLineMode`: it sets the line by a baseline of its
+        // own, 4 pt high in a row of 18 pt text. One line comes from the
+        // paragraph style's truncation instead.
+        label.cell?.truncatesLastVisibleLine = true
+        label.autoresizingMask = []
+        addSubview(label)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func configure(field: LibraryColumnField, state: LibraryRowState, actions: LibraryRowActions) {
+        guard let text = LibraryCellText.make(field, state.cell) else { return }
+        // Per cell, inside the column — an unanalyzed row dims its text
+        // but not the gutter badges or the row tint.
+        let next = Shown(text: text, dimmed: !state.track.isAnalyzed, size: LibraryRowLayout.textSize)
+        guard next != shown else { return }
+        let resized = shown?.size != next.size
+        shown = next
+        label.attributedStringValue = Self.attributed(text, size: next.size)
+        label.alphaValue = next.dimmed ? DimUnanalyzed.dimmedOpacity : 1
+        let toolTip = (text.toolTip?.isEmpty ?? true) ? nil : text.toolTip
+        if label.toolTip != toolTip { label.toolTip = toolTip }
+        if resized { place() }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        place()
+    }
+
+    /// The label with its line of text on the row's middle, as SwiftUI
+    /// centres a `Text`, starting at the column's inset. The text field
+    /// draws from the top of its frame, so the frame is hung from the
+    /// top: half of what the row has over the line's own height above it.
+    private func place() {
+        let metrics = Self.metrics(shown?.size ?? LibraryRowLayout.textSize)
+        let above = ((bounds.height - metrics.line) / 2 * 2).rounded() / 2
+        let inset = LibraryColumnLayout.columnLeadingInset - Self.fragmentPadding
+        label.frame = NSRect(
+            x: inset, y: bounds.height - above - metrics.frame,
+            width: max(0, bounds.width - inset + Self.fragmentPadding), height: metrics.frame)
+    }
+
+    /// A line's height in the system font — ascender to descender — and
+    /// the whole points of frame that hold it.
+    private static var knownMetrics: [CGFloat: (line: CGFloat, frame: CGFloat)] = [:]
+    private static func metrics(_ size: CGFloat) -> (line: CGFloat, frame: CGFloat) {
+        if let known = knownMetrics[size] { return known }
+        let font = NSFont.systemFont(ofSize: size)
+        let line = font.ascender - font.descender + font.leading
+        let metrics = (line: line, frame: line.rounded(.up))
+        knownMetrics[size] = metrics
+        return metrics
+    }
+
+    private static let primary = NSColor(DubColor.textPrimary)
+    private static let secondary = NSColor(DubColor.textSecondary)
+    private static let tertiary = NSColor(DubColor.textTertiary)
+    private static var keyColors: [String: NSColor] = [:]
+
+    private static func color(_ ink: LibraryCellText.Ink) -> NSColor {
+        switch ink {
+        case .primary: return primary
+        case .secondary: return secondary
+        case .tertiary: return tertiary
+        case .key(let notation):
+            if let known = keyColors[notation] { return known }
+            let color = DubColor.camelotKey(notation).map { NSColor($0) } ?? secondary
+            keyColors[notation] = color
+            return color
+        }
+    }
+
+    private static func attributed(_ text: LibraryCellText, size: CGFloat) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = text.truncation
+        paragraph.alignment = text.trailing ? .right : .left
+        let font = text.digits
+            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)
+            : NSFont.systemFont(ofSize: size)
+        let line = NSMutableAttributedString(
+            string: text.text,
+            attributes: [
+                .font: font, .foregroundColor: color(text.ink),
+                .kern: LibraryRowLayout.tracking, .paragraphStyle: paragraph,
+            ])
+        if let note = text.note {
+            line.append(NSAttributedString(
+                string: "  " + note,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: max(size - 3, 10)),
+                    .foregroundColor: tertiary, .paragraphStyle: paragraph,
+                ]))
+        }
+        return line
+    }
+}
+
 /// A reused cell hosting the SwiftUI `LibraryColumnCell`.
 ///
 /// Reconfiguring assigns a new `rootView` — a structural diff of one
 /// small concrete view, not the `AnyView` re-host of an entire table
-/// that this migration exists to remove.
-final class LibraryHostingCellView: NSTableCellView {
-    private let host: NSHostingView<AnyView>
+/// that this migration exists to remove. It is skipped when the cell
+/// already shows what it is asked to: most rows have no badge, no stars
+/// and no colour, and those cells look the same from one list to the
+/// next. What the view fires goes through `actions`, which is always the
+/// current row's, so a view kept from another row still acts on this one.
+final class LibraryHostingCellView: LibraryCellView {
+    /// What the host was last given, as far as it shows.
+    private enum Shown: Equatable {
+        case gutter(deckA: Bool, deckB: Bool, duplicate: Bool, warning: Bool, toolTip: String)
+        case rating(Int, analyzed: Bool)
+        case color(String?, analyzed: Bool)
+        case cell(LibraryColumnField, LibraryCellState, size: CGFloat)
+    }
 
-    init(identifier: NSUserInterfaceItemIdentifier) {
-        host = NSHostingView(rootView: AnyView(EmptyView()))
-        super.init(frame: .zero)
-        self.identifier = identifier
+    private let host: LibraryCellHost
+    private var shown: Shown?
+    private var actions = LibraryRowActions()
+
+    override init(identifier: NSUserInterfaceItemIdentifier) {
+        host = LibraryCellHost(rootView: AnyView(EmptyView()))
+        super.init(identifier: identifier)
         host.translatesAutoresizingMaskIntoConstraints = false
         addSubview(host)
         NSLayoutConstraint.activate([
@@ -597,21 +812,58 @@ final class LibraryHostingCellView: NSTableCellView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func configureGutter(state: LibraryRowState, actions: LibraryRowActions) {
+        self.actions = actions
+        let next = Shown.gutter(
+            deckA: state.isOnDeckA, deckB: state.isOnDeckB,
+            duplicate: state.track.potentialDuplicateId != nil,
+            warning: state.showsUnreachableWarning, toolTip: state.unreachableTooltip)
+        guard next != shown else { return }
+        shown = next
         host.rootView = AnyView(
-            LibraryRowIndicators(state: state, onDuplicateJump: actions.onDuplicateJump))
+            LibraryRowIndicators(
+                state: state, onDuplicateJump: { [weak self] in self?.actions.onDuplicateJump() }))
     }
 
-    func configure(
+    override func configure(
         field: LibraryColumnField,
         state: LibraryRowState,
         actions: LibraryRowActions
     ) {
+        self.actions = actions
+        let analyzed = state.track.isAnalyzed
+        let next: Shown
+        switch field {
+        case .rating: next = .rating(Int(state.track.rating ?? 0), analyzed: analyzed)
+        case .color: next = .color(state.track.color, analyzed: analyzed)
+        default: next = .cell(field, state.cell, size: LibraryRowLayout.textSize)
+        }
+        guard next != shown else { return }
+        shown = next
+        let through = LibraryCellActions(
+            onRate: { [weak self] rating in self?.actions.cell.onRate(rating) },
+            onColor: { [weak self] token in self?.actions.cell.onColor(token) })
         host.rootView = AnyView(
-            LibraryColumnCell(field: field, state: state.cell, actions: actions.cell)
+            LibraryColumnCell(field: field, state: state.cell, actions: through)
                 // Per cell, inside the column — an unanalyzed row dims
                 // its text but not the gutter badges or the row tint.
-                .modifier(DimUnanalyzed(isAnalyzed: state.track.isAnalyzed))
+                .modifier(DimUnanalyzed(isAnalyzed: analyzed))
                 .frame(maxWidth: .infinity, alignment: .leading))
+    }
+}
+
+/// A cell's SwiftUI host, telling `LibraryListTiming` what it costs: its
+/// layout, and each time it enters or leaves the window.
+final class LibraryCellHost: NSHostingView<AnyView> {
+    override func layout() {
+        guard LibraryListTiming.isTiming else { return super.layout() }
+        let started = LibraryListTiming.now
+        super.layout()
+        LibraryListTiming.cellLaidOut(took: LibraryListTiming.now - started)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        LibraryListTiming.cellMoved()
     }
 }
 
@@ -829,6 +1081,11 @@ final class LibraryNSTableView: NSTableView {
         }
         Self.log.notice("drag begins with \(items.count, privacy: .public) item(s), chip placed before the session")
         return super.beginDraggingSession(with: items, event: event, source: source)
+    }
+
+    override func layout() {
+        LibraryListTiming.tableLayout()
+        super.layout()
     }
 
     private static let log = Logger(subsystem: "com.dub.app", category: "drag")

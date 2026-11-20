@@ -275,6 +275,8 @@ struct PreferencesSheet: View {
     }
 
     @AppStorage(PerformanceView.browseModeKey) private var browseMode = false
+    @AppStorage(LibraryRowLayout.textSizeKey) private var libraryTextSize =
+        LibraryRowLayout.defaultTextSize
     @AppStorage(MainWindowController.hideMenuBarKey) private var hideMenuBar = true
 
     private var loadingGroup: some View {
@@ -370,6 +372,19 @@ struct PreferencesSheet: View {
                 librarySourceRow("Apple Music", kind: .itunes, isOn: $model.itunesImportEnabled, last: true)
                 note("Apple Music keeps each of its libraries apart (hold ⌥ as you open Music to switch). Dub reads the one you choose here when it starts; right-click Apple Music in the sidebar to read it again after you change it. In Music, turn on Settings ▸ Files ▸ Share Library XML with other applications; Music then keeps that library's XML current, and Choose… takes it, or a library you exported with File ▸ Library ▸ Export Library….")
                     .padding(.top, DubSpacing.xs)
+            }
+            group("Browser") {
+                matchStepperRow(
+                    "Text size",
+                    "How big track and playlist names are in the library. The rows grow with it.",
+                    value: "\(Int(libraryTextSize)) pt",
+                    decrement: {
+                        libraryTextSize = max(LibraryRowLayout.textSizeRange.lowerBound, libraryTextSize - 1)
+                    },
+                    increment: {
+                        libraryTextSize = min(LibraryRowLayout.textSizeRange.upperBound, libraryTextSize + 1)
+                    },
+                    last: true)
             }
             group("Matching") {
                 note("The Matching smart crate lists what mixes with the track playing now, nearest first, and follows it as the music changes.")

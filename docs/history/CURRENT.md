@@ -82,6 +82,116 @@ gate is local-only because GitHub CI has no macOS app job.
 
 **Since alpha.5, on `main`:**
 
+- **Browser adjustments (2026-11-20, Daniel; uncommitted, built; he
+  found the text size and its letter spacing right; library snapshot
+  baselines NOT re-recorded).** The
+  waveform zoom starts at 0.5× and is remembered
+  (`dub.waveformZoomIndex`). The browser's text size is a setting,
+  Preferences ▸ Library ▸ Text size, 12–24 pt, default 18 with 31 pt rows
+  (was a fixed 14 / 28, "much smaller than in Traktor" — whose 14 and 21
+  are not points). A click on a folder in another app's library lists
+  every track under it (`imported_crate_tracks` walks down); only the
+  arrow folds. No row-height setting and no shortcut for the size: the
+  one setting is enough (Daniel, 2026-11-20).
+
+- **A click on a playlist: 670 ms → 150 ms (2026-11-20, Daniel:
+  "Traktor clicking of the library is instant … can we get there?";
+  uncommitted, built, measured with `LibraryBench` in a Release build on
+  his library; library snapshot baselines NOT re-recorded and they will
+  differ).** Median from the pick to the main thread at rest, over lists
+  that fill the screen; the 2,183-track Apple Music node went 900 → 245.
+  The library itself answered in 10–30 ms throughout, so all of it was
+  the app:
+  - `reloadData()` took every row view, a SwiftUI host per column, off
+    the table and back: half a second. The table refills the rows it
+    holds (`Coordinator.refillRows`).
+  - The **folded filter bar** was kept current out of sight — five boxes
+    given new rows and widths for every list: 290 ms. Folded, the boxes
+    hold nothing (`boxFacets`); opening the bar fills them. Open, the bar
+    costs about 70 ms a click.
+  - The **sidebar's rows** were rebuilt and compared on every change to
+    `LibraryView`'s state: 90 ms. Each is now a `SidebarNodeRow`,
+    `Equatable`, skipped unless its own values moved.
+  - The **cells**: 170 ms for some 340 SwiftUI hosts. A column that is a
+    line of text is drawn by AppKit (`LibraryTextCellView` from
+    `LibraryCellText`); BPM, rating, colour and the gutter stay SwiftUI
+    and are skipped when they already show the value.
+  - The **sort** went through `KeyPathComparator`: 175 ms for 2,183
+    titles, 22 comparing the strings (`sortedByText`).
+  Each list logs its phases (`category == "list"`), now from the pick
+  and with the redraw split by phase. `open Dub.app --args
+  -dubLibraryBench 1` clicks through nine lists by itself. What is left
+  of the 150: ~35 ms before the rows land (the pick's own pass through
+  the window), ~17 fetch, ~100 for SwiftUI's update, layout and drawing.
+  Not done: the pick still fires on mouse-up (`onTapGesture`), which is
+  a finger's 60–100 ms that Traktor's mouse-down does not spend; the
+  filter bar when open; the 105 ms fetch of a 2,183-row list.
+
+- **Four things from the 2026-11-19 session (Daniel; uncommitted, built,
+  none tried in the app, Swift tests compiled but not run).** The right
+  deck's **LOCK** lit in its deck tint, teal, beside amber controls — it
+  takes `DubColor.controlAccent` like every other control. **Quick
+  Scratch** now drops an engaged echo-out, on its deck and on the deck the
+  tune doubles to. The **phase meter** read every grid as one tempo and one
+  anchor, so on a followed track the marker wandered with the band; it
+  now reads the grid's own beats (`PhaseMeterInputs.followedBeats`,
+  fetched once per grid generation). **Echo out keeps the master's time**
+  when the other deck is the master and playing
+  (`WaveformAppModel.echoOutTempo`).
+
+- **Search looks in the list on screen (FFI 92, 2026-11-19, Daniel: with
+  the Apple Music node selected, "searching for any song gives me 0
+  results"; uncommitted, not checked on the rig).** Search went to the
+  collection whatever was selected, and 2,540 of his 2,654 tracks are in
+  other apps' libraries only. Now All Tracks searches the collection as
+  before and every other list is narrowed to its rows the search matches
+  (`DubLibrary::search_track_ids`), keeping the list's own order.
+- **One analysis result no longer re-sorts the library list (2026-11-19,
+  Daniel: "a lot of beachballs" while skipping through tracks;
+  uncommitted, not checked on the rig).** The stall log had the main
+  thread in `sortedRows` and `LibraryTrack.==` for 4.3 s and 3.7 s: each
+  result re-sorted the whole view and compared it with the old one, and a
+  load fires several. The changed row is now overwritten in place, or
+  moved by a binary search when what it is sorted or filtered by changed
+  (`LibraryView.repositionRow`). The Swift snapshot suite was not run.
+
+- **The tempo a band keeps can be read (2026-11-19, Daniel: quantize the
+  tracks whose tempo "is simply drifting", leave megamixes and real tempo
+  changes in follow mode; uncommitted, a library function only — the app
+  does not call it yet).** The followed beats could not carry that
+  decision: on tracks locked in Traktor *and* at Dub's tempo they read a
+  four-bar tempo spread of 2.6 %, the same as on unlocked ones. `band_pulse`
+  (`dub-bpm/src/pulse.rs`) reads the tempo bar by bar instead, all bars
+  chosen together. `tests/follow_corpus.rs` is its benchmark: locked
+  Traktor tracks as they are, and bent ±1 % by the new stretcher. Outside
+  the first and last 20 s, 91 % of steady tracks never read more than
+  0.5 % off (follow's chain: 31 %) and 87 % of drifting ones (27 %).
+  Over the library (2,547 tracks, body of each): Traktor-locked tracks
+  swing 0.19 % at the median, unlocked 1.94 %. **Not done:** which of beat
+  and off-beat the pulse sits on is a guess (more onset wins); a rule for
+  "one tempo that wanders" against "changes tempo" (bands move 1–2 %
+  within a few bars, so slowness is not the test — a held step is);
+  follow mode still draws the old chain; nothing is stretched.
+
+- **Key lock has a new stretcher (2026-11-19, Daniel: steadying a band's
+  tempo "first needs a good key lock"; uncommitted, not on the rig, not
+  judged by ear yet).** Measuring the M14 WSOLA found four faults: sub notes
+  under 48 Hz followed the platter (133 cents sharp at +8 %), drum hits
+  wandered up to 11 ms with some doubled, the record lost 5 dB at 12–16 kHz
+  because the deck interpolated it twice, and a locked deck played ~10 ms
+  ahead of its own playhead. `SpliceStretcher` replaces it in the deck: the
+  record copied untouched, joined before hits and where it repeats, bass and
+  the rest apart (PRD §6.1.1 has the table). No FFI change. `WsolaStretcher`
+  stays for `dub stretch-bench` only — delete it once the new one has been
+  heard on the rig. Listening pairs were rendered for Daniel (reggae,
+  dubstep, dnb, funk at ±6 %); he heard less bass in the new one, most on
+  the dnb track, and it measured 0.3–1.7 dB short below 170 Hz — fixed the
+  same day with a steep bass split at 150 Hz (now within 0.2 dB on those
+  four), not yet re-heard. Next on this path: straightening a
+  variable-tempo track to its grid, which should render offline through
+  this same stretcher, one ratio per beat, so the result scratches and
+  reverses like any other track.
+
 - **Tempo is read inside one octave; the rule pile is gone (FFI 91,
   2026-11-19, Daniel: "the quality of analysis is pretty poor").** Scored
   against his 1,758 locked Traktor grids the detector got 62.4 % of tempos:

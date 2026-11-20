@@ -89,6 +89,7 @@ struct PerformanceView: View {
     }
 
     var body: some View {
+        let _ = LibraryListTiming.windowBody()
         surface
             .environment(\.dubMapping, mapping)
     }
@@ -816,7 +817,9 @@ struct PerformanceView: View {
     /// beatmatching aid that lies. Session state rather than a stored
     /// preference — a zoom you left on last week is not what you want
     /// to find when you open the app in a booth.
-    @State private var waveZoomIndex = WaveformZoom.defaultIndex
+    @AppStorage(WaveformZoom.storageKey) private var storedWaveZoomIndex = WaveformZoom.defaultIndex
+
+    private var waveZoomIndex: Int { WaveformZoom.clamped(storedWaveZoomIndex) }
 
     /// Drives the zoom control's fade. The *strips* and the gutter
     /// between them count, not the deck columns either side — a
@@ -863,7 +866,11 @@ struct PerformanceView: View {
                 .overlay(alignment: .top) {
                     // The one place both strips can see it, and out of
                     // the way of either.
-                    WaveformZoomControl(index: $waveZoomIndex, visible: waveformHovered)
+                    WaveformZoomControl(
+                        index: Binding(
+                            get: { waveZoomIndex },
+                            set: { storedWaveZoomIndex = WaveformZoom.clamped($0) }),
+                        visible: waveformHovered)
                         .padding(.top, DubSpacing.sm)
                 }
                 // Above both panes, so the overhang is not clipped by

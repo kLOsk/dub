@@ -408,12 +408,24 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
+        // Each crate's own members, as stored: `imported_crate_tracks`
+        // also lists what its subcrates hold, which is the browser's
+        // view, not what the importer wrote.
+        let own: std::collections::HashSet<(i64, String)> = lib
+            .connection()
+            .prepare("SELECT imported_crate_id, track_id FROM imported_crate_tracks")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         rows.into_iter()
             .map(|(id, name, parent)| {
                 let titles = lib
                     .imported_crate_tracks(id)
                     .unwrap()
                     .into_iter()
+                    .filter(|t| own.contains(&(id, t.id.clone())))
                     .map(|t| t.title.unwrap_or_default())
                     .collect();
                 (name, parent, titles)

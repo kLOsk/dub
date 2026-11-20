@@ -1,13 +1,16 @@
 //! Time-stretch / key-lock engine for Dub.
 //!
-//! [`WsolaStretcher`] — pure-Rust, FFT-free WSOLA (waveform-similarity
-//! overlap-add), behind the [`TimeStretcher`] trait and dispatched by the
-//! [`Stretcher`] enum (no `dyn` — the audio thread forbids heap-allocated trait
-//! objects). No `unsafe`, no C build dependency, so the crate stays permissively
+//! [`SpliceStretcher`] is the one the deck runs: it copies the record sample
+//! for sample and joins it right before drum hits and where the record
+//! repeats itself, bass and the rest separately. [`WsolaStretcher`] is the
+//! stretcher it replaced on 2026-11-19 (waveform-similarity overlap-add), kept
+//! so `dub stretch-bench` can still set the two side by side. Both sit behind
+//! the [`TimeStretcher`] trait; the audio thread uses the concrete type, never
+//! `dyn`. No `unsafe`, no C build dependency, so the crate stays permissively
 //! licensed — the posture `dub-bpm` and `dub-fingerprint` chose over their LGPL
 //! C alternatives. (An opt-in Rubber Band backend was evaluated in M14.2–M14.4
-//! and dropped: WSOLA sounded better — more faithful stereo — and keeps Dub
-//! permissive.)
+//! and dropped: a time-domain stretcher sounded better — more faithful stereo —
+//! and keeps Dub permissive.)
 //!
 //! All audio is interleaved stereo `f32` (`L, R, L, R, …`); buffer lengths are
 //! `frames * 2`. Frame counts (`consumed` / `produced` / latency) are stereo
@@ -22,10 +25,12 @@
 //! A stretcher exposes two orthogonal controls: [`set_time_ratio`] (output
 //! length ÷ input length) and [`set_pitch_scale`] (output pitch × input
 //! pitch). Dub's master-tempo "key lock" keeps tempo on the platter and pitch
-//! fixed; the deck drives the stretcher as a pure pitch corrector
-//! (`time_ratio = 1`, `pitch_scale = 1 / rate`) so the insert is
-//! frame-count-preserving and the transport playhead stays exact. See PRD
-//! §6.1.1 and the M14 plan.
+//! fixed; the deck feeds the record in at its own speed and drives the
+//! stretcher as a pure time-stretch (`time_ratio = 1 / rate`,
+//! `pitch_scale = 1`), so a record at the engine's sample rate is never
+//! interpolated. Until 2026-11-19 the deck played the record fast or slow by
+//! straight-line interpolation first and had the stretcher pitch it back
+//! (`pitch_scale = 1 / rate`), which cost 5 dB at 12–16 kHz. See PRD §6.1.1.
 //!
 //! [`set_time_ratio`]: TimeStretcher::set_time_ratio
 //! [`set_pitch_scale`]: TimeStretcher::set_pitch_scale
@@ -33,8 +38,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod splice;
 mod wsola;
 
+pub use splice::{Joins, SpliceStretcher};
 pub use wsola::WsolaStretcher;
 
 /// Library version reported by the crate.
@@ -48,13 +55,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// preallocated state.
 pub trait TimeStretcher {
     /// Set the pitch multiplier (output pitch ÷ input pitch). `1.0` leaves
-    /// pitch unchanged. The deck drives this to `1.0 / rate` for key lock.
+    /// pitch unchanged, and is where the deck holds it for key lock.
     /// Cheap — folds into the per-frame hop math; no allocation.
     fn set_pitch_scale(&mut self, scale: f64);
 
     /// Set the time-stretch ratio (output length ÷ input length). `1.0`
-    /// preserves duration. The deck holds this at `1.0` for key lock (its own
-    /// resampler already moved tempo). Cheap; no allocation.
+    /// preserves duration. The deck drives this to `1.0 / rate` for key
+    /// lock. Cheap; no allocation.
     fn set_time_ratio(&mut self, ratio: f64);
 
     /// Push `input` (interleaved stereo) and write whatever output is ready
@@ -68,9 +75,11 @@ pub trait TimeStretcher {
     /// function of configuration and current ratio.
     fn max_output_for(&self, in_frames: usize) -> usize;
 
-    /// Constant algorithmic latency in stereo frames at the current config.
-    /// The engine discards this many primed frames so a bypass→engaged
-    /// crossfade lines up with the dry playhead.
+    /// Frames by which the output trails the input: frame `n` of the input
+    /// comes out as frame `n + latency` at unity. The engine discards this
+    /// many primed frames so a bypass→engaged crossfade lines up with the dry
+    /// playhead. Record a stretcher only needs *ahead* of where it plays is
+    /// not latency — report it here and a locked deck plays early.
     fn latency_frames(&self) -> usize;
 
     /// Flush all internal state to silence. RT-safe (zeroes preallocated
@@ -117,66 +126,13 @@ impl TimeStretcher for Passthrough {
 
 /// Which time-stretch engine a deck is using. `Copy` + FFI-friendly so the UI
 /// can toggle key lock per deck. `ResamplerOnly` = key lock off (pitch shifts
-/// with rate); `DubOwn` = our WSOLA key lock.
+/// with rate); `DubOwn` = our own key lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StretchBackend {
     /// Identity — the deck's own resampler handles rate ([`Passthrough`]).
     ResamplerOnly,
-    /// Dub's pure-Rust WSOLA ([`WsolaStretcher`]). The default key-lock engine.
+    /// Dub's own stretcher ([`SpliceStretcher`]). The key-lock engine.
     DubOwn,
-}
-
-/// One deck's selected stretcher, dispatched by `match` (no `dyn` on the audio
-/// thread).
-pub enum Stretcher {
-    /// Identity / resampler-only.
-    Passthrough(Passthrough),
-    /// Pure-Rust WSOLA.
-    DubOwn(WsolaStretcher),
-}
-
-impl TimeStretcher for Stretcher {
-    fn set_pitch_scale(&mut self, scale: f64) {
-        match self {
-            Stretcher::Passthrough(s) => s.set_pitch_scale(scale),
-            Stretcher::DubOwn(s) => s.set_pitch_scale(scale),
-        }
-    }
-
-    fn set_time_ratio(&mut self, ratio: f64) {
-        match self {
-            Stretcher::Passthrough(s) => s.set_time_ratio(ratio),
-            Stretcher::DubOwn(s) => s.set_time_ratio(ratio),
-        }
-    }
-
-    fn process(&mut self, input: &[f32], output: &mut [f32]) -> (usize, usize) {
-        match self {
-            Stretcher::Passthrough(s) => s.process(input, output),
-            Stretcher::DubOwn(s) => s.process(input, output),
-        }
-    }
-
-    fn max_output_for(&self, in_frames: usize) -> usize {
-        match self {
-            Stretcher::Passthrough(s) => s.max_output_for(in_frames),
-            Stretcher::DubOwn(s) => s.max_output_for(in_frames),
-        }
-    }
-
-    fn latency_frames(&self) -> usize {
-        match self {
-            Stretcher::Passthrough(s) => s.latency_frames(),
-            Stretcher::DubOwn(s) => s.latency_frames(),
-        }
-    }
-
-    fn reset(&mut self) {
-        match self {
-            Stretcher::Passthrough(s) => s.reset(),
-            Stretcher::DubOwn(s) => s.reset(),
-        }
-    }
 }
 
 #[cfg(test)]

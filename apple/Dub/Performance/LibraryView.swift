@@ -42,6 +42,7 @@
 //  modification.
 
 import AppKit
+import os
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -261,6 +262,31 @@ private struct LibraryRowComparator: SortComparator {
 
     private static func cell(_ track: LibraryTrack, _ index: Int) -> LibraryColumnValue {
         track.extras.indices.contains(index) ? track.extras[index] : .empty
+    }
+
+    /// `rows` in this order, when it is by a built-in text column —
+    /// title, artist and the like, which is how nearly every list opens.
+    /// `nil` for any other column.
+    ///
+    /// The same order `compare` gives, an eighth of the time: sorting
+    /// through a `KeyPathComparator` took 113 ms for the 2 183 titles of
+    /// an Apple Music library, and comparing the strings themselves 15
+    /// (measured on that library, 2026-11-20). It was most of the wait
+    /// for a long list.
+    func sortedByText(_ rows: [LibraryTrack]) -> [LibraryTrack]? {
+        guard case .field(let comparator, let column) = basis,
+              let keyPath = comparator.keyPath as? KeyPath<LibraryTrack, String>
+        else { return nil }
+        let keys = rows.map { $0[keyPath: keyPath] }
+        let empty = column.map { column in rows.map { $0.isEmpty(for: column) } }
+        let wanted: ComparisonResult = order == .forward ? .orderedAscending : .orderedDescending
+        var indices = Array(rows.indices)
+        indices.sort { a, b in
+            // Empty cells last in both directions, as in `compare`.
+            if let empty, empty[a] || empty[b] { return !empty[a] && empty[b] }
+            return keys[a].localizedStandardCompare(keys[b]) == wanted
+        }
+        return indices.map { rows[$0] }
     }
 }
 
@@ -965,6 +991,10 @@ struct LibraryView: View {
     /// the folders inside them (`SidebarFolding`). Persisted, so the
     /// sidebar opens the way the DJ left it.
     @AppStorage("librarySidebarFolding") private var foldingRaw: String = ""
+    /// Read here so a change in Preferences re-evaluates the browser;
+    /// the rows take the size itself from `LibraryRowLayout`.
+    @AppStorage(LibraryRowLayout.textSizeKey) private var libraryTextSize =
+        LibraryRowLayout.defaultTextSize
 
     private var folding: SidebarFolding { SidebarFolding(raw: foldingRaw) }
 
@@ -1154,6 +1184,9 @@ struct LibraryView: View {
     /// Listing fetch limit. Sized for the M11d.1/2 single-page
     /// model; real virtualization + paging lands at M11d.4.
     private static let listingLimit: UInt32 = 5_000
+    /// How many matching tracks a search of the list on screen asks the
+    /// library for: every one, in practice.
+    private static let searchMatchLimit: UInt32 = 200_000
     /// How far the Matching crate looks: every track, in practice.
     private static let matchingScanLimit: UInt32 = 200_000
 
@@ -1161,6 +1194,7 @@ struct LibraryView: View {
         // The sidebar's width is the split's own state, not this
         // view's: a drag would otherwise re-run this body — and the
         // table update behind it — on every frame. See `LibrarySplit`.
+        let _ = LibraryListTiming.libraryBody()
         LibrarySplit(sidebar: sidebar, content: rightPane)
         // No `minHeight`: `DeckLibrarySplit` frames this explicitly and
         // `DeckLibrarySplit` owns the floor (`DubLayout.libraryMinHeight`).
@@ -1176,6 +1210,7 @@ struct LibraryView: View {
             if abs(rounded - libraryHeight) >= 1 { libraryHeight = rounded }
         }
         .onAppear { refreshColumnParseCaches() }
+        .task { await runBenchIfAsked() }
         .onChange(of: columnWidthsStorage) { _ in refreshColumnParseCaches() }
         .onChange(of: visibleColumnsStorage) { _ in refreshColumnParseCaches() }
         // Camelot ↔ musical changes the Key *cells*, and the table
@@ -1260,6 +1295,10 @@ struct LibraryView: View {
             // about to Space-load. The rows the user sees haven't
             // moved; new rows just append.
             refreshTracks(preserveSelection: true)
+        }
+        .onChange(of: libraryTextSize) { _ in
+            // Same rows, new size: the row host re-renders on a revision.
+            tracksContentRevision &+= 1
         }
         .task(id: searchText) {
             // B-9 — debounce FTS5 queries: wait 250 ms after the
@@ -1524,13 +1563,14 @@ struct LibraryView: View {
         let isDropTarget = crateDropTargetId == crate.id
         let isRenaming = renamingCrateId == crate.id
         return HStack(spacing: DubSpacing.sm) {
+            Self.arrowSlot
             Image(systemName: source.systemImage)
                 .frame(width: 16)
                 .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
             if isRenaming {
                 TextField("Crate name", text: $crateRenameText)
                     .textFieldStyle(.plain)
-                    .font(DubFont.body)
+                    .libraryRowText()
                     .focused($crateRenameFocused)
                     .onSubmit { commitCrateRename(crate.id) }
                     .onExitCommand { cancelCrateRename() }
@@ -1541,19 +1581,19 @@ struct LibraryView: View {
                     }
             } else {
                 Text(crate.name)
-                    .font(DubFont.body)
+                    .libraryRowText()
                     .foregroundStyle(DubColor.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
                 Text("\(crate.trackCount)")
-                    .font(DubFont.micro)
+                    .font(LibraryRowLayout.smallFont)
                     .foregroundStyle(DubColor.textTertiary)
                     .monospacedDigit()
             }
         }
         .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
+        .padding(.vertical, LibraryRowLayout.sidebarRowPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .overlay {
@@ -1566,9 +1606,7 @@ struct LibraryView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard !isRenaming else { return }
-            searchFocused = false
-            NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedSource = source
+            select(source)
         }
         // v8 — drag a crate onto a favourites slot (payload decoded in
         // `handleFavoriteDrop`).
@@ -1630,180 +1668,109 @@ struct LibraryView: View {
 
     private func importedSourceRow(_ group: ImportedSourceGroup) -> some View {
         let source = LibrarySource.importedSource(kind: group.kind)
-        let isSelected = selectedSource == source
-        let canCollapse = !group.crates.isEmpty
         let isCollapsed = folding.isSourceFolded(group.kind)
-        return HStack(spacing: DubSpacing.sm) {
-            // Disclosure triangle: only a source with playlists/crates
-            // has anything to collapse. Sources without keep an empty
-            // slot of the same width so their icons stay aligned.
-            Group {
-                if canCollapse {
+        // Only a source with playlists/crates has anything to collapse.
+        let arrow: SidebarNodeRow.Arrow = group.crates.isEmpty ? .none : (isCollapsed ? .closed : .open)
+        return SidebarNodeRow(
+            source: source,
+            icon: group.kind.systemImage,
+            name: group.kind.label,
+            count: "\(group.trackCount)",
+            arrow: arrow,
+            arrowHelp: isCollapsed ? "Show playlists" : "Hide playlists",
+            foldKey: SidebarFolding.sourceKey(group.kind),
+            leading: DubSpacing.lg,
+            isSelected: selectedSource == source,
+            textSize: CGFloat(libraryTextSize),
+            onPick: { select(source) },
+            onFold: { fold { $0.toggleSource(group.kind) } })
+            .equatable()
+            // Dub reads Apple Music's library at launch and on this, never on
+            // its own while you play (Daniel, 2026-11-18).
+            .contextMenu {
+                if group.kind == .itunes {
                     Button {
-                        fold { $0.toggleSource(group.kind) }
+                        model.reloadItunesLibrary()
                     } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(DubColor.textTertiary)
-                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
-                            .contentShape(Rectangle())
+                        Label("Reload Apple Music Library", systemImage: "arrow.clockwise")
                     }
-                    .buttonStyle(.plain)
-                    .help(isCollapsed ? "Show playlists" : "Hide playlists")
+                    .disabled(libraryModel.libraryImportInProgress)
                 }
             }
-            .frame(width: 10)
-            Image(systemName: group.kind.systemImage)
-                .frame(width: 16)
-                .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
-            Text(group.kind.label)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 0)
-            Text("\(group.trackCount)")
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textTertiary)
-                .monospacedDigit()
-        }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? DubColor.surface2 : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            searchFocused = false
-            NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedSource = source
-        }
-        // Dub reads Apple Music's library at launch and on this, never on
-        // its own while you play (Daniel, 2026-11-18).
-        .contextMenu {
-            if group.kind == .itunes {
-                Button {
-                    model.reloadItunesLibrary()
-                } label: {
-                    Label("Reload Apple Music Library", systemImage: "arrow.clockwise")
-                }
-                .disabled(libraryModel.libraryImportInProgress)
-            }
-        }
     }
 
     private func importedCrateRow(_ node: SidebarFolding.Node, kind: ImportedSourceKind) -> some View {
         let crate = node.crate
-        let depth = node.depth
         let source = LibrarySource.importedCrate(id: crate.id)
-        let isSelected = selectedSource == source
-        return HStack(spacing: DubSpacing.sm) {
-            // A folder folds, like its source; a playlist keeps the
-            // slot empty so the icons line up.
-            Group {
-                if node.hasChildren {
-                    Button {
-                        fold { $0.toggleFolder(kind, path: node.path) }
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(DubColor.textTertiary)
-                            .rotationEffect(.degrees(node.isOpen ? 90 : 0))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help(node.isOpen ? "Fold \(crate.name)" : "Show what's in \(crate.name)")
-                }
-            }
-            .frame(width: 10)
-            Image(systemName: node.hasChildren ? "folder" : "list.bullet")
-                .frame(width: 16)
-                .foregroundStyle(isSelected ? DubColor.textPrimary : DubColor.textSecondary)
-            Text(crate.name)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 0)
-            Text("\(node.count.value)")
-                .font(DubFont.micro)
-                .foregroundStyle(DubColor.textTertiary)
-                .monospacedDigit()
-                .help(node.count.isPlaylists
-                    ? "\(node.count.value) playlist\(node.count.value == 1 ? "" : "s")"
-                    : "\(node.count.value) track\(node.count.value == 1 ? "" : "s")")
-        }
-        .padding(.leading, DubSpacing.lg + CGFloat(depth + 1) * DubSpacing.md)
-        .padding(.trailing, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? DubColor.surface2 : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // A folder with no tracks of its own has nothing to list:
-            // a click on it folds it, as on a Finder sidebar.
-            if node.hasChildren, crate.trackCount == 0 {
-                fold { $0.toggleFolder(kind, path: node.path) }
-                return
-            }
-            searchFocused = false
-            NSApp.keyWindow?.makeFirstResponder(nil)
-            selectedSource = source
-        }
-        // v8 — drag an imported playlist onto a favourites slot.
-        .onDrag {
-            NSItemProvider(object: "importedcrate:\(crate.id)" as NSString)
-        }
+        let count = node.count
+        return SidebarNodeRow(
+            source: source,
+            icon: node.hasChildren ? "folder" : "list.bullet",
+            name: crate.name,
+            count: "\(count.value)",
+            countHelp: count.isPlaylists
+                ? "\(count.value) playlist\(count.value == 1 ? "" : "s")"
+                : "\(count.value) track\(count.value == 1 ? "" : "s")",
+            // A folder folds, like its source; a playlist keeps the slot
+            // empty so the icons line up.
+            arrow: node.hasChildren ? (node.isOpen ? .open : .closed) : .none,
+            arrowHelp: node.isOpen ? "Fold \(crate.name)" : "Show what's in \(crate.name)",
+            foldKey: SidebarFolding.folderKey(kind, path: node.path),
+            leading: DubSpacing.lg + CGFloat(node.depth + 1) * DubSpacing.md,
+            isSelected: selectedSource == source,
+            textSize: CGFloat(libraryTextSize),
+            // v8 — drag an imported playlist onto a favourites slot.
+            dragPayload: "importedcrate:\(crate.id)",
+            // A click shows what is in the node — for a folder, every
+            // track under it. Folding is the arrow's job alone; a click
+            // on a folder used to fold it and show nothing (Daniel,
+            // 2026-11-20).
+            onPick: { select(source) },
+            onFold: { fold { $0.toggleFolder(kind, path: node.path) } })
+            .equatable()
+    }
+
+    /// The width a folding arrow takes, left empty on a row that has
+    /// none. Every sidebar row starts with it, so icons and names stand
+    /// in one column whether or not the row folds — rows with an arrow
+    /// used to sit a step in from the rows without (Daniel, 2026-11-20).
+    private static var arrowSlot: some View {
+        Color.clear.frame(width: SidebarNodeRow.arrowWidth, height: 1)
     }
 
     private func sidebarRow(_ entry: LibrarySource) -> some View {
-        let isSelected = entry == selectedSource && entry.isAvailable
-        return HStack(spacing: DubSpacing.sm) {
-            Image(systemName: entry.systemImage)
-                .frame(width: 16)
-                .foregroundStyle(
-                    entry.isAvailable
-                        ? (isSelected ? DubColor.textPrimary : DubColor.textSecondary)
-                        : DubColor.textPlaceholder)
-            Text(entry.label)
-                .font(DubFont.body)
-                .foregroundStyle(
-                    entry.isAvailable
-                        ? DubColor.textPrimary
-                        : DubColor.textPlaceholder)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 0)
-            // The library's size, on the row that *is* the library.
-            // It used to sit in a `LIBRARY` header above the tree,
-            // where it was a number floating next to a caption; here it
-            // reads as what it is, and matches how every crate row
-            // already states its own count.
-            if entry == .allTracks, libraryModel.libraryTrackCount > 0 {
-                Text("\(libraryModel.libraryTrackCount)")
-                    .font(DubFont.micro)
-                    .monospacedDigit()
-                    .foregroundStyle(DubColor.textTertiary)
-                    .help("Total tracks in library")
-            }
-            if !entry.isAvailable {
-                Image(systemName: "lock.fill")
-                    .font(.system(size: 9))
-                    .foregroundStyle(DubColor.textPlaceholder)
-                    .help("Coming soon.")
-            }
-        }
-        .padding(.horizontal, DubSpacing.lg)
-        .padding(.vertical, DubSpacing.xs)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? DubColor.surface2 : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            searchFocused = false
-            NSApp.keyWindow?.makeFirstResponder(nil)
-            if entry.isAvailable {
-                selectedSource = entry
-            }
-        }
+        // The library's size, on the row that *is* the library. It used
+        // to sit in a `LIBRARY` header above the tree, where it was a
+        // number floating next to a caption; here it reads as what it
+        // is, and matches how every crate row already states its count.
+        let counts = entry == .allTracks && libraryModel.libraryTrackCount > 0
+        return SidebarNodeRow(
+            source: entry,
+            icon: entry.systemImage,
+            name: entry.label,
+            count: counts ? "\(libraryModel.libraryTrackCount)" : nil,
+            countHelp: counts ? "Total tracks in library" : nil,
+            leading: DubSpacing.lg,
+            isSelected: entry == selectedSource && entry.isAvailable,
+            isAvailable: entry.isAvailable,
+            textSize: CGFloat(libraryTextSize),
+            onPick: {
+                if entry.isAvailable {
+                    select(entry)
+                } else {
+                    searchFocused = false
+                    NSApp.keyWindow?.makeFirstResponder(nil)
+                }
+            })
+            .equatable()
+    }
+
+    /// Show a node's tracks: what a click on any sidebar row does.
+    private func select(_ source: LibrarySource) {
+        LibraryListTiming.picked()
+        searchFocused = false
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        selectedSource = source
     }
 
     // MARK: - Right pane (search + track list)
@@ -2137,6 +2104,23 @@ struct LibraryView: View {
         .background(DubColor.surface1)
     }
 
+    /// What the boxes list: the values in the list on screen, and nothing
+    /// while the bar is folded.
+    ///
+    /// The boxes are kept while folded (see `filterBar`), and they used to
+    /// be kept current too: every list that arrived gave five boxes new
+    /// rows and new widths, out of sight. That was the largest single
+    /// part of the wait after a click on a playlist — some 290 ms of
+    /// 700, with the bar folded (`LibraryBench`, 2026-11-20). Folded,
+    /// they now hold nothing and a new list changes nothing in them;
+    /// opening the bar fills them.
+    private var boxFacets: [LibraryFilterField: [LibraryFacetValue]] {
+        filterBarCollapsed ? [:] : facets
+    }
+    private var boxBpmFacet: [LibraryBpmBucketCount] {
+        filterBarCollapsed ? [] : bpmBucketFacet
+    }
+
     /// The active filters in one line, in the bar's box order.
     private var filterSummary: String {
         LibraryFilterSummary.text(enabledFilterFields.compactMap { field -> (field: String, values: [String])? in
@@ -2192,7 +2176,7 @@ struct LibraryView: View {
         let ceiling = LibraryFilterBoxWidth.ceiling(barWidth: filterBarWidth > 0 ? filterBarWidth : nil)
         switch field.kind {
         case .categorical:
-            let values = facets[field] ?? []
+            let values = boxFacets[field] ?? []
             return LibraryFilterBoxWidth.width(
                 header: field.headerLabel,
                 labels: values.map { $0.value ?? "(none)" },
@@ -2202,8 +2186,8 @@ struct LibraryView: View {
         case .bpmBuckets:
             return LibraryFilterBoxWidth.width(
                 header: field.headerLabel,
-                labels: bpmBucketFacet.map(\.bucket.label),
-                counts: bpmBucketFacet.map(\.count),
+                labels: boxBpmFacet.map(\.bucket.label),
+                counts: boxBpmFacet.map(\.count),
                 hasSwatch: false,
                 maxWidth: ceiling)
         case .ratingThreshold:
@@ -2227,7 +2211,7 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func filterValueList(_ field: LibraryFilterField) -> some View {
-        let values = facets[field] ?? []
+        let values = boxFacets[field] ?? []
         if values.isEmpty {
             Text("—")
                 .font(DubFont.body)
@@ -2257,7 +2241,7 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func bpmBucketList() -> some View {
-        if bpmBucketFacet.isEmpty {
+        if boxBpmFacet.isEmpty {
             Text("No BPM")
                 .font(DubFont.body)
                 .foregroundStyle(DubColor.textTertiary)
@@ -2267,7 +2251,7 @@ struct LibraryView: View {
                 // Lazy: a box shows six rows of a list that can run to
                 // hundreds (COMMENT), and only those need building.
                 LazyVStack(spacing: 0) {
-                    ForEach(bpmBucketFacet) { row in
+                    ForEach(boxBpmFacet) { row in
                         filterValueRow(
                             label: row.bucket.label,
                             count: row.count,
@@ -3008,8 +2992,9 @@ struct LibraryView: View {
         guard let idx = tracks.firstIndex(where: { $0.id == update.trackId }) else {
             return
         }
-        tracks[idx] = tracks[idx].patchedAfterAnalysis(update)
-        recomputeSortedTracks()
+        let old = tracks[idx]
+        tracks[idx] = old.patchedAfterAnalysis(update)
+        repositionRow(old: old, new: tracks[idx])
         tracksContentRevision &+= 1
     }
 
@@ -3026,9 +3011,86 @@ struct LibraryView: View {
         case let .rating(value): row.rating = value
         case let .color(value): row.color = value
         }
+        let old = tracks[idx]
         tracks[idx] = row
-        recomputeSortedTracks()
+        repositionRow(old: old, new: row)
         tracksContentRevision &+= 1
+    }
+
+    /// Put one changed row where it now belongs in `sortedTracks` and
+    /// `sortedTrackIds`, without sorting the rest.
+    ///
+    /// One analysis result changes one row. Both callers used to answer
+    /// it with `recomputeSortedTracks()`: a sort of the whole view and
+    /// then a comparison of the whole result with what was there. On a
+    /// 2,600-row view that is hundreds of milliseconds, a load fires
+    /// several results in a row, and loading a few tracks one after
+    /// another froze the app for four seconds at a time
+    /// (`MainThreadWatchdog`, 2026-11-19: `sortedRows` and
+    /// `LibraryTrack.==` under `applyAnalysisUpdate`). Now the row is
+    /// overwritten where it stands when nothing it is sorted or filtered
+    /// by changed, and otherwise taken out and put back at the place a
+    /// binary search finds.
+    private func repositionRow(old: LibraryTrack, new: LibraryTrack) {
+        let wasShown = !filterState.isActive || filterState.passes(old)
+        let isShown = !filterState.isActive || filterState.passes(new)
+        guard wasShown || isShown else { return }
+        let at = wasShown ? sortedTracks.firstIndex(where: { $0.id == new.id }) : nil
+        if wasShown, at == nil {
+            // The memoised arrays are behind `tracks`; start over.
+            recomputeSortedTracks()
+            return
+        }
+        if let at, isShown,
+           sortOrder.isEmpty || Self.compare(old, new, by: sortOrder) == .orderedSame
+        {
+            sortedTracks[at] = new
+            return
+        }
+        if !sortOrder.isEmpty || !isShown {
+            if let at {
+                sortedTracks.remove(at: at)
+                sortedTrackIds.remove(at: at)
+            }
+            if isShown {
+                let to = Self.insertionIndex(for: new, in: sortedTracks, by: sortOrder)
+                sortedTracks.insert(new, at: to)
+                sortedTrackIds.insert(new.id, at: to)
+            }
+            return
+        }
+        // Newly let through the filter with no sort: its place is its
+        // place in `tracks`, which only the full pass knows.
+        recomputeSortedTracks()
+    }
+
+    /// `a` against `b` by each comparator in turn, as `sorted(using:)`
+    /// reads a list of them.
+    nonisolated private static func compare(
+        _ a: LibraryTrack, _ b: LibraryTrack, by order: [LibraryRowComparator]
+    ) -> ComparisonResult {
+        for comparator in order {
+            let result = comparator.compare(a, b)
+            if result != .orderedSame { return result }
+        }
+        return .orderedSame
+    }
+
+    /// Where `row` goes in `sorted`: after every row that does not sort
+    /// after it.
+    nonisolated private static func insertionIndex(
+        for row: LibraryTrack, in sorted: [LibraryTrack], by order: [LibraryRowComparator]
+    ) -> Int {
+        var (low, high) = (0, sorted.count)
+        while low < high {
+            let middle = (low + high) / 2
+            if compare(sorted[middle], row, by: order) == .orderedDescending {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        return low
     }
 
     /// Refresh the memoised `sortedTracks` and `sortedTrackIds`
@@ -3086,6 +3148,7 @@ struct LibraryView: View {
         _ rows: [LibraryTrack], filter: LibraryFilterState, order: [LibraryRowComparator]
     ) -> [LibraryTrack] {
         let base = filter.isActive ? rows.filter { filter.passes($0) } : rows
+        if order.count == 1, let sorted = order[0].sortedByText(base) { return sorted }
         return order.isEmpty ? base : base.sorted(using: order)
     }
 
@@ -3978,56 +4041,75 @@ struct LibraryView: View {
         let matchWindow = libraryModel.matchWindow
 
         isLoading = true
+        let clickedAt = ProcessInfo.processInfo.systemUptime
+        let pickedAt = LibraryListTiming.takePick(before: clickedAt)
         Task.detached(priority: .userInitiated) {
-            let rows: [LibraryTrack]
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            var fetched: [LibraryTrack]
             // M11d-history: per-row "← from <track>" annotations,
             // populated only by the Session History source so the
             // dict doubles as the "is this source active" gate at
             // render time.
             var fromTitles: [String: String] = [:]
             do {
-                if !query.isEmpty {
-                    rows = try library.search(query: query, limit: limit)
+                // Search looks in the list on screen. All Tracks is the
+                // collection, which has its own search; every other list
+                // — another app's library, a playlist, a crate, history —
+                // is fetched as it is browsed and narrowed to the rows
+                // the search matches, so it keeps its own order. Search
+                // used to go to the collection whatever was selected,
+                // and most tracks in another app's library are not in
+                // it: with Apple Music selected it found nothing at all
+                // (2026-11-19).
+                var searchesCollection = false
+                if case .allTracks = source { searchesCollection = true }
+                if !query.isEmpty, searchesCollection {
+                    fetched = try library.search(query: query, limit: limit)
                 } else {
                     switch source {
                     case .allTracks:
-                        rows = try library.listTracks(limit: limit, offset: 0)
+                        fetched = try library.listTracks(limit: limit, offset: 0)
                     case .recentlyPlayed:
-                        rows = try library.recentlyPlayed(limit: limit)
+                        fetched = try library.recentlyPlayed(limit: limit)
                     case .sessionHistory:
                         let plays = try library.sessionHistory(limit: limit)
-                        rows = plays.map(\.track)
+                        fetched = plays.map(\.track)
                         for play in plays {
                             if let from = play.fromTrackTitle {
                                 fromTitles[play.track.id] = from
                             }
                         }
                     case .justImported:
-                        rows = try library.justImported(
+                        fetched = try library.justImported(
                             sinceUnixSecs: since, limit: limit)
                     case .dubCrate(let crateId):
-                        rows = try library.crateTracks(crateId: crateId)
+                        fetched = try library.crateTracks(crateId: crateId)
                     case .importedSource(let kind):
-                        rows = try library.listTracksBySource(
+                        fetched = try library.listTracksBySource(
                             source: kind.sourceTag, limit: limit, offset: 0)
                     case .importedCrate(let id):
-                        rows = try library.importedCrateTracks(importedCrateId: id)
+                        fetched = try library.importedCrateTracks(importedCrateId: id)
                     case .favoriteSlot(let slot):
-                        rows = try library.favoriteSlotTracks(slot: slot)
+                        fetched = try library.favoriteSlotTracks(slot: slot)
                     case .matching:
                         // The whole library, not the browser's page: a
                         // match can be anywhere in a 30 000-track
                         // collection. Off the main thread, and only when
                         // the playing track changes.
                         if let matchReference {
-                            rows = TrackMatching.matches(
+                            fetched = TrackMatching.matches(
                                 try library.listTracks(limit: Self.matchingScanLimit, offset: 0),
                                 against: matchReference, window: matchWindow)
                         } else {
-                            rows = []
+                            fetched = []
                         }
                     default:
-                        rows = []
+                        fetched = []
+                    }
+                    if !query.isEmpty {
+                        let matched = Set(try library.searchTrackIds(
+                            query: query, limit: Self.searchMatchLimit))
+                        fetched = fetched.filter { matched.contains($0.id) }
                     }
                 }
             } catch {
@@ -4035,8 +4117,10 @@ struct LibraryView: View {
                 await MainActor.run {
                     model.surfaceError("Library refresh failed: \(message)")
                 }
-                rows = []
+                fetched = []
             }
+            let rows = fetched
+            let fetchedAt = ProcessInfo.processInfo.systemUptime
             // Immutable snapshot — the @Sendable MainActor closure
             // can't capture the mutated local `var` directly.
             let resolvedFromTitles = fromTitles
@@ -4047,18 +4131,24 @@ struct LibraryView: View {
             // waveform links and every deck update queued behind it.
             let sorted = Self.sortedRows(rows, filter: filterSnapshot, order: sortSnapshot)
             let sortedIds = sorted.map(\.id)
+            let sortedAt = ProcessInfo.processInfo.systemUptime
             let facetsPrepared = Self.computedFacets(
                 rows, open: libraryOpen, fields: fieldsSnapshot, filter: filterSnapshot)
             let reachability = WaveformAppModel.probeVolumeReachability(
                 for: rows, previous: reachabilityBefore)
+            let preparedAt = ProcessInfo.processInfo.systemUptime
             await MainActor.run {
+                let landingAt = ProcessInfo.processInfo.systemUptime
                 self.tracks = rows
                 self.sessionFromTitles = resolvedFromTitles
                 if self.sortOrder == sortSnapshot, self.filterState == filterSnapshot {
-                    if sorted != self.sortedTracks {
-                        self.sortedTracks = sorted
-                        self.sortedTrackIds = sortedIds
-                    }
+                    // Assigned outright. This used to compare the whole
+                    // new list with the old one first, row by row and
+                    // field by field on the main thread, to skip an
+                    // invalidation that `tracksContentRevision` below
+                    // causes anyway.
+                    self.sortedTracks = sorted
+                    self.sortedTrackIds = sortedIds
                     self.facets = facetsPrepared.facets
                     self.bpmBucketFacet = facetsPrepared.bpm
                 } else {
@@ -4068,6 +4158,25 @@ struct LibraryView: View {
                 self.model.applyVolumeReachability(reachability)
                 self.tracksContentRevision &+= 1
                 self.isLoading = false
+                let landedAt = ProcessInfo.processInfo.systemUptime
+                let rowCount = rows.count
+                LibraryListTiming.begin()
+                LibraryListTiming.afterPaint {
+                    let paintedAt = ProcessInfo.processInfo.systemUptime
+                    LibraryListTiming.log(
+                        rows: rowCount,
+                        lead: clickedAt - pickedAt,
+                        queued: startedAt - clickedAt,
+                        fetch: fetchedAt - startedAt,
+                        prepare: preparedAt - fetchedAt,
+                        sort: sortedAt - fetchedAt,
+                        hop: landingAt - preparedAt,
+                        landing: landedAt - landingAt,
+                        paint: paintedAt - landedAt,
+                        total: paintedAt - pickedAt,
+                        pass: LibraryListTiming.end(),
+                        paintedAt: paintedAt)
+                }
                 // M11d-history: a reveal staged across this refresh
                 // lands now that the rows are in. Always clears —
                 // a track that vanished from the library drops the
@@ -4098,6 +4207,71 @@ struct LibraryView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Bench
+
+    /// Click through a fixed round of lists, once per entry of
+    /// `LibraryBench.rounds`. See `LibraryBench`.
+    private func runBenchIfAsked() async {
+        guard LibraryBench.isAsked else { return }
+        func pause(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
+        for _ in 0..<300 where !libraryModel.libraryIsOpen || libraryModel.importedSources.isEmpty {
+            await pause(100)
+        }
+        // Launch has its own refreshes and analysis; let them finish.
+        await pause(8_000)
+        let round = benchRound()
+        guard round.count > 2 else {
+            LibraryListTiming.note("bench: no lists to click through")
+            return
+        }
+        LibraryListTiming.note("bench: \(round.count) lists a round, \(LibraryBench.rounds.count) rounds")
+        let filterWasFolded = filterBarCollapsed
+        for (name, filterOpen) in LibraryBench.rounds {
+            filterBarCollapsed = filterOpen ? false : filterWasFolded
+            // The first pick of a round also pays for whatever the round
+            // changed; it is labelled apart. It is a list
+            // the round neither ends on nor starts with: picking the list
+            // already showing does nothing.
+            for (index, source) in ([round[round.count / 2]] + round).enumerated() {
+                LibraryBench.label = index == 0 ? "[\(name), settling] " : "[\(name)] "
+                let shown = LibraryListTiming.listsShown
+                select(source)
+                for _ in 0..<100 where LibraryListTiming.listsShown == shown { await pause(50) }
+                // Whatever the main thread still does once the list is
+                // up shows as this task being resumed late.
+                var late: TimeInterval = 0
+                for _ in 0..<25 {
+                    let asked = LibraryListTiming.now
+                    await pause(10)
+                    late = max(late, LibraryListTiming.now - asked - 0.010)
+                }
+                if late > 0.020 {
+                    LibraryListTiming.note(
+                        "\(LibraryBench.label)then the main thread was held \(Int(late * 1_000)) ms more")
+                }
+            }
+        }
+        LibraryBench.label = ""
+        filterBarCollapsed = filterWasFolded
+        select(.allTracks)
+        LibraryListTiming.note("bench: done")
+    }
+
+    /// The lists a round clicks through: imported playlists from the
+    /// shortest to the longest, a whole imported library, the collection
+    /// — ordered so the list on screen both grows and shrinks.
+    private func benchRound() -> [LibrarySource] {
+        let crates = libraryModel.importedSources
+            .flatMap(\.crates)
+            .filter { $0.trackCount > 0 }
+            .sorted { ($0.trackCount, $0.id) < ($1.trackCount, $1.id) }
+        guard crates.count >= 4, let group = libraryModel.importedSources.max(by: { $0.trackCount < $1.trackCount })
+        else { return [] }
+        let at = { (share: Double) in LibrarySource.importedCrate(id: crates[Int(Double(crates.count - 1) * share)].id) }
+        let whole = LibrarySource.importedSource(kind: group.kind)
+        return [at(0.1), at(0.5), at(1), at(0.2), whole, at(0.7), .allTracks, at(0.9), at(0)]
     }
 
     // MARK: - NSOpenPanel (Import Folder…)
@@ -4230,10 +4404,322 @@ struct LibraryColumnLayout {
 }
 
 enum LibraryRowLayout {
-    static let estimatedHeight: CGFloat = 28
+    /// The size of the browser's text — track rows and the sidebar's
+    /// nodes — is the DJ's to set (Preferences ▸ Library ▸ Text size).
+    /// It was a fixed 14 pt, which read "much smaller than in Traktor"
+    /// on the rig (Daniel, 2026-11-20). Traktor's own "14" and "21" are
+    /// in its scaled units, not points, so the numbers do not carry
+    /// over; the eye does.
+    static let textSizeKey = "dub.libraryTextSize"
+    static let textSizeRange: ClosedRange<Double> = 12...24
+    static let defaultTextSize: Double = 18
+
+    /// The stored size, inside the range; the default when none is stored.
+    static var textSize: CGFloat {
+        let stored = UserDefaults.standard.double(forKey: textSizeKey)
+        let size = stored == 0 ? defaultTextSize : stored
+        return CGFloat(min(max(size, textSizeRange.lowerBound), textSizeRange.upperBound))
+    }
+
+    /// Extra space between letters, growing with the size. The system
+    /// font sets itself tighter and narrower as it gets bigger — its
+    /// headline cut, from about 18 pt — and a list of track names in it
+    /// reads as tall and squeezed ("a bit stretched vertically", Daniel,
+    /// 2026-11-20). This gives back the openness of the small-text cut:
+    /// none at 14 pt, a third of a point at 18.
+    static var tracking: CGFloat { max(0, (textSize - 14) * 0.08) }
+
+    /// A row's main text, and its smaller companions (counts, notes).
+    static var font: Font { .system(size: textSize) }
+    static var smallFont: Font { .system(size: max(textSize - 3, 10)) }
+
+    /// A track row: the text and room around it, 31 pt at the default.
+    static var estimatedHeight: CGFloat { (textSize * 1.7).rounded() }
+    /// Space above and below a sidebar row's label, to match.
+    static var sidebarRowPadding: CGFloat { (textSize * 0.25).rounded() }
     /// The column header: the 10 pt caps label with 4 pt above and
     /// below. Was AppKit's 28 pt default.
     static let headerHeight: CGFloat = 20
+}
+
+/// One row of the sidebar's tree, as values.
+///
+/// The rows were built by `LibraryView` itself, so every change to any of
+/// its state — the pick, the loading flag, the list arriving — built all
+/// of them again and left SwiftUI to compare what it got: with some
+/// hundred playlists showing, about 90 ms of each click
+/// (`LibraryBench`, 2026-11-20). A row that is a view of its own and
+/// `Equatable` is skipped when its values are the ones it already shows,
+/// which between two clicks is every row but the two whose highlight
+/// moved.
+///
+/// `==` leaves the closures out, as it must. They are safe to keep from
+/// an earlier build of the row because everything they capture is in the
+/// comparison: the source they pick and the key they fold.
+private struct SidebarNodeRow: View, Equatable {
+    enum Arrow: Equatable { case none, closed, open }
+
+    static let arrowWidth: CGFloat = 10
+
+    var source: LibrarySource
+    var icon: String
+    var name: String
+    var count: String?
+    var countHelp: String?
+    var arrow: Arrow = .none
+    var arrowHelp: String = ""
+    var foldKey: String = ""
+    /// The space left of the arrow slot: the tree's indent.
+    var leading: CGFloat
+    var isSelected: Bool
+    /// A node not built yet: dimmed, with a lock.
+    var isAvailable: Bool = true
+    /// The DJ's text size. The row reads it from the stored setting; it is
+    /// carried so that a change of it is a change of the row.
+    var textSize: CGFloat
+    /// What the row drags as, onto a favourites slot.
+    var dragPayload: String?
+    var onPick: () -> Void
+    var onFold: () -> Void = {}
+
+    static func == (a: SidebarNodeRow, b: SidebarNodeRow) -> Bool {
+        a.source == b.source && a.icon == b.icon && a.name == b.name && a.count == b.count
+            && a.countHelp == b.countHelp && a.arrow == b.arrow && a.arrowHelp == b.arrowHelp
+            && a.foldKey == b.foldKey && a.leading == b.leading && a.isSelected == b.isSelected
+            && a.isAvailable == b.isAvailable && a.textSize == b.textSize
+            && a.dragPayload == b.dragPayload
+    }
+
+    var body: some View {
+        if let dragPayload {
+            row.onDrag { NSItemProvider(object: dragPayload as NSString) }
+        } else {
+            row
+        }
+    }
+
+    private var row: some View {
+        HStack(spacing: DubSpacing.sm) {
+            Group {
+                if arrow != .none {
+                    Button(action: onFold) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DubColor.textTertiary)
+                            .rotationEffect(.degrees(arrow == .open ? 90 : 0))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(arrowHelp)
+                }
+            }
+            .frame(width: Self.arrowWidth)
+            Image(systemName: icon)
+                .frame(width: 16)
+                .foregroundStyle(
+                    isAvailable
+                        ? (isSelected ? DubColor.textPrimary : DubColor.textSecondary)
+                        : DubColor.textPlaceholder)
+            Text(name)
+                .libraryRowText()
+                .foregroundStyle(isAvailable ? DubColor.textPrimary : DubColor.textPlaceholder)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            if let count {
+                Text(count)
+                    .font(LibraryRowLayout.smallFont)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .monospacedDigit()
+                    .help(countHelp ?? "")
+            }
+            if !isAvailable {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(DubColor.textPlaceholder)
+                    .help("Coming soon.")
+            }
+        }
+        .padding(.leading, leading)
+        .padding(.trailing, DubSpacing.lg)
+        .padding(.vertical, LibraryRowLayout.sidebarRowPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onPick)
+    }
+}
+
+/// How long a list took to appear, in the unified log:
+///
+///     /usr/bin/log show --predicate 'subsystem == "com.dub.app" AND \
+///         category == "list"' --last 5m --style compact
+///
+/// A click on a node should read as instant, and "it feels slow" does not
+/// say whether the wait is the library's query, the sort, or the table.
+/// `lead` is the pick reaching the library call, `queued` the wait for a
+/// worker, `fetch` the library call with its rows crossing into Swift,
+/// `prepare` the sort, facets and volume probe, `hop` the wait for the
+/// main thread, `landing` the assignments there, and `paint` everything
+/// the main thread then does before it next comes to rest.
+///
+/// `paint` is most of it, and none of it is our code running, so it is
+/// split by the moments our code is called on the way (`Pass`): `wait`
+/// until SwiftUI starts on the views, `update` until it has handed the
+/// table its rows, `window` until the table is laid out — the rest of the
+/// window's SwiftUI and its layout — `rows` until the last cell is, and
+/// `draw` for what is left.
+/// In Release builds too: one line a list, and a Debug build's numbers
+/// say little about the app a DJ runs.
+enum LibraryListTiming {
+    private static let logger = Logger(subsystem: "com.dub.app", category: "list")
+
+    static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// One list's arrival on the main thread, from the landing to rest.
+    struct Pass {
+        var landedAt: TimeInterval
+        var firstBodyAt: TimeInterval?
+        var libraryBodies = 0
+        var windowBodies = 0
+        var tableUpdatedAt: TimeInterval?
+        var refill: TimeInterval = 0
+        var tableLayoutAt: TimeInterval?
+        var lastCellAt: TimeInterval?
+        var cellLayout: TimeInterval = 0
+        var cellLayouts = 0
+        var cellsMoved = 0
+    }
+
+    @MainActor private static var pass: Pass?
+    @MainActor private static var pickedAt: TimeInterval?
+    /// Lists that have finished appearing, for `LibraryBench` to wait on.
+    @MainActor private(set) static var listsShown = 0
+
+    /// A node was picked. The library call starts a SwiftUI update later.
+    @MainActor static func picked() { pickedAt = now }
+
+    /// The pick this refresh answers, if one just happened.
+    @MainActor static func takePick(before start: TimeInterval) -> TimeInterval {
+        defer { pickedAt = nil }
+        guard let pickedAt, start - pickedAt < 1 else { return start }
+        return pickedAt
+    }
+
+    @MainActor static func begin() { pass = Pass(landedAt: now) }
+    @MainActor static func end() -> Pass? {
+        defer { pass = nil }
+        listsShown += 1
+        return pass
+    }
+
+    @MainActor static func libraryBody() {
+        guard pass != nil else { return }
+        pass?.libraryBodies += 1
+        if pass?.firstBodyAt == nil { pass?.firstBodyAt = now }
+    }
+    @MainActor static func windowBody() {
+        guard pass != nil else { return }
+        pass?.windowBodies += 1
+        if pass?.firstBodyAt == nil { pass?.firstBodyAt = now }
+    }
+    @MainActor static func tableUpdated(refill: TimeInterval) {
+        guard pass != nil else { return }
+        pass?.tableUpdatedAt = now
+        pass?.refill += refill
+    }
+    @MainActor static func tableLayout() {
+        guard pass != nil, pass?.tableLayoutAt == nil else { return }
+        pass?.tableLayoutAt = now
+    }
+    @MainActor static var isTiming: Bool { pass != nil }
+    @MainActor static func cellLaidOut(took: TimeInterval) {
+        pass?.cellLayout += took
+        pass?.cellLayouts += 1
+        pass?.lastCellAt = now
+        if pass?.tableLayoutAt == nil { pass?.tableLayoutAt = now - took }
+    }
+    @MainActor static func cellMoved() { pass?.cellsMoved += 1 }
+
+    /// Run `body` when the main thread next goes idle: after the layout
+    /// and display pass the current turn of the run loop has queued.
+    @MainActor
+    static func afterPaint(_ body: @escaping () -> Void) {
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, false, CFIndex.max
+        ) { _, _ in body() }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    }
+
+    @MainActor
+    static func log(
+        rows: Int, lead: TimeInterval, queued: TimeInterval, fetch: TimeInterval,
+        prepare: TimeInterval, sort: TimeInterval, hop: TimeInterval, landing: TimeInterval, paint: TimeInterval,
+        total: TimeInterval, pass: Pass?, paintedAt: TimeInterval
+    ) {
+        let ms = { (t: TimeInterval) in Int((t * 1_000).rounded()) }
+        var line = "\(LibraryBench.label)\(rows) rows: lead \(ms(lead)), queued \(ms(queued)), "
+            + "fetch \(ms(fetch)), prepare \(ms(prepare)), sort \(ms(sort)), hop \(ms(hop)), landing \(ms(landing)), "
+            + "paint \(ms(paint)), total \(ms(total)) ms"
+        if let pass {
+            // Each mark falls back to the one after it, so a phase our
+            // code was never called in reads as 0 rather than as a gap.
+            let rowsDone = pass.lastCellAt ?? paintedAt
+            let tableAt = pass.tableLayoutAt ?? rowsDone
+            let updatedAt = pass.tableUpdatedAt ?? tableAt
+            let bodyAt = pass.firstBodyAt ?? updatedAt
+            line += " | wait \(ms(bodyAt - pass.landedAt)), update \(ms(updatedAt - bodyAt)), "
+                + "window \(ms(tableAt - updatedAt)), rows \(ms(rowsDone - tableAt)), "
+                + "draw \(ms(paintedAt - rowsDone))"
+                + " | bodies \(pass.libraryBodies)+\(pass.windowBodies), refill \(ms(pass.refill)), "
+                + "cells \(pass.cellLayouts) in \(ms(pass.cellLayout)), moved \(pass.cellsMoved)"
+        }
+        logger.notice("\(line, privacy: .public)")
+    }
+
+    static func note(_ text: String) {
+        logger.notice("\(text, privacy: .public)")
+    }
+}
+
+/// The browser clicking through its own lists, so what a click costs can
+/// be measured without a hand on the mouse — and measured again after a
+/// change, on the same lists in the same order.
+///
+///     open Dub.app --args -dubLibraryBench 1
+///
+/// It picks a handful of lists of different lengths, in an order that
+/// goes from short to long and back, and clicks through them once for
+/// each entry of `rounds`. Each list is one `LibraryListTiming` line,
+/// labelled with its round. Use a Release build: a Debug build's numbers
+/// are several times these.
+///
+/// To find what a part of the browser costs, leave it out for a round
+/// and take the difference. That is how the folded filter bar (290 ms of
+/// a 670 ms click), the sidebar's rows (90) and the cells' SwiftUI hosts
+/// (170) were found on 2026-11-20, none of which a profile named: the
+/// time was all inside SwiftUI and AppKit.
+enum LibraryBench {
+    /// `filterOpen` runs the round with the filter bar unfolded, whatever
+    /// the DJ has it set to; the bench puts it back.
+    static let rounds: [(name: String, filterOpen: Bool)] = [
+        ("as it is", false),
+        ("filter bar open", true),
+        ("as it is, again", false),
+    ]
+
+    static var isAsked: Bool { UserDefaults.standard.bool(forKey: "dubLibraryBench") }
+
+    /// Goes in front of each timing line while the bench runs. Main
+    /// thread only.
+    static var label = ""
+}
+
+extension View {
+    /// The browser's text: its size and its letter spacing.
+    func libraryRowText() -> some View {
+        font(LibraryRowLayout.font).tracking(LibraryRowLayout.tracking)
+    }
 }
 
 /// Where a "Move…" crate context-menu item places the track within
@@ -4455,13 +4941,15 @@ private struct LibraryTextFocusDismissMonitor: NSViewRepresentable {
 /// first appeared.
 struct DimUnanalyzed: ViewModifier {
     let isAnalyzed: Bool
+    /// Shared with the cells AppKit draws (`LibraryTextCellView`).
+    static let dimmedOpacity: CGFloat = 0.55
     func body(content: Content) -> some View {
         // 0.55 chosen to read as "this row is waiting for
         // analysis" without losing legibility of the title /
         // artist text. Slightly higher than the 0.40 we use for
         // disabled controls; rows are still selectable +
         // draggable, just visually deferred.
-        content.opacity(isAnalyzed ? 1.0 : 0.55)
+        content.opacity(isAnalyzed ? 1.0 : Self.dimmedOpacity)
     }
 }
 

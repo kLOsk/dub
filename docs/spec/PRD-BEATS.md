@@ -1212,3 +1212,30 @@ tempo-synced features still read the one tempo; lines sit at onset-frame
 precision. Straightening the audio to the even grid (warping) would build
 on this and is not started.
 
+**The pulse (2026-11-19, not yet used by the app).** A line on each hit is
+the band's feel; straightening a record needs the tempo underneath it.
+`dub_bpm::band_pulse` reads that: through a window four bars wide, moved a
+bar at a time, every tempo within 8 % of the track's and every place the
+beat could fall is scored by the onset a comb at that tempo and place lands
+on, and one answer per bar is chosen for the whole track at once — the
+path with the most onset, less a price for each change of tempo or of
+place from the bar before. The comb has a tooth on every half beat, so the
+beat and the off-beat score alike and nothing pulls the reading from one
+to the other; which of the two is the beat is decided once, afterwards.
+
+Measured on tracks locked in Traktor (every sixth of 1,767;
+`tests/follow_corpus.rs`), as they are and bent ±1 % by the stretcher, the
+first and last 20 seconds left out:
+
+| | a line on each hit | the pulse |
+|---|---|---|
+| Steady: four-bar tempo off, median song (rms) | 0.21 % | 0.03 % |
+| Steady: songs never more than 0.5 % off | 31 % | 91 % |
+| Drifting ±1 %: off, median song (rms) | 0.23 % | 0.06 % |
+| Drifting ±1 %: songs never more than 0.5 % off | 27 % | 87 % |
+
+Over the library (2,547 tracks), the four-bar tempo's whole swing in the
+body of a track is 0.19 % at the median where the Traktor grid is locked
+and 1.94 % where it is not; 79 % of locked tracks swing under 0.5 % and
+73 % of unlocked ones over 1 %.
+

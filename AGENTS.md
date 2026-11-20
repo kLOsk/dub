@@ -55,8 +55,12 @@ crates/
   dub-dsp/           Resamplers, filters, and the shipped FX: EchoOut (M15), the PT2399 dub echo,
                      the three siren units (GS1 / DS01E / SN76477) and the vintage chain
                      (spring / RE-201 / BigKnob / phaser) parked behind the deferred FX-deck role (M16).
-  dub-stretch/       M14 — pure-Rust WSOLA time-stretch / key-lock engine. No unsafe, no C deps
+  dub-stretch/       M14 — pure-Rust time-stretch / key-lock engine. No unsafe, no C deps
                      (Rubber Band was benched and dropped; see the M14 row in PRD §12.0).
+                     The deck runs `SpliceStretcher` (2026-11-19): the record copied untouched,
+                     joined before drum hits and where it repeats, bass and the rest apart.
+                     `WsolaStretcher` (the M14 original) stays for `dub stretch-bench` to compare.
+                     `tests/stretch_quality.rs` is the measurement any change answers to.
   dub-io/            symphonia-based decoders, in-memory track buffers.
   dub-encode/        M26 — offline FLAC encode (flacenc) + Vorbis-comment/PICTURE tagging (metaflac)
                      for ripped tracks. Deliberately permissive-only (MP3/LAME deferred).

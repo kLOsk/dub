@@ -49,52 +49,109 @@ final class LibraryCellSnapshotTests: XCTestCase {
     private func cell(
         _ field: LibraryColumnField,
         _ track: LibraryTrack,
-        mode: KeyNotationMode = .camelot,
-        sessionFrom: String? = nil,
         moving: Bool = false
     ) -> LibraryColumnCell {
         LibraryColumnCell(
             field: field,
-            state: LibraryCellState(
-                track: track,
-                sessionFromTitle: sessionFrom,
-                keyNotationMode: mode,
-                movingGridsShown: moving))
+            state: LibraryCellState(track: track, movingGridsShown: moving))
+    }
+
+    /// The text columns are drawn by AppKit (`LibraryTextCellView`), so
+    /// these lay the production cells out by hand, as `LibraryTable`'s
+    /// row view does.
+    @MainActor
+    private func snapText(
+        _ cells: [(field: LibraryColumnField, state: LibraryCellState, width: CGFloat)],
+        height: CGFloat = 28,
+        named name: String,
+        file: StaticString = #filePath,
+        testName: String = #function,
+        line: UInt = #line
+    ) {
+        let row = NSTableRowView()
+        row.frame = CGRect(x: 0, y: 0, width: cells.map(\.width).reduce(0, +), height: height)
+        row.backgroundColor = NSColor(DubColor.surface0)
+        var x: CGFloat = 0
+        for entry in cells {
+            let cell = LibraryCellView.make(
+                column: NSUserInterfaceItemIdentifier(entry.field.rawValue))
+            cell.configure(
+                field: entry.field, state: LibraryRowState(cell: entry.state),
+                actions: LibraryRowActions())
+            cell.frame = CGRect(x: x, y: 0, width: entry.width, height: height)
+            row.addSubview(cell)
+            x += entry.width
+        }
+        row.layoutSubtreeIfNeeded()
+        assertSnapshot(
+            of: row, as: .image(perceptualPrecision: 0.98), named: name,
+            file: file, testName: testName, line: line)
+    }
+
+    private func state(
+        _ track: LibraryTrack, mode: KeyNotationMode = .camelot, sessionFrom: String? = nil
+    ) -> LibraryCellState {
+        LibraryCellState(track: track, sessionFromTitle: sessionFrom, keyNotationMode: mode)
     }
 
     // MARK: - Text columns
 
+    @MainActor
     func test_textCells_populated() {
-        let track = LibraryTrack.fixture()
-        let row = HStack(spacing: 0) {
-            cell(.artist, track).frame(width: 120, alignment: .leading)
-            cell(.title, track).frame(width: 180, alignment: .leading)
-            cell(.album, track).frame(width: 140, alignment: .leading)
-            cell(.genre, track).frame(width: 140, alignment: .leading)
-        }
-        snap(row, width: 580, named: "text-cells-populated")
+        let track = state(.fixture())
+        snapText(
+            [(.artist, track, 120), (.title, track, 180), (.album, track, 140), (.genre, track, 140)],
+            named: "text-cells-populated")
     }
 
     /// Every optional column renders an em-dash, not an empty cell —
     /// "we have no value" has to be visible.
+    @MainActor
     func test_textCells_empty() {
-        let track = LibraryTrack.fixture(
-            title: nil, artist: nil, album: nil, genre: nil)
-        let row = HStack(spacing: 0) {
-            cell(.artist, track).frame(width: 120, alignment: .leading)
-            cell(.title, track).frame(width: 180, alignment: .leading)
-            cell(.album, track).frame(width: 140, alignment: .leading)
-        }
-        snap(row, width: 440, named: "text-cells-empty")
+        let track = state(.fixture(title: nil, artist: nil, album: nil, genre: nil))
+        snapText(
+            [(.artist, track, 120), (.title, track, 180), (.album, track, 140)],
+            named: "text-cells-empty")
     }
 
-    /// Session History rows carry a "← from" sub-label at the lowest
-    /// layout priority, so the title never compresses for it.
+    /// Session History rows carry a "← from" remark after the title; the
+    /// line is cut at its end, so the remark gives way before the title.
+    @MainActor
     func test_titleCell_withSessionHistoryHint() {
-        snap(
-            cell(.title, .fixture(), sessionFrom: "Bow Down")
-                .frame(width: 260, alignment: .leading),
-            width: 260, named: "title-session-hint")
+        snapText(
+            [(.title, state(.fixture(), sessionFrom: "Bow Down"), 260)],
+            named: "title-session-hint")
+    }
+
+    /// What a text column says, apart from how it is drawn.
+    func test_textColumns_asValues() {
+        let track = LibraryTrack.fixture(key: "8B", durationMs: 213_000, crateOrdinal: 11)
+        XCTAssertNil(LibraryCellText.make(.bpm, state(track)))
+        XCTAssertNil(LibraryCellText.make(.rating, state(track)))
+        XCTAssertNil(LibraryCellText.make(.color, state(track)))
+
+        let title = LibraryCellText.make(.title, state(track))
+        XCTAssertEqual(title?.text, "Ain't No Mountain High Enough")
+        XCTAssertEqual(title?.ink, .primary)
+        XCTAssertEqual(title?.truncation, .byTruncatingMiddle)
+        XCTAssertEqual(LibraryCellText.make(.title, state(.fixture(title: nil)))?.text, "Untitled")
+        let hinted = LibraryCellText.make(.title, state(track, sessionFrom: "Bow Down"))
+        XCTAssertEqual(hinted?.note, "← from Bow Down")
+        XCTAssertEqual(hinted?.truncation, .byTruncatingTail)
+
+        XCTAssertEqual(LibraryCellText.make(.artist, state(.fixture(artist: nil)))?.text, "—")
+        XCTAssertEqual(LibraryCellText.make(.duration, state(track))?.text, "3:33")
+        XCTAssertEqual(LibraryCellText.make(.duration, state(track))?.digits, true)
+
+        let order = LibraryCellText.make(.crateOrder, state(track))
+        XCTAssertEqual(order?.text, "12")
+        XCTAssertEqual(order?.trailing, true)
+        XCTAssertEqual(order?.ink, .tertiary)
+
+        let key = LibraryCellText.make(.key, state(track, mode: .musical))
+        XCTAssertEqual(key?.ink, .key("8B"))
+        XCTAssertEqual(key?.toolTip, "8B")
+        XCTAssertEqual(LibraryCellText.make(.key, state(.fixture(key: nil)))?.ink, .secondary)
     }
 
     // MARK: - BPM glyph states
@@ -177,14 +234,16 @@ final class LibraryCellSnapshotTests: XCTestCase {
 
     // MARK: - Key notation
 
+    @MainActor
     func test_keyCell_bothNotations() {
         let track = LibraryTrack.fixture(key: "8B")
-        let row = HStack(spacing: 0) {
-            cell(.key, track, mode: .camelot).frame(width: 80, alignment: .leading)
-            cell(.key, track, mode: .musical).frame(width: 100, alignment: .leading)
-            cell(.key, .fixture(key: nil)).frame(width: 80, alignment: .leading)
-        }
-        snap(row, width: 260, named: "key-notations")
+        snapText(
+            [
+                (.key, state(track, mode: .camelot), 80),
+                (.key, state(track, mode: .musical), 100),
+                (.key, state(.fixture(key: nil)), 80),
+            ],
+            named: "key-notations")
     }
 
     // MARK: - Rating and colour
@@ -215,17 +274,17 @@ final class LibraryCellSnapshotTests: XCTestCase {
 
     // MARK: - Numeric columns
 
+    @MainActor
     func test_numericCells() {
-        let track = LibraryTrack.fixture(year: 1996, durationMs: 213_000)
-        let row = HStack(spacing: 0) {
-            cell(.duration, track).frame(width: 60, alignment: .leading)
-            cell(.year, track).frame(width: 60, alignment: .leading)
-            // `#` is the only built-in that right-aligns.
-            cell(.crateOrder, .fixture(crateOrdinal: 11))
-                .frame(width: 44, alignment: .leading)
-            cell(.duration, .fixture(durationMs: 0)).frame(width: 60, alignment: .leading)
-        }
-        snap(row, width: 224, named: "numeric-cells")
+        let track = state(.fixture(year: 1996, durationMs: 213_000))
+        snapText(
+            [
+                (.duration, track, 60), (.year, track, 60),
+                // `#` is the only built-in that right-aligns.
+                (.crateOrder, state(.fixture(crateOrdinal: 11)), 44),
+                (.duration, state(.fixture(durationMs: 0)), 60),
+            ],
+            named: "numeric-cells")
     }
 }
 
@@ -288,8 +347,8 @@ extension LibraryTrack {
 }
 
 /// The assembled row, built the way `LibraryTable` builds it: a
-/// `LibraryTintedRowView` holding one `LibraryHostingCellView` per
-/// column, gutter first.
+/// `LibraryTintedRowView` holding one `LibraryCellView` per column,
+/// gutter first.
 ///
 /// It renders the production classes rather than a stand-in. A
 /// stand-in row composed the same cells and could stay green while the
@@ -342,8 +401,8 @@ final class LibraryRowSnapshotTests: XCTestCase {
         x += LibraryGutterColumn.width
 
         for column in Self.columns {
-            let cell = LibraryHostingCellView(
-                identifier: NSUserInterfaceItemIdentifier(column.field.rawValue))
+            let cell = LibraryCellView.make(
+                column: NSUserInterfaceItemIdentifier(column.field.rawValue))
             cell.configure(field: column.field, state: state, actions: actions)
             cell.frame = CGRect(x: x, y: 0, width: column.width, height: height)
             row.addSubview(cell)

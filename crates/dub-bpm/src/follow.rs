@@ -64,15 +64,7 @@ pub fn follow_grid(
     let (odf, _) = crate::offline::onset_envelopes(samples, sample_rate, channels).ok()?;
     #[allow(clippy::cast_precision_loss)]
     let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
-    let frames = chain(&odf, 60.0 / grid.bpm * odf_sr)?;
-    let mut beats: Vec<f64> = frames.iter().map(|&f| f / odf_sr).collect();
-    // The onsets peak mid-attack; the lines go on the kick's visible
-    // edge, as the even grid's do.
-    let shift = crate::beats::kick_edge_offset_secs(&beats, samples, sample_rate, channels);
-    for b in &mut beats {
-        *b += shift;
-    }
-    beats.retain(|&b| b >= 0.0);
+    let beats = beats_on_the_band(&odf, odf_sr, samples, sample_rate, channels, grid.bpm)?;
     if beats.len() < 8 || !worth_following(&odf, odf_sr, &beats, &grid.beats) {
         return None;
     }
@@ -91,6 +83,46 @@ pub fn follow_grid(
         bar_phase,
         ..grid.clone()
     })
+}
+
+/// The beats of a band playing around `bpm`, whether or not they fit the
+/// track better than an even grid does. [`follow_grid`] is this behind its
+/// gate; the benchmark in `tests/follow_corpus.rs` reads it bare, to see
+/// what the tracker does on a track that is steady.
+#[must_use]
+pub fn followed_beats(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    bpm: f64,
+) -> Option<Vec<f64>> {
+    if bpm <= 0.0 || sample_rate == 0 {
+        return None;
+    }
+    let (odf, _) = crate::offline::onset_envelopes(samples, sample_rate, channels).ok()?;
+    #[allow(clippy::cast_precision_loss)]
+    let odf_sr = f64::from(sample_rate) / HOP_SIZE as f64;
+    beats_on_the_band(&odf, odf_sr, samples, sample_rate, channels, bpm)
+}
+
+fn beats_on_the_band(
+    odf: &[f32],
+    odf_sr: f64,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    bpm: f64,
+) -> Option<Vec<f64>> {
+    let frames = chain(odf, 60.0 / bpm * odf_sr)?;
+    let mut beats: Vec<f64> = frames.iter().map(|&f| f / odf_sr).collect();
+    // The onsets peak mid-attack; the lines go on the kick's visible
+    // edge, as the even grid's do.
+    let shift = crate::beats::kick_edge_offset_secs(&beats, samples, sample_rate, channels);
+    for b in &mut beats {
+        *b += shift;
+    }
+    beats.retain(|&b| b >= 0.0);
+    Some(beats)
 }
 
 /// How many beats back the local tempo is read over: two bars. One

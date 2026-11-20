@@ -132,7 +132,7 @@ fn print_help() {
     eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
-    eprintln!("  stretch-bench     [--input <wav>] [--dump <dir>] [--full]");
+    eprintln!("  stretch-bench     [--input <file>] [--from <secs>] [--secs <secs>] [--dump <dir>] [--full] [--rates a,b]");
     eprintln!("                    M14 A/B: time-stretch backends (resampler vs WSOLA) —");
     eprintln!("                    CPU + pitch/transient/timbre metrics across a rate sweep.");
     eprintln!("  import            (--traktor <nml> | --serato <dir> | --itunes <xml>");

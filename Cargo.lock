@@ -672,6 +672,7 @@ dependencies = [
  "dub-io",
  "dub-peaks",
  "dub-spectral",
+ "dub-stretch",
  "hound",
  "proptest",
  "realfft",
