@@ -12,7 +12,7 @@ the installed CLI.
 - Write only what the code, the repo's docs or the maintainer says. Never
   invent a feature, limit, menu item or label.
 - UI words are copied from the app's source (`apple/Dub/`), exactly as the app
-  prints them: **LOCKED**, **Preferences ▸ Audio**, **↻**.
+  prints them: **LOCKED**, **Preferences ▸ Audio**, **CALIBRATE**.
 - Alpha features (behind **Preferences ▸ Alpha**) are marked as such.
 - Screenshots come from the real app, not test renders, and live in `images/`.
 

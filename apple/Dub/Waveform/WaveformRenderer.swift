@@ -622,6 +622,57 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         return UInt32(max(Double(chunksPerColumn), min(even, 4096)))
     }
 
+    /// How far past a step the zoom may sit before a held aggregation
+    /// is given up.
+    nonisolated public static let aggregationHold: Double = 0.06
+
+    /// `columnAggregation`, staying on the aggregation the strip is
+    /// already drawn with while the zoom is only just across a step.
+    ///
+    /// The steps sit at the even zooms, and `0.5×` — the default — is
+    /// zoom 2.0 exactly. The zoom handed in is the DJ's times the
+    /// platter's rate, so a 44.1 kHz record played at zero pitch lands
+    /// on the step and every wobble of the rate re-drew the strip with
+    /// columns twice or half as wide ("alternating between a wide and a
+    /// narrow one", Daniel, 2026-11-22). Holding costs a column at most
+    /// 6 % under one pixel, which the 4× MSAA resolves.
+    nonisolated public static func columnAggregation(
+        timeAxisZoom: Double, holding held: UInt32?
+    ) -> UInt32 {
+        let wanted = columnAggregation(timeAxisZoom: timeAxisZoom)
+        guard let held, held != wanted, held >= UInt32(chunksPerColumn), held % 2 == 0
+        else { return wanted }
+        let zoom = max(0.05, timeAxisZoom)
+        let upper = Double(held) * (1 + aggregationHold)
+        let lower = Double(held) <= Double(chunksPerColumn)
+            ? 0 : (Double(held) - 2) * (1 - aggregationHold)
+        return zoom <= upper && zoom > lower ? held : wanted
+    }
+
+    /// How far the platter may run from the record's own speed before
+    /// the strip changes how much audio a column holds: 45 on a 33 is
+    /// 1.35, so nothing a pitch fader does reaches it.
+    nonisolated public static let aggregationRateSpan: Double = 1.5
+
+    /// The aggregation a strip draws with: the one its zoom asks for at
+    /// the record's own speed, kept whatever the pitch fader does.
+    ///
+    /// A change of aggregation redraws every column twice or half as
+    /// wide, which the DJ sees as the waveform turning into another
+    /// one. Pitch must not cause that, so the column's *width* takes
+    /// the pitch instead — down to two thirds of a pixel, which the 4×
+    /// MSAA resolves. Only a platter far outside any fader's range
+    /// falls back to the zoom-with-rate aggregation, held as above.
+    nonisolated public static func columnAggregation(
+        timeAxisZoom: Double, restZoom: Double, holding held: UInt32?
+    ) -> UInt32 {
+        let ratio = timeAxisZoom / max(0.05, restZoom)
+        if ratio <= aggregationRateSpan, ratio >= 1 / aggregationRateSpan {
+            return columnAggregation(timeAxisZoom: restZoom)
+        }
+        return columnAggregation(timeAxisZoom: timeAxisZoom, holding: held)
+    }
+
     /// Drawable pixels spanned by one drawn column along the time
     /// axis. M10.5f set this to 2 (the "2× zoom-in") so each
     /// trapezoidal slice covers 2 drawable pixels and the total
@@ -1096,6 +1147,8 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
     /// Render-thread state for following the platter.
     private var axisFollower = PlatterAxisFollower()
     private var axisFollowedAtNs: UInt64?
+    /// The aggregation the last frame drew with (render thread).
+    private var drawnAggregation: UInt32?
 
     /// The axis rate each deck's strip last drew with, for the mouse
     /// scrub: a pixel dragged has to be the same slice of track as the
@@ -1598,15 +1651,20 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
             platterRate: axisRate(
                 fixed: appearance.platterRate, pos: pos, targetNs: targetEngineHostTimeNs),
             peakDurSecs: peakChunkDurationSecs)
-        let pixelsPerDrawnColumn =
-            Self.effectivePixelsPerDrawnColumn(timeAxisZoom: axisZoom)
+        // Zoom-dependent: past the one-pixel column floor this
+        // grows so the column covers more audio instead.
+        let restZoom = Self.effectiveTimeAxisZoom(
+            timeAxisZoom: appearance.timeAxisZoom, platterRate: 1.0,
+            peakDurSecs: peakChunkDurationSecs)
+        let heldAgg = Self.columnAggregation(
+            timeAxisZoom: axisZoom, restZoom: restZoom, holding: drawnAggregation)
+        drawnAggregation = heldAgg
+        let agg = Int(heldAgg)
+        let pixelsPerDrawnColumn = Double(agg) / max(0.05, axisZoom)
         let drawnAbovePixels = max(
             0, Int((Double(pastPixels) / pixelsPerDrawnColumn).rounded(.down)))
         let drawnBelowPixels = max(
             0, Int((Double(futurePixels) / pixelsPerDrawnColumn).rounded(.down)))
-        // Zoom-dependent: past the one-pixel column floor this
-        // grows so the column covers more audio instead.
-        let agg = Int(Self.columnAggregation(timeAxisZoom: axisZoom))
 
         // Playhead chunk + chunks past it. In File mode this is
         // computed off the *unclamped* playhead seconds so a hard
@@ -2067,6 +2125,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                 loopBounds: loopBounds,
                 predicted: predicted,
                 ghost: predicted == nil ? nil : thruGhost,
+                chunksPerColumn: agg,
                 snappedChunkF: Double(playheadChunkSigned),
                 drawnAbove: drawnAbove,
                 // A THRU deck draws no waveform below the playhead — there
@@ -2524,6 +2583,7 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         loopBounds: (Double, Double)?,
         predicted: PredictedBeats?,
         ghost: ThruGhost?,
+        chunksPerColumn: Int,
         snappedChunkF: Double,
         drawnAbove: Int,
         drawnBelow: Int,
@@ -2534,8 +2594,15 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
         let peakDur = peakChunkDurationSecs
         guard peakDur > 0, drawnAbove >= 2, drawnBelow >= 2 else { return }
 
-        let chunksPerColumn = Int(
-            Self.columnAggregation(timeAxisZoom: appearance.timeAxisZoom))
+        // `chunksPerColumn` is the waveform's own, handed in. This used
+        // to work it out again from the zoom the DJ set — but the
+        // waveform works it out from that zoom *times* the platter's rate
+        // and the track's sample rate (`effectiveTimeAxisZoom`), and the
+        // two round to different columns as soon as the product crosses
+        // a whole step: at 0.5× on a 48 kHz track, or with a steadied
+        // record's rate a few percent off. The lines were then laid on a
+        // scale twice the waveform's and ran across it at twice its
+        // speed ("the grid goes crazy", Daniel, 2026-11-20).
         let pastFirstChunkSigned =
             Int64(snappedChunkF) + 1 - Int64(drawnAbove * chunksPerColumn)
         let futureLastChunkSigned =

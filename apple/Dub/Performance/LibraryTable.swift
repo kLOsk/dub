@@ -125,6 +125,9 @@ struct LibraryTable: NSViewRepresentable {
     /// view. Cleared through `onScrollHandled` once acted on, or the
     /// next update would scroll again on every unrelated change.
     var scrollToTrackId: String?
+    /// The first search match from outside the list on screen: a line
+    /// is drawn above it, between that list's matches and the rest.
+    var dividerAboveTrackId: String?
     var callbacks = LibraryTableCallbacks()
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -208,6 +211,13 @@ struct LibraryTable: NSViewRepresentable {
             table.reloadData()
         }
 
+        // The divider belongs to a row view, which a refill of the cells
+        // does not rebuild.
+        if coordinator.lastDividerAboveTrackId != dividerAboveTrackId {
+            coordinator.lastDividerAboveTrackId = dividerAboveTrackId
+            table.reloadData()
+        }
+
         let refillStarted = LibraryListTiming.now
         if tracksChanged {
             coordinator.lastTrackIds = ids
@@ -237,6 +247,7 @@ struct LibraryTable: NSViewRepresentable {
         var parent: LibraryTable
         weak var table: NSTableView?
         var lastTrackIds: [String] = []
+        var lastDividerAboveTrackId: String?
         /// Identity, so `menuNeedsUpdate` can tell the header's menu
         /// from the rows'. Both share this coordinator as delegate.
         weak var headerMenu: NSMenu?
@@ -372,6 +383,11 @@ struct LibraryTable: NSViewRepresentable {
             } else if let field = LibraryColumnField(rawValue: id.rawValue) {
                 cell.configure(field: field, state: state, actions: actions)
             }
+            // A track already played tonight is dimmed. Not its gutter:
+            // the deck badge there says where the track is now.
+            let alpha: CGFloat = state.cell.played && id != LibraryGutterColumn.identifier
+                ? LibraryRowLayout.playedAlpha : 1
+            if cell.alphaValue != alpha { cell.alphaValue = alpha }
         }
 
         private func rowTint(_ track: LibraryTrack) -> NSColor? {
@@ -419,8 +435,10 @@ struct LibraryTable: NSViewRepresentable {
             }()
             if parent.tracks.indices.contains(row) {
                 view.tint = rowTint(parent.tracks[row])
+                view.dividerAbove = parent.tracks[row].id == parent.dividerAboveTrackId
             } else {
                 view.tint = nil
+                view.dividerAbove = false
             }
             return view
         }
@@ -657,7 +675,6 @@ class LibraryCellView: NSTableCellView {
 final class LibraryTextCellView: LibraryCellView {
     private struct Shown: Equatable {
         var text: LibraryCellText
-        var dimmed: Bool
         var size: CGFloat
     }
 
@@ -684,14 +701,11 @@ final class LibraryTextCellView: LibraryCellView {
 
     override func configure(field: LibraryColumnField, state: LibraryRowState, actions: LibraryRowActions) {
         guard let text = LibraryCellText.make(field, state.cell) else { return }
-        // Per cell, inside the column — an unanalyzed row dims its text
-        // but not the gutter badges or the row tint.
-        let next = Shown(text: text, dimmed: !state.track.isAnalyzed, size: LibraryRowLayout.textSize)
+        let next = Shown(text: text, size: LibraryRowLayout.textSize)
         guard next != shown else { return }
         let resized = shown?.size != next.size
         shown = next
         label.attributedStringValue = Self.attributed(text, size: next.size)
-        label.alphaValue = next.dimmed ? DimUnanalyzed.dimmedOpacity : 1
         let toolTip = (text.toolTip?.isEmpty ?? true) ? nil : text.toolTip
         if label.toolTip != toolTip { label.toolTip = toolTip }
         if resized { place() }
@@ -782,9 +796,10 @@ final class LibraryTextCellView: LibraryCellView {
 final class LibraryHostingCellView: LibraryCellView {
     /// What the host was last given, as far as it shows.
     private enum Shown: Equatable {
-        case gutter(deckA: Bool, deckB: Bool, duplicate: Bool, warning: Bool, toolTip: String)
-        case rating(Int, analyzed: Bool)
-        case color(String?, analyzed: Bool)
+        case gutter(
+            deckA: Bool, deckB: Bool, duplicate: Bool, warning: Bool, analysed: Bool, toolTip: String)
+        case rating(Int)
+        case color(String?)
         case cell(LibraryColumnField, LibraryCellState, size: CGFloat)
     }
 
@@ -816,7 +831,8 @@ final class LibraryHostingCellView: LibraryCellView {
         let next = Shown.gutter(
             deckA: state.isOnDeckA, deckB: state.isOnDeckB,
             duplicate: state.track.potentialDuplicateId != nil,
-            warning: state.showsUnreachableWarning, toolTip: state.unreachableTooltip)
+            warning: state.showsUnreachableWarning, analysed: state.showsAnalysedMark,
+            toolTip: state.unreachableTooltip)
         guard next != shown else { return }
         shown = next
         host.rootView = AnyView(
@@ -830,11 +846,10 @@ final class LibraryHostingCellView: LibraryCellView {
         actions: LibraryRowActions
     ) {
         self.actions = actions
-        let analyzed = state.track.isAnalyzed
         let next: Shown
         switch field {
-        case .rating: next = .rating(Int(state.track.rating ?? 0), analyzed: analyzed)
-        case .color: next = .color(state.track.color, analyzed: analyzed)
+        case .rating: next = .rating(Int(state.track.rating ?? 0))
+        case .color: next = .color(state.track.color)
         default: next = .cell(field, state.cell, size: LibraryRowLayout.textSize)
         }
         guard next != shown else { return }
@@ -844,9 +859,6 @@ final class LibraryHostingCellView: LibraryCellView {
             onColor: { [weak self] token in self?.actions.cell.onColor(token) })
         host.rootView = AnyView(
             LibraryColumnCell(field: field, state: state.cell, actions: through)
-                // Per cell, inside the column — an unanalyzed row dims
-                // its text but not the gutter badges or the row tint.
-                .modifier(DimUnanalyzed(isAnalyzed: analyzed))
                 .frame(maxWidth: .infinity, alignment: .leading))
     }
 }
@@ -879,6 +891,12 @@ final class LibraryTintedRowView: NSTableRowView {
         didSet { if tint != oldValue { needsDisplay = true } }
     }
 
+    /// The line between a search's matches from the list on screen and
+    /// its matches from the rest of the library.
+    var dividerAbove = false {
+        didSet { if dividerAbove != oldValue { needsDisplay = true } }
+    }
+
     override var isSelected: Bool {
         didSet { if isSelected != oldValue { needsDisplay = true } }
     }
@@ -892,6 +910,11 @@ final class LibraryTintedRowView: NSTableRowView {
         if let tint {
             tint.setFill()
             bounds.fill()
+        }
+        if dividerAbove {
+            NSColor(DubColor.textTertiary).setFill()
+            let top = isFlipped ? bounds.minY : bounds.maxY - 2
+            NSRect(x: 0, y: top, width: bounds.width, height: 2).fill()
         }
     }
 

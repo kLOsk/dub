@@ -75,8 +75,8 @@ mod version_tokens;
 mod volumes;
 
 pub use analysis::{
-    analyze_compute, analyze_compute_with_track, ActiveBeatgrid, AnalysisComputed, AnalysisJob,
-    AnalysisOutcome,
+    analyze_compute, analyze_compute_with_track, analyze_decode, measure_loudness, ActiveBeatgrid,
+    AnalysisComputed, AnalysisJob, AnalysisOutcome, LoudnessJob, MeasuredLoudness,
 };
 pub use columns::{
     ColumnGroup, ColumnKind, ColumnSet, ColumnValue, LibraryColumnId, MetadataField, MetadataSource,

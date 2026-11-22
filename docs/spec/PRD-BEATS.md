@@ -145,7 +145,7 @@ contract.
 | Action | Trigger | Effect on `bpm` | Effect on `beat_anchor` | Effect on `bar_phase` | Notes |
 |---|---|---|---|---|---|
 | **Auto analyze** | first deck-load of an un-analyzed track, or right-click → Analyze (when the track has never been analyzed) | Set from estimator | Set from estimator | First-measurable-beat rule (the 1 = first grid beat clearing the amplitude floor; backbeat snare/bass fallback) — §6.3 | Writes `auto` row in `track_beatgrids`; `is_active=1` unless a higher-priority row exists. |
-| **Re-analyze** | right-click → Re-analyze (when the track has been analyzed at least once, and `grid_locked = false`) | Recomputed | Recomputed | Recomputed | Writes new `auto` row; demotes any active `user_tap` row so the new auto grid becomes active. |
+| **Re-analyze** | right-click → Re-analyze (when the track has been analyzed at least once, and `grid_locked = false`) | Recomputed | Recomputed | Recomputed | Writes new `auto` row; demotes any active `user_tap` row **and any imported grid** so the new auto grid becomes active (2026-11-22, `reanalyze_track`, FFI 94 — asking for it by name is asking for Dub's reading; before, an unlocked Traktor grid kept the slot and the command changed nothing on screen). The pass a deck load runs by itself still leaves an imported grid in place. The same imported grid arriving again on the next launch does not take the slot back; re-gridded in its app, it does. Changing the app order in Preferences re-picks every unlocked track, this one included: lock the grid to keep it. |
 | **Tap tempo** (3+ taps in one session) | deck-header BPM column (when `grid_locked = false` **and deck transport is playing**) | **The taps are a hint** (§4.2): the song's own tempo is found within ±12 % of the tapped one, refined and integer-snapped like an analysed tempo. Only a song that holds no tempo of its own keeps the tapped one (±3 % fit) | The whole song places the lines, in the phase the taps point at (§4.1, playing deck) | The beat by the first tap is the 1 | Writes new `user_tap` row; demotes any prior `user_tap` row for this track to `is_active = 0`. Each tap session is independent of all prior tap sessions (§4.6). Session window is dynamic (§4.2). |
 | **Set the 1** (1–2 taps in one session) | deck-header BPM column (when `grid_locked = false`) — works in any transport state (playing, paused, cued) | Unchanged (BPM preserved bit-exact) | **Re-anchored** (§4.1): on a stopped deck, onto the leading edge of the kick under the playhead; on a playing deck, onto the beats of the whole song in the phase the tap chose | Set so the tapped beat is the 1 | Writes new `user_tap` row (BPM copied from the previous active grid; anchor + phase recomputed by the relatch). Demotes any prior `user_tap` row to `is_active = 0`. |
 | **Nudge anchor** | future v1.x (PRD §15 backlog) | Unchanged | `± ε` (typically 5 ms) | Unchanged | UI not in v1. |
@@ -374,8 +374,11 @@ Lock is absolute. When `grid_locked = true`:
   import). Over an *imported* grid the lock keeps the grid but lets the
   first analysis run: no auto pass displaces an imported grid, and the
   track still needs its key, waveform and loudness
-  (`Library::lock_refuses_analysis`). The menu item stays disabled as
-  above.
+  (`Library::lock_refuses_analysis`). The menu item is enabled for such
+  a track until that first analysis has run (2026-11-22; it used to stay
+  disabled, which left a library of imported locks unanalysable ahead of
+  a gig), and a selection's label names what it skips: **Re-analyze
+  Selected (3 of 61 · 58 analysed and locked)**.
 - Toggle lock is the only available grid action. The user
   explicitly unlocks, then runs the desired mutation, then
   (optionally) re-locks. Two clicks by design — combining
@@ -557,8 +560,11 @@ the hits then move against the lines as the song goes on.
 
 **The mark.** An unlocked grid whose hits move against its lines
 by **8 ms per minute of song or more**, either way
-(`GridQuality::drifts`, `DRIFT_WARNING_MS_PER_MIN`), shows the ⚠
-"May drift over a long mix" mark in the deck header and in the
+(`GridQuality::drifts`, `DRIFT_WARNING_MS_PER_MIN`), shows the ⚠ mark ("The grid's tempo is slightly off, so its lines slide
+over a long mix · Re-analyze to correct it, or Lock grid to accept";
+until 2026-11-22 "May drift over a long mix", which named neither the
+cause nor the cure and read as a case for the following grid) in the
+deck header and in the
 library's BPM column. A locked grid never shows it: the DJ has
 accepted it. The grid itself is still drawn uniformly — the mark
 warns that the alignment will degrade across the track, and the
@@ -1243,7 +1249,11 @@ whatever the hits say: *Ain't No Mountain High Enough* wanders a third of
 a second and its hits land on only 1.1× the even grid's onset, so the
 hits' test turned it away, and it had only been shown as followed from a
 saved map (Daniel, 2026-11-20: "it should be"). That adds *The Passenger*
-and *Lust for Life* too, and none of 99 Traktor-locked tracks. An
+and *Lust for Life* too, and none of 99 Traktor-locked tracks. A rule that a track must be off its grid's tempo through
+most of its length was tried the same day and taken out again: it was
+written for the *Bam Bam* disco remix, whose "crazy grid" turned out to be
+a drawing fault, and that record does slow down in its middle — a track
+to follow (Daniel). An
 unlocked track is followed afresh at each load, since a saved map does not
 say which tracker made it; a locked one plays as saved. Checked on twelve
 of his tracks: on six the lines sit 4–9 ms from the hits; on *Mary Jane*
@@ -1253,9 +1263,20 @@ the ones moving. Open: on *Funky Kingston* and *Gold* pulse and hits part
 by half a beat for whole sections and it is not known which is right, so
 lines can still sit on the off-beat in places.
 
+**The DJ's word (2026-11-22, FFI 94, schema v13; built, untried).** The
+test above was fitted on about a hundred tracks and is unsure on some, so
+each track carries the DJ's word: **Beat grid ▸ Automatic / Follow the
+band / Even grid**, on the library row's right-click and the deck BPM's.
+Automatic asks the test; Follow lays the band's beats without asking
+(`follow_grid_always`); Even keeps the even grid and drops any saved
+band-followed beats. `tracks.grid_follow`, `DubLibrary::set_grid_follow`,
+`DubEngine::set_deck_grid_follow` re-lays a loaded deck's grid. Offered
+only while the following grid is on, and not on a locked grid, which
+plays as saved.
+
 **Steadying (2026-11-20, Alpha, FFI 93; built, untried).** A deck's
-**STEADY** switch, shown beside LOCK on a record whose grid follows its
-band: on, each beat is played in the time a beat takes at the tempo the
+**STEADY** switch — a metronome icon beside the BPM since 2026-11-21 — on
+a record whose grid follows its band: on, each beat is played in the time a beat takes at the tempo the
 band keeps — the middle gap of its beats — so the record holds one tempo
 while a second is brought in; off, the band plays as it played (Daniel,
 2026-11-19: "pull them in line during transition but keep them funky when

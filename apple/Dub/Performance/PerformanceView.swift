@@ -255,7 +255,7 @@ struct PerformanceView: View {
         case .b: enabled = deckBEnabled
         }
         let deck = (side == .a) ? model.deckA : model.deckB
-        return DeckHeaderState.from(
+        var header = DeckHeaderState.from(
             side: side,
             deckState: deck,
             engineRunning: model.isRunning,
@@ -263,6 +263,8 @@ struct PerformanceView: View {
             thruMode: model.engineMode == .timecode && !model.isInternalMixer,
             isMaster: model.masterDeck == side,
             prepMode: model.engineMode == .prep || model.isInternalMixer)
+        header.followChoiceOffered = model.followChoiceOffered && deck.loadedLibraryTrackId != nil
+        return header
     }
 
     /// Deck headers are **never** mirrored. Real turntables aren't
@@ -299,10 +301,13 @@ struct PerformanceView: View {
             onToggleGridLocked: {
                 model.toggleLoadedDeckGridLocked(side: side)
             },
+            onSetGridFollow: { follow in
+                model.setLoadedDeckGridFollow(side: side, follow: follow)
+            },
+            onToggleSteady: { model.toggleSteady(side: side) },
             onSetInternal: { model.setDeckInternal(side: side) },
             onSetTimecode: { model.setDeckTimecode(side: side) },
-            onSetThru: { model.setDeckThru(side: side) },
-            onRecalibrate: { model.recalibrateDeck(side: side) })
+            onSetThru: { model.setDeckThru(side: side) })
     }
 
     // MARK: - Performance pad column
@@ -406,6 +411,9 @@ struct PerformanceView: View {
             onHalveBpm: { model.scaleLoadedDeckBpm(side: side, multiplier: 0.5) },
             onResetBpm: { model.resetLoadedDeckBeatGrid(side: side) },
             onToggleGridLocked: { model.toggleLoadedDeckGridLocked(side: side) },
+            onSetGridFollow: { follow in
+                model.setLoadedDeckGridFollow(side: side, follow: follow)
+            },
             onHistoryHint: { model.revealHistoryHint(side: side) },
             onScaleTempo: { factor in model.scaleThruTempo(side, by: factor) },
             onResetTempo: { model.resetThruTempo(side) },
@@ -427,7 +435,6 @@ struct PerformanceView: View {
             onSetTimecode: { header.onSetTimecode?() },
             onSetThru: { header.onSetThru?() },
             onSetFx: { model.setDeckDubFx(side: side) },
-            onRecalibrate: { header.onRecalibrate?() },
             onToggleKeyLock: { model.toggleKeyLock(side: side) },
             onToggleSteady: { model.toggleSteady(side: side) })
     }
@@ -468,7 +475,6 @@ struct PerformanceView: View {
             onPause: header.onPause,
             onSetTimecode: { header.onSetTimecode?() },
             onSetThru: { header.onSetThru?() },
-            onRecalibrate: { header.onRecalibrate?() },
             onInput: { kind in model.setFxInput(side, kind) },
             onTrim: { db in model.setFxInputTrim(side, db: db) },
             onToggle: { unit in model.toggleFxRackSlot(side, unit.slot) },
@@ -815,12 +821,11 @@ struct PerformanceView: View {
     /// Half of what the strips and the centre gutter do not take, never
     /// below the column's floor.
     /// Zoom is shared: two strips at different scales is a
-    /// beatmatching aid that lies. Session state rather than a stored
-    /// preference — a zoom you left on last week is not what you want
-    /// to find when you open the app in a booth.
-    @AppStorage(WaveformZoom.storageKey) private var storedWaveZoomIndex = WaveformZoom.defaultIndex
-
-    private var waveZoomIndex: Int { WaveformZoom.clamped(storedWaveZoomIndex) }
+    /// beatmatching aid that lies. Remembered across launches (Daniel,
+    /// 2026-11-20) — but held here as `@State` and written to the
+    /// defaults on the side, not read through `@AppStorage`: with that,
+    /// a press on the zoom took over a second to show.
+    @State private var waveZoomIndex = WaveformZoom.stored()
 
     /// Drives the zoom control's fade. The *strips* and the gutter
     /// between them count, not the deck columns either side — a
@@ -870,7 +875,10 @@ struct PerformanceView: View {
                     WaveformZoomControl(
                         index: Binding(
                             get: { waveZoomIndex },
-                            set: { storedWaveZoomIndex = WaveformZoom.clamped($0) }),
+                            set: {
+                                waveZoomIndex = WaveformZoom.clamped($0)
+                                UserDefaults.standard.set(waveZoomIndex, forKey: WaveformZoom.storageKey)
+                            }),
                         visible: waveformHovered)
                         .padding(.top, DubSpacing.sm)
                 }

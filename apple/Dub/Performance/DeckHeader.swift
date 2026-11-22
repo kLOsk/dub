@@ -274,6 +274,12 @@ struct DeckHeaderState: Equatable {
     /// under a label that looks fixed reads as a fault.
     var followingGrid: Bool = false
 
+    /// The DJ's word on whether this track's grid follows its band, for
+    /// the BPM right-click; `nil` leaves it to Dub.
+    var gridFollowWord: Bool? = nil
+    /// The following grid is on, so the BPM right-click offers the choice.
+    var followChoiceOffered: Bool = false
+
     /// The BPM readout's label.
     var bpmLabel: String {
         // Held to its tempo, the record is not following anything.
@@ -390,13 +396,17 @@ struct DeckHeaderCallbacks {
     /// hood — but kept close to the BPM number where the
     /// "good to go" decision actually happens.
     var onToggleGridLocked: (() -> Void)? = nil
+    /// Deck-header BPM context menu — Beat grid ▸ Automatic / Follow the
+    /// band / Even grid. The same choice the library row offers.
+    var onSetGridFollow: ((Bool?) -> Void)? = nil
+    /// The STEADY switch beside the BPM, on a grid that follows its band.
+    var onToggleSteady: (() -> Void)? = nil
 
     /// Source-control switch (PRD §5.1.1): select Internal / Timecode /
-    /// Thru for the deck, and manually recalibrate the needle.
+    /// Thru for the deck.
     var onSetInternal: (() -> Void)? = nil
     var onSetTimecode: (() -> Void)? = nil
     var onSetThru: (() -> Void)? = nil
-    var onRecalibrate: (() -> Void)? = nil
 
     /// No-op fallback used by the cold-launch / preview state where
     /// no model is wired in yet.
@@ -547,8 +557,7 @@ struct DeckHeader: View {
                 onInternal: { callbacks.onSetInternal?() },
                 onPause: { callbacks.onPause() },
                 onTimecode: { callbacks.onSetTimecode?() },
-                onThru: { callbacks.onSetThru?() },
-                onRecalibrate: { callbacks.onRecalibrate?() })
+                onThru: { callbacks.onSetThru?() })
         }
     }
 
@@ -772,7 +781,7 @@ struct DeckHeader: View {
     /// mirrored) so the eye always lands on it.
     private var formattedPitch: String {
         guard let p = state.pitchPercent else { return "—" }
-        return String(format: "%+.1f %%", p)
+        return PitchText.signed(p) + " %"
     }
 
     // MARK: - Row 3 — track time + transport glyphs (track loaded)
@@ -1098,7 +1107,10 @@ struct DeckHeader: View {
                         .font(.system(size: 9))
                         .foregroundStyle(
                             state.followingGrid ? DubColor.gridMoving : DubColor.textSecondary)
-                } else if LibraryCellFormat.drifts(state.gridDriftQuality) {
+                } else if !state.followingGrid, LibraryCellFormat.drifts(state.gridDriftQuality) {
+                    // The drift is the *even* grid's against the song; a
+                    // grid that follows the band has none to warn of,
+                    // which is the rule the library row already keeps.
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 9))
                         .foregroundStyle(.orange)
@@ -1113,6 +1125,7 @@ struct DeckHeader: View {
                 callbacks.onTapBpm?()
             }
             .help(bpmColumnHelpText)
+            steadySwitch
         }
         // Attach the context menu at the column level (not on the
         // tap target) so it stays reachable when the tap is disabled
@@ -1120,6 +1133,35 @@ struct DeckHeader: View {
         // left-click then, but right-click must still reach "Unlock
         // grid", the only path to it from the performance surface.
         .contextMenu { bpmContextMenu }
+    }
+
+    /// Steadying, as on the Performance strip: a metronome beside the
+    /// tempo it holds, only on a record whose grid follows its band.
+    /// Outside the BPM's tap target, so a press meant for it is not a tap.
+    @ViewBuilder
+    private var steadySwitch: some View {
+        if let toggle = callbacks.onToggleSteady, state.followingGrid || state.steadyState != 0 {
+            let on = state.steadyState != 0
+            let tint = DubColor.controlAccent
+            Image(systemName: "metronome")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(
+                    on ? tint.opacity(state.steadyState == 2 ? 1.0 : 0.55) : DubColor.textTertiary)
+                .frame(width: 20, height: 16)
+                .background(on ? tint.opacity(0.16) : DubColor.surface2)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
+                .contentShape(Rectangle())
+                .onPressDown(perform: toggle)
+                .help(on
+                      ? "Steady on — the record is held to its tempo; turn it off to let the band play as it played"
+                      : "Steady off — the band plays as it played. Turn it on to hold one tempo while you mix")
+                .accessibilityLabel("Steady")
+                .accessibilityValue(on ? "on" : "off")
+                .accessibilityAddTraits(.isButton)
+        }
     }
 
     /// Deck-header BPM right-click menu (PRD-BEATS §4 octave
@@ -1152,6 +1194,11 @@ struct DeckHeader: View {
         if let onToggleGridLocked = callbacks.onToggleGridLocked {
             Button(state.gridLocked ? "Unlock grid" : "Lock grid",
                    action: onToggleGridLocked)
+        }
+        if state.followChoiceOffered, !state.gridLocked,
+           let onSetGridFollow = callbacks.onSetGridFollow
+        {
+            GridFollowMenu(word: state.gridFollowWord, onSet: onSetGridFollow)
         }
     }
 
@@ -1452,6 +1499,7 @@ extension DeckHeaderState {
                 gridDriftQuality: deckState.gridDriftQuality,
                 historyHint: deckState.historyHint)
             header.followingGrid = deckState.localBpm != nil
+            header.gridFollowWord = deckState.gridFollow
             header.steadyState = deckState.steadyState
             header.timecodeReadiness = Self.timecodeReadiness(from: deckState)
             return header
@@ -1575,4 +1623,40 @@ extension DeckHeaderState {
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
+}
+
+/// The pitch readout's digits. A platter resting at zero sits a few
+/// hundredths either side of it, and `%+.1f` prints those as `-0.0`
+/// and `+0.0` in turn: the sign flickered on a deck that was not
+/// moving. A value that rounds to zero has one spelling.
+enum PitchText {
+    static func signed(_ percent: Double, decimals: Int = 1) -> String {
+        let scale = pow(10, Double(decimals))
+        let rounded = (percent * scale).rounded() / scale
+        return String(format: "%+.\(decimals)f", rounded == 0 ? 0 : rounded)
+    }
+}
+
+
+/// Beat grid ▸ Automatic / Follow the band / Even grid, for a BPM's
+/// right-click. The current choice carries the tick.
+struct GridFollowMenu: View {
+    let word: Bool?
+    let onSet: (Bool?) -> Void
+
+    var body: some View {
+        Menu(GridFollowChoice.menuTitle) {
+            ForEach(GridFollowChoice.allCases, id: \.self) { choice in
+                Button {
+                    onSet(choice.word)
+                } label: {
+                    if choice == GridFollowChoice(word: word) {
+                        Label(choice.title, systemImage: "checkmark")
+                    } else {
+                        Text(choice.title)
+                    }
+                }
+            }
+        }
+    }
 }

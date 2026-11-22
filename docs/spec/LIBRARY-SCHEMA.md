@@ -32,7 +32,7 @@ Goals (in priority order):
 ## Schema versioning and migration policy
 
 A single `schema_version` row tracks the current applied schema. The
-v1.0 baseline is **version 1**; the current applied version is **12**.
+v1.0 baseline is **version 1**; the current applied version is **13**.
 Each bump is additive (new tables / columns with safe defaults / indexes),
 so a third-party reader that ignores the new columns keeps working. Any
 change to the table set, column set, indexes, FTS5 definition, or trigger
@@ -54,6 +54,7 @@ logic requires a version bump and a migration step.
 | 10      | Imported cues on the pads | `track_cue_takeover (track_id PK, taken_at)` — the tracks whose imported hot cues the DJ took over by editing one in Dub; from then on the pads read `source='user'` only, so a cleared cue stays cleared. Additive. See `track_cues`. |
 | 11      | Saved following grid | `track_tempo_maps (track_id PK, kind CHECK ('followed'), beats BLOB f64 LE, bar_phase, base_source / base_bpm / base_anchor_secs, bpm_min / bpm_max, created_at)` — the band-followed beats the deck played, kept with the even grid they were followed from. Reused while that grid is active; always on a locked track. `kind` leaves room for time-stretched tracks. Additive. |
 | 12      | Tags inside the file | `track_files.tags_read_mtime INTEGER` — the file's `mtime` when its embedded DJ tags (Traktor's `TRAKTOR4` frame) were last read; NULL = never. An import reads them only when it differs, so an unchanged library costs one indexed read per file. Also `track_beatgrids.source_locked INTEGER NOT NULL DEFAULT 0` (the app locked that grid) and `library_settings (key PK, value)` (`import_order`: which app comes first). Additive. |
+| 13      | The DJ's word on following | `tracks.grid_follow INTEGER` — NULL leaves a track's grid to the tracker's own test, 1 follows the band whatever it says, 0 keeps the even grid (Beat grid ▸ Automatic / Follow the band / Even grid). Additive. |
 
 ### Backward compatibility contract
 
@@ -202,6 +203,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- row with it. Both NULL when unset.
     user_rating                 INTEGER CHECK (user_rating IS NULL OR (user_rating >= 0 AND user_rating <= 5)),
     color                       TEXT,
+    -- The DJ's word on whether the grid follows its band (schema v13,
+    -- 2026-11-22). NULL leaves it to the tracker's own test; 1 follows
+    -- the band whatever the test says; 0 keeps the even grid.
+    grid_follow                 INTEGER CHECK (grid_follow IS NULL OR grid_follow IN (0, 1)),
     created_at                  INTEGER NOT NULL,
     updated_at                  INTEGER NOT NULL
 );

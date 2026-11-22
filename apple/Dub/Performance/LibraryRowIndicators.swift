@@ -39,6 +39,19 @@ struct LibraryRowState: Equatable {
     var unreachableTooltip: String = ""
 
     var track: LibraryTrack { cell.track }
+
+    /// The small waveform that says Dub has analysed this track. A BPM
+    /// and a key in the row do not say so — they can be another app's,
+    /// read from its library without Dub ever opening the file (Daniel,
+    /// 2026-11-22). It is the least urgent mark in the gutter, so it
+    /// gives way when two others already fill the 36 pt.
+    var showsAnalysedMark: Bool {
+        guard track.isAnalyzed else { return false }
+        let others = [
+            isOnDeckA, isOnDeckB, track.potentialDuplicateId != nil, showsUnreachableWarning,
+        ].filter { $0 }.count
+        return others < 2
+    }
 }
 
 struct LibraryRowActions {
@@ -48,7 +61,7 @@ struct LibraryRowActions {
 }
 
 /// The 36 pt gutter: deck badges, the duplicate link, the offline-file
-/// warning. Ordered by how much the DJ needs to see it.
+/// warning, the analysed mark. Ordered by how much the DJ needs to see it.
 struct LibraryRowIndicators: View {
     let state: LibraryRowState
     var onDuplicateJump: () -> Void = {}
@@ -71,6 +84,12 @@ struct LibraryRowIndicators: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.red.opacity(0.65))
                     .help(state.unreachableTooltip)
+            }
+            if state.showsAnalysedMark {
+                Image(systemName: "waveform")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DubColor.textTertiary)
+                    .help("Analysed by Dub: key, loudness and waveform are ready.")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

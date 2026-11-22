@@ -4,8 +4,9 @@
 //
 //  Preferences ▸ Audio in Performance: the interface, and where each
 //  deck comes in and goes out (canvas "Dub Audio Routing", 2026-11-15).
-//  A box `devices.toml` knows is shown read-only. Any other box the DJ
-//  routes: a pair per deck in and out, one deck or two, a meter on each
+//  A box `devices.toml` knows and someone has tried is shown read-only.
+//  Any other box — unknown, or known only by a guess nobody has tried —
+//  the DJ routes: a pair per deck in and out, one deck or two, a meter on each
 //  input saying what arrives there — timecode, music or nothing — so the
 //  right pair finds itself, and a test tone on each output to see which
 //  mixer channel lights. Applying reconnects the interface, which
@@ -23,6 +24,7 @@ struct AudioRoutingSection: View {
 
     @State private var draft: AudioRouting
     @State private var inputs: UInt32 = 0
+    @State private var copied = false
     private let known: KnownInterfaceInfo?
 
     init(model: WaveformAppModel, device: AudioDeviceInfo) {
@@ -34,17 +36,23 @@ struct AudioRoutingSection: View {
         self._draft = State(initialValue: AudioRoutingStore.load(device.name) ?? model.currentRouting(device))
     }
 
+    /// The DJ sets the routing unless Dub ships a map someone has tried
+    /// on the real box. A shipped guess ("KNOWN · UNTESTED") is where the
+    /// pickers start, and stays the DJ's to correct: it was read off a
+    /// manual, and a wrong one used to be locked in.
+    private var editable: Bool { known?.verified != true }
+
     private var outputs: UInt32 { device.outputChannels }
     private var playing: Bool { deckA.state.isPlaying || deckB.state.isPlaying }
     private var problem: (fault: AudioRouting.Fault, message: String)? {
-        known == nil && inputs > 0 ? draft.problem(inputs: inputs, outputs: outputs) : nil
+        editable && inputs > 0 ? draft.problem(inputs: inputs, outputs: outputs) : nil
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.xl) {
             section("Interface") { interfaceCard }
             section("Routing") {
-                if known == nil {
+                if editable {
                     HStack {
                         Spacer(minLength: 0)
                         deckCountSwitch
@@ -55,7 +63,7 @@ struct AudioRoutingSection: View {
                     clash(problem.message)
                 }
                 Text(
-                    known == nil
+                    editable
                         ? "The meter reads what arrives on that pair — timecode, music or nothing — so drop the needle and the right pair finds itself. TEST sends a short tone to that pair to see which mixer channel lights."
                         : "Channel numbers as printed on the back of the interface. Dub ships this interface's map, so there is nothing to set. TEST sends a short tone to a deck's pair to see which mixer channel lights."
                 )
@@ -63,7 +71,7 @@ struct AudioRoutingSection: View {
                 .foregroundStyle(DubColor.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
             }
-            if known == nil {
+            if editable {
                 HStack(alignment: .firstTextBaseline) {
                     Text(
                         playing
@@ -82,11 +90,12 @@ struct AudioRoutingSection: View {
                     .foregroundStyle(DubColor.controlAccent)
                     .disabled(playing || !model.hasSavedRouting(device))
                 }
+                shareRow
             }
         }
         .onAppear { inputs = model.inputChannelCount(device) }
         .onChange(of: draft) { next in
-            guard known == nil, inputs > 0, next.problem(inputs: inputs, outputs: outputs) == nil,
+            guard editable, inputs > 0, next.problem(inputs: inputs, outputs: outputs) == nil,
                 next != model.currentRouting(device) || !model.hasSavedRouting(device)
             else { return }
             model.setAudioRouting(next, for: device)
@@ -121,7 +130,8 @@ struct AudioRoutingSection: View {
         let (word, colour): (String, Color) = {
             switch known?.verified {
             case true?: return ("KNOWN · TESTED", DubColor.stateLocked)
-            case false?: return ("KNOWN · UNTESTED", DubColor.stateTentative)
+            case false?:
+                return (model.hasSavedRouting(device) ? "SET BY YOU" : "KNOWN · UNTESTED", DubColor.stateTentative)
             case nil: return (model.hasSavedRouting(device) ? "SET BY YOU" : "NOT SET UP", DubColor.stateTentative)
             }
         }()
@@ -184,7 +194,7 @@ struct AudioRoutingSection: View {
             .foregroundStyle(DubColor.textTertiary)
             Divider()
             deckRow(.a)
-            if draft.twoDeck || known != nil {
+            if draft.twoDeck || !editable {
                 Divider()
                 deckRow(.b)
             }
@@ -196,7 +206,7 @@ struct AudioRoutingSection: View {
 
     private func deckRow(_ side: DeckSide) -> some View {
         let isA = side == .a
-        let shown = known == nil ? draft : model.currentRouting(device)
+        let shown = editable ? draft : model.currentRouting(device)
         let inFirst = isA ? shown.deckAIn : shown.deckBIn
         let outFirst = isA ? shown.deckAOut : shown.deckBOut
         let inFault = problem?.fault == (isA ? .deckAInput : .deckBInput)
@@ -246,7 +256,7 @@ struct AudioRoutingSection: View {
         _ label: String, first: UInt32, channels: UInt32, fault: Bool,
         set: @escaping (UInt32) -> Void
     ) -> some View {
-        if known != nil || channels == 0 {
+        if !editable || channels == 0 {
             Text(AudioRouting.label(first))
                 .font(DubFont.numericInline)
                 .foregroundStyle(DubColor.textPrimary)
@@ -264,6 +274,32 @@ struct AudioRoutingSection: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(fault ? DubColor.stateError : Color.clear, lineWidth: 1))
+        }
+    }
+
+    /// A routing that works is worth more than this rig: copied as an
+    /// entry for the list of interfaces Dub ships a map for, it can be
+    /// sent in, and the next DJ with this box sets nothing up.
+    @ViewBuilder
+    private var shareRow: some View {
+        if model.hasSavedRouting(device),
+            let entry = draft.registryEntry(deviceName: device.name, outputChannels: outputs)
+        {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Works on your rig? Copy this interface's map and send it in, and Dub will know the box.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: DubSpacing.md)
+                Button(copied ? "Copied" : "Copy map") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(entry, forType: .string)
+                    copied = true
+                }
+                .buttonStyle(.plain)
+                .font(DubFont.micro)
+                .foregroundStyle(DubColor.controlAccent)
+            }
         }
     }
 

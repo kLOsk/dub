@@ -565,6 +565,9 @@ struct DeckState: Equatable {
     /// M11d.7 — stamped from library row at load time.
     var gridLocked: Bool = false
     var gridDriftQuality: Float? = nil
+    /// The DJ's word on whether this track's grid follows its band
+    /// (`DubLibrary.gridFollow`): `nil` leaves it to the tracker.
+    var gridFollow: Bool? = nil
 
     /// M11d-history — display title of the track the DJ has most
     /// often mixed into from this one (`played_into` top-1),
@@ -622,6 +625,7 @@ struct DeckState: Equatable {
         manualGridEditCount = 0
         gridLocked = false
         gridDriftQuality = nil
+        gridFollow = nil
         isLoading = false
         hotCues = Array(repeating: nil, count: DeckState.hotCueCount)
         hotCuesFrom = nil
@@ -660,6 +664,7 @@ struct DeckState: Equatable {
         manualGridEditCount = other.manualGridEditCount
         gridLocked = other.gridLocked
         gridDriftQuality = other.gridDriftQuality
+        gridFollow = other.gridFollow
         // The same track carries the same cues; they are persisted per
         // track, not per deck.
         hotCues = other.hotCues
@@ -1297,6 +1302,35 @@ final class WaveformAppModel: ObservableObject {
         didSet { UserDefaults.standard.set(itunesImportEnabled, forKey: Self.kItunesImport) }
     }
 
+    /// The apps whose libraries are out of the sidebar (Daniel,
+    /// 2026-11-22: "i use itunes and want traktor beatgrids. i dont care
+    /// about the traktor collection node"). The switch above says whether
+    /// an app's grids, keys and cues are used; this only says whether its
+    /// library is shown. Hidden means hidden: its playlists leave the
+    /// sidebar and a track reachable only through it leaves the search.
+    @Published private(set) var sidebarHiddenSources: Set<String> = []
+
+    func isHiddenInSidebar(_ kind: ImportedSourceKind) -> Bool {
+        sidebarHiddenSources.contains(kind.sourceTag)
+    }
+
+    func setHiddenInSidebar(_ kind: ImportedSourceKind, hidden: Bool) {
+        var next = sidebarHiddenSources
+        if hidden { next.insert(kind.sourceTag) } else { next.remove(kind.sourceTag) }
+        guard next != sidebarHiddenSources else { return }
+        sidebarHiddenSources = next
+        UserDefaults.standard.set(next.sorted().joined(separator: ","), forKey: Self.kSidebarHidden)
+        reloadImportedSources()
+        libraryModel.analysisGeneration &+= 1
+    }
+
+    /// The apps a search does not look through: hidden in the sidebar,
+    /// or switched off.
+    var searchHiddenSources: [String] {
+        Array(sidebarHiddenSources.union(disabledSourceTags)).sorted()
+    }
+
+    private static let kSidebarHidden = "dub.sidebarHiddenSources"
     private static let kSeratoImport = "dub.seratoImportEnabled"
     private static let kTraktorImport = "dub.traktorImportEnabled"
     private static let kRekordboxImport = "dub.rekordboxImportEnabled"
@@ -1715,6 +1749,7 @@ final class WaveformAppModel: ObservableObject {
     /// a definite anchor.
     private var stickyMaster: DeckSide = .a
     private var lastPlayStart: [DeckSide: Date] = [:]
+    private var settledPlay: [DeckSide: SettledPlay] = [:]
 
     /// Polling timer for the deck-chrome `@Published` mirrors
     /// (`hasTrack`, `isPlaying`, `durationSecs`, `peaksGeneration`,
@@ -1840,6 +1875,9 @@ final class WaveformAppModel: ObservableObject {
         self.traktorImportEnabled = UserDefaults.standard.bool(forKey: Self.kTraktorImport)
         self.rekordboxImportEnabled = UserDefaults.standard.bool(forKey: Self.kRekordboxImport)
         self.itunesImportEnabled = UserDefaults.standard.bool(forKey: Self.kItunesImport)
+        self.sidebarHiddenSources = Set(
+            (UserDefaults.standard.string(forKey: Self.kSidebarHidden) ?? "")
+                .split(separator: ",").map(String.init))
         self.itunesLibraryPath = UserDefaults.standard.string(forKey: Self.kItunesLibraryPath)
         // Rehydrate persisted device UIDs from UserDefaults. The
         // `didSet` writes back to disk on every change, so this is
@@ -2047,6 +2085,7 @@ final class WaveformAppModel: ObservableObject {
         masterDeck = nil
         stickyMaster = .a
         lastPlayStart.removeAll()
+        settledPlay.removeAll()
     }
 
     // MARK: Microphone permission (Serato-style)
@@ -2340,7 +2379,7 @@ final class WaveformAppModel: ObservableObject {
     /// decks, so it is refused while either deck plays; the sheet locks
     /// the pickers then.
     func setAudioRouting(_ routing: AudioRouting?, for device: AudioDeviceInfo) {
-        guard !deckA.isPlaying, !deckB.isPlaying, knownInterface(device) == nil else { return }
+        guard !deckA.isPlaying, !deckB.isPlaying, knownInterface(device)?.verified != true else { return }
         let ffi = routing?.ffi(outputChannels: device.outputChannels)
         do {
             try engine.setRoutingOverride(deviceName: device.name, routing: ffi)
@@ -2359,9 +2398,11 @@ final class WaveformAppModel: ObservableObject {
     }
 
     /// Before a start: the DJ's routing for an interface Dub does not
-    /// know. A known interface keeps its shipped map.
+    /// know, or knows only by a map nobody has tried. A known, tested
+    /// interface keeps its shipped map.
     private func applySavedRouting(for device: AudioDeviceInfo) {
-        guard knownInterface(device) == nil, let saved = AudioRoutingStore.load(device.name) else { return }
+        guard knownInterface(device)?.verified != true, let saved = AudioRoutingStore.load(device.name)
+        else { return }
         try? engine.setRoutingOverride(
             deviceName: device.name, routing: saved.ffi(outputChannels: device.outputChannels))
     }
@@ -2522,6 +2563,28 @@ final class WaveformAppModel: ObservableObject {
         stallTimed("pollDecks", threshold: 0.03) { pollDecksTimed() }
     }
 
+    private var playedTally: [DeckSide: PlayedTally] = [:]
+    private var playedTalliedAt: TimeInterval?
+
+    /// Add this poll to each deck's playing time, and mark a track as
+    /// played this session once it has had thirty seconds.
+    private func tallyPlayed() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = playedTalliedAt.map { now - $0 } ?? 0
+        playedTalliedAt = now
+        for (side, deck) in [(DeckSide.a, deckA), (.b, deckB)] {
+            // Performance only: in Prep a track is being prepared, not
+            // played out, however long it runs.
+            let id = engineMode == .timecode && deck.hasTrack && !deck.isThru
+                ? deck.loadedLibraryTrackId : nil
+            if let played = playedTally[side, default: PlayedTally()].tick(
+                trackId: id, playing: deck.isPlaying, dt: dt)
+            {
+                libraryModel.playedThisSession.insert(played)
+            }
+        }
+    }
+
     private func pollDecksTimed() {
         let newA = readDeckState(side: .a, prev: deckA)
         let newB = readDeckState(side: .b, prev: deckB)
@@ -2530,6 +2593,7 @@ final class WaveformAppModel: ObservableObject {
             bWas: deckB.isPlaying, bNow: newB.isPlaying)
         if newA != deckA { deckA = newA }
         if newB != deckB { deckB = newB }
+        tallyPlayed()
         syncFxEcho()
         recomputeMaster()
         pollSampler()
@@ -2847,9 +2911,6 @@ final class WaveformAppModel: ObservableObject {
         // because it bypasses the engine mutex entirely.
         let pos = engine.positionSnapshot(deckIdx: side.ffiDeckIdx)
         let nowPlaying = pos.isPlaying
-        if nowPlaying, !prev.isPlaying {
-            lastPlayStart[side] = Date()
-        }
         var next = prev
         next.hasTrack = pos.hasTrack
         next.isPlaying = nowPlaying
@@ -3089,8 +3150,17 @@ final class WaveformAppModel: ObservableObject {
             stickyMaster = .a
             return
         }
-        let aPlaying = deckA.isPlaying
-        let bPlaying = deckB.isPlaying
+        // A deck counts once its play state has held: a crackling
+        // cartridge contact starts and stops a timecode deck many
+        // times a second, and must not take the master each time.
+        let now = Date()
+        for (side, deck) in [(DeckSide.a, deckA), (.b, deckB)]
+        where settledPlay[side, default: SettledPlay()].update(
+            playing: deck.isPlaying, at: now.timeIntervalSinceReferenceDate) {
+            lastPlayStart[side] = now
+        }
+        let aPlaying = settledPlay[.a]?.isPlaying ?? false
+        let bPlaying = settledPlay[.b]?.isPlaying ?? false
         let newMaster: DeckSide
         switch (aPlaying, bPlaying) {
         case (true, false): newMaster = .a
@@ -3443,7 +3513,8 @@ final class WaveformAppModel: ObservableObject {
             return
         }
         var groups: [ImportedSourceGroup] = []
-        for kind in ImportedSourceKind.allCases where isSourceEnabled(kind) {
+        for kind in ImportedSourceKind.allCases
+        where isSourceEnabled(kind) && !isHiddenInSidebar(kind) {
             let tag = kind.sourceTag
             let crates = (try? library.listImportedCrates(source: tag)) ?? []
             let count = (try? library.countTracksBySource(source: tag)) ?? 0
@@ -4205,6 +4276,7 @@ final class WaveformAppModel: ObservableObject {
             // (FFI 69, `DubLibrary.trackKey`). Best-effort: a read
             // failure leaves the dash, which is what it meant before.
             stamped.key = (try? library.trackKey(trackId: trackId)) ?? nil
+            stamped.gridFollow = (try? library.gridFollow(trackId: trackId)) ?? nil
             if librarySelection.selectedLibraryTrackId == trackId,
                let snap = librarySelection.selectedLibraryTrack, snap.id == trackId
             {
@@ -4353,6 +4425,22 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
+    /// A track analysed before analysis measured loudness never got
+    /// one and played at unity gain on every load (31 in Daniel's
+    /// library, 2026-11-22). Measure it now, in the background, without
+    /// touching the grid: the gain applies from the next load. A track
+    /// that is owed nothing costs one indexed read off the main actor.
+    private func backfillLoudness(trackId: String) {
+        analyzingTrackIds.insert(trackId)
+        let library = self.library
+        Task.detached(priority: .utility) {
+            _ = try? library.backfillTrackLoudness(trackId: trackId)
+            await MainActor.run { [weak self] in
+                _ = self?.analyzingTrackIds.remove(trackId)
+            }
+        }
+    }
+
     /// M11c.1 — kick off lazy analysis for `trackId` if it has
     /// not been analyzed yet. Returns immediately; analysis runs
     /// on a background task and bumps `analysisGeneration` when
@@ -4369,6 +4457,7 @@ final class WaveformAppModel: ObservableObject {
         // entirely. Avoids spawning a Task for every Space-load
         // on a fully-analyzed library.
         if let analyzed = try? library.isTrackAnalyzed(trackId: trackId), analyzed {
+            backfillLoudness(trackId: trackId)
             return
         }
         analyzingTrackIds.insert(trackId)
@@ -4454,6 +4543,48 @@ final class WaveformAppModel: ObservableObject {
                 _ = try? engine.setDeckGridLocked(
                     deckIdx: side.ffiDeckIdx, locked: locked)
             }
+        }
+    }
+
+    /// Whether the DJ may say, per track, that its grid follows its band
+    /// (the following grid is on).
+    var followChoiceOffered: Bool { alphaFeaturesEnabled && followingGridEnabled }
+
+    /// Take the DJ's word on whether a track's grid follows its band
+    /// (`nil`: leave it to Dub), and lay the grid again on any deck that
+    /// has the track loaded. A grid told to stay even gives up its saved
+    /// band-followed beats, so the library stops marking it as following.
+    @MainActor
+    func setGridFollow(trackId: String, follow: Bool?) async {
+        guard libraryModel.libraryIsOpen else { return }
+        do {
+            try library.setGridFollow(trackId: trackId, follow: follow)
+            if follow == false { try library.deleteTempoMap(trackId: trackId) }
+            libraryModel.analysisGeneration &+= 1
+        } catch {
+            surfaceError("Beat grid choice failed: \(error.localizedDescription)")
+            return
+        }
+        for side in [DeckSide.a, DeckSide.b] {
+            var deck = state(for: side)
+            guard deck.loadedLibraryTrackId == trackId else { continue }
+            deck.gridFollow = follow
+            setState(deck, for: side)
+            guard isRunning else { continue }
+            let engine = self.engine
+            let deckIdx = side.ffiDeckIdx
+            // Following the band takes a second or so.
+            Task.detached(priority: .userInitiated) {
+                _ = try? engine.setDeckGridFollow(deckIdx: deckIdx, follow: follow)
+            }
+        }
+    }
+
+    func setLoadedDeckGridFollow(side: DeckSide, follow: Bool?) {
+        let deck = state(for: side)
+        guard deck.hasTrack, let trackId = deck.loadedLibraryTrackId else { return }
+        Task { @MainActor in
+            await self.setGridFollow(trackId: trackId, follow: follow)
         }
     }
 
@@ -4650,7 +4781,9 @@ final class WaveformAppModel: ObservableObject {
             let result = await Task.detached(priority: .userInitiated) {
                 () -> Result<LibraryAnalysisOutcome, Error> in
                 do {
-                    let outcome = try library.analyzeTrack(trackId: trackId)
+                    // The DJ asked for this pass, so its grid replaces an
+                    // imported one on an unlocked track (FFI 94).
+                    let outcome = try library.reanalyzeTrack(trackId: trackId)
                     return .success(outcome)
                 } catch {
                     return .failure(error)
@@ -4806,6 +4939,7 @@ final class WaveformAppModel: ObservableObject {
                 setState(s, for: side)
             }
             lastPlayStart[side] = Date()
+            settledPlay[side, default: SettledPlay()].force(true)
             recomputeMaster()
         } catch let error as EngineError {
             surfaceError(describe(error))
@@ -4844,6 +4978,7 @@ final class WaveformAppModel: ObservableObject {
         s.isPlaying = false
         s.isPanicPlay = false
         setState(s, for: side)
+        settledPlay[side, default: SettledPlay()].force(false)
         recomputeMaster()
     }
 
@@ -4886,6 +5021,7 @@ final class WaveformAppModel: ObservableObject {
                 setState(s, for: side)
             }
             lastPlayStart[side] = Date()
+            settledPlay[side, default: SettledPlay()].force(true)
             recomputeMaster()
         } catch let error as EngineError {
             surfaceError(describe(error))
@@ -5270,6 +5406,7 @@ final class WaveformAppModel: ObservableObject {
                     setState(s, for: side)
                 }
                 lastPlayStart[side] = Date()
+                settledPlay[side, default: SettledPlay()].force(true)
                 recomputeMaster()
             } catch let error as EngineError {
                 surfaceError(describe(error))
@@ -5386,6 +5523,7 @@ final class WaveformAppModel: ObservableObject {
             s.isPlaying = true
             setState(s, for: side)
             lastPlayStart[side] = Date()
+            settledPlay[side, default: SettledPlay()].force(true)
             recomputeMaster()
         } catch let error as EngineError {
             surfaceError(describe(error))
@@ -5521,11 +5659,6 @@ final class WaveformAppModel: ObservableObject {
             }
             try? engine.setDeckControlMode(deckIdx: side.ffiDeckIdx, mode: .internalPlay)
         }
-    }
-
-    /// Manually (re)calibrate a deck's timecode needle (the ↻ button).
-    func recalibrateDeck(side: DeckSide) {
-        try? engine.calibrateDeck(deckIdx: side.ffiDeckIdx)
     }
 
     // MARK: - Key Lock (master tempo) — M14 live A/B
@@ -7702,10 +7835,10 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 }
                 return true
             },
-            onBrowse: { next in
+            onBrowse: { next, extend in
                 Task { @MainActor in
                     model.libraryModel.browseRequest = LibraryBrowseRequest(
-                        next: next, token: UUID())
+                        next: next, extend: extend, token: UUID())
                 }
                 return true
             },
@@ -7837,7 +7970,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
             onLoopOff: @escaping (_ side: DeckSide) -> Bool,
             onLoopKey: @escaping (_ action: DubAction) -> Bool,
             onFocusSearch: @escaping () -> Bool,
-            onBrowse: @escaping (_ next: Bool) -> Bool,
+            onBrowse: @escaping (_ next: Bool, _ extend: Bool) -> Bool,
             onHotCue: @escaping (_ side: DeckSide?, _ index: Int, _ clear: Bool) -> Bool,
             onSidebar: @escaping (_ step: LibrarySidebarStep) -> Bool,
             onSirenPreset: @escaping (_ index: Int) -> Bool,
@@ -7885,7 +8018,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                            shift: flags.contains(.shift),
                            control: flags.contains(.control),
                            option: flags.contains(.option)),
-                       onBrowse(next)
+                       onBrowse(next, flags.contains(.shift))
                     {
                         return nil
                     }
@@ -7926,7 +8059,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
                 case .focusSearch:
                     if onFocusSearch() { return nil }
                 case .browse(let next):
-                    if onBrowse(next) { return nil }
+                    if onBrowse(next, argShift) { return nil }
                 case .hotCue(let index):
                     if onHotCue(nil, index, argShift) { return nil }
                 case .deckCue(let side, let index):

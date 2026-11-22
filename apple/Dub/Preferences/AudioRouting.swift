@@ -70,6 +70,33 @@ struct AudioRouting: Codable, Equatable {
             twoDeck: twoDeck)
     }
 
+    /// This routing as an entry for `crates/dub-audio/devices.toml`, the
+    /// list of interfaces Dub ships a map for — so a routing proven on a
+    /// rig can be sent in and the next DJ with that box sets nothing up
+    /// (Daniel, 2026-11-20: "save the soundcards i connect so we can adapt
+    /// them as preconfigured soundcards"). `nil` for one deck: the list
+    /// holds two-deck interfaces.
+    func registryEntry(deviceName: String, outputChannels: UInt32) -> String? {
+        guard twoDeck else { return nil }
+        let name = deviceName.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        var lines = [
+            "[[interface]]",
+            "name_pattern = \"\(name)\"",
+            "display_name = \"\(name)\"",
+            "output_channels = \(outputChannels)",
+            "deck_a_first_channel = \(deckAOut)",
+            "deck_b_first_channel = \(deckBOut)",
+        ]
+        // The inputs are taken to sit on the outputs' channels unless said.
+        if deckAIn != deckAOut || deckBIn != deckBOut {
+            lines.append("deck_a_input_first_channel = \(deckAIn)")
+            lines.append("deck_b_input_first_channel = \(deckBIn)")
+        }
+        lines.append("verified = true")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     /// Which deck's input pair is wrong, for the picker to mark.
     enum Fault: Equatable { case deckBInput, deckBOutput, deckAInput, deckAOutput }
 

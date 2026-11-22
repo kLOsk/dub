@@ -527,18 +527,14 @@ mod tests {
     }
 
     #[test]
-    fn audio6_is_unverified() {
+    fn audio6_is_routed_as_played() {
         let r = DeviceRegistry::embedded();
         let a6 = r
             .match_interface("Traktor Audio 6")
             .expect("matches Audio 6");
-        assert!(
-            !a6.verified,
-            "Audio 6 routing is a driver-panel guess; must stay unverified \
-             until validated on real hardware"
-        );
-        assert_eq!(a6.deck_a_zero_based(), 0);
-        assert_eq!(a6.deck_b_zero_based(), 2);
+        assert!(a6.verified, "played on Daniel's box, 2026-11-20");
+        assert_eq!(a6.deck_a_zero_based(), 2);
+        assert_eq!(a6.deck_b_zero_based(), 4);
     }
 
     #[test]

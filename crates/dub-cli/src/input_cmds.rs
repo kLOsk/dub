@@ -77,6 +77,109 @@ impl InputArgs {
     }
 }
 
+/// Seconds of audio the device-to-writer ring holds for `levels` and
+/// `capture`. The writer shares a disk with everything else on the
+/// machine; one second (the engine's default) is a stall a busy disk
+/// does produce, and a capture with a hole in it is worse than useless
+/// as ground truth.
+const CAPTURE_RING_SECS: usize = 10;
+
+/// Stereo pairs that between them carry every one of `channels`.
+///
+/// `AudioInput` hands audio over as stereo pairs and only pair 0 exists
+/// unless asked for, so a reader that wants all N channels has to ask
+/// for all of them. An odd last channel is paired with its neighbour
+/// (a pair needs two different channels) and only its left is read.
+/// One channel alone cannot form a pair, hence the error.
+fn pairs_covering(channels: u32) -> Result<Vec<(u32, u32)>> {
+    if channels < 2 {
+        return Err(anyhow!(
+            "need at least 2 channels (got {channels}); record a pair and keep one side"
+        ));
+    }
+    let mut pairs: Vec<(u32, u32)> = (0..channels / 2).map(|p| (2 * p, 2 * p + 1)).collect();
+    if channels % 2 == 1 {
+        pairs.push((channels - 1, channels - 2));
+    }
+    Ok(pairs)
+}
+
+impl InputArgs {
+    /// [`Self::to_options`] for a reader that wants every opened
+    /// channel, not only the first pair.
+    pub(crate) fn to_all_channel_options(&self) -> Result<InputOptions> {
+        let mut opts = self.to_options();
+        opts.output_pairs = Some(pairs_covering(opts.channels)?);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let sr = opts.sample_rate.map_or(96_000, |sr| sr.round() as usize);
+        opts.ringbuf_frames = sr.max(48_000) * CAPTURE_RING_SECS;
+        Ok(opts)
+    }
+}
+
+/// Whole frames every pair can supply right now, given each pair's
+/// buffered sample count and room for `max_frames`.
+///
+/// The pairs are filled by one callback but read one after another, so
+/// at any instant a later pair may hold a callback more than an earlier
+/// one. Taking the same count from each is what keeps them in step.
+fn frames_ready(available_samples: impl Iterator<Item = usize>, max_frames: usize) -> usize {
+    available_samples
+        .map(|samples| samples / 2)
+        .min()
+        .map_or(0, |frames| frames.min(max_frames))
+}
+
+/// Copy one pair's stereo samples into its channels of an interleaved
+/// `channels`-wide buffer. A pair past the last channel (the odd one's
+/// borrowed neighbour) contributes its left only.
+fn place_pair(pair: &[f32], pair_idx: usize, channels: usize, out: &mut [f32]) {
+    let left = pair_idx * 2;
+    for (frame, lr) in out.chunks_exact_mut(channels).zip(pair.chunks_exact(2)) {
+        frame[left] = lr[0];
+        if left + 1 < channels {
+            frame[left + 1] = lr[1];
+        }
+    }
+}
+
+/// Reads every channel of an [`AudioInput`] opened with
+/// [`InputArgs::to_all_channel_options`] as interleaved frames.
+struct AllChannels {
+    channels: usize,
+    pair: Vec<f32>,
+}
+
+impl AllChannels {
+    fn new(input: &AudioInput, max_frames: usize) -> Self {
+        Self {
+            channels: input.channels() as usize,
+            pair: vec![0.0; max_frames * 2],
+        }
+    }
+
+    /// Fill `out` with as many whole frames as are buffered; returns
+    /// the number of frames.
+    fn read(&mut self, input: &mut AudioInput, out: &mut [f32]) -> usize {
+        let max_frames = (out.len() / self.channels).min(self.pair.len() / 2);
+        let pairs = input.pair_count();
+        let frames = frames_ready((0..pairs).map(|p| input.available_pair(p)), max_frames);
+        for p in 0..pairs {
+            let pair = &mut self.pair[..frames * 2];
+            // Only this thread drains the rings, so what was counted
+            // above is still there.
+            let got = input.read_into_pair(p, pair);
+            place_pair(
+                &pair[..got],
+                p,
+                self.channels,
+                &mut out[..frames * self.channels],
+            );
+        }
+        frames
+    }
+}
+
 /// Parse the shared input flags out of `args`. Unknown flags or
 /// command-specific positionals are returned via the second tuple
 /// element so callers can interpret them.
@@ -273,7 +376,7 @@ pub fn levels(args: &[String]) -> Result<()> {
     if !leftover.is_empty() {
         return Err(anyhow!("unexpected args: {:?}", leftover));
     }
-    let opts = input_args.to_options();
+    let opts = input_args.to_all_channel_options()?;
     let mut input = AudioInput::start_with_options(&opts).context("opening input device")?;
 
     println!(
@@ -293,6 +396,7 @@ pub fn levels(args: &[String]) -> Result<()> {
     let channels = input.channels() as usize;
     let block_frames = 4096_usize;
     let mut buf = vec![0.0_f32; block_frames * channels];
+    let mut reader = AllChannels::new(&input, block_frames);
     let mut rms_acc = vec![0.0_f64; channels];
     let mut peak = vec![0.0_f32; channels];
     let mut samples_per_channel: u64 = 0;
@@ -303,13 +407,11 @@ pub fn levels(args: &[String]) -> Result<()> {
     let mut next_refresh = Instant::now() + refresh;
 
     while start.elapsed() < total {
-        let n = input.read_into(&mut buf);
-        if n == 0 {
+        let frames = reader.read(&mut input, &mut buf);
+        if frames == 0 {
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
-        // n is samples, not frames.
-        let frames = n / channels;
         for f in 0..frames {
             for (ch, acc) in rms_acc.iter_mut().enumerate().take(channels) {
                 let s = buf[f * channels + ch];
@@ -407,6 +509,23 @@ fn redraw_levels(rms_acc: &[f64], peak: &[f32], samples: u64) {
     eprint!("{line}");
 }
 
+/// How far a capture's length is from the time it took, as a fraction,
+/// when that is too far to be an honest clock.
+///
+/// A crystal is good to a few hundredths of a percent, and the first
+/// and last callback add a few milliseconds either way. The 2026-11-21
+/// Serato captures ran 0.59 % long with no overflow counted, and their
+/// carrier jumped phase every 38 s: the only trace of it was this sum.
+fn clock_excess(captured_secs: f64, wall_secs: f64) -> Option<f64> {
+    const MIN_SECS: f64 = 30.0;
+    const LIMIT: f64 = 0.001;
+    if wall_secs < MIN_SECS {
+        return None;
+    }
+    let excess = captured_secs / wall_secs - 1.0;
+    (excess.abs() > LIMIT).then_some(excess)
+}
+
 /// `dub capture <output.wav> [--device NAME] [--duration SECS] ...`
 ///
 /// Capture the input device to a 32-bit float WAV.
@@ -440,7 +559,7 @@ pub fn capture(args: &[String]) -> Result<()> {
         anyhow!("usage: dub capture <output.wav> [--device NAME] [--duration SECS] ...")
     })?;
 
-    let opts = input_args.to_options();
+    let opts = input_args.to_all_channel_options()?;
     let mut input = AudioInput::start_with_options(&opts).context("opening input device")?;
 
     println!(
@@ -465,6 +584,7 @@ pub fn capture(args: &[String]) -> Result<()> {
     let channels = input.channels() as usize;
     let block_frames = 4096_usize;
     let mut buf = vec![0.0_f32; block_frames * channels];
+    let mut reader = AllChannels::new(&input, block_frames);
 
     // Enter stops the capture. A record side does not run to a
     // convenient number of seconds, and a rip baseline wants the whole
@@ -482,28 +602,27 @@ pub fn capture(args: &[String]) -> Result<()> {
 
     let start = Instant::now();
     let total = Duration::from_secs_f64(input_args.duration_secs());
-    let mut samples_written: u64 = 0;
+    let mut frames: u64 = 0;
     let mut peak: f32 = 0.0;
 
     while start.elapsed() < total && !stop_flag.load(Ordering::Acquire) {
-        let n = input.read_into(&mut buf);
+        let n = reader.read(&mut input, &mut buf);
         if n == 0 {
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
-        for s in &buf[..n] {
+        for s in &buf[..n * channels] {
             writer.write_sample(*s).context("writing sample")?;
             let abs = s.abs();
             if abs > peak {
                 peak = abs;
             }
         }
-        samples_written += n as u64;
+        frames += n as u64;
     }
     writer.finalize().context("finalizing WAV")?;
 
     let elapsed = start.elapsed();
-    let frames = samples_written / channels as u64;
     let cb_count = input.callback_count();
     println!();
     println!(
@@ -524,6 +643,16 @@ pub fn capture(args: &[String]) -> Result<()> {
         eprintln!(
             "warning: input ringbuf overflowed {} times — capture missing samples",
             input.overflow_count()
+        );
+    }
+    if let Some(excess) = clock_excess(
+        frames as f64 / f64::from(input.sample_rate()),
+        elapsed.as_secs_f64(),
+    ) {
+        eprintln!(
+            "warning: the device delivered {:+.2} % more audio than time passed — \
+             its clock was not the one it reported; do not measure pitch from this file",
+            excess * 100.0
         );
     }
     if cb_count == 0 {
@@ -653,6 +782,70 @@ mod tests {
         };
         let opts = a.to_options();
         assert_eq!(opts.channels, 1);
+    }
+
+    #[test]
+    fn every_opened_channel_is_asked_for() {
+        // `--input-channels 3,4,5,6` used to reach the file as its
+        // first pair under a four-channel header.
+        let input = InputArgs {
+            input_channels: Some(vec![3, 4, 5, 6]),
+            ..InputArgs::default()
+        };
+        let opts = input.to_all_channel_options().unwrap();
+        assert_eq!(opts.channels, 4);
+        assert_eq!(opts.output_pairs, Some(vec![(0, 1), (2, 3)]));
+
+        assert_eq!(pairs_covering(6).unwrap(), [(0, 1), (2, 3), (4, 5)]);
+        assert_eq!(pairs_covering(2).unwrap(), [(0, 1)]);
+        assert_eq!(pairs_covering(3).unwrap(), [(0, 1), (2, 1)]);
+        assert!(pairs_covering(1).is_err());
+    }
+
+    #[test]
+    fn pairs_land_on_their_own_channels() {
+        // Six channels whose value names them: frame f, channel c
+        // holds 10 f + c.
+        let channels = 6;
+        let frames = 5;
+        let mut out = vec![-1.0_f32; frames * channels];
+        for p in 0..3 {
+            let pair: Vec<f32> = (0..frames)
+                .flat_map(|f| [(10 * f + 2 * p) as f32, (10 * f + 2 * p + 1) as f32])
+                .collect();
+            place_pair(&pair, p, channels, &mut out);
+        }
+        for (i, v) in out.iter().enumerate() {
+            let want = (10 * (i / channels) + i % channels) as f32;
+            assert!((v - want).abs() < f32::EPSILON, "sample {i}: {v} != {want}");
+        }
+    }
+
+    #[test]
+    fn an_odd_last_channel_takes_only_its_left() {
+        let mut out = vec![0.0_f32; 6];
+        place_pair(&[1.0, 2.0, 3.0, 4.0], 0, 3, &mut out);
+        place_pair(&[7.0, 99.0, 8.0, 99.0], 1, 3, &mut out);
+        assert_eq!(out, [1.0, 2.0, 7.0, 3.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn the_slowest_pair_sets_how_much_is_read() {
+        // Pair 1 is a callback ahead of pair 0: read what both have.
+        assert_eq!(frames_ready([512, 1024].into_iter(), 4096), 256);
+        assert_eq!(frames_ready([20_000, 20_000].into_iter(), 4096), 4096);
+        assert_eq!(frames_ready([513].into_iter(), 4096), 256);
+        assert_eq!(frames_ready(std::iter::empty(), 4096), 0);
+    }
+
+    #[test]
+    fn a_capture_longer_than_its_own_duration_is_called_out() {
+        // The Serato take of 2026-11-21, and the Traktor take beside it.
+        let serato = clock_excess(722.080, 717.829).unwrap();
+        assert!((serato - 0.0059).abs() < 0.0002, "{serato}");
+        assert!(clock_excess(718.933, 718.927).is_none());
+        // Too short for start-up slack to average out.
+        assert!(clock_excess(5.05, 5.0).is_none());
     }
 
     #[test]

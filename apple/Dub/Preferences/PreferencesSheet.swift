@@ -214,6 +214,7 @@ struct PreferencesSheet: View {
                     note("Connect a DJ interface to enter Performance mode, and its routing shows here. With none connected Dub runs Track Preparation through the built-in output.")
                 }
             }
+            TraktorAudioSection()
             #if DEBUG
             devSection
             #endif
@@ -362,7 +363,7 @@ struct PreferencesSheet: View {
     private var libraryTab: some View {
         VStack(alignment: .leading, spacing: DubSpacing.xl) {
             group("Import from") {
-                note("Dub reads each library read-only, merges its tracks into your collection, and shows that app's crates and playlists in the sidebar. Enabling a source scans its default folder now and on every launch.")
+                note("Dub reads each library read-only, merges its tracks into your collection, and shows that app's crates and playlists in the sidebar. Enabling a source scans its default folder now and on every launch. To use an app's beat grids, keys and cues without its library, right-click it in the sidebar and hide it.")
                     .padding(.bottom, DubSpacing.xs)
                 librarySourceRow(
                     "Serato", kind: .serato, isOn: $model.seratoImportEnabled,
@@ -488,6 +489,13 @@ struct PreferencesSheet: View {
                         .font(DubFont.micro)
                         .foregroundStyle(DubColor.textSecondary)
                         .help("Pick which Apple Music library Dub follows.")
+                }
+                if isOn.wrappedValue, model.isHiddenInSidebar(kind) {
+                    Button("Show in sidebar") { model.setHiddenInSidebar(kind, hidden: false) }
+                        .buttonStyle(.plain)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textSecondary)
+                        .help("Its library is hidden: the grids, keys and cues are in use, the playlists are not shown and are not searched.")
                 }
                 if isOn.wrappedValue {
                     Button("Rescan") { model.scanEnabledSources() }

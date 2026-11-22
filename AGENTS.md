@@ -116,10 +116,13 @@ testdata/
   rip-baselines/     Three real record sides (24-bit FLAC, gitignored — 748 MB) + a tracked
                      README. Ground truth for every constant in dub-rip/src/gaps.rs; replay
                      with `dub rip-tune`. Never re-fit those gates against a single record.
-  timecode/          10 s excerpts of real SL 3 timecode (tracked, ~5 MB) driving
-                     `real_vinyl_tests.rs` — steady-nominal, scratch, needle-drop. Synthetic
-                     carriers cannot reproduce vinyl's correlated surface noise, which is
-                     where the −0.31 % pitch bias hid. Full captures in `full/`, gitignored.
+  timecode/          10 s excerpts of real SL 3 timecode driving `real_vinyl_tests.rs` —
+                     steady-nominal, scratch, needle-drop, two held pitches. Gitignored with
+                     the full captures in `full/` (recordings of Serato's / NI's records,
+                     not ours to license); only the README is tracked, and the tests skip
+                     where the files are absent, so they run locally and not in GitHub CI.
+                     Synthetic carriers cannot reproduce vinyl's correlated surface noise,
+                     which is where the −0.31 % pitch bias hid.
 Makefile             test / app / ci / sweep / docs-check / snapshot …
 ```
 

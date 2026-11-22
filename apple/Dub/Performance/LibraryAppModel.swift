@@ -109,9 +109,11 @@ struct LibraryRevealRequest: Equatable {
 }
 
 /// A mapped next / previous track key: move the browser selection one
-/// row. The token makes two presses in a row two changes.
+/// row, or with Shift held grow or shrink it by one row, as a
+/// Shift-click would. The token makes two presses in a row two changes.
 struct LibraryBrowseRequest: Equatable {
     let next: Bool
+    var extend = false
     let token: UUID
 }
 
@@ -392,6 +394,11 @@ final class LibraryAppModel: ObservableObject {
     /// moving grid in `DubColor.gridMoving`. Off, the decks play even
     /// grids and the column says nothing of the saved maps.
     @Published var movingGridsShown: Bool = false
+
+    /// Tracks played since Dub started — thirty seconds or more on a
+    /// deck (`PlayedTally`). Their rows are dimmed, so the DJ sees what
+    /// has already gone out tonight. Not kept across a restart.
+    @Published var playedThisSession: Set<String> = []
 
     /// M11c.1 — immediate row patch for the LibraryView BPM / key /
     /// dim-state columns. Emitted alongside `analysisGeneration`

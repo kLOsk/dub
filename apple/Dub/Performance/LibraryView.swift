@@ -825,6 +825,13 @@ private struct LibraryBpmBucketCount: Identifiable {
 ///
 /// `allTracks`, `recentlyPlayed`, `justImported` are wired in M11d.1;
 /// the remaining sections render as disabled greyscale placeholders.
+/// How the DJ left one list: its sort and its filter selections.
+private struct SourceViewChoice {
+    var sortColumn: LibraryColumnField?
+    var ascending: Bool
+    var filter: LibraryFilterState
+}
+
 private enum LibrarySource: Hashable, Identifiable {
     case allTracks
     case recentlyPlayed
@@ -833,6 +840,10 @@ private enum LibrarySource: Hashable, Identifiable {
     /// were mixed into from the other deck.
     case sessionHistory
     case justImported
+    /// Tracks none of whose files can be found — in Dub's collection or
+    /// known from another app's library. Listed so they can be read and
+    /// cleared out; in the sidebar only while there are any.
+    case missing
     /// Tracks that mix with the one playing: a key a step either way
     /// round the Camelot wheel (or its relative), a tempo within ±3 BPM.
     /// It follows the playing track (Daniel, 2026-11-17).
@@ -865,6 +876,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .recentlyPlayed:              return "Recently Played"
         case .sessionHistory:              return "Session History"
         case .justImported:                return "Just Imported"
+        case .missing:                     return "Missing"
         case .matching:                    return "Matching"
         case .dubCrate:                    return "Crate"
         case .importedSource(let kind):    return kind.label
@@ -881,6 +893,7 @@ private enum LibrarySource: Hashable, Identifiable {
         case .matching:                    return "tuningfork"
         case .sessionHistory:              return "calendar.day.timeline.left"
         case .justImported:                return "tray.and.arrow.down"
+        case .missing:                     return "exclamationmark.triangle"
         case .dubCrate:                    return "square.stack.fill"
         case .importedSource(let kind):    return kind.systemImage
         case .importedCrate:               return "list.bullet"
@@ -906,6 +919,7 @@ private enum LibrarySource: Hashable, Identifiable {
     var isAvailable: Bool {
         switch self {
         case .allTracks, .recentlyPlayed, .sessionHistory, .justImported, .matching: return true
+        case .missing: return true
         case .dubCrate, .importedSource, .importedCrate, .favoriteSlot: return true
         // M26b: no longer a placeholder — it lists committed rips and
         // hands one back for re-splitting (R-44).
@@ -941,7 +955,7 @@ private enum LibrarySource: Hashable, Identifiable {
     /// Per §8.5.1, the sidebar groups sections under a heading.
     var group: String {
         switch self {
-        case .allTracks:
+        case .allTracks, .missing:
             return "Library"
         case .recentlyPlayed, .sessionHistory, .justImported, .matching:
             return "Smart Crates"
@@ -1060,6 +1074,10 @@ struct LibraryView: View {
 
     /// Active filter selections (transient; reset on source change).
     @State private var filterState = LibraryFilterState()
+    /// The sort and filters each list was left with, for this run of
+    /// Dub only, and the list they currently belong to.
+    @State private var sourceViews: [LibrarySource: SourceViewChoice] = [:]
+    @State private var shownSource: LibrarySource = .allTracks
     /// Memoized categorical facet value-lists per box, recomputed only on
     /// real changes (refresh / filter toggle / enabled-set change) — same
     /// per-body-re-eval discipline as `sortedTracks`.
@@ -1117,6 +1135,9 @@ struct LibraryView: View {
     /// uses single-page fetches (5 000 rows); 100k-track
     /// libraries land paging at M11d.4.
     @State private var tracks: [LibraryTrack] = []
+    /// While a search is on: the rows that matched outside the list on
+    /// screen. They sit under that list's own matches, below a divider.
+    @State private var elsewhereIds: Set<String> = []
 
     /// `true` while the source is being queried. Drives the spinner
     /// at the top of the list.
@@ -1222,6 +1243,7 @@ struct LibraryView: View {
         // The on-deck markers. A load changes no row id, so the table
         // would keep the old gutter without a revision.
         .onChange(of: model.deckTrackIds) { _ in tracksContentRevision &+= 1 }
+        .onChange(of: libraryModel.playedThisSession) { _ in tracksContentRevision &+= 1 }
         .onAppear {
             applyExtraColumns()
         }
@@ -1235,9 +1257,20 @@ struct LibraryView: View {
             applyExtraColumns(preserveSelection: true)
         }
         .onChange(of: selectedSource) { newSource in
-            // Pick the default sort for the new source. The user can
+            // Each list keeps the sort and filters the DJ left it with,
+            // until Dub quits: coming back to a playlist sorted by BPM
+            // finds it sorted by BPM (Daniel, 2026-11-22).
+            sourceViews[shownSource] = SourceViewChoice(
+                sortColumn: activeSortColumn, ascending: sortAscending, filter: filterState)
+            shownSource = newSource
+            let remembered = sourceViews[newSource]
+            // Otherwise the default sort for the new source. The user can
             // still click any column header afterwards to override it.
-            if newSource.crateId != nil {
+            if let remembered {
+                activeSortColumn = remembered.sortColumn
+                sortAscending = remembered.ascending
+                syncSortOrderFromHeader()
+            } else if newSource.crateId != nil {
                 // A crate opens in its manual order: sort by the `#`
                 // column ascending. This is the only sort state that
                 // enables drag-to-reorder; the user can click any
@@ -1266,10 +1299,10 @@ struct LibraryView: View {
                         order: .forward)
                 ]
             }
-            // v8: a new view has its own distinct values, so the active
-            // filter selections no longer apply. `refreshTracks` rebuilds
-            // the facets from the new `tracks`.
-            filterState.reset()
+            // A list seen for the first time starts unfiltered: another
+            // list's selections are not values it has. `refreshTracks`
+            // rebuilds the facets from the new `tracks`.
+            filterState = remembered?.filter ?? LibraryFilterState()
             if newSource == .realRecords {
                 model.refreshPastRips()
             } else {
@@ -1333,7 +1366,7 @@ struct LibraryView: View {
         }
         .onChange(of: libraryModel.browseRequest) { request in
             guard let request else { return }
-            browse(next: request.next)
+            browse(next: request.next, extend: request.extend)
         }
         .onChange(of: libraryModel.matchReference) { _ in
             // The crate follows the playing track.
@@ -1414,6 +1447,23 @@ struct LibraryView: View {
     /// does not need the width of the window — it needs to be where
     /// your eye already is when you are looking for a record.
     private var sidebarHeader: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            searchField
+            if let caption = LibrarySearchGroups.caption(
+                shown: sortedTrackIds, elsewhere: elsewhereIds,
+                searching: !searchText.isEmpty, inCollection: selectedSource == .allTracks)
+            {
+                Text(caption)
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .lineLimit(1)
+                    .padding(.horizontal, DubSpacing.sm + 2)
+                    .padding(.bottom, DubSpacing.sm)
+            }
+        }
+    }
+
+    private var searchField: some View {
         HStack(spacing: 4) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11))
@@ -1446,12 +1496,20 @@ struct LibraryView: View {
         .background(DubColor.surface2)
     }
 
+    /// The Library section's rows. Missing is there only while a track
+    /// is missing, or while the list is still open after the last one
+    /// was cleared.
+    private var libraryEntries: [LibrarySource] {
+        libraryModel.missingTrackCount > 0 || selectedSource == .missing
+            ? [.allTracks, .missing] : [.allTracks]
+    }
+
     private var sidebarTree: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 section(
                     heading: "Library",
-                    entries: [.allTracks])
+                    entries: libraryEntries)
                 section(
                     heading: "Smart Crates",
                     entries: [.matching, .recentlyPlayed, .sessionHistory, .justImported])
@@ -1695,6 +1753,16 @@ struct LibraryView: View {
                         Label("Reload Apple Music Library", systemImage: "arrow.clockwise")
                     }
                     .disabled(libraryModel.libraryImportInProgress)
+                }
+                // Its grids, keys and cues stay in use; only the library
+                // leaves the sidebar. Preferences ▸ Library brings it back.
+                Button {
+                    let showsIt = selectedSource == source
+                        || group.crates.contains { selectedSource == .importedCrate(id: $0.id) }
+                    if showsIt { select(.allTracks) }
+                    model.setHiddenInSidebar(group.kind, hidden: true)
+                } label: {
+                    Label("Hide \(group.kind.label) Library", systemImage: "eye.slash")
                 }
             }
     }
@@ -2500,6 +2568,8 @@ struct LibraryView: View {
                 rowState: { rowState(for: $0) },
                 rowActions: { rowActions(for: $0) },
                 scrollToTrackId: keyboardScrollTarget,
+                dividerAboveTrackId: LibrarySearchGroups.firstElsewhere(
+                    sortedTracks, elsewhere: elsewhereIds),
                 callbacks: LibraryTableCallbacks(
                     onToggleSort: { field in toggleSort(field) },
                     onColumnResized: { field, width in
@@ -2586,6 +2656,22 @@ struct LibraryView: View {
                 await model.setGridLocked(trackId: trackId, locked: locked)
             }
         }
+        if model.followChoiceOffered {
+            let library = model.library
+            builder.gridFollowWord = { trackId in
+                (try? library.gridFollow(trackId: trackId)) ?? nil
+            }
+            builder.onSetGridFollow = { trackId, follow in
+                Task { @MainActor in
+                    await model.setGridFollow(trackId: trackId, follow: follow)
+                }
+            }
+        } else {
+            builder.gridFollowWord = nil
+            builder.onSetGridFollow = nil
+        }
+        builder.onRemoveMissing = selectedSource == .missing
+            ? { ids in confirmRemoveMissing(ids) } : nil
         builder.crateId = selectedSource.crateId
         builder.onCrateRemove = { ids in
             guard let crateId = selectedSource.crateId else { return }
@@ -2661,6 +2747,8 @@ struct LibraryView: View {
         // reorder over a partial list would drop hidden rows, so disable
         // it while a filter is active.
         if filterState.isActive { return false }
+        // A search shows part of the crate, and rows from outside it.
+        if !searchText.isEmpty { return false }
         if activeSortColumn == nil { return true }
         return activeSortColumn == .crateOrder && sortAscending
     }
@@ -3123,7 +3211,8 @@ struct LibraryView: View {
     /// idiom. The cost is one sort + one map per real change,
     /// down from three sorts + two maps per body re-eval pre-fix.
     private func recomputeSortedTracks() {
-        let sorted = Self.sortedRows(tracks, filter: filterState, order: sortOrder)
+        let sorted = Self.sortedRows(
+            tracks, filter: filterState, order: sortOrder, elsewhere: elsewhereIds)
         if sorted != sortedTracks {
             sortedTracks = sorted
             sortedTrackIds = sorted.map(\.id)
@@ -3145,11 +3234,17 @@ struct LibraryView: View {
     /// task silently hops back to the main thread — the watchdog caught
     /// exactly that the first time round.
     nonisolated private static func sortedRows(
-        _ rows: [LibraryTrack], filter: LibraryFilterState, order: [LibraryRowComparator]
+        _ rows: [LibraryTrack], filter: LibraryFilterState, order: [LibraryRowComparator],
+        elsewhere: Set<String>
     ) -> [LibraryTrack] {
         let base = filter.isActive ? rows.filter { filter.passes($0) } : rows
-        if order.count == 1, let sorted = order[0].sortedByText(base) { return sorted }
-        return order.isEmpty ? base : base.sorted(using: order)
+        let sorted: [LibraryTrack]
+        if order.count == 1, let byText = order[0].sortedByText(base) {
+            sorted = byText
+        } else {
+            sorted = order.isEmpty ? base : base.sorted(using: order)
+        }
+        return LibrarySearchGroups.hereFirst(sorted, elsewhere: elsewhere)
     }
 
     // MARK: - Filter bar (v8)
@@ -3491,6 +3586,7 @@ struct LibraryView: View {
                 sessionFromTitle: sessionFromTitles[track.id],
                 keyNotationMode: keyNotationMode,
                 movingGridsShown: libraryModel.movingGridsShown,
+                played: libraryModel.playedThisSession.contains(track.id),
                 extraIndexById: extraColumnIndex),
             isOnDeckA: model.deckTrackIds.a == track.id,
             isOnDeckB: model.deckTrackIds.b == track.id,
@@ -3536,6 +3632,37 @@ struct LibraryView: View {
     /// the normal refresh path, whose completion consumes the
     /// pending id (and silently drops it when the track no longer
     /// exists in the library).
+    /// Ask, then take the missing tracks out of the library. The sheet
+    /// says what goes with them, and that another app's library will
+    /// bring its own back.
+    private func confirmRemoveMissing(_ ids: [String]) {
+        guard !ids.isEmpty else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = ids.count == 1
+            ? "Remove this missing track from the library?"
+            : "Remove \(ids.count) missing tracks from the library?"
+        alert.informativeText =
+            "Their cues, grids and places in crates go with them, and this cannot be undone. "
+            + "No file is deleted. A track that another app's library still lists "
+            + "comes back the next time that library is read."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let library = model.library
+        Task { @MainActor in
+            let removed = await Task.detached(priority: .userInitiated) {
+                (try? library.removeMissingTracks(trackIds: ids)) ?? 0
+            }.value
+            guard removed > 0 else { return }
+            rowSelection.selectedTrackIds = []
+            rowSelection.selectionAnchorId = nil
+            model.refreshMissingTrackCount()
+            refreshTracks()
+        }
+    }
+
     private func revealTrack(_ trackId: String) {
         if sortedTrackIds.contains(trackId) {
             completeReveal(trackId)
@@ -3568,12 +3695,43 @@ struct LibraryView: View {
     /// in the order the list shows. With nothing selected it starts at
     /// the top (next) or the bottom (previous); at either end it stays.
     /// Leaves the search field, so Space loads what it lands on.
-    private func browse(next: Bool) {
+    private func browse(next: Bool, extend: Bool = false) {
+        if extend, let grown = Self.extendedSelection(
+            rowSelection.selectedTrackIds, anchor: rowSelection.selectionAnchorId,
+            in: sortedTrackIds, next: next)
+        {
+            searchFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            rowSelection.selectedTrackIds = Set(grown.selection)
+            syncModelPrimarySelection()
+            keyboardScrollTarget = grown.edge
+            return
+        }
         guard let target = Self.browseTarget(
             from: primarySelectedTrackId, in: sortedTrackIds, next: next)
         else { return }
         searchFocused = false
         completeReveal(target)
+    }
+
+    /// Shift with a next / previous track key: the selection as a
+    /// Shift-click one row further would leave it. The row the selection
+    /// started from stays put and the other end moves, so the same key
+    /// the other way shrinks it again. `nil` where there is no run to
+    /// grow — nothing selected, or rows picked apart with ⌘ — and the
+    /// key then just moves.
+    static func extendedSelection<ID: Hashable>(
+        _ selected: Set<ID>, anchor: ID?, in ids: [ID], next: Bool
+    ) -> (selection: [ID], edge: ID)? {
+        guard let anchor, let from = ids.firstIndex(of: anchor), selected.contains(anchor)
+        else { return nil }
+        let at = ids.indices.filter { selected.contains(ids[$0]) }
+        guard let low = at.first, let high = at.last, high - low + 1 == at.count,
+              from == low || from == high
+        else { return nil }
+        let edge = from == low ? high : low
+        let to = next ? min(edge + 1, ids.count - 1) : max(edge - 1, 0)
+        return (Array(ids[min(from, to)...max(from, to)]), ids[to])
     }
 
     // MARK: - Sidebar keys (⌘⇧ arrows by default)
@@ -3595,7 +3753,7 @@ struct LibraryView: View {
             guard !folding.isSectionFolded(heading) else { return }
             stops += entries.filter(\.isAvailable).map { SidebarStop(source: $0) }
         }
-        section("Library", [.allTracks])
+        section("Library", libraryEntries)
         section("Smart Crates", [.matching, .recentlyPlayed, .sessionHistory, .justImported])
         section("Dub Crates", libraryModel.crates.map { .dubCrate(id: $0.id) })
         if !libraryModel.importedSources.isEmpty, !folding.isSectionFolded("Imported Sources") {
@@ -3884,6 +4042,8 @@ struct LibraryView: View {
             return "Nothing played this session yet."
         case .justImported:
             return "No imports this session."
+        case .missing:
+            return "No missing tracks."
         case .matching:
             return libraryModel.matchReference == nil
                 ? "Play a track and what mixes with it shows here."
@@ -3914,6 +4074,8 @@ struct LibraryView: View {
             return "Tracks you play this session show up here, in set order."
         case .justImported:
             return "Tracks imported this session show up here."
+        case .missing:
+            return "Every track's file is where Dub expects it."
         case .matching:
             return "Its key and tempo window is in Preferences ▸ Library. Tracks with no BPM or key yet don't show."
         case .dubCrate:
@@ -4027,6 +4189,7 @@ struct LibraryView: View {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let limit = Self.listingLimit
         let library = model.library
+        let searchHidden = model.searchHiddenSources
         let since = model.appLaunchUnixSeconds
         // What the sort and the facets depend on, taken now so the
         // background pass sees one consistent view. If either moves
@@ -4051,16 +4214,19 @@ struct LibraryView: View {
             // dict doubles as the "is this source active" gate at
             // render time.
             var fromTitles: [String: String] = [:]
+            var elsewhere: Set<String> = []
             do {
-                // Search looks in the list on screen. All Tracks is the
-                // collection, which has its own search; every other list
-                // — another app's library, a playlist, a crate, history —
-                // is fetched as it is browsed and narrowed to the rows
-                // the search matches, so it keeps its own order. Search
-                // used to go to the collection whatever was selected,
-                // and most tracks in another app's library are not in
-                // it: with Apple Music selected it found nothing at all
-                // (2026-11-19).
+                // Search finds the record wherever it is (Daniel,
+                // 2026-11-22), and shows the list on screen first. All
+                // Tracks is the collection, which has its own search;
+                // every other list — another app's library, a playlist,
+                // a crate, history — is fetched as it is browsed and
+                // narrowed to the rows the search matches, so it keeps
+                // its own order. Under those come the matches from the
+                // rest of the library (`elsewhere`). Search used to go to
+                // the collection whatever was selected, and most tracks
+                // in another app's library are not in it: with Apple
+                // Music selected it found nothing at all (2026-11-19).
                 var searchesCollection = false
                 if case .allTracks = source { searchesCollection = true }
                 if !query.isEmpty, searchesCollection {
@@ -4082,6 +4248,8 @@ struct LibraryView: View {
                     case .justImported:
                         fetched = try library.justImported(
                             sinceUnixSecs: since, limit: limit)
+                    case .missing:
+                        fetched = try library.missingTracks(limit: limit)
                     case .dubCrate(let crateId):
                         fetched = try library.crateTracks(crateId: crateId)
                     case .importedSource(let kind):
@@ -4112,6 +4280,14 @@ struct LibraryView: View {
                         fetched = fetched.filter { matched.contains($0.id) }
                     }
                 }
+                if !query.isEmpty {
+                    let here = Set(fetched.map(\.id))
+                    let others = try library.searchAnywhere(
+                        query: query, limit: limit, hiddenSources: searchHidden
+                    ).filter { !here.contains($0.id) }
+                    elsewhere = Set(others.map(\.id))
+                    fetched += others
+                }
             } catch {
                 let message = error.localizedDescription
                 await MainActor.run {
@@ -4120,6 +4296,7 @@ struct LibraryView: View {
                 fetched = []
             }
             let rows = fetched
+            let elsewhereIds = elsewhere
             let fetchedAt = ProcessInfo.processInfo.systemUptime
             // Immutable snapshot — the @Sendable MainActor closure
             // can't capture the mutated local `var` directly.
@@ -4129,7 +4306,8 @@ struct LibraryView: View {
             // below is then assignments and one table reload; it used
             // to be a second of main thread at launch, with the
             // waveform links and every deck update queued behind it.
-            let sorted = Self.sortedRows(rows, filter: filterSnapshot, order: sortSnapshot)
+            let sorted = Self.sortedRows(
+                rows, filter: filterSnapshot, order: sortSnapshot, elsewhere: elsewhereIds)
             let sortedIds = sorted.map(\.id)
             let sortedAt = ProcessInfo.processInfo.systemUptime
             let facetsPrepared = Self.computedFacets(
@@ -4140,6 +4318,7 @@ struct LibraryView: View {
             await MainActor.run {
                 let landingAt = ProcessInfo.processInfo.systemUptime
                 self.tracks = rows
+                self.elsewhereIds = elsewhereIds
                 self.sessionFromTitles = resolvedFromTitles
                 if self.sortOrder == sortSnapshot, self.filterState == filterSnapshot {
                     // Assigned outright. This used to compare the whole
@@ -4334,20 +4513,6 @@ struct LibraryView: View {
     }
 }
 
-// MARK: - DimUnanalyzed modifier
-
-/// PRD §8.5.3 visual cue for the M11c.1 lazy-analysis lifecycle.
-///
-/// Tracks that have never been analyzed (no `analysis_cache` row
-/// stamped yet) render at reduced opacity. Once auto-analysis
-/// completes (whether or not a grid was found) the row flips
-/// back to full opacity. Imported grids from a future Serato /
-/// Traktor / rekordbox milestone also drop the dim because the
-/// importer stamps `analysis_cache` as it lands the grid.
-///
-/// Implemented as a `ViewModifier` so the same opacity rule
-/// applies uniformly to every column in the LibraryView table
-/// without duplicating the `.opacity(...)` call across cells.
 /// Notation mode for the LibraryView Key column. Persisted across
 /// app launches via `@AppStorage("libraryKeyNotationMode")`.
 /// Canonical Camelot is the default — it's the dominant
@@ -4404,6 +4569,9 @@ struct LibraryColumnLayout {
 }
 
 enum LibraryRowLayout {
+    /// How strongly a track already played this session is drawn.
+    static let playedAlpha: CGFloat = 0.4
+
     /// The size of the browser's text — track rows and the sidebar's
     /// nodes — is the DJ's to set (Preferences ▸ Library ▸ Text size).
     /// It was a fixed 14 pt, which read "much smaller than in Traktor"
@@ -4925,34 +5093,6 @@ private struct LibraryTextFocusDismissMonitor: NSViewRepresentable {
     }
 }
 
-/// Right-click context menu for a library row. PRD-BEATS §4.4
-/// "single Re-analyze entry" — collapses Analyze and Re-analyze
-/// into one verb that depends on the row's current state. Lives in
-/// its own `View` struct (rather than inline in a row's
-/// `.contextMenu { ... }`) for one reason:
-/// SwiftUI's `.contextMenu` body closure does NOT reliably
-/// re-evaluate when the parent's `@State` changes. Empirically the
-/// closure runs once when the row is first attached and the
-/// captured selection then sticks across subsequent multi-selects.
-/// Threading the selection through an explicit child view forces
-/// SwiftUI's identity diffing to recreate the menu body whenever
-/// the inputs change, so the visible label "(N of M)" tracks the
-/// live selection rather than whatever was selected when the row
-/// first appeared.
-struct DimUnanalyzed: ViewModifier {
-    let isAnalyzed: Bool
-    /// Shared with the cells AppKit draws (`LibraryTextCellView`).
-    static let dimmedOpacity: CGFloat = 0.55
-    func body(content: Content) -> some View {
-        // 0.55 chosen to read as "this row is waiting for
-        // analysis" without losing legibility of the title /
-        // artist text. Slightly higher than the 0.40 we use for
-        // disabled controls; rows are still selectable +
-        // draggable, just visually deferred.
-        content.opacity(isAnalyzed ? 1.0 : Self.dimmedOpacity)
-    }
-}
-
 // MARK: - Conditional view modifier
 
 private extension View {
@@ -5126,5 +5266,46 @@ private struct RelocateSheet: View {
             let result = await model.runRelocate(matchingFolder: url)
             lastRunSummary = result
         }
+    }
+}
+
+
+/// A search lists the matches from the list on screen first and the
+/// matches from the rest of the library under them.
+enum LibrarySearchGroups {
+    /// `rows` with the ones from elsewhere moved to the end. Each group
+    /// keeps the order it came in, so a column sort sorts within both.
+    static func hereFirst(_ rows: [LibraryTrack], elsewhere: Set<String>) -> [LibraryTrack] {
+        hereFirst(rows, id: \.id, elsewhere: elsewhere)
+    }
+
+    static func hereFirst<Row>(
+        _ rows: [Row], id: (Row) -> String, elsewhere: Set<String>
+    ) -> [Row] {
+        guard !elsewhere.isEmpty else { return rows }
+        return rows.filter { !elsewhere.contains(id($0)) }
+            + rows.filter { elsewhere.contains(id($0)) }
+    }
+
+    /// The row the divider is drawn above: the first one from elsewhere.
+    static func firstElsewhere(_ rows: [LibraryTrack], elsewhere: Set<String>) -> String? {
+        firstElsewhere(rows.map(\.id), elsewhere: elsewhere)
+    }
+
+    static func firstElsewhere(_ ids: [String], elsewhere: Set<String>) -> String? {
+        guard !elsewhere.isEmpty else { return nil }
+        return ids.first { elsewhere.contains($0) }
+    }
+
+    /// What the search found where, under the search field. `nil` when
+    /// no search is on.
+    static func caption(
+        shown: [String], elsewhere: Set<String>, searching: Bool, inCollection: Bool
+    ) -> String? {
+        guard searching else { return nil }
+        let others = shown.filter { elsewhere.contains($0) }.count
+        let here = shown.count - others
+        let place = inCollection ? "in your collection" : "in this list"
+        return "\(here) \(place) · \(others) elsewhere"
     }
 }

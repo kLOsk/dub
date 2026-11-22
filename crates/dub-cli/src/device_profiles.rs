@@ -93,16 +93,12 @@ mod tests {
     }
 
     #[test]
-    fn audio6_matches_and_is_unverified() {
+    fn audio6_matches_as_played() {
         let d = match_device("Traktor Audio 6").expect("should match");
         assert_eq!(d.display_name, "Traktor Audio 6");
-        assert!(
-            !d.verified,
-            "Audio 6 routing is a best-effort guess; should be marked unverified \
-             until validated against real hardware"
-        );
-        assert_eq!(d.deck_a_zero_based(), 0);
-        assert_eq!(d.deck_b_zero_based(), 2);
+        assert!(d.verified, "played on Daniel's box, 2026-11-20");
+        assert_eq!(d.deck_a_zero_based(), 2);
+        assert_eq!(d.deck_b_zero_based(), 4);
     }
 
     #[test]

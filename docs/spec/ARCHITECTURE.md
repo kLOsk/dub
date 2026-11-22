@@ -1433,8 +1433,9 @@ three layered changes:
      `--input-channels 3,4` for timecode automatically gets deck A
      audio on the matching output pair. No `2N+1/2N+2` formula —
      that formula is wrong for our reference device.
-   - **Traktor Audio 6** (unverified): best-effort guess
-     deck A 1+2, deck B 3+4. Warns at startup until validated.
+   - **Traktor Audio 6** (verified 2026-11-21, as Daniel routed and
+     played it): deck A 3+4, deck B 5+6, inputs on the same pairs. The
+     guess it replaces had 1+2 and 3+4.
 
 The CLI's resolution priority (in `timecode_deck.rs::resolve_output_routing`):
 

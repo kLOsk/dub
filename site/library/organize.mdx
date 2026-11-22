@@ -150,15 +150,16 @@ seconds later. While it works, the bottom-right corner of the list shows
 
 To analyse ahead of a gig, select tracks, right-click and choose **Analyze**
 (or **Re-analyze** for tracks done before). The menu counts what it will
-do: **Re-analyze Selected (3 of 5)** means two of the five have a locked
-grid and are skipped.
+do: **Re-analyze Selected (3 of 5 · 2 analysed and locked)** means two of the
+five are already analysed and have a locked grid, so they are skipped. A locked track that has never been analysed is
+not skipped: it gets its key, waveform and loudness, and keeps its grid.
 
 Marks in the **BPM** column:
 
 | Mark | Means |
 | --- | --- |
 | **⚠** *Imported and analysed grids disagree* | Another app's grid and Dub's analysis don't match. Show the per-app BPM columns to compare. |
-| **⚠** *May drift over a long mix* | The beats move against the grid by 8 ms a minute or more, so the lines may sit off the beat late in the track. Right-click ▸ **Lock grid** to accept it. |
+| **⚠** *The grid's tempo is slightly off* | The beats move against the grid by 8 ms a minute or more, so the lines slide off the beat late in the track. Right-click ▸ **Re-analyze** to correct it, or **Lock grid** to accept it. |
 | Padlock | The grid is locked. Analysis leaves it alone. Right-click ▸ **Unlock grid** to free it. |
 | **BPM in cyan** | A moving grid: it follows the band (**Following beat grid**, alpha). Hover it for the band's tempo range. |
 | Cyan padlock | A moving grid you accepted: the track always plays it as saved. |
@@ -203,3 +204,13 @@ example **12 missing**.
 Dub never deletes a track because its file went missing. Your grids, cues,
 ratings and history stay, and when the drive comes back the old path works
 again.
+
+To see which tracks are missing, open **Missing** in the sidebar, under
+**All Tracks**. It is there while any track is missing, and lists them
+whether they came from a folder you imported or from another app's library.
+
+If a track is gone for good, select it there, right-click and choose
+**Remove from Library…**. That removes its cues, grid and places in crates,
+and can't be undone; no file is deleted. A track that another app's library
+still lists comes back the next time Dub reads that library, so remove it
+in that app too.

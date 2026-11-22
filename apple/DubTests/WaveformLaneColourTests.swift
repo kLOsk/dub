@@ -88,6 +88,45 @@ final class WaveformLaneColourTests: XCTestCase {
             "0.25x must fold twice the chunks into a column")
     }
 
+    /// 0.5× on a 44.1 kHz record at zero pitch is zoom 2.0 exactly, the
+    /// step between two and four chunks a column. A rate wobbling
+    /// around zero must not redraw the strip each time it crosses.
+    func testAZoomWobblingOnAStepKeepsItsAggregation() {
+        for start: UInt32 in [2, 4] {
+            var held: UInt32? = start
+            for wobble in [-0.0005, 0.0004, -0.0003, 0.0005, 0.03, -0.03] {
+                let agg = WaveformRenderer.columnAggregation(
+                    timeAxisZoom: 2.0 * (1 + wobble), holding: held)
+                XCTAssertEqual(agg, start, "a \(wobble * 100) % wobble moved it off \(start)")
+                held = agg
+            }
+        }
+    }
+
+    /// The hold is a margin, not a latch: a real pitch move or a new
+    /// zoom rung still gets the aggregation it asks for.
+    func testAZoomWellPastAStepChangesAggregation() {
+        XCTAssertEqual(WaveformRenderer.columnAggregation(timeAxisZoom: 2.16, holding: 2), 4)
+        XCTAssertEqual(WaveformRenderer.columnAggregation(timeAxisZoom: 1.84, holding: 4), 2)
+        XCTAssertEqual(WaveformRenderer.columnAggregation(timeAxisZoom: 4.0, holding: 2), 4)
+        XCTAssertEqual(WaveformRenderer.columnAggregation(timeAxisZoom: 1.0, holding: 4), 2)
+        XCTAssertEqual(WaveformRenderer.columnAggregation(timeAxisZoom: 2.0, holding: nil), 2)
+    }
+
+    /// Pitch never changes how much audio a column holds: anywhere a
+    /// fader reaches, the strip keeps the aggregation of its zoom rung.
+    func testPitchDoesNotChangeTheAggregation() {
+        for zoom in WaveformZoom.steps {
+            let rest = WaveformRenderer.columnAggregation(timeAxisZoom: zoom)
+            for rate in [0.70, 0.92, 0.9995, 1.0005, 1.08, 1.35, 1.49] {
+                XCTAssertEqual(
+                    WaveformRenderer.columnAggregation(
+                        timeAxisZoom: zoom * rate, restZoom: zoom, holding: nil),
+                    rest, "zoom \(zoom) at rate \(rate)")
+            }
+        }
+    }
+
     /// Odd aggregations would re-pair a transient chunk with a
     /// different neighbour frame to frame, which is the band-colour
     /// flicker the playhead snap exists to prevent.

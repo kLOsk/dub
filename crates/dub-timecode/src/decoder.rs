@@ -177,14 +177,45 @@ const LONG_LAG_MAX: usize = 16;
 /// would risk ambiguity — fall back to lag-1.
 const LONG_LAG_MAX_RATE: f64 = 1.2;
 
-/// Pole for the smoothed roundness feeding the long-lag gate
-/// (τ ≈ 130 ms at 64-frame chunks).
-const ROUNDNESS_ALPHA: f64 = 0.01;
+/// |rate| above which the long-lag sum reads the carrier through the
+/// carrier band-pass ([`CARRIER_BP_Q`]). Below it the unfiltered sum
+/// carries on as before.
+const CARRIER_BAND_MIN_RATE: f64 = 0.8;
 
-/// Minimum residual-ellipse roundness (`ellipse_factor`) for the
-/// long-lag path. Post-whitening rigs sit near 1.0; an uncalibrated
-/// cartridge's strong ellipse keeps the exact lag-1 correction model.
-const LONG_LAG_MIN_ROUNDNESS: f64 = 0.99;
+/// Q of each of the two band-pass sections around the carrier.
+///
+/// The long-lag sum adds every frequency's power at that frequency's
+/// own angle, so anything beside the carrier line pulls the reading:
+/// content below the carrier pulls it low, content above pulls it
+/// high. Serato CV02 has almost nothing there (0.1 % of the power) and
+/// reads true. Traktor MK1 on a real deck carries 1.1 % below the
+/// carrier (its data sidebands, 300–1900 Hz), 0.4 % above, and 0.4 %
+/// at the second harmonic; lopsided, they left it 0.1 % low at every
+/// pitch once the ellipse was corrected (four captures, 2026-11-21).
+/// Two sections at Q 2.5 cut the octave either side by 23 dB. The same
+/// filter runs on both channels, so the carrier's own rotation and its
+/// ellipse come through unchanged.
+const CARRIER_BP_Q: f64 = 2.5;
+
+/// How fast the band-pass centre follows the carrier, in seconds.
+///
+/// The centre sits on the carrier, not on its nominal frequency: left
+/// at nominal with the platter at ±8 %, the carrier rides the peak's
+/// slope and the content on its far side comes back in. It follows the
+/// unfiltered reading, never its own output, so it cannot chase itself.
+///
+/// Slow on purpose: the centre moving shifts the filter's phase, which
+/// reads as a frequency error while it moves.
+const CARRIER_BP_FOLLOW_SECS: f64 = 0.25;
+
+/// How close (in rate) the carrier must be to the band-pass centre for
+/// the filtered sum to be read. Wider than a record's wobble and a
+/// block's noise, far narrower than a brake or a scratch.
+const CARRIER_BP_ON_CENTRE: f64 = 0.02;
+
+/// Time on centre before the band-pass is read: several times its
+/// ring-in (1.6 ms at Q 2.5 on a 1 kHz carrier).
+const CARRIER_BP_SETTLE_SECS: f64 = 0.01;
 
 /// Cap on the high-pass amplitude compensation (see the carrier-
 /// presence block in [`Decoder::process`]). 8× covers carriers down to
@@ -197,8 +228,9 @@ const MAX_AMP_BOOST: f64 = 8.0;
 /// boosted into "carrier present".
 const AMP_COMP_MIN_RATE: f64 = 0.02;
 
-/// One 2nd-order Butterworth high-pass section (RBJ biquad, Direct
-/// Form 1, `f64`). Allocation-free and branch-free per sample — RT-safe.
+/// One 2nd-order section (RBJ biquad, Direct Form 1, `f64`): a
+/// Butterworth high-pass or a unity-peak band-pass. Allocation-free and
+/// branch-free per sample — RT-safe.
 #[derive(Debug, Clone, Copy)]
 struct BiquadHp {
     b0: f64,
@@ -229,6 +261,36 @@ impl BiquadHp {
             y1: 0.0,
             y2: 0.0,
         }
+    }
+
+    /// Unity-peak band-pass at `center_hz`.
+    fn band_pass(center_hz: f64, q: f64, sample_rate: f64) -> Self {
+        let mut section = Self {
+            b0: 0.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        };
+        section.retune_band_pass(center_hz, q, sample_rate);
+        section
+    }
+
+    /// Move a band-pass to `center_hz`, keeping its state.
+    fn retune_band_pass(&mut self, center_hz: f64, q: f64, sample_rate: f64) {
+        let w0 = std::f64::consts::TAU * center_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        self.b0 = alpha / a0;
+        self.b1 = 0.0;
+        self.b2 = -alpha / a0;
+        self.a1 = -2.0 * cos_w0 / a0;
+        self.a2 = (1.0 - alpha) / a0;
     }
 
     #[inline]
@@ -272,6 +334,16 @@ pub struct Decoder {
     /// Ring of the last [`LONG_LAG_MAX`] whitened complex samples for
     /// the long-lag estimator (only `long_lag` entries are used).
     lag_hist: [(f64, f64); LONG_LAG_MAX],
+    /// The same ring for the band-passed carrier.
+    lag_hist_bp: [(f64, f64); LONG_LAG_MAX],
+    /// Two band-pass sections per channel, centred on the carrier —
+    /// see [`CARRIER_BP_Q`].
+    carrier_bp: [[BiquadHp; 2]; 2],
+    /// Where the band-pass sits, as a rate (1.0 = nominal carrier).
+    carrier_bp_rate: f64,
+    /// How long the carrier has sat on the band-pass centre without a
+    /// break — see [`CARRIER_BP_SETTLE_SECS`].
+    carrier_bp_settled_secs: f64,
     lag_pos: usize,
     /// Samples seen since reset — the long-lag sum is valid once this
     /// reaches `long_lag`.
@@ -280,14 +352,6 @@ pub struct Decoder {
     /// clamped to `[2, LONG_LAG_MAX]`, so `|rate| ≤` ~1.25 stays
     /// unambiguous (CV02 @48 k → 16, MK1 → 9, MK2 → 7).
     long_lag: usize,
-    /// Slow EMA (τ ≈ 130 ms) of the residual-ellipse roundness used by
-    /// the long-lag gate. Gating on the instantaneous roundness made
-    /// the estimator path toggle per block on a dirty rig hovering at
-    /// the threshold — alternating the ~0.3 % lag-1 bias on and off,
-    /// which read as display jitter. Starts at 0 so a fresh decoder
-    /// (and the single-block ellipse-law tests) is on the exact lag-1
-    /// path until the estimate matures.
-    roundness_smoothed: f64,
     /// Cumulative position in seconds-at-unity-speed.
     position_secs: f64,
     /// 2×2 channel-whitening matrix applied to `(ch1, ch0)` before the
@@ -374,11 +438,18 @@ impl Decoder {
             ellipse_correction: true,
             input_hp: [BiquadHp::new(INPUT_HP_HZ, f64::from(sample_rate)); 2],
             lag_hist: [(0.0, 0.0); LONG_LAG_MAX],
+            lag_hist_bp: [(0.0, 0.0); LONG_LAG_MAX],
+            carrier_bp: [[BiquadHp::band_pass(
+                f64::from(format.carrier_hz()),
+                CARRIER_BP_Q,
+                f64::from(sample_rate),
+            ); 2]; 2],
+            carrier_bp_rate: 1.0,
+            carrier_bp_settled_secs: 0.0,
             lag_pos: 0,
             lag_warm: 0,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             long_lag: ((sample_rate / (2.5 * format.carrier_hz())) as usize).clamp(2, LONG_LAG_MAX),
-            roundness_smoothed: 0.0,
             absolute: None,
         }
     }
@@ -482,6 +553,10 @@ impl Decoder {
         self.lag_warm = 0;
         self.input_hp[0].reset();
         self.input_hp[1].reset();
+        for section in self.carrier_bp.iter_mut().flatten() {
+            section.reset();
+        }
+        self.carrier_bp_settled_secs = 0.0;
         if let Some(t) = self.absolute.as_mut() {
             t.reset();
         }
@@ -534,6 +609,11 @@ impl Decoder {
         let mut samples_consumed = 0_usize;
         let mut acc_l_re = 0.0_f64;
         let mut acc_l_im = 0.0_f64;
+        let mut band_lag_re = 0.0_f64;
+        let mut band_lag_im = 0.0_f64;
+        let mut band_sq_re = 0.0_f64;
+        let mut band_sq_im = 0.0_f64;
+        let mut band_cross = 0.0_f64;
         let mut lag_pairs = 0_usize;
 
         let w = self.whitening;
@@ -567,13 +647,27 @@ impl Decoder {
             // Long-lag coherent sum: s_curr · conj(s_{n−long_lag}).
             // The ring always advances; the sum only counts once the
             // ring holds `long_lag` real samples.
+            let (mut band_re, mut band_im) = (re, im);
+            for section in &mut self.carrier_bp[0] {
+                band_re = section.process(band_re);
+            }
+            for section in &mut self.carrier_bp[1] {
+                band_im = section.process(band_im);
+            }
+            band_sq_re += band_re * band_re;
+            band_sq_im += band_im * band_im;
+            band_cross += band_re * band_im;
             if self.lag_warm >= self.long_lag {
                 let (hre, him) = self.lag_hist[self.lag_pos];
                 acc_l_re += re * hre + im * him;
                 acc_l_im += im * hre - re * him;
+                let (hre, him) = self.lag_hist_bp[self.lag_pos];
+                band_lag_re += band_re * hre + band_im * him;
+                band_lag_im += band_im * hre - band_re * him;
                 lag_pairs += 1;
             }
             self.lag_hist[self.lag_pos] = (re, im);
+            self.lag_hist_bp[self.lag_pos] = (band_re, band_im);
             self.lag_pos = (self.lag_pos + 1) % self.long_lag;
             self.lag_warm = self.lag_warm.saturating_add(1);
             self.prev_re = re;
@@ -606,10 +700,8 @@ impl Decoder {
         let mag_acc = sq_re_acc + sq_im_acc;
 
         // Confidence numerator first: the ellipse estimate must adapt
-        // from THIS block's covariance before the rate path is chosen,
-        // or the roundness gate runs one block stale (a fresh decoder
-        // would route an uncalibrated ellipse through the long-lag
-        // path on its very first block).
+        // from THIS block's covariance before the rate is corrected
+        // with it, or a fresh decoder's first block goes uncorrected.
         let coherent_mag = (acc_re * acc_re + acc_im * acc_im).sqrt();
         let coherence = if mag_acc > 1e-12 {
             #[allow(clippy::cast_possible_truncation)]
@@ -617,27 +709,84 @@ impl Decoder {
         } else {
             0.0
         };
+        // The ellipse is measured on the signal the rate is read from.
+        // Near playing speed that is the band-passed carrier: a bump on
+        // the record is a burst of low, one-sided power, and read off
+        // the unfiltered covariance it passed for a very oval carrier —
+        // the correction then held a steady +6.6 % at +3.8 % for a
+        // second (Serato capture, 2026-11-21).
+        //
+        // The band-pass is only read while it sits on the carrier. It
+        // adds 1.6 ms of delay, and a carrier sliding off its centre
+        // picks up phase on the way: through a brake or a scratch the
+        // filtered reading trails by several percent. So the unfiltered
+        // long-lag rate says where the carrier is, the centre follows
+        // that, and the filtered sum is used once the two agree.
+        #[allow(clippy::cast_precision_loss)]
+        let rate_wide = acc_l_im.atan2(acc_l_re)
+            / self.long_lag as f64
+            / (std::f64::consts::TAU * dt)
+            / nominal;
+        let near_playing_speed = lag_pairs > 0
+            && rate_lag1.abs() > CARRIER_BAND_MIN_RATE
+            && rate_lag1.abs() < LONG_LAG_MAX_RATE;
+        let on_centre = near_playing_speed
+            && coherence > 0.9
+            && (rate_wide.abs() - self.carrier_bp_rate).abs() < CARRIER_BP_ON_CENTRE;
+        // …and has sat there long enough to have rung in: its first
+        // milliseconds after a start, a needle drop or a scratch are
+        // the filter's own transient, not the carrier.
+        #[allow(clippy::cast_precision_loss)]
+        if on_centre {
+            self.carrier_bp_settled_secs += n_frames as f64 * dt;
+        } else {
+            self.carrier_bp_settled_secs = 0.0;
+        }
+        let carrier_band = self.carrier_bp_settled_secs > CARRIER_BP_SETTLE_SECS;
         if coherence > 0.9 {
-            self.update_ellipse_estimate(sq_re_acc, sq_im_acc, cross_acc, mag_acc);
-            self.roundness_smoothed +=
-                ROUNDNESS_ALPHA * (self.ellipse_factor() - self.roundness_smoothed);
+            if carrier_band {
+                self.update_ellipse_estimate(
+                    band_sq_re,
+                    band_sq_im,
+                    band_cross,
+                    band_sq_re + band_sq_im,
+                );
+            } else {
+                self.update_ellipse_estimate(sq_re_acc, sq_im_acc, cross_acc, mag_acc);
+            }
         }
 
         // Prefer the long-lag phase (per-sample equivalent) inside the
-        // unambiguous band AND while the (whitened) residual ellipse is
-        // round: same carrier term, ~20× less correlated-noise shrink —
-        // this is what puts a true 0.00 % at fader 0 on a real (noisy)
-        // record. A strongly elliptical signal (uncalibrated cartridge)
-        // stays on the lag-1 path, whose ellipse-bias model and
-        // correction are exact; the long-lag weighting follows a
-        // different (uncorrected) law, but at roundness ≥
-        // [`LONG_LAG_MIN_ROUNDNESS`] the residual is second-order.
-        let use_long_lag = lag_pairs > 0
-            && rate_lag1.abs() < LONG_LAG_MAX_RATE
-            && self.roundness_smoothed > LONG_LAG_MIN_ROUNDNESS;
+        // unambiguous band: same carrier term, ~20× less
+        // correlated-noise shrink — this is what puts a true 0.00 % at
+        // fader 0 on a real (noisy) record.
+        //
+        // A residual ellipse biases it by the same law as lag-1, only
+        // at the lag's angle: the carrier's image component adds
+        // `|b|²·e^(−jLω)` to the sum, so `tan θ_measured = R·tan(Lω)`.
+        // Dividing `R` back out of the real part undoes it in every
+        // quadrant. This path used to be left uncorrected and gated on
+        // roundness > 0.99 instead; a cartridge sitting on that gate
+        // flapped between two estimators that disagreed by over 1 %
+        // (Traktor vinyl, 2026-11-21), and one just inside it read up
+        // to 0.15 % off toward ±8 %.
+        let use_long_lag = lag_pairs > 0 && rate_lag1.abs() < LONG_LAG_MAX_RATE;
         #[allow(clippy::cast_precision_loss)]
         let phase_diff = if use_long_lag {
-            acc_l_im.atan2(acc_l_re) / self.long_lag as f64
+            let r = if self.ellipse_correction && self.ellipse_primed && coherence > 0.9 {
+                self.ellipse_factor()
+            } else {
+                1.0
+            };
+            // Near playing speed the band-passed carrier is the one
+            // to read: what sits beside the carrier line pulls the
+            // unfiltered sum off it (see [`CARRIER_BP_Q`]).
+            let (l_re, l_im) = if carrier_band {
+                (band_lag_re, band_lag_im)
+            } else {
+                (acc_l_re, acc_l_im)
+            };
+            l_im.atan2(r * l_re) / self.long_lag as f64
         } else {
             phase_lag1
         };
@@ -704,6 +853,18 @@ impl Decoder {
         // want for relative position.
         self.position_secs += rate * block_secs_real;
 
+        if near_playing_speed && coherence > 0.9 {
+            let follow = 1.0 - (-block_secs_real / CARRIER_BP_FOLLOW_SECS).exp();
+            self.carrier_bp_rate += follow * (rate_wide.abs() - self.carrier_bp_rate);
+            self.carrier_bp_rate = self
+                .carrier_bp_rate
+                .clamp(CARRIER_BAND_MIN_RATE, LONG_LAG_MAX_RATE);
+            let center = nominal * self.carrier_bp_rate;
+            for section in self.carrier_bp.iter_mut().flatten() {
+                section.retune_band_pass(center, CARRIER_BP_Q, f64::from(self.sample_rate));
+            }
+        }
+
         DecodeOutput {
             rate,
             position_secs: self.position_secs,
@@ -745,15 +906,15 @@ impl Decoder {
             let er = (sq_re_acc - sq_im_acc) / mag_acc;
             let ec = 2.0 * cross_acc / mag_acc;
             if self.ellipse_primed {
-                // The residual ellipse is steady at a given pitch, so a
-                // fairly fast pole is safe (and downstream rate
-                // smoothing soaks up any per-block noise). Fast enough
-                // that it converges to the new pitch's ellipse within
-                // a fraction of a second — otherwise a reading taken
-                // soon after a pitch move retains the *previous*
-                // pitch's azimuth (opposite sign), skewing the extremes
-                // asymmetrically.
-                const ELLIPSE_ALPHA: f64 = 0.15;
+                // ~70 ms at 64-frame blocks. Fast enough to reach a new
+                // pitch's ellipse within a fraction of a second —
+                // otherwise a reading taken soon after a pitch move
+                // keeps the *previous* pitch's azimuth (opposite sign)
+                // and skews the extremes. Not faster: the estimate now
+                // corrects the steady long-lag rate too, where its
+                // block-to-block noise would land in the reading (0.15
+                // measured a little worse on four real captures).
+                const ELLIPSE_ALPHA: f64 = 0.02;
                 self.ellipse_er += ELLIPSE_ALPHA * (er - self.ellipse_er);
                 self.ellipse_ec += ELLIPSE_ALPHA * (ec - self.ellipse_ec);
             } else {
@@ -929,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_imbalance_biases_rate_low_and_whitening_removes_it() {
+    fn channel_imbalance_biases_rate_and_whitening_removes_it() {
         let sr = 48_000.0_f32;
         let g = 1.26_f32; // ≈ 2 dB imbalance
         let mut gen = Generator::new(Format::SeratoCv02, sr);
@@ -938,18 +1099,24 @@ mod tests {
         imbalance_ch1(&mut buf, g);
 
         // Uncalibrated AND with the self-calibrating ellipse correction
-        // disabled: rate reads LOW by ≈ 2G/(G²+1) — the user's "−2.3 %"
-        // reproduced from a known imbalance. (With the correction on — the
-        // default — this same imbalance is now fixed automatically; see
+        // disabled, the long-lag angle θ = L·ω reads
+        // `atan2(R·sin θ, cos θ)` with `R = 2G/(G²+1)`. (With the
+        // correction on — the default — this same imbalance is fixed
+        // automatically; see
         // `ellipse_correction_fixes_gain_imbalance_without_calibration`.)
         let mut dec = Decoder::new(Format::SeratoCv02, sr);
         dec.set_ellipse_correction(false);
         let raw = dec.process(&buf);
-        let predicted = 2.0 * f64::from(g) / (f64::from(g) * f64::from(g) + 1.0);
-        assert!(predicted < 0.99, "sanity: predicted bias {predicted}");
+        let r = 2.0 * f64::from(g) / (f64::from(g) * f64::from(g) + 1.0);
+        let theta = 16.0 * std::f64::consts::TAU * 1000.0 / 48_000.0;
+        let predicted = (r * theta.sin()).atan2(theta.cos()) / theta;
         assert!(
-            (raw.rate - predicted).abs() < 0.01,
-            "raw rate {} should match 2G/(G²+1) = {predicted}",
+            (predicted - 1.0).abs() > 0.004,
+            "sanity: predicted bias {predicted}"
+        );
+        assert!(
+            (raw.rate - predicted).abs() < 0.002,
+            "raw rate {} should match the ellipse law, {predicted}",
             raw.rate
         );
 
@@ -989,6 +1156,119 @@ mod tests {
         );
     }
 
+    /// Mean decoded rate over one second of 64-frame blocks, after a
+    /// short warm-up — the engine's own block size.
+    fn mean_rate_on_ellipse(format: Format, rate: f64, g: f32) -> f64 {
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(format, sr);
+        let mut buf = vec![0.0f32; 60_000 * 2];
+        gen.render(&mut buf, rate, 0.5);
+        imbalance_ch1(&mut buf, g);
+        let mut dec = Decoder::new(format, sr);
+        let rates: Vec<f64> = buf.chunks_exact(128).map(|c| dec.process(c).rate).collect();
+        let settled = &rates[rates.len() - 750..];
+        settled.iter().sum::<f64>() / 750.0
+    }
+
+    #[test]
+    fn a_slightly_oval_carrier_reads_true_across_the_pitch_range() {
+        // Daniel's rig, 2026-11-21: Serato vinyl read up to 0.15 % off
+        // toward ±8 %, by a different amount on each deck. A cartridge
+        // that is a little out of round (roundness ≈ 0.995 here) took
+        // the long-lag path, which had no ellipse correction.
+        for format in [Format::SeratoCv02, Format::TraktorMk1] {
+            for rate in [0.92, 0.96, 1.0, 1.04, 1.08] {
+                let got = mean_rate_on_ellipse(format, rate, 1.105);
+                assert!(
+                    (got / rate - 1.0).abs() < 2e-4,
+                    "{format:?} at {rate}: read {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn content_beside_the_carrier_does_not_pull_the_reading() {
+        // Daniel's Traktor vinyl, 2026-11-21: a round carrier, 1 % of
+        // the power in data sidebands below it and 0.4 % at the second
+        // harmonic. The long-lag sum weighed all of it and read 0.1 %
+        // low at every pitch.
+        for rate in [0.92, 1.0, 1.08] {
+            let sr = 48_000.0_f64;
+            let w = std::f64::consts::TAU * 2000.0 * rate / sr;
+            let mut dec = Decoder::new(Format::TraktorMk1, 48_000.0);
+            let (mut sum, mut n) = (0.0, 0.0);
+            for block in 0..1500_u32 {
+                let mut buf = [0.0_f32; 128];
+                for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+                    let t = f64::from(block * 64 + i as u32);
+                    let (mut re, mut im) = ((w * t).cos(), (w * t).sin());
+                    for (ratio, amp) in [(0.55, 0.06), (0.7, 0.06), (0.85, 0.06), (2.0, 0.065)] {
+                        re += amp * (ratio * w * t).cos();
+                        im += amp * (ratio * w * t).sin();
+                    }
+                    frame[0] = (0.3 * im) as f32;
+                    frame[1] = (0.3 * re) as f32;
+                }
+                let out = dec.process(&buf);
+                if block >= 750 {
+                    sum += out.rate;
+                    n += 1.0;
+                }
+            }
+            let err = (sum / n / rate - 1.0) * 100.0;
+            assert!(err.abs() < 0.02, "rate {rate}: {err:+.3} % off");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn a_shaken_stylus_does_not_pull_the_reading_at_pitch() {
+        // Bass from the sound system frequency-modulates the carrier:
+        // even sidebands 100 Hz either side. A band-pass left on the
+        // nominal carrier weighs them unevenly once the platter is
+        // pitched, and reads 0.3 % low here.
+        let rate = 1.066_f64;
+        let w = std::f64::consts::TAU * 1000.0 * rate / 48_000.0;
+        let wm = std::f64::consts::TAU * 100.0 / 48_000.0;
+        let mut dec = Decoder::new(Format::SeratoCv02, 48_000.0);
+        let (mut sum, mut n) = (0.0, 0.0);
+        for block in 0..3000_u32 {
+            let mut buf = [0.0_f32; 128];
+            for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+                let t = f64::from(block * 64 + i as u32);
+                let phase = w * t + 0.5 * (wm * t).sin();
+                frame[0] = (0.3 * phase.sin()) as f32;
+                frame[1] = (0.3 * phase.cos()) as f32;
+            }
+            let out = dec.process(&buf);
+            if block >= 1500 {
+                sum += out.rate;
+                n += 1.0;
+            }
+        }
+        let err = (sum / n / rate - 1.0) * 100.0;
+        assert!(err.abs() < 0.08, "{err:+.3} % off");
+    }
+
+    #[test]
+    fn the_reading_does_not_jump_where_roundness_crosses_a_threshold() {
+        // Same day, Traktor vinyl: at some pitches the residual ellipse
+        // sat on the 0.99 roundness gate, the decoder flapped between
+        // its two estimators, and they disagreed by over 1 %. Either
+        // side of that old gate must now read the same.
+        for format in [Format::SeratoCv02, Format::TraktorMk1] {
+            let rounder = mean_rate_on_ellipse(format, 1.05, 1.14);
+            let ovaler = mean_rate_on_ellipse(format, 1.05, 1.16);
+            assert!(
+                (rounder - ovaler).abs() < 2e-4,
+                "{format:?}: {rounder} against {ovaler}"
+            );
+            assert!((rounder / 1.05 - 1.0).abs() < 2e-4, "{format:?}: {rounder}");
+        }
+    }
+
     #[test]
     fn whitening_is_noop_on_a_balanced_signal() {
         // A clean (already circular) signal should calibrate to ≈ identity.
@@ -1006,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn frequency_dependent_azimuth_causes_quadratic_pitch_droop() {
+    fn frequency_dependent_azimuth_causes_a_pitch_dependent_error() {
         // Reproduces the field bug: a calibrated deck reads ~0% at
         // nominal but droops at the pitch extremes (observed +8%→+5%,
         // −8%→−12%). Cause: the cartridge's inter-channel quadrature
@@ -1037,24 +1317,20 @@ mod tests {
             let out = dec.process(&buf);
             let measured_pitch = (out.rate - 1.0) * 100.0;
             // Coherence stays ~1.0 (the metric is blind to azimuth at a
-            // 1 kHz carrier) while the rate droops — exactly the field
-            // signature. At ±8% the measured pitch is pulled toward zero
-            // by ~3%, asymmetrically (more on the slow side), matching
-            // the reported +8%→+5% / −8%→−12%.
+            // 1 kHz carrier) while the rate reads off, by an amount
+            // that grows with the pitch — the field signature.
             assert!(
                 out.confidence > 0.99,
                 "coherence stays high: {}",
                 out.confidence
             );
-            if p > 0.0 {
+            let error = (measured_pitch - p * 100.0).abs();
+            if p == 0.0 {
+                assert!(error < 0.05, "no azimuth, no error: {measured_pitch:.2}");
+            } else {
                 assert!(
-                    measured_pitch < p * 100.0 - 2.0,
-                    "expected droop at +pitch, got {measured_pitch:.2}"
-                );
-            } else if p < 0.0 {
-                assert!(
-                    measured_pitch < p * 100.0 - 2.0,
-                    "expected larger droop at -pitch, got {measured_pitch:.2}"
+                    error > 0.3,
+                    "expected a pitch error at {p}, got {measured_pitch:.2}"
                 );
             }
         }

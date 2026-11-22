@@ -430,7 +430,7 @@ struct OnboardingSheet: View {
                 OnboardingSwitchLine(position: "INT", detail: "The track plays on its own clock — also how you save a set when a needle fails.")
                 OnboardingSwitchLine(position: "THRU", detail: "A real record on the platter plays straight through.")
             }
-            para("Calibrate once per needle and control record: ↻ next to the switch, with the needle down and the record playing.")
+            para("Calibrate once per needle and control record: CALIBRATE in the deck's SIGNAL panel, with the needle down and the record playing.")
             Link(destination: Self.manualURL) {
                 Label("Your first set, in the manual", systemImage: "book")
             }

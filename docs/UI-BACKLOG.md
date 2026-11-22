@@ -369,8 +369,8 @@ halves; they are pinned now: `int_back_to_tc_keeps_the_playhead_where_int_has_it
 drift, no heal; it reads −1.9 s of drift if the `DeckSetControlMode`
 re-anchor is taken out) and `a_needle_calibrates_while_int_plays_on`.
 Gap (2) below was wrong: the command path re-anchors the monitor
-(`lib.rs`, `DeckSetControlMode`). The app half: ↻ Recalibrate is on INT
-as well as TC (`SourceControlView.offersRecalibrate`), and while INT plays
+(`lib.rs`, `DeckSetControlMode`). The app half: calibrating works on INT
+as well as TC (the signal drawer's CALIBRATE, since 2026-11-21), and while INT plays
 over a timecode input the TC segment carries a lamp — amber while the
 needle is measured, green once the record is calibrated and locked
 (`TimecodeReadiness`, `SourceControlReadinessTests`). The lamp sits in the

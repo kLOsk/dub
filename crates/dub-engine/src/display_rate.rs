@@ -92,23 +92,34 @@ const ADAPT_GUARD: f64 = 0.0075;
 const MED_WIN: usize = 9;
 
 /// Innovation below this is presence noise; above it, *sustained*, is
-/// a real fader move. ~0.1 % ≈ 0.17 BPM at 175 — moves smaller than
+/// a real fader move. 0.1 % ≈ 0.17 BPM at 175 — moves smaller than
 /// that ease in on the steady pole (jitter immunity wins, per the
 /// operator: "smoothen this much harder").
-const MOVE_NOISE_BAND: f64 = 0.002;
+///
+/// Was 0.2 % while the decoder's own reading wandered by that much. With
+/// the decoder reading true (2026-11-21) a 0.1–0.35 % nudge was the
+/// slow case: half shown 0.9 s after the platter, on four captures of
+/// Daniel's rig. Halving the band, halving [`MOVE_CONFIRM_SECS`] and
+/// slowing [`TAU_STEADY`] to pay for it brought that to 0.45 s, and the
+/// time to within 0.05 % from 1.05 s to 0.2 s, for the same flicker on
+/// a still fader (0.1-digit flips per minute: pitch 9.7 → 10.3, BPM at
+/// 174 24 → 25). Tighter (0.05 %) doubles the flicker.
+const MOVE_NOISE_BAND: f64 = 0.001;
 
 /// Sign-consistent out-of-band time required to confirm a real move.
 /// Spikes last a few quanta and alternate; a hand on the fader
 /// sustains.
-const MOVE_CONFIRM_SECS: f64 = 0.6;
+const MOVE_CONFIRM_SECS: f64 = 0.3;
 
 /// Pole while steady — slow, per the operator's spec: "when the
 /// pitch fader is steady it can be very slow to move". Was 3.0 when
 /// this pole carried the anti-jitter load alone; with the wobble
 /// canceller + median in front, 1.5 keeps the readout calm while a
 /// beatmatch dial-in (sub-noise-band by definition) lands in ~3 s
-/// instead of ~8 s ("slow to update", on-rig).
-const TAU_STEADY: f64 = 1.5;
+/// instead of ~8 s ("slow to update", on-rig). 2.0 since the noise
+/// band was halved: less now has to ease in on this pole, so it can be
+/// calmer (see [`MOVE_NOISE_BAND`]).
+const TAU_STEADY: f64 = 2.0;
 
 /// Pole once a move is confirmed — "fast and snappy".
 const TAU_FAST: f64 = 0.08;
@@ -858,15 +869,23 @@ mod tests {
 
         let rb = ringbuf::HeapRb::<f32>::new(spec.sample_rate as usize * 2);
         let (mut tx, rx) = rb.split();
+        // `DUB_CAPTURE_FORMAT=mk1` replays a Traktor pressing.
+        let format = std::env::var("DUB_CAPTURE_FORMAT")
+            .ok()
+            .and_then(|name| dub_timecode::Format::from_cli_arg(&name))
+            .unwrap_or(dub_timecode::Format::SeratoCv02);
         let cfg = crate::timecode::TimecodeInputConfig {
             input_sample_rate: sr,
+            format,
             ..crate::timecode::TimecodeInputConfig::default()
         };
         let mut input = crate::timecode::TimecodeInput::new(rx, cfg);
         let mut display = DisplayRateFilter::new();
 
         let dtq = f64::from(QUANTUM as u32) / f64::from(sr);
-        let mut csv = String::from("t,conf,amp,rate,lock,displayed_pitch\n");
+        // `display_in` and `pos` are what the display filter was fed,
+        // so the filter alone can be re-run offline on a capture.
+        let mut csv = String::from("t,conf,amp,rate,lock,displayed_pitch,display_in,pos\n");
         let mut displayed = f64::NAN;
         let mut calibration_started = false;
         let mut t = 0.0f64;
@@ -897,13 +916,15 @@ mod tests {
             }
             let _ = writeln!(
                 csv,
-                "{:.4},{:.3},{:.4},{:+.5},{},{:+.4}",
+                "{:.4},{:.3},{:.4},{:+.5},{},{:+.4},{:.7},{:.6}",
                 t,
                 out.confidence,
                 out.amplitude,
                 out.rate,
                 lock,
-                (displayed - 1.0) * 100.0
+                (displayed - 1.0) * 100.0,
+                input.last_display_rate(),
+                out.position_secs
             );
             t += dtq;
         }

@@ -209,6 +209,9 @@ pub struct AnalysisJob {
     file_path: PathBuf,
     /// The octave the tempo is read in: the genre's, or the DJ's range.
     octave: dub_bpm::TempoOctave,
+    /// The DJ asked for this pass by name ([`Library::reanalyze_prepare`]),
+    /// so its grid takes the active slot from an imported one.
+    claims_grid: bool,
 }
 
 /// Chromaprint computed during the lock-free phase, pending
@@ -267,13 +270,53 @@ pub struct AnalysisComputed {
 /// Decodes the job's file from disk, then delegates the DSP passes
 /// to [`analyze_compute_with_track`].
 pub fn analyze_compute(job: &AnalysisJob) -> Result<AnalysisComputed> {
+    analyze_compute_with_track(job, &analyze_decode(job)?)
+}
+
+/// Decode the job's file, for a caller that wants the audio for more
+/// than [`analyze_compute_with_track`] — following the band over the
+/// grid the pass leaves active, which needs the same samples.
+pub fn analyze_decode(job: &AnalysisJob) -> Result<dub_io::Track> {
+    dub_io::Track::load_from_path(&job.file_path).map_err(|e| LibraryError::DecodeFailed {
+        track_id: job.track_id.clone(),
+        path: job.file_path.clone(),
+        reason: format!("{e}"),
+    })
+}
+
+/// A loudness measurement owed to a track that was analysed before
+/// analysis measured loudness: what [`Library::loudness_prepare`] hands
+/// to [`measure_loudness`], which needs no database.
+pub struct LoudnessJob {
+    track_id: String,
+    fingerprint_id: i64,
+    file_path: PathBuf,
+}
+
+/// What [`measure_loudness`] found, for [`Library::loudness_commit`].
+pub struct MeasuredLoudness {
+    lufs_i: Option<f64>,
+    sample_peak_dbfs: f64,
+}
+
+/// Decode the job's file and measure its loudness, and nothing else.
+/// Lock-free, like [`analyze_compute`].
+pub fn measure_loudness(job: &LoudnessJob) -> Result<MeasuredLoudness> {
     let track =
         dub_io::Track::load_from_path(&job.file_path).map_err(|e| LibraryError::DecodeFailed {
             track_id: job.track_id.clone(),
             path: job.file_path.clone(),
             reason: format!("{e}"),
         })?;
-    analyze_compute_with_track(job, &track)
+    let loudness = dub_dsp::measure_integrated_loudness(
+        track.samples(),
+        track.sample_rate(),
+        u16::from(track.channels()),
+    );
+    Ok(MeasuredLoudness {
+        lufs_i: loudness.lufs_i,
+        sample_peak_dbfs: loudness.sample_peak_dbfs,
+    })
 }
 
 /// The compute stage of [`analyze_compute`], run over a track the
@@ -482,7 +525,29 @@ impl Library {
             existing_fingerprint_id,
             file_path,
             octave,
+            claims_grid: false,
         })
+    }
+
+    /// [`Self::analyze_prepare`] for a pass the DJ asked for — Re-analyze
+    /// or Reset grid — whose grid then becomes the active one even where
+    /// an imported grid holds the slot. Unlocking a track and re-analysing
+    /// it is asking for Dub's reading; leaving Traktor's grid in place
+    /// made the command do nothing the DJ could see (*My Boo*,
+    /// 2026-11-22: 130.09 kept over a measured 130.07, 49 ms of slide by
+    /// the end). A locked track keeps its grid as before.
+    pub fn reanalyze_prepare(&self, track_id: &str) -> Result<AnalysisJob> {
+        let mut job = self.analyze_prepare(track_id)?;
+        job.claims_grid = true;
+        Ok(job)
+    }
+
+    /// [`Self::analyze_track`] for a pass the DJ asked for; see
+    /// [`Self::reanalyze_prepare`].
+    pub fn reanalyze_track(&self, track_id: &str) -> Result<AnalysisOutcome> {
+        let job = self.reanalyze_prepare(track_id)?;
+        let computed = analyze_compute(&job)?;
+        self.analyze_commit(&job, computed)
     }
 
     /// Write phase of [`Self::analyze_track`]: persist everything
@@ -565,6 +630,16 @@ impl Library {
             );
         }
         if let Some(grid) = computed.grid {
+            let claims = job.claims_grid && !self.is_grid_locked(track_id)?;
+            if claims {
+                self.connection()
+                    .execute(
+                        "UPDATE track_beatgrids SET is_active = 0 \
+                         WHERE track_id = ?1 AND source != 'auto'",
+                        params![track_id],
+                    )
+                    .map_err(|e| LibraryError::sqlite("reanalyze_claim_grid", e))?;
+            }
             let other_grid_active = self.has_non_auto_active_grid(track_id)?;
             let grid_auto_is_active = !other_grid_active;
             self.upsert_auto_beatgrid(
@@ -772,6 +847,43 @@ impl Library {
             })
             .map_err(|e| LibraryError::sqlite("is_track_analyzed", e))?;
         Ok(analyzed.is_some())
+    }
+
+    /// The DJ's word on whether `track_id`'s grid follows its band:
+    /// `Some(true)` follow it, `Some(false)` keep the even grid, `None`
+    /// (also for an unknown track) leave it to the tracker's own test.
+    ///
+    /// That test was fitted on about a hundred tracks and is unsure on
+    /// some; when it guesses wrong the DJ had no way to say so for the
+    /// one track (Daniel, 2026-11-22).
+    pub fn grid_follow(&self, track_id: &str) -> Result<Option<bool>> {
+        let word: Option<Option<i64>> = self
+            .connection()
+            .query_row(
+                "SELECT grid_follow FROM tracks WHERE id = ?1",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("grid_follow", e))?;
+        Ok(word.flatten().map(|w| w != 0))
+    }
+
+    /// Record the DJ's word; see [`Self::grid_follow`]. A locked grid
+    /// plays as saved, so it is refused there like any other grid edit.
+    pub fn set_grid_follow(&self, track_id: &str, follow: Option<bool>) -> Result<()> {
+        if self.is_grid_locked(track_id)? {
+            return Err(LibraryError::GridLocked {
+                track_id: track_id.to_string(),
+            });
+        }
+        self.connection()
+            .execute(
+                "UPDATE tracks SET grid_follow = ?2 WHERE id = ?1",
+                params![track_id, follow.map(i64::from)],
+            )
+            .map_err(|e| LibraryError::sqlite("set_grid_follow", e))?;
+        Ok(())
     }
 
     /// The track's musical key as the browser shows it: the notation
@@ -1089,7 +1201,11 @@ impl Library {
     /// active slot only when it outranks every currently-active row from
     /// another source (`SourcePrefs::grid_rank`); when it claims the slot,
     /// the other active row is demoted first (the one-active-per-track index
-    /// forbids two). A non-finite / non-positive grid is skipped (graceful —
+    /// forbids two). A grid that arrives unchanged and was not the active
+    /// one stays that way: the DJ re-analysed over it
+    /// ([`Self::reanalyze_prepare`]), and the next launch's import brings
+    /// nothing new to undo that with. Re-gridded in its app, it claims
+    /// again. A non-finite / non-positive grid is skipped (graceful —
     /// a corrupt source row never aborts an import).
     pub fn upsert_imported_beatgrid(
         &self,
@@ -1123,8 +1239,30 @@ impl Library {
             }
             v
         };
-        let claim_active =
-            active_others.iter().all(|s| prefs.grid_rank(s) < rank) && rank.is_some();
+        let passed_over = !active_others.is_empty()
+            && conn
+                .query_row(
+                    "SELECT anchor_secs, bpm, bar_phase FROM track_beatgrids \
+                     WHERE track_id = ?1 AND source = ?2 AND is_active = 0",
+                    params![track_id, source],
+                    |r| {
+                        Ok((
+                            r.get::<_, f64>(0)?,
+                            r.get::<_, f64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| LibraryError::sqlite("upsert_imported_beatgrid_before", e))?
+                .is_some_and(|(a, b, phase)| {
+                    (a - anchor_secs).abs() < 1e-9
+                        && (b - bpm).abs() < 1e-9
+                        && phase == i64::from(bar_phase)
+                });
+        let claim_active = !passed_over
+            && active_others.iter().all(|s| prefs.grid_rank(s) < rank)
+            && rank.is_some();
         if claim_active {
             conn.execute(
                 "UPDATE track_beatgrids SET is_active = 0 \
@@ -1394,8 +1532,9 @@ impl Library {
     /// loudness columns into that upsert's `SET` list would null them
     /// out on every such edit. This method touches only the three
     /// loudness columns, leaving the grid/key/waveform state intact,
-    /// and is called from exactly one place — [`Self::analyze_track`],
-    /// once per analysis pass.
+    /// and is called once per analysis pass, and by
+    /// [`Self::loudness_commit`] for a track analysed before there was
+    /// a loudness to store.
     ///
     /// `lufs_i = None` (silence / too-short input) is recorded with
     /// `has_lufs = 0` so the load path falls back to unity gain. The
@@ -1421,6 +1560,53 @@ impl Library {
             )
             .map_err(|e| LibraryError::sqlite("stamp_loudness", e))?;
         Ok(())
+    }
+
+    /// The measurement an analysed track is still owed, or `None` when
+    /// it is owed none.
+    ///
+    /// Analysis runs once per track, and before 2026-06-10 it measured
+    /// no loudness: such a track counts as analysed, is never analysed
+    /// again, and played at unity gain on every load (31 in Daniel's
+    /// library, 2026-11-22). Re-analysing is no cure — it replaces a
+    /// set-the-1 grid and a lock refuses it — so the loudness is
+    /// measured by itself, lock or no lock, touching nothing else.
+    ///
+    /// Owed means analysed with neither a loudness nor a peak stored. A
+    /// pass that measured and found silence stored its peak
+    /// ([`Self::stamp_loudness`]), so it is not asked again.
+    pub fn loudness_prepare(&self, track_id: &str) -> Result<Option<LoudnessJob>> {
+        let owed: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT ac.fingerprint_id FROM tracks t \
+                 JOIN analysis_cache ac ON ac.fingerprint_id = t.fingerprint_id \
+                 WHERE t.id = ?1 AND ac.analyzed_at IS NOT NULL \
+                   AND COALESCE(ac.has_lufs, 0) = 0 AND ac.true_peak_dbtp IS NULL",
+                params![track_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LibraryError::sqlite("loudness_prepare", e))?;
+        let Some(fingerprint_id) = owed else {
+            return Ok(None);
+        };
+        let (_, file_path) = self.track_analysis_keys(track_id)?;
+        Ok(Some(LoudnessJob {
+            track_id: track_id.to_string(),
+            fingerprint_id,
+            file_path,
+        }))
+    }
+
+    /// Store what [`measure_loudness`] found for `job`. The gain it
+    /// gives applies from the track's next load, as after any analysis.
+    pub fn loudness_commit(&self, job: &LoudnessJob, measured: &MeasuredLoudness) -> Result<()> {
+        self.stamp_loudness(
+            job.fingerprint_id,
+            measured.lufs_i,
+            measured.sample_peak_dbfs,
+        )
     }
 
     /// Linear deck gain that normalizes `track_id` toward the default
@@ -1944,6 +2130,83 @@ mod tests {
             "normalized peak {peak_after_db} dBFS must respect the {} dBFS ceiling",
             dub_dsp::CEILING_DBFS
         );
+    }
+
+    /// Daniel's library, 2026-11-22: 31 tracks analysed in May, before
+    /// analysis measured loudness, 14 of them with a grid he set the 1
+    /// on and 5 locked. Unity gain on every load, for good.
+    #[test]
+    fn a_track_analysed_before_loudness_existed_gets_it_and_keeps_its_grid() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, fp_id, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        assert!(
+            lib.loudness_prepare(&track_id).unwrap().is_none(),
+            "a track with its loudness is owed nothing"
+        );
+
+        // As the May passes left it, with a locked set-the-1 grid.
+        lib.connection()
+            .execute(
+                "UPDATE analysis_cache SET lufs_i = NULL, true_peak_dbtp = NULL, has_lufs = 0 \
+                 WHERE fingerprint_id = ?1",
+                params![fp_id],
+            )
+            .unwrap();
+        lib.upsert_user_tap_beatgrid(&track_id, 0.123, 120.5, 1)
+            .unwrap();
+        lib.set_grid_locked(&track_id, true).unwrap();
+        assert!(lib.track_normalization_gain(&track_id).unwrap().is_none());
+
+        let job = lib
+            .loudness_prepare(&track_id)
+            .unwrap()
+            .expect("the loudness is owed");
+        let measured = measure_loudness(&job).unwrap();
+        lib.loudness_commit(&job, &measured).unwrap();
+
+        assert!(lib.track_normalization_gain(&track_id).unwrap().is_some());
+        assert!(lib.loudness_prepare(&track_id).unwrap().is_none());
+        let grid = lib.active_beatgrid_for_track(&track_id).unwrap().unwrap();
+        assert_eq!(grid.source, "user_tap");
+        assert!((grid.bpm - 120.5).abs() < 1e-9);
+        assert!(lib.is_grid_locked(&track_id).unwrap());
+    }
+
+    #[test]
+    fn a_silent_track_is_measured_once() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, fp_id, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.analyze_track(&track_id).unwrap();
+        lib.connection()
+            .execute(
+                "UPDATE analysis_cache SET lufs_i = NULL, true_peak_dbtp = NULL, has_lufs = 0 \
+                 WHERE fingerprint_id = ?1",
+                params![fp_id],
+            )
+            .unwrap();
+        let job = lib.loudness_prepare(&track_id).unwrap().unwrap();
+        // The measurement of a file with nothing in it.
+        let silence = MeasuredLoudness {
+            lufs_i: None,
+            sample_peak_dbfs: -120.0,
+        };
+        lib.loudness_commit(&job, &silence).unwrap();
+        assert!(lib.track_normalization_gain(&track_id).unwrap().is_none());
+        assert!(
+            lib.loudness_prepare(&track_id).unwrap().is_none(),
+            "a silent track would be decoded again on every load"
+        );
+    }
+
+    #[test]
+    fn a_track_never_analysed_is_owed_no_loudness_of_its_own() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        assert!(lib.loudness_prepare(&track_id).unwrap().is_none());
     }
 
     #[test]
@@ -2723,6 +2986,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tap_active, 0, "stale user_tap row must be demoted");
+    }
+
+    /// *My Boo*, 2026-11-22: Traktor's grid at 130.09 slid 49 ms over
+    /// the track; Daniel unlocked it and re-analysed, Dub measured
+    /// 130.07 and kept showing 130.09.
+    #[test]
+    fn a_reanalysis_the_dj_asked_for_replaces_an_imported_grid() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.upsert_imported_beatgrid_locked(&track_id, "traktor", 0.17, 120.3, true)
+            .unwrap();
+        assert!(lib.is_grid_locked(&track_id).unwrap());
+
+        // The pass a deck load runs leaves the imported grid alone.
+        lib.set_grid_locked(&track_id, false).unwrap();
+        let lazy = lib.analyze_track(&track_id).unwrap();
+        assert!(!lazy.grid_auto_is_active);
+        assert_eq!(active_grid_source(&lib, &track_id), "traktor");
+
+        let asked = lib.reanalyze_track(&track_id).unwrap();
+        assert!(asked.grid_auto_is_active);
+        assert_eq!(active_grid_source(&lib, &track_id), "auto");
+
+        // The next launch imports the same Traktor grid again.
+        lib.upsert_imported_beatgrid_locked(&track_id, "traktor", 0.17, 120.3, true)
+            .unwrap();
+        assert_eq!(active_grid_source(&lib, &track_id), "auto");
+        assert!(!lib.is_grid_locked(&track_id).unwrap());
+
+        // Locked, it is Dub's grid that is locked, and it stays.
+        lib.set_grid_locked(&track_id, true).unwrap();
+        assert!(lib.lock_refuses_analysis(&track_id).unwrap());
+        assert_eq!(active_grid_source(&lib, &track_id), "auto");
+
+        // Re-gridded in Traktor, the new grid is news and takes over.
+        lib.set_grid_locked(&track_id, false).unwrap();
+        lib.upsert_imported_beatgrid_locked(&track_id, "traktor", 0.17, 120.0, true)
+            .unwrap();
+        assert_eq!(active_grid_source(&lib, &track_id), "traktor");
+    }
+
+    #[test]
+    fn a_reanalysis_leaves_a_locked_imported_grid_alone() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        lib.upsert_imported_beatgrid_locked(&track_id, "traktor", 0.17, 120.3, true)
+            .unwrap();
+        let outcome = lib.reanalyze_track(&track_id).unwrap();
+        assert!(!outcome.grid_auto_is_active);
+        assert_eq!(active_grid_source(&lib, &track_id), "traktor");
+    }
+
+    #[test]
+    fn the_djs_word_on_following_is_kept_and_a_lock_refuses_it() {
+        let lib = Library::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (track_id, _, _) = seed_track_with_file(&lib, &tmp, 120.0, 8.0);
+        assert_eq!(lib.grid_follow(&track_id).unwrap(), None);
+        lib.set_grid_follow(&track_id, Some(true)).unwrap();
+        assert_eq!(lib.grid_follow(&track_id).unwrap(), Some(true));
+        lib.set_grid_follow(&track_id, Some(false)).unwrap();
+        assert_eq!(lib.grid_follow(&track_id).unwrap(), Some(false));
+        lib.set_grid_locked(&track_id, true).unwrap();
+        assert!(lib.set_grid_follow(&track_id, None).is_err());
+        assert_eq!(lib.grid_follow(&track_id).unwrap(), Some(false));
+        assert_eq!(lib.grid_follow("no-such-track").unwrap(), None);
+    }
+
+    fn active_grid_source(lib: &Library, track_id: &str) -> String {
+        lib.active_beatgrid_for_track(track_id)
+            .unwrap()
+            .expect("an active grid")
+            .source
     }
 
     /// PRD-BEATS C2 (round 4) — `bar_phase` is a first-class

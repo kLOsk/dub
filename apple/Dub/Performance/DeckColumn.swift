@@ -163,6 +163,9 @@ struct DeckColumnHeader: Equatable {
     /// The grid follows the band (`DeckHeaderState.followingGrid`): the
     /// BPM, its label and its padlock wear `DubColor.gridMoving`.
     var gridMoves: Bool = false
+    /// `DeckHeaderState.gridFollowWord` / `.followChoiceOffered`.
+    var gridFollowWord: Bool? = nil
+    var followChoiceOffered: Bool = false
     /// "↝ usually: <track>" — the track most often mixed into from this
     /// one, `nil` with none or with the hint off in Preferences.
     var historyHint: String?
@@ -195,6 +198,8 @@ struct DeckColumnHeader: Equatable {
         thruTempo = state.thruTempo
         gridLocked = state.gridLocked
         gridMoves = state.followingGrid
+        gridFollowWord = state.gridFollowWord
+        followChoiceOffered = state.followChoiceOffered
         historyHint = showsHistoryHint ? state.historyHint : nil
         bpmLabel = state.bpmLabel
         sourceControl = state.sourceControl
@@ -239,6 +244,7 @@ struct DeckColumnCallbacks {
     var onHalveBpm: () -> Void = {}
     var onResetBpm: () -> Void = {}
     var onToggleGridLocked: () -> Void = {}
+    var onSetGridFollow: (Bool?) -> Void = { _ in }
     /// A click on "↝ usually:" — show that track in the library, so
     /// Space loads it.
     var onHistoryHint: () -> Void = {}
@@ -256,7 +262,6 @@ struct DeckColumnCallbacks {
     var onSetTimecode: () -> Void = {}
     var onSetThru: () -> Void = {}
     var onSetFx: () -> Void = {}
-    var onRecalibrate: () -> Void = {}
     /// M14 key lock on / off. `nil` hides the button — Prep has no
     /// platter to hold a pitch against.
     var onToggleKeyLock: (() -> Void)? = nil
@@ -622,8 +627,7 @@ struct DeckColumn<Overview: View>: View {
             onTimecode: callbacks.onSetTimecode,
             onThru: callbacks.onSetThru,
             showFx: state.fxAvailable,
-            onFx: callbacks.onSetFx,
-            onRecalibrate: callbacks.onRecalibrate)
+            onFx: callbacks.onSetFx)
     }
 
     /// The artist shares a row with the readouts; the title has the next
@@ -780,7 +784,8 @@ struct DeckColumn<Overview: View>: View {
                     onDouble: callbacks.onDoubleBpm,
                     onHalve: callbacks.onHalveBpm,
                     onReset: callbacks.onResetBpm,
-                    onToggleLock: callbacks.onToggleGridLocked)
+                    onToggleLock: callbacks.onToggleGridLocked,
+                    onSetFollow: callbacks.onSetGridFollow)
                 : nil,
             tapSession: tapSession ?? TapSessionViewModel())
     }
@@ -1123,6 +1128,7 @@ struct DeckReadouts: View {
         var onHalve: () -> Void
         var onReset: () -> Void
         var onToggleLock: () -> Void
+        var onSetFollow: (Bool?) -> Void
     }
 
     struct Live {
@@ -1143,26 +1149,35 @@ struct DeckReadouts: View {
                 // A live record has no key and plays at the speed it is
                 // heard at: the tempo is the only number it has.
                 thruBpm(thru)
-            } else if let track {
-                trackBpm(track)
             } else {
-                trackBpmReadout
+                // Each switch sits against the number it holds, outside
+                // the BPM's tap pad: a press meant for STEADY must not
+                // set the 1.
+                HStack(alignment: .top, spacing: DubSpacing.xs) {
+                    if let track {
+                        trackBpm(track)
+                    } else {
+                        trackBpmReadout
+                    }
+                    steadyButton
+                }
             }
             if header.thruTempo == nil {
-                readout(
-                    "KEY", header.key,
-                    font: DubFont.numericInline, widest: "12B",
-                    tint: DubColor.camelotKey(header.key))
+                HStack(alignment: .top, spacing: DubSpacing.xs) {
+                    readout(
+                        "KEY", header.key,
+                        font: DubFont.numericInline, widest: "12B",
+                        tint: DubColor.camelotKey(header.key))
+                    keyLockButton
+                }
                 // Six places: the sign, three digits, the point and a tenth.
                 // A scratch drives the smoothed rate well past ±100 %, and
                 // the slot has to hold that too or the row jumps mid-cut.
                 readout(
-                    "PITCH", header.pitchTenths.map { String(format: "%+.1f", $0) },
+                    "PITCH", header.pitchTenths.map { PitchText.signed($0) },
                     font: DubFont.numericInline, widest: "-888.8",
-                    live: live.map { l in { l.pitch().map { String(format: "%+.1f", $0) } } },
+                    live: live.map { l in { l.pitch().map { PitchText.signed($0) } } },
                     size: DubFont.numericInlineSize)
-                keyLockButton
-                steadyButton
             }
         }
         .fixedSize()
@@ -1209,6 +1224,9 @@ struct DeckReadouts: View {
                     Divider()
                 }
                 Button(header.gridLocked ? "Unlock grid" : "Lock grid", action: t.onToggleLock)
+                if header.followChoiceOffered, !header.gridLocked {
+                    GridFollowMenu(word: header.gridFollowWord, onSet: t.onSetFollow)
+                }
             }
             .help(header.gridLocked
                   ? "Grid is locked. Right-click to unlock before tapping."
@@ -1254,48 +1272,24 @@ struct DeckReadouts: View {
         .mappable(.tapTempo(side))
     }
 
-    /// M14 key lock, at the end of the row the pitch it holds is on —
-    /// where Traktor puts it, next to the pitch fader.
+    /// M14 key lock: a note beside the key it holds — an icon, not the
+    /// labelled ON / OFF box it was, which took a readout's column for a
+    /// switch (Daniel, 2026-11-21). A note and not a padlock: the padlock
+    /// in this row is the locked grid's, on the BPM label.
     ///
     /// **Two states, not one.** The button lights from `keyLockOn` (the
-    /// DJ's switch, immediate on tap); the dot reports what the engine
-    /// is actually doing — dim while the platter sits at unity or a
-    /// loop has it bypassed, solid once the stretcher is holding a
+    /// DJ's switch, immediate on tap); how strongly reports what the
+    /// engine is actually doing — dim while the platter sits at unity or
+    /// a loop has it bypassed, full once the stretcher is holding a
     /// pitch. A single lit state would claim work that isn't happening
     /// at +0.0 %.
     @ViewBuilder
     private var keyLockButton: some View {
         if let toggle = onToggleKeyLock {
             let on = header.keyLockOn
-            // The control accent, not the deck's tint: a lit control
-            // means "on" on either deck (`DubColor.controlAccent`). In
-            // the deck's tint the right deck's LOCK lit teal beside
-            // amber controls (Daniel, 2026-11-19).
-            let tint = DubColor.controlAccent
-            VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
-                Text("LOCK")
-                    .font(DubFont.micro)
-                    .tracking(DubFont.capsTracking)
-                    .foregroundStyle(DubColor.textTertiary)
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(on ? tint.opacity(header.keyLockState == 2 ? 1.0 : 0.35)
-                                 : DubColor.textPlaceholder)
-                        .frame(width: 5, height: 5)
-                    Text(on ? "ON" : "OFF")
-                        .font(DubFont.numericInline)
-                        .foregroundStyle(on ? tint : DubColor.textPlaceholder)
-                }
-                .padding(.horizontal, DubSpacing.sm)
-                .padding(.vertical, 3)
-                .background(on ? tint.opacity(0.16) : DubColor.surface2)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 3, style: .continuous)
-                        .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
-                .contentShape(Rectangle())
-                .onPressDown(perform: toggle)
-            }
+            iconSwitch(
+                "music.note", on: on, working: header.keyLockState == 2,
+                beside: DubFont.numericInline, action: toggle)
             .help(on
                   ? "Key lock on — the pitch holds while the platter moves the tempo"
                   : "Key lock off — pitch rides the platter, like a record")
@@ -1305,50 +1299,67 @@ struct DeckReadouts: View {
         }
     }
 
-    /// Steadying (Alpha), beside the key lock it is built on: hold a
-    /// record whose grid follows its band to the grid's tempo while a
-    /// second record is brought in, and let the band play as it played
+    /// Steadying (Alpha), a metronome beside the tempo it holds: keep a
+    /// record whose grid follows its band at one tempo while a second
+    /// record is brought in, and let the band play as it played
     /// otherwise. Only on such a record — one with an even grid has one
     /// tempo already, and a switch that does nothing is a switch too many.
+    /// The BPM label says the rest: `BPM · FOLLOW`, `BPM · STEADY`.
     ///
-    /// Lit from the DJ's switch; the dot is solid while the engine is
-    /// holding the tempo and dim while it is not for now (a scratch, a
-    /// stretch without beats), as LOCK's is.
+    /// Lit from the DJ's switch; full while the engine is holding the
+    /// tempo and dim while it is not for now (a scratch, a stretch
+    /// without beats), as the key lock's is.
     @ViewBuilder
     private var steadyButton: some View {
         if let toggle = onToggleSteady, header.gridMoves || header.steadyState != 0 {
             let on = header.steadyState != 0
-            let tint = DubColor.controlAccent
-            VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
-                Text("STEADY")
-                    .font(DubFont.micro)
-                    .tracking(DubFont.capsTracking)
-                    .foregroundStyle(DubColor.textTertiary)
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(on ? tint.opacity(header.steadyState == 2 ? 1.0 : 0.35)
-                                 : DubColor.textPlaceholder)
-                        .frame(width: 5, height: 5)
-                    Text(on ? "ON" : "OFF")
-                        .font(DubFont.numericInline)
-                        .foregroundStyle(on ? tint : DubColor.textPlaceholder)
-                }
-                .padding(.horizontal, DubSpacing.sm)
-                .padding(.vertical, 3)
-                .background(on ? tint.opacity(0.16) : DubColor.surface2)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 3, style: .continuous)
-                        .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
-                .contentShape(Rectangle())
-                .onPressDown(perform: toggle)
-            }
+            iconSwitch(
+                "metronome", on: on, working: header.steadyState == 2,
+                beside: DubFont.numericLarge, action: toggle)
             .help(on
                   ? "Steady on — the record is held to its tempo; turn it off to let the band play as it played"
                   : "Steady off — the band plays as it played. Turn it on to hold one tempo while you mix")
             .accessibilityLabel("Steady")
             .accessibilityValue(on ? "on" : "off")
         }
+    }
+
+    /// A switch drawn as its icon, sat on the value row of the readout it
+    /// belongs to: `beside` is that value's font, and the hidden label and
+    /// digit give the button the readout's own two rows to centre on.
+    ///
+    /// The control accent, not the deck's tint: a lit control means "on"
+    /// on either deck (`DubColor.controlAccent`). In the deck's tint the
+    /// right deck's LOCK lit teal beside amber controls (Daniel,
+    /// 2026-11-19).
+    private func iconSwitch(
+        _ symbol: String, on: Bool, working: Bool, beside font: Font, action: @escaping () -> Void
+    ) -> some View {
+        let tint = DubColor.controlAccent
+        return VStack(spacing: 2) {
+            Text(" ")
+                .font(DubFont.micro)
+                .hidden()
+            Text("8")
+                .font(font)
+                .hidden()
+                .frame(width: 22)
+                .overlay {
+                    Image(systemName: symbol)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(on ? tint.opacity(working ? 1.0 : 0.55) : DubColor.textTertiary)
+                        .frame(width: 22, height: 20)
+                        .background(on ? tint.opacity(0.16) : DubColor.surface2)
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .stroke(on ? tint.opacity(0.55) : DubColor.divider, lineWidth: 1))
+                }
+        }
+        // The whole two rows take the press, not the drawn 22 × 20.
+        .contentShape(Rectangle())
+        .onPressDown(perform: action)
+        .accessibilityAddTraits(.isButton)
     }
 
     /// `widest` is drawn hidden underneath the value and sets the

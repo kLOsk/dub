@@ -13,13 +13,19 @@
 //! zero** on a real deck. A synthetic test cannot produce that bias,
 //! because synthetic noise is white by construction. The fixtures here
 //! can, and `steady_nominal_has_no_pitch_bias` is the test that would
-//! have caught it in CI instead of on stage.
+//! have caught it before the stage instead of on it.
 //!
 //! The fixtures are 10 s excerpts of `dub capture` recordings from the
 //! SL 3, stored as 24-bit FLAC (verified bit-exact off the original
 //! 32-bit float — the captures sit exactly on the 24-bit grid because
 //! `dub capture` applies no gain). See `testdata/timecode/README.md` for
 //! what each one contains and where it came from.
+//!
+//! The fixtures are **not in git**: they are recordings of Serato's
+//! and Native Instruments' control records, which are not ours to
+//! license. Each test skips, saying so, when its fixture is absent — so
+//! these run where the recordings are (the pre-push hook on the rig
+//! machine) and not in GitHub CI.
 //!
 //! These drive the **production** path — `TimecodeInput::drive`, so the
 //! decoder, the rate smoother, anchor learning and the lift policy, in
@@ -53,9 +59,18 @@ struct Quantum {
     engaged: bool,
 }
 
-/// Replay a fixture through the real drive path.
-fn replay(name: &str) -> Vec<Quantum> {
+/// Replay a Serato fixture through the real drive path. `None`, with a
+/// line on stderr, when the recording is not on this machine.
+fn replay(name: &str) -> Option<Vec<Quantum>> {
+    replay_as(name, dub_timecode::Format::SeratoCv02)
+}
+
+fn replay_as(name: &str, format: dub_timecode::Format) -> Option<Vec<Quantum>> {
     let path = fixture(name);
+    if !path.exists() {
+        eprintln!("skipped: {name} is not in testdata/timecode/ (see its README)");
+        return None;
+    }
     let track = dub_io::Track::load_from_path(&path)
         .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     assert_eq!(track.channels(), 2, "timecode fixtures are stereo");
@@ -66,6 +81,7 @@ fn replay(name: &str) -> Vec<Quantum> {
     let (mut tx, rx) = rb.split();
     let cfg = TimecodeInputConfig {
         input_sample_rate: sr,
+        format,
         ..TimecodeInputConfig::default()
     };
     let mut input = TimecodeInput::new(rx, cfg);
@@ -92,7 +108,7 @@ fn replay(name: &str) -> Vec<Quantum> {
         });
     }
     assert!(out.len() > 100, "{name}: only {} quanta decoded", out.len());
-    out
+    Some(out)
 }
 
 /// **The lag-1 bias regression.** A platter running at nominal on a
@@ -106,7 +122,9 @@ fn replay(name: &str) -> Vec<Quantum> {
 /// this needs real groove noise.
 #[test]
 fn steady_nominal_has_no_pitch_bias() {
-    let q = replay("serato-cv02-steady-nominal.flac");
+    let Some(q) = replay("serato-cv02-steady-nominal.flac") else {
+        return;
+    };
     let locked: Vec<&Quantum> = q.iter().filter(|x| x.confidence > 0.9).collect();
     assert!(
         locked.len() * 100 / q.len() >= 95,
@@ -124,13 +142,69 @@ fn steady_nominal_has_no_pitch_bias() {
     );
 }
 
+/// Mean pitch in percent over the locked part of a held-pitch fixture,
+/// skipping the first two seconds (calibration and smoother settling).
+fn held_pitch_pct(q: &[Quantum]) -> f64 {
+    let settled: Vec<&Quantum> = q[2 * 48_000 / QUANTUM..]
+        .iter()
+        .filter(|x| x.confidence > 0.9)
+        .collect();
+    assert!(settled.len() > 500, "only {} locked quanta", settled.len());
+    (settled.iter().map(|x| x.rate).sum::<f64>() / settled.len() as f64 - 1.0) * 100.0
+}
+
+/// **Traktor vinyl held at a pitch must read that pitch.** The fixture
+/// is Daniel's right deck at a true +3.198 % (counted off the carrier's
+/// unwrapped phase). It read +1.96 % on average and jumped by 3 %
+/// inside the hold: this cartridge's residual ellipse sat on the old
+/// 0.99 roundness gate, so the decoder flapped between the long-lag
+/// estimator and lag-1, which reads ~1.8 % low on this pressing's
+/// groove noise.
+///
+/// With the gate gone it read +3.05 %, still 0.15 % low: MK1 carries
+/// its data in sidebands under the carrier and a second harmonic above,
+/// and the long-lag sum weighed them in. Read through the carrier
+/// band-pass it shows +3.23 %.
+#[test]
+fn traktor_mk1_held_pitch_reads_true() {
+    let Some(q) = replay_as(
+        "traktor-mk1-pitch-plus3.flac",
+        dub_timecode::Format::TraktorMk1,
+    ) else {
+        return;
+    };
+    let pitch = held_pitch_pct(&q);
+    assert!(
+        (pitch - 3.198).abs() < 0.07,
+        "read {pitch:+.3} % at a true +3.198 %"
+    );
+}
+
+/// **The far end of the fader must read as true as the middle.** The
+/// fixture is Daniel's left deck on Serato vinyl at a true −7.998 %. It
+/// read 0.14 % high — the long-lag estimator had no ellipse correction,
+/// and its error grows with the angle the lag spans, so with pitch.
+#[test]
+fn serato_far_pitch_reads_true() {
+    let Some(q) = replay("serato-cv02-pitch-minus8.flac") else {
+        return;
+    };
+    let pitch = held_pitch_pct(&q);
+    assert!(
+        (pitch + 7.998).abs() < 0.07,
+        "read {pitch:+.3} % at a true −7.998 %"
+    );
+}
+
 /// The groove position must advance at real time, and monotonically.
 ///
 /// This is the relative integrator measured against the clock rather
 /// than against itself: 10 s of nominal groove is 10 s of playhead.
 #[test]
 fn steady_nominal_position_advances_at_real_time() {
-    let q = replay("serato-cv02-steady-nominal.flac");
+    let Some(q) = replay("serato-cv02-steady-nominal.flac") else {
+        return;
+    };
     let locked: Vec<&Quantum> = q.iter().filter(|x| x.confidence > 0.9).collect();
 
     let span_secs = (locked.len() * QUANTUM) as f64 / 48_000.0;
@@ -163,7 +237,9 @@ fn steady_nominal_position_advances_at_real_time() {
 /// actual hand until now.
 #[test]
 fn scratching_never_reads_as_a_lift() {
-    let q = replay("serato-cv02-scratch.flac");
+    let Some(q) = replay("serato-cv02-scratch.flac") else {
+        return;
+    };
 
     let reverse = q.iter().filter(|x| x.rate < -0.5).count();
     let forward = q.iter().filter(|x| x.rate > 0.5).count();
@@ -191,7 +267,9 @@ fn scratching_never_reads_as_a_lift() {
 /// The policy must not engage while there is no carrier to engage on.
 #[test]
 fn the_needle_drop_does_not_engage_early() {
-    let q = replay("serato-cv02-needle-drop.flac");
+    let Some(q) = replay("serato-cv02-needle-drop.flac") else {
+        return;
+    };
 
     let silent: Vec<&Quantum> = q.iter().take_while(|x| x.amplitude < 0.01).collect();
     assert!(

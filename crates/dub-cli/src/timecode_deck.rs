@@ -1402,14 +1402,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_output_routing_auto_detects_audio6_warns_unverified() {
+    fn resolve_output_routing_auto_detects_audio6() {
         let opts = opts_default();
         let r = resolve_output_routing(&dev("Traktor Audio 6", 6), &routing_args_from_opts(&opts))
             .unwrap();
-        assert_eq!(r.routing, [Some(0), Some(2)]);
+        assert_eq!(r.routing, [Some(2), Some(4)]);
         assert!(
-            r.summary.contains("unverified"),
-            "Audio 6 should warn until validated: {}",
+            !r.summary.contains("unverified"),
+            "the Audio 6 has been played on: {}",
             r.summary
         );
     }

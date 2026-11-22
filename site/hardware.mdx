@@ -23,7 +23,7 @@ Dub sits between your turntables and your mixer. For the two-deck
 | Serato Control CV02 vinyl | Timecode | Tested |
 | Traktor Scratch MK1 vinyl | Timecode | Tested |
 | Traktor Scratch MK2 vinyl | Timecode | Decoder shipped, not yet confirmed on a real pressing |
-| Native Instruments Audio 6 | Interface | Known to Dub, not yet confirmed on hardware |
+| Native Instruments Traktor Audio 6 | Interface | Tested |
 | Any external mixer with line inputs | The mixer | Works |
 | Phase, MIDI and HID controllers | Control | Planned after 1.0 |
 
@@ -71,3 +71,16 @@ Your routing applies as soon as you change it: the interface reconnects and
 both decks empty, so the routing is locked while a deck is playing. If two
 decks would share a pair, Dub tells you and keeps the last routing that
 worked. **Forget this interface** removes your routing for it.
+
+### Traktor Audio 6: Direct Thru and Phono
+
+The Traktor Audio 6 has two switches per deck inside the box. With one
+plugged in, **Preferences ▸ Audio** shows them and sets them:
+
+- **Direct Thru** wires that deck's input straight to its output and mutes
+  Dub there. Leave it off to play from Dub, and to use Dub's own **THRU**
+  with effects on a real record.
+- **Phono** is for a turntable plugged straight into the box. Switch it off
+  for a line-level source.
+
+The switches show what the box itself reports.

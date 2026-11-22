@@ -82,7 +82,7 @@ pub use confidence::{
 };
 pub use downbeat::{refine_downbeat_backbeat, DownbeatRefinement};
 pub use estimator::{BpmEstimator, BpmEstimatorError};
-pub use follow::{follow_grid, followed_beats, local_bpm};
+pub use follow::{follow_grid, follow_grid_always, followed_beats, local_bpm};
 pub use octave_profile::{
     octave_profile_from_genre, octave_profile_from_label, OctaveProfile, TempoOctave,
 };

@@ -44,6 +44,30 @@ final class AudioRoutingTests: XCTestCase {
             "This interface has 4 inputs; deck B can't take 5 – 6.")
     }
 
+    /// A routing set by hand comes out as an entry `devices.toml` takes,
+    /// with the inputs named only where they differ from the outputs.
+    func testARoutingCopiesAsARegistryEntry() {
+        let same = AudioRouting(twoDeck: true, deckAIn: 3, deckBIn: 5, deckAOut: 3, deckBOut: 5)
+        XCTAssertEqual(
+            same.registryEntry(deviceName: "DJM-250MK2", outputChannels: 8),
+            """
+            [[interface]]
+            name_pattern = "DJM-250MK2"
+            display_name = "DJM-250MK2"
+            output_channels = 8
+            deck_a_first_channel = 3
+            deck_b_first_channel = 5
+            verified = true
+
+            """)
+        let apart = AudioRouting(twoDeck: true, deckAIn: 1, deckBIn: 3, deckAOut: 3, deckBOut: 5)
+        let entry = apart.registryEntry(deviceName: "Box \"X\"", outputChannels: 6) ?? ""
+        XCTAssertTrue(entry.contains("deck_a_input_first_channel = 1\ndeck_b_input_first_channel = 3"))
+        XCTAssertTrue(entry.contains("name_pattern = \"Box \\\"X\\\"\""))
+        let one = AudioRouting(twoDeck: false, deckAIn: 1, deckBIn: 1, deckAOut: 1, deckBOut: 1)
+        XCTAssertNil(one.registryEntry(deviceName: "Solo", outputChannels: 2))
+    }
+
     func testTheEngineGetsWholePairsAndOneDeckDoublesItsOutput() {
         var r = AudioRouting.starting(inputs: 4, outputs: 4)
         let two = r.ffi(outputChannels: 4)

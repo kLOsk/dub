@@ -195,7 +195,7 @@ final class SignalScopeNSView: NSView {
         draw("PITCH", at: CGPoint(x: 0, y: Self.pitchTop + 5), font: Self.label,
              colour: DubColor.textSecondary, tracking: 1)
         let live = t.hasTimecodeInput && t.lockState != 0
-        draw(live ? String(format: "%+.2f %%", t.pitchPercent) : "—",
+        draw(live ? PitchText.signed(t.pitchPercent, decimals: 2) + " %" : "—",
              at: CGPoint(x: w, y: Self.pitchTop), font: .monospacedDigitSystemFont(ofSize: 18, weight: .semibold),
              colour: live ? DubColor.textPrimary : DubColor.textTertiary, alignment: .right)
 

@@ -160,6 +160,24 @@ const ZERO_ANCHOR_CAPTURE_SECS: f64 = 3.6;
 /// setting — the calibrate-at-any-pitch contract survives.
 const ZERO_ANCHOR_GUARD: f64 = 0.004;
 
+/// The zero capture is judged a slice at a time, each this long.
+const ZERO_ANCHOR_SLICE_SECS: f64 = 0.1;
+
+/// Two consecutive slices further apart than this are not a platter
+/// resting at the detent, and the capture starts over from the later
+/// one. Measured on the SL 3 (2026-11-22): a resting platter moves
+/// 0.03 % between slices, 0.12 % at worst with its wobble; the input
+/// stream's start-up fault (phase steps at every device buffer for
+/// half a second, a second after the stream opens) moves the reading
+/// 0.5–0.8 %. Averaged in, that fault set one deck's zero 0.085 % off
+/// for a whole session.
+const ZERO_ANCHOR_STEADY: f64 = 0.002;
+
+/// How long the zero capture may keep starting over before it is
+/// dropped. No anchor shows the platter's true speed, which is the
+/// honest reading for a deck that never rested.
+const ZERO_ANCHOR_GIVE_UP_SECS: f64 = 15.0;
+
 /// Default RMS amplitude floor below which the input is treated as
 /// "carrier dead" regardless of confidence.
 ///
@@ -679,10 +697,9 @@ pub struct TimecodeInput {
     /// [`Self::begin_calibration`], dies with the attach (DJs travel;
     /// every venue's decks are relearned fresh).
     anchors: AnchorMap,
-    /// In-flight zero-anchor capture: `(Σ rate·dt, secs)` over
-    /// confident chunks. Armed when the whitening calibration
-    /// installs; `None` otherwise.
-    zero_anchor_cap: Option<(f64, f64)>,
+    /// In-flight zero-anchor capture over confident chunks. Armed
+    /// when the whitening calibration installs; `None` otherwise.
+    zero_anchor_cap: Option<ZeroCapture>,
     /// Confidence / amplitude floors for anchor learning, copied from
     /// the attach config (a chunk participates only when it would
     /// also count as a clean lock).
@@ -727,6 +744,19 @@ struct LiveTaps {
     bpm: HeapProd<f32>,
     peaks: HeapProd<f32>,
     mono: Vec<f32>,
+}
+
+/// An in-flight zero-anchor capture: `Σ rate·dt` and seconds of the
+/// steady run so far, the slice being filled, the slice before it, and
+/// the time since it was armed. `Copy`, RT-safe to accumulate.
+#[derive(Debug, Clone, Copy, Default)]
+struct ZeroCapture {
+    sum: f64,
+    secs: f64,
+    slice_sum: f64,
+    slice_secs: f64,
+    last_slice: Option<f64>,
+    elapsed: f64,
 }
 
 /// Running covariance of the raw `(ch1, ch0)` input during a
@@ -874,7 +904,8 @@ impl TimecodeInput {
     ///
     /// While a capture is armed (whitening just installed, fader at the
     /// detent per the calibration ritual), average
-    /// [`ZERO_ANCHOR_CAPTURE_SECS`] of confident carrier and adopt only
+    /// [`ZERO_ANCHOR_CAPTURE_SECS`] of confident carrier that held still
+    /// throughout ([`ZERO_ANCHOR_STEADY`]) and adopt only
     /// inside [`ZERO_ANCHOR_GUARD`] — calibrating at any other pitch
     /// position just skips the anchor (the calibrate-at-any-pitch
     /// contract). The capture window spans two full 33⅓ revolutions, so
@@ -887,16 +918,36 @@ impl TimecodeInput {
         if !clean {
             return;
         }
-        if let Some((sum, secs)) = self.zero_anchor_cap.as_mut() {
-            *sum += raw_rate * dt;
-            *secs += dt;
-            if *secs >= ZERO_ANCHOR_CAPTURE_SECS {
-                let mean = *sum / *secs;
-                self.zero_anchor_cap = None;
-                if (mean - 1.0).abs() <= ZERO_ANCHOR_GUARD {
-                    self.anchors.learn_zero(mean);
-                }
+        let Some(cap) = self.zero_anchor_cap.as_mut() else {
+            return;
+        };
+        cap.elapsed += dt;
+        cap.slice_sum += raw_rate * dt;
+        cap.slice_secs += dt;
+        if cap.slice_secs < ZERO_ANCHOR_SLICE_SECS {
+            return;
+        }
+        let slice = cap.slice_sum / cap.slice_secs;
+        let steady = cap
+            .last_slice
+            .is_none_or(|last| (slice - last).abs() <= ZERO_ANCHOR_STEADY);
+        if !steady {
+            cap.sum = 0.0;
+            cap.secs = 0.0;
+        }
+        cap.sum += cap.slice_sum;
+        cap.secs += cap.slice_secs;
+        cap.last_slice = Some(slice);
+        cap.slice_sum = 0.0;
+        cap.slice_secs = 0.0;
+        if cap.secs >= ZERO_ANCHOR_CAPTURE_SECS {
+            let mean = cap.sum / cap.secs;
+            self.zero_anchor_cap = None;
+            if (mean - 1.0).abs() <= ZERO_ANCHOR_GUARD {
+                self.anchors.learn_zero(mean);
             }
+        } else if cap.elapsed >= ZERO_ANCHOR_GIVE_UP_SECS {
+            self.zero_anchor_cap = None;
         }
     }
 
@@ -1278,7 +1329,7 @@ impl TimecodeInput {
                 // still has the fader at the 0 detent (the wobble fit
                 // settles for ~4 s after this point, so the capture
                 // completes inside the gated "measuring" window).
-                self.zero_anchor_cap = Some((0.0, 0.0));
+                self.zero_anchor_cap = Some(ZeroCapture::default());
             }
         }
     }
@@ -2077,6 +2128,42 @@ mod anchor_learning_tests {
         }
         assert!(!input.is_calibrating(), "a stuck capture never timed out");
         assert!(!input.is_calibrated());
+    }
+
+    /// SL 3, 2026-11-22: for half a second, a second after the stream
+    /// opened, the input stepped in phase at every device buffer and
+    /// the deck read up to 1 % fast. That landed inside the zero
+    /// capture and the deck read 0.085 % low all session.
+    #[test]
+    fn a_burst_inside_the_zero_capture_does_not_move_the_zero() {
+        let (mut input, mut tx) = input_with_producer();
+        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
+        input.begin_calibration(4_800);
+        let _ = run(&mut input, &mut tx, &mut gen, 1.0005, 1.0);
+        let _ = run(&mut input, &mut tx, &mut gen, 1.0105, 0.6);
+        let _ = run(&mut input, &mut tx, &mut gen, 1.0005, 6.0);
+        assert!(input.anchors().zero_learned(), "the zero was never learned");
+        let mean = run(&mut input, &mut tx, &mut gen, 1.0005, 2.0);
+        assert!(
+            (mean - 1.0).abs() < 1e-4,
+            "the burst is in the zero: detent reads {mean}"
+        );
+    }
+
+    #[test]
+    fn a_platter_that_never_rests_gets_no_zero() {
+        let (mut input, mut tx) = input_with_producer();
+        let mut gen = dub_timecode::signal::Generator::new(Format::SeratoCv02, SR);
+        input.begin_calibration(4_800);
+        for i in 0..40 {
+            let rate = if i % 2 == 0 { 0.997 } else { 1.003 };
+            let _ = run(&mut input, &mut tx, &mut gen, rate, 0.5);
+        }
+        let _ = run(&mut input, &mut tx, &mut gen, 1.002, 6.0);
+        assert!(
+            !input.anchors().zero_learned(),
+            "a zero was taken from a platter being pushed about"
+        );
     }
 
     #[test]

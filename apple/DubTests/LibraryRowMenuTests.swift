@@ -110,7 +110,7 @@ final class LibraryRowMenuTests: XCTestCase {
         XCTAssertEqual(
             builder().analyzeMenuLabel(
                 rightClickedTrack: .fixture(), allCount: 5, unlockedCount: 3),
-            "Re-analyze Selected (3 of 5)")
+            "Re-analyze Selected (3 of 5 · 2 analysed and locked)")
     }
 
     // MARK: - Analyze enablement
@@ -138,8 +138,37 @@ final class LibraryRowMenuTests: XCTestCase {
         ]
         let builder = builder(tracks: tracks, selected: ["t0", "t1", "t2"])
         builder.onAnalyzeRequested = { requested = $0 }
-        try fire("Re-analyze Selected (2 of 3)", in: builder.menu(for: tracks[0]))
+        try fire("Re-analyze Selected (2 of 3 · 1 analysed and locked)", in: builder.menu(for: tracks[0]))
         XCTAssertEqual(requested.map(Set.init), ["t0", "t2"])
+    }
+
+    /// A locked track that was never analysed still gets its first
+    /// pass: key, waveform and loudness, under the grid it keeps.
+    func testALockedTrackNeverAnalysedIsStillAnalysed() throws {
+        var requested: [String]?
+        let tracks = [
+            LibraryTrack.fixture(id: "t0", gridLocked: true, isAnalyzed: false),
+            LibraryTrack.fixture(id: "t1", gridLocked: true, isAnalyzed: false),
+            LibraryTrack.fixture(id: "t2", gridLocked: true),
+        ]
+        let builder = builder(tracks: tracks, selected: ["t0", "t1", "t2"])
+        builder.onAnalyzeRequested = { requested = $0 }
+        try fire("Analyze Selected (2 of 3 · 1 analysed and locked)", in: builder.menu(for: tracks[0]))
+        XCTAssertEqual(requested.map(Set.init), ["t0", "t1"])
+    }
+
+    /// Removing from the library is offered only where the view gave
+    /// the menu a way to do it — the Missing list.
+    func testRemoveFromLibraryIsOnlyInTheMissingList() throws {
+        let tracks = [LibraryTrack.fixture(id: "t0"), LibraryTrack.fixture(id: "t1")]
+        let plain = builder(tracks: tracks, selected: ["t0", "t1"])
+        XCTAssertNil(item("Remove from Library (2)…", in: plain.menu(for: tracks[0])))
+
+        var removed: [String]?
+        let missing = builder(tracks: tracks, selected: ["t0", "t1"])
+        missing.onRemoveMissing = { removed = $0 }
+        try fire("Remove from Library (2)…", in: missing.menu(for: tracks[0]))
+        XCTAssertEqual(removed.map(Set.init), ["t0", "t1"])
     }
 
     // MARK: - Grid lock

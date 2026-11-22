@@ -91,6 +91,32 @@ pub fn follow_grid(
     channels: u8,
     grid: &BeatGrid,
 ) -> Option<BeatGrid> {
+    follow_grid_when(samples, sample_rate, channels, grid, false)
+}
+
+/// [`follow_grid`] for a track the DJ said follows its band: the beats
+/// the tracker finds, whether or not they leave the even grid by enough
+/// to pass its own test. `None` only when it finds no beats to lay.
+///
+/// The test was fitted on about a hundred of one DJ's tracks and is
+/// unsure on some of them; the DJ hears which it is.
+#[must_use]
+pub fn follow_grid_always(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    grid: &BeatGrid,
+) -> Option<BeatGrid> {
+    follow_grid_when(samples, sample_rate, channels, grid, true)
+}
+
+fn follow_grid_when(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    grid: &BeatGrid,
+    always: bool,
+) -> Option<BeatGrid> {
     if grid.bpm <= 0.0 || grid.beats.len() < 8 || sample_rate == 0 {
         return None;
     }
@@ -119,7 +145,7 @@ pub fn follow_grid(
     let leaves = pulse
         .as_ref()
         .is_some_and(|p| leaves_the_grid_secs(p, 60.0 / grid.bpm) >= PULSE_LEAVES_GRID_SECS);
-    if !leaves && !worth_following(&odf, odf_sr, &hits, &grid.beats) {
+    if !always && !leaves && !worth_following(&odf, odf_sr, &hits, &grid.beats) {
         return None;
     }
     let beats = pulse.unwrap_or(hits);
@@ -444,6 +470,23 @@ mod tests {
     fn a_steady_track_keeps_its_even_grid() {
         let samples = click_track(174.0, 60.0, SR);
         assert!(follow_grid(&samples, SR, 1, &even_grid(174.0, 60.0)).is_none());
+    }
+
+    /// The DJ said this track follows its band: the tracker's own test
+    /// is not asked, and a steady track gets lines where its clicks are.
+    #[test]
+    fn a_track_the_dj_says_follows_is_followed_whatever_the_test_says() {
+        let samples = click_track(174.0, 60.0, SR);
+        let grid = even_grid(174.0, 60.0);
+        assert!(follow_grid(&samples, SR, 1, &grid).is_none());
+        let followed = follow_grid_always(&samples, SR, 1, &grid).expect("followed");
+        let period = 60.0 / 174.0;
+        let off = followed
+            .beats
+            .windows(2)
+            .map(|w| (w[1] - w[0] - period).abs())
+            .fold(0.0, f64::max);
+        assert!(off < 0.02, "a steady track's lines moved {off} s apart");
     }
 
     /// The 1 stays where the even grid had it.

@@ -94,6 +94,105 @@ gate is local-only because GitHub CI has no macOS app job.
   arrow folds. No row-height setting and no shortcut for the size: the
   one setting is enough (Daniel, 2026-11-20).
 
+- **Interfaces: a map set by hand can be sent in (2026-11-20, Daniel:
+  "save the soundcards i connect so we can adapt them as preconfigured";
+  uncommitted, built, not tried on an interface).** Dub already kept a
+  hand-set routing per interface (FFI 87). New: Preferences ▸ Audio has
+  **Copy map**, which puts the routing on the clipboard as a
+  `devices.toml` entry; and an interface Dub knows only by an untested
+  guess (the Traktor Audio 6) is no longer locked — the guess is where
+  the pickers start. The Traktor Audio 6 went in as verified on
+  2026-11-21 (decks on 3+4 and 5+6, read from the routing Daniel saved
+  and played); still waiting on the DJM-250MK2. Same day: Preferences ▸
+  Audio sets the TA6's own Direct Thru and Phono switches per deck
+  (`TraktorAudioBox`; NI's control panel is 32-bit and no longer runs).
+  Read path tried on Daniel's box; the write is his to try.
+
+- **Turntable pitch read true (2026-11-21, uncommitted).** Daniel beatmatches
+  by lining up the numbers, and found Traktor's steadier and truer at ±8 %.
+  Measured on four captures of his rig against counted carrier cycles, then
+  fixed in the decoder: the long-lag estimator gets the ellipse correction
+  and the roundness gate is gone, and near playing speed the carrier is read
+  through a band-pass that follows it (LESSONS, timecode). Serato vinyl and
+  Traktor MK1 now both within 0.06 % across the fader on both decks (Serato
+  was 0.15 %, Traktor 1.2 % with 3 % jumps). A value that rounds to zero prints `+0.0` (`PitchText`):
+  the sign flipped on a resting platter. **Nudges, measured on the same captures:** a 0.1–0.35 % nudge was
+  half shown 0.9 s after the platter. The display filter's noise band and
+  confirm time are halved and its steady pole slowed to 2.0 s
+  (`display_rate.rs`): half shown at 0.45 s, within 0.05 % at 0.2 s (was
+  1.05 s), for the same digit flicker on a still fader. **Not done:** the left deck reading about 0.05 % high
+  at the zero click on Serato vinyl, and Daniel's
+  own check on the rig. **`dub capture` (2026-11-22):** it opened N
+  channels and read the first pair, so `--input-channels 3,4,5,6` gave a
+  four-channel header over stereo data and `--channels 6` could not be
+  closed; it and `dub levels` now read every channel, through a 10 s
+  ring. The four captures above were therefore made by two `dub capture`
+  processes at once, and the **Serato take is faulty**: 722.08 s of
+  audio in 717.83 s (+0.59 %, no overflow counted), with the carrier
+  jumping phase in 512-frame steps for about a second every 38 s on both
+  decks. The Traktor take beside it is 718.933 s in 718.927 s. Capture
+  now warns when the two disagree by 0.1 %. **Fresh Serato take, one process,
+  both decks (2026-11-22, `sl3-serato-1122-0844-*`):** 324.299 s in
+  324.297 s. Bare decoder +0.004…+0.043 % on both decks; shown pitch
+  with the first 3 s skipped −0.015…+0.055 % left, ±0.023 % right. The
+  same 512-frame phase steps are there for 0.1 s at stream start and
+  again at 1.05–1.7 s, on both decks, with audio repeated 16384 frames
+  later — below our code (SL 3 driver or HAL). Replayed from the first sample the zero anchor
+  averaged that glitch in and the left deck read 0.08 % low all take.
+  **Fixed:** the zero capture is judged in 0.1 s slices and starts over
+  when two differ by 0.2 % (`ZERO_ANCHOR_STEADY`), giving up after 15 s;
+  same replay now −0.03…+0.04 % left, ±0.025 % right. Not tried in the
+  app. Left at −5…−8 % reads 0.05 % above the rest: not chased.
+
+- **Re-analyze gives Dub's grid (2026-11-22, uncommitted, FFI 94, not
+  tried in the app).** *My Boo* (Ghost Town DJs): Traktor's 130.09
+  slides 49 ms over the track; Daniel unlocked and re-analysed, Dub
+  measured 130.07, stored it and kept showing Traktor's, because an
+  imported grid outranked `auto` even unlocked. Re-analyze and Reset
+  grid now go through `reanalyze_track`, whose grid takes the slot on
+  an unlocked track; an unchanged import no longer takes it back
+  (PRD-BEATS §4 table). Not done: his track still has the tap grid at
+  130.09 active until he re-analyses it; a change of app order
+  re-picks unlocked tracks.
+
+- **The DJ's word on following, and an app's library hidden
+  (2026-11-22, uncommitted, FFI 94, schema v13, built, not tried in the
+  app).** *Beat grid ▸ Automatic / Follow the band / Even grid* on the
+  library row's right-click and the deck BPM's, while the following grid
+  is on and the grid unlocked (`tracks.grid_follow`,
+  `follow_grid_always`, `set_deck_grid_follow`; PRD-BEATS). The drift
+  mark now reads "The grid's tempo is slightly off … Re-analyze to
+  correct it, or Lock grid to accept" (*My Boo* read as a case for
+  following and was a tempo 0.018 BPM out). Right-click an app in the
+  sidebar ▸ Hide … Library: its grids, keys and cues stay in use, its
+  node and playlists go, and search leaves out tracks reachable only
+  through it; Preferences ▸ Library ▸ Show in sidebar undoes it
+  (Daniel: "i use itunes and want traktor beatgrids"). Not done: the
+  FOLLOW / STEADY labels and icons on the deck are as they were; Swift
+  tests and snapshots not run (the drift sentence and both BPM menus
+  changed).
+
+- **Search finds the record wherever it is (2026-11-22, uncommitted,
+  FFI 94, built, not looked at in the app).** Daniel: "i think i want
+  everywhere not just the current playlist". The search still narrows
+  the list on screen, in its order; under a divider come the matches
+  from the rest of the library (`search_anywhere`), and a line under
+  the search field counts both ("3 in this list · 12 elsewhere").
+  Traktor does this with Enter; here it needs no key. A column sort
+  sorts within each group; crate drag-reorder is off while searching.
+  No snapshot of the divider yet.
+
+- **Loudness for tracks analysed before there was one (2026-11-22,
+  uncommitted, FFI 94, not tried in the app).** Analysis runs once per
+  track and measured no loudness before 2026-06-10: 31 tracks in
+  Daniel's library were analysed, had none, and played at unity on
+  every load; 14 carry a set-the-1 grid and 5 a lock, so Re-analyze was
+  no cure. A deck load now measures the loudness alone for such a track
+  (`loudness_prepare` / `measure_loudness` / `loudness_commit`,
+  `backfill_track_loudness`), grid and lock untouched; the gain applies
+  from the next load. "Night Shift - Bonanza" (2026-06-22, no loudness,
+  no waveform) is unexplained and will be measured the same way.
+
 - **The following grid on the band's pulse, and a STEADY switch
   (2026-11-20, Daniel: "tempo tracker i need to judge. please wire it in.
   i would want to try the transition way"; uncommitted, built, FFI 93,
@@ -567,6 +666,14 @@ hardware.
   GEOB, 1 crate). Still to see: a Serato 5 library, a library on an
   external drive (`location.path` non-empty), and Lexicon's Serato 5 grid
   tag. A Serato 4/5 smart crate is skipped, not evaluated.
+- **Following grid: a half-beat jump across a breakdown (parked,
+  2026-11-21).** The tracker picks which half of the beat is the kick once
+  for the whole track, so a record that comes out of a break half a beat
+  shifted (*Bam Bam*, Dj Turk Disco Remix) has its lines right on one side
+  only. The fix is to choose again after a beatless stretch, and only
+  there; it belongs with the tracker handling beatless stretches, and has
+  to be checked against the Traktor-locked corpus because a second choice
+  is a second chance to land on a reggae offbeat. STEADY is not affected.
 - **MIDI.** Map mode's keyboard lane shipped; the MIDI lane is the same
   mechanism pointed at `dub-controller` once that crate is real — the
   missing half of Expert FX.

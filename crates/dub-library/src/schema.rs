@@ -39,7 +39,7 @@ use crate::error::{LibraryError, Result};
 /// The highest schema version this binary knows how to apply. Bump
 /// in lockstep with adding an entry to [`MIGRATIONS`] and updating
 /// `docs/spec/LIBRARY-SCHEMA.md`.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// One migration step. Applied inside a single SQLite transaction;
 /// either every statement lands or none does.
@@ -101,6 +101,10 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 12,
         sql: V12_MIGRATION,
+    },
+    Migration {
+        target_version: 13,
+        sql: V13_MIGRATION,
     },
 ];
 
@@ -787,6 +791,14 @@ CREATE TABLE IF NOT EXISTS library_settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+"#;
+
+/// v13 — the DJ's word on whether a track's grid follows its band
+/// (2026-11-22). NULL leaves it to the tracker's own test, 1 follows the
+/// band whatever the test says, 0 keeps the even grid. Additive.
+const V13_MIGRATION: &str = r#"
+ALTER TABLE tracks ADD COLUMN grid_follow INTEGER
+    CHECK (grid_follow IS NULL OR grid_follow IN (0, 1));
 "#;
 
 #[cfg(test)]

@@ -29,10 +29,17 @@ final class LibraryRowMenu {
     var analysisBatchInProgress = false
     var onAnalyzeRequested: (([String]) -> Void)?
     var onSetGridLocked: ((String, Bool) -> Void)?
+    /// The DJ's word on the right-clicked track's grid, read as the menu
+    /// opens; `nil` when the choice is not offered (the following grid
+    /// is off).
+    var gridFollowWord: ((String) -> Bool?)?
+    var onSetGridFollow: ((String, Bool?) -> Void)?
     /// Crate context (M11d-next): non-nil when the visible listing is a
     /// Dub crate, enabling "Remove from Crate" and "Move…".
     var crateId: Int64?
     var onCrateRemove: (([String]) -> Void)?
+    /// Set only in the Missing list: take these tracks out of the library.
+    var onRemoveMissing: (([String]) -> Void)?
     var onCrateMove: ((String, CrateMove) -> Void)?
 
     /// `NSMenuItem` holds its target weakly. Without keeping the
@@ -45,7 +52,12 @@ final class LibraryRowMenu {
         menu.autoenablesItems = false
 
         let targets = analyzeTargets(rightClickedTrack: track)
-        let unlocked = targets.filter { !isLocked($0) }
+        // A locked track is skipped once it has been analysed: its grid
+        // is settled. One that never was still wants its key, waveform
+        // and loudness, and the pass leaves the locked grid alone — with
+        // Traktor's locks imported, that was most of a library the menu
+        // refused to analyse ahead of a gig (1,721 tracks, 2026-11-22).
+        let unlocked = targets.filter { !isLocked($0) || !isAnalyzed($0) }
         let analyzeItem = NSMenuItem(
             title: analyzeMenuLabel(
                 rightClickedTrack: track,
@@ -70,6 +82,24 @@ final class LibraryRowMenu {
         }
         menu.addItem(lockItem)
 
+        if let gridFollowWord, let onSetGridFollow {
+            let current = GridFollowChoice(word: gridFollowWord(track.id))
+            let parent = NSMenuItem(
+                title: GridFollowChoice.menuTitle, action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            for choice in GridFollowChoice.allCases {
+                let item = NSMenuItem(title: choice.title, action: nil, keyEquivalent: "")
+                item.state = choice == current ? .on : .off
+                attach(item) { onSetGridFollow(track.id, choice.word) }
+                submenu.addItem(item)
+            }
+            parent.submenu = submenu
+            // A locked grid plays as saved.
+            parent.isEnabled = !track.gridLocked
+            menu.addItem(parent)
+        }
+
         // R-49 — sample lineage (PRD §5.2.5a). A link-out, so it needs
         // no key and no network of ours; disabled only when the row
         // carries neither artist nor title.
@@ -88,6 +118,17 @@ final class LibraryRowMenu {
         if crateId != nil {
             menu.addItem(.separator())
             appendCrateItems(to: menu, rightClickedTrack: track)
+        }
+
+        if let onRemoveMissing {
+            let targets = analyzeTargets(rightClickedTrack: track)
+            menu.addItem(.separator())
+            let item = NSMenuItem(
+                title: targets.count > 1
+                    ? "Remove from Library (\(targets.count))…" : "Remove from Library…",
+                action: nil, keyEquivalent: "")
+            attach(item) { onRemoveMissing(targets) }
+            menu.addItem(item)
         }
 
         // Drop the previous run's anchors once a new menu is built —
@@ -146,13 +187,19 @@ final class LibraryRowMenu {
         return [track.id]
     }
 
+    private func isAnalyzed(_ trackId: String) -> Bool {
+        tracks.first(where: { $0.id == trackId })?.isAnalyzed ?? true
+    }
+
     private func isLocked(_ trackId: String) -> Bool {
         tracks.first(where: { $0.id == trackId })?.gridLocked ?? false
     }
 
     /// PRD-BEATS §4.4 label. Reflects mixed-lock selections as
-    /// "Re-analyze Selected (3 of 5)" so the user can see how many rows
-    /// the analyse pass will skip before clicking.
+    /// "Re-analyze Selected (3 of 5 · 2 analysed and locked)" so the user
+    /// can see how many rows the pass will skip before clicking, and
+    /// why: "(3 of 61)" alone read as a miscount, and "58 locked" as if
+    /// a lock kept a track from its loudness and key (Daniel, 2026-11-22).
     func analyzeMenuLabel(
         rightClickedTrack track: LibraryTrack,
         allCount: Int,
@@ -161,7 +208,8 @@ final class LibraryRowMenu {
         let verb = track.isAnalyzed ? "Re-analyze" : "Analyze"
         guard allCount > 1 else { return verb }
         if unlockedCount < allCount {
-            return "\(verb) Selected (\(unlockedCount) of \(allCount))"
+            return "\(verb) Selected (\(unlockedCount) of \(allCount) · "
+                + "\(allCount - unlockedCount) analysed and locked)"
         }
         return "\(verb) Selected (\(allCount))"
     }

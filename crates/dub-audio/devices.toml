@@ -56,21 +56,25 @@ deck_a_first_channel = 3
 deck_b_first_channel = 5
 verified = true
 
-# -- Unverified interfaces ---------------------------------------------
-#
-# These are driver-panel guesses we apply but cannot yet validate end-to-end
-# against real hardware. The CLI marks them as unverified so the user
-# double-checks the routing on the first session.
-
-# Traktor Audio 6 (Native Instruments). Deck A on ch 1+2, deck B on ch 3+4.
+# Traktor Audio 6 (Native Instruments). Deck A on ch 3+4, deck B on ch 5+6,
+# inputs on the same pairs — as Daniel routed and played it on his own box
+# (2026-11-20). The driver-panel guess this replaces had the decks on 1+2
+# and 3+4.
 [[interface]]
 name_pattern = "Audio 6"
 display_name = "Traktor Audio 6"
 manufacturer = "Native Instruments"
 output_channels = 6
-deck_a_first_channel = 1
-deck_b_first_channel = 3
-verified = false
+deck_a_first_channel = 3
+deck_b_first_channel = 5
+verified = true
+
+# -- Unverified interfaces ---------------------------------------------
+#
+# Driver-panel guesses we apply but cannot yet validate end-to-end against
+# real hardware go here, marked `verified = false`: the CLI flags them so
+# the user double-checks the routing on the first session, and the app
+# leaves their routing open to change. (None at the moment.)
 
 # -- Denylist ----------------------------------------------------------
 #

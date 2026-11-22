@@ -355,11 +355,8 @@ extension LibraryTrack {
 /// real table drifted away from it — which is exactly what happened to
 /// the `LibraryRowView` these replaced.
 ///
-/// Three details are pinned here, all of which look incidental:
+/// Two details are pinned here, both of which look incidental:
 ///
-/// * `DimUnanalyzed` is per *cell*, inside the column — an unanalyzed
-///   row dims its cell text but not the gutter badges and not the
-///   colour tint. Applying it to the row changes them.
 /// * The row tint is faint on purpose, because it sits *above* the
 ///   selection fill.
 /// * That ordering is what keeps a selected coloured row legible, and
@@ -454,13 +451,6 @@ final class LibraryRowSnapshotTests: XCTestCase {
         var track = LibraryTrack.fixture()
         track.potentialDuplicateId = "t2"
         snap(state(track, unreachable: true), named: "row-unreachable-duplicate")
-    }
-
-    /// The dim must reach the cell text but not the gutter badge and not
-    /// the colour tint.
-    func test_row_unanalyzed_dimsCellsOnly() {
-        let track = LibraryTrack.fixture(color: "green", isAnalyzed: false)
-        snap(state(track, deckA: true), named: "row-unanalyzed")
     }
 
     func test_row_colourTinted() {

@@ -469,6 +469,13 @@ const ANCHOR_DISAGREEMENT_SECS: f64 = 0.050;
 /// of Daniel's tracks (2026-11-18), most of them songs where the grid in
 /// use agrees with the audio and the *other* app is off. A grid the DJ set
 /// in Dub is never flagged; they placed it by ear.
+///
+/// A track whose grid follows the band (a `track_tempo_maps` row) is
+/// compared on tempo only. Two even grids laid over a tempo that
+/// wanders each fit a different stretch of the song, so their downbeats
+/// part by more than 50 ms whichever is right — and neither is what the
+/// deck plays, which is the followed lines (*How You Keep A Dance*,
+/// 172 ms apart at 72.1–73.1 BPM, 2026-11-22).
 fn bpm_disagreement_sql() -> String {
     let period = "(60.0 / g1.bpm)";
     let delta = "ABS(g1.anchor_secs - g2.anchor_secs)";
@@ -486,7 +493,9 @@ fn bpm_disagreement_sql() -> String {
                AND g1.bpm > 0 AND g2.bpm > 0 \
                AND (ABS(g1.bpm - g2.bpm) > \
                         {BPM_DISAGREEMENT_FRACTION} * MIN(g1.bpm, g2.bpm) \
-                    OR MIN({phase}, {period} - {phase}) > {ANCHOR_DISAGREEMENT_SECS}) \
+                    OR (MIN({phase}, {period} - {phase}) > {ANCHOR_DISAGREEMENT_SECS} \
+                        AND NOT EXISTS (SELECT 1 FROM track_tempo_maps m \
+                                        WHERE m.track_id = t.id))) \
          )"
     )
 }
@@ -1543,6 +1552,53 @@ impl Library {
         Ok(n.max(0) as u64)
     }
 
+    /// The missing tracks as browser rows, for the list the DJ reads
+    /// them in: the same tracks [`Self::missing_track_count`] counts,
+    /// whichever library they came from, oldest in the library first.
+    pub fn missing_track_rows(&self, limit: u32) -> Result<Vec<TrackRow>> {
+        let select = &self.track_select;
+        let sql = format!(
+            "{select} \
+             WHERE NOT EXISTS ( \
+                SELECT 1 FROM track_files tf \
+                WHERE tf.track_id = t.id AND tf.is_missing = 0 \
+             ) \
+             ORDER BY t.created_at ASC LIMIT ?1"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_missing_track_rows", e))?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], self.map_track_row())
+            .map_err(|e| LibraryError::sqlite("query_missing_track_rows", e))?;
+        collect_track_rows(rows, "missing_track_rows")
+    }
+
+    /// Remove `track_id` from the catalog if, and only if, it is
+    /// missing: none of its files is still there. Returns whether it
+    /// was removed. The guard is here rather than in the caller so a
+    /// list that went stale — the drive came back, the file was
+    /// relocated — cannot take a track that can be played with it.
+    ///
+    /// Everything Dub holds for the track goes with it (cues, grids,
+    /// crate membership); see [`Self::delete_track`]. A track another
+    /// app's library still lists comes back, missing again, with that
+    /// app's next import.
+    pub fn remove_track_if_missing(&self, track_id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM tracks WHERE id = ?1 AND NOT EXISTS ( \
+                    SELECT 1 FROM track_files tf \
+                    WHERE tf.track_id = tracks.id AND tf.is_missing = 0 \
+                 )",
+                params![track_id],
+            )
+            .map_err(|e| LibraryError::sqlite("remove_track_if_missing", e))?;
+        Ok(changed > 0)
+    }
+
     /// List missing canonical tracks for the M11d.4 Relocate
     /// panel. Returns up to `limit` rows, each carrying enough
     /// signal for the matcher: original filename (last path
@@ -1941,6 +1997,57 @@ impl Library {
             .query_map(params![fts_query, limit as i64], self.map_track_row())
             .map_err(|e| LibraryError::sqlite("query_search_tracks", e))?;
         collect_track_rows(rows, "search_tracks")
+    }
+
+    /// Every track the search matches, in the collection or not, by the
+    /// same rules as [`Self::search_tracks`].
+    ///
+    /// The browser shows these under the matches from the list on screen
+    /// (Daniel, 2026-11-22: a search should find the record wherever it
+    /// is, not only in the playlist that happens to be open).
+    ///
+    /// `hidden` names the apps whose libraries the DJ took out of the
+    /// sidebar. A track that can only be reached through those — not in
+    /// the collection, in no Dub crate, in no other app's library — is
+    /// left out: hidden means hidden, in search too.
+    pub fn search_tracks_anywhere(
+        &self,
+        query: &str,
+        limit: u32,
+        hidden: &[String],
+    ) -> Result<Vec<TrackRow>> {
+        let fts_query = build_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hidden = format!(",{},", hidden.join(","));
+        let select = &self.track_select;
+        let apps = "ms.track_id = t.id AND ms.imported_at > 0 \
+                    AND ms.source IN ('serato', 'traktor', 'rekordbox', 'itunes')";
+        let sql = format!(
+            "{select} \
+             WHERE t.id IN (\
+                SELECT DISTINCT track_id FROM track_metadata_fts \
+                WHERE track_metadata_fts MATCH ?1\
+             ) \
+             AND (t.in_collection = 1 \
+                  OR EXISTS (SELECT 1 FROM crate_tracks ct WHERE ct.track_id = t.id) \
+                  OR NOT EXISTS (SELECT 1 FROM track_metadata_source ms WHERE {apps}) \
+                  OR EXISTS (SELECT 1 FROM track_metadata_source ms WHERE {apps} \
+                             AND instr(?3, ',' || ms.source || ',') = 0)) \
+             ORDER BY t.created_at ASC LIMIT ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| LibraryError::sqlite("prepare_search_tracks_anywhere", e))?;
+        let rows = stmt
+            .query_map(
+                params![fts_query, i64::from(limit), hidden],
+                self.map_track_row(),
+            )
+            .map_err(|e| LibraryError::sqlite("query_search_tracks_anywhere", e))?;
+        collect_track_rows(rows, "search_tracks_anywhere")
     }
 
     /// The ids of every track the search matches, in the collection or
@@ -3747,6 +3854,46 @@ mod tests {
 
         assert!(lib.search_track_ids("a", 10).unwrap().is_empty());
         assert_eq!(lib.search_track_ids("high", 1).unwrap().len(), 1);
+
+        let anywhere = |hidden: &[&str]| -> Vec<String> {
+            let hidden: Vec<String> = hidden.iter().map(|s| (*s).to_string()).collect();
+            let mut rows: Vec<String> = lib
+                .search_tracks_anywhere("high", 10, &hidden)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            anywhere(&[]),
+            both,
+            "the rows of both, not only the collection's"
+        );
+        assert!(lib.search_tracks_anywhere("a", 10, &[]).unwrap().is_empty());
+
+        // The track outside the collection is known only from Traktor's
+        // library. With that library hidden it is not found; in a crate,
+        // or in another app's library as well, it is.
+        lib.conn
+            .execute(
+                "INSERT INTO track_metadata_source (track_id, source, title, imported_at) \
+                 VALUES (?1, 'traktor', 'High Tide', 1)",
+                params![ids[1]],
+            )
+            .unwrap();
+        assert_eq!(anywhere(&[]), both);
+        assert_eq!(anywhere(&["traktor"]), vec![ids[0].clone()]);
+        lib.conn
+            .execute(
+                "INSERT INTO track_metadata_source (track_id, source, title, imported_at) \
+                 VALUES (?1, 'itunes', 'High Tide', 1)",
+                params![ids[1]],
+            )
+            .unwrap();
+        assert_eq!(anywhere(&["traktor"]), both);
+        assert_eq!(anywhere(&["traktor", "itunes"]), vec![ids[0].clone()]);
     }
 
     #[test]
@@ -3961,6 +4108,19 @@ mod tests {
         assert_eq!(rows[0].track_id, ids[1]);
         // Filename derived from the most-recent relative_path.
         assert_eq!(rows[0].last_filename.as_deref(), Some("Lost.wav"));
+
+        // The browser's list is the same one track.
+        let listed = lib.missing_track_rows(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, ids[1]);
+
+        // Only a missing track can be removed this way.
+        assert!(!lib.remove_track_if_missing(&ids[0]).unwrap());
+        assert!(lib.track_row_by_id(&ids[0]).unwrap().is_some());
+        assert!(lib.remove_track_if_missing(&ids[1]).unwrap());
+        assert!(lib.track_row_by_id(&ids[1]).unwrap().is_none());
+        assert_eq!(lib.missing_track_count().unwrap(), 0);
+        assert!(!lib.remove_track_if_missing(&ids[1]).unwrap());
     }
 
     #[test]
@@ -4995,6 +5155,52 @@ mod tests {
                 .unwrap()
                 .bpm_disagreement
         );
+    }
+
+    /// A track that follows the band plays neither even grid, and two
+    /// even grids over a wandering tempo always part somewhere.
+    #[test]
+    fn a_followed_track_is_not_flagged_for_its_downbeat() {
+        let lib = Library::open_in_memory().unwrap();
+        let track = seed_column_fixture(&lib);
+        insert_grid(&lib, &track, "auto", 0.25, 120.0);
+        insert_grid(&lib, &track, "serato", 0.33, 120.0);
+        activate(&lib, &track, "serato");
+        let map = crate::tempo_map::TempoMap {
+            kind: "followed".to_string(),
+            beats: vec![0.33, 0.83, 1.34],
+            bar_phase: 0,
+            base_source: "serato".to_string(),
+            base_bpm: 120.0,
+            base_anchor_secs: 0.33,
+            bpm_min: 119.0,
+            bpm_max: 121.0,
+        };
+        lib.save_tempo_map(&track, &map).unwrap();
+        let flagged = |lib: &Library| {
+            lib.track_row_by_id(&track)
+                .unwrap()
+                .unwrap()
+                .bpm_disagreement
+        };
+        assert!(!flagged(&lib), "a downbeat apart on a followed track");
+
+        lib.connection()
+            .execute(
+                "UPDATE track_beatgrids SET bpm = 240.0 WHERE track_id = ?1 AND source = 'auto'",
+                params![track],
+            )
+            .unwrap();
+        assert!(flagged(&lib), "an octave split still shows");
+
+        lib.delete_tempo_map(&track).unwrap();
+        lib.connection()
+            .execute(
+                "UPDATE track_beatgrids SET bpm = 120.0 WHERE track_id = ?1 AND source = 'auto'",
+                params![track],
+            )
+            .unwrap();
+        assert!(flagged(&lib), "even again, the downbeat counts again");
     }
 
     /// Two apps disagreeing with each other is not the warning: the grid

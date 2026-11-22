@@ -35,6 +35,9 @@ struct LibraryCellState: Equatable {
     /// The following grid is on, so a saved tempo map is what the deck
     /// plays and the BPM shows it (`LibraryAppModel.movingGridsShown`).
     var movingGridsShown: Bool = false
+    /// Played this session (`LibraryAppModel.playedThisSession`): the
+    /// row is drawn dimmed.
+    var played: Bool = false
     /// Registry id → index into `track.extras`, from what the FFI
     /// actually applied (see `applyExtraColumns`).
     var extraIndexById: [String: Int] = [:]
@@ -225,6 +228,38 @@ struct LibraryCellText: Equatable {
 }
 
 /// Pure cell formatting. Free of the view so the migration's reused
+/// The DJ's word on one track's beat grid, as the library row's and the
+/// deck BPM's right-click both offer it. One wording for both.
+enum GridFollowChoice: CaseIterable {
+    case automatic, follow, even
+
+    init(word: Bool?) {
+        switch word {
+        case nil: self = .automatic
+        case true?: self = .follow
+        case false?: self = .even
+        }
+    }
+
+    var word: Bool? {
+        switch self {
+        case .automatic: return nil
+        case .follow: return true
+        case .even: return false
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .follow: return "Follow the band"
+        case .even: return "Even grid"
+        }
+    }
+
+    static let menuTitle = "Beat grid"
+}
+
 /// cells and the tests share exactly one implementation.
 enum LibraryCellFormat {
     static func displayTitle(_ track: LibraryTrack) -> String {
@@ -262,7 +297,8 @@ enum LibraryCellFormat {
                 return "Imported and analysed grids disagree · "
                     + "enable the per-source BPM columns to compare"
             case .drift:
-                return "May drift over a long mix · right-click → Lock grid to accept"
+                return "The grid's tempo is slightly off, so its lines slide over a long mix · "
+                    + "right-click → Re-analyze to correct it, or Lock grid to accept"
             }
         }
     }

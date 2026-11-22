@@ -114,11 +114,55 @@
   is yours before "calibrating it away"; a measured zero-reference would have
   broken Traktor's calibrate-at-any-pitch contract). The long-lag estimator
   (16 samples for CV02, format-scaled for ambiguity) collapses ρ^L and reads
-  +0.0x %; it engages only inside |rate| < 1.2 and only when the *smoothed*
-  residual-ellipse roundness is high (the lag-1 ellipse-bias law and its
-  `atan(tan/R)` correction don't transfer to long lags — and gating on the
-  instantaneous roundness made the two paths' bias difference toggle per block,
-  which read as display jitter).
+  +0.0x %; it engages inside |rate| < 1.2.
+- **A threshold between two estimators is a fault waiting for the rig that
+  sits on it — and the ellipse law does transfer to the long lag.** The
+  long-lag path used to run uncorrected and only above a smoothed roundness
+  of 0.99, on the belief that lag-1's `atan(tan/R)` correction did not carry
+  over. It does, at the lag's angle: the carrier's image adds `|b|²·e^(−jLω)`
+  to the sum, so `tan θ = R·tan(Lω)` and `atan2(im, R·re)` undoes it. Measured
+  on Daniel's rig (2026-11-21, four 12-minute captures, truth counted off the
+  carrier's unwrapped phase): Serato vinyl inside the gate read up to 0.15 %
+  off toward ±8 %, differently on each deck; Traktor MK1 vinyl sat *on* the
+  gate at some pitches, flapped to lag-1 (which reads ~1.8 % low on that
+  pressing) and showed a steady platter 1.2 % low and jumping by 3 %. With
+  the correction on the long lag and no gate: Serato within 0.06 %, Traktor
+  within 0.13 %. Two things that did **not** help, so don't retry them
+  blind: a quarter-cycle lag (no ellipse sensitivity on paper, but +0.3 %
+  on Traktor from the weaker noise decorrelation), and reading the ellipse
+  off a lagged pseudo-covariance instead of the block covariance (same
+  result).
+- **The long-lag sum weighs everything in the band, so read the carrier
+  alone.** Traktor MK1 stayed 0.1 % low at every pitch after the ellipse fix.
+  A spectrum of the capture showed why: 1.1 % of the power in data sidebands
+  under the carrier, 0.4 % above, 0.4 % at the second harmonic. Each adds to
+  the sum at its own angle, and lopsided they pull it. Serato has 0.1 % there
+  and read true. The fix is two band-pass sections (Q 2.5) on both channels
+  ahead of the long-lag sum. Three things that looked optional and are not:
+  the centre **follows the carrier** (left at nominal, a pitched carrier rides
+  the slope and the far-side content returns); it follows the *unfiltered*
+  reading, never its own output; and the filtered sum is read only once the
+  carrier has sat on the centre for 10 ms — through a brake or a scratch the
+  filter trails by several percent, and its first milliseconds are its own
+  ring-in. The ellipse is measured on the same filtered signal. A flat band
+  wide enough for ±8 % leaves 0.08 %. The Serato captures have about a second of
+  phase stepping ±2.4 rad in 512-frame steps every 38 s (a recording
+  fault, found 2026-11-22: CURRENT); the filter rings on that and the
+  on-centre test drops back to the unfiltered sum, which rides it.
+- **A mean taken once at session start has to refuse what is not
+  steady.** The zero anchor averaged 3.6 s after calibration, and the
+  SL 3's input stream steps in phase for half a second, a second after
+  it opens: one deck's zero sat 0.085 % off for the session. The capture
+  now restarts when consecutive 0.1 s slices differ by 0.2 % (a resting
+  platter: 0.03 %, 0.12 % at worst) and gives up after 15 s.
+- **A capture that is longer than the time it took is not ground truth.**
+  The Serato take above ran 0.59 % long with zero overflows, and nothing
+  said so for a day; one hold's error and the on-centre gate were chased
+  on what was a recorder fault. `dub capture` compares the two and warns.
+- **A pitch readout is checked against counted carrier cycles, not against
+  itself.** Steadiness tests passed for months while the reading was wrong by
+  a pitch-dependent amount. `testdata/timecode/` now has held-pitch fixtures
+  with the true pitch in the test.
 - **A cartridge is a velocity sensor — gate carrier presence on
   filter-compensated amplitude.** A slow draw is doubly quiet (low velocity ×
   input high-pass attenuation at its low carrier frequency); gating on the raw

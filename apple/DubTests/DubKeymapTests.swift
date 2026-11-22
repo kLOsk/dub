@@ -215,6 +215,35 @@ final class DubKeymapTests: XCTestCase {
         XCTAssertFalse(DubKeymap.buttonless.contains { $0.id.hasPrefix("grid.") })
     }
 
+    /// Shift + the next / previous key grows the selection from the row
+    /// it started on, and shrinks it again the other way.
+    func testShiftBrowseExtendsTheSelectionLikeAShiftClick() {
+        let ids = ["a", "b", "c", "d", "e"]
+        var sel: Set<String> = ["c"]
+        func press(_ next: Bool) -> String? {
+            guard let g = LibraryView.extendedSelection(sel, anchor: "c", in: ids, next: next)
+            else { return nil }
+            sel = Set(g.selection)
+            return g.edge
+        }
+        XCTAssertEqual(press(true), "d")
+        XCTAssertEqual(press(true), "e")
+        XCTAssertEqual(sel, ["c", "d", "e"])
+        XCTAssertEqual(press(true), "e", "the last row is the end")
+        XCTAssertEqual(press(false), "d")
+        XCTAssertEqual(sel, ["c", "d"])
+        XCTAssertEqual(press(false), "c")
+        XCTAssertEqual(press(false), "b")
+        XCTAssertEqual(sel, ["b", "c"], "past the start row it grows the other way")
+    }
+
+    func testShiftBrowseLeavesScatteredRowsAlone() {
+        let ids = ["a", "b", "c", "d"]
+        XCTAssertNil(LibraryView.extendedSelection(["a", "c"], anchor: "a", in: ids, next: true))
+        XCTAssertNil(LibraryView.extendedSelection([], anchor: nil, in: ids, next: true))
+        XCTAssertNil(LibraryView.extendedSelection(["a", "b", "c"], anchor: "b", in: ids, next: true))
+    }
+
     /// Next / previous track move one row in the list's order, start at
     /// an end when nothing is selected, and stop at the ends.
     func testBrowseTarget() {

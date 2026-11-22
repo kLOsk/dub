@@ -253,7 +253,6 @@ struct FxChannelCallbacks {
     var onPause: () -> Void = {}
     var onSetTimecode: () -> Void = {}
     var onSetThru: () -> Void = {}
-    var onRecalibrate: () -> Void = {}
     var onInput: (_ kind: FxInputKind) -> Void = { _ in }
     var onTrim: (_ db: Double) -> Void = { _ in }
     /// The IN/OUT toggle on a unit's face.

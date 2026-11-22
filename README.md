@@ -175,7 +175,7 @@ output for grids, cues and samples. Plug in an interface with at least
 | Serato Control CV02 vinyl | Timecode | ✅ tested |
 | Traktor Scratch MK1 vinyl | Timecode | ✅ tested |
 | Traktor Scratch MK2 vinyl | Timecode | ⚠️ decoder shipped, awaiting a real pressing |
-| Native Instruments Audio 6 | Interface | ⚠️ profile unverified |
+| Native Instruments Traktor Audio 6 | Interface | ✅ tested |
 | Any external mixer with line inputs | The mixer | ✅ |
 | Phase, MIDI / HID controllers | Control | ◻ planned after 1.0 |
 
@@ -196,7 +196,7 @@ Known gaps right now:
 
 - Live tempo on a THRU record reads drum'n'bass at two-thirds of its tempo.
   Tap the BPM to override.
-- Traktor MK2 and the Audio 6 have not been confirmed on real hardware.
+- Traktor MK2 vinyl has not been confirmed on a real pressing.
 - The download is not notarized yet (see [Download](#download)).
 - macOS only.
 
@@ -221,7 +221,7 @@ spec is [`PRD.md`](docs/spec/PRD.md).
 - **Tested like it matters**: over 1,600 Rust tests and 280 Swift unit and
   snapshot tests, fuzzed library parsers, and gates fitted against real records.
 
-The FFI contract version (`dub_ffi::FFI_VERSION`) is **93** at the
+The FFI contract version (`dub_ffi::FFI_VERSION`) is **94** at the
 time of writing. Architecture notes: [`ARCHITECTURE.md`](docs/spec/ARCHITECTURE.md).
 
 ### The `dub` CLI

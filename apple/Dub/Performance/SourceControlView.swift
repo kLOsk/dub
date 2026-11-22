@@ -12,11 +12,14 @@
 //  - DUB FX — the deck is the outboard rack on the mixer's send (F-38);
 //    only drawn once the channel is enabled in Preferences.
 //
-//  The small ↻ recalibrates the needle — on TC, and on INT too: the
-//  stage rescue (P-33, 2026-11-15) is INT to save the set, a new needle
-//  or control record, calibrate it while INT plays, then TC by hand.
-//  While INT runs over a timecode input, a lamp in the TC segment says
-//  whether the record under it is ready to take the deck back.
+//  Calibrating the needle is in the signal drawer (`DeckSignalPanel`),
+//  beside the scope that shows what it did — not here: it is done once
+//  per needle, and this switch is used all night (Daniel, 2026-11-21).
+//  It works on INT as on TC: the stage rescue (P-33, 2026-11-15) is INT
+//  to save the set, a new needle or control record, calibrate it while
+//  INT plays, then TC by hand. While INT runs over a timecode input, a
+//  lamp in the TC segment says whether the record under it is ready to
+//  take the deck back.
 //
 
 import SwiftUI
@@ -77,7 +80,6 @@ struct SourceControlView: View {
     /// a Preferences opt-in, and a scratch set never wants the segment.
     var showFx: Bool = false
     var onFx: () -> Void = {}
-    var onRecalibrate: () -> Void = {}
 
     var body: some View {
         // No status dot and word beside the switch any more. It said
@@ -88,33 +90,19 @@ struct SourceControlView: View {
         // had picked. Two places reporting the same thing from
         // different sources is one place too many, and the wrong one
         // was the one that could not see the signal.
-        HStack(spacing: DubSpacing.sm) {
-            // Three-state switch. INT is the play/pause control: it
-            // shows ▶ to start internal playback and ⏸ while playing.
-            HStack(spacing: 0) {
-                intSegment
-                segment("TC", active: isTimecodeActive, lamp: tcLamp, action: onTimecode)
-                segment("THRU", active: isThruActive, action: onThru)
-                if showFx {
-                    segment("DUB FX", active: status == .fx, action: onFx)
-                }
-            }
-            .background(DubColor.surface2)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
-
-            if Self.offersRecalibrate(status) {
-                Button(action: onRecalibrate) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(DubColor.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .help(status == .internalPlay
-                    ? "Calibrate the needle while INT plays on"
-                    : "Recalibrate this needle")
+        // Three-state switch. INT is the play/pause control: it shows ▶
+        // to start internal playback and ⏸ while playing.
+        HStack(spacing: 0) {
+            intSegment
+            segment("TC", active: isTimecodeActive, lamp: tcLamp, action: onTimecode)
+            segment("THRU", active: isThruActive, action: onThru)
+            if showFx {
+                segment("DUB FX", active: status == .fx, action: onFx)
             }
         }
+        .background(DubColor.surface2)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(DubColor.divider, lineWidth: 1))
     }
 
     /// The INT segment: a play/pause toggle that also *is* the
@@ -175,16 +163,6 @@ struct SourceControlView: View {
         case .none: return nil
         case .measuring: return DubColor.stateTentative
         case .ready: return DubColor.stateLocked
-        }
-    }
-
-    /// TC and INT — INT is where a needle is calibrated mid-set. Never
-    /// THRU or DUB FX: those inputs are not timecode, and the engine
-    /// refuses to measure them.
-    static func offersRecalibrate(_ status: SourceControlStatus) -> Bool {
-        switch status {
-        case .timecode, .calibrating, .internalPlay: return true
-        case .off, .thru, .fx: return false
         }
     }
 

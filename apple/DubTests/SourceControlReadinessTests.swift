@@ -41,13 +41,4 @@ final class SourceControlReadinessTests: XCTestCase {
                 .none)
         }
     }
-
-    func testRecalibrateIsOfferedOnIntAsWellAsTc() {
-        XCTAssertTrue(SourceControlView.offersRecalibrate(.internalPlay))
-        XCTAssertTrue(SourceControlView.offersRecalibrate(.timecode))
-        XCTAssertTrue(SourceControlView.offersRecalibrate(.calibrating))
-        XCTAssertFalse(SourceControlView.offersRecalibrate(.thru))
-        XCTAssertFalse(SourceControlView.offersRecalibrate(.fx))
-        XCTAssertFalse(SourceControlView.offersRecalibrate(.off))
-    }
 }

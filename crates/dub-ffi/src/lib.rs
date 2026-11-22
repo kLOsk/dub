@@ -608,7 +608,22 @@ pub use rip::{
 ///       and [`DeckTelemetry::steady_state`] says whether it is. The
 ///       following grid's beats are now the band's pulse
 ///       (`dub_bpm::band_pulse`), not a line on each hit.
-pub const FFI_VERSION: u32 = 93;
+///   94. **Re-analyze gives Dub's grid.** [`DubLibrary::reanalyze_track`]:
+///       the pass the DJ asks for by name takes the active slot from an
+///       imported grid on an unlocked track. [`DubLibrary::analyze_track`]
+///       (a deck load's own pass) still leaves an imported grid in place.
+///       [`DubLibrary::backfill_track_loudness`] measures the loudness
+///       of a track analysed before analysis measured any.
+///       [`DubLibrary::search_anywhere`]: the rows of every match, for
+///       a search that finds the record outside the list on screen.
+///       **The DJ's word on following.** [`DubLibrary::grid_follow`] /
+///       [`DubLibrary::set_grid_follow`] (schema v13),
+///       [`LibraryBeatGrid::grid_follow`] and
+///       [`DubEngine::set_deck_grid_follow`]: per track, follow the
+///       band, keep the even grid, or leave it to the tracker.
+///       **Missing tracks, listed and cleared.**
+///       [`DubLibrary::missing_tracks`] / [`DubLibrary::remove_missing_tracks`].
+pub const FFI_VERSION: u32 = 94;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -893,6 +908,10 @@ struct FilePeaks {
     /// [`DubEngine::set_deck_grid_locked`] when the Apple shell
     /// toggles the lock from the library UI without reloading.
     grid_locked: bool,
+    /// The DJ's word on whether this track's grid follows its band
+    /// (`tracks.grid_follow`, FFI 94): `None` leaves it to the tracker.
+    /// Set at load, changed by [`DubEngine::set_deck_grid_follow`].
+    grid_follow: Option<bool>,
 }
 
 impl PeakSource {
@@ -1278,7 +1297,7 @@ impl DubEngine {
         if !FOLLOWING_GRID.load(Ordering::Acquire) {
             return;
         }
-        let (track, grid) = {
+        let (track, grid, word) = {
             let state = lock_state(&self.state);
             let EngineState::Running(running) = &*state else {
                 return;
@@ -1289,10 +1308,10 @@ impl DubEngine {
             let Some(PeakSource::File(fp)) = running.peaks[idx].as_ref() else {
                 return;
             };
-            (track, fp.beat_grid.clone())
+            (track, fp.beat_grid.clone(), fp.grid_follow)
         };
         let samples = samples_for_offline_analysis(&track);
-        let Some(followed) = followed_grid(&grid, &track, &samples) else {
+        let Some(followed) = followed_grid(&grid, &track, &samples, word) else {
             return;
         };
         let mut state = lock_state(&self.state);
@@ -4356,6 +4375,64 @@ impl DubEngine {
         Ok(())
     }
 
+    /// Take the DJ's word on whether the loaded track's grid follows its
+    /// band (`None`: leave it to the tracker) and lay the grid again by
+    /// it: the even grid first, then the band's beats on top where the
+    /// word or the tracker says so. Follows the band on the calling
+    /// thread — a second or so — so call it off the main thread. FFI 94.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::NotRunning`] when the engine isn't running.
+    /// * [`EngineError::InvalidDeckIndex`] when `deck_idx` is out of range.
+    /// * [`EngineError::NoTrackLoaded`] when the deck has no File source.
+    /// * [`EngineError::GridLocked`] on a locked grid, which plays as saved.
+    pub fn set_deck_grid_follow(
+        &self,
+        deck_idx: u64,
+        follow: Option<bool>,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        {
+            let mut state = lock_state(&self.state);
+            let EngineState::Running(running) = &mut *state else {
+                return Err(EngineError::NotRunning);
+            };
+            let duration_secs = running
+                .file_tracks
+                .get(idx)
+                .and_then(|t| t.as_ref())
+                .ok_or(EngineError::NoTrackLoaded(deck_idx))?
+                .duration_seconds();
+            let Some(PeakSource::File(fp)) = running.peaks[idx].as_mut() else {
+                return Err(EngineError::NoTrackLoaded(deck_idx));
+            };
+            if fp.grid_locked {
+                return Err(EngineError::GridLocked(deck_idx));
+            }
+            fp.grid_follow = follow;
+            if fp.beat_grid.follows {
+                let even = synthesise_beat_grid(
+                    fp.beat_grid.bpm,
+                    fp.beat_grid.even_anchor_secs,
+                    duration_secs,
+                    u8::try_from(fp.beat_grid.even_bar_phase).unwrap_or(0),
+                );
+                fp.beat_grid = BeatGrid {
+                    beats: even.beats,
+                    bar_phase: even.bar_phase,
+                    follows: false,
+                    even_anchor_secs: even.even_anchor_secs,
+                    even_bar_phase: even.even_bar_phase,
+                    ..fp.beat_grid.clone()
+                };
+            }
+        }
+        self.bump_beat_grid_generation(idx);
+        self.refollow(idx);
+        Ok(())
+    }
+
     /// Tap tempo: rebuild the deck's grid from a run of taps (3 or more)
     /// made while the track plays.
     ///
@@ -6115,6 +6192,7 @@ fn background_analyze_and_install(
                 .as_ref()
                 .map(|g| g.grid_locked)
                 .unwrap_or(false),
+            grid_follow: library_grid.as_ref().and_then(|g| g.grid_follow),
         });
         match target {
             AnalysisTarget::Live(slot) => {
@@ -6222,8 +6300,10 @@ fn background_analyze_and_install(
     // load worker, after the record is already playing.
     let saved = library_grid.as_ref().and_then(|lg| {
         let map = lg.tempo_map.as_ref()?;
-        let usable =
-            FOLLOWING_GRID.load(Ordering::Acquire) && map.beats.len() >= 2 && lg.grid_locked;
+        let usable = FOLLOWING_GRID.load(Ordering::Acquire)
+            && map.beats.len() >= 2
+            && lg.grid_locked
+            && lg.grid_follow != Some(false);
         usable.then(|| BeatGrid {
             beats: map.beats.clone(),
             bar_phase: map.bar_phase,
@@ -6235,7 +6315,12 @@ fn background_analyze_and_install(
     });
     let (grid, source_label) = match saved {
         Some(saved) => (saved, "followed (saved)"),
-        None => match followed_grid(&grid, &track, full_samples.get()) {
+        None => match followed_grid(
+            &grid,
+            &track,
+            full_samples.get(),
+            library_grid.as_ref().and_then(|lg| lg.grid_follow),
+        ) {
             Some(followed) => (followed, "followed"),
             None => (grid, source_label),
         },
@@ -6316,10 +6401,100 @@ fn sync_steady(state: &Mutex<EngineState>, shared: &[Arc<DeckSharedState>; 2], i
     shared.steady().clear();
 }
 
+impl DubLibrary {
+    /// Compute and commit one analysis pass, then follow the band over
+    /// the grid it leaves active.
+    fn analyze_job(
+        &self,
+        track_id: &str,
+        job: &dub_library::AnalysisJob,
+    ) -> std::result::Result<LibraryAnalysisOutcome, LibraryFfiError> {
+        let track = dub_library::analyze_decode(job)?;
+        let computed = dub_library::analyze_compute_with_track(job, &track)?;
+        let outcome = self.with_library(|lib| {
+            Ok(LibraryAnalysisOutcome::from(
+                lib.analyze_commit(job, computed)?,
+            ))
+        })?;
+        // The map is an extra on top of a finished analysis: a failure
+        // here leaves the track analysed and even, as a load would find it.
+        let _ = self.follow_after_analysis(track_id, &track);
+        Ok(outcome)
+    }
+
+    /// Save (or drop) the track's following grid once it is analysed,
+    /// so the library shows a track that follows its band before it has
+    /// ever been on a deck. It used to be saved only from a loaded deck,
+    /// and a batch analysis left every such track looking even until
+    /// then (Daniel, 2026-11-22). The same decision a load makes
+    /// ([`followed_grid`]), over the same even grid.
+    ///
+    /// A locked track's saved map is left alone: it is what the DJ
+    /// accepted. One with no map yet is followed as its first load
+    /// would follow it.
+    fn follow_after_analysis(
+        &self,
+        track_id: &str,
+        track: &Track,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        if !FOLLOWING_GRID.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let found = self.with_library(|lib| {
+            let Some(active) = lib.active_beatgrid_for_track(track_id)? else {
+                return Ok(None);
+            };
+            if lib.is_grid_locked(track_id)? && lib.tempo_map(track_id)?.is_some() {
+                return Ok(None);
+            }
+            Ok(Some((
+                LibraryBeatGrid::from(active),
+                lib.grid_follow(track_id)?,
+            )))
+        })?;
+        let Some((active, word)) = found else {
+            return Ok(());
+        };
+        let even = synthesise_beat_grid(
+            active.bpm,
+            active.anchor_secs,
+            track.duration_seconds(),
+            u8::try_from(active.bar_phase).unwrap_or(0),
+        );
+        let samples = samples_for_offline_analysis(track);
+        let followed = followed_grid(&even, track, &samples, word);
+        self.with_library(|lib| {
+            match followed {
+                Some(grid) => lib.save_tempo_map(
+                    track_id,
+                    &dub_library::TempoMap::followed(
+                        grid.beats,
+                        u8::try_from(grid.bar_phase).unwrap_or(0),
+                        &active.source,
+                        active.bpm,
+                        active.anchor_secs,
+                    ),
+                ),
+                None => lib.delete_tempo_map(track_id),
+            }
+            .map_err(|e| LibraryFfiError::QueryFailed(e.to_string()))
+        })
+    }
+}
+
 /// The band's own beats for `grid`, when following is switched on and the
 /// track's band wanders off it — see [`DubEngine::set_following_grid`].
-fn followed_grid(grid: &BeatGrid, track: &Track, samples: &[f32]) -> Option<BeatGrid> {
-    if !FOLLOWING_GRID.load(Ordering::Acquire) || grid.beats.is_empty() {
+///
+/// `word` is the DJ's on this track (`tracks.grid_follow`): `Some(false)`
+/// keeps the even grid, `Some(true)` follows the band without asking the
+/// tracker's own test, `None` asks it.
+fn followed_grid(
+    grid: &BeatGrid,
+    track: &Track,
+    samples: &[f32],
+    word: Option<bool>,
+) -> Option<BeatGrid> {
+    if !FOLLOWING_GRID.load(Ordering::Acquire) || grid.beats.is_empty() || word == Some(false) {
         return None;
     }
     let even = CoreBeatGrid {
@@ -6331,7 +6506,12 @@ fn followed_grid(grid: &BeatGrid, track: &Track, samples: &[f32]) -> Option<Beat
         quality: None,
         downbeat_confidence: grid.downbeat_confidence,
     };
-    let followed = dub_bpm::follow_grid(samples, track.sample_rate(), track.channels(), &even)?;
+    let follow = if word == Some(true) {
+        dub_bpm::follow_grid_always
+    } else {
+        dub_bpm::follow_grid
+    };
+    let followed = follow(samples, track.sample_rate(), track.channels(), &even)?;
     Some(BeatGrid {
         beats: followed.beats,
         bar_phase: u32::from(followed.bar_phase),
@@ -6477,6 +6657,7 @@ fn file_peaks_without_grid(p: OfflinePeaks) -> FilePeaks {
         samples_per_filtered_chunk: u32::try_from(p.samples_per_filtered_chunk).unwrap_or(u32::MAX),
         beat_grid: BeatGrid::empty(),
         grid_locked: false,
+        grid_follow: None,
     }
 }
 
@@ -7347,7 +7528,7 @@ mod tests {
         // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
         // 91→92: `search_track_ids`.
         // 92→93: `set_deck_steady`, `DeckTelemetry.steady_state`.
-        assert_eq!(FFI_VERSION, 93);
+        assert_eq!(FFI_VERSION, 94);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {
@@ -8012,6 +8193,7 @@ mod tests {
             samples_per_filtered_chunk: 512,
             beat_grid: BeatGrid::empty(),
             grid_locked: false,
+            grid_follow: None,
         };
         let peaks: [Option<PeakSource>; 2] = [Some(PeakSource::File(synthetic_file_peaks)), None];
         engine.bump_peak_generation_for_occupied(&peaks);
@@ -8065,6 +8247,7 @@ mod tests {
             samples_per_filtered_chunk: 64,
             beat_grid: BeatGrid::empty(),
             grid_locked: false,
+            grid_follow: None,
         };
         let source = PeakSource::File(file);
 
@@ -8763,6 +8946,10 @@ pub struct LibraryBeatGrid {
     /// instead of following the band again — while the map was followed
     /// from this very grid, and always on a locked track.
     pub tempo_map: Option<LibraryTempoMap>,
+    /// The DJ's word on whether this track's grid follows its band
+    /// (schema v13, FFI 94): `true` follow, `false` keep the even grid,
+    /// `None` leave it to the tracker.
+    pub grid_follow: Option<bool>,
 }
 
 /// A track's saved tempo map as the engine takes it at load (FFI 89).
@@ -8792,6 +8979,7 @@ impl From<dub_library::ActiveBeatgrid> for LibraryBeatGrid {
             waveform_sidecar_path: g.waveform_sidecar_path,
             bar_phase: u32::from(g.bar_phase),
             tempo_map: None,
+            grid_follow: None,
         }
     }
 }
@@ -9354,6 +9542,22 @@ impl DubLibrary {
         })
     }
 
+    /// Every track the search matches, in the collection or not. The
+    /// browser lists these under the matches from the list on screen.
+    /// `hidden_sources` are the apps whose libraries are out of the
+    /// sidebar: a track reachable only through them is left out. FFI 94.
+    pub fn search_anywhere(
+        &self,
+        query: String,
+        limit: u32,
+        hidden_sources: Vec<String>,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.search_tracks_anywhere(&query, limit, &hidden_sources)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
     /// The ids of every track the search matches, in the collection or
     /// not. The browser searches the list it is showing by keeping the
     /// rows of that list whose ids come back here; [`Self::search`]
@@ -9746,6 +9950,38 @@ impl DubLibrary {
     /// footer per PRD §8.5.5.
     pub fn missing_track_count(&self) -> std::result::Result<u64, LibraryFfiError> {
         self.with_library(|lib| Ok(lib.missing_track_count()?))
+    }
+
+    /// The missing tracks as browser rows: what
+    /// [`Self::missing_track_count`] counts, to read and to clear out.
+    /// FFI 94.
+    pub fn missing_tracks(
+        &self,
+        limit: u32,
+    ) -> std::result::Result<Vec<LibraryTrack>, LibraryFfiError> {
+        self.with_library(|lib| {
+            let rows = lib.missing_track_rows(limit)?;
+            Ok(rows.into_iter().map(LibraryTrack::from).collect())
+        })
+    }
+
+    /// Remove the missing ones among `track_ids` from the library, with
+    /// their cues, grids and crate places; returns how many went. A
+    /// track whose file is there is never removed, whatever the caller
+    /// believed. No file on disk is touched. FFI 94.
+    pub fn remove_missing_tracks(
+        &self,
+        track_ids: Vec<String>,
+    ) -> std::result::Result<u32, LibraryFfiError> {
+        self.with_library(|lib| {
+            let mut removed = 0u32;
+            for id in &track_ids {
+                if lib.remove_track_if_missing(id)? {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
     }
 
     /// Fetch the next batch of `track_files` rows for the
@@ -10239,12 +10475,55 @@ impl DubLibrary {
         track_id: String,
     ) -> std::result::Result<LibraryAnalysisOutcome, LibraryFfiError> {
         let job = self.with_library(|lib| Ok(lib.analyze_prepare(&track_id)?))?;
-        let computed = dub_library::analyze_compute(&job)?;
-        self.with_library(|lib| {
-            Ok(LibraryAnalysisOutcome::from(
-                lib.analyze_commit(&job, computed)?,
-            ))
-        })
+        self.analyze_job(&track_id, &job)
+    }
+
+    /// [`Self::analyze_track`] for a pass the DJ asked for (Re-analyze,
+    /// Reset grid): on an unlocked track its grid becomes the active
+    /// one even where an imported grid held the slot. FFI 94.
+    pub fn reanalyze_track(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<LibraryAnalysisOutcome, LibraryFfiError> {
+        let job = self.with_library(|lib| Ok(lib.reanalyze_prepare(&track_id)?))?;
+        self.analyze_job(&track_id, &job)
+    }
+
+    /// The DJ's word on whether `track_id`'s grid follows its band:
+    /// `true` follow, `false` keep the even grid, `None` leave it to
+    /// the tracker. FFI 94.
+    pub fn grid_follow(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<Option<bool>, LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.grid_follow(&track_id)?))
+    }
+
+    /// Record the DJ's word; see [`Self::grid_follow`]. Refused with
+    /// `GridLocked` on a locked grid.
+    pub fn set_grid_follow(
+        &self,
+        track_id: String,
+        follow: Option<bool>,
+    ) -> std::result::Result<(), LibraryFfiError> {
+        self.with_library(|lib| Ok(lib.set_grid_follow(&track_id, follow)?))
+    }
+
+    /// Measure and store the loudness of a track that was analysed
+    /// before analysis measured any, leaving its grid, key and lock
+    /// alone. `false`, at the cost of one indexed read, when the track
+    /// is owed none — so a deck load can ask every time. The decode
+    /// runs with no library lock held. FFI 94.
+    pub fn backfill_track_loudness(
+        &self,
+        track_id: String,
+    ) -> std::result::Result<bool, LibraryFfiError> {
+        let Some(job) = self.with_library(|lib| Ok(lib.loudness_prepare(&track_id)?))? else {
+            return Ok(false);
+        };
+        let measured = dub_library::measure_loudness(&job)?;
+        self.with_library(|lib| Ok(lib.loudness_commit(&job, &measured)?))?;
+        Ok(true)
     }
 
     /// `true` once auto-analysis (or an imported grid) has run for
@@ -10290,6 +10569,7 @@ impl DubLibrary {
                 base_bpm: m.base_bpm,
                 base_anchor_secs: m.base_anchor_secs,
             });
+            grid.grid_follow = lib.grid_follow(&track_id)?;
             Ok(Some(grid))
         })
     }
@@ -11126,6 +11406,80 @@ mod library_ffi_tests {
         assert_eq!(lib.missing_track_count().unwrap(), 0);
         assert!(lib.list_files_for_scan(10).unwrap().is_empty());
         assert!(lib.list_missing_tracks(10).unwrap().is_empty());
+    }
+
+    /// A mono 16-bit WAV of clicks whose tempo climbs from 100 to 105
+    /// BPM: a band no even grid fits.
+    fn write_wandering_clicks(path: &std::path::Path) {
+        let sr = 44_100u32;
+        let secs = 90.0f64;
+        let mut pcm = vec![0.0f32; (secs * f64::from(sr)) as usize];
+        let mut t = 0.5f64;
+        while t < secs - 1.0 {
+            let at = (t * f64::from(sr)) as usize;
+            for (i, s) in pcm[at..].iter_mut().take(2_400).enumerate() {
+                *s += (-(i as f32) / 600.0).exp();
+            }
+            t += 60.0 / (100.0 + 5.0 * t / secs);
+        }
+        let data: Vec<u8> = pcm
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 30_000.0) as i16).to_le_bytes())
+            .collect();
+        let len = u32::try_from(data.len()).unwrap();
+        let mut wav = Vec::with_capacity(data.len() + 44);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sr.to_le_bytes());
+        wav.extend_from_slice(&(sr * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&len.to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// Analysing a track saves its following grid, so the library shows
+    /// it before the track has been on a deck — and only with the
+    /// following grid on, and never against the DJ's "even grid".
+    #[test]
+    fn analysis_saves_the_following_grid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music = tmp.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        write_wandering_clicks(&music.join("band.wav"));
+        let lib = DubLibrary::new();
+        lib.open_at(tmp.path().join("lib.sqlite").to_string_lossy().to_string())
+            .unwrap();
+        lib.import_folder(music.to_string_lossy().to_string())
+            .unwrap();
+        let id = lib.list_tracks(10, 0).unwrap()[0].id.clone();
+        let map = |lib: &DubLibrary| {
+            lib.active_beat_grid(id.clone())
+                .unwrap()
+                .and_then(|g| g.tempo_map)
+        };
+
+        FOLLOWING_GRID.store(false, Ordering::Release);
+        lib.analyze_track(id.clone()).unwrap();
+        assert!(map(&lib).is_none(), "following is off: nothing is saved");
+
+        FOLLOWING_GRID.store(true, Ordering::Release);
+        lib.set_grid_follow(id.clone(), Some(true)).unwrap();
+        lib.reanalyze_track(id.clone()).unwrap();
+        let saved = map(&lib).expect("a following grid is saved");
+        assert!(saved.beats.len() > 100);
+        assert_eq!(saved.base_source, "auto");
+
+        lib.set_grid_follow(id.clone(), Some(false)).unwrap();
+        lib.reanalyze_track(id.clone()).unwrap();
+        assert!(map(&lib).is_none(), "the DJ's even grid drops the map");
+        FOLLOWING_GRID.store(false, Ordering::Release);
     }
 
     #[test]

@@ -264,8 +264,7 @@ struct FxRackColumn: View, Equatable {
             onTimecode: callbacks.onSetTimecode,
             onThru: callbacks.onSetThru,
             showFx: true,
-            onFx: {},
-            onRecalibrate: callbacks.onRecalibrate)
+            onFx: {})
     }
 
     private var expertChip: some View {

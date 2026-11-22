@@ -74,6 +74,11 @@ enum WaveformZoom {
     /// Where the DJ's last choice is kept, so a restart comes back to it.
     static let storageKey = "dub.waveformZoomIndex"
 
+    /// The zoom the DJ last left, or the default on a first launch.
+    static func stored(_ defaults: UserDefaults = .standard) -> Int {
+        defaults.object(forKey: storageKey) == nil ? defaultIndex : clamped(defaults.integer(forKey: storageKey))
+    }
+
     /// A stored index brought inside the ladder: a build with a
     /// different ladder must not index past its end.
     static func clamped(_ index: Int) -> Int {

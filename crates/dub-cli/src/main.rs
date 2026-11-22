@@ -276,7 +276,7 @@ fn print_help() {
     eprintln!("    Output routing (M5.5.2): on startup, the CoreAudio default-output device's");
     eprintln!("    name is matched against the known-device table. SL3 routes deck A to physical");
     eprintln!("    output channels 3+4 and deck B to 5+6 (matching SL3's per-deck wiring); aux");
-    eprintln!("    stays on 1+2. Audio 6 routes deck A to 1+2 and deck B to 3+4 (unverified).");
+    eprintln!("    stays on 1+2. Audio 6 routes deck A to 3+4 and deck B to 5+6.");
     eprintln!("    Unknown devices fall back to the 2-ch internal mixer with a warning. Pass");
     eprintln!("    --deck-a-out-ch / --deck-b-out-ch (1-based) for manual routing on unknown");
     eprintln!("    interfaces, --device-profile NAME to pin a specific profile, or");
