@@ -863,6 +863,16 @@
   one. Find each hit's shape in the output: where it landed against the
   tempo, how much of it arrived, whether a second copy sits beside it —
   and discount hits the record itself plays twice.
+- **The stretcher's output is not the raw read at the playhead.** Every
+  way out of key lock — switching it off, a loop switching steadying off,
+  a jump's declick — cut from the stretcher's stream to a raw read in one
+  sample, and on a deck pitched off the record that stepped 12–88× a
+  normal sample (Daniel heard it engaging a reverse loop, 2026-11-22). The
+  way in always crossfaded; the way out never did, and every key-lock test
+  measured steady playback. Leaving the stretcher is now `Disengaging`,
+  the mirror of `Engaging`, and a declick that starts while engaged takes
+  its old side from the stretcher (`prev_stretched`). Any new transition
+  out of a stretched path needs the same: measure the step *across* it.
 
 ## Build + test hygiene
 

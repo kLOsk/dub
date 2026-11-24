@@ -1027,6 +1027,13 @@ enum DeclickState {
         prev_position: f64,
         prev_rate: f64,
         prev_playing: bool,
+        /// The old side was the key-lock stretcher's output, so the fade
+        /// carries on from the stretcher, not from a raw read at
+        /// `prev_position`: the two are not the same waveform, and
+        /// starting the fade from the raw read cut from one to the other
+        /// in a sample (a reverse loop engaged on a pitched, key-locked
+        /// deck stepped 50–90× a normal sample, 2026-11-22).
+        prev_stretched: bool,
         /// Counts down from `envelope.len()` to 0.
         samples_remaining: u32,
     },
@@ -1225,6 +1232,13 @@ enum KeyLockState {
     Engaging { i: u32 },
     /// Stretcher fully engaged — pitch held.
     Engaged,
+    /// Crossfading engaged → bypass over the same envelope (index `i`):
+    /// the stretcher's stream fades out while the raw read fades in. Going
+    /// straight to `Bypassed` cut from one waveform to another — the
+    /// stretched audio is not the raw read at the playhead — and clicked
+    /// whenever key lock was switched off, or a loop switched steadying
+    /// off, on a deck whose pitch was not the record's.
+    Disengaging { i: u32 },
 }
 
 impl Deck {
@@ -1472,6 +1486,11 @@ impl Deck {
         let new_prev_position = self.position;
         let new_prev_rate = self.rate;
         let new_prev_playing = self.playing;
+        let new_prev_stretched = self.playing
+            && matches!(
+                self.lock_state,
+                KeyLockState::Engaged | KeyLockState::Engaging { .. }
+            );
         let n = self.declick_envelope.len();
 
         // If a ramp is already active, its prev_source needs to be
@@ -1515,6 +1534,7 @@ impl Deck {
             prev_position: new_prev_position,
             prev_rate: new_prev_rate,
             prev_playing: new_prev_playing,
+            prev_stretched: new_prev_stretched,
             samples_remaining: n,
         };
     }
@@ -1560,6 +1580,22 @@ impl Deck {
     #[must_use]
     pub fn rate(&self) -> f64 {
         self.rate
+    }
+
+    /// Track frames the playhead moves per output frame at `engine_sr`,
+    /// as of the last block: the platter's rate, with steadying on top.
+    /// `None` with no track. What another deck's echo-out needs to know
+    /// when this deck's next beat line comes round.
+    #[must_use]
+    pub fn playhead_increment(&self, engine_sr: f32) -> Option<f64> {
+        let track = self.source.as_ref()?;
+        if engine_sr <= 0.0 {
+            return None;
+        }
+        Some(
+            self.rate * f64::from(track.sample_rate()) / f64::from(engine_sr)
+                * self.steadying.unwrap_or(1.0),
+        )
     }
 
     /// Set the playback rate in **musical** units (see
@@ -1634,7 +1670,11 @@ impl Deck {
     /// then moved by more or less than the platter did, on purpose.
     #[must_use]
     pub fn is_steadying(&self) -> bool {
-        self.steadying.is_some() && !matches!(self.lock_state, KeyLockState::Bypassed)
+        self.steadying.is_some()
+            && matches!(
+                self.lock_state,
+                KeyLockState::Engaged | KeyLockState::Engaging { .. }
+            )
     }
 
     /// Current playback position in track frames.
@@ -2013,6 +2053,7 @@ impl Deck {
             prev_position,
             prev_rate,
             prev_playing,
+            prev_stretched,
             samples_remaining,
         } = &mut self.declick
         {
@@ -2039,7 +2080,31 @@ impl Deck {
                 // path so the old side smoothly tails to silence if it
                 // happens to walk past its track end during the M3.5
                 // crossfade.
-                let (old_l, old_r) = if *prev_playing {
+                let (old_l, old_r) = if *prev_playing && *prev_stretched {
+                    // The stretcher's own continuation, fed from where it
+                    // was reading. No loop seam: the old stream had none
+                    // at the jump that started this fade, and wrapping it
+                    // now would cut it into the new loop.
+                    if let Some(t) = prev_source.as_ref() {
+                        #[allow(clippy::cast_precision_loss)]
+                        let tlen = t.frames() as f64;
+                        kl_next(
+                            &mut self.stretchers.splice,
+                            t,
+                            tlen,
+                            env,
+                            &mut self.read_cursor,
+                            engaged_feed,
+                            None,
+                            &mut self.stretch_in,
+                            &mut self.stretch_out,
+                            &mut self.stretch_out_len,
+                            &mut self.stretch_out_read,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    }
+                } else if *prev_playing {
                     if let Some(t) = prev_source.as_ref() {
                         let (l, r) = read_stereo_at(t, *prev_position);
                         #[allow(clippy::cast_precision_loss)]
@@ -2121,14 +2186,39 @@ impl Deck {
                 self.lock_state = match self.lock_state {
                     KeyLockState::Bypassed if can_engage => KeyLockState::Engaging { i: 0 },
                     KeyLockState::Bypassed => KeyLockState::Bypassed,
-                    s if must_bypass => {
-                        let _ = s;
-                        KeyLockState::Bypassed
-                    }
+                    // Runs to its end, then the settle timer decides.
+                    KeyLockState::Disengaging { i } => KeyLockState::Disengaging { i },
+                    // A transport change's declick has already faded the
+                    // stretcher out (`prev_stretched`), so bypass is clean.
+                    _ if must_bypass && declick_active => KeyLockState::Bypassed,
+                    _ if must_bypass => KeyLockState::Disengaging { i: 0 },
                     s => s,
                 };
 
-                if matches!(self.lock_state, KeyLockState::Bypassed) {
+                if let KeyLockState::Disengaging { .. } = self.lock_state {
+                    render_disengaging(
+                        &mut self.stretchers.splice,
+                        track,
+                        track_len,
+                        &self.declick_envelope,
+                        &self.lock_xfade,
+                        out,
+                        stride,
+                        offset,
+                        frames_consumed_in_fade,
+                        gain,
+                        new_increment,
+                        engaged_feed,
+                        loop_seam,
+                        &mut pos,
+                        &mut self.read_cursor,
+                        &mut self.stretch_in,
+                        &mut self.stretch_out,
+                        &mut self.stretch_out_len,
+                        &mut self.stretch_out_read,
+                        &mut self.lock_state,
+                    );
+                } else if matches!(self.lock_state, KeyLockState::Bypassed) {
                     // --- Bypass path (raw resampler) — unchanged behaviour. ---
                     let env = &self.declick_envelope;
                     for chunk in out.chunks_exact_mut(stride).skip(frames_consumed_in_fade) {
@@ -2255,7 +2345,10 @@ impl Deck {
         // bypassed) / engaged.
         let kl_state = if !self.key_lock_enabled {
             0
-        } else if matches!(self.lock_state, KeyLockState::Bypassed) {
+        } else if matches!(
+            self.lock_state,
+            KeyLockState::Bypassed | KeyLockState::Disengaging { .. }
+        ) {
             1
         } else {
             2
@@ -2656,6 +2749,73 @@ fn render_engaged<S: TimeStretcher>(
                 (l, r)
             }
             _ => (sl, sr),
+        };
+        chunk[offset] += l * gain;
+        chunk[offset + 1] += r * gain;
+        *pos = wrap_looped(*pos + new_increment, seam);
+    }
+}
+
+/// The key-locked stream handing over to the raw read: the stretcher
+/// keeps playing what it was fed and fades out over `lock_xfade` while
+/// the raw read at the playhead fades in — the mirror of the engage in
+/// [`render_engaged`]. The stretcher's time ratio is left as the last
+/// engaged block set it: a disengage can be caused by a rate the
+/// stretcher cannot take (a scratch, a stop), and its tail should play on
+/// as it was going. Ends in `Bypassed`; the settle timer re-primes it.
+#[allow(clippy::too_many_arguments)]
+fn render_disengaging<S: TimeStretcher>(
+    stretcher: &mut S,
+    track: &Track,
+    track_len: f64,
+    declick_env: &DeclickEnvelope,
+    lock_xfade: &DeclickEnvelope,
+    out: &mut [f32],
+    stride: usize,
+    offset: usize,
+    start: usize,
+    gain: f32,
+    new_increment: f64,
+    feed_increment: f64,
+    seam: Option<LoopSeam>,
+    pos: &mut f64,
+    read_cursor: &mut f64,
+    stretch_in: &mut [f32],
+    stretch_out: &mut [f32],
+    out_len: &mut usize,
+    out_read: &mut usize,
+    lock_state: &mut KeyLockState,
+) {
+    for chunk in out.chunks_exact_mut(stride).skip(start) {
+        let (bl, br) = read_looped(track, *pos, seam, declick_env);
+        let edge = track_tail_fade_scale(track_len, *pos, declick_env);
+        let (l, r) = if let KeyLockState::Disengaging { i } = *lock_state {
+            let (sl, sr) = kl_next(
+                stretcher,
+                track,
+                track_len,
+                declick_env,
+                read_cursor,
+                feed_increment,
+                seam,
+                stretch_in,
+                stretch_out,
+                out_len,
+                out_read,
+            );
+            let raw_in = lock_xfade.fade_in(i);
+            let next = i + 1;
+            *lock_state = if next >= lock_xfade.len() {
+                KeyLockState::Bypassed
+            } else {
+                KeyLockState::Disengaging { i: next }
+            };
+            (
+                sl * (1.0 - raw_in) + bl * edge * raw_in,
+                sr * (1.0 - raw_in) + br * edge * raw_in,
+            )
+        } else {
+            (bl * edge, br * edge)
         };
         chunk[offset] += l * gain;
         chunk[offset + 1] += r * gain;
@@ -3107,6 +3267,79 @@ mod tests {
             s[i * 2 + 1] = v;
         }
         const_track(&s, 2, 48_000)
+    }
+
+    /// A deck playing a sine at `rate` with key lock on, settled into
+    /// the stretcher: what the tests below change something on.
+    fn key_locked_sine_deck(freq: f32, rate: f64) -> Deck {
+        let mut deck = test_deck();
+        deck.set_source(kl_sine_track(freq, 48_000 * 12));
+        deck.set_playing(true);
+        deck.set_rate(rate);
+        deck.set_stretch_backend(dub_stretch::StretchBackend::DubOwn);
+        deck.set_key_lock(true);
+        deck.quiesce_declick_for_test();
+        deck
+    }
+
+    /// The largest step across a change, against the largest in the
+    /// steady half second before it. The tail of `before` is joined on,
+    /// so a cut at the very first sample of `after` is measured too.
+    fn step_ratio(before: &[f32], after: &[f32]) -> f32 {
+        let steady = max_step(&before[before.len() / 2..]);
+        let mut joined = before[before.len() - 128..].to_vec();
+        joined.extend_from_slice(after);
+        max_step(&joined) / steady
+    }
+
+    /// A reverse loop engaged on a key-locked deck pitched off the
+    /// record jumps the playhead back, and the jump's fade has to start
+    /// from what was playing: the stretcher's output. It started from a
+    /// raw read at the old playhead, a different waveform, and the cut
+    /// between them stepped 47–88× a normal sample (2026-11-22). 83.5 Hz
+    /// lands half a cycle out across the one-second loop, the worst a
+    /// fade can be handed; a two-millisecond fade over that is ~3×.
+    /// Measured up to the first wrap, through the jump and the
+    /// stretcher taking over again.
+    #[test]
+    fn a_reverse_loop_engages_without_a_click_on_a_key_locked_pitched_deck() {
+        for freq in [83.0f32, 83.5, 440.0, 440.5] {
+            let mut deck = key_locked_sine_deck(freq, 1.06);
+            let before = kl_render(&mut deck, 300, 512);
+            assert_eq!(
+                deck.shared.load_key_lock_state(),
+                2,
+                "engaged before the loop"
+            );
+            let out_f = deck.position_frames() - 1_000.0;
+            deck.set_loop(out_f - 48_000.0, out_f);
+            let after = kl_render(&mut deck, 70, 512);
+            let ratio = step_ratio(&before, &after);
+            assert!(
+                ratio < 3.5,
+                "{freq} Hz: engaging the loop stepped {ratio:.1}× a normal sample"
+            );
+        }
+    }
+
+    /// Key lock switched off on a pitched deck hands over to the raw read
+    /// over a crossfade, the mirror of switching it on. It cut over in
+    /// one sample and stepped up to 88× (2026-11-22). The same path is
+    /// taken when a loop switches steadying off.
+    #[test]
+    fn switching_key_lock_off_on_a_pitched_deck_is_not_a_click() {
+        for freq in [83.5f32, 440.5] {
+            let mut deck = key_locked_sine_deck(freq, 1.06);
+            let before = kl_render(&mut deck, 300, 512);
+            deck.set_key_lock(false);
+            let after = kl_render(&mut deck, 20, 512);
+            let ratio = step_ratio(&before, &after);
+            assert!(
+                ratio < 1.5,
+                "{freq} Hz: key lock off stepped {ratio:.1}× a normal sample"
+            );
+            assert_eq!(deck.shared.load_key_lock_state(), 0);
+        }
     }
 
     fn kl_render(deck: &mut Deck, blocks: usize, block_frames: usize) -> Vec<f32> {

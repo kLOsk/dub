@@ -2596,6 +2596,7 @@ final class WaveformAppModel: ObservableObject {
         tallyPlayed()
         syncFxEcho()
         recomputeMaster()
+        syncEchoFollow()
         pollSampler()
         logSignalDiagnostics()
     }
@@ -6645,12 +6646,7 @@ final class WaveformAppModel: ObservableObject {
         // *its* time: echoing the old tune out under the one just
         // dropped in, the repeats have to land on the new tune's beat
         // (Daniel, 2026-11-19).
-        let other: DeckSide = side == .a ? .b : .a
-        let effectiveBpm = Self.echoOutTempo(
-            own: tempoAsHeard(side),
-            master: masterDeck == other && state(for: other).isPlaying
-                ? tempoAsHeard(other) : nil,
-            tapped: dubFxDeck.flatMap { state(for: $0).fxRack.spaceEchoTapBpm })
+        let (effectiveBpm, _) = echoLead(side)
         guard effectiveBpm > 0 else { return }
         try? engine.engageEchoOut(
             deckIdx: side.ffiDeckIdx,
@@ -6658,6 +6654,50 @@ final class WaveformAppModel: ObservableObject {
             bpm: effectiveBpm,
             feedback: 0.6,    // PRD §6.3 default feedback (60 %)
             lpfHz: 8000)      // PRD §6.3 default feedback low-pass (8 kHz)
+        sendEchoFollow(side)
+    }
+
+    /// The tempo an echo-out on `side` keeps, and the deck it takes it
+    /// from: the other deck while that is the master and playing, else its
+    /// own deck.
+    private func echoLead(_ side: DeckSide) -> (bpm: Double, deck: DeckSide) {
+        let other: DeckSide = side == .a ? .b : .a
+        let otherLeads = masterDeck == other && state(for: other).isPlaying
+        let bpm = Self.echoOutTempo(
+            own: tempoAsHeard(side),
+            master: otherLeads ? tempoAsHeard(other) : nil,
+            tapped: dubFxDeck.flatMap { state(for: $0).fxRack.spaceEchoTapBpm })
+        return (bpm, otherLeads ? other : side)
+    }
+
+    /// When each deck's echo last told the engine what to follow.
+    private var echoFollowSentAt: [DeckSide: TimeInterval] = [:]
+
+    /// Tell the engine what `side`'s echo-out follows (FFI 95): the leading
+    /// deck's beat, placed on its grid, or its tempo alone where it has no
+    /// grid. The echo glides onto it like a tape echo — Daniel, 2026-11-22:
+    /// "if the grid of the master is off the echo quickly speeds up or
+    /// slows down to be in sync with the master grid".
+    private func sendEchoFollow(_ side: DeckSide) {
+        guard isRunning else { return }
+        let (bpm, lead) = echoLead(side)
+        echoFollowSentAt[side] = ProcessInfo.processInfo.systemUptime
+        try? engine.echoFollow(deckIdx: side.ffiDeckIdx, masterIdx: lead.ffiDeckIdx, roomBpm: bpm)
+    }
+
+    /// Re-send what each ringing echo follows four times a second: the
+    /// master changes, its pitch moves, and a following grid's beat
+    /// changes as the record goes on.
+    private func syncEchoFollow() {
+        let now = ProcessInfo.processInfo.systemUptime
+        for side in [DeckSide.a, .b] {
+            guard state(for: side).echoDivision != nil else {
+                echoFollowSentAt[side] = nil
+                continue
+            }
+            if let at = echoFollowSentAt[side], now - at < 0.25 { continue }
+            sendEchoFollow(side)
+        }
     }
 
     /// A deck's tempo as the room hears it: a track's tempo where the

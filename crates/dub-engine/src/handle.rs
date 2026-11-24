@@ -1286,6 +1286,7 @@ impl DeckCommand<'_> {
         delay_frames: u32,
         feedback: f32,
         lp_coeff: f32,
+        beat_track_frames: f64,
     ) -> Result<(), CommandError> {
         let idx = self.handle.check_deck(self.idx)?;
         self.handle.send(Command::DeckEngageEcho {
@@ -1293,6 +1294,33 @@ impl DeckCommand<'_> {
             delay_frames,
             feedback,
             lp_coeff,
+            beat_track_frames,
+        })
+    }
+
+    /// Tell this deck's echo-out what to follow: see
+    /// [`Command::DeckEchoFollow`]. `master` is `None` for nothing.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn echo_follow(
+        self,
+        master: Option<usize>,
+        beat_track_frames: f64,
+        period_track_frames: f64,
+        room_period_secs: f64,
+    ) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        let master = match master {
+            Some(m) => self.handle.check_deck(m)?,
+            None => u8::MAX,
+        };
+        self.handle.send(Command::DeckEchoFollow {
+            idx,
+            master,
+            beat_track_frames,
+            period_track_frames,
+            room_period_secs,
         })
     }
 

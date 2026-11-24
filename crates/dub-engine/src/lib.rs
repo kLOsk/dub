@@ -384,6 +384,11 @@ pub struct Engine {
     /// (not on [`Deck`]) because the FX operates on the per-deck output bus
     /// and applies uniformly to file, timecode, and Thru decks (PRD §5.3).
     echo: [dub_dsp::EchoOut; DECK_COUNT],
+    /// The beat line, in its deck's track frames, that each echo's capture
+    /// is waiting to pass (`NaN` once passed, or with no grid).
+    echo_beat_line: [f64; DECK_COUNT],
+    /// What each echo follows once its beat is in.
+    echo_follow: [EchoFollow; DECK_COUNT],
     /// Per-deck dub-siren synth (M16, PRD §6.3). A *generator* summed onto the
     /// deck's output bus **after** the echo, so it sounds with or without a
     /// track and is never swallowed by echo-out's dry-mute. Each holds its
@@ -565,7 +570,81 @@ impl PanicPlayState {
     }
 }
 
+/// What one deck's echo-out follows: see [`Command::DeckEchoFollow`].
+#[derive(Debug, Clone, Copy)]
+struct EchoFollow {
+    master: Option<usize>,
+    beat_track_frames: f64,
+    period_track_frames: f64,
+    room_period_secs: f64,
+}
+
+impl EchoFollow {
+    const NONE: Self = Self {
+        master: None,
+        beat_track_frames: f64::NAN,
+        period_track_frames: f64::NAN,
+        room_period_secs: f64::NAN,
+    };
+}
+
 impl Engine {
+    /// Where each deck's playhead starts this block and how fast it moves,
+    /// for a deck playing a track: an echo following another deck reads its
+    /// beat from these, before that deck's own render moves it on.
+    fn playheads(&self) -> [Option<(f64, f64)>; DECK_COUNT] {
+        std::array::from_fn(|i| {
+            let deck = &self.decks[i];
+            let plays_a_track = self.thru_sources[i].is_none()
+                && !matches!(self.control_mode[i], ControlMode::Thru | ControlMode::Fx)
+                && deck.is_playing();
+            plays_a_track
+                .then(|| {
+                    deck.playhead_increment(self.sample_rate)
+                        .map(|inc| (deck.position_frames(), inc))
+                })
+                .flatten()
+        })
+    }
+
+    /// Feed deck `idx`'s echo-out for this block, after the deck has
+    /// rendered and before the echo runs: during the capture, where the
+    /// deck's beat line passed; once the beat is in, where the master's
+    /// beats fall (or its tempo alone, or nothing). `heads` are the decks'
+    /// playheads and speeds at the block's start. RT-safe: arithmetic.
+    fn drive_echo(&mut self, idx: usize, heads: &[Option<(f64, f64)>; DECK_COUNT], frames: usize) {
+        let line = self.echo_beat_line[idx];
+        if line.is_finite() {
+            if let Some((start, _)) = heads[idx] {
+                let end = self.decks[idx].position_frames();
+                if end > start && line > start && line <= end {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
+                    let at = ((line - start) / (end - start) * frames as f64) as usize;
+                    self.echo[idx].mark_beat(at.min(frames.saturating_sub(1)));
+                    self.echo_beat_line[idx] = f64::NAN;
+                }
+            }
+            if self.echo[idx].state() == dub_dsp::EchoState::Engaged {
+                self.echo_beat_line[idx] = f64::NAN;
+            }
+        }
+        let follow = self.echo_follow[idx];
+        let on_the_grid = follow.master.and_then(|m| heads[m]).and_then(|(pos, inc)| {
+            let (beat, period) = (follow.beat_track_frames, follow.period_track_frames);
+            (inc > 1e-6 && beat.is_finite() && period.is_finite() && period > 0.0).then(|| {
+                let next = beat + ((pos - beat) / period).ceil() * period;
+                (period / inc, Some((next - pos) / inc))
+            })
+        });
+        let room = (follow.room_period_secs.is_finite() && follow.room_period_secs > 0.0)
+            .then(|| (follow.room_period_secs * f64::from(self.sample_rate), None));
+        self.echo[idx].follow(on_the_grid.or(room));
+    }
+
     /// Create a new engine without a control channel. Suitable for
     /// offline rendering, golden tests, or any single-threaded use where
     /// the caller drives state directly via [`Engine::deck_mut`].
@@ -598,6 +677,8 @@ impl Engine {
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
             echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
+            echo_beat_line: [f64::NAN; DECK_COUNT],
+            echo_follow: [EchoFollow::NONE; DECK_COUNT],
             siren: std::array::from_fn(|_| dub_dsp::SirenVoice::new(sample_rate)),
             sn76477: std::array::from_fn(|_| dub_dsp::Sn76477::new(sample_rate)),
             sn76477_presets: std::array::from_fn(|i| dub_dsp::sn76477_preset(i, sample_rate)),
@@ -687,6 +768,8 @@ impl Engine {
             control_override: [false; DECK_COUNT],
             source_classifier: std::array::from_fn(|_| SourceClassifier::new()),
             echo: std::array::from_fn(|_| dub_dsp::EchoOut::new(sample_rate)),
+            echo_beat_line: [f64::NAN; DECK_COUNT],
+            echo_follow: [EchoFollow::NONE; DECK_COUNT],
             siren: std::array::from_fn(|_| dub_dsp::SirenVoice::new(sample_rate)),
             sn76477: std::array::from_fn(|_| dub_dsp::Sn76477::new(sample_rate)),
             sn76477_presets: std::array::from_fn(|i| dub_dsp::sn76477_preset(i, sample_rate)),
@@ -1102,6 +1185,7 @@ impl Engine {
             *sample = 0.0;
         }
         let sr = self.sample_rate;
+        let heads = self.playheads();
         // Per-deck render dispatch (M7). We can't use
         // `decks.iter_mut().enumerate()` here because the body needs
         // *disjoint* mutable access to both `self.thru_sources[idx]`
@@ -1187,6 +1271,9 @@ impl Engine {
             // through the engine, so muting it is just not writing the
             // passthrough out. When idle the call is a near-no-op that just
             // keeps the delay ring warm.
+            if self.echo[idx].state() != dub_dsp::EchoState::Idle {
+                self.drive_echo(idx, &heads, out.len() / num_channels);
+            }
             self.echo[idx].process_block(out, num_channels, first_us);
             self.decks[idx].store_echo_state(self.echo[idx].state_code());
 
@@ -2141,14 +2228,36 @@ impl Engine {
                 delay_frames,
                 feedback,
                 lp_coeff,
+                beat_track_frames,
             } => {
-                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                let i = idx as usize;
+                if let Some(echo) = self.echo.get_mut(i) {
                     echo.engage(delay_frames as usize, feedback, lp_coeff);
+                    self.echo_beat_line[i] = beat_track_frames;
+                }
+            }
+            Command::DeckEchoFollow {
+                idx,
+                master,
+                beat_track_frames,
+                period_track_frames,
+                room_period_secs,
+            } => {
+                if let Some(follow) = self.echo_follow.get_mut(idx as usize) {
+                    *follow = EchoFollow {
+                        master: (usize::from(master) < DECK_COUNT).then_some(usize::from(master)),
+                        beat_track_frames,
+                        period_track_frames,
+                        room_period_secs,
+                    };
                 }
             }
             Command::DeckReleaseEcho { idx } => {
-                if let Some(echo) = self.echo.get_mut(idx as usize) {
+                let i = idx as usize;
+                if let Some(echo) = self.echo.get_mut(i) {
                     echo.release();
+                    self.echo_follow[i] = EchoFollow::NONE;
+                    self.echo_beat_line[i] = f64::NAN;
                 }
             }
             Command::DeckSetEchoHold { idx, on } => {
@@ -3045,6 +3154,56 @@ mod tests {
         engine
     }
 
+    /// An echo told to follow the other deck settles its laps on that
+    /// deck's beat, read off its grid and its playhead as it plays: deck B
+    /// at 125 BPM on a 48 kHz track, a quarter beat out, under a 120 BPM
+    /// throw from deck A.
+    #[test]
+    fn an_echo_settles_on_the_master_decks_beat() {
+        let long = |v: f32| {
+            Arc::new(Track::from_interleaved(vec![v; 48_000 * 60 * 2], 48_000, 2).unwrap())
+        };
+        let mut engine = Engine::new(48_000.0, 16);
+        for (i, v) in [(0, 0.3f32), (1, 0.5)] {
+            engine.deck_mut(i).set_source(long(v));
+            engine.deck_mut(i).set_playing(true);
+            engine.deck_mut(i).quiesce_declick_for_test();
+        }
+        engine.deck_mut(1).set_position_frames(5_760.0);
+        engine.deck_mut(1).quiesce_declick_for_test();
+        let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
+        engine.apply_command(Command::DeckEngageEcho {
+            idx: 0,
+            delay_frames: 24_000,
+            feedback: 0.6,
+            lp_coeff: lp,
+            beat_track_frames: 100.0,
+        });
+        engine.apply_command(Command::DeckEchoFollow {
+            idx: 0,
+            master: 1,
+            beat_track_frames: 0.0,
+            period_track_frames: 23_040.0,
+            room_period_secs: 0.48,
+        });
+        let mut out = vec![0.0_f32; 256 * 4];
+        let mut rt = RealtimeContext::new();
+        let mut furthest = 0.0f64;
+        for _ in 0..(48_000 * 20 / 256) {
+            engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+            furthest = furthest.max((engine.echo[0].delay() - 23_040.0).abs());
+        }
+        let delay = engine.echo[0].delay();
+        assert!(
+            (delay - 23_040.0).abs() < 2.0,
+            "settled at a delay of {delay}"
+        );
+        assert!(
+            furthest > 1_000.0,
+            "it pulled onto the beat on the way: {furthest}"
+        );
+    }
+
     #[test]
     fn render_routed_internal_mixer_matches_render() {
         // M4 backward compat: render_routed with INTERNAL_MIXER_ROUTING
@@ -3333,6 +3492,14 @@ mod tests {
                 delay_frames: 480,
                 feedback: 0.6,
                 lp_coeff: lp,
+                beat_track_frames: f64::NAN,
+            });
+            engine.apply_command(Command::DeckEchoFollow {
+                idx: 0,
+                master: 1,
+                beat_track_frames: 100.0,
+                period_track_frames: 24_000.0,
+                room_period_secs: 0.5,
             });
             for _ in 0..200 {
                 engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
@@ -3368,7 +3535,7 @@ mod tests {
         assert_eq!(engine.deck(0).load_echo_state(), 0);
 
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
-        handle.deck(0).engage_echo(480, 0.5, lp).unwrap();
+        handle.deck(0).engage_echo(480, 0.5, lp, f64::NAN).unwrap();
         // The press lights the pad at once; the deck plays the next beat
         // dry while it is captured (256 of 480 frames rendered)…
         engine.render(&mut rt, &mut out);
@@ -3766,7 +3933,7 @@ mod tests {
         // Echo first (mutes the — absent — dry), then fire preset 0 (HK628
         // Rifle) summed on top.
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
-        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        handle.deck(0).engage_echo(256, 0.6, lp, f64::NAN).unwrap();
         handle.deck(0).fire_siren_preset(0, 0).unwrap();
 
         let mut peak = 0.0_f32;
@@ -3793,7 +3960,7 @@ mod tests {
         let mut rt = RealtimeContext::new();
         let mut out = vec![0.0_f32; 64 * 2];
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
-        handle.deck(0).engage_echo(480, 0.6, lp).unwrap();
+        handle.deck(0).engage_echo(480, 0.6, lp, f64::NAN).unwrap();
         handle.deck(0).set_echo_hold(true).unwrap();
         handle.deck(0).set_space_echo_hold(true).unwrap();
         engine.render(&mut rt, &mut out);
@@ -3834,7 +4001,7 @@ mod tests {
         );
 
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
-        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        handle.deck(0).engage_echo(256, 0.6, lp, f64::NAN).unwrap();
         let mut last = 0.0_f32;
         for _ in 0..16 {
             engine.render(&mut rt, &mut out);
@@ -3875,7 +4042,7 @@ mod tests {
         assert!(engine.deck(0).shared().load_output().0 > 0.45);
 
         let lp = dub_dsp::one_pole_coeff(8_000.0, 48_000.0);
-        handle.deck(0).engage_echo(256, 0.6, lp).unwrap();
+        handle.deck(0).engage_echo(256, 0.6, lp, f64::NAN).unwrap();
         // 4 s: the loop decays to nothing and the held peak falls past
         // the meter's floor.
         for _ in 0..750 {
@@ -3923,6 +4090,7 @@ mod tests {
             delay_frames: 480,
             feedback: 0.6,
             lp_coeff: lp,
+            beat_track_frames: f64::NAN,
         });
         let mut last = 0.0_f32;
         for _ in 0..12 {

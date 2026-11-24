@@ -15,6 +15,19 @@
 //!
 //! It is a **toggle**, not a hold: on → mute + echo; off → dry back.
 //!
+//! ## Following the master (2026-11-22)
+//!
+//! Once the beat is in, the echo can follow another deck the way a tape
+//! echo follows its motor: [`EchoOut::follow`] gives it the master's beat
+//! length and, when the master has a grid, how far off its next beat is.
+//! The delay then **glides** — the read head runs a little fast or slow,
+//! so the repeats shift in pitch for as long as it moves, as tape does —
+//! until a lap is one master beat and the captured beat's own beat line
+//! lands on the master's. A master pitched up mid-echo speeds the repeats
+//! up with it; a record dropped half a beat off pulls the echo onto its
+//! beat in a short swoop. The glide is capped at [`MAX_GLIDE`] either way.
+//! With nothing to follow the delay holds, which is the echo as it was.
+//!
 //! ## How it works (single write head)
 //!
 //! A stereo ring buffer is written continuously while **idle** so the last
@@ -81,6 +94,31 @@ pub const DEFAULT_FEEDBACK: f32 = 0.6;
 /// it can never grow.
 pub const HOLD_FEEDBACK: f32 = 0.995;
 
+/// The fastest the delay may glide, in frames of delay per frame: the
+/// read head runs at most this much faster or slower than the tape, which
+/// is the most the repeats are bent in pitch (±20 % ≈ ±3 semitones). It is
+/// what a half-beat pull-in sounds like at its steepest.
+pub const MAX_GLIDE: f64 = 0.2;
+
+/// How much of the echo's offset from the master's beat one lap is aimed to
+/// take out: the delay heads for `period − sign(offset) · min(PHASE_PULL ·
+/// |offset|, brake)`, where `brake` is the most the glide can give back
+/// before the next beat line arrives. Taking all of it (1.0) overshot by
+/// about 53 ms; 2 and 3 rang; a fraction of the offset measured from the
+/// lap's own length halved the miss each beat and left a half-beat throw
+/// 11 ms off after five. At 0.8 with the brake it is on the beat by the
+/// fourth repeat and does not overshoot.
+const PHASE_PULL: f64 = 0.8;
+
+/// The share of the glide's cap the brake counts on having: the glide
+/// eases in and out, so it is not at full speed for the whole return.
+const BRAKE_MARGIN: f64 = 0.6;
+
+/// Seconds for the glide to settle on its aim: the motor's inertia. It
+/// also smooths how the glide starts and stops, so the pitch bends rather
+/// than steps.
+const GLIDE_SETTLE_SECS: f64 = 0.04;
+
 /// Default feedback low-pass cutoff (PRD §6.3: 8 kHz).
 pub const DEFAULT_LPF_HZ: f32 = 8_000.0;
 
@@ -143,8 +181,27 @@ pub struct EchoOut {
     /// Write head; read index is always `(write − delay_frames) & mask`.
     write: usize,
 
-    /// Active echo length in frames (`≤ capacity`). Snapshotted on engage.
+    /// Echo length the press asked for, in frames (`≤ capacity`): the length
+    /// of the capture.
     delay_frames: usize,
+    /// The delay the read head trails by now, in (fractional) frames. Equal
+    /// to `delay_frames` until [`EchoOut::follow`] moves it.
+    delay: f64,
+    /// How fast `delay` is moving, frames per frame: the read head runs at
+    /// `1 − glide` of the tape's speed. Eased toward `glide_aim`.
+    glide: f64,
+    /// Where the glide is heading, set once a block by `follow`.
+    glide_aim: f64,
+    /// The delay `follow` aims at, or `None` to hold.
+    delay_aim: Option<f64>,
+    /// Per-frame easing of `glide` toward `glide_aim` (`GLIDE_SETTLE_SECS`).
+    glide_ease: f64,
+    /// Frames of delay error the glide closes per frame before the cap.
+    glide_gain: f64,
+    /// Ring index of the captured beat's beat line: the press, or the
+    /// outgoing deck's beat line if one fell inside the capture. Moves on
+    /// each lap to where the sample is written back.
+    marker: Option<f64>,
     /// Per-lap decay, clamped to `[0, MAX_FEEDBACK]`.
     feedback: f32,
     /// One-pole low-pass coefficient `a = 1 − e^(−2π·fc/sr)` for the
@@ -187,6 +244,13 @@ impl EchoOut {
             mask: cap - 1,
             write: 0,
             delay_frames: 1,
+            delay: 1.0,
+            glide: 0.0,
+            glide_aim: 0.0,
+            delay_aim: None,
+            glide_ease: 1.0 - (-1.0 / (GLIDE_SETTLE_SECS * f64::from(sample_rate)).max(1.0)).exp(),
+            glide_gain: 0.25 / (GLIDE_SETTLE_SECS * f64::from(sample_rate)).max(1.0),
+            marker: None,
             feedback: DEFAULT_FEEDBACK,
             lp_coeff: one_pole_coeff(DEFAULT_LPF_HZ, sample_rate),
             lp_l: 0.0,
@@ -222,6 +286,93 @@ impl EchoOut {
         self.lp_r = 0.0;
         self.state = EchoState::Capturing;
         self.capture_left = self.delay_frames;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.delay = self.delay_frames as f64;
+        }
+        self.glide = 0.0;
+        self.glide_aim = 0.0;
+        self.delay_aim = None;
+        // The press is the beat line until the deck says otherwise.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.marker = Some(self.write as f64);
+        }
+    }
+
+    /// The outgoing deck's beat line passed `frame` frames into the block
+    /// about to be processed. During the capture it becomes the point the
+    /// echo lines up with the master's beat; afterwards it is ignored.
+    pub fn mark_beat(&mut self, frame: usize) {
+        if self.state == EchoState::Capturing && frame < self.capture_left {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                self.marker = Some(((self.write + frame) & self.mask) as f64);
+            }
+        }
+    }
+
+    /// Follow a master for the next block: `period` is its beat in output
+    /// frames, `to_next_beat` how many output frames until its next beat
+    /// line (`None` without a grid, which follows the tempo only). `None`
+    /// for `master` holds the delay where it is. Call once a block, before
+    /// [`EchoOut::process_block`]; ignored until the beat is captured.
+    pub fn follow(&mut self, master: Option<(f64, Option<f64>)>) {
+        if self.state != EchoState::Engaged {
+            return;
+        }
+        let Some((period, to_next_beat)) = master else {
+            self.delay_aim = None;
+            return;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let longest = (self.capacity() - 4) as f64;
+        if !period.is_finite() || period < 2.0 {
+            self.delay_aim = None;
+            return;
+        }
+        let period = period.min(longest);
+        let mut aim = period;
+        if let (Some(to_beat), Some(marker)) = (to_next_beat, self.marker) {
+            if to_beat.is_finite() {
+                // When the captured beat line next comes round, against when
+                // the master's does — the nearer way round.
+                let arrives = self.ring_distance(self.read_position(), marker);
+                // The miss less what the delay's current stretch adds to
+                // it: how far the echo's beat sits off the master's for
+                // good. Only a lap of other than one master beat moves that.
+                let offset = wrap_half(arrives - to_beat - (self.delay - period), period);
+                // Stretch the laps against it, but never further from one
+                // beat than the glide can bring them back from before the
+                // offset is gone, or the echo swings past the beat.
+                let brake = (2.0 * MAX_GLIDE * BRAKE_MARGIN * period * offset.abs()).sqrt();
+                aim = period - offset.signum() * (PHASE_PULL * offset.abs()).min(brake);
+            }
+        }
+        self.delay_aim = Some(aim.clamp(2.0, longest));
+    }
+
+    /// Where the read head is, as a fractional ring index.
+    fn read_position(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let cap = self.capacity() as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let w = self.write as f64;
+        (w - self.delay).rem_euclid(cap)
+    }
+
+    /// Frames forward from ring position `from` to ring position `to`.
+    fn ring_distance(&self, from: f64, to: f64) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let cap = self.capacity() as f64;
+        (to - from).rem_euclid(cap)
+    }
+
+    /// The delay the read head trails by, in frames (fractional while it
+    /// glides).
+    #[must_use]
+    pub fn delay(&self) -> f64 {
+        self.delay
     }
 
     /// Disengage (toggle off): the dry signal comes back (the deck has kept
@@ -312,9 +463,34 @@ impl EchoOut {
             };
             let wet_target = self.wet_target;
 
-            let read = (self.write.wrapping_sub(self.delay_frames)) & self.mask;
-            let echo_l = self.ring_l[read];
-            let echo_r = self.ring_r[read];
+            // The glide eases toward its aim and moves the delay; the read
+            // head is where it lands, between two frames.
+            if self.state == EchoState::Engaged {
+                if let Some(aim) = self.delay_aim {
+                    self.glide_aim =
+                        ((aim - self.delay) * self.glide_gain).clamp(-MAX_GLIDE, MAX_GLIDE);
+                } else {
+                    self.glide_aim = 0.0;
+                }
+                self.glide += (self.glide_aim - self.glide) * self.glide_ease;
+                self.delay = (self.delay + self.glide).clamp(2.0, self.longest_delay());
+                if let Some(marker) = self.marker {
+                    // The read head stepped `1 − glide` frames to get here; if
+                    // the beat line was in that step it is read now, and
+                    // written back where the write head is — less however
+                    // far past it the read head already was, or the line
+                    // would creep a fraction of a frame every lap.
+                    #[allow(clippy::cast_precision_loss)]
+                    let cap = self.capacity() as f64;
+                    let since = (self.read_position() - marker).rem_euclid(cap);
+                    if since < 1.0 - self.glide {
+                        #[allow(clippy::cast_precision_loss)]
+                        let here = self.write as f64;
+                        self.marker = Some((here - since).rem_euclid(cap));
+                    }
+                }
+            }
+            let (echo_l, echo_r) = self.read_interpolated();
 
             match self.state {
                 EchoState::Idle => {
@@ -387,6 +563,28 @@ impl EchoOut {
     fn capacity(&self) -> usize {
         self.mask + 1
     }
+
+    /// The longest delay the ring can hold with room to interpolate.
+    fn longest_delay(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let cap = self.capacity() as f64;
+        cap - 4.0
+    }
+
+    /// The ring read `delay` frames behind the write head, between frames
+    /// by straight line. At a whole-frame delay it is the frame itself.
+    fn read_interpolated(&self) -> (f32, f32) {
+        let pos = self.read_position();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i0 = (pos.floor() as usize) & self.mask;
+        let i1 = (i0 + 1) & self.mask;
+        #[allow(clippy::cast_possible_truncation)]
+        let frac = (pos - pos.floor()) as f32;
+        (
+            self.ring_l[i0] + (self.ring_l[i1] - self.ring_l[i0]) * frac,
+            self.ring_r[i0] + (self.ring_r[i1] - self.ring_r[i0]) * frac,
+        )
+    }
 }
 
 /// Ring capacity: a power-of-two frame count holding `RING_BEATS` at
@@ -403,6 +601,16 @@ fn ring_capacity(sample_rate: f32) -> usize {
 pub fn one_pole_coeff(cutoff_hz: f32, sample_rate: f32) -> f32 {
     let fc = cutoff_hz.clamp(20.0, sample_rate * 0.45);
     1.0 - (-2.0 * PI * fc / sample_rate).exp()
+}
+
+/// `x` brought into `[−period/2, period/2)`: the nearer way round a beat.
+fn wrap_half(x: f64, period: f64) -> f64 {
+    let r = x.rem_euclid(period);
+    if r >= period / 2.0 {
+        r - period
+    } else {
+        r
+    }
 }
 
 #[inline]
@@ -492,6 +700,153 @@ mod tests {
                     "echo sample {i}: {y}, want the captured {x} at feedback 0.5"
                 );
             }
+        }
+    }
+
+    /// Throw one click — the outgoing beat line, at the press — and let it
+    /// repeat while `master(frame)` says what to follow each 256-frame
+    /// block. Returns the frames at which the repeats arrive.
+    fn click_repeats(
+        delay: usize,
+        blocks: usize,
+        master: impl Fn(usize) -> Option<(f64, Option<f64>)>,
+    ) -> Vec<f64> {
+        let mut echo = EchoOut::new(SR);
+        echo.engage(delay, 0.9, 1.0);
+        let block = 256usize;
+        let mut out = Vec::with_capacity(blocks * block);
+        let mut frame = 0usize;
+        for _ in 0..blocks {
+            echo.follow(master(frame));
+            let mut buf = vec![0.0f32; block * 2];
+            if frame == 0 {
+                buf[0] = 1.0;
+                buf[1] = 1.0;
+            }
+            echo.process_block(&mut buf, 2, 0);
+            out.extend(buf.chunks_exact(2).map(|c| c[0]));
+            frame += block;
+        }
+        // Each repeat is a click spread over a frame or two by the glide;
+        // its arrival is the weighted middle of that spread.
+        let mut arrivals = Vec::new();
+        let mut i = delay;
+        while i < out.len() {
+            if out[i].abs() > 1e-3 {
+                let end = (i + 4).min(out.len());
+                let (mut w, mut at) = (0.0f64, 0.0f64);
+                for (j, x) in out.iter().enumerate().take(end).skip(i) {
+                    w += f64::from(x.abs());
+                    at += j as f64 * f64::from(x.abs());
+                }
+                arrivals.push(at / w);
+                i = end + delay / 4;
+            } else {
+                i += 1;
+            }
+        }
+        arrivals
+    }
+
+    /// A master pitched up mid-echo speeds the repeats up with it: the
+    /// laps settle on its beat, a 120 BPM throw following 131 BPM.
+    #[test]
+    fn the_repeats_follow_the_masters_tempo() {
+        let arrivals = click_repeats(24_000, 1_200, |_| Some((22_000.0, None)));
+        let laps: Vec<f64> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(laps.len() > 8, "{laps:?}");
+        for lap in &laps[4..] {
+            assert!(
+                (lap - 22_000.0).abs() < 3.0,
+                "a lap of {lap}, not 22 000: {laps:?}"
+            );
+        }
+    }
+
+    /// A master whose beat falls half a beat from the echo's: the echo
+    /// pulls onto it within a few beats, and stays.
+    #[test]
+    fn the_repeats_pull_onto_the_masters_beat() {
+        let period = 24_000.0;
+        // The master's beats fall half a beat after the press, then every
+        // beat: `to_next_beat` counted from the frame the block starts.
+        let master_beat = |frame: usize| {
+            let since = (frame as f64 - period / 2.0).rem_euclid(period);
+            Some((period, Some((period - since) % period)))
+        };
+        let arrivals = click_repeats(24_000, 1_500, master_beat);
+        assert!(arrivals.len() > 12, "{arrivals:?}");
+        let off = |at: f64| {
+            let e = (at - period / 2.0).rem_euclid(period);
+            e.min(period - e)
+        };
+        assert!(off(arrivals[0]) > 11_000.0, "starts half a beat off");
+        // On the beat by the fourth repeat, and no swing past it after.
+        for (n, &at) in arrivals.iter().enumerate().skip(3) {
+            assert!(
+                off(at) < 48.0,
+                "repeat {n} lands {} frames off the master's beat: {arrivals:?}",
+                off(at)
+            );
+        }
+    }
+
+    /// The pull bends the repeats' pitch, and no more than [`MAX_GLIDE`]:
+    /// the delay never moves faster than that many frames per frame, which
+    /// is how far the read head runs off the tape's speed.
+    #[test]
+    fn the_pull_never_bends_further_than_the_cap() {
+        let period = 24_000.0;
+        let mut echo = EchoOut::new(SR);
+        echo.engage(24_000, 0.9, 1.0);
+        let block = 256usize;
+        let mut frame = 0usize;
+        let mut last = echo.delay();
+        let mut fastest = 0.0f64;
+        for _ in 0..1_500 {
+            let since = (frame as f64 - period / 2.0).rem_euclid(period);
+            echo.follow(Some((period, Some((period - since) % period))));
+            let mut buf = vec![0.0f32; block * 2];
+            echo.process_block(&mut buf, 2, 0);
+            fastest = fastest.max((echo.delay() - last).abs() / block as f64);
+            last = echo.delay();
+            frame += block;
+        }
+        assert!(
+            fastest > MAX_GLIDE * 0.9,
+            "the pull used the glide: {fastest}"
+        );
+        assert!(
+            fastest <= MAX_GLIDE + 1e-9,
+            "glided {fastest} frames per frame"
+        );
+    }
+
+    /// The master at another tempo *and* off the beat: a 120 BPM throw
+    /// under a 125 BPM record dropped a quarter beat out settles on both.
+    #[test]
+    fn the_repeats_take_the_masters_tempo_and_beat_together() {
+        let period = 23_040.0;
+        let master_beat = |frame: usize| {
+            let since = (frame as f64 - period / 4.0).rem_euclid(period);
+            Some((period, Some((period - since) % period)))
+        };
+        let arrivals = click_repeats(24_000, 1_500, master_beat);
+        let off = |at: f64| wrap_half(at - period / 4.0, period).abs();
+        for (n, &at) in arrivals.iter().enumerate().skip(5) {
+            assert!(off(at) < 48.0, "repeat {n} lands {} frames off", off(at));
+        }
+        let last = arrivals[arrivals.len() - 1] - arrivals[arrivals.len() - 2];
+        assert!((last - period).abs() < 2.0, "settled on laps of {last}");
+    }
+
+    /// With nothing to follow the delay holds, and the echo is the one it
+    /// always was.
+    #[test]
+    fn with_nothing_to_follow_the_delay_holds() {
+        let arrivals = click_repeats(24_000, 600, |_| None);
+        for lap in arrivals.windows(2).map(|w| w[1] - w[0]) {
+            assert!((lap - 24_000.0).abs() < 1e-6, "lap {lap}");
         }
     }
 

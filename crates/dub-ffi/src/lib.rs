@@ -623,7 +623,12 @@ pub use rip::{
 ///       band, keep the even grid, or leave it to the tracker.
 ///       **Missing tracks, listed and cleared.**
 ///       [`DubLibrary::missing_tracks`] / [`DubLibrary::remove_missing_tracks`].
-pub const FFI_VERSION: u32 = 94;
+///   95. **Echo-out follows the master.** [`DubEngine::echo_follow`]: once
+///       the beat is in, the echo glides to the master's tempo and onto its
+///       grid, like a tape echo; [`DubEngine::engage_echo_out`] notes the
+///       deck's own beat line so the throw lines up by its beat, not by the
+///       instant of the press.
+pub const FFI_VERSION: u32 = 95;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
@@ -2598,6 +2603,9 @@ impl DubEngine {
         lpf_hz: f32,
     ) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
+        let playhead_secs = self
+            .position_snapshot_at_host_time_inner(deck_idx, DeckSharedState::host_time_now_ns())
+            .elapsed_secs;
         let mut state = lock_state(&self.state);
         let EngineState::Running(running) = &mut *state else {
             return Err(EngineError::NotRunning);
@@ -2605,6 +2613,17 @@ impl DubEngine {
         if !(bpm.is_finite() && bpm > 0.0 && division_beats.is_finite() && division_beats > 0.0) {
             return Ok(());
         }
+        // The deck's first beat line from here: where the throw lines up
+        // with the master's beat when it follows one.
+        let beat_track_frames = match running.peaks[idx].as_ref() {
+            Some(PeakSource::File(file)) => file
+                .beat_grid
+                .beats
+                .iter()
+                .find(|&&b| b >= playhead_secs)
+                .map_or(f64::NAN, |&b| b * f64::from(file.sample_rate)),
+            _ => f64::NAN,
+        };
         // Sample rates (44.1k/48k/96k/192k) are all exact in f32.
         #[allow(clippy::cast_precision_loss)]
         let engine_sr = running.sample_rate as f32;
@@ -2615,7 +2634,63 @@ impl DubEngine {
         running
             .handle
             .deck(idx)
-            .engage_echo(delay_frames, feedback, lp_coeff)
+            .engage_echo(delay_frames, feedback, lp_coeff, beat_track_frames)
+            .map_err(map_command_error)
+    }
+
+    /// What `deck_idx`'s echo-out follows once its beat is in: the master
+    /// deck `master_idx`'s beat, placed on its grid where it has one, and
+    /// `room_bpm` (the master's tempo as the room hears it) where it has
+    /// not. `None` and a non-positive tempo leave the delay where it is.
+    /// The echo glides onto it like a tape echo: the repeats bend in pitch
+    /// while they speed up, slow down or move onto the master's beat
+    /// (`dub_dsp::EchoOut::follow`). Called a few times a second while an
+    /// echo rings: a following grid's beat changes as the record goes on.
+    /// FFI 95.
+    ///
+    /// # Errors
+    /// [`EngineError::NotRunning`] if the engine isn't running;
+    /// [`EngineError::InvalidDeck`] on a bad index.
+    pub fn echo_follow(
+        &self,
+        deck_idx: u64,
+        master_idx: Option<u64>,
+        room_bpm: f64,
+    ) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let master = master_idx.map(deck_idx_to_usize).transpose()?;
+        let master_secs = master_idx.map(|m| {
+            self.position_snapshot_at_host_time_inner(m, DeckSharedState::host_time_now_ns())
+                .elapsed_secs
+        });
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::NotRunning);
+        };
+        // A beat line of the master's grid at or before its playhead, and
+        // the beat's length there — a following grid's beats vary.
+        let (beat, period) = match (master, master_secs) {
+            (Some(m), Some(at)) => match running.peaks[m].as_ref() {
+                Some(PeakSource::File(file)) if file.beat_grid.beats.len() >= 2 => {
+                    let beats = &file.beat_grid.beats;
+                    let i = beats.partition_point(|&b| b <= at).saturating_sub(1);
+                    let i = i.min(beats.len() - 2);
+                    let sr = f64::from(file.sample_rate);
+                    (beats[i] * sr, (beats[i + 1] - beats[i]) * sr)
+                }
+                _ => (f64::NAN, f64::NAN),
+            },
+            _ => (f64::NAN, f64::NAN),
+        };
+        let room_period_secs = if room_bpm.is_finite() && room_bpm > 0.0 {
+            60.0 / room_bpm
+        } else {
+            f64::NAN
+        };
+        running
+            .handle
+            .deck(idx)
+            .echo_follow(master, beat, period, room_period_secs)
             .map_err(map_command_error)
     }
 
@@ -7528,7 +7603,8 @@ mod tests {
         // `BeatGrid.follows` / `.even_anchor_secs`, `LibraryTrack.tempo_*`.
         // 91→92: `search_track_ids`.
         // 92→93: `set_deck_steady`, `DeckTelemetry.steady_state`.
-        assert_eq!(FFI_VERSION, 94);
+        // 94→95: `echo_follow`.
+        assert_eq!(FFI_VERSION, 95);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {

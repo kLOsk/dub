@@ -166,11 +166,31 @@ pub enum Command {
     /// warm-captured continuously, so engaging freezes the last beat and
     /// recirculates it with decay. While engaged the dry is muted (100 % wet)
     /// on every deck, Thru included.
+    ///
+    /// `beat_track_frames` is the deck's next beat line after the press,
+    /// in track frames (`NaN` without a grid): where the throw lines up
+    /// with the master's beat when it follows one.
     DeckEngageEcho {
         idx: u8,
         delay_frames: u32,
         feedback: f32,
         lp_coeff: f32,
+        beat_track_frames: f64,
+    },
+
+    /// What deck `idx`'s echo-out follows once its beat is in. `master`
+    /// is the deck it follows (`u8::MAX` for none); `beat_track_frames` /
+    /// `period_track_frames` are a beat line of that deck's grid near its
+    /// playhead and the beat's length there, in its track frames (`NaN`
+    /// without a grid). `room_period_secs` is the master's beat in room
+    /// time, followed for tempo alone where there is no grid to place it
+    /// on (`NaN` for nothing to follow: the delay holds).
+    DeckEchoFollow {
+        idx: u8,
+        master: u8,
+        beat_track_frames: f64,
+        period_track_frames: f64,
+        room_period_secs: f64,
     },
 
     /// Toggle echo-out off on deck `idx`: restore the (muted) dry signal —
@@ -570,12 +590,28 @@ impl std::fmt::Debug for Command {
                 delay_frames,
                 feedback,
                 lp_coeff,
+                beat_track_frames,
             } => f
                 .debug_struct("DeckEngageEcho")
                 .field("idx", idx)
                 .field("delay_frames", delay_frames)
                 .field("feedback", feedback)
                 .field("lp_coeff", lp_coeff)
+                .field("beat_track_frames", beat_track_frames)
+                .finish(),
+            Self::DeckEchoFollow {
+                idx,
+                master,
+                beat_track_frames,
+                period_track_frames,
+                room_period_secs,
+            } => f
+                .debug_struct("DeckEchoFollow")
+                .field("idx", idx)
+                .field("master", master)
+                .field("beat_track_frames", beat_track_frames)
+                .field("period_track_frames", period_track_frames)
+                .field("room_period_secs", room_period_secs)
                 .finish(),
             Self::DeckReleaseEcho { idx } => {
                 f.debug_struct("DeckReleaseEcho").field("idx", idx).finish()
