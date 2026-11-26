@@ -65,9 +65,10 @@
 //! **RT-safety**: a handful of scalar fields, O(1) per update, two
 //! `sin_cos` calls per block, no allocation, no locks.
 
-/// Groove time per physical revolution at 33⅓ RPM. (45 RPM pressings
-/// also advance 1.8 record-seconds per turn only if cut at 33⅓ — the
-/// §5.4.1 RPM work owns adjusting this alongside detection.)
+/// Groove time per physical revolution. Every control record is cut at
+/// 33⅓, so a turn holds 1.8 s of groove at either speed; the engine
+/// feeds this filter groove time (track time × the platter's speed),
+/// not the 45 rpm deck's track time.
 const REV_SECS: f64 = 1.8;
 
 /// LMS adaptation time constant — a few revolutions to learn a

@@ -359,6 +359,10 @@ pub enum Command {
     /// ▸ Audio): which mixer channel lights? Refused while the deck plays.
     DeckTestTone { idx: u8 },
 
+    /// Follow MWM Phase by counting its carrier's cycles on every deck
+    /// that has named it, or stop (Preferences ▸ Beta ▸ MWM Phase).
+    SetPhaseCounting { on: bool },
+
     /// Load a new track on deck `idx`. The `Arc<Track>` is sent by value;
     /// the engine swaps it onto the deck on the audio thread without
     /// dropping the previous `Arc` — that goes back through the trash
@@ -774,6 +778,9 @@ impl std::fmt::Debug for Command {
                 .field("idx", idx)
                 .finish(),
             Self::DeckTestTone { idx } => f.debug_struct("DeckTestTone").field("idx", idx).finish(),
+            Self::SetPhaseCounting { on } => {
+                f.debug_struct("SetPhaseCounting").field("on", on).finish()
+            }
             Self::DeckLoad { idx, gain, .. } => f
                 .debug_struct("DeckLoad")
                 .field("idx", idx)

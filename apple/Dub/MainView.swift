@@ -1201,6 +1201,22 @@ final class WaveformAppModel: ObservableObject {
     /// DUB FX is on the surface: its own switch, behind the alpha one.
     var dubFxAvailable: Bool { alphaFeaturesEnabled && dubFxEnabled }
 
+    /// Preferences ▸ Beta: follow MWM Phase by counting its signal. A TC
+    /// deck whose calibration recognises Phase — a flat tone with no
+    /// position code — takes its position from the tone's own cycles, so a
+    /// sample stays under the sticker; off, Phase is read for its speed
+    /// only and drifts tens of milliseconds over a couple of minutes of
+    /// juggling (measured 2026-11-24). Takes effect at once. Persisted
+    /// under `dub.phaseCounting`.
+    @Published var phaseCountingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(phaseCountingEnabled, forKey: Self.kPhaseCounting)
+            engine.setPhaseCounting(on: phaseCountingEnabled)
+        }
+    }
+
+    private static let kPhaseCounting = "dub.phaseCounting"
+
     /// The deck that is the DUB FX channel right now, if one is.
     var dubFxDeck: DeckSide? {
         if deckA.isDubFx { return .a }
@@ -1617,6 +1633,19 @@ final class WaveformAppModel: ObservableObject {
         side == .a ? tapSessionA : tapSessionB
     }
 
+    /// Each deck's SIGNAL drawer: open, and what it does by itself at
+    /// the session's first calibration. Kept here because Prep takes the
+    /// Performance surface down and it has to come back as it was; plain
+    /// `let`s for the same reason as the tap sessions, so only the
+    /// drawer redraws when it moves. `-signalOpen` starts both open, for
+    /// profiling the panel.
+    let signalDrawerA = SignalDrawer(open: ProcessInfo.processInfo.arguments.contains("-signalOpen"))
+    let signalDrawerB = SignalDrawer(open: ProcessInfo.processInfo.arguments.contains("-signalOpen"))
+
+    func signalDrawer(for side: DeckSide) -> SignalDrawer {
+        side == .a ? signalDrawerA : signalDrawerB
+    }
+
     private func wireTapToGridControllers() {
         tapToGridA.onTapCountChanged = { [weak self] count in
             self?.tapSessionA.tapCount = count
@@ -1869,6 +1898,9 @@ final class WaveformAppModel: ObservableObject {
         // `didSet` does not run in `init`: hand the engine the stored choice.
         engine.setFollowingGrid(
             on: followGrid && UserDefaults.standard.bool(forKey: Self.kAlphaFeatures))
+        let phaseCounting = UserDefaults.standard.bool(forKey: Self.kPhaseCounting)
+        self.phaseCountingEnabled = phaseCounting
+        engine.setPhaseCounting(on: phaseCounting)
         // External-library import enables default OFF, so the plain
         // `bool(forKey:)` ("unset" → false) is the correct cold-boot value.
         self.seratoImportEnabled = UserDefaults.standard.bool(forKey: Self.kSeratoImport)

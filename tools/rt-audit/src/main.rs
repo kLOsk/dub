@@ -180,6 +180,8 @@ fn run_timecode_audit() -> Result<std::time::Duration> {
         rx,
         TimecodeInputConfig {
             format: dub_timecode::Format::SeratoCv02,
+            detect_vinyl: false,
+            count_synthetic: false,
             input_sample_rate: SAMPLE_RATE,
             max_block_frames: BLOCK_SIZE * 4,
             confidence_threshold: 0.7,

@@ -490,6 +490,8 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let cfg = TimecodeInputConfig {
         format: opts.format,
+        detect_vinyl: false,
+        count_synthetic: false,
         input_sample_rate: sr,
         max_block_frames: BLOCK_FRAMES,
         confidence_threshold: opts.engage,
@@ -689,6 +691,8 @@ fn drive_loop(
 fn apply_threshold_changes(policy: &mut LiftPolicy, state: &UiState) {
     *policy = LiftPolicy::new(&TimecodeInputConfig {
         format: Format::SeratoCv02,
+        detect_vinyl: false,
+        count_synthetic: false,
         input_sample_rate: 0.0,
         max_block_frames: BLOCK_FRAMES,
         confidence_threshold: state.engage,

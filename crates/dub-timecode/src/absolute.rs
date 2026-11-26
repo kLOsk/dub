@@ -28,6 +28,8 @@
 //! construction. Lookups are a single array index — alloc-free, used on
 //! the hot path.
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 /// Parity (XOR) of the bits of `x` selected by `mask` — the LFSR
 /// feedback term.
 #[inline]
@@ -67,6 +69,25 @@ pub(crate) fn lfsr_rev(state: u32, taps: u32, bits: u32) -> u32 {
 #[must_use]
 pub(crate) fn lfsr_output_bit(state: u32, bits: u32) -> u32 {
     (state >> (bits - 1)) & 1
+}
+
+/// One position LUT per pressing for the whole process. Every deck on a
+/// Traktor record would otherwise hold its own 32 MB table per side. The
+/// cache keeps a reference, so a tracker dropped on the audio thread
+/// only decrements a count and never frees.
+fn shared_lut(def: &crate::defs::TimecodeDef) -> Option<Arc<PositionLut>> {
+    type Built = Vec<(&'static str, Arc<PositionLut>)>;
+    static LUTS: OnceLock<Mutex<Built>> = OnceLock::new();
+    let mut luts = LUTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, lut)) = luts.iter().find(|(name, _)| *name == def.name) {
+        return Some(Arc::clone(lut));
+    }
+    let lut = Arc::new(PositionLut::build(def.bits, def.taps, def.seed)?);
+    luts.push((def.name, Arc::clone(&lut)));
+    Some(lut)
 }
 
 /// Sentinel stored for the forbidden all-zeros window (never appears in
@@ -161,19 +182,26 @@ const ACQUIRE_VERIFY: u32 = 32;
 /// only safe recovery is a fresh acquisition.
 const MAX_ERROR_RUN: u32 = 4;
 
-/// Per-cycle EMA pole for the slicer's high/low level trackers. Each
-/// level only updates on cycles classified into it, so the threshold
-/// holds steady through the m-sequence's longest same-bit runs.
-/// (Used by the offline `--sweep` slicer; the live tracker uses the
-/// peak/trough follower below.)
+/// Per-cycle EMA pole of the live slicer's threshold: the running mean
+/// of the last ~12 cycles' level. The m-sequence is balanced over that
+/// span, so the mean sits between a one and a zero.
+///
+/// The threshold used to be the midpoint of two rails, each fed only by
+/// cycles sliced its way and pulled toward the other at a 330-cycle pole
+/// so it could not strand. That was sticker drift (2026-11-24): a
+/// cartridge's level follows the record's speed, every push, catch and
+/// release moved it, and the stranded rail took ~400 ms to follow — the
+/// lock with it. Ten seconds of real scratching on a clean carrier
+/// locked zero times. With the mean the same scratch locks on its
+/// forward strokes, and steady play keeps its lock (96 % of both
+/// 12-minute Serato captures, as before). Reading the level per unit
+/// speed instead locked a little more in the scratch but assumes the
+/// level follows the speed, which a Control CD's does not.
 const LEVEL_ALPHA: f64 = 0.08;
 
-/// Slow "unstick" pole for the live slicer's *unselected* rail. Keeps
-/// the rail the current cycle wasn't classified into drifting gently
-/// toward the signal so it can't get stranded (the all-zero-bitstream
-/// deadlock). Far slower than `LEVEL_ALPHA` so it barely perturbs the
-/// threshold but survives the m-sequence's ~20-cycle same-bit runs.
-const LEVEL_UNSTICK: f64 = 0.003;
+/// The offline `--sweep` slicer's two-rail "unstick" pole, kept as it
+/// was: the sweep reads steady captures, where it never mattered.
+const SWEEP_LEVEL_UNSTICK: f64 = 0.003;
 
 /// EMA pole for the bit-agreement confidence readout.
 const AGREE_ALPHA: f32 = 0.05;
@@ -194,20 +222,34 @@ const READ_INTERVAL_ALPHA: f64 = 0.1;
 /// zero-crossing hysteresis + the no-read timeout instead.
 const PRESENCE_FLOOR_SQ: f64 = 1e-4;
 
-/// Per-variant LFSR acquisition/lock state. The tracker holds one per
-/// auto-detect candidate (Serato 2a/2b/cd) and locks whichever's LFSR
-/// validates against the shared bit stream.
-struct VariantState {
-    name: &'static str,
-    lut: PositionLut,
-    taps: u32,
-    bits: u32,
-    /// Fill window during acquisition; once locked, the LFSR state whose
-    /// MSB is the current cycle's bit.
+/// One direction's acquisition window: the last `bits` bits read while
+/// the record moved that way, and how many consecutive windows looked up
+/// to consecutive positions.
+#[derive(Clone, Copy, Default)]
+struct Window {
     register: u32,
     filled: u32,
     last_lookup: Option<u32>,
     consec_hits: u32,
+}
+
+/// Per-variant LFSR acquisition/lock state. The tracker holds one per
+/// auto-detect candidate (Serato 2a/2b/cd, Traktor A/B) and locks
+/// whichever's LFSR validates against the shared bit stream.
+struct VariantState {
+    name: &'static str,
+    lut: Arc<PositionLut>,
+    taps: u32,
+    bits: u32,
+    /// Once locked, the LFSR state whose MSB is the current cycle's bit.
+    register: u32,
+    /// Acquisition while the record runs forward: each bit enters at the
+    /// top, so the window *is* the state of the cycle just read.
+    fwd: Window,
+    /// Acquisition while it runs backward (a spin back to the sticker):
+    /// the bits arrive newest-first, so each enters at the bottom and the
+    /// window is the state of the cycle the reads started from.
+    rev: Window,
 }
 
 /// Per-deck absolute-position tracker (M6) — AM bit read off the
@@ -217,7 +259,8 @@ struct VariantState {
 /// per sample ([`AbsoluteTracker::on_sample`]) — the same phasor the
 /// relative path uses. The running unwrapped phase marks each carrier
 /// cycle; one data bit is read per cycle from the cycle's **magnitude
-/// RMS** (the amplitude-modulated bit), sliced by a two-level threshold.
+/// RMS** (the amplitude-modulated bit), sliced against the running mean
+/// of the last ~12 cycles.
 /// This per-cycle integration reads real vinyl at ~95 % vs ~80 % for the
 /// raw zero-crossing peak read it replaces (validated by `--sweep` on a
 /// real capture); the bit model is unchanged (still AM, not the rejected
@@ -250,10 +293,9 @@ pub struct AbsoluteTracker {
     /// the AM data-bit observable.
     cyc_mag_sq: f64,
     cyc_n: u32,
-    /// Two-level deadlock-free bit-slicer rails (EMAs of the high/low
-    /// per-cycle RMS); the bit is `rms > midpoint(env_high, env_low)`.
-    env_high: f64,
-    env_low: f64,
+    /// The slicer's threshold: the running mean of the per-cycle RMS
+    /// ([`LEVEL_ALPHA`]); the bit is `rms > level`.
+    level: f64,
 
     // --- read interval / sub-cycle position interpolation ---
     /// Samples since the last bit read (the sub-cycle numerator).
@@ -286,12 +328,18 @@ pub struct AbsoluteTracker {
 impl AbsoluteTracker {
     /// Create a tracker for a format, auto-detecting across its candidate
     /// pressings. Serato builds 2a/2b/cd validators (both vinyl sides +
-    /// the Control CD) and locks whichever the signal matches. Returns
-    /// `None` for formats whose absolute bitstream we don't decode yet
-    /// (Traktor — its def flags differ; future work).
+    /// the Control CD), Traktor MK1 both sides of Traktor Scratch, and
+    /// the tracker locks whichever the signal matches. Returns `None` for
+    /// Traktor MK2, whose bitstream is not public.
     ///
-    /// **Off-RT only** — builds one position LUT per candidate (~4 MB
-    /// each for Serato).
+    /// Traktor MK1 (2026-11-24) needed nothing format-specific: the bit
+    /// is read off the whole phasor's magnitude, so xwax's channel and
+    /// polarity flags don't enter, and its defs locked 96.7 % and 99.2 %
+    /// of two 12-minute captures of the real record with no jumps.
+    ///
+    /// **Off-RT only** — the first tracker for a pressing builds its
+    /// position LUT (4 MB for Serato's 20-bit code, 32 MB for Traktor's
+    /// 23-bit one); later trackers share it.
     ///
     /// # Panics
     /// `sample_rate` must be positive.
@@ -302,7 +350,10 @@ impl AbsoluteTracker {
             crate::Format::SeratoCv02 => {
                 Self::with_candidates(sample_rate, &crate::defs::serato_candidates())
             }
-            crate::Format::TraktorMk1 | crate::Format::TraktorMk2 => None,
+            crate::Format::TraktorMk1 => {
+                Self::with_candidates(sample_rate, &crate::defs::traktor_candidates())
+            }
+            crate::Format::TraktorMk2 => None,
         }
     }
 
@@ -323,16 +374,15 @@ impl AbsoluteTracker {
             {
                 continue;
             }
-            let lut = PositionLut::build(def.bits, def.taps, def.seed)?;
+            let lut = shared_lut(def)?;
             variants.push(VariantState {
                 name: def.name,
                 lut,
                 taps: def.taps,
                 bits: def.bits,
                 register: 0,
-                filled: 0,
-                last_lookup: None,
-                consec_hits: 0,
+                fwd: Window::default(),
+                rev: Window::default(),
             });
         }
         if variants.is_empty() {
@@ -348,8 +398,7 @@ impl AbsoluteTracker {
             prev_cycle: 0,
             cyc_mag_sq: 0.0,
             cyc_n: 0,
-            env_high: 0.0,
-            env_low: 0.0,
+            level: 0.0,
             samples_since_read: 0,
             read_interval: spc,
             read_primed: false,
@@ -513,27 +562,19 @@ impl AbsoluteTracker {
             if full {
                 self.read_primed = true;
                 self.read_interval = dt;
-                self.env_high = rms;
-                self.env_low = rms;
+                self.level = rms;
             }
             return;
         }
         self.read_interval += READ_INTERVAL_ALPHA * (dt - self.read_interval);
 
-        // Two-level deadlock-free slice. The rails update only on full
-        // cycles so a scratch-turnaround partial can't poison the
-        // threshold; the partial's (untrusted) bit still steps the LFSR
-        // so the position keeps tracking the groove.
-        let threshold = 0.5 * (self.env_high + self.env_low);
-        let bit = u32::from(rms > threshold);
+        // Slice against the running mean. It updates only on full cycles
+        // so a scratch-turnaround partial can't poison the threshold; the
+        // partial's (untrusted) bit still steps the LFSR so the position
+        // keeps tracking the groove.
+        let bit = u32::from(rms > self.level);
         if full {
-            if bit == 1 {
-                self.env_high += LEVEL_ALPHA * (rms - self.env_high);
-                self.env_low += LEVEL_UNSTICK * (rms - self.env_low);
-            } else {
-                self.env_low += LEVEL_ALPHA * (rms - self.env_low);
-                self.env_high += LEVEL_UNSTICK * (rms - self.env_high);
-            }
+            self.level += LEVEL_ALPHA * (rms - self.level);
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -583,41 +624,56 @@ impl AbsoluteTracker {
             }
             self.bit_index += if forward { 1 } else { -1 };
             self.last_forward = forward;
-        } else if forward {
-            // Acquire only on forward play (DJs cue forward); a reverse
-            // window would index the LUT backward and never self-verify.
-            // A stray reverse read (sampling jitter near a crossing) is
-            // simply skipped, not treated as a window break.
-            self.acquire_all(bit);
+        } else {
+            // Acquire in the direction of travel. Backward too since
+            // 2026-11-24: a juggle's spin back to the sticker is often the
+            // longest clean stretch of carrier between two catches, and
+            // unlocked it ran on the relative path, 2–3 ms off by the
+            // release. A read against the window's direction (sampling
+            // jitter near a crossing) is skipped, not a window break.
+            self.acquire_all(bit, forward);
         }
     }
 
-    /// Acquisition: shift the bit into every candidate's register (MSB),
-    /// and lock to the first whose LUT positions advance by exactly one
-    /// for `ACQUIRE_VERIFY` consecutive reads — the m-sequence's own
+    /// Acquisition: shift the bit into every candidate's window for this
+    /// direction, and lock to the first whose LUT positions step by
+    /// exactly one (up going forward, down going back) for
+    /// `ACQUIRE_VERIFY` consecutive reads — the m-sequence's own
     /// predict-and-verify, run in parallel so the right pressing wins.
-    fn acquire_all(&mut self, bit: u32) {
+    fn acquire_all(&mut self, bit: u32, forward: bool) {
         let mut lut_hits = 0u64;
         let mut max_consec = self.dbg_max_consec;
         let mut lock_to: Option<(usize, i64)> = None;
         for (i, v) in self.variants.iter_mut().enumerate() {
-            v.register = (v.register >> 1) | (bit << (v.bits - 1));
-            v.filled = (v.filled + 1).min(v.bits);
-            if v.filled < v.bits {
+            let mask = (1u32 << v.bits) - 1;
+            let w = if forward { &mut v.fwd } else { &mut v.rev };
+            w.register = if forward {
+                (w.register >> 1) | (bit << (v.bits - 1))
+            } else {
+                ((w.register << 1) & mask) | bit
+            };
+            w.filled = (w.filled + 1).min(v.bits);
+            if w.filled < v.bits {
                 continue;
             }
-            let Some(p) = v.lut.lookup(v.register) else {
-                v.last_lookup = None;
-                v.consec_hits = 0;
+            let Some(p) = v.lut.lookup(w.register) else {
+                w.last_lookup = None;
+                w.consec_hits = 0;
                 continue;
             };
             lut_hits += 1;
-            let period = (1u32 << v.bits) - 1;
-            let consistent = v.last_lookup.is_some_and(|prev| p == (prev + 1) % period);
-            v.consec_hits = if consistent { v.consec_hits + 1 } else { 0 };
-            max_consec = max_consec.max(v.consec_hits);
-            v.last_lookup = Some(p);
-            if v.consec_hits >= ACQUIRE_VERIFY && lock_to.is_none() {
+            let period = mask;
+            let consistent = w.last_lookup.is_some_and(|prev| {
+                if forward {
+                    p == (prev + 1) % period
+                } else {
+                    p == (prev + period - 1) % period
+                }
+            });
+            w.consec_hits = if consistent { w.consec_hits + 1 } else { 0 };
+            max_consec = max_consec.max(w.consec_hits);
+            w.last_lookup = Some(p);
+            if w.consec_hits >= ACQUIRE_VERIFY && lock_to.is_none() {
                 lock_to = Some((i, i64::from(p)));
             }
         }
@@ -625,15 +681,27 @@ impl AbsoluteTracker {
         self.dbg_max_consec = max_consec;
 
         if let Some((i, p)) = lock_to {
-            // The just-read bit completed the window at sequence index
-            // `p`; we've now entered cycle `p + 1`, so anchor there and
-            // advance the register to that state (matches the absolute
-            // position the generator/groove is at right now).
             let v = &mut self.variants[i];
-            v.register = lfsr_fwd(v.register, v.taps, v.bits);
+            if forward {
+                // The just-read bit completed the window at sequence index
+                // `p`; we've now entered cycle `p + 1`, so anchor there and
+                // advance the register to that state (matches the absolute
+                // position the generator/groove is at right now).
+                v.register = lfsr_fwd(v.fwd.register, v.taps, v.bits);
+                self.bit_index = p + 1;
+            } else {
+                // The window is the state of cycle `p`, where these reads
+                // began; the last of its `bits` reads took the needle back
+                // into cycle `p − bits`. Step the state back to there.
+                let mut state = v.rev.register;
+                for _ in 0..v.bits {
+                    state = lfsr_rev(state, v.taps, v.bits);
+                }
+                v.register = state;
+                self.bit_index = p - i64::from(v.bits);
+            }
             self.locked_variant = Some(i);
-            self.bit_index = p + 1;
-            self.last_forward = true;
+            self.last_forward = forward;
             self.agreement = 1.0;
             self.error_run = 0;
         }
@@ -649,9 +717,8 @@ impl AbsoluteTracker {
     fn reset_acquisition(&mut self) {
         for v in &mut self.variants {
             v.register = 0;
-            v.filled = 0;
-            v.last_lookup = None;
-            v.consec_hits = 0;
+            v.fwd = Window::default();
+            v.rev = Window::default();
         }
     }
 }
@@ -919,10 +986,10 @@ fn slice_values(values: &[f64]) -> Vec<u8> {
         let high = v > threshold;
         if high {
             env_high += LEVEL_ALPHA * (v - env_high);
-            env_low += LEVEL_UNSTICK * (v - env_low);
+            env_low += SWEEP_LEVEL_UNSTICK * (v - env_low);
         } else {
             env_low += LEVEL_ALPHA * (v - env_low);
-            env_high += LEVEL_UNSTICK * (v - env_high);
+            env_high += SWEEP_LEVEL_UNSTICK * (v - env_high);
         }
         bits.push(u8::from(high));
     }
@@ -1570,6 +1637,28 @@ mod tests {
             (delta - 500.0).abs() < 2.0,
             "reverse moved {delta}, expected ~500"
         );
+    }
+
+    #[test]
+    fn acquires_while_the_record_runs_backward() {
+        // A spin back from a cold start: the tracker must find the
+        // position going backward, and it must be the true one.
+        let mut g = modulated_generator();
+        let mut t = tracker();
+        // Start well into the side so the spin back has room.
+        run(&mut g, &mut t, 1.0, 4 * 48_000);
+        for rate in [-1.0, -4.0] {
+            t.reset();
+            assert!(!t.locked());
+            run(&mut g, &mut t, rate, 24_000);
+            assert!(t.locked(), "no lock running at {rate}x backward");
+            let pos = t.position_cycles().expect("locked");
+            let truth = ground_truth(&g);
+            assert!(
+                (pos - truth).abs() <= 1.0,
+                "backward lock at {pos}, truth {truth} ({rate}x)"
+            );
+        }
     }
 
     #[test]

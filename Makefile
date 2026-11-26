@@ -204,10 +204,24 @@ DIST_ZIP     = dist/Dub-$(DUB_VERSION)-macOS-universal.zip
 # README's download button) always gets the newest Dub. GitHub resolves
 # `latest` only for a release not marked pre-release.
 DIST_LATEST  = dist/Dub-macOS-universal.zip
+DIST_APP     = $(APP_BUILD_DIR)/Build/Products/Release/Dub.app
+
+# Signing (2026-11-26). A release is signed with the Developer ID in the
+# login keychain, under the hardened runtime, then notarized by Apple and
+# the ticket stapled to the app, so it opens with a double-click instead of
+# "Open Anyway". Nothing secret lives here: the identity is found in the
+# keychain by name, and the notary credentials are a keychain profile,
+# stored once with
+#     xcrun notarytool store-credentials dub-notary --apple-id <id> --team-id <team>
+# Xcode still signs ad hoc; the release signature replaces it here, so a
+# Release build needs no certificate on a machine that doesn't ship.
+# `make dist ADHOC=1` builds the old ad-hoc, un-notarized zip.
+SIGN_IDENTITY  ?= Developer ID Application
+NOTARY_PROFILE ?= dub-notary
 
 dist:
 	$(MAKE) app APP_CONFIG=Release
-	@lipo -info "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app/Contents/MacOS/Dub" \
+	@lipo -info "$(DIST_APP)/Contents/MacOS/Dub" \
 	    | grep -q 'x86_64 arm64\|arm64 x86_64' \
 	    || { echo "dist: Dub.app is not universal"; exit 1; }
 	@mkdir -p dist
@@ -215,9 +229,25 @@ dist:
 	@# Xcode rebuilds into the bundle it made on the first Release build, so
 	@# its folders keep that day's date and Finder shows it on the download.
 	@# Folder dates are not part of the code signature.
-	find "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" -type d -exec touch {} +
+	find "$(DIST_APP)" -type d -exec touch {} +
+ifneq ($(ADHOC),1)
+	@security find-identity -v -p codesigning | grep -q "$(SIGN_IDENTITY)" \
+	    || { echo "dist: no \"$(SIGN_IDENTITY)\" certificate in the keychain (ADHOC=1 to ship unsigned)"; exit 1; }
+	codesign --force --timestamp --options runtime \
+	    --entitlements apple/Dub/Dub.entitlements \
+	    --sign "$(SIGN_IDENTITY)" "$(DIST_APP)"
+	codesign --verify --strict --verbose=2 "$(DIST_APP)"
+	@# Apple notarizes a zip of the app; the ticket is then stapled to the
+	@# app itself, so it opens offline too, and the shipped zip is made
+	@# after, from the stapled app.
+	ditto -c -k --keepParent "$(DIST_APP)" dist/notarize.zip
+	xcrun notarytool submit dist/notarize.zip --keychain-profile "$(NOTARY_PROFILE)" --wait
+	rm -f dist/notarize.zip
+	xcrun stapler staple "$(DIST_APP)"
+	spctl --assess --type execute --verbose=2 "$(DIST_APP)"
+endif
 	ditto -c -k --sequesterRsrc --keepParent \
-	    "$(APP_BUILD_DIR)/Build/Products/Release/Dub.app" "$(DIST_ZIP)"
+	    "$(DIST_APP)" "$(DIST_ZIP)"
 	cd dist && shasum -a 256 "$(notdir $(DIST_ZIP))" > "$(notdir $(DIST_ZIP)).sha256"
 	cp "$(DIST_ZIP)" "$(DIST_LATEST)"
 	@echo ""

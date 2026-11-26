@@ -288,3 +288,106 @@ fn the_needle_drop_does_not_engage_early() {
         "policy never engaged after the needle landed"
     );
 }
+
+/// What a detecting deck (the app's attach) named a recording, whether it
+/// read a position code, and its mean rate over the last 2 s. `None`
+/// when the recording is not on this machine.
+fn name_the_record(name: &str) -> Option<(Option<dub_timecode::Detection>, bool, bool, f64)> {
+    let path = fixture(name);
+    if !path.exists() {
+        eprintln!("skipped: {name} is not in testdata/timecode/ (see its README)");
+        return None;
+    }
+    let track = dub_io::Track::load_from_path(&path)
+        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let (mut tx, rx) = ringbuf::HeapRb::<f32>::new(track.sample_rate() as usize * 2).split();
+    let cfg = TimecodeInputConfig {
+        input_sample_rate: track.sample_rate() as f32,
+        detect_vinyl: true,
+        ..TimecodeInputConfig::default()
+    };
+    let mut input = TimecodeInput::new(rx, cfg);
+    let quanta: Vec<&[f32]> = track.samples().chunks(QUANTUM * 2).collect();
+    let tail = quanta.len().saturating_sub(2 * 48_000 / QUANTUM);
+    let (mut sum, mut n, mut calibrating) = (0.0, 0.0, false);
+    for (i, quantum) in quanta.into_iter().enumerate() {
+        assert_eq!(tx.push_slice(quantum), quantum.len());
+        let _ = input.drive();
+        let Some(o) = input.last_output() else {
+            continue;
+        };
+        if !calibrating && o.confidence > 0.8 && o.amplitude > 0.05 {
+            input.begin_calibration(48_000);
+            calibrating = true;
+        }
+        if i >= tail && o.confidence > 0.9 {
+            sum += o.rate;
+            n += 1.0;
+        }
+    }
+    Some((
+        input.vinyl(),
+        input.position_code(),
+        input.synthetic(),
+        sum / n,
+    ))
+}
+
+/// **Calibration names real records.** Serato vinyl and Traktor MK1 vinyl
+/// on the rig, and Daniel's MWM Phase Essential through the SL 3 on line:
+/// each must come out as what it is, and still read its true pitch.
+#[test]
+fn real_records_are_named_at_calibration() {
+    use dub_timecode::{Detection, Format, PlatterSpeed};
+    let at_33 = |format| {
+        Some(Detection {
+            format,
+            speed: PlatterSpeed::Rpm33,
+        })
+    };
+    if let Some((named, code, synthetic, rate)) = name_the_record("serato-cv02-steady-nominal.flac")
+    {
+        assert_eq!(named, at_33(Format::SeratoCv02));
+        assert!(code, "Serato's position code went unseen");
+        assert!(!synthetic, "Serato vinyl taken for Phase");
+        assert!(
+            (rate - 1.0).abs() < 0.0015,
+            "Serato at the detent read {rate}"
+        );
+    }
+    if let Some((named, code, synthetic, rate)) = name_the_record("traktor-mk1-pitch-plus3.flac") {
+        assert_eq!(named, at_33(Format::TraktorMk1));
+        assert!(code, "MK1's position code went unseen");
+        assert!(!synthetic, "Traktor vinyl taken for Phase");
+        assert!(
+            (rate - 1.03198).abs() < 0.0007,
+            "Traktor at a true +3.198 % read {rate}"
+        );
+    }
+    for take in [
+        "full/phase-serato-1124-deckA-line.wav",
+        "full/phase-serato-1124-deckB-probe.wav",
+    ] {
+        if let Some((named, code, synthetic, rate)) = name_the_record(take) {
+            assert_eq!(named, at_33(Format::TraktorMk2), "{take}");
+            assert!(!code, "{take}: Phase carries no position code");
+            assert!(synthetic, "{take}: Phase not recognised as Phase");
+            assert!((rate - 1.0).abs() < 0.001, "{take} read {rate}");
+        }
+    }
+    // Phase set to Serato in Phase Manager: a flat 1 kHz, no code. It must
+    // not pass for Serato vinyl, or the deck trusts a code that isn't there
+    // and the SIGNAL panel never asks for Traktor mode.
+    if let Some((named, code, synthetic, rate)) =
+        name_the_record("full/phase-serato-mode-1124-deckB-excerpt.wav")
+    {
+        assert_eq!(named, at_33(Format::SeratoCv02));
+        assert!(!code, "Phase in Serato mode read as carrying a code");
+        assert!(synthetic, "Phase in Serato mode not recognised as Phase");
+        // Steady play at 33 with the pitch at 0: its 0.564 % taken out.
+        assert!(
+            (rate - 1.0).abs() < 5e-4,
+            "Phase in Serato mode plays at {rate:.5}"
+        );
+    }
+}

@@ -628,12 +628,26 @@ pub use rip::{
 ///       grid, like a tape echo; [`DubEngine::engage_echo_out`] notes the
 ///       deck's own beat line so the throw lines up by its beat, not by the
 ///       instant of the press.
-pub const FFI_VERSION: u32 = 95;
+///   96. **Calibration names the record.** [`DeckTelemetry::vinyl`],
+///       [`DeckTelemetry::platter_rpm`], [`DeckTelemetry::vinyl_position_code`]
+///       and [`DeckTelemetry::detecting_vinyl`]: the TC decks no longer
+///       assume Serato at 33; each names Serato, Traktor MK1 or MK2 at 33
+///       or 45 while it calibrates, and says whether it reads a position
+///       code or speed only. **MWM Phase (Beta).**
+///       [`DubEngine::set_phase_counting`], [`DeckTelemetry::vinyl_synthetic`]
+///       and [`DeckTelemetry::vinyl_counted`]: a deck that names Phase can
+///       follow it by counting its cycles.
+pub const FFI_VERSION: u32 = 96;
 
 /// Whether a loading track's grid may follow its band
 /// ([`DubEngine::set_following_grid`]). Process-wide: the load worker is
 /// detached and reads it when its grid is ready.
 static FOLLOWING_GRID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a deck that names MWM Phase follows it by counting its cycles
+/// ([`DubEngine::set_phase_counting`]). Process-wide: a timecode input
+/// attached later reads it into its config.
+static PHASE_COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -3994,6 +4008,12 @@ impl DubEngine {
             sticker_drift_ms: tc.sticker_drift_ms,
             pitch_settled: tc.pitch_settled,
             measure_progress: tc.measure_progress,
+            vinyl: tc.vinyl,
+            platter_rpm: tc.platter_rpm,
+            vinyl_position_code: tc.position_code,
+            detecting_vinyl: tc.detecting_vinyl,
+            vinyl_synthetic: tc.synthetic,
+            vinyl_counted: tc.counting,
             key_lock_state: shared.load_key_lock_state(),
             steady_state: shared.steady().state() as u8,
             echo_state: shared.load_echo_state(),
@@ -4166,6 +4186,22 @@ impl DubEngine {
         match running.peaks[idx].as_ref() {
             Some(PeakSource::File(f)) => f.beat_grid.clone(),
             _ => BeatGrid::empty(),
+        }
+    }
+
+    /// Follow MWM Phase by counting its signal (Preferences ▸ Beta). With
+    /// it on, a TC deck whose calibration names Phase — a flat carrier
+    /// with no position code — takes its position from the carrier's own
+    /// cycles, so a sample stays under the sticker as on control vinyl,
+    /// instead of adding up Phase's speed, which leaked tens of
+    /// milliseconds over a couple of minutes of juggling. Takes effect at
+    /// once on a deck already reading Phase; works whether or not the
+    /// engine is running. Off by default.
+    pub fn set_phase_counting(&self, on: bool) {
+        PHASE_COUNTING.store(on, Ordering::Release);
+        let mut state = lock_state(&self.state);
+        if let EngineState::Running(running) = &mut *state {
+            let _ = running.handle.set_phase_counting(on);
         }
     }
 
@@ -5341,6 +5377,25 @@ pub struct DeckTelemetry {
     /// progress line (whitening capture + pitch stabilization,
     /// time-weighted). 1.0 when nothing is measuring.
     pub measure_progress: f32,
+    /// The control record calibration named on this needle: 0 not yet ·
+    /// 1 Serato · 2 Traktor MK1 · 3 Traktor MK2 (or anything else on its
+    /// 2.5 kHz carrier, such as MWM Phase as recorded on the rig). PRD §5.4.
+    pub vinyl: u8,
+    /// The platter speed calibration named: 33 or 45; 0 until it has.
+    pub platter_rpm: u8,
+    /// Whether the record's position code locked when it was named. Without
+    /// one the deck follows speed only and the sticker hold can't apply —
+    /// the panel says so.
+    pub vinyl_position_code: bool,
+    /// Whether calibration is naming the record right now.
+    pub detecting_vinyl: bool,
+    /// The carrier is synthesised — MWM Phase — not a record: flat level,
+    /// no position code. `vinyl` then says which mode Phase sends (1 is its
+    /// Serato mode, 3 its Traktor mode).
+    pub vinyl_synthetic: bool,
+    /// The deck follows Phase's counted carrier
+    /// ([`DubEngine::set_phase_counting`]) rather than its speed.
+    pub vinyl_counted: bool,
     /// M14 key-lock indicator state: 0 off · 1 standby (enabled but bypassed —
     /// scratch / reverse / extreme rate) · 2 engaged (pitch held). Drives the
     /// deck-header key-lock dot (dim / green). PRD §6.1.1.
@@ -5411,6 +5466,12 @@ impl DeckTelemetry {
             sticker_drift_ms: f64::NAN,
             pitch_settled: true,
             measure_progress: 1.0,
+            vinyl: dub_engine::VINYL_UNKNOWN,
+            platter_rpm: 0,
+            vinyl_position_code: false,
+            detecting_vinyl: false,
+            vinyl_synthetic: false,
+            vinyl_counted: false,
             key_lock_state: 0,
             steady_state: 0,
             echo_state: 0,
@@ -6996,10 +7057,14 @@ fn start_thru_inner(
             }
         }
         PerfSource::Timecode => {
-            // Serato CV02, no-calibration defaults. Input SR and block
-            // bound come from the live device; thresholds use the
-            // empirically-tuned `TimecodeInputConfig::default()` values.
+            // Calibration names each deck's record and speed (Serato,
+            // Traktor MK1 or MK2, at 33 or 45 — PRD §5.4); it reads as
+            // Serato at 33 until then. Input SR and block bound come from
+            // the live device; thresholds use the empirically-tuned
+            // `TimecodeInputConfig::default()` values.
             let tc_cfg = TimecodeInputConfig {
+                detect_vinyl: true,
+                count_synthetic: PHASE_COUNTING.load(Ordering::Acquire),
                 input_sample_rate: input_sr_f32,
                 max_block_frames: THRU_MAX_BLOCK_FRAMES,
                 ..TimecodeInputConfig::default()
@@ -7604,7 +7669,10 @@ mod tests {
         // 91→92: `search_track_ids`.
         // 92→93: `set_deck_steady`, `DeckTelemetry.steady_state`.
         // 94→95: `echo_follow`.
-        assert_eq!(FFI_VERSION, 95);
+        // 95→96: `DeckTelemetry.vinyl` / `platter_rpm` /
+        // `vinyl_position_code` / `detecting_vinyl` / `vinyl_synthetic` /
+        // `vinyl_counted`, `set_phase_counting`.
+        assert_eq!(FFI_VERSION, 96);
     }
 
     fn routing(a_in: u32, b_in: u32, a_out: u32, b_out: u32, outs: u32) -> PerformanceRouting {

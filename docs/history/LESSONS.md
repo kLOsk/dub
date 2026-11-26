@@ -656,6 +656,15 @@
   only search carried a comment that node-scoped search was "not wired
   here", and with most of a library living in other apps' nodes that
   read as search being broken.
+- **A drawer over a pane is an `.overlay`, and its width hangs on
+  something that stays.** The SIGNAL drawer (2026-11-26) was a sibling in
+  the deck pane's `ZStack`, so an open panel taller than the pane
+  stretched the deck row and pushed the other deck 32 pt down; an
+  `.overlay` is offered the pane's size and cannot change it. And its
+  fixed width sat on `Group { if showing { … } }.frame(width:)`: a
+  `Group`'s modifiers go to its children, so with no child there was no
+  width, and the shut offset threw the tab off the screen. Hang it on
+  `Color.clear` and put the content in its overlay.
 
 ## Vinyl rip (M26)
 
@@ -873,6 +882,67 @@
   the mirror of `Engaging`, and a declick that starts while engaged takes
   its old side from the stretcher (`prev_stretched`). Any new transition
   out of a stretched path needs the same: measure the step *across* it.
+- **Sticker drift was the bit slicer, not the heal.** The LFSR lock is what
+  keeps a sample on the record, and it was missing exactly when the DJ
+  moves the record: the slicer's unselected rail re-learned a level change
+  over ~330 cycles, and a cartridge's level follows the record's speed, so
+  every push, catch and release left the threshold stranded. Ten seconds of
+  real scratching locked zero times on a clean carrier; a release took
+  400 ms to relock against 50 ms in steady play; short juggle phrases never
+  relocked at all, and the error stacked pass on pass (2026-11-24,
+  `tests/sticker_drift.rs`). A faster heal changed nothing — there was no
+  lock to heal from. The slicer cuts against a 12-cycle running mean now,
+  and acquisition runs backward too, so a spin back to the sticker locks.
+  Reading the level per unit speed (a cycle's length cancels the
+  cartridge's speed-following level) locked a little more in the scratch
+  but is a model of the signal, and a Control CD's level does not follow
+  its speed — the running mean assumes nothing. Two other findings from the same audit: Traktor MK1
+  had no absolute decode at all although xwax's defs locked 97–99 % of the
+  real captures first time, and the heal compared the groove at a block's
+  end with the playhead at its start (`advance_position_frames` only
+  queues). Tried and worse, so don't retry blind: counting the carrier's
+  own unwrapped phase as the position (25–50 ms off over the same scratch,
+  at any gate or DC-block setting) — noise at the turnarounds slips half
+  cycles faster than the rate integral loses motion.
+- **The app read every control record as Serato at 33⅓.** The decoder took
+  a format, the CLI passed `--format`, and the app never did — the docs said
+  Traktor MK1 was tested, which it was, on captures, offline (2026-11-24, found
+  probing MWM Phase). Calibration now names the record and speed; there is no
+  setting. Two traps on the way: **45 rpm is not a rescale of the output** —
+  the decoder's long-lag estimator and carrier band-pass switch off above
+  rate 1.2, so a 45 platter read as 1.35 fell to the lag-1 path and its
+  −0.3 % vinyl bias; the decoder's own unity has to move
+  (`Decoder::set_platter_speed`). And **a decision made once on the audio
+  thread still runs there**: `detect` collected its candidates into a `Vec`,
+  which only the allocation test caught. Testing it, the synthetic position
+  code at depth 0.4 biased the read rate +0.2–0.5 % at either speed (0.02 %
+  at 0.15) — the zero anchor hides that at the detent, so a test that checks
+  a rate off the detent needs the shallower depth.
+- **A position code that jumps while the carrier doesn't is not always the
+  decoder.** A Traktor take read as MK1 relocking 0.35 s off, twice, in
+  steady play (2026-11-24). The tell that it was the audio: the record's
+  carrier and the other deck's (Phase) broke at the same instants, to the
+  millisecond — the input stream had dropped buffers while a release build
+  ran beside the capture, and the same take opened with the SL 3's
+  start-up repeats. Live, a drop is harmless (the deck holds its speed
+  through the gap and the code comes back where the playhead is); replayed
+  from the file, it reads as drift. **Never run a build during a rig
+  capture**, and check a take for simultaneous breaks before blaming a
+  decoder (`stream_faults` in `tests/phase_drift.rs`). `dub capture`
+  reports ring overflow and a clock that delivers more audio than time,
+  but it cannot see buffers CoreAudio drops before its callback.
+
+- **A harness that absorbs faults can manufacture accuracy.** The Phase
+  harness took each stream fault out by re-zeroing the count against the
+  record's code. On the Traktor take that happened 143 times (160 before
+  the detector was gated on a strong carrier: at a scratch turnaround both
+  decks sink into noise together and read as a break), so the count was
+  pulled back to the truth every few hundred milliseconds and printed
+  "within 1.2 ms" — quoted in the PRD, the manual and to Daniel before it
+  was caught (2026-11-24). Any correction a harness applies to the measured
+  quantity has to be counted and shown beside the result; a take with
+  faults inside the measured stretch measures nothing
+  (`warn_late_faults`).
 
 ## Build + test hygiene
 

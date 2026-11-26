@@ -430,6 +430,16 @@ impl EngineHandle {
         self.send(Command::SetMasterGain { gain })
     }
 
+    /// Follow MWM Phase by counting its carrier's cycles on every deck
+    /// that has named it, or stop (Preferences ▸ Beta ▸ MWM Phase). Inputs
+    /// attached later take it from their config's `count_synthetic`.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] if the audio thread is not draining.
+    pub fn set_phase_counting(&mut self, on: bool) -> Result<(), CommandError> {
+        self.send(Command::SetPhaseCounting { on })
+    }
+
     /// Bind a sample to sampler slot `slot` (M17, PRD §7.1).
     ///
     /// `source` must already be at the engine's sample rate — convert

@@ -33,9 +33,18 @@
 //! ([`FALLBACK_REMAP_SECS`]) catches programmatic jumps (cue/seek/track
 //! load) that bypass the needle entirely.
 //!
-//! Diagnostic only — nothing feeds back into transport (PRD §5.1:
-//! relative mode, no needle-drop). **RT-safety**: a few scalar fields,
-//! pure arithmetic.
+//! **A needle skip keeps the sticker.** That is what relative mode is
+//! for: a skip must not ruin the performance. A skip moves the needle by
+//! whole turns of the record, so an offset that jumps by one or two turns
+//! (within [`SKIP_TOLERANCE_SECS`]) moves the anchor by exactly those
+//! turns: the track plays on from where the hand put it, and only what
+//! is left over — motion the decode lost in the same gap — reads as
+//! drift. Read as drift whole, a skip inside a scratch was healed toward
+//! the skipped groove for three minutes.
+//!
+//! The engine heals what this measures (PRD §5.4.3); the monitor itself
+//! never touches transport. **RT-safety**: a few scalar fields, pure
+//! arithmetic.
 
 /// After a sustained-silence gap, the needle reappearing more than
 /// this far (groove seconds) from where the signal stopped means it
@@ -68,6 +77,21 @@ const TRAVEL_GESTURE_SECS: f64 = 3.0;
 /// skid. Below it, even a travel gesture heals (small decode loss).
 const SKID_JUMP_SECS: f64 = 0.25;
 
+/// One turn of the record at 33⅓ rpm, in seconds. Every pressing Dub
+/// reads is a 12" cut at 33⅓, so a turn always holds the same groove;
+/// at 45 it passes in 1/1.35 of the time, and the decoder reports
+/// positions in track time (see [`DriftMonitor::set_platter_speed`]).
+const TURN_SECS: f64 = 1.8;
+
+/// How near a whole number of turns an offset jump must land to be a
+/// skip. Decode loss across a gap is milliseconds to tens of them; a
+/// skip is a turn give or take that.
+const SKIP_TOLERANCE_SECS: f64 = 0.15;
+
+/// The most turns one skip is taken for. Further than that the needle
+/// was moved, and the lift and fallback rules decide.
+const MAX_SKIP_TURNS: f64 = 2.0;
+
 /// Contiguous near-silence longer than this means the needle left the
 /// groove (or the platter sat stopped — harmless either way, since a
 /// stop-and-release moves the offset by ~nothing and the small-jump
@@ -95,6 +119,9 @@ pub(crate) struct DriftMonitor {
     /// for the needle-relocation test after a silent gap. NaN until
     /// the first observation.
     last_groove: f64,
+    /// One turn of the record in the seconds the groove is reported in:
+    /// [`TURN_SECS`] at 33⅓, 1/1.35 of it at 45.
+    turn_secs: f64,
 }
 
 impl DriftMonitor {
@@ -106,7 +133,15 @@ impl DriftMonitor {
             lift_seen: false,
             pending_remap: false,
             last_groove: f64::NAN,
+            turn_secs: TURN_SECS,
         }
+    }
+
+    /// The platter turns `factor` times as fast as 33⅓ rpm (1.35 at 45),
+    /// so a skip of one turn moves the groove by `TURN_SECS / factor` of
+    /// track time.
+    pub(crate) fn set_platter_speed(&mut self, factor: f64) {
+        self.turn_secs = TURN_SECS / factor;
     }
 
     /// The playhead is about to move (or just moved) by command rather
@@ -143,12 +178,21 @@ impl DriftMonitor {
         // grooves with no silence — a big jump after one is physical,
         // not decode loss. Re-anchor; never late-correct it as drift.
         let skidded = groove_gap > TRAVEL_GESTURE_SECS && jump.abs() > SKID_JUMP_SECS;
-        let remap = self.anchor.is_nan()
-            || self.pending_remap
-            || relocated
-            || skidded
-            || jump.abs() > FALLBACK_REMAP_SECS;
-        if remap {
+        // A skip: since the last reading the offset moved by whole turns.
+        let step = if self.drift.is_nan() {
+            jump
+        } else {
+            jump - self.drift
+        };
+        let turns = (step / self.turn_secs).round();
+        let skipped = turns != 0.0
+            && turns.abs() <= MAX_SKIP_TURNS
+            && (step - turns * self.turn_secs).abs() < SKIP_TOLERANCE_SECS;
+        if self.anchor.is_nan() || self.pending_remap || relocated {
+            self.anchor = offset;
+        } else if skipped {
+            self.anchor += turns * self.turn_secs;
+        } else if skidded || jump.abs() > FALLBACK_REMAP_SECS {
             self.anchor = offset;
         }
         self.pending_remap = false;
@@ -296,12 +340,13 @@ mod tests {
 
     #[test]
     fn backspin_needle_skid_reanchors_instead_of_jumping_the_song() {
-        // A backspin throws the groove back ~10 s with no silence (the
-        // needle stays down and skids across grooves). The tracked
-        // playhead followed most of it, but the skid leaves a 2 s
-        // discrepancy. That is a physical needle skip — relative mode
-        // re-anchors silently; healing it would audibly jump the song
-        // a beat after the release (the on-rig report).
+        // A backspin throws the groove back ~10 s with no silence. The
+        // tracked playhead followed most of it, but the record and the
+        // track came out 2 s apart — not a whole number of turns, so not
+        // a clean skip, and after that much travel not decode loss
+        // either. Relative mode re-anchors silently; healing it would
+        // audibly jump the song a beat after the release (the on-rig
+        // report).
         let mut m = DriftMonitor::new();
         m.observe(42.0, 10.0);
         let d = m.observe(32.0, 2.0); // groove −10 s, playhead −8 s
@@ -309,6 +354,75 @@ mod tests {
         // Precision accounting continues from the new anchor.
         let d = m.observe(33.0, 2.99);
         assert!((d - 0.01).abs() < 1e-9, "post-skid drift misread: {d}");
+    }
+
+    #[test]
+    fn a_skip_during_a_backspin_keeps_the_sticker_and_heals_the_rest() {
+        // The same backspin, but the needle jumped one groove and the
+        // decode lost 30 ms besides: the turn is kept, the 30 ms healed.
+        let mut m = DriftMonitor::new();
+        m.observe(42.0, 10.0);
+        let d = m.observe(32.0 - TURN_SECS, 0.03); // groove −11.8, playhead −9.97
+        assert!((d - (-0.03)).abs() < 1e-9, "backspin skip misread: {d}");
+    }
+
+    #[test]
+    fn a_skip_inside_a_scratch_keeps_the_sticker() {
+        // Scratching in place (no long travel, no silence) and the needle
+        // jumps a groove: the offset moves by one turn plus the 20 ms the
+        // decode lost meanwhile. The turn is the skip and is kept; the
+        // 20 ms is drift.
+        let mut m = DriftMonitor::new();
+        m.observe(42.0, 10.0);
+        let d = m.observe(42.5 + TURN_SECS, 10.48);
+        assert!((d - 0.02).abs() < 1e-9, "skip read as drift: {d}");
+        // And the accounting carries on from there.
+        let d = m.observe(43.5 + TURN_SECS, 11.48);
+        assert!((d - 0.02).abs() < 1e-9, "after the skip: {d}");
+    }
+
+    #[test]
+    fn skips_either_way_and_two_turns_keep_the_sticker() {
+        for turns in [-2.0, -1.0, 1.0, 2.0] {
+            let mut m = DriftMonitor::new();
+            m.observe(42.0, 10.0);
+            m.observe(43.0, 10.99); // 10 ms of drift so far
+            let d = m.observe(43.2 + turns * TURN_SECS, 11.185);
+            assert!(
+                (d - 0.015).abs() < 1e-9,
+                "{turns} turns: the skip moved the reading to {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_45_a_turn_is_shorter_in_track_time() {
+        // At 45 one turn passes in 1.8 / 1.35 = 1.333 s of track time. A
+        // skip of one turn there is a skip; a 33⅓ turn's 1.8 s is not.
+        let turn_45 = TURN_SECS / 1.35;
+        let mut m = DriftMonitor::new();
+        m.set_platter_speed(1.35);
+        m.observe(42.0, 10.0);
+        let d = m.observe(42.5 + turn_45, 10.48);
+        assert!((d - 0.02).abs() < 1e-9, "a 45 skip read as drift: {d}");
+        let mut m = DriftMonitor::new();
+        m.set_platter_speed(1.35);
+        m.observe(42.0, 10.0);
+        let d = m.observe(42.5 + TURN_SECS, 10.48);
+        assert!(
+            (d - 0.02 - TURN_SECS).abs() < 1e-9,
+            "a 33⅓ turn kept at 45: {d}"
+        );
+    }
+
+    #[test]
+    fn a_jump_between_whole_turns_is_not_a_skip() {
+        // 0.9 s is half a turn: no skip makes that. With no lift and no
+        // long travel it stays drift, to be reported and healed.
+        let mut m = DriftMonitor::new();
+        m.observe(42.0, 10.0);
+        let d = m.observe(43.9, 11.0);
+        assert!((d - 0.9).abs() < 1e-9, "half a turn taken for a skip: {d}");
     }
 
     #[test]

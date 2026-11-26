@@ -165,16 +165,23 @@ extension PerformanceView {
                 }
             }
             loadErrorOverlay(side: side, deckState: deckState)
-            // Timecode signal health, on the deck instead of buried in
-            // Preferences: a slim SIGNAL tab on the deck's outer edge
-            // slides the per-deck scope over the pads area. Overlay, so
-            // toggling never reflows the Metal waveform column. Prep
-            // mode is file-only — no timecode chrome there.
-            if waveformOrientation == .vertical {
-                DeckSignalSlideOut(engine: model.engine, side: side, deckIdx: deckIdx)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Timecode signal health, on the deck instead of buried in
+        // Preferences: a slim SIGNAL tab on the deck's outer edge slides
+        // the per-deck scope over the deck column, and opens by itself
+        // while the deck first calibrates. An `.overlay`, not a sibling in
+        // the stack: it takes the pane's size and never sets it. As a
+        // sibling, an open panel taller than the pane stretched its whole
+        // deck row and pushed the other deck down (2026-11-26). Prep mode
+        // is file-only — no timecode chrome there.
+        .overlay {
+            if waveformOrientation == .vertical {
+                DeckSignalSlideOut(
+                    engine: model.engine, side: side, deckIdx: deckIdx,
+                    drawer: model.signalDrawer(for: side))
+            }
+        }
         .modifier(DeckDropTarget(model: model, side: side))
     }
 

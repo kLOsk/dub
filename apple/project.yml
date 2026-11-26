@@ -115,6 +115,11 @@ targets:
         # sandbox + the audio-input entitlement lands with the
         # distribution milestone after M10.2.
         com.apple.security.app-sandbox: false
+        # Releases are signed with the hardened runtime for notarization
+        # (`make dist`, 2026-11-26), and under it macOS hands an app
+        # without this entitlement silence from every input: the decks
+        # would hear no timecode. Debug builds run without the runtime.
+        com.apple.security.device.audio-input: true
     dependencies:
       # Swift package wrapping the generated UniFFI bindings + the
       # DubCore.xcframework binary target.

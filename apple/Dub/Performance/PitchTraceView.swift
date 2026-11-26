@@ -24,6 +24,10 @@
 //  amplitude numbers are gone from the face; sticker drift shows in
 //  Debug builds only, for when the tracking itself is being fixed.
 //
+//  Calibration's progress bar is here, beside CALIBRATE (2026-11-25).
+//  It used to cover the track overview, because the panel was shut while
+//  a deck calibrated; now the drawer opens for it (`SignalDrawer`).
+//
 
 import AppKit
 import DubCore
@@ -34,15 +38,22 @@ import SwiftUI
 struct SignalScopeView: NSViewRepresentable {
     let engine: DubEngine
     let deckIdx: UInt64
+    /// The deck's colour, for the calibration bar.
+    let tint: Color
 
     static var height: CGFloat { SignalScopeNSView.height }
+    static var minHeight: CGFloat { SignalScopeNSView.minHeight }
+    static var scopeLeast: CGFloat { SignalScopeNSView.scopeLeast }
 
     func makeNSView(context: Context) -> SignalScopeNSView {
-        SignalScopeNSView(engine: engine, deckIdx: deckIdx)
+        let view = SignalScopeNSView(engine: engine, deckIdx: deckIdx)
+        view.tint = NSColor(tint)
+        return view
     }
 
     func updateNSView(_ view: SignalScopeNSView, context: Context) {
         view.deckIdx = deckIdx
+        view.tint = NSColor(tint)
     }
 
     static func dismantleNSView(_ view: SignalScopeNSView, coordinator: ()) {
@@ -55,29 +66,53 @@ final class SignalScopeNSView: NSView {
 
     private let engine: DubEngine
     var deckIdx: UInt64
+    var tint: NSColor = .white
 
     private static let interval: TimeInterval = 1.0 / 20.0
     private var telemetry: DeckTelemetry?
     private var scope: [Float] = []
     private var timer: Timer?
 
-    // Row geometry, top down. Fixed: the panel is a fixed width and these
-    // are the only things in it.
+    // Row geometry, top down, with the scope at its full height. The
+    // panel is a fixed width, so only the height varies.
     private static let adviceTop: CGFloat = 32
     private static let scopeTop: CGFloat = 70
     static let scopeHeight: CGFloat = 140
     private static let metersTop: CGFloat = scopeTop + scopeHeight + 14
     private static let meterRow: CGFloat = 20
     private static let pitchTop: CGFloat = metersTop + meterRow * 3 + 8
+    /// The record on the platter, and the line under it.
+    private static let vinylTop: CGFloat = pitchTop + 30
     #if DEBUG
-    private static let driftTop: CGFloat = pitchTop + 26
+    private static let driftTop: CGFloat = vinylTop + 40
     private static let calibrationTop: CGFloat = driftTop + 24
     #else
-    private static let calibrationTop: CGFloat = pitchTop + 30
+    private static let calibrationTop: CGFloat = vinylTop + 40
     #endif
-    /// The calibration row is as tall as the button laid over its end.
+    /// The calibration line runs the panel's width, over the row the
+    /// button sits at the end of: no line it says reaches under the
+    /// button, and the bar has the rest of the row.
+    private static let calibrationLine: CGFloat = 20
+    /// The button's row is as tall as the button.
     static let calibrationRow: CGFloat = 28
-    static let height: CGFloat = calibrationTop + calibrationRow
+    /// What the bar leaves for the button laid over the row's end.
+    static let calibrateButtonReserve: CGFloat = 98
+    static let height: CGFloat = calibrationTop + calibrationLine + calibrationRow
+
+    /// The scope is the row that gives way when the deck pane is short,
+    /// and every row under it moves up. The deck pane is cut to the deck
+    /// column's height, and at full size the panel was taller than that:
+    /// it stretched its deck's row, which pushed the other deck down and
+    /// left CALIBRATE below the screen (2026-11-26).
+    static let minHeight: CGFloat = height - scopeHeight
+    /// Smaller than this the circle cannot be read, so it goes.
+    static let scopeLeast: CGFloat = 56
+
+    /// The scope's height in a view this tall.
+    static func scopeHeight(in height: CGFloat) -> CGFloat {
+        let room = min(scopeHeight, height - minHeight)
+        return room >= scopeLeast ? room : 0
+    }
 
     init(engine: DubEngine, deckIdx: UInt64) {
         self.engine = engine
@@ -92,6 +127,14 @@ final class SignalScopeNSView: NSView {
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { false }
+
+    /// The rows move with the height, and `.onSetNeedsDisplay` does not
+    /// redraw on a resize by itself.
+    override func setFrameSize(_ newSize: NSSize) {
+        let resized = newSize != frame.size
+        super.setFrameSize(newSize)
+        if resized { needsDisplay = true }
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     // MARK: - Sampling
@@ -134,6 +177,8 @@ final class SignalScopeNSView: NSView {
         let key = "\(t.hasTimecodeInput)/\(t.lockState)/\(t.weakChannel)/\(t.calibrating)"
             + "/\(t.calibrated)/\(t.pitchSettled)/\(String(format: "%.2f", t.pitchPercent))"
             + "/\(SignalStatus.levelFigure(t.inputRmsLeft))/\(SignalStatus.levelFigure(t.inputRmsRight))"
+            + "/\(t.vinyl)/\(t.platterRpm)/\(t.vinylPositionCode)/\(t.detectingVinyl)"
+            + "/\(t.vinylSynthetic)/\(t.vinylCounted)/\(Int(t.measureProgress * 100))"
         guard key != lastKey else { return false }
         lastKey = key
         return true
@@ -165,8 +210,18 @@ final class SignalScopeNSView: NSView {
             with: CGRect(x: 0, y: Self.adviceTop, width: w, height: 32),
             options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
 
-        drawScope(ctx, rect: CGRect(x: 0, y: Self.scopeTop, width: w, height: Self.scopeHeight),
-                  tint: tint, live: status.kind != .noInput && status.kind != .noSignal)
+        let scopeHeight = Self.scopeHeight(in: bounds.height)
+        // What the scope gave up, taken off every row under it.
+        let up = Self.scopeHeight - scopeHeight
+        let metersTop = Self.metersTop - up
+        let pitchTop = Self.pitchTop - up
+        let vinylTop = Self.vinylTop - up
+        let calibrationTop = Self.calibrationTop - up
+
+        if scopeHeight > 0 {
+            drawScope(ctx, rect: CGRect(x: 0, y: Self.scopeTop, width: w, height: scopeHeight),
+                      tint: tint, live: status.kind != .noInput && status.kind != .noSignal)
+        }
 
         // The two sides of the pair and how well the carrier decodes.
         let weak = SignalStatus.weakSide(
@@ -175,7 +230,7 @@ final class SignalScopeNSView: NSView {
             weak == side ? NSColor(DubColor.stateTentative)
                 : status.kind == .weak ? NSColor(DubColor.stateLocked) : tint
         }
-        var y = Self.metersTop
+        var y = metersTop
         meter("LEVEL L", fraction: SignalStatus.levelFraction(t.inputRmsLeft),
               figure: SignalStatus.levelFigure(t.inputRmsLeft), colour: sideColour("Left"),
               top: y, width: w, ctx: ctx)
@@ -191,31 +246,77 @@ final class SignalScopeNSView: NSView {
 
         // Pitch.
         ctx.setFillColor(NSColor(DubColor.divider).cgColor)
-        ctx.fill(CGRect(x: 0, y: Self.pitchTop - 4, width: w, height: 1))
-        draw("PITCH", at: CGPoint(x: 0, y: Self.pitchTop + 5), font: Self.label,
+        ctx.fill(CGRect(x: 0, y: pitchTop - 4, width: w, height: 1))
+        draw("PITCH", at: CGPoint(x: 0, y: pitchTop + 5), font: Self.label,
              colour: DubColor.textSecondary, tracking: 1)
         let live = t.hasTimecodeInput && t.lockState != 0
         draw(live ? PitchText.signed(t.pitchPercent, decimals: 2) + " %" : "—",
-             at: CGPoint(x: w, y: Self.pitchTop), font: .monospacedDigitSystemFont(ofSize: 18, weight: .semibold),
+             at: CGPoint(x: w, y: pitchTop), font: .monospacedDigitSystemFont(ofSize: 18, weight: .semibold),
              colour: live ? DubColor.textPrimary : DubColor.textTertiary, alignment: .right)
+
+        // The record on the platter, named at calibration, and whether
+        // the deck reads its position or only its speed.
+        let vinyl = SignalStatus.vinyl(
+            hasInput: t.hasTimecodeInput, vinyl: t.vinyl, rpm: t.platterRpm,
+            positionCode: t.vinylPositionCode, detecting: t.detectingVinyl,
+            synthetic: t.vinylSynthetic, counted: t.vinylCounted)
+        draw("VINYL", at: CGPoint(x: 0, y: vinylTop + 3), font: Self.label,
+             colour: DubColor.textSecondary, tracking: 1)
+        draw(vinyl.name, at: CGPoint(x: w, y: vinylTop),
+             font: .systemFont(ofSize: 13, weight: .semibold),
+             colour: vinyl.name == "—" ? DubColor.textTertiary : DubColor.textPrimary,
+             alignment: .right, tracking: 0.6)
+        draw(vinyl.note, at: CGPoint(x: 0, y: vinylTop + 20), font: .systemFont(ofSize: 11),
+             colour: vinyl.colour)
 
         #if DEBUG
         // Sticker drift: how far relative tracking has slid against the
         // record's own position. A tracking diagnostic, not a DJ's number.
-        draw("STICKER DRIFT · DEBUG", at: CGPoint(x: 0, y: Self.driftTop + 2), font: Self.label,
+        let driftTop = Self.driftTop - up
+        draw("STICKER DRIFT · DEBUG", at: CGPoint(x: 0, y: driftTop + 2), font: Self.label,
              colour: DubColor.textTertiary, tracking: 1)
         let drift = t.stickerDriftMs
         draw(drift.isNaN ? "—" : String(format: "%+.1f ms", drift),
-             at: CGPoint(x: w, y: Self.driftTop), font: .monospacedDigitSystemFont(ofSize: 13, weight: .medium),
+             at: CGPoint(x: w, y: driftTop), font: .monospacedDigitSystemFont(ofSize: 13, weight: .medium),
              colour: drift.isNaN || abs(drift) < 5 ? DubColor.textTertiary : DubColor.stateTentative,
              alignment: .right)
         #endif
 
+        // Calibration: what the deck is doing about the needle, and while
+        // a TC deck measures, how far it has got — the deck holds its
+        // track until the bar is full.
+        let turning = t.lockState == 1 || t.lockState == 2
         let calibration = SignalStatus.calibration(
             hasInput: t.hasTimecodeInput, pitchSettled: t.pitchSettled,
-            calibrating: t.calibrating, calibrated: t.calibrated)
-        draw(calibration.text, at: CGPoint(x: 0, y: Self.calibrationTop + 6),
+            calibrating: t.calibrating, calibrated: t.calibrated,
+            turning: turning, weakChannel: t.weakChannel)
+        draw(calibration.text, at: CGPoint(x: 0, y: calibrationTop),
              font: .systemFont(ofSize: 12), colour: calibration.colour)
+        if SignalStatus.measuring(hasInput: t.hasTimecodeInput, pitchSettled: t.pitchSettled) {
+            let refused = t.weakChannel != 0
+            let progress = CGFloat(max(0, min(1, t.measureProgress)))
+            if !refused {
+                draw("\(Int((progress * 100).rounded())) %", at: CGPoint(x: w, y: calibrationTop + 1),
+                     font: .monospacedDigitSystemFont(ofSize: 11, weight: .medium),
+                     colour: DubColor.textSecondary, alignment: .right)
+            }
+            let barHeight: CGFloat = 6
+            let track = CGRect(
+                x: 0,
+                y: calibrationTop + Self.calibrationLine + (Self.calibrationRow - barHeight) / 2 + 1,
+                width: max(0, w - Self.calibrateButtonReserve), height: barHeight)
+            ctx.setFillColor(NSColor(DubColor.surface3).cgColor)
+            ctx.addPath(CGPath(roundedRect: track, cornerWidth: 3, cornerHeight: 3, transform: nil))
+            ctx.fillPath()
+            // A refused calibration fills red: it is not going on until
+            // the weak side is fixed.
+            let filled = refused ? track.width : max(barHeight, track.width * progress)
+            ctx.setFillColor(refused ? NSColor(DubColor.stateError).cgColor : tint.cgColor)
+            ctx.addPath(CGPath(
+                roundedRect: CGRect(x: track.minX, y: track.minY, width: filled, height: barHeight),
+                cornerWidth: 3, cornerHeight: 3, transform: nil))
+            ctx.fillPath()
+        }
     }
 
     private static let label = NSFont.systemFont(ofSize: 10, weight: .bold)

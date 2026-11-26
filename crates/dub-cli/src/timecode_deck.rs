@@ -740,6 +740,8 @@ fn attach_timecode_via_handle(
 ) -> Result<()> {
     let cfg = TimecodeInputConfig {
         format,
+        detect_vinyl: false,
+        count_synthetic: false,
         input_sample_rate: input_sr,
         // CoreAudio output blocks vary; 4096 is a safe upper bound
         // matching the pre-M5.4.5 synchronous attach path.

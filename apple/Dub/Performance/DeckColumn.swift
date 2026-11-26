@@ -139,12 +139,6 @@ struct DeckColumnHeader: Equatable {
     /// Steadying, as the engine has it (0 off · 1 on, nothing held for
     /// now · 2 held to its tempo).
     var steadyState: UInt8 = 0
-    /// The deck is still in its session-start measurement (whitening
-    /// capture, then the pitch settle) and the engine is holding the
-    /// track. A flag, not the progress: the progress is continuous and
-    /// is drawn by `CalibrationBar` on a layer, so this flips twice a
-    /// session and the column is not rebuilt in between.
-    var calibrating: Bool = false
     /// Rounded to the tenth the readout prints. The raw value moves
     /// continuously on a timecode deck, and a difference the DJ cannot
     /// see is not a reason to rebuild the column.
@@ -188,7 +182,6 @@ struct DeckColumnHeader: Equatable {
         // window — for a difference nobody can see.
         bpm = state.liveBpm.map { ($0 * 10).rounded() / 10 }
         key = state.key
-        calibrating = !state.pitchSettled
         keyLockOn = state.keyLockOn
         keyLockState = state.keyLockState
         steadyState = state.steadyState
@@ -361,8 +354,7 @@ struct DeckColumn<Overview: View>: View {
 
     private var blocks: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
-            sourceRow
-            identityAndReadouts
+            header
             // A little more than the stack's own gap above the three
             // blocks that start a new thought: the times, the marks and
             // the loop. Eight points between everything read as one
@@ -424,15 +416,11 @@ struct DeckColumn<Overview: View>: View {
             // reserves space the view then draws outside of. It takes
             // the height as a parameter instead — see
             // `TrackOverviewView.height`.
+            // Calibration's progress is in the SIGNAL drawer, which opens
+            // for it (`SignalDrawer`, 2026-11-25). It covered this
+            // overview from 2026-09-23, when the drawer stayed shut and
+            // a held deck said nothing anywhere else.
             overview()
-                .overlay {
-                    if state.header.calibrating, let liveEngine, let liveDeckIdx {
-                        CalibrationBar(
-                            engine: liveEngine, deckIdx: liveDeckIdx,
-                            tint: DubColor.deckTint(state.side))
-                            .allowsHitTesting(false)
-                    }
-                }
         }
     }
 
@@ -561,6 +549,41 @@ struct DeckColumn<Overview: View>: View {
 
     // MARK: - Identity
 
+    /// The switch, the names and the readouts: the deck's header, and all
+    /// of it the handle for an instant double — drag it onto the other
+    /// deck, the same thing ⌘⇧← / ⌘⇧→ do (Daniel, 2026-11-26; it was the
+    /// title and artist text alone, a small target).
+    ///
+    /// **Behind the header, not on it.** A drag source on the block takes
+    /// the press before any control inside sees it: on the identity block
+    /// it left the key lock inert (2026-09-22). Laid underneath, it gets
+    /// the presses that land on nothing — gaps, names, readouts, which let
+    /// them through (`allowsHitTesting(false)`) — while the switch, BPM's
+    /// tap pad, STEADY and the key lock answer their own.
+    private var header: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.sm) {
+            sourceRow
+            identityAndReadouts
+        }
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onDrag(if: state.hasTrack) {
+                    DeckDoubleDrag.provider(for: state.side)
+                } preview: { doubleDragChip }
+                .help(state.hasTrack ? "Drag onto the other deck for an instant double" : "")
+        }
+    }
+
+    /// What the drag carries under the pointer: the library's chip,
+    /// ♪ Artist — Title, so a double looks like the load it is. With the
+    /// drag on a clear layer there was nothing to picture, and the
+    /// pointer's + went alone (Daniel, 2026-11-26).
+    private var doubleDragChip: some View {
+        Image(nsImage: LibraryDragChip.image(
+            artist: state.header.trackArtist, title: state.header.trackTitle ?? "—"))
+    }
+
     /// The source switch is the only part of the old header band that
     /// was a *control* rather than a readout, so it heads the column it
     /// switches. INT is the play control — see `SourceControlView`.
@@ -603,6 +626,11 @@ struct DeckColumn<Overview: View>: View {
                 .padding(.horizontal, DubSpacing.sm)
                 .padding(.vertical, 2)
                 .overlay(Capsule(style: .continuous).stroke(tint, lineWidth: 1))
+                // Part of the header's drag handle, and it keeps its own
+                // tooltip, so the drag is on it rather than through it.
+                .onDrag(if: state.hasTrack) {
+                    DeckDoubleDrag.provider(for: state.side)
+                } preview: { doubleDragChip }
                 .help("The master deck — the one the siren and samples land on, "
                     + "and the one Space-load avoids.")
         }
@@ -647,32 +675,22 @@ struct DeckColumn<Overview: View>: View {
     /// order to learn.
     private var identityAndReadouts: some View {
         let outward = state.side == .a
+        // The names let presses through to the header's drag (`header`).
         return VStack(alignment: outward ? .leading : .trailing, spacing: 2) {
             HStack(alignment: .lastTextBaseline, spacing: DubSpacing.lg) {
                 if outward {
-                    draggableSubtitle
+                    subtitleLine
+                        .allowsHitTesting(false)
                     readouts
                 } else {
                     readouts
-                    draggableSubtitle
+                    subtitleLine
+                        .allowsHitTesting(false)
                 }
             }
             titleLine
-                .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
-                .help(dragHelp)
+                .allowsHitTesting(false)
         }
-    }
-
-    /// Drag the tune to the other deck for an instant double — the same
-    /// thing ⌘← / ⌘→ do, as a gesture. **On the text, not the block.**
-    /// It was on the whole identity VStack, which put the readouts
-    /// inside the drag source: a drag source takes the press before any
-    /// child gesture sees it, so the LOCK button in that row was inert
-    /// and there was nothing wrong with the button (2026-09-22). This
-    /// is what the block's comment always claimed — "the readouts stay
-    /// put under the pointer" — now actually the case.
-    private var dragHelp: String {
-        state.hasTrack ? "Drag onto the other deck for an instant double" : ""
     }
 
     /// A step below the title, not level with it. The two ran at
@@ -680,14 +698,6 @@ struct DeckColumn<Overview: View>: View {
     /// that at a glance the pair read as one block of text rather than
     /// as a name and its artist. Under a scratch this line is the parked
     /// tune and where it is, so the DJ can see it is still there.
-    /// The artist half of the drag handle. The readouts share this row
-    /// but must not drag — see `dragHelp`.
-    private var draggableSubtitle: some View {
-        subtitleLine
-            .onDrag(if: state.hasTrack) { DeckDoubleDrag.provider(for: state.side) }
-            .help(dragHelp)
-    }
-
     private var subtitleLine: some View {
         let outward = state.side == .a
         return Text(subtitle)
@@ -1157,19 +1167,16 @@ struct DeckReadouts: View {
                     if let track {
                         trackBpm(track)
                     } else {
+                        // Not a control: a press here is the header's
+                        // drag for an instant double.
                         trackBpmReadout
+                            .allowsHitTesting(false)
                     }
                     steadyButton
                 }
             }
             if header.thruTempo == nil {
-                HStack(alignment: .top, spacing: DubSpacing.xs) {
-                    readout(
-                        "KEY", header.key,
-                        font: DubFont.numericInline, widest: "12B",
-                        tint: DubColor.camelotKey(header.key))
-                    keyLockButton
-                }
+                keyGroup
                 // Six places: the sign, three digits, the point and a tenth.
                 // A scratch drives the smoothed rate well past ±100 %, and
                 // the slot has to hold that too or the row jumps mid-cut.
@@ -1178,9 +1185,29 @@ struct DeckReadouts: View {
                     font: DubFont.numericInline, widest: "-888.8",
                     live: live.map { l in { l.pitch().map { PitchText.signed($0) } } },
                     size: DubFont.numericInlineSize)
+                    .allowsHitTesting(false)
             }
         }
         .fixedSize()
+    }
+
+    /// The key with its lock on the far side from the row's edge — after
+    /// the key on deck B, before it on deck A — so the row is one mirror:
+    /// KEY hangs over its key as BPM and PITCH do over theirs, the key's
+    /// slot takes up the slack on the lock's side, and the gap to the lock
+    /// is the same on both decks (Daniel, 2026-11-26). On deck A the lock
+    /// came after the key too, which hugged it and left KEY over the key
+    /// alone at the group's middle.
+    private var keyGroup: some View {
+        HStack(alignment: .top, spacing: DubSpacing.xs) {
+            if trailing { keyLockButton }
+            readout(
+                "KEY", header.key,
+                font: DubFont.numericInline, widest: "12B",
+                tint: DubColor.camelotKey(header.key))
+                .allowsHitTesting(false)
+            if !trailing { keyLockButton }
+        }
     }
 
     private var trackBpmReadout: some View {
@@ -1371,18 +1398,7 @@ struct DeckReadouts: View {
         labelTint: Color? = nil, labelLock: Bool = false, lockTint: Color? = nil
     ) -> some View {
         VStack(alignment: trailing ? .trailing : .leading, spacing: 2) {
-            HStack(spacing: 3) {
-                Text(label)
-                    .font(DubFont.micro)
-                    .tracking(DubFont.capsTracking)
-                    .foregroundStyle(labelTint ?? DubColor.textTertiary)
-                if labelLock {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 7))
-                        .foregroundStyle(lockTint ?? DubColor.textTertiary)
-                        .accessibilityLabel(lockTint == nil ? "Grid locked" : "Moving grid, accepted")
-                }
-            }
+            readoutLabel(label, tint: labelTint, lock: labelLock, lockTint: lockTint)
             if let live {
                 Text(widest)
                     .font(font)
@@ -1397,6 +1413,23 @@ struct DeckReadouts: View {
                     }
             } else {
                 staticValue(value, font: font, widest: widest, tint: tint)
+            }
+        }
+    }
+
+    private func readoutLabel(
+        _ label: String, tint: Color? = nil, lock: Bool = false, lockTint: Color? = nil
+    ) -> some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(DubFont.micro)
+                .tracking(DubFont.capsTracking)
+                .foregroundStyle(tint ?? DubColor.textTertiary)
+            if lock {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(lockTint ?? DubColor.textTertiary)
+                    .accessibilityLabel(lockTint == nil ? "Grid locked" : "Moving grid, accepted")
             }
         }
     }
@@ -1424,6 +1457,19 @@ extension View {
     func onDrag(if enabled: Bool, _ data: @escaping () -> NSItemProvider) -> some View {
         if enabled {
             onDrag(data)
+        } else {
+            self
+        }
+    }
+
+    /// The same, with what the drag shows under the pointer.
+    @ViewBuilder
+    func onDrag<Preview: View>(
+        if enabled: Bool, _ data: @escaping () -> NSItemProvider,
+        @ViewBuilder preview: () -> Preview
+    ) -> some View {
+        if enabled {
+            onDrag(data, preview: preview)
         } else {
             self
         }

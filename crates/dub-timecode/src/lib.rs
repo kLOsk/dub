@@ -50,6 +50,7 @@ mod absolute;
 mod classifier;
 mod decoder;
 mod defs;
+mod detect;
 mod format;
 pub mod signal;
 mod smoothing;
@@ -66,6 +67,7 @@ pub use defs::{
     find_def, serato_candidates, TimecodeDef, SWITCH_PHASE, SWITCH_POLARITY, SWITCH_PRIMARY,
     TIMECODE_DEFS,
 };
+pub use detect::{detect, nominal_hz, Detection, PlatterSpeed};
 pub use format::Format;
 pub use smoothing::RateSmoother;
 

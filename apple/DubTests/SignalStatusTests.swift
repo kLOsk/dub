@@ -69,11 +69,78 @@ final class SignalStatusTests: XCTestCase {
         XCTAssertEqual(
             SignalStatus.calibration(hasInput: true, pitchSettled: true, calibrating: false, calibrated: true).text,
             "Calibrated")
-        XCTAssertTrue(
-            SignalStatus.calibration(hasInput: true, pitchSettled: false, calibrating: false, calibrated: false)
-                .text.hasPrefix("Measuring"))
+        // The capture and the pitch settle are one job to the DJ.
+        XCTAssertEqual(
+            SignalStatus.calibration(hasInput: true, pitchSettled: false, calibrating: true, calibrated: false).text,
+            "Calibrating…")
+        XCTAssertEqual(
+            SignalStatus.calibration(hasInput: true, pitchSettled: false, calibrating: false, calibrated: true).text,
+            "Calibrating…")
+        XCTAssertEqual(
+            SignalStatus.calibration(
+                hasInput: true, pitchSettled: false, calibrating: false, calibrated: false, turning: false).text,
+            "Calibrating · play the record")
+        // A recalibration on INT: the engine calls every mode but TC settled.
+        XCTAssertEqual(
+            SignalStatus.calibration(hasInput: true, pitchSettled: true, calibrating: true, calibrated: false).text,
+            "Calibrating…")
+        XCTAssertEqual(
+            SignalStatus.calibration(
+                hasInput: true, pitchSettled: false, calibrating: false, calibrated: false, weakChannel: 2).text,
+            "Can't calibrate · right channel weak")
         XCTAssertEqual(
             SignalStatus.calibration(hasInput: false, pitchSettled: true, calibrating: false, calibrated: false).text,
             "")
+        XCTAssertTrue(SignalStatus.measuring(hasInput: true, pitchSettled: false))
+        XCTAssertFalse(SignalStatus.measuring(hasInput: false, pitchSettled: false))
+    }
+
+    /// The lines that keep the SIGNAL drawer open ask the DJ to do
+    /// something; MK2's speed only is what the record is.
+    func testWhichVinylLinesAsk() {
+        XCTAssertFalse(SignalStatus.vinylAsks(vinyl: 1, synthetic: false, counted: false), "Serato")
+        XCTAssertFalse(SignalStatus.vinylAsks(vinyl: 3, synthetic: false, counted: false), "MK2, speed only")
+        XCTAssertFalse(SignalStatus.vinylAsks(vinyl: 1, synthetic: true, counted: true), "Phase, Serato mode")
+        XCTAssertTrue(SignalStatus.vinylAsks(vinyl: 1, synthetic: true, counted: false), "Phase, Beta off")
+        XCTAssertTrue(SignalStatus.vinylAsks(vinyl: 3, synthetic: true, counted: true), "Phase, Traktor mode")
+    }
+
+    /// Calibration names the record and its speed; the row says whether
+    /// the deck reads its position or only its speed.
+    func testTheVinylRow() {
+        XCTAssertEqual(SignalStatus.vinylName(vinyl: 1, rpm: 33), "SERATO · 33")
+        XCTAssertEqual(SignalStatus.vinylName(vinyl: 2, rpm: 45), "TRAKTOR MK1 · 45")
+        XCTAssertEqual(SignalStatus.vinylName(vinyl: 3, rpm: 33), "TRAKTOR MK2 · 33")
+        XCTAssertNil(SignalStatus.vinylName(vinyl: 0, rpm: 0))
+
+        let serato = SignalStatus.vinyl(hasInput: true, vinyl: 1, rpm: 33, positionCode: true, detecting: false)
+        XCTAssertEqual(serato.name, "SERATO · 33")
+        XCTAssertTrue(serato.note.hasPrefix("Position"))
+        let phase = SignalStatus.vinyl(hasInput: true, vinyl: 3, rpm: 33, positionCode: false, detecting: false)
+        XCTAssertTrue(phase.note.hasPrefix("Speed only"))
+        XCTAssertEqual(
+            SignalStatus.vinyl(hasInput: true, vinyl: 0, rpm: 0, positionCode: false, detecting: true).name, "…")
+        XCTAssertEqual(
+            SignalStatus.vinyl(hasInput: false, vinyl: 1, rpm: 33, positionCode: true, detecting: false).name, "—")
+    }
+
+    /// MWM Phase is named for what it is, says whether it is counted, and
+    /// in its Traktor mode (the count drifts through juggling) asks for
+    /// Serato mode, its factory setting, instead.
+    func testPhaseOnTheVinylRow() {
+        XCTAssertEqual(SignalStatus.vinylName(vinyl: 1, rpm: 33, synthetic: true), "PHASE · 33")
+        let counted = SignalStatus.vinyl(
+            hasInput: true, vinyl: 1, rpm: 33, positionCode: false, detecting: false,
+            synthetic: true, counted: true)
+        XCTAssertEqual(counted.name, "PHASE · 33")
+        XCTAssertTrue(counted.note.hasPrefix("Counted"))
+        let off = SignalStatus.vinyl(
+            hasInput: true, vinyl: 1, rpm: 33, positionCode: false, detecting: false,
+            synthetic: true, counted: false)
+        XCTAssertTrue(off.note.contains("Beta"))
+        let traktorMode = SignalStatus.vinyl(
+            hasInput: true, vinyl: 3, rpm: 33, positionCode: false, detecting: false,
+            synthetic: true, counted: true)
+        XCTAssertTrue(traktorMode.note.contains("Serato"))
     }
 }

@@ -52,6 +52,13 @@ impl InputArgs {
     /// number of channels we open the AU with equals the number of
     /// entries in the map, and the map itself is converted from
     /// 1-based (user-facing) to 0-based (CoreAudio).
+    ///
+    /// `--channels N` above 2 gets the identity map `0..N`. Without a
+    /// map the input unit fills only the device's first stream, and the
+    /// SL 3 publishes its inputs as stereo streams: `--channels 6` read
+    /// two channels de-interleaved as six, so every pair showed inputs
+    /// 1–2 and a capture kept a third of its frames (2026-11-24, which
+    /// is how Phase on decks A and B read as silence).
     pub fn to_options(&self) -> InputOptions {
         let (channels, channel_map) = match &self.input_channels {
             Some(v) => {
@@ -60,7 +67,12 @@ impl InputArgs {
                 #[allow(clippy::cast_possible_truncation)]
                 (v.len() as u32, Some(map))
             }
-            None => (self.channels.map_or(2, |c| c.max(1)), None),
+            None => {
+                let channels = self.channels.map_or(2, |c| c.max(1));
+                #[allow(clippy::cast_possible_wrap)]
+                let map = (channels > 2).then(|| (0..channels as i32).collect());
+                (channels, map)
+            }
         };
         InputOptions {
             device_name: self.device.clone(),
@@ -526,6 +538,13 @@ fn clock_excess(captured_secs: f64, wall_secs: f64) -> Option<f64> {
     (excess.abs() > LIMIT).then_some(excess)
 }
 
+/// Whether a `read_line` on stdin was the DJ pressing Enter. End of
+/// input (a capture run in the background, or from a script) reads
+/// zero bytes and is not: `--duration` decides there.
+fn enter_pressed(read: &std::io::Result<usize>) -> bool {
+    matches!(read, Ok(n) if *n > 0)
+}
+
 /// `dub capture <output.wav> [--device NAME] [--duration SECS] ...`
 ///
 /// Capture the input device to a 32-bit float WAV.
@@ -595,8 +614,9 @@ pub fn capture(args: &[String]) -> Result<()> {
     let flag = Arc::clone(&stop_flag);
     std::thread::spawn(move || {
         let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        flag.store(true, Ordering::Release);
+        if enter_pressed(&std::io::stdin().read_line(&mut line)) {
+            flag.store(true, Ordering::Release);
+        }
     });
     eprintln!("recording — press Enter to stop (or wait out --duration)");
 
@@ -763,6 +783,29 @@ mod tests {
             parse_input_args(&s(&["--device", "X", "-o", "out.wav", "extra-positional"])).unwrap();
         assert_eq!(input.device.as_deref(), Some("X"));
         assert_eq!(leftover, ["-o", "out.wav", "extra-positional"]);
+    }
+
+    #[test]
+    fn more_than_a_pair_maps_every_device_channel() {
+        // Unmapped, the SL 3 gave its first stream only: `--channels 6`
+        // read inputs 1–2 three times over.
+        let (input, _) = parse_input_args(&s(&["--channels", "6"])).unwrap();
+        let opts = input.to_options();
+        assert_eq!(opts.channels, 6);
+        assert_eq!(opts.channel_map.as_deref(), Some(&[0, 1, 2, 3, 4, 5][..]));
+        // A plain pair stays unmapped: a mono built-in mic has no second
+        // channel to name, and the first stream is the pair anyway.
+        let (input, _) = parse_input_args(&s(&["--channels", "2"])).unwrap();
+        assert_eq!(input.to_options().channel_map, None);
+    }
+
+    #[test]
+    fn only_a_line_from_stdin_stops_a_capture() {
+        // Run in the background, stdin is at its end before the capture
+        // starts; that read as Enter and stopped it at 0 frames.
+        assert!(enter_pressed(&Ok(1)));
+        assert!(!enter_pressed(&Ok(0)), "end of input is not Enter");
+        assert!(!enter_pressed(&Err(std::io::Error::other("closed"))));
     }
 
     #[test]

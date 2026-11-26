@@ -17,6 +17,7 @@
 //
 
 @testable import Dub
+import DubCore
 import SwiftUI
 import XCTest
 
@@ -104,29 +105,6 @@ final class PerformanceLayoutTests: XCTestCase {
         }
     }
 
-    /// Rig, 2026-09-23: timecode on, needle down, no track yet — the
-    /// deck was calibrating and the column said nothing. That is the
-    /// first thing a DJ does at a gig, so the bar has to show there.
-    func test_anEmptyTimecodeDeck_showsItsCalibration() {
-        var deck = DeckState()
-        deck.hasTimecodeInput = true
-        deck.controlMode = 1
-        deck.pitchSettled = false
-        deck.measureProgress = 0.3
-        let header = DeckHeaderState.from(
-            side: .a, deckState: deck, engineRunning: true,
-            deckEnabled: true, thruMode: true, isMaster: false,
-            prepMode: false)
-        XCTAssertTrue(DeckColumnHeader(header).calibrating)
-
-        deck.pitchSettled = true
-        let settled = DeckHeaderState.from(
-            side: .a, deckState: deck, engineRunning: true,
-            deckEnabled: true, thruMode: true, isMaster: false,
-            prepMode: false)
-        XCTAssertFalse(DeckColumnHeader(settled).calibrating)
-    }
-
     /// The deck region is cut to the columns' own height (2026-11-14),
     /// so the column fits by construction; what has to hold is the rest:
     /// on a 1440 × 900 window the column, the rack bar under it and the
@@ -143,6 +121,41 @@ final class PerformanceLayoutTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             size.height + DubLayout.rackBarHeight + 1 + DubLayout.libraryMinHeight, total + 0.5,
             "the deck column and the rack bar leave the library less than its floor at 1440 × 900")
+    }
+
+    /// The deck pane is cut to the column's height, and the SIGNAL panel
+    /// lies over it, so the panel has to fit that height with its scope
+    /// still readable. Rig, 2026-11-26: it needed 490 pt of a 438 pt
+    /// pane, stretched its deck's row, pushed the other deck down and
+    /// hid CALIBRATE. The scope gives way now; this holds the floor.
+    @MainActor
+    func test_signalPanel_fitsTheDeckColumn_withItsScope() {
+        let column = fittingSize(
+            DeckColumn(state: Self.columnFixture) {
+                Color.clear.frame(height: DubLayout.deckColumnOverviewHeight)
+            },
+            width: columnWidthAt1440).height
+        let floor = fittingSize(
+            DeckSignalPanel(engine: DubEngine(), side: .a, deckIdx: 0),
+            width: DubLayout.deckSignalPanelWidth).height
+        XCTAssertGreaterThanOrEqual(floor, SignalScopeView.minHeight, "the panel measured short of its rows")
+        XCTAssertLessThanOrEqual(
+            floor + SignalScopeView.scopeLeast, column + 0.5,
+            "the panel needs \(floor) pt and a \(SignalScopeView.scopeLeast) pt scope in a \(column) pt deck column")
+    }
+
+    /// Shut, the drawer keeps its panel's width with nothing in it: the
+    /// offset that hides the panel moves the tab by that width, and when
+    /// the width went with the content the tab went off the screen
+    /// (2026-11-26).
+    @MainActor
+    func test_shutSignalDrawer_keepsItsTabOnTheEdge() {
+        let host = NSHostingView(rootView: DeckSignalSlideOut(
+            engine: DubEngine(), side: .a, deckIdx: 0, drawer: SignalDrawer()))
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            host.fittingSize.width, DubLayout.deckSignalPanelWidth + DubLayout.deckSignalTabWidth,
+            accuracy: 0.5)
     }
 
     /// The column's floor has to hold the trigger row — the scratch

@@ -21,14 +21,65 @@ Dub sits between your turntables and your mixer. For the two-deck
 | --- | --- | --- |
 | Serato SL 3 | Interface (reference rig) | Tested |
 | Serato Control CV02 vinyl | Timecode | Tested |
-| Traktor Scratch MK1 vinyl | Timecode | Tested |
-| Traktor Scratch MK2 vinyl | Timecode | Decoder shipped, not yet confirmed on a real pressing |
+| Traktor Scratch MK1 vinyl | Timecode | Decoder tested on recordings, not yet played in the app |
+| Traktor Scratch MK2 vinyl | Timecode, speed only | Decoder shipped, not yet confirmed on a real pressing |
+| MWM Phase Essential | Beta: see [MWM Phase](#mwm-phase-beta) | Measured against a record on the rig, not yet played in the app |
 | Native Instruments Traktor Audio 6 | Interface | Tested |
 | Any external mixer with line inputs | The mixer | Works |
-| Phase, MIDI and HID controllers | Control | Planned after 1.0 |
+| Phase over USB (no cables), MIDI and HID controllers | Control | Planned after 1.0 |
+
+Each deck works out at calibration which control record is on it and whether
+it turns at 33 or 45; there's nothing to set. See
+[Calibration](/first-set#calibration).
 
 Other class-compliant interfaces with 4 inputs and 4 outputs should work.
 Dub needs to know which channels each deck uses, which is the next section.
+
+## MWM Phase (beta)
+
+<Note>
+**Beta.** Switch it on in **Preferences ▸ Beta ▸ Count Phase's signal**. The
+setup steps are beside the switch too.
+</Note>
+
+Phase replaces control vinyl with a remote on each record. Its receiver sends
+Dub how fast the record turns, as a signal on its outputs. With the beta
+switch on, Dub also counts that signal to know where the record is, so a
+sample stays under your sticker through juggles, scratches and spin backs.
+
+1. Plug the Phase receiver into the Mac by USB and open Phase Manager. Check
+   that the DVS software is **Serato**, its factory setting. Phase reads the
+   record 0.56 % fast in that mode and Dub takes it out. In Traktor mode the
+   sticker drifted when we juggled.
+2. Run the receiver's two outputs into your interface's deck inputs, in place
+   of the turntables, and switch those inputs to **LINE**. On PHONO the signal
+   clips.
+3. Put each remote on its record. The needle can stay up: Phase doesn't read
+   the groove.
+4. Turn the beta switch on, set the deck to **TC**, start the platter at 33
+   with the pitch at 0, and let it play a few seconds while the deck
+   calibrates.
+5. The deck's **SIGNAL** panel is open while it calibrates. **VINYL** reads
+   **PHASE · 33**, with **Counted · the sticker holds** under it, and the
+   panel slides away when it's done.
+
+What to expect:
+
+- **About 10 ms behind your hand.** That's Phase's own sensor and radio,
+  whatever software reads it. Mixing and juggling feel like vinyl; on fast
+  cuts you may feel it.
+- **The sticker holds.** On our recordings in Serato mode, Dub's count came
+  back within 2 ms of the record under it after four minutes of juggling and
+  spin backs. In Traktor mode two minutes of juggling moved it 80 ms, which
+  is why Dub asks for Serato mode.
+- **No needle troubles.** Skips, dust and worn records stop mattering.
+- **No safety net.** Phase sends no position code, so whatever the count
+  gains or loses stays until you recalibrate. What a flat battery or a lost
+  radio link does isn't tested yet.
+
+If **VINYL** says **Speed only · Preferences ▸ Beta**, the switch is off. If
+it says **Set Phase Manager to Serato**, Phase is in Traktor mode. Either way
+the panel stays open until you fix it or close it.
 
 ## Setting up your interface
 

@@ -111,15 +111,95 @@ struct SignalStatus: Equatable {
         }
     }
 
+    /// The record calibration named, as the DJ says it — `SERATO · 33` —
+    /// or `nil` before it has named one. `vinyl`: 1 Serato · 2 Traktor
+    /// MK1 · 3 Traktor MK2 (FFI `DeckTelemetry.vinyl`); `synthetic`, MWM
+    /// Phase on either of their carriers, which is named for what it is.
+    static func vinylName(vinyl: UInt8, rpm: UInt8, synthetic: Bool = false) -> String? {
+        let name: String
+        switch vinyl {
+        case 1: name = synthetic ? "PHASE" : "SERATO"
+        case 2: name = synthetic ? "PHASE" : "TRAKTOR MK1"
+        case 3: name = synthetic ? "PHASE" : "TRAKTOR MK2"
+        default: return nil
+        }
+        return rpm == 0 ? name : "\(name) · \(rpm)"
+    }
+
+    /// The VINYL row: what is on the platter, named at calibration, and
+    /// whether the deck reads where the needle is on it or only how fast
+    /// it turns. Speed only (Traktor MK2, Phase, a worn record) means
+    /// nothing pulls a sample back under the sticker, so it says so.
+    ///
+    /// MWM Phase has no code either, but counted (Preferences ▸ Beta) its
+    /// own cycles hold the sticker in its Serato mode, the factory setting
+    /// (the engine takes out the 0.56 % it reads fast there). In Traktor
+    /// mode the count drifted through juggling, so the line asks for
+    /// Serato mode instead of promising the sticker.
+    static func vinyl(
+        hasInput: Bool, vinyl: UInt8, rpm: UInt8, positionCode: Bool, detecting: Bool,
+        synthetic: Bool = false, counted: Bool = false
+    ) -> (name: String, note: String, colour: Color) {
+        guard hasInput else { return ("—", "", DubColor.textTertiary) }
+        if detecting { return ("…", "Listening to the record", DubColor.stateTentative) }
+        guard let name = vinylName(vinyl: vinyl, rpm: rpm, synthetic: synthetic) else {
+            return ("—", "Named when it calibrates", DubColor.textTertiary)
+        }
+        if synthetic {
+            if !counted { return (name, "Speed only · Preferences ▸ Beta", DubColor.stateTentative) }
+            return vinyl == 1
+                ? (name, "Counted · the sticker holds", DubColor.textSecondary)
+                : (name, "Set Phase Manager to Serato", DubColor.stateTentative)
+        }
+        return positionCode
+            ? (name, "Position · the sticker holds", DubColor.textSecondary)
+            : (name, "Speed only · no sticker hold", DubColor.stateTentative)
+    }
+
+    /// Whether the VINYL line asks the DJ to do something, rather than
+    /// saying what the record is: Phase uncounted, or in its Traktor
+    /// mode. Speed only on a Traktor MK2 is what that record is, and asks
+    /// nothing. Keeps the SIGNAL drawer open (`SignalDrawer`).
+    static func vinylAsks(vinyl: UInt8, synthetic: Bool, counted: Bool) -> Bool {
+        synthetic && (!counted || vinyl != 1)
+    }
+
+    /// A TC deck is still measuring the needle — the whitening capture,
+    /// then the platter's wobble — and holds its track until it is done.
+    /// The engine says settled for every mode but TC, so a recalibration
+    /// on INT is `calibrating` without this, and has no progress to show.
+    static func measuring(hasInput: Bool, pitchSettled: Bool) -> Bool {
+        hasInput && !pitchSettled
+    }
+
     /// The calibration line: what the deck is doing about it now. It
     /// measures by itself the first time it hears a turning record each
     /// session, so a date would say nothing.
+    ///
+    /// The capture and the wobble fit are one job to the DJ, and both
+    /// need the record turning: while either runs it says *Calibrating*,
+    /// and what it needs when it cannot go on (rig, 2026-11-14). A
+    /// calibration refused for a weak side says which side.
+    ///
+    /// - Parameters:
+    ///   - turning: the record is turning under the needle (locked or
+    ///     degraded).
+    ///   - weakChannel: the side a calibration refused — 0 none, 1 left,
+    ///     2 right.
     static func calibration(
-        hasInput: Bool, pitchSettled: Bool, calibrating: Bool, calibrated: Bool
+        hasInput: Bool, pitchSettled: Bool, calibrating: Bool, calibrated: Bool,
+        turning: Bool = true, weakChannel: UInt8 = 0
     ) -> (text: String, colour: Color) {
         guard hasInput else { return ("", DubColor.textTertiary) }
-        if calibrating { return ("Calibrating… play the record", DubColor.stateTentative) }
-        if !pitchSettled { return ("Measuring… play the record", DubColor.stateTentative) }
+        if calibrating || measuring(hasInput: hasInput, pitchSettled: pitchSettled) {
+            if weakChannel != 0 {
+                let side = weakChannel == 1 ? "left" : "right"
+                return ("Can't calibrate · \(side) channel weak", DubColor.stateError)
+            }
+            return turning
+                ? ("Calibrating…", DubColor.stateTentative)
+                : ("Calibrating · play the record", DubColor.stateTentative)
+        }
         if calibrated { return ("Calibrated", DubColor.stateLocked) }
         return ("Measures by itself at needle-down", DubColor.textTertiary)
     }

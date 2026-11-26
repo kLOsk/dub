@@ -58,7 +58,7 @@
 //! atan2 calls/sec/deck — trivial.
 
 use crate::absolute::AbsoluteTracker;
-use crate::Format;
+use crate::{Format, PlatterSpeed};
 
 /// Output of one [`Decoder::process`] call. Caller drives deck
 /// transport from these.
@@ -321,8 +321,20 @@ impl BiquadHp {
 /// need cross-thread access (you almost certainly don't).
 pub struct Decoder {
     sample_rate: f32,
-    /// Nominal carrier frequency in Hz (cached from [`Format`]).
+    /// The control record this decoder reads.
+    format: Format,
+    /// The carrier at unity playback, in Hz: the format's carrier times
+    /// the platter speed. Everything the decoder reports is relative to
+    /// it, so at 45 rpm a resting platter reads rate 1.0.
     carrier_hz: f32,
+    /// Groove speed relative to 33⅓ rpm (1.0, or 1.35 at 45) — see
+    /// [`Decoder::set_platter_speed`]. Divides the absolute position,
+    /// which the tracker counts in 33⅓ groove frames, into track frames.
+    speed: f64,
+    /// How fast the source sends its carrier against its format's, at the
+    /// record's own speed: 1.0 for a record — see
+    /// [`Decoder::set_carrier_scale`].
+    carrier_scale: f64,
     /// Previous complex sample's real part (= file ch1, the cos
     /// component). Retained across `process` calls so the
     /// phase-difference formula has continuity at block boundaries.
@@ -396,7 +408,22 @@ pub struct Decoder {
     /// with [`Decoder::with_absolute`]. Fed per-sample from the
     /// `process` loop; its LUT is allocated at construction, off-RT.
     absolute: Option<AbsoluteTracker>,
+    /// The carrier's own cycles counted, when the position is that — see
+    /// [`Decoder::set_counting`].
+    count: Option<CycleCount>,
 }
+
+/// A counted carrier: its unwrapped phase in turns, and the previous raw
+/// `(ch1, ch0)` sample for the next phase step.
+#[derive(Debug, Clone, Copy, Default)]
+struct CycleCount {
+    turns: f64,
+    prev: (f64, f64),
+}
+
+/// Below this |s|² (an amplitude of 0.01) there is no carrier to count:
+/// a still Phase remote sends silence, and noise there has no phase.
+const COUNT_FLOOR_SQ: f64 = 1e-4;
 
 impl Decoder {
     /// Create a decoder for the given timecode format and sample rate.
@@ -426,7 +453,10 @@ impl Decoder {
         assert!(sample_rate > 0.0, "sample rate must be > 0");
         Self {
             sample_rate,
+            format,
             carrier_hz: format.carrier_hz(),
+            speed: 1.0,
+            carrier_scale: 1.0,
             prev_re: 0.0,
             prev_im: 0.0,
             primed: false,
@@ -448,17 +478,134 @@ impl Decoder {
             carrier_bp_settled_secs: 0.0,
             lag_pos: 0,
             lag_warm: 0,
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            long_lag: ((sample_rate / (2.5 * format.carrier_hz())) as usize).clamp(2, LONG_LAG_MAX),
+            long_lag: long_lag_for(sample_rate, format.carrier_hz()),
             absolute: None,
+            count: None,
         }
+    }
+
+    /// Report the position as the carrier's own cycles counted, instead of
+    /// a decoded position code. For a **synthesised** carrier only — MWM
+    /// Phase sends a tone whose phase is its remote's count of the record's
+    /// turning, so counting it is Phase's own record of where the record
+    /// is, as exact as the remote. On real vinyl the count loses whole
+    /// cycles to dust ticks and more where the record stops and the
+    /// cartridge's output falls away (−3 to −21 ms over five minutes of
+    /// steady play, +36 ms over four of juggling, against the record's own
+    /// code — `dub-engine/tests/phase_drift.rs`), so a position code is the
+    /// answer there instead.
+    ///
+    /// While counting, [`DecodeOutput::abs_position_frames`] is the count
+    /// (from wherever counting started) at full confidence, so the engine
+    /// drives the deck from its exact deltas and heals against it, as it
+    /// does on a position code. Turning it on starts the count at zero;
+    /// turning it on again when it is on changes nothing. RT-safe.
+    pub fn set_counting(&mut self, on: bool) {
+        if !on {
+            self.count = None;
+        } else if self.count.is_none() {
+            self.count = Some(CycleCount::default());
+        }
+    }
+
+    /// Whether the position is the counted carrier ([`Self::set_counting`]).
+    #[must_use]
+    pub fn counting(&self) -> bool {
+        self.count.is_some()
+    }
+
+    /// The control record this decoder reads.
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// The carrier at unity playback in Hz: the format's carrier times
+    /// the platter speed. `rate × carrier_hz()` is the carrier the
+    /// needle is reading right now.
+    #[must_use]
+    pub fn carrier_hz(&self) -> f32 {
+        self.carrier_hz
+    }
+
+    /// Read the record as turning at `speed`. At 45 rpm the carrier runs
+    /// 1.35× its 33⅓ frequency; with the speed set, that reads as rate
+    /// 1.0 and every position comes out in track time, so the long-lag
+    /// estimator and the carrier band-pass work where they were tuned.
+    /// Left at 33⅓, a 45 rpm platter reads 1.35 and drops to the lag-1
+    /// estimator, which carries a −0.3 % bias on real vinyl.
+    ///
+    /// Restarts the estimators' history (a few milliseconds to refill).
+    /// RT-safe: scalar writes and filter retunes, no allocation.
+    pub fn set_platter_speed(&mut self, speed: PlatterSpeed) {
+        self.speed = speed.factor();
+        self.retune();
+    }
+
+    /// The source sends its carrier `scale` times its format's at the
+    /// record's own speed, so read it as that: rate, position and the
+    /// count all come out at the record's speed. 1.0 for a record (the
+    /// default). MWM Phase's Serato mode sends its 1 kHz 0.564 % fast.
+    /// The position code's fix is the groove's and stays as it is.
+    ///
+    /// Restarts the estimators' history, as [`Self::set_platter_speed`]
+    /// does. RT-safe.
+    pub fn set_carrier_scale(&mut self, scale: f64) {
+        self.carrier_scale = scale;
+        self.retune();
+    }
+
+    /// Put the unity carrier where the platter speed and the carrier scale
+    /// say, and retune what depends on it.
+    #[allow(clippy::cast_possible_truncation)]
+    fn retune(&mut self) {
+        self.carrier_hz =
+            (f64::from(self.format.carrier_hz()) * self.speed * self.carrier_scale) as f32;
+        self.long_lag = long_lag_for(self.sample_rate, self.carrier_hz);
+        self.lag_pos = 0;
+        self.lag_warm = 0;
+        self.carrier_bp_rate = 1.0;
+        self.carrier_bp_settled_secs = 0.0;
+        for section in self.carrier_bp.iter_mut().flatten() {
+            section.retune_band_pass(
+                f64::from(self.carrier_hz),
+                CARRIER_BP_Q,
+                f64::from(self.sample_rate),
+            );
+            section.reset();
+        }
+        self.ellipse_primed = false;
+    }
+
+    /// The absolute position in track frames: the counted carrier while
+    /// counting, else the position code's fix, or `None` while it has
+    /// none (or there is no tracker).
+    fn abs_position_frames(&self) -> Option<f64> {
+        if let Some(count) = self.count {
+            return Some(count.turns / f64::from(self.carrier_hz) * f64::from(self.sample_rate));
+        }
+        self.absolute
+            .as_ref()
+            .and_then(AbsoluteTracker::position_frames)
+            .map(|frames| frames / self.speed)
+    }
+
+    /// How sure the absolute position is: full while counting (the count
+    /// is the source's own), else the position code's agreement.
+    fn abs_confidence(&self) -> f32 {
+        if self.count.is_some() {
+            return 1.0;
+        }
+        self.absolute
+            .as_ref()
+            .map_or(0.0, AbsoluteTracker::confidence)
     }
 
     /// Like [`Decoder::new`], but with **absolute-position decoding**
     /// enabled (M6). Builds the format's position LUT — allocates a few
     /// MB, so this MUST run off the audio thread; `process` itself
     /// stays alloc-free. For a format whose bitstream we don't decode
-    /// (Traktor MK2, and MK1 until Phase 2) this silently degrades to
+    /// (Traktor MK2) this silently degrades to
     /// a plain relative decoder — `abs_position_frames` stays `None`.
     ///
     /// # Panics
@@ -557,6 +704,9 @@ impl Decoder {
             section.reset();
         }
         self.carrier_bp_settled_secs = 0.0;
+        if let Some(count) = self.count.as_mut() {
+            *count = CycleCount::default();
+        }
         if let Some(t) = self.absolute.as_mut() {
             t.reset();
         }
@@ -584,14 +734,8 @@ impl Decoder {
                 position_secs: self.position_secs,
                 amplitude: 0.0,
                 confidence: 0.0,
-                abs_position_frames: self
-                    .absolute
-                    .as_ref()
-                    .and_then(AbsoluteTracker::position_frames),
-                abs_confidence: self
-                    .absolute
-                    .as_ref()
-                    .map_or(0.0, AbsoluteTracker::confidence),
+                abs_position_frames: self.abs_position_frames(),
+                abs_confidence: self.abs_confidence(),
             };
         }
 
@@ -670,6 +814,26 @@ impl Decoder {
             self.lag_hist_bp[self.lag_pos] = (band_re, band_im);
             self.lag_pos = (self.lag_pos + 1) % self.long_lag;
             self.lag_warm = self.lag_warm.saturating_add(1);
+            // Counting (a synthesised carrier, `set_counting`): this
+            // sample's phase step, s · conj(s_prev), added up — on the raw
+            // input, not the high-passed one: the high-pass shifts the
+            // carrier's phase more the slower it turns, and each pass
+            // through zero speed left a third of a cycle behind (0.15 ms a
+            // juggle pass at 2.5 kHz). A synthesised carrier has no rumble
+            // or hum to filter. Exact while the carrier is there; through
+            // silence the count holds.
+            if let Some(count) = self.count.as_mut() {
+                let (raw_re, raw_im) = (f64::from(frame[1]), f64::from(frame[0]));
+                let (prev_re, prev_im) = count.prev;
+                if raw_re * raw_re + raw_im * raw_im >= COUNT_FLOOR_SQ
+                    && prev_re * prev_re + prev_im * prev_im >= COUNT_FLOOR_SQ
+                {
+                    let step = (raw_im * prev_re - raw_re * prev_im)
+                        .atan2(raw_re * prev_re + raw_im * prev_im);
+                    count.turns += step / std::f64::consts::TAU;
+                }
+                count.prev = (raw_re, raw_im);
+            }
             self.prev_re = re;
             self.prev_im = im;
             self.primed = true;
@@ -870,14 +1034,8 @@ impl Decoder {
             position_secs: self.position_secs,
             amplitude,
             confidence,
-            abs_position_frames: self
-                .absolute
-                .as_ref()
-                .and_then(AbsoluteTracker::position_frames),
-            abs_confidence: self
-                .absolute
-                .as_ref()
-                .map_or(0.0, AbsoluteTracker::confidence),
+            abs_position_frames: self.abs_position_frames(),
+            abs_confidence: self.abs_confidence(),
         }
     }
 
@@ -936,6 +1094,13 @@ impl Decoder {
             rate
         }
     }
+}
+
+/// The long-lag span for a carrier at unity: `floor(sr / (2.5 · carrier))`
+/// clamped to `[2, LONG_LAG_MAX]`, so `|rate| ≤` ~1.25 stays unambiguous.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn long_lag_for(sample_rate: f32, carrier_hz: f32) -> usize {
+    ((sample_rate / (2.5 * carrier_hz)) as usize).clamp(2, LONG_LAG_MAX)
 }
 
 /// Inverse magnitude of the input high-pass at `carrier_hz`, capped at
@@ -1761,6 +1926,138 @@ mod tests {
         assert!(
             (p1 - p0 - 4_800.0).abs() < 1.0,
             "abs delta {} should be ≈ 4800 frames",
+            p1 - p0
+        );
+    }
+
+    /// Mean rate over the last second of `secs` of a carrier at `rate`
+    /// (33⅓ terms), read in 64-frame blocks with the speed set to `speed`.
+    fn mean_rate_at(format: Format, speed: PlatterSpeed, rate: f64, secs: f64) -> f64 {
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(format, sr);
+        let mut dec = Decoder::new(format, sr);
+        dec.set_platter_speed(speed);
+        let mut buf = vec![0.0f32; 64 * 2];
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let blocks = (secs * 48_000.0 / 64.0) as usize;
+        let (mut sum, mut n) = (0.0, 0.0);
+        for b in 0..blocks {
+            gen.render(&mut buf, rate, 0.5);
+            let out = dec.process(&buf);
+            if b + 750 >= blocks {
+                sum += out.rate;
+                n += 1.0;
+            }
+        }
+        sum / n
+    }
+
+    #[test]
+    fn a_45_rpm_platter_reads_unity_once_the_speed_is_set() {
+        for format in [Format::SeratoCv02, Format::TraktorMk1, Format::TraktorMk2] {
+            let at_45 = PlatterSpeed::Rpm45.factor();
+            let read = mean_rate_at(format, PlatterSpeed::Rpm45, at_45, 2.0);
+            assert!((read - 1.0).abs() < 2e-4, "{format:?} at 45 read {read}");
+            let pitched = mean_rate_at(format, PlatterSpeed::Rpm45, at_45 * 1.08, 2.0);
+            assert!(
+                (pitched - 1.08).abs() < 3e-4,
+                "{format:?} +8 % read {pitched}"
+            );
+            let unset = mean_rate_at(format, PlatterSpeed::Rpm33, at_45, 2.0);
+            assert!(
+                (unset - at_45).abs() < 0.01,
+                "{format:?} unset read {unset}"
+            );
+        }
+    }
+
+    #[test]
+    fn counting_a_synthesised_carrier_follows_every_gesture() {
+        // A Phase-like tone (flat, no code) through a juggle: play, a
+        // scratch, a spin back, the remote held still (silence), play on.
+        // The count is where the record is, to well under a millisecond.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::TraktorMk2, sr);
+        let mut dec = Decoder::new(Format::TraktorMk2, sr);
+        dec.set_counting(true);
+        let mut buf = vec![0.0f32; 64 * 2];
+        let mut truth = 0.0_f64;
+        let block = 64.0 / 48_000.0;
+        let mut play = |dec: &mut Decoder, gen: &mut Generator, truth: &mut f64, rate: f64| {
+            gen.render(&mut buf, rate, 0.33);
+            dec.process(&buf);
+            *truth += rate * block;
+        };
+        for _ in 0..375 {
+            play(&mut dec, &mut gen, &mut truth, 1.0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        for i in 0..1500 {
+            let rate = 2.5 * (f64::from(i) / 1500.0 * std::f64::consts::TAU * 6.0).sin();
+            play(&mut dec, &mut gen, &mut truth, rate);
+        }
+        for _ in 0..300 {
+            play(&mut dec, &mut gen, &mut truth, -4.0);
+        }
+        let silence = vec![0.0f32; 64 * 2];
+        for _ in 0..200 {
+            dec.process(&silence);
+        }
+        for _ in 0..375 {
+            play(&mut dec, &mut gen, &mut truth, 1.0);
+        }
+        let counted = dec.process(&[]).abs_position_frames.expect("counting") / 48_000.0;
+        assert!(
+            (counted - truth).abs() < 5e-4,
+            "counted {counted:.5} s, the record moved {truth:.5} s"
+        );
+        assert!((dec.process(&[]).abs_confidence - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn counting_is_off_until_asked_and_restarts_only_when_turned_on() {
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::TraktorMk2, sr);
+        let mut dec = Decoder::new(Format::TraktorMk2, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen.render(&mut buf, 1.0, 0.33);
+        assert_eq!(dec.process(&buf).abs_position_frames, None);
+        dec.set_counting(true);
+        gen.render(&mut buf, 1.0, 0.33);
+        let p = dec.process(&buf).abs_position_frames.expect("counting");
+        dec.set_counting(true);
+        gen.render(&mut buf, 1.0, 0.33);
+        let q = dec.process(&buf).abs_position_frames.expect("counting");
+        assert!(
+            (q - p - 4_800.0).abs() < 1.0,
+            "a second on reset it: {p} → {q}"
+        );
+    }
+
+    #[test]
+    fn at_45_the_absolute_position_moves_in_track_time() {
+        // The tracker counts 33⅓ groove frames; at 45 a second of play
+        // covers 1.35 s of them, and the decoder hands the deck one.
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(Format::SeratoCv02, sr);
+        assert!(gen.enable_absolute(Format::SeratoCv02, 0.4));
+        let mut dec = Decoder::with_absolute(Format::SeratoCv02, sr);
+        dec.set_platter_speed(PlatterSpeed::Rpm45);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        let at_45 = PlatterSpeed::Rpm45.factor();
+        for _ in 0..3 {
+            gen.render(&mut buf, at_45, 0.5);
+            dec.process(&buf);
+        }
+        let p0 = dec.process(&[]).abs_position_frames.expect("locked");
+        for _ in 0..10 {
+            gen.render(&mut buf, at_45, 0.5);
+            dec.process(&buf);
+        }
+        let p1 = dec.process(&[]).abs_position_frames.expect("still locked");
+        assert!(
+            (p1 - p0 - 48_000.0).abs() < 2.0,
+            "one second at 45 advanced {} frames",
             p1 - p0
         );
     }

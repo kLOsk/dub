@@ -13,8 +13,8 @@
 //  DJ pick its pairs (2026-11-15, FFI 87) — two shipped maps cannot
 //  cover the interfaces DJs actually own.
 //
-//  Seven tabs down the left, one per thing the DJ is configuring — AUDIO
-//  · DECKS · FX · LIBRARY · VINYL · KEYS · ALPHA — the shape of Traktor's
+//  Eight tabs down the left, one per thing the DJ is configuring — AUDIO
+//  · DECKS · FX · LIBRARY · VINYL · KEYS · BETA · ALPHA — the shape of Traktor's
 //  preferences and of System Settings, in Dub's own chrome. It replaced
 //  (2026-09-16) one scroll of eight caps-titled blocks, each toggle
 //  under a paragraph, where FX sat below the fold and the sheet read
@@ -24,7 +24,9 @@
 //  auto-applies; nothing here is committed by a button.
 //
 //  ALPHA holds what works but is not finished, behind one master switch
-//  that is off by default (2026-11-12, DUB FX first).
+//  that is off by default (2026-11-12, DUB FX first). BETA holds what is
+//  finished and measured but not yet proven on enough rigs, each with how
+//  to set it up beside its switch (2026-11-24, MWM Phase first).
 //
 //  A DEV-only block (compiled in `#if DEBUG` only) on the Audio tab
 //  adds a manual mode override and device/channel overrides so the
@@ -47,6 +49,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
     case library
     case vinyl
     case keys
+    case beta
     case alpha
 
     var id: String { rawValue }
@@ -59,6 +62,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         case .library: return "Library"
         case .vinyl: return "Vinyl"
         case .keys: return "Keys"
+        case .beta: return "Beta"
         case .alpha: return "Alpha"
         }
     }
@@ -72,6 +76,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         case .library: return "The DJ apps whose libraries Dub reads into your one collection."
         case .vinyl: return "Recording records into the library, and naming what you ripped."
         case .keys: return "What the keyboard fires. Mapped on the live surface, listed here."
+        case .beta: return "Finished and measured, but not yet played on many rigs. Each switch says how to set it up."
         case .alpha: return "Features that work but aren't finished. They will change; leave them off at a gig."
         }
     }
@@ -193,6 +198,7 @@ struct PreferencesSheet: View {
         case .library: libraryTab
         case .vinyl: vinylTab
         case .keys: keysTab
+        case .beta: betaTab
         case .alpha: alphaTab
         }
     }
@@ -321,6 +327,32 @@ struct PreferencesSheet: View {
                     "Beat-match the siren's echo",
                     "Locks the siren's echo to the deck's tempo — one beat per repeat, or half a beat when a beat is longer than the echo can hold — instead of the DUB knob's time, so the repeats fall in time with the tune.",
                     isOn: $model.sirenDelaySync, enabled: model.sirenEnabled, last: true)
+            }
+        }
+    }
+
+    // MARK: - Beta
+
+    /// MWM Phase: the switch, then how to set it up, in the order the DJ
+    /// does it. The measured numbers are said plainly — 10 ms behind the
+    /// hand is Phase's own, and the DJ should know it before a gig.
+    private var betaTab: some View {
+        VStack(alignment: .leading, spacing: DubSpacing.xl) {
+            group("MWM Phase") {
+                toggleRow(
+                    "Count Phase's signal",
+                    "With a Phase remote on a record instead of control vinyl, Dub follows the remote's own count of the record's turning, so a sample stays under your sticker through juggles, scratches and spin backs. Off, Dub reads only Phase's speed, and the sticker drifts a few milliseconds every juggle.",
+                    isOn: $model.phaseCountingEnabled, last: true)
+            }
+            group("Setting it up") {
+                note("1. Plug the Phase receiver into the Mac by USB and open Phase Manager. Check that the DVS software is Serato, its factory setting. Dub takes out the 0.56 % Phase reads fast there; in Traktor mode the sticker drifted when we juggled.")
+                note("2. Run the receiver's two outputs into your interface's deck inputs, in place of the turntables, and switch those inputs to LINE. On PHONO the signal clips.")
+                note("3. Put each remote on its record. The needle can stay up: Phase doesn't read the groove.")
+                note("4. Turn this switch on, set the deck to TC, start the platter at 33 with the pitch at 0 and let it play a few seconds while the deck calibrates.")
+                note("5. Open the deck's SIGNAL panel. VINYL reads PHASE · 33 with Counted · the sticker holds. If it says Speed only, this switch is off or the deck hasn't calibrated yet; press CALIBRATE with the record playing.")
+            }
+            group("What to expect") {
+                note("Phase answers your hand about 10 ms late — its own sensor and radio, the same whatever software reads it. Mixing and juggling feel like vinyl; on fast cuts you may feel it. Needle skips, dust and worn records stop mattering. Phase sends no position code, so whatever its count gains or loses stays until you recalibrate. In our tests it came back within 2 ms of the record after four minutes of juggling and spin backs. What a flat battery or a lost radio link does is not tested yet.")
             }
         }
     }

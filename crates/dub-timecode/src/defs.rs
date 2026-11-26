@@ -191,6 +191,19 @@ pub fn serato_candidates() -> [&'static TimecodeDef; 3] {
     ]
 }
 
+/// The Traktor Scratch MK1 pressings to auto-detect across (sides A
+/// and B share the polynomial; only the seed differs).
+///
+/// # Panics
+/// Never: both names are in [`TIMECODE_DEFS`].
+#[must_use]
+pub fn traktor_candidates() -> [&'static TimecodeDef; 2] {
+    [
+        find_def("traktor_a").unwrap(),
+        find_def("traktor_b").unwrap(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

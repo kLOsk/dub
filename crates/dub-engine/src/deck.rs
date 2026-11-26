@@ -169,6 +169,14 @@ pub struct DeckSharedState {
     /// the deck is *driven* by per-block deltas, never by this value.
     tc_abs_locked: AtomicBool,
     tc_abs_position_secs_bits: AtomicU64,
+    /// What calibration named on the needle — see
+    /// [`TimecodeTelemetry::vinyl`] and the fields after it.
+    tc_vinyl: AtomicU8,
+    tc_platter_rpm: AtomicU8,
+    tc_position_code: AtomicBool,
+    tc_synthetic: AtomicBool,
+    tc_counting: AtomicBool,
+    tc_detecting_vinyl: AtomicBool,
     /// Sticker-drift reading in milliseconds (see [`crate::drift`]);
     /// NaN until the first ABS-locked observation. Diagnostic only.
     tc_sticker_drift_ms_bits: AtomicU64,
@@ -349,7 +357,44 @@ pub struct TimecodeTelemetry {
     /// Measurement progress [0, 1] for the deck-header calibration
     /// progress line; 1.0 when nothing is measuring.
     pub measure_progress: f32,
+    /// The control record calibration named: [`VINYL_UNKNOWN`] until it
+    /// has, then [`VINYL_SERATO`], [`VINYL_TRAKTOR_MK1`] or
+    /// [`VINYL_TRAKTOR_MK2`].
+    pub vinyl: u8,
+    /// The platter speed calibration named: 33 or 45, 0 until it has.
+    pub platter_rpm: u8,
+    /// Whether a position code locked while the record was named. Without
+    /// one the deck follows speed only and the sticker hold can't apply.
+    pub position_code: bool,
+    /// Whether the carrier is synthesised — MWM Phase — not a record.
+    pub synthetic: bool,
+    /// Whether the deck follows the counted carrier (Phase with
+    /// Preferences ▸ Beta ▸ MWM Phase on) rather than its speed.
+    pub counting: bool,
+    /// Whether calibration is naming the record right now.
+    pub detecting_vinyl: bool,
 }
+
+/// What a timecode input reports beside the record it named, published
+/// together each block (see [`TimecodeTelemetry`]).
+#[allow(clippy::struct_excessive_bools)] // four independent facts, mirrored to the FFI
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VinylFlags {
+    pub(crate) position_code: bool,
+    pub(crate) synthetic: bool,
+    pub(crate) counting: bool,
+    pub(crate) detecting: bool,
+}
+
+/// [`TimecodeTelemetry::vinyl`]: no record named yet.
+pub const VINYL_UNKNOWN: u8 = 0;
+/// [`TimecodeTelemetry::vinyl`]: Serato control vinyl.
+pub const VINYL_SERATO: u8 = 1;
+/// [`TimecodeTelemetry::vinyl`]: Traktor Scratch MK1 vinyl.
+pub const VINYL_TRAKTOR_MK1: u8 = 2;
+/// [`TimecodeTelemetry::vinyl`]: Traktor Scratch MK2 vinyl — or anything
+/// else on its 2.5 kHz carrier, such as MWM Phase as recorded on the rig.
+pub const VINYL_TRAKTOR_MK2: u8 = 3;
 
 /// Process-local monotonic clock origin shared by the audio
 /// thread (writer) and the FFI snapshot reader. Lazily
@@ -420,6 +465,12 @@ impl DeckSharedState {
             tc_pitch_settled: AtomicBool::new(true),
             tc_measure_progress_bits: AtomicU32::new(1.0f32.to_bits()),
             tc_abs_position_secs_bits: AtomicU64::new(0.0f64.to_bits()),
+            tc_vinyl: AtomicU8::new(VINYL_UNKNOWN),
+            tc_platter_rpm: AtomicU8::new(0),
+            tc_position_code: AtomicBool::new(false),
+            tc_synthetic: AtomicBool::new(false),
+            tc_counting: AtomicBool::new(false),
+            tc_detecting_vinyl: AtomicBool::new(false),
             loop_active: AtomicBool::new(false),
             loop_in_secs_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_secs_bits: AtomicU64::new(0.0f64.to_bits()),
@@ -482,6 +533,7 @@ impl DeckSharedState {
         self.tc_sticker_drift_ms_bits
             .store(f64::NAN.to_bits(), Ordering::Relaxed);
         self.tc_pitch_settled.store(true, Ordering::Relaxed);
+        self.publish_vinyl(None, VinylFlags::default());
         self.store_output(0.0, false);
         self.store_loop(false, 0.0, 0.0);
         self.publish_calibration([[1.0, 0.0], [0.0, 1.0]], 0, 0);
@@ -529,6 +581,31 @@ impl DeckSharedState {
             .store(pitch_settled, Ordering::Relaxed);
         self.tc_measure_progress_bits
             .store(measure_progress.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publish what calibration named on this needle (audio thread). A
+    /// few relaxed stores; RT-safe.
+    pub(crate) fn publish_vinyl(&self, named: Option<dub_timecode::Detection>, flags: VinylFlags) {
+        let (vinyl, rpm) = named.map_or((VINYL_UNKNOWN, 0), |d| {
+            let vinyl = match d.format {
+                dub_timecode::Format::SeratoCv02 => VINYL_SERATO,
+                dub_timecode::Format::TraktorMk1 => VINYL_TRAKTOR_MK1,
+                dub_timecode::Format::TraktorMk2 => VINYL_TRAKTOR_MK2,
+            };
+            let rpm = match d.speed {
+                dub_timecode::PlatterSpeed::Rpm33 => 33,
+                dub_timecode::PlatterSpeed::Rpm45 => 45,
+            };
+            (vinyl, rpm)
+        });
+        self.tc_vinyl.store(vinyl, Ordering::Relaxed);
+        self.tc_platter_rpm.store(rpm, Ordering::Relaxed);
+        self.tc_position_code
+            .store(flags.position_code, Ordering::Relaxed);
+        self.tc_synthetic.store(flags.synthetic, Ordering::Relaxed);
+        self.tc_counting.store(flags.counting, Ordering::Relaxed);
+        self.tc_detecting_vinyl
+            .store(flags.detecting, Ordering::Relaxed);
     }
 
     /// Publish auto source-detection + calibration state (audio thread).
@@ -744,6 +821,12 @@ impl DeckSharedState {
             sticker_drift_ms: f64::from_bits(self.tc_sticker_drift_ms_bits.load(Ordering::Relaxed)),
             pitch_settled: self.tc_pitch_settled.load(Ordering::Relaxed),
             measure_progress: f32::from_bits(self.tc_measure_progress_bits.load(Ordering::Relaxed)),
+            vinyl: self.tc_vinyl.load(Ordering::Relaxed),
+            platter_rpm: self.tc_platter_rpm.load(Ordering::Relaxed),
+            position_code: self.tc_position_code.load(Ordering::Relaxed),
+            synthetic: self.tc_synthetic.load(Ordering::Relaxed),
+            counting: self.tc_counting.load(Ordering::Relaxed),
+            detecting_vinyl: self.tc_detecting_vinyl.load(Ordering::Relaxed),
         }
     }
 
@@ -1347,6 +1430,12 @@ impl Deck {
             pitch_settled,
             measure_progress,
         );
+    }
+
+    /// Forward what calibration named on this needle to the deck's
+    /// shared state (RT-safe; called from `drive_timecode_inputs`).
+    pub(crate) fn publish_vinyl(&self, named: Option<dub_timecode::Detection>, flags: VinylFlags) {
+        self.shared.publish_vinyl(named, flags);
     }
 
     /// Forward auto source-detection + calibration state to the deck's

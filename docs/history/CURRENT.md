@@ -108,6 +108,157 @@ gate is local-only because GitHub CI has no macOS app job.
   (`TraktorAudioBox`; NI's control panel is 32-bit and no longer runs).
   Read path tried on Daniel's box; the write is his to try.
 
+- **The sticker holds (2026-11-24, uncommitted, not on the rig).** Daniel:
+  juggling, the samples should stay where they sit on the record, and a
+  skip must not move the track — "the whole point of relative mode".
+  Audited with `dub-engine/tests/sticker_drift.rs` (his deck A scratch
+  capture and Traktor take through the engine, plus a synthetic juggle on
+  both vinyls). Found and fixed: the LFSR slicer re-learned a level change
+  over 330 cycles, so the lock never came during a scratch (0 locks in
+  10 s; out 22 ms behind) and short juggle phrases stacked to −64 ms;
+  acquisition was forward-only, so a spin back never locked; Traktor MK1
+  had no absolute decode at all (+1.2 ms a pass, unbounded) — xwax's defs
+  lock 96.7 / 99.2 % of his 12-minute takes, LUTs shared across decks
+  (32 MB a side); the heal's 4 ms deadband left the sticker up to 4 ms off
+  (now a 0.5 s exponential pull, still capped at 1 %); a skip inside a
+  scratch was healed toward the skipped groove for minutes (now whole-turn
+  jumps move the anchor); the heal read the playhead a block early. Now:
+  the real scratch comes out 0.3 ms off (median), juggles land within a
+  millisecond on a typical pass, 4 ms at worst. **Not done:** a juggling
+  capture on the rig, both vinyls; the relative path still under-reads a
+  fast spin's travel ~0.7 % (the rate smoother's lag), which an unlocked
+  spin back carries to the release; a dust tick still slows the deck for
+  a moment (~3 ms, healed within a second). Until the entry below, the app
+  read Serato vinyl only (every path attached `TimecodeInputConfig::default()`,
+  hardwired to `SeratoCv02`), so the Traktor half reached the app only with it.
+
+- **Calibration names the record (2026-11-24, uncommitted, not on the rig).**
+  Daniel: detect the vinyl at calibration, 33 and 45 both, no runtime
+  switching, and show each deck's result. Each TC deck now builds a decoder
+  per format at attach (LUTs shared, 64 MB for Traktor) and, while
+  calibrating, names Serato / Traktor MK1 / MK2 at 33⅓ or 45 from a second of
+  steady carrier plus which position code locked (`dub_timecode::detect`,
+  `TimecodeInput::probe_vinyl`), then swaps that decoder in with its speed
+  set. Whitening, the zero anchor and the wobble fit wait for the name. At 45
+  the decoder reads 1.35× as unity (long-lag and band-pass where they were
+  tuned); positions are track time, the skip rule's turn is 1.333 s, the
+  wobble fit stays in groove time. The SIGNAL panel has a VINYL row (`SERATO ·
+  33`, then *Position · the sticker holds* or *Speed only · no sticker hold*)
+  and the calibration bar says `CALIBRATING · TRAKTOR MK1 · 45`. The PRD's
+  Preferences RPM override is dropped (§5.4.1). FFI 96. Tests: all six records
+  and speeds named and playing at unity through `drive()`, MK1 at 45 −6 %
+  told from MK2 at 33⅓ by its code, same-record recalibration untouched,
+  detection allocation-free (it wasn't: `detect` collected a `Vec`), an engine
+  test of MK1 at 45 +2 % moving the track 1.02 s a second. **Not done:** the
+  rig — Phase into the SL3 on line (as recorded, it should read `TRAKTOR MK2 ·
+  33 · Speed only`), then Traktor vinyl at 33 and 45; a 33↔45 switch mid-set
+  plays 35 % off until CALIBRATE, as agreed.
+
+- **Phase measured against the record under it (2026-11-24).** Daniel
+  remembered Phase on Traktor as "it worked but it was always off". The
+  Phase remote on a control record, the needle on it into deck A, the
+  receiver into deck B, recorded together (`tests/phase_drift.rs`; the
+  takes are in `testdata/timecode/full/`, not in git). Neither mode sends a
+  position code (Serato mode: a flat 1 kHz; Traktor mode: a flat 2.5 kHz).
+  Phase is the record's motion **8 ms late** (Serato mode, correlation
+  0.9998) or **10 ms** (Traktor mode, 0.998). **Serato mode reads 0.56 %
+  fast**, 5.6 ms of drift a second, beyond the zero anchor's ±0.4 % guard;
+  Traktor mode reads true. **Phase's own count**, its tone's cycles counted:
+  in the clean Serato-mode take, its 0.56 % taken out, it came back within
+  3 ms of the record after 229 s of juggling and backspins, while the
+  engine adding up speed lost 66 ms more. So "always off" was the speed
+  error plus the software adding up speed, not Phase's sensing.
+  **Corrected the same day:** the Traktor-mode take broke 143 times in the
+  input stream (a build ran beside it; the fault detector, now gated on a
+  strong carrier, had also fired at scratch turnarounds), and each break
+  re-zeroed the count against the record — its "±2 ms" and "1.2 ms" were
+  the harness, not Phase; the harness now flags faults inside the measured
+  stretch. **The clean Traktor-mode take (2026-11-25,**
+  `phase-vs-traktor-1125-traktor-mode-4ch.wav`, nothing else running, faults
+  only in the first 2 s): 11 ms late (0.993), speed true to 0.01 %, the
+  count within 7 ms over the last 105 s of steady play, but two minutes of
+  juggling moved it +80 ms (+91 at the end; the engine adding up speed
+  ended −16). The gain sits where the record's code goes unread (stops,
+  turnarounds, hand on the record); Phase never passed 5×, so the 2.5 kHz
+  carrier didn't run out of room. Unsettled: Phase in Traktor mode, or the
+  remote, loose on the label (no magnet yet) and knocked once in the take,
+  shifting at hard stops. Daniel: the remote was as loose in the Serato-mode
+  take, which held. **So Serato mode it is (2026-11-25, uncommitted):** a
+  deck that names Phase on a Serato carrier reads it 0.564 % slower
+  (`Decoder::set_carrier_scale`, `PHASE_SERATO_MODE_FAST`). On the Serato
+  take the engine's count now ends −1.9 ms after 229 s of juggling (it was
+  +510), and the panel asks Traktor-mode Phase for *Set Phase Manager to
+  Serato*. The 1.00564 was fitted on that same take, so a second
+  Serato-mode take, out of sample, is owed. **Built the same day (uncommitted, not on
+  the rig): Preferences ▸ Beta ▸ Count Phase's signal** (a new Beta tab,
+  setup steps beside the switch; `site/hardware.mdx#mwm-phase-beta`).
+  Calibration names a flat, codeless carrier **PHASE** (level spread under
+  0.3 %), and with the switch on the decoder counts its cycles on the raw
+  input (counted after the 120 Hz high-pass it lost a third of a cycle at
+  every pass through zero) and the engine drives the deck from the count's
+  deltas. Synthetic juggle: within 0.2 ms of the sticker over 16 passes,
+  against 12–15 ms adding up speed. Calibration names Phase in
+  Serato mode PHASE with no code (`real_records_are_named_at_calibration`,
+  an excerpt of the take's deck B), though a bare `Decoder::with_absolute`
+  left running on that tone reports locks at confidence ≥ 0.9 now and
+  then: not chased. **Counting real vinyl** (Daniel asked; measured, not
+  built): against the record's own code, −3 / −21 ms over 310 s of steady
+  play with fader moves (adding up speed +37 / +85) and +36 ms over the
+  juggling take (+106). About three times better than speed for MK2, but
+  it loses whole cycles to dust ticks (deck A's error moves in exact
+  1.0 ms steps) and more at stops, so no sticker hold; a tick filter would
+  need an MK2 recording, which we don't have. FFI 96 (`set_phase_counting`,
+  `DeckTelemetry.vinyl_synthetic` / `vinyl_counted`). **Not done:** played
+  in the app; a flat battery or lost radio link untested. The Traktor take first looked like the
+  MK1 decoder relocking 0.35 s off; it was the input stream dropping audio
+  while a build ran beside the capture (both decks' carriers broke at the
+  same instants), and the harness now takes such faults out.
+- **The SIGNAL drawer opens for calibration (Daniel, 2026-11-25,
+  uncommitted, not on the rig).** A TC deck's first calibration of the
+  session opens its drawer by itself; once calibrated and LOCKED for 1.5 s
+  it slides away to its tab. It stays while something wants fixing (no
+  input, a weak side, Phase uncounted or in Traktor mode; MK2's speed only
+  asks nothing), never opens by itself again that session, and the DJ's
+  click or × ends all of it (`SignalDrawer`, held by the model so Prep
+  doesn't reset it). The bar that covered the track overview while a deck
+  measured is gone; the panel's calibration line has the bar and the
+  percent beside **CALIBRATE**, a refusal fills it red, and a closed tab
+  fills as the deck measures. The drawer now slides as one piece on an
+  offset (it was a width animated from zero, re-laid out every frame) and
+  its content leaves the tree once it has slid away. Prep's header line
+  stays: there is no drawer there. First try in the app (2026-11-26) found
+  two layout bugs, both fixed with a layout test each: shut, the tab slid
+  off the screen (the panel's width hung on a `Group`, which went with its
+  content); and open, the panel needed 490 pt of a 438 pt deck pane, so it
+  stretched its deck row and pushed the other deck down. The drawer is an
+  `.overlay` on the pane now, and the scope gives way when the pane is
+  short. Swift suite green (426 + 2).
+
+- **The deck header, mirrored and draggable (Daniel, 2026-11-26,
+  uncommitted).** The readout row is one mirror: deck A's labels hang right
+  and its key lock sits *before* the key, deck B's hang left with the lock
+  after, so the key is as far from its lock on both (snapshot
+  `readouts-both-decks`). The whole header, switch row to title, is the
+  instant-double drag handle now, not the title and artist text alone, and
+  it carries the library's `♪ Artist — Title` chip: the drag lies *behind*
+  the header, so the switch, BPM's tap pad, STEADY and the key lock keep
+  their presses (a drag source on the block made the lock inert,
+  2026-09-22). Not tried with a mouse yet.
+
+- **Phase on TC (2026-11-24, probe only).** Daniel's MWM Phase Essential,
+  Phase Manager set to Serato, into the SL3 on line: both decks give a clean
+  2.5 kHz quadrature sine (−9.4 dBFS, constant amplitude, so no position
+  code). `decode-timecode --format traktor-mk2` reads +1.0002 at confidence
+  1.0; as Serato it reads 2.5×. Captures:
+  `testdata/timecode/full/phase-serato-1124-deck{A-line,B-probe}.wav`. On
+  phono the receiver clips flat. Also found and fixed in `dub levels` /
+  `dub capture`: `--channels 6` read only inputs 1–2, three times over, and
+  kept a third of the frames — unmapped, the input unit fills the device's
+  first stream only, so more than a pair now gets the identity channel map
+  (not yet re-run on the SL 3; `--input-channels N,M` always worked). And a
+  capture run in the background stopped at 0 frames, its empty stdin taken
+  for Enter; end of input no longer stops it.
+
 - **Turntable pitch read true (2026-11-21, uncommitted).** Daniel beatmatches
   by lining up the numbers, and found Traktor's steadier and truer at ±8 %.
   Measured on four captures of his rig against counted carrier cycles, then

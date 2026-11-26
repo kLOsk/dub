@@ -53,7 +53,9 @@
 use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::{HeapCons, HeapProd};
 
-use dub_timecode::{whitening_from_covariance, DecodeOutput, Decoder, Format, RateSmoother};
+use dub_timecode::{
+    whitening_from_covariance, DecodeOutput, Decoder, Detection, Format, PlatterSpeed, RateSmoother,
+};
 
 use crate::anchor::AnchorMap;
 
@@ -178,6 +180,42 @@ const ZERO_ANCHOR_STEADY: f64 = 0.002;
 /// honest reading for a deck that never rested.
 const ZERO_ANCHOR_GIVE_UP_SECS: f64 = 15.0;
 
+/// Seconds of steady carrier the vinyl detection averages before it
+/// names the record. The candidates sit 8 % apart or more, so a second
+/// is plenty for the frequency; it is also long enough for a position
+/// code to lock many times over (tens of milliseconds each).
+const VINYL_PROBE_SECS: f64 = 1.0;
+
+/// Two consecutive slices (relative) further apart than this are a
+/// platter still coming up to speed, and the probe starts over.
+/// Looser than [`ZERO_ANCHOR_STEADY`]: this only has to tell records
+/// 8 % apart, not measure a detent.
+const VINYL_PROBE_STEADY: f64 = 0.01;
+
+/// The carrier a chunk must sit on to count toward the probe, in Hz:
+/// below Serato at 33⅓ with the fader at −10 % to above Traktor MK2 at
+/// 45 with it at +10 %. Backward or barely turning counts for nothing.
+const VINYL_PROBE_HZ: std::ops::RangeInclusive<f64> = 850.0..=3_800.0;
+
+/// A carrier whose level varies less than this (standard deviation over
+/// mean, chunk to chunk, through the probe's steady second) and that
+/// carries no position code is synthesised: MWM Phase. Measured on the
+/// rig (2026-11-24, `tests/phase_drift.rs`): Phase 0.013–0.032 %, Serato
+/// and Traktor vinyl 7–10 % (their code is in the level). Real Traktor
+/// MK2 vinyl, with no code in its level, still carries surface noise and
+/// a cartridge's wobble.
+const SYNTHETIC_MAX_SPREAD: f64 = 0.003;
+
+/// How fast MWM Phase's Serato mode, its factory setting, sends its 1 kHz:
+/// it read the record under the remote 0.564 % fast against the record's
+/// own code (fitted 0.563–0.565 %, one receiver on firmware 9,
+/// 2026-11-24, `tests/phase_drift.rs`). Taken out wherever calibration
+/// names Phase on a Serato carrier. Serato mode is the one Dub asks for:
+/// with this taken out, its count came back within 3 ms of the record
+/// after four minutes of juggling, where Traktor mode's, which reads true,
+/// gained 80 ms over two (2026-11-25).
+pub(crate) const PHASE_SERATO_MODE_FAST: f64 = 1.005_64;
+
 /// Default RMS amplitude floor below which the input is treated as
 /// "carrier dead" regardless of confidence.
 ///
@@ -225,8 +263,23 @@ impl PassthroughLevel {
 /// at attach time, so the audio thread sees only checked values.
 #[derive(Debug, Clone, Copy)]
 pub struct TimecodeInputConfig {
-    /// Timecode format on the input vinyl.
+    /// Timecode format on the input vinyl — or, with `detect_vinyl`, the
+    /// one read until calibration names the record.
     pub format: Format,
+
+    /// Name the control record and its speed during calibration instead
+    /// of trusting `format` at 33⅓ (PRD §5.4). Builds a decoder for every
+    /// format at attach, LUTs included, so the audio thread only ever
+    /// swaps them. The app sets it; tools that take `--format` don't.
+    pub detect_vinyl: bool,
+
+    /// Follow a synthesised carrier — MWM Phase, named at calibration by
+    /// its flat level ([`SYNTHETIC_MAX_SPREAD`]) — by counting its cycles
+    /// (`Decoder::set_counting`) instead of adding up its speed. Phase's
+    /// tone carries no position code; its phase is the remote's own count.
+    /// Preferences ▸ Beta ▸ MWM Phase; changeable live with
+    /// [`TimecodeInput::set_count_synthetic`].
+    pub count_synthetic: bool,
 
     /// Sample rate of the input audio stream (Hz). Must match the
     /// engine's render sample rate to within 0.5 Hz; SR conversion
@@ -284,6 +337,8 @@ impl Default for TimecodeInputConfig {
     fn default() -> Self {
         Self {
             format: Format::SeratoCv02,
+            detect_vinyl: false,
+            count_synthetic: false,
             input_sample_rate: 48_000.0,
             max_block_frames: 4096,
             confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
@@ -643,6 +698,30 @@ pub struct TimecodeInput {
     /// Per-deck phase tracker. Holds prev-sample state across blocks.
     decoder: Decoder,
 
+    /// Decoders for the other records the deck may meet, parked until
+    /// calibration names one. Empty unless the attach asked for
+    /// detection. Built off-RT; the audio thread only swaps them with
+    /// `decoder`, never builds or frees one. Detection runs exactly when
+    /// there are spares.
+    spares: Vec<Decoder>,
+    /// Vinyl detection in flight — armed by [`Self::begin_calibration`]
+    /// when detecting; the whitening capture waits until it names the
+    /// record.
+    probe: Option<VinylProbe>,
+    /// The record and speed being read: the attach's format at 33⅓
+    /// until detection names one.
+    vinyl: Detection,
+    /// `None` until `vinyl` is named (by detection, or by the attach when
+    /// not detecting); then what was found with it.
+    named: Option<Named>,
+    /// Count a synthesised carrier's cycles when one is named — see
+    /// [`TimecodeInputConfig::count_synthetic`].
+    count_synthetic: bool,
+    /// Bumps each time detection names a different record or speed, so
+    /// the engine relearns what depends on it (the wobble fit, the
+    /// sticker monitor's turn).
+    vinyl_seq: u32,
+
     /// Pre-allocated workspace for one block of input samples. Sized
     /// `max_block_frames * 2` (interleaved stereo) at attach time.
     scratch: Vec<f32>,
@@ -759,6 +838,53 @@ struct ZeroCapture {
     elapsed: f64,
 }
 
+/// What calibration found with the record it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Named {
+    /// A position code locked while it was named. Without one (Traktor
+    /// MK2, Phase, a worn record) the deck follows speed — or, for Phase
+    /// with counting on, its count — and no code pulls the sticker back.
+    position_code: bool,
+    /// The carrier is synthesised (MWM Phase): flat to within
+    /// [`SYNTHETIC_MAX_SPREAD`], no code.
+    synthetic: bool,
+}
+
+/// An in-flight vinyl detection: the steady run's `Σ carrier·dt` and
+/// seconds, how long each position code was locked through it, and the
+/// slice being filled. `Copy`, RT-safe to accumulate.
+#[derive(Debug, Clone, Copy, Default)]
+struct VinylProbe {
+    sum: f64,
+    secs: f64,
+    serato_secs: f64,
+    traktor_secs: f64,
+    /// `Σ level`, `Σ level²` and the chunk count of the run, for how flat
+    /// the carrier's level is ([`SYNTHETIC_MAX_SPREAD`]).
+    level_sum: f64,
+    level_sq: f64,
+    levels: f64,
+    slice_sum: f64,
+    slice_secs: f64,
+    slice_serato: f64,
+    slice_traktor: f64,
+    slice_level_sum: f64,
+    slice_level_sq: f64,
+    slice_levels: f64,
+    last_slice: Option<f64>,
+}
+
+impl VinylProbe {
+    /// Standard deviation over mean of the run's chunk levels.
+    fn level_spread(&self) -> f64 {
+        if self.levels < 2.0 || self.level_sum <= 0.0 {
+            return f64::INFINITY;
+        }
+        let mean = self.level_sum / self.levels;
+        (self.level_sq / self.levels - mean * mean).max(0.0).sqrt() / mean
+    }
+}
+
 /// Running covariance of the raw `(ch1, ch0)` input during a
 /// calibration capture. All-arithmetic, `Copy`, RT-safe to accumulate.
 #[derive(Debug, Clone, Copy)]
@@ -805,9 +931,30 @@ impl TimecodeInput {
         // silently stay relative-only. The audio thread sees only the
         // pre-built table (M6).
         let decoder = Decoder::with_absolute(config.format, config.input_sample_rate);
+        let spares = if config.detect_vinyl {
+            [Format::SeratoCv02, Format::TraktorMk1, Format::TraktorMk2]
+                .into_iter()
+                .filter(|&f| f != config.format)
+                .map(|f| Decoder::with_absolute(f, config.input_sample_rate))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             rx,
             decoder,
+            spares,
+            probe: None,
+            vinyl: Detection {
+                format: config.format,
+                speed: PlatterSpeed::Rpm33,
+            },
+            named: (!config.detect_vinyl).then_some(Named {
+                position_code: false,
+                synthetic: false,
+            }),
+            count_synthetic: config.count_synthetic,
+            vinyl_seq: 0,
             scratch,
             last_popped: 0,
             last_output: None,
@@ -889,6 +1036,17 @@ impl TimecodeInput {
         // the new whitening installs.
         self.anchors.reset();
         self.zero_anchor_cap = None;
+        // Name the record first: whitening, the zero anchor and the
+        // wobble fit all read a rate that is only right once the decoder
+        // knows the record and its speed. The decoder in use keeps
+        // driving meanwhile, so recalibrating mid-set never changes what
+        // plays unless the record did.
+        if !self.spares.is_empty() {
+            self.probe = Some(VinylProbe::default());
+            for spare in &mut self.spares {
+                spare.reset();
+            }
+        }
     }
 
     /// Drop an in-flight calibration without installing it — the input
@@ -898,6 +1056,190 @@ impl TimecodeInput {
     /// has not changed. RT-safe.
     pub(crate) fn cancel_calibration(&mut self) {
         self.cal = None;
+        self.probe = None;
+    }
+
+    /// Fold one decoded chunk into the vinyl detection. `out` is the
+    /// decoder in use's reading of `scratch[start..end]`; the parked
+    /// decoders that read a position code decode the same chunk, so a
+    /// lock on either code is seen whichever record is being read.
+    ///
+    /// Counts only a chunk turning forward near a control record's
+    /// carrier; a slice that moved more than [`VINYL_PROBE_STEADY`] from
+    /// the last restarts the run. After [`VINYL_PROBE_SECS`] of steady
+    /// carrier it names the record ([`dub_timecode::detect`]) — or, if
+    /// nothing fits, starts over. RT-safe: decoding into parked
+    /// decoders and scalar arithmetic.
+    fn probe_vinyl(&mut self, start: usize, end: usize, out: &DecodeOutput, dt: f64) {
+        let (mut serato, mut traktor) = match self.decoder.format() {
+            Format::SeratoCv02 => (self.decoder.absolute_locked(), false),
+            Format::TraktorMk1 => (false, self.decoder.absolute_locked()),
+            Format::TraktorMk2 => (false, false),
+        };
+        for spare in &mut self.spares {
+            if spare.format().lfsr_taps().is_none() {
+                continue;
+            }
+            spare.process(&self.scratch[start..end]);
+            match spare.format() {
+                Format::SeratoCv02 => serato |= spare.absolute_locked(),
+                Format::TraktorMk1 => traktor |= spare.absolute_locked(),
+                Format::TraktorMk2 => {}
+            }
+        }
+        let carrier = out.rate * f64::from(self.decoder.carrier_hz());
+        let clean = out.confidence >= CAL_CONFIDENCE_FLOOR
+            && out.amplitude >= self.anchor_amp_floor
+            && VINYL_PROBE_HZ.contains(&carrier);
+        let Some(p) = self.probe.as_mut() else {
+            return;
+        };
+        if !clean {
+            return;
+        }
+        p.slice_sum += carrier * dt;
+        p.slice_secs += dt;
+        let level = f64::from(out.amplitude);
+        p.slice_level_sum += level;
+        p.slice_level_sq += level * level;
+        p.slice_levels += 1.0;
+        if serato {
+            p.slice_serato += dt;
+        }
+        if traktor {
+            p.slice_traktor += dt;
+        }
+        if p.slice_secs < ZERO_ANCHOR_SLICE_SECS {
+            return;
+        }
+        let filled = *p;
+        let slice = filled.slice_sum / filled.slice_secs;
+        let steady = filled
+            .last_slice
+            .is_none_or(|last| (slice / last - 1.0).abs() <= VINYL_PROBE_STEADY);
+        let run = if steady {
+            filled
+        } else {
+            VinylProbe::default()
+        };
+        *p = VinylProbe {
+            sum: run.sum + filled.slice_sum,
+            secs: run.secs + filled.slice_secs,
+            serato_secs: run.serato_secs + filled.slice_serato,
+            traktor_secs: run.traktor_secs + filled.slice_traktor,
+            level_sum: run.level_sum + filled.slice_level_sum,
+            level_sq: run.level_sq + filled.slice_level_sq,
+            levels: run.levels + filled.slice_levels,
+            last_slice: Some(slice),
+            ..VinylProbe::default()
+        };
+        if p.secs < VINYL_PROBE_SECS {
+            return;
+        }
+        let carrier = p.sum / p.secs;
+        let locked = if p.serato_secs >= 0.5 * p.secs {
+            Some(Format::SeratoCv02)
+        } else if p.traktor_secs >= 0.5 * p.secs {
+            Some(Format::TraktorMk1)
+        } else {
+            None
+        };
+        let named = Named {
+            position_code: locked.is_some(),
+            synthetic: locked.is_none() && p.level_spread() < SYNTHETIC_MAX_SPREAD,
+        };
+        match dub_timecode::detect(carrier, locked) {
+            Some(found) => self.adopt_vinyl(found, named),
+            None => self.probe = Some(VinylProbe::default()),
+        }
+    }
+
+    /// Read the deck as `found` from here on: bring that record's decoder
+    /// in (parking the one in use), set its speed and start it fresh.
+    /// Kept as is when it is already what is being read, so a mid-set
+    /// recalibration of the same record changes nothing that plays.
+    /// RT-safe: a swap and scalar resets.
+    fn adopt_vinyl(&mut self, found: Detection, named: Named) {
+        self.probe = None;
+        let unchanged = self.vinyl == found
+            && self.decoder.format() == found.format
+            && self.named.is_some_and(|n| n.synthetic == named.synthetic);
+        self.named = Some(named);
+        if unchanged {
+            return;
+        }
+        if self.decoder.format() != found.format {
+            if let Some(spare) = self.spares.iter_mut().find(|d| d.format() == found.format) {
+                std::mem::swap(&mut self.decoder, spare);
+            }
+        }
+        self.decoder.set_platter_speed(found.speed);
+        self.decoder
+            .set_carrier_scale(if named.synthetic && found.format == Format::SeratoCv02 {
+                PHASE_SERATO_MODE_FAST
+            } else {
+                1.0
+            });
+        self.decoder.reset();
+        self.decoder.clear_whitening();
+        self.rate_smoother.reset();
+        self.decoder
+            .set_counting(named.synthetic && self.count_synthetic);
+        self.vinyl = found;
+        self.vinyl_seq = self.vinyl_seq.wrapping_add(1);
+    }
+
+    /// Count a synthesised carrier's cycles (Preferences ▸ Beta ▸ MWM
+    /// Phase), or stop. Takes effect at once on a deck already reading
+    /// Phase; a deck that isn't counts from when it names one. RT-safe.
+    pub(crate) fn set_count_synthetic(&mut self, on: bool) {
+        self.count_synthetic = on;
+        let synthetic = self.named.is_some_and(|n| n.synthetic);
+        self.decoder.set_counting(on && synthetic);
+    }
+
+    /// Whether calibration named a synthesised carrier (MWM Phase).
+    #[must_use]
+    pub fn synthetic(&self) -> bool {
+        self.named.is_some_and(|n| n.synthetic)
+    }
+
+    /// Whether the deck follows the counted carrier rather than its speed.
+    #[must_use]
+    pub fn counting(&self) -> bool {
+        self.decoder.counting()
+    }
+
+    /// The record and speed this deck reads, once known: named by
+    /// detection, or by the attach when not detecting.
+    #[must_use]
+    pub fn vinyl(&self) -> Option<Detection> {
+        self.named.map(|_| self.vinyl)
+    }
+
+    /// Whether a position code locked when the record was named — the
+    /// sticker hold works only then (Traktor MK2 and Phase carry none).
+    #[must_use]
+    pub fn position_code(&self) -> bool {
+        self.named.is_some_and(|n| n.position_code)
+    }
+
+    /// Bumps each time detection names a different record or speed.
+    #[must_use]
+    pub(crate) fn vinyl_seq(&self) -> u32 {
+        self.vinyl_seq
+    }
+
+    /// Whether detection is naming the record right now.
+    #[must_use]
+    pub fn is_detecting_vinyl(&self) -> bool {
+        self.probe.is_some()
+    }
+
+    /// Groove speed relative to 33⅓ rpm for the record being read.
+    #[must_use]
+    pub fn speed_factor(&self) -> f64 {
+        self.vinyl.speed.factor()
     }
 
     /// Fold one chunk's raw smoothed rate into the zero (detent) anchor.
@@ -940,7 +1282,9 @@ impl TimecodeInput {
         cap.last_slice = Some(slice);
         cap.slice_sum = 0.0;
         cap.slice_secs = 0.0;
-        if cap.secs >= ZERO_ANCHOR_CAPTURE_SECS {
+        // Two turns at either speed: the capture spans two 33⅓
+        // revolutions, which at 45 pass in 1/1.35 of the time.
+        if cap.secs >= ZERO_ANCHOR_CAPTURE_SECS / self.vinyl.speed.factor() {
             let mean = cap.sum / cap.secs;
             self.zero_anchor_cap = None;
             if (mean - 1.0).abs() <= ZERO_ANCHOR_GUARD {
@@ -1125,7 +1469,11 @@ impl TimecodeInput {
             let end = (start + DECODE_CHUNK_FRAMES * 2).min(popped_even);
             let chunk_frames = (end - start) / 2;
             let mut out = self.decoder.process(&self.scratch[start..end]);
-            if self.cal.is_some()
+            #[allow(clippy::cast_precision_loss)]
+            let dt_secs = chunk_frames as f64 / f64::from(self.input_sample_rate);
+            if self.probe.is_some() {
+                self.probe_vinyl(start, end, &out, dt_secs);
+            } else if self.cal.is_some()
                 && CAL_RATE_BAND.contains(&out.rate.abs())
                 && out.confidence >= CAL_CONFIDENCE_FLOOR
                 && out.amplitude >= self.anchor_amp_floor
@@ -1133,8 +1481,6 @@ impl TimecodeInput {
                 self.fold_calibration(start, end);
             }
             start = end;
-            #[allow(clippy::cast_precision_loss)]
-            let dt_secs = chunk_frames as f64 / f64::from(self.input_sample_rate);
             self.last_raw_rate = out.rate;
             // De-spike + adaptively smooth the rate the instant it
             // leaves the decoder, so the same clean value feeds both
@@ -1307,6 +1653,7 @@ impl TimecodeInput {
             let timeout = (CAL_TIMEOUT_SECS * self.input_sample_rate) as usize;
             if cal.frames < cal.target && cal.elapsed >= timeout {
                 self.cal = None;
+                self.probe = None;
                 return;
             }
             if cal.frames >= cal.target {
@@ -1425,6 +1772,8 @@ mod policy_tests {
     fn make(engage: f32, disengage: f32, sticky: u32) -> LiftPolicy {
         LiftPolicy::new(&TimecodeInputConfig {
             format: Format::SeratoCv02,
+            detect_vinyl: false,
+            count_synthetic: false,
             input_sample_rate: 48_000.0,
             max_block_frames: 64,
             confidence_threshold: engage,
@@ -1676,6 +2025,8 @@ mod policy_tests {
         // accidentally regress it.
         let mut p = LiftPolicy::new(&TimecodeInputConfig {
             format: Format::SeratoCv02,
+            detect_vinyl: false,
+            count_synthetic: false,
             input_sample_rate: 48_000.0,
             max_block_frames: 64,
             confidence_threshold: 0.8,
@@ -2204,6 +2555,349 @@ mod anchor_learning_tests {
         assert!(
             (disp - mean).abs() < 5e-4,
             "display must equal playback (no display-only warp), got {disp} vs {mean}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vinyl_detection_tests {
+    //! Calibration names the control record and its speed through the
+    //! real ringbuf → decoder → drive() path, then reads it at unity.
+
+    use dub_timecode::signal::Generator;
+    use ringbuf::traits::{Producer as _, Split as _};
+    use ringbuf::HeapRb;
+
+    use super::*;
+
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 512;
+
+    fn detecting_input() -> (TimecodeInput, ringbuf::HeapProd<f32>) {
+        let (tx, rx) = HeapRb::<f32>::new(48_000 * 2).split();
+        let cfg = TimecodeInputConfig {
+            detect_vinyl: true,
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+            hold_until_calibrated: false,
+            ..TimecodeInputConfig::default()
+        };
+        (TimecodeInput::new(rx, cfg), tx)
+    }
+
+    /// A record of `format`, its position code on when it has one. At
+    /// depth 0.15 the code biases the read rate +0.02 %; at 0.4 it would
+    /// be +0.2–0.5 %, far beyond any real pressing.
+    fn record(format: Format) -> Generator {
+        let mut gen = Generator::new(format, SR);
+        gen.enable_absolute(format, 0.15);
+        gen
+    }
+
+    /// Play `secs` at `pitch` (1.0 = the detent) and return the mean rate
+    /// the deck was driven at over the last half second.
+    fn play(
+        input: &mut TimecodeInput,
+        tx: &mut ringbuf::HeapProd<f32>,
+        gen: &mut Generator,
+        speed: PlatterSpeed,
+        pitch: f64,
+        secs: f64,
+    ) -> f64 {
+        let mut sig = vec![0.0_f32; BLOCK * 2];
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let blocks = (secs * f64::from(SR) / BLOCK as f64) as usize;
+        let (mut sum, mut n) = (0.0, 0.0);
+        for b in 0..blocks {
+            gen.render(&mut sig, speed.factor() * pitch, 0.4);
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            let _ = input.drive();
+            if b + 47 >= blocks {
+                if let Some(out) = input.last_output() {
+                    sum += out.rate;
+                    n += 1.0;
+                }
+            }
+        }
+        sum / n
+    }
+
+    #[test]
+    fn every_record_at_either_speed_is_named_and_plays_at_unity() {
+        for format in [Format::SeratoCv02, Format::TraktorMk1, Format::TraktorMk2] {
+            for speed in [PlatterSpeed::Rpm33, PlatterSpeed::Rpm45] {
+                let (mut input, mut tx) = detecting_input();
+                let mut gen = record(format);
+                input.begin_calibration(4_800);
+                assert!(input.is_detecting_vinyl());
+                assert_eq!(input.vinyl(), None, "named before it listened");
+                let rate = play(&mut input, &mut tx, &mut gen, speed, 1.0, 6.0);
+                let found = Detection { format, speed };
+                assert_eq!(input.vinyl(), Some(found));
+                assert_eq!(
+                    input.position_code(),
+                    format.lfsr_taps().is_some(),
+                    "{found:?}: position code"
+                );
+                assert!(input.is_calibrated(), "{found:?} never calibrated");
+                assert!((rate - 1.0).abs() < 1e-3, "{found:?} plays at {rate}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fader_off_the_detent_is_named_and_plays_its_pitch() {
+        // MK1 at 45 pulled 6 % down sits nearer MK2's 33⅓ carrier than
+        // its own; the position code names it.
+        let (mut input, mut tx) = detecting_input();
+        let mut gen = record(Format::TraktorMk1);
+        input.begin_calibration(4_800);
+        let rate = play(
+            &mut input,
+            &mut tx,
+            &mut gen,
+            PlatterSpeed::Rpm45,
+            0.94,
+            6.0,
+        );
+        let found = Detection {
+            format: Format::TraktorMk1,
+            speed: PlatterSpeed::Rpm45,
+        };
+        assert_eq!(input.vinyl(), Some(found));
+        assert!((rate - 0.94).abs() < 1e-3, "plays at {rate}");
+    }
+
+    #[test]
+    fn recalibrating_the_same_record_changes_nothing_that_plays() {
+        let (mut input, mut tx) = detecting_input();
+        let mut gen = record(Format::SeratoCv02);
+        input.begin_calibration(4_800);
+        play(&mut input, &mut tx, &mut gen, PlatterSpeed::Rpm33, 1.0, 3.0);
+        let seq = input.vinyl_seq();
+        input.begin_calibration(4_800);
+        let rate = play(&mut input, &mut tx, &mut gen, PlatterSpeed::Rpm33, 1.0, 3.0);
+        assert_eq!(input.vinyl_seq(), seq, "the same record was re-adopted");
+        assert!((rate - 1.0).abs() < 1e-3, "plays at {rate}");
+    }
+
+    #[test]
+    fn a_new_record_is_named_on_recalibration() {
+        let (mut input, mut tx) = detecting_input();
+        let mut serato = record(Format::SeratoCv02);
+        input.begin_calibration(4_800);
+        play(
+            &mut input,
+            &mut tx,
+            &mut serato,
+            PlatterSpeed::Rpm33,
+            1.0,
+            3.0,
+        );
+        let seq = input.vinyl_seq();
+        let mut traktor = record(Format::TraktorMk1);
+        input.begin_calibration(4_800);
+        let rate = play(
+            &mut input,
+            &mut tx,
+            &mut traktor,
+            PlatterSpeed::Rpm45,
+            1.0,
+            6.0,
+        );
+        assert_eq!(
+            input.vinyl(),
+            Some(Detection {
+                format: Format::TraktorMk1,
+                speed: PlatterSpeed::Rpm45,
+            })
+        );
+        assert_ne!(input.vinyl_seq(), seq);
+        assert!((rate - 1.0).abs() < 1e-3, "plays at {rate}");
+    }
+
+    /// A deck that detects, counting a synthesised carrier or not.
+    fn phase_input(count: bool) -> (TimecodeInput, ringbuf::HeapProd<f32>) {
+        let (tx, rx) = HeapRb::<f32>::new(48_000 * 2).split();
+        let cfg = TimecodeInputConfig {
+            detect_vinyl: true,
+            count_synthetic: count,
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+            hold_until_calibrated: false,
+            ..TimecodeInputConfig::default()
+        };
+        (TimecodeInput::new(rx, cfg), tx)
+    }
+
+    #[test]
+    fn a_flat_codeless_carrier_is_named_phase_and_counted_only_when_asked() {
+        // MWM Phase in its Traktor mode: a flat 2.5 kHz tone, no code.
+        for count in [false, true] {
+            let (mut input, mut tx) = phase_input(count);
+            let mut gen = Generator::new(Format::TraktorMk2, SR);
+            input.begin_calibration(4_800);
+            play(&mut input, &mut tx, &mut gen, PlatterSpeed::Rpm33, 1.0, 3.0);
+            assert!(input.synthetic(), "Phase not named");
+            assert!(!input.position_code());
+            assert_eq!(input.counting(), count, "counting with the switch {count}");
+            let counted = input.last_output().and_then(|o| o.abs_position_frames);
+            assert_eq!(counted.is_some(), count);
+        }
+        // Turned on while the deck already reads Phase: it counts at once.
+        let (mut input, mut tx) = phase_input(false);
+        let mut gen = Generator::new(Format::TraktorMk2, SR);
+        input.begin_calibration(4_800);
+        play(&mut input, &mut tx, &mut gen, PlatterSpeed::Rpm33, 1.0, 3.0);
+        input.set_count_synthetic(true);
+        assert!(input.counting());
+        input.set_count_synthetic(false);
+        assert!(!input.counting());
+    }
+
+    /// Phase in its Serato mode: a flat 1 kHz, 0.564 % fast. Named Phase,
+    /// it plays and counts at the record's own speed. A coded Serato record
+    /// turning that fast is the DJ's pitch, and plays as it turns.
+    #[test]
+    fn phase_in_serato_mode_plays_and_counts_at_the_records_speed() {
+        let fast = PHASE_SERATO_MODE_FAST;
+        for count in [false, true] {
+            let (mut input, mut tx) = phase_input(count);
+            let mut gen = Generator::new(Format::SeratoCv02, SR);
+            input.begin_calibration(4_800);
+            play(
+                &mut input,
+                &mut tx,
+                &mut gen,
+                PlatterSpeed::Rpm33,
+                fast,
+                3.0,
+            );
+            assert!(input.synthetic(), "Phase in Serato mode not named");
+            let start = input.last_output().and_then(|o| o.abs_position_frames);
+            let rate = play(
+                &mut input,
+                &mut tx,
+                &mut gen,
+                PlatterSpeed::Rpm33,
+                fast,
+                2.0,
+            );
+            assert!((rate - 1.0).abs() < 3e-4, "plays at {rate}");
+            if count {
+                let end = input.last_output().and_then(|o| o.abs_position_frames);
+                let (Some(start), Some(end)) = (start, end) else {
+                    panic!("not counting");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let played = (2.0 * f64::from(SR) / BLOCK as f64).floor() * BLOCK as f64;
+                let off_ms = (end - start - played) / f64::from(SR) * 1000.0;
+                assert!(
+                    off_ms.abs() < 1.0,
+                    "the count is {off_ms:+.2} ms off after 2 s"
+                );
+            }
+        }
+        let (mut input, mut tx) = detecting_input();
+        let mut gen = record(Format::SeratoCv02);
+        input.begin_calibration(4_800);
+        let rate = play(
+            &mut input,
+            &mut tx,
+            &mut gen,
+            PlatterSpeed::Rpm33,
+            fast,
+            3.0,
+        );
+        assert!(!input.synthetic(), "a coded record named Phase");
+        assert!(
+            (rate - fast).abs() < 3e-4,
+            "a record at +0.56 % plays at {rate}"
+        );
+    }
+
+    #[test]
+    fn a_record_is_never_taken_for_phase() {
+        // A coded record (Serato), and a codeless carrier with a vinyl's
+        // noise and a cartridge's wobble on its level.
+        let (mut input, mut tx) = phase_input(true);
+        let mut gen = record(Format::SeratoCv02);
+        input.begin_calibration(4_800);
+        play(&mut input, &mut tx, &mut gen, PlatterSpeed::Rpm33, 1.0, 3.0);
+        assert!(!input.synthetic(), "a coded record named Phase");
+        assert!(!input.counting());
+
+        let (mut input, mut tx) = phase_input(true);
+        let mut gen = Generator::new(Format::TraktorMk2, SR);
+        input.begin_calibration(4_800);
+        let mut sig = vec![0.0_f32; BLOCK * 2];
+        let mut noise = 0x2468_ace1_u32;
+        #[allow(clippy::cast_precision_loss)]
+        for b in 0..282 {
+            // 0.55 Hz wobble of ±2 % on the level, as a turn of a warped
+            // record gives, and surface noise 40 dB down.
+            let t = (b * BLOCK) as f64 / f64::from(SR);
+            #[allow(clippy::cast_possible_truncation)]
+            let level = (0.33 * (1.0 + 0.02 * (std::f64::consts::TAU * 0.55 * t).sin())) as f32;
+            gen.render(&mut sig, 1.0, level);
+            for s in &mut sig {
+                noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                #[allow(clippy::cast_possible_truncation)]
+                let n = (f64::from(noise >> 8) / f64::from(1u32 << 24) - 0.5) as f32;
+                *s += n * 0.0066;
+            }
+            assert_eq!(tx.push_slice(&sig), sig.len());
+            let _ = input.drive();
+        }
+        assert_eq!(
+            input.vinyl().map(|d| d.format),
+            Some(Format::TraktorMk2),
+            "the record was not named"
+        );
+        assert!(!input.synthetic(), "a wobbly, noisy record named Phase");
+    }
+
+    #[test]
+    fn without_detection_the_attach_names_the_record() {
+        let (_tx, rx) = HeapRb::<f32>::new(64).split();
+        let input = TimecodeInput::new(rx, TimecodeInputConfig::default());
+        assert_eq!(
+            input.vinyl(),
+            Some(Detection {
+                format: Format::SeratoCv02,
+                speed: PlatterSpeed::Rpm33,
+            })
+        );
+        assert!(input.spares.is_empty(), "built decoders it never uses");
+    }
+
+    #[test]
+    fn detection_runs_allocation_free() {
+        let (mut input, mut tx) = detecting_input();
+        let mut gen = record(Format::TraktorMk1);
+        // Two seconds rendered up front: the probe, the swap to MK1 at
+        // 45 and the start of whitening all happen inside the window.
+        let mut sig = vec![0.0_f32; 188 * BLOCK * 2];
+        gen.render(&mut sig, PlatterSpeed::Rpm45.factor(), 0.4);
+        input.begin_calibration(4_800);
+        assert_no_alloc::assert_no_alloc(|| {
+            for block in sig.chunks_exact(BLOCK * 2) {
+                let _ = tx.push_slice(block);
+                let _ = input.drive();
+            }
+        });
+        assert_eq!(
+            input.vinyl().map(|d| d.speed),
+            Some(PlatterSpeed::Rpm45),
+            "the window did not cover the detection"
         );
     }
 }

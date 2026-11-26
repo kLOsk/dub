@@ -120,7 +120,9 @@ impl Format {
     /// algorithm description (clean-room: parameters only, no code
     /// derived — consistent with `crate::decoder`'s clean-room note):
     /// - Serato CV02 (`serato_2a`): 20-bit, taps `0x361e4`, seed `0x59017`.
-    /// - Traktor MK1 (`traktor_a`): 23-bit — **Phase 2**, taps TBD.
+    /// - Traktor MK1 (`traktor_a`): 23-bit, taps `0x41040`, seed
+    ///   `0x134503` (decoded since 2026-11-24; the tracker also tries
+    ///   side B).
     /// - Traktor MK2: offset modulation, bitstream not publicly
     ///   reverse-engineered → `None` (absolute auto-disabled; relative
     ///   decode still works).
@@ -128,20 +130,21 @@ impl Format {
     pub fn lfsr_taps(self) -> Option<u32> {
         match self {
             Self::SeratoCv02 => Some(0x0003_61e4),
-            // Phase 2: Traktor MK1 absolute. None until the traktor_a
-            // taps/seed are wired and rig-validated.
-            Self::TraktorMk1 | Self::TraktorMk2 => None,
+            Self::TraktorMk1 => Some(0x0004_1040),
+            Self::TraktorMk2 => None,
         }
     }
 
     /// Initial LFSR state (the position-0 window) for the absolute
     /// bitstream, paired with [`Self::lfsr_taps`]. `None` when the format
-    /// has no decoded bitstream. Serato CV02: `0x59017`.
+    /// has no decoded bitstream. Serato CV02: `0x59017`; Traktor MK1
+    /// side A: `0x134503`.
     #[must_use]
     pub fn lfsr_seed(self) -> Option<u32> {
         match self {
             Self::SeratoCv02 => Some(0x0005_9017),
-            Self::TraktorMk1 | Self::TraktorMk2 => None,
+            Self::TraktorMk1 => Some(0x0013_4503),
+            Self::TraktorMk2 => None,
         }
     }
 

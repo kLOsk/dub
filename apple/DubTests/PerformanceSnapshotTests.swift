@@ -523,6 +523,31 @@ final class PerformanceSnapshotTests: XCTestCase {
         snap(deckBg(stack), width: 460, height: 200, named: "key-lock-states")
     }
 
+    /// The row on both decks, a short key and the widest: one mirror —
+    /// deck A's labels hang right and its key lock comes before the key,
+    /// deck B's hang left with the lock after, and the key stands as far
+    /// from its lock on both (Daniel, 2026-11-26).
+    func test_deckReadouts_mirroredOnBothDecks() {
+        func row(_ side: DeckSide, key: String) -> some View {
+            DeckReadouts(
+                header: Self.header("Bow Down", "Westside Connection", 83.0, key, 0),
+                trailing: side == .a, side: side, onToggleKeyLock: {})
+        }
+        let grid = VStack(spacing: 12) {
+            ForEach(["4A", "12B"], id: \.self) { key in
+                HStack(spacing: 0) {
+                    row(.a, key: key)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    Rectangle().fill(DubColor.divider).frame(width: 1).padding(.horizontal, 24)
+                    row(.b, key: key)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .padding()
+        snap(deckBg(grid), width: 640, height: 150, named: "readouts-both-decks")
+    }
+
     func test_deckHeader_withSourceControl() {
         // Auto-selected TIMECODE: the row-3 switch carries the source +
         // tracking dot, so the row-1 FILE pill is suppressed (no

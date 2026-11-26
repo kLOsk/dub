@@ -46,9 +46,24 @@ never switches it for you.
 ## Calibration
 
 You don't need to calibrate by hand. The first time a deck hears a turning
-control record in a session, it measures the needle by itself: the deck says
-**CALIBRATING** while it does, then **Calibrated**. Keep the record playing at
-normal speed for a moment.
+control record in a session, it measures the needle by itself. Keep the record
+playing at normal speed, pitch at 0, for a few seconds. The deck holds its
+track until it's done.
+
+While it measures, the deck's [SIGNAL panel](#the-signal-panel) is open: you
+see the needle's signal, both channels and a bar filling in. When the deck has
+calibrated and reads **LOCKED**, the panel slides away to its tab. If something
+needs fixing, a weak channel or no input, it stays open and says what. Close it
+with **×** if you'd rather; the tab then fills up as the deck measures.
+
+It also works out which control record is on the platter and whether it's
+turning at 33 or 45. There's nothing to set: Serato vinyl and Traktor Scratch
+MK1 and MK2 vinyl all work, at either speed, and the two decks can differ. The
+**VINYL** line in the panel names it, for example **TRAKTOR MK1 · 45**.
+
+If you switch the turntable between 33 and 45 in the middle of a set, press
+**CALIBRATE** with the record playing at pitch 0. Until you do, the deck plays
+at the old speed.
 
 **CALIBRATE** in the deck's **SIGNAL** panel recalibrates on demand, after a
 needle change or a new control record. It works on **TC** and on **INT**, so you can
@@ -57,8 +72,11 @@ recalibrate while the set plays on (see
 
 ## The signal panel
 
-Each deck has a **SIGNAL** tab at its outer edge. It opens one word for the
-state of that deck's timecode and one line on what to check:
+Each deck has a **SIGNAL** tab at its outer edge. The panel opens by itself
+for the deck's first calibration of a session, and any time you click the tab.
+After that first calibration it never opens by itself, so it won't cover your
+pads mid-set; the tab's dot shows the signal instead. The panel shows one word
+for the state of that deck's timecode and one line on what to check:
 
 | Word | Meaning | What to check |
 | --- | --- | --- |
@@ -70,6 +88,17 @@ state of that deck's timecode and one line on what to check:
 
 The panel also meters each input channel in dB and draws the timecode's
 shape: a clean signal is a round circle, a weak channel squashes it.
+
+Under the pitch, **VINYL** names the control record and speed, and one line
+says what Dub can read from it:
+
+- **Position · the sticker holds**: Dub reads where the needle is on the
+  record, so samples stay under your stickers through scratches, spin backs
+  and skips. Serato and Traktor MK1 vinyl.
+- **Speed only · no sticker hold**: Dub reads how fast the record turns, not
+  where the needle is, so anything that slips stays slipped. Traktor MK2 vinyl.
+- **PHASE**: an MWM Phase remote instead of control vinyl. See
+  [MWM Phase](/hardware#mwm-phase-beta).
 
 ## The output meters
 

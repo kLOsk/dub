@@ -101,6 +101,17 @@ impl Generator {
         self.abs_mod.as_ref().map(|m| m.position)
     }
 
+    /// A needle skip: the record under the needle moves `cycles` carrier
+    /// cycles (negative = back) with no motion in between, as when the
+    /// stylus jumps a groove. The phase is left where it is, so the
+    /// carrier stays continuous; only the position and its bitstream
+    /// move. No-op without absolute modulation.
+    pub fn skip_cycles(&mut self, cycles: i64) {
+        for _ in 0..cycles.unsigned_abs() {
+            self.advance_cycle(cycles > 0);
+        }
+    }
+
     /// Reset phase to zero. Useful when restarting a test scenario at
     /// a known starting point.
     pub fn reset(&mut self) {

@@ -1009,8 +1009,12 @@ enum LibraryGutterColumn {
 /// to say what is being dragged without covering the drop target.
 enum LibraryDragChip {
     static func image(for track: LibraryTrack, extraCount: Int = 0) -> NSImage {
-        let artist = track.artist ?? "—"
-        var text = "\(artist) — \(LibraryCellFormat.displayTitle(track))"
+        image(artist: track.artist, title: LibraryCellFormat.displayTitle(track), extraCount: extraCount)
+    }
+
+    /// The same chip for a deck's track, dragged for an instant double.
+    static func image(artist: String?, title: String, extraCount: Int = 0) -> NSImage {
+        var text = "\(artist ?? "—") — \(title)"
         if extraCount > 0 { text += "   +\(extraCount)" }
 
         let paragraph = NSMutableParagraphStyle()
