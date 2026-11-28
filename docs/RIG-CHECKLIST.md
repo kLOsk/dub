@@ -234,6 +234,14 @@ Clear these first; they are the open items in `history/CURRENT.md`.
       → the waveform stretches with the pitch the whole way (no jump, no new
       zoom at the end); BPM reads the track's BPM × the pitch.
 - [ ] `hands` Scratch hard → the waveform keeps its zoom; the deck follows the hand.
+- [ ] `loop` The motions without hands: `dub timecode-gen motions.wav` (a
+      lift and drop 60 s on, a hand stop, hard scratching, −8 / +8 %) into
+      deck A on TC with a programmed track, Dub started with
+      `DUB_DRAW_LOG=<file>` (Debug), then `dub draw-check <file>` → the deck
+      holds through each lift and stop and carries on at unity; no step in
+      steady play; the zoom holds through stop and scratch and follows the
+      fader; the playhead traces the scratch strokes. Real vinyl's noise is
+      not in it: the `hands` items above stay.
 
 ## 3. Playback, waveform, phase meter
 

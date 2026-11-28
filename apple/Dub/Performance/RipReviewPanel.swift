@@ -313,6 +313,9 @@ struct RipReviewPanel: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = DebugTrace.printChanges ? Self._printChanges() : ()
+        #endif
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             toolbar
             RipTrackMap(state: state, onSelect: callbacks.togglePlay)
@@ -735,6 +738,9 @@ struct RipTrackRow: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = DebugTrace.printChanges ? Self._printChanges() : ()
+        #endif
         HStack(spacing: Self.spacing) {
             Button(action: onTogglePlay) {
                 Image(systemName: isPlaying ? "pause.fill" : "play.fill")

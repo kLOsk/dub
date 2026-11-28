@@ -90,6 +90,9 @@ struct PerformanceView: View {
 
     var body: some View {
         let _ = LibraryListTiming.windowBody()
+        #if DEBUG
+        let _ = DebugTrace.printChanges ? Self._printChanges() : ()
+        #endif
         surface
             .environment(\.dubMapping, mapping)
     }

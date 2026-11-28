@@ -7723,6 +7723,9 @@ struct MainView: View {
     @AppStorage("dub.hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
     var body: some View {
+        #if DEBUG
+        let _ = DebugTrace.printChanges ? Self._printChanges() : ()
+        #endif
         let _ = LibraryListTiming.windowBody()
         ZStack {
             PerformanceView(

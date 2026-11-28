@@ -59,3 +59,13 @@ enum DevEnvironment {
         return values
     }
 }
+
+#if DEBUG
+/// `DUB_PRINT_CHANGES=1` in a Debug build: the app's top-level views print
+/// what made SwiftUI run their body again (`_printChanges`). For finding
+/// what invalidates the whole window — a click into a rip review field
+/// stalled it ~150 ms per click (rig, 2026-11-27).
+enum DebugTrace {
+    static let printChanges = ProcessInfo.processInfo.environment["DUB_PRINT_CHANGES"] != nil
+}
+#endif

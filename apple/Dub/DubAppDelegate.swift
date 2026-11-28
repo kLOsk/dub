@@ -31,6 +31,14 @@ final class DubAppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindowController: MainWindowController?
 
     static func main() {
+        // macOS's password AutoFill looks at every text field that takes
+        // focus, asking it for its next key view — and with no explicit
+        // loop AppKit works that out by walking the whole window, SwiftUI's
+        // view graph included: ~150 ms, a stall dump on a third of the
+        // clicks into a rip's title, artist or album (rig, 2026-11-28).
+        // Dub has no login to fill. Registered, not written: a value set
+        // with `defaults write` still wins.
+        UserDefaults.standard.register(defaults: ["NSAutoFillHeuristicControllerEnabled": false])
         let app = NSApplication.shared
         app.delegate = sharedDelegate
         _ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)

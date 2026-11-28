@@ -1019,6 +1019,45 @@ certificate exists here. Needs Daniel: Xcode ▸ Settings ▸ Accounts ▸ Manag
 Certificates ▸ + Apple Development, then the team ID into `.env`. The
 release path (`dist`) is unchanged: it re-signs with the Developer ID.
 
+**The turntable motions through the loop, measured (2026-11-28,
+uncommitted).** `dub timecode-gen` renders rig section 2's motions as
+timecode (a lift and drop 60 s on, a hand stop, strokes at three times
+unity, −8 / +8 %), and a Debug Dub started with `DUB_DRAW_LOG=<file>`
+writes one line per drawn frame (`DrawLog.swift`) that `dub draw-check`
+reads back. Saxon on deck A, TC, the file twice through the SL 3 loop:
+- The deck holds through each lift and stop (the strip stops within a
+  frame and stops drawing) and carries on at unity; nothing runs on.
+- Steady play, at unity and held at −8 / +8 %: no step (worst 0.22 ms of
+  track time unexplained), beat lines within 0.18 px, zoom within
+  ±0.02 %.
+- The zoom holds through both stops and both scratches, and glides to the
+  fader's −8 / +8 % with a short lag, as `effectiveTimeAxisZoom` intends.
+- The playhead traces the scratch strokes (±191 ms of groove) within 12 ms
+  RMS, 22 ms at worst: the decoder's few ms of latency at three times
+  unity.
+The first run used the generator's test modulation depth and read the
+deck +0.7 % fast, its zoom breathing 0.9 %; that was the signal, not Dub
+(LESSONS, Timecode). Covers the `hands` items 2.4, 2.5 and 2.7 for how Dub
+reacts; real vinyl's noise still needs the recorded session.
+
+**The 150 ms stall on a click into a rip review field: macOS's password
+AutoFill (2026-11-28, uncommitted, measured in the app).** Every click
+into a title, artist or album field that took focus could freeze the
+window ~150–200 ms (12 stall dumps filling one side's rows on 2026-11-27).
+The dumps: `NSAutoFillHeuristicController
+_showPasswordAutoFillIfNecessaryForView` asks the field for its
+`nextValidKeyView`, and with no explicit key loop AppKit computes one
+visually across the whole window, SwiftUI's view graph included. Not
+SwiftUI focus (an AppKit field stalled the same way) and not a view body
+(`DUB_PRINT_CHANGES`, below, showed none re-running). Dub registers
+`NSAutoFillHeuristicControllerEnabled = false` at launch
+(`DubAppDelegate.main`; registered, never written): clicks into the
+review's text fields went from 2 of 4, 2 of 9 and 3 of 12 stalling to 0
+of 18. Dub has no login for AutoFill to fill. **Debug aid kept:**
+`DUB_PRINT_CHANGES=1` makes MainView, PerformanceView and the rip review
+print what re-ran their body (`DebugTrace`, `_printChanges`); launch the
+binary under `script -q -F out.txt …` to see it live.
+
 ## Open
 
 - **No waveform while recording a rip.** `hasSource` includes

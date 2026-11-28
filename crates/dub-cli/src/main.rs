@@ -31,6 +31,7 @@ mod calibration;
 mod decode_timecode;
 mod device_profiles;
 mod diagnose;
+mod draw_check;
 mod export;
 mod import;
 mod input_cmds;
@@ -45,6 +46,7 @@ mod scope;
 mod stretch_bench;
 mod thru;
 mod timecode_deck;
+mod timecode_gen;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -71,6 +73,8 @@ fn main() -> ExitCode {
         "thru-check" => rig_check::run_thru_check(&args[2..]),
         "dropout-check" => rig_check::run_dropout_check(&args[2..]),
         "thru-tempo" => rig_check::run_thru_tempo(&args[2..]),
+        "timecode-gen" => timecode_gen::run(&args[2..]),
+        "draw-check" => draw_check::run(&args[2..]),
         "rip" => rip::run(&args[2..]),
         "rip-tune" => rip_tune::run(&args[2..]),
         "recognize" => recognize::run(&args[2..]),
@@ -145,6 +149,14 @@ fn print_help() {
     eprintln!("  thru-tempo <wav[:L,R]> [--from S] [--secs S] [--every 1]   the THRU tempo readout, replayed");
     eprintln!("                    holes in a recording of a deck playing: a few ms of near");
     eprintln!("                    silence between loud neighbours.");
+    eprintln!("  timecode-gen <out.wav> [--motion lift|stop|scratch|pitch|all]");
+    eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2] [--sr HZ] [--level PEAK]");
+    eprintln!("                    the rig's turntable motions as a timecode WAV: a needle lifted");
+    eprintln!("                    and dropped 60 s on, a hand stop, hard scratching, the fader");
+    eprintln!("                    at -8 and +8 %. Play it through the loop with dub loopback.");
+    eprintln!("  draw-check <draw.log> [--deck N] [--from SECS] [--to SECS] [--jump-ms MS]");
+    eprintln!("                    what the waveform strips drew, from a Debug Dub started with");
+    eprintln!("                    DUB_DRAW_LOG=<file>: playhead jumps, zoom changes, beat lines.");
     eprintln!("  rig-coach         [--tag hands|robot|loop] [--section N] [--checklist PATH]");
     eprintln!("                    [--out DIR] [--fresh] [--mute] [--list]");
     eprintln!("                    reads docs/RIG-CHECKLIST.md aloud one item at a time;");

@@ -98,7 +98,10 @@ crates/
                      loopback (a recorded take out of one pair of the interface, another
                      pair recorded: the turntable with no hands) / rig-coach (the rig
                      checklist read aloud; `make rig`) / loop-check / echo-check /
-                     thru-check / dropout-check / thru-tempo (what those takes did).
+                     thru-check / dropout-check / thru-tempo (what those takes did) /
+                     timecode-gen (the rig's needle lift, hand stop, scratch and pitch
+                     steps as a timecode WAV for the loop) / draw-check (what the
+                     waveform strips drew, from a Debug Dub run with `DUB_DRAW_LOG`).
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).

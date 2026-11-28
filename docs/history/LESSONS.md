@@ -63,6 +63,17 @@
 
 ## Timecode / control vinyl (validate on real hardware)
 
+- **A synthetic carrier's position modulation must be shallow, or it lies
+  about the rate.** The generator's unit-test depth (0.5: a 0 bit halves
+  the data channel) made Dub's decoder read a steady unity carrier 0.4 %
+  fast offline and the deck +0.7 % through the loop, wandering 0.2–1.7 %,
+  and the waveform's zoom, which follows the pitch, breathed 0.9 % with it
+  (2026-11-28). At 0.15 it reads 1.0000, −8 % and +8 % exactly and the
+  position still decodes; `dub timecode-gen` defaults to that, pinned by
+  `the_decoder_reads_the_default_modulation_at_its_true_rate`. Before
+  blaming the decoder for a rate on generated input, decode the file
+  offline at depth 0.
+
 - **A deck's telemetry must not live only inside the decode loop.**
   `drive_timecode_inputs` `continue`d past a deck with no input before
   publishing anything, so the control mode a deck was switched to came back
@@ -517,6 +528,17 @@
   232 ms in `AudioDeviceStart`.
 
 ## Library / SwiftUI
+
+- **A text field taking focus can cost the whole window: password AutoFill
+  walks it.** macOS's `NSAutoFillHeuristicController` asks every focused
+  text field for its next key view; with no explicit loop AppKit computes
+  one visually over the entire window, SwiftUI hosting view and all —
+  ~150–200 ms in Dub's main window, on a third of clicks into a field
+  (2026-11-28). It is AppKit's, so making a field AppKit instead of
+  SwiftUI does not help. Dub registers `NSAutoFillHeuristicControllerEnabled
+  = false` at launch (no login to fill). Read the stall dump to the
+  bottom before blaming SwiftUI: the top frames were all SwiftUI graph
+  work, the cause was ten frames down.
 
 - **Anything that can stand in a deck's place reports `DeckColumnHeightKey`.**
   The Performance deck region is cut to the taller column's reported

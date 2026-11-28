@@ -2012,6 +2012,27 @@ final class WaveformRenderer: NSObject, @unchecked Sendable {
                     peaksLenGlobal,
                     pos.hasTrack ? 1 : 0)
 
+        #if DEBUG
+        // The same frame for `dub draw-check`, when Dub was started with
+        // `DUB_DRAW_LOG` (see `DrawLog`). Vsync-driven frames only: the
+        // one-off warm-up draws have no target time on the engine clock.
+        if let drawLog = DrawLog.shared, let targetNs = targetEngineHostTimeNs {
+            let secsPerPixel = peakChunkDurationSecs * max(0.05, axisZoom)
+            var nextBeatPixels = Double.nan
+            if beats.confidence > 0, !beats.beats.isEmpty, secsPerPixel > 0 {
+                let i = Self.firstBeatIndex(in: beats.beats, atOrAfter: pos.playheadSecsUnclamped)
+                if i < beats.beats.count {
+                    nextBeatPixels = (beats.beats[i] - pos.playheadSecsUnclamped) / secsPerPixel
+                }
+            }
+            drawLog.record(
+                deck: deckIdx, targetNs: targetNs, hasTrack: pos.hasTrack,
+                playheadSecs: pos.playheadSecsUnclamped, rate: pos.debugAdvanceRate,
+                secsPerPixel: secsPerPixel, aggregation: agg, nextBeatPixels: nextBeatPixels,
+                drawnAbove: drawnAbove, drawnBelow: drawnBelow)
+        }
+        #endif
+
         // 3. Fill both region slots in the per-frame uniform buffer.
         //
         // Past draw sets `chunksAbovePlayhead = chunksAbove` (> 0).
