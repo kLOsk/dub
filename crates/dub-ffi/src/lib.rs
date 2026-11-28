@@ -772,6 +772,13 @@ pub struct DubEngine {
     /// "load never blocks playback"). Cloning the `Arc` is free
     /// and the `Mutex` itself is unchanged.
     state: Arc<Mutex<EngineState>>,
+    /// Held across a session's whole start or stop, so only one opens or
+    /// tears down the interface at a time. The open waits on the driver,
+    /// seconds while an SL 3 comes up after a hot-plug, and `state` is
+    /// what the screen reads several times a frame: holding `state`
+    /// through it froze the status strip in [`Self::sample_rate`] (rig
+    /// run, 2026-11-27). See [`Self::install_session`].
+    start_gate: Mutex<()>,
     /// Per-deck monotonic generation counter for the `PeakSource`
     /// slot. Bumps every time the slot is *assigned* a new source
     /// (Thru session start, `load_track` swap, etc.) **and** every
@@ -1447,6 +1454,27 @@ impl DubEngine {
 impl DubEngine {
     /// The routing a start uses: the DJ's for this device when set, else
     /// the registry's.
+    /// Starts a session: `open` validates and brings the devices up, and
+    /// the result becomes the running state.
+    ///
+    /// `open` runs under [`Self::start_gate`] and *not* the state lock,
+    /// so everything that reads the engine meanwhile answers at once, as
+    /// stopped, instead of waiting out the driver. A second start or a
+    /// stop queues on the gate behind it, so a stop that overtakes a
+    /// start still stops what the start opened.
+    fn install_session(
+        &self,
+        open: impl FnOnce() -> Result<RunningState, EngineError>,
+    ) -> Result<(), EngineError> {
+        let _gate = lock_gate(&self.start_gate);
+        if matches!(*lock_state(&self.state), EngineState::Running(_)) {
+            return Err(EngineError::AlreadyRunning);
+        }
+        let running = open()?;
+        *lock_state(&self.state) = EngineState::Running(Box::new(running));
+        Ok(())
+    }
+
     fn routing_info(&self, device_name: &str) -> dub_audio::PerformanceRouting {
         let set = self
             .routing_overrides
@@ -1469,6 +1497,7 @@ impl DubEngine {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Arc::new(Mutex::new(EngineState::Stopped)),
+            start_gate: Mutex::new(()),
             peak_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
             beat_grid_generation_seq: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
             tempo_range_low_bits: AtomicU64::new(TempoOctave::DEFAULT.low().to_bits()),
@@ -1699,27 +1728,22 @@ impl DubEngine {
         channels: Vec<u32>,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-
-        if channels.len() != 2 || channels.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels));
-        }
-
-        let routing = self.routing_info(&device_name);
-        let running = start_thru_inner(
-            &device_name,
-            routing,
-            &channels,
-            None,
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-            PerfSource::Thru,
-            false,
-        )?;
-        *state = EngineState::Running(Box::new(running));
+        self.install_session(|| {
+            if channels.len() != 2 || channels.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels));
+            }
+            let routing = self.routing_info(&device_name);
+            start_thru_inner(
+                &device_name,
+                routing,
+                &channels,
+                None,
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+                PerfSource::Thru,
+                false,
+            )
+        })?;
         self.bump_peak_generation(0);
         Ok(())
     }
@@ -1751,36 +1775,31 @@ impl DubEngine {
         channels_b: Vec<u32>,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-
-        if channels_a.len() != 2 || channels_a.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels_a));
-        }
-        if channels_b.len() != 2 || channels_b.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels_b));
-        }
-        // No channel may appear in both pairs.
-        if channels_a.iter().any(|c| channels_b.contains(c)) {
-            let mut combined = channels_a;
-            combined.extend(channels_b);
-            return Err(EngineError::InvalidChannels(combined));
-        }
-
-        let routing = self.routing_info(&device_name);
-        let running = start_thru_inner(
-            &device_name,
-            routing,
-            &channels_a,
-            Some(&channels_b),
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-            PerfSource::Thru,
-            false,
-        )?;
-        *state = EngineState::Running(Box::new(running));
+        self.install_session(|| {
+            if channels_a.len() != 2 || channels_a.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels_a));
+            }
+            if channels_b.len() != 2 || channels_b.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels_b));
+            }
+            // No channel may appear in both pairs.
+            if channels_a.iter().any(|c| channels_b.contains(c)) {
+                let mut combined = channels_a;
+                combined.extend(channels_b);
+                return Err(EngineError::InvalidChannels(combined));
+            }
+            let routing = self.routing_info(&device_name);
+            start_thru_inner(
+                &device_name,
+                routing,
+                &channels_a,
+                Some(&channels_b),
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+                PerfSource::Thru,
+                false,
+            )
+        })?;
         self.bump_peak_generation(0);
         self.bump_peak_generation(1);
         Ok(())
@@ -1808,27 +1827,22 @@ impl DubEngine {
         channels: Vec<u32>,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-
-        if channels.len() != 2 || channels.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels));
-        }
-
-        let routing = self.routing_info(&device_name);
-        let running = start_thru_inner(
-            &device_name,
-            routing,
-            &channels,
-            None,
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-            PerfSource::Timecode,
-            false,
-        )?;
-        *state = EngineState::Running(Box::new(running));
+        self.install_session(|| {
+            if channels.len() != 2 || channels.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels));
+            }
+            let routing = self.routing_info(&device_name);
+            start_thru_inner(
+                &device_name,
+                routing,
+                &channels,
+                None,
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+                PerfSource::Timecode,
+                false,
+            )
+        })?;
         self.bump_peak_generation(0);
         Ok(())
     }
@@ -1860,35 +1874,30 @@ impl DubEngine {
         channels_b: Vec<u32>,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-
-        if channels_a.len() != 2 || channels_a.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels_a));
-        }
-        if channels_b.len() != 2 || channels_b.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels_b));
-        }
-        if channels_a.iter().any(|c| channels_b.contains(c)) {
-            let mut combined = channels_a;
-            combined.extend(channels_b);
-            return Err(EngineError::InvalidChannels(combined));
-        }
-
-        let routing = self.routing_info(&device_name);
-        let running = start_thru_inner(
-            &device_name,
-            routing,
-            &channels_a,
-            Some(&channels_b),
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-            PerfSource::Timecode,
-            false,
-        )?;
-        *state = EngineState::Running(Box::new(running));
+        self.install_session(|| {
+            if channels_a.len() != 2 || channels_a.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels_a));
+            }
+            if channels_b.len() != 2 || channels_b.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels_b));
+            }
+            if channels_a.iter().any(|c| channels_b.contains(c)) {
+                let mut combined = channels_a;
+                combined.extend(channels_b);
+                return Err(EngineError::InvalidChannels(combined));
+            }
+            let routing = self.routing_info(&device_name);
+            start_thru_inner(
+                &device_name,
+                routing,
+                &channels_a,
+                Some(&channels_b),
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+                PerfSource::Timecode,
+                false,
+            )
+        })?;
         self.bump_peak_generation(0);
         self.bump_peak_generation(1);
         Ok(())
@@ -1915,6 +1924,7 @@ impl DubEngine {
     /// the counter. Bumping on stop closes the gap so a quit-then-
     /// restart sequence renders cleanly from frame zero.
     pub fn stop_thru(&self) {
+        let _gate = lock_gate(&self.start_gate);
         let mut state = lock_state(&self.state);
         if let EngineState::Running(running) = &*state {
             self.bump_peak_generation_for_occupied(&running.peaks);
@@ -1979,21 +1989,16 @@ impl DubEngine {
         output_channels: u32,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-        if output_channels < 2 {
-            return Err(EngineError::InvalidChannels(vec![output_channels]));
-        }
-
-        let running = start_engine_inner(
-            output_channels,
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-        )?;
-        *state = EngineState::Running(Box::new(running));
-        Ok(())
+        self.install_session(|| {
+            if output_channels < 2 {
+                return Err(EngineError::InvalidChannels(vec![output_channels]));
+            }
+            start_engine_inner(
+                output_channels,
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+            )
+        })
     }
 
     /// Load a track on the given deck (M10.5).
@@ -6047,6 +6052,11 @@ fn lock_state(state: &Mutex<EngineState>) -> std::sync::MutexGuard<'_, EngineSta
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn lock_gate(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    gate.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn peak_source_for(running: &RunningState, deck_idx: u64) -> Option<&PeakSource> {
     let idx: usize = deck_idx.try_into().ok()?;
     running.peaks.get(idx).and_then(|s| s.as_ref())
@@ -6872,13 +6882,36 @@ enum PerfSource {
     Timecode,
 }
 
+/// Where a session's decks leave the interface: each deck on its OWN
+/// physical pair of a known multi-out interface — PRD non-negotiable
+/// §2.1, the external mixer is the product, decks are never summed in
+/// software. That holds with only deck A open too: a rip's record has to
+/// come out where THRU puts it, on deck A's mixer channel, and summing
+/// put it on the interface's first pair, the SL 3's aux (rig run,
+/// 2026-11-27). Unknown and heuristic-only devices sum to a 2-channel
+/// master so the dev rig (built-in output) still works.
+fn session_output_routing(
+    routing: &dub_audio::PerformanceRouting,
+) -> (u32, dub_engine::OutputRouting) {
+    if routing.two_deck && routing.output_channels >= 4 {
+        (
+            routing.output_channels,
+            [
+                Some(routing.deck_a_output_first.saturating_sub(1)),
+                Some(routing.deck_b_output_first.saturating_sub(1)),
+            ],
+        )
+    } else {
+        (2, INTERNAL_MIXER_ROUTING)
+    }
+}
+
 /// Open the input device, build the engine, and attach the chosen
 /// per-deck source (Thru passthrough, or timecode-driven file
 /// playback). Returns the full [`RunningState`] on success.
 ///
-/// Pulled out of `start_thru` so the `Mutex` guard stays narrow:
-/// this function never touches `self.state`, only the audio
-/// subsystem.
+/// Never touches `self.state`, only the audio subsystem: it runs
+/// inside [`DubEngine::install_session`], outside the state lock.
 // Eight because the routing is resolved by the caller, which holds the
 // overrides; every argument is one decision about the session, and a
 // struct around them would only rename the list.
@@ -6953,25 +6986,7 @@ fn start_thru_inner(
     );
 
     // ----- 5. Open output -------------------------------------------
-    // Two-deck Performance mode routes each deck to its OWN physical
-    // output pair on the interface — PRD non-negotiable §2.1: the
-    // external mixer is the product, decks are never summed in
-    // software. We resolve the per-deck output map from the registry
-    // by the input device name (the interface). Single-deck Thru and
-    // unknown / heuristic-only devices fall back to the 2-channel
-    // internal-mixer sum so the dev rig (built-in output) still works.
-    let (output_channels, output_routing): (u32, dub_engine::OutputRouting) =
-        if channels_b.is_some() && routing_info.two_deck && routing_info.output_channels >= 4 {
-            (
-                routing_info.output_channels,
-                [
-                    Some(routing_info.deck_a_output_first.saturating_sub(1)),
-                    Some(routing_info.deck_b_output_first.saturating_sub(1)),
-                ],
-            )
-        } else {
-            (2, INTERNAL_MIXER_ROUTING)
-        };
+    let (output_channels, output_routing) = session_output_routing(&routing_info);
     let output_opts = OutputOptions {
         channels: output_channels,
         device_uid: output_device_uid
@@ -7297,6 +7312,123 @@ fn filtered_peak_chunks_to_bytes(chunks: &[FilteredPeakChunk]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Opening an interface can take seconds (the SL 3 coming up after a
+    /// hot-plug). The screen reads the engine all the while, so nothing it
+    /// reads may wait for the open (rig run, 2026-11-27: the status strip
+    /// froze in `sample_rate`).
+    mod session_start {
+        use super::super::{DubEngine, EngineError};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        /// Starts a session whose interface open blocks until the returned
+        /// sender fires, then fails. Returns once the open has begun.
+        fn begin_slow_open(
+            engine: &Arc<DubEngine>,
+        ) -> (
+            mpsc::Sender<()>,
+            thread::JoinHandle<Result<(), EngineError>>,
+        ) {
+            let (opened_tx, opened_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let engine = Arc::clone(engine);
+            let starter = thread::spawn(move || {
+                engine.install_session(|| {
+                    opened_tx.send(()).expect("test alive");
+                    release_rx.recv().ok();
+                    Err(EngineError::AudioStartFailed("test open".to_string()))
+                })
+            });
+            opened_rx.recv().expect("the open began");
+            (release_tx, starter)
+        }
+
+        #[test]
+        fn readers_answer_while_an_interface_is_opening() {
+            let engine = DubEngine::new();
+            let (release, starter) = begin_slow_open(&engine);
+
+            let (read_tx, read_rx) = mpsc::channel();
+            let reader = Arc::clone(&engine);
+            thread::spawn(move || {
+                read_tx
+                    .send((reader.sample_rate(), reader.peaks_len(0)))
+                    .ok();
+            });
+            let read = read_rx.recv_timeout(Duration::from_secs(2));
+
+            release.send(()).ok();
+            assert!(starter.join().expect("starter").is_err());
+            assert_eq!(read, Ok((0, 0)), "a reader waited for the interface");
+        }
+
+        #[test]
+        fn a_stop_waits_for_the_open_it_overtook() {
+            let engine = DubEngine::new();
+            let (release, starter) = begin_slow_open(&engine);
+
+            let (stopped_tx, stopped_rx) = mpsc::channel();
+            let stopper = Arc::clone(&engine);
+            thread::spawn(move || {
+                stopper.stop_thru();
+                stopped_tx.send(()).ok();
+            });
+            // Returning now would leave whatever the open brings up
+            // running after the stop.
+            assert!(
+                stopped_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "the stop returned before the open finished"
+            );
+
+            release.send(()).ok();
+            starter.join().expect("starter").ok();
+            assert!(stopped_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
+
+        #[test]
+        fn a_known_interface_keeps_each_deck_on_its_own_outputs() {
+            let sl3 = dub_audio::DeviceRegistry::embedded().performance_routing("SL 3");
+            // Deck A on 3+4, deck B on 5+6: the aux pair (1+2) is never
+            // where a deck's record comes out.
+            assert_eq!(
+                super::super::session_output_routing(&sl3),
+                (6, [Some(2), Some(4)])
+            );
+        }
+
+        #[test]
+        fn an_unknown_interface_sums_to_a_stereo_master() {
+            let unknown = dub_audio::PerformanceRouting::heuristic_default();
+            assert_eq!(
+                super::super::session_output_routing(&unknown),
+                (2, dub_engine::INTERNAL_MIXER_ROUTING)
+            );
+        }
+
+        #[test]
+        fn a_second_start_waits_for_the_first() {
+            let engine = DubEngine::new();
+            let (release, starter) = begin_slow_open(&engine);
+
+            let (second_tx, second_rx) = mpsc::channel();
+            let second = Arc::clone(&engine);
+            thread::spawn(move || {
+                let result =
+                    second.install_session(|| Err(EngineError::AudioStartFailed("second".into())));
+                second_tx.send(result).ok();
+            });
+            assert!(
+                second_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "two interface opens ran at once"
+            );
+
+            release.send(()).ok();
+            starter.join().expect("starter").ok();
+            assert!(second_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
+    }
 
     /// A sidecar that deserialises cleanly can still belong to a
     /// different track — nothing in the file names the audio it came

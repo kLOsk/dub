@@ -101,6 +101,13 @@ pub struct LiveStreamConfig {
     /// RMS below which the input is silence — a lifted needle, not a
     /// quiet passage (−50 dBFS).
     pub silence_rms: f32,
+    /// Seconds after a record's first sound the tracker does not hear:
+    /// the needle landing. From silence to a full mix is one onset many
+    /// times any drum hit's (57 against the music's 9.5 on a dnb side,
+    /// 2026-11-27), and the tempo search scores a beat against everything
+    /// in its window, so that one onset held the confidence under the bar
+    /// for showing a tempo for as long as it stayed there: 38 s on the rig.
+    pub settle_secs: f32,
 }
 
 impl Default for LiveStreamConfig {
@@ -109,6 +116,7 @@ impl Default for LiveStreamConfig {
             odf_window_secs: 60.0,
             needle_up_secs: 1.0,
             silence_rms: 0.003,
+            settle_secs: 0.5,
         }
     }
 }
@@ -260,8 +268,12 @@ impl BpmStream {
             tracker.set_odf_window_secs(Some(l.odf_window_secs));
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let needle_up_samples = (l.needle_up_secs.max(0.0) * cfg.sample_rate as f32) as usize;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let settle_frames = (l.settle_secs.max(0.0) * cfg.sample_rate as f32) as usize;
             LiveState {
                 needle_up_samples: needle_up_samples.max(1),
+                settle_frames,
+                settling: 0,
                 silence_ms: l.silence_rms * l.silence_rms,
                 quiet: 0,
                 needle_up: false,
@@ -360,6 +372,10 @@ struct LiveState {
     quiet: usize,
     needle_up: bool,
     channels: usize,
+    /// [`LiveStreamConfig::settle_secs`] in frames.
+    settle_frames: usize,
+    /// Frames of the needle's landing still to pass unheard.
+    settling: usize,
 }
 
 fn analysis_loop(
@@ -388,7 +404,7 @@ fn analysis_loop(
                 break;
             }
             drained_any = true;
-            let audio = &block[..n];
+            let mut audio = &block[..n];
             let block_start = shared.consumed.load(Ordering::Relaxed);
             let frames = n / live.as_ref().map_or(1, |l| l.channels);
             shared
@@ -413,6 +429,7 @@ fn analysis_loop(
                     // down, or the first heard since the stream began.
                     if shared.record_start.load(Ordering::Relaxed) == NO_RECORD {
                         shared.record_start.store(block_start, Ordering::Release);
+                        live.settling = live.settle_frames;
                     }
                 }
                 if !live.needle_up && live.quiet >= live.needle_up_samples {
@@ -429,6 +446,19 @@ fn analysis_loop(
                 }
                 if live.needle_up {
                     continue;
+                }
+                if live.settling > 0 {
+                    if live.settling >= frames {
+                        live.settling -= frames;
+                        continue;
+                    }
+                    // Since the record began the tracker has heard only
+                    // silence; starting it over drops that, and the
+                    // landing's edge with it, so it begins on the music.
+                    let skip = live.settling * live.channels;
+                    live.settling = 0;
+                    tracker.reset();
+                    audio = &audio[skip..];
                 }
             }
             if let Some(ev) = tracker.process(audio) {
@@ -672,6 +702,68 @@ mod tests {
             "the second record did not lock as a new one: {:?}",
             stream.snapshot()
         );
+    }
+
+    /// Seconds of `record` before a live stream reads `bpm` (within 1.5),
+    /// with `lead_in` frames of silence before it; `None` if it never does.
+    /// The stream is handed a quarter second at a time and looked at once
+    /// it has taken it, so each look sees exactly the audio before it.
+    fn secs_to_read(
+        live: LiveStreamConfig,
+        lead_in: usize,
+        record: &[f32],
+        bpm: f64,
+    ) -> Option<f64> {
+        let sr = 48_000u32;
+        let (mut tx, rx) = ring_for_samples(48_000);
+        let stream = BpmStream::spawn_live(rx, cfg_mono(sr), live).expect("spawn");
+        let silence = vec![0.0; lead_in];
+        let mut fed = 0usize;
+        for chunk in silence.chunks(12_000).chain(record.chunks(12_000)) {
+            push_all(&mut tx, chunk);
+            fed += chunk.len();
+            assert!(wait_until(Duration::from_secs(5), || {
+                stream.snapshot().consumed_frames >= fed as u64
+            }));
+            let reads = stream
+                .snapshot()
+                .state
+                .bpm()
+                .is_some_and(|b| (b - bpm).abs() <= 1.5);
+            if reads && fed > lead_in {
+                return Some((fed - lead_in) as f64 / f64::from(sr));
+            }
+        }
+        None
+    }
+
+    /// The tracker starts on the music, not on the needle landing: a
+    /// record's first [`LiveStreamConfig::settle_secs`] go unheard, after
+    /// a lift and at the stream's first sound alike, and the tracker then
+    /// reads as if the record began there. The landing's edge is the
+    /// biggest onset a THRU deck ever hears; on the rig it hid a dnb
+    /// side's tempo for 38 s (2026-11-27, `tests/thru_real_records.rs`).
+    #[test]
+    fn a_record_is_heard_from_after_the_needle_lands() {
+        let sr = 48_000u32;
+        let record = synthetic::click_track(128.0, 12.0, sr);
+        let live = LiveStreamConfig::default();
+        let at_once = LiveStreamConfig {
+            settle_secs: 0.0,
+            ..live
+        };
+        let later = LiveStreamConfig {
+            settle_secs: 3.0,
+            ..live
+        };
+        for lead_in in [72_000, 0] {
+            let heard = secs_to_read(at_once, lead_in, &record, 128.0).expect("reads at once");
+            let settled = secs_to_read(later, lead_in, &record, 128.0).expect("reads settled");
+            assert!(
+                (settled - (3.0 + heard)).abs() <= 0.5,
+                "lead-in {lead_in}: read {settled:.2} s in with a 3 s settle, {heard:.2} s without"
+            );
+        }
     }
 
     /// The record's clock starts at its first sound, stops when the

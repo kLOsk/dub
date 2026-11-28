@@ -93,5 +93,21 @@ testdata/rip-baselines/*.wav
 testdata/timecode/full/
 testdata/timecode/*.flac
 
+# `make rig` takes: every input of the interface for each hands item, about
+# 70 MB a minute, and recordings of the same control records as above.
+testdata/rig-takes/
+
 # `make dist` release artifacts — uploaded to GitHub releases, not committed.
 dist/
+
+# Polyscope's per-workspace scratch: agents' notes, rig capture logs, the
+# pitch-coach helper. Local to this machine.
+.context/
+
+# Agent skills live in the home folder (`npx skills add … -g`). Run without
+# `-g` inside the repo, `npx skills` installs into it instead — 43 MB for the
+# taste skill alone. Kept out, with that skill's build state.
+.agents/
+skills-lock.json
+.claude/skills/design-taste-frontend
+.taste-skill/

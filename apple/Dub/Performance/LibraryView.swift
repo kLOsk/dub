@@ -3997,7 +3997,7 @@ struct LibraryView: View {
                 .help("\(libraryModel.missingTrackCount) tracks can't be found. "
                     + "Click to point Dub at the folder that holds them.")
             }
-            Text(LibraryStatusCount.text(
+            Text(DubDataDir.statusPrefix(for: DubDataDir.current) + LibraryStatusCount.text(
                 listed: tracks.count, shown: filteredTracks.count,
                 filtered: filterState.isActive))
                 .font(DubFont.micro)

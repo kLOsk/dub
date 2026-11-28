@@ -26,7 +26,7 @@ Dub sits between your turntables and your mixer. For the two-deck
 | MWM Phase Essential | Beta: see [MWM Phase](#mwm-phase-beta) | Measured against a record on the rig, not yet played in the app |
 | Native Instruments Traktor Audio 6 | Interface | Tested |
 | Any external mixer with line inputs | The mixer | Works |
-| Phase over USB (no cables), MIDI and HID controllers | Control | Planned after 1.0 |
+| MIDI and HID controllers | Control | Planned after 1.0 |
 
 Each deck works out at calibration which control record is on it and whether
 it turns at 33 or 45; there's nothing to set. See
@@ -76,6 +76,9 @@ What to expect:
 - **No safety net.** Phase sends no position code, so whatever the count
   gains or loses stays until you recalibrate. What a flat battery or a lost
   radio link does isn't tested yet.
+- **Cables, not USB.** Phase can also connect over USB without the audio
+  cables, but only with a key from MWM for each app, and MWM isn't issuing
+  new keys. Dub reads Phase through its RCA outputs.
 
 If **VINYL** says **Speed only · Preferences ▸ Beta**, the switch is off. If
 it says **Set Phase Manager to Serato**, Phase is in Traktor mode. Either way

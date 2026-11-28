@@ -57,4 +57,26 @@ final class FxEchoSyncTests: XCTestCase {
         XCTAssertEqual(FxEchoTempo(source: .deck(.a), bpm: 92.44).text, "A · 92.4")
         XCTAssertEqual(FxEchoTempo(source: .tap, bpm: 78).text, "TAP · 78.0")
     }
+
+    /// A tempo that moves on its own — the platter under a pitch ride, the
+    /// tracker settling — moves the repeat only past 0.3 %, so the rack is
+    /// not rebuilt on every poll.
+    func testADriftingTempoMovesTheRepeatOnlyPastTheThreshold() {
+        let at = FxRackControls.syncedRepeatMs(bpm: 133.1, division: 0.75)!
+        let near = FxRackControls.syncedRepeatMs(bpm: 132.9, division: 0.75)!
+        let far = FxRackControls.syncedRepeatMs(bpm: 132.5, division: 0.75)!
+        XCTAssertFalse(FxRackControls.syncMovesRepeat(fromMs: at, toMs: near, sourceChanged: false, exact: false))
+        XCTAssertTrue(FxRackControls.syncMovesRepeat(fromMs: at, toMs: far, sourceChanged: false, exact: false))
+        XCTAssertTrue(FxRackControls.syncMovesRepeat(fromMs: at, toMs: near, sourceChanged: true, exact: false))
+    }
+
+    /// The DJ's own tempo lands exactly: four taps at 132.9 on a deck the
+    /// tracker read 133.1 left the echo at 133.1, 0.15 % under the
+    /// threshold, and the line under REPEAT disagreed with the deck
+    /// (rig, 2026-11-28).
+    func testATapLandsExactlyUnderTheThreshold() {
+        let at = FxRackControls.syncedRepeatMs(bpm: 133.1, division: 0.75)!
+        let tapped = FxRackControls.syncedRepeatMs(bpm: 132.9, division: 0.75)!
+        XCTAssertTrue(FxRackControls.syncMovesRepeat(fromMs: at, toMs: tapped, sourceChanged: false, exact: true))
+    }
 }

@@ -814,10 +814,44 @@ are the songs where Dub's tempo is off Traktor's was not checked.
   beat of a playing deck fixes one by hand (PRD-BEATS §4.1).
 - **The 1.** Unscored: Traktor is no reference for it. §5's learned
   tracker remains the only categorical answer on record.
-- **Two-thirds and four-thirds (1.9 %)** still happen where sixteenth-note
-  content makes those lags as periodic as the beat.
+- **Two-thirds and four-thirds** — 1.9 % then; 0.7 % after §8.11.
 - **Thru decks** read in the default octave; the DJ's tempo range does not
-  reach them yet. The dnb baseline record still reads 116.5, two-thirds.
+  reach them yet. The dnb baseline record still reads 116.5 (§8.11).
 - **None of the tap work has been tried on a deck.** The numbers above
   are simulated taps on files.
 
+### 8.11 Three-two ties, settled on the duple hierarchy (2026-11-28)
+
+Two rig misreads in THRU — a reggae intro at 98.5 for 131 and the dnb
+baseline at 116.6 — led here; neither is fixed by what came of it. The
+reggae intro's onsets pulse at 98.7 (a triplet figure, no beat until the
+drums) and the dnb's snares repeat every 0.512 s, so every measure below
+prefers the reading shown. Daniel is re-recording the dnb side.
+
+What does generalise came from the whole corpus. A new test,
+`a_thru_deck_reads_locked_grids_in_their_tempo_family`, reads every locked
+song as a THRU deck does (no genre, the default octave, the live search's
+60 s window) on its first 20 s and on a minute from its middle, and sorts
+the reading into Traktor's tempo, an octave of it, the three-two family,
+or other. `DUB_BPM_CANDIDATES_OUT` writes each song's whole candidate
+table and autocorrelation, so a rule can be simulated on 3,500 tables in
+seconds instead of re-analysed in minutes.
+
+In the three-two misreads the right tempo was usually a near-tie (within
+5 % on 29 of 54); but right readings had a three-two rival that close too
+(157 of 1,689), so the score alone cannot part them. Of the measures tried
+on those ties, the one that did is the mean local energy at the beat's
+quarter, half, one, two and four beats. Measures that include three times
+the lag did worse than keeping the winner: the third harmonic is what makes
+the two-thirds rival score. Applied only when a rival in the family (4:3,
+3:4, 3:2, 2:3) scores within 10 %:
+
+| THRU-style reading | three-two before | after |
+|---|---|---|
+| first 20 s (1,762 songs) | 70 | 34 |
+| a minute from the middle (1,747) | 54 | 21 |
+
+and the library as it analyses (genre octaves, whole songs, 1,768 locked
+songs, same manifest): tempo 96.3 % → 97.4 %, three-two 34 → 12, half
+18 → 20, other 6 → 7; placement, taps and the drift warning unchanged.
+`settle_three_two` in `tempo.rs`.

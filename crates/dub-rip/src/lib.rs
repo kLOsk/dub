@@ -24,7 +24,8 @@ mod salvage;
 mod session;
 
 pub use capture::{simulate as simulate_auto_capture, AutoCaptureSim};
-pub use commit::{CommitProgress, RipOutcome, SegmentOutcome};
+pub use commit::read_side;
+pub use commit::{CommitProgress, LibraryAccess, RipOutcome, SegmentOutcome};
 pub use gaps::{
     analyze as analyze_gaps, cell_levels_db, cell_peaks_db, detect_gaps, Gap, GapAnalysis,
     GapConfig,

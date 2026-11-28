@@ -213,6 +213,18 @@ final class ReleaseScreenTests: XCTestCase {
         XCTAssertEqual(LibraryStatusCount.text(listed: 108, shown: 12, filtered: true), "12 of 108")
     }
 
+    /// `DUB_DATA_DIR` marks the library footer, and only an absolute
+    /// folder counts — the library refuses a relative one on open.
+    func test_aScratchFolderMarksTheLibrary() {
+        XCTAssertNil(DubDataDir.folder(from: [:]))
+        XCTAssertNil(DubDataDir.folder(from: ["DUB_DATA_DIR": ""]))
+        XCTAssertNil(DubDataDir.folder(from: ["DUB_DATA_DIR": "scratch"]))
+        let folder = DubDataDir.folder(from: ["DUB_DATA_DIR": "/tmp/dub-scratch"])
+        XCTAssertEqual(folder?.path, "/tmp/dub-scratch")
+        XCTAssertEqual(DubDataDir.statusPrefix(for: nil), "")
+        XCTAssertEqual(DubDataDir.statusPrefix(for: folder), "SCRATCH LIBRARY · ")
+    }
+
     // MARK: - Snapshots
 
     func test_deckRowAndRackBar_onEveryReleaseScreen() {

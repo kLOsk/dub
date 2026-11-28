@@ -102,6 +102,17 @@ struct FxRackControls: Equatable {
         return max(ms, spaceEchoRepeatRange.lowerBound)
     }
 
+    /// Whether SYNC moves the repeat from `fromMs` to `toMs`. A tempo that
+    /// moves on its own — a pitch ride, the tracker settling — moves it
+    /// only past 0.3 % (about a tenth of a BPM), so a settled platter never
+    /// rebuilds the rack and the engine's heads glide between the steps.
+    /// The DJ's own act (`exact`: a tap, ×2 / ½, back to the tracker) lands
+    /// exactly: a tap 0.15 % off the tracker's reading left the echo, and
+    /// the BPM printed under it, on the old number (rig, 2026-11-28).
+    static func syncMovesRepeat(fromMs: Double, toMs: Double, sourceChanged: Bool, exact: Bool) -> Bool {
+        exact || sourceChanged || abs(toMs - fromMs) > fromMs * 0.003
+    }
+
     /// A gap between taps longer than this starts a new count.
     static let tapRunGapSecs: TimeInterval = 2
 

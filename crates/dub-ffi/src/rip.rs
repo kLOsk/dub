@@ -314,11 +314,14 @@ struct SplitIds {
     entries: Vec<(u32, u64)>,
 }
 
-/// Shared state of the commit worker. `recorded_frames` /
-/// `elapsed_secs` / `stop_reason` are frozen at confirm time so
-/// [`DubRipSession::status`] can answer during a commit without
-/// touching the session mutex (which the worker holds while
-/// encoding).
+/// Shared state of the commit worker. Everything the review screen
+/// reads while a commit runs is frozen here at confirm time, so
+/// [`DubRipSession::status`] and [`DubRipSession::segments`] answer
+/// without touching the session mutex — the worker holds it for the
+/// whole encode, and the screen polls from the main thread. Reading
+/// the side's bounds through the session froze Dub for 21.8 s on a
+/// four-track side (rig, 2026-11-27). Plan edits are refused while
+/// the job runs, so the snapshot cannot go stale.
 #[derive(Default)]
 struct CommitJob {
     running: bool,
@@ -329,6 +332,8 @@ struct CommitJob {
     recorded_frames: u64,
     elapsed_secs: f64,
     stop_reason: RipStopReason,
+    side_secs: (f64, f64),
+    segments: Vec<RipSegment>,
 }
 
 /// What recognition made of one segment (M26c).
@@ -445,7 +450,7 @@ fn map_rip_error(e: RipError) -> RipFfiError {
     let msg = e.to_string();
     match e {
         RipError::InvalidConfig(_) => RipFfiError::InvalidConfig(msg),
-        RipError::InvalidState { .. } => RipFfiError::InvalidState(msg),
+        RipError::InvalidState { .. } | RipError::LibraryClosed => RipFfiError::InvalidState(msg),
         RipError::Split(_) => RipFfiError::InvalidSplit(msg),
         RipError::TrackIndexOutOfRange { .. } => RipFfiError::InvalidSegment(msg),
         RipError::CaptureFailed(_) | RipError::StopTimeout => RipFfiError::CaptureFailed(msg),
@@ -538,26 +543,17 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-/// Resolve the default rip destination:
-/// `~/Music/Dub/Rips/<timestamp>`, de-duplicated with a `-N` suffix
-/// if two sessions land in the same second.
-/// The directory rips live in, without minting a new session.
+/// The directory rips live in, without minting a new session:
+/// `~/Music/Dub/Rips/`, or `Rips/` inside `DUB_DATA_DIR`.
 fn rips_root() -> Result<PathBuf, RipFfiError> {
-    let music = dirs::audio_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
-        .ok_or_else(|| {
-            RipFfiError::InvalidConfig("cannot resolve the user's Music directory".into())
-        })?;
-    Ok(music.join("Dub").join("Rips"))
+    dub_library::default_rips_dir().map_err(|e| RipFfiError::InvalidConfig(e.to_string()))
 }
 
+/// Resolve the default rip destination: `<rips_root>/<timestamp>`,
+/// de-duplicated with a `-N` suffix if two sessions land in the same
+/// second.
 fn default_session_dir() -> Result<PathBuf, RipFfiError> {
-    let music = dirs::audio_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
-        .ok_or_else(|| {
-            RipFfiError::InvalidConfig("cannot resolve the user's Music directory".into())
-        })?;
-    let base = music.join("Dub").join("Rips");
+    let base = rips_root()?;
     let stamp = timestamp_for(SystemTime::now());
     let mut dir = base.join(&stamp);
     let mut n = 2_u32;
@@ -575,55 +571,58 @@ fn set_segment_state(job: &mut CommitJob, index: usize, state: RipSegmentJobStat
     }
 }
 
-/// Body of the `dub-rip-commit` worker thread. Locks the library for
-/// the duration of the commit (the same single-connection model every
-/// other library write uses), fills the job state from the
-/// [`dub_rip::RipOutcome`], and bumps the generation so pollers
-/// refresh.
+/// The FFI's library as the commit sees it: locked per call, so the
+/// browser on the main thread reads it between an import and the next
+/// encode. Held for the whole commit, it froze the browser for as long
+/// as the import ran.
+struct SharedLibrary<'a>(&'a Mutex<Option<dub_library::Library>>);
+
+impl dub_rip::LibraryAccess for SharedLibrary<'_> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dub_library::Library) -> R) -> Option<R> {
+        lock_mutex(self.0).as_mut().map(f)
+    }
+}
+
+/// Body of the `dub-rip-commit` worker thread. Holds the session for
+/// the commit and the library only for each write (`SharedLibrary`),
+/// fills the job state from the [`dub_rip::RipOutcome`], and bumps the
+/// generation so pollers refresh.
 fn run_commit_job(
     session: &Mutex<RipSession>,
     library: &DubLibrary,
     job: &Mutex<CommitJob>,
     generation: &AtomicU64,
 ) {
-    let result = {
-        let mut lib_guard = lock_mutex(&library.inner);
-        match lib_guard.as_mut() {
-            None => Err("library not open".to_string()),
-            Some(lib) => {
-                // Report each segment as it happens (M26b / R-39).
-                // Locking `job` briefly here is safe: `status` scopes
-                // its job guard and drops it before ever reaching for
-                // the session, so there is no path that holds job and
-                // then waits on session.
-                let mut on_progress = |event: dub_rip::CommitProgress| {
-                    {
-                        let mut job = lock_mutex(job);
-                        match event {
-                            dub_rip::CommitProgress::Started { index } => {
-                                set_segment_state(&mut job, index, RipSegmentJobState::Running);
-                            }
-                            dub_rip::CommitProgress::Finished { index, imported } => {
-                                let state = if imported {
-                                    RipSegmentJobState::Done
-                                } else {
-                                    RipSegmentJobState::Failed
-                                };
-                                set_segment_state(&mut job, index, state);
-                            }
-                            dub_rip::CommitProgress::ArchiveStarted => {}
-                        }
-                    }
-                    // Poll-driven UI: the dots only move when the
-                    // generation does.
-                    generation.fetch_add(1, Ordering::Release);
-                };
-                lock_mutex(session)
-                    .commit_with_progress(lib, &mut on_progress)
-                    .map_err(|e| e.to_string())
+    // Report each segment as it happens (M26b / R-39). Locking `job`
+    // briefly here is safe: `status` scopes its job guard and drops it
+    // before ever reaching for the session, so there is no path that
+    // holds job and then waits on session.
+    let mut on_progress = |event: dub_rip::CommitProgress| {
+        {
+            let mut job = lock_mutex(job);
+            match event {
+                dub_rip::CommitProgress::Started { index } => {
+                    set_segment_state(&mut job, index, RipSegmentJobState::Running);
+                }
+                dub_rip::CommitProgress::Finished { index, imported } => {
+                    let state = if imported {
+                        RipSegmentJobState::Done
+                    } else {
+                        RipSegmentJobState::Failed
+                    };
+                    set_segment_state(&mut job, index, state);
+                }
+                dub_rip::CommitProgress::ArchiveStarted => {}
             }
         }
+        // Poll-driven UI: the dots only move when the generation does.
+        generation.fetch_add(1, Ordering::Release);
     };
+    // The session for the whole pass, the library only for each import
+    // and analysis write (`SharedLibrary`). Always in that order.
+    let result = lock_mutex(session)
+        .commit_with_progress(&mut SharedLibrary(&library.inner), &mut on_progress)
+        .map_err(|e| e.to_string());
 
     let mut job = lock_mutex(job);
     job.running = false;
@@ -660,8 +659,10 @@ fn run_commit_job(
             }
         }
         Err(e) => {
+            // Nothing still runs once the job has ended: a segment
+            // started when the pass stopped failed with it.
             for seg in &mut job.per_segment {
-                if seg.state == RipSegmentJobState::Pending {
+                if seg.state != RipSegmentJobState::Done {
                     seg.state = RipSegmentJobState::Failed;
                 }
             }
@@ -738,27 +739,22 @@ impl DubEngine {
         channels: Vec<u32>,
         output_device_uid: Option<String>,
     ) -> Result<(), EngineError> {
-        let mut state = lock_state(&self.state);
-        if matches!(*state, EngineState::Running(_)) {
-            return Err(EngineError::AlreadyRunning);
-        }
-
-        if channels.len() != 2 || channels.contains(&0) {
-            return Err(EngineError::InvalidChannels(channels));
-        }
-
-        let routing = self.routing_info(&device_name);
-        let running = crate::start_thru_inner(
-            &device_name,
-            routing,
-            &channels,
-            None,
-            output_device_uid.as_deref(),
-            &self.deck_shared,
-            PerfSource::Thru,
-            true,
-        )?;
-        *state = EngineState::Running(Box::new(running));
+        self.install_session(|| {
+            if channels.len() != 2 || channels.contains(&0) {
+                return Err(EngineError::InvalidChannels(channels));
+            }
+            let routing = self.routing_info(&device_name);
+            crate::start_thru_inner(
+                &device_name,
+                routing,
+                &channels,
+                None,
+                output_device_uid.as_deref(),
+                &self.deck_shared,
+                PerfSource::Thru,
+                true,
+            )
+        })?;
         self.bump_peak_generation(0);
         Ok(())
     }
@@ -1080,13 +1076,47 @@ impl DubRipSession {
 
     /// The side's bounds in seconds, read off the manifest.
     fn side_bounds(&self) -> (f64, f64) {
-        let session = lock_mutex(&self.session);
-        let manifest = session.manifest();
-        (
-            frames_to_secs(manifest.side_start(), self.sample_rate),
-            frames_to_secs(manifest.side_end(), self.sample_rate),
-        )
+        side_secs_of(lock_mutex(&self.session).manifest(), self.sample_rate)
     }
+}
+
+fn side_secs_of(manifest: &dub_rip::RipManifest, sample_rate: u32) -> (f64, f64) {
+    (
+        frames_to_secs(manifest.side_start(), sample_rate),
+        frames_to_secs(manifest.side_end(), sample_rate),
+    )
+}
+
+/// The derived segments: split boundaries + recorded length +
+/// per-segment metadata. Empty until the recording stopped.
+fn segments_of(manifest: &dub_rip::RipManifest, sample_rate: u32) -> Vec<RipSegment> {
+    if manifest.recorded_frames == 0 {
+        return Vec::new();
+    }
+    let ranges = dub_rip::segments(
+        &manifest.boundaries_frames,
+        manifest.side_start(),
+        manifest.side_end(),
+    );
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, range)| {
+            let entry = manifest.tracks.get(i);
+            let meta = entry.map(|t| t.meta.clone()).unwrap_or_default();
+            RipSegment {
+                index: u32::try_from(i).unwrap_or(u32::MAX),
+                dropped: entry.is_some_and(|t| t.dropped),
+                start_secs: frames_to_secs(range.start, sample_rate),
+                end_secs: frames_to_secs(range.end, sample_rate),
+                title: meta.title,
+                artist: meta.artist,
+                album: meta.album,
+                genre: meta.genre,
+                year: meta.year,
+            }
+        })
+        .collect()
 }
 
 #[uniffi::export]
@@ -1167,6 +1197,34 @@ impl DubRipSession {
                 ));
             }
         }
+        {
+            // A re-split is a committed rip opened to split again: its
+            // tracks and `side.flac` live in this directory and the
+            // library still plays them, but re-split clears the plan, so
+            // the guard above saw nothing imported and Discard deleted
+            // the whole rip (found reading the code, 2026-11-28). Leaving
+            // a re-split puts the rip back as it was; nothing is deleted.
+            let mut session = lock_mutex(&self.session);
+            if session.is_resplit() {
+                if self.cancelled.swap(true, Ordering::AcqRel) {
+                    return Ok(());
+                }
+                session.abandon_resplit().map_err(map_rip_error)?;
+                drop(session);
+                self.synced.store(true, Ordering::Release);
+                self.bump_generation();
+                return Ok(());
+            }
+            // Tracks queued for replacement mean a re-split this object
+            // did not open (one left half-done): never delete those.
+            if !session.manifest().replaced_uuids.is_empty() {
+                return Err(RipFfiError::InvalidState(
+                    "this side's tracks are in the library; reopen it with \
+                     Re-split instead of discarding"
+                        .into(),
+                ));
+            }
+        }
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -1233,11 +1291,12 @@ impl DubRipSession {
                     job.elapsed_secs,
                     job.recorded_frames,
                     job.error.clone(),
+                    job.side_secs,
                 )
             })
         };
-        if let Some((phase, stop_reason, elapsed_secs, recorded_frames, error)) = commit {
-            let (side_start_secs, side_end_secs) = self.side_bounds();
+        if let Some((phase, stop_reason, elapsed_secs, recorded_frames, error, side)) = commit {
+            let (side_start_secs, side_end_secs) = side;
             return RipSessionStatus {
                 phase,
                 stop_reason,
@@ -1502,36 +1561,14 @@ impl DubRipSession {
     /// recording stopped (segment boundaries need the final length).
     #[must_use]
     pub fn segments(&self) -> Vec<RipSegment> {
-        self.sync_if_terminal();
-        let session = lock_mutex(&self.session);
-        let manifest = session.manifest();
-        if manifest.recorded_frames == 0 {
-            return Vec::new();
+        {
+            let job = lock_mutex(&self.job);
+            if job.running {
+                return job.segments.clone();
+            }
         }
-        let ranges = dub_rip::segments(
-            &manifest.boundaries_frames,
-            manifest.side_start(),
-            manifest.side_end(),
-        );
-        ranges
-            .iter()
-            .enumerate()
-            .map(|(i, range)| {
-                let entry = manifest.tracks.get(i);
-                let meta = entry.map(|t| t.meta.clone()).unwrap_or_default();
-                RipSegment {
-                    index: u32::try_from(i).unwrap_or(u32::MAX),
-                    dropped: entry.is_some_and(|t| t.dropped),
-                    start_secs: frames_to_secs(range.start, self.sample_rate),
-                    end_secs: frames_to_secs(range.end, self.sample_rate),
-                    title: meta.title,
-                    artist: meta.artist,
-                    album: meta.album,
-                    genre: meta.genre,
-                    year: meta.year,
-                }
-            })
-            .collect()
+        self.sync_if_terminal();
+        segments_of(lock_mutex(&self.session).manifest(), self.sample_rate)
     }
 
     /// Drop a segment from the commit, or put it back.
@@ -1768,7 +1805,7 @@ impl DubRipSession {
         self.guard_not_cancelled()?;
         self.sync_if_terminal();
 
-        let (recorded_frames, elapsed_secs, stop_reason, segment_count) = {
+        let (recorded_frames, elapsed_secs, stop_reason, segment_count, side_secs, segments) = {
             let session = lock_mutex(&self.session);
             let status = session.status();
             let RipState::Stopped(reason) = status.state else {
@@ -1777,12 +1814,14 @@ impl DubRipSession {
                     status.state
                 )));
             };
-            let count = session.manifest().boundaries_frames.len() + 1;
+            let manifest = session.manifest();
             (
                 status.recorded_frames,
                 status.elapsed_secs,
                 map_stop_reason(reason),
-                count,
+                manifest.boundaries_frames.len() + 1,
+                side_secs_of(manifest, self.sample_rate),
+                segments_of(manifest, self.sample_rate),
             )
         };
 
@@ -1800,6 +1839,8 @@ impl DubRipSession {
             job.recorded_frames = recorded_frames;
             job.elapsed_secs = elapsed_secs;
             job.stop_reason = stop_reason;
+            job.side_secs = side_secs;
+            job.segments = segments;
             job.per_segment = (0..segment_count)
                 .map(|i| RipSegmentJob {
                     index: u32::try_from(i).unwrap_or(u32::MAX),
@@ -1851,7 +1892,8 @@ impl DubRipSession {
     }
 }
 
-/// Recognise the current split plan off the spill.
+/// Recognise the current split plan off the side (the spill, or
+/// `side.flac` once committed).
 ///
 /// Runs on the recognition worker with no lock held across the network
 /// calls: the session mutex is taken only to copy the plan out, because
@@ -1863,24 +1905,25 @@ fn recognize_side(
     album: bool,
     discogs_token: Option<&str>,
 ) -> Result<RipRecognitionStatus, String> {
-    let (spill, boundaries, side_start, side_end) = {
+    let (session_dir, boundaries, side_start, side_end) = {
         let session = lock_mutex(session);
         let manifest = session.manifest();
         (
-            session.spill_path(),
+            session.session_dir().to_path_buf(),
             manifest.boundaries_frames.clone(),
             manifest.side_start(),
             manifest.side_end(),
         )
     };
 
-    let (samples, info) = dub_rip::read_spill_all(&spill).map_err(|e| format!("{e}"))?;
+    let (samples, sample_rate) = dub_rip::read_side(&session_dir).map_err(|e| format!("{e}"))?;
     let ranges = dub_rip::segments(&boundaries, side_start, side_end);
     if ranges.is_empty() {
         return Err("nothing to recognise".into());
     }
 
-    let channels = usize::from(info.channels.max(1));
+    // `read_side` is always the stereo pair the record tap took.
+    let channels = 2_usize;
     // Chromaprint takes i16; the spill is 32-bit float.
     let pcm: Vec<Vec<i16>> = ranges
         .iter()
@@ -1901,8 +1944,8 @@ fn recognize_side(
         .iter()
         .map(|samples| SegmentAudio {
             samples,
-            sample_rate: info.sample_rate,
-            channels: info.channels,
+            sample_rate,
+            channels: 2,
         })
         .collect();
 
@@ -2625,6 +2668,83 @@ mod tests {
         assert_eq!(library.track_count().unwrap(), 2);
     }
 
+    /// The commit worker holds the session for the whole encode, and
+    /// the review screen polls `status` and `segments` from the main
+    /// thread throughout. On the rig a four-track side froze Dub for
+    /// 21.8 s in `side_bounds` (2026-11-27). The library is read from
+    /// the main thread too, by the browser, and the encode held it as
+    /// well. Here the test holds the library: the worker must still
+    /// encode, and stall only at the import, holding the session, while
+    /// the review answers.
+    #[test]
+    fn the_review_and_the_library_answer_while_a_commit_encodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = Arc::new(recorded_session(dir.path(), 12));
+        ffi.add_split(6.0).unwrap();
+        ffi.set_segment_metadata(1, Some("B side".into()), None, None, None, None)
+            .unwrap();
+        let before = ffi.segments();
+        let side = (ffi.status().side_start_secs, ffi.status().side_end_secs);
+        let session_dir = PathBuf::from(ffi.session_dir());
+
+        let library = DubLibrary::new();
+        library
+            .open_at(
+                dir.path()
+                    .join("library.sqlite")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+        let lib_guard = lock_mutex(&library.inner);
+        ffi.confirm_encode_and_import(Arc::clone(&library)).unwrap();
+
+        let encoded = || {
+            std::fs::read_dir(&session_dir).unwrap().any(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                name.ends_with(".flac") && name != dub_rip::ARCHIVE_FILE
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !encoded() {
+            assert!(
+                Instant::now() < deadline,
+                "the commit waited on the library to encode"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&ffi);
+        std::thread::spawn(move || {
+            let status = reader.status();
+            let _ = tx.send((status, reader.segments()));
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(2));
+        drop(lib_guard);
+        let (status, segments) = answered.expect("the review waited on the commit");
+
+        assert_eq!(status.phase, RipPhase::Encoding);
+        assert_eq!((status.side_start_secs, status.side_end_secs), side);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].title.as_deref(), Some("B side"));
+        for (now, then) in segments.iter().zip(&before) {
+            assert_eq!(
+                (now.start_secs, now.end_secs),
+                (then.start_secs, then.end_secs)
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while ffi.status().phase == RipPhase::Encoding {
+            assert!(Instant::now() < deadline, "commit worker timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ffi.status().phase, RipPhase::Done);
+        assert_eq!(ffi.segments().len(), 2);
+        assert_eq!(library.track_count().unwrap(), 2);
+    }
+
     #[test]
     fn commit_fails_cleanly_on_a_closed_library() {
         let dir = tempfile::tempdir().unwrap();
@@ -2658,6 +2778,65 @@ mod tests {
             .confirm_encode_and_import(DubLibrary::new())
             .unwrap_err();
         assert!(matches!(err, RipFfiError::InvalidState(_)), "got {err:?}");
+    }
+
+    /// Discard on a re-split leaves the rip as it was: the imported
+    /// tracks, `side.flac` and the plan with its names. Re-split clears
+    /// the plan, and the discard guard used to read only that.
+    #[test]
+    fn discarding_a_resplit_keeps_the_committed_rip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffi = recorded_session(dir.path(), 6);
+        ffi.set_segment_metadata(0, Some("Love Train".into()), None, None, None, None)
+            .unwrap();
+        let session_dir = PathBuf::from(ffi.session_dir());
+        let library = DubLibrary::new();
+        library
+            .open_at(
+                dir.path()
+                    .join("library.sqlite")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+        ffi.confirm_encode_and_import(Arc::clone(&library)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while ffi.status().phase == RipPhase::Encoding {
+            assert!(Instant::now() < deadline, "commit worker timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ffi.status().phase, RipPhase::Done);
+        assert_eq!(library.track_count().unwrap(), 1);
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&session_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = files();
+        let manifest_before = dub_rip::load_manifest(&session_dir).unwrap();
+        drop(ffi);
+
+        let resplit = RipSession::resplit_from_archive(session_dir.clone()).unwrap();
+        let resplit = DubRipSession::resumed(resplit, SR, &[]);
+        resplit
+            .set_segment_metadata(0, Some("Changed my mind".into()), None, None, None, None)
+            .unwrap();
+        resplit.cancel().unwrap();
+
+        assert_eq!(files(), before, "the discard deleted part of the rip");
+        // Identify reads the side from the archive once the spill is gone.
+        let (side, _) = dub_rip::read_side(&session_dir).unwrap();
+        assert!(side.len() >= 2 * 5 * SR as usize, "{} samples", side.len());
+        assert_eq!(
+            dub_rip::load_manifest(&session_dir).unwrap(),
+            manifest_before,
+            "the rip's plan and names are back as they were"
+        );
+        assert_eq!(library.track_count().unwrap(), 1);
+        assert_eq!(resplit.status().phase, RipPhase::Idle);
     }
 
     #[test]

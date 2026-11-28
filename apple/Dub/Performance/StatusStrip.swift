@@ -55,6 +55,10 @@ struct StatusStripState: Equatable {
     /// and the strip says so rather than reading IDLE.
     var connecting: String? = nil
 
+    /// macOS is asking whether Dub may use the microphone; the engine
+    /// waits on the answer, and the strip says so rather than IDLE.
+    var awaitingMicrophone: Bool = false
+
     /// Sample rate formatted as "48.0 kHz" or `nil` if `0` (engine
     /// not running yet).
     var sampleRateText: String? {
@@ -309,7 +313,17 @@ struct StatusStrip: View {
 
     @ViewBuilder
     private var statusText: some View {
-        if let device = state.connecting {
+        if state.awaitingMicrophone, !state.isRunning {
+            HStack(spacing: DubSpacing.sm) {
+                Circle()
+                    .fill(DubColor.stateTentative)
+                    .frame(width: 6, height: 6)
+                Text("WAITING FOR MICROPHONE ACCESS")
+                    .font(DubFont.caps)
+                    .tracking(0.6)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
+        } else if let device = state.connecting {
             HStack(spacing: DubSpacing.sm) {
                 Circle()
                     .fill(DubColor.stateTentative)
@@ -419,6 +433,7 @@ struct StatusStripContainer: View {
     var mapMode: Bool = false
     var onToggleMap: (() -> Void)? = nil
     var connecting: String? = nil
+    var awaitingMicrophone: Bool = false
     var showsMap: Bool = true
     let openPreferences: () -> Void
     let openAbout: () -> Void
@@ -446,7 +461,8 @@ struct StatusStripContainer: View {
                 modeSwitch: modeSwitch,
                 mapMode: mapMode,
                 showsMap: showsMap,
-                connecting: connecting),
+                connecting: connecting,
+                awaitingMicrophone: awaitingMicrophone),
             openPreferences: openPreferences,
             openAbout: openAbout,
             onSelectMode: onSelectMode,

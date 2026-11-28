@@ -165,7 +165,9 @@ extension WaveformAppModel {
     /// engine with the deck-0 record tap wired, arms + starts a rip
     /// session, and flips the UI into `.capture`.
     func startRipCapture() {
-        guard canStartRipCapture else { return }
+        // A second press while the interface is still opening would stop
+        // the first open from the main thread and wait it out.
+        guard canStartRipCapture, !engineStarts.inFlight else { return }
         guard let route = ripCaptureRoute() else {
             surfaceError(
                 ripDevOverrideEngaged
@@ -188,13 +190,26 @@ extension WaveformAppModel {
     /// Open the Thru-for-rip engine on the resolved route, then
     /// create + start the session. Any failure falls back to the
     /// plain Prep engine so the DJ is never left silent.
+    ///
+    /// The open waits on the interface's driver, so it runs on
+    /// `deviceQueue` like the Performance start: on the main thread it
+    /// held the app for 232 ms in `AudioDeviceStart` (rig run,
+    /// 2026-11-27). A stop or another start overtaking it wins.
     private func openRipCapture(route: RipCaptureRoute) {
         stop()
-        do {
+        startOnDeviceQueue(device: route.deviceName, { engine in
             try engine.startThruForRip(
                 deviceName: route.deviceName,
                 channels: route.channels,
                 outputDeviceUid: route.outputUid)
+        }, commit: { [weak self] opened in
+            self?.commitRipCapture(opened)
+        })
+    }
+
+    private func commitRipCapture(_ opened: Result<Void, Error>) {
+        do {
+            try opened.get()
             markEngineStartedForRipCapture()
             let session = try engine.createRipSession(
                 deckIdx: 0,
@@ -276,9 +291,11 @@ extension WaveformAppModel {
         }
     }
 
-    /// Dismiss a finished (`.done`) or capture-failed rip without
-    /// touching deck A. Used by the bar's dismiss affordance and the
-    /// done-state auto-clear.
+    /// Close a finished (`.done`) or failed rip. Used by the bar's Done
+    /// and the done-state auto-clear. Deck A lets go of the side, as it
+    /// does on Discard and on leaving for Prep: after an import it held
+    /// `side.raw`, a file the commit had just replaced with `side.flac`
+    /// (rig, 2026-11-27).
     func dismissRip() {
         guard let session = ripSession else {
             clearRipState()
@@ -289,7 +306,12 @@ extension WaveformAppModel {
             // cancelling removes the session dir.
             try? session.cancel()
         }
+        let deckHoldsSide = deckA.sourceURL?.path.hasPrefix(session.sessionDir()) ?? false
         clearRipState()
+        if deckHoldsSide {
+            stop()
+            startPrep()
+        }
     }
 
     // MARK: PREP · REC · PERF
@@ -369,6 +391,7 @@ extension WaveformAppModel {
         ripJobs = nil
         ripLastGeneration = 0
         ripPhase = .none
+        ripIsResplit = false
     }
 
     // MARK: Poll
@@ -483,6 +506,12 @@ extension WaveformAppModel {
         ripDoneClearTask?.cancel()
         ripDoneClearTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 4_000_000_000)
+            // Closing lets go of deck A, so never while the side is
+            // sounding: the confirmation stays up until it stops, or
+            // until Done.
+            while !Task.isCancelled, self?.ripPhase == .done, self?.deckA.isPlaying == true {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
             guard let self, !Task.isCancelled else { return }
             if self.ripPhase == .done { self.dismissRip() }
         }
@@ -583,6 +612,7 @@ extension WaveformAppModel {
         do {
             let session = try engine.resplitRipSession(sessionDir: sessionDir)
             ripSession = session
+            ripIsResplit = true
             ripLastGeneration = session.generation()
             ripSplits = session.splitMarkers()
             ripSegments = session.segments()
@@ -901,8 +931,11 @@ extension WaveformAppModel {
     /// is worse than no match.
     func identifyRip() {
         guard let session = ripSession else { return }
-        let key = acoustIdKey
-        guard !key.trimmingCharacters(in: .whitespaces).isEmpty else {
+        // A key typed in Preferences wins: it is the one on screen. A
+        // developer's goes in the repo's `.env` instead (Debug builds).
+        let typed = acoustIdKey.trimmingCharacters(in: .whitespaces)
+        let key = typed.isEmpty ? (DevEnvironment.value("DUB_ACOUSTID_KEY") ?? "") : typed
+        guard !key.isEmpty else {
             ripRecognition = RipRecognitionUi(
                 finished: true,
                 error: "No AcoustID key — add one in Preferences"

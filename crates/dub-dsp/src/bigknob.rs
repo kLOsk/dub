@@ -27,6 +27,7 @@
 //! under `assert_no_alloc`.
 
 use crate::echo::one_pole_coeff;
+use crate::glide::{knob_glide_coeff, Glide};
 
 const DENORMAL_FLOOR: f32 = 1.0e-20;
 
@@ -51,8 +52,12 @@ pub struct BigKnobHpf {
     g: f32,
     g_target: f32,
     g_smooth: f32,
-    /// SVF damping = 1 / Q.
-    k: f32,
+    /// SVF damping = 1 / Q, gliding: a Q knob taken in steps zippered.
+    k: Glide,
+    knob_glide: f32,
+    /// Audio has run since construction or [`BigKnobHpf::reset`]; until
+    /// then a new Q is taken at once.
+    primed: bool,
     /// Integrator state, per channel.
     ic1: [f32; 2],
     ic2: [f32; 2],
@@ -87,7 +92,9 @@ impl BigKnobHpf {
             g: 0.0,
             g_target: 0.0,
             g_smooth: one_pole_coeff(40.0, sample_rate),
-            k: std::f32::consts::SQRT_2, // Q = 0.707
+            k: Glide::new(std::f32::consts::SQRT_2), // Q = 0.707
+            knob_glide: knob_glide_coeff(sample_rate),
+            primed: false,
             ic1: [0.0; 2],
             ic2: [0.0; 2],
             macro_g,
@@ -122,9 +129,10 @@ impl BigKnobHpf {
         self.g_target = self.step_g[i];
     }
 
-    /// Resonance (Q): 0.5 (gentle, passive-like) up to ~8 (sharp). Off-RT.
+    /// Resonance (Q): 0.5 (gentle, passive-like) up to ~8 (sharp). RT-safe;
+    /// once audio runs the filter glides to it.
     pub fn set_resonance(&mut self, q: f32) {
-        self.k = 1.0 / q.clamp(0.5, 8.0);
+        self.k.set(1.0 / q.clamp(0.5, 8.0), !self.primed);
     }
 
     /// Advanced **super-knob**: one 0..1 macro performs the whole bass-drop —
@@ -153,15 +161,19 @@ impl BigKnobHpf {
         self.ic1 = [0.0; 2];
         self.ic2 = [0.0; 2];
         self.g = self.g_target;
+        self.k.snap();
+        self.primed = false;
     }
 
     /// High-pass the stereo block **in place**. RT-safe: one divide per frame,
     /// otherwise adds/mults; coefficient ramps toward target (no clicks).
     pub fn process_block(&mut self, out: &mut [f32], stride: usize, offset: usize) {
         debug_assert!(stride >= 2 && offset + 2 <= stride);
+        self.primed = true;
         for frame in out.chunks_exact_mut(stride) {
             self.g = flush(self.g + self.g_smooth * (self.g_target - self.g));
-            let a1 = 1.0 / (1.0 + self.g * (self.g + self.k));
+            let k = self.k.next(self.knob_glide);
+            let a1 = 1.0 / (1.0 + self.g * (self.g + k));
             let a2 = self.g * a1;
             let a3 = self.g * a2;
             for ch in 0..2 {
@@ -171,7 +183,7 @@ impl BigKnobHpf {
                 let v2 = self.ic2[ch] + a2 * self.ic1[ch] + a3 * v3;
                 self.ic1[ch] = flush(2.0 * v1 - self.ic1[ch]);
                 self.ic2[ch] = flush(2.0 * v2 - self.ic2[ch]);
-                frame[offset + ch] = x - self.k * v1 - v2; // high-pass output
+                frame[offset + ch] = x - k * v1 - v2; // high-pass output
             }
         }
     }

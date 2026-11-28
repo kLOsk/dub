@@ -226,6 +226,7 @@ struct PerformanceView: View {
             mapMode: model.mapMode,
             onToggleMap: { model.mapMode.toggle() },
             connecting: model.engineStarts.connecting,
+            awaitingMicrophone: model.awaitingInputPermission,
             // Performance only: Prep is prepared with the mouse and has
             // nothing to map, and recording less so (rig, 2026-09-26).
             showsMap: model.engineMode == .timecode && model.ripPhase == .none,
@@ -845,7 +846,11 @@ struct PerformanceView: View {
 
     @ViewBuilder
     private func perfDeckRow(columnWidth: CGFloat) -> some View {
-        HStack(spacing: 1) {
+        // Top-aligned. A pane taller than the region is cut at its foot,
+        // like a column; centred, the row grew to the tall pane and the
+        // other deck sat halfway down it with its own foot cut off
+        // (deck A under a DUB FX deck B, rig 2026-11-27).
+        HStack(alignment: .top, spacing: 1) {
             deckPane(
                 side: .a, deckIdx: 0, enabled: deckAEnabled,
                 columnWidth: columnWidth,
@@ -1200,7 +1205,8 @@ struct PerformanceView: View {
             recognition: model.ripRecognition,
             playingIndex: model.ripPlayingSegment,
             genres: model.ripGenres,
-            metadataRevision: model.ripMetadataRevision)
+            metadataRevision: model.ripMetadataRevision,
+            isResplit: model.ripIsResplit)
     }
 
     private var ripReviewPanelCallbacks: RipReviewPanelCallbacks {

@@ -193,6 +193,14 @@
   (~176 LOC) — it was a display-only transform with no audio counterpart, so it
   could only ever diverge. A "stabilised" readout that isn't the thing you hear
   is a bug, not a feature.
+- **Nothing a TC deck learns may learn from a THRU or DUB FX input.** Music
+  decodes as a clean timecode lock often enough to teach whatever listens.
+  It started the auto-calibration (2026-11-11: back on TC, SETTLING PITCH
+  47 %), then, once that was gated, settled the pitch readout's wobble fit
+  (2026-11-27: PITCH −100.76 % and Calibrating 80 % with a silent input,
+  80 % being the fit's four fifths of the progress). Gate on the deck's
+  mode, not on the decoder's lock: the decoder cannot tell a record from a
+  control record. Hold rather than reset, so a THRU visit costs TC nothing.
 
 ## BPM / beat grid
 
@@ -342,6 +350,32 @@
   the tapped integer wins (Apocalypse: 174.8/174.9/175.10 → 175.0 regardless of
   where you tap). `AUTO` stays strict so a clean fit at a genuine fractional
   tempo (Chase & Status 174.98) is preserved. Don't loosen AUTO.
+- **A needle landing in a loud side is one huge onset; skip it.** On the rig
+  the landing's spectral flux was 57 against a p99.9 of 9.5 for the music
+  around it. The live THRU tracker normalises the autocorrelation by its
+  zero lag, so that one value flattened confidence under the 0.20 a dim
+  tempo needs for as long as it sat in the 60 s window: no BPM for 42 s
+  after a record change (rig 8.7, 2026-11-27). A tap was blamed first; it
+  only happened to come before. `LiveStreamConfig::settle_secs` (0.5 s)
+  now drops the first half second after the needle lands. Synthetic beds
+  (noise, multisines) did not reproduce it, and neither did a clean
+  digital cut into the same record: the interface makes the landing one
+  sharper step. `testdata/rip-baselines/thru-needle-drop-c.flac` is the
+  real one, and `dub thru-tempo` replays any recording through the live
+  listener.
+- **Weigh a tempo rule on every candidate table, not on the record that
+  prompted it.** Two rig misreads (a reggae intro at 98.5 for 131, a dnb
+  side at 116.6) looked like one 3:2 problem. The reggae intro's onsets
+  really pulse at 98.7: a triplet figure with no beat in it until the
+  drums. The dnb's snares repeat every 0.512 s: two beats of a 173 tune
+  heard 35 % fast, which is what a 33 played at 45 gives, or an odd
+  three-beat pattern at 175. No onset rule fixes either. Exporting every locked Traktor song's
+  table (`DUB_BPM_CANDIDATES_OUT`) and simulating rules on it found what
+  does generalise: in a near-tie inside the three-two family, the beat
+  whose quarters, halves, doubles and bars repeat most wins. Read the way
+  a THRU deck reads (no genre), three-two readings fell 54 → 21 of 1,747
+  and 70 → 34 on songs' first 20 s. Features that include the third
+  harmonic made it worse: it is exactly what makes the rival score.
 
 ## Waveform rendering (Metal)
 
@@ -436,6 +470,17 @@
   rack, and routing the siren and the sampler into it is the point of the
   `→ FX` pill — so the render order flips per deck on `control_mode`, not
   globally. `fx_deck_renders_the_siren_through_the_rack` holds both ends.
+- **Every switch and every knob on the audio path glides; measure across the
+  join.** The rack's IN/OUT, the Space Echo's selector and nine knobs were
+  all taken in one sample, and every one clicked or zippered by measure
+  (2026-11-28, `dub-engine/tests/fx_by_ear.rs`): a switch fades over 5 ms
+  and a knob glides (`dub-dsp/src/glide.rs`), with setters snapping until
+  audio has run so the unit tests' first samples stay exact. A unit coming
+  back in from out starts clean (reset): frozen, the Space Echo replayed
+  its tape and the spring kept a KICK pressed while it was out. The first
+  version of the click test measured the window *after* each switch and
+  found nothing: a step lives between the last sample before and the first
+  after, so the window must hold both (`run_across`).
 - **Emulate the real unit's control surface, don't invent knobs.** Expert mode
   mirrors the physical box (DS01E = MODE / PITCH / RATE / TRIGGER + PT2399
   TIME / FEEDBACK / ECHO VOLUME / FILTER / ECHO CUT). Confirm the real layout
@@ -458,8 +503,30 @@
 - **The FFI is audio-thread-non-affecting by construction** — every method
   reads `PeakBuffer` atomics or runs once at attach. Swift never reaches into
   the IO proc. Keep it that way.
+- **Never hold `DubEngine.state` across a device open.** Opening the SL 3
+  takes seconds; the start functions used to hold the state lock for all
+  of it, so every screen getter (`sampleRate`, `peaksLen`, `thruTempo` …)
+  waited on it from the main thread — the engine-start freeze, three stall
+  dumps in one rig run (2026-11-27). Moving the *call* to `deviceQueue` did
+  not help, because the getters still queued behind the lock. Opens now run
+  under `start_gate` only (`DubEngine::install_session`) and the state lock
+  is taken just to install the running session; `stop_thru` takes the gate
+  first, so a stop that overtakes a start stops what it opened. Lock
+  order: gate, then state. And open a device from Swift through
+  `startOnDeviceQueue`, never on the main thread — the rip's REC did, for
+  232 ms in `AudioDeviceStart`.
 
 ## Library / SwiftUI
+
+- **Anything that can stand in a deck's place reports `DeckColumnHeightKey`.**
+  The Performance deck region is cut to the taller column's reported
+  height; a pane that reports nothing is simply not counted. The DUB FX
+  rack (561 pt) did not report, so beside a THRU deck A the region was cut
+  to 392 pt; the `HStack` grew to the rack and, centred by default, put
+  deck A 85 pt down with its foot cut off (rig, 2026-11-27). The deck row
+  is top-aligned now, so an overflow cuts the tall pane's foot rather than
+  moving its neighbour. Check a new pane with `fittingSize` in
+  `PerformanceLayoutTests`: a snapshot forces its frame and looks fine.
 
 - **A number that moves while a record plays must never be `@Published`.**
   `deckA` / `deckB` publish on any change, and a live pitch or input level
@@ -652,6 +719,12 @@
   (`~/Library/Logs/Dub/stall-*.txt`): read that before guessing — the
   report was "beachballs while skipping through the track", and neither
   the seek nor the stretcher that had changed that day was in it.
+- **An `NSComboBox` with no items still opens on its arrow — as nothing.**
+  The empty list is invisible, and the next click anywhere in the window
+  goes to closing it: PREP did nothing, and the run notes blamed the
+  field's focus (rig, 2026-11-27). The tell was the field's text still
+  selected after the "lost" click. `RipGenreComboBox` turns the arrow of
+  an empty list into the start of an edit.
 - **A search field searches what the DJ is looking at.** The collection-
   only search carried a comment that node-scoped search was "not wired
   here", and with most of a library living in other apps' nodes that
@@ -667,6 +740,16 @@
   `Color.clear` and put the content in its overlay.
 
 ## Vinyl rip (M26)
+
+- **A committed side has no spill, and a re-split has no plan: guard on
+  what is on disk.** After a commit the session folder holds `side.flac`
+  and the imported FLACs, not `side.raw.wav`; re-split clears the plan
+  and queues the old tracks in `replaced_uuids`. Recognition read only
+  the spill (Identify failed on every re-split) and Discard's guard read
+  only the plan (it would have deleted a rip the library still plays,
+  2026-11-28). Read the side through `read_side`; leaving a re-split
+  restores the manifest it opened from (`abandon_resplit`) and deletes
+  nothing.
 
 - **The record tap must be wired at Thru-attach time.** The `AudioInput`
   consumer is take-once and re-attaching a `ThruSource` displaces the one
@@ -1113,6 +1196,11 @@
   with "Vinyl recording" enabled and a DJ interface present, a PREP / PERF
   switch overrides auto-detect so the DJ rig can digitize records in Prep
   mode (PRD §5.2.7); the override clears when the interface unplugs.
+  **It lasts one session.** It was saved, and since unplugging only cleared
+  it while Dub ran, the last REC or PREP press brought the next launch up in
+  Prep at the turntables (2026-11-27). A choice the DJ made under a
+  condition must not outlive the session it was made in: a launch follows
+  the hardware.
 - **Whole tracks decode to RAM; forward/backward playback is byte-symmetric.**
   No per-block disk streaming. Instant rewind/backspin depends on this.
 - **The dep graph is fully permissive — keep it that way.** The old GPLv3

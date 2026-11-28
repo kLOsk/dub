@@ -26,6 +26,7 @@
 //! Verified under `assert_no_alloc`.
 
 use crate::echo::one_pole_coeff;
+use crate::glide::{knob_glide_coeff, Glide};
 
 const DENORMAL_FLOOR: f32 = 1.0e-20;
 
@@ -49,6 +50,10 @@ impl Allpass {
         }
     }
 
+    fn reset(&mut self) {
+        self.buf.fill(0.0);
+    }
+
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let delayed = self.buf[self.idx];
@@ -67,7 +72,8 @@ struct Spring {
     write: usize,
     read_len: usize,
     aps: Vec<Allpass>,
-    feedback: f32,
+    /// The tank's loop gain, gliding: DECAY taken in steps zippered.
+    feedback: Glide,
     damp_coeff: f32,
     damp_lp: f32,
     dc: f32,
@@ -92,15 +98,26 @@ impl Spring {
             write: 0,
             read_len,
             aps,
-            feedback,
+            feedback: Glide::new(feedback),
             damp_coeff,
             damp_lp: 0.0,
             dc: 0.0,
         }
     }
 
+    fn reset(&mut self) {
+        self.delay.fill(0.0);
+        for ap in &mut self.aps {
+            ap.reset();
+        }
+        self.damp_lp = 0.0;
+        self.dc = 0.0;
+        self.feedback.snap();
+    }
+
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
+    fn process(&mut self, x: f32, glide: f32) -> f32 {
+        let feedback = self.feedback.next(glide);
         let read = self.delay[(self.write.wrapping_sub(self.read_len)) & self.mask];
         // Damping low-pass in the loop (highs decay first).
         self.damp_lp = flush(self.damp_lp + self.damp_coeff * (read - self.damp_lp));
@@ -112,13 +129,13 @@ impl Spring {
         // DC blocker (springs pass little bass): one-pole high-pass.
         let hp = d - self.dc;
         self.dc = flush(self.dc + 0.005 * hp);
-        self.delay[self.write] = flush(x + hp * self.feedback);
+        self.delay[self.write] = flush(x + hp * feedback);
         self.write = (self.write + 1) & self.mask;
         hp
     }
 
-    fn set(&mut self, feedback: f32, damp_coeff: f32) {
-        self.feedback = feedback.clamp(0.0, 0.97);
+    fn set(&mut self, feedback: f32, damp_coeff: f32, snap: bool) {
+        self.feedback.set(feedback.clamp(0.0, 0.97), snap);
         self.damp_coeff = damp_coeff.clamp(0.02, 1.0);
     }
 }
@@ -132,7 +149,12 @@ const MACRO_LUT_LEN: usize = 65;
 #[derive(Debug)]
 pub struct SpringReverb {
     springs: [Spring; 2],
-    wet: f32,
+    /// The wet level, gliding: WET taken in steps zippered.
+    wet: Glide,
+    knob_glide: f32,
+    /// Audio has run since construction or [`SpringReverb::reset`]; until
+    /// then a knob is taken at once.
+    primed: bool,
     /// Pending "kick" excitation injected over the next few samples.
     kick_left: u32,
     kick_level: f32,
@@ -183,7 +205,9 @@ impl SpringReverb {
         }
         Self {
             springs,
-            wet: 0.5,
+            wet: Glide::new(0.5),
+            knob_glide: knob_glide_coeff(sample_rate),
+            primed: false,
             kick_left: 0,
             kick_level: 0.0,
             noise: 0x9e37_79b9,
@@ -198,24 +222,26 @@ impl SpringReverb {
     pub fn set_params(&mut self, decay: f32, damping_hz: f32, wet: f32, sample_rate: f32) {
         let fb = decay.clamp(0.0, 0.97);
         let damp = one_pole_coeff(damping_hz, sample_rate);
+        let snap = !self.primed;
         for s in &mut self.springs {
-            s.set(fb, damp);
+            s.set(fb, damp, snap);
         }
-        self.wet = wet.clamp(0.0, 1.0);
+        self.wet.set(wet.clamp(0.0, 1.0), snap);
     }
 
-    /// Set only the wet mix (0..1). Pure assignment, RT-safe.
+    /// Set only the wet mix (0..1). RT-safe; once audio runs it glides.
     pub fn set_wet(&mut self, wet: f32) {
-        self.wet = wet.clamp(0.0, 1.0);
+        self.wet.set(wet.clamp(0.0, 1.0), !self.primed);
     }
 
     /// Expert DECAY: the tank's feedback (0..1 → tail length). Pure
     /// assignment, RT-safe; the damping is left where TONE put it.
     pub fn set_decay(&mut self, decay: f32) {
         let fb = decay.clamp(0.0, 0.97);
+        let snap = !self.primed;
         for s in &mut self.springs {
             let damp = s.damp_coeff;
-            s.set(fb, damp);
+            s.set(fb, damp, snap);
         }
     }
 
@@ -234,19 +260,21 @@ impl SpringReverb {
         } else {
             self.tone_damp[MACRO_LUT_LEN - 1]
         };
+        let snap = !self.primed;
         for s in &mut self.springs {
-            let fb = s.feedback;
-            s.set(fb, damp);
+            let fb = s.feedback.target();
+            s.set(fb, damp, snap);
         }
     }
 
     /// Apply already-resolved tank parameters. Pure assignment, RT-safe — the
     /// damping coefficient must be precomputed off-RT (e.g. via the macro LUT).
     fn set_resolved(&mut self, feedback: f32, damp_coeff: f32, wet: f32) {
+        let snap = !self.primed;
         for s in &mut self.springs {
-            s.set(feedback, damp_coeff);
+            s.set(feedback, damp_coeff, snap);
         }
-        self.wet = wet.clamp(0.0, 1.0);
+        self.wet.set(wet.clamp(0.0, 1.0), snap);
     }
 
     /// Advanced **super-knob**: one 0..1 macro grows the tank — 0 = a small,
@@ -269,6 +297,18 @@ impl SpringReverb {
         self.set_resolved(0.6 + m * 0.37, damp, 0.1 + m * 0.8);
     }
 
+    /// Silence the tank and drop a kick not yet played. The rings are a few
+    /// thousand samples, so the audio thread may call it: a unit coming
+    /// back in starts clean instead of replaying what it held.
+    pub fn reset(&mut self) {
+        for s in &mut self.springs {
+            s.reset();
+        }
+        self.kick_left = 0;
+        self.wet.snap();
+        self.primed = false;
+    }
+
     /// Whack the spring — inject a thunder-crash impulse (`level` 0..1).
     pub fn kick(&mut self, level: f32) {
         self.kick_level = level.clamp(0.0, 1.0);
@@ -281,30 +321,37 @@ impl SpringReverb {
     pub fn process_block(&mut self, out: &mut [f32], stride: usize, offset: usize) {
         debug_assert!(stride >= 2 && offset + 2 <= stride);
         for frame in out.chunks_exact_mut(stride) {
-            let dry = 0.5 * (frame[offset] + frame[offset + 1]);
-
-            // Kick excitation (a short noise burst into the springs).
-            let mut exc = dry;
-            if self.kick_left > 0 {
-                self.kick_left -= 1;
-                self.noise = self
-                    .noise
-                    .wrapping_mul(1_664_525)
-                    .wrapping_add(1_013_904_223);
-                #[allow(clippy::cast_precision_loss)]
-                let n = (self.noise >> 9) as f32 / (1u32 << 23) as f32 - 1.0;
-                exc += n * self.kick_level;
-            }
-
-            let mut wet = 0.0;
-            for s in &mut self.springs {
-                wet += s.process(exc);
-            }
-            wet *= 0.5 * self.wet;
-
+            let wet = self.tick(0.5 * (frame[offset] + frame[offset + 1]));
             frame[offset] += wet;
             frame[offset + 1] += wet;
         }
+    }
+
+    /// One sample through the tank: `dry` in, the wet (already at the
+    /// `wet` level) out. For a host that mixes the tail itself — the
+    /// Space Echo fading its onboard reverb in and out. RT-safe.
+    #[inline]
+    pub fn tick(&mut self, dry: f32) -> f32 {
+        self.primed = true;
+        // Kick excitation (a short noise burst into the springs).
+        let mut exc = dry;
+        if self.kick_left > 0 {
+            self.kick_left -= 1;
+            self.noise = self
+                .noise
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            #[allow(clippy::cast_precision_loss)]
+            let n = (self.noise >> 9) as f32 / (1u32 << 23) as f32 - 1.0;
+            exc += n * self.kick_level;
+        }
+
+        let glide = self.knob_glide;
+        let mut wet = 0.0;
+        for s in &mut self.springs {
+            wet += s.process(exc, glide);
+        }
+        wet * 0.5 * self.wet.next(glide)
     }
 }
 
@@ -353,9 +400,9 @@ mod tests {
         let damp = s.springs[0].damp_coeff;
         s.set_decay(0.9);
         assert!((s.springs[0].damp_coeff - damp).abs() < 1e-9);
-        assert!((s.springs[0].feedback - 0.9).abs() < 1e-6);
+        assert!((s.springs[0].feedback.target() - 0.9).abs() < 1e-6);
         s.set_tone(0.75);
-        assert!((s.springs[0].feedback - 0.9).abs() < 1e-6);
+        assert!((s.springs[0].feedback.target() - 0.9).abs() < 1e-6);
         assert!(
             s.springs[0].damp_coeff > damp,
             "brighter tone = larger coefficient"
@@ -425,6 +472,26 @@ mod tests {
         assert!(early > 1e-3, "kick produced no sound: {early}");
         assert!(late < early, "kick tail did not decay");
         assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 4.0));
+    }
+
+    /// Reset silences a ringing tank and drops a kick not yet played —
+    /// what the engine relies on when the unit comes back in.
+    #[test]
+    fn reset_silences_the_tank_and_drops_a_pending_kick() {
+        let mut rev = SpringReverb::new(SR);
+        rev.set_params(0.85, 2_600.0, 1.0, SR);
+        rev.kick(1.0);
+        let mut buf = [0.0f32; 2 * 4_800];
+        rev.process_block(&mut buf, 2, 0);
+        assert!(buf.iter().any(|s| s.abs() > 1e-3), "the kick rang nothing");
+        rev.kick(1.0);
+        rev.reset();
+        let mut after = [0.0f32; 2 * 4_800];
+        rev.process_block(&mut after, 2, 0);
+        assert!(
+            after.iter().all(|&s| s == 0.0),
+            "the tank rang on after reset"
+        );
     }
 
     #[test]

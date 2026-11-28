@@ -34,7 +34,10 @@ mod diagnose;
 mod export;
 mod import;
 mod input_cmds;
+mod loopback;
 mod recognize;
+mod rig_check;
+mod rig_coach;
 mod rip;
 mod rip_resplit;
 mod rip_tune;
@@ -61,6 +64,13 @@ fn main() -> ExitCode {
         "list-outputs" => input_cmds::list_outputs(),
         "levels" => input_cmds::levels(&args[2..]),
         "capture" => input_cmds::capture(&args[2..]),
+        "loopback" => loopback::run(&args[2..]),
+        "rig-coach" => rig_coach::run(&args[2..]),
+        "loop-check" => rig_check::run_loop_check(&args[2..]),
+        "echo-check" => rig_check::run_echo_check(&args[2..]),
+        "thru-check" => rig_check::run_thru_check(&args[2..]),
+        "dropout-check" => rig_check::run_dropout_check(&args[2..]),
+        "thru-tempo" => rig_check::run_thru_tempo(&args[2..]),
         "rip" => rip::run(&args[2..]),
         "rip-tune" => rip_tune::run(&args[2..]),
         "recognize" => recognize::run(&args[2..]),
@@ -112,6 +122,35 @@ fn print_help() {
     eprintln!("                    [--input-channels N,M] [--sr SR] [--duration SECS]");
     eprintln!("                                                  record input device to WAV");
     eprintln!("                    --input-channels uses 1-based indices: SL3 deck A = 3,4");
+    eprintln!("  loopback <take>   [--record <wav>] [--device NAME] [--output-device NAME]");
+    eprintln!("                    [--output-channels N,M] [--input-channels N,M]");
+    eprintln!("                    [--from SECS] [--secs SECS] [--repeat N] [--gain G]");
+    eprintln!("                    [--lead-in SECS] [--tail SECS]");
+    eprintln!("                    play a recorded take out of one pair of the interface,");
+    eprintln!("                    sample for sample, and record another pair meanwhile:");
+    eprintln!("                    a turntable with no hands for a running Dub. Channels");
+    eprintln!("                    are 1-based; both default to 1,2, the SL 3's aux pair.");
+    eprintln!("                    Never changes the device's rate or buffer size.");
+    eprintln!("  loop-check <wav> --bpm B IN,OUT,BEATS...");
+    eprintln!("                    a loop's length, its seams and its exit, from a recording of");
+    eprintln!("                    the deck (dub loopback --record); IN / OUT are seconds of it.");
+    eprintln!("  echo-check <untouched.wav> <echo.wav> --presses FILE --bpm B");
+    eprintln!("                    [--rates FILE --take-start SECS]");
+    eprintln!("                    ECHO OUT against an untouched pass of the same take: when the");
+    eprintln!("                    dry muted, the repeats, where the tune came back.");
+    eprintln!("  thru-check <rec.wav> [--in 3,4] [--out 1,2] [--every SECS]");
+    eprintln!("                    a THRU deck's output against what it received, from one");
+    eprintln!("                    recording of both: the delay through it, and any dropout.");
+    eprintln!("  dropout-check <wav[:L,R]> [--window-ms 5] [--floor-db -60] [--around-db -35]");
+    eprintln!("  thru-tempo <wav[:L,R]> [--from S] [--secs S] [--every 1]   the THRU tempo readout, replayed");
+    eprintln!("                    holes in a recording of a deck playing: a few ms of near");
+    eprintln!("                    silence between loud neighbours.");
+    eprintln!("  rig-coach         [--tag hands|robot|loop] [--section N] [--checklist PATH]");
+    eprintln!("                    [--out DIR] [--fresh] [--mute] [--list]");
+    eprintln!("                    reads docs/RIG-CHECKLIST.md aloud one item at a time;");
+    eprintln!("                    answer p / f / s at the decks. Writes the run to");
+    eprintln!("                    docs/rig-runs/ as it goes, names any stall dump that");
+    eprintln!("                    lands during an item, and picks an unfinished run up.");
     eprintln!("  rip               [--device NAME] [--input-channels N,M] [--duration SECS]");
     eprintln!("                    [--out DIR] [--splits SEC,SEC,...] [--titles T,T,...]");
     eprintln!("                    [--artist A] [--album B] [--genre G] [--year Y]");
@@ -149,8 +188,9 @@ fn print_help() {
     eprintln!("  diagnose <path-or-id>                    grid / waveform / BPM debugger");
     eprintln!("  recognize <session-dir> [--key KEY] [--apply]");
     eprintln!("                    name a committed rip's tracks — AcoustID + MusicBrainz.");
-    eprintln!("                    Key from --key or $DUB_ACOUSTID_KEY (free at");
-    eprintln!("                    acoustid.org/new-application). Read-only unless --apply.");
+    eprintln!("                    Dub's application key from --key, $DUB_ACOUSTID_KEY or");
+    eprintln!("                    the repo's .env (acoustid.org/new-application). Read-only");
+    eprintln!("                    unless --apply.");
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--window MS] [--head N]");

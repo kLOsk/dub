@@ -12,6 +12,7 @@
 pub mod bigknob;
 mod blep;
 pub mod echo;
+mod glide;
 pub mod hk628;
 pub mod loudness;
 pub mod phaser;

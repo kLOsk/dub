@@ -42,7 +42,8 @@ import SwiftUI
 /// header band consumed, so title, tempo, key, pitch and the source
 /// switch keep one source of truth.
 /// The height a deck column's blocks take, padding included — the taller
-/// of the two decks. The Performance surface cuts the deck region to it:
+/// of the two decks, a DUB FX deck's rack counting as its column
+/// (`FxRackColumn`). The Performance surface cuts the deck region to it:
 /// the waveform strip is no longer than the columns beside it, and what
 /// used to be empty space under them is the library's (Daniel,
 /// 2026-11-14).

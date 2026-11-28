@@ -673,23 +673,7 @@ impl AudioOutput {
         opts: &OutputOptions,
         routing: dub_engine::OutputRouting,
     ) -> Result<Self, AudioError> {
-        // Per-device output selection (M5.7). Prefer UID — stable across
-        // reconnects and unique across same-model duplicates. Fall back
-        // to a name substring match for older drivers whose UIDs aren't
-        // stable, then to the macOS default output AU if nothing was
-        // requested. Each branch yields a `(AudioUnit, AudioObjectID)`
-        // pair so the rest of the function is independent of the
-        // resolution path.
-        let (mut audio_unit, device_id, needs_init) = open_output_audio_unit(opts)?;
-        let device_name = get_device_name(device_id).unwrap_or_default();
         let engine_sr = engine.sample_rate();
-
-        if opts.channels < 2 {
-            return Err(AudioError::Device(format!(
-                "OutputOptions.channels = {} is invalid; need at least 2 to hold a stereo pair",
-                opts.channels
-            )));
-        }
         for (deck_idx, slot) in routing.iter().enumerate() {
             if let Some(first) = slot {
                 if (*first).saturating_add(2) > opts.channels {
@@ -701,67 +685,12 @@ impl AudioOutput {
                 }
             }
         }
-
-        // Same SR alignment as the legacy stereo path. See the long
-        // comment in start_with_buffer_size for the full rationale.
-        let device_sr = get_device_nominal_sample_rate(device_id)?;
         let target_sr = opts.sample_rate.unwrap_or(engine_sr);
-        if (f64::from(target_sr) - device_sr).abs() > 0.5 {
-            set_device_sample_rate(device_id, f64::from(target_sr)).map_err(|e| {
-                AudioError::Device(format!(
-                    "output device '{device_name}' refused SR {target_sr} Hz \
-                     (was {device_sr} Hz): {e:?} — check Audio MIDI Setup \
-                     for supported rates",
-                ))
-            })?;
-        }
-
-        // Force interleaved f32 N-channel at the engine's SR. Same
-        // alignment guarantee as the stereo path; the only difference
-        // is `channels: opts.channels`.
-        let format = StreamFormat {
-            sample_rate: f64::from(target_sr),
-            sample_format: SampleFormat::F32,
-            flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
-            channels: opts.channels,
-        };
-        audio_unit.set_stream_format(format, Scope::Input, Element::Output)?;
-
-        // Optional channel map: reorder logical AU channels to physical
-        // device channels. Most users (including the SL3) don't need
-        // this — the device's physical layout is already in order, so
-        // logical out N == physical out N+1 (1-based). Provided for
-        // future quirky devices.
-        if let Some(map) = &opts.channel_map {
-            if map.len() != opts.channels as usize {
-                return Err(AudioError::Device(format!(
-                    "channel_map.len() = {} but opts.channels = {}; map must have one entry \
-                     per logical AU channel",
-                    map.len(),
-                    opts.channels
-                )));
-            }
-            set_output_channel_map(&audio_unit, map)?;
-        }
-
-        // HAL units opened for a *specific* device (the `device_uid` /
-        // `device_name` Performance path) come back uninitialized so the
-        // stream format / channel map above can be set first. They must
-        // be initialized before `start()`, exactly like the input path —
-        // otherwise `AudioOutputUnitStart` returns
-        // `kAudioUnitErr_Uninitialized`. The `IOType::DefaultOutput`
-        // branch is already initialized by `AudioUnit::new`, so skip it
-        // there (re-initializing a live default-output unit is needless).
-        if needs_init {
-            audio_unit
-                .initialize()
-                .map_err(|e| AudioError::Device(format!("audio_unit.initialize(output): {e}")))?;
-        }
-
-        if let Some(frames) = opts.buffer_frames {
-            set_buffer_frame_size(device_id, frames)?;
-        }
-        let buffer_frames = get_buffer_frame_size(device_id)?;
+        let OpenedOutput {
+            mut audio_unit,
+            device_name,
+            buffer_frames,
+        } = open_configured_output(opts, target_sr, DeviceRate::Set)?;
 
         let callback_count = Arc::new(AtomicU64::new(0));
         let cb_count = callback_count.clone();
@@ -803,6 +732,60 @@ impl AudioOutput {
             audio_unit,
             callback_count,
             sample_rate: target_sr,
+            buffer_frames,
+            channels: opts.channels,
+            device_name,
+        })
+    }
+
+    /// Play whatever `render` writes, with no engine in between.
+    ///
+    /// `render(buffer, channels)` runs on the real-time thread once per
+    /// callback with an interleaved buffer `channels` wide; it must fill
+    /// all of it and must not allocate, lock or block. This is what
+    /// `dub loopback` plays a recorded take through: the samples reach
+    /// the converter as they were recorded.
+    ///
+    /// Unlike [`Self::start_with_options`] this never changes the
+    /// device's sample rate: the device may be the one a running Dub is
+    /// playing on, so a mismatch is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError`] if the device can't be opened, runs at
+    /// another rate than `sample_rate`, rejects the stream format, or
+    /// the callback can't be installed.
+    pub fn start_with_source<F>(
+        sample_rate: f32,
+        opts: &OutputOptions,
+        mut render: F,
+    ) -> Result<Self, AudioError>
+    where
+        F: FnMut(&mut [f32], usize) + Send + 'static,
+    {
+        let OpenedOutput {
+            mut audio_unit,
+            device_name,
+            buffer_frames,
+        } = open_configured_output(opts, sample_rate, DeviceRate::Require)?;
+
+        let callback_count = Arc::new(AtomicU64::new(0));
+        let cb_count = callback_count.clone();
+        let num_channels = opts.channels as usize;
+        audio_unit.set_render_callback(
+            move |args: render_callback::Args<data::Interleaved<f32>>| {
+                render(args.data.buffer, num_channels);
+                cb_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )?;
+
+        start_audio_unit_with_retry(&mut audio_unit, "output")?;
+
+        Ok(Self {
+            audio_unit,
+            callback_count,
+            sample_rate,
             buffer_frames,
             channels: opts.channels,
             device_name,
@@ -904,6 +887,126 @@ fn device_id_from_audio_unit(au: &AudioUnit) -> Result<AudioObjectID, AudioError
         Element::Output,
     )?;
     Ok(device_id)
+}
+
+/// What to do when an output device isn't running at the rate we need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceRate {
+    /// Switch the device over. Right for the engine, which owns the
+    /// interface it plays on.
+    Set,
+    /// Refuse. Right for a player that shares the interface with a
+    /// running Dub: changing the rate under it would restart its engine.
+    Require,
+}
+
+/// An output unit with its stream format, channel map and buffer size
+/// applied, ready for a render callback.
+struct OpenedOutput {
+    audio_unit: AudioUnit,
+    device_name: String,
+    buffer_frames: u32,
+}
+
+/// Open the output device `opts` names and configure it for interleaved
+/// f32 at `target_sr`. Shared by every output path so the order of the
+/// HAL calls (format and map before `initialize`, buffer size after)
+/// lives in one place.
+fn open_configured_output(
+    opts: &OutputOptions,
+    target_sr: f32,
+    rate: DeviceRate,
+) -> Result<OpenedOutput, AudioError> {
+    if opts.channels < 2 {
+        return Err(AudioError::Device(format!(
+            "OutputOptions.channels = {} is invalid; need at least 2 to hold a stereo pair",
+            opts.channels
+        )));
+    }
+
+    // Per-device output selection (M5.7). Prefer UID — stable across
+    // reconnects and unique across same-model duplicates. Fall back
+    // to a name substring match for older drivers whose UIDs aren't
+    // stable, then to the macOS default output AU if nothing was
+    // requested.
+    let (mut audio_unit, device_id, needs_init) = open_output_audio_unit(opts)?;
+    let device_name = get_device_name(device_id).unwrap_or_default();
+
+    // Same SR alignment as the legacy stereo path. See the long
+    // comment in start_with_buffer_size for the full rationale.
+    let device_sr = get_device_nominal_sample_rate(device_id)?;
+    if (f64::from(target_sr) - device_sr).abs() > 0.5 {
+        match rate {
+            DeviceRate::Set => {
+                set_device_sample_rate(device_id, f64::from(target_sr)).map_err(|e| {
+                    AudioError::Device(format!(
+                        "output device '{device_name}' refused SR {target_sr} Hz \
+                         (was {device_sr} Hz): {e:?} — check Audio MIDI Setup \
+                         for supported rates",
+                    ))
+                })?;
+            }
+            DeviceRate::Require => {
+                return Err(AudioError::Device(format!(
+                    "output device '{device_name}' runs at {device_sr} Hz and the audio \
+                     is {target_sr} Hz; not changing the rate of a device another app \
+                     may be playing on",
+                )));
+            }
+        }
+    }
+
+    // Force interleaved f32 N-channel at the target SR, so CoreAudio
+    // inserts no converter.
+    let format = StreamFormat {
+        sample_rate: f64::from(target_sr),
+        sample_format: SampleFormat::F32,
+        flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
+        channels: opts.channels,
+    };
+    audio_unit.set_stream_format(format, Scope::Input, Element::Output)?;
+
+    // Optional channel map: reorder logical AU channels to physical
+    // device channels. Most users (including the SL3) don't need
+    // this — the device's physical layout is already in order, so
+    // logical out N == physical out N+1 (1-based). Provided for
+    // future quirky devices.
+    if let Some(map) = &opts.channel_map {
+        if map.len() != opts.channels as usize {
+            return Err(AudioError::Device(format!(
+                "channel_map.len() = {} but opts.channels = {}; map must have one entry \
+                 per logical AU channel",
+                map.len(),
+                opts.channels
+            )));
+        }
+        set_output_channel_map(&audio_unit, map)?;
+    }
+
+    // HAL units opened for a *specific* device (the `device_uid` /
+    // `device_name` Performance path) come back uninitialized so the
+    // stream format / channel map above can be set first. They must
+    // be initialized before `start()`, exactly like the input path —
+    // otherwise `AudioOutputUnitStart` returns
+    // `kAudioUnitErr_Uninitialized`. The `IOType::DefaultOutput`
+    // branch is already initialized by `AudioUnit::new`, so skip it
+    // there (re-initializing a live default-output unit is needless).
+    if needs_init {
+        audio_unit
+            .initialize()
+            .map_err(|e| AudioError::Device(format!("audio_unit.initialize(output): {e}")))?;
+    }
+
+    if let Some(frames) = opts.buffer_frames {
+        set_buffer_frame_size(device_id, frames)?;
+    }
+    let buffer_frames = get_buffer_frame_size(device_id)?;
+
+    Ok(OpenedOutput {
+        audio_unit,
+        device_name,
+        buffer_frames,
+    })
 }
 
 /// Build the output AudioUnit and resolve its bound device-id, honoring

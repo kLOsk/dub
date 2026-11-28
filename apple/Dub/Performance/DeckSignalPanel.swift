@@ -305,7 +305,7 @@ struct DeckSignalSlideOut: View {
             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Toggle deck \(side.label) signal panel")
+        .accessibilityLabel("Toggle \(side.label) signal panel")
     }
 
     private static let tabWidth = DubLayout.deckSignalTabWidth
@@ -370,7 +370,7 @@ struct DeckSignalPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             HStack {
-                Text("SIGNAL · DECK \(side.label)")
+                Text("SIGNAL · \(side.label)")
                     .font(DubFont.caps)
                     .tracking(1.2)
                     .foregroundStyle(DubColor.textSecondary)

@@ -30,6 +30,9 @@ enum BeatgridCalibrationLog {
         qos: .utility)
 
     static var logURL: URL {
+        if let folder = DubDataDir.current {
+            return folder.appendingPathComponent(fileName)
+        }
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask).first!

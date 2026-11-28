@@ -24,13 +24,86 @@ const LIBRARY_DB_FILE: &str = "library.sqlite";
 /// files are now named `{fingerprint_hex}.wf` under this directory.
 const WAVEFORMS_CACHE_SUBDIR: &str = "waveforms";
 
+/// Subdirectory for rip sessions: `~/Music/Dub/Rips/` by default.
+const RIPS_SUBDIR: &str = "Rips";
+
+/// Environment variable that moves everything Dub keeps on disk —
+/// the library, its waveform sidecars, rip sessions — into one
+/// folder. For test runs that must not touch the DJ's own library:
+/// a rig checklist run loads tracks (set history) and commits rips
+/// (imports), and the waveform sidecars are named by the database's
+/// own row ids, so a second database sharing the default cache would
+/// overwrite the first one's waveforms.
+///
+/// Unset, every location is the platform default. Reaches the app
+/// with `open --env DUB_DATA_DIR=/abs/path Dub.app`.
+pub const DATA_DIR_ENV: &str = "DUB_DATA_DIR";
+
+/// The folder [`DATA_DIR_ENV`] names, if it is set.
+///
+/// # Errors
+/// [`LibraryError::DataDirNotAbsolute`] for a relative path: an app
+/// launched from the Finder runs with `/` as its working directory,
+/// so a relative folder would land somewhere nobody meant.
+pub fn data_dir_override() -> Result<Option<PathBuf>> {
+    data_dir_from(std::env::var_os(DATA_DIR_ENV))
+}
+
+fn data_dir_from(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>> {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(value);
+    if !dir.is_absolute() {
+        return Err(LibraryError::DataDirNotAbsolute { path: dir });
+    }
+    Ok(Some(dir))
+}
+
+/// Where the library database, waveform sidecars and rips live for a
+/// [`DATA_DIR_ENV`] folder: all three side by side inside it.
+fn library_db_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(LIBRARY_DB_FILE)
+}
+
+fn waveforms_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(WAVEFORMS_CACHE_SUBDIR)
+}
+
+fn rips_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(RIPS_SUBDIR)
+}
+
+/// The folder rip sessions are written to and recovered from:
+/// `~/Music/Dub/Rips/`, or `Rips/` inside [`DATA_DIR_ENV`].
+///
+/// # Errors
+/// A relative [`DATA_DIR_ENV`], or no Music or home directory.
+pub fn default_rips_dir() -> Result<PathBuf> {
+    if let Some(dir) = data_dir_override()? {
+        return Ok(rips_in(&dir));
+    }
+    let music = dirs::audio_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+        .ok_or_else(|| LibraryError::VolumeUuidUnavailable {
+            path: PathBuf::from("<music_dir>"),
+            reason: "platform did not expose a Music or home directory",
+        })?;
+    Ok(music.join(APP_SUPPORT_SUBDIR).join(RIPS_SUBDIR))
+}
+
 /// The default on-disk path to `library.sqlite`. Creates the parent
 /// directory chain if needed; the caller of [`crate::Library::open_default`]
 /// expects an openable path.
 ///
 /// On macOS this resolves to
-/// `~/Library/Application Support/Dub/library.sqlite`.
+/// `~/Library/Application Support/Dub/library.sqlite`, or to
+/// `library.sqlite` inside [`DATA_DIR_ENV`] when that is set.
 pub fn default_library_db_path() -> Result<PathBuf> {
+    if let Some(dir) = data_dir_override()? {
+        ensure_dir(&dir)?;
+        return Ok(library_db_in(&dir));
+    }
     let base = dirs::config_dir().ok_or_else(|| LibraryError::VolumeUuidUnavailable {
         path: PathBuf::from("<config_dir>"),
         reason: "platform did not expose a user config directory",
@@ -44,11 +117,17 @@ pub fn default_library_db_path() -> Result<PathBuf> {
 /// renderer + M10.5j cache use this path; the library subsystem
 /// stores filenames relative to it in `analysis_cache.waveform_sidecar_path`.
 ///
-/// On macOS this resolves to `~/Library/Caches/Dub/waveforms/`.
+/// On macOS this resolves to `~/Library/Caches/Dub/waveforms/`, or to
+/// `waveforms/` inside [`DATA_DIR_ENV`] when that is set.
 /// Tests redirect to a per-test tempdir via
 /// [`crate::Library::with_waveforms_cache_dir`] rather than a
 /// global env var — see PRD-BEATS C1 (round 4).
 pub fn default_waveforms_cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = data_dir_override()? {
+        let dir = waveforms_in(&dir);
+        ensure_dir(&dir)?;
+        return Ok(dir);
+    }
     let base = dirs::cache_dir().ok_or_else(|| LibraryError::VolumeUuidUnavailable {
         path: PathBuf::from("<cache_dir>"),
         reason: "platform did not expose a user cache directory",
@@ -82,4 +161,46 @@ pub fn waveform_sidecar_path(fingerprint_id: i64) -> Result<PathBuf> {
 fn ensure_dir(dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| LibraryError::io(dir, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn unset_or_empty_means_the_defaults() {
+        assert_eq!(data_dir_from(None).unwrap(), None);
+        assert_eq!(data_dir_from(Some(OsString::new())).unwrap(), None);
+    }
+
+    #[test]
+    fn an_absolute_folder_is_taken() {
+        assert_eq!(
+            data_dir_from(Some(OsString::from("/tmp/dub-scratch"))).unwrap(),
+            Some(PathBuf::from("/tmp/dub-scratch"))
+        );
+    }
+
+    #[test]
+    fn a_relative_folder_is_refused() {
+        let err = data_dir_from(Some(OsString::from("scratch"))).unwrap_err();
+        assert!(
+            matches!(err, LibraryError::DataDirNotAbsolute { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains(DATA_DIR_ENV));
+    }
+
+    #[test]
+    fn everything_lives_side_by_side_inside_it() {
+        let dir = Path::new("/tmp/dub-scratch");
+        assert_eq!(
+            library_db_in(dir),
+            Path::new("/tmp/dub-scratch/library.sqlite")
+        );
+        assert_eq!(waveforms_in(dir), Path::new("/tmp/dub-scratch/waveforms"));
+        assert_eq!(rips_in(dir), Path::new("/tmp/dub-scratch/Rips"));
+    }
 }

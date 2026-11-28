@@ -54,6 +54,31 @@ impl RipOutcome {
     }
 }
 
+/// The library, for the moments a commit needs it: importing a track,
+/// opening and closing its analysis, removing a track a re-split
+/// replaced. The FFI keeps the library behind a mutex the browser reads
+/// from the main thread, and a commit that held it for the encode froze
+/// the browser for the whole import; everything slow — encoding,
+/// tagging, analysing, the side archive — runs between these calls.
+pub trait LibraryAccess {
+    /// Runs `f` on the library, or returns `None` if it has been closed.
+    fn with<R>(&mut self, f: impl FnOnce(&mut Library) -> R) -> Option<R>;
+}
+
+impl LibraryAccess for Library {
+    fn with<R>(&mut self, f: impl FnOnce(&mut Library) -> R) -> Option<R> {
+        Some(f(self))
+    }
+}
+
+/// Why a segment did not import.
+enum SegmentError {
+    /// This segment failed; the rest of the side carries on.
+    Failed(String),
+    /// The library went away: no further segment can import either.
+    LibraryClosed,
+}
+
 /// Where a segment is in the commit pass, reported as it happens.
 ///
 /// The commit worker is the slowest thing in the rip flow (encode +
@@ -78,11 +103,11 @@ pub enum CommitProgress {
     ArchiveStarted,
 }
 
-pub(crate) fn commit_session(
+pub(crate) fn commit_session<L: LibraryAccess>(
     session_dir: &Path,
     spill_path: &Path,
     manifest: &mut RipManifest,
-    library: &mut Library,
+    library: &mut L,
     progress: &mut dyn FnMut(CommitProgress),
 ) -> Result<RipOutcome, RipError> {
     // A fully committed session (every segment imported, archive
@@ -203,7 +228,8 @@ pub(crate) fn commit_session(
         let result = commit_segment(library, pcm, sample_rate, &file, &tags);
         let (library_uuid, error) = match result {
             Ok((uuid, analysis_error)) => (Some(uuid), analysis_error),
-            Err(e) => (None, Some(e)),
+            Err(SegmentError::Failed(e)) => (None, Some(e)),
+            Err(SegmentError::LibraryClosed) => return Err(RipError::LibraryClosed),
         };
 
         let entry = &mut manifest.tracks[index];
@@ -270,18 +296,20 @@ pub(crate) fn commit_session(
         for uuid in &manifest.replaced_uuids {
             // A track the operator already deleted by hand is not an
             // error; the goal state is "it is gone", and it is.
-            match library.delete_track(uuid) {
-                Ok(()) => removed.push(uuid.clone()),
-                Err(dub_library::LibraryError::TrackNotFound { .. }) => removed.push(uuid.clone()),
-                Err(e) => {
-                    if let Some(seg) = outcome.segments.first_mut() {
-                        let note = format!("could not remove the replaced track {uuid}: {e}");
-                        seg.error = Some(match seg.error.take() {
-                            Some(prev) => format!("{prev}; {note}"),
-                            None => note,
-                        });
-                    }
+            let failure = match library.with(|lib| lib.delete_track(uuid)) {
+                Some(Ok(()) | Err(dub_library::LibraryError::TrackNotFound { .. })) => {
+                    removed.push(uuid.clone());
+                    None
                 }
+                Some(Err(e)) => Some(e.to_string()),
+                None => Some("library not open".to_string()),
+            };
+            if let (Some(e), Some(seg)) = (failure, outcome.segments.first_mut()) {
+                let note = format!("could not remove the replaced track {uuid}: {e}");
+                seg.error = Some(match seg.error.take() {
+                    Some(prev) => format!("{prev}; {note}"),
+                    None => note,
+                });
             }
         }
         manifest.replaced_uuids.retain(|u| !removed.contains(u));
@@ -328,17 +356,21 @@ fn remove_orphaned_segments(session_dir: &Path, manifest: &RipManifest) {
 /// Encode + tag + import + pre-analyze one segment. Returns the
 /// library UUID and, separately, a non-fatal analysis error (the
 /// track is imported either way; analysis re-runs lazily on load).
-fn commit_segment(
-    library: &mut Library,
+fn commit_segment<L: LibraryAccess>(
+    library: &mut L,
     pcm: &[f32],
     sample_rate: u32,
     file: &Path,
     tags: &TrackTags,
-) -> Result<(String, Option<String>), String> {
-    encode_flac_24bit(pcm, sample_rate, 2, file).map_err(|e| format!("encode failed: {e}"))?;
-    write_tags(file, tags).map_err(|e| format!("tagging failed: {e}"))?;
+) -> Result<(String, Option<String>), SegmentError> {
+    encode_flac_24bit(pcm, sample_rate, 2, file)
+        .map_err(|e| SegmentError::Failed(format!("encode failed: {e}")))?;
+    write_tags(file, tags).map_err(|e| SegmentError::Failed(format!("tagging failed: {e}")))?;
 
-    let imported = import_file(library, file).map_err(|e| format!("import failed: {e}"))?;
+    let imported = library
+        .with(|lib| import_file(lib, file))
+        .ok_or(SegmentError::LibraryClosed)?
+        .map_err(|e| SegmentError::Failed(format!("import failed: {e}")))?;
 
     // Analysis needs the imported track's id, so it cannot run before
     // the file exists — BPM and key only exist after the first tag
@@ -373,21 +405,24 @@ fn with_analysis(tags: &TrackTags, outcome: &AnalysisOutcome) -> TrackTags {
 /// this is bit-identical to decoding the file back). Populates
 /// fingerprint, beat grid, key, LUFS, and the waveform sidecar so
 /// ripped tracks arrive in the library "prepared".
-fn analyze_segment(
-    library: &Library,
+fn analyze_segment<L: LibraryAccess>(
+    library: &mut L,
     uuid: &str,
     pcm: &[f32],
     sample_rate: u32,
 ) -> Result<AnalysisOutcome, String> {
+    let closed = || "analysis stopped: library closed".to_string();
     let job = library
-        .analyze_prepare(uuid)
+        .with(|lib| lib.analyze_prepare(uuid))
+        .ok_or_else(closed)?
         .map_err(|e| format!("analysis prepare failed: {e}"))?;
     let track = dub_io::Track::from_interleaved(pcm.to_vec(), sample_rate, 2)
         .ok_or_else(|| "analysis input rejected by dub-io".to_string())?;
     let computed = analyze_compute_with_track(&job, &track)
         .map_err(|e| format!("analysis compute failed: {e}"))?;
     library
-        .analyze_commit(&job, computed)
+        .with(|lib| lib.analyze_commit(&job, computed))
+        .ok_or_else(closed)?
         .map_err(|e| format!("analysis commit failed: {e}"))
 }
 
@@ -493,6 +528,22 @@ fn sanitize_file_stem(stem: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// The whole side, interleaved stereo, and its sample rate: the spill
+/// while there is one, else `side.flac` — a committed side reopened to
+/// split again keeps only the archive. Recognition reads the side
+/// through this too; reading the spill alone, Identify failed on every
+/// re-split ("side spill unreadable", rig 2026-11-28).
+///
+/// # Errors
+///
+/// [`RipError::SpillUnreadable`] if neither can be read.
+pub fn read_side(session_dir: &Path) -> Result<(Vec<f32>, u32), RipError> {
+    read_spill(
+        &session_dir.join(crate::session::SPILL_FILE),
+        &session_dir.join(ARCHIVE_FILE),
+    )
 }
 
 /// Read the spill for encoding.

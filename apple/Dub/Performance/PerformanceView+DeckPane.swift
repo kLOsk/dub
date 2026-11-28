@@ -440,34 +440,60 @@ extension PerformanceView {
     }
 
     func idleCaption(side: DeckSide) -> String {
+        Self.idleCaption(
+            side: side, running: model.isRunning, mode: model.engineMode,
+            awaitingMicrophone: model.awaitingInputPermission)
+    }
+
+    func idleHint(side: DeckSide) -> String {
+        Self.idleHint(
+            side: side, running: model.isRunning, mode: model.engineMode,
+            awaitingMicrophone: model.awaitingInputPermission, lastError: model.lastError)
+    }
+
+    /// The idle deck's caption. Static so its wording is tested without
+    /// an engine (`MicrophoneWaitTests`).
+    static func idleCaption(
+        side: DeckSide, running: Bool, mode: EngineMode, awaitingMicrophone: Bool
+    ) -> String {
+        if !running, awaitingMicrophone { return "WAITING FOR MICROPHONE ACCESS" }
         switch side {
         case .a:
-            guard model.isRunning else { return "ENGINE STOPPED" }
-            return model.engineMode == .prep ? "NO TRACK LOADED" : "DECK STOPPED"
+            guard running else { return "ENGINE STOPPED" }
+            return mode == .prep ? "NO TRACK LOADED" : "DECK STOPPED"
         case .b:
-            if !model.isRunning { return "ENGINE STOPPED" }
-            switch model.engineMode {
+            if !running { return "ENGINE STOPPED" }
+            switch mode {
             case .timecode: return "SINGLE-DECK MODE"
             case .prep:     return "PREP MODE — DECK B OFF"
             }
         }
     }
 
-    func idleHint(side: DeckSide) -> String {
+    static func idleHint(
+        side: DeckSide, running: Bool, mode: EngineMode, awaitingMicrophone: Bool,
+        lastError: String?
+    ) -> String {
         switch side {
         case .a:
-            if !model.isRunning {
+            if !running {
+                // macOS's prompt first: until it is answered nothing in
+                // Preferences can start the engine.
+                if awaitingMicrophone {
+                    return "macOS is asking whether Dub may use the microphone: that is how "
+                        + "your interface's inputs reach it. Click Allow in its window."
+                }
                 // Surface the real reason the engine is stopped (a
                 // start failure / mic denial) so the user sees the
                 // actual error instead of a generic "configure" nudge.
-                if let err = model.lastError {
+                if let err = lastError {
                     return err
                 }
                 return "Open Preferences (⌘,) to pick an input device and start."
             }
             return "Drag an audio file here, or press Space to load the browser selection."
         case .b:
-            if !model.isRunning {
+            if !running {
                 // U-20 — deck A already carries the engine-stopped
                 // "Open Preferences" nudge (or the real start error).
                 // Repeating it on deck B is the one genuinely
@@ -475,7 +501,7 @@ extension PerformanceView {
                 // quiet here; its caption ("ENGINE STOPPED") is enough.
                 return ""
             }
-            switch model.engineMode {
+            switch mode {
             case .timecode:
                 return "Drag a file here, or configure deck B's channels in Preferences (⌘,) for Thru."
             case .prep:

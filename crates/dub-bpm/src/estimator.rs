@@ -13,7 +13,7 @@
 //! (PRD §5.2.3).
 
 use crate::onset::OnsetDetector;
-use crate::tempo::estimate_tempo;
+use crate::tempo::{estimate_tempo, score_lags};
 use crate::{BpmEstimate, BpmRange, TempoOctave, HOP_SIZE};
 
 /// Errors that can occur while constructing a streaming estimator.
@@ -22,6 +22,20 @@ pub enum BpmEstimatorError {
     /// Sample rate is zero.
     #[error("invalid sample rate: 0")]
     ZeroSampleRate,
+}
+
+/// Every lag the tempo search scored — see [`BpmEstimator::candidates`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TempoCandidates {
+    /// ODF samples per second: lag `l` is `60 × odf_sample_rate / l` BPM.
+    pub odf_sample_rate: f64,
+    /// The first lag scored; `scores[i]` is lag `lag_min + i`.
+    pub lag_min: usize,
+    /// Each lag's harmonic-mean local energy.
+    pub scores: Vec<f64>,
+    /// The autocorrelation from lag 0, over its value at lag 0.
+    pub acf: Vec<f64>,
 }
 
 /// Streaming tempo estimator. Feed audio with [`process`], read the
@@ -148,6 +162,27 @@ impl BpmEstimator {
         ) {
             self.last_estimate = Some(est);
         }
+    }
+
+    /// The tempo search's whole table over the current onsets — for
+    /// diagnostics that weigh a rule against every candidate, not for
+    /// the app. `None` where the search would find nothing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn candidates(&self) -> Option<TempoCandidates> {
+        let table = score_lags(
+            self.detector.odf(),
+            self.odf_sample_rate,
+            self.bpm_range,
+            TempoOctave::DEFAULT,
+        )?;
+        let zero = table.acf_raw[0];
+        Some(TempoCandidates {
+            odf_sample_rate: self.odf_sample_rate,
+            lag_min: table.lag_min,
+            scores: table.scores,
+            acf: table.acf_raw.iter().map(|v| v / zero).collect(),
+        })
     }
 
     /// Current best estimate, or `None` if the estimator has never

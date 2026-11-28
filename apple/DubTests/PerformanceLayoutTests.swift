@@ -226,6 +226,62 @@ final class PerformanceLayoutTests: XCTestCase {
         XCTAssertEqual(size.height, DubLayout.deckColumnEchoHeight, accuracy: 0.5)
     }
 
+    // MARK: - The DUB FX channel
+
+    /// Every unit in: the rack at its tallest.
+    private static let fxRackFixture: FxChannelState = {
+        var s = FxChannelState()
+        s.side = .b
+        s.input = .send
+        s.inputPair = "3–4"
+        s.active = [true, true, true, true]
+        s.motion = false
+        return s
+    }()
+
+    private final class ReportedHeight { var height: CGFloat = 0 }
+
+    /// What a view reports under `DeckColumnHeightKey` once laid out,
+    /// in a host far taller than it so nothing is squeezed.
+    @MainActor
+    private func reportedDeckColumnHeight(_ view: some View, width: CGFloat) -> CGFloat {
+        let reported = ReportedHeight()
+        let host = NSHostingView(
+            rootView: view.frame(width: width)
+                .onPreferenceChange(DeckColumnHeightKey.self) { reported.height = $0 })
+        host.frame = CGRect(x: 0, y: 0, width: width, height: 2000)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        return reported.height
+    }
+
+    /// With a deck on DUB FX the rack stands where that deck's column
+    /// would, and the deck region is cut to what the columns report. The
+    /// rack reported nothing (rig, 2026-11-27): the region shrank to deck
+    /// A's THRU column, the rack ran off its foot below the Space Echo's
+    /// knobs, and the row, as tall as the rack, centred deck A in it —
+    /// ~85 pt down, its TEMPO row and ECHO OUT cut off.
+    @MainActor
+    func test_fxRack_reportsItsHeightToTheDeckRegion() {
+        let natural = fittingSize(FxRackColumn(state: Self.fxRackFixture), width: columnWidthAt1440).height
+        let reported = reportedDeckColumnHeight(FxRackColumn(state: Self.fxRackFixture), width: columnWidthAt1440)
+        XCTAssertGreaterThan(natural, 0)
+        XCTAssertEqual(
+            reported, natural, accuracy: 1,
+            "the rack reported \(reported) pt to the deck region and needs \(natural) pt")
+    }
+
+    /// The rack, the rack bar under it and the library's floor fit a
+    /// 1440 × 900 window, as the deck column does.
+    func test_fxRack_fitsThePane_onALaptopScreen() {
+        let size = fittingSize(FxRackColumn(state: Self.fxRackFixture), width: columnWidthAt1440)
+        let total = 900 - DubLayout.statusStripHeight - 1
+        XCTAssertLessThanOrEqual(
+            size.height + DubLayout.rackBarHeight + 1 + DubLayout.libraryMinHeight, total + 0.5,
+            "the FX rack needs \(size.height) pt; with the rack bar it leaves the library less than "
+                + "its floor at 1440 × 900")
+    }
+
     // MARK: - The global rack bar
 
     func test_rackBar_fitsItsHeightToken() {

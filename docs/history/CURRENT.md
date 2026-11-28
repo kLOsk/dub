@@ -234,6 +234,24 @@ gate is local-only because GitHub CI has no macOS app job.
   `.overlay` on the pane now, and the scope gives way when the pane is
   short. Swift suite green (426 + 2).
 
+- **A launch page (Daniel, 2026-11-26, a draft), on branch `feat/website`
+  since 2026-11-28** (one commit on `9d88a4b`, not pushed): it grows there
+  and merges into main to launch, because `pages.yml` deploys from main.
+  `website/`:
+  one hand-written page (`index.html`, `style.css`, no build step, no kit)
+  for DJs and the press. The first draft followed the taste skill and read
+  as a SaaS page; Daniel kept the look and had the words, pictures and
+  structure redone around who it is for: bring your rig and your crates,
+  then turntablists (the sticker holds), sound systems (siren, Echo Out,
+  THRU) and collectors (rip), the mixer stance, an honest status, download,
+  press. Dub's own colours, real screenshots, the SIGNAL panel, THRU deck
+  and siren as live HTML. Marked placeholders stand where the film, a
+  juggle clip, a rig photo, Daniel's story, the press kit and a contact go.
+  Deploys by `.github/workflows/pages.yml` for `website/**` only; `ci.yml`
+  ignores `website/**`. Before launch: the placeholders, Pages switched on,
+  a domain (canonical, absolute og:image), self-hosted fonts instead of
+  Google Fonts, Impressum and Datenschutz, and the notarized build.
+
 - **The deck header, mirrored and draggable (Daniel, 2026-11-26,
   uncommitted).** The readout row is one mirror: deck A's labels hang right
   and its key lock sits *before* the key, deck B's hang left with the lock
@@ -394,7 +412,7 @@ gate is local-only because GitHub CI has no macOS app job.
   filter bar when open; the 105 ms fetch of a 2,183-row list.
 
 - **Four things from the 2026-11-19 session (Daniel; uncommitted, built,
-  none tried in the app, Swift tests compiled but not run).** The right
+  none tried in the app; Swift tests passed 2026-11-28).** The right
   deck's **LOCK** lit in its deck tint, teal, beside amber controls — it
   takes `DubColor.controlAccent` like every other control. **Quick
   Scratch** now drops an engaged echo-out, on its deck and on the deck the
@@ -419,7 +437,7 @@ gate is local-only because GitHub CI has no macOS app job.
   result re-sorted the whole view and compared it with the old one, and a
   load fires several. The changed row is now overwritten in place, or
   moved by a binary search when what it is sorted or filtered by changed
-  (`LibraryView.repositionRow`). The Swift snapshot suite was not run.
+  (`LibraryView.repositionRow`). The Swift snapshot suite passed 2026-11-28.
 
 - **The tempo a band keeps can be read (2026-11-19, Daniel: quantize the
   tracks whose tempo "is simply drifting", leave megamixes and real tempo
@@ -507,9 +525,9 @@ gate is local-only because GitHub CI has no macOS app job.
   (`GridQuality::drifts`; PRD-BEATS §5.3): 7.0 % of locked grids, 92.3 %
   of a 12 ms/min drift. Stored readings are the old kind until a song is
   re-analysed or its 1 is set again; *Hey Ya*'s stored 5.6 is under the
-  new limit either way. **Not run:** the Swift snapshot suite — the
-  fixtures that draw the mark moved from 5 to 12 so the pictures should
-  not change.
+  new limit either way. The Swift snapshot suite passed 2026-11-28 with
+  the baselines unchanged (the fixtures that draw the mark moved from 5
+  to 12 so the pictures would not change).
 - **Tap tempo: the taps are a hint (FFI 91, 2026-11-19, Daniel: "the dj
   always taps wrong, he's never as accurate as the transients").** 3+ taps
   on a playing deck now tell Dub roughly how fast and roughly where; the
@@ -795,6 +813,212 @@ hardware.
    `dub rip-tune`. The trim brackets, the Real Records node and re-split
    have never been driven on the rig with a record on the platter.
 
+**The checklist is split by who can run it (2026-11-27, uncommitted).**
+`RIG-CHECKLIST.md` tags every item `robot` (the agent drives the app),
+`loop` (the agent plays a recorded take through the SL 3: AUX OUT → LEFT
+DECK IN, LEFT DECK OUT → AUX IN) or `hands` (Daniel): 16 · 24 · 28. Nothing
+has been run that way yet. ① **`DUB_DATA_DIR`** is the scratch library
+(2026-11-27): set, the library, its waveform sidecars, rip sessions and the
+grid-calibration log all live in that folder (`dub_library::paths`,
+`DubDataDir.swift`), and the library footer reads SCRATCH LIBRARY. The
+sidecars are why it is one folder and not just another database: they are
+named by the database's row ids, so a second database in the default cache
+would overwrite the first one's waveforms. Launched on it, the real
+`library.sqlite` stayed untouched. ② `dub loopback` is built: a take out of
+one pair of the interface sample for sample, another pair recorded, the
+device's rate and buffer never changed (`AudioOutput::start_with_source`,
+which shares `open_configured_output` with the engine's path). On
+the SL 3 the same day, cabled AUX OUT → LEFT DECK IN → (deck A) → AUX IN:
+a 10 s Serato take came back at −0.1 dB, correlation 0.999, and decoded as
+the original; beside a running Dub it locked deck A, and a siren shot
+routed to deck A arrived on AUX IN. No `loop` item has been run yet. It
+reports where the take sits in the recording and at what level, not the
+round-trip delay: the two streams start a few milliseconds apart and
+nothing ties them to one clock yet, so a THRU latency figure needs the
+callbacks' timestamps first.
+
+**First `loop` results (2026-11-27, Debug build, scratch library):** 2.1, 2.6,
+4.1, 0.10 and 5.1 pass, in `docs/rig-runs/2026-11-27-1430-9d88a4b-loop.md`.
+The checks are `dub loop-check` / `dub echo-check` (`rig_check.rs`, tested on
+synthetic loops and echoes), the drivers `make rig-drive` +
+`scripts/rig/lib.sh`. Lessons from getting them wrong first: decode a take
+before calling it steady (`testdata/timecode/README.md` maps the steady
+stretches), time presses from the recording's start (`dub loopback` prints
+it), and check for the lock screen — macOS reports Dub frontmost under it.
+
+**Loop run (2026-11-27): 21 pass, 2 fail, 7.7 postponed** after a rerun on
+the fixed build (`docs/rig-runs/2026-11-27-1430-9d88a4b-loop.md`, Debug
+build, uncommitted). Fixed and rerun on the rig:
+- **Engine-start freeze**: the start functions held `DubEngine.state` across
+  the device open, so every screen getter waited seconds. Opens now run under
+  `start_gate` only (`install_session`); no lock stall in the rerun.
+- **REC opened the interface on the main thread**: now `startOnDeviceQueue`,
+  shared with Performance.
+- **The rip's pass-through played on the aux pair (1–2)** and fed back on the
+  loop cabling; it now plays on deck A's outputs like THRU (Daniel: "same as
+  thru"). 7.1 / 7.4 / 7.5 / 0.12 pass: auto-start, run-out stop and the split
+  match `dub rip-tune` on the same side.
+- **8.7, no tempo after a record change**: the needle landing in a loud side
+  is one onset ~6× any in the music and held confidence down for up to a
+  minute; the live listener now skips 0.5 s after the needle
+  (`settle_secs`). 3 s to a tempo on the rig, was nothing for 38 s.
+
+Fixed after the rerun, tested, seen in the app 2026-11-28:
+- **The rip's Import froze Dub for 21.8 s**: `status` read the side's bounds
+  through the session lock the encode holds. `status` / `segments` now answer
+  from what was frozen at Import.
+- **…and it no longer holds the library for the encode (2026-11-28).** The
+  commit takes the library only to import a track, open and close its
+  analysis, and remove a replaced one (`dub_rip::LibraryAccess`; the FFI's
+  `SharedLibrary` locks per call). Encoding, tagging, analysing and the
+  side archive run with the library free, so the browser reads it
+  between tracks. `the_review_and_the_library_answer_while_a_commit_encodes`
+  holds the library and requires a FLAC to appear; the old worker encoded
+  nothing.
+
+Open from it:
+- **8.6**: the reggae intro reads 98.5 until the drums (~43 s; offline too):
+  its onsets are a triplet figure with no beat in them, and no onset rule
+  reads 131 out of it. The dnb side is set aside: Daniel is recording a
+  better one (its snares repeat every 0.512 s — two beats of a 173 tune
+  heard 35 % fast, as a 33 played at 45 would be, or a three-beat pattern
+  at 175).
+- **The SL 3 got stuck at the 2026-11-28 launch.** The rebuilt app's five
+  tries at the input all failed (`'stop'`) behind the microphone prompt, and
+  afterwards even `dub capture` hung; a replug cleared it and Dub connected
+  by itself. What stuck it is open (the old build had quit with its engine
+  running). Run file, "Rerun 2026-11-28". **Narrowed the same afternoon:**
+  Dub opens the input only through `ensureInputPermission`, and a rebuilt
+  app behind the prompt at 14:29 sat idle — `.notDetermined`, waiting on
+  `requestAccess`, no device open (stack sample: main thread in its run
+  loop, no HAL threads). So the morning's five tries must have come with
+  macOS reporting `.authorized` (the grant of an earlier build) while the
+  real access raised a new prompt and failed with `'stop'`. Which of those
+  two states a rebuild lands in, and whether the failed starts are what
+  stick the SL 3, is still open; a stable signing identity (Apple
+  Development) would end both.
+- **THRU decks read in 78–156** (the DJ's default octave) since 2026-11-19;
+  Daniel's "80–160 if it helps" is already the case. What was left was the
+  three-two family inside the octave, which Daniel wants gone ("the crowd
+  doesn't mind pressing 2x … avoid the 1.5x"). **Built 2026-11-28:** near
+  ties in that family are settled on the beat's duple hierarchy
+  (`settle_three_two`). Read as a THRU deck reads, three-two readings of
+  1,769 locked Traktor songs fell 54 → 21 (a minute in) and 70 → 34 (first
+  20 s); the library's own analysis went 96.3 % → 97.4 % on tempo with
+  placement and taps unchanged. Investigation §8.11. Not on the rig yet.
+- **0.4**: SYNC follows deck A, tap included (Repeat at ¾ beat every time),
+  but with deck B on DUB FX the deck row is cut short: deck A drops ~95 pt
+  and loses TEMPO and ECHO OUT, the rack is cut below its knobs, so the
+  `♩ A · <bpm>` line cannot be seen. Alpha. **Fixed 2026-11-28:** the
+  deck region is cut to the columns' reported
+  height and the rack reported none, so the region shrank to deck A's THRU
+  column (392 pt) while the rack needs 561; the row grew to the rack and,
+  centred, put deck A (561 − 392) / 2 ≈ 85 pt down. The rack reports its
+  height now (`FxRackColumn`, `DeckColumnHeightKey`), the deck row is
+  top-aligned, and the units sit 2 pt apart instead of 6 so the rack fits
+  a 1440 × 900 window over the library's floor (`PerformanceLayoutTests`,
+  two new tests, red before). The seven FX snapshots were re-recorded:
+  the same units, closer. **Rerun on the rig 2026-11-28: PASS** (run file,
+  "0.4 again"). Left from it: after a tap the echo's line read `♩ A ·
+  133.1` beside the deck's `BPM · TAP 132.9` — SYNC moves only past a
+  0.3 % change (`syncFxEcho`, for pitch rides) and the tap was 0.15 %.
+  **Fixed the same day and seen in the app:** the DJ's own acts (a tap on
+  the deck's BPM, ×2 / ½, back to the tracker, TAP on the unit) land
+  exactly; the poll keeps the threshold (`FxRackControls.syncMovesRepeat`,
+  `FxEchoSyncTests`). On the rig at 16:40, four taps → deck `BPM · TAP
+  132.6`, echo `♩ A · 132.6` (run file, "7.7 and the echo line"). While the
+  tracker settles by less than 0.3 % the line can still trail the deck's
+  number (133.6 against 133.4 there).
+
+Small ones from it, fixed 2026-11-28 and all four seen in the app the same
+day (the empty-list arrow on an empty scratch library, every library source
+off for that launch through the command line, with the unfinished rip of
+2026-11-27 reopened from the banner: the arrow put the caret in the field,
+no list opened, and one click on PREP went to Prep):
+- **A genre typed on one rip row is offered on the others** before the
+  library has it (`RipReviewPanelState.genres(for:)`; never the row's own,
+  so the list does not move under the letters being typed).
+- **Done lets go of deck A**, as Discard and PREP already did: after an
+  import it held `side.raw`, a file the commit had replaced. The auto-close
+  waits while the side is playing.
+- **THRU and DUB FX no longer teach the pitch readout** (`dub-engine`,
+  `the_pitch_readout_never_learns_a_thru_or_fx_input`): music decoded as a
+  clean lock settled the wobble fit, so back on TC a silent deck read PITCH
+  −100.76 % and Calibrating 80 %. What TC learned is held across a THRU visit.
+- **The "PREP only ends the edit" click was an empty genre list**: the
+  arrow of an `NSComboBox` with no items opens an invisible list that eats
+  the next click. With nothing to list, the arrow now starts the edit.
+
+**`make rig` reads the `hands` items aloud** (`dub rig-coach`, 2026-11-27):
+one key per item at the decks, the run written to `docs/rig-runs/` after
+every answer, stall dumps named on the item they landed in, an unfinished
+run picked up. It parses the checklist, and a test fails if an item there
+loses its tag. Driven through a pseudo-terminal here; not yet used in a
+real session. **It records each item (2026-11-28):** `make rig` passes
+`--record`, and the coach runs `dub capture` of every input of the
+interface (6 on the SL 3) from the moment an item comes up to its answer,
+into `testdata/rig-takes/<run>/<item>.wav` (gitignored), the take named in
+the run file beside the verdict (`· take: …`). A child process, stopped
+with a line on its stdin as Enter stops a capture and killed after 5 s if
+it hangs. `dub loopback --take-channels 3,4` plays deck A's pair of such a
+take back through the loop cable. Seen on the SL 3 through a
+pseudo-terminal: two takes, 6 channels, no overflow. This is what turns
+the one recorded hands session into `loop` items.
+
+**A launch with an interface opens Performance again (2026-11-27,
+uncommitted).** The PREP / REC override was saved in `dub.modeOverride` and
+won at the next launch, so Dub opened in Prep with the SL 3 plugged in after
+any rip or PREP visit. It lasts one session now, and the old key is removed
+at launch. Reproduced and fixed in the app: `prep` saved, SL 3 plugged in →
+the old build opened PREP, the new one PERF. Also fixed: the signal panel's
+title read SIGNAL · DECK DECK A. While macOS's microphone prompt is up
+(every rebuilt Debug app asks again), both decks read ENGINE STOPPED ·
+open Preferences to pick an input, which points the wrong way. **Fixed
+2026-11-28 and seen in the app:** the strip and both idle decks read
+WAITING FOR MICROPHONE ACCESS, and deck A says to click Allow
+(`awaitingInputPermission`, `MicrophoneWaitTests`).
+
+**The DUB FX rack's by-ear items, measured offline (2026-11-28,
+uncommitted).** `dub-engine/tests/fx_by_ear.rs` drives the channel the way
+the app does (a send on deck A's pair, the deck on DUB FX, the command
+handle) and measures what rig section 6 listened for: a click is a corner
+sharper than the unit's own steady sound (never under a −60 dBFS step), a
+zipper the same on a knob dragged at a drag's ~60 values a second. It
+found, all red first, all fixed:
+- **Every unit clicked on IN/OUT**: the rack switched in one sample (the
+  Big Knob by 0.29 on a 0.25 send). A switch now fades over 5 ms
+  (`RACK_FADE_SECS`, smoothstep).
+- **The Space Echo replayed its tape** when switched back in (0.22 of the
+  0.25 send, 8 s after the send stopped), and **a KICK pressed with the
+  spring out thundered** the next time it went in. A unit coming in from
+  out now starts clean (reset), as the siren's echo already did.
+- **The selector clicked** (0.39): heads, the feedback tap and the onboard
+  reverb now fade over 5 ms when it turns (`SELECTOR_FADE_SECS`).
+- **Nine knobs zippered** (4–134× their held sound; Big Knob Q worst, then
+  Intensity, whose steps were written onto the tape): echo volume,
+  intensity, the onboard reverb, wow/flutter, spring wet and decay, phaser
+  mix, depth and feedback now glide (`dub-dsp/src/glide.rs`, 4 ms).
+Already clean: the Repeat sweep, the Big Knob's detents at Q 8, the KICK
+every time. **For the ear, not changed:** a RUNAWAY settles after ~40 s at
+1.0 (Long), 1.5 (Triple) and 1.9 (Triple + reverb) at the default echo
+volume — bounded, but past full scale, so the interface clips it; Q 8 on a
+detent near a note is up to +18 dB (the filter's own gain); and a KICK sits
+about 28 dB under the send at the default wet. The app is not rebuilt with
+these yet (a rebuild asks for the microphone again).
+
+**Signing that keeps the microphone grant, wired, waiting on the
+certificate (2026-11-28, uncommitted).** Every ad-hoc rebuild is a new app
+to macOS, so the microphone prompt came back after each `make app` and
+each Swift test run (three times this afternoon). `make app` and `make
+snapshot` now sign with "Apple Development" when that certificate is in
+the keychain and `DUB_TEAM_ID` is in `.env` (`.env.example` explains it),
+and print which way they signed; without either they stay ad hoc, as
+today. Checked with `make -n` both ways (the signed branch with a stand-in
+identity, not built); not yet built signed, since no Apple Development
+certificate exists here. Needs Daniel: Xcode ▸ Settings ▸ Accounts ▸ Manage
+Certificates ▸ + Apple Development, then the team ID into `.env`. The
+release path (`dist`) is unchanged: it re-signs with the Developer ID.
+
 ## Open
 
 - **No waveform while recording a rip.** `hasSource` includes
@@ -802,6 +1026,8 @@ hardware.
   mount. Either the Thru-for-rip peaks tap is not feeding deck 0's stream or
   the mount is starved; retest starvation first — the `RipEnvelopeTiler` fix
   removed a large main-thread load that was running the whole time.
+  **2026-11-28 on the loop: the strip drew the waveform while recording**
+  (screenshot 15 s in). Close it after one session with a real needle.
 - **Space Echo HOLD / SYNC / TAP on the rig:** the aux send is patched into
   5/6 (deck B's pair) but nothing arrives there. Looks like the mixer side.
 - **dnb on THRU reads 116.6 (⅔ of ~175)**, live and offline — the next
@@ -861,9 +1087,49 @@ in `DubColor`.
   A flake — a re-run passes — but it can fail the pre-push hook. If it
   becomes routine, drop `perceptualPrecision` for an exact compare plus a
   small `precision`.
-- **The AcoustID key is not in the repo and must not be.** `dub recognize`
-  reads `$DUB_ACOUSTID_KEY` or `--key`; without it every lookup returns
-  `MissingCredential` on purpose.
+- **The AcoustID key for test runs lives in the repo's `.env`** (gitignored;
+  `.env.example` is the tracked template), 2026-11-28, Daniel: better than
+  Preferences. `DUB_ACOUSTID_KEY` is Dub's *application* key (lookups send
+  it as `client`), not the account page's API key, which submits
+  fingerprints in a person's name. `dub recognize` reads `--key`, then the
+  environment, then `.env`; a Debug app reads the environment, then `.env`
+  (`DevEnvironment.swift`, the file found from the checkout it was built
+  from), and a key typed in Preferences wins. A Release build never reads
+  `.env`. Checked the same day with no key in the environment: `dub
+  recognize` on `rip-baseline-b` named 6 of 10 (MFSB, The O'Jays ×2,
+  Billy Paul, The Three Degrees, The Trammps; MFSB under a Japanese
+  release's title), the reggae 12" 0 of 4. **Seen in the app 2026-11-28:
+  7.7 PASS** (run file, "7.7 and the echo line"): a loop rip of the soul
+  sampler's first two tracks, Identify named both in under 10 s, Use all
+  and Import wrote `Artist - Title.flac`. Two fixes from it, **seen in the
+  app at 17:21**: Use all left the Title and Artist fields blank while the
+  track map had the names (the row re-seeded from the segment as it was
+  *before* the change — macOS 13's `onChange` runs the old closure; the
+  seed now carries the names, `RipRowSeed`), and the SIDE label squeezed
+  to "SI…" beside Use all. Left open: MFSB came in under the Japanese
+  release's title (the M26c foreign-pressing tie, PRD §5.2.7), and no
+  MusicBrainz recording ID reaches the tags although `dub-encode` writes
+  one when given it.
+  **Two more from checking that fix on a re-split (16:59), both fixed and
+  seen in the app at 17:21** (Identify named 2 of 2 on the re-split, Use
+  all filled the fields, and Discard left the folder's four files and a
+  byte-identical `rip.json`): Identify on a rip reopened with Re-split
+  failed with "side spill unreadable" — recognition read only the spill,
+  which a commit replaces with `side.flac`; it now reads the side the way
+  the commit does (`dub_rip::read_side`). And **Discard side… on a
+  re-split would have deleted the whole rip** — `side.flac` and the
+  imported FLACs the library still plays: re-split clears the plan, and
+  the discard guard looked only at the plan's imported tracks (found
+  reading the code; not clicked). Leaving a re-split now puts the rip
+  back as it was (`RipSession::abandon_resplit`,
+  `discarding_a_resplit_keeps_the_committed_rip`, red without it), and a
+  side with tracks queued for replacement is never deleted. On a
+  re-split the button now reads **Leave re-split**, one click with no
+  "really?" (Daniel; `RipReviewPanelState.leaveTitle`, snapshot
+  `test_ripReviewPanel_resplit`).
+  Whether Dub should ship its application key built in, so DJs
+  never see the field, is Daniel's call and open. Without any key every
+  lookup returns `MissingCredential` on purpose.
 
 ## Keeping this file honest
 

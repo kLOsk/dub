@@ -7,7 +7,28 @@ APP_BUILD_DIR ?= $(CURDIR)/apple/build
 APP_CONFIG    ?= Debug
 APP_BUNDLE     = $(APP_BUILD_DIR)/Build/Products/$(APP_CONFIG)/Dub.app
 
-.PHONY: help fmt fmt-check clippy test smoke rt-audit cov fuzz-quick soak clean ci hooks docs-check deny audit attribution app app-release dist run-app open-app xcframework snapshot sweep check-stale
+# Signing for `make app` and the Swift test host. Ad hoc, every rebuild is
+# a new app to macOS, which asks for the microphone again (rig,
+# 2026-11-28). With an Apple Development certificate in the keychain and
+# DUB_TEAM_ID in .env (or the environment), the signature names the team
+# and survives a rebuild, and so does the microphone grant. Without
+# either it stays ad hoc and says why. A release is re-signed with the
+# Developer ID in `dist` either way.
+DUB_TEAM_ID  ?= $(shell sed -n 's/^DUB_TEAM_ID=//p' .env 2>/dev/null | tr -d '[:space:]' | head -1)
+DEV_IDENTITY ?= Apple Development
+HAVE_DEV_IDENTITY := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -q '"$(DEV_IDENTITY)' && echo yes)
+ifneq ($(and $(DUB_TEAM_ID),$(HAVE_DEV_IDENTITY)),)
+APP_SIGNING      = CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$(DEV_IDENTITY)" DEVELOPMENT_TEAM=$(DUB_TEAM_ID)
+APP_SIGNING_NOTE = Signed: $(DEV_IDENTITY), team from DUB_TEAM_ID. macOS keeps the microphone grant across rebuilds.
+else ifeq ($(HAVE_DEV_IDENTITY),yes)
+APP_SIGNING      =
+APP_SIGNING_NOTE = Signed ad hoc: an $(DEV_IDENTITY) certificate is in the keychain but DUB_TEAM_ID is not in .env.
+else
+APP_SIGNING      =
+APP_SIGNING_NOTE = Signed ad hoc: no $(DEV_IDENTITY) certificate in the keychain, so macOS asks for the microphone again after every rebuild.
+endif
+
+.PHONY: help fmt fmt-check clippy test smoke rig rig-drive rt-audit cov fuzz-quick soak clean ci hooks docs-check deny audit attribution app app-release dist run-app open-app xcframework snapshot sweep check-stale
 
 # --- Build-artifact hygiene -------------------------------------------
 #
@@ -32,6 +53,8 @@ help:
 	@echo "  make test          run all tests (cargo nextest + clippy)"
 	@echo "  make smoke         run the dub-cli smoke binary"
 	@echo "  make rt-audit      run the RT-safety harness"
+	@echo "  make rig           the rig checklist read aloud, one item at a time (RIG='--section 2')"
+	@echo "  make rig-drive     the click / drag / window helpers the agent's rig runs use"
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fmt-check     cargo fmt --check"
 	@echo "  make clippy        cargo clippy --all-targets -- -D warnings"
@@ -74,6 +97,21 @@ test: check-stale clippy
 
 smoke:
 	cargo run -p dub-cli -- smoke
+
+# The DJ's half of docs/RIG-CHECKLIST.md, spoken, each item recorded from
+# the interface into testdata/rig-takes/. RIG passes flags through:
+# make rig RIG='--section 2', RIG=--list, RIG=--mute.
+rig:
+	cargo run -q -p dub-cli -- rig-coach --record $(RIG)
+
+# The agent's half: synthetic clicks and window ids for driving Dub during
+# the checklist's robot and loop items (scripts/rig/lib.sh uses them).
+RIG_DRIVE_TOOLS = click tap2 taps rclick drag type winlist
+rig-drive: $(addprefix target/rig-drive/,$(RIG_DRIVE_TOOLS))
+
+target/rig-drive/%: tools/rig-drive/%.swift
+	@mkdir -p target/rig-drive
+	swiftc -O $< -o $@
 
 rt-audit:
 	cargo run -p dub-cli -- rt-audit
@@ -181,15 +219,18 @@ app: check-stale xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 	    -configuration $(APP_CONFIG) \
 	    -destination 'platform=macOS' \
 	    -derivedDataPath $(APP_BUILD_DIR) \
+	    $(APP_SIGNING) \
 	    | xcbeautify 2>/dev/null || \
 	xcodebuild build \
 	    -project apple/Dub.xcodeproj \
 	    -scheme Dub \
 	    -configuration $(APP_CONFIG) \
 	    -destination 'platform=macOS' \
-	    -derivedDataPath $(APP_BUILD_DIR)
+	    -derivedDataPath $(APP_BUILD_DIR) \
+	    $(APP_SIGNING)
 	@echo ""
 	@echo "Built: $(APP_BUNDLE)"
+	@echo "$(APP_SIGNING_NOTE)"
 
 app-release:
 	$(MAKE) app APP_CONFIG=Release
@@ -265,13 +306,13 @@ snapshot: xcframework $(CURDIR)/apple/Dub.xcodeproj/project.pbxproj
 	    -project apple/Dub.xcodeproj -scheme Dub \
 	    -destination 'platform=macOS' \
 	    -derivedDataPath $(APP_BUILD_DIR) \
-	    -only-testing:DubTests \
+	    -only-testing:DubTests $(APP_SIGNING) \
 	    | xcbeautify 2>/dev/null || \
 	xcodebuild test \
 	    -project apple/Dub.xcodeproj -scheme Dub \
 	    -destination 'platform=macOS' \
 	    -derivedDataPath $(APP_BUILD_DIR) \
-	    -only-testing:DubTests
+	    -only-testing:DubTests $(APP_SIGNING)
 
 trace-grid:
 	@# Capture every os_signpost from the waveform renderer into a

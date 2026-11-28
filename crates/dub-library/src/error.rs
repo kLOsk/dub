@@ -76,6 +76,15 @@ pub enum LibraryError {
         supported: u32,
     },
 
+    /// `DUB_DATA_DIR` named a relative folder. An app launched from the
+    /// Finder runs with `/` as its working directory, so the library
+    /// would land somewhere nobody meant.
+    #[error("DUB_DATA_DIR must be an absolute path, got {path:?}")]
+    DataDirNotAbsolute {
+        /// The folder the variable named.
+        path: PathBuf,
+    },
+
     /// macOS volume discovery via `getattrlist(2)` failed for the
     /// given mount point. Common causes: a network filesystem that
     /// does not expose a stable UUID, or an unmounted path. The

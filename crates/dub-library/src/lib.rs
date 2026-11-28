@@ -96,7 +96,10 @@ pub use history::{HistoryEventType, HistoryWrite, SessionTracker, MIN_TRANSITION
 pub use import_order::{DEFAULT_IMPORT_ORDER, IMPORT_SOURCES};
 pub use importer::{import_file, import_folder, ImportError, ImportSummary, ImportedTrack};
 pub use itunes_import::import_itunes;
-pub use paths::{default_library_db_path, default_waveforms_cache_dir, waveform_sidecar_path};
+pub use paths::{
+    data_dir_override, default_library_db_path, default_rips_dir, default_waveforms_cache_dir,
+    waveform_sidecar_path, DATA_DIR_ENV,
+};
 pub use rekordbox_import::import_rekordbox;
 pub use schema::SCHEMA_VERSION;
 pub use serato_import::import_serato;

@@ -187,6 +187,25 @@ struct FxRackColumn: View, Equatable {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            content
+                // The rack stands where the deck's column would, and the
+                // deck region is cut to what the columns report. Unreported,
+                // the region shrank to the other deck's column and the rack
+                // ran off its foot (rig, 2026-11-27).
+                .background(GeometryReader { geo in
+                    Color.clear.preference(
+                        key: DeckColumnHeightKey.self,
+                        value: geo.size.height + DubSpacing.md * 2)
+                })
+            Spacer(minLength: 0)
+        }
+        .padding(DubSpacing.md)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DubColor.surface1)
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             sourceRow
             HStack(alignment: .firstTextBaseline, spacing: DubSpacing.sm) {
@@ -201,7 +220,10 @@ struct FxRackColumn: View, Equatable {
                     .truncationMode(.tail)
             }
             FxPathLine(state: state)
-            VStack(spacing: 6) {
+            // A seam, not a gap: rack units sit flush, and at 6 pt the
+            // rack missed a 1440 × 900 window by 9 pt
+            // (`PerformanceLayoutTests.test_fxRack_fitsThePane_onALaptopScreen`).
+            VStack(spacing: 2) {
                 FxBigKnobUnit(
                     on: state.isOn(.bigKnob), controls: state.controls,
                     toggleLegend: state.toggleLegend(.bigKnob),
@@ -229,11 +251,7 @@ struct FxRackColumn: View, Equatable {
                     onKick: callbacks.onKick,
                     kickLegend: state.kickLegend)
             }
-            Spacer(minLength: 0)
         }
-        .padding(DubSpacing.md)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(DubColor.surface1)
     }
 
     /// The switch on the column's inner edge, as on a music deck, and the

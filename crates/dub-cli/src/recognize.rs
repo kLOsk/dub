@@ -15,9 +15,12 @@
 //! changes nothing, because a wrong match written into the library is
 //! worse than no match at all.
 //!
-//! The AcoustID key comes from `--key` or `$DUB_ACOUSTID_KEY`. It is
-//! deliberately *not* read from a file in the repo or the session dir —
-//! a credential that lives next to the code gets committed eventually.
+//! The key is Dub's AcoustID *application* key, the one lookups send as
+//! `client`: it names the app, not a person. The *API key* on an AcoustID
+//! account page is a different thing, for submitting fingerprints in that
+//! person's name, and Dub never submits. It comes from `--key`, then
+//! `$DUB_ACOUSTID_KEY`, then the repo's `.env` (gitignored;
+//! `.env.example` is the tracked template), never from the session dir.
 
 use std::path::{Path, PathBuf};
 
@@ -55,14 +58,23 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let key = match opts.key {
         Some(k) => k,
-        None => std::env::var(KEY_ENV).map_err(|_| {
-            anyhow!(
-                "no AcoustID key.\n  \
-                 Register a free one at https://acoustid.org/new-application, then:\n    \
-                 export {KEY_ENV}=your-key\n  \
-                 or pass --key <key>. Do not put it in a file in the repo."
-            )
-        })?,
+        None => std::env::var(KEY_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(dot_env_path())
+                    .ok()
+                    .and_then(|text| dot_env_value(&text, KEY_ENV))
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "no AcoustID key.\n  \
+                     Put Dub's application key (acoustid.org/new-application; not the\n  \
+                     API key for submitting) in .env at the repo root:\n    \
+                     {KEY_ENV}=the-key\n  \
+                     or export {KEY_ENV}, or pass --key <key>."
+                )
+            })?,
     };
 
     // A directory holding a rip.json is a session; anything else is
@@ -379,6 +391,40 @@ fn apply(session_dir: &Path, result: &SideRecognition, loaded: &[Loaded]) -> Res
     Ok(())
 }
 
+/// The repo's `.env`, found from the workspace this binary was built in,
+/// so `cargo run -p dub-cli` reads it from any directory.
+fn dot_env_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env")
+}
+
+/// The value of `name` in `.env` text: `NAME=value` lines, `export`
+/// allowed, `#` comments, quotes around the value dropped, the last line
+/// winning. Empty counts as unset, so `.env.example` copied and not yet
+/// filled in reads as no key.
+fn dot_env_value(text: &str, name: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        let value = value.trim();
+        let value = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or(""),
+            _ => value.split(" #").next().unwrap_or("").trim_end(),
+        };
+        found = (!value.is_empty()).then(|| value.to_string());
+    }
+    found
+}
+
 struct Opts {
     path: PathBuf,
     key: Option<String>,
@@ -430,7 +476,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
                  --apply  write the result into a session's rip.json.\n  \
                  a session dir recognises its committed tracks; any decodable audio file is\n  \
                  auto-split first and is read-only.\n  \
-                 the key may also come from ${KEY_ENV}"
+                 the key may also come from ${KEY_ENV} or the repo's .env"
             )
         })?,
         key,
@@ -438,4 +484,43 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         album,
         discogs_token,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dot_env_value, KEY_ENV};
+
+    #[test]
+    fn a_dot_env_line_gives_its_value() {
+        let text = "# keys for test runs\n\nOTHER=1\nDUB_ACOUSTID_KEY=abc123\n";
+        assert_eq!(dot_env_value(text, KEY_ENV).as_deref(), Some("abc123"));
+        assert_eq!(dot_env_value(text, "OTHER").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn export_quotes_spaces_and_trailing_comments_are_dropped() {
+        let quoted = "export DUB_ACOUSTID_KEY = \"abc 123\"\n";
+        assert_eq!(dot_env_value(quoted, KEY_ENV).as_deref(), Some("abc 123"));
+        let single = "DUB_ACOUSTID_KEY='abc'";
+        assert_eq!(dot_env_value(single, KEY_ENV).as_deref(), Some("abc"));
+        let commented = "DUB_ACOUSTID_KEY=abc # the application key\r\n";
+        assert_eq!(dot_env_value(commented, KEY_ENV).as_deref(), Some("abc"));
+    }
+
+    /// `.env.example` copied and not yet filled in reads as no key, so
+    /// the error says what to do rather than AcoustID refusing "".
+    #[test]
+    fn an_empty_or_commented_out_key_is_no_key() {
+        assert_eq!(dot_env_value("DUB_ACOUSTID_KEY=\n", KEY_ENV), None);
+        assert_eq!(dot_env_value("DUB_ACOUSTID_KEY=\"\"\n", KEY_ENV), None);
+        assert_eq!(dot_env_value("# DUB_ACOUSTID_KEY=abc\n", KEY_ENV), None);
+        assert_eq!(dot_env_value("DUB_ACOUSTID_KEYS=abc\n", KEY_ENV), None);
+        assert_eq!(dot_env_value("", KEY_ENV), None);
+    }
+
+    #[test]
+    fn the_last_line_for_a_key_wins() {
+        let text = "DUB_ACOUSTID_KEY=old\nDUB_ACOUSTID_KEY=new\n";
+        assert_eq!(dot_env_value(text, KEY_ENV).as_deref(), Some("new"));
+    }
 }

@@ -84,6 +84,15 @@ pub const DECK_COUNT: usize = 2;
 /// consecutive slices so any block size is handled allocation-free.
 const SIREN_CHUNK: usize = 1024;
 
+/// How long a rack unit takes to come in or go out on its IN/OUT switch.
+/// Switched in one sample, every unit clicked (the Big Knob by a step of
+/// 0.29 on a 0.25 send, `tests/fx_by_ear.rs`); 5 ms is under anything a
+/// hand on the switch can tell apart from instant.
+const RACK_FADE_SECS: f32 = 0.005;
+
+/// Frames of the dry copy a fading rack unit is mixed against, per slice.
+const RACK_CHUNK: usize = 256;
+
 /// The routing test tone (Preferences ▸ Audio, CLICK): long enough for a
 /// mixer channel's meter to light and be seen, short enough to be a pip.
 const TEST_TONE_SECS: f32 = 0.25;
@@ -430,9 +439,16 @@ pub struct Engine {
     bigknob: [dub_dsp::BigKnobHpf; DECK_COUNT],
     phaser: [dub_dsp::Phaser; DECK_COUNT],
     /// Which rack slots are engaged per deck, indexed by [`FxSlot`] as `usize`
-    /// (`[Spring, SpaceEcho, BigKnob, Phaser]`). A disengaged slot is skipped
-    /// entirely (true bypass).
+    /// (`[Spring, SpaceEcho, BigKnob, Phaser]`): where each slot's switch
+    /// is. A slot out and faded is skipped entirely (true bypass).
     rack_active: [[bool; 4]; DECK_COUNT],
+    /// Where each slot's fade is, 0 (out) to 1 (in), moving toward
+    /// `rack_active` over [`RACK_FADE_SECS`].
+    rack_gain: [[f32; 4]; DECK_COUNT],
+    /// Per-sample step of the rack fade.
+    rack_fade_step: f32,
+    /// The dry pair a fading slot is mixed against ([`RACK_CHUNK`] frames).
+    rack_dry: Box<[f32]>,
     /// F-38 stage 3: the DUB FX channel's MIC input — sum the pair to both
     /// channels, so a mic on one side of the pair is heard on both.
     /// `false` is SEND: the pair passes as it comes.
@@ -704,6 +720,9 @@ impl Engine {
             bigknob: std::array::from_fn(|_| dub_dsp::BigKnobHpf::new(sample_rate)),
             phaser: std::array::from_fn(|_| dub_dsp::Phaser::new(sample_rate)),
             rack_active: [[false; 4]; DECK_COUNT],
+            rack_gain: [[0.0; 4]; DECK_COUNT],
+            rack_fade_step: 1.0 / (RACK_FADE_SECS * sample_rate).max(1.0),
+            rack_dry: vec![0.0; RACK_CHUNK * 2].into_boxed_slice(),
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
@@ -797,6 +816,9 @@ impl Engine {
             bigknob: std::array::from_fn(|_| dub_dsp::BigKnobHpf::new(sample_rate)),
             phaser: std::array::from_fn(|_| dub_dsp::Phaser::new(sample_rate)),
             rack_active: [[false; 4]; DECK_COUNT],
+            rack_gain: [[0.0; 4]; DECK_COUNT],
+            rack_fade_step: 1.0 / (RACK_FADE_SECS * sample_rate).max(1.0),
+            rack_dry: vec![0.0; RACK_CHUNK * 2].into_boxed_slice(),
             fx_input_mono: [false; DECK_COUNT],
             input_meter: [InputMeter::default(); DECK_COUNT],
             input_meter_lr: [[InputMeter::default(); 2]; DECK_COUNT],
@@ -1057,23 +1079,113 @@ impl Engine {
     /// Vintage-FX rack (PRD §6.3) — the dub processing chain. Each
     /// engaged slot processes the deck's output bus in turn: the inserts
     /// (Big Knob HPF, phaser) rewrite in place, then the sends (RE-201
-    /// tape echo, spring reverb) add their wet on top. A disengaged slot
-    /// is skipped entirely. No state is published — the UI toggle is the
+    /// tape echo, spring reverb) add their wet on top. A slot out is
+    /// skipped entirely. No state is published — the UI toggle is the
     /// source of truth (these never self-terminate). RT-safe.
+    ///
+    /// The switch fades: a slot coming in or going out is mixed against
+    /// the dry over [`RACK_FADE_SECS`]. One coming in from out starts
+    /// clean — reset first — so the Space Echo does not replay the tape it
+    /// went out with, nor the spring a kick pressed while it was out
+    /// (both measured in `tests/fx_by_ear.rs`). The same goes for the
+    /// siren's echo once it fades (see `render_siren_into`).
+    // The fade is clamped onto exactly 0.0 and 1.0 when it lands, so the
+    // equalities below are exact by construction.
+    #[allow(clippy::float_cmp)]
     fn process_rack(&mut self, idx: usize, out: &mut [f32], num_channels: usize, first_us: usize) {
-        let active = self.rack_active[idx];
-        if active[FxSlot::BigKnob as usize] {
-            self.bigknob[idx].process_block(out, num_channels, first_us);
+        for slot in [
+            FxSlot::BigKnob,
+            FxSlot::Phaser,
+            FxSlot::SpaceEcho,
+            FxSlot::Spring,
+        ] {
+            let s = slot as usize;
+            let target = if self.rack_active[idx][s] { 1.0 } else { 0.0 };
+            let gain = self.rack_gain[idx][s];
+            if gain == target {
+                if target > 0.0 {
+                    self.process_rack_slot(idx, slot, out, num_channels, first_us);
+                }
+                continue;
+            }
+            if gain == 0.0 {
+                self.reset_rack_slot(idx, slot);
+            }
+            self.rack_gain[idx][s] =
+                self.fade_rack_slot(idx, slot, gain, target, out, num_channels, first_us);
         }
-        if active[FxSlot::Phaser as usize] {
-            self.phaser[idx].process_block(out, num_channels, first_us);
+    }
+
+    fn process_rack_slot(
+        &mut self,
+        idx: usize,
+        slot: FxSlot,
+        out: &mut [f32],
+        num_channels: usize,
+        first_us: usize,
+    ) {
+        match slot {
+            FxSlot::BigKnob => self.bigknob[idx].process_block(out, num_channels, first_us),
+            FxSlot::Phaser => self.phaser[idx].process_block(out, num_channels, first_us),
+            FxSlot::SpaceEcho => self.re201[idx].process_block(out, num_channels, first_us),
+            FxSlot::Spring => self.spring[idx].process_block(out, num_channels, first_us),
         }
-        if active[FxSlot::SpaceEcho as usize] {
-            self.re201[idx].process_block(out, num_channels, first_us);
+    }
+
+    fn reset_rack_slot(&mut self, idx: usize, slot: FxSlot) {
+        match slot {
+            FxSlot::BigKnob => self.bigknob[idx].reset(),
+            FxSlot::Phaser => self.phaser[idx].reset(),
+            FxSlot::SpaceEcho => self.re201[idx].reset(),
+            FxSlot::Spring => self.spring[idx].reset(),
         }
-        if active[FxSlot::Spring as usize] {
-            self.spring[idx].process_block(out, num_channels, first_us);
+    }
+
+    /// Run `slot` over `out` while its fade moves from `gain` toward
+    /// `target`, mixing what it made against the dry it was given; returns
+    /// where the fade got to. The curve is a smoothstep, so the mix has no
+    /// corner where the fade starts or lands. RT-safe: the dry copy is the
+    /// pre-allocated `rack_dry`, sliced into [`RACK_CHUNK`] frames.
+    #[allow(clippy::too_many_arguments)]
+    fn fade_rack_slot(
+        &mut self,
+        idx: usize,
+        slot: FxSlot,
+        mut gain: f32,
+        target: f32,
+        out: &mut [f32],
+        num_channels: usize,
+        first_us: usize,
+    ) -> f32 {
+        let step = if target > gain {
+            self.rack_fade_step
+        } else {
+            -self.rack_fade_step
+        };
+        let mut dry = std::mem::take(&mut self.rack_dry);
+        for slice in out.chunks_mut(RACK_CHUNK * num_channels) {
+            let frames = slice.len() / num_channels;
+            for f in 0..frames {
+                let o = f * num_channels + first_us;
+                dry[f * 2] = slice[o];
+                dry[f * 2 + 1] = slice[o + 1];
+            }
+            self.process_rack_slot(idx, slot, slice, num_channels, first_us);
+            for f in 0..frames {
+                gain = (gain + step).clamp(0.0, 1.0);
+                if (step > 0.0 && gain > target) || (step < 0.0 && gain < target) {
+                    gain = target;
+                }
+                let w = gain * gain * (3.0 - 2.0 * gain);
+                let o = f * num_channels + first_us;
+                for c in 0..2 {
+                    let d = dry[f * 2 + c];
+                    slice[o + c] = d + w * (slice[o + c] - d);
+                }
+            }
         }
+        self.rack_dry = dry;
+        gain
     }
 
     /// Meter what leaves deck `idx`'s pair this block — the last thing
@@ -1566,7 +1678,16 @@ impl Engine {
                 // smoothed rate in the position seqlock.
                 #[allow(clippy::cast_precision_loss)]
                 let dt = frames as f64 / f64::from(self.sample_rate);
-                if lock_state == 1 {
+                // Held, not reset, on THRU and DUB FX: a record or a send
+                // decodes as a clean lock often enough to settle the fit
+                // on music (rig, 2026-11-27: back on TC with a silent
+                // input, PITCH −100.76 % and Calibrating 80 %). What TC
+                // learned is kept for the needle's return.
+                let live_input =
+                    matches!(self.control_mode[idx], ControlMode::Thru | ControlMode::Fx);
+                if live_input {
+                    // Hold.
+                } else if lock_state == 1 {
                     // The readout consumes the **played** rate (zero
                     // anchor only): the header BPM is the rate the
                     // groove actually moves at, so two decks matched to
@@ -5330,6 +5451,77 @@ mod tests {
         });
         feed(&mut engine, 750);
         assert_eq!(input(&engine), (false, true), "TC did not calibrate");
+    }
+
+    /// Rig, 2026-11-27: after four minutes of records on THRU, deck A
+    /// came back to TC reading PITCH −100.76 % and Calibrating 80 % with
+    /// silence on its input. The music had decoded as a clean lock often
+    /// enough to settle the pitch readout's wobble fit (four fifths of
+    /// the progress) and leave its value where the music put it. THRU
+    /// and DUB FX inputs never feed the readout; what TC learned before
+    /// a THRU visit is still there after it, so flipping to THRU for a
+    /// record and back costs no settle.
+    #[test]
+    fn the_pitch_readout_never_learns_a_thru_or_fx_input() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut tx) = engine_with_tc_deck0(sr, block);
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        let mut sig = vec![0.0_f32; block * 2];
+        let mut feed = |engine: &mut Engine, rate: f64, blocks: usize| {
+            for _ in 0..blocks {
+                gen.render(&mut sig, rate, 0.5);
+                assert_eq!(tx.push_slice(&sig), sig.len());
+                engine.render(&mut rt, &mut buf);
+            }
+        };
+        // 8 s of a clean carrier 3 % slow, on THRU then on DUB FX.
+        for mode in [ControlMode::Thru, ControlMode::Fx] {
+            engine.apply_command(Command::DeckSetControlMode { idx: 0, mode });
+            feed(&mut engine, 0.97, 1_500);
+            assert!(
+                engine.tc_display_rate[0].settle_progress() == 0.0,
+                "{mode:?} taught the wobble fit ({:.2})",
+                engine.tc_display_rate[0].settle_progress()
+            );
+            assert!(
+                (engine.tc_display_value[0] - 1.0).abs() < f64::EPSILON,
+                "{mode:?} moved the pitch readout to {:.4}",
+                engine.tc_display_value[0]
+            );
+        }
+
+        // On TC the same carrier settles the fit and reads its pitch…
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        feed(&mut engine, 0.97, 1_500);
+        assert!(engine.tc_display_rate[0].settled(), "TC never settled");
+        let on_tc = engine.tc_display_value[0];
+        assert!((on_tc - 0.97).abs() < 0.005, "TC read {on_tc:.4}");
+
+        // …and a THRU visit at another speed neither unsettles nor moves it.
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Thru,
+        });
+        feed(&mut engine, 1.04, 1_500);
+        engine.apply_command(Command::DeckSetControlMode {
+            idx: 0,
+            mode: ControlMode::Timecode,
+        });
+        assert!(
+            engine.tc_display_rate[0].settled(),
+            "a THRU visit unsettled TC"
+        );
+        assert!(
+            (engine.tc_display_value[0] - on_tc).abs() < f64::EPSILON,
+            "a THRU visit moved the readout from {on_tc:.4} to {:.4}",
+            engine.tc_display_value[0]
+        );
     }
 
     /// Drive `engine` to a clean ABS lock: feed `gen` carrier one block

@@ -75,6 +75,14 @@
 //! wide ([`TempoOctave`]), chosen by genre or by the DJ, and the score
 //! above is the whole decision: 96 % on the same songs.
 //!
+//! One octave still holds a tempo and its two-thirds or four-thirds,
+//! and the harmonic score cannot part them when they nearly tie: a
+//! beat's third harmonic is its two-thirds rival's beat. Those ties are
+//! settled on the beat's duple hierarchy — its quarters, halves, two
+//! and four beats ([`settle_three_two`]). A half or double reading is a
+//! press of ×2; a two-thirds one is a number a DJ cannot fix at a
+//! glance.
+//!
 //! Confidence is still the *normalized cross-correlation* at the
 //! fundamental peak — `acf[P] / acf[0]`. For a perfectly periodic
 //! signal this approaches 1.0; for noise it tends toward 0. Below
@@ -320,24 +328,42 @@ fn search_lags(odf_sample_rate: f64, range: BpmRange, octave: TempoOctave) -> (u
     (range_min.max(octave_min), range_max.min(octave_max))
 }
 
-/// Estimate tempo from an ODF: the strongest periodicity inside
-/// `octave`, within `range`.
-///
-/// `odf_sample_rate` is the ODF's own sample rate in Hz — typically
-/// `audio_sr / HOP_SIZE`. The function does no audio-rate scaling
-/// itself; it operates purely in ODF time.
-///
-/// There is no prior and no genre rule here. Which octave a tempo is
-/// counted in is not in the audio; the caller says, with `octave`
-/// (see [`crate::OctaveProfile::tempo_octave`]). Inside one octave the
-/// harmonic-mean score below picks the same tempo family as a
-/// hand-locked Traktor grid on 96 % of 1,758 songs.
-pub(crate) fn estimate_tempo(
+/// Every candidate lag in one octave, scored: what [`estimate_tempo`]
+/// picks from, kept apart so a diagnostic can read the whole table.
+pub(crate) struct LagScores {
+    /// The first lag scored; `scores[i]` is lag `lag_min + i`.
+    pub(crate) lag_min: usize,
+    /// Harmonic-mean local energy per lag (`NEG_INFINITY` where none).
+    pub(crate) scores: Vec<f64>,
+    /// The raw autocorrelation, lag 0 up to [`Self::max_lag`].
+    pub(crate) acf_raw: Vec<f64>,
+    /// The last lag `acf_raw` holds.
+    pub(crate) max_lag: usize,
+}
+
+/// Window half-width of a peak's local energy; see [`score_lags`].
+const WINDOW: usize = 2;
+
+impl LagScores {
+    /// A peak's total energy: `acf_raw` summed over `lag ± WINDOW`.
+    pub(crate) fn local(&self, lag: usize) -> f64 {
+        if lag > self.max_lag {
+            return 0.0;
+        }
+        let lo = lag.saturating_sub(WINDOW);
+        let hi = (lag + WINDOW).min(self.max_lag);
+        self.acf_raw[lo..=hi].iter().sum()
+    }
+}
+
+/// Score every lag `search_lags` allows. `None` when there is too
+/// little ODF for the slowest candidate, or no energy in it at all.
+pub(crate) fn score_lags(
     odf: &[f32],
     odf_sample_rate: f64,
     range: BpmRange,
     octave: TempoOctave,
-) -> Option<BpmEstimate> {
+) -> Option<LagScores> {
     let (lag_min, lag_max) = search_lags(odf_sample_rate, range, octave);
     if lag_min < 2 || lag_max <= lag_min {
         return None;
@@ -362,8 +388,7 @@ pub(crate) fn estimate_tempo(
         *slot = autocorr_at(&detrended, lag);
     }
 
-    let acf_zero = acf_raw[0];
-    if acf_zero < 1e-12 {
+    if acf_raw[0] < 1e-12 {
         // No energy → no detection. Covers silence and post-detrending
         // flat signals.
         return None;
@@ -419,27 +444,12 @@ pub(crate) fn estimate_tempo(
     // `MAX_HARMONICS = 4` and ~67 integer lag candidates in the
     // 60–200 BPM range at our ODF rates, that's `67 · 4 · 5 = 1340`
     // lookups per `recompute()` — well under the M8 1 ms budget.
-    const WINDOW: usize = 2;
-
-    let local = |lag: usize| -> f64 {
-        if lag > max_lag {
-            return 0.0;
-        }
-        let lo = lag.saturating_sub(WINDOW);
-        let hi = (lag + WINDOW).min(max_lag);
-        let mut sum = 0.0f64;
-        for &v in &acf_raw[lo..=hi] {
-            sum += v;
-        }
-        sum
+    let mut table = LagScores {
+        lag_min,
+        scores: Vec::with_capacity(lag_max - lag_min + 1),
+        acf_raw,
+        max_lag,
     };
-
-    // Harmonic-mean local-energy score for every candidate lag; the
-    // best wins, and a tie goes to the faster tempo.
-    let n_candidates = lag_max - lag_min + 1;
-    let mut raw_scores: Vec<f64> = Vec::with_capacity(n_candidates);
-    let mut max_raw_score = f64::NEG_INFINITY;
-    let mut best_lo: Option<usize> = None;
 
     // Optional DFT×ACF cross-tempogram weighting (`DUB_BPM_TEMPOGRAM=1`).
     // When enabled, each candidate's harmonic-mean ACF score is multiplied
@@ -460,13 +470,13 @@ pub(crate) fn estimate_tempo(
             if probe > max_lag {
                 break;
             }
-            score_sum += local(probe);
+            score_sum += table.local(probe);
             k_count += 1;
         }
         let raw_score = if k_count == 0 {
             f64::NEG_INFINITY
         } else if k_count < MIN_HARMONICS_FOR_MEAN {
-            local(lo)
+            table.local(lo)
         } else {
             #[allow(clippy::cast_precision_loss)]
             let count_f = k_count as f64;
@@ -476,8 +486,112 @@ pub(crate) fn estimate_tempo(
             Some(w) if raw_score.is_finite() => raw_score * w[lo - lag_min],
             _ => raw_score,
         };
-        raw_scores.push(raw_score);
+        table.scores.push(raw_score);
+    }
+    Some(table)
+}
 
+/// How close a three-two rival must score to the winner to be weighed
+/// against it by [`duple_support`].
+const THREE_TWO_TIE: f64 = 0.9;
+/// The multiples of a beat that repeat in duple time: the quarter, the
+/// half, the beat, two and four beats. No third: three times a lag is
+/// exactly what makes a two-thirds rival score as well as the beat.
+const DUPLE_MULTIPLES: [f64; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+/// Lag ratios of the three-two family inside one octave.
+const THREE_TWO_RATIOS: [f64; 4] = [4.0 / 3.0, 0.75, 1.5, 2.0 / 3.0];
+
+/// How strongly `lag`'s duple hierarchy repeats: the mean local energy
+/// at [`DUPLE_MULTIPLES`] of it.
+fn duple_support(table: &LagScores, lag: usize) -> f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let lags = DUPLE_MULTIPLES
+        .iter()
+        .map(|k| (k * lag as f64).round() as usize)
+        .filter(|&l| l <= table.max_lag);
+    let (sum, n) = lags.fold((0.0, 0usize), |(sum, n), l| (sum + table.local(l), n + 1));
+    #[allow(clippy::cast_precision_loss)]
+    let mean = sum / n.max(1) as f64;
+    mean
+}
+
+/// The winner, or a rival in its three-two family (two-thirds,
+/// four-thirds and their octaves) that scores nearly as well and whose
+/// duple hierarchy repeats more strongly.
+///
+/// A half or double reading is a press of ×2 away; a two-thirds one is
+/// a number a DJ cannot fix at a glance (Daniel, 2026-11-28). Where the
+/// two score within [`THREE_TWO_TIE`] of each other the harmonic score
+/// cannot tell them apart — its third harmonic is the rival's beat — so
+/// they are weighed on the beat's quarters, halves, doubles and bars
+/// instead. Read as a THRU deck reads (no genre, a minute of music),
+/// 1,769 songs locked in Traktor went from 54 three-two readings to 32,
+/// and from 70 to 41 on their first 20 s
+/// (`tests/traktor_grid_corpus.rs`).
+fn settle_three_two(table: &LagScores, winner: usize) -> usize {
+    let winner_score = table.scores[winner - table.lag_min];
+    if winner_score <= 0.0 {
+        return winner;
+    }
+    let (mut best, mut best_support) = (winner, duple_support(table, winner));
+    for (i, &score) in table.scores.iter().enumerate() {
+        let lag = table.lag_min + i;
+        if score < THREE_TWO_TIE * winner_score {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = lag as f64 / winner as f64;
+        if !THREE_TWO_RATIOS
+            .iter()
+            .any(|r| (ratio / r - 1.0).abs() <= 0.03)
+        {
+            continue;
+        }
+        let support = duple_support(table, lag);
+        if support > best_support {
+            (best, best_support) = (lag, support);
+        }
+    }
+    best
+}
+
+/// Estimate tempo from an ODF: the strongest periodicity inside
+/// `octave`, within `range`.
+///
+/// `odf_sample_rate` is the ODF's own sample rate in Hz — typically
+/// `audio_sr / HOP_SIZE`. The function does no audio-rate scaling
+/// itself; it operates purely in ODF time.
+///
+/// There is no prior and no genre rule here. Which octave a tempo is
+/// counted in is not in the audio; the caller says, with `octave`
+/// (see [`crate::OctaveProfile::tempo_octave`]). Inside one octave the
+/// harmonic-mean score below picks the same tempo family as a
+/// hand-locked Traktor grid on 96 % of 1,758 songs.
+pub(crate) fn estimate_tempo(
+    odf: &[f32],
+    odf_sample_rate: f64,
+    range: BpmRange,
+    octave: TempoOctave,
+) -> Option<BpmEstimate> {
+    let table = score_lags(odf, odf_sample_rate, range, octave)?;
+    let LagScores {
+        lag_min,
+        ref scores,
+        ref acf_raw,
+        max_lag,
+    } = table;
+    let acf_zero = acf_raw[0];
+    let local = |lag: usize| table.local(lag);
+
+    // The best wins, and a tie goes to the faster tempo.
+    let mut max_raw_score = f64::NEG_INFINITY;
+    let mut best_lo: Option<usize> = None;
+    for (i, &raw_score) in scores.iter().enumerate() {
+        let lo = lag_min + i;
         if raw_score.is_finite() {
             let better = if !max_raw_score.is_finite() {
                 true
@@ -498,20 +612,25 @@ pub(crate) fn estimate_tempo(
         }
     }
 
-    let best_lo = best_lo?;
+    let best_lo = settle_three_two(&table, best_lo?);
 
     if std::env::var("DUB_BPM_DEBUG").is_ok() {
         eprintln!(
-            "DEBUG: lag_min={lag_min} lag_max={lag_max} odf_sr={odf_sample_rate:.3} \
-             best_lo={best_lo} max_raw={max_raw_score:.6}"
+            "DEBUG: lag_min={lag_min} lag_max={} odf_sr={odf_sample_rate:.3} \
+             best_lo={best_lo} max_raw={max_raw_score:.6}",
+            lag_min + scores.len() - 1
         );
-        for (i, &s) in raw_scores.iter().enumerate() {
+        for (i, &s) in scores.iter().enumerate() {
             let lo = lag_min + i;
             #[allow(clippy::cast_precision_loss)]
             let bpm = 60.0 * odf_sample_rate / lo as f64;
             let ratio = s / max_raw_score;
             if ratio > 0.45 {
-                eprintln!("  lag={lo:3} bpm={bpm:6.2} raw={s:.6} ratio={ratio:.3}");
+                eprintln!(
+                    "  lag={lo:3} bpm={bpm:6.2} raw={s:.6} ratio={ratio:.3} L={:.3} duple={:.3}",
+                    local(lo) / acf_zero,
+                    duple_support(&table, lo) / acf_zero,
+                );
             }
         }
     }
@@ -857,5 +976,57 @@ mod tests {
         // the octave has nothing to add.
         let narrow = BpmRange::new(60.0, 90.0).unwrap();
         assert_eq!(search_lags(100.0, narrow, TempoOctave::DEFAULT), (66, 100));
+    }
+
+    /// A table with the winner at lag 48 and one rival, and energy at
+    /// `beat`'s duple multiples twice as strong as at the winner's.
+    fn tie(rival: usize, rival_score: f64, beat: usize) -> LagScores {
+        let mut acf_raw = vec![0.0; 301];
+        acf_raw[0] = 1.0;
+        for k in [4, 2, 1] {
+            acf_raw[48 / k] += 0.5;
+            acf_raw[beat / k] += 1.0;
+        }
+        for k in [2, 4] {
+            acf_raw[48 * k] += 0.5;
+            acf_raw[beat * k] += 1.0;
+        }
+        let mut scores = vec![0.1; 36];
+        scores[48 - 37] = 1.0;
+        scores[rival - 37] = rival_score;
+        LagScores {
+            lag_min: 37,
+            scores,
+            acf_raw,
+            max_lag: 300,
+        }
+    }
+
+    /// Rig, 2026-11-28 (Daniel): a half or double tempo is a press of ×2,
+    /// a two-thirds one is not. A four-thirds rival that nearly ties and
+    /// whose quarters, halves and bars repeat more strongly is the beat.
+    #[test]
+    fn a_near_tie_in_the_three_two_family_goes_to_the_duple_beat() {
+        assert_eq!(settle_three_two(&tie(64, 0.95, 64), 48), 64, "four-thirds");
+        assert_eq!(settle_three_two(&tie(72, 0.95, 72), 48), 72, "three-halves");
+    }
+
+    #[test]
+    fn only_a_near_tie_in_the_three_two_family_is_weighed() {
+        assert_eq!(
+            settle_three_two(&tie(64, 0.85, 64), 48),
+            48,
+            "a rival well behind keeps losing"
+        );
+        assert_eq!(
+            settle_three_two(&tie(56, 0.99, 56), 48),
+            48,
+            "seven-sixths is not a three-two rival"
+        );
+        assert_eq!(
+            settle_three_two(&tie(64, 0.95, 48), 48),
+            48,
+            "the winner's own hierarchy is the stronger"
+        );
     }
 }

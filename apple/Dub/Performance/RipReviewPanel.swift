@@ -50,6 +50,34 @@ struct RipSegmentMetadata: Equatable {
     var year: String
 }
 
+/// What re-seeds a row's fields: a re-cut, or names landing from outside
+/// the row (Use all). Equal on those alone, so the row's own edits coming
+/// back through the poll never re-seed it (that reset a field mid-typing,
+/// rig 2026-09-25). It carries the segment's names because macOS 13's
+/// `onChange(of:perform:)` runs the closure from *before* the change:
+/// read from `self` there, `segment` was the old one, and Use all seeded
+/// every field empty while the track map showed the names (rig,
+/// 2026-11-28).
+struct RipRowSeed: Equatable {
+    let startSecs: Double
+    let endSecs: Double
+    let revision: Int
+    let names: RipSegmentMetadata
+
+    init(segment: RipSegmentUi, revision: Int) {
+        startSecs = segment.startSecs
+        endSecs = segment.endSecs
+        self.revision = revision
+        names = RipSegmentMetadata(
+            title: segment.title, artist: segment.artist, album: segment.album,
+            genre: segment.genre, year: segment.year)
+    }
+
+    static func == (a: Self, b: Self) -> Bool {
+        a.startSecs == b.startSecs && a.endSecs == b.endSecs && a.revision == b.revision
+    }
+}
+
 /// Per-segment commit dot.
 enum RipJobDot: Equatable {
     case pending
@@ -106,6 +134,16 @@ struct RipReviewPanelState: Equatable {
     /// Changes when names land in the plan from outside the rows (Use
     /// all); the rows re-seed on it, and on nothing else but a re-cut.
     var metadataRevision: Int = 0
+    /// A committed rip reopened with Re-split. Leaving it deletes
+    /// nothing — the rip goes back as it was — so its button is a plain
+    /// "Leave re-split", with no "really?" step (Daniel, 2026-11-28).
+    var isResplit: Bool = false
+
+    /// The label on the button that ends the review without importing.
+    static func leaveTitle(isResplit: Bool, armed: Bool) -> String {
+        if isResplit { return "Leave re-split" }
+        return armed ? "Really discard the side?" : "Discard side…"
+    }
 
     /// A piece this short at either end of the side is the needle-drop
     /// or the run-out, not a track — the row suggests leaving it out.
@@ -139,6 +177,34 @@ struct RipReviewPanelState: Equatable {
             title: segment.title, artist: segment.artist, album: segment.album,
             genre: segment.genre, year: segment.year)
         return s == current ? nil : s
+    }
+
+    /// The genres a row's field completes from: those typed on the
+    /// side's other rows first, then the collection's. A side is mostly
+    /// one genre, and a new one typed on track 1 is not in the library
+    /// until the import, so track 2 did not offer it (rig, 2026-11-27).
+    /// The row's own genre stays out: it changes with every letter, and
+    /// the list must not move under the field being typed in. A rip
+    /// spelling the library has in another case takes the library's.
+    func genres(for segment: RipSegmentUi) -> [String] {
+        var library: [String: String] = [:]
+        for g in genres where library[g.lowercased()] == nil {
+            library[g.lowercased()] = g
+        }
+        var seen = Set<String>()
+        var out: [String] = []
+        for other in segments where other.index != segment.index {
+            let typed = other.genre.trimmingCharacters(in: .whitespaces)
+            guard !typed.isEmpty else { continue }
+            let key = typed.lowercased()
+            if seen.insert(key).inserted {
+                out.append(library[key] ?? typed)
+            }
+        }
+        for g in genres where seen.insert(g.lowercased()).inserted {
+            out.append(g)
+        }
+        return out
     }
 
     /// `22:50 · 3 of 4 import · 0:12 trimmed`.
@@ -269,10 +335,14 @@ struct RipReviewPanel: View {
     private var toolbar: some View {
         HStack(spacing: DubSpacing.md) {
             HStack(spacing: DubSpacing.sm) {
+                // Fixed: with Use all in the tools, the row ran out of room
+                // and this was the one squeezed, to "SI…" (rig,
+                // 2026-11-28). The status notes after it truncate instead.
                 Text("SIDE")
                     .font(DubFont.caps)
                     .tracking(DubFont.capsTracking)
                     .foregroundStyle(DubColor.textSecondary)
+                    .fixedSize()
                 Text(state.summaryText)
                     .font(DubFont.numericInline)
                     .foregroundStyle(DubColor.textSecondary)
@@ -408,7 +478,9 @@ struct RipReviewPanel: View {
 
     private var discardButton: some View {
         Button {
-            if discardArmed {
+            if state.isResplit {
+                callbacks.cancel()
+            } else if discardArmed {
                 discardArmed = false
                 callbacks.cancel()
             } else {
@@ -419,16 +491,20 @@ struct RipReviewPanel: View {
                 }
             }
         } label: {
-            Text(discardArmed ? "Really discard the side?" : "Discard side…")
+            Text(RipReviewPanelState.leaveTitle(isResplit: state.isResplit, armed: discardArmed))
                 .font(DubFont.body)
-                .foregroundStyle(discardArmed ? .white : DubColor.stateError)
+                .foregroundStyle(
+                    discardArmed ? .white
+                        : state.isResplit ? DubColor.textSecondary : DubColor.stateError)
                 .padding(.horizontal, DubSpacing.md)
                 .frame(height: 28)
                 .background(discardArmed ? DubColor.stateError : Color.clear)
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("Throw the recording away — nothing is imported")
+        .help(state.isResplit
+              ? "Close the re-split — the tracks and their names stay as they were"
+              : "Throw the recording away — nothing is imported")
     }
 
     // MARK: Tracklist
@@ -477,7 +553,7 @@ struct RipReviewPanel: View {
                         isPlaying: state.playingIndex == segment.index,
                         shortReason: state.shortPieceReason(segment),
                         suggestion: state.suggestion(for: segment),
-                        genres: state.genres,
+                        genres: state.genres(for: segment),
                         revision: state.metadataRevision,
                         onMetadata: { callbacks.setMetadata(segment.index, $0) },
                         onTogglePlay: { callbacks.togglePlay(segment.index) },
@@ -715,11 +791,8 @@ struct RipTrackRow: View {
         .onChange(of: genre) { _ in metadataEdited() }
         .onChange(of: year) { _ in metadataEdited() }
         // Re-seed on a re-cut, or when names land from outside the row
-        // (Use all) — never on the row's own edits coming back through
-        // the 10 Hz poll. Comparing against the session did that, and a
-        // letter typed between the send and the echo was reset: the
-        // field blinked (rig, 2026-09-25).
-        .onChange(of: seedKey) { _ in reseed() }
+        // (Use all), from the names the seed carries (`RipRowSeed`).
+        .onChange(of: RipRowSeed(segment: segment, revision: revision)) { reseed($0.names) }
     }
 
     /// Inside the title field's trailing edge: Use for a suggestion, or
@@ -762,10 +835,6 @@ struct RipTrackRow: View {
         return "Short — leave out?"
     }
 
-    private var seedKey: String {
-        "\(segment.startSecs)-\(segment.endSecs)|\(revision)"
-    }
-
     private func take(_ s: RipSegmentMetadata) {
         if !s.title.isEmpty { title = s.title }
         if !s.artist.isEmpty { artist = s.artist }
@@ -774,13 +843,13 @@ struct RipTrackRow: View {
         if !s.year.isEmpty { year = s.year }
     }
 
-    private func reseed() {
+    private func reseed(_ names: RipSegmentMetadata) {
         debounce?.cancel()
-        title = segment.title
-        artist = segment.artist
-        album = segment.album
-        genre = segment.genre
-        year = segment.year
+        title = names.title
+        artist = names.artist
+        album = names.album
+        genre = names.genre
+        year = names.year
     }
 
     private func metadataEdited() {
@@ -1000,7 +1069,7 @@ struct RipGenreField: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSComboBox {
-        let box = NSComboBox()
+        let box = RipGenreComboBox()
         box.completes = true
         box.usesDataSource = false
         box.isBordered = false
@@ -1064,5 +1133,23 @@ struct RipGenreField: NSViewRepresentable {
             guard let box = note.object as? NSComboBox else { return }
             parent.text = box.stringValue
         }
+    }
+}
+
+/// The arrow of an empty list opens it anyway, as nothing at all, and
+/// the next click anywhere in the window goes to closing it: PREP did
+/// nothing after a click on the arrow of a genre field with no genres
+/// to offer (rig, 2026-11-27). With nothing to list, the arrow starts
+/// the edit instead.
+final class RipGenreComboBox: NSComboBox {
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard numberOfItems == 0, let cell, point.x > cell.titleRect(forBounds: bounds).maxX else {
+            super.mouseDown(with: event)
+            return
+        }
+        guard window?.makeFirstResponder(self) == true else { return }
+        let end = (stringValue as NSString).length
+        currentEditor()?.selectedRange = NSRange(location: end, length: 0)
     }
 }

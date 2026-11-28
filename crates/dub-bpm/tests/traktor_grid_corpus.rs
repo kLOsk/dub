@@ -78,7 +78,7 @@ use std::sync::Mutex;
 
 use dub_bpm::{
     analyze_beat_grid_from_bpm_and_anchor, analyze_beat_grid_with_profile, fit_grid_at_playing_tap,
-    octave_profile_from_genre, OctaveProfile,
+    octave_profile_from_genre, BpmEstimator, BpmRange, OctaveProfile,
 };
 use dub_io::Track;
 
@@ -92,8 +92,10 @@ const SAME_GRID_BPM: f64 = 0.05;
 /// A DJ does not hear a line this close to the beat as off it.
 const ON_THE_BEAT_MS: f64 = 25.0;
 
-/// Measured 96.3 % on 1,767 songs (2026-11-19).
-const MIN_TEMPO_AGREEMENT: f64 = 0.95;
+/// Measured 96.3 % on 1,767 songs (2026-11-19); 97.4 % on 1,768 with
+/// the three-two tie-break (2026-11-28; 96.3 % on the same manifest
+/// without it, 34 three-two readings down to 12).
+const MIN_TEMPO_AGREEMENT: f64 = 0.965;
 /// Measured 87.0 % on the 1,631 of them within 0.05 BPM of Traktor, 58
 /// half a beat off (84.7 % and 105 before `move_off_the_off_beat`).
 const MIN_ON_THE_BEAT: f64 = 0.85;
@@ -333,6 +335,192 @@ fn the_analyser_agrees_with_grids_locked_in_traktor() {
         own * 100.0,
         MAX_OWN_GRIDS_WARNED * 100.0
     );
+}
+
+/// A THRU deck has no genre tag: it reads every record in the default
+/// octave, from what it has heard so far. Half or double of Traktor's
+/// tempo is a press of ×2 away and the DJ takes it; a reading in the
+/// three-two family (two-thirds, four-thirds and their octaves) is a
+/// number nobody can fix at a glance (Daniel, 2026-11-28). Each song is
+/// heard twice: its first 20 s, the way a needle drop starts, and a
+/// minute from its middle, the live search's whole window.
+#[test]
+fn a_thru_deck_reads_locked_grids_in_their_tempo_family() {
+    let Some(manifest) = std::env::var_os(MANIFEST_ENV) else {
+        eprintln!("{MANIFEST_ENV} not set; skipping the THRU tempo-family corpus.");
+        return;
+    };
+    let songs = read_manifest(&PathBuf::from(manifest));
+    assert!(!songs.is_empty(), "the manifest names no songs");
+    // Every song's whole candidate table, for weighing a rule offline:
+    // path, window start, Traktor's BPM, the reading, the ODF rate, the
+    // first lag, the scores, the autocorrelation.
+    let candidates_out = std::env::var_os(CANDIDATES_ENV)
+        .map(|path| Mutex::new(std::fs::File::create(path).expect("create the candidates file")));
+
+    let readings = for_each_song(&songs, |song| {
+        let mut load = Track::begin_streaming(&song.path).ok()?;
+        load.decode_until_secs(THRU_BODY.1).ok()?;
+        let track = load.track();
+        let (rate, channels) = (track.sample_rate(), usize::from(track.channels().max(1)));
+        let all = track.samples_to_vec();
+        let frames = all.len() / channels;
+        let read = |(from, to): (f64, f64)| -> Option<f64> {
+            let at = |secs: f64| ((secs * f64::from(rate)) as usize).min(frames);
+            if at(to) - at(from) < at(to - from) {
+                return None;
+            }
+            let mono: Vec<f32> = all[at(from) * channels..at(to) * channels]
+                .chunks_exact(channels)
+                .map(|f| f.iter().sum::<f32>() / channels as f32)
+                .collect();
+            let mut estimator = BpmEstimator::with_range(rate, BpmRange::DEFAULT).ok()?;
+            estimator.set_window_secs(Some(60.0));
+            for block in mono.chunks(4096) {
+                estimator.feed(block);
+            }
+            estimator.recompute();
+            let bpm = estimator.current().map(|e| e.bpm)?;
+            if let Some(out) = &candidates_out {
+                if let Some(table) = estimator.candidates() {
+                    let join = |v: &[f64]| {
+                        v.iter()
+                            .map(|x| format!("{x:.5}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    let line = format!(
+                        "{}\t{from}\t{}\t{bpm:.3}\t{:.4}\t{}\t{}\t{}\n",
+                        song.path.display(),
+                        song.bpm,
+                        table.odf_sample_rate,
+                        table.lag_min,
+                        join(&table.scores),
+                        join(&table.acf),
+                    );
+                    use std::io::Write as _;
+                    let _ = out
+                        .lock()
+                        .expect("no writer panics")
+                        .write_all(line.as_bytes());
+                }
+            }
+            Some(bpm)
+        };
+        Some((read(THRU_INTRO), read(THRU_BODY)))
+    });
+
+    let mut tally: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
+    let mut heard = [0usize; 2];
+    let mut three_two_by_family: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (song, reading) in songs.iter().zip(&readings) {
+        let Some(pair) = reading else { continue };
+        for (i, (part, bpm)) in [("intro", pair.0), ("body", pair.1)]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(bpm) = bpm else { continue };
+            heard[i] += 1;
+            let family = tempo_family(bpm, song.bpm);
+            *tally.entry((part, family)).or_default() += 1;
+            if part == "body" {
+                let entry = three_two_by_family
+                    .entry(format!("{:?}", song.profile))
+                    .or_default();
+                entry.1 += 1;
+                entry.0 += usize::from(family == "three-two");
+            }
+        }
+    }
+    let share = |n: usize, of: usize| 100.0 * n as f64 / of.max(1) as f64;
+    eprintln!(
+        "\nTHRU-style readings in the default octave, against {} locked grids:",
+        songs.len()
+    );
+    for (i, part) in ["intro", "body"].into_iter().enumerate() {
+        eprintln!("  {part} ({} songs heard):", heard[i]);
+        for family in ["tempo", "octave", "three-two", "other"] {
+            let n = tally.get(&(part, family)).copied().unwrap_or(0);
+            eprintln!("    {family:10} {n:5}  {:5.1} %", share(n, heard[i]));
+        }
+    }
+    eprintln!("  three-two in the body, by genre tag:");
+    for (family, (n, of)) in &three_two_by_family {
+        eprintln!("    {family:12} {n:4} of {of:5}  {:5.1} %", share(*n, *of));
+    }
+    assert!(heard[1] > 0, "no song in the manifest could be read");
+    for (i, part, ceiling) in [
+        (0, "intro", MAX_THRU_THREE_TWO_INTRO),
+        (1, "body", MAX_THRU_THREE_TWO_BODY),
+    ] {
+        let n = tally.get(&(part, "three-two")).copied().unwrap_or(0);
+        let rate = n as f64 / heard[i].max(1) as f64;
+        assert!(
+            rate <= ceiling,
+            "{:.1} % of {} THRU readings ({part}) are in the three-two family; \
+             the ceiling is {:.1} %",
+            rate * 100.0,
+            heard[i],
+            ceiling * 100.0
+        );
+    }
+}
+
+/// Measured 1.9 % (34 of 1,762) on 2026-11-28 with the three-two
+/// tie-break; 4.0 % before it.
+const MAX_THRU_THREE_TWO_INTRO: f64 = 0.025;
+/// Measured 1.2 % (21 of 1,747); 3.1 % before the tie-break.
+const MAX_THRU_THREE_TWO_BODY: f64 = 0.016;
+
+/// Where to write every song's candidate table, if anywhere.
+const CANDIDATES_ENV: &str = "DUB_BPM_CANDIDATES_OUT";
+
+/// The first 20 s of a song, as a needle drop at its start hears it.
+const THRU_INTRO: (f64, f64) = (0.0, 20.0);
+/// A minute from the middle of a song: the live search's whole window.
+const THRU_BODY: (f64, f64) = (60.0, 120.0);
+
+/// Which family `bpm` is in, against `reference`: its `tempo`, an
+/// `octave` of it, the `three-two` family (2:3, 4:3 and their octaves),
+/// or `other`.
+fn tempo_family(bpm: f64, reference: f64) -> &'static str {
+    let folded = (bpm / reference).log2().rem_euclid(1.0).exp2();
+    let near = |x: f64| (folded / x - 1.0).abs() <= SAME_TEMPO;
+    if (bpm / reference - 1.0).abs() <= SAME_TEMPO {
+        "tempo"
+    } else if near(1.0) || near(2.0) {
+        "octave"
+    } else if near(1.5) || near(4.0 / 3.0) {
+        "three-two"
+    } else {
+        "other"
+    }
+}
+
+/// Run `read` over every song on all but two cores.
+fn for_each_song<T: Send>(songs: &[Song], read: impl Fn(&Song) -> T + Sync) -> Vec<T> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<T>>> = Mutex::new(songs.iter().map(|_| None).collect());
+    let workers =
+        std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2).max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(song) = songs.get(i) else {
+                    break;
+                };
+                let result = read(song);
+                results.lock().expect("no worker panics holding this")[i] = Some(result);
+            });
+        }
+    });
+    results
+        .into_inner()
+        .expect("no worker panics holding this")
+        .into_iter()
+        .map(|r| r.expect("every song read"))
+        .collect()
 }
 
 /// `path<TAB>genre<TAB>bpm<TAB>anchor_secs`, no header.

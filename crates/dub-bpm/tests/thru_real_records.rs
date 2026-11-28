@@ -248,3 +248,99 @@ fn a_thru_decks_forecast_beats_hold_still_on_real_records() {
         "THRU forecast jumping on: {failures:#?}"
     );
 }
+
+/// How soon after the needle a THRU deck must show a tempo when it is
+/// dropped into the loud middle of a side.
+const NEEDLE_DROP_READ_SECS: f64 = 8.0;
+
+/// A needle dropped 60 s into the drum'n'bass side (PRD §2.2.10 #10): the
+/// deck must show a tempo within [`NEEDLE_DROP_READ_SECS`]. The take is the
+/// rig's own, what Dub received through the SL 3 (2026-11-27, checklist
+/// 8.7): a second of the lifted needle's silence, then the side at full
+/// level. The landing's edge was an onset of 57 against the music's 9.5,
+/// and it held the tempo search's confidence under the bar for showing
+/// anything for all 38 s of the take; a run that skipped its first half
+/// second read in 3. Driven through the live stream, the way the deck
+/// runs it, since the stream is what hears the needle.
+///
+/// The tempo it shows is the side's known two-thirds reading (above), so
+/// only that a tempo shows is asserted.
+#[test]
+fn a_needle_dropped_into_a_loud_side_shows_a_tempo() {
+    use dub_bpm::BpmStream;
+    use ringbuf::traits::{Producer, Split};
+
+    let path = baselines().join("thru-needle-drop-c.flac");
+    if !path.exists() {
+        eprintln!(
+            "{} not present; skipping the needle-drop THRU test",
+            path.display()
+        );
+        return;
+    }
+    let mut load = Track::begin_streaming(&path).expect("open the take");
+    load.decode_until_secs(f64::INFINITY)
+        .expect("decode the take");
+    let track = load.track();
+    let sr = track.sample_rate();
+    let ch = usize::from(track.channels());
+    let mono: Vec<f32> = track
+        .samples_to_vec()
+        .chunks_exact(ch)
+        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+        .collect();
+
+    let quarter = sr as usize / 4;
+    let (mut tx, rx) = ringbuf::HeapRb::<f32>::new(quarter * 2).split();
+    let stream = BpmStream::spawn_live(
+        rx,
+        TrackerConfig {
+            sample_rate: sr,
+            channels: 1,
+            analysis_period_samples: sr,
+            bpm_range: dub_bpm::BpmRange::DEFAULT,
+        },
+        LiveStreamConfig::default(),
+    )
+    .expect("stream");
+    let mut fed = 0usize;
+    let mut shown = None;
+    for chunk in mono.chunks(quarter) {
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let n = tx.push_slice(rest);
+            rest = &rest[n..];
+            std::thread::yield_now();
+        }
+        fed += chunk.len();
+        let started = std::time::Instant::now();
+        while stream.snapshot().consumed_frames < fed as u64 {
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "the stream stopped taking audio"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let snap = stream.snapshot();
+        if let (Some(bpm), Some(start)) = (snap.state.bpm(), snap.record_start_frame) {
+            #[allow(clippy::cast_precision_loss)]
+            let after = (fed as u64 - start) as f64 / f64::from(sr);
+            shown = Some((after, bpm));
+            break;
+        }
+    }
+    let line = shown.map_or_else(
+        || {
+            format!(
+                "dnb dropped 60 s in: no tempo in {:.0} s",
+                mono.len() as f64 / f64::from(sr)
+            )
+        },
+        |(after, bpm)| format!("dnb dropped 60 s in: {bpm:.1} shown {after:.1} s after the needle"),
+    );
+    eprintln!("{line}");
+    assert!(
+        shown.is_some_and(|(after, _)| after <= NEEDLE_DROP_READ_SECS),
+        "{line}"
+    );
+}

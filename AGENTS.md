@@ -94,7 +94,11 @@ crates/
                      `FFI_VERSION` is the contract number; bump it and README together (docs-check gates it).
   dub-cli/           `dub` binary — smoke / play / capture / levels /
                      timecode-deck / thru / scope / calibrate / analyze /
-                     rip / rip-tune / rip-resplit / recognize / export / decode-timecode.
+                     rip / rip-tune / rip-resplit / recognize / export / decode-timecode /
+                     loopback (a recorded take out of one pair of the interface, another
+                     pair recorded: the turntable with no hands) / rig-coach (the rig
+                     checklist read aloud; `make rig`) / loop-check / echo-check /
+                     thru-check / dropout-check / thru-tempo (what those takes did).
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).

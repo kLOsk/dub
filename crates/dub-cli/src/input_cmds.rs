@@ -157,13 +157,13 @@ fn place_pair(pair: &[f32], pair_idx: usize, channels: usize, out: &mut [f32]) {
 
 /// Reads every channel of an [`AudioInput`] opened with
 /// [`InputArgs::to_all_channel_options`] as interleaved frames.
-struct AllChannels {
+pub(crate) struct AllChannels {
     channels: usize,
     pair: Vec<f32>,
 }
 
 impl AllChannels {
-    fn new(input: &AudioInput, max_frames: usize) -> Self {
+    pub(crate) fn new(input: &AudioInput, max_frames: usize) -> Self {
         Self {
             channels: input.channels() as usize,
             pair: vec![0.0; max_frames * 2],
@@ -172,7 +172,7 @@ impl AllChannels {
 
     /// Fill `out` with as many whole frames as are buffered; returns
     /// the number of frames.
-    fn read(&mut self, input: &mut AudioInput, out: &mut [f32]) -> usize {
+    pub(crate) fn read(&mut self, input: &mut AudioInput, out: &mut [f32]) -> usize {
         let max_frames = (out.len() / self.channels).min(self.pair.len() / 2);
         let pairs = input.pair_count();
         let frames = frames_ready((0..pairs).map(|p| input.available_pair(p)), max_frames);
@@ -528,7 +528,7 @@ fn redraw_levels(rms_acc: &[f64], peak: &[f32], samples: u64) {
 /// and last callback add a few milliseconds either way. The 2026-11-21
 /// Serato captures ran 0.59 % long with no overflow counted, and their
 /// carrier jumped phase every 38 s: the only trace of it was this sum.
-fn clock_excess(captured_secs: f64, wall_secs: f64) -> Option<f64> {
+pub(crate) fn clock_excess(captured_secs: f64, wall_secs: f64) -> Option<f64> {
     const MIN_SECS: f64 = 30.0;
     const LIMIT: f64 = 0.001;
     if wall_secs < MIN_SECS {

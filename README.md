@@ -177,11 +177,18 @@ output for grids, cues and samples. Plug in an interface with at least
 | Traktor Scratch MK2 vinyl | Timecode | ⚠️ decoder shipped, awaiting a real pressing |
 | Native Instruments Traktor Audio 6 | Interface | ✅ tested |
 | Any external mixer with line inputs | The mixer | ✅ |
-| Phase, MIDI / HID controllers | Control | ◻ planned after 1.0 |
+| MWM Phase Essential | Wireless control, through its RCA outputs | ⚠️ beta, measured against a record, not yet played in the app |
+| MIDI / HID controllers | Control | ◻ planned after 1.0 |
 
 Other class-compliant 4-in / 4-out interfaces should work: pick each deck's
 input and output pair in **Preferences ▸ Audio**
 ([how](https://dub-3ccc829c.mintlify.site/hardware#setting-up-your-interface)).
+
+Dub reads MWM Phase the way it reads control vinyl: the receiver's RCA
+outputs go into the interface, and Dub counts the signal to hold the sticker
+([setup](https://dub-3ccc829c.mintlify.site/hardware#mwm-phase-beta)). Phase
+can also connect over USB without the audio cables, but only with a key from
+MWM for each app, and MWM isn't issuing new keys.
 
 ## Status
 

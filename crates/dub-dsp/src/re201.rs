@@ -29,6 +29,7 @@
 //! denormal-flushed. Verified under `assert_no_alloc`.
 
 use crate::echo::one_pole_coeff;
+use crate::glide::{knob_glide_coeff, Glide};
 use crate::spring::SpringReverb;
 
 const DENORMAL_FLOOR: f32 = 1.0e-20;
@@ -104,6 +105,16 @@ impl Re201Mode {
 /// enough that a synced echo lands on the new tempo within a beat.
 pub const REPEAT_GLIDE_SECS: f32 = 0.08;
 
+/// How long a head, the feedback tap or the onboard reverb takes to come in
+/// or go out when the mode selector turns. Switched in one sample, a turn
+/// clicked by a step of 0.39 with the echoes ringing
+/// (`dub-engine/tests/fx_by_ear.rs`).
+pub const SELECTOR_FADE_SECS: f32 = 0.005;
+
+/// Wow and flutter depth (fraction of the delay) per unit of tape age.
+const WOW_DEPTH: f32 = 0.004;
+const FLUTTER_DEPTH: f32 = 0.0018;
+
 /// Least the heads move per sample while gliding: 0.1 % tape speed.
 const GLIDE_MIN_SLEW: f32 = 1e-3;
 
@@ -134,13 +145,26 @@ pub struct Re201 {
     /// new rate is taken at once — there is nothing on the tape to bend.
     primed: bool,
     heads_active: [bool; 3],
+    /// Where each head's fade is (0 out … 1 in), moving toward
+    /// `heads_active` over [`SELECTOR_FADE_SECS`].
+    head_gain: [f32; 3],
+    /// The same for the feedback tap, toward `fb_head_idx`: a turn from one
+    /// head to two crossfades the loop's source instead of jumping it.
+    fb_gain: [f32; 3],
+    /// Per-sample step of those fades.
+    selector_step: f32,
     /// Index of the longest *active* head — feedback recirculates from this one
     /// tap, so loop gain tracks Intensity regardless of how many heads are live
     /// (the wet output still sums all active heads for the multi-tap texture).
     fb_head_idx: usize,
 
-    intensity: f32,
-    echo_volume: f32,
+    // The knobs, gliding: taken in steps, Intensity wrote its steps onto
+    // the tape, and Echo Volume and the tape's age zippered.
+    intensity: Glide,
+    echo_volume: Glide,
+    /// Tape age (0..2): scales the wow and flutter depths.
+    wear: Glide,
+    knob_glide: f32,
 
     // Tape tone in the feedback path.
     fb_lp: f32,
@@ -154,12 +178,12 @@ pub struct Re201 {
     flutter_phase: f64,
     wow_inc: f64,
     flutter_inc: f64,
-    wow_depth: f32,
-    flutter_depth: f32,
 
     // Onboard spring reverb.
     reverb: SpringReverb,
     reverb_on: bool,
+    /// Where the onboard reverb's fade is, toward `reverb_on`.
+    reverb_gain: f32,
     /// HOLD: no new input onto the tape, loop gain pinned at
     /// [`HOLD_INTENSITY`].
     hold: bool,
@@ -194,10 +218,15 @@ impl Re201 {
             glide_coeff: 1.0 - (-1.0 / (REPEAT_GLIDE_SECS * sample_rate)).exp(),
             primed: false,
             heads_active: [true, true, true],
+            head_gain: [1.0; 3],
+            fb_gain: [0.0, 0.0, 1.0],
+            selector_step: 1.0 / (SELECTOR_FADE_SECS * sample_rate).max(1.0),
             fb_head_idx: 2,
-            intensity: 0.5,
+            intensity: Glide::new(0.5),
             hold: false,
-            echo_volume: 0.7,
+            echo_volume: Glide::new(0.7),
+            wear: Glide::new(0.0),
+            knob_glide: knob_glide_coeff(sample_rate),
             fb_lp: 0.0,
             fb_lp_coeff: one_pole_coeff(3_000.0, sample_rate),
             fb_dc: 0.0,
@@ -207,10 +236,9 @@ impl Re201 {
             flutter_phase: 0.0,
             wow_inc: f64::from(0.6 * SINE_LEN as f32 / sample_rate),
             flutter_inc: f64::from(6.3 * SINE_LEN as f32 / sample_rate),
-            wow_depth: 0.0,
-            flutter_depth: 0.0,
             reverb: SpringReverb::new(sample_rate),
             reverb_on: false,
+            reverb_gain: 0.0,
         };
         re.set_repeat_rate(300.0);
         re.set_reverb(0.0);
@@ -232,6 +260,19 @@ impl Re201 {
             .next_back()
             .unwrap_or(0);
         self.reverb_on = reverb;
+        if !self.primed {
+            self.settle_selector();
+        }
+    }
+
+    /// Put every selector fade where the mode wants it: nothing is
+    /// sounding yet, so there is nothing to fade.
+    fn settle_selector(&mut self) {
+        for i in 0..3 {
+            self.head_gain[i] = f32::from(u8::from(self.heads_active[i]));
+            self.fb_gain[i] = f32::from(u8::from(self.heads_active[i] && i == self.fb_head_idx));
+        }
+        self.reverb_gain = f32::from(u8::from(self.reverb_on));
     }
 
     /// Repeat Rate: set the longest head's delay in ms (heads 1 & 2 follow at
@@ -267,19 +308,17 @@ impl Re201 {
     /// Intensity (feedback): 0 = single repeat, ~1.1 = self-oscillation. The
     /// in-loop soft-clip keeps it bounded.
     pub fn set_intensity(&mut self, intensity: f32) {
-        self.intensity = intensity.clamp(0.0, 1.2);
+        self.intensity.set(intensity.clamp(0.0, 1.2), !self.primed);
     }
 
     /// Echo Volume: wet level of the tape repeats (0..1).
     pub fn set_echo_volume(&mut self, vol: f32) {
-        self.echo_volume = vol.clamp(0.0, 1.0);
+        self.echo_volume.set(vol.clamp(0.0, 1.0), !self.primed);
     }
 
     /// Tape age: scales wow + flutter depth (0 = pristine, 1 = worn).
     pub fn set_wow_flutter(&mut self, amount: f32) {
-        let a = amount.clamp(0.0, 2.0);
-        self.wow_depth = 0.004 * a;
-        self.flutter_depth = 0.0018 * a;
+        self.wear.set(amount.clamp(0.0, 2.0), !self.primed);
     }
 
     /// Onboard spring reverb wet mix (0..1). Only audible in a reverb mode.
@@ -308,12 +347,20 @@ impl Re201 {
         self.set_reverb_wet(m * 0.6);
     }
 
-    /// Clear the tape and all filter/LFO state. Bounded but touches the whole
-    /// ring; call off-RT.
+    /// Clear the tape, the onboard reverb and all filter/LFO state. Touches
+    /// the whole ring (64 k samples at 48 kHz, a memset of a few
+    /// microseconds); the engine calls it on the audio thread when the unit
+    /// comes back in, so it starts clean rather than replaying what was on
+    /// the tape when it went out.
     pub fn reset(&mut self) {
         self.head_delays = self.head_targets;
         self.primed = false;
         self.tape.fill(0.0);
+        self.reverb.reset();
+        self.settle_selector();
+        self.intensity.snap();
+        self.echo_volume.snap();
+        self.wear.snap();
         self.write = 0;
         self.fb_lp = 0.0;
         self.fb_dc = 0.0;
@@ -366,7 +413,8 @@ impl Re201 {
             // Wow + flutter modulate the read position (→ pitch wobble).
             let wow = self.lut(self.wow_phase);
             let flutter = self.lut(self.flutter_phase);
-            let modulation = 1.0 + wow * self.wow_depth + flutter * self.flutter_depth;
+            let wear = self.wear.next(self.knob_glide);
+            let modulation = 1.0 + (wow * WOW_DEPTH + flutter * FLUTTER_DEPTH) * wear;
             self.wow_phase += self.wow_inc;
             if self.wow_phase >= SINE_LEN as f64 {
                 self.wow_phase -= SINE_LEN as f64;
@@ -376,22 +424,20 @@ impl Re201 {
                 self.flutter_phase -= SINE_LEN as f64;
             }
 
-            // Sum the active playback heads for the wet output; capture the
-            // longest active head separately as the single feedback source.
+            // Sum the playback heads for the wet output, each at its
+            // selector fade; the feedback recirculates from the longest
+            // active head alone, crossfaded when the selector moves it.
+            let step = self.selector_step;
             let mut echo = 0.0;
             let mut fb_in = 0.0;
-            for (i, (d, &active)) in self
-                .head_delays
-                .iter()
-                .zip(self.heads_active.iter())
-                .enumerate()
-            {
-                if active {
-                    let r = self.read_frac(d * modulation);
-                    echo += r;
-                    if i == self.fb_head_idx {
-                        fb_in = r;
-                    }
+            for i in 0..3 {
+                let on = self.heads_active[i];
+                self.head_gain[i] = approach(self.head_gain[i], on, step);
+                self.fb_gain[i] = approach(self.fb_gain[i], on && i == self.fb_head_idx, step);
+                if self.head_gain[i] > 0.0 || self.fb_gain[i] > 0.0 {
+                    let r = self.read_frac(self.head_delays[i] * modulation);
+                    echo += r * smoothstep(self.head_gain[i]);
+                    fb_in += r * smoothstep(self.fb_gain[i]);
                 }
             }
 
@@ -410,20 +456,45 @@ impl Re201 {
             let (record, gain) = if self.hold {
                 (0.0, HOLD_INTENSITY)
             } else {
-                (dry, self.intensity)
+                (dry, self.intensity.next(self.knob_glide))
             };
             self.tape[self.write] = flush(record + coloured * gain);
             self.write = (self.write + 1) & self.mask;
 
-            let wet = echo * self.echo_volume;
+            let wet = echo * self.echo_volume.next(self.knob_glide);
             frame[offset] += wet;
             frame[offset + 1] += wet;
-        }
 
-        if self.reverb_on {
-            self.reverb.process_block(out, stride, offset);
+            // The onboard reverb, on what the frame now holds. Coming in
+            // from silence it starts clean, not with the tail it went out on.
+            if self.reverb_on && self.reverb_gain == 0.0 {
+                self.reverb.reset();
+            }
+            self.reverb_gain = approach(self.reverb_gain, self.reverb_on, step);
+            if self.reverb_gain > 0.0 {
+                let rv = self.reverb.tick(0.5 * (frame[offset] + frame[offset + 1]))
+                    * smoothstep(self.reverb_gain);
+                frame[offset] += rv;
+                frame[offset + 1] += rv;
+            }
         }
     }
+}
+
+/// `gain` one `step` toward 1 when `on`, else toward 0.
+#[inline]
+fn approach(gain: f32, on: bool, step: f32) -> f32 {
+    if on {
+        (gain + step).min(1.0)
+    } else {
+        (gain - step).max(0.0)
+    }
+}
+
+/// A fade's curve: no corner where it starts or lands.
+#[inline]
+fn smoothstep(g: f32) -> f32 {
+    g * g * (3.0 - 2.0 * g)
 }
 
 /// Bounded soft-clip (Padé `tanh` approximation) — tape compression that also
@@ -617,6 +688,53 @@ mod tests {
             assert!(
                 after < before * 2.0,
                 "repeat change at +{at} clicked: {before} → {after}"
+            );
+        }
+    }
+
+    /// Every turn of the selector, with the echoes ringing: heads, the
+    /// feedback tap and the onboard reverb fade in and out, so the wet
+    /// never steps further than it does held still.
+    #[test]
+    fn a_mode_turn_fades_instead_of_clicking() {
+        let sr = SR as usize;
+        let mut worst = Vec::new();
+        for (from, to) in [
+            (Re201Mode::Short, Re201Mode::Long),
+            (Re201Mode::Long, Re201Mode::Triple),
+            (Re201Mode::Triple, Re201Mode::TripleReverb),
+            (Re201Mode::TripleReverb, Re201Mode::Reverb),
+            (Re201Mode::Reverb, Re201Mode::Short),
+        ] {
+            let mut re = Re201::new(SR);
+            re.set_mode(from);
+            re.set_repeat_rate(300.0);
+            re.set_intensity(0.5);
+            re.set_echo_volume(1.0);
+            re.set_reverb_wet(0.5);
+            let mut wet = Vec::with_capacity(sr * 2);
+            for i in 0..sr * 2 {
+                if i == sr + 37 {
+                    re.set_mode(to);
+                }
+                let x = 0.4 * (i as f32 * 2.0 * std::f32::consts::PI * 151.3 / SR).sin();
+                let mut buf = [x, x];
+                re.process_block(&mut buf, 2, 0);
+                wet.push(buf[0] - x);
+            }
+            let step = |w: &[f32]| {
+                w.windows(2)
+                    .map(|p| (p[1] - p[0]).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let before = step(&wet[sr / 2..sr]).max(step(&wet[sr * 3 / 2..]));
+            let across = step(&wet[sr..sr + sr / 10]);
+            worst.push((from, to, before, across));
+        }
+        for (from, to, before, across) in worst {
+            assert!(
+                across < before * 2.0 + 1e-3,
+                "{from:?} → {to:?} clicked: {before} held, {across} across the turn"
             );
         }
     }

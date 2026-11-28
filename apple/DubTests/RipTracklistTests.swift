@@ -36,6 +36,23 @@ final class RipTracklistTests: XCTestCase {
         XCTAssertEqual(state.shortPieceReason(state.segments[4]), "probably the run-out")
     }
 
+    /// A genre typed on one row is offered on the others before the
+    /// library has it; never on its own row, whose list would move under
+    /// the letters being typed; in the library's spelling when it has
+    /// one (rig, 2026-11-27).
+    func testAGenreTypedOnOneRowIsOfferedOnTheOthers() {
+        var one = seg(0, 0, 300)
+        one.genre = "Reggae "
+        var two = seg(1, 300, 600)
+        two.genre = "dubstep - wobble"
+        let three = seg(2, 600, 900)
+        var state = RipReviewPanelState(mode: .review, sideDurationSecs: 900, segments: [one, two, three])
+        state.genres = ["Dubstep - Wobble", "Hip-Hop"]
+        XCTAssertEqual(state.genres(for: three), ["Reggae", "Dubstep - Wobble", "Hip-Hop"])
+        XCTAssertEqual(state.genres(for: one), ["Dubstep - Wobble", "Hip-Hop"])
+        XCTAssertEqual(state.genres(for: two), ["Reggae", "Dubstep - Wobble", "Hip-Hop"])
+    }
+
     /// A suggestion that already matches the row is not offered again.
     func testASuggestionAlreadyTakenIsNotOffered() {
         var s = seg(0, 0, 300)
@@ -46,5 +63,37 @@ final class RipTracklistTests: XCTestCase {
         XCTAssertNil(state.suggestion(for: s))
         state.recognition?.suggestions[0]?.artist = "Augustus Pablo"
         XCTAssertNotNil(state.suggestion(for: s))
+    }
+
+    /// A row re-seeds on a re-cut or on Use all, and only then; the seed
+    /// carries the names, so the re-seed takes the ones that just landed
+    /// (rig, 2026-11-28: read from the row, Use all seeded them empty).
+    func testARowReSeedsOnUseAllWithTheNamesThatLanded() {
+        var before = seg(1, 9, 400)
+        var after = before
+        after.title = "Love Train"
+        after.artist = "The O'Jays"
+        // The row's own edit coming back through the poll: no re-seed.
+        XCTAssertEqual(
+            RipRowSeed(segment: before, revision: 3), RipRowSeed(segment: after, revision: 3))
+        // Use all bumps the revision: a re-seed, with the new names.
+        let landed = RipRowSeed(segment: after, revision: 4)
+        XCTAssertNotEqual(RipRowSeed(segment: before, revision: 3), landed)
+        XCTAssertEqual(landed.names.title, "Love Train")
+        XCTAssertEqual(landed.names.artist, "The O'Jays")
+        // A re-cut re-seeds too.
+        before.endSecs = 380
+        XCTAssertNotEqual(
+            RipRowSeed(segment: before, revision: 3), RipRowSeed(segment: after, revision: 3))
+    }
+
+    /// A re-split is left, not discarded: nothing on disk goes, so the
+    /// button says so and asks no "really?" (Daniel, 2026-11-28).
+    func testAReSplitIsLeftAndANewRecordingIsDiscarded() {
+        XCTAssertEqual(RipReviewPanelState.leaveTitle(isResplit: true, armed: false), "Leave re-split")
+        XCTAssertEqual(RipReviewPanelState.leaveTitle(isResplit: true, armed: true), "Leave re-split")
+        XCTAssertEqual(RipReviewPanelState.leaveTitle(isResplit: false, armed: false), "Discard side…")
+        XCTAssertEqual(
+            RipReviewPanelState.leaveTitle(isResplit: false, armed: true), "Really discard the side?")
     }
 }

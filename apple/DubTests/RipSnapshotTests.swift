@@ -323,4 +323,17 @@ final class RipSnapshotTests: XCTestCase {
              width: 1200, height: 300, named: "trimmed")
     }
 
+    /// A committed rip reopened with Re-split: "Leave re-split" where a
+    /// new recording has "Discard side…".
+    func test_ripReviewPanel_resplit() {
+        let state = RipReviewPanelState(
+            mode: .review,
+            sideDurationSecs: 1218,
+            trimmedSecs: 143,
+            segments: threeSegments,
+            isResplit: true)
+        snap(deckBg(RipReviewPanel(state: state)),
+             width: 1200, height: 300, named: "resplit")
+    }
+
 }

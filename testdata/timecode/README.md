@@ -44,6 +44,20 @@ test's threshold is 0.15 %, verified by injecting ±0.3 % with
 `ffmpeg -af asetrate` — that reads +0.264 % / −0.334 % and fails, so the test
 is sensitive at the scale the historical bug lived at.
 
+## Which stretches are steady
+
+For anything that needs the platter at a constant speed (loop lengths, Echo
+Out timing, BPM against the pitch), play only a steady stretch. Decode a
+take before trusting its name: `sl3-deckB-60s.flac` is not a minute of
+steady play.
+
+| Take | Steady at 0 % | Other stretches |
+|---|---|---|
+| `full/sl3-deckB-60s.flac` | 38–65 s | 0–2 needle landing, 3–10 +8 %, 11–16 −8 %, 19–34 scratching, 35–37 +5 % |
+| `full/sl3-serato-1122-0844-left.wav` | 0–17, 128–149, 261–284 s | +1.6 / +3.3 / +5.0 / +6.6 / +8.0 % from 18 s, −1.3 … −8.0 % from 150 s, ~+2 % after 285 s |
+
+`dub loopback <take> --from S --secs N` plays just that stretch.
+
 ## Format
 
 24-bit FLAC, converted from the original 32-bit float captures and **verified

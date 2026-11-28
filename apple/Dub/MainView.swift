@@ -753,6 +753,12 @@ final class WaveformAppModel: ObservableObject {
     @Published var channelsBText: String = ""
     @Published var palette: WaveformPalette = .serato
 
+    /// While macOS asks whether Dub may use the microphone. The decks and
+    /// the strip say so: "open Preferences to pick an input" sent the DJ
+    /// the wrong way, and nothing there helps until the prompt is
+    /// answered (every rebuilt Debug app asks again; rig, 2026-11-27).
+    @Published private(set) var awaitingInputPermission = false
+
     /// Engine mode the next Start call will use. **Derived state**:
     /// set only by `applyAutoDetect()` (launch + hot-plug) and, in
     /// DEBUG builds, by the dev override below. There is no
@@ -1060,29 +1066,28 @@ final class WaveformAppModel: ObservableObject {
     /// that window would read "nothing engaged" and undo the press.
     private var quickScratchEngagedAt: [DeckSide: Date] = [:]
 
-    /// M26a manual Prep ↔ Performance override, persisted so the
-    /// choice survives a relaunch. `nil` = follow hardware
-    /// auto-detect (the shipping default). Non-nil wins over
-    /// auto-detect **only while a DJ interface is present and the
-    /// vinyl-recording toggle is on**; unplugging the interface
-    /// clears it (see `reevaluateModeForDeviceChange`), so the
-    /// fail-safe fallback is always auto-Prep.
+    /// M26a manual Prep ↔ Performance override, for this session only.
+    /// `nil` = follow hardware auto-detect (the shipping default).
+    /// Non-nil wins over auto-detect **only while a DJ interface is
+    /// present and the vinyl-recording toggle is on**; unplugging the
+    /// interface clears it (see `reevaluateModeForDeviceChange`), so
+    /// the fail-safe fallback is always auto-Prep.
     ///
-    /// The `didSet` only persists. Mode re-detection + the engine
-    /// restart go through `setModeOverride(_:)` so the hot-plug
-    /// path can clear the override without triggering a second
-    /// restart.
-    @Published private(set) var modeOverride: EngineMode? {
-        didSet {
-            if let mode = modeOverride {
-                UserDefaults.standard.set(mode.rawValue, forKey: Self.kModeOverride)
-            } else {
-                UserDefaults.standard.removeObject(forKey: Self.kModeOverride)
-            }
-        }
-    }
+    /// Not persisted. It used to be, so the last PREP or REC press
+    /// with the interface plugged in carried into the next launch and
+    /// Dub opened in Prep at the turntables (2026-11-27). Unplugging
+    /// only cleared it while Dub was running. A launch follows the
+    /// hardware, as the manual says; an unfinished rip is still
+    /// offered the moment Prep is opened.
+    ///
+    /// Mode re-detection + the engine restart go through
+    /// `setModeOverride(_:)` so the hot-plug path can clear the
+    /// override without triggering a second restart.
+    @Published private(set) var modeOverride: EngineMode?
 
-    private static let kModeOverride = "dub.modeOverride"
+    /// Where versions before 2026-11-27 saved the override. Removed at
+    /// launch so a stale `prep` can't come back with an older build.
+    private static let kRetiredModeOverride = "dub.modeOverride"
 
     /// User-facing setter for the status-strip PREP / PERF switch.
     /// Re-runs detection and restarts the engine exactly like the
@@ -1531,6 +1536,11 @@ final class WaveformAppModel: ObservableObject {
     /// RipSplitMarkerOverlay / RipReviewPanel are mounted.
     @Published var ripPhase: RipUiPhase = .none
 
+    /// The review is a committed rip reopened with Re-split: leaving it
+    /// puts the rip back as it was, so the panel offers "Leave re-split"
+    /// where a new recording has "Discard side…".
+    @Published var ripIsResplit = false
+
     /// Which track of the side is rolling in review — the one card
     /// that shows a pause glyph. Republished from the rip poll, and
     /// only when it actually changes (a boundary crossing or a
@@ -1876,9 +1886,7 @@ final class WaveformAppModel: ObservableObject {
             defaultsKey: Self.kDiscogsToken,
             defaults: .standard,
             store: Self.secrets)
-        self.modeOverride = UserDefaults.standard
-            .string(forKey: Self.kModeOverride)
-            .flatMap(EngineMode.init(rawValue:))
+        UserDefaults.standard.removeObject(forKey: Self.kRetiredModeOverride)
         self.echoOutEnabled =
             UserDefaults.standard.object(forKey: Self.kEchoOutEnabled) as? Bool ?? true
         self.sirenEnabled =
@@ -1981,6 +1989,26 @@ final class WaveformAppModel: ObservableObject {
     /// Background engine starts, and which one may commit. Published for
     /// the status strip's CONNECTING state.
     @Published private(set) var engineStarts = EngineStartGate()
+
+    /// An engine start that talks to the interface: `open` runs on
+    /// `deviceQueue`, then `commit` on the main actor, unless a stop or a
+    /// newer start overtook it meanwhile. The status strip shows
+    /// CONNECTING until then.
+    func startOnDeviceQueue(
+        device: String,
+        _ open: @escaping (DubEngine) throws -> Void,
+        commit: @escaping @MainActor (Result<Void, Error>) -> Void
+    ) {
+        let ticket = engineStarts.begin(device: device)
+        let engine = self.engine
+        deviceQueue.async {
+            let result = Result<Void, Error> { try open(engine) }
+            Task { @MainActor [weak self] in
+                guard let self, self.engineStarts.finish(ticket) else { return }
+                commit(result)
+            }
+        }
+    }
 
     private func applyDeviceList(_ all: [AudioDeviceInfo]) {
         performanceDevices = all.filter { $0.category == .performanceInterface }
@@ -2106,8 +2134,8 @@ final class WaveformAppModel: ObservableObject {
     func stop() {
         stopPolling()
         // Any background start must not commit after this. If one is
-        // still opening the interface, `stopEngine` waits for it on the
-        // engine's lock and then stops what it opened.
+        // still opening the interface, `stopEngine` waits for it and then
+        // stops what it opened.
         engineStarts.cancel()
         engine.stopEngine()
         isRunning = false
@@ -2146,8 +2174,12 @@ final class WaveformAppModel: ObservableObject {
         case .notDetermined:
             // The system prompt's completion fires on an arbitrary
             // queue; hop back onto the main actor to touch the model.
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                Task { @MainActor in completion(granted) }
+            awaitingInputPermission = true
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                Task { @MainActor in
+                    self?.awaitingInputPermission = false
+                    completion(granted)
+                }
             }
         case .denied, .restricted:
             completion(false)
@@ -2338,44 +2370,39 @@ final class WaveformAppModel: ObservableObject {
         // here, unless a stop or a newer start overtook it meanwhile
         // (`EngineStartGate`). The status strip shows CONNECTING until
         // then.
-        let ticket = engineStarts.begin(device: inputDevice.name)
-        let engine = self.engine
-        deviceQueue.async {
-            let result = Result<Void, Error> {
-                if routing.twoDeck {
-                    if useThru {
-                        try engine.startThruTwoDeck(
-                            deviceName: inputDevice.name,
-                            channelsA: routing.deckAInput,
-                            channelsB: routing.deckBInput,
-                            outputDeviceUid: outputUID)
-                    } else {
-                        try engine.startPerformanceTwoDeck(
-                            deviceName: inputDevice.name,
-                            channelsA: routing.deckAInput,
-                            channelsB: routing.deckBInput,
-                            outputDeviceUid: outputUID)
-                    }
+        startOnDeviceQueue(device: inputDevice.name, { engine in
+            if routing.twoDeck {
+                if useThru {
+                    try engine.startThruTwoDeck(
+                        deviceName: inputDevice.name,
+                        channelsA: routing.deckAInput,
+                        channelsB: routing.deckBInput,
+                        outputDeviceUid: outputUID)
                 } else {
-                    if useThru {
-                        try engine.startThru(
-                            deviceName: inputDevice.name,
-                            channels: routing.deckAInput,
-                            outputDeviceUid: outputUID)
-                    } else {
-                        try engine.startPerformance(
-                            deviceName: inputDevice.name,
-                            channels: routing.deckAInput,
-                            outputDeviceUid: outputUID)
-                    }
+                    try engine.startPerformanceTwoDeck(
+                        deviceName: inputDevice.name,
+                        channelsA: routing.deckAInput,
+                        channelsB: routing.deckBInput,
+                        outputDeviceUid: outputUID)
+                }
+            } else {
+                if useThru {
+                    try engine.startThru(
+                        deviceName: inputDevice.name,
+                        channels: routing.deckAInput,
+                        outputDeviceUid: outputUID)
+                } else {
+                    try engine.startPerformance(
+                        deviceName: inputDevice.name,
+                        channels: routing.deckAInput,
+                        outputDeviceUid: outputUID)
                 }
             }
-            Task { @MainActor [weak self] in
-                guard let self, self.engineStarts.finish(ticket) else { return }
-                self.commitTimecodeStart(result, routing: routing)
-                if case .success = result { self.pointAtAudioIfUnrouted(inputDevice) }
-            }
-        }
+        }, commit: { [weak self] result in
+            guard let self else { return }
+            self.commitTimecodeStart(result, routing: routing)
+            if case .success = result { self.pointAtAudioIfUnrouted(inputDevice) }
+        })
     }
 
     // MARK: Routing an interface Dub does not know (FFI 87)
@@ -2879,7 +2906,7 @@ final class WaveformAppModel: ObservableObject {
         let record = deck.thruNeedleUp ? deck.thruRecordSeq &+ 1 : deck.thruRecordSeq
         deck.thruTap = DeckState.ThruTap(bpm: (bpm * 10).rounded() / 10, recordSeq: record)
         setState(deck, for: side)
-        syncFxEcho()
+        syncFxEcho(exact: true)
     }
 
     /// A tap on a deck's BPM, by click or by its mapped key: on THRU the
@@ -2920,7 +2947,7 @@ final class WaveformAppModel: ObservableObject {
                 ? nil : DeckState.ThruScale(factor: next, recordSeq: record)
         }
         setState(deck, for: side)
-        syncFxEcho()
+        syncFxEcho(exact: true)
     }
 
     /// Drop the tap and the scale: the readout goes back to what the
@@ -2932,7 +2959,7 @@ final class WaveformAppModel: ObservableObject {
         deck.thruScale = nil
         thruTaps[side] = nil
         setState(deck, for: side)
-        syncFxEcho()
+        syncFxEcho(exact: true)
     }
 
     /// The tempos a THRU override may land on.
@@ -7032,7 +7059,7 @@ final class WaveformAppModel: ObservableObject {
             c.spaceEchoTapBpm = bpm
         }
         setFxRack(side, c)
-        syncFxEcho()
+        syncFxEcho(exact: true)
     }
 
     /// TAP's presses, seconds of uptime. Not state anything draws.
@@ -7056,10 +7083,9 @@ final class WaveformAppModel: ObservableObject {
 
     /// SYNC, on every poll. The repeat follows the platter's pitch, so it
     /// moves while the DJ rides the fader — but the state, which rebuilds
-    /// the rack, only changes when the repeat would move by more than
-    /// 0.3 % (about a tenth of a BPM). A settled platter never crosses it;
-    /// the engine's heads glide between the steps.
-    private func syncFxEcho() {
+    /// the rack, only changes past `FxRackControls.syncMovesRepeat`'s
+    /// threshold. `exact` for the DJ's own act, which lands as tapped.
+    private func syncFxEcho(exact: Bool = false) {
         guard let side = dubFxDeck else { return }
         var deck = state(for: side)
         guard deck.fxRack.spaceEchoSync, let tempo = fxEchoTempo(fxSide: side),
@@ -7072,9 +7098,10 @@ final class WaveformAppModel: ObservableObject {
             }
             return
         }
-        let current = deck.fxRack.spaceEchoRepeatMs
-        let moved = abs(ms - current) > current * 0.003
-        guard moved || deck.fxEchoTempo?.source != tempo.source else { return }
+        guard FxRackControls.syncMovesRepeat(
+            fromMs: deck.fxRack.spaceEchoRepeatMs, toMs: ms,
+            sourceChanged: deck.fxEchoTempo?.source != tempo.source, exact: exact)
+        else { return }
         deck.fxRack.spaceEchoRepeatMs = ms
         deck.fxEchoTempo = tempo
         setState(deck, for: side)

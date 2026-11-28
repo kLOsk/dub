@@ -211,6 +211,9 @@ pub enum RipError {
 
     #[error("side spill unreadable: {0}")]
     SpillUnreadable(String),
+
+    #[error("library not open")]
+    LibraryClosed,
 }
 
 /// One record-a-side session. See the crate docs for the workflow.
@@ -219,6 +222,9 @@ pub struct RipSession {
     shared: Arc<CaptureShared>,
     worker: Option<JoinHandle<()>>,
     manifest: RipManifest,
+    /// A re-split's manifest as it was before [`Self::resplit_from_archive`]
+    /// cleared the plan: what [`Self::abandon_resplit`] puts back.
+    before_resplit: Option<RipManifest>,
 }
 
 impl RipSession {
@@ -241,6 +247,7 @@ impl RipSession {
             shared: Arc::new(CaptureShared::new()),
             worker: None,
             manifest,
+            before_resplit: None,
         })
     }
 
@@ -316,6 +323,7 @@ impl RipSession {
             shared,
             worker: None,
             manifest,
+            before_resplit: None,
         })
     }
 
@@ -339,6 +347,7 @@ impl RipSession {
     /// [`RipError::SpillUnreadable`] if the archive cannot be decoded.
     pub fn resplit_from_archive(session_dir: PathBuf) -> Result<Self, RipError> {
         let mut manifest = manifest::load(&session_dir)?;
+        let before = manifest.clone();
         let archive = session_dir.join(ARCHIVE_FILE);
         if !archive.is_file() {
             return Err(RipError::SpillUnreadable(format!(
@@ -391,7 +400,33 @@ impl RipSession {
             shared,
             worker: None,
             manifest,
+            before_resplit: Some(before),
         })
+    }
+
+    /// True for a session reopened from its archive to split again: its
+    /// tracks are in the library, and they and `side.flac` live in the
+    /// session directory.
+    #[must_use]
+    pub fn is_resplit(&self) -> bool {
+        self.before_resplit.is_some()
+    }
+
+    /// Leave a re-split without committing it: the manifest goes back
+    /// to the plan, names and imported tracks it had before, so the rip
+    /// is as it was. Nothing on disk but `rip.json` is touched. A no-op
+    /// on a session that is not a re-split.
+    ///
+    /// # Errors
+    ///
+    /// [`RipError::Manifest`] if the manifest cannot be written.
+    pub fn abandon_resplit(&mut self) -> Result<(), RipError> {
+        let Some(before) = self.before_resplit.take() else {
+            return Ok(());
+        };
+        manifest::save(&self.cfg.session_dir, &before)?;
+        self.manifest = before;
+        Ok(())
     }
 
     /// Path of the capture spill WAV.
@@ -716,9 +751,9 @@ impl RipSession {
     /// # Errors
     ///
     /// Same as [`Self::commit`].
-    pub fn commit_with_progress(
+    pub fn commit_with_progress<L: crate::LibraryAccess>(
         &mut self,
-        library: &mut dub_library::Library,
+        library: &mut L,
         progress: &mut dyn FnMut(crate::CommitProgress),
     ) -> Result<crate::RipOutcome, RipError> {
         self.require_stopped("commit")?;
